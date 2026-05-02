@@ -119,7 +119,7 @@ pub const TRANSFORMATION_MONOTONICITY_EPS: f64 = 1.0e-8;
 /// A value of 12 is already beyond any practically observable standard-normal
 /// quantile in this model's sample sizes, so this is a domain invariant rather
 /// than statistical shrinkage.
-pub const TRANSFORMATION_NORMAL_H_ABS_MAX: f64 = 12.0;
+pub const TRANSFORMATION_NORMAL_H_ABS_MAX: f64 = 1.0e6;
 /// Maximum number of response quantiles drawn into the monotonicity grid.
 /// Shared between fit and predict so the grid construction is identical.
 pub const TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES: usize = 129;
@@ -1721,6 +1721,233 @@ impl TransformationNormalFamily {
         })
     }
 
+    fn scop_psi_psi_value_score_hvp_from_cov(
+        &self,
+        beta: &Array1<f64>,
+        cov: ArrayView2<'_, f64>,
+        cov_i: ArrayView2<'_, f64>,
+        cov_j: ArrayView2<'_, f64>,
+        cov_ij: ArrayView2<'_, f64>,
+        direction: Option<&Array1<f64>>,
+    ) -> Result<(f64, Array1<f64>, Option<Array1<f64>>), String> {
+        let n = self.response_val_basis.nrows();
+        let p_resp = self.response_val_basis.ncols();
+        let p_cov = self.covariate_design.ncols();
+        let p_total = p_resp * p_cov;
+        if beta.len() != p_total {
+            return Err(format!(
+                "SCOP psi-psi beta length {} != p_resp({p_resp}) * p_cov({p_cov})",
+                beta.len()
+            ));
+        }
+        for (name, mat) in [
+            ("cov", cov),
+            ("cov_i", cov_i),
+            ("cov_j", cov_j),
+            ("cov_ij", cov_ij),
+        ] {
+            if mat.nrows() != n || mat.ncols() != p_cov {
+                return Err(format!(
+                    "SCOP psi-psi {name} shape {}x{} != expected {}x{}",
+                    mat.nrows(),
+                    mat.ncols(),
+                    n,
+                    p_cov
+                ));
+            }
+        }
+        let beta_mat = beta
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP psi-psi beta reshape failed: {e}"))?;
+        let direction_mat = match direction {
+            Some(v) => {
+                if v.len() != p_total {
+                    return Err(format!(
+                        "SCOP psi-psi HVP direction length {} != p_total {p_total}",
+                        v.len()
+                    ));
+                }
+                Some(
+                    v.view()
+                        .into_shape_with_order((p_resp, p_cov))
+                        .map_err(|e| format!("SCOP psi-psi direction reshape failed: {e}"))?,
+                )
+            }
+            None => None,
+        };
+
+        #[derive(Clone)]
+        struct JetHv {
+            value: f64,
+            grad: Array1<f64>,
+            dot: f64,
+            grad_dot: Array1<f64>,
+        }
+
+        impl JetHv {
+            fn zero(p: usize) -> Self {
+                Self {
+                    value: 0.0,
+                    grad: Array1::<f64>::zeros(p),
+                    dot: 0.0,
+                    grad_dot: Array1::<f64>::zeros(p),
+                }
+            }
+
+            fn linear_block(
+                value: f64,
+                dot: f64,
+                p_total: usize,
+                p_cov: usize,
+                block: usize,
+                row: ArrayView1<'_, f64>,
+            ) -> Self {
+                let mut out = Self::zero(p_total);
+                out.value = value;
+                out.dot = dot;
+                let offset = block * p_cov;
+                for c in 0..p_cov {
+                    out.grad[offset + c] = row[c];
+                }
+                out
+            }
+
+            fn add_scaled_assign(&mut self, scale: f64, rhs: &Self) {
+                self.value += scale * rhs.value;
+                self.grad.scaled_add(scale, &rhs.grad);
+                self.dot += scale * rhs.dot;
+                self.grad_dot.scaled_add(scale, &rhs.grad_dot);
+            }
+
+            fn add(&self, rhs: &Self) -> Self {
+                let mut out = self.clone();
+                out.add_scaled_assign(1.0, rhs);
+                out
+            }
+
+            fn scaled(&self, scale: f64) -> Self {
+                let mut out = self.clone();
+                out.value *= scale;
+                out.grad.mapv_inplace(|v| scale * v);
+                out.dot *= scale;
+                out.grad_dot.mapv_inplace(|v| scale * v);
+                out
+            }
+
+            fn mul(&self, rhs: &Self) -> Self {
+                Self {
+                    value: self.value * rhs.value,
+                    grad: &self.grad * rhs.value + &(&rhs.grad * self.value),
+                    dot: self.dot * rhs.value + self.value * rhs.dot,
+                    grad_dot: &self.grad_dot * rhs.value
+                        + &(&self.grad * rhs.dot)
+                        + &(&rhs.grad_dot * self.value)
+                        + &(&rhs.grad * self.dot),
+                }
+            }
+
+            fn recip(&self) -> Self {
+                let inv = 1.0 / self.value;
+                let inv_sq = inv * inv;
+                let inv_cu = inv_sq * inv;
+                Self {
+                    value: inv,
+                    grad: self.grad.mapv(|v| -v * inv_sq),
+                    dot: -self.dot * inv_sq,
+                    grad_dot: self.grad_dot.mapv(|v| -v * inv_sq)
+                        + self.grad.mapv(|v| 2.0 * v * self.dot * inv_cu),
+                }
+            }
+        }
+
+        let weights = self.weights.as_ref();
+        let mut objective_psi_psi = 0.0;
+        let mut score_psi_psi = Array1::<f64>::zeros(p_total);
+        let mut hvp = direction.map(|_| Array1::<f64>::zeros(p_total));
+
+        for row_idx in 0..n {
+            let cov_row = cov.row(row_idx);
+            let cov_i_row = cov_i.row(row_idx);
+            let cov_j_row = cov_j.row(row_idx);
+            let cov_ij_row = cov_ij.row(row_idx);
+            let rv = self.response_val_basis.row(row_idx);
+            let rd = self.response_deriv_basis.row(row_idx);
+
+            let mut h = JetHv::zero(p_total);
+            let mut hp = JetHv::zero(p_total);
+            let mut h_i = JetHv::zero(p_total);
+            let mut h_j = JetHv::zero(p_total);
+            let mut h_ij = JetHv::zero(p_total);
+            let mut hp_i = JetHv::zero(p_total);
+            let mut hp_j = JetHv::zero(p_total);
+            let mut hp_ij = JetHv::zero(p_total);
+
+            for k in 0..p_resp {
+                let beta_k = beta_mat.row(k);
+                let dir_k = direction_mat.as_ref().map(|d| d.row(k));
+                let gamma = beta_k.dot(&cov_row);
+                let gamma_i = beta_k.dot(&cov_i_row);
+                let gamma_j = beta_k.dot(&cov_j_row);
+                let gamma_ij = beta_k.dot(&cov_ij_row);
+                let gamma_dot = dir_k.as_ref().map(|d| d.dot(&cov_row)).unwrap_or(0.0);
+                let gamma_i_dot = dir_k.as_ref().map(|d| d.dot(&cov_i_row)).unwrap_or(0.0);
+                let gamma_j_dot = dir_k.as_ref().map(|d| d.dot(&cov_j_row)).unwrap_or(0.0);
+                let gamma_ij_dot = dir_k.as_ref().map(|d| d.dot(&cov_ij_row)).unwrap_or(0.0);
+
+                let g =
+                    JetHv::linear_block(gamma, gamma_dot, p_total, p_cov, k, cov_row);
+                let gi =
+                    JetHv::linear_block(gamma_i, gamma_i_dot, p_total, p_cov, k, cov_i_row);
+                let gj =
+                    JetHv::linear_block(gamma_j, gamma_j_dot, p_total, p_cov, k, cov_j_row);
+                let gij =
+                    JetHv::linear_block(gamma_ij, gamma_ij_dot, p_total, p_cov, k, cov_ij_row);
+
+                if k == 0 {
+                    h.add_scaled_assign(rv[k], &g);
+                    hp.add_scaled_assign(rd[k], &g);
+                    h_i.add_scaled_assign(rv[k], &gi);
+                    h_j.add_scaled_assign(rv[k], &gj);
+                    h_ij.add_scaled_assign(rv[k], &gij);
+                    hp_i.add_scaled_assign(rd[k], &gi);
+                    hp_j.add_scaled_assign(rd[k], &gj);
+                    hp_ij.add_scaled_assign(rd[k], &gij);
+                } else {
+                    let g_sq = g.mul(&g);
+                    let g_gi = g.mul(&gi);
+                    let g_gj = g.mul(&gj);
+                    let psi_cross = gj.mul(&gi).add(&g.mul(&gij));
+
+                    h.add_scaled_assign(rv[k], &g_sq);
+                    hp.add_scaled_assign(rd[k], &g_sq);
+                    h_i.add_scaled_assign(2.0 * rv[k], &g_gi);
+                    h_j.add_scaled_assign(2.0 * rv[k], &g_gj);
+                    h_ij.add_scaled_assign(2.0 * rv[k], &psi_cross);
+                    hp_i.add_scaled_assign(2.0 * rd[k], &g_gi);
+                    hp_j.add_scaled_assign(2.0 * rd[k], &g_gj);
+                    hp_ij.add_scaled_assign(2.0 * rd[k], &psi_cross);
+                }
+            }
+
+            let inv_hp = hp.recip();
+            let inv_hp_sq = inv_hp.mul(&inv_hp);
+            let value = h_i
+                .mul(&h_j)
+                .add(&h.mul(&h_ij))
+                .add(&hp_ij.mul(&inv_hp).scaled(-1.0))
+                .add(&hp_i.mul(&hp_j).mul(&inv_hp_sq));
+            let wi = weights[row_idx];
+            objective_psi_psi += wi * value.value;
+            score_psi_psi.scaled_add(wi, &value.grad);
+            if let Some(ref mut out) = hvp {
+                out.scaled_add(wi, &value.grad_dot);
+            }
+        }
+
+        Ok((objective_psi_psi, score_psi_psi, hvp))
+    }
+
     fn scop_psi_hessian_directional_derivative(
         &self,
         beta: &Array1<f64>,
@@ -2549,10 +2776,6 @@ impl CustomFamily for TransformationNormalFamily {
         let axis_i = deriv_i.implicit_axis;
         let axis_j = deriv_j.implicit_axis;
 
-        let beta_mat = beta
-            .view()
-            .into_shape_with_order((p_resp, p_cov))
-            .map_err(|e| format!("SCOP psi-psi beta reshape failed: {e}"))?;
         let cov = self
             .covariate_design
             .try_row_chunk(0..n)
@@ -2583,187 +2806,38 @@ impl CustomFamily for TransformationNormalFamily {
             }
         }
 
-        #[derive(Clone)]
-        struct Jet2 {
-            value: f64,
-            grad: Array1<f64>,
-            hess: Array2<f64>,
-        }
-
-        impl Jet2 {
-            fn zero(p: usize) -> Self {
-                Self {
-                    value: 0.0,
-                    grad: Array1::<f64>::zeros(p),
-                    hess: Array2::<f64>::zeros((p, p)),
-                }
-            }
-
-            fn linear_block(
-                value: f64,
-                p_total: usize,
-                p_cov: usize,
-                block: usize,
-                row: ArrayView1<'_, f64>,
-            ) -> Self {
-                let mut out = Self::zero(p_total);
-                out.value = value;
-                let offset = block * p_cov;
-                for c in 0..p_cov {
-                    out.grad[offset + c] = row[c];
-                }
-                out
-            }
-
-            fn add_scaled_assign(&mut self, scale: f64, rhs: &Self) {
-                self.value += scale * rhs.value;
-                self.grad.scaled_add(scale, &rhs.grad);
-                self.hess.scaled_add(scale, &rhs.hess);
-            }
-
-            fn add(&self, rhs: &Self) -> Self {
-                let mut out = self.clone();
-                out.add_scaled_assign(1.0, rhs);
-                out
-            }
-
-            fn scaled(&self, scale: f64) -> Self {
-                let mut out = self.clone();
-                out.value *= scale;
-                out.grad.mapv_inplace(|v| scale * v);
-                out.hess.mapv_inplace(|v| scale * v);
-                out
-            }
-
-            fn mul(&self, rhs: &Self) -> Self {
-                let p = self.grad.len();
-                let mut hess = &self.hess * rhs.value + &(&rhs.hess * self.value);
-                for a in 0..p {
-                    let self_a = self.grad[a];
-                    let rhs_a = rhs.grad[a];
-                    for b in 0..p {
-                        hess[[a, b]] += self_a * rhs.grad[b] + rhs_a * self.grad[b];
-                    }
-                }
-                Self {
-                    value: self.value * rhs.value,
-                    grad: &self.grad * rhs.value + &(&rhs.grad * self.value),
-                    hess,
-                }
-            }
-
-            fn recip(&self) -> Self {
-                let inv = 1.0 / self.value;
-                let inv_sq = inv * inv;
-                let inv_cu = inv_sq * inv;
-                let p = self.grad.len();
-                let mut hess = &self.hess * (-inv_sq);
-                for a in 0..p {
-                    for b in 0..p {
-                        hess[[a, b]] += 2.0 * self.grad[a] * self.grad[b] * inv_cu;
-                    }
-                }
-                Self {
-                    value: inv,
-                    grad: self.grad.mapv(|v| -v * inv_sq),
-                    hess,
-                }
-            }
-        }
-
-        let weights = self.weights.as_ref();
-        let mut objective_psi_psi = 0.0;
-        let mut score_psi_psi = Array1::<f64>::zeros(p_total);
-        let mut hessian_psi_psi = Array2::<f64>::zeros((p_total, p_total));
-
-        for i in 0..n {
-            let cov_row = cov.row(i);
-            let cov_i_row = cov_i.row(i);
-            let cov_j_row = cov_j.row(i);
-            let cov_ij_row = cov_ij.row(i);
-            let rv = self.response_val_basis.row(i);
-            let rd = self.response_deriv_basis.row(i);
-
-            let mut h = Jet2::zero(p_total);
-            let mut hp = Jet2::zero(p_total);
-            let mut h_i = Jet2::zero(p_total);
-            let mut h_j = Jet2::zero(p_total);
-            let mut h_ij = Jet2::zero(p_total);
-            let mut hp_i = Jet2::zero(p_total);
-            let mut hp_j = Jet2::zero(p_total);
-            let mut hp_ij = Jet2::zero(p_total);
-
-            for k in 0..p_resp {
-                let gamma = beta_mat.row(k).dot(&cov_row);
-                let gamma_i = beta_mat.row(k).dot(&cov_i_row);
-                let gamma_j = beta_mat.row(k).dot(&cov_j_row);
-                let gamma_ij = beta_mat.row(k).dot(&cov_ij_row);
-                let g = Jet2::linear_block(gamma, p_total, p_cov, k, cov_row);
-                let gi = Jet2::linear_block(gamma_i, p_total, p_cov, k, cov_i_row);
-                let gj = Jet2::linear_block(gamma_j, p_total, p_cov, k, cov_j_row);
-                let gij = Jet2::linear_block(gamma_ij, p_total, p_cov, k, cov_ij_row);
-
-                if k == 0 {
-                    h.add_scaled_assign(rv[k], &g);
-                    hp.add_scaled_assign(rd[k], &g);
-                    h_i.add_scaled_assign(rv[k], &gi);
-                    h_j.add_scaled_assign(rv[k], &gj);
-                    h_ij.add_scaled_assign(rv[k], &gij);
-                    hp_i.add_scaled_assign(rd[k], &gi);
-                    hp_j.add_scaled_assign(rd[k], &gj);
-                    hp_ij.add_scaled_assign(rd[k], &gij);
-                } else {
-                    let g_sq = g.mul(&g);
-                    let g_gi = g.mul(&gi);
-                    let g_gj = g.mul(&gj);
-                    let psi_cross = gj.mul(&gi).add(&g.mul(&gij));
-
-                    h.add_scaled_assign(rv[k], &g_sq);
-                    hp.add_scaled_assign(rd[k], &g_sq);
-                    h_i.add_scaled_assign(2.0 * rv[k], &g_gi);
-                    h_j.add_scaled_assign(2.0 * rv[k], &g_gj);
-                    h_ij.add_scaled_assign(2.0 * rv[k], &psi_cross);
-                    hp_i.add_scaled_assign(2.0 * rd[k], &g_gi);
-                    hp_j.add_scaled_assign(2.0 * rd[k], &g_gj);
-                    hp_ij.add_scaled_assign(2.0 * rd[k], &psi_cross);
-                }
-            }
-
-            let inv_hp = hp.recip();
-            let inv_hp_sq = inv_hp.mul(&inv_hp);
-            // For one row of negative log likelihood V = 0.5 h^2 - log(h'),
-            // ∂²V/∂ψ_i∂ψ_j =
-            // h_i h_j + h h_ij - h'_ij/h' + h'_i h'_j/(h')².
-            let value = h_i
-                .mul(&h_j)
-                .add(&h.mul(&h_ij))
-                .add(&hp_ij.mul(&inv_hp).scaled(-1.0))
-                .add(&hp_i.mul(&hp_j).mul(&inv_hp_sq));
-            let wi = weights[i];
-            objective_psi_psi += wi * value.value;
-            score_psi_psi.scaled_add(wi, &value.grad);
-            hessian_psi_psi.scaled_add(wi, &value.hess);
-        }
-
-        hessian_psi_psi = 0.5 * (&hessian_psi_psi + &hessian_psi_psi.t());
+        let (objective_psi_psi, score_psi_psi, _) = self
+            .scop_psi_psi_value_score_hvp_from_cov(
+                beta,
+                cov.view(),
+                cov_i.view(),
+                cov_j.view(),
+                cov_ij.view(),
+                None,
+            )?;
+        let hessian_psi_psi_operator: Box<dyn HyperOperator> =
+            Box::new(TransformationNormalPsiPsiHessianOperator::new(
+                Arc::new(self.clone()),
+                beta.clone(),
+                cov,
+                cov_i,
+                cov_j,
+                cov_ij,
+            ));
 
         // Result-validation gate. A trial point can still make the SCOP row
         // terms non-finite through an invalid h' or an exploding ψ second
         // derivative in the covariate basis. Surface that as an infeasible
         // exact-Newton evaluation instead of passing NaNs into the unified
         // outer evaluator.
-        if !objective_psi_psi.is_finite()
-            || !score_psi_psi.iter().all(|v| v.is_finite())
-            || !hessian_psi_psi.iter().all(|v| v.is_finite())
-        {
+        if !objective_psi_psi.is_finite() || !score_psi_psi.iter().all(|v| v.is_finite()) {
             return Err(format!(
                 "TransformationNormalFamily exact ψ-ψ second-order terms produced \
                  non-finite values at psi_i={psi_i}, psi_j={psi_j}: \
-                 obj_finite={}, score_all_finite={}, hess_all_finite={}. \
+                 obj_finite={}, score_all_finite={}. \
                  The outer evaluator should retreat from this trial point.",
                 objective_psi_psi.is_finite(),
                 score_psi_psi.iter().all(|v| v.is_finite()),
-                hessian_psi_psi.iter().all(|v| v.is_finite()),
             ));
         }
 
@@ -2779,8 +2853,8 @@ impl CustomFamily for TransformationNormalFamily {
         Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
             objective_psi_psi,
             score_psi_psi,
-            hessian_psi_psi,
-            hessian_psi_psi_operator: None,
+            hessian_psi_psi: Array2::zeros((0, 0)),
+            hessian_psi_psi_operator: Some(hessian_psi_psi_operator),
         }))
     }
 
@@ -2837,16 +2911,19 @@ impl CustomFamily for TransformationNormalFamily {
 
     fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
         // CTN's SCOP coefficient-space joint Hessian is supplied as a
-        // row-streaming matrix-free Hv operator. This advertises β-space
-        // representation only, not a profiled outer θθ Hessian-vector product.
+        // row-streaming matrix-free Hv operator.
+        true
+    }
+
+    fn outer_hyper_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
         true
     }
 
     fn outer_hyper_hessian_dense_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
-        // The current CTN ψψ path is pairwise row streaming, not a scalable
-        // dense outer hyper-Hessian capability. Keep CTN on exact-gradient
-        // outer optimization until a true directional outer-HVP is implemented.
-        false
+        // Dense materialization remains mathematically available through the
+        // outer-HVP operator, but SCOP's primary production path is the
+        // matrix-free θθ operator above.
+        true
     }
 }
 
@@ -2916,16 +2993,8 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
         Ok(Some(self.compute_diagonal()?))
     }
 
-    fn directional_derivative(
-        &self,
-        d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
-        let out = self.family.scop_hessian_directional_derivative(
-            &self.beta,
-            d_beta_flat,
-            &self.row_quantities,
-        )?;
-        Ok(Some(out))
+    fn directional_derivative(&self, _: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
+        Ok(None)
     }
 
     fn directional_derivative_operator(
@@ -2951,16 +3020,10 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
 
     fn second_directional_derivative(
         &self,
-        u: &Array1<f64>,
-        v: &Array1<f64>,
+        _: &Array1<f64>,
+        _: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let out = self.family.scop_hessian_second_directional_derivative(
-            &self.beta,
-            u,
-            v,
-            &self.row_quantities,
-        )?;
-        Ok(Some(out))
+        Ok(None)
     }
 
     fn second_directional_derivative_operator(
@@ -3146,6 +3209,91 @@ impl HyperOperator for TransformationNormalD2hMatrixFreeOperator {
                 &self.row_quantities,
             )
             .expect("validated CTN d2H operator inputs should not fail")
+    }
+
+    fn is_implicit(&self) -> bool {
+        true
+    }
+}
+
+struct TransformationNormalPsiPsiHessianOperator {
+    family: Arc<TransformationNormalFamily>,
+    beta: Array1<f64>,
+    cov: Array2<f64>,
+    cov_i: Array2<f64>,
+    cov_j: Array2<f64>,
+    cov_ij: Array2<f64>,
+}
+
+impl TransformationNormalPsiPsiHessianOperator {
+    fn new(
+        family: Arc<TransformationNormalFamily>,
+        beta: Array1<f64>,
+        cov: Array2<f64>,
+        cov_i: Array2<f64>,
+        cov_j: Array2<f64>,
+        cov_ij: Array2<f64>,
+    ) -> Self {
+        Self {
+            family,
+            beta,
+            cov,
+            cov_i,
+            cov_j,
+            cov_ij,
+        }
+    }
+
+    fn p_total(&self) -> usize {
+        self.beta.len()
+    }
+
+    fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
+        self.family
+            .scop_psi_psi_value_score_hvp_from_cov(
+                &self.beta,
+                self.cov.view(),
+                self.cov_i.view(),
+                self.cov_j.view(),
+                self.cov_ij.view(),
+                Some(v),
+            )
+            .expect("validated CTN psi-psi operator inputs should not fail")
+            .2
+            .expect("CTN psi-psi operator called without HVP output")
+    }
+}
+
+impl HyperOperator for TransformationNormalPsiPsiHessianOperator {
+    fn dim(&self) -> usize {
+        self.p_total()
+    }
+
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        debug_assert_eq!(v.len(), self.p_total());
+        self.apply(v)
+    }
+
+    fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
+        debug_assert_eq!(factor.nrows(), self.p_total());
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let p = factor.nrows();
+        let k = factor.ncols();
+        let cols: Vec<Array1<f64>> = (0..k)
+            .into_par_iter()
+            .map(|c| self.apply(&factor.column(c).to_owned()))
+            .collect();
+        let mut out = Array2::<f64>::zeros((p, k));
+        for (c, bv) in cols.into_iter().enumerate() {
+            out.column_mut(c).assign(&bv);
+        }
+        out
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let p = self.p_total();
+        let identity = Array2::<f64>::eye(p);
+        self.mul_mat(&identity)
     }
 
     fn is_implicit(&self) -> bool {
@@ -4770,26 +4918,33 @@ fn build_tensor_penalties_kronecker(
     let eye_cov = Array2::<f64>::eye(p_cov);
     let mut penalties = Vec::new();
 
-    // Covariate penalties: I_resp ⊗ S_cov_m
+    let mut location_resp = Array2::<f64>::zeros((p_resp, p_resp));
+    location_resp[[0, 0]] = 1.0;
+    let mut shape_resp = Array2::<f64>::eye(p_resp);
+    shape_resp[[0, 0]] = 0.0;
+
+    // Covariate penalties: split the derivative-free location row from the
+    // squared monotone shape rows. Sharing one λ across both roles oversmooths
+    // b(x) whenever the shape rows need stronger regularization.
     for s_cov in covariate_penalties {
-        match s_cov {
-            PenaltyMatrix::Dense(right) => penalties.push(PenaltyMatrix::KroneckerFactored {
-                left: eye_resp.clone(),
-                right,
-            }),
-            penalty @ PenaltyMatrix::Blockwise { .. } => {
-                penalties.push(PenaltyMatrix::KroneckerFactored {
-                    left: eye_resp.clone(),
-                    right: penalty.to_dense(),
-                })
-            }
+        let right = match s_cov {
+            PenaltyMatrix::Dense(right) => right,
+            penalty @ PenaltyMatrix::Blockwise { .. } => penalty.to_dense(),
             PenaltyMatrix::KroneckerFactored { .. } => {
                 return Err(
                     "transformation covariate penalties must be single-block, not already Kronecker-factored"
                         .to_string(),
                 )
             }
-        }
+        };
+        penalties.push(PenaltyMatrix::KroneckerFactored {
+            left: location_resp.clone(),
+            right: right.clone(),
+        });
+        penalties.push(PenaltyMatrix::KroneckerFactored {
+            left: shape_resp.clone(),
+            right,
+        });
     }
 
     // Response penalties: S_resp_m ⊗ I_cov
@@ -4869,60 +5024,90 @@ fn compute_warm_start(
         target_hp[i] = inv_tau;
     }
 
-    let mut beta = Array1::<f64>::zeros(p_total);
-    let weighted_inv_tau_sum: f64 = target_hp
-        .iter()
-        .zip(weights.iter())
-        .map(|(&hp, &w)| hp * w)
-        .sum();
-    let weight_sum: f64 = weights.iter().sum::<f64>().max(1e-12);
-    let mean_inv_tau = (weighted_inv_tau_sum / weight_sum).max(TRANSFORMATION_MONOTONICITY_EPS);
-    let mean_m_sum = match x_deriv_kron {
-        KroneckerDesign::KhatriRao { left, .. } if left.ncols() == p_resp => {
-            let mut total = 0.0;
-            let mut wsum = 0.0;
-            for i in 0..n {
-                let row_sum: f64 = left.row(i).slice(s![1..]).iter().sum();
-                total += weights[i] * row_sum;
-                wsum += weights[i];
-            }
-            (total / wsum.max(1e-12)).max(1e-12)
-        }
-        _ => 1.0,
-    };
-    let gamma_const = (mean_inv_tau / mean_m_sum).sqrt();
+    // LSQ-in-γ² formulation. The SCOP-CTN forward map writes
+    //   h_i  = γ_0(x_i) · I_0(y_i) + Σ_{k≥1} γ_k(x_i)² · I_k(y_i)
+    //   h'_i = γ_0(x_i) · M_0(y_i) + Σ_{k≥1} γ_k(x_i)² · M_k(y_i),
+    // which is *linear in α* with α_0(x) = γ_0(x), α_k(x) = γ_k(x)² for k≥1.
+    // We solve the joint normal equations for α_kj on the stacked design
+    //   [X_val_kron; X_deriv_kron] · α = [t_h; t_hp]
+    // with light ridge, then recover γ via elementwise sqrt with NNLS clamp.
+    // This recovers the affine seed h(y) = (y - loc)/scale exactly when the
+    // I-spline / M-spline span contains the affine pair, modulo ridge bias.
+    let policy = ResourcePolicy::default_library();
+    let gram_val = x_val_kron.weighted_gram(weights, &policy);
+    let gram_deriv = x_deriv_kron.weighted_gram(weights, &policy);
+    let mut a = gram_val + gram_deriv;
 
+    let mut weighted_t_h = Array1::<f64>::zeros(n);
+    let mut weighted_t_hp = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        weighted_t_h[i] = weights[i] * target_h[i];
+        weighted_t_hp[i] = weights[i] * target_hp[i];
+    }
+    let rhs = x_val_kron.transpose_mul(&weighted_t_h)
+        + x_deriv_kron.transpose_mul(&weighted_t_hp);
+
+    let mut diag_trace = 0.0;
+    for j in 0..p_total {
+        diag_trace += a[[j, j]];
+    }
+    let ridge = if p_total > 0 {
+        (diag_trace / p_total as f64).max(1.0) * 1e-10
+    } else {
+        1e-10
+    };
+    for j in 0..p_total {
+        a[[j, j]] += ridge;
+    }
+
+    use crate::faer_ndarray::FaerCholesky;
+    use faer::Side;
+    let factor = a
+        .cholesky(Side::Lower)
+        .map_err(|e| format!("warm-start joint LSQ Cholesky failed: {e:?}"))?;
+    let alpha = factor.solvevec(&rhs);
+    if alpha.iter().any(|v| !v.is_finite()) {
+        return Err("warm-start joint LSQ produced non-finite coefficients".to_string());
+    }
+
+    // Recover γ from α: row 0 is linear (γ_0 = α_0), rows k≥1 are squared
+    // (γ_k = sqrt(α_k_at_each_row)). Since α_k is parameterized as a linear
+    // combination of covariate columns, we transform in coefficient space by
+    // sqrt-ing the per-row α_k values and then re-projecting back to the
+    // covariate basis via least-squares (NNLS-style: clamp negative α to 0).
+    let mut beta = Array1::<f64>::zeros(p_total);
+    // Linear k=0: γ_0(x) = α_0(x) directly.
+    for j in 0..p_cov {
+        beta[j] = alpha[j];
+    }
+    // Squared k≥1: per-row α_k(x_i), clamp to ≥0, sqrt, then re-project.
+    let alpha_view = alpha.view().into_shape_with_order((p_resp, p_cov)).unwrap();
     let zero_offset = Array1::<f64>::zeros(n);
     let log_lambdas = Array1::<f64>::zeros(covariate_penalties.len());
-    let target_gamma = Array1::<f64>::from_elem(n, gamma_const);
+    let mut alpha_row_eval = Array1::<f64>::zeros(n);
     for k in 1..p_resp {
+        let alpha_k = alpha_view.row(k).to_owned();
+        // α_k(x_i) = b_cov(x_i) · alpha_k.
+        let row_vals = covariate_design.matrixvectormultiply(&alpha_k);
+        for i in 0..n {
+            // NNLS clamp: any negative α_k is rounded to zero before sqrt.
+            // Affine targets representable in the SCOP span give nonnegative α
+            // to working precision; only basis-incompatible targets force the
+            // clamp.
+            alpha_row_eval[i] = row_vals[i].max(0.0).sqrt();
+        }
         let row_beta = solve_penalizedweighted_projection(
             covariate_design,
             &zero_offset,
-            &target_gamma,
+            &alpha_row_eval,
             weights,
             covariate_penalties,
             &log_lambdas,
-            1e-8,
+            1e-12,
         )?;
         for c in 0..p_cov {
             beta[k * p_cov + c] = row_beta[c];
         }
-    }
-
-    let shape_contrib = x_val_kron.scop_affine_squared_forward(&beta);
-    let target_location = &target_h - &shape_contrib;
-    let beta_location = solve_penalizedweighted_projection(
-        covariate_design,
-        &zero_offset,
-        &target_location,
-        weights,
-        covariate_penalties,
-        &log_lambdas,
-        1e-8,
-    )?;
-    for c in 0..p_cov {
-        beta[c] = beta_location[c];
     }
 
     if beta.iter().any(|v| !v.is_finite()) {
@@ -6296,17 +6481,17 @@ mod tests {
     }
 
     #[test]
-    fn ctn_inner_hvp_does_not_advertise_outer_hyper_hessian() {
+    fn ctn_inner_and_outer_hvp_capabilities_are_advertised() {
         let psi = array![0.15, -0.10];
         let (family, _, _, spec) = toy_family_and_derivatives(&psi);
         let specs = std::slice::from_ref(&spec);
 
         assert!(family.inner_coefficient_hessian_hvp_available(specs));
-        assert!(!family.outer_hyper_hessian_hvp_available(specs));
-        assert!(!family.outer_hyper_hessian_dense_available(specs));
+        assert!(family.outer_hyper_hessian_hvp_available(specs));
+        assert!(family.outer_hyper_hessian_dense_available(specs));
         assert_eq!(
             family.exact_outer_derivative_order(specs, &BlockwiseFitOptions::default()),
-            crate::custom_family::ExactOuterDerivativeOrder::First
+            crate::custom_family::ExactOuterDerivativeOrder::Second
         );
 
         let options = BlockwiseFitOptions {
@@ -6321,7 +6506,7 @@ mod tests {
         );
         assert_eq!(
             hessian,
-            crate::solver::outer_strategy::Derivative::Unavailable
+            crate::solver::outer_strategy::Derivative::Analytic
         );
     }
 
@@ -7708,19 +7893,7 @@ pub fn fit_transformation_normal(
         kappa_dims,
     );
     let rho0 = probe_block.initial_log_lambdas.clone();
-    // Data-aware floor on the outer search range. In small-n / large-p CTN
-    // fits, λ < 1 lets the transformation interpolate with huge h values while
-    // still satisfying monotonicity. Keep the floor only in that underdetermined
-    // regime; well-determined fits retain the broad REML search interval.
-    let total_param_count = probe_block.design.ncols();
-    let n_obs_for_bound = response.len();
-    let rho_floor =
-        if total_param_count > 0 && n_obs_for_bound < 5usize.saturating_mul(total_param_count) {
-            let underdetermination = 5.0 * total_param_count as f64 / n_obs_for_bound.max(1) as f64;
-            (underdetermination * underdetermination).ln().max(0.0)
-        } else {
-            -12.0
-        };
+    let rho_floor = -12.0;
     let rho_lower = Array1::<f64>::from_elem(n_penalties, rho_floor);
     let rho_upper = Array1::<f64>::from_elem(n_penalties, 12.0);
     let probe_blocks = vec![probe_block];

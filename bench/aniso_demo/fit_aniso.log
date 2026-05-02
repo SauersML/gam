@@ -10,426 +10,1637 @@ Inner: Data Loading |  33% ▕█████▍          ▏
 [RUNNING] fit | optimizing transformation-normal model | elapsed=0s
 Workflow: Fit |  20% ▕███▎            ▏
 Inner: Data Loading |  33% ▕█████▍          ▏
-[INFO] [transformation-normal] exact joint setup: rho_dim=5 log_kappa_dim=5 dims_per_term=[5]
-[INFO] [transformation-normal] skipping baseline custom-family prefit before exact joint optimization (rho_dim=5, log_kappa_dim=5, rho0_range=[1.007, 3.862]); using CTN warm start and penalty-scale rho seed
+[INFO] [transformation-normal] exact joint setup: rho_dim=6 log_kappa_dim=5 dims_per_term=[5]
+[INFO] [transformation-normal] skipping baseline custom-family prefit before exact joint optimization (rho_dim=6, log_kappa_dim=5, rho0_range=[0.129, 3.350]); using CTN warm start and penalty-scale rho seed
 [INFO] [transformation-normal] entering exact joint outer optimization (analytic_gradient=true, analytic_hessian=false)
-[INFO] [OUTER] n-block exact-joint spatial: n_params=10, gradient=Analytic, hessian=Unavailable -> solver=Bfgs, hessian_source=BfgsApprox [solver=Bfgs;hessian=BfgsApprox;matrix-free=false] [no Hessian: BFGS approximation]
-[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=6, order=1, power=8, length_scale=1)', cols=5): 0.000s
-[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.017s
+[INFO] [OUTER] n-block exact-joint spatial: n_params=11, gradient=Analytic, hessian=Unavailable -> solver=Bfgs, hessian_source=BfgsApprox [solver=Bfgs;hessian=BfgsApprox;matrix-free=false] [no Hessian: BFGS approximation]
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.021s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.003s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.007s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=1.436e0 alpha_grid=1.206e0 elapsed=0.004s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=1.684e0 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=inf elapsed=0.003s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=1.313e1 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.001s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.004s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=inf elapsed=0.004s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=inf elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=3.016e5 elapsed=0.003s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=inf elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.001s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=inf elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
-[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.009s
-[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.006s
-[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.005s
-[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.005s
-[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.006s
-[INFO] [STAGE] outer eval start order=ValueAndGradient dim=10 (first-order bridge)
-[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.000s cost=3.566677e2 |g|=5.198e0 (first-order bridge)
-[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=inf elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.005s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.007s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=3.564e0 alpha_grid=5.882e-1 elapsed=0.003s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=8.230e0 alpha_grid=6.942e-3 elapsed=0.003s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.017s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.000s cost=3.573694e2 |g|=4.664e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.021s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.004s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=8.283e0 alpha_grid=3.495e-5 elapsed=0.006s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=inf elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=8.283e0 alpha_grid=1.748e-7 elapsed=0.003s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=3.362e1 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.001s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.004s
-[INFO] [STAGE] outer eval start order=ValueAndGradient dim=10 (first-order bridge)
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=6.785e1 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.003s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=8.283e0 alpha_grid=8.738e-10 elapsed=0.004s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=3.376e3 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.003s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.008s
-[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.010s
-[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.008s
-[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.003s
-[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.005s
-[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.005s
-[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.290s cost=3.422776e2 |g|=2.981e0 (first-order bridge)
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=3.490e6 alpha_grid=5.320e5 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.017s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.146s cost=3.264708e2 |g|=4.655e1 (first-order bridge)
 [INFO] [BFGS] step accepted via StrongWolfe; inverse update applied
-[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.000s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.022s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=7.099e0 alpha_grid=5.630e0 elapsed=0.004s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=1.160e1 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=5.120e1 alpha_grid=3.451e1 elapsed=0.003s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=7.045e1 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=3.557e3 alpha_grid=1.404e3 elapsed=0.003s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=2.483e3 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=6.891e5 alpha_grid=2.676e5 elapsed=0.003s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=2.818e6 alpha_grid=4.077e5 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
-[INFO] [STAGE] outer eval start order=ValueAndGradient dim=10 (first-order bridge)
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.001s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.001s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
-[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.003s
-[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.004s
-[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.007s
-[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.006s
-[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.009s
-[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.327s cost=3.063323e2 |g|=1.905e1 (first-order bridge)
-[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.000s
-[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.005s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.009s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=3.145e1 alpha_grid=1.721e1 elapsed=0.010s
-[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=3.159e3 alpha_grid=1.810e3 elapsed=0.018s
-[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.003s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=6.067e5 alpha_grid=3.462e5 elapsed=0.004s
-[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.001s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.004s
-[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
-[INFO] [STAGE] outer eval start order=ValueAndGradient dim=10 (first-order bridge)
-[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
-[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
-[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.010s
-[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.003s
-[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.013s
-[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.005s
-[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.007s
-[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.279s cost=3.018244e2 |g|=2.136e1 (first-order bridge)
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.017s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.148s cost=3.134472e2 |g|=5.457e1 (first-order bridge)
 [INFO] [BFGS] step accepted via StrongWolfe; inverse update applied
-[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.000s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.021s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=5.959e1 alpha_grid=1.910e0 elapsed=0.008s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=9.348e1 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.003s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=3.113e4 alpha_grid=1.812e2 elapsed=0.009s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=6.840e3 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=6.254e6 alpha_grid=3.605e4 elapsed=0.004s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.001s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.005s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.007s
-[INFO] [STAGE] outer eval start order=ValueAndGradient dim=10 (first-order bridge)
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.007s
-[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
-[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.006s
-[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.006s
-[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.005s
-[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.006s
-[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.006s
-[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.279s cost=3.017323e2 |g|=2.141e1 (first-order bridge)
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.022s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.029s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.017s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.163s cost=3.123604e2 |g|=5.535e1 (first-order bridge)
 [INFO] [BFGS] step accepted via StrongWolfe; inverse update applied
-[WARN] [BFGS] Max iterations reached: iters=3, f=3.017323e2, ||g||=3.776e-1, fe=9, ge=5, Δ=4.834e0
+[WARN] [BFGS] Max iterations reached: iters=3, f=3.123604e2, ||g||=4.903e-5, fe=7, ge=4, Δ=1.415e0
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.022s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=inf elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=6.892e0 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=4.073e0 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=2.635e1 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=1.584e2 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=1.787e4 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.017s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
 [INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.000s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=4.949e0 alpha_grid=4.081e-2 elapsed=0.005s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=5.203e0 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=5.134e0 alpha_grid=2.125e-4 elapsed=0.004s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=8.882e0 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=5.135e0 alpha_grid=1.063e-6 elapsed=0.003s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=2.164e1 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.009s
-[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.006s
-[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.006s
-[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.005s
-[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.014s
-[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.006s
-[INFO] [STAGE] outer eval start order=ValueAndGradient dim=10 (first-order bridge)
-[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.000s cost=3.040662e2 |g|=2.091e1 (first-order bridge)
-[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=2.611e2 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=1.110e1 alpha_grid=1.145e-8 elapsed=0.006s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=1.837e4 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
-[INFO] [STAGE] outer eval start order=ValueAndGradient dim=10 (first-order bridge)
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.003s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.007s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=1.110e1 alpha_grid=5.725e-11 elapsed=0.003s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.017s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.176s cost=3.098493e2 |g|=6.199e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.022s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
-[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.006s
-[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.006s
-[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.004s
-[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.005s
-[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.009s
-[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.322s cost=3.021562e2 |g|=2.118e1 (first-order bridge)
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=4.013e1 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=5.315e2 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=6.166e4 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.021s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=3.786e7 alpha_grid=3.962e5 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.024s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=1.202e8 alpha_grid=8.582e5 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.023s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=2.500e8 alpha_grid=1.778e6 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.021s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=4.775e8 alpha_grid=1.319e6 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.021s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=3.040e6 alpha_grid=1.972e4 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=1.858e7 alpha_grid=3.192e6 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.021s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=7.159e2 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=1.223e5 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.020s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=5.447e1 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=2.301e3 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=4.321e5 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.020s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=4.783e1 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=1.736e3 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=2.016e7 alpha_grid=3.185e5 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.016s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.141s cost=3.091635e2 |g|=5.836e1 (first-order bridge)
 [INFO] [BFGS] step accepted via StrongWolfe; inverse update applied
-[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.000s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.022s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=6.797e0 alpha_grid=5.908e0 elapsed=0.003s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=3.250e2 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=2.276e3 alpha_grid=1.743e3 elapsed=0.003s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=3.138e4 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=3.833e5 alpha_grid=2.762e5 elapsed=0.004s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.001s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.004s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.004s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.007s
-[INFO] [STAGE] outer eval start order=ValueAndGradient dim=10 (first-order bridge)
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.003s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
-[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
-[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.004s
-[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.004s
-[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.012s
-[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.006s
-[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.009s
-[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.301s cost=3.013756e2 |g|=2.158e1 (first-order bridge)
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.016s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.136s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
 [INFO] [BFGS] step accepted via StrongWolfe; inverse update applied
-[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.000s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.020s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=2.556e1 alpha_grid=6.991e-1 elapsed=0.004s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=1.315e4 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.003s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.007s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=8.277e1 alpha_grid=1.147e-2 elapsed=0.004s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=2.583e6 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.001s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.004s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=8.371e1 alpha_grid=5.802e-5 elapsed=0.004s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=8.372e1 alpha_grid=2.901e-7 elapsed=0.007s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.020s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.003s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.007s
-[INFO] [STAGE] outer eval start order=ValueAndGradient dim=10 (first-order bridge)
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=2.217e4 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=8.372e1 alpha_grid=1.451e-9 elapsed=0.005s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
-[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.006s
-[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.006s
-[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.004s
-[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.005s
-[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.004s
-[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.240s cost=3.011763e2 |g|=2.162e1 (first-order bridge)
-[INFO] [BFGS] step accepted via StrongWolfe; inverse update applied
-[WARN] [BFGS] Max iterations reached: iters=3, f=3.011763e2, ||g||=1.697e-1, fe=7, ge=4, Δ=4.834e0
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.021s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.001s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.004s
-[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
-[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=8.372e1 alpha_grid=7.256e-12 elapsed=0.003s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=4.392e4 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.001s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
 [INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
-[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
-[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.005s
-[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.007s
-[INFO] [spatial-kappa] term 0 ("duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=6, order=1, power=8, length_scale=1)"): anisotropic length scales optimized (global length_scale=1.0000)
-  axis 0: eta=+0.0000, length=1.0000, kappa=1.0000
-  axis 1: eta=+0.0000, length=1.0000, kappa=1.0000
-  axis 2: eta=+0.0000, length=1.0000, kappa=1.0000
-  axis 3: eta=+0.0000, length=1.0000, kappa=1.0000
-  axis 4: eta=+0.0000, length=1.0000, kappa=1.0000
-[RUNNING] fit | optimizing transformation-normal model | elapsed=4s
-Workflow: Fit |  60% ▕█████████▋      ▏ | ETA: 3s
-Inner: Data Loading |  33% ▕█████▍          ▏ | ETA: 9s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.020s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=8.786e4 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.021s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=1.758e5 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.005s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.005s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.022s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.002s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=3.515e5 elapsed=0.002s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.003s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.003s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.002s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.027s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=1.160e7 alpha_grid=7.031e5 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.016s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.131s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.019s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=1.708e6 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.022s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.020s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=3.005e6 alpha_grid=1.906e6 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.020s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.021s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.025s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.002s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.026s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.023s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.021s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.020s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.020s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.021s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.018s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.017s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.162s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.020s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.016s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.142s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.020s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.016s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.156s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[WARN] [BFGS Adaptive] Strong Wolfe failed at iter 2. Falling back to Backtracking.
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.032s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=1.341e4 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=2.635e6 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.021s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.020s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.016s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.146s cost=3.091002e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.020s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=2.217e4 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.003s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.003s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.017s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.142s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.020s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=4.392e4 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.016s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.138s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.020s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=8.786e4 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.016s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.139s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.020s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=1.758e5 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.019s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.018s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.143s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.021s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=3.515e5 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.018s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.029s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.191s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.033s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=1.160e7 alpha_grid=7.031e5 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.016s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.137s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.020s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=2.623e6 alpha_grid=1.406e6 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.017s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.139s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.020s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.016s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.138s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.020s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=3.104e6 alpha_grid=1.881e6 elapsed=0.000s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.016s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.129s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.021s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.016s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.129s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.019s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.016s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.129s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.019s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.016s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.128s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.019s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.016s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.128s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.020s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.016s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.129s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.019s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.016s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.132s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.019s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.017s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.136s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.020s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.017s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.143s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.020s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.018s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.016s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.016s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.141s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.020s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.021s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.017s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.161s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.021s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.017s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.150s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.022s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.017s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.151s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.022s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.017s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.146s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.024s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.018s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.017s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.154s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.021s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.018s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.017s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.150s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.021s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.018s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.018s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.017s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.164s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.040s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.017s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.151s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.021s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.017s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.157s cost=3.091001e2 |g|=5.809e1 (first-order bridge)
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=11 (first-order bridge)
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.021s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=1.320e4 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=2.593e6 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.017s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.017s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.766s cost=3.091002e2 |g|=5.809e1 (first-order bridge)
+[WARN] [BFGS] Max iterations reached: iters=3, f=3.091001e2, ||g||=2.494e-1, fe=14, ge=4, Δ=2.395e-1
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)', cols=17): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.021s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=1.110e4 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=3.483e6 alpha_grid=2.185e6 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=126 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (SCOP exact dense) n=300 p=126 flops~4762800 elapsed=0.000s
+[INFO] [STAGE] CTN evaluate end n=300 p=126 elapsed=0.001s
+[INFO] [transformation-normal] final fixed-rho CTN validation: max_abs_h=3.384621e0 max_abs_covariate_basis=1.000000e0
+[INFO] [spatial-kappa] term 0 ("duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)"): anisotropic length scales optimized (global length_scale=0.9709)
+  axis 0: eta=-0.0000, length=0.9709, kappa=1.0300
+  axis 1: eta=+0.0000, length=0.9709, kappa=1.0300
+  axis 2: eta=-0.0000, length=0.9709, kappa=1.0300
+  axis 3: eta=+0.0000, length=0.9709, kappa=1.0300
+  axis 4: eta=+0.0000, length=0.9708, kappa=1.0300
+[RUNNING] fit | optimizing transformation-normal model | elapsed=48s
+Workflow: Fit |  60% ▕█████████▋      ▏ | ETA: 32s
+Inner: Data Loading |  33% ▕█████▍          ▏ | ETA: 97s
 model fit complete | family=transformation-normal | outer_iter=0 | converged=true
-[spatial-kappa] term 0 ("duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=6, order=1, power=8, length_scale=1)"): anisotropic length scales (global length_scale=1.0000)
-  axis 0: eta=+0.0000, length=1.0000, kappa=1.0000
-  axis 1: eta=+0.0000, length=1.0000, kappa=1.0000
-  axis 2: eta=+0.0000, length=1.0000, kappa=1.0000
-  axis 3: eta=+0.0000, length=1.0000, kappa=1.0000
-  axis 4: eta=+0.0000, length=1.0000, kappa=1.0000
-[RUNNING] fit | writing transformation-normal model | elapsed=4s
-Workflow: Fit |  80% ▕████████████▊   ▏ | ETA: 1s
-Inner: Data Loading |  33% ▕█████▍          ▏ | ETA: 9s
+[spatial-kappa] term 0 ("duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)"): anisotropic length scales (global length_scale=0.9709)
+  axis 0: eta=-0.0000, length=0.9709, kappa=1.0300
+  axis 1: eta=+0.0000, length=0.9709, kappa=1.0300
+  axis 2: eta=-0.0000, length=0.9709, kappa=1.0300
+  axis 3: eta=+0.0000, length=0.9709, kappa=1.0300
+  axis 4: eta=+0.0000, length=0.9708, kappa=1.0300
+[RUNNING] fit | writing transformation-normal model | elapsed=48s
+Workflow: Fit |  80% ▕████████████▊   ▏ | ETA: 12s
+Inner: Data Loading |  33% ▕█████▍          ▏ | ETA: 97s
 saved model: /Users/user/gam/bench/aniso_demo/model_aniso.json
-[RUNNING] fit | writing transformation-normal model | elapsed=4s
+[RUNNING] fit | writing transformation-normal model | elapsed=48s
 Workflow: Fit | 100% ▕████████████████▏
-Inner: Data Loading |  33% ▕█████▍          ▏ | ETA: 9s
+Inner: Data Loading |  33% ▕█████▍          ▏ | ETA: 97s
 Note: transformation-normal fit complete
-[RUNNING] fit | writing transformation-normal model | elapsed=4s
+[RUNNING] fit | writing transformation-normal model | elapsed=48s
 Workflow: Fit | 100% ▕████████████████▏
-Inner: Data Loading |  33% ▕█████▍          ▏ | ETA: 9s
+Inner: Data Loading |  33% ▕█████▍          ▏ | ETA: 97s
 Note: transformation-normal fit complete
-[RUNNING] fit | writing transformation-normal model | elapsed=4s
+[RUNNING] fit | writing transformation-normal model | elapsed=48s
 Workflow: Fit | 100% ▕████████████████▏
-Inner: Data Loading |  33% ▕█████▍          ▏ | ETA: 9s
+Inner: Data Loading |  33% ▕█████▍          ▏ | ETA: 97s
 Note: transformation-normal fit complete

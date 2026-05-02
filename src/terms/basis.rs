@@ -2584,6 +2584,10 @@ impl RadialScalarKind {
                 block_order, dim, ..
             } => {
                 let phi = polyharmonic_kernel(r, *block_order, *dim);
+                if r < 1e-14 {
+                    // Collision: q, t diverge but s_a = 0 ⇒ q·s_a, t·s_a vanish.
+                    return Ok((phi, 0.0, 0.0));
+                }
                 let (q, t, _, _) = duchon_polyharmonic_operator_block_jets(r, *block_order, *dim)?;
                 Ok((phi, q, t))
             }
@@ -7757,53 +7761,13 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         }
     };
 
-    let d0 = {
-        let kernel_cols = d0_raw.ncols();
-        let total_cols = kernel_cols + poly_cols;
-        let mut padded = Array2::<f64>::zeros((p, total_cols));
-        padded.slice_mut(s![.., 0..kernel_cols]).assign(&d0_raw);
-        if poly_cols > 0 {
-            let poly_values = polynomial_block_from_order(centers, nullspace_order);
-            padded.slice_mut(s![.., kernel_cols..]).assign(&poly_values);
-        }
-        if let Some(z) = identifiability_transform {
-            fast_ab(&padded, z)
-        } else {
-            padded
-        }
-    };
-    let d1 = {
-        let kernel_cols = d1_raw.ncols();
-        let total_cols = kernel_cols + poly_cols;
-        let mut padded = Array2::<f64>::zeros((p * d, total_cols));
-        padded.slice_mut(s![.., 0..kernel_cols]).assign(&d1_raw);
-        if poly_cols > 0 {
-            let poly_grad = polynomial_gradient_operator_block(centers, nullspace_order);
-            padded.slice_mut(s![.., kernel_cols..]).assign(&poly_grad);
-        }
-        if let Some(z) = identifiability_transform {
-            fast_ab(&padded, z)
-        } else {
-            padded
-        }
-    };
-    let d2 = {
-        let kernel_cols = d2_raw.ncols();
-        let total_cols = kernel_cols + poly_cols;
-        let mut padded = Array2::<f64>::zeros((p * d * d, total_cols));
-        padded.slice_mut(s![.., 0..kernel_cols]).assign(&d2_raw);
-        if poly_cols > 0 {
-            let poly_hessian = polynomial_hessian_operator_block(centers, nullspace_order);
-            padded
-                .slice_mut(s![.., kernel_cols..])
-                .assign(&poly_hessian);
-        }
-        if let Some(z) = identifiability_transform {
-            fast_ab(&padded, z)
-        } else {
-            padded
-        }
-    };
+    // The polynomial tail is the Duchon nullspace. It belongs in the model
+    // design, but not in operator penalties; otherwise broad polynomial
+    // trends get regularized and the smooth cannot freely absorb global PC
+    // shifts.
+    let d0 = project_operator(&d0_raw, p);
+    let d1 = project_operator(&d1_raw, p * d);
+    let d2 = project_operator(&d2_raw, p * d * d);
     let d0_eta_proj: Vec<Array2<f64>> = d0_raw_eta.iter().map(|m| project_operator(m, p)).collect();
     let d1_eta_proj: Vec<Array2<f64>> = d1_raw_eta
         .iter()
@@ -9717,39 +9681,14 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     let total_cols = kernel_cols + poly_cols;
     let mut d0 = Array2::<f64>::zeros((p_colloc, total_cols));
     d0.slice_mut(s![.., 0..kernel_cols]).assign(&d0_kernel);
-    if poly_cols > 0 {
-        let mut poly_scaled = poly;
-        for (k, &scale_k) in row_scales.iter().enumerate() {
-            poly_scaled.row_mut(k).mapv_inplace(|v| scale_k * v);
-        }
-        d0.slice_mut(s![.., kernel_cols..]).assign(&poly_scaled);
-    }
     let mut d1 = Array2::<f64>::zeros((p_colloc * dim, total_cols));
     d1.slice_mut(s![.., 0..kernel_cols]).assign(&d1_kernel);
-    if poly_cols > 0 {
-        let mut poly_grad = polynomial_gradient_operator_block(centers, nullspace_order);
-        for (k, &scale_k) in row_scales.iter().enumerate() {
-            for axis in 0..dim {
-                poly_grad
-                    .row_mut(k * dim + axis)
-                    .mapv_inplace(|v| scale_k * v);
-            }
-        }
-        d1.slice_mut(s![.., kernel_cols..]).assign(&poly_grad);
-    }
     let mut d2 = Array2::<f64>::zeros((p_colloc * dim * dim, total_cols));
     d2.slice_mut(s![.., 0..kernel_cols]).assign(&d2_kernel);
-    if poly_cols > 0 {
-        let mut poly_hessian = polynomial_hessian_operator_block(centers, nullspace_order);
-        for (k, &scale_k) in row_scales.iter().enumerate() {
-            for local in 0..(dim * dim) {
-                poly_hessian
-                    .row_mut(k * dim * dim + local)
-                    .mapv_inplace(|v| scale_k * v);
-            }
-        }
-        d2.slice_mut(s![.., kernel_cols..]).assign(&poly_hessian);
-    }
+    // The polynomial block is the unpenalized Duchon nullspace. These
+    // collocation operators feed only penalty construction, so the polynomial
+    // columns intentionally remain zero before the outer identifiability
+    // transform is applied.
     if let Some(z) = identifiability_transform {
         let z = z.to_owned();
         d0 = fast_ab(&d0, &z);
@@ -12676,13 +12615,9 @@ fn build_duchon_operator_penalty_psi_derivatives(
     d2_psi_psi
         .slice_mut(s![.., 0..kernel_cols])
         .assign(&d2_raw_psi_psi);
-    if poly_cols > 0 {
-        d0.slice_mut(s![.., kernel_cols..]).assign(&poly);
-        let poly_grad = polynomial_gradient_operator_block(centers, effective_nullspace_order);
-        d1.slice_mut(s![.., kernel_cols..]).assign(&poly_grad);
-        let poly_hessian = polynomial_hessian_operator_block(centers, effective_nullspace_order);
-        d2.slice_mut(s![.., kernel_cols..]).assign(&poly_hessian);
-    }
+    // The polynomial block is the Duchon nullspace. Keep it in the total
+    // coordinate system so identifiability transforms line up, but leave its
+    // operator columns and psi-derivatives at zero so it remains unpenalized.
 
     let project = |mat: Array2<f64>| {
         if let Some(z) = identifiability_transform {
@@ -15507,113 +15442,6 @@ fn monomial_basis_block(points: ArrayView2<'_, f64>, max_total_degree: usize) ->
                 }
             }
             block[[row, col]] = value;
-        }
-    }
-    block
-}
-
-fn monomial_hessian_operator_block(
-    points: ArrayView2<'_, f64>,
-    max_total_degree: usize,
-) -> Array2<f64> {
-    let n = points.nrows();
-    let d = points.ncols();
-    let exponents = monomial_exponents(d, max_total_degree);
-    let mut block = Array2::<f64>::zeros((n * d * d, exponents.len()));
-    for (col, exponents) in exponents.iter().enumerate() {
-        for row in 0..n {
-            for axis_a in 0..d {
-                for axis_b in 0..d {
-                    let ea = exponents[axis_a];
-                    let eb = exponents[axis_b];
-                    let coeff = if axis_a == axis_b {
-                        if ea < 2 {
-                            continue;
-                        }
-                        (ea * (ea - 1)) as f64
-                    } else {
-                        if ea == 0 || eb == 0 {
-                            continue;
-                        }
-                        (ea * eb) as f64
-                    };
-                    let mut value = coeff;
-                    for axis in 0..d {
-                        let mut exponent = exponents[axis];
-                        if axis == axis_a {
-                            exponent -= 1;
-                        }
-                        if axis == axis_b {
-                            exponent -= 1;
-                        }
-                        if exponent != 0 {
-                            value *= points[[row, axis]].powi(exponent as i32);
-                        }
-                    }
-                    block[[(row * d + axis_a) * d + axis_b, col]] = value;
-                }
-            }
-        }
-    }
-    block
-}
-
-fn polynomial_hessian_operator_block(
-    points: ArrayView2<'_, f64>,
-    order: DuchonNullspaceOrder,
-) -> Array2<f64> {
-    match order {
-        DuchonNullspaceOrder::Zero | DuchonNullspaceOrder::Linear => Array2::<f64>::zeros((
-            points.nrows() * points.ncols() * points.ncols(),
-            polynomial_block_from_order(points, order).ncols(),
-        )),
-        DuchonNullspaceOrder::Degree(degree) => monomial_hessian_operator_block(points, degree),
-    }
-}
-
-/// Polynomial-monomial gradient operator block: (n·d, num_monomials) matrix
-/// whose row (k·d + axis) holds ∂_axis(monomial) evaluated at points[k]. For
-/// `Zero` (constants only) every gradient is zero. For `Linear` only the
-/// {x_1, …, x_d} columns get a unit gradient at the corresponding axis.
-/// For `Degree(p)` with p ≥ 2 the higher-order monomials need a real
-/// gradient — without it `tension = D_1^T D_1` leaves quadratic and higher
-/// polynomial-null-space coefficients unpenalised, allowing them to grow
-/// without bound on near-noiseless data.
-fn polynomial_gradient_operator_block(
-    points: ArrayView2<'_, f64>,
-    order: DuchonNullspaceOrder,
-) -> Array2<f64> {
-    let n = points.nrows();
-    let d = points.ncols();
-    let exponents: Vec<Vec<usize>> = match order {
-        DuchonNullspaceOrder::Zero => monomial_exponents(d, 0),
-        DuchonNullspaceOrder::Linear => monomial_exponents(d, 1),
-        DuchonNullspaceOrder::Degree(degree) => monomial_exponents(d, degree),
-    };
-    let mut block = Array2::<f64>::zeros((n * d, exponents.len()));
-    if d == 0 {
-        return block;
-    }
-    for (col, alpha) in exponents.iter().enumerate() {
-        for row in 0..n {
-            for axis in 0..d {
-                let exponent = alpha[axis];
-                if exponent == 0 {
-                    continue;
-                }
-                let mut value = exponent as f64;
-                for other in 0..d {
-                    let e = if other == axis {
-                        exponent - 1
-                    } else {
-                        alpha[other]
-                    };
-                    if e != 0 {
-                        value *= points[[row, other]].powi(e as i32);
-                    }
-                }
-                block[[row * d + axis, col]] = value;
-            }
         }
     }
     block
@@ -20962,32 +20790,6 @@ pub mod closed_form_penalty {
             }
         }
 
-        let any_nan = !value.is_finite()
-            || d_eta.iter().any(|v| !v.is_finite())
-            || !d_kappa.is_finite()
-            || d2_eta.iter().any(|row| row.iter().any(|v| !v.is_finite()))
-            || d2_eta_kappa.iter().any(|v| !v.is_finite())
-            || !d2_kappa.is_finite();
-        if any_nan {
-            let (big_r_dbg, s1_dbg, s2_dbg, u1_dbg, u2_dbg) = aniso_invariants(eta, r);
-            eprintln!(
-                "[radial pair NaN] q={} m={} s={} κ={} R={} s1={} s2={} u1={} u2={} value={} d_eta={:?} d_kappa={} d2_kappa={} d2_eta={:?}",
-                q,
-                m,
-                s,
-                kappa,
-                big_r_dbg,
-                s1_dbg,
-                s2_dbg,
-                u1_dbg,
-                u2_dbg,
-                value,
-                d_eta,
-                d_kappa,
-                d2_kappa,
-                d2_eta,
-            );
-        }
         PairBlockBundle {
             value,
             d_eta,
@@ -21051,20 +20853,6 @@ mod tests {
         let kappa = psi.exp();
         let t = kappa * D::from(r);
         (psi * D::from(eta + 2.0)).exp() * (D::from(2.0 * d) + D::from(4.0 * d + 8.0) * t * t)
-    }
-
-    #[test]
-    fn polynomial_hessian_operator_penalizes_trace_free_curvature() {
-        let points = array![[0.0, 0.0]];
-        let hessian = monomial_hessian_operator_block(points.view(), 2);
-        let beta = array![0.0, 0.0, 0.0, 1.0, 0.0, -1.0];
-        let signal = hessian.dot(&beta);
-        let frobenius_sq = signal.iter().map(|value| value * value).sum::<f64>();
-        let laplacian = signal[0] + signal[3];
-
-        assert_eq!(signal.to_vec(), vec![2.0, 0.0, 0.0, -2.0]);
-        assert_eq!(laplacian, 0.0);
-        assert_eq!(frobenius_sq, 8.0);
     }
 
     /// Independent recursive implementation of B-spline basis function evaluation.
