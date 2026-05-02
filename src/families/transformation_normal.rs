@@ -1943,103 +1943,53 @@ impl TransformationNormalFamily {
             return Ok((objective_psi_psi, score_psi_psi, None));
         }
 
-        #[derive(Clone)]
-        struct JetHv {
-            value: f64,
-            grad: Array1<f64>,
-            dot: f64,
-            grad_dot: Array1<f64>,
-        }
-
-        impl JetHv {
-            fn zero(p: usize) -> Self {
-                Self {
-                    value: 0.0,
-                    grad: Array1::<f64>::zeros(p),
-                    dot: 0.0,
-                    grad_dot: Array1::<f64>::zeros(p),
-                }
-            }
-
-            fn linear_block(
-                value: f64,
-                dot: f64,
-                p_total: usize,
-                p_cov: usize,
-                block: usize,
-                row: ArrayView1<'_, f64>,
-            ) -> Self {
-                let mut out = Self::zero(p_total);
-                out.value = value;
-                out.dot = dot;
-                let offset = block * p_cov;
-                for c in 0..p_cov {
-                    out.grad[offset + c] = row[c];
-                }
-                out
-            }
-
-            fn add_scaled_assign(&mut self, scale: f64, rhs: &Self) {
-                self.value += scale * rhs.value;
-                self.grad.scaled_add(scale, &rhs.grad);
-                self.dot += scale * rhs.dot;
-                self.grad_dot.scaled_add(scale, &rhs.grad_dot);
-            }
-
-            fn add(&self, rhs: &Self) -> Self {
-                let mut out = self.clone();
-                out.add_scaled_assign(1.0, rhs);
-                out
-            }
-
-            fn scaled(&self, scale: f64) -> Self {
-                let mut out = self.clone();
-                out.value *= scale;
-                out.grad.mapv_inplace(|v| scale * v);
-                out.dot *= scale;
-                out.grad_dot.mapv_inplace(|v| scale * v);
-                out
-            }
-
-            fn mul(&self, rhs: &Self) -> Self {
-                Self {
-                    value: self.value * rhs.value,
-                    grad: &self.grad * rhs.value + &(&rhs.grad * self.value),
-                    dot: self.dot * rhs.value + self.value * rhs.dot,
-                    grad_dot: &self.grad_dot * rhs.value
-                        + &(&self.grad * rhs.dot)
-                        + &(&rhs.grad_dot * self.value)
-                        + &(&rhs.grad * self.dot),
-                }
-            }
-
-            fn recip(&self) -> Self {
-                let inv = 1.0 / self.value;
-                let inv_sq = inv * inv;
-                let inv_cu = inv_sq * inv;
-                Self {
-                    value: inv,
-                    grad: self.grad.mapv(|v| -v * inv_sq),
-                    dot: -self.dot * inv_sq,
-                    grad_dot: self.grad_dot.mapv(|v| -v * inv_sq)
-                        + self.grad.mapv(|v| 2.0 * v * self.dot * inv_cu),
-                }
-            }
-        }
-
         let weights = self.weights.as_ref();
         let direction_mat = direction_mat.expect("directional CTN psi-psi path requires direction");
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let (objective_psi_psi, score_psi_psi, hvp) = (0..n)
+
+        struct PsiPairDirectionalAccum {
+            objective: f64,
+            score: Array1<f64>,
+            hvp: Array1<f64>,
+            gamma: Vec<f64>,
+            gamma_i: Vec<f64>,
+            gamma_j: Vec<f64>,
+            gamma_ij: Vec<f64>,
+            gamma_dot: Vec<f64>,
+            gamma_i_dot: Vec<f64>,
+            gamma_j_dot: Vec<f64>,
+            gamma_ij_dot: Vec<f64>,
+        }
+
+        impl PsiPairDirectionalAccum {
+            fn new(p_total: usize, p_resp: usize) -> Self {
+                Self {
+                    objective: 0.0,
+                    score: Array1::<f64>::zeros(p_total),
+                    hvp: Array1::<f64>::zeros(p_total),
+                    gamma: vec![0.0; p_resp],
+                    gamma_i: vec![0.0; p_resp],
+                    gamma_j: vec![0.0; p_resp],
+                    gamma_ij: vec![0.0; p_resp],
+                    gamma_dot: vec![0.0; p_resp],
+                    gamma_i_dot: vec![0.0; p_resp],
+                    gamma_j_dot: vec![0.0; p_resp],
+                    gamma_ij_dot: vec![0.0; p_resp],
+                }
+            }
+
+            fn merge(mut self, rhs: Self) -> Self {
+                self.objective += rhs.objective;
+                self.score.scaled_add(1.0, &rhs.score);
+                self.hvp.scaled_add(1.0, &rhs.hvp);
+                self
+            }
+        }
+
+        let accum = (0..n)
             .into_par_iter()
             .fold(
-                || {
-                    (
-                        0.0_f64,
-                        Array1::<f64>::zeros(p_total),
-                        Array1::<f64>::zeros(p_total),
-                    )
-                },
+                || PsiPairDirectionalAccum::new(p_total, p_resp),
                 |mut acc, row_idx| {
                     let cov_row = cov.row(row_idx);
                     let cov_i_row = cov_i.row(row_idx);
@@ -2048,98 +1998,188 @@ impl TransformationNormalFamily {
                     let rv = self.response_val_basis.row(row_idx);
                     let rd = self.response_deriv_basis.row(row_idx);
 
-                    let mut h = JetHv::zero(p_total);
-                    let mut hp = JetHv::zero(p_total);
-                    let mut h_i = JetHv::zero(p_total);
-                    let mut h_j = JetHv::zero(p_total);
-                    let mut h_ij = JetHv::zero(p_total);
-                    let mut hp_i = JetHv::zero(p_total);
-                    let mut hp_j = JetHv::zero(p_total);
-                    let mut hp_ij = JetHv::zero(p_total);
-
                     for k in 0..p_resp {
                         let beta_k = beta_mat.row(k);
                         let dir_k = direction_mat.row(k);
-                        let gamma = beta_k.dot(&cov_row);
-                        let gamma_i = beta_k.dot(&cov_i_row);
-                        let gamma_j = beta_k.dot(&cov_j_row);
-                        let gamma_ij = beta_k.dot(&cov_ij_row);
-                        let gamma_dot = dir_k.dot(&cov_row);
-                        let gamma_i_dot = dir_k.dot(&cov_i_row);
-                        let gamma_j_dot = dir_k.dot(&cov_j_row);
-                        let gamma_ij_dot = dir_k.dot(&cov_ij_row);
-
-                        let g = JetHv::linear_block(gamma, gamma_dot, p_total, p_cov, k, cov_row);
-                        let gi =
-                            JetHv::linear_block(gamma_i, gamma_i_dot, p_total, p_cov, k, cov_i_row);
-                        let gj =
-                            JetHv::linear_block(gamma_j, gamma_j_dot, p_total, p_cov, k, cov_j_row);
-                        let gij = JetHv::linear_block(
-                            gamma_ij,
-                            gamma_ij_dot,
-                            p_total,
-                            p_cov,
-                            k,
-                            cov_ij_row,
-                        );
-
-                        if k == 0 {
-                            h.add_scaled_assign(rv[k], &g);
-                            hp.add_scaled_assign(rd[k], &g);
-                            h_i.add_scaled_assign(rv[k], &gi);
-                            h_j.add_scaled_assign(rv[k], &gj);
-                            h_ij.add_scaled_assign(rv[k], &gij);
-                            hp_i.add_scaled_assign(rd[k], &gi);
-                            hp_j.add_scaled_assign(rd[k], &gj);
-                            hp_ij.add_scaled_assign(rd[k], &gij);
-                        } else {
-                            let g_sq = g.mul(&g);
-                            let g_gi = g.mul(&gi);
-                            let g_gj = g.mul(&gj);
-                            let psi_cross = gj.mul(&gi).add(&g.mul(&gij));
-
-                            h.add_scaled_assign(rv[k], &g_sq);
-                            hp.add_scaled_assign(rd[k], &g_sq);
-                            h_i.add_scaled_assign(2.0 * rv[k], &g_gi);
-                            h_j.add_scaled_assign(2.0 * rv[k], &g_gj);
-                            h_ij.add_scaled_assign(2.0 * rv[k], &psi_cross);
-                            hp_i.add_scaled_assign(2.0 * rd[k], &g_gi);
-                            hp_j.add_scaled_assign(2.0 * rd[k], &g_gj);
-                            hp_ij.add_scaled_assign(2.0 * rd[k], &psi_cross);
-                        }
+                        acc.gamma[k] = beta_k.dot(&cov_row);
+                        acc.gamma_i[k] = beta_k.dot(&cov_i_row);
+                        acc.gamma_j[k] = beta_k.dot(&cov_j_row);
+                        acc.gamma_ij[k] = beta_k.dot(&cov_ij_row);
+                        acc.gamma_dot[k] = dir_k.dot(&cov_row);
+                        acc.gamma_i_dot[k] = dir_k.dot(&cov_i_row);
+                        acc.gamma_j_dot[k] = dir_k.dot(&cov_j_row);
+                        acc.gamma_ij_dot[k] = dir_k.dot(&cov_ij_row);
                     }
 
-                    let inv_hp = hp.recip();
-                    let inv_hp_sq = inv_hp.mul(&inv_hp);
-                    let value = h_i
-                        .mul(&h_j)
-                        .add(&h.mul(&h_ij))
-                        .add(&hp_ij.mul(&inv_hp).scaled(-1.0))
-                        .add(&hp_i.mul(&hp_j).mul(&inv_hp_sq));
+                    let mut h = rv[0] * acc.gamma[0];
+                    let mut hp = rd[0] * acc.gamma[0];
+                    let mut h_i = rv[0] * acc.gamma_i[0];
+                    let mut h_j = rv[0] * acc.gamma_j[0];
+                    let mut h_ij = rv[0] * acc.gamma_ij[0];
+                    let mut hp_i = rd[0] * acc.gamma_i[0];
+                    let mut hp_j = rd[0] * acc.gamma_j[0];
+                    let mut hp_ij = rd[0] * acc.gamma_ij[0];
+                    let mut h_dot = rv[0] * acc.gamma_dot[0];
+                    let mut hp_dot = rd[0] * acc.gamma_dot[0];
+                    let mut h_i_dot = rv[0] * acc.gamma_i_dot[0];
+                    let mut h_j_dot = rv[0] * acc.gamma_j_dot[0];
+                    let mut h_ij_dot = rv[0] * acc.gamma_ij_dot[0];
+                    let mut hp_i_dot = rd[0] * acc.gamma_i_dot[0];
+                    let mut hp_j_dot = rd[0] * acc.gamma_j_dot[0];
+                    let mut hp_ij_dot = rd[0] * acc.gamma_ij_dot[0];
+
+                    for k in 1..p_resp {
+                        let g = acc.gamma[k];
+                        let gi = acc.gamma_i[k];
+                        let gj = acc.gamma_j[k];
+                        let gij = acc.gamma_ij[k];
+                        let u = acc.gamma_dot[k];
+                        let ui = acc.gamma_i_dot[k];
+                        let uj = acc.gamma_j_dot[k];
+                        let uij = acc.gamma_ij_dot[k];
+                        h += rv[k] * g * g;
+                        hp += rd[k] * g * g;
+                        h_i += 2.0 * rv[k] * g * gi;
+                        h_j += 2.0 * rv[k] * g * gj;
+                        h_ij += 2.0 * rv[k] * (gj * gi + g * gij);
+                        hp_i += 2.0 * rd[k] * g * gi;
+                        hp_j += 2.0 * rd[k] * g * gj;
+                        hp_ij += 2.0 * rd[k] * (gj * gi + g * gij);
+                        h_dot += 2.0 * rv[k] * g * u;
+                        hp_dot += 2.0 * rd[k] * g * u;
+                        h_i_dot += 2.0 * rv[k] * (u * gi + g * ui);
+                        h_j_dot += 2.0 * rv[k] * (u * gj + g * uj);
+                        h_ij_dot += 2.0 * rv[k] * (uj * gi + gj * ui + u * gij + g * uij);
+                        hp_i_dot += 2.0 * rd[k] * (u * gi + g * ui);
+                        hp_j_dot += 2.0 * rd[k] * (u * gj + g * uj);
+                        hp_ij_dot += 2.0 * rd[k] * (uj * gi + gj * ui + u * gij + g * uij);
+                    }
+
+                    let inv_hp = 1.0 / hp;
+                    let inv_hp_sq = inv_hp * inv_hp;
+                    let inv_hp_cu = inv_hp_sq * inv_hp;
+                    let inv_hp_qu = inv_hp_sq * inv_hp_sq;
+                    let value = h_i * h_j + h * h_ij - hp_ij * inv_hp + hp_i * hp_j * inv_hp_sq;
                     let wi = weights[row_idx];
-                    acc.0 += wi * value.value;
-                    acc.1.scaled_add(wi, &value.grad);
-                    acc.2.scaled_add(wi, &value.grad_dot);
+                    acc.objective += wi * value;
+
+                    for k in 0..p_resp {
+                        let offset = k * p_cov;
+                        let (rvk, rdk) = (rv[k], rd[k]);
+                        let (g, gi, gj, gij) = (
+                            acc.gamma[k],
+                            acc.gamma_i[k],
+                            acc.gamma_j[k],
+                            acc.gamma_ij[k],
+                        );
+                        let (u, ui, uj, uij) = (
+                            acc.gamma_dot[k],
+                            acc.gamma_i_dot[k],
+                            acc.gamma_j_dot[k],
+                            acc.gamma_ij_dot[k],
+                        );
+                        for cidx in 0..p_cov {
+                            let c = cov_row[cidx];
+                            let ci = cov_i_row[cidx];
+                            let cj = cov_j_row[cidx];
+                            let cij = cov_ij_row[cidx];
+                            let (
+                                dh,
+                                dhp,
+                                dh_i,
+                                dh_j,
+                                dh_ij,
+                                dhp_i,
+                                dhp_j,
+                                dhp_ij,
+                                ddh,
+                                ddhp,
+                                ddh_i,
+                                ddh_j,
+                                ddh_ij,
+                                ddhp_i,
+                                ddhp_j,
+                                ddhp_ij,
+                            ) = if k == 0 {
+                                (
+                                    rvk * c,
+                                    rdk * c,
+                                    rvk * ci,
+                                    rvk * cj,
+                                    rvk * cij,
+                                    rdk * ci,
+                                    rdk * cj,
+                                    rdk * cij,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                )
+                            } else {
+                                (
+                                    2.0 * rvk * g * c,
+                                    2.0 * rdk * g * c,
+                                    2.0 * rvk * (gi * c + g * ci),
+                                    2.0 * rvk * (gj * c + g * cj),
+                                    2.0 * rvk * (gj * ci + gi * cj + gij * c + g * cij),
+                                    2.0 * rdk * (gi * c + g * ci),
+                                    2.0 * rdk * (gj * c + g * cj),
+                                    2.0 * rdk * (gj * ci + gi * cj + gij * c + g * cij),
+                                    2.0 * rvk * u * c,
+                                    2.0 * rdk * u * c,
+                                    2.0 * rvk * (ui * c + u * ci),
+                                    2.0 * rvk * (uj * c + u * cj),
+                                    2.0 * rvk * (uj * ci + ui * cj + uij * c + u * cij),
+                                    2.0 * rdk * (ui * c + u * ci),
+                                    2.0 * rdk * (uj * c + u * cj),
+                                    2.0 * rdk * (uj * ci + ui * cj + uij * c + u * cij),
+                                )
+                            };
+
+                            let grad = dh_i * h_j + h_i * dh_j + dh * h_ij + h * dh_ij
+                                - dhp_ij * inv_hp
+                                + hp_ij * dhp * inv_hp_sq
+                                + (dhp_i * hp_j + hp_i * dhp_j) * inv_hp_sq
+                                - 2.0 * hp_i * hp_j * dhp * inv_hp_cu;
+                            let n1 = dhp_i * hp_j + hp_i * dhp_j;
+                            let n1_dot =
+                                ddhp_i * hp_j + dhp_i * hp_j_dot + hp_i_dot * dhp_j + hp_i * ddhp_j;
+                            let n2_dot =
+                                hp_i_dot * hp_j * dhp + hp_i * hp_j_dot * dhp + hp_i * hp_j * ddhp;
+                            let hv = ddh_i * h_j
+                                + dh_i * h_j_dot
+                                + h_i_dot * dh_j
+                                + h_i * ddh_j
+                                + ddh * h_ij
+                                + dh * h_ij_dot
+                                + h_dot * dh_ij
+                                + h * ddh_ij
+                                - ddhp_ij * inv_hp
+                                + dhp_ij * hp_dot * inv_hp_sq
+                                + hp_ij_dot * dhp * inv_hp_sq
+                                + hp_ij * ddhp * inv_hp_sq
+                                - 2.0 * hp_ij * dhp * hp_dot * inv_hp_cu
+                                + n1_dot * inv_hp_sq
+                                - 2.0 * n1 * hp_dot * inv_hp_cu
+                                - 2.0 * n2_dot * inv_hp_cu
+                                + 6.0 * hp_i * hp_j * dhp * hp_dot * inv_hp_qu;
+                            acc.score[offset + cidx] += wi * grad;
+                            acc.hvp[offset + cidx] += wi * hv;
+                        }
+                    }
                     acc
                 },
             )
             .reduce(
-                || {
-                    (
-                        0.0_f64,
-                        Array1::<f64>::zeros(p_total),
-                        Array1::<f64>::zeros(p_total),
-                    )
-                },
-                |mut left, right| {
-                    left.0 += right.0;
-                    left.1.scaled_add(1.0, &right.1);
-                    left.2.scaled_add(1.0, &right.2);
-                    left
-                },
+                || PsiPairDirectionalAccum::new(p_total, p_resp),
+                |left, right| left.merge(right),
             );
 
-        Ok((objective_psi_psi, score_psi_psi, Some(hvp)))
+        Ok((accum.objective, accum.score, Some(accum.hvp)))
     }
 
     fn scop_psi_hessian_directional_derivative(
