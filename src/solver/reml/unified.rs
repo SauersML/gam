@@ -1396,6 +1396,15 @@ pub trait HyperOperator: Send + Sync {
         u.dot(&bv)
     }
 
+    /// Whether `bilinear_view` is implemented as a direct scalar contraction.
+    ///
+    /// The default `bilinear_view` materializes `Bv`; callers that already
+    /// own reusable work buffers should keep using `mul_vec_into` unless an
+    /// operator advertises a genuinely faster scalar contraction.
+    fn has_fast_bilinear_view(&self) -> bool {
+        false
+    }
+
     /// Full dense materialization (fallback for exact trace computation).
     ///
     /// Panics or returns a zero matrix if the operator was designed to avoid
@@ -10137,7 +10146,12 @@ impl StochasticTraceEstimator {
                     let dense_count = dense_matrices.len();
                     for (oi, op) in operators.iter().enumerate() {
                         let k = dense_count + oi;
-                        probe_values[k] = op.bilinear_view(w.view(), z.view());
+                        if op.has_fast_bilinear_view() {
+                            probe_values[k] = op.bilinear_view(w.view(), z.view());
+                        } else {
+                            op.mul_vec_into(w.view(), a_w.view_mut());
+                            probe_values[k] = z.dot(&a_w);
+                        }
                     }
                 })
             }
