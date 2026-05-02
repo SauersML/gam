@@ -5937,6 +5937,76 @@ impl StoredFirstDrift {
     }
 }
 
+struct BorrowedStoredDriftOperator<'a> {
+    drift: &'a StoredFirstDrift,
+    dim_hint: usize,
+}
+
+impl HyperOperator for BorrowedStoredDriftOperator<'_> {
+    fn dim(&self) -> usize {
+        self.dim_hint
+    }
+
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(v.len());
+        self.mul_vec_into(v.view(), out.view_mut());
+        out
+    }
+
+    fn mul_vec_view(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(v.len());
+        self.mul_vec_into(v, out.view_mut());
+        out
+    }
+
+    fn mul_vec_into(&self, v: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
+        out.fill(0.0);
+        if let Some(matrix) = self.drift.dense.as_ref() {
+            dense_matvec_into(matrix, v, out.view_mut());
+        }
+        for op in &self.drift.operators {
+            op.scaled_add_mul_vec(v, 1.0, out.view_mut());
+        }
+    }
+
+    fn scaled_add_mul_vec(&self, v: ArrayView1<'_, f64>, scale: f64, out: ArrayViewMut1<'_, f64>) {
+        if scale == 0.0 {
+            return;
+        }
+        let mut out = out;
+        if let Some(matrix) = self.drift.dense.as_ref() {
+            dense_matvec_scaled_add_into(matrix, v, scale, out.view_mut());
+        }
+        for op in &self.drift.operators {
+            op.scaled_add_mul_vec(v, scale, out.view_mut());
+        }
+    }
+
+    fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
+        self.drift.apply_dot(v.view(), u.view())
+    }
+
+    fn bilinear_view(&self, v: ArrayView1<'_, f64>, u: ArrayView1<'_, f64>) -> f64 {
+        self.drift.apply_dot(v, u)
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let mut out = self
+            .drift
+            .dense
+            .clone()
+            .unwrap_or_else(|| Array2::<f64>::zeros((self.dim_hint, self.dim_hint)));
+        for op in &self.drift.operators {
+            out += &op.to_dense();
+        }
+        out
+    }
+
+    fn is_implicit(&self) -> bool {
+        !self.drift.operators.is_empty()
+    }
+}
+
 /// Linear combination of `HyperOperator` factors with explicit scalar
 /// weights. Used to bundle a coord's per-mode drift operators (or any other
 /// per-term linear combination) into a single matrix-free operator that
@@ -6673,11 +6743,10 @@ fn build_outer_hessian_operator(
             // triangle entry.  For `--scale-dimensions` with 16 ψ axes this
             // replaces 136 independent solve batches with one 16-coordinate
             // batch sharing the same probes and Krylov solves.
-            let bundled: Vec<CompositeHyperOperator> = coords
+            let bundled: Vec<BorrowedStoredDriftOperator<'_>> = coords
                 .iter()
-                .map(|coord| CompositeHyperOperator {
-                    dense: coord.total_drift.dense.clone(),
-                    operators: coord.total_drift.operators.clone(),
+                .map(|coord| BorrowedStoredDriftOperator {
+                    drift: &coord.total_drift,
                     dim_hint: hop.dim(),
                 })
                 .collect();
