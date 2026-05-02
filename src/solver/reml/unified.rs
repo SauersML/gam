@@ -10895,6 +10895,61 @@ mod tests {
     }
 
     #[test]
+    fn fourth_derivative_trace_matrix_matches_scalar_pair_formula() {
+        let n = 37usize;
+        let p = 5usize;
+        let t = 4usize;
+        let mut rng = Xoshiro256SS::from_seed(0xF047_ACE5_u64);
+        let unit = |rng: &mut Xoshiro256SS| {
+            let bits = rng.next_u64() >> 11;
+            (bits as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0
+        };
+
+        let mut x_data = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for j in 0..p {
+                x_data[[i, j]] = unit(&mut rng);
+            }
+        }
+        let mut c_array = Array1::<f64>::zeros(n);
+        let mut d_array = Array1::<f64>::zeros(n);
+        let mut leverage = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            c_array[i] = unit(&mut rng);
+            d_array[i] = unit(&mut rng);
+            leverage[i] = 0.25 + unit(&mut rng).abs();
+        }
+        let x = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x_data));
+        let ing = ScalarGlmIngredients {
+            c_array: &c_array,
+            d_array: Some(&d_array),
+            x: &x,
+        };
+
+        let mut modes = Vec::with_capacity(t);
+        for _ in 0..t {
+            let mut mode = Array1::<f64>::zeros(p);
+            for j in 0..p {
+                mode[j] = unit(&mut rng);
+            }
+            modes.push(mode);
+        }
+        let mode_refs = modes.iter().collect::<Vec<_>>();
+        let gram = compute_fourth_derivative_trace_matrix(&ing, &mode_refs, &leverage)
+            .expect("batched fourth trace")
+            .expect("d-array is present");
+
+        for i in 0..t {
+            for j in 0..t {
+                let scalar = compute_fourth_derivative_trace(&ing, &modes[i], &modes[j], &leverage)
+                    .expect("scalar fourth trace")
+                    .expect("d-array is present");
+                assert_relative_eq!(gram[[i, j]], scalar, epsilon = 1e-10, max_relative = 1e-10);
+            }
+        }
+    }
+
+    #[test]
     fn operator_hessian_matches_dense_with_extended_glm_corrections() {
         let h = array![[4.0, 0.35], [0.35, 2.7]];
         let hop = Arc::new(DenseSpectralOperator::from_symmetric(&h).unwrap());

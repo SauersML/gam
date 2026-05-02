@@ -27,7 +27,10 @@ use gam::basis::{
     BasisMetadata, CenterStrategy, SpatialIdentifiability, ThinPlateBasisSpec,
     build_thin_plate_basis,
 };
+use gam::estimate::{AdaptiveRegularizationOptions, FitOptions};
 use gam::faer_ndarray::FaerCholesky;
+use gam::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec};
+use gam::types::LikelihoodFamily;
 use ndarray::{Array1, Array2, s};
 use rand::RngExt;
 use rand::SeedableRng;
@@ -215,6 +218,54 @@ fn r_squared(y: &Array1<f64>, yhat: &Array1<f64>) -> f64 {
     1.0 - ss_res / ss_tot
 }
 
+fn standard_fit_options(max_iter: usize) -> FitOptions {
+    FitOptions {
+        latent_cloglog: None,
+        mixture_link: None,
+        optimize_mixture: false,
+        sas_link: None,
+        optimize_sas: false,
+        compute_inference: true,
+        max_iter,
+        tol: 1e-7,
+        nullspace_dims: vec![],
+        linear_constraints: None,
+        firth_bias_reduction: false,
+        adaptive_regularization: Some(AdaptiveRegularizationOptions {
+            enabled: false,
+            ..Default::default()
+        }),
+        penalty_shrinkage_floor: None,
+        rho_prior: Default::default(),
+        kronecker_penalty_system: None,
+        kronecker_factored: None,
+    }
+}
+
+fn marginal_tps_spec(num_centers: usize) -> TermCollectionSpec {
+    TermCollectionSpec {
+        linear_terms: vec![],
+        random_effect_terms: vec![],
+        smooth_terms: (0..2)
+            .map(|feature| SmoothTermSpec {
+                name: format!("x{feature}_tps"),
+                basis: SmoothBasisSpec::ThinPlate {
+                    feature_cols: vec![feature],
+                    spec: ThinPlateBasisSpec {
+                        center_strategy: CenterStrategy::EqualMass { num_centers },
+                        length_scale: 1.0,
+                        double_penalty: false,
+                        identifiability: SpatialIdentifiability::default(),
+                        radial_reparam: None,
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            })
+            .collect(),
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 /// **TEST A — basis-coverage on smooth 2D function, near-OLS.**
@@ -386,7 +437,68 @@ fn tps_two_marginal_k18_blocks_must_span_seed118_style_additive_signal() {
     );
 }
 
-/// **TEST E — REML must find an interior optimum, not the upper boundary.**
+/// **TEST E — full REML fit must preserve a seed-118-style additive signal.**
+///
+/// The basis-only test above proves the formula-path TPS design can represent
+/// the signal. This test adds the real Gaussian REML/PIRLS smoothing selection
+/// layer. If this fails while the basis-only test passes, the mechanism is not
+/// knot placement or basis capacity; it is the smoothing-parameter criterion or
+/// optimizer selecting an over-smoothed solution.
+#[test]
+fn tps_reml_fit_must_not_oversmooth_seed118_style_additive_signal() {
+    let mut rng = StdRng::seed_from_u64(0x118_BA51_C046E);
+    let x_all_raw = skewed_2d(&mut rng, 150);
+    let y0_all = standardize(sawtooth_signal(&x_all_raw.column(0).to_owned()));
+    let y1_all = standardize(polynomial_signal(&x_all_raw.column(1).to_owned()));
+    let y_all_clean = y0_all + &(0.75 * y1_all);
+
+    let xtr_raw = x_all_raw.slice(s![0..120, ..]).to_owned();
+    let xtr = zscore_train(xtr_raw);
+    let ytr_clean = y_all_clean.slice(s![0..120]).to_owned();
+    let noise = Normal::new(0.0, 0.02).unwrap();
+    let ytr = Array1::from_iter(ytr_clean.iter().map(|v| v + noise.sample(&mut rng)));
+    let weights = Array1::ones(ytr.len());
+    let offset = Array1::zeros(ytr.len());
+
+    let fitted = gam::smooth::fit_term_collection_forspec(
+        xtr.view(),
+        ytr.view(),
+        weights.view(),
+        offset.view(),
+        &marginal_tps_spec(18),
+        LikelihoodFamily::GaussianIdentity,
+        &standard_fit_options(80),
+    )
+    .expect("seed-118-style marginal TPS REML fit should succeed");
+
+    let yhat = fitted.design.design.dot(&fitted.fit.beta);
+    let r2 = r_squared(&ytr_clean, &yhat);
+    let max_log_lambda = fitted
+        .fit
+        .log_lambdas
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    assert!(
+        r2 >= 0.82,
+        "REML over-smoothed a seed-118-style additive signal: training-space R² = {:.4} < 0.82, \
+         log_lambdas={:?}, reml_score={:.6e}, outer_gradient_norm={:.3e}. \
+         Basis-only coverage passes for the same design, so this localizes the failure to smoothing selection.",
+        r2,
+        fitted.fit.log_lambdas.to_vec(),
+        fitted.fit.reml_score,
+        fitted.fit.outer_gradient_norm
+    );
+    assert!(
+        max_log_lambda < 8.0,
+        "REML selected an upper-tail smoothing solution for a signal the TPS basis can span: \
+         log_lambdas={:?}",
+        fitted.fit.log_lambdas.to_vec()
+    );
+}
+
+/// **TEST F — REML must find an interior optimum, not the upper boundary.**
 ///
 /// This test will be added in a follow-up once the rust API for fitting a
 /// TPS smooth via fit_gam is reconciled with the current PenaltySpec /
