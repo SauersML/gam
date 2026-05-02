@@ -96,7 +96,9 @@ const BASE_TRANSFORMATION_TENSOR_WIDTH: usize = 160;
 /// underfitting forced by the small-sample cap above. This upper cap keeps the
 /// tensor width bounded even when the covariate side is narrow.
 const LARGE_SAMPLE_TRANSFORMATION_TENSOR_WIDTH: usize = 320;
-const STANDARD_NORMAL_LOG_ABS_MEAN: f64 = -0.635_181_422_730_739_1;
+/// E[log |Z|] for Z ~ N(0, 1), used to put local log-absolute residual
+/// projections on the standard-normal scale.
+const STANDARD_NORMAL_MEAN_LOG_ABS: f64 = -0.635_181_422_730_739_1;
 /// Relative tolerance for response-grid deduplication and zero-width-gap
 /// skipping. Used by both the fit-time grid builder
 /// (`transformation_monotonicity_response_grid`) and the predict-time
@@ -3099,11 +3101,15 @@ impl HyperOperator for TransformationNormalDhMatrixFreeOperator {
 
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
         debug_assert_eq!(factor.nrows(), self.p_total());
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let p = factor.nrows();
         let k = factor.ncols();
+        let cols: Vec<Array1<f64>> = (0..k)
+            .into_par_iter()
+            .map(|c| self.apply(&factor.column(c).to_owned()))
+            .collect();
         let mut out = Array2::<f64>::zeros((p, k));
-        for c in 0..k {
-            let bv = self.apply(&factor.column(c).to_owned());
+        for (c, bv) in cols.into_iter().enumerate() {
             out.column_mut(c).assign(&bv);
         }
         out
@@ -3265,15 +3271,11 @@ impl HyperOperator for TransformationNormalPsiPsiHessianOperator {
 
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
         debug_assert_eq!(factor.nrows(), self.p_total());
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let p = factor.nrows();
         let k = factor.ncols();
-        let cols: Vec<Array1<f64>> = (0..k)
-            .into_par_iter()
-            .map(|c| self.apply(&factor.column(c).to_owned()))
-            .collect();
         let mut out = Array2::<f64>::zeros((p, k));
-        for (c, bv) in cols.into_iter().enumerate() {
+        for c in 0..k {
+            let bv = self.apply(&factor.column(c).to_owned());
             out.column_mut(c).assign(&bv);
         }
         out
@@ -5147,7 +5149,7 @@ fn estimate_default_warm_start(
     let residual_floor = global_scale * 1e-3 + 1e-12;
     let log_scale_target =
         Array1::from_iter(response.iter().zip(location.iter()).map(|(&y, &mu)| {
-            (y - mu).abs().max(residual_floor).ln() - STANDARD_NORMAL_LOG_ABS_MEAN
+            (y - mu).abs().max(residual_floor).ln() - STANDARD_NORMAL_MEAN_LOG_ABS
         }));
     let beta_log_scale = solve_penalizedweighted_projection(
         covariate_design,
@@ -5199,11 +5201,6 @@ fn build_transformation_score_calibration_design(
 ) -> Result<(Array2<f64>, Vec<f64>, Vec<f64>, Vec<Vec<f64>>, f64), String> {
     let n = data.nrows();
     let d = feature_cols.len();
-    if d == 0 {
-        return Err(
-            "transformation score calibration requires at least one covariate feature".to_string(),
-        );
-    }
     let weight_sum = weights.iter().copied().sum::<f64>();
     if !(weight_sum.is_finite() && weight_sum > 0.0) {
         return Err(
@@ -5257,6 +5254,8 @@ fn build_transformation_score_calibration_design(
 
     let centers = if let Some(saved) = rbf_centers {
         saved.to_vec()
+    } else if d == 0 {
+        Vec::new()
     } else {
         let k = n.min(32).max(1);
         (0..k)
@@ -5383,7 +5382,7 @@ fn calibrate_transformation_scores(
     let log_scale_target = Array1::from_iter(
         centered_h
             .iter()
-            .map(|&value| value.abs().max(residual_floor).ln() - STANDARD_NORMAL_LOG_ABS_MEAN),
+            .map(|&value| value.abs().max(residual_floor).ln() - STANDARD_NORMAL_MEAN_LOG_ABS),
     );
     let log_scale_beta = solve_penalizedweighted_projection(
         &calibration_design,
@@ -6079,6 +6078,30 @@ mod tests {
     }
 
     #[test]
+    fn transformation_score_calibration_allows_intercept_only_design() {
+        let data = array![[0.0], [1.0], [2.0]];
+        let weights = Array1::ones(data.nrows());
+        let (design, center, scale, rbf_centers, bandwidth) =
+            build_transformation_score_calibration_design(
+                data.view(),
+                &weights,
+                &[],
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("intercept-only calibration design");
+
+        assert_eq!(design.dim(), (data.nrows(), 1));
+        assert!(design.column(0).iter().all(|&value| value == 1.0));
+        assert!(center.is_empty());
+        assert!(scale.is_empty());
+        assert!(rbf_centers.is_empty());
+        assert_eq!(bandwidth, 1.0);
+    }
+
+    #[test]
     fn tensor_psi_penalty_derivatives_follow_shape_only_scop_layout() {
         let response = array![-1.0, -0.2, 0.6, 1.3];
         let (val_basis, deriv_basis, knots, transform, p_resp) = toy_response_basis(&response);
@@ -6653,6 +6676,64 @@ mod tests {
     }
 
     #[test]
+    fn transformation_normal_joint_psi_second_order_terms_are_operator_backed() {
+        let psi = array![0.15, -0.10];
+        let (family, derivative_blocks, state, spec) = toy_family_and_derivatives(&psi);
+        let states = vec![state.clone()];
+        let specs = vec![spec];
+
+        let terms = family
+            .exact_newton_joint_psisecond_order_terms(&states, &specs, &derivative_blocks, 0, 1)
+            .expect("analytic psi second-order terms")
+            .expect("psi second-order terms should be present");
+
+        assert_eq!(terms.hessian_psi_psi.nrows(), 0);
+        assert_eq!(terms.hessian_psi_psi.ncols(), 0);
+        let op = terms
+            .hessian_psi_psi_operator
+            .as_ref()
+            .expect("CTN psi-psi Hessian must be operator-backed");
+        assert!(op.is_implicit());
+        let p = state.beta.len();
+        assert_eq!(op.dim(), p);
+
+        let dense = op.to_dense();
+        assert_eq!(dense.nrows(), p);
+        assert_eq!(dense.ncols(), p);
+
+        let v = toy_probe_vector(p, 901);
+        let got_vec = op.mul_vec(&v);
+        let want_vec = dense.dot(&v);
+        for i in 0..p {
+            let tol = 1e-10 * want_vec[i].abs().max(1.0) + 1e-10;
+            assert!(
+                (got_vec[i] - want_vec[i]).abs() <= tol,
+                "psi-psi operator matvec mismatch at {i}: got={:.6e}, want={:.6e}",
+                got_vec[i],
+                want_vec[i]
+            );
+        }
+
+        let mut factor = Array2::<f64>::zeros((p, 3));
+        for (col, seed) in [902_u64, 903, 904].into_iter().enumerate() {
+            factor.column_mut(col).assign(&toy_probe_vector(p, seed));
+        }
+        let got_mat = op.mul_mat(&factor);
+        let want_mat = dense.dot(&factor);
+        for row in 0..p {
+            for col in 0..factor.ncols() {
+                let tol = 1e-10 * want_mat[[row, col]].abs().max(1.0) + 1e-10;
+                assert!(
+                    (got_mat[[row, col]] - want_mat[[row, col]]).abs() <= tol,
+                    "psi-psi operator mul_mat mismatch at ({row}, {col}): got={:.6e}, want={:.6e}",
+                    got_mat[[row, col]],
+                    want_mat[[row, col]]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn transformation_normal_joint_psihessian_directional_derivative_matches_fd() {
         let psi = array![0.15, -0.10];
         let h = 1e-6;
@@ -6870,7 +6951,7 @@ mod tests {
     #[test]
     fn ctn_inner_and_outer_hvp_capabilities_are_advertised() {
         let psi = array![0.15, -0.10];
-        let (family, _, _, spec) = toy_family_and_derivatives(&psi);
+        let (family, derivative_blocks, _, spec) = toy_family_and_derivatives(&psi);
         let specs = std::slice::from_ref(&spec);
 
         assert!(family.inner_coefficient_hessian_hvp_available(specs));
@@ -6892,6 +6973,28 @@ mod tests {
             crate::solver::outer_strategy::Derivative::Analytic
         );
         assert_eq!(hessian, crate::solver::outer_strategy::Derivative::Analytic);
+
+        let rho_dim = spec.initial_log_lambdas.len();
+        let psi_dim = derivative_blocks[0].len();
+        let outer_plan =
+            crate::solver::outer_strategy::plan(&crate::solver::outer_strategy::OuterCapability {
+                gradient,
+                hessian,
+                n_params: rho_dim + psi_dim,
+                psi_dim,
+                fixed_point_available: false,
+                barrier_config: None,
+                prefer_gradient_only: false,
+                disable_fixed_point: true,
+            });
+        assert_eq!(
+            outer_plan.solver,
+            crate::solver::outer_strategy::Solver::Arc
+        );
+        assert_eq!(
+            outer_plan.hessian_source,
+            crate::solver::outer_strategy::HessianSource::Analytic
+        );
     }
 
     #[test]
@@ -8433,13 +8536,12 @@ pub fn fit_transformation_normal(
         analytic_hessian,
         // Transformation-normal has β-dependent H (through 1/h'²), so the
         // EFS Wood-Fasiolo PSD invariant fails — disable fixed-point so the
-        // planner cannot pick EFS / Hybrid-EFS. With fixed-point ruled out
-        // and analytic gradient + Hessian declared, the planner then chooses
-        // ARC by default and BFGS only when TauTauHessianPolicy reports
-        // prefer_gradient_only (e.g. multi-dimensional Duchon, dense tau
-        // cache exceeding budget) — which IS the typical biobank-scale CTN
-        // configuration with --scale-dimensions and ≥4 PCs.
+        // planner cannot pick EFS / Hybrid-EFS. CTN supplies SCOP ψ-axis
+        // second-order curvature through matrix-free HVPs, so do not let the
+        // dense tau-tau memory policy downgrade analytic Hessian planning to
+        // gradient-only BFGS; ARC can consume the operator directly.
         true,
+        false,
         // fit_fn
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             ensure_exact_geometry(&specs[0], &designs[0])?;
