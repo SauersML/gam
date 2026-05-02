@@ -16132,6 +16132,18 @@ fn build_thin_plate_penalty_psi_derivativeswithworkspace(
     workspace: &mut BasisWorkspace,
     order: ThinPlateDerivativeOrder,
 ) -> Result<(Option<Array2<f64>>, Option<Array2<f64>>), BasisError> {
+    // Match build_thin_plate_basis exactly (after the WIP Wood-TPRS rewrite):
+    //
+    //   M(ψ)        = Z_kernel^T Ω(ψ) Z_kernel
+    //   V, Λ(ψ)    = eigh(M)        (or V from spec.radial_reparam, frozen)
+    //   S_raw(ψ)   = pad(diag(Λ(ψ)), total_cols)         // kernel block + zero poly
+    //   S_norm(ψ)  = S_raw(ψ) / ||S_raw(ψ)||_F
+    //   S_final(ψ) = Z_id^T S_norm(ψ) Z_id              // identifiability transform
+    //
+    // where Ω_ij(ψ) = φ(r_ij(ψ)), r_ij(ψ) = ||c_i - c_j|| · exp(ψ).
+    //
+    // We need d/dψ S_final and d²/dψ² S_final, applied in the same composition
+    // order as the build path so the analytic derivative matches FD of S_final.
     let z_kernel = thin_plate_kernel_constraint_nullspace(centers, &mut workspace.cache)?;
     let kernel_cols = z_kernel.ncols();
     let poly_cols = thin_plate_polynomial_basis_dimension(centers.ncols());
@@ -16140,35 +16152,16 @@ fn build_thin_plate_penalty_psi_derivativeswithworkspace(
     let d = centers.ncols();
     let want_first = order.wants_first();
     let want_second = order.wants_second();
-    let mut omega_psi = if want_first {
-        Some(Array2::<f64>::zeros((k, k)))
-    } else {
-        None
-    };
+
+    // 1) Build Ω, Ω_ψ, Ω_ψψ on centers (k × k). Ω is needed to recover Λ when
+    //    V is frozen and to apply Hellmann-Feynman in the fresh-V path.
+    let mut omega = Array2::<f64>::zeros((k, k));
+    let mut omega_psi = Array2::<f64>::zeros((k, k));
     let mut omega_psi_psi = if want_second {
         Some(Array2::<f64>::zeros((k, k)))
     } else {
         None
     };
-
-    // Exact ThinPlate bending-penalty derivatives.
-    //
-    // The raw curvature block is the center Gram matrix
-    //   Omega_ij(psi) = phi(r_ij(psi)),
-    //   r_ij(psi) = ||c_i - c_j|| / length_scale = ||c_i - c_j|| exp(psi).
-    //
-    // The same chain rule as the design block applies entrywise:
-    //   Omega_ij,psi     = phi_r(r_ij) * r_ij
-    //   Omega_ij,psipsi  = phi_rr(r_ij) * r_ij^2 + phi_r(r_ij) * r_ij.
-    //
-    // Because the kernel nullspace projector Z_kernel and the frozen
-    // identifiability transform Z do not depend on psi during optimization,
-    // the projected penalty derivatives are just congruences:
-    //   S_psi     = Z^T [diag(Z_kernel^T Omega_psi Z_kernel, 0)] Z
-    //   S_psipsi  = Z^T [diag(Z_kernel^T Omega_psipsi Z_kernel, 0)] Z.
-    //
-    // The double-penalty nullspace block is the projector onto the fixed
-    // polynomial nullspace after freezing, so its psi derivatives are zero.
     for i in 0..k {
         for j in i..k {
             let mut dist2 = 0.0;
@@ -16176,12 +16169,12 @@ fn build_thin_plate_penalty_psi_derivativeswithworkspace(
                 let delta = centers[[i, axis]] - centers[[j, axis]];
                 dist2 += delta * delta;
             }
-            let (_, phi_psi, phi_psi_psi) =
+            let (phi, phi_psi, phi_psi_psi) =
                 thin_plate_kernel_psi_triplet_from_distance(dist2.sqrt(), spec.length_scale, d)?;
-            if let Some(ref mut buf) = omega_psi {
-                buf[[i, j]] = phi_psi;
-                buf[[j, i]] = phi_psi;
-            }
+            omega[[i, j]] = phi;
+            omega[[j, i]] = phi;
+            omega_psi[[i, j]] = phi_psi;
+            omega_psi[[j, i]] = phi_psi;
             if let Some(ref mut buf) = omega_psi_psi {
                 buf[[i, j]] = phi_psi_psi;
                 buf[[j, i]] = phi_psi_psi;
@@ -16189,21 +16182,149 @@ fn build_thin_plate_penalty_psi_derivativeswithworkspace(
         }
     }
 
-    let project = |kernel_block: Array2<f64>| -> Array2<f64> {
-        let mut s = Array2::<f64>::zeros((total_cols, total_cols));
-        s.slice_mut(s![0..kernel_cols, 0..kernel_cols])
-            .assign(&kernel_block);
-        project_penalty_matrix(&s, identifiability_transform)
-    };
+    // 2) Project to the constrained kernel space.
+    let m_constrained = symmetrize_penalty(&z_kernel.t().dot(&omega).dot(&z_kernel));
+    let m_psi_constrained = symmetrize_penalty(&z_kernel.t().dot(&omega_psi).dot(&z_kernel));
+    let m_pp_constrained = omega_psi_psi
+        .as_ref()
+        .map(|m| symmetrize_penalty(&z_kernel.t().dot(m).dot(&z_kernel)));
 
-    let s_psi_out = omega_psi.map(|m| {
-        let kernel_psi = z_kernel.t().dot(&m).dot(&z_kernel);
-        project(kernel_psi)
+    // 3) Get V (frozen or fresh from eigh).
+    let (v, lambda) = if let Some(frozen) = spec.radial_reparam.as_ref() {
+        if frozen.nrows() != kernel_cols || frozen.ncols() != kernel_cols {
+            return Err(BasisError::DimensionMismatch(format!(
+                "thin-plate frozen radial reparam shape {:?} does not match radial dimension {}",
+                frozen.dim(),
+                kernel_cols
+            )));
+        }
+        let v_owned = frozen.to_owned();
+        let lambda_diag = fast_ab(&fast_atb(&v_owned, &m_constrained), &v_owned);
+        let mut evals = Array1::<f64>::zeros(kernel_cols);
+        for i in 0..kernel_cols {
+            evals[i] = lambda_diag[[i, i]].max(0.0);
+        }
+        (v_owned, evals)
+    } else if kernel_cols == 0 {
+        (Array2::<f64>::zeros((0, 0)), Array1::<f64>::zeros(0))
+    } else {
+        let (mut evals, evecs) =
+            FaerEigh::eigh(&m_constrained, Side::Lower).map_err(BasisError::LinalgError)?;
+        for ev in evals.iter_mut() {
+            if *ev < 0.0 {
+                *ev = 0.0;
+            }
+        }
+        (evecs, evals)
+    };
+    let v_is_frozen = spec.radial_reparam.is_some();
+
+    // 4) Rotate the constrained-space derivatives into V's basis. These are the
+    //    coefficients used by Hellmann-Feynman / standard perturbation theory:
+    //      A_ψ[i,j]  = v_i^T M_ψ  v_j
+    //      A_ψψ[i,j] = v_i^T M_ψψ v_j.
+    let a_psi = if kernel_cols > 0 {
+        v.t().dot(&m_psi_constrained).dot(&v)
+    } else {
+        Array2::<f64>::zeros((0, 0))
+    };
+    let a_pp = m_pp_constrained.as_ref().map(|m| {
+        if kernel_cols > 0 {
+            v.t().dot(m).dot(&v)
+        } else {
+            Array2::<f64>::zeros((0, 0))
+        }
     });
-    let s_psi_psi_out = omega_psi_psi.map(|m| {
-        let kernel_psi_psi = z_kernel.t().dot(&m).dot(&z_kernel);
-        project(kernel_psi_psi)
+
+    // 5) Build the un-normalized rotated penalty and its ψ-derivatives.
+    //
+    //    Frozen V (predict-time): the penalty is V^T M(ψ) V — a full kc×kc
+    //    matrix that equals diag(Λ_0) only at fit-time ψ_0. Its ψ-derivatives
+    //    are simply A_ψ and A_ψψ (full matrices).
+    //
+    //    Fresh V (fit-time, no frozen reparam): V(ψ) re-diagonalizes M(ψ) at
+    //    each ψ, so the penalty is identically diag(Λ(ψ)). Off-diagonals
+    //    vanish at every ψ; on-diagonals follow from non-degenerate eigenvalue
+    //    perturbation:
+    //      dΛ_i/dψ   = A_ψ[i,i]
+    //      d²Λ_i/dψ² = A_ψψ[i,i] + 2 Σ_{k ≠ i} A_ψ[i,k]² / (Λ_i − Λ_k)
+    //    For degenerate eigenvalues the off-diagonal correction is dropped on
+    //    the offending pairs (their contribution is encoded in subspace
+    //    rotations rather than scalar eigenvalue motion).
+    let s_raw_kernel = Array2::from_diag(&lambda);
+    let s_raw_psi_kernel = if v_is_frozen {
+        a_psi.clone()
+    } else {
+        let mut diag = Array2::<f64>::zeros((kernel_cols, kernel_cols));
+        for i in 0..kernel_cols {
+            diag[[i, i]] = a_psi[[i, i]];
+        }
+        diag
+    };
+    let s_raw_pp_kernel = a_pp.as_ref().map(|m_pp| {
+        if v_is_frozen {
+            m_pp.clone()
+        } else {
+            let mut diag = Array2::<f64>::zeros((kernel_cols, kernel_cols));
+            for i in 0..kernel_cols {
+                let mut acc = m_pp[[i, i]];
+                for k_idx in 0..kernel_cols {
+                    if k_idx == i {
+                        continue;
+                    }
+                    let denom = lambda[i] - lambda[k_idx];
+                    if denom.abs() > 1e-14 {
+                        acc += 2.0 * a_psi[[i, k_idx]].powi(2) / denom;
+                    }
+                }
+                diag[[i, i]] = acc;
+            }
+            diag
+        }
     });
+
+    // 6) Pad to total_cols (poly block has zero penalty).
+    let pad = |kernel_block: &Array2<f64>| -> Array2<f64> {
+        let mut s = Array2::<f64>::zeros((total_cols, total_cols));
+        if kernel_cols > 0 {
+            s.slice_mut(s![0..kernel_cols, 0..kernel_cols])
+                .assign(kernel_block);
+        }
+        s
+    };
+    let s_raw = pad(&s_raw_kernel);
+    let s_raw_psi = pad(&s_raw_psi_kernel);
+    let s_raw_pp = s_raw_pp_kernel.as_ref().map(pad);
+
+    // 7) Apply the Frobenius normalization chain rule. The build path divides
+    //    by ||S_raw||_F before applying the identifiability transform, so the
+    //    derivative must do the same in the same order. The chain rule needs
+    //    S_raw_pp to compute c''; pass zeros if only the first derivative was
+    //    requested (the first-derivative output does not depend on it).
+    let s_raw_pp_for_chain = s_raw_pp
+        .clone()
+        .unwrap_or_else(|| Array2::<f64>::zeros(s_raw.raw_dim()));
+    let (_, s_norm_psi, s_norm_pp, _c) =
+        normalize_penaltywith_psi_derivatives(&s_raw, &s_raw_psi, &s_raw_pp_for_chain);
+
+    // 8) Apply the identifiability transform last (matches build path order:
+    //    `if let Some(z) = ... { Z^T penalty_norm Z }`).
+    let s_psi_out = if want_first {
+        Some(project_penalty_matrix(
+            &s_norm_psi,
+            identifiability_transform,
+        ))
+    } else {
+        None
+    };
+    let s_psi_psi_out = if want_second && s_raw_pp.is_some() {
+        Some(project_penalty_matrix(
+            &s_norm_pp,
+            identifiability_transform,
+        ))
+    } else {
+        None
+    };
 
     Ok((s_psi_out, s_psi_psi_out))
 }
@@ -21501,6 +21622,7 @@ mod tests {
             length_scale: 1.0,
             double_penalty: true,
             identifiability: SpatialIdentifiability::default(),
+            radial_reparam: None,
         };
         let result = build_thin_plate_basis(data.view(), &spec).unwrap();
         assert_eq!(result.penalties.len(), 2);
@@ -21532,6 +21654,7 @@ mod tests {
             length_scale: 1.0,
             double_penalty: false,
             identifiability: SpatialIdentifiability::None,
+            radial_reparam: None,
         };
         let result = build_thin_plate_basis(data.view(), &spec).expect("large thin-plate basis");
         assert!(matches!(
@@ -21555,6 +21678,7 @@ mod tests {
             length_scale: 1.0,
             double_penalty: false,
             identifiability: SpatialIdentifiability::OrthogonalToParametric,
+            radial_reparam: None,
         };
         let result = build_thin_plate_basis(data.view(), &spec).unwrap();
         let result_design = result.design.to_dense();
@@ -21598,6 +21722,7 @@ mod tests {
                 length_scale: 1.0,
                 double_penalty: false,
                 identifiability: SpatialIdentifiability::default(),
+                radial_reparam: None,
             },
             ThinPlateBasisSpec {
                 center_strategy: CenterStrategy::KMeans {
@@ -21607,12 +21732,14 @@ mod tests {
                 length_scale: 1.0,
                 double_penalty: false,
                 identifiability: SpatialIdentifiability::default(),
+                radial_reparam: None,
             },
             ThinPlateBasisSpec {
                 center_strategy: CenterStrategy::UniformGrid { points_per_dim: 2 },
                 length_scale: 1.0,
                 double_penalty: false,
                 identifiability: SpatialIdentifiability::default(),
+                radial_reparam: None,
             },
             ThinPlateBasisSpec {
                 center_strategy: CenterStrategy::UserProvided(array![
@@ -21624,6 +21751,7 @@ mod tests {
                 length_scale: 1.0,
                 double_penalty: false,
                 identifiability: SpatialIdentifiability::default(),
+                radial_reparam: None,
             },
         ];
         for spec in specs {
@@ -24903,6 +25031,7 @@ mod tests {
             length_scale: 0.9,
             double_penalty: true,
             identifiability: SpatialIdentifiability::None,
+            radial_reparam: None,
         };
         let deriv = build_thin_plate_basis_log_kappa_derivative(data.view(), &spec)
             .expect("analytic ThinPlate derivative should build");
@@ -24959,6 +25088,7 @@ mod tests {
             length_scale: 0.9,
             double_penalty: true,
             identifiability: SpatialIdentifiability::None,
+            radial_reparam: None,
         };
         let analytic = build_thin_plate_basis_log_kappasecond_derivative(data.view(), &spec)
             .expect("analytic ThinPlate second derivative should build");
