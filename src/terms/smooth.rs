@@ -2406,11 +2406,13 @@ fn freeze_raw_spatial_metadata(metadata: BasisMetadata, raw_cols: usize) -> Basi
             length_scale,
             identifiability_transform: None,
             input_scales,
+            radial_reparam,
         } => BasisMetadata::ThinPlate {
             centers,
             length_scale,
             identifiability_transform: Some(Array2::eye(raw_cols)),
             input_scales,
+            radial_reparam,
         },
         BasisMetadata::Duchon {
             centers,
@@ -2582,6 +2584,7 @@ fn build_shape_constraint_design_1d(
                 centers,
                 length_scale,
                 identifiability_transform,
+                radial_reparam,
                 ..
             },
         ) => {
@@ -2595,6 +2598,7 @@ fn build_shape_constraint_design_1d(
                         transform: z.clone(),
                     })
                     .unwrap_or(SpatialIdentifiability::None),
+                radial_reparam: radial_reparam.clone(),
             };
             build_thin_plate_basis(grid_2d.view(), &evalspec)?
                 .design
@@ -4751,6 +4755,7 @@ fn with_identifiability_transform(
             length_scale,
             identifiability_transform,
             input_scales,
+            radial_reparam,
         } => Ok(BasisMetadata::ThinPlate {
             centers: centers.clone(),
             length_scale: *length_scale,
@@ -4759,6 +4764,7 @@ fn with_identifiability_transform(
                 transform,
             )?,
             input_scales: input_scales.clone(),
+            radial_reparam: radial_reparam.clone(),
         }),
         BasisMetadata::Matern {
             centers,
@@ -11629,6 +11635,7 @@ pub fn freeze_term_collection_from_design(
                     length_scale,
                     identifiability_transform,
                     input_scales: meta_scales,
+                    radial_reparam,
                     ..
                 },
             ) => {
@@ -11643,6 +11650,7 @@ pub fn freeze_term_collection_from_design(
                         _ => SpatialIdentifiability::None,
                     },
                 };
+                s.radial_reparam = radial_reparam.clone();
                 *input_scales = meta_scales.clone();
             }
             (
@@ -13734,6 +13742,7 @@ mod tests {
                         length_scale: 1.0,
                         double_penalty: true,
                         identifiability: SpatialIdentifiability::default(),
+                        radial_reparam: None,
                     },
                     input_scales: None,
                 },
@@ -13777,6 +13786,7 @@ mod tests {
                     length_scale: 1.0,
                     double_penalty: false,
                     identifiability: SpatialIdentifiability::default(),
+                    radial_reparam: None,
                 },
                 input_scales: None,
             },

@@ -1266,6 +1266,12 @@ pub struct ThinPlateSplineBasis {
     pub num_kernel_basis: usize,
     pub num_polynomial_basis: usize,
     pub dimension: usize,
+    /// Wood-TPRS radial reparameterization (k-M) × (k-M) matrix V whose columns are
+    /// eigenvectors of the constrained kernel penalty Z' Ω Z, sorted so the leading
+    /// columns carry the most penalized directions. `kernel_constrained` columns and
+    /// the radial penalty block are expressed in this rotated basis: design columns
+    /// are `Φ Z V` and the radial penalty is `diag(Λ)`.
+    pub radial_reparam: Array2<f64>,
 }
 
 /// Matérn smoothness parameter `nu` (half-integer variants with closed forms).
@@ -1676,6 +1682,12 @@ pub struct ThinPlateBasisSpec {
     pub double_penalty: bool,
     #[serde(default)]
     pub identifiability: SpatialIdentifiability,
+    /// Frozen Wood-TPRS radial reparameterization. When `Some`, the dense builder
+    /// reuses this `(k-M) × (k-M)` matrix instead of recomputing it from the
+    /// eigendecomposition of the constrained kernel penalty. Used at predict-time
+    /// to guarantee identical reparameterization to fit-time.
+    #[serde(default)]
+    pub radial_reparam: Option<Array2<f64>>,
 }
 
 /// Per-smooth identifiability policy for spatial (TPS / Duchon) bases.
@@ -1952,6 +1964,10 @@ pub enum BasisMetadata {
         identifiability_transform: Option<Array2<f64>>,
         /// Per-column standard deviations used for input standardization (d > 1).
         input_scales: Option<Vec<f64>>,
+        /// Wood-TPRS radial reparameterization carried into prediction so the
+        /// rotated radial basis at predict-time matches fit-time exactly. `None`
+        /// in the lazy/streaming path which retains the original basis.
+        radial_reparam: Option<Array2<f64>>,
     },
     Matern {
         centers: Array2<f64>,
@@ -5832,7 +5848,7 @@ pub fn build_thin_plate_basiswithworkspace(
             dense_bytes as f64 / (1024.0 * 1024.0),
         );
     }
-    let (design, identifiability_transform, mut candidates) = if use_lazy {
+    let (design, identifiability_transform, mut candidates, radial_reparam_meta) = if use_lazy {
         let poly_block = thin_plate_polynomial_block(data);
         let d = data.ncols();
         let length_scale_sq = spec.length_scale * spec.length_scale;
@@ -5893,12 +5909,13 @@ pub fn build_thin_plate_basiswithworkspace(
                 op: None,
             });
         }
-        (design, identifiability_transform, candidates)
+        (design, identifiability_transform, candidates, None)
     } else {
         let tps = create_thin_plate_spline_basis_scaledwithworkspace(
             data,
             centers.view(),
             spec.length_scale,
+            spec.radial_reparam.as_ref(),
             workspace,
         )?;
         let identifiability_transform = spatial_identifiability_transform_from_design(
@@ -5934,7 +5951,8 @@ pub fn build_thin_plate_basiswithworkspace(
                 op: None,
             });
         }
-        (design, identifiability_transform, candidates)
+        let radial_reparam_meta = Some(tps.radial_reparam.clone());
+        (design, identifiability_transform, candidates, radial_reparam_meta)
     };
     if let Some(z) = identifiability_transform.as_ref() {
         candidates = candidates
@@ -5966,6 +5984,7 @@ pub fn build_thin_plate_basiswithworkspace(
             length_scale: spec.length_scale,
             identifiability_transform,
             input_scales: None,
+            radial_reparam: radial_reparam_meta,
         },
         kronecker_factored: None,
     })
@@ -15879,13 +15898,14 @@ pub fn create_thin_plate_spline_basiswithworkspace(
     knots: ArrayView2<f64>,
     workspace: &mut BasisWorkspace,
 ) -> Result<ThinPlateSplineBasis, BasisError> {
-    create_thin_plate_spline_basis_scaledwithworkspace(data, knots, 1.0, workspace)
+    create_thin_plate_spline_basis_scaledwithworkspace(data, knots, 1.0, None, workspace)
 }
 
 fn create_thin_plate_spline_basis_scaledwithworkspace(
     data: ArrayView2<f64>,
     knots: ArrayView2<f64>,
     length_scale: f64,
+    frozen_radial_reparam: Option<&Array2<f64>>,
     workspace: &mut BasisWorkspace,
 ) -> Result<ThinPlateSplineBasis, BasisError> {
     let n = data.nrows();
@@ -15981,16 +16001,62 @@ fn create_thin_plate_spline_basis_scaledwithworkspace(
 
     let kernel_cols = kernel_constrained.ncols();
     let total_cols = kernel_cols + poly_cols;
+
+    // Wood-TPRS radial reparameterization. Eigendecompose Ω_constrained = V Λ V'
+    // and rotate the radial design columns into the eigenbasis. The bending block
+    // becomes diag(Λ) — a numerically conditioned form whose Gram matrix has
+    // near-orthogonal columns under Φ's metric, avoiding rank-collapse / log|H|
+    // blowup at low log-λ that the raw [Φ Z] basis exhibits.
+    let (radial_reparam, radial_eigvals): (Array2<f64>, Array1<f64>) =
+        if let Some(frozen) = frozen_radial_reparam {
+            if frozen.nrows() != kernel_cols || frozen.ncols() != kernel_cols {
+                return Err(BasisError::DimensionMismatch(format!(
+                    "thin-plate frozen radial reparam shape {:?} does not match radial dimension {}",
+                    frozen.dim(),
+                    kernel_cols
+                )));
+            }
+            let v = frozen.to_owned();
+            let vt_omega_v = fast_atb(&v, &omega_constrained);
+            let lambda_diag = fast_ab(&vt_omega_v, &v);
+            let mut evals = Array1::<f64>::zeros(kernel_cols);
+            for i in 0..kernel_cols {
+                evals[i] = lambda_diag[[i, i]].max(0.0);
+            }
+            (v, evals)
+        } else if kernel_cols == 0 {
+            (
+                Array2::<f64>::zeros((0, 0)),
+                Array1::<f64>::zeros(0),
+            )
+        } else {
+            let sym = symmetrize_penalty(&omega_constrained);
+            let (mut evals, evecs) =
+                FaerEigh::eigh(&sym, Side::Lower).map_err(BasisError::LinalgError)?;
+            for v in evals.iter_mut() {
+                if *v < 0.0 {
+                    *v = 0.0;
+                }
+            }
+            (evecs, evals)
+        };
+
+    let kernel_rotated = if kernel_cols == 0 {
+        kernel_constrained.clone()
+    } else {
+        fast_ab(&kernel_constrained, &radial_reparam)
+    };
+
     let mut basis = Array2::<f64>::zeros((n, total_cols));
     basis
         .slice_mut(s![.., 0..kernel_cols])
-        .assign(&kernel_constrained);
+        .assign(&kernel_rotated);
     basis.slice_mut(s![.., kernel_cols..]).assign(&poly_block);
 
     let mut penalty_bending = Array2::<f64>::zeros((total_cols, total_cols));
-    penalty_bending
-        .slice_mut(s![0..kernel_cols, 0..kernel_cols])
-        .assign(&omega_constrained);
+    for i in 0..kernel_cols {
+        penalty_bending[[i, i]] = radial_eigvals[i];
+    }
     let penalty_ridge = build_nullspace_shrinkage_penalty(&penalty_bending)?
         .map(|block| block.sym_penalty)
         .unwrap_or_else(|| Array2::<f64>::zeros((total_cols, total_cols)));
@@ -16002,6 +16068,7 @@ fn create_thin_plate_spline_basis_scaledwithworkspace(
         num_kernel_basis: kernel_cols,
         num_polynomial_basis: poly_cols,
         dimension: d,
+        radial_reparam,
     })
 }
 
@@ -20772,6 +20839,20 @@ pub mod closed_form_penalty {
             }
         }
 
+        let any_nan = !value.is_finite()
+            || d_eta.iter().any(|v| !v.is_finite())
+            || !d_kappa.is_finite()
+            || d2_eta.iter().any(|row| row.iter().any(|v| !v.is_finite()))
+            || d2_eta_kappa.iter().any(|v| !v.is_finite())
+            || !d2_kappa.is_finite();
+        if any_nan {
+            let (big_r_dbg, s1_dbg, s2_dbg, u1_dbg, u2_dbg) = aniso_invariants(eta, r);
+            eprintln!(
+                "[radial pair NaN] q={} m={} s={} κ={} R={} s1={} s2={} u1={} u2={} value={} d_eta={:?} d_kappa={} d2_kappa={} d2_eta={:?}",
+                q, m, s, kappa, big_r_dbg, s1_dbg, s2_dbg, u1_dbg, u2_dbg,
+                value, d_eta, d_kappa, d2_kappa, d2_eta,
+            );
+        }
         PairBlockBundle {
             value,
             d_eta,
