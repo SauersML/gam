@@ -542,7 +542,10 @@ where
         for i in 0..n_smooths {
             forced[i] = val;
         }
-        log::info!("[PREPASS] FORCED rho={:?}", forced.as_slice().unwrap_or(&[]));
+        log::info!(
+            "[PREPASS] FORCED rho={:?}",
+            forced.as_slice().unwrap_or(&[])
+        );
         return forced;
     }
     let bnds = normalize_bounds(bounds);

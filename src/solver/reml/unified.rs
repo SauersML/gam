@@ -5792,10 +5792,7 @@ fn compute_outer_hessian(
             if !value.is_finite() {
                 eprintln!(
                     "[OUTER non-finite] {} at ({}, {}) = {}",
-                    name,
-                    ii,
-                    jj,
-                    value,
+                    name, ii, jj, value,
                 );
             }
         };

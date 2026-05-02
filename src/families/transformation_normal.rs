@@ -5750,8 +5750,8 @@ mod tests {
             .row_quantities(&state.beta)
             .expect("toy row quantities");
         // SCOP-CTN forward: h = X_val · γ²-affine + offset, h' = X_deriv · γ²-affine.
-        let direct_h = family.x_val_kron.scop_affine_squared_forward(&state.beta)
-            + family.offset.as_ref();
+        let direct_h =
+            family.x_val_kron.scop_affine_squared_forward(&state.beta) + family.offset.as_ref();
         let direct_h_prime = family.x_deriv_kron.scop_affine_squared_forward(&state.beta);
         let weights = family.weights.as_ref();
 
@@ -5872,9 +5872,12 @@ mod tests {
         // ever diverge (e.g. a chunk-size change), this test fails before the
         // production line search silently picks up the regression.
         let beta = &block_states[0].beta;
-        let alpha_obs_uncached = family
-            .x_deriv_kron
-            .min_step_to_boundary(beta, &delta, TRANSFORMATION_MONOTONICITY_EPS, 1e-14);
+        let alpha_obs_uncached = family.x_deriv_kron.min_step_to_boundary(
+            beta,
+            &delta,
+            TRANSFORMATION_MONOTONICITY_EPS,
+            1e-14,
+        );
         let alpha_grid_uncached = family.x_deriv_grid_kron.min_step_to_boundary(
             beta,
             &delta,
@@ -5917,8 +5920,10 @@ mod tests {
         let weights = Array1::from_elem(response.len(), 1.0);
         let offset = Array1::from_elem(response.len(), 0.7);
         let cov_rows = response.len();
-        let covariate_design =
-            DesignMatrix::Dense(DenseDesignMatrix::from(Array2::from_elem((cov_rows, 1), 1.0)));
+        let covariate_design = DesignMatrix::Dense(DenseDesignMatrix::from(Array2::from_elem(
+            (cov_rows, 1),
+            1.0,
+        )));
         let warm_start = TransformationWarmStart {
             location: Array1::from_elem(response.len(), 1.0),
             scale: Array1::from_elem(response.len(), 2.0),
