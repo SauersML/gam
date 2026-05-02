@@ -534,6 +534,7 @@ fn predict_table_impl(
             mean_interval_method: gam::predict::MeanIntervalMethod::TransformEta,
             includeobservation_interval: false,
             apply_bias_correction: true,
+            ..gam::predict::PredictUncertaintyOptions::default()
         };
         let prediction = predictor
             .predict_full_uncertainty(&predict_input, &fit, &uncertainty_options)
@@ -1128,12 +1129,13 @@ fn build_transformation_normal_ffi_payload(
     payload.unified = Some(tn_result.fit.clone());
     payload.fit_result = Some(tn_result.fit);
     payload.data_schema = Some(dataset.schema.clone());
-    payload.training_headers = Some(dataset.headers.clone());
+    payload.set_training_feature_metadata(dataset.headers.clone(), dataset.feature_ranges());
     payload.resolved_termspec = Some(frozen_covariate);
     payload.transformation_response_knots = Some(family.response_knots().to_vec());
     payload.transformation_response_transform = Some(response_transform_rows);
     payload.transformation_response_degree = Some(family.response_degree());
     payload.transformation_response_median = Some(family.response_median());
+    payload.transformation_score_calibration = Some(tn_result.score_calibration);
     payload.offset_column = fit_config.offset_column.clone();
     Ok(payload)
 }

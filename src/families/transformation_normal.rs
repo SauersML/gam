@@ -8,19 +8,19 @@
 //! arbitrary covariate design operator. Column 0 is an unconstrained location
 //! component `b(x)`. The I-spline columns are shape components with squared
 //! covariate-side coefficients, giving the SCOP representation
-//! `h(y, x) = b(x) + Σ_k I_k(y) γ_k(x)^2` and
-//! `h'(y, x) = Σ_k M_k(y) γ_k(x)^2`. Monotonicity is enforced by the
-//! non-negative M-spline derivative basis, explicit derivative lower-bound
-//! constraints on a response grid, the natural `log(h')` barrier in the
-//! likelihood, and a fraction-to-boundary line search.
+//! `h(y, x) = b(x) + ε·(y−median_y) + Σ_k I_k(y) γ_k(x)^2` and
+//! `h'(y, x) = ε + Σ_k M_k(y) γ_k(x)^2`. Monotonicity is structural:
+//! the fixed derivative floor `ε` keeps the change-of-variables log-density
+//! away from the `log(0)` singularity, while the non-negative M-spline basis
+//! and squared covariate-side coefficients supply the learned shape.
 //!
 //! The log-likelihood per observation is the change-of-variables density for a
 //! standard normal target:
 //!
 //!   ℓ_i = -½ h_i² + log(h'_i)
 //!
-//! where `h_i = b(x_i) + Σ_k I_k(y_i) γ_k(x_i)^2` and
-//! `h'_i = Σ_k M_k(y_i) γ_k(x_i)^2`.
+//! where `h_i = b(x_i) + ε·(y_i−median_y) + Σ_k I_k(y_i) γ_k(x_i)^2`
+//! and `h'_i = ε + Σ_k M_k(y_i) γ_k(x_i)^2`.
 
 use crate::basis::{
     BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
@@ -44,6 +44,7 @@ use crate::matrix::{
     DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator, SymmetricMatrix,
 };
 use crate::pirls::LinearInequalityConstraints;
+use crate::probability::{log1mexp_positive, normal_logcdf, normal_pdf};
 use crate::resource::{MatrixMaterializationError, ResourcePolicy};
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
@@ -184,6 +185,10 @@ pub struct TransformationNormalFamily {
     // --- Response-direction basis (fixed, does not depend on κ) ---
     /// Response value basis: n × p_resp. Columns: [1, I_1(y), ..., I_k(y)].
     response_val_basis: Array2<f64>,
+    /// Response value basis at the finite lower support endpoint.
+    response_lower_basis: Array1<f64>,
+    /// Response value basis at the finite upper support endpoint.
+    response_upper_basis: Array1<f64>,
     /// Response derivative basis: n × p_resp. Columns: [0, M_1(y), ..., M_k(y)].
     response_deriv_basis: Array2<f64>,
 
@@ -209,6 +214,9 @@ pub struct TransformationNormalFamily {
     response_transform: Array2<f64>,
     response_degree: usize,
     response_median: f64,
+    response_floor_offset: Arc<Array1<f64>>,
+    response_lower_floor_offset: f64,
+    response_upper_floor_offset: f64,
 
     /// Last row-space transformation quantities for an exact beta vector.
     ///
@@ -225,6 +233,8 @@ struct TransformationNormalRowQuantityCache {
     beta: Arc<Array1<f64>>,
     h: Arc<Array1<f64>>,
     h_prime: Arc<Array1<f64>>,
+    h_lower: Arc<Array1<f64>>,
+    h_upper: Arc<Array1<f64>>,
     log_likelihood: f64,
 }
 
@@ -242,10 +252,14 @@ impl TransformationNormalRowQuantityCache {
 fn build_transformation_row_derived(
     h: &Array1<f64>,
     h_prime: &Array1<f64>,
+    h_lower: &Array1<f64>,
+    h_upper: &Array1<f64>,
     weights: &Array1<f64>,
 ) -> Result<TransformationNormalRowDerived, String> {
     let n = h_prime.len();
     debug_assert_eq!(h.len(), n);
+    debug_assert_eq!(h_lower.len(), n);
+    debug_assert_eq!(h_upper.len(), n);
     debug_assert_eq!(weights.len(), n);
 
     let mut log_likelihood = 0.0;
@@ -279,7 +293,10 @@ fn build_transformation_row_derived(
         let weighted_h = weights[i] * h[i];
         let weighted_inv_h_prime = weights[i] * inv_h_prime;
         let weighted_inv_h_prime_sq = weights[i] * inv_h_prime_sq;
-        log_likelihood += weights[i] * (-0.5 * h[i] * h[i] + hp.ln());
+        let log_z = log_normal_cdf_diff(h_upper[i], h_lower[i]).map_err(|e| {
+            format!("TransformationNormalFamily row_quantities: row {i} invalid endpoint normalizer: {e}")
+        })?;
+        log_likelihood += weights[i] * (-0.5 * h[i] * h[i] + hp.ln() - log_z);
         let derived_values = [
             ("1/h'", inv_h_prime),
             ("1/h'^2", inv_h_prime_sq),
@@ -288,6 +305,7 @@ fn build_transformation_row_derived(
             ("w*h", weighted_h),
             ("w/h'", weighted_inv_h_prime),
             ("w/h'^2", weighted_inv_h_prime_sq),
+            ("log normalizer", log_z),
         ];
         for (name, value) in derived_values {
             if !value.is_finite() {
@@ -305,6 +323,154 @@ fn build_transformation_row_derived(
     }
 
     Ok(TransformationNormalRowDerived { log_likelihood })
+}
+
+fn log_normal_cdf_diff(upper: f64, lower: f64) -> Result<f64, String> {
+    if !(upper.is_finite() && lower.is_finite()) {
+        return Err(format!(
+            "finite support endpoints required, got lower={lower}, upper={upper}"
+        ));
+    }
+    if upper <= lower {
+        return Err(format!(
+            "upper endpoint score must exceed lower endpoint score, got lower={lower:.6e}, upper={upper:.6e}"
+        ));
+    }
+    let log_upper = normal_logcdf(upper);
+    let log_lower = normal_logcdf(lower);
+    let gap = log_upper - log_lower;
+    if !(gap.is_finite() && gap > 0.0) {
+        return Err(format!(
+            "normal CDF endpoint mass is not representable, lower={lower:.6e}, upper={upper:.6e}"
+        ));
+    }
+    let log_z = log_upper + log1mexp_positive(gap);
+    if !log_z.is_finite() {
+        return Err(format!(
+            "normal CDF endpoint mass underflowed, lower={lower:.6e}, upper={upper:.6e}"
+        ));
+    }
+    Ok(log_z)
+}
+
+#[derive(Clone, Copy)]
+struct LogNormalCdfDiffDerivatives {
+    first: [f64; 2],
+    second: [[f64; 2]; 2],
+    third: [[[f64; 2]; 2]; 2],
+    fourth: [[[[f64; 2]; 2]; 2]; 2],
+}
+
+fn factorial(n: usize) -> f64 {
+    match n {
+        0 | 1 => 1.0,
+        2 => 2.0,
+        3 => 6.0,
+        4 => 24.0,
+        _ => unreachable!("CTN normalizer derivatives only need order <= 4"),
+    }
+}
+
+fn poly_mul_truncated(a: &[[f64; 5]; 5], b: &[[f64; 5]; 5]) -> [[f64; 5]; 5] {
+    let mut out = [[0.0; 5]; 5];
+    for ia in 0..=4 {
+        for ib in 0..=(4 - ia) {
+            let av = a[ia][ib];
+            if av == 0.0 {
+                continue;
+            }
+            for ja in 0..=(4 - ia) {
+                for jb in 0..=(4 - ia - ja).min(4 - ib) {
+                    let bv = b[ja][jb];
+                    if bv != 0.0 && ia + ib + ja + jb <= 4 {
+                        out[ia + ja][ib + jb] += av * bv;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn log_normal_cdf_diff_derivatives(
+    upper: f64,
+    lower: f64,
+) -> Result<LogNormalCdfDiffDerivatives, String> {
+    let log_z = log_normal_cdf_diff(upper, lower)?;
+    let z = log_z.exp();
+    if !(z.is_finite() && z > 0.0) {
+        return Err(format!(
+            "normal CDF endpoint mass is not finite, lower={lower:.6e}, upper={upper:.6e}"
+        ));
+    }
+
+    let phi_u = normal_pdf(upper);
+    let phi_l = normal_pdf(lower);
+    let s_u = [
+        0.0,
+        phi_u,
+        -upper * phi_u,
+        (upper * upper - 1.0) * phi_u,
+        -(upper * upper * upper - 3.0 * upper) * phi_u,
+    ];
+    let s_l = [
+        0.0,
+        -phi_l,
+        lower * phi_l,
+        -(lower * lower - 1.0) * phi_l,
+        (lower * lower * lower - 3.0 * lower) * phi_l,
+    ];
+
+    let mut r = [[0.0; 5]; 5];
+    for order in 1..=4 {
+        r[order][0] = s_u[order] / (factorial(order) * z);
+        r[0][order] = s_l[order] / (factorial(order) * z);
+    }
+
+    let r2 = poly_mul_truncated(&r, &r);
+    let r3 = poly_mul_truncated(&r2, &r);
+    let r4 = poly_mul_truncated(&r3, &r);
+    let mut q = [[0.0; 5]; 5];
+    for i in 0..=4 {
+        for j in 0..=(4 - i) {
+            q[i][j] = r[i][j] - 0.5 * r2[i][j] + r3[i][j] / 3.0 - 0.25 * r4[i][j];
+        }
+    }
+
+    let mut first = [0.0; 2];
+    first[0] = q[1][0];
+    first[1] = q[0][1];
+
+    let mut second = [[0.0; 2]; 2];
+    let mut third = [[[0.0; 2]; 2]; 2];
+    let mut fourth = [[[[0.0; 2]; 2]; 2]; 2];
+    for a in 0..2 {
+        for b in 0..2 {
+            let nu = (a == 0) as usize + (b == 0) as usize;
+            let nl = 2 - nu;
+            second[a][b] = q[nu][nl] * factorial(nu) * factorial(nl);
+            for c in 0..2 {
+                let nu = (a == 0) as usize + (b == 0) as usize + (c == 0) as usize;
+                let nl = 3 - nu;
+                third[a][b][c] = q[nu][nl] * factorial(nu) * factorial(nl);
+                for d in 0..2 {
+                    let nu = (a == 0) as usize
+                        + (b == 0) as usize
+                        + (c == 0) as usize
+                        + (d == 0) as usize;
+                    let nl = 4 - nu;
+                    fourth[a][b][c][d] = q[nu][nl] * factorial(nu) * factorial(nl);
+                }
+            }
+        }
+    }
+
+    Ok(LogNormalCdfDiffDerivatives {
+        first,
+        second,
+        third,
+        fourth,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -384,6 +550,8 @@ impl TransformationNormalFamily {
         let (resp_val, resp_deriv, resp_penalties, resp_knots, resp_transform) =
             build_response_basis(response, config)?;
         let p_resp = resp_val.ncols();
+        let (response_lower_basis, response_upper_basis) =
+            response_endpoint_value_bases(&resp_transform);
 
         // ----- 2. Row-wise Kronecker product (operator form) -----
         let x_val_kron = KroneckerDesign::new_khatri_rao(&resp_val, covariate_design.clone())?;
@@ -445,12 +613,16 @@ impl TransformationNormalFamily {
         } else {
             0.5 * (sorted_resp[sorted_resp.len() / 2 - 1] + sorted_resp[sorted_resp.len() / 2])
         };
+        let (response_floor_offset, response_lower_floor_offset, response_upper_floor_offset) =
+            response_floor_offsets(response, &resp_knots, resp_median);
 
         Ok(Self {
             x_val_kron,
             x_deriv_kron,
             x_deriv_grid_kron,
             response_val_basis: resp_val,
+            response_lower_basis,
+            response_upper_basis,
             response_deriv_basis: resp_deriv,
             covariate_design,
             weights: Arc::new(weights.clone()),
@@ -463,6 +635,9 @@ impl TransformationNormalFamily {
             response_transform: resp_transform,
             response_degree: config.response_degree,
             response_median: resp_median,
+            response_floor_offset: Arc::new(response_floor_offset),
+            response_lower_floor_offset,
+            response_upper_floor_offset,
             row_quantity_cache: Arc::new(Mutex::new(None)),
         })
     }
@@ -543,6 +718,16 @@ impl TransformationNormalFamily {
         }
 
         let p_resp = response_val_basis.ncols();
+        if response_transform.ncols() + 1 != p_resp {
+            return Err(format!(
+                "response transform columns {} imply p_resp {}, but response value basis has {} columns",
+                response_transform.ncols(),
+                response_transform.ncols() + 1,
+                p_resp
+            ));
+        }
+        let (response_lower_basis, response_upper_basis) =
+            response_endpoint_value_bases(&response_transform);
 
         // Row-wise Kronecker product (operator form).
         let x_val_kron =
@@ -601,12 +786,16 @@ impl TransformationNormalFamily {
         } else {
             0.5 * (sorted_resp[sorted_resp.len() / 2 - 1] + sorted_resp[sorted_resp.len() / 2])
         };
+        let (response_floor_offset, response_lower_floor_offset, response_upper_floor_offset) =
+            response_floor_offsets(response, &response_knots, resp_median);
 
         Ok(Self {
             x_val_kron,
             x_deriv_kron,
             x_deriv_grid_kron,
             response_val_basis,
+            response_lower_basis,
+            response_upper_basis,
             response_deriv_basis,
             covariate_design,
             weights: Arc::new(weights.clone()),
@@ -619,6 +808,9 @@ impl TransformationNormalFamily {
             response_transform: response_transform.clone(),
             response_degree,
             response_median: resp_median,
+            response_floor_offset: Arc::new(response_floor_offset),
+            response_lower_floor_offset,
+            response_upper_floor_offset,
             row_quantity_cache: Arc::new(Mutex::new(None)),
         })
     }
@@ -639,10 +831,11 @@ impl TransformationNormalFamily {
 
     /// Return the `ParameterBlockSpec` for this family (single block).
     pub fn block_spec(&self) -> ParameterBlockSpec {
+        let offset = self.offset.as_ref() + self.response_floor_offset.as_ref();
         ParameterBlockSpec {
             name: self.block_name.clone(),
             design: DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(self.x_val_kron.clone()))),
-            offset: self.offset.as_ref().clone(),
+            offset,
             penalties: self.tensor_penalties.clone(),
             nullspace_dims: vec![],
             initial_log_lambdas: self.initial_log_lambdas.clone(),
@@ -662,6 +855,45 @@ impl TransformationNormalFamily {
 
     // --- Internal helpers ---
 
+    fn scop_endpoint_values(
+        &self,
+        beta: &Array1<f64>,
+        beta_mat: ArrayView2<'_, f64>,
+        cov: ArrayView2<'_, f64>,
+    ) -> Result<(Array1<f64>, Array1<f64>), String> {
+        let n = cov.nrows();
+        let p_resp = self.response_val_basis.ncols();
+        if beta.len() != p_resp * self.covariate_design.ncols() {
+            return Err(format!(
+                "SCOP endpoint beta length {} != p_resp({p_resp}) * p_cov({})",
+                beta.len(),
+                self.covariate_design.ncols()
+            ));
+        }
+        let mut lower = Array1::<f64>::zeros(n);
+        let mut upper = Array1::<f64>::zeros(n);
+        let mut gamma = vec![0.0; p_resp];
+        for i in 0..n {
+            let cov_row = cov.row(i);
+            for k in 0..p_resp {
+                gamma[k] = beta_mat.row(k).dot(&cov_row);
+            }
+            let mut h_l = self.response_lower_basis[0] * gamma[0]
+                + self.offset[i]
+                + self.response_lower_floor_offset;
+            let mut h_u = self.response_upper_basis[0] * gamma[0]
+                + self.offset[i]
+                + self.response_upper_floor_offset;
+            for k in 1..p_resp {
+                h_l += self.response_lower_basis[k] * gamma[k] * gamma[k];
+                h_u += self.response_upper_basis[k] * gamma[k] * gamma[k];
+            }
+            lower[i] = h_l;
+            upper[i] = h_u;
+        }
+        Ok((lower, upper))
+    }
+
     fn row_quantities(
         &self,
         beta: &Array1<f64>,
@@ -680,8 +912,24 @@ impl TransformationNormalFamily {
         // γ_k(x) = ψ(x)ᵀ Γ_{k,:} and h'(y, x) = Σ_k γ_k(x)² · M_k(y).
         // Response column 0 is the unconstrained affine/location component
         // b(x); all remaining response columns are squared shape components.
-        let h = self.x_val_kron.scop_affine_squared_forward(beta) + self.offset.as_ref();
-        let h_prime = self.x_deriv_kron.scop_affine_squared_forward(beta);
+        let h = self.x_val_kron.scop_affine_squared_forward(beta)
+            + self.offset.as_ref()
+            + self.response_floor_offset.as_ref();
+        let h_prime = self
+            .x_deriv_kron
+            .scop_affine_squared_forward(beta)
+            .mapv(|hp| hp + TRANSFORMATION_MONOTONICITY_EPS);
+        let p_resp = self.response_val_basis.ncols();
+        let p_cov = self.covariate_design.ncols();
+        let beta_mat = beta
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP endpoint beta reshape failed: {e}"))?;
+        let cov = self
+            .covariate_design
+            .try_row_chunk(0..self.response_val_basis.nrows())
+            .map_err(|e| format!("SCOP endpoint values require covariate row chunk: {e}"))?;
+        let (h_lower, h_upper) = self.scop_endpoint_values(beta, beta_mat, cov.view())?;
         for (i, &value) in h.iter().enumerate() {
             if !value.is_finite() {
                 return Err(format!(
@@ -732,11 +980,19 @@ impl TransformationNormalFamily {
         // is outside the finite representable range, surface an evaluation
         // error so the outer solver can retreat; do not clamp or approximate
         // the analytic Hessian terms.
-        let derived = build_transformation_row_derived(&h, &h_prime, self.weights.as_ref())?;
+        let derived = build_transformation_row_derived(
+            &h,
+            &h_prime,
+            &h_lower,
+            &h_upper,
+            self.weights.as_ref(),
+        )?;
         let row_quantities = TransformationNormalRowQuantityCache {
             beta: Arc::new(beta.clone()),
             h: Arc::new(h),
             h_prime: Arc::new(h_prime),
+            h_lower: Arc::new(h_lower),
+            h_upper: Arc::new(h_upper),
             log_likelihood: derived.log_likelihood,
         };
 
@@ -774,12 +1030,16 @@ impl TransformationNormalFamily {
         let weights = self.weights.as_ref();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
+        let h_lower = row_quantities.h_lower.as_ref();
+        let h_upper = row_quantities.h_upper.as_ref();
         let mut gradient = Array1::<f64>::zeros(p_total);
         let mut hessian = Array2::<f64>::zeros((p_total, p_total));
         let mut gamma = vec![0.0; p_resp];
         let mut dh_factor = vec![0.0; p_resp];
         let mut dhp_factor = vec![0.0; p_resp];
         let mut second_diag = vec![0.0; p_resp];
+        let mut lower_factor = vec![0.0; p_resp];
+        let mut upper_factor = vec![0.0; p_resp];
 
         for i in 0..n {
             let cov_row = cov.row(i);
@@ -795,6 +1055,14 @@ impl TransformationNormalFamily {
                 gamma[k] = beta_mat.row(k).dot(&cov_row);
             }
 
+            let q = log_normal_cdf_diff_derivatives(h_upper[i], h_lower[i])?;
+            lower_factor[0] = self.response_lower_basis[0];
+            upper_factor[0] = self.response_upper_basis[0];
+            for k in 1..p_resp {
+                lower_factor[k] = 2.0 * self.response_lower_basis[k] * gamma[k];
+                upper_factor[k] = 2.0 * self.response_upper_basis[k] * gamma[k];
+            }
+
             second_diag.fill(0.0);
             dh_factor[0] = rv[0];
             dhp_factor[0] = rd[0];
@@ -805,7 +1073,10 @@ impl TransformationNormalFamily {
             }
 
             for k in 0..p_resp {
-                let score_factor = wi * (-hi * dh_factor[k] + dhp_factor[k] * inv_hp);
+                let normalizer_score_factor =
+                    q.first[0] * upper_factor[k] + q.first[1] * lower_factor[k];
+                let score_factor =
+                    wi * (-hi * dh_factor[k] + dhp_factor[k] * inv_hp - normalizer_score_factor);
                 for c in 0..p_cov {
                     gradient[k * p_cov + c] += score_factor * cov_row[c];
                 }
@@ -818,6 +1089,22 @@ impl TransformationNormalFamily {
                     if k == l {
                         block_factor += second_diag[k];
                     }
+                    let upper_ab = if k == l && k > 0 {
+                        2.0 * self.response_upper_basis[k]
+                    } else {
+                        0.0
+                    };
+                    let lower_ab = if k == l && k > 0 {
+                        2.0 * self.response_lower_basis[k]
+                    } else {
+                        0.0
+                    };
+                    block_factor += q.first[0] * upper_ab
+                        + q.first[1] * lower_ab
+                        + q.second[0][0] * upper_factor[k] * upper_factor[l]
+                        + q.second[0][1] * upper_factor[k] * lower_factor[l]
+                        + q.second[1][0] * lower_factor[k] * upper_factor[l]
+                        + q.second[1][1] * lower_factor[k] * lower_factor[l];
                     block_factor *= wi;
                     if block_factor == 0.0 {
                         continue;
@@ -862,8 +1149,12 @@ impl TransformationNormalFamily {
         let weights = self.weights.as_ref();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
+        let h_lower = row_quantities.h_lower.as_ref();
+        let h_upper = row_quantities.h_upper.as_ref();
         let mut gradient = Array1::<f64>::zeros(p_total);
         let mut gamma = vec![0.0; p_resp];
+        let mut lower_factor = vec![0.0; p_resp];
+        let mut upper_factor = vec![0.0; p_resp];
 
         for i in 0..n {
             let cov_row = cov.row(i);
@@ -877,12 +1168,23 @@ impl TransformationNormalFamily {
                 gamma[k] = beta_mat.row(k).dot(&cov_row);
             }
 
-            let score0 = wi * (-hi * rv[0] + rd[0] * inv_hp);
+            let q = log_normal_cdf_diff_derivatives(h_upper[i], h_lower[i])?;
+            lower_factor[0] = self.response_lower_basis[0];
+            upper_factor[0] = self.response_upper_basis[0];
+            for k in 1..p_resp {
+                lower_factor[k] = 2.0 * self.response_lower_basis[k] * gamma[k];
+                upper_factor[k] = 2.0 * self.response_upper_basis[k] * gamma[k];
+            }
+
+            let normalizer_score0 = q.first[0] * upper_factor[0] + q.first[1] * lower_factor[0];
+            let score0 = wi * (-hi * rv[0] + rd[0] * inv_hp - normalizer_score0);
             for c in 0..p_cov {
                 gradient[c] += score0 * cov_row[c];
             }
             for k in 1..p_resp {
-                let score_factor = wi * 2.0 * gamma[k] * (-hi * rv[k] + rd[k] * inv_hp);
+                let normalizer_score = q.first[0] * upper_factor[k] + q.first[1] * lower_factor[k];
+                let score_factor =
+                    wi * (2.0 * gamma[k] * (-hi * rv[k] + rd[k] * inv_hp) - normalizer_score);
                 let offset = k * p_cov;
                 for c in 0..p_cov {
                     gradient[offset + c] += score_factor * cov_row[c];
@@ -953,6 +1255,8 @@ impl TransformationNormalFamily {
             .map_err(|e| format!("SCOP Hessian directional derivative requires row chunk: {e}"))?;
         let weights = self.weights.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
+        let h_lower = row_quantities.h_lower.as_ref();
+        let h_upper = row_quantities.h_upper.as_ref();
         let mut out = Array2::<f64>::zeros((p_total, p_total));
 
         for i in 0..n {
@@ -974,27 +1278,69 @@ impl TransformationNormalFamily {
 
             let mut h_dir = rv[0] * gamma_dir[0];
             let mut hp_dir = rd[0] * gamma_dir[0];
+            let mut endpoint_dir = [
+                self.response_upper_basis[0] * gamma_dir[0],
+                self.response_lower_basis[0] * gamma_dir[0],
+            ];
             for k in 1..p_resp {
                 h_dir += 2.0 * rv[k] * gamma[k] * gamma_dir[k];
                 hp_dir += 2.0 * rd[k] * gamma[k] * gamma_dir[k];
+                endpoint_dir[0] +=
+                    2.0 * self.response_upper_basis[k] * gamma[k] * gamma_dir[k];
+                endpoint_dir[1] +=
+                    2.0 * self.response_lower_basis[k] * gamma[k] * gamma_dir[k];
             }
+            let q = log_normal_cdf_diff_derivatives(h_upper[i], h_lower[i])?;
 
             let mut h_factor = vec![0.0; p_resp];
             let mut hp_factor = vec![0.0; p_resp];
             let mut h_factor_dir = vec![0.0; p_resp];
             let mut hp_factor_dir = vec![0.0; p_resp];
+            let mut endpoint_factor = [vec![0.0; p_resp], vec![0.0; p_resp]];
+            let mut endpoint_factor_dir = [vec![0.0; p_resp], vec![0.0; p_resp]];
             h_factor[0] = rv[0];
             hp_factor[0] = rd[0];
+            endpoint_factor[0][0] = self.response_upper_basis[0];
+            endpoint_factor[1][0] = self.response_lower_basis[0];
             for k in 1..p_resp {
                 h_factor[k] = 2.0 * rv[k] * gamma[k];
                 hp_factor[k] = 2.0 * rd[k] * gamma[k];
                 h_factor_dir[k] = 2.0 * rv[k] * gamma_dir[k];
                 hp_factor_dir[k] = 2.0 * rd[k] * gamma_dir[k];
+                endpoint_factor[0][k] = 2.0 * self.response_upper_basis[k] * gamma[k];
+                endpoint_factor[1][k] = 2.0 * self.response_lower_basis[k] * gamma[k];
+                endpoint_factor_dir[0][k] = 2.0 * self.response_upper_basis[k] * gamma_dir[k];
+                endpoint_factor_dir[1][k] = 2.0 * self.response_lower_basis[k] * gamma_dir[k];
             }
 
             for k in 0..p_resp {
                 for l in 0..p_resp {
                     let same_shape = k == l && k > 0;
+                    let mut normalizer_block = 0.0;
+                    for a in 0..2 {
+                        let h_a_ab = if same_shape {
+                            2.0 * if a == 0 {
+                                self.response_upper_basis[k]
+                            } else {
+                                self.response_lower_basis[k]
+                            }
+                        } else {
+                            0.0
+                        };
+                        for b in 0..2 {
+                            normalizer_block +=
+                                q.second[a][b] * endpoint_dir[b] * h_a_ab;
+                            normalizer_block += q.second[a][b]
+                                * (endpoint_factor_dir[a][k] * endpoint_factor[b][l]
+                                    + endpoint_factor[a][k] * endpoint_factor_dir[b][l]);
+                            for c_ep in 0..2 {
+                                normalizer_block += q.third[a][b][c_ep]
+                                    * endpoint_dir[c_ep]
+                                    * endpoint_factor[a][k]
+                                    * endpoint_factor[b][l];
+                            }
+                        }
+                    }
                     for c in 0..p_cov {
                         let row_idx = k * p_cov + c;
                         let h_a = h_factor[k] * cov_row[c];
@@ -1020,7 +1366,8 @@ impl TransformationNormalFamily {
                                 + h_dir * h_ab
                                 + (dhp_a * hp_b + hp_a * dhp_b) * inv_hp_sq
                                 - 2.0 * hp_a * hp_b * hp_dir * inv_hp_cu
-                                + hp_ab * hp_dir * inv_hp_sq;
+                                + hp_ab * hp_dir * inv_hp_sq
+                                + normalizer_block * cov_row[c] * cov_row[d];
                             out[[row_idx, col_idx]] += wi * value;
                         }
                     }
@@ -1092,6 +1439,8 @@ impl TransformationNormalFamily {
         })?;
         let weights = self.weights.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
+        let h_lower = row_quantities.h_lower.as_ref();
+        let h_upper = row_quantities.h_upper.as_ref();
         let mut out = Array2::<f64>::zeros((p_total, p_total));
 
         for i in 0..n {
@@ -1118,12 +1467,28 @@ impl TransformationNormalFamily {
             let mut hp_v = rd[0] * gamma_v[0];
             let mut h_uv = 0.0;
             let mut hp_uv = 0.0;
+            let mut endpoint_u = [
+                self.response_upper_basis[0] * gamma_u[0],
+                self.response_lower_basis[0] * gamma_u[0],
+            ];
+            let mut endpoint_v = [
+                self.response_upper_basis[0] * gamma_v[0],
+                self.response_lower_basis[0] * gamma_v[0],
+            ];
+            let mut endpoint_uv = [0.0, 0.0];
             for k in 1..p_resp {
                 hp_u += 2.0 * rd[k] * gamma[k] * gamma_u[k];
                 hp_v += 2.0 * rd[k] * gamma[k] * gamma_v[k];
                 h_uv += 2.0 * rv[k] * gamma_u[k] * gamma_v[k];
                 hp_uv += 2.0 * rd[k] * gamma_u[k] * gamma_v[k];
+                endpoint_u[0] += 2.0 * self.response_upper_basis[k] * gamma[k] * gamma_u[k];
+                endpoint_u[1] += 2.0 * self.response_lower_basis[k] * gamma[k] * gamma_u[k];
+                endpoint_v[0] += 2.0 * self.response_upper_basis[k] * gamma[k] * gamma_v[k];
+                endpoint_v[1] += 2.0 * self.response_lower_basis[k] * gamma[k] * gamma_v[k];
+                endpoint_uv[0] += 2.0 * self.response_upper_basis[k] * gamma_u[k] * gamma_v[k];
+                endpoint_uv[1] += 2.0 * self.response_lower_basis[k] * gamma_u[k] * gamma_v[k];
             }
+            let q = log_normal_cdf_diff_derivatives(h_upper[i], h_lower[i])?;
 
             let mut h_factor = vec![0.0; p_resp];
             let mut hp_factor = vec![0.0; p_resp];
@@ -1131,8 +1496,13 @@ impl TransformationNormalFamily {
             let mut hp_factor_u = vec![0.0; p_resp];
             let mut h_factor_v = vec![0.0; p_resp];
             let mut hp_factor_v = vec![0.0; p_resp];
+            let mut endpoint_factor = [vec![0.0; p_resp], vec![0.0; p_resp]];
+            let mut endpoint_factor_u = [vec![0.0; p_resp], vec![0.0; p_resp]];
+            let mut endpoint_factor_v = [vec![0.0; p_resp], vec![0.0; p_resp]];
             h_factor[0] = rv[0];
             hp_factor[0] = rd[0];
+            endpoint_factor[0][0] = self.response_upper_basis[0];
+            endpoint_factor[1][0] = self.response_lower_basis[0];
             for k in 1..p_resp {
                 h_factor[k] = 2.0 * rv[k] * gamma[k];
                 hp_factor[k] = 2.0 * rd[k] * gamma[k];
@@ -1140,11 +1510,64 @@ impl TransformationNormalFamily {
                 hp_factor_u[k] = 2.0 * rd[k] * gamma_u[k];
                 h_factor_v[k] = 2.0 * rv[k] * gamma_v[k];
                 hp_factor_v[k] = 2.0 * rd[k] * gamma_v[k];
+                endpoint_factor[0][k] = 2.0 * self.response_upper_basis[k] * gamma[k];
+                endpoint_factor[1][k] = 2.0 * self.response_lower_basis[k] * gamma[k];
+                endpoint_factor_u[0][k] = 2.0 * self.response_upper_basis[k] * gamma_u[k];
+                endpoint_factor_u[1][k] = 2.0 * self.response_lower_basis[k] * gamma_u[k];
+                endpoint_factor_v[0][k] = 2.0 * self.response_upper_basis[k] * gamma_v[k];
+                endpoint_factor_v[1][k] = 2.0 * self.response_lower_basis[k] * gamma_v[k];
             }
 
             for k in 0..p_resp {
                 for l in 0..p_resp {
                     let same_shape = k == l && k > 0;
+                    let mut normalizer_block = 0.0;
+                    for a in 0..2 {
+                        let h_a_ab = if same_shape {
+                            2.0 * if a == 0 {
+                                self.response_upper_basis[k]
+                            } else {
+                                self.response_lower_basis[k]
+                            }
+                        } else {
+                            0.0
+                        };
+                        for b in 0..2 {
+                            normalizer_block += q.second[a][b] * endpoint_uv[b] * h_a_ab;
+                            for c_ep in 0..2 {
+                                normalizer_block += q.third[a][b][c_ep]
+                                    * endpoint_v[c_ep]
+                                    * endpoint_u[b]
+                                    * h_a_ab;
+                                normalizer_block += q.third[a][b][c_ep]
+                                    * endpoint_uv[c_ep]
+                                    * endpoint_factor[a][k]
+                                    * endpoint_factor[b][l];
+                                normalizer_block += q.third[a][b][c_ep]
+                                    * endpoint_u[c_ep]
+                                    * (endpoint_factor_v[a][k] * endpoint_factor[b][l]
+                                        + endpoint_factor[a][k] * endpoint_factor_v[b][l]);
+                                normalizer_block += q.third[a][b][c_ep]
+                                    * endpoint_v[c_ep]
+                                    * endpoint_factor_u[a][k]
+                                    * endpoint_factor[b][l];
+                                normalizer_block += q.third[a][b][c_ep]
+                                    * endpoint_v[c_ep]
+                                    * endpoint_factor[a][k]
+                                    * endpoint_factor_u[b][l];
+                                for d_ep in 0..2 {
+                                    normalizer_block += q.fourth[a][b][c_ep][d_ep]
+                                        * endpoint_v[d_ep]
+                                        * endpoint_u[c_ep]
+                                        * endpoint_factor[a][k]
+                                        * endpoint_factor[b][l];
+                                }
+                            }
+                            normalizer_block += q.second[a][b]
+                                * (endpoint_factor_u[a][k] * endpoint_factor_v[b][l]
+                                    + endpoint_factor_v[a][k] * endpoint_factor_u[b][l]);
+                        }
+                    }
                     for c in 0..p_cov {
                         let row_idx = k * p_cov + c;
                         let hp_a = hp_factor[k] * cov_row[c];
@@ -1176,7 +1599,8 @@ impl TransformationNormalFamily {
                                 - 2.0 * hp_a * hp_b * hp_uv * inv_hp_cu
                                 + 6.0 * hp_a * hp_b * hp_u * hp_v * inv_hp_qu
                                 + hp_ab * hp_uv * inv_hp_sq
-                                - 2.0 * hp_ab * hp_u * hp_v * inv_hp_cu;
+                                - 2.0 * hp_ab * hp_u * hp_v * inv_hp_cu
+                                + normalizer_block * cov_row[c] * cov_row[d];
                             out[[row_idx, col_idx]] += wi * value;
                         }
                     }
@@ -1219,6 +1643,8 @@ impl TransformationNormalFamily {
         let weights = self.weights.as_ref();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
+        let h_lower = row_quantities.h_lower.as_ref();
+        let h_upper = row_quantities.h_upper.as_ref();
         let mut out = Array1::<f64>::zeros(p_total);
 
         for i in 0..n {
@@ -1240,10 +1666,15 @@ impl TransformationNormalFamily {
 
             let mut h_probe = rv[0] * probe_gamma[0];
             let mut hp_probe = rd[0] * probe_gamma[0];
+            let mut lower_probe = self.response_lower_basis[0] * probe_gamma[0];
+            let mut upper_probe = self.response_upper_basis[0] * probe_gamma[0];
             for k in 1..p_resp {
                 h_probe += 2.0 * rv[k] * gamma[k] * probe_gamma[k];
                 hp_probe += 2.0 * rd[k] * gamma[k] * probe_gamma[k];
+                lower_probe += 2.0 * self.response_lower_basis[k] * gamma[k] * probe_gamma[k];
+                upper_probe += 2.0 * self.response_upper_basis[k] * gamma[k] * probe_gamma[k];
             }
+            let q = log_normal_cdf_diff_derivatives(h_upper[i], h_lower[i])?;
 
             for k in 0..p_resp {
                 let h_factor = if k == 0 {
@@ -1261,8 +1692,35 @@ impl TransformationNormalFamily {
                 } else {
                     2.0 * (hi * rv[k] - rd[k] * inv_hp) * probe_gamma[k]
                 };
-                let scalar =
-                    wi * (h_factor * h_probe + hp_factor * hp_probe * inv_hp_sq + second_probe);
+                let lower_factor = if k == 0 {
+                    self.response_lower_basis[0]
+                } else {
+                    2.0 * self.response_lower_basis[k] * gamma[k]
+                };
+                let upper_factor = if k == 0 {
+                    self.response_upper_basis[0]
+                } else {
+                    2.0 * self.response_upper_basis[k] * gamma[k]
+                };
+                let lower_factor_probe = if k == 0 {
+                    0.0
+                } else {
+                    2.0 * self.response_lower_basis[k] * probe_gamma[k]
+                };
+                let upper_factor_probe = if k == 0 {
+                    0.0
+                } else {
+                    2.0 * self.response_upper_basis[k] * probe_gamma[k]
+                };
+                let normalizer_probe = q.first[0] * upper_factor_probe
+                    + q.first[1] * lower_factor_probe
+                    + (q.second[0][0] * upper_factor + q.second[1][0] * lower_factor) * upper_probe
+                    + (q.second[0][1] * upper_factor + q.second[1][1] * lower_factor) * lower_probe;
+                let scalar = wi
+                    * (h_factor * h_probe
+                        + hp_factor * hp_probe * inv_hp_sq
+                        + second_probe
+                        + normalizer_probe);
                 for c in 0..p_cov {
                     out[k * p_cov + c] += scalar * cov_row[c];
                 }
@@ -1309,6 +1767,8 @@ impl TransformationNormalFamily {
             .map_err(|e| format!("SCOP dH matvec requires row chunk: {e}"))?;
         let weights = self.weights.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
+        let h_lower = row_quantities.h_lower.as_ref();
+        let h_upper = row_quantities.h_upper.as_ref();
         let mut out = Array1::<f64>::zeros(p_total);
 
         for i in 0..n {
@@ -1336,6 +1796,15 @@ impl TransformationNormalFamily {
             let mut hp_probe = rd[0] * gamma_probe[0];
             let mut h_dir_probe = 0.0;
             let mut hp_dir_probe = 0.0;
+            let mut endpoint_dir = [
+                self.response_upper_basis[0] * gamma_dir[0],
+                self.response_lower_basis[0] * gamma_dir[0],
+            ];
+            let mut endpoint_probe = [
+                self.response_upper_basis[0] * gamma_probe[0],
+                self.response_lower_basis[0] * gamma_probe[0],
+            ];
+            let mut endpoint_dir_probe = [0.0, 0.0];
             for k in 1..p_resp {
                 h_dir += 2.0 * rv[k] * gamma[k] * gamma_dir[k];
                 hp_dir += 2.0 * rd[k] * gamma[k] * gamma_dir[k];
@@ -1343,7 +1812,20 @@ impl TransformationNormalFamily {
                 hp_probe += 2.0 * rd[k] * gamma[k] * gamma_probe[k];
                 h_dir_probe += 2.0 * rv[k] * gamma_dir[k] * gamma_probe[k];
                 hp_dir_probe += 2.0 * rd[k] * gamma_dir[k] * gamma_probe[k];
+                endpoint_dir[0] +=
+                    2.0 * self.response_upper_basis[k] * gamma[k] * gamma_dir[k];
+                endpoint_dir[1] +=
+                    2.0 * self.response_lower_basis[k] * gamma[k] * gamma_dir[k];
+                endpoint_probe[0] +=
+                    2.0 * self.response_upper_basis[k] * gamma[k] * gamma_probe[k];
+                endpoint_probe[1] +=
+                    2.0 * self.response_lower_basis[k] * gamma[k] * gamma_probe[k];
+                endpoint_dir_probe[0] +=
+                    2.0 * self.response_upper_basis[k] * gamma_dir[k] * gamma_probe[k];
+                endpoint_dir_probe[1] +=
+                    2.0 * self.response_lower_basis[k] * gamma_dir[k] * gamma_probe[k];
             }
+            let q = log_normal_cdf_diff_derivatives(h_upper[i], h_lower[i])?;
 
             for k in 0..p_resp {
                 let h_factor = if k == 0 {
@@ -1376,13 +1858,66 @@ impl TransformationNormalFamily {
                 } else {
                     2.0 * rd[k] * gamma_probe[k]
                 };
+                let endpoint_factor = [
+                    if k == 0 {
+                        self.response_upper_basis[0]
+                    } else {
+                        2.0 * self.response_upper_basis[k] * gamma[k]
+                    },
+                    if k == 0 {
+                        self.response_lower_basis[0]
+                    } else {
+                        2.0 * self.response_lower_basis[k] * gamma[k]
+                    },
+                ];
+                let endpoint_factor_dir = [
+                    if k == 0 {
+                        0.0
+                    } else {
+                        2.0 * self.response_upper_basis[k] * gamma_dir[k]
+                    },
+                    if k == 0 {
+                        0.0
+                    } else {
+                        2.0 * self.response_lower_basis[k] * gamma_dir[k]
+                    },
+                ];
+                let endpoint_factor_probe = [
+                    if k == 0 {
+                        0.0
+                    } else {
+                        2.0 * self.response_upper_basis[k] * gamma_probe[k]
+                    },
+                    if k == 0 {
+                        0.0
+                    } else {
+                        2.0 * self.response_lower_basis[k] * gamma_probe[k]
+                    },
+                ];
+                let mut normalizer_scalar = 0.0;
+                for a in 0..2 {
+                    for b in 0..2 {
+                        normalizer_scalar +=
+                            q.second[a][b] * endpoint_dir[b] * endpoint_factor_probe[a];
+                        normalizer_scalar += q.second[a][b]
+                            * (endpoint_factor_dir[a] * endpoint_probe[b]
+                                + endpoint_factor[a] * endpoint_dir_probe[b]);
+                        for c_ep in 0..2 {
+                            normalizer_scalar += q.third[a][b][c_ep]
+                                * endpoint_dir[c_ep]
+                                * endpoint_factor[a]
+                                * endpoint_probe[b];
+                        }
+                    }
+                }
                 let scalar = wi
                     * (h_factor_dir * h_probe
                         + h_factor * h_dir_probe
                         + h_dir * h_second_probe
                         + (hp_factor_dir * hp_probe + hp_factor * hp_dir_probe) * inv_hp_sq
                         - 2.0 * hp_factor * hp_probe * hp_dir * inv_hp_cu
-                        + hp_second_probe * hp_dir * inv_hp_sq);
+                        + hp_second_probe * hp_dir * inv_hp_sq
+                        + normalizer_scalar);
                 for c in 0..p_cov {
                     out[k * p_cov + c] += scalar * cov_row[c];
                 }
@@ -1439,6 +1974,8 @@ impl TransformationNormalFamily {
             .map_err(|e| format!("SCOP d2H matvec requires row chunk: {e}"))?;
         let weights = self.weights.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
+        let h_lower = row_quantities.h_lower.as_ref();
+        let h_upper = row_quantities.h_upper.as_ref();
         let mut out = Array1::<f64>::zeros(p_total);
 
         for i in 0..n {
@@ -1472,6 +2009,21 @@ impl TransformationNormalFamily {
             let mut hp_u_probe = 0.0;
             let mut h_v_probe = 0.0;
             let mut hp_v_probe = 0.0;
+            let mut endpoint_u = [
+                self.response_upper_basis[0] * gamma_u[0],
+                self.response_lower_basis[0] * gamma_u[0],
+            ];
+            let mut endpoint_v = [
+                self.response_upper_basis[0] * gamma_v[0],
+                self.response_lower_basis[0] * gamma_v[0],
+            ];
+            let mut endpoint_probe = [
+                self.response_upper_basis[0] * gamma_probe[0],
+                self.response_lower_basis[0] * gamma_probe[0],
+            ];
+            let mut endpoint_uv = [0.0, 0.0];
+            let mut endpoint_u_probe = [0.0, 0.0];
+            let mut endpoint_v_probe = [0.0, 0.0];
             for k in 1..p_resp {
                 hp_u += 2.0 * rd[k] * gamma[k] * gamma_u[k];
                 hp_v += 2.0 * rd[k] * gamma[k] * gamma_v[k];
@@ -1482,7 +2034,26 @@ impl TransformationNormalFamily {
                 hp_u_probe += 2.0 * rd[k] * gamma_u[k] * gamma_probe[k];
                 h_v_probe += 2.0 * rv[k] * gamma_v[k] * gamma_probe[k];
                 hp_v_probe += 2.0 * rd[k] * gamma_v[k] * gamma_probe[k];
+                endpoint_u[0] += 2.0 * self.response_upper_basis[k] * gamma[k] * gamma_u[k];
+                endpoint_u[1] += 2.0 * self.response_lower_basis[k] * gamma[k] * gamma_u[k];
+                endpoint_v[0] += 2.0 * self.response_upper_basis[k] * gamma[k] * gamma_v[k];
+                endpoint_v[1] += 2.0 * self.response_lower_basis[k] * gamma[k] * gamma_v[k];
+                endpoint_probe[0] +=
+                    2.0 * self.response_upper_basis[k] * gamma[k] * gamma_probe[k];
+                endpoint_probe[1] +=
+                    2.0 * self.response_lower_basis[k] * gamma[k] * gamma_probe[k];
+                endpoint_uv[0] += 2.0 * self.response_upper_basis[k] * gamma_u[k] * gamma_v[k];
+                endpoint_uv[1] += 2.0 * self.response_lower_basis[k] * gamma_u[k] * gamma_v[k];
+                endpoint_u_probe[0] +=
+                    2.0 * self.response_upper_basis[k] * gamma_u[k] * gamma_probe[k];
+                endpoint_u_probe[1] +=
+                    2.0 * self.response_lower_basis[k] * gamma_u[k] * gamma_probe[k];
+                endpoint_v_probe[0] +=
+                    2.0 * self.response_upper_basis[k] * gamma_v[k] * gamma_probe[k];
+                endpoint_v_probe[1] +=
+                    2.0 * self.response_lower_basis[k] * gamma_v[k] * gamma_probe[k];
             }
+            let q = log_normal_cdf_diff_derivatives(h_upper[i], h_lower[i])?;
 
             for k in 0..p_resp {
                 let hp_factor = if k == 0 {
@@ -1520,6 +2091,93 @@ impl TransformationNormalFamily {
                 } else {
                     2.0 * rd[k] * gamma_probe[k]
                 };
+                let endpoint_factor = [
+                    if k == 0 {
+                        self.response_upper_basis[0]
+                    } else {
+                        2.0 * self.response_upper_basis[k] * gamma[k]
+                    },
+                    if k == 0 {
+                        self.response_lower_basis[0]
+                    } else {
+                        2.0 * self.response_lower_basis[k] * gamma[k]
+                    },
+                ];
+                let endpoint_factor_u = [
+                    if k == 0 {
+                        0.0
+                    } else {
+                        2.0 * self.response_upper_basis[k] * gamma_u[k]
+                    },
+                    if k == 0 {
+                        0.0
+                    } else {
+                        2.0 * self.response_lower_basis[k] * gamma_u[k]
+                    },
+                ];
+                let endpoint_factor_v = [
+                    if k == 0 {
+                        0.0
+                    } else {
+                        2.0 * self.response_upper_basis[k] * gamma_v[k]
+                    },
+                    if k == 0 {
+                        0.0
+                    } else {
+                        2.0 * self.response_lower_basis[k] * gamma_v[k]
+                    },
+                ];
+                let endpoint_factor_probe = [
+                    if k == 0 {
+                        0.0
+                    } else {
+                        2.0 * self.response_upper_basis[k] * gamma_probe[k]
+                    },
+                    if k == 0 {
+                        0.0
+                    } else {
+                        2.0 * self.response_lower_basis[k] * gamma_probe[k]
+                    },
+                ];
+                let mut normalizer_scalar = 0.0;
+                for a in 0..2 {
+                    for b in 0..2 {
+                        normalizer_scalar +=
+                            q.second[a][b] * endpoint_uv[b] * endpoint_factor_probe[a];
+                        for c_ep in 0..2 {
+                            normalizer_scalar += q.third[a][b][c_ep]
+                                * endpoint_v[c_ep]
+                                * endpoint_u[b]
+                                * endpoint_factor_probe[a];
+                            normalizer_scalar += q.third[a][b][c_ep]
+                                * endpoint_uv[c_ep]
+                                * endpoint_factor[a]
+                                * endpoint_probe[b];
+                            normalizer_scalar += q.third[a][b][c_ep]
+                                * endpoint_u[c_ep]
+                                * (endpoint_factor_v[a] * endpoint_probe[b]
+                                    + endpoint_factor[a] * endpoint_v_probe[b]);
+                            normalizer_scalar += q.third[a][b][c_ep]
+                                * endpoint_v[c_ep]
+                                * endpoint_factor_u[a]
+                                * endpoint_probe[b];
+                            normalizer_scalar += q.third[a][b][c_ep]
+                                * endpoint_v[c_ep]
+                                * endpoint_factor[a]
+                                * endpoint_u_probe[b];
+                            for d_ep in 0..2 {
+                                normalizer_scalar += q.fourth[a][b][c_ep][d_ep]
+                                    * endpoint_v[d_ep]
+                                    * endpoint_u[c_ep]
+                                    * endpoint_factor[a]
+                                    * endpoint_probe[b];
+                            }
+                        }
+                        normalizer_scalar += q.second[a][b]
+                            * (endpoint_factor_u[a] * endpoint_v_probe[b]
+                                + endpoint_factor_v[a] * endpoint_u_probe[b]);
+                    }
+                }
                 let scalar = wi
                     * (h_factor_u * h_v_probe
                         + h_factor_v * h_u_probe
@@ -1536,7 +2194,8 @@ impl TransformationNormalFamily {
                         - 2.0 * hp_factor * hp_probe * hp_uv * inv_hp_cu
                         + 6.0 * hp_factor * hp_probe * hp_u * hp_v * inv_hp_qu
                         + hp_second_probe * hp_uv * inv_hp_sq
-                        - 2.0 * hp_second_probe * hp_u * hp_v * inv_hp_cu);
+                        - 2.0 * hp_second_probe * hp_u * hp_v * inv_hp_cu
+                        + normalizer_scalar);
                 for c in 0..p_cov {
                     out[k * p_cov + c] += scalar * cov_row[c];
                 }
@@ -1572,6 +2231,8 @@ impl TransformationNormalFamily {
         let weights = self.weights.as_ref();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
+        let h_lower = row_quantities.h_lower.as_ref();
+        let h_upper = row_quantities.h_upper.as_ref();
         let mut diag = Array1::<f64>::zeros(p_total);
         for i in 0..n {
             let cov_row = cov.row(i);
@@ -1586,6 +2247,7 @@ impl TransformationNormalFamily {
             for k in 0..p_resp {
                 gamma[k] = beta_mat.row(k).dot(&cov_row);
             }
+            let q = log_normal_cdf_diff_derivatives(h_upper[i], h_lower[i])?;
             for k in 0..p_resp {
                 let h_factor = if k == 0 {
                     rv[0]
@@ -1602,11 +2264,37 @@ impl TransformationNormalFamily {
                 } else {
                     2.0 * (hi * rv[k] - rd[k] * inv_hp)
                 };
+                let lower_factor = if k == 0 {
+                    self.response_lower_basis[0]
+                } else {
+                    2.0 * self.response_lower_basis[k] * gamma[k]
+                };
+                let upper_factor = if k == 0 {
+                    self.response_upper_basis[0]
+                } else {
+                    2.0 * self.response_upper_basis[k] * gamma[k]
+                };
+                let lower_second = if k == 0 {
+                    0.0
+                } else {
+                    2.0 * self.response_lower_basis[k]
+                };
+                let upper_second = if k == 0 {
+                    0.0
+                } else {
+                    2.0 * self.response_upper_basis[k]
+                };
+                let normalizer_second = q.first[0] * upper_second
+                    + q.first[1] * lower_second
+                    + q.second[0][0] * upper_factor * upper_factor
+                    + (q.second[0][1] + q.second[1][0]) * upper_factor * lower_factor
+                    + q.second[1][1] * lower_factor * lower_factor;
                 for c in 0..p_cov {
                     let cc = cov_row[c] * cov_row[c];
                     diag[k * p_cov + c] += wi
                         * ((h_factor * h_factor + hp_factor * hp_factor * inv_hp_sq) * cc
-                            + second * cc);
+                            + second * cc
+                            + normalizer_second * cc);
                 }
             }
         }
@@ -2938,20 +3626,7 @@ impl CustomFamily for TransformationNormalFamily {
             Ok(rq) => rq,
             Err(_) => return Ok(f64::NEG_INFINITY),
         };
-        let h = row_quantities.h.as_ref();
-        let h_prime = row_quantities.h_prime.as_ref();
-        let ll = {
-            use rayon::prelude::*;
-            let weights = self.weights.as_ref();
-            h.as_slice()
-                .unwrap()
-                .par_iter()
-                .zip(h_prime.as_slice().unwrap().par_iter())
-                .zip(weights.as_slice().unwrap().par_iter())
-                .map(|((&hi, &hpi), &wi)| wi * (-0.5 * hi * hi + hpi.ln()))
-                .sum::<f64>()
-        };
-        Ok(ll)
+        Ok(row_quantities.log_likelihood)
     }
 
     /// Log-likelihood + flat joint gradient without building the dense Hessian.
@@ -3026,7 +3701,7 @@ impl CustomFamily for TransformationNormalFamily {
         // Honest CTN per-gradient cost. The default
         // (`coefficient_hessian_cost / 2`) only counts the inner Newton solve
         // and undercounts each outer evaluation, because CTN also runs a
-        // monotonicity fraction-to-boundary scan via
+        // numerical-underflow guard over the derivative grid via
         // `KronDesign::min_step_to_boundary` on every gradient/cost step.
         // That pass walks the n_cov × n_grid virtual row space, forming
         // chunk-local `c · Rᵀ` and `d · Rᵀ` factors, with cost
@@ -3079,24 +3754,19 @@ impl CustomFamily for TransformationNormalFamily {
         let beta = &block_states[0].beta;
         let scan_start = std::time::Instant::now();
 
-        // Fraction-to-boundary: find the largest α ∈ (0, 1] such that
-        // h'(y_i; x_i; β + α · δ) ≥ ε at every observed row and
-        // h'(y_g; x_i) ≥ ε at every (covariate, response-grid) pair on the
-        // monotonicity grid. Both reductions use the same strict-feasibility
-        // margin TRANSFORMATION_MONOTONICITY_EPS as the predict-time
-        // monotonicity check (`src/inference/predict_input.rs`).
+        // Numerical-underflow guard for the learned, beta-dependent part of
+        // the SCOP derivative. The actual derivative is
         //
-        // Under SCOP-CTN with I-spline shape components,
-        // `h'(y, x) = Σ_{r≥1} M_r(y) · γ_r(x)²` is structurally non-negative
-        // for every β: M_r ≥ 0 (M-spline on clamped knots) and γ_r² ≥ 0.
-        // This scan therefore protects only the *numerical floor* — keeping
-        // h' away from the −log h' singularity in the likelihood — not
-        // monotonicity itself. Using slack=0 on the observation rows
-        // previously allowed the optimizer to converge to a β with
-        // h'(y_i, x_i) ∈ (0, ε), which is fit-feasible but predict-rejected
-        // (the −log h' barrier in the likelihood pushes h' toward 0⁺
-        // asymptotically but does not enforce any specific lower bound).
-        // Matching slacks closes that gap.
+        //   h'(y, x) = ε + q(y, x; β),    q = Σ M_r(y) γ_r(x)^2.
+        //
+        // Since ε is integrated directly into h and h', q=0 is a perfectly
+        // smooth interior point of the likelihood; treating q=ε as a hard
+        // line-search boundary makes the inner mode a constrained/KKT point
+        // while the exact outer REML Hessian assumes an unconstrained smooth
+        // mode. That mismatch is what produced enormous ARC model decreases
+        // and dozens of trust-region rejections on small CTN demos. The scan
+        // therefore only rejects catastrophic numerical drift below −ε, where
+        // even the structural floor could be cancelled.
         //
         // Each design owns its own streaming reduction over its virtual rows
         // (KhatriRao: n observations; Kronecker: n_cov × n_grid pairs without
@@ -3111,7 +3781,7 @@ impl CustomFamily for TransformationNormalFamily {
         let alpha_obs = self.x_deriv_kron.scop_affine_squared_min_step_to_boundary(
             beta,
             delta,
-            TRANSFORMATION_MONOTONICITY_EPS,
+            -TRANSFORMATION_MONOTONICITY_EPS,
             1e-14,
         );
         let alpha_grid = self
@@ -3119,7 +3789,7 @@ impl CustomFamily for TransformationNormalFamily {
             .scop_affine_squared_min_step_to_boundary(
                 beta,
                 delta,
-                TRANSFORMATION_MONOTONICITY_EPS,
+                -TRANSFORMATION_MONOTONICITY_EPS,
                 1e-14,
             );
         let alpha_max = 1.0_f64.min(alpha_obs).min(alpha_grid);
@@ -3148,10 +3818,9 @@ impl CustomFamily for TransformationNormalFamily {
         if block_index != 0 {
             return Ok(None);
         }
-        // The CTN tensor design is intentionally factored. The dense active-set
-        // constraint API cannot represent that without persisting the full
-        // n_grid x p_response x p_covariate matrix, so monotonicity is enforced
-        // by the likelihood barrier plus the fraction-to-boundary step rule.
+        // The CTN tensor design is intentionally factored. Strict monotonicity
+        // is encoded structurally as `h' = ε + Σ M_r γ_r²`, so there are no
+        // dense active-set constraints to expose here.
         Ok(None)
     }
 
@@ -3995,6 +4664,38 @@ fn evaluate_response_derivative_basis(
     let mut out = Array2::<f64>::zeros((values.len(), shape_deriv.ncols() + 1));
     out.slice_mut(s![.., 1..]).assign(&shape_deriv);
     Ok(out)
+}
+
+fn response_endpoint_value_bases(transform: &Array2<f64>) -> (Array1<f64>, Array1<f64>) {
+    let mut lower = Array1::<f64>::zeros(transform.ncols() + 1);
+    let mut upper = Array1::<f64>::zeros(transform.ncols() + 1);
+    lower[0] = 1.0;
+    upper[0] = 1.0;
+    for col in 0..transform.ncols() {
+        upper[col + 1] = transform.column(col).sum();
+    }
+    (lower, upper)
+}
+
+fn response_floor_offsets(
+    response: &Array1<f64>,
+    knots: &Array1<f64>,
+    response_median: f64,
+) -> (Array1<f64>, f64, f64) {
+    let row_offsets = response.mapv(|y| TRANSFORMATION_MONOTONICITY_EPS * (y - response_median));
+    let lower_y = knots
+        .first()
+        .copied()
+        .unwrap_or_else(|| response.iter().copied().fold(f64::INFINITY, f64::min));
+    let upper_y = knots
+        .last()
+        .copied()
+        .unwrap_or_else(|| response.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+    (
+        row_offsets,
+        TRANSFORMATION_MONOTONICITY_EPS * (lower_y - response_median),
+        TRANSFORMATION_MONOTONICITY_EPS * (upper_y - response_median),
+    )
 }
 
 fn transformation_monotonicity_response_grid(
@@ -6980,10 +7681,15 @@ mod tests {
         let row = family
             .row_quantities(&state.beta)
             .expect("toy row quantities");
-        // SCOP-CTN forward: h = X_val · γ²-affine + offset, h' = X_deriv · γ²-affine.
-        let direct_h =
-            family.x_val_kron.scop_affine_squared_forward(&state.beta) + family.offset.as_ref();
-        let direct_h_prime = family.x_deriv_kron.scop_affine_squared_forward(&state.beta);
+        // SCOP-CTN forward: h = X_val · γ²-affine + offset + ε(y−median),
+        // h' = X_deriv · γ²-affine + ε.
+        let direct_h = family.x_val_kron.scop_affine_squared_forward(&state.beta)
+            + family.offset.as_ref()
+            + family.response_floor_offset.as_ref();
+        let direct_h_prime = family
+            .x_deriv_kron
+            .scop_affine_squared_forward(&state.beta)
+            .mapv(|hp| hp + TRANSFORMATION_MONOTONICITY_EPS);
         let weights = family.weights.as_ref();
 
         assert_eq!(row.h.as_ref(), &direct_h);
@@ -6992,7 +7698,8 @@ mod tests {
         let mut expected_ll = 0.0;
         for i in 0..direct_h.len() {
             let hp = direct_h_prime[i];
-            expected_ll += weights[i] * (-0.5 * direct_h[i] * direct_h[i] + hp.ln());
+            let log_z = log_normal_cdf_diff(row.h_upper[i], row.h_lower[i]).expect("endpoint mass");
+            expected_ll += weights[i] * (-0.5 * direct_h[i] * direct_h[i] + hp.ln() - log_z);
         }
 
         assert!(
@@ -7041,8 +7748,10 @@ mod tests {
     fn ctn_row_quantities_reject_nonrepresentable_exact_derivatives() {
         let h = array![0.0];
         let h_prime = array![1.0e-100];
+        let h_lower = array![-8.0];
+        let h_upper = array![8.0];
         let weights = array![1.0];
-        let err = build_transformation_row_derived(&h, &h_prime, &weights)
+        let err = build_transformation_row_derived(&h, &h_prime, &h_lower, &h_upper, &weights)
             .expect_err("1/h'^4 overflows f64 and must not be clamped");
         assert!(
             err.contains("1/h'^4") && err.contains("outside the finite exact-derivative range"),
@@ -7084,9 +7793,9 @@ mod tests {
             matches!(family.x_deriv_grid_kron, KroneckerDesign::Kronecker { .. }),
             "toy family must keep the Kronecker grid variant for cached-path coverage"
         );
-        // δ direction with a negative leading h' contribution so the grid
-        // reduction binds above ε rather than returning +∞ (which would still
-        // be bit-equivalent but would not exercise the streaming reduction).
+        // δ direction with a negative leading derivative contribution. The
+        // structural ε floor means the production guard binds only if the
+        // learned derivative part would drift below −ε.
         let p_total = state.beta.len();
         let mut delta = toy_probe_vector(p_total, 0xDE17A);
         delta[0] = -0.30;
@@ -7106,13 +7815,13 @@ mod tests {
         let alpha_obs_uncached = family.x_deriv_kron.min_step_to_boundary(
             beta,
             &delta,
-            TRANSFORMATION_MONOTONICITY_EPS,
+            -TRANSFORMATION_MONOTONICITY_EPS,
             1e-14,
         );
         let alpha_grid_uncached = family.x_deriv_grid_kron.min_step_to_boundary(
             beta,
             &delta,
-            TRANSFORMATION_MONOTONICITY_EPS,
+            -TRANSFORMATION_MONOTONICITY_EPS,
             1e-14,
         );
         let alpha_max_uncached = 1.0_f64.min(alpha_obs_uncached).min(alpha_grid_uncached);
@@ -7182,8 +7891,11 @@ mod tests {
         let h = row.h.as_ref();
         let h_prime = row.h_prime.as_ref();
         // expected_h[i] = (response[i] - location)/scale = (y - 1)/2.
-        let expected_h: Array1<f64> = response.mapv(|y| (y - 1.0) / 2.0);
-        let expected_h_prime = Array1::from_elem(response.len(), 0.5);
+        let expected_h: Array1<f64> = response.mapv(|y| {
+            (y - 1.0) / 2.0 + TRANSFORMATION_MONOTONICITY_EPS * (y - family.response_median())
+        });
+        let expected_h_prime =
+            Array1::from_elem(response.len(), 0.5 + TRANSFORMATION_MONOTONICITY_EPS);
 
         for i in 0..expected_h.len() {
             assert!(

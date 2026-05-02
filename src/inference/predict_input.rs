@@ -164,6 +164,9 @@ pub fn build_predict_input_for_model(
             let response_degree = payload
                 .transformation_response_degree
                 .ok_or("saved transformation-normal model missing response_degree")?;
+            let response_median = payload
+                .transformation_response_median
+                .ok_or("saved transformation-normal model missing response_median")?;
 
             let t_rows = response_transform_vecs.len();
             let t_cols = if t_rows > 0 {
@@ -310,7 +313,7 @@ pub fn build_predict_input_for_model(
                             data.ncols()
                         ));
                     }
-                    z[j] = (data[[i, col]] - calibration.feature_center[j])
+                    z[j] = (design_input[[i, col]] - calibration.feature_center[j])
                         / calibration.feature_scale[j];
                     calib_mat[[i, 1 + j]] = z[j];
                 }
@@ -339,14 +342,9 @@ pub fn build_predict_input_for_model(
             let score_log_scale = calib_mat.dot(&log_scale_beta);
 
             // Under SCOP-CTN with I-spline shape components,
-            // `h'(y, x) = Σ_{r≥1} M_r(y) · γ_r(x)²`. Both M_r and γ_r² are
-            // non-negative for every (β, x, y), so h' ≥ 0 holds structurally
-            // by construction (column 0 of `resp_deriv` is zero — only the
-            // squared shape rows contribute). This check is therefore a
-            // numerical-floor guard, not a monotonicity certificate: the
-            // CTN log-density `log h'` has a −∞ singularity at h' = 0, so
-            // we reject points where the floating-point evaluation of h'
-            // dropped below ε.
+            // `h'(y, x) = ε + Σ_{r≥1} M_r(y) · γ_r(x)²`. Both M_r and γ_r²
+            // are non-negative for every (β, x, y), and ε is the fixed
+            // derivative floor serialized through the model definition.
             let monotonicity_eps = TRANSFORMATION_MONOTONICITY_EPS;
             let beta_mat_ref = &beta_mat;
             let cov_mat_ref = &cov_mat;
@@ -361,19 +359,16 @@ pub fn build_predict_input_for_model(
                         let gamma = beta_mat_ref.row(r).dot(&cov_row);
                         hp += resp_row[r] * gamma * gamma;
                     }
-                    hp
+                    hp + monotonicity_eps
                 })
                 .reduce(|| f64::INFINITY, f64::min);
             if min_h_prime < monotonicity_eps {
                 return Err(format!(
                     "prediction failed: transformation-normal h'(y, x) numerical floor \
                      violated. Minimum evaluated h'(y, x) is {min_h_prime:.3e}, threshold \
-                     {monotonicity_eps:.0e}. Under SCOP h' ≥ 0 holds structurally, so this \
-                     indicates a vanishing-density configuration (some (y, x) where every \
-                     γ_r(x)² · M_r(y) collapses to 0) rather than non-monotonicity. The \
-                     log-density `log h'` would diverge to −∞ at such a point. Refit with \
-                     stronger regularization (raise the penalty seed) or with more training \
-                     data; this typically arises when n is small relative to p_resp × p_cov."
+                     {monotonicity_eps:.0e}. Under SCOP h' = ε + Σ M_r γ_r² holds \
+                     structurally, so this indicates floating-point cancellation below \
+                     the fixed derivative floor."
                 ));
             }
 
@@ -397,7 +392,7 @@ pub fn build_predict_input_for_model(
                             "prediction failed: transformation-normal h at row {i} is {val:.6e}, outside the standard-normal bound ±{TRANSFORMATION_NORMAL_H_ABS_MAX}; max_abs_covariate_basis={max_abs_cov:.6e}, max_abs_gamma={max_abs_gamma:.6e}"
                         ));
                     }
-                    Ok(val)
+                    Ok(val + monotonicity_eps * (response_new[i] - response_median))
                 })
                 .collect();
             let h =
