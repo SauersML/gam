@@ -5730,7 +5730,7 @@ fn compute_outer_hessian(
                                 }
                             }
                         }
-                        log::warn!(
+                        eprintln!(
                             "[OUTER ext-ext non-finite] ({},{}): cross_trace={} base={} m_terms={} correction={} pair.a={} pair.ld_s={} g.dot(v_jj)={} pair_g_finite={} first_bad_pair_g={:?} b_mat_finite={} first_bad_b_mat={:?} b_operator_present={} b_mat_dim={}x{} ext_v[ii]_finite={} ext_v[jj]_finite={} coord_i.b_depends_on_beta={} coord_j.b_depends_on_beta={}",
                             ii,
                             jj,
@@ -5790,7 +5790,7 @@ fn compute_outer_hessian(
         // instead of just flagging the final outer-Hessian entry.
         let report_finite = |name: &str, value: f64, ii: usize, jj: usize| {
             if !value.is_finite() {
-                log::warn!(
+                eprintln!(
                     "[OUTER non-finite] {} at ({}, {}) = {}",
                     name,
                     ii,
@@ -5803,7 +5803,7 @@ fn compute_outer_hessian(
             report_finite("rho_a_vals[kk]", rho_a_vals[kk], kk, kk);
             for entry in penalty_a_k_betas[kk].iter() {
                 if !entry.is_finite() {
-                    log::warn!(
+                    eprintln!(
                         "[OUTER non-finite] penalty_a_k_betas[{}] has non-finite",
                         kk
                     );
@@ -5812,7 +5812,7 @@ fn compute_outer_hessian(
             }
             for entry in v_ks[kk].iter() {
                 if !entry.is_finite() {
-                    log::warn!("[OUTER non-finite] v_ks[{}] has non-finite", kk);
+                    eprintln!("[OUTER non-finite] v_ks[{}] has non-finite", kk);
                     break;
                 }
             }
@@ -5834,7 +5834,7 @@ fn compute_outer_hessian(
         if let Some(ref h_g) = leverage {
             for entry in h_g.iter() {
                 if !entry.is_finite() {
-                    log::warn!("[OUTER non-finite] leverage h^G has non-finite entries");
+                    eprintln!("[OUTER non-finite] leverage h^G has non-finite entries");
                     break;
                 }
             }
@@ -5842,7 +5842,7 @@ fn compute_outer_hessian(
         if let Some(ref z_c) = adjoint_z_c {
             for entry in z_c.iter() {
                 if !entry.is_finite() {
-                    log::warn!("[OUTER non-finite] adjoint_z_c has non-finite entries");
+                    eprintln!("[OUTER non-finite] adjoint_z_c has non-finite entries");
                     break;
                 }
             }

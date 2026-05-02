@@ -259,6 +259,15 @@ pub fn build_predict_input_for_model(
                 .try_row_chunk(0..n)
                 .map_err(|e| e.to_string())?;
 
+            // Under SCOP-CTN with I-spline shape components,
+            // `h'(y, x) = Σ_{r≥1} M_r(y) · γ_r(x)²`. Both M_r and γ_r² are
+            // non-negative for every (β, x, y), so h' ≥ 0 holds structurally
+            // by construction (column 0 of `resp_deriv` is zero — only the
+            // squared shape rows contribute). This check is therefore a
+            // numerical-floor guard, not a monotonicity certificate: the
+            // CTN log-density `log h'` has a −∞ singularity at h' = 0, so
+            // we reject points where the floating-point evaluation of h'
+            // dropped below ε.
             let monotonicity_eps = TRANSFORMATION_MONOTONICITY_EPS;
             let beta_mat_ref = &beta_mat;
             let cov_mat_ref = &cov_mat;
@@ -278,13 +287,14 @@ pub fn build_predict_input_for_model(
                 .reduce(|| f64::INFINITY, f64::min);
             if min_h_prime < monotonicity_eps {
                 return Err(format!(
-                    "prediction failed: transformation-normal fit is non-monotone in y \
-                     for at least one observation. Minimum evaluated h'(y, x) is \
-                     {min_h_prime:.3e}, threshold {monotonicity_eps:.0e}. The model β \
-                     admits a region where h(y, x) decreases in y, which contradicts the \
-                     CTN conditional-Gaussianization contract. Refit with stronger \
-                     regularization (raise the penalty seed) or with more training data; \
-                     this typically arises when n is small relative to p_resp × p_cov."
+                    "prediction failed: transformation-normal h'(y, x) numerical floor \
+                     violated. Minimum evaluated h'(y, x) is {min_h_prime:.3e}, threshold \
+                     {monotonicity_eps:.0e}. Under SCOP h' ≥ 0 holds structurally, so this \
+                     indicates a vanishing-density configuration (some (y, x) where every \
+                     γ_r(x)² · M_r(y) collapses to 0) rather than non-monotonicity. The \
+                     log-density `log h'` would diverge to −∞ at such a point. Refit with \
+                     stronger regularization (raise the penalty seed) or with more training \
+                     data; this typically arises when n is small relative to p_resp × p_cov."
                 ));
             }
 
