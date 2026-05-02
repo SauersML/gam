@@ -19837,8 +19837,9 @@ pub mod closed_form_penalty {
     /// pointwise in any (m, s, d) regime and avoids the Schoenberg
     /// 80-node quadrature.
     ///
-    /// For `R = 0` the radial form is singular; falls back to the
-    /// Schoenberg implementation in that degenerate case (Δ_B^q f(0)).
+    /// For `R = 0` the radial chain is singular; use the exact odd-d hybrid
+    /// Taylor self-pair limit when available, otherwise route to the
+    /// Schoenberg heat representation for the degenerate pair.
     pub fn anisotropic_duchon_penalty_radial(
         q: usize,
         m: usize,
@@ -19866,8 +19867,9 @@ pub mod closed_form_penalty {
         let (big_r, s1, s2, u1, u2) = aniso_invariants(eta, r);
 
         if big_r == 0.0 {
-            // Radial form is singular at R = 0; defer to Schoenberg path
-            // which integrates against the heat kernel and is finite there.
+            if let Some(value) = super::hybrid_self_pair_value_odd_d(q, m, s, d, kappa, eta) {
+                return value;
+            }
             return anisotropic_duchon_penalty(q, m, s, kappa, eta, r);
         }
 
@@ -20591,6 +20593,7 @@ pub mod closed_form_penalty {
         let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order_h);
         let (g, g_r, g_s1, g_s2, g_u1, g_u2) = radial_g_q_partials(q, big_r, s1, s2, u1, u2, &fr);
         let big_j = eta.iter().sum::<f64>().exp();
+        let value = big_j * g;
 
         // ∂_η_l (J · g) = J · (g + ∂_η_l g)
         //   ∂_η_l g = g_R · ∂R/∂η_l + g_s1 · ∂s1/∂η_l + g_s2 · ∂s2/∂η_l
@@ -20633,7 +20636,6 @@ pub mod closed_form_penalty {
         // `radial_g_q_partials` directly on the second-κ-partial table.
         let d2_kappa = if s != 0 && kappa != 0.0 {
             let max_order = 2 * q + 1;
-            let (big_r, s1, s2, u1, u2) = aniso_invariants(eta, r);
             let ddfr = radial_derivatives_of_isotropic_duchon_kappa_partial2(
                 d, m, s, kappa, big_r, max_order,
             );
@@ -20769,7 +20771,7 @@ pub mod closed_form_penalty {
         }
 
         PairBlockBundle {
-            value: big_j * g,
+            value,
             d_eta,
             d_kappa,
             d2_eta,

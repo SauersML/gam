@@ -4902,6 +4902,64 @@ fn compute_fourth_derivative_trace(
     Ok(Some(acc))
 }
 
+/// Compute every fourth-derivative trace for a coordinate set in one pass.
+///
+/// For scalar GLM Hessian corrections,
+///
+/// ```text
+///   Q_ij = tr(G X' diag(d * (Xv_i) * (Xv_j)) X)
+///        = Σ_r d_r h^G_r (Xv_i)_r (Xv_j)_r.
+/// ```
+///
+/// This is a weighted Gram matrix of the row-space mode matrix `XV`.  Computing
+/// it once replaces the per-pair `Xv_i` / `Xv_j` matvecs in
+/// `compute_fourth_derivative_trace`, reducing the exact outer Hessian from
+/// `O(T²)` design matvecs to `O(T)` design matvecs plus one `T×T` Gram.
+fn compute_fourth_derivative_trace_matrix(
+    ing: &ScalarGlmIngredients<'_>,
+    modes: &[&Array1<f64>],
+    leverage: &Array1<f64>,
+) -> Result<Option<Array2<f64>>, String> {
+    let Some(d_array) = ing.d_array else {
+        return Ok(None);
+    };
+    let n = ing.c_array.len();
+    let t = modes.len();
+    if t == 0 {
+        return Ok(Some(Array2::zeros((0, 0))));
+    }
+    if d_array.len() != n || leverage.len() != n {
+        return Err(format!(
+            "fourth-derivative trace shape mismatch: c={}, d={}, leverage={}",
+            n,
+            d_array.len(),
+            leverage.len()
+        ));
+    }
+
+    let mut x_modes = Array2::<f64>::zeros((n, t));
+    for (j, mode) in modes.iter().enumerate() {
+        let x_v = ing.x.matrixvectormultiply(mode);
+        if x_v.len() != n {
+            return Err(format!(
+                "fourth-derivative trace Xv length mismatch for mode {j}: got {}, expected {n}",
+                x_v.len()
+            ));
+        }
+        x_modes.column_mut(j).assign(&x_v);
+    }
+
+    let mut weighted = x_modes.clone();
+    Zip::from(weighted.rows_mut())
+        .and(d_array)
+        .and(leverage)
+        .for_each(|mut row, &d, &h| {
+            let scale = d * h;
+            row.mapv_inplace(|value| value * scale);
+        });
+    Ok(Some(crate::faer_ndarray::fast_atb(&x_modes, &weighted)))
+}
+
 /// Compute the IFT second-derivative correction contribution to h2_trace.
 ///
 /// This is the SINGLE implementation of the formula:
@@ -4928,6 +4986,7 @@ fn compute_ift_correction_trace(
     adjoint_z_c: Option<&Array1<f64>>,
     glm_ingredients: Option<&ScalarGlmIngredients<'_>>,
     leverage: Option<&Array1<f64>>,
+    precomputed_fourth_trace: Option<f64>,
     subspace: Option<&PenaltySubspaceTrace>,
 ) -> Result<f64, String> {
     if !effective_deriv.has_corrections() {
@@ -4938,11 +4997,15 @@ fn compute_ift_correction_trace(
     // to materialising the correction and tracing through the subspace.
     if let (Some(z_c), None) = (adjoint_z_c, subspace) {
         let c_trace = rhs.dot(z_c);
-        let d_trace = match (glm_ingredients, leverage) {
-            (Some(ing), Some(h_g)) => {
-                compute_fourth_derivative_trace(ing, v_i, v_j, h_g)?.unwrap_or(0.0)
+        let d_trace = if let Some(trace) = precomputed_fourth_trace {
+            trace
+        } else {
+            match (glm_ingredients, leverage) {
+                (Some(ing), Some(h_g)) => {
+                    compute_fourth_derivative_trace(ing, v_i, v_j, h_g)?.unwrap_or(0.0)
+                }
+                _ => 0.0,
             }
-            _ => 0.0,
         };
         Ok(c_trace + d_trace)
     } else {
@@ -5248,6 +5311,19 @@ fn compute_outer_hessian(
         ext_h_matrices.push(Some(h_i));
     }
 
+    let fourth_trace_matrix =
+        if incl_logdet_h && solution.penalty_subspace_trace.is_none() && adjoint_z_c.is_some() {
+            match (glm_ingredients.as_ref(), leverage.as_ref()) {
+                (Some(ing), Some(h_g)) if ing.d_array.is_some() => {
+                    let modes = v_ks.iter().chain(ext_v.iter()).collect::<Vec<_>>();
+                    compute_fourth_derivative_trace_matrix(ing, &modes, h_g)?
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
     // ── Stochastic second-order cross-trace precomputation ──
     //
     // When implicit operators are present and the problem is large, compute
@@ -5433,6 +5509,7 @@ fn compute_outer_hessian(
                 adjoint_z_c.as_ref(),
                 glm_ingredients.as_ref(),
                 leverage.as_ref(),
+                fourth_trace_matrix.as_ref().map(|trace| trace[[kk, ll]]),
                 subspace,
             )?;
 
@@ -5531,6 +5608,9 @@ fn compute_outer_hessian(
                         adjoint_z_c.as_ref(),
                         glm_ingredients.as_ref(),
                         leverage.as_ref(),
+                        fourth_trace_matrix
+                            .as_ref()
+                            .map(|trace| -trace[[rho_idx, k + ext_idx]]),
                         subspace,
                     )?;
 
@@ -5633,6 +5713,9 @@ fn compute_outer_hessian(
                         adjoint_z_c.as_ref(),
                         glm_ingredients.as_ref(),
                         leverage.as_ref(),
+                        fourth_trace_matrix
+                            .as_ref()
+                            .map(|trace| trace[[k + ii, k + jj]]),
                         subspace,
                     )?;
 
@@ -6039,6 +6122,7 @@ struct UnifiedOuterHessianOperator {
     kernel: OuterHessianDerivativeKernel,
     adjoint_z_c: Option<Array1<f64>>,
     leverage: Option<Array1<f64>>,
+    fourth_trace: Option<Array2<f64>>,
     callback_second_modes: Option<Vec<Array1<f64>>>,
 }
 
@@ -6199,8 +6283,17 @@ impl UnifiedOuterHessianOperator {
             "missing leverage cache for scalar outer Hessian operator".to_string()
         })?;
         let c_trace = self.pair_rhs_combo_dot(idx, alpha, z_c.view());
-        let d_trace =
-            compute_fourth_derivative_trace(&ingredients, v_i, m_alpha, h_g)?.unwrap_or(0.0);
+        let d_trace = if let Some(trace) = self.fourth_trace.as_ref() {
+            let mut combo = 0.0;
+            for (j, &alpha_j) in alpha.iter().enumerate() {
+                if alpha_j != 0.0 {
+                    combo += alpha_j * self.coords[j].correction_sign() * trace[[idx, j]];
+                }
+            }
+            combo
+        } else {
+            compute_fourth_derivative_trace(&ingredients, v_i, m_alpha, h_g)?.unwrap_or(0.0)
+        };
         Ok(c_trace + v_i_sign * d_trace)
     }
 
@@ -6676,6 +6769,32 @@ fn build_outer_hessian_operator(
                 })
                 .collect::<Vec<_>>()
         });
+    let fourth_trace = if incl_logdet_h && adjoint_z_c.is_some() {
+        match (&kernel, leverage.as_ref()) {
+            (
+                OuterHessianDerivativeKernel::ScalarGlm {
+                    c_array,
+                    d_array: Some(d_array),
+                    x,
+                },
+                Some(h_g),
+            ) => {
+                let modes = coords.iter().map(|coord| &coord.v).collect::<Vec<_>>();
+                compute_fourth_derivative_trace_matrix(
+                    &ScalarGlmIngredients {
+                        c_array,
+                        d_array: Some(d_array),
+                        x,
+                    },
+                    &modes,
+                    h_g,
+                )?
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
 
     Ok(UnifiedOuterHessianOperator {
         hop,
@@ -6697,6 +6816,7 @@ fn build_outer_hessian_operator(
         kernel,
         adjoint_z_c,
         leverage,
+        fourth_trace,
         callback_second_modes,
     })
 }
