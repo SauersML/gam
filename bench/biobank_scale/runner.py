@@ -280,7 +280,8 @@ def preflight_marginal_slope_biobank(
         f"K_pc: {centers}",
         f"Duchon tuple: order={BIOBANK_DUCHON16D_ORDER}, power={BIOBANK_DUCHON16D_POWER}, length_scale={BIOBANK_DUCHON16D_LENGTH_SCALE:g}",
         "Duchon smooth: lazy chunked",
-        "anisotropy derivatives: implicit streaming",
+        "marginal-slope anisotropy derivatives: implicit streaming",
+        "conditional PGS CTN geometry: isotropic joint-PC Duchon",
         "CTN Kronecker: factored (Kronecker variant for monotonicity grid)",
         f"CTN response grid points (upper bound): {n_grid_estimate}",
         f"CTN p_resp upper bound: {p_resp_estimate}",
@@ -714,7 +715,6 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
         str(rust_bin),
         "fit",
         "--transformation-normal",
-        "--scale-dimensions",
         "--out",
         str(ctn_model_path),
         str(ctn_fit_input_path),
@@ -741,6 +741,8 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
     pc_cols = _pc_std_columns(spec.pc_count)
     diagnostics = [
         f"conditional PGS CTN formula: {formula}",
+        "conditional PGS CTN fit uses the isotropic joint-PC Duchon geometry; "
+        "downstream marginal-slope fits own the anisotropic scale-dimension model",
         f"conditional PGS CTN fit is phenotype-blind and train-only; downstream z column: {PGS_CTN_Z_COLUMN}",
         f"conditional PGS CTN fit subsample: {len(ctn_fit_rows)} of {len(train_rows)} train rows (cap {PGS_CTN_FIT_SUBSAMPLE_N})",
     ]
