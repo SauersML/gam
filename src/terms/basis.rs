@@ -19878,6 +19878,10 @@ pub mod closed_form_penalty {
         // Build invariants R, s_1, s_2, u_1, u_2.
         let (big_r, s1, s2, u1, u2) = aniso_invariants(eta, r);
 
+        if smoothness_gate_requires_schoenberg_route(q, d, m, s) {
+            return anisotropic_duchon_penalty(q, m, s, kappa, eta, r);
+        }
+
         if big_r == 0.0 {
             if let Some(value) = super::hybrid_self_pair_value_odd_d(q, m, s, d, kappa, eta) {
                 return value;
@@ -19897,7 +19901,7 @@ pub mod closed_form_penalty {
         // q=2: the radial chain (-Δ)² R_4^4 picks up a constant residue
         // -7/(48π²) that R_2^4 = -ln(R)/(8π²) does not contain.
         //
-        // Two fallbacks are possible. For η = 0 the anisotropic Laplacian
+        // Two mathematically distinct routes are possible. For η = 0 the anisotropic Laplacian
         // collapses to the ordinary radial Laplacian and the unique
         // closed-form `isotropic_duchon_penalty(q, d, m, s, κ, R)` is
         // exact, so we use it directly. For η ≠ 0 we route to the
@@ -19992,6 +19996,11 @@ pub mod closed_form_penalty {
         // Hybrid: any Riesz block j ∈ {1, …, 2m} can be log-typed; if so the
         // partial-fraction sum of derivatives carries the residue through.
         (1..=2 * m).any(is_log)
+    }
+
+    fn smoothness_gate_requires_schoenberg_route(q: usize, d: usize, m: usize, s: usize) -> bool {
+        let order = m + s;
+        q > 0 && 2 * order <= d + 2 * q && 4 * order > d + 2 * q
     }
 
     /// Anisotropic invariants used by the radial form:
@@ -20580,7 +20589,9 @@ pub mod closed_form_penalty {
         );
         let d = eta.len();
         let (big_r_check, _, _, _, _) = aniso_invariants(eta, r);
-        let analytic_first_ok = big_r_check > 0.0 && !relevant_block_is_log_riesz(d, m, s, kappa);
+        let analytic_first_ok = big_r_check > 0.0
+            && !smoothness_gate_requires_schoenberg_route(q, d, m, s)
+            && !relevant_block_is_log_riesz(d, m, s, kappa);
         if big_r_check == 0.0
             && let Some(bundle) = hybrid_self_pair_bundle_odd_d(q, m, s, kappa, eta)
         {
