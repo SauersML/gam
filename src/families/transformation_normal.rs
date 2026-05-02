@@ -7357,6 +7357,53 @@ mod tests {
     }
 
     #[test]
+    fn ctn_scop_gradient_matches_loglikelihood_fd() {
+        let psi = array![0.15, -0.10];
+        let (family, _, state, spec) = toy_family_and_derivatives(&psi);
+        let p = spec.design.ncols();
+
+        let analytic = family
+            .exact_newton_joint_gradient_evaluation(std::slice::from_ref(&state), &[spec])
+            .expect("SCOP analytic gradient evaluation")
+            .expect("SCOP analytic gradient must be present");
+        assert_eq!(analytic.gradient.len(), p);
+
+        let eps = 1e-6;
+        for coord in 0..p {
+            let mut beta_plus = state.beta.clone();
+            beta_plus[coord] += eps;
+            let plus_state = ParameterBlockState {
+                beta: beta_plus,
+                eta: state.eta.clone(),
+            };
+            let ll_plus = family
+                .log_likelihood_only(std::slice::from_ref(&plus_state))
+                .expect("positive perturbation remains feasible");
+
+            let mut beta_minus = state.beta.clone();
+            beta_minus[coord] -= eps;
+            let minus_state = ParameterBlockState {
+                beta: beta_minus,
+                eta: state.eta.clone(),
+            };
+            let ll_minus = family
+                .log_likelihood_only(std::slice::from_ref(&minus_state))
+                .expect("negative perturbation remains feasible");
+
+            let fd = (ll_plus - ll_minus) / (2.0 * eps);
+            let scale = fd.abs().max(analytic.gradient[coord].abs()).max(1.0);
+            let tol = 5e-6 * scale + 5e-8;
+            assert!(
+                (analytic.gradient[coord] - fd).abs() <= tol,
+                "SCOP gradient FD mismatch at {coord}: analytic={:.6e}, fd={:.6e}, tol={:.6e}",
+                analytic.gradient[coord],
+                fd,
+                tol,
+            );
+        }
+    }
+
+    #[test]
     fn ctn_exact_newton_joint_gradient_evaluation_matches_evaluate() {
         // The joint-Newton inner solver prefers
         // `exact_newton_joint_gradient_evaluation` over `evaluate()` to refresh
