@@ -5109,6 +5109,49 @@ fn compute_base_h2_trace(
     }
 }
 
+fn compute_base_h2_traces(
+    hop: &dyn HessianOperator,
+    pairs: &[&HyperCoordPair],
+    subspace: Option<&PenaltySubspaceTrace>,
+) -> Vec<f64> {
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    if subspace.is_none() && hop.logdet_traces_match_hinv_kernel() {
+        let mut out = vec![0.0; pairs.len()];
+        let mut dense_refs: Vec<&Array2<f64>> = Vec::new();
+        let mut dense_slots = Vec::new();
+        let mut op_refs: Vec<&dyn HyperOperator> = Vec::new();
+        let mut op_slots = Vec::new();
+        for (idx, pair) in pairs.iter().enumerate() {
+            if let Some(op) = pair.b_operator.as_deref() {
+                op_slots.push(idx);
+                op_refs.push(op);
+            } else if pair.b_mat.nrows() > 0 {
+                dense_slots.push(idx);
+                dense_refs.push(&pair.b_mat);
+            }
+        }
+        if !dense_refs.is_empty() || !op_refs.is_empty() {
+            let estimator = StochasticTraceEstimator::with_defaults();
+            let values = estimator.estimate_traces_with_operators(hop, &dense_refs, &op_refs);
+            for (local, &slot) in dense_slots.iter().enumerate() {
+                out[slot] = values[local];
+            }
+            let offset = dense_refs.len();
+            for (local, &slot) in op_slots.iter().enumerate() {
+                out[slot] = values[offset + local];
+            }
+        }
+        return out;
+    }
+
+    pairs
+        .iter()
+        .map(|pair| compute_base_h2_trace(hop, &pair.b_mat, pair.b_operator.as_deref(), subspace))
+        .collect()
+}
+
 #[inline]
 fn can_use_stochastic_logdet_hinv_kernel(
     hop: &dyn HessianOperator,
@@ -6629,24 +6672,21 @@ fn build_outer_hessian_operator(
         let pairs: Vec<(usize, usize)> = (0..k)
             .flat_map(|rho_idx| (0..ext_dim).map(move |ext_idx| (rho_idx, ext_idx)))
             .collect();
-        let entries: Vec<(usize, usize, HyperCoordPair, f64)> = pairs
+        let entries: Vec<(usize, usize, HyperCoordPair)> = pairs
             .into_par_iter()
             .map(|(rho_idx, ext_idx)| {
                 let pair = rho_ext_fn(rho_idx, ext_idx);
-                // `build_outer_hessian_operator` only fires when the
-                // projected-logdet kernel is absent (see guard in
-                // `reml_laml_evaluate`), so the full-space trace here is
-                // correct. Passing `None` keeps the call sites uniform.
-                let base = compute_base_h2_trace(
-                    hop.as_ref(),
-                    &pair.b_mat,
-                    pair.b_operator.as_deref(),
-                    None,
-                );
-                (rho_idx, ext_idx, pair, base)
+                (rho_idx, ext_idx, pair)
             })
             .collect();
-        for (rho_idx, ext_idx, pair, base) in entries {
+        // `build_outer_hessian_operator` only fires when the projected-logdet
+        // kernel is absent (see guard in `reml_laml_evaluate`), so the
+        // full-space trace here is correct.  Batch all second-drift traces so
+        // `--scale-dimensions` pays one shared Hutchinson solve stream for the
+        // whole rho-ext block instead of one estimator per pair.
+        let pair_refs: Vec<&HyperCoordPair> = entries.iter().map(|(_, _, pair)| pair).collect();
+        let bases = compute_base_h2_traces(hop.as_ref(), &pair_refs, None);
+        for ((rho_idx, ext_idx, pair), base) in entries.into_iter().zip(bases.into_iter()) {
             let row = rho_idx;
             let col = k + ext_idx;
             pair_a[[row, col]] = pair.a;
@@ -6665,20 +6705,16 @@ fn build_outer_hessian_operator(
         let pairs: Vec<(usize, usize)> = (0..ext_dim)
             .flat_map(|ii| (ii..ext_dim).map(move |jj| (ii, jj)))
             .collect();
-        let entries: Vec<(usize, usize, HyperCoordPair, f64)> = pairs
+        let entries: Vec<(usize, usize, HyperCoordPair)> = pairs
             .into_par_iter()
             .map(|(ii, jj)| {
                 let pair = ext_pair_fn(ii, jj);
-                let base = compute_base_h2_trace(
-                    hop.as_ref(),
-                    &pair.b_mat,
-                    pair.b_operator.as_deref(),
-                    None,
-                );
-                (ii, jj, pair, base)
+                (ii, jj, pair)
             })
             .collect();
-        for (ii, jj, pair, base) in entries {
+        let pair_refs: Vec<&HyperCoordPair> = entries.iter().map(|(_, _, pair)| pair).collect();
+        let bases = compute_base_h2_traces(hop.as_ref(), &pair_refs, None);
+        for ((ii, jj, pair), base) in entries.into_iter().zip(bases.into_iter()) {
             let row = k + ii;
             let col = k + jj;
             pair_a[[row, col]] = pair.a;
