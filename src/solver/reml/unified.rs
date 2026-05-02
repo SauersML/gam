@@ -6555,71 +6555,97 @@ fn build_outer_hessian_operator(
     }
 
     if let Some(rho_ext_fn) = solution.rho_ext_pair_fn.as_ref() {
-        for rho_idx in 0..k {
-            for ext_idx in 0..ext_dim {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let pairs: Vec<(usize, usize)> = (0..k)
+            .flat_map(|rho_idx| (0..ext_dim).map(move |ext_idx| (rho_idx, ext_idx)))
+            .collect();
+        let entries: Vec<(usize, usize, HyperCoordPair, f64)> = pairs
+            .into_par_iter()
+            .map(|(rho_idx, ext_idx)| {
                 let pair = rho_ext_fn(rho_idx, ext_idx);
-                let row = rho_idx;
-                let col = k + ext_idx;
-                pair_a[[row, col]] = pair.a;
-                pair_a[[col, row]] = pair.a;
-                pair_ld_s[[row, col]] = pair.ld_s;
-                pair_ld_s[[col, row]] = pair.ld_s;
-                pair_g[row][col] = Some(pair.g.clone());
-                pair_g[col][row] = Some(pair.g);
                 // `build_outer_hessian_operator` only fires when the
                 // projected-logdet kernel is absent (see guard in
                 // `reml_laml_evaluate`), so the full-space trace here is
-                // correct.  Passing `None` keeps the call sites uniform.
+                // correct. Passing `None` keeps the call sites uniform.
                 let base = compute_base_h2_trace(
                     hop.as_ref(),
                     &pair.b_mat,
                     pair.b_operator.as_deref(),
                     None,
                 );
-                base_h2[[row, col]] = base;
-                base_h2[[col, row]] = base;
-            }
+                (rho_idx, ext_idx, pair, base)
+            })
+            .collect();
+        for (rho_idx, ext_idx, pair, base) in entries {
+            let row = rho_idx;
+            let col = k + ext_idx;
+            pair_a[[row, col]] = pair.a;
+            pair_a[[col, row]] = pair.a;
+            pair_ld_s[[row, col]] = pair.ld_s;
+            pair_ld_s[[col, row]] = pair.ld_s;
+            pair_g[row][col] = Some(pair.g.clone());
+            pair_g[col][row] = Some(pair.g);
+            base_h2[[row, col]] = base;
+            base_h2[[col, row]] = base;
         }
     }
 
     if let Some(ext_pair_fn) = solution.ext_coord_pair_fn.as_ref() {
-        for ii in 0..ext_dim {
-            for jj in ii..ext_dim {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let pairs: Vec<(usize, usize)> = (0..ext_dim)
+            .flat_map(|ii| (ii..ext_dim).map(move |jj| (ii, jj)))
+            .collect();
+        let entries: Vec<(usize, usize, HyperCoordPair, f64)> = pairs
+            .into_par_iter()
+            .map(|(ii, jj)| {
                 let pair = ext_pair_fn(ii, jj);
-                let row = k + ii;
-                let col = k + jj;
-                pair_a[[row, col]] = pair.a;
-                pair_a[[col, row]] = pair.a;
-                pair_ld_s[[row, col]] = pair.ld_s;
-                pair_ld_s[[col, row]] = pair.ld_s;
-                let g_pair = pair.g.clone();
-                pair_g[row][col] = Some(g_pair.clone());
-                pair_g[col][row] = Some(g_pair);
                 let base = compute_base_h2_trace(
                     hop.as_ref(),
                     &pair.b_mat,
                     pair.b_operator.as_deref(),
                     None,
                 );
-                base_h2[[row, col]] = base;
-                base_h2[[col, row]] = base;
-            }
+                (ii, jj, pair, base)
+            })
+            .collect();
+        for (ii, jj, pair, base) in entries {
+            let row = k + ii;
+            let col = k + jj;
+            pair_a[[row, col]] = pair.a;
+            pair_a[[col, row]] = pair.a;
+            pair_ld_s[[row, col]] = pair.ld_s;
+            pair_ld_s[[col, row]] = pair.ld_s;
+            let g_pair = pair.g.clone();
+            pair_g[row][col] = Some(g_pair.clone());
+            pair_g[col][row] = Some(g_pair);
+            base_h2[[row, col]] = base;
+            base_h2[[col, row]] = base;
         }
     }
 
-    for ii in 0..total {
-        for jj in ii..total {
-            let trace = compute_drift_deriv_traces(
-                hop.as_ref(),
-                coords[ii].b_depends_on_beta,
-                coords[jj].b_depends_on_beta,
-                coords[ii].ext_index,
-                coords[jj].ext_index,
-                &coords[ii].v,
-                &coords[jj].v,
-                solution.fixed_drift_deriv.as_ref(),
-                None,
-            );
+    {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let pairs: Vec<(usize, usize)> = (0..total)
+            .flat_map(|ii| (ii..total).map(move |jj| (ii, jj)))
+            .collect();
+        let entries: Vec<((usize, usize), f64)> = pairs
+            .into_par_iter()
+            .map(|(ii, jj)| {
+                let trace = compute_drift_deriv_traces(
+                    hop.as_ref(),
+                    coords[ii].b_depends_on_beta,
+                    coords[jj].b_depends_on_beta,
+                    coords[ii].ext_index,
+                    coords[jj].ext_index,
+                    &coords[ii].v,
+                    &coords[jj].v,
+                    solution.fixed_drift_deriv.as_ref(),
+                    None,
+                );
+                ((ii, jj), trace)
+            })
+            .collect();
+        for ((ii, jj), trace) in entries {
             m_pair_trace[[ii, jj]] = trace;
             m_pair_trace[[jj, ii]] = trace;
         }

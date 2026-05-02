@@ -55,7 +55,6 @@ use crate::solver::estimate::UnifiedFitResult;
 use crate::solver::estimate::reml::unified::HyperOperator;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
@@ -5560,7 +5559,7 @@ struct TensorKroneckerPsiOperator {
     covariate_derivs: Vec<CustomFamilyBlockPsiDerivative>,
     covariate_dense_cache: Arc<Mutex<Option<Arc<Array2<f64>>>>>,
     covariate_first_cache: Arc<Vec<Mutex<Option<Arc<Array2<f64>>>>>>,
-    covariate_second_cache: Arc<Mutex<HashMap<(usize, usize), Arc<Array2<f64>>>>>,
+    covariate_second_cache: Arc<Vec<Mutex<Option<Arc<Array2<f64>>>>>>,
 }
 
 impl TensorKroneckerPsiOperator {
@@ -5835,38 +5834,53 @@ impl TensorKroneckerPsiOperator {
             <= CTN_COVARIATE_SECOND_CACHE_MAX_BYTES
     }
 
+    fn cov_second_pair_key_index(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+    ) -> Result<(usize, usize, usize), crate::terms::basis::BasisError> {
+        let q = self.covariate_derivs.len();
+        if axis_d >= q || axis_e >= q {
+            return Err(crate::terms::basis::BasisError::InvalidInput(format!(
+                "tensor Kronecker second ψ axes ({axis_d}, {axis_e}) out of bounds for {q} axes",
+            )));
+        }
+        let (left, right) = if axis_d <= axis_e {
+            (axis_d, axis_e)
+        } else {
+            (axis_e, axis_d)
+        };
+        let row_start = left * q - left.saturating_mul(left.saturating_sub(1)) / 2;
+        Ok((left, right, row_start + (right - left)))
+    }
+
     fn materialize_cov_second_axis_arc(
         &self,
         axis_d: usize,
         axis_e: usize,
     ) -> Result<Arc<Array2<f64>>, crate::terms::basis::BasisError> {
-        if axis_d >= self.covariate_derivs.len() || axis_e >= self.covariate_derivs.len() {
-            return Err(crate::terms::basis::BasisError::InvalidInput(format!(
-                "tensor Kronecker second ψ axes ({axis_d}, {axis_e}) out of bounds for {} axes",
-                self.covariate_derivs.len()
-            )));
-        }
-        let key = if axis_d <= axis_e {
-            (axis_d, axis_e)
-        } else {
-            (axis_e, axis_d)
-        };
+        let (left, right, slot_idx) = self.cov_second_pair_key_index(axis_d, axis_e)?;
         if !self.should_cache_cov_second_axes() {
-            return Ok(Arc::new(self.materialize_cov_second_axis(key.0, key.1)?));
+            return Ok(Arc::new(self.materialize_cov_second_axis(left, right)?));
         }
 
-        let mut cache = self.covariate_second_cache.lock().map_err(|_| {
+        let slot = self.covariate_second_cache.get(slot_idx).ok_or_else(|| {
             crate::terms::basis::BasisError::InvalidInput(format!(
-                "tensor Kronecker covariate second-derivative cache mutex poisoned for axes {},{}",
-                key.0, key.1
+                "tensor Kronecker second-derivative cache index {slot_idx} missing for axes {left},{right}",
             ))
         })?;
-        if let Some(cached) = cache.get(&key) {
+        let mut cache = slot.lock().map_err(|_| {
+            crate::terms::basis::BasisError::InvalidInput(format!(
+                "tensor Kronecker covariate second-derivative cache mutex poisoned for axes {},{}",
+                left, right
+            ))
+        })?;
+        if let Some(cached) = cache.as_ref() {
             return Ok(cached.clone());
         }
 
-        let materialized = Arc::new(self.materialize_cov_second_axis(key.0, key.1)?);
-        cache.insert(key, materialized.clone());
+        let materialized = Arc::new(self.materialize_cov_second_axis(left, right)?);
+        *cache = Some(materialized.clone());
         Ok(materialized)
     }
 
@@ -8281,7 +8295,11 @@ pub fn build_tensor_psi_derivatives(
             covariate_first_cache: Arc::new(
                 (0..n_axes).map(|_| Mutex::new(None)).collect::<Vec<_>>(),
             ),
-            covariate_second_cache: Arc::new(Mutex::new(HashMap::new())),
+            covariate_second_cache: Arc::new(
+                (0..(n_axes.saturating_mul(n_axes + 1) / 2))
+                    .map(|_| Mutex::new(None))
+                    .collect::<Vec<_>>(),
+            ),
         });
 
     let mut derivs = Vec::with_capacity(n_axes);
