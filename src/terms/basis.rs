@@ -27644,6 +27644,83 @@ mod tests {
         (nodes, weights)
     }
 
+    fn symmetric_eigenvalue_bounds_jacobi(matrix: &Array2<f64>) -> (f64, f64) {
+        let n = matrix.nrows();
+        assert_eq!(n, matrix.ncols());
+        if n == 0 {
+            return (0.0, 0.0);
+        }
+
+        let mut a = matrix.to_owned();
+        let diag_scale = (0..n)
+            .map(|i| a[[i, i]].abs())
+            .fold(0.0_f64, f64::max)
+            .max(1.0);
+        let tol = 1e-14 * diag_scale;
+
+        for _ in 0..(100 * n * n).max(1) {
+            let mut p = 0usize;
+            let mut q = 0usize;
+            let mut max_off = 0.0_f64;
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let off = a[[i, j]].abs();
+                    if off > max_off {
+                        max_off = off;
+                        p = i;
+                        q = j;
+                    }
+                }
+            }
+            if max_off <= tol {
+                break;
+            }
+
+            let app = a[[p, p]];
+            let aqq = a[[q, q]];
+            let apq = a[[p, q]];
+            if apq == 0.0 {
+                continue;
+            }
+            let tau = (aqq - app) / (2.0 * apq);
+            let t = if tau >= 0.0 {
+                1.0 / (tau + (1.0 + tau * tau).sqrt())
+            } else {
+                -1.0 / (-tau + (1.0 + tau * tau).sqrt())
+            };
+            let c = 1.0 / (1.0 + t * t).sqrt();
+            let s_rot = t * c;
+
+            for k in 0..n {
+                if k == p || k == q {
+                    continue;
+                }
+                let akp = a[[k, p]];
+                let akq = a[[k, q]];
+                let new_kp = c * akp - s_rot * akq;
+                let new_kq = s_rot * akp + c * akq;
+                a[[k, p]] = new_kp;
+                a[[p, k]] = new_kp;
+                a[[k, q]] = new_kq;
+                a[[q, k]] = new_kq;
+            }
+
+            a[[p, p]] = app - t * apq;
+            a[[q, q]] = aqq + t * apq;
+            a[[p, q]] = 0.0;
+            a[[q, p]] = 0.0;
+        }
+
+        let mut min_eval = f64::INFINITY;
+        let mut max_abs_eval = 0.0_f64;
+        for i in 0..n {
+            let value = a[[i, i]];
+            min_eval = min_eval.min(value);
+            max_abs_eval = max_abs_eval.max(value.abs());
+        }
+        (min_eval, max_abs_eval)
+    }
+
     #[test]
     fn test_isotropic_hybrid_partial_fraction() {
         // d=3, m=2, s=2, κ=1, q=2 → a = 2m-q = 2, b = 2s = 4.
@@ -28579,10 +28656,8 @@ mod tests {
                 let zgz = z.t().dot(&gz);
                 let sym = (&zgz + &zgz.t()) * 0.5;
 
-                let (evals, _) = FaerEigh::eigh(&sym, Side::Lower).expect("eigh");
-                let scale = evals.iter().fold(0.0_f64, |a, &v| a.max(v.abs()));
+                let (min_eig, scale) = symmetric_eigenvalue_bounds_jacobi(&sym);
                 let tol = 1e-9 * scale + 1e-12;
-                let min_eig = evals.iter().cloned().fold(f64::INFINITY, f64::min);
                 assert!(
                     min_eig > -tol,
                     "constrained pair-block not PSD: q={q} d={d} m={m} s={s} κ={kappa} \
