@@ -6664,86 +6664,117 @@ fn build_outer_hessian_operator(
     let cross_trace: Option<Array2<f64>> = if incl_logdet_h {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let dense_hop_opt = hop.as_dense_spectral();
-        // Enumerate the upper triangle (`ii ≤ jj`) so each `(ii, jj)` is an
-        // independent unit of work — every entry of `cross_trace` is computed
-        // from `coords[ii]` / `coords[jj]` only, with no shared mutable
-        // state, so we can dispatch the K(K+1)/2 pair traces in parallel.
-        let pairs: Vec<(usize, usize)> = (0..total)
-            .flat_map(|ii| (ii..total).map(move |jj| (ii, jj)))
-            .collect();
-        let pair_values: Vec<((usize, usize), f64)> = pairs
-            .into_par_iter()
-            .map(|(ii, jj)| {
-                let left = &coords[ii].total_drift;
-                let right = &coords[jj].total_drift;
-                let mut value = 0.0;
-                if let (Some(left_dense), Some(right_dense)) =
-                    (left.dense.as_ref(), right.dense.as_ref())
-                {
-                    if let (Some(dense_hop), Some(left_rot), Some(right_rot)) = (
-                        dense_hop_opt,
-                        left.dense_rotated.as_ref(),
-                        right.dense_rotated.as_ref(),
-                    ) {
-                        value += dense_hop.trace_logdet_hessian_cross_rotated(left_rot, right_rot);
-                    } else {
-                        value += hop.trace_logdet_hessian_cross(left_dense, right_dense);
+        if hop.prefers_stochastic_trace_estimation() && hop.logdet_traces_match_hinv_kernel() {
+            // Matrix-free backends expose the SPD logdet kernel
+            //   ∂² log|H|[A_i,A_j] = -tr(H⁻¹ A_i H⁻¹ A_j).
+            //
+            // Estimate the whole coordinate matrix in one Hutchinson batch
+            // rather than launching one two-coordinate estimator per upper
+            // triangle entry.  For `--scale-dimensions` with 16 ψ axes this
+            // replaces 136 independent solve batches with one 16-coordinate
+            // batch sharing the same probes and Krylov solves.
+            let bundled: Vec<CompositeHyperOperator> = coords
+                .iter()
+                .map(|coord| CompositeHyperOperator {
+                    dense: coord.total_drift.dense.clone(),
+                    operators: coord.total_drift.operators.clone(),
+                    dim_hint: hop.dim(),
+                })
+                .collect();
+            let op_refs: Vec<&dyn HyperOperator> =
+                bundled.iter().map(|op| op as &dyn HyperOperator).collect();
+            let estimator = StochasticTraceEstimator::for_outer_hessian(hop.dim(), total);
+            let no_dense: [&Array2<f64>; 0] = [];
+            let mut ct = estimator.estimate_second_order_traces_with_operators(
+                hop.as_ref(),
+                &no_dense,
+                &op_refs,
+            );
+            ct.mapv_inplace(|value| -value);
+            Some(ct)
+        } else {
+            // Enumerate the upper triangle (`ii ≤ jj`) so each `(ii, jj)` is an
+            // independent unit of work — every entry of `cross_trace` is computed
+            // from `coords[ii]` / `coords[jj]` only, with no shared mutable
+            // state, so we can dispatch the K(K+1)/2 pair traces in parallel.
+            let pairs: Vec<(usize, usize)> = (0..total)
+                .flat_map(|ii| (ii..total).map(move |jj| (ii, jj)))
+                .collect();
+            let pair_values: Vec<((usize, usize), f64)> = pairs
+                .into_par_iter()
+                .map(|(ii, jj)| {
+                    let left = &coords[ii].total_drift;
+                    let right = &coords[jj].total_drift;
+                    let mut value = 0.0;
+                    if let (Some(left_dense), Some(right_dense)) =
+                        (left.dense.as_ref(), right.dense.as_ref())
+                    {
+                        if let (Some(dense_hop), Some(left_rot), Some(right_rot)) = (
+                            dense_hop_opt,
+                            left.dense_rotated.as_ref(),
+                            right.dense_rotated.as_ref(),
+                        ) {
+                            value +=
+                                dense_hop.trace_logdet_hessian_cross_rotated(left_rot, right_rot);
+                        } else {
+                            value += hop.trace_logdet_hessian_cross(left_dense, right_dense);
+                        }
                     }
-                }
-                if let Some(left_dense) = left.dense.as_ref() {
-                    for op in &right.operators {
-                        value -= hop.trace_hinv_matrix_operator_cross(left_dense, op.as_ref());
+                    if let Some(left_dense) = left.dense.as_ref() {
+                        for op in &right.operators {
+                            value -= hop.trace_hinv_matrix_operator_cross(left_dense, op.as_ref());
+                        }
                     }
-                }
-                if let Some(right_dense) = right.dense.as_ref() {
-                    for op in &left.operators {
-                        value -= hop.trace_hinv_matrix_operator_cross(right_dense, op.as_ref());
+                    if let Some(right_dense) = right.dense.as_ref() {
+                        for op in &left.operators {
+                            value -= hop.trace_hinv_matrix_operator_cross(right_dense, op.as_ref());
+                        }
                     }
+                    if !left.operators.is_empty() && !right.operators.is_empty() {
+                        // Bundle each side's per-mode operators into a single
+                        // weight-1 linear combination so the cross trace expands
+                        // as `tr(H⁻¹ Â B̂) = Σ_a Σ_b tr(H⁻¹ A_a B_b)` with one
+                        // call into the cross-trace kernel instead of the full
+                        // O(|left.ops|·|right.ops|) sweep. Mathematically
+                        // equivalent (bilinearity of `tr(H⁻¹ · ·)`).
+                        let left_bundle = WeightedHyperOperator {
+                            terms: left
+                                .operators
+                                .iter()
+                                .map(|op| (1.0, Arc::clone(op)))
+                                .collect(),
+                            dim_hint: hop.dim(),
+                        };
+                        let right_bundle = WeightedHyperOperator {
+                            terms: right
+                                .operators
+                                .iter()
+                                .map(|op| (1.0, Arc::clone(op)))
+                                .collect(),
+                            dim_hint: hop.dim(),
+                        };
+                        value -= hop.trace_hinv_operator_cross(&left_bundle, &right_bundle);
+                    }
+                    ((ii, jj), value)
+                })
+                .collect();
+            let mut ct = Array2::<f64>::zeros((total, total));
+            for ((ii, jj), value) in pair_values {
+                if !value.is_finite() {
+                    log::warn!(
+                        "[OPERATOR cross_trace non-finite] cross_trace[{}, {}] = {}",
+                        ii,
+                        jj,
+                        value,
+                    );
                 }
-                if !left.operators.is_empty() && !right.operators.is_empty() {
-                    // Bundle each side's per-mode operators into a single
-                    // weight-1 linear combination so the cross trace expands
-                    // as `tr(H⁻¹ Â B̂) = Σ_a Σ_b tr(H⁻¹ A_a B_b)` with one
-                    // call into the cross-trace kernel instead of the full
-                    // O(|left.ops|·|right.ops|) sweep. Mathematically
-                    // equivalent (bilinearity of `tr(H⁻¹ · ·)`).
-                    let left_bundle = WeightedHyperOperator {
-                        terms: left
-                            .operators
-                            .iter()
-                            .map(|op| (1.0, Arc::clone(op)))
-                            .collect(),
-                        dim_hint: hop.dim(),
-                    };
-                    let right_bundle = WeightedHyperOperator {
-                        terms: right
-                            .operators
-                            .iter()
-                            .map(|op| (1.0, Arc::clone(op)))
-                            .collect(),
-                        dim_hint: hop.dim(),
-                    };
-                    value -= hop.trace_hinv_operator_cross(&left_bundle, &right_bundle);
+                ct[[ii, jj]] = value;
+                if ii != jj {
+                    ct[[jj, ii]] = value;
                 }
-                ((ii, jj), value)
-            })
-            .collect();
-        let mut ct = Array2::<f64>::zeros((total, total));
-        for ((ii, jj), value) in pair_values {
-            if !value.is_finite() {
-                log::warn!(
-                    "[OPERATOR cross_trace non-finite] cross_trace[{}, {}] = {}",
-                    ii,
-                    jj,
-                    value,
-                );
             }
-            ct[[ii, jj]] = value;
-            if ii != jj {
-                ct[[jj, ii]] = value;
-            }
+            Some(ct)
         }
-        Some(ct)
     } else {
         None
     };
