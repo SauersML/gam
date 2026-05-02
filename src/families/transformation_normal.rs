@@ -55,6 +55,7 @@ use crate::solver::estimate::UnifiedFitResult;
 use crate::solver::estimate::reml::unified::HyperOperator;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
@@ -119,6 +120,7 @@ pub const TRANSFORMATION_MONOTONICITY_EPS: f64 = 1.0e-8;
 /// shared dense tau-tau memory policy must not downgrade analytic Hessian
 /// planning to gradient-only BFGS for this family.
 const CTN_ALLOW_TAU_TAU_GRADIENT_ONLY_PREFERENCE: bool = false;
+const CTN_COVARIATE_SECOND_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
 /// Absolute bound for feasible transformation scores on the standard-normal
 /// scale. The CTN likelihood targets `h(Y|x) ~ N(0,1)`; accepting exact-Newton
 /// iterates with finite positive `h'` but astronomical `|h|` lets the objective
@@ -2848,13 +2850,13 @@ impl CustomFamily for TransformationNormalFamily {
             .materialize_cov_first_axis_arc(axis_j)
             .map_err(|e| format!("tensor psi-psi materialize_cov_first_axis(j) failed: {e}"))?;
         let cov_ij = op
-            .materialize_cov_second_axis(axis_i, axis_j)
+            .materialize_cov_second_axis_arc(axis_i, axis_j)
             .map_err(|e| format!("tensor psi-psi materialize_cov_second_axis failed: {e}"))?;
         for (name, mat) in [
             ("cov", cov.as_ref()),
             ("cov_i", cov_i.as_ref()),
             ("cov_j", cov_j.as_ref()),
-            ("cov_ij", &cov_ij),
+            ("cov_ij", cov_ij.as_ref()),
         ] {
             if mat.nrows() != n || mat.ncols() != p_cov {
                 return Err(format!(
@@ -3278,7 +3280,7 @@ struct TransformationNormalPsiPsiHessianOperator {
     cov: Arc<Array2<f64>>,
     cov_i: Arc<Array2<f64>>,
     cov_j: Arc<Array2<f64>>,
-    cov_ij: Array2<f64>,
+    cov_ij: Arc<Array2<f64>>,
 }
 
 impl TransformationNormalPsiPsiHessianOperator {
@@ -3288,7 +3290,7 @@ impl TransformationNormalPsiPsiHessianOperator {
         cov: Arc<Array2<f64>>,
         cov_i: Arc<Array2<f64>>,
         cov_j: Arc<Array2<f64>>,
-        cov_ij: Array2<f64>,
+        cov_ij: Arc<Array2<f64>>,
     ) -> Self {
         Self {
             family,
@@ -5558,6 +5560,7 @@ struct TensorKroneckerPsiOperator {
     covariate_derivs: Vec<CustomFamilyBlockPsiDerivative>,
     covariate_dense_cache: Arc<Mutex<Option<Arc<Array2<f64>>>>>,
     covariate_first_cache: Arc<Vec<Mutex<Option<Arc<Array2<f64>>>>>>,
+    covariate_second_cache: Arc<Mutex<HashMap<(usize, usize), Arc<Array2<f64>>>>>,
 }
 
 impl TensorKroneckerPsiOperator {
@@ -5819,6 +5822,52 @@ impl TensorKroneckerPsiOperator {
             }
         }
         Ok(Array2::<f64>::zeros((self.n_data(), self.p_cov())))
+    }
+
+    fn should_cache_cov_second_axes(&self) -> bool {
+        let n = self.n_data();
+        let p = self.p_cov();
+        let q = self.covariate_derivs.len();
+        let n_pairs = q.saturating_mul(q + 1) / 2;
+        n.saturating_mul(p)
+            .saturating_mul(std::mem::size_of::<f64>())
+            .saturating_mul(n_pairs)
+            <= CTN_COVARIATE_SECOND_CACHE_MAX_BYTES
+    }
+
+    fn materialize_cov_second_axis_arc(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+    ) -> Result<Arc<Array2<f64>>, crate::terms::basis::BasisError> {
+        if axis_d >= self.covariate_derivs.len() || axis_e >= self.covariate_derivs.len() {
+            return Err(crate::terms::basis::BasisError::InvalidInput(format!(
+                "tensor Kronecker second ψ axes ({axis_d}, {axis_e}) out of bounds for {} axes",
+                self.covariate_derivs.len()
+            )));
+        }
+        let key = if axis_d <= axis_e {
+            (axis_d, axis_e)
+        } else {
+            (axis_e, axis_d)
+        };
+        if !self.should_cache_cov_second_axes() {
+            return Ok(Arc::new(self.materialize_cov_second_axis(key.0, key.1)?));
+        }
+
+        let mut cache = self.covariate_second_cache.lock().map_err(|_| {
+            crate::terms::basis::BasisError::InvalidInput(format!(
+                "tensor Kronecker covariate second-derivative cache mutex poisoned for axes {},{}",
+                key.0, key.1
+            ))
+        })?;
+        if let Some(cached) = cache.get(&key) {
+            return Ok(cached.clone());
+        }
+
+        let materialized = Arc::new(self.materialize_cov_second_axis(key.0, key.1)?);
+        cache.insert(key, materialized.clone());
+        Ok(materialized)
     }
 
     /// Directional `Σ_j v_psi[j] · ∂C/∂ψ_j` returning an `n × p_cov` matrix.
@@ -8232,6 +8281,7 @@ pub fn build_tensor_psi_derivatives(
             covariate_first_cache: Arc::new(
                 (0..n_axes).map(|_| Mutex::new(None)).collect::<Vec<_>>(),
             ),
+            covariate_second_cache: Arc::new(Mutex::new(HashMap::new())),
         });
 
     let mut derivs = Vec::with_capacity(n_axes);
