@@ -1895,12 +1895,9 @@ impl TransformationNormalFamily {
                 let gamma_j_dot = dir_k.as_ref().map(|d| d.dot(&cov_j_row)).unwrap_or(0.0);
                 let gamma_ij_dot = dir_k.as_ref().map(|d| d.dot(&cov_ij_row)).unwrap_or(0.0);
 
-                let g =
-                    JetHv::linear_block(gamma, gamma_dot, p_total, p_cov, k, cov_row);
-                let gi =
-                    JetHv::linear_block(gamma_i, gamma_i_dot, p_total, p_cov, k, cov_i_row);
-                let gj =
-                    JetHv::linear_block(gamma_j, gamma_j_dot, p_total, p_cov, k, cov_j_row);
+                let g = JetHv::linear_block(gamma, gamma_dot, p_total, p_cov, k, cov_row);
+                let gi = JetHv::linear_block(gamma_i, gamma_i_dot, p_total, p_cov, k, cov_i_row);
+                let gj = JetHv::linear_block(gamma_j, gamma_j_dot, p_total, p_cov, k, cov_j_row);
                 let gij =
                     JetHv::linear_block(gamma_ij, gamma_ij_dot, p_total, p_cov, k, cov_ij_row);
 
@@ -2806,15 +2803,14 @@ impl CustomFamily for TransformationNormalFamily {
             }
         }
 
-        let (objective_psi_psi, score_psi_psi, _) = self
-            .scop_psi_psi_value_score_hvp_from_cov(
-                beta,
-                cov.view(),
-                cov_i.view(),
-                cov_j.view(),
-                cov_ij.view(),
-                None,
-            )?;
+        let (objective_psi_psi, score_psi_psi, _) = self.scop_psi_psi_value_score_hvp_from_cov(
+            beta,
+            cov.view(),
+            cov_i.view(),
+            cov_j.view(),
+            cov_ij.view(),
+            None,
+        )?;
         let hessian_psi_psi_operator: Box<dyn HyperOperator> =
             Box::new(TransformationNormalPsiPsiHessianOperator::new(
                 Arc::new(self.clone()),
@@ -5044,8 +5040,7 @@ fn compute_warm_start(
         weighted_t_h[i] = weights[i] * target_h[i];
         weighted_t_hp[i] = weights[i] * target_hp[i];
     }
-    let rhs = x_val_kron.transpose_mul(&weighted_t_h)
-        + x_deriv_kron.transpose_mul(&weighted_t_hp);
+    let rhs = x_val_kron.transpose_mul(&weighted_t_h) + x_deriv_kron.transpose_mul(&weighted_t_hp);
 
     let mut diag_trace = 0.0;
     for j in 0..p_total {
@@ -6257,9 +6252,23 @@ mod tests {
         }
 
         let hess_fd = (&plus.hessian_psi - &minus.hessian_psi) / (2.0 * h);
+        // The CTN psi-psi second-order kernel exposes its dense p_total×p_total
+        // block through `hessian_psi_psi` when the family materializes it
+        // eagerly, or through an operator-backed `hessian_psi_psi_operator`
+        // when the family stages the Hessian as HVPs. The FD comparison needs
+        // the dense matrix either way, so materialize the operator on demand.
+        let analytic_hessian = if analytic.hessian_psi_psi.nrows() > 0 {
+            analytic.hessian_psi_psi.clone()
+        } else {
+            analytic
+                .hessian_psi_psi_operator
+                .as_ref()
+                .expect("CTN psi-psi must expose either dense Hessian or operator")
+                .to_dense()
+        };
         assert_matrix_derivativefd(
             &hess_fd,
-            &analytic.hessian_psi_psi,
+            &analytic_hessian,
             2e-4,
             "transformation normal psi second-order Hessian",
         );
@@ -6504,10 +6513,7 @@ mod tests {
             gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-        assert_eq!(
-            hessian,
-            crate::solver::outer_strategy::Derivative::Analytic
-        );
+        assert_eq!(hessian, crate::solver::outer_strategy::Derivative::Analytic);
     }
 
     #[test]
@@ -7246,6 +7252,22 @@ mod tests {
         eprintln!("[oracle] ψ = {:?}", psi.as_slice().unwrap());
         eprintln!("[oracle] v = {:?}", v.as_slice().unwrap());
 
+        // The CTN psi-psi second-order kernel can return the dense block
+        // either eagerly (`hessian_psi_psi`, p_total×p_total) or lazily
+        // (`hessian_psi_psi_operator`, materialized via `to_dense`). The
+        // oracle dump records the dense numbers, so materialize on demand.
+        let dense_pair_hessian = |terms: &ExactNewtonJointPsiSecondOrderTerms| -> Array2<f64> {
+            if terms.hessian_psi_psi.nrows() > 0 {
+                terms.hessian_psi_psi.clone()
+            } else {
+                terms
+                    .hessian_psi_psi_operator
+                    .as_ref()
+                    .expect("CTN psi-psi must expose either dense Hessian or operator")
+                    .to_dense()
+            }
+        };
+
         // Per-pair pairwise body — likelihood pieces only (no penalty/logdet).
         let mut pair_records = Vec::new();
         for i in 0..psi_dim {
@@ -7264,10 +7286,8 @@ mod tests {
                     .score_psi_psi
                     .iter()
                     .fold(0.0f64, |m, x| m.max(x.abs()));
-                let b_inf = terms
-                    .hessian_psi_psi
-                    .iter()
-                    .fold(0.0f64, |m, x| m.max(x.abs()));
+                let b_dense = dense_pair_hessian(&terms);
+                let b_inf = b_dense.iter().fold(0.0f64, |m, x| m.max(x.abs()));
                 eprintln!(
                     "[oracle] pair (i={i}, j={j}): a={:.10}, ‖g‖∞={:.6e}, ‖b_mat‖∞={:.6e}",
                     terms.objective_psi_psi, g_inf, b_inf,
@@ -7277,8 +7297,8 @@ mod tests {
                     "j": j,
                     "a": terms.objective_psi_psi,
                     "g": terms.score_psi_psi.to_vec(),
-                    "b_mat": terms.hessian_psi_psi.iter().copied().collect::<Vec<f64>>(),
-                    "b_mat_shape": [terms.hessian_psi_psi.nrows(), terms.hessian_psi_psi.ncols()],
+                    "b_mat": b_dense.iter().copied().collect::<Vec<f64>>(),
+                    "b_mat_shape": [b_dense.nrows(), b_dense.ncols()],
                 }));
             }
         }
@@ -7302,7 +7322,7 @@ mod tests {
                 a_dir[i] += v[j] * terms.objective_psi_psi;
                 let mut g_row = g_dir.slice_mut(s![i, ..]);
                 g_row.scaled_add(v[j], &terms.score_psi_psi);
-                b_dir[i].scaled_add(v[j], &terms.hessian_psi_psi);
+                b_dir[i].scaled_add(v[j], &dense_pair_hessian(&terms));
             }
         }
 
