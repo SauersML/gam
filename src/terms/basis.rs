@@ -18165,18 +18165,7 @@ pub fn evaluate_bspline_fourth_derivative_scalar_into(
 /// Matérn block:  M_ℓ^d(r; κ) = F^{-1}{(|ρ|² + κ²)^{-ℓ}}(r).
 pub mod closed_form_penalty {
     use crate::probability::binomial_coefficient_f64 as binomial_f64;
-    use smallvec::SmallVec;
     use statrs::function::gamma::{gamma as gamma_fn, ln_gamma};
-
-    /// Stack-capacity for per-pair η/r buffers used in pair-block hot paths.
-    /// Production d ≤ 16 (PC dim 6–16); above that the SmallVec spills to heap.
-    type EtaBuf = SmallVec<[f64; 16]>;
-
-    fn eta_buf_from(src: &[f64]) -> EtaBuf {
-        let mut buf: EtaBuf = SmallVec::with_capacity(src.len());
-        buf.extend_from_slice(src);
-        buf
-    }
 
     const EULER_GAMMA: f64 = 0.577_215_664_901_532_9_f64;
 
@@ -20550,10 +20539,10 @@ pub mod closed_form_penalty {
     /// anisotropic pair-block `J · g_q`.
     ///
     /// Uses analytic chain rules on `(R, s_1, s_2, u_1, u_2)` for regular
-    /// non-log regimes. Degenerate self-pairs and log-Riesz regimes route to
-    /// the Schoenberg derivative bundle whenever its heat-kernel integral is
-    /// convergent; finite-part regimes outside that integral domain retain
-    /// local central stencils around the radial value.
+    /// non-log regimes. Degenerate odd-dimensional hybrid self-pairs use the
+    /// closed Taylor limit; other singular/log-Riesz regimes use the analytic
+    /// Schoenberg derivative bundle for the same heat-kernel representation
+    /// used by the value path.
     pub fn pair_block_radial_with_j_second_derivatives(
         q: usize,
         m: usize,
@@ -20600,7 +20589,7 @@ pub mod closed_form_penalty {
             aniso_invariants_eta_jacobian(eta, r);
         let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order);
         let (g, g_r, g_s1, g_s2, g_u1, g_u2) = radial_g_q_partials(q, big_r, s1, s2, u1, u2, &fr);
-        let big_j = big_j_of(eta);
+        let big_j = eta.iter().sum::<f64>().exp();
 
         // ∂_η_l (J · g) = J · (g + ∂_η_l g)
         //   ∂_η_l g = g_R · ∂R/∂η_l + g_s1 · ∂s1/∂η_l + g_s2 · ∂s2/∂η_l
@@ -20784,7 +20773,7 @@ pub mod closed_form_penalty {
         }
 
         PairBlockBundle {
-            value,
+            value: big_j * g,
             d_eta,
             d_kappa,
             d2_eta,
