@@ -9620,11 +9620,11 @@ impl StochasticTraceConfig {
     fn outer_hessian(dim: usize, n_coords: usize) -> Self {
         let large_problem = dim >= 512 || n_coords >= 4;
         Self {
-            n_probes_min: if large_problem { 4 } else { 6 },
-            n_probes_max: if large_problem { 8 } else { 24 },
-            relative_tol: if large_problem { 0.12 } else { 0.05 },
-            tau_rel: 1e-3,
-            solve_rel_tol: if large_problem { 1e-4 } else { 1e-5 },
+            n_probes_min: if large_problem { 2 } else { 6 },
+            n_probes_max: if large_problem { 4 } else { 24 },
+            relative_tol: if large_problem { 0.20 } else { 0.05 },
+            tau_rel: if large_problem { 2e-3 } else { 1e-3 },
+            solve_rel_tol: if large_problem { 5e-4 } else { 1e-5 },
             seed: 0xC0A5_7ACE,
         }
     }
