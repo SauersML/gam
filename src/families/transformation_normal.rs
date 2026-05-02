@@ -55,7 +55,7 @@ use crate::solver::estimate::UnifiedFitResult;
 use crate::solver::estimate::reml::unified::HyperOperator;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use std::cell::RefCell;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -115,6 +115,10 @@ pub const TRANSFORMATION_GRID_RELATIVE_TOL: f64 = 1.0e-12;
 /// in sync prevents the predict path from rejecting fits that the
 /// optimizer accepted as feasible — and vice versa.
 pub const TRANSFORMATION_MONOTONICITY_EPS: f64 = 1.0e-8;
+/// SCOP-CTN supplies ψ-axis second-order curvature as matrix-free HVPs, so the
+/// shared dense tau-tau memory policy must not downgrade analytic Hessian
+/// planning to gradient-only BFGS for this family.
+const CTN_ALLOW_TAU_TAU_GRADIENT_ONLY_PREFERENCE: bool = false;
 /// Absolute bound for feasible transformation scores on the standard-normal
 /// scale. The CTN likelihood targets `h(Y|x) ~ N(0,1)`; accepting exact-Newton
 /// iterates with finite positive `h'` but astronomical `|h|` lets the objective
@@ -2776,23 +2780,22 @@ impl CustomFamily for TransformationNormalFamily {
         let axis_i = deriv_i.implicit_axis;
         let axis_j = deriv_j.implicit_axis;
 
-        let cov = self
-            .covariate_design
-            .try_row_chunk(0..n)
-            .map_err(|e| format!("SCOP psi-psi terms require covariate row chunk: {e}"))?;
+        let cov = op
+            .materialize_covariate_dense_arc()
+            .map_err(|e| format!("SCOP psi-psi materialize covariate design failed: {e}"))?;
         let cov_i = op
-            .materialize_cov_first_axis(axis_i)
+            .materialize_cov_first_axis_arc(axis_i)
             .map_err(|e| format!("tensor psi-psi materialize_cov_first_axis(i) failed: {e}"))?;
         let cov_j = op
-            .materialize_cov_first_axis(axis_j)
+            .materialize_cov_first_axis_arc(axis_j)
             .map_err(|e| format!("tensor psi-psi materialize_cov_first_axis(j) failed: {e}"))?;
         let cov_ij = op
             .materialize_cov_second_axis(axis_i, axis_j)
             .map_err(|e| format!("tensor psi-psi materialize_cov_second_axis failed: {e}"))?;
         for (name, mat) in [
-            ("cov", &cov),
-            ("cov_i", &cov_i),
-            ("cov_j", &cov_j),
+            ("cov", cov.as_ref()),
+            ("cov_i", cov_i.as_ref()),
+            ("cov_j", cov_j.as_ref()),
             ("cov_ij", &cov_ij),
         ] {
             if mat.nrows() != n || mat.ncols() != p_cov {
@@ -3214,9 +3217,9 @@ impl HyperOperator for TransformationNormalD2hMatrixFreeOperator {
 struct TransformationNormalPsiPsiHessianOperator {
     family: Arc<TransformationNormalFamily>,
     beta: Array1<f64>,
-    cov: Array2<f64>,
-    cov_i: Array2<f64>,
-    cov_j: Array2<f64>,
+    cov: Arc<Array2<f64>>,
+    cov_i: Arc<Array2<f64>>,
+    cov_j: Arc<Array2<f64>>,
     cov_ij: Array2<f64>,
 }
 
@@ -3224,9 +3227,9 @@ impl TransformationNormalPsiPsiHessianOperator {
     fn new(
         family: Arc<TransformationNormalFamily>,
         beta: Array1<f64>,
-        cov: Array2<f64>,
-        cov_i: Array2<f64>,
-        cov_j: Array2<f64>,
+        cov: Arc<Array2<f64>>,
+        cov_i: Arc<Array2<f64>>,
+        cov_j: Arc<Array2<f64>>,
         cov_ij: Array2<f64>,
     ) -> Self {
         Self {
@@ -5495,6 +5498,8 @@ struct TensorKroneckerPsiOperator {
     response_val_basis: Arc<Array2<f64>>,
     covariate_design: DesignMatrix,
     covariate_derivs: Vec<CustomFamilyBlockPsiDerivative>,
+    covariate_dense_cache: Arc<OnceLock<Arc<Array2<f64>>>>,
+    covariate_first_cache: Arc<Vec<OnceLock<Arc<Array2<f64>>>>>,
 }
 
 impl TensorKroneckerPsiOperator {
@@ -5620,6 +5625,66 @@ impl TensorKroneckerPsiOperator {
         Ok(Array1::<f64>::zeros(self.p_cov()))
     }
 
+    fn materialize_covariate_dense_arc(
+        &self,
+    ) -> Result<Arc<Array2<f64>>, crate::terms::basis::BasisError> {
+        if let Some(cached) = self.covariate_dense_cache.get() {
+            return Ok(cached.clone());
+        }
+        let dense = Arc::new(
+            self.covariate_design
+                .try_row_chunk(0..self.n_data())
+                .map_err(|e| {
+                    crate::terms::basis::BasisError::InvalidInput(format!(
+                        "tensor Kronecker covariate dense materialization failed: {e}"
+                    ))
+                })?,
+        );
+        let _ = self.covariate_dense_cache.set(dense.clone());
+        Ok(self.covariate_dense_cache.get().cloned().unwrap_or(dense))
+    }
+
+    fn materialize_cov_first_axis_uncached(
+        &self,
+        axis: usize,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        let deriv = self.cov_deriv(axis)?;
+        if deriv.x_psi.nrows() == self.n_data() && deriv.x_psi.ncols() == self.p_cov() {
+            return Ok(deriv.x_psi.clone());
+        }
+        let Some(op) = deriv.implicit_operator.as_ref() else {
+            return Err(crate::terms::basis::BasisError::InvalidInput(format!(
+                "missing covariate psi materialization for axis {axis}"
+            )));
+        };
+        let mat_op = op.as_materializable().ok_or_else(|| {
+            crate::terms::basis::BasisError::InvalidInput(format!(
+                "covariate psi operator for axis {axis} does not support dense materialization"
+            ))
+        })?;
+        mat_op.materialize_first(deriv.implicit_axis)
+    }
+
+    fn materialize_cov_first_axis_arc(
+        &self,
+        axis: usize,
+    ) -> Result<Arc<Array2<f64>>, crate::terms::basis::BasisError> {
+        if axis >= self.covariate_derivs.len() {
+            return Err(crate::terms::basis::BasisError::InvalidInput(format!(
+                "tensor Kronecker psi axis {axis} out of bounds for {} axes",
+                self.covariate_derivs.len()
+            )));
+        }
+        let axis_cache = &self.covariate_first_cache[axis];
+        if let Some(cached) = axis_cache.get() {
+            return Ok(cached.clone());
+        }
+
+        let materialized = Arc::new(self.materialize_cov_first_axis_uncached(axis)?);
+        let _ = axis_cache.set(materialized.clone());
+        Ok(axis_cache.get().cloned().unwrap_or(materialized))
+    }
+
     fn materialize_cov_first(
         &self,
         axis: usize,
@@ -5649,21 +5714,7 @@ impl TensorKroneckerPsiOperator {
         &self,
         axis: usize,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        let deriv = self.cov_deriv(axis)?;
-        if deriv.x_psi.nrows() == self.n_data() && deriv.x_psi.ncols() == self.p_cov() {
-            return Ok(deriv.x_psi.clone());
-        }
-        let Some(op) = deriv.implicit_operator.as_ref() else {
-            return Err(crate::terms::basis::BasisError::InvalidInput(format!(
-                "missing covariate psi materialization for axis {axis}"
-            )));
-        };
-        let mat_op = op.as_materializable().ok_or_else(|| {
-            crate::terms::basis::BasisError::InvalidInput(format!(
-                "covariate psi operator for axis {axis} does not support dense materialization"
-            ))
-        })?;
-        mat_op.materialize_first(deriv.implicit_axis)
+        Ok((*self.materialize_cov_first_axis_arc(axis)?).clone())
     }
 
     /// Per-axis covariate second-derivative materialization for axis pair
@@ -6954,6 +7005,11 @@ mod tests {
         let (family, derivative_blocks, _, spec) = toy_family_and_derivatives(&psi);
         let specs = std::slice::from_ref(&spec);
 
+        assert!(
+            !CTN_ALLOW_TAU_TAU_GRADIENT_ONLY_PREFERENCE,
+            "SCOP-CTN must keep analytic Hessian planning available to ARC; \
+             dense tau-tau policy must not downgrade it to gradient-only BFGS"
+        );
         assert!(family.inner_coefficient_hessian_hvp_available(specs));
         assert!(family.outer_hyper_hessian_hvp_available(specs));
         assert!(family.outer_hyper_hessian_dense_available(specs));
@@ -8057,6 +8113,10 @@ pub fn build_tensor_psi_derivatives(
             response_val_basis: Arc::new(family.response_val_basis.clone()),
             covariate_design: family.covariate_design.clone(),
             covariate_derivs: covariate_psi_derivs.to_vec(),
+            covariate_dense_cache: Arc::new(OnceLock::new()),
+            covariate_first_cache: Arc::new(
+                (0..n_axes).map(|_| OnceLock::new()).collect::<Vec<_>>(),
+            ),
         });
 
     let mut derivs = Vec::with_capacity(n_axes);
@@ -8541,7 +8601,7 @@ pub fn fit_transformation_normal(
         // dense tau-tau memory policy downgrade analytic Hessian planning to
         // gradient-only BFGS; ARC can consume the operator directly.
         true,
-        false,
+        CTN_ALLOW_TAU_TAU_GRADIENT_ONLY_PREFERENCE,
         // fit_fn
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             ensure_exact_geometry(&specs[0], &designs[0])?;
