@@ -20582,12 +20582,13 @@ pub mod closed_form_penalty {
         let mut d2_eta_kappa = vec![0.0_f64; d];
 
         // Analytic d_eta and d_kappa via chain rule on (R, s_1, s_2, u_1, u_2).
-        // Need radial derivatives up to order 2q + 1 because g_R contains
-        // f^{(2q+1)} (one extra differentiation beyond what g_q itself uses).
-        let max_order = 2 * q + 1;
+        // Need radial derivatives up to order 2q + 2 because the η-Hessian
+        // uses g_RR (q=2 → f^{(6)}). The same table is reused for value and
+        // first η derivatives.
+        let max_order_h = (2 * q + 2).min(6);
         let (big_r, s1, s2, u1, u2, dr_de, ds1_de, ds2_de, du1_de, du2_de) =
             aniso_invariants_eta_jacobian(eta, r);
-        let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order);
+        let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order_h);
         let (g, g_r, g_s1, g_s2, g_u1, g_u2) = radial_g_q_partials(q, big_r, s1, s2, u1, u2, &fr);
         let big_j = eta.iter().sum::<f64>().exp();
 
@@ -20606,17 +20607,20 @@ pub mod closed_form_penalty {
         // ∂_κ. Analytic via chain rule on F^{(k)}: only the radial-derivative
         // table depends on κ, the invariants (R, s_1, s_2, u_1, u_2) do not.
         // ∂_κ (J · g_q) = J · g_q evaluated with fr replaced by ∂_κ fr.
-        let d_kappa = if s != 0 && kappa != 0.0 {
+        let dfr = if s != 0 && kappa != 0.0 {
             let max_order = 2 * q + 1;
-            let (big_r, s1, s2, u1, u2) = aniso_invariants(eta, r);
-            let dfr = radial_derivatives_of_isotropic_duchon_kappa_partial(
+            Some(radial_derivatives_of_isotropic_duchon_kappa_partial(
                 d, m, s, kappa, big_r, max_order,
-            );
+            ))
+        } else {
+            None
+        };
+        let d_kappa = if let Some(dfr) = &dfr {
             // The same g_q expansion in (R, s1, s2, u1, u2) but with ∂_κ F^{(k)}
             // in place of F^{(k)}; the (R, ..., u2) factors are κ-independent.
             // Because g_q is linear in each F^{(k)} for q ∈ {0, 1, 2}, the
             // partial helper applied to ∂_κ F gives ∂_κ g_q.
-            let (dg, _, _, _, _, _) = radial_g_q_partials(q, big_r, s1, s2, u1, u2, &dfr);
+            let (dg, _, _, _, _, _) = radial_g_q_partials(q, big_r, s1, s2, u1, u2, dfr);
             big_j * dg
         } else {
             0.0
@@ -20655,10 +20659,6 @@ pub mod closed_form_penalty {
         //   ∂²u_2/∂η_k ∂η_l = 36 b_l³ r_l² δ_{kl}
         // R is built from R² = Σ b_k r_k² so
         //   ∂²R/∂η_k ∂η_l = 2 b_l r_l² δ_{kl} / R − b_k b_l r_k² r_l² / R³.
-        let max_order_h = 2 * q + 2; // need f^{(2q+2)} for g_RR (q=2 → f^{(6)}).
-        let max_order_h = max_order_h.min(6);
-        let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order_h);
-        let (g, g_r, g_s1, g_s2, g_u1, g_u2) = radial_g_q_partials(q, big_r, s1, s2, u1, u2, &fr);
         let (
             g_rr,
             g_r_s1,
@@ -20755,13 +20755,9 @@ pub mod closed_form_penalty {
         //   ∂_{η_l} ∂_κ g = (∂_κ g_R) · ∂R/∂η_l
         //                  + (∂_κ g_s1) · ∂s1/∂η_l + (∂_κ g_s2) · ∂s2/∂η_l
         //                  + (∂_κ g_u1) · ∂u1/∂η_l + (∂_κ g_u2) · ∂u2/∂η_l.
-        if s != 0 && kappa != 0.0 {
-            let max_order = 2 * q + 1;
-            let dfr = radial_derivatives_of_isotropic_duchon_kappa_partial(
-                d, m, s, kappa, big_r, max_order,
-            );
+        if let Some(dfr) = &dfr {
             let (dg, dg_r, dg_s1, dg_s2, dg_u1, dg_u2) =
-                radial_g_q_partials(q, big_r, s1, s2, u1, u2, &dfr);
+                radial_g_q_partials(q, big_r, s1, s2, u1, u2, dfr);
             for l in 0..d {
                 let bare_cross = dg_r * dr_de[l]
                     + dg_s1 * ds1_de[l]

@@ -8919,7 +8919,7 @@ impl HessianOperator for SparseCholeskyOperator {
             Ok(sol) => sol,
             Err(e) => {
                 log::warn!("SparseCholeskyOperator::solve failed: {e}");
-                Array1::zeros(self.n_dim)
+                Array1::from_elem(self.n_dim, f64::NAN)
             }
         }
     }
@@ -8929,7 +8929,7 @@ impl HessianOperator for SparseCholeskyOperator {
             Ok(sol) => sol,
             Err(e) => {
                 log::warn!("SparseCholeskyOperator::solve_multi failed: {e}");
-                Array2::zeros((self.n_dim, rhs.ncols()))
+                Array2::from_elem((self.n_dim, rhs.ncols()), f64::NAN)
             }
         }
     }
@@ -9355,8 +9355,8 @@ impl HessianOperator for MatrixFreeSpdOperator {
         if let Some(fallback) = self.dense_fallback() {
             return fallback.solve(rhs);
         }
-        log::warn!("MatrixFreeSpdOperator::solve failed; returning zeros");
-        Array1::zeros(self.n_dim)
+        log::warn!("MatrixFreeSpdOperator::solve failed; returning NaNs");
+        Array1::from_elem(self.n_dim, f64::NAN)
     }
 
     fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64> {
