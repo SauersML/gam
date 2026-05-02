@@ -532,22 +532,6 @@ where
     if k == 0 || n_smooths == 0 || n_smooths > k {
         return rho_seed.clone();
     }
-    // PROBE: force log-sp = -6 for all smooths (testing seed 118 basis question).
-    if std::env::var("GAM_FORCE_RHO").is_ok() {
-        let val: f64 = std::env::var("GAM_FORCE_RHO")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(-6.0);
-        let mut forced = rho_seed.clone();
-        for i in 0..n_smooths {
-            forced[i] = val;
-        }
-        log::info!(
-            "[PREPASS] FORCED rho={:?}",
-            forced.as_slice().unwrap_or(&[])
-        );
-        return forced;
-    }
     let bnds = normalize_bounds(bounds);
     let clamp_vec = |v: &Array1<f64>| -> Array1<f64> {
         let mut out = v.clone();
