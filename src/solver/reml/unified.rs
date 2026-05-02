@@ -10137,8 +10137,7 @@ impl StochasticTraceEstimator {
                     let dense_count = dense_matrices.len();
                     for (oi, op) in operators.iter().enumerate() {
                         let k = dense_count + oi;
-                        op.mul_vec_into(w.view(), a_w.view_mut());
-                        probe_values[k] = z.dot(&a_w);
+                        probe_values[k] = op.bilinear_view(w.view(), z.view());
                     }
                 })
             }
