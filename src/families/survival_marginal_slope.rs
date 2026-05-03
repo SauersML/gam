@@ -10013,7 +10013,7 @@ impl SurvivalMarginalSlopeFamily {
     }
 
     /// Exact directional derivative of the joint Hessian for timewiggle-only
-    /// models (no score-warp / link-deviation).  Replaces FD by analytically
+    /// models (no score-warp / link-deviation).  Computes the derivative by
     /// differentiating the J^T H J + f·K pullback through the timewiggle
     /// q-map geometry (equation 47 of the unified pullback framework).
     fn exact_newton_joint_hessian_directional_derivative_timewiggle_inner(
@@ -10590,7 +10590,7 @@ impl SurvivalMarginalSlopeFamily {
         )
     }
     /// Fully exact second directional derivative D²H[d,e] for timewiggle-only.
-    /// No FD. Differentiates DH[e] along d analytically using m₂–m₅ scalars.
+    /// Differentiates DH[e] along d analytically using m₂–m₅ scalars.
     ///
     /// D²H[d,e] = J^T Ψ J  +  Σ γ_r K_r
     ///   + Σ bilinear(W_k, left_k, right_k)  for k in {T_e×dJ_d, T_d×dJ_e, H×d²J, H×dJ_d×dJ_e}

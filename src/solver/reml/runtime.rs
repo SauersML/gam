@@ -3450,7 +3450,8 @@ impl<'a> RemlState<'a> {
         // Rationale: the Firth/Jeffreys penalty, the penalized score equation,
         // and therefore dβ̂/dρ all live on the identifiable subspace (matching
         // `firth_op.q_basis`); extending the logdet kernel to the null space
-        // is both unphysical and FD-inconsistent.
+        // is both unphysical and inconsistent with the analytic subspace
+        // derivatives.
         let hessian_mode = if bundle.firth_dense_operator.is_some() {
             PseudoLogdetMode::HardPseudo
         } else {

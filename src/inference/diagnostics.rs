@@ -1,10 +1,9 @@
 //! Analytic diagnostic helpers for LAML/REML optimization.
 //!
-//! Production diagnostics inspect analytic invariants only. Finite differences
-//! belong in `#[cfg(test)]` checks, never in fitting, prediction, or runtime
-//! diagnostic APIs. This module implements diagnostic strategies that identify
-//! root causes of gradient pathologies from quantities the optimizer already
-//! computes:
+//! Production diagnostics inspect analytic invariants only. Runtime fitting,
+//! prediction, and diagnostic APIs must consume quantities the optimizer
+//! already computes. This module implements diagnostic strategies that identify
+//! root causes of gradient pathologies from those analytic quantities:
 //!
 //! 1. KKT Audit (Envelope Theorem Check): Detects violations of the stationarity
 //!    assumption used in implicit differentiation.
