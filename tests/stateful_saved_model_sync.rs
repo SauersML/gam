@@ -18,7 +18,7 @@ use tempfile::tempdir;
 
 const EXPECTED_MODEL_PAYLOAD_VERSION: u64 = 4;
 const EXPECTED_SAVED_MODEL_ROOT_FIELD_COUNT: usize = 2;
-const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 71;
+const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 72;
 const EXPECTED_STANDARD_FAMILY_FIELD_COUNT: usize = 6;
 
 fn read_saved_model_json(path: &Path) -> Value {
