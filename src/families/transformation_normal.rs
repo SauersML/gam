@@ -3697,11 +3697,8 @@ impl TransformationNormalFamily {
 
     fn scop_psi_pair_rows_per_chunk(&self, p_cov: usize) -> usize {
         let policy = ResourcePolicy::default_library();
-        crate::resource::rows_for_target_bytes(
-            policy.row_chunk_target_bytes,
-            4 * p_cov.max(1),
-        )
-        .max(1)
+        crate::resource::rows_for_target_bytes(policy.row_chunk_target_bytes, 4 * p_cov.max(1))
+            .max(1)
     }
 
     fn scop_psi_pair_cov_chunks(
@@ -3756,17 +3753,16 @@ impl TransformationNormalFamily {
             let rows = start..end;
             let (cov, cov_i, cov_j, cov_ij) =
                 self.scop_psi_pair_cov_chunks(op, axis_i, axis_j, rows.clone())?;
-            let (obj_chunk, score_chunk, hvp_chunk) = self
-                .scop_psi_psi_value_score_hvp_from_cov(
-                    beta,
-                    cov.view(),
-                    cov_i.view(),
-                    cov_j.view(),
-                    cov_ij.view(),
-                    start,
-                    &endpoint_q[start..end],
-                    direction,
-                )?;
+            let (obj_chunk, score_chunk, hvp_chunk) = self.scop_psi_psi_value_score_hvp_from_cov(
+                beta,
+                cov.view(),
+                cov_i.view(),
+                cov_j.view(),
+                cov_ij.view(),
+                start,
+                &endpoint_q[start..end],
+                direction,
+            )?;
             objective += obj_chunk;
             score.scaled_add(1.0, &score_chunk);
             if let (Some(total), Some(chunk)) = (hvp.as_mut(), hvp_chunk.as_ref()) {
@@ -4738,14 +4734,15 @@ impl CustomFamily for TransformationNormalFamily {
         let axis_i = deriv_i.implicit_axis;
         let axis_j = deriv_j.implicit_axis;
 
-        let (objective_psi_psi, score_psi_psi, _) = self.scop_psi_psi_value_score_hvp_from_operator(
-            beta,
-            op,
-            axis_i,
-            axis_j,
-            row.endpoint_q.as_slice(),
-            None,
-        )?;
+        let (objective_psi_psi, score_psi_psi, _) = self
+            .scop_psi_psi_value_score_hvp_from_operator(
+                beta,
+                op,
+                axis_i,
+                axis_j,
+                row.endpoint_q.as_slice(),
+                None,
+            )?;
         let hessian_psi_psi_operator: Box<dyn HyperOperator> =
             Box::new(TransformationNormalPsiPsiHessianOperator::new(
                 Arc::new(self.clone()),
@@ -7769,7 +7766,6 @@ impl TensorKroneckerPsiOperator {
         }
         Ok(out)
     }
-
 
     fn lifted_forward(
         &self,
