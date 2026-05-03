@@ -2871,6 +2871,43 @@ impl RowwiseKroneckerPsiDerivativeOperator {
         }
         cols
     }
+
+    fn lifted_row_chunk_with_base<F>(
+        &self,
+        rows: Range<usize>,
+        mut base_chunk: F,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError>
+    where
+        F: FnMut(Range<usize>) -> Result<Array2<f64>, crate::terms::basis::BasisError>,
+    {
+        if rows.start > rows.end || rows.end > self.n_data() {
+            return Err(crate::terms::basis::BasisError::Other(format!(
+                "rowwise kronecker psi row chunk {}..{} out of bounds for {} rows",
+                rows.start,
+                rows.end,
+                self.n_data()
+            )));
+        }
+        if rows.is_empty() {
+            return Ok(Array2::<f64>::zeros((0, self.p_out)));
+        }
+
+        let first_block = rows.start / self.n_per_block;
+        let last_block = (rows.end - 1) / self.n_per_block;
+        let mut blocks = Vec::with_capacity(last_block + 1 - first_block);
+        for block_idx in first_block..=last_block {
+            let block_global_start = block_idx * self.n_per_block;
+            let local_start = rows.start.saturating_sub(block_global_start);
+            let local_end = (rows.end - block_global_start).min(self.n_per_block);
+            let local_rows = local_start..local_end;
+            let base = base_chunk(local_rows.clone())?;
+            let time = self.time_bases[block_idx]
+                .slice(ndarray::s![local_rows, ..])
+                .to_owned();
+            blocks.push(rowwise_kronecker_dense(&base, &time));
+        }
+        Ok(stack_dense_row_blocks(&blocks))
+    }
 }
 
 impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator {
@@ -3031,8 +3068,9 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         axis: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        let mat = MaterializablePsiDerivativeOperator::materialize_first(self, axis)?;
-        Ok(mat.slice(ndarray::s![rows, ..]).to_owned())
+        self.lifted_row_chunk_with_base(rows, |local_rows| {
+            self.base.row_chunk_first(axis, local_rows)
+        })
     }
 
     fn row_chunk_second_diag(
@@ -3040,8 +3078,9 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         axis: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        let mat = MaterializablePsiDerivativeOperator::materialize_second_diag(self, axis)?;
-        Ok(mat.slice(ndarray::s![rows, ..]).to_owned())
+        self.lifted_row_chunk_with_base(rows, |local_rows| {
+            self.base.row_chunk_second_diag(axis, local_rows)
+        })
     }
 
     fn row_chunk_second_cross(
@@ -3050,9 +3089,9 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         axis_e: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        let mat =
-            MaterializablePsiDerivativeOperator::materialize_second_cross(self, axis_d, axis_e)?;
-        Ok(mat.slice(ndarray::s![rows, ..]).to_owned())
+        self.lifted_row_chunk_with_base(rows, |local_rows| {
+            self.base.row_chunk_second_cross(axis_d, axis_e, local_rows)
+        })
     }
 
     fn as_materializable(&self) -> Option<&dyn MaterializablePsiDerivativeOperator> {
@@ -16703,5 +16742,54 @@ mod tests {
             .expect("forward_mul second");
         assert_eq!(fwd_second.len(), n);
         assert!(fwd_second.iter().all(|x| *x == 0.0));
+    }
+
+    #[test]
+    fn rowwise_kronecker_psi_row_chunks_match_dense_materialization() {
+        let first = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+        let second_diag = array![[0.5, 1.0], [1.5, 2.0], [2.5, 3.0]];
+        let second_cross = array![[-1.0, 0.25], [-1.5, 0.5], [-2.0, 0.75]];
+        let base = build_embedded_dense_psi_operator(
+            &first,
+            &second_diag,
+            Some(&vec![(1, second_cross.clone())]),
+            0..2,
+            2,
+            0,
+        )
+        .expect("embedded dense base");
+        let time_a = Arc::new(array![[1.0, 0.0], [0.5, 1.0], [1.5, -0.5]]);
+        let time_b = Arc::new(array![[0.25, 2.0], [-1.0, 0.75], [0.0, 1.25]]);
+        let op = build_rowwise_kronecker_psi_operator(base, vec![time_a, time_b])
+            .expect("rowwise kronecker psi operator");
+        let mat = op
+            .as_materializable()
+            .expect("rowwise operator dense reference");
+        let rows = 1..5;
+
+        let first_dense = mat.materialize_first(0).expect("dense first");
+        let first_chunk = op.row_chunk_first(0, rows.clone()).expect("chunk first");
+        assert_eq!(
+            first_chunk,
+            first_dense.slice(ndarray::s![rows.clone(), ..]).to_owned()
+        );
+
+        let diag_dense = mat.materialize_second_diag(0).expect("dense diag");
+        let diag_chunk = op
+            .row_chunk_second_diag(0, rows.clone())
+            .expect("chunk diag");
+        assert_eq!(
+            diag_chunk,
+            diag_dense.slice(ndarray::s![rows.clone(), ..]).to_owned()
+        );
+
+        let cross_dense = mat.materialize_second_cross(0, 1).expect("dense cross");
+        let cross_chunk = op
+            .row_chunk_second_cross(0, 1, rows.clone())
+            .expect("chunk cross");
+        assert_eq!(
+            cross_chunk,
+            cross_dense.slice(ndarray::s![rows, ..]).to_owned()
+        );
     }
 }
