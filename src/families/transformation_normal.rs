@@ -3890,6 +3890,331 @@ impl TransformationNormalFamily {
         Ok(total)
     }
 
+    fn scop_psi_psi_trace_factor_from_cov(
+        &self,
+        beta: &Array1<f64>,
+        cached_h: ArrayView1<'_, f64>,
+        cached_h_prime: ArrayView1<'_, f64>,
+        cov: ArrayView2<'_, f64>,
+        cov_i: ArrayView2<'_, f64>,
+        cov_j: ArrayView2<'_, f64>,
+        cov_ij: ArrayView2<'_, f64>,
+        row_start: usize,
+        endpoint_q: &[LogNormalCdfDiffDerivatives],
+        factor: ArrayView2<'_, f64>,
+    ) -> Result<f64, String> {
+        let total_n = self.response_val_basis.nrows();
+        let n = cov.nrows();
+        let p_resp = self.response_val_basis.ncols();
+        let p_cov = self.covariate_design.ncols();
+        let p_total = p_resp * p_cov;
+        let rank = factor.ncols();
+        if row_start > total_n || row_start + n > total_n {
+            return Err(format!(
+                "SCOP psi-psi projected trace row window [{row_start}, {}) exceeds n={total_n}",
+                row_start + n
+            ));
+        }
+        if beta.len() != p_total || factor.nrows() != p_total {
+            return Err(format!(
+                "SCOP psi-psi projected trace length mismatch: beta={}, factor_rows={}, expected={p_total}",
+                beta.len(),
+                factor.nrows()
+            ));
+        }
+        if endpoint_q.len() != n {
+            return Err(format!(
+                "SCOP psi-psi projected trace endpoint normalizer cache length {} != n={n}",
+                endpoint_q.len()
+            ));
+        }
+        if cached_h.len() != n || cached_h_prime.len() != n {
+            return Err(format!(
+                "SCOP psi-psi projected trace row-quantity cache length mismatch: h={}, h_prime={}, expected={n}",
+                cached_h.len(),
+                cached_h_prime.len()
+            ));
+        }
+        for (name, mat) in [
+            ("cov", cov),
+            ("cov_i", cov_i),
+            ("cov_j", cov_j),
+            ("cov_ij", cov_ij),
+        ] {
+            if mat.nrows() != n || mat.ncols() != p_cov {
+                return Err(format!(
+                    "SCOP psi-psi projected trace {name} shape {}x{} != expected {}x{}",
+                    mat.nrows(),
+                    mat.ncols(),
+                    n,
+                    p_cov
+                ));
+            }
+        }
+
+        let beta_mat = beta
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP psi-psi projected trace beta reshape failed: {e}"))?;
+        let endpoint_basis = [
+            self.response_upper_basis
+                .as_slice()
+                .ok_or_else(|| "SCOP endpoint upper basis is not contiguous".to_string())?,
+            self.response_lower_basis
+                .as_slice()
+                .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
+        ];
+
+        struct PsiPairTraceAccum {
+            value: f64,
+            gamma: Vec<f64>,
+            gamma_i: Vec<f64>,
+            gamma_j: Vec<f64>,
+            gamma_ij: Vec<f64>,
+            f: Vec<f64>,
+            f_i: Vec<f64>,
+            f_j: Vec<f64>,
+            f_ij: Vec<f64>,
+        }
+
+        impl PsiPairTraceAccum {
+            fn new(p_resp: usize) -> Self {
+                Self {
+                    value: 0.0,
+                    gamma: vec![0.0; p_resp],
+                    gamma_i: vec![0.0; p_resp],
+                    gamma_j: vec![0.0; p_resp],
+                    gamma_ij: vec![0.0; p_resp],
+                    f: vec![0.0; p_resp],
+                    f_i: vec![0.0; p_resp],
+                    f_j: vec![0.0; p_resp],
+                    f_ij: vec![0.0; p_resp],
+                }
+            }
+        }
+
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let weights = self.weights.as_ref();
+        let total = (0..n)
+            .into_par_iter()
+            .fold(
+                || PsiPairTraceAccum::new(p_resp),
+                |mut acc, row_idx| {
+                    let cov_row = cov.row(row_idx);
+                    let cov_i_row = cov_i.row(row_idx);
+                    let cov_j_row = cov_j.row(row_idx);
+                    let cov_ij_row = cov_ij.row(row_idx);
+                    let global_row = row_start + row_idx;
+                    let rv = self.response_val_basis.row(global_row);
+                    let rd = self.response_deriv_basis.row(global_row);
+
+                    for k in 0..p_resp {
+                        let beta_k = beta_mat.row(k);
+                        acc.gamma[k] = beta_k.dot(&cov_row);
+                        acc.gamma_i[k] = beta_k.dot(&cov_i_row);
+                        acc.gamma_j[k] = beta_k.dot(&cov_j_row);
+                        acc.gamma_ij[k] = beta_k.dot(&cov_ij_row);
+                    }
+
+                    let h = cached_h[row_idx];
+                    let hp = cached_h_prime[row_idx];
+                    let mut h_i = rv[0] * acc.gamma_i[0];
+                    let mut h_j = rv[0] * acc.gamma_j[0];
+                    let mut h_ij = rv[0] * acc.gamma_ij[0];
+                    let mut hp_i = rd[0] * acc.gamma_i[0];
+                    let mut hp_j = rd[0] * acc.gamma_j[0];
+                    let mut hp_ij = rd[0] * acc.gamma_ij[0];
+                    for k in 1..p_resp {
+                        let g = acc.gamma[k];
+                        let gi = acc.gamma_i[k];
+                        let gj = acc.gamma_j[k];
+                        let gij = acc.gamma_ij[k];
+                        h_i += 2.0 * rv[k] * g * gi;
+                        h_j += 2.0 * rv[k] * g * gj;
+                        h_ij += 2.0 * rv[k] * (gj * gi + g * gij);
+                        hp_i += 2.0 * rd[k] * g * gi;
+                        hp_j += 2.0 * rd[k] * g * gj;
+                        hp_ij += 2.0 * rd[k] * (gj * gi + g * gij);
+                    }
+
+                    let q = endpoint_q[row_idx];
+                    let mut endpoint_i = [0.0; 2];
+                    let mut endpoint_j = [0.0; 2];
+                    let mut endpoint_ij = [0.0; 2];
+                    for e in 0..2 {
+                        let basis = endpoint_basis[e];
+                        endpoint_i[e] = basis[0] * acc.gamma_i[0];
+                        endpoint_j[e] = basis[0] * acc.gamma_j[0];
+                        endpoint_ij[e] = basis[0] * acc.gamma_ij[0];
+                        for k in 1..p_resp {
+                            endpoint_i[e] += 2.0 * basis[k] * acc.gamma[k] * acc.gamma_i[k];
+                            endpoint_j[e] += 2.0 * basis[k] * acc.gamma[k] * acc.gamma_j[k];
+                            endpoint_ij[e] += 2.0
+                                * basis[k]
+                                * (acc.gamma_j[k] * acc.gamma_i[k]
+                                    + acc.gamma[k] * acc.gamma_ij[k]);
+                        }
+                    }
+
+                    let inv_hp = 1.0 / hp;
+                    let inv_hp_sq = inv_hp * inv_hp;
+                    let inv_hp_cu = inv_hp_sq * inv_hp;
+                    let inv_hp_qu = inv_hp_sq * inv_hp_sq;
+                    let wi = weights[global_row];
+
+                    for col in 0..rank {
+                        for k in 0..p_resp {
+                            let offset = k * p_cov;
+                            let mut f = 0.0;
+                            let mut f_i = 0.0;
+                            let mut f_j = 0.0;
+                            let mut f_ij = 0.0;
+                            for cidx in 0..p_cov {
+                                let coeff = factor[[offset + cidx, col]];
+                                f += coeff * cov_row[cidx];
+                                f_i += coeff * cov_i_row[cidx];
+                                f_j += coeff * cov_j_row[cidx];
+                                f_ij += coeff * cov_ij_row[cidx];
+                            }
+                            acc.f[k] = f;
+                            acc.f_i[k] = f_i;
+                            acc.f_j[k] = f_j;
+                            acc.f_ij[k] = f_ij;
+                        }
+
+                        let mut h_f = rv[0] * acc.f[0];
+                        let mut hp_f = rd[0] * acc.f[0];
+                        let mut h_i_f = rv[0] * acc.f_i[0];
+                        let mut h_j_f = rv[0] * acc.f_j[0];
+                        let mut h_ij_f = rv[0] * acc.f_ij[0];
+                        let mut hp_i_f = rd[0] * acc.f_i[0];
+                        let mut hp_j_f = rd[0] * acc.f_j[0];
+                        let mut hp_ij_f = rd[0] * acc.f_ij[0];
+
+                        let mut h_ff = 0.0;
+                        let mut hp_ff = 0.0;
+                        let mut h_i_ff = 0.0;
+                        let mut h_j_ff = 0.0;
+                        let mut h_ij_ff = 0.0;
+                        let mut hp_i_ff = 0.0;
+                        let mut hp_j_ff = 0.0;
+                        let mut hp_ij_ff = 0.0;
+
+                        for k in 1..p_resp {
+                            let g = acc.gamma[k];
+                            let gi = acc.gamma_i[k];
+                            let gj = acc.gamma_j[k];
+                            let gij = acc.gamma_ij[k];
+                            let f = acc.f[k];
+                            let fi = acc.f_i[k];
+                            let fj = acc.f_j[k];
+                            let fij = acc.f_ij[k];
+
+                            h_f += 2.0 * rv[k] * g * f;
+                            hp_f += 2.0 * rd[k] * g * f;
+                            h_i_f += 2.0 * rv[k] * (f * gi + g * fi);
+                            h_j_f += 2.0 * rv[k] * (f * gj + g * fj);
+                            h_ij_f += 2.0 * rv[k] * (fj * gi + gj * fi + f * gij + g * fij);
+                            hp_i_f += 2.0 * rd[k] * (f * gi + g * fi);
+                            hp_j_f += 2.0 * rd[k] * (f * gj + g * fj);
+                            hp_ij_f += 2.0 * rd[k] * (fj * gi + gj * fi + f * gij + g * fij);
+
+                            h_ff += 2.0 * rv[k] * f * f;
+                            hp_ff += 2.0 * rd[k] * f * f;
+                            h_i_ff += 4.0 * rv[k] * f * fi;
+                            h_j_ff += 4.0 * rv[k] * f * fj;
+                            h_ij_ff += 2.0 * rv[k] * (fj * fi + fj * fi + f * fij + f * fij);
+                            hp_i_ff += 4.0 * rd[k] * f * fi;
+                            hp_j_ff += 4.0 * rd[k] * f * fj;
+                            hp_ij_ff += 2.0 * rd[k] * (fj * fi + fj * fi + f * fij + f * fij);
+                        }
+
+                        let mut endpoint_f = [0.0; 2];
+                        let mut endpoint_i_f = [0.0; 2];
+                        let mut endpoint_j_f = [0.0; 2];
+                        let mut endpoint_ij_f = [0.0; 2];
+                        let mut endpoint_ff = [0.0; 2];
+                        let mut endpoint_i_ff = [0.0; 2];
+                        let mut endpoint_j_ff = [0.0; 2];
+                        let mut endpoint_ij_ff = [0.0; 2];
+                        for e in 0..2 {
+                            let basis = endpoint_basis[e];
+                            endpoint_f[e] = basis[0] * acc.f[0];
+                            endpoint_i_f[e] = basis[0] * acc.f_i[0];
+                            endpoint_j_f[e] = basis[0] * acc.f_j[0];
+                            endpoint_ij_f[e] = basis[0] * acc.f_ij[0];
+                            for k in 1..p_resp {
+                                let basis_k = basis[k];
+                                let g = acc.gamma[k];
+                                let gi = acc.gamma_i[k];
+                                let gj = acc.gamma_j[k];
+                                let gij = acc.gamma_ij[k];
+                                let f = acc.f[k];
+                                let fi = acc.f_i[k];
+                                let fj = acc.f_j[k];
+                                let fij = acc.f_ij[k];
+                                endpoint_f[e] += 2.0 * basis_k * g * f;
+                                endpoint_i_f[e] += 2.0 * basis_k * (f * gi + g * fi);
+                                endpoint_j_f[e] += 2.0 * basis_k * (f * gj + g * fj);
+                                endpoint_ij_f[e] +=
+                                    2.0 * basis_k * (fj * gi + gj * fi + f * gij + g * fij);
+                                endpoint_ff[e] += 2.0 * basis_k * f * f;
+                                endpoint_i_ff[e] += 4.0 * basis_k * f * fi;
+                                endpoint_j_ff[e] += 4.0 * basis_k * f * fj;
+                                endpoint_ij_ff[e] += 4.0 * basis_k * (fj * fi + f * fij);
+                            }
+                        }
+
+                        let numerator_f = hp_i_f * hp_j + hp_i * hp_j_f;
+                        let numerator_ff = hp_i_ff * hp_j + 2.0 * hp_i_f * hp_j_f + hp_i * hp_j_ff;
+                        let value_ff = h_i_ff * h_j
+                            + 2.0 * h_i_f * h_j_f
+                            + h_i * h_j_ff
+                            + h_ff * h_ij
+                            + 2.0 * h_f * h_ij_f
+                            + h * h_ij_ff
+                            - hp_ij_ff * inv_hp
+                            + 2.0 * hp_ij_f * hp_f * inv_hp_sq
+                            + hp_ij * hp_ff * inv_hp_sq
+                            - 2.0 * hp_ij * hp_f * hp_f * inv_hp_cu
+                            + numerator_ff * inv_hp_sq
+                            - 4.0 * numerator_f * hp_f * inv_hp_cu
+                            - 2.0 * hp_i * hp_j * hp_ff * inv_hp_cu
+                            + 6.0 * hp_i * hp_j * hp_f * hp_f * inv_hp_qu
+                            + endpoint_chain_fourth(
+                                &q,
+                                endpoint_i,
+                                endpoint_j,
+                                endpoint_f,
+                                endpoint_f,
+                                endpoint_ij,
+                                endpoint_i_f,
+                                endpoint_i_f,
+                                endpoint_j_f,
+                                endpoint_j_f,
+                                endpoint_ff,
+                                endpoint_ij_f,
+                                endpoint_ij_f,
+                                endpoint_i_ff,
+                                endpoint_j_ff,
+                                endpoint_ij_ff,
+                            );
+                        acc.value += wi * value_ff;
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || PsiPairTraceAccum::new(p_resp),
+                |mut left, right| {
+                    left.value += right.value;
+                    left
+                },
+            )
+            .value;
+        Ok(total)
+    }
+
     fn scop_psi_pair_rows_per_chunk(&self, p_cov: usize) -> usize {
         let policy = ResourcePolicy::default_library();
         crate::resource::rows_for_target_bytes(policy.row_chunk_target_bytes, 4 * p_cov.max(1))
@@ -5607,31 +5932,20 @@ impl TransformationNormalPsiPsiHessianOperator {
         row_start: usize,
         row_end: usize,
     ) -> f64 {
-        let trace_col = |col: usize| {
-            let v = factor.column(col);
-            self.family
-                .scop_psi_psi_bilinear_from_cov(
-                    &self.beta,
-                    self.row_h.slice(s![row_start..row_end]),
-                    self.row_h_prime.slice(s![row_start..row_end]),
-                    cov.view(),
-                    cov_i.view(),
-                    cov_j.view(),
-                    cov_ij.view(),
-                    row_start,
-                    &self.endpoint_q[row_start..row_end],
-                    v,
-                    v,
-                )
-                .expect("validated CTN psi-psi projected trace inputs should not fail")
-        };
-
-        if rayon::current_thread_index().is_some() {
-            (0..factor.ncols()).map(trace_col).sum()
-        } else {
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            (0..factor.ncols()).into_par_iter().map(trace_col).sum()
-        }
+        self.family
+            .scop_psi_psi_trace_factor_from_cov(
+                &self.beta,
+                self.row_h.slice(s![row_start..row_end]),
+                self.row_h_prime.slice(s![row_start..row_end]),
+                cov.view(),
+                cov_i.view(),
+                cov_j.view(),
+                cov_ij.view(),
+                row_start,
+                &self.endpoint_q[row_start..row_end],
+                factor.view(),
+            )
+            .expect("validated CTN psi-psi projected trace inputs should not fail")
     }
 }
 
@@ -9424,6 +9738,20 @@ mod tests {
             "psi-psi operator bilinear mismatch: got={:.6e}, want={:.6e}",
             got_bilinear,
             want_bilinear
+        );
+
+        let got_trace = op.trace_projected_factor(&factor);
+        let want_trace = factor
+            .iter()
+            .zip(want_mat.iter())
+            .map(|(&f, &bf)| f * bf)
+            .sum::<f64>();
+        let tol = 1e-10 * want_trace.abs().max(1.0) + 1e-10;
+        assert!(
+            (got_trace - want_trace).abs() <= tol,
+            "psi-psi operator projected trace mismatch: got={:.6e}, want={:.6e}",
+            got_trace,
+            want_trace
         );
     }
 
