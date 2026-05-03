@@ -86,12 +86,9 @@ fn rewrite_thin_plate_knots_error(
             ))
         }
         // Insufficient-rows shortfall raised by `select_thin_plate_knots` when
-        // the resolved knot count exceeds the available row count. The raw
-        // message references the *post-radial-rank-inflation* knot count, which
-        // is an internal detail of `thin_plate_knot_strategy_for_radial_rank`;
-        // rewrite it in terms of the user's requested center count and the
-        // polynomial-nullspace minimum so the diagnostic matches the parameter
-        // the user actually set.
+        // the requested center count exceeds the available row count. Rewrite
+        // it in term language so the diagnostic points at the smooth term and
+        // the polynomial-nullspace minimum the user needs to satisfy.
         BasisError::InvalidInput(msg)
             if msg.starts_with("requested ") && msg.contains(" knots but only ") =>
         {
@@ -4253,19 +4250,29 @@ fn smooth_has_overlapping_linear_terms(
         .any(|linear| feature_cols.contains(&linear.feature_col))
 }
 
-fn smooth_intrinsic_parametric_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
-    // Global smooth identifiability temporarily disables basis-local spatial
-    // transforms so it can compose parametric and smooth-ownership constraints
-    // in one coefficient transform. Thin-plate smooths with parametric
-    // orthogonality therefore need their own feature polynomial block restored
-    // here even when the formula has no explicit linear term for that feature.
+fn smooth_intrinsic_parametric_feature_cols(
+    linear_terms: &[LinearTermSpec],
+    term: &SmoothTermSpec,
+) -> Vec<usize> {
+    // Ownership rule for spatial polynomial directions:
+    // explicit linear terms own only their matching axes; otherwise an
+    // unpenalized TPS nullspace must be projected out. When double-penalty is
+    // active the nullspace is already regularized, so it remains in the smooth.
+    let feature_cols = smooth_term_feature_cols(term);
+    let has_model_owned_overlap = linear_terms
+        .iter()
+        .any(|linear| feature_cols.contains(&linear.feature_col));
+    if has_model_owned_overlap {
+        return Vec::new();
+    }
+
     match &term.basis {
         SmoothBasisSpec::ThinPlate {
             feature_cols, spec, ..
         } if matches!(
             spec.identifiability,
             SpatialIdentifiability::OrthogonalToParametric
-        ) =>
+        ) && !spec.double_penalty =>
         {
             feature_cols.clone()
         }
@@ -4351,7 +4358,7 @@ fn apply_global_smooth_identifiability(
             .collect::<Vec<_>>();
         let needs_parametric_block = !skip_global_transform
             && (smooth_has_overlapping_linear_terms(linear_terms, termspec)
-                || !smooth_intrinsic_parametric_feature_cols(termspec).is_empty()
+                || !smooth_intrinsic_parametric_feature_cols(linear_terms, termspec).is_empty()
                 || matches!(
                     spatial_identifiability_policy(termspec),
                     Some(SpatialIdentifiability::OrthogonalToParametric)
@@ -4613,7 +4620,7 @@ fn build_parametric_constraint_block_for_term(
     let n = data.nrows();
     let p_data = data.ncols();
     let feature_cols = smooth_term_feature_cols(termspec);
-    let mut parametric_cols = smooth_intrinsic_parametric_feature_cols(termspec);
+    let mut parametric_cols = smooth_intrinsic_parametric_feature_cols(linear_terms, termspec);
     for &feature_col in &parametric_cols {
         if feature_col >= p_data {
             return Err(BasisError::DimensionMismatch(format!(
@@ -13825,9 +13832,9 @@ mod tests {
 
     #[test]
     fn build_smooth_design_accepts_monotone_thin_plate_1dwith_linear_constraints() {
-        // 1D TPS with `num_centers = 4` requests 4 radial functions, so the
-        // builder needs `4 + polynomial_dim(1) = 4 + 2 = 6` raw knots. Use 7
-        // points so farthest-point selection has slack.
+        // 1D TPS with `num_centers = 4` requests exactly 4 centers. The
+        // polynomial nullspace is represented by separate columns, not by
+        // hidden extra knots.
         let data = array![[0.0], [0.15], [0.35], [0.5], [0.65], [0.85], [1.0]];
         let terms = vec![SmoothTermSpec {
             name: "mono_tps".to_string(),
