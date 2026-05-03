@@ -11331,39 +11331,6 @@ fn synchronized_states_from_flat_beta<F: CustomFamily + Clone + Send + Sync + 's
     Ok(synced)
 }
 
-fn penalizedobjective_at_beta<F: CustomFamily + Clone + Send + Sync + 'static>(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    states: &[ParameterBlockState],
-    per_block_log_lambdas: &[Array1<f64>],
-) -> Result<f64, String> {
-    let eval = family.evaluate(states)?;
-    if eval.blockworking_sets.len() != specs.len() {
-        return Err(format!(
-            "family returned {} block working sets, expected {}",
-            eval.blockworking_sets.len(),
-            specs.len()
-        ));
-    }
-    let mut penalty = 0.0_f64;
-    for b in 0..specs.len() {
-        let spec = &specs[b];
-        let beta = &states[b].beta;
-        let lambdas = per_block_log_lambdas
-            .get(b)
-            .cloned()
-            .unwrap_or_else(|| Array1::zeros(spec.penalties.len()))
-            .mapv(f64::exp);
-        for (k, s) in spec.penalties.iter().enumerate() {
-            if k < lambdas.len() {
-                let sb = s.dot(beta);
-                penalty += 0.5 * lambdas[k] * beta.dot(&sb);
-            }
-        }
-    }
-    Ok(-eval.log_likelihood + penalty)
-}
-
 /// Inf-norm of the penalized stationarity residual with KKT multipliers
 /// projected out at active lower bounds.
 ///
@@ -11576,87 +11543,6 @@ fn exact_newton_joint_stationarity_inf_norm_from_gradient(
     Ok(inf_norm)
 }
 
-fn compute_joint_hessian_from_objective<F: CustomFamily + Clone + Send + Sync + 'static>(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    states: &[ParameterBlockState],
-    per_block_log_lambdas: &[Array1<f64>],
-) -> Result<Array2<f64>, String> {
-    let ranges = block_param_ranges(specs);
-    let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
-    let beta_hat = flatten_state_betas(states, specs);
-    let mut h = Array2::<f64>::zeros((total, total));
-
-    let mut statesf0 = states.to_vec();
-    set_states_from_flat_beta(&mut statesf0, specs, &beta_hat)?;
-    refresh_all_block_etas(family, specs, &mut statesf0)?;
-    let f0 = penalizedobjective_at_beta(family, specs, &statesf0, per_block_log_lambdas)?;
-
-    let steps = Array1::from_iter(beta_hat.iter().map(|&b| (1e-4 * (1.0 + b.abs())).max(1e-6)));
-
-    for i in 0..total {
-        let hi = steps[i];
-        let mut bp = beta_hat.clone();
-        bp[i] += hi;
-        let mut sp = states.to_vec();
-        set_states_from_flat_beta(&mut sp, specs, &bp)?;
-        refresh_all_block_etas(family, specs, &mut sp)?;
-        let fp = penalizedobjective_at_beta(family, specs, &sp, per_block_log_lambdas)?;
-
-        let mut bm = beta_hat.clone();
-        bm[i] -= hi;
-        let mut sm = states.to_vec();
-        set_states_from_flat_beta(&mut sm, specs, &bm)?;
-        refresh_all_block_etas(family, specs, &mut sm)?;
-        let fm = penalizedobjective_at_beta(family, specs, &sm, per_block_log_lambdas)?;
-
-        h[[i, i]] = ((fp - 2.0 * f0 + fm) / (hi * hi)).max(0.0);
-
-        for j in 0..i {
-            let hj = steps[j];
-            let mut bpp = beta_hat.clone();
-            bpp[i] += hi;
-            bpp[j] += hj;
-            let mut spp = states.to_vec();
-            set_states_from_flat_beta(&mut spp, specs, &bpp)?;
-            refresh_all_block_etas(family, specs, &mut spp)?;
-            let fpp = penalizedobjective_at_beta(family, specs, &spp, per_block_log_lambdas)?;
-
-            let mut bpm = beta_hat.clone();
-            bpm[i] += hi;
-            bpm[j] -= hj;
-            let mut spm = states.to_vec();
-            set_states_from_flat_beta(&mut spm, specs, &bpm)?;
-            refresh_all_block_etas(family, specs, &mut spm)?;
-            let fpm = penalizedobjective_at_beta(family, specs, &spm, per_block_log_lambdas)?;
-
-            let mut bmp = beta_hat.clone();
-            bmp[i] -= hi;
-            bmp[j] += hj;
-            let mut smp = states.to_vec();
-            set_states_from_flat_beta(&mut smp, specs, &bmp)?;
-            refresh_all_block_etas(family, specs, &mut smp)?;
-            let fmp = penalizedobjective_at_beta(family, specs, &smp, per_block_log_lambdas)?;
-
-            let mut bmm = beta_hat.clone();
-            bmm[i] -= hi;
-            bmm[j] -= hj;
-            let mut smm = states.to_vec();
-            set_states_from_flat_beta(&mut smm, specs, &bmm)?;
-            refresh_all_block_etas(family, specs, &mut smm)?;
-            let fmm = penalizedobjective_at_beta(family, specs, &smm, per_block_log_lambdas)?;
-
-            let hij = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
-            h[[i, j]] = hij;
-            h[[j, i]] = hij;
-        }
-    }
-    for i in 0..total {
-        h[[i, i]] = h[[i, i]].max(1e-12);
-    }
-    Ok(h)
-}
-
 fn compute_joint_covariance<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -11666,28 +11552,29 @@ fn compute_joint_covariance<F: CustomFamily + Clone + Send + Sync + 'static>(
 ) -> Result<Array2<f64>, String> {
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
-    let mut h = if let Some(h_exact) = exact_newton_joint_hessian_symmetrized(
+    let Some(mut h) = exact_newton_joint_hessian_symmetrized(
         family,
         states,
         specs,
         total,
         "joint exact-newton Hessian shape mismatch in covariance",
-    )? {
-        let mut h = h_exact;
-        for (b, spec) in specs.iter().enumerate() {
-            let (start, end) = ranges[b];
-            let lambdas = per_block_log_lambdas[b].mapv(f64::exp);
-            let mut s_lambda = Array2::<f64>::zeros((end - start, end - start));
-            for (k, s) in spec.penalties.iter().enumerate() {
-                s.add_scaled_to(lambdas[k], &mut s_lambda);
-            }
-            h.slice_mut(ndarray::s![start..end, start..end])
-                .scaled_add(1.0, &s_lambda);
-        }
-        h
-    } else {
-        compute_joint_hessian_from_objective(family, specs, states, per_block_log_lambdas)?
+    )?
+    else {
+        return Err(
+            "joint covariance requires an exact analytic Hessian; objective perturbation is forbidden"
+                .to_string(),
+        );
     };
+    for (b, spec) in specs.iter().enumerate() {
+        let (start, end) = ranges[b];
+        let lambdas = per_block_log_lambdas[b].mapv(f64::exp);
+        let mut s_lambda = Array2::<f64>::zeros((end - start, end - start));
+        for (k, s) in spec.penalties.iter().enumerate() {
+            s.add_scaled_to(lambdas[k], &mut s_lambda);
+        }
+        h.slice_mut(ndarray::s![start..end, start..end])
+            .scaled_add(1.0, &s_lambda);
+    }
     symmetrize_dense_in_place(&mut h);
     if use_exact_newton_strict_spd(family) {
         let (inv, stats) = strict_inverse_spd_with_lm_continuation(&h)?;
