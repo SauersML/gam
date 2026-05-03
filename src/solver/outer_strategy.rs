@@ -2741,6 +2741,27 @@ fn run_operator_trust_region(
                 operator_stop_reason: Some(OperatorTrustRegionStopReason::Converged),
             });
         }
+        if trust_radius <= OPERATOR_TRUST_RADIUS_REJECT_FLOOR {
+            log::info!(
+                "[ARC-timing] iter={iter} status=reject_floor cost={:.6e} grad_norm={:.3e} \
+                 trust_radius={:.3e}",
+                eval_k.cost,
+                g_norm,
+                trust_radius,
+            );
+            return Ok(OuterResult {
+                rho: x_k,
+                final_value: eval_k.cost,
+                iterations: iter,
+                final_grad_norm: g_norm,
+                final_gradient: Some(eval_k.gradient),
+                final_hessian: None,
+                converged: false,
+                plan_used: plan,
+                operator_trust_radius: Some(trust_radius),
+                operator_stop_reason: Some(OperatorTrustRegionStopReason::RejectFloor),
+            });
+        }
 
         let HessianResult::Operator(op_arc) = &eval_k.hessian else {
             return Err(EstimationError::RemlOptimizationFailed(
@@ -2810,33 +2831,31 @@ fn run_operator_trust_region(
             continue;
         }
 
-        let eval_trial = match obj.eval_with_order(&x_trial, OuterEvalOrder::ValueGradientHessian) {
-            Ok(eval) => {
-                match finite_outer_eval_or_error("outer operator eval failed", layout, eval) {
-                    Ok(eval) => eval,
-                    Err(ObjectiveEvalError::Recoverable { message }) => {
-                        let elapsed = iter_start.elapsed().as_secs_f64();
-                        log::info!(
-                            "[ARC-timing] iter={iter} status=infeasible_trial cost={:.6e} \
-                             grad_norm={:.3e} pred_dec={:.3e} trust_radius={:.3e}->{:.3e} \
-                             hv_applies={} elapsed={:.3}s reason={}",
-                            eval_k.cost,
-                            g_norm,
-                            pred_dec,
-                            trust_radius,
-                            (trust_radius * 0.25).max(1e-12),
-                            counter.count(),
-                            elapsed,
-                            message,
-                        );
-                        trust_radius = (trust_radius * 0.25).max(1e-12);
-                        continue;
-                    }
-                    Err(ObjectiveEvalError::Fatal { message }) => {
-                        return Err(EstimationError::RemlOptimizationFailed(message));
-                    }
+        let trial_cost = match obj.eval_cost(&x_trial) {
+            Ok(cost) => match finite_cost_or_error("outer operator trial cost failed", cost) {
+                Ok(cost) => cost,
+                Err(ObjectiveEvalError::Recoverable { message }) => {
+                    let elapsed = iter_start.elapsed().as_secs_f64();
+                    log::info!(
+                        "[ARC-timing] iter={iter} status=infeasible_trial cost={:.6e} \
+                         grad_norm={:.3e} pred_dec={:.3e} trust_radius={:.3e}->{:.3e} \
+                         hv_applies={} elapsed={:.3}s reason={}",
+                        eval_k.cost,
+                        g_norm,
+                        pred_dec,
+                        trust_radius,
+                        (trust_radius * 0.25).max(1e-12),
+                        counter.count(),
+                        elapsed,
+                        message,
+                    );
+                    trust_radius = (trust_radius * 0.25).max(1e-12);
+                    continue;
                 }
-            }
+                Err(ObjectiveEvalError::Fatal { message }) => {
+                    return Err(EstimationError::RemlOptimizationFailed(message));
+                }
+            },
             Err(err) => {
                 let elapsed = iter_start.elapsed().as_secs_f64();
                 log::info!(
@@ -2856,7 +2875,7 @@ fn run_operator_trust_region(
                 continue;
             }
         };
-        let act_dec = eval_k.cost - eval_trial.cost;
+        let act_dec = eval_k.cost - trial_cost;
         let rho = act_dec / pred_dec;
         let accepted_by_ratio = rho > OPERATOR_ETA_ACCEPT;
         let accepted = accepted_by_ratio;
@@ -2869,11 +2888,7 @@ fn run_operator_trust_region(
         };
         let hv_applies = counter.count();
         let elapsed = iter_start.elapsed().as_secs_f64();
-        let next_cost = if accepted {
-            eval_trial.cost
-        } else {
-            eval_k.cost
-        };
+        let next_cost = if accepted { trial_cost } else { eval_k.cost };
         log::info!(
             "[ARC-timing] iter={iter} status={} cost={:.6e}->{:.6e} grad_norm={:.3e} \
              rho={:.3} pred_dec={:.3e} act_dec={:.3e} trust_radius={:.3e}->{:.3e} \
@@ -2897,6 +2912,52 @@ fn run_operator_trust_region(
 
         trust_radius = new_trust_radius;
         if accepted {
+            let eval_trial = match obj
+                .eval_with_order(&x_trial, OuterEvalOrder::ValueGradientHessian)
+            {
+                Ok(eval) => {
+                    match finite_outer_eval_or_error("outer operator eval failed", layout, eval) {
+                        Ok(eval) => eval,
+                        Err(ObjectiveEvalError::Recoverable { message }) => {
+                            let elapsed = iter_start.elapsed().as_secs_f64();
+                            log::info!(
+                                "[ARC-timing] iter={iter} status=accepted_eval_error \
+                                     cost={:.6e} grad_norm={:.3e} trust_radius={:.3e}->{:.3e} \
+                                     hv_applies={} elapsed={:.3}s reason={}",
+                                eval_k.cost,
+                                g_norm,
+                                trust_radius,
+                                (trust_radius * 0.25).max(1e-12),
+                                counter.count(),
+                                elapsed,
+                                message,
+                            );
+                            trust_radius = (trust_radius * 0.25).max(1e-12);
+                            continue;
+                        }
+                        Err(ObjectiveEvalError::Fatal { message }) => {
+                            return Err(EstimationError::RemlOptimizationFailed(message));
+                        }
+                    }
+                }
+                Err(err) => {
+                    let elapsed = iter_start.elapsed().as_secs_f64();
+                    log::info!(
+                        "[ARC-timing] iter={iter} status=accepted_eval_error \
+                             cost={:.6e} grad_norm={:.3e} trust_radius={:.3e}->{:.3e} \
+                             hv_applies={} elapsed={:.3}s reason={}",
+                        eval_k.cost,
+                        g_norm,
+                        trust_radius,
+                        (trust_radius * 0.25).max(1e-12),
+                        counter.count(),
+                        elapsed,
+                        err,
+                    );
+                    trust_radius = (trust_radius * 0.25).max(1e-12);
+                    continue;
+                }
+            };
             x_k = x_trial;
             eval_k = eval_trial;
         } else if trust_radius <= OPERATOR_TRUST_RADIUS_REJECT_FLOOR {
@@ -3781,6 +3842,18 @@ mod tests {
 
         fn materialize_dense(&self) -> Result<Array2<f64>, String> {
             Err("seed materialization failed".to_string())
+        }
+    }
+
+    struct IdentityOuterHessianOperator;
+
+    impl OuterHessianOperator for IdentityOuterHessianOperator {
+        fn dim(&self) -> usize {
+            1
+        }
+
+        fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+            Ok(v.clone())
         }
     }
 
@@ -5133,18 +5206,6 @@ mod tests {
 
     #[test]
     fn arc_budget_retry_preserves_operator_trust_radius() {
-        struct IdentityOuterHessianOperator;
-
-        impl OuterHessianOperator for IdentityOuterHessianOperator {
-            fn dim(&self) -> usize {
-                1
-            }
-
-            fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
-                Ok(v.clone())
-            }
-        }
-
         struct RejectingArcObjective {
             trial_abs: Arc<std::sync::Mutex<Vec<f64>>>,
         }
@@ -5164,6 +5225,12 @@ mod tests {
             }
 
             fn eval_cost(&mut self, theta: &Array1<f64>) -> Result<f64, EstimationError> {
+                if theta[0] != 0.0 {
+                    self.trial_abs
+                        .lock()
+                        .expect("trial recorder mutex poisoned")
+                        .push(theta[0].abs());
+                }
                 Ok(-theta[0])
             }
 
@@ -5176,12 +5243,6 @@ mod tests {
                 theta: &Array1<f64>,
                 _: OuterEvalOrder,
             ) -> Result<OuterEval, EstimationError> {
-                if theta[0] != 0.0 {
-                    self.trial_abs
-                        .lock()
-                        .expect("trial recorder mutex poisoned")
-                        .push(theta[0].abs());
-                }
                 Ok(OuterEval {
                     cost: -theta[0],
                     gradient: array![1.0],
@@ -5250,6 +5311,95 @@ mod tests {
         assert!(
             (trials[1] - 0.5).abs() < 1e-12,
             "retry must resume from the shrunken trust radius instead of replaying radius=1, got {trials:?}"
+        );
+    }
+
+    #[test]
+    fn operator_arc_rejected_trial_uses_cost_only() {
+        struct CountingRejectedTrialObjective {
+            cost_calls: Arc<std::sync::atomic::AtomicUsize>,
+            full_calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl OuterObjective for CountingRejectedTrialObjective {
+            fn capability(&self) -> OuterCapability {
+                OuterCapability {
+                    gradient: Derivative::Analytic,
+                    hessian: Derivative::Analytic,
+                    n_params: 1,
+                    psi_dim: 0,
+                    fixed_point_available: false,
+                    barrier_config: None,
+                    prefer_gradient_only: false,
+                    disable_fixed_point: false,
+                }
+            }
+
+            fn eval_cost(&mut self, theta: &Array1<f64>) -> Result<f64, EstimationError> {
+                self.cost_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(theta[0].abs())
+            }
+
+            fn eval(&mut self, theta: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+                self.eval_with_order(theta, OuterEvalOrder::ValueGradientHessian)
+            }
+
+            fn eval_with_order(
+                &mut self,
+                theta: &Array1<f64>,
+                _: OuterEvalOrder,
+            ) -> Result<OuterEval, EstimationError> {
+                self.full_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(OuterEval {
+                    cost: theta[0].abs(),
+                    gradient: array![1.0],
+                    hessian: HessianResult::Operator(Arc::new(IdentityOuterHessianOperator)),
+                })
+            }
+
+            fn reset(&mut self) {}
+        }
+
+        let cost_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let full_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut obj = CountingRejectedTrialObjective {
+            cost_calls: Arc::clone(&cost_calls),
+            full_calls: Arc::clone(&full_calls),
+        };
+        let seed = array![0.0];
+        let initial_eval = obj
+            .eval_with_order(&seed, OuterEvalOrder::ValueGradientHessian)
+            .expect("initial eval");
+        let result = run_operator_trust_region(
+            &mut obj,
+            &seed,
+            OuterThetaLayout::new(1, 0),
+            None,
+            1e-12,
+            1,
+            initial_eval,
+            OuterPlan {
+                solver: Solver::Arc,
+                hessian_source: HessianSource::Analytic,
+            },
+            None,
+        )
+        .expect("operator ARC attempt");
+        assert!(
+            !result.converged,
+            "single-iteration fixture should reject and exhaust its budget"
+        );
+        assert_eq!(
+            cost_calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one rejected trial should require exactly one cost-only evaluation"
+        );
+        assert_eq!(
+            full_calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "rejected trial must not request gradient/Hessian; only initial eval should be full"
         );
     }
 
