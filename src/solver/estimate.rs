@@ -1397,6 +1397,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             fit_linear_constraints.clone(),
         )?;
         reml_state.set_penalty_shrinkage_floor(opts.penalty_shrinkage_floor);
+        reml_state.set_rho_prior(opts.rho_prior.clone());
         reml_state.set_link_states(
             config.link_kind.mixture_state().cloned(),
             config.link_kind.sas_state().copied(),
@@ -1800,6 +1801,7 @@ where
         fit_linear_constraints.clone(),
     )?;
     reml_state.set_penalty_shrinkage_floor(opts.penalty_shrinkage_floor);
+    reml_state.set_rho_prior(opts.rho_prior.clone());
     if let Some(kron) = opts.kronecker_penalty_system.clone() {
         reml_state.set_kronecker_penalty_system(kron);
     }
@@ -4696,6 +4698,7 @@ where
         fit_linear_constraints,
     )?;
     reml_state.set_penalty_shrinkage_floor(opts.penalty_shrinkage_floor);
+    reml_state.set_rho_prior(opts.rho_prior.clone());
     reml_state.set_link_states(
         cfg.link_kind.mixture_state().cloned(),
         cfg.link_kind.sas_state().copied(),
@@ -4763,6 +4766,7 @@ where
         fit_linear_constraints,
     )?;
     reml_state.set_penalty_shrinkage_floor(opts.penalty_shrinkage_floor);
+    reml_state.set_rho_prior(opts.rho_prior.clone());
     reml_state.set_link_states(
         cfg.link_kind.mixture_state().cloned(),
         cfg.link_kind.sas_state().copied(),
