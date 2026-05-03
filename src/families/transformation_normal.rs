@@ -2633,9 +2633,45 @@ impl TransformationNormalFamily {
         direction: &Array1<f64>,
     ) -> Result<Array1<f64>, String> {
         let n = self.response_val_basis.nrows();
+        let cov = self
+            .covariate_design
+            .try_row_chunk(0..n)
+            .map_err(|e| format!("SCOP psi Hessian apply requires covariate row chunk: {e}"))?;
+        let cov_psi = op
+            .materialize_cov_first_axis(axis)
+            .map_err(|e| format!("SCOP psi Hessian apply materialize_cov_first failed: {e}"))?;
+        self.scop_psi_hessian_apply_from_operator_with_cov(
+            beta,
+            row_quantities,
+            axis,
+            &cov,
+            &cov_psi,
+            direction,
+        )
+    }
+
+    fn scop_psi_hessian_apply_from_operator_with_cov(
+        &self,
+        beta: &Array1<f64>,
+        row_quantities: &TransformationNormalRowQuantityCache,
+        axis: usize,
+        cov: &Array2<f64>,
+        cov_psi: &Array2<f64>,
+        direction: &Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
+        let n = self.response_val_basis.nrows();
         let p_resp = self.response_val_basis.ncols();
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
+        if cov.nrows() != n || cov.ncols() != p_cov {
+            return Err(format!(
+                "SCOP psi Hessian apply covariate shape {}x{} != expected {}x{}",
+                cov.nrows(),
+                cov.ncols(),
+                n,
+                p_cov
+            ));
+        }
         if beta.len() != p_total || direction.len() != p_total {
             return Err(format!(
                 "SCOP psi Hessian apply length mismatch: beta={}, direction={}, expected={p_total}",
@@ -2651,16 +2687,9 @@ impl TransformationNormalFamily {
             .view()
             .into_shape_with_order((p_resp, p_cov))
             .map_err(|e| format!("SCOP psi Hessian apply direction reshape failed: {e}"))?;
-        let cov = self
-            .covariate_design
-            .try_row_chunk(0..n)
-            .map_err(|e| format!("SCOP psi Hessian apply requires covariate row chunk: {e}"))?;
-        let cov_psi = op
-            .materialize_cov_first_axis(axis)
-            .map_err(|e| format!("SCOP psi Hessian apply materialize_cov_first failed: {e}"))?;
         if cov_psi.nrows() != n || cov_psi.ncols() != p_cov {
             return Err(format!(
-                "SCOP psi Hessian apply covariate derivative shape {}x{} != expected {}x{}",
+                "SCOP psi Hessian apply covariate derivative shape {}x{} for axis {axis} != expected {}x{}",
                 cov_psi.nrows(),
                 cov_psi.ncols(),
                 n,
@@ -5388,16 +5417,46 @@ impl HyperOperator for TransformationNormalPsiHessianOperator {
             .expect("validated CTN psi Hessian operator inputs should not fail")
     }
 
+    fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
+        debug_assert_eq!(factor.nrows(), self.dim());
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let n = self.family.response_val_basis.nrows();
+        let p = factor.nrows();
+        let k = factor.ncols();
+        let cov = self
+            .family
+            .covariate_design
+            .try_row_chunk(0..n)
+            .expect("validated CTN psi Hessian operator covariate chunk should not fail");
+        let cov_psi = self
+            .tensor_op()
+            .materialize_cov_first_axis(self.axis)
+            .expect("validated CTN psi Hessian operator covariate derivative should not fail");
+        let cols: Vec<Array1<f64>> = (0..k)
+            .into_par_iter()
+            .map(|col| {
+                self.family
+                    .scop_psi_hessian_apply_from_operator_with_cov(
+                        &self.beta,
+                        &self.row_quantities,
+                        self.axis,
+                        &cov,
+                        &cov_psi,
+                        &factor.column(col).to_owned(),
+                    )
+                    .expect("validated CTN psi Hessian operator batched input should not fail")
+            })
+            .collect();
+        let mut out = Array2::<f64>::zeros((p, k));
+        for (col, applied) in cols.into_iter().enumerate() {
+            out.column_mut(col).assign(&applied);
+        }
+        out
+    }
+
     fn to_dense(&self) -> Array2<f64> {
         let p = self.dim();
-        let mut dense = Array2::<f64>::zeros((p, p));
-        let mut basis = Array1::<f64>::zeros(p);
-        for col in 0..p {
-            basis[col] = 1.0;
-            let applied = self.mul_vec(&basis);
-            dense.column_mut(col).assign(&applied);
-            basis[col] = 0.0;
-        }
+        let dense = self.mul_mat(&Array2::<f64>::eye(p));
         0.5 * (&dense + &dense.t())
     }
 
