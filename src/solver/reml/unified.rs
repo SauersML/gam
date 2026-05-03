@@ -6889,6 +6889,51 @@ fn build_outer_hessian_operator(
             );
             ct.mapv_inplace(|value| -value);
             Some(ct)
+        } else if let Some(dense_hop) = dense_hop_opt {
+            // Exact smooth-logdet Hessian kernel for operator-backed drifts.
+            //
+            // The second derivative of
+            //     log |r_epsilon(H(theta))|
+            // is not, in general,
+            //     -tr(H_epsilon^{-1} H_i H_epsilon^{-1} H_j).
+            // That identity only holds for the unregularized SPD logdet.
+            // DenseSpectralOperator uses the divided-difference kernel of
+            // log r_epsilon(sigma), so every dense/operator component must be
+            // rotated into the eigenbasis and contracted with that same
+            // kernel.  The dense Hessian assembly path already does this;
+            // the matrix-free outer-Hv path must match it exactly.
+            let rotated: Vec<Array2<f64>> = coords
+                .iter()
+                .map(|coord| {
+                    let mut projected =
+                        coord.total_drift.dense_rotated.clone().unwrap_or_else(|| {
+                            Array2::<f64>::zeros((dense_hop.n_dim, dense_hop.n_dim))
+                        });
+                    for op in &coord.total_drift.operators {
+                        projected +=
+                            &dense_hop.projected_operator(&dense_hop.eigenvectors, op.as_ref());
+                    }
+                    projected
+                })
+                .collect();
+
+            let mut ct = Array2::<f64>::zeros((total, total));
+            for ii in 0..total {
+                for jj in ii..total {
+                    let value =
+                        dense_hop.trace_logdet_hessian_cross_rotated(&rotated[ii], &rotated[jj]);
+                    if !value.is_finite() {
+                        return Err(format!(
+                            "outer Hessian operator cross_trace[{ii}, {jj}] is non-finite ({value})"
+                        ));
+                    }
+                    ct[[ii, jj]] = value;
+                    if ii != jj {
+                        ct[[jj, ii]] = value;
+                    }
+                }
+            }
+            Some(ct)
         } else {
             // Enumerate the upper triangle (`ii ≤ jj`) so each `(ii, jj)` is an
             // independent unit of work — every entry of `cross_trace` is computed
@@ -11145,8 +11190,8 @@ mod tests {
     }
 
     #[test]
-    fn operator_hessian_matches_dense_with_extended_glm_corrections() {
-        let h = array![[4.0, 0.35], [0.35, 2.7]];
+    fn operator_hessian_matches_dense_with_operator_drifts_and_extended_glm_corrections() {
+        let h = array![[1.0e-7, 0.0], [0.0, 2.7]];
         let hop = Arc::new(DenseSpectralOperator::from_symmetric(&h).unwrap());
         let beta = array![0.4, -0.7];
         let penalty_root = array![[1.2, 0.1], [0.0, 0.8]];
@@ -11188,7 +11233,9 @@ mod tests {
             ext_coords: vec![HyperCoord {
                 a: -0.21,
                 g: array![0.33, -0.42],
-                drift: HyperCoordDrift::from_dense(ext_drift),
+                drift: HyperCoordDrift::from_operator(Arc::new(DenseMatrixHyperOperator {
+                    matrix: ext_drift,
+                })),
                 ld_s: 0.07,
                 b_depends_on_beta: false,
                 is_penalty_like: false,
