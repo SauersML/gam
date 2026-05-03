@@ -73,9 +73,27 @@ fn rewrite_thin_plate_knots_error(
     spec: &ThinPlateBasisSpec,
 ) -> BasisError {
     match err {
+        // Polynomial-nullspace shortfall reported directly by the kernel
+        // builder ("thin-plate spline requires at least N centers to span ...").
         BasisError::InvalidInput(msg)
             if msg.contains("thin-plate spline requires at least")
                 && (msg.contains("centers to span") || msg.contains("knots to span")) =>
+        {
+            let min_centers = feature_count + 1;
+            let requested = describe_thin_plate_center_request(&spec.center_strategy);
+            BasisError::InvalidInput(format!(
+                "joint TPS term '{termname}' over {feature_count} covariates with {requested} is invalid; minimum centers is {min_centers}"
+            ))
+        }
+        // Insufficient-rows shortfall raised by `select_thin_plate_knots` when
+        // the resolved knot count exceeds the available row count. The raw
+        // message references the *post-radial-rank-inflation* knot count, which
+        // is an internal detail of `thin_plate_knot_strategy_for_radial_rank`;
+        // rewrite it in terms of the user's requested center count and the
+        // polynomial-nullspace minimum so the diagnostic matches the parameter
+        // the user actually set.
+        BasisError::InvalidInput(msg)
+            if msg.starts_with("requested ") && msg.contains(" knots but only ") =>
         {
             let min_centers = feature_count + 1;
             let requested = describe_thin_plate_center_request(&spec.center_strategy);
@@ -13807,7 +13825,10 @@ mod tests {
 
     #[test]
     fn build_smooth_design_accepts_monotone_thin_plate_1dwith_linear_constraints() {
-        let data = array![[0.0], [0.25], [0.5], [0.75], [1.0]];
+        // 1D TPS with `num_centers = 4` requests 4 radial functions, so the
+        // builder needs `4 + polynomial_dim(1) = 4 + 2 = 6` raw knots. Use 7
+        // points so farthest-point selection has slack.
+        let data = array![[0.0], [0.15], [0.35], [0.5], [0.65], [0.85], [1.0]];
         let terms = vec![SmoothTermSpec {
             name: "mono_tps".to_string(),
             basis: SmoothBasisSpec::ThinPlate {
