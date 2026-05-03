@@ -18337,13 +18337,13 @@ pub mod closed_form_penalty {
         let kappa_sq = kappa * kappa;
 
         // A_j = (-1)^{a-j} · C(a+b-j-1, a-j) · κ^{-2(a+b-j)}, j = 1..a
-        let mut sum = 0.0_f64;
+        let mut sum = KahanSum::default();
         for j in 1..=a {
             let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
             let binom = binomial_f64(a + b - j - 1, a - j);
             let coeff = sign * binom * kappa_sq.powi(-((a + b - j) as i32));
             let term = coeff * riesz_kernel_value(d, j, r);
-            sum += term;
+            sum.add(term);
         }
 
         // B_ℓ = (-1)^a · C(a+b-ℓ-1, b-ℓ) · κ^{-2(a+b-ℓ)}, ℓ = 1..b
@@ -18352,10 +18352,10 @@ pub mod closed_form_penalty {
             let binom = binomial_f64(a + b - ell - 1, b - ell);
             let coeff = sign_a * binom * kappa_sq.powi(-((a + b - ell) as i32));
             let term = coeff * matern_kernel_value(d, ell, kappa, r);
-            sum += term;
+            sum.add(term);
         }
 
-        sum
+        sum.sum()
     }
 
     /// Analytic anisotropic Duchon pair-block kernel.
