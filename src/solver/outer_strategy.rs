@@ -2960,8 +2960,7 @@ fn run_operator_trust_region(
                         Ok(eval) => eval,
                         Err(ObjectiveEvalError::Recoverable { message }) => {
                             let elapsed = iter_start.elapsed().as_secs_f64();
-                            let rejected_trust_radius =
-                                (new_trust_radius * 0.25).max(1e-12);
+                            let rejected_trust_radius = (new_trust_radius * 0.25).max(1e-12);
                             log::info!(
                                 "[ARC-timing] iter={iter} status=accepted_eval_error \
                                      cost={:.6e}->{:.6e} grad_norm={:.3e} rho={:.3} \
@@ -3053,20 +3052,20 @@ fn run_operator_trust_region(
             );
             trust_radius = new_trust_radius;
             if trust_radius <= OPERATOR_TRUST_RADIUS_REJECT_FLOOR {
-            let final_grad = projected_gradient(&x_k, &eval_k.gradient, bounds);
-            let final_grad_norm = final_grad.dot(&final_grad).sqrt();
-            return Ok(OuterResult {
-                rho: x_k,
-                final_value: eval_k.cost,
-                iterations: iter + 1,
-                final_grad_norm,
-                final_gradient: Some(eval_k.gradient),
-                final_hessian: None,
-                converged: false,
-                plan_used: plan,
-                operator_trust_radius: Some(trust_radius),
-                operator_stop_reason: Some(OperatorTrustRegionStopReason::RejectFloor),
-            });
+                let final_grad = projected_gradient(&x_k, &eval_k.gradient, bounds);
+                let final_grad_norm = final_grad.dot(&final_grad).sqrt();
+                return Ok(OuterResult {
+                    rho: x_k,
+                    final_value: eval_k.cost,
+                    iterations: iter + 1,
+                    final_grad_norm,
+                    final_gradient: Some(eval_k.gradient),
+                    final_hessian: None,
+                    converged: false,
+                    plan_used: plan,
+                    operator_trust_radius: Some(trust_radius),
+                    operator_stop_reason: Some(OperatorTrustRegionStopReason::RejectFloor),
+                });
             } else if dense_model.is_none() {
                 materialize_dense_after_rejection = true;
             }
