@@ -6392,15 +6392,12 @@ impl UnifiedOuterHessianOperator {
         let h_g = self.leverage.as_ref().ok_or_else(|| {
             "missing leverage cache for scalar outer Hessian operator".to_string()
         })?;
-        let idx_is_ext = self.coords[idx].is_ext();
         let mut c_trace = 0.0;
         for (j, &alpha_j) in alpha.iter().enumerate() {
             if alpha_j == 0.0 {
                 continue;
             }
-            let j_is_ext = self.coords[j].is_ext();
-            let sign = if idx_is_ext || j_is_ext { -1.0 } else { 1.0 };
-            c_trace += sign * alpha_j * self.pair_rhs_dot(idx, j, z_c.view());
+            c_trace += alpha_j * self.pair_rhs_dot(idx, j, z_c.view());
         }
         let d_trace = if let Some(trace) = self.fourth_trace.as_ref() {
             let mut combo = 0.0;
