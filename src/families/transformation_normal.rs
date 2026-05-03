@@ -14,13 +14,15 @@
 //! away from the `log(0)` singularity, while the non-negative M-spline basis
 //! and squared covariate-side coefficients supply the learned shape.
 //!
-//! The log-likelihood per observation is the change-of-variables density for a
-//! standard normal target:
+//! The log-likelihood per observation is the finite-support normalized
+//! change-of-variables density for a standard normal target:
 //!
-//!   ℓ_i = -½ h_i² + log(h'_i)
+//!   ℓ_i = -½ h_i² + log(h'_i) - log(Φ(h_U(x_i)) - Φ(h_L(x_i)))
 //!
 //! where `h_i = b(x_i) + ε·(y_i−median_y) + Σ_k I_k(y_i) γ_k(x_i)^2`
-//! and `h'_i = ε + Σ_k M_k(y_i) γ_k(x_i)^2`.
+//! and `h'_i = ε + Σ_k M_k(y_i) γ_k(x_i)^2`. The endpoint normalizer is
+//! required because the I-spline response basis saturates at finite support
+//! values rather than mapping onto the full real line.
 
 use crate::basis::{
     BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
@@ -44,7 +46,7 @@ use crate::matrix::{
     DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator, SymmetricMatrix,
 };
 use crate::pirls::LinearInequalityConstraints;
-use crate::probability::{log1mexp_positive, normal_logcdf, normal_pdf};
+use crate::probability::{log1mexp_positive, normal_logcdf};
 use crate::resource::{MatrixMaterializationError, ResourcePolicy};
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
@@ -123,11 +125,11 @@ const CTN_ALLOW_TAU_TAU_GRADIENT_ONLY_PREFERENCE: bool = false;
 const CTN_COVARIATE_SECOND_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
 /// Absolute bound for feasible transformation scores on the standard-normal
 /// scale. The CTN likelihood targets `h(Y|x) ~ N(0,1)`; accepting exact-Newton
-/// iterates with finite positive `h'` but astronomical `|h|` lets the objective
-/// and population calibration diagnostics overflow into meaningless values.
-/// A value of 12 is already beyond any practically observable standard-normal
-/// quantile in this model's sample sizes, so this is a domain invariant rather
-/// than statistical shrinkage.
+/// iterates with finite positive `h'` but astronomical `|h|` lets curvature
+/// diagnostics overflow into meaningless values. This is a numerical runaway
+/// guard, not a statistical plausibility filter: startup seeds can temporarily
+/// land outside practically observable normal quantiles before the line search
+/// moves them back into the likelihood's high-density region.
 pub const TRANSFORMATION_NORMAL_H_ABS_MAX: f64 = 1.0e6;
 /// Maximum number of response quantiles drawn into the monotonicity grid.
 /// Shared between fit and predict so the grid construction is identical.
@@ -195,6 +197,13 @@ pub struct TransformationNormalFamily {
     // --- Covariate side (rebuilt on κ change) ---
     /// Original covariate design used on the right side of the tensor product.
     covariate_design: DesignMatrix,
+    /// Dense covariate block shared by row-quantity and endpoint evaluations.
+    ///
+    /// CTN row quantities are rebuilt at every accepted/probed β, but the
+    /// covariate design is fixed for the family. Caching this immutable
+    /// `n × p_cov` block avoids repeated chunk materialization and keeps
+    /// biobank-scale runs from churning large transient allocations.
+    covariate_dense_cache: Arc<Mutex<Option<Arc<Array2<f64>>>>>,
     /// Optional non-negative row weights folded directly into the likelihood.
     weights: Arc<Array1<f64>>,
     /// Additive offset for the transformation linear predictor.
@@ -233,14 +242,14 @@ struct TransformationNormalRowQuantityCache {
     beta: Arc<Array1<f64>>,
     h: Arc<Array1<f64>>,
     h_prime: Arc<Array1<f64>>,
-    h_lower: Arc<Array1<f64>>,
-    h_upper: Arc<Array1<f64>>,
+    endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
     log_likelihood: f64,
 }
 
 #[derive(Debug)]
 struct TransformationNormalRowDerived {
     log_likelihood: f64,
+    endpoint_q: Vec<LogNormalCdfDiffDerivatives>,
 }
 
 impl TransformationNormalRowQuantityCache {
@@ -263,6 +272,7 @@ fn build_transformation_row_derived(
     debug_assert_eq!(weights.len(), n);
 
     let mut log_likelihood = 0.0;
+    let mut endpoint_q = Vec::with_capacity(n);
 
     if let Some((i, value)) = h
         .iter()
@@ -293,9 +303,10 @@ fn build_transformation_row_derived(
         let weighted_h = weights[i] * h[i];
         let weighted_inv_h_prime = weights[i] * inv_h_prime;
         let weighted_inv_h_prime_sq = weights[i] * inv_h_prime_sq;
-        let log_z = log_normal_cdf_diff(h_upper[i], h_lower[i]).map_err(|e| {
+        let q = log_normal_cdf_diff_derivatives(h_upper[i], h_lower[i]).map_err(|e| {
             format!("TransformationNormalFamily row_quantities: row {i} invalid endpoint normalizer: {e}")
         })?;
+        let log_z = q.log_z;
         log_likelihood += weights[i] * (-0.5 * h[i] * h[i] + hp.ln() - log_z);
         let derived_values = [
             ("1/h'", inv_h_prime),
@@ -315,6 +326,7 @@ fn build_transformation_row_derived(
                 ));
             }
         }
+        endpoint_q.push(q);
     }
     if !log_likelihood.is_finite() {
         return Err(format!(
@@ -322,7 +334,10 @@ fn build_transformation_row_derived(
         ));
     }
 
-    Ok(TransformationNormalRowDerived { log_likelihood })
+    Ok(TransformationNormalRowDerived {
+        log_likelihood,
+        endpoint_q,
+    })
 }
 
 fn log_normal_cdf_diff(upper: f64, lower: f64) -> Result<f64, String> {
@@ -335,6 +350,9 @@ fn log_normal_cdf_diff(upper: f64, lower: f64) -> Result<f64, String> {
         return Err(format!(
             "upper endpoint score must exceed lower endpoint score, got lower={lower:.6e}, upper={upper:.6e}"
         ));
+    }
+    if lower > 0.0 {
+        return log_normal_cdf_diff(-lower, -upper);
     }
     let log_upper = normal_logcdf(upper);
     let log_lower = normal_logcdf(lower);
@@ -353,12 +371,115 @@ fn log_normal_cdf_diff(upper: f64, lower: f64) -> Result<f64, String> {
     Ok(log_z)
 }
 
-#[derive(Clone, Copy)]
+fn signed_normal_pdf_ratio(
+    x: f64,
+    polynomial_factor: f64,
+    log_z: f64,
+    factorial_scale: f64,
+) -> f64 {
+    if polynomial_factor == 0.0 {
+        return 0.0;
+    }
+    const LOG_SQRT_2PI: f64 = 0.918_938_533_204_672_7;
+    let log_abs =
+        polynomial_factor.abs().ln() - 0.5 * x * x - LOG_SQRT_2PI - factorial_scale.ln() - log_z;
+    polynomial_factor.signum() * log_abs.exp()
+}
+
+#[derive(Clone, Copy, Debug)]
 struct LogNormalCdfDiffDerivatives {
+    log_z: f64,
     first: [f64; 2],
     second: [[f64; 2]; 2],
     third: [[[f64; 2]; 2]; 2],
     fourth: [[[[f64; 2]; 2]; 2]; 2],
+}
+
+fn endpoint_chain_first(q: &LogNormalCdfDiffDerivatives, a: [f64; 2]) -> f64 {
+    q.first[0] * a[0] + q.first[1] * a[1]
+}
+
+fn endpoint_chain_second(
+    q: &LogNormalCdfDiffDerivatives,
+    a: [f64; 2],
+    b: [f64; 2],
+    ab: [f64; 2],
+) -> f64 {
+    let mut out = endpoint_chain_first(q, ab);
+    for i in 0..2 {
+        for j in 0..2 {
+            out += q.second[i][j] * a[i] * b[j];
+        }
+    }
+    out
+}
+
+fn endpoint_chain_third(
+    q: &LogNormalCdfDiffDerivatives,
+    a: [f64; 2],
+    b: [f64; 2],
+    c: [f64; 2],
+    ab: [f64; 2],
+    ac: [f64; 2],
+    bc: [f64; 2],
+    abc: [f64; 2],
+) -> f64 {
+    let mut out = endpoint_chain_first(q, abc);
+    for i in 0..2 {
+        for j in 0..2 {
+            out += q.second[i][j] * (ab[i] * c[j] + ac[i] * b[j] + bc[i] * a[j]);
+            for k in 0..2 {
+                out += q.third[i][j][k] * a[i] * b[j] * c[k];
+            }
+        }
+    }
+    out
+}
+
+fn endpoint_chain_fourth(
+    q: &LogNormalCdfDiffDerivatives,
+    a: [f64; 2],
+    b: [f64; 2],
+    c: [f64; 2],
+    d: [f64; 2],
+    ab: [f64; 2],
+    ac: [f64; 2],
+    ad: [f64; 2],
+    bc: [f64; 2],
+    bd: [f64; 2],
+    cd: [f64; 2],
+    abc: [f64; 2],
+    abd: [f64; 2],
+    acd: [f64; 2],
+    bcd: [f64; 2],
+    abcd: [f64; 2],
+) -> f64 {
+    let mut out = endpoint_chain_first(q, abcd);
+    for i in 0..2 {
+        for j in 0..2 {
+            out += q.second[i][j]
+                * (abc[i] * d[j]
+                    + abd[i] * c[j]
+                    + acd[i] * b[j]
+                    + bcd[i] * a[j]
+                    + ab[i] * cd[j]
+                    + ac[i] * bd[j]
+                    + ad[i] * bc[j]);
+            for k in 0..2 {
+                out += q.third[i][j][k]
+                    * (ab[i] * c[j] * d[k]
+                        + ac[i] * b[j] * d[k]
+                        + ad[i] * b[j] * c[k]
+                        + bc[i] * a[j] * d[k]
+                        + bd[i] * a[j] * c[k]
+                        + cd[i] * a[j] * b[k]);
+                for l in 0..2 {
+                    out += q.fourth[i][j][k][l] * a[i] * b[j] * c[k] * d[l];
+                }
+            }
+        }
+    }
+    out
 }
 
 fn factorial(n: usize) -> f64 {
@@ -397,34 +518,38 @@ fn log_normal_cdf_diff_derivatives(
     lower: f64,
 ) -> Result<LogNormalCdfDiffDerivatives, String> {
     let log_z = log_normal_cdf_diff(upper, lower)?;
-    let z = log_z.exp();
-    if !(z.is_finite() && z > 0.0) {
+    if !log_z.is_finite() {
         return Err(format!(
-            "normal CDF endpoint mass is not finite, lower={lower:.6e}, upper={upper:.6e}"
+            "normal CDF endpoint log-mass is not finite, lower={lower:.6e}, upper={upper:.6e}"
         ));
     }
 
-    let phi_u = normal_pdf(upper);
-    let phi_l = normal_pdf(lower);
     let s_u = [
         0.0,
-        phi_u,
-        -upper * phi_u,
-        (upper * upper - 1.0) * phi_u,
-        -(upper * upper * upper - 3.0 * upper) * phi_u,
+        1.0,
+        -upper,
+        upper * upper - 1.0,
+        -(upper * upper * upper - 3.0 * upper),
     ];
     let s_l = [
         0.0,
-        -phi_l,
-        lower * phi_l,
-        -(lower * lower - 1.0) * phi_l,
-        (lower * lower * lower - 3.0 * lower) * phi_l,
+        -1.0,
+        lower,
+        -(lower * lower - 1.0),
+        lower * lower * lower - 3.0 * lower,
     ];
 
     let mut r = [[0.0; 5]; 5];
     for order in 1..=4 {
-        r[order][0] = s_u[order] / (factorial(order) * z);
-        r[0][order] = s_l[order] / (factorial(order) * z);
+        let factor = factorial(order);
+        r[order][0] = signed_normal_pdf_ratio(upper, s_u[order], log_z, factor);
+        r[0][order] = signed_normal_pdf_ratio(lower, s_l[order], log_z, factor);
+        if !(r[order][0].is_finite() && r[0][order].is_finite()) {
+            return Err(format!(
+                "normal CDF endpoint derivative ratio is not representable at order {order}, \
+                 lower={lower:.6e}, upper={upper:.6e}, log_z={log_z:.6e}"
+            ));
+        }
     }
 
     let r2 = poly_mul_truncated(&r, &r);
@@ -466,6 +591,7 @@ fn log_normal_cdf_diff_derivatives(
     }
 
     Ok(LogNormalCdfDiffDerivatives {
+        log_z,
         first,
         second,
         third,
@@ -638,6 +764,7 @@ impl TransformationNormalFamily {
             response_floor_offset: Arc::new(response_floor_offset),
             response_lower_floor_offset,
             response_upper_floor_offset,
+            covariate_dense_cache: Arc::new(Mutex::new(None)),
             row_quantity_cache: Arc::new(Mutex::new(None)),
         })
     }
@@ -811,6 +938,7 @@ impl TransformationNormalFamily {
             response_floor_offset: Arc::new(response_floor_offset),
             response_lower_floor_offset,
             response_upper_floor_offset,
+            covariate_dense_cache: Arc::new(Mutex::new(None)),
             row_quantity_cache: Arc::new(Mutex::new(None)),
         })
     }
@@ -855,6 +983,24 @@ impl TransformationNormalFamily {
 
     // --- Internal helpers ---
 
+    fn covariate_dense_arc(&self) -> Result<Arc<Array2<f64>>, String> {
+        let mut cache = self
+            .covariate_dense_cache
+            .lock()
+            .expect("CTN covariate dense cache mutex poisoned");
+        if let Some(cached) = cache.as_ref() {
+            return Ok(cached.clone());
+        }
+        let dense = Arc::new(
+            self.covariate_design
+                .try_row_chunk(0..self.response_val_basis.nrows())
+                .map_err(|e| format!("SCOP covariate dense materialization failed: {e}"))?,
+        );
+        *cache = Some(dense.clone());
+        Ok(dense)
+    }
+
+    #[cfg(test)]
     fn scop_endpoint_values(
         &self,
         beta: &Array1<f64>,
@@ -908,28 +1054,60 @@ impl TransformationNormalFamily {
             }
         }
 
-        // SCOP-CTN: h(y, x) = b(x) + Σ_k γ_k(x)² · I_k(y), with
-        // γ_k(x) = ψ(x)ᵀ Γ_{k,:} and h'(y, x) = Σ_k γ_k(x)² · M_k(y).
-        // Response column 0 is the unconstrained affine/location component
-        // b(x); all remaining response columns are squared shape components.
-        let h = self.x_val_kron.scop_affine_squared_forward(beta)
-            + self.offset.as_ref()
-            + self.response_floor_offset.as_ref();
-        let h_prime = self
-            .x_deriv_kron
-            .scop_affine_squared_forward(beta)
-            .mapv(|hp| hp + TRANSFORMATION_MONOTONICITY_EPS);
         let p_resp = self.response_val_basis.ncols();
         let p_cov = self.covariate_design.ncols();
         let beta_mat = beta
             .view()
             .into_shape_with_order((p_resp, p_cov))
             .map_err(|e| format!("SCOP endpoint beta reshape failed: {e}"))?;
-        let cov = self
-            .covariate_design
-            .try_row_chunk(0..self.response_val_basis.nrows())
-            .map_err(|e| format!("SCOP endpoint values require covariate row chunk: {e}"))?;
-        let (h_lower, h_upper) = self.scop_endpoint_values(beta, beta_mat, cov.view())?;
+        let cov = self.covariate_dense_arc()?;
+
+        // SCOP-CTN: h(y, x) = b(x) + Σ_k γ_k(x)² · I_k(y), with
+        // γ_k(x) = ψ(x)ᵀ Γ_{k,:} and h'(y, x) = Σ_k γ_k(x)² · M_k(y).
+        // Response column 0 is the unconstrained affine/location component
+        // b(x); all remaining response columns are squared shape components.
+        //
+        // The observed value, derivative value, and finite-support endpoints
+        // all depend on the same covariate-side γ_k(x_i).  Compute γ once and
+        // fan it out exactly; the previous path projected β through the same
+        // covariate design three times per row-quantity build.
+        let gamma = fast_ab(cov.as_ref(), &beta_mat.t().to_owned());
+        let n = gamma.nrows();
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let rows: Vec<(f64, f64, f64, f64)> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let gamma_row = gamma.row(i);
+                let val_row = self.response_val_basis.row(i);
+                let deriv_row = self.response_deriv_basis.row(i);
+                let g0 = gamma_row[0];
+                let offset_i = self.offset[i];
+                let mut h_acc = val_row[0] * g0 + offset_i + self.response_floor_offset[i];
+                let mut hp_acc = deriv_row[0] * g0 + TRANSFORMATION_MONOTONICITY_EPS;
+                let mut lower_acc =
+                    self.response_lower_basis[0] * g0 + offset_i + self.response_lower_floor_offset;
+                let mut upper_acc =
+                    self.response_upper_basis[0] * g0 + offset_i + self.response_upper_floor_offset;
+                for k in 1..p_resp {
+                    let g_sq = gamma_row[k] * gamma_row[k];
+                    h_acc += val_row[k] * g_sq;
+                    hp_acc += deriv_row[k] * g_sq;
+                    lower_acc += self.response_lower_basis[k] * g_sq;
+                    upper_acc += self.response_upper_basis[k] * g_sq;
+                }
+                (h_acc, hp_acc, lower_acc, upper_acc)
+            })
+            .collect();
+        let mut h = Array1::<f64>::zeros(n);
+        let mut h_prime = Array1::<f64>::zeros(n);
+        let mut h_lower = Array1::<f64>::zeros(n);
+        let mut h_upper = Array1::<f64>::zeros(n);
+        for (i, (h_i, hp_i, lower_i, upper_i)) in rows.into_iter().enumerate() {
+            h[i] = h_i;
+            h_prime[i] = hp_i;
+            h_lower[i] = lower_i;
+            h_upper[i] = upper_i;
+        }
         for (i, &value) in h.iter().enumerate() {
             if !value.is_finite() {
                 return Err(format!(
@@ -991,8 +1169,7 @@ impl TransformationNormalFamily {
             beta: Arc::new(beta.clone()),
             h: Arc::new(h),
             h_prime: Arc::new(h_prime),
-            h_lower: Arc::new(h_lower),
-            h_upper: Arc::new(h_upper),
+            endpoint_q: Arc::new(derived.endpoint_q),
             log_likelihood: derived.log_likelihood,
         };
 
@@ -1030,8 +1207,6 @@ impl TransformationNormalFamily {
         let weights = self.weights.as_ref();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
-        let h_lower = row_quantities.h_lower.as_ref();
-        let h_upper = row_quantities.h_upper.as_ref();
         let mut gradient = Array1::<f64>::zeros(p_total);
         let mut hessian = Array2::<f64>::zeros((p_total, p_total));
         let mut gamma = vec![0.0; p_resp];
@@ -1055,7 +1230,7 @@ impl TransformationNormalFamily {
                 gamma[k] = beta_mat.row(k).dot(&cov_row);
             }
 
-            let q = log_normal_cdf_diff_derivatives(h_upper[i], h_lower[i])?;
+            let q = row_quantities.endpoint_q[i];
             lower_factor[0] = self.response_lower_basis[0];
             upper_factor[0] = self.response_upper_basis[0];
             for k in 1..p_resp {
@@ -1149,8 +1324,6 @@ impl TransformationNormalFamily {
         let weights = self.weights.as_ref();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
-        let h_lower = row_quantities.h_lower.as_ref();
-        let h_upper = row_quantities.h_upper.as_ref();
         let mut gradient = Array1::<f64>::zeros(p_total);
         let mut gamma = vec![0.0; p_resp];
         let mut lower_factor = vec![0.0; p_resp];
@@ -1168,7 +1341,7 @@ impl TransformationNormalFamily {
                 gamma[k] = beta_mat.row(k).dot(&cov_row);
             }
 
-            let q = log_normal_cdf_diff_derivatives(h_upper[i], h_lower[i])?;
+            let q = row_quantities.endpoint_q[i];
             lower_factor[0] = self.response_lower_basis[0];
             upper_factor[0] = self.response_upper_basis[0];
             for k in 1..p_resp {
@@ -1255,8 +1428,6 @@ impl TransformationNormalFamily {
             .map_err(|e| format!("SCOP Hessian directional derivative requires row chunk: {e}"))?;
         let weights = self.weights.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
-        let h_lower = row_quantities.h_lower.as_ref();
-        let h_upper = row_quantities.h_upper.as_ref();
         let mut out = Array2::<f64>::zeros((p_total, p_total));
 
         for i in 0..n {
@@ -1285,12 +1456,10 @@ impl TransformationNormalFamily {
             for k in 1..p_resp {
                 h_dir += 2.0 * rv[k] * gamma[k] * gamma_dir[k];
                 hp_dir += 2.0 * rd[k] * gamma[k] * gamma_dir[k];
-                endpoint_dir[0] +=
-                    2.0 * self.response_upper_basis[k] * gamma[k] * gamma_dir[k];
-                endpoint_dir[1] +=
-                    2.0 * self.response_lower_basis[k] * gamma[k] * gamma_dir[k];
+                endpoint_dir[0] += 2.0 * self.response_upper_basis[k] * gamma[k] * gamma_dir[k];
+                endpoint_dir[1] += 2.0 * self.response_lower_basis[k] * gamma[k] * gamma_dir[k];
             }
-            let q = log_normal_cdf_diff_derivatives(h_upper[i], h_lower[i])?;
+            let q = row_quantities.endpoint_q[i];
 
             let mut h_factor = vec![0.0; p_resp];
             let mut hp_factor = vec![0.0; p_resp];
@@ -1328,8 +1497,7 @@ impl TransformationNormalFamily {
                             0.0
                         };
                         for b in 0..2 {
-                            normalizer_block +=
-                                q.second[a][b] * endpoint_dir[b] * h_a_ab;
+                            normalizer_block += q.second[a][b] * endpoint_dir[b] * h_a_ab;
                             normalizer_block += q.second[a][b]
                                 * (endpoint_factor_dir[a][k] * endpoint_factor[b][l]
                                     + endpoint_factor[a][k] * endpoint_factor_dir[b][l]);
@@ -1439,8 +1607,6 @@ impl TransformationNormalFamily {
         })?;
         let weights = self.weights.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
-        let h_lower = row_quantities.h_lower.as_ref();
-        let h_upper = row_quantities.h_upper.as_ref();
         let mut out = Array2::<f64>::zeros((p_total, p_total));
 
         for i in 0..n {
@@ -1488,7 +1654,7 @@ impl TransformationNormalFamily {
                 endpoint_uv[0] += 2.0 * self.response_upper_basis[k] * gamma_u[k] * gamma_v[k];
                 endpoint_uv[1] += 2.0 * self.response_lower_basis[k] * gamma_u[k] * gamma_v[k];
             }
-            let q = log_normal_cdf_diff_derivatives(h_upper[i], h_lower[i])?;
+            let q = row_quantities.endpoint_q[i];
 
             let mut h_factor = vec![0.0; p_resp];
             let mut hp_factor = vec![0.0; p_resp];
@@ -1535,10 +1701,8 @@ impl TransformationNormalFamily {
                         for b in 0..2 {
                             normalizer_block += q.second[a][b] * endpoint_uv[b] * h_a_ab;
                             for c_ep in 0..2 {
-                                normalizer_block += q.third[a][b][c_ep]
-                                    * endpoint_v[c_ep]
-                                    * endpoint_u[b]
-                                    * h_a_ab;
+                                normalizer_block +=
+                                    q.third[a][b][c_ep] * endpoint_v[c_ep] * endpoint_u[b] * h_a_ab;
                                 normalizer_block += q.third[a][b][c_ep]
                                     * endpoint_uv[c_ep]
                                     * endpoint_factor[a][k]
@@ -1643,8 +1807,6 @@ impl TransformationNormalFamily {
         let weights = self.weights.as_ref();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
-        let h_lower = row_quantities.h_lower.as_ref();
-        let h_upper = row_quantities.h_upper.as_ref();
         let mut out = Array1::<f64>::zeros(p_total);
 
         for i in 0..n {
@@ -1674,7 +1836,7 @@ impl TransformationNormalFamily {
                 lower_probe += 2.0 * self.response_lower_basis[k] * gamma[k] * probe_gamma[k];
                 upper_probe += 2.0 * self.response_upper_basis[k] * gamma[k] * probe_gamma[k];
             }
-            let q = log_normal_cdf_diff_derivatives(h_upper[i], h_lower[i])?;
+            let q = row_quantities.endpoint_q[i];
 
             for k in 0..p_resp {
                 let h_factor = if k == 0 {
@@ -1767,8 +1929,6 @@ impl TransformationNormalFamily {
             .map_err(|e| format!("SCOP dH matvec requires row chunk: {e}"))?;
         let weights = self.weights.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
-        let h_lower = row_quantities.h_lower.as_ref();
-        let h_upper = row_quantities.h_upper.as_ref();
         let mut out = Array1::<f64>::zeros(p_total);
 
         for i in 0..n {
@@ -1812,20 +1972,16 @@ impl TransformationNormalFamily {
                 hp_probe += 2.0 * rd[k] * gamma[k] * gamma_probe[k];
                 h_dir_probe += 2.0 * rv[k] * gamma_dir[k] * gamma_probe[k];
                 hp_dir_probe += 2.0 * rd[k] * gamma_dir[k] * gamma_probe[k];
-                endpoint_dir[0] +=
-                    2.0 * self.response_upper_basis[k] * gamma[k] * gamma_dir[k];
-                endpoint_dir[1] +=
-                    2.0 * self.response_lower_basis[k] * gamma[k] * gamma_dir[k];
-                endpoint_probe[0] +=
-                    2.0 * self.response_upper_basis[k] * gamma[k] * gamma_probe[k];
-                endpoint_probe[1] +=
-                    2.0 * self.response_lower_basis[k] * gamma[k] * gamma_probe[k];
+                endpoint_dir[0] += 2.0 * self.response_upper_basis[k] * gamma[k] * gamma_dir[k];
+                endpoint_dir[1] += 2.0 * self.response_lower_basis[k] * gamma[k] * gamma_dir[k];
+                endpoint_probe[0] += 2.0 * self.response_upper_basis[k] * gamma[k] * gamma_probe[k];
+                endpoint_probe[1] += 2.0 * self.response_lower_basis[k] * gamma[k] * gamma_probe[k];
                 endpoint_dir_probe[0] +=
                     2.0 * self.response_upper_basis[k] * gamma_dir[k] * gamma_probe[k];
                 endpoint_dir_probe[1] +=
                     2.0 * self.response_lower_basis[k] * gamma_dir[k] * gamma_probe[k];
             }
-            let q = log_normal_cdf_diff_derivatives(h_upper[i], h_lower[i])?;
+            let q = row_quantities.endpoint_q[i];
 
             for k in 0..p_resp {
                 let h_factor = if k == 0 {
@@ -1974,8 +2130,6 @@ impl TransformationNormalFamily {
             .map_err(|e| format!("SCOP d2H matvec requires row chunk: {e}"))?;
         let weights = self.weights.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
-        let h_lower = row_quantities.h_lower.as_ref();
-        let h_upper = row_quantities.h_upper.as_ref();
         let mut out = Array1::<f64>::zeros(p_total);
 
         for i in 0..n {
@@ -2038,10 +2192,8 @@ impl TransformationNormalFamily {
                 endpoint_u[1] += 2.0 * self.response_lower_basis[k] * gamma[k] * gamma_u[k];
                 endpoint_v[0] += 2.0 * self.response_upper_basis[k] * gamma[k] * gamma_v[k];
                 endpoint_v[1] += 2.0 * self.response_lower_basis[k] * gamma[k] * gamma_v[k];
-                endpoint_probe[0] +=
-                    2.0 * self.response_upper_basis[k] * gamma[k] * gamma_probe[k];
-                endpoint_probe[1] +=
-                    2.0 * self.response_lower_basis[k] * gamma[k] * gamma_probe[k];
+                endpoint_probe[0] += 2.0 * self.response_upper_basis[k] * gamma[k] * gamma_probe[k];
+                endpoint_probe[1] += 2.0 * self.response_lower_basis[k] * gamma[k] * gamma_probe[k];
                 endpoint_uv[0] += 2.0 * self.response_upper_basis[k] * gamma_u[k] * gamma_v[k];
                 endpoint_uv[1] += 2.0 * self.response_lower_basis[k] * gamma_u[k] * gamma_v[k];
                 endpoint_u_probe[0] +=
@@ -2053,7 +2205,7 @@ impl TransformationNormalFamily {
                 endpoint_v_probe[1] +=
                     2.0 * self.response_lower_basis[k] * gamma_v[k] * gamma_probe[k];
             }
-            let q = log_normal_cdf_diff_derivatives(h_upper[i], h_lower[i])?;
+            let q = row_quantities.endpoint_q[i];
 
             for k in 0..p_resp {
                 let hp_factor = if k == 0 {
@@ -2231,8 +2383,6 @@ impl TransformationNormalFamily {
         let weights = self.weights.as_ref();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
-        let h_lower = row_quantities.h_lower.as_ref();
-        let h_upper = row_quantities.h_upper.as_ref();
         let mut diag = Array1::<f64>::zeros(p_total);
         for i in 0..n {
             let cov_row = cov.row(i);
@@ -2247,7 +2397,7 @@ impl TransformationNormalFamily {
             for k in 0..p_resp {
                 gamma[k] = beta_mat.row(k).dot(&cov_row);
             }
-            let q = log_normal_cdf_diff_derivatives(h_upper[i], h_lower[i])?;
+            let q = row_quantities.endpoint_q[i];
             for k in 0..p_resp {
                 let h_factor = if k == 0 {
                     rv[0]
@@ -2372,6 +2522,7 @@ impl TransformationNormalFamily {
             let inv_hp = 1.0 / hp;
             let inv_hp_sq = inv_hp * inv_hp;
             let inv_hp_cu = inv_hp_sq * inv_hp;
+            let q = row_quantities.endpoint_q[i];
 
             let mut gamma = vec![0.0; p_resp];
             let mut gamma_psi = vec![0.0; p_resp];
@@ -2386,7 +2537,34 @@ impl TransformationNormalFamily {
                 h_psi += 2.0 * rv[k] * gamma[k] * gamma_psi[k];
                 hp_psi += 2.0 * rd[k] * gamma[k] * gamma_psi[k];
             }
-            objective_psi += wi * (hi * h_psi - hp_psi * inv_hp);
+
+            let endpoint_basis = [
+                self.response_upper_basis
+                    .as_slice()
+                    .ok_or_else(|| "SCOP endpoint upper basis is not contiguous".to_string())?,
+                self.response_lower_basis
+                    .as_slice()
+                    .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
+            ];
+            let mut endpoint_psi = [0.0; 2];
+            let mut endpoint_factor = vec![[0.0; 2]; p_resp];
+            let mut endpoint_psi_cov_factor = vec![[0.0; 2]; p_resp];
+            let mut endpoint_psi_psi_factor = vec![[0.0; 2]; p_resp];
+            for e in 0..2 {
+                let basis = endpoint_basis[e];
+                endpoint_psi[e] = basis[0] * gamma_psi[0];
+                endpoint_factor[0][e] = basis[0];
+                endpoint_psi_psi_factor[0][e] = basis[0];
+                for k in 1..p_resp {
+                    endpoint_psi[e] += 2.0 * basis[k] * gamma[k] * gamma_psi[k];
+                    endpoint_factor[k][e] = 2.0 * basis[k] * gamma[k];
+                    endpoint_psi_cov_factor[k][e] = 2.0 * basis[k] * gamma_psi[k];
+                    endpoint_psi_psi_factor[k][e] = 2.0 * basis[k] * gamma[k];
+                }
+            }
+
+            objective_psi +=
+                wi * (hi * h_psi - hp_psi * inv_hp + endpoint_chain_first(&q, endpoint_psi));
 
             let mut h_factor = vec![0.0; p_resp];
             let mut hp_factor = vec![0.0; p_resp];
@@ -2415,9 +2593,20 @@ impl TransformationNormalFamily {
                     let hpsi_a = hpsi_cov_factor[k] * cov_row[c] + hpsi_psi_factor[k] * psi_row[c];
                     let hppsi_a =
                         hppsi_cov_factor[k] * cov_row[c] + hppsi_psi_factor[k] * psi_row[c];
+                    let endpoint_a = [
+                        endpoint_factor[k][0] * cov_row[c],
+                        endpoint_factor[k][1] * cov_row[c],
+                    ];
+                    let endpoint_psi_a = [
+                        endpoint_psi_cov_factor[k][0] * cov_row[c]
+                            + endpoint_psi_psi_factor[k][0] * psi_row[c],
+                        endpoint_psi_cov_factor[k][1] * cov_row[c]
+                            + endpoint_psi_psi_factor[k][1] * psi_row[c],
+                    ];
                     score_psi[idx] += wi
                         * (h_a * h_psi + hi * hpsi_a - hppsi_a * inv_hp
-                            + hp_psi * hp_a * inv_hp_sq);
+                            + hp_psi * hp_a * inv_hp_sq
+                            + endpoint_chain_second(&q, endpoint_psi, endpoint_a, endpoint_psi_a));
                 }
             }
 
@@ -2440,6 +2629,26 @@ impl TransformationNormalFamily {
                                 hpsi_cov_factor[l] * cov_row[d] + hpsi_psi_factor[l] * psi_row[d];
                             let hppsi_b =
                                 hppsi_cov_factor[l] * cov_row[d] + hppsi_psi_factor[l] * psi_row[d];
+                            let endpoint_a = [
+                                endpoint_factor[k][0] * cov_row[c],
+                                endpoint_factor[k][1] * cov_row[c],
+                            ];
+                            let endpoint_b = [
+                                endpoint_factor[l][0] * cov_row[d],
+                                endpoint_factor[l][1] * cov_row[d],
+                            ];
+                            let endpoint_psi_a = [
+                                endpoint_psi_cov_factor[k][0] * cov_row[c]
+                                    + endpoint_psi_psi_factor[k][0] * psi_row[c],
+                                endpoint_psi_cov_factor[k][1] * cov_row[c]
+                                    + endpoint_psi_psi_factor[k][1] * psi_row[c],
+                            ];
+                            let endpoint_psi_b = [
+                                endpoint_psi_cov_factor[l][0] * cov_row[d]
+                                    + endpoint_psi_psi_factor[l][0] * psi_row[d],
+                                endpoint_psi_cov_factor[l][1] * cov_row[d]
+                                    + endpoint_psi_psi_factor[l][1] * psi_row[d],
+                            ];
                             let (h_ab, hp_ab, hpsi_ab, hppsi_ab) = if same_shape {
                                 (
                                     2.0 * rv[k] * cov_row[c] * cov_row[d],
@@ -2452,6 +2661,22 @@ impl TransformationNormalFamily {
                             } else {
                                 (0.0, 0.0, 0.0, 0.0)
                             };
+                            let (endpoint_ab, endpoint_psi_ab) = if same_shape {
+                                (
+                                    [
+                                        2.0 * endpoint_basis[0][k] * cov_row[c] * cov_row[d],
+                                        2.0 * endpoint_basis[1][k] * cov_row[c] * cov_row[d],
+                                    ],
+                                    [
+                                        2.0 * endpoint_basis[0][k]
+                                            * (psi_row[d] * cov_row[c] + psi_row[c] * cov_row[d]),
+                                        2.0 * endpoint_basis[1][k]
+                                            * (psi_row[d] * cov_row[c] + psi_row[c] * cov_row[d]),
+                                    ],
+                                )
+                            } else {
+                                ([0.0; 2], [0.0; 2])
+                            };
                             let value = hpsi_a * h_b
                                 + h_a * hpsi_b
                                 + h_psi * h_ab
@@ -2459,7 +2684,17 @@ impl TransformationNormalFamily {
                                 + (hppsi_a * hp_b + hp_a * hppsi_b) * inv_hp_sq
                                 - 2.0 * hp_a * hp_b * hp_psi * inv_hp_cu
                                 - hppsi_ab * inv_hp
-                                + hp_ab * hp_psi * inv_hp_sq;
+                                + hp_ab * hp_psi * inv_hp_sq
+                                + endpoint_chain_third(
+                                    &q,
+                                    endpoint_psi,
+                                    endpoint_a,
+                                    endpoint_b,
+                                    endpoint_psi_a,
+                                    endpoint_psi_b,
+                                    endpoint_ab,
+                                    endpoint_psi_ab,
+                                );
                             hessian_psi[[row_idx, col_idx]] += wi * value;
                         }
                     }
@@ -2482,6 +2717,7 @@ impl TransformationNormalFamily {
         cov_i: ArrayView2<'_, f64>,
         cov_j: ArrayView2<'_, f64>,
         cov_ij: ArrayView2<'_, f64>,
+        endpoint_q: &[LogNormalCdfDiffDerivatives],
         direction: Option<&Array1<f64>>,
     ) -> Result<(f64, Array1<f64>, Option<Array1<f64>>), String> {
         let n = self.response_val_basis.nrows();
@@ -2492,6 +2728,12 @@ impl TransformationNormalFamily {
             return Err(format!(
                 "SCOP psi-psi beta length {} != p_resp({p_resp}) * p_cov({p_cov})",
                 beta.len()
+            ));
+        }
+        if endpoint_q.len() != n {
+            return Err(format!(
+                "SCOP psi-psi endpoint normalizer cache length {} != n={n}",
+                endpoint_q.len()
             ));
         }
         for (name, mat) in [
@@ -2530,6 +2772,14 @@ impl TransformationNormalFamily {
             }
             None => None,
         };
+        let endpoint_basis = [
+            self.response_upper_basis
+                .as_slice()
+                .ok_or_else(|| "SCOP endpoint upper basis is not contiguous".to_string())?,
+            self.response_lower_basis
+                .as_slice()
+                .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
+        ];
 
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
@@ -2610,7 +2860,27 @@ impl TransformationNormalFamily {
                         let inv_hp = 1.0 / hp;
                         let inv_hp_sq = inv_hp * inv_hp;
                         let inv_hp_cu = inv_hp_sq * inv_hp;
-                        let value = h_i * h_j + h * h_ij - hp_ij * inv_hp + hp_i * hp_j * inv_hp_sq;
+                        let q = endpoint_q[row_idx];
+                        let mut endpoint_i = [0.0; 2];
+                        let mut endpoint_j = [0.0; 2];
+                        let mut endpoint_ij = [0.0; 2];
+                        for e in 0..2 {
+                            let basis = endpoint_basis[e];
+                            endpoint_i[e] = basis[0] * acc.gamma_i[0];
+                            endpoint_j[e] = basis[0] * acc.gamma_j[0];
+                            endpoint_ij[e] = basis[0] * acc.gamma_ij[0];
+                            for k in 1..p_resp {
+                                endpoint_i[e] += 2.0 * basis[k] * acc.gamma[k] * acc.gamma_i[k];
+                                endpoint_j[e] += 2.0 * basis[k] * acc.gamma[k] * acc.gamma_j[k];
+                                endpoint_ij[e] += 2.0
+                                    * basis[k]
+                                    * (acc.gamma_j[k] * acc.gamma_i[k]
+                                        + acc.gamma[k] * acc.gamma_ij[k]);
+                            }
+                        }
+                        let value = h_i * h_j + h * h_ij - hp_ij * inv_hp
+                            + hp_i * hp_j * inv_hp_sq
+                            + endpoint_chain_second(&q, endpoint_i, endpoint_j, endpoint_ij);
                         let wi = weights[row_idx];
                         acc.objective += wi * value;
 
@@ -2651,11 +2921,55 @@ impl TransformationNormalFamily {
                                         2.0 * rdk * (gj * ci + gi * cj + gij * c + g * cij),
                                     )
                                 };
+                                let endpoint_a = if k == 0 {
+                                    [endpoint_basis[0][k] * c, endpoint_basis[1][k] * c]
+                                } else {
+                                    [
+                                        2.0 * endpoint_basis[0][k] * g * c,
+                                        2.0 * endpoint_basis[1][k] * g * c,
+                                    ]
+                                };
+                                let endpoint_i_a = if k == 0 {
+                                    [endpoint_basis[0][k] * ci, endpoint_basis[1][k] * ci]
+                                } else {
+                                    [
+                                        2.0 * endpoint_basis[0][k] * (gi * c + g * ci),
+                                        2.0 * endpoint_basis[1][k] * (gi * c + g * ci),
+                                    ]
+                                };
+                                let endpoint_j_a = if k == 0 {
+                                    [endpoint_basis[0][k] * cj, endpoint_basis[1][k] * cj]
+                                } else {
+                                    [
+                                        2.0 * endpoint_basis[0][k] * (gj * c + g * cj),
+                                        2.0 * endpoint_basis[1][k] * (gj * c + g * cj),
+                                    ]
+                                };
+                                let endpoint_ij_a = if k == 0 {
+                                    [endpoint_basis[0][k] * cij, endpoint_basis[1][k] * cij]
+                                } else {
+                                    [
+                                        2.0 * endpoint_basis[0][k]
+                                            * (gj * ci + gi * cj + gij * c + g * cij),
+                                        2.0 * endpoint_basis[1][k]
+                                            * (gj * ci + gi * cj + gij * c + g * cij),
+                                    ]
+                                };
                                 let grad = dh_i * h_j + h_i * dh_j + dh * h_ij + h * dh_ij
                                     - dhp_ij * inv_hp
                                     + hp_ij * dhp * inv_hp_sq
                                     + (dhp_i * hp_j + hp_i * dhp_j) * inv_hp_sq
-                                    - 2.0 * hp_i * hp_j * dhp * inv_hp_cu;
+                                    - 2.0 * hp_i * hp_j * dhp * inv_hp_cu
+                                    + endpoint_chain_third(
+                                        &q,
+                                        endpoint_i,
+                                        endpoint_j,
+                                        endpoint_a,
+                                        endpoint_ij,
+                                        endpoint_i_a,
+                                        endpoint_j_a,
+                                        endpoint_ij_a,
+                                    );
                                 acc.score[offset + cidx] += wi * grad;
                             }
                         }
@@ -2780,6 +3094,47 @@ impl TransformationNormalFamily {
                     let inv_hp_cu = inv_hp_sq * inv_hp;
                     let inv_hp_qu = inv_hp_sq * inv_hp_sq;
                     let wi = weights[row_idx];
+                    let q = endpoint_q[row_idx];
+                    let mut endpoint_i = [0.0; 2];
+                    let mut endpoint_j = [0.0; 2];
+                    let mut endpoint_ij = [0.0; 2];
+                    let mut endpoint_d = [0.0; 2];
+                    let mut endpoint_i_d = [0.0; 2];
+                    let mut endpoint_j_d = [0.0; 2];
+                    let mut endpoint_ij_d = [0.0; 2];
+                    for e in 0..2 {
+                        let basis = endpoint_basis[e];
+                        endpoint_i[e] = basis[0] * acc.gamma_i[0];
+                        endpoint_j[e] = basis[0] * acc.gamma_j[0];
+                        endpoint_ij[e] = basis[0] * acc.gamma_ij[0];
+                        endpoint_d[e] = basis[0] * acc.gamma_dot[0];
+                        endpoint_i_d[e] = basis[0] * acc.gamma_i_dot[0];
+                        endpoint_j_d[e] = basis[0] * acc.gamma_j_dot[0];
+                        endpoint_ij_d[e] = basis[0] * acc.gamma_ij_dot[0];
+                        for k in 1..p_resp {
+                            endpoint_i[e] += 2.0 * basis[k] * acc.gamma[k] * acc.gamma_i[k];
+                            endpoint_j[e] += 2.0 * basis[k] * acc.gamma[k] * acc.gamma_j[k];
+                            endpoint_ij[e] += 2.0
+                                * basis[k]
+                                * (acc.gamma_j[k] * acc.gamma_i[k]
+                                    + acc.gamma[k] * acc.gamma_ij[k]);
+                            endpoint_d[e] += 2.0 * basis[k] * acc.gamma[k] * acc.gamma_dot[k];
+                            endpoint_i_d[e] += 2.0
+                                * basis[k]
+                                * (acc.gamma_dot[k] * acc.gamma_i[k]
+                                    + acc.gamma[k] * acc.gamma_i_dot[k]);
+                            endpoint_j_d[e] += 2.0
+                                * basis[k]
+                                * (acc.gamma_dot[k] * acc.gamma_j[k]
+                                    + acc.gamma[k] * acc.gamma_j_dot[k]);
+                            endpoint_ij_d[e] += 2.0
+                                * basis[k]
+                                * (acc.gamma_j_dot[k] * acc.gamma_i[k]
+                                    + acc.gamma_j[k] * acc.gamma_i_dot[k]
+                                    + acc.gamma_dot[k] * acc.gamma_ij[k]
+                                    + acc.gamma[k] * acc.gamma_ij_dot[k]);
+                        }
+                    }
 
                     for k in 0..p_resp {
                         let offset = k * p_cov;
@@ -2858,6 +3213,74 @@ impl TransformationNormalFamily {
                                 )
                             };
 
+                            let endpoint_a = if k == 0 {
+                                [endpoint_basis[0][k] * c, endpoint_basis[1][k] * c]
+                            } else {
+                                [
+                                    2.0 * endpoint_basis[0][k] * g * c,
+                                    2.0 * endpoint_basis[1][k] * g * c,
+                                ]
+                            };
+                            let endpoint_i_a = if k == 0 {
+                                [endpoint_basis[0][k] * ci, endpoint_basis[1][k] * ci]
+                            } else {
+                                [
+                                    2.0 * endpoint_basis[0][k] * (gi * c + g * ci),
+                                    2.0 * endpoint_basis[1][k] * (gi * c + g * ci),
+                                ]
+                            };
+                            let endpoint_j_a = if k == 0 {
+                                [endpoint_basis[0][k] * cj, endpoint_basis[1][k] * cj]
+                            } else {
+                                [
+                                    2.0 * endpoint_basis[0][k] * (gj * c + g * cj),
+                                    2.0 * endpoint_basis[1][k] * (gj * c + g * cj),
+                                ]
+                            };
+                            let endpoint_ij_a = if k == 0 {
+                                [endpoint_basis[0][k] * cij, endpoint_basis[1][k] * cij]
+                            } else {
+                                [
+                                    2.0 * endpoint_basis[0][k]
+                                        * (gj * ci + gi * cj + gij * c + g * cij),
+                                    2.0 * endpoint_basis[1][k]
+                                        * (gj * ci + gi * cj + gij * c + g * cij),
+                                ]
+                            };
+                            let endpoint_a_d = if k == 0 {
+                                [0.0; 2]
+                            } else {
+                                [
+                                    2.0 * endpoint_basis[0][k] * u * c,
+                                    2.0 * endpoint_basis[1][k] * u * c,
+                                ]
+                            };
+                            let endpoint_i_a_d = if k == 0 {
+                                [0.0; 2]
+                            } else {
+                                [
+                                    2.0 * endpoint_basis[0][k] * (ui * c + u * ci),
+                                    2.0 * endpoint_basis[1][k] * (ui * c + u * ci),
+                                ]
+                            };
+                            let endpoint_j_a_d = if k == 0 {
+                                [0.0; 2]
+                            } else {
+                                [
+                                    2.0 * endpoint_basis[0][k] * (uj * c + u * cj),
+                                    2.0 * endpoint_basis[1][k] * (uj * c + u * cj),
+                                ]
+                            };
+                            let endpoint_ij_a_d = if k == 0 {
+                                [0.0; 2]
+                            } else {
+                                [
+                                    2.0 * endpoint_basis[0][k]
+                                        * (uj * ci + ui * cj + uij * c + u * cij),
+                                    2.0 * endpoint_basis[1][k]
+                                        * (uj * ci + ui * cj + uij * c + u * cij),
+                                ]
+                            };
                             let n1 = dhp_i * hp_j + hp_i * dhp_j;
                             let n1_dot =
                                 ddhp_i * hp_j + dhp_i * hp_j_dot + hp_i_dot * dhp_j + hp_i * ddhp_j;
@@ -2879,7 +3302,25 @@ impl TransformationNormalFamily {
                                 + n1_dot * inv_hp_sq
                                 - 2.0 * n1 * hp_dot * inv_hp_cu
                                 - 2.0 * n2_dot * inv_hp_cu
-                                + 6.0 * hp_i * hp_j * dhp * hp_dot * inv_hp_qu;
+                                + 6.0 * hp_i * hp_j * dhp * hp_dot * inv_hp_qu
+                                + endpoint_chain_fourth(
+                                    &q,
+                                    endpoint_i,
+                                    endpoint_j,
+                                    endpoint_a,
+                                    endpoint_d,
+                                    endpoint_ij,
+                                    endpoint_i_a,
+                                    endpoint_i_d,
+                                    endpoint_j_a,
+                                    endpoint_j_d,
+                                    endpoint_a_d,
+                                    endpoint_ij_a,
+                                    endpoint_ij_d,
+                                    endpoint_i_a_d,
+                                    endpoint_j_a_d,
+                                    endpoint_ij_a_d,
+                                );
                             acc.hvp[offset + cidx] += wi * hv;
                         }
                     }
@@ -2901,6 +3342,7 @@ impl TransformationNormalFamily {
         cov_i: ArrayView2<'_, f64>,
         cov_j: ArrayView2<'_, f64>,
         cov_ij: ArrayView2<'_, f64>,
+        endpoint_q: &[LogNormalCdfDiffDerivatives],
         left: ArrayView1<'_, f64>,
         right: ArrayView1<'_, f64>,
     ) -> Result<f64, String> {
@@ -2914,6 +3356,12 @@ impl TransformationNormalFamily {
                 beta.len(),
                 left.len(),
                 right.len()
+            ));
+        }
+        if endpoint_q.len() != n {
+            return Err(format!(
+                "SCOP psi-psi bilinear endpoint normalizer cache length {} != n={n}",
+                endpoint_q.len()
             ));
         }
         for (name, mat) in [
@@ -2942,6 +3390,14 @@ impl TransformationNormalFamily {
         let right_mat = right
             .into_shape_with_order((p_resp, p_cov))
             .map_err(|e| format!("SCOP psi-psi bilinear right reshape failed: {e}"))?;
+        let endpoint_basis = [
+            self.response_upper_basis
+                .as_slice()
+                .ok_or_else(|| "SCOP endpoint upper basis is not contiguous".to_string())?,
+            self.response_lower_basis
+                .as_slice()
+                .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
+        ];
 
         struct PsiPairBilinearAccum {
             value: f64,
@@ -3098,6 +3554,70 @@ impl TransformationNormalFamily {
                         hp_ij_lr += 2.0 * rd[k] * (lj * ri + rj * li + l * rij + r * lij);
                     }
 
+                    let q = endpoint_q[row_idx];
+                    let mut endpoint_i = [0.0; 2];
+                    let mut endpoint_j = [0.0; 2];
+                    let mut endpoint_ij = [0.0; 2];
+                    let mut endpoint_l = [0.0; 2];
+                    let mut endpoint_r = [0.0; 2];
+                    let mut endpoint_i_l = [0.0; 2];
+                    let mut endpoint_j_l = [0.0; 2];
+                    let mut endpoint_ij_l = [0.0; 2];
+                    let mut endpoint_i_r = [0.0; 2];
+                    let mut endpoint_j_r = [0.0; 2];
+                    let mut endpoint_ij_r = [0.0; 2];
+                    let mut endpoint_l_r = [0.0; 2];
+                    let mut endpoint_i_l_r = [0.0; 2];
+                    let mut endpoint_j_l_r = [0.0; 2];
+                    let mut endpoint_ij_l_r = [0.0; 2];
+                    for e in 0..2 {
+                        let basis = endpoint_basis[e];
+                        endpoint_i[e] = basis[0] * acc.gamma_i[0];
+                        endpoint_j[e] = basis[0] * acc.gamma_j[0];
+                        endpoint_ij[e] = basis[0] * acc.gamma_ij[0];
+                        endpoint_l[e] = basis[0] * acc.left[0];
+                        endpoint_r[e] = basis[0] * acc.right[0];
+                        endpoint_i_l[e] = basis[0] * acc.left_i[0];
+                        endpoint_j_l[e] = basis[0] * acc.left_j[0];
+                        endpoint_ij_l[e] = basis[0] * acc.left_ij[0];
+                        endpoint_i_r[e] = basis[0] * acc.right_i[0];
+                        endpoint_j_r[e] = basis[0] * acc.right_j[0];
+                        endpoint_ij_r[e] = basis[0] * acc.right_ij[0];
+                        for k in 1..p_resp {
+                            let basis_k = basis[k];
+                            let g = acc.gamma[k];
+                            let gi = acc.gamma_i[k];
+                            let gj = acc.gamma_j[k];
+                            let gij = acc.gamma_ij[k];
+                            let l = acc.left[k];
+                            let li = acc.left_i[k];
+                            let lj = acc.left_j[k];
+                            let lij = acc.left_ij[k];
+                            let r = acc.right[k];
+                            let ri = acc.right_i[k];
+                            let rj = acc.right_j[k];
+                            let rij = acc.right_ij[k];
+                            endpoint_i[e] += 2.0 * basis_k * g * gi;
+                            endpoint_j[e] += 2.0 * basis_k * g * gj;
+                            endpoint_ij[e] += 2.0 * basis_k * (gj * gi + g * gij);
+                            endpoint_l[e] += 2.0 * basis_k * g * l;
+                            endpoint_r[e] += 2.0 * basis_k * g * r;
+                            endpoint_i_l[e] += 2.0 * basis_k * (l * gi + g * li);
+                            endpoint_j_l[e] += 2.0 * basis_k * (l * gj + g * lj);
+                            endpoint_ij_l[e] +=
+                                2.0 * basis_k * (lj * gi + gj * li + l * gij + g * lij);
+                            endpoint_i_r[e] += 2.0 * basis_k * (r * gi + g * ri);
+                            endpoint_j_r[e] += 2.0 * basis_k * (r * gj + g * rj);
+                            endpoint_ij_r[e] +=
+                                2.0 * basis_k * (rj * gi + gj * ri + r * gij + g * rij);
+                            endpoint_l_r[e] += 2.0 * basis_k * l * r;
+                            endpoint_i_l_r[e] += 2.0 * basis_k * (l * ri + r * li);
+                            endpoint_j_l_r[e] += 2.0 * basis_k * (l * rj + r * lj);
+                            endpoint_ij_l_r[e] +=
+                                2.0 * basis_k * (lj * ri + rj * li + l * rij + r * lij);
+                        }
+                    }
+
                     let inv_hp = 1.0 / hp;
                     let inv_hp_sq = inv_hp * inv_hp;
                     let inv_hp_cu = inv_hp_sq * inv_hp;
@@ -3123,7 +3643,25 @@ impl TransformationNormalFamily {
                         - 2.0 * numerator_l * hp_r * inv_hp_cu
                         - 2.0 * numerator_r * hp_l * inv_hp_cu
                         - 2.0 * hp_i * hp_j * hp_lr * inv_hp_cu
-                        + 6.0 * hp_i * hp_j * hp_l * hp_r * inv_hp_qu;
+                        + 6.0 * hp_i * hp_j * hp_l * hp_r * inv_hp_qu
+                        + endpoint_chain_fourth(
+                            &q,
+                            endpoint_i,
+                            endpoint_j,
+                            endpoint_l,
+                            endpoint_r,
+                            endpoint_ij,
+                            endpoint_i_l,
+                            endpoint_i_r,
+                            endpoint_j_l,
+                            endpoint_j_r,
+                            endpoint_l_r,
+                            endpoint_ij_l,
+                            endpoint_ij_r,
+                            endpoint_i_l_r,
+                            endpoint_j_l_r,
+                            endpoint_ij_l_r,
+                        );
                     acc.value += weights[row_idx] * value_lr;
                     acc
                 },
@@ -3185,6 +3723,14 @@ impl TransformationNormalFamily {
 
         let weights = self.weights.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
+        let endpoint_basis = [
+            self.response_upper_basis
+                .as_slice()
+                .ok_or_else(|| "SCOP endpoint upper basis is not contiguous".to_string())?,
+            self.response_lower_basis
+                .as_slice()
+                .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
+        ];
         let mut out = Array2::<f64>::zeros((p_total, p_total));
 
         for i in 0..n {
@@ -3223,6 +3769,37 @@ impl TransformationNormalFamily {
                     2.0 * rv[k] * (gamma_dir[k] * gamma_psi[k] + gamma[k] * gamma_psi_dir[k]);
                 hp_psi_dir +=
                     2.0 * rd[k] * (gamma_dir[k] * gamma_psi[k] + gamma[k] * gamma_psi_dir[k]);
+            }
+            let q = row_quantities.endpoint_q[i];
+            let mut endpoint_psi = [0.0; 2];
+            let mut endpoint_dir = [0.0; 2];
+            let mut endpoint_psi_dir = [0.0; 2];
+            let mut endpoint_factor = vec![[0.0; 2]; p_resp];
+            let mut endpoint_factor_dir = vec![[0.0; 2]; p_resp];
+            let mut endpoint_psi_cov_factor = vec![[0.0; 2]; p_resp];
+            let mut endpoint_psi_psi_factor = vec![[0.0; 2]; p_resp];
+            let mut endpoint_psi_cov_factor_dir = vec![[0.0; 2]; p_resp];
+            let mut endpoint_psi_psi_factor_dir = vec![[0.0; 2]; p_resp];
+            for e in 0..2 {
+                let basis = endpoint_basis[e];
+                endpoint_psi[e] = basis[0] * gamma_psi[0];
+                endpoint_dir[e] = basis[0] * gamma_dir[0];
+                endpoint_psi_dir[e] = basis[0] * gamma_psi_dir[0];
+                endpoint_factor[0][e] = basis[0];
+                endpoint_psi_psi_factor[0][e] = basis[0];
+                for k in 1..p_resp {
+                    endpoint_psi[e] += 2.0 * basis[k] * gamma[k] * gamma_psi[k];
+                    endpoint_dir[e] += 2.0 * basis[k] * gamma[k] * gamma_dir[k];
+                    endpoint_psi_dir[e] += 2.0
+                        * basis[k]
+                        * (gamma_dir[k] * gamma_psi[k] + gamma[k] * gamma_psi_dir[k]);
+                    endpoint_factor[k][e] = 2.0 * basis[k] * gamma[k];
+                    endpoint_factor_dir[k][e] = 2.0 * basis[k] * gamma_dir[k];
+                    endpoint_psi_cov_factor[k][e] = 2.0 * basis[k] * gamma_psi[k];
+                    endpoint_psi_psi_factor[k][e] = 2.0 * basis[k] * gamma[k];
+                    endpoint_psi_cov_factor_dir[k][e] = 2.0 * basis[k] * gamma_psi_dir[k];
+                    endpoint_psi_psi_factor_dir[k][e] = 2.0 * basis[k] * gamma_dir[k];
+                }
             }
             let d_inv_hp = -hp_dir * inv_hp_sq;
             let d_inv_hp_sq = -2.0 * hp_dir * inv_hp_cu;
@@ -3303,6 +3880,62 @@ impl TransformationNormalFamily {
                             } else {
                                 (0.0, 0.0, 0.0, 0.0)
                             };
+                            let endpoint_a = [
+                                endpoint_factor[k][0] * cov_row[c],
+                                endpoint_factor[k][1] * cov_row[c],
+                            ];
+                            let endpoint_b = [
+                                endpoint_factor[l][0] * cov_row[d],
+                                endpoint_factor[l][1] * cov_row[d],
+                            ];
+                            let endpoint_psi_a = [
+                                endpoint_psi_cov_factor[k][0] * cov_row[c]
+                                    + endpoint_psi_psi_factor[k][0] * psi_row[c],
+                                endpoint_psi_cov_factor[k][1] * cov_row[c]
+                                    + endpoint_psi_psi_factor[k][1] * psi_row[c],
+                            ];
+                            let endpoint_psi_b = [
+                                endpoint_psi_cov_factor[l][0] * cov_row[d]
+                                    + endpoint_psi_psi_factor[l][0] * psi_row[d],
+                                endpoint_psi_cov_factor[l][1] * cov_row[d]
+                                    + endpoint_psi_psi_factor[l][1] * psi_row[d],
+                            ];
+                            let endpoint_a_dir = [
+                                endpoint_factor_dir[k][0] * cov_row[c],
+                                endpoint_factor_dir[k][1] * cov_row[c],
+                            ];
+                            let endpoint_b_dir = [
+                                endpoint_factor_dir[l][0] * cov_row[d],
+                                endpoint_factor_dir[l][1] * cov_row[d],
+                            ];
+                            let endpoint_psi_a_dir = [
+                                endpoint_psi_cov_factor_dir[k][0] * cov_row[c]
+                                    + endpoint_psi_psi_factor_dir[k][0] * psi_row[c],
+                                endpoint_psi_cov_factor_dir[k][1] * cov_row[c]
+                                    + endpoint_psi_psi_factor_dir[k][1] * psi_row[c],
+                            ];
+                            let endpoint_psi_b_dir = [
+                                endpoint_psi_cov_factor_dir[l][0] * cov_row[d]
+                                    + endpoint_psi_psi_factor_dir[l][0] * psi_row[d],
+                                endpoint_psi_cov_factor_dir[l][1] * cov_row[d]
+                                    + endpoint_psi_psi_factor_dir[l][1] * psi_row[d],
+                            ];
+                            let (endpoint_ab, endpoint_psi_ab) = if same_shape {
+                                (
+                                    [
+                                        2.0 * endpoint_basis[0][k] * cov_row[c] * cov_row[d],
+                                        2.0 * endpoint_basis[1][k] * cov_row[c] * cov_row[d],
+                                    ],
+                                    [
+                                        2.0 * endpoint_basis[0][k]
+                                            * (psi_row[d] * cov_row[c] + psi_row[c] * cov_row[d]),
+                                        2.0 * endpoint_basis[1][k]
+                                            * (psi_row[d] * cov_row[c] + psi_row[c] * cov_row[d]),
+                                    ],
+                                )
+                            } else {
+                                ([0.0; 2], [0.0; 2])
+                            };
                             let numerator = hppsi_a * hp_b + hp_a * hppsi_b;
                             let numerator_dir = hppsi_a_dir * hp_b
                                 + hppsi_a * hp_b_dir
@@ -3325,7 +3958,25 @@ impl TransformationNormalFamily {
                                         + barrier_product * d_inv_hp_cu)
                                 - hppsi_ab * d_inv_hp
                                 + hp_ab * hp_psi_dir * inv_hp_sq
-                                + hp_ab * hp_psi * d_inv_hp_sq;
+                                + hp_ab * hp_psi * d_inv_hp_sq
+                                + endpoint_chain_fourth(
+                                    &q,
+                                    endpoint_psi,
+                                    endpoint_a,
+                                    endpoint_b,
+                                    endpoint_dir,
+                                    endpoint_psi_a,
+                                    endpoint_psi_b,
+                                    endpoint_psi_dir,
+                                    endpoint_ab,
+                                    endpoint_a_dir,
+                                    endpoint_b_dir,
+                                    endpoint_psi_ab,
+                                    endpoint_psi_a_dir,
+                                    endpoint_psi_b_dir,
+                                    [0.0; 2],
+                                    [0.0; 2],
+                                );
                             out[[row_idx, col_idx]] += wi * value;
                         }
                     }
@@ -3983,6 +4634,7 @@ impl CustomFamily for TransformationNormalFamily {
             cov_i.view(),
             cov_j.view(),
             cov_ij.view(),
+            row.endpoint_q.as_slice(),
             None,
         )?;
         let hessian_psi_psi_operator: Box<dyn HyperOperator> =
@@ -3993,6 +4645,7 @@ impl CustomFamily for TransformationNormalFamily {
                 cov_i,
                 cov_j,
                 cov_ij,
+                Arc::clone(&row.endpoint_q),
             ));
 
         // Result-validation gate. A trial point can still make the SCOP row
@@ -4393,6 +5046,7 @@ struct TransformationNormalPsiPsiHessianOperator {
     cov_i: Arc<Array2<f64>>,
     cov_j: Arc<Array2<f64>>,
     cov_ij: Arc<Array2<f64>>,
+    endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
 }
 
 impl TransformationNormalPsiPsiHessianOperator {
@@ -4403,6 +5057,7 @@ impl TransformationNormalPsiPsiHessianOperator {
         cov_i: Arc<Array2<f64>>,
         cov_j: Arc<Array2<f64>>,
         cov_ij: Arc<Array2<f64>>,
+        endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
     ) -> Self {
         Self {
             family,
@@ -4411,6 +5066,7 @@ impl TransformationNormalPsiPsiHessianOperator {
             cov_i,
             cov_j,
             cov_ij,
+            endpoint_q,
         }
     }
 
@@ -4426,6 +5082,7 @@ impl TransformationNormalPsiPsiHessianOperator {
                 self.cov_i.view(),
                 self.cov_j.view(),
                 self.cov_ij.view(),
+                self.endpoint_q.as_slice(),
                 Some(v),
             )
             .expect("validated CTN psi-psi operator inputs should not fail")
@@ -4454,6 +5111,7 @@ impl HyperOperator for TransformationNormalPsiPsiHessianOperator {
                 self.cov_i.view(),
                 self.cov_j.view(),
                 self.cov_ij.view(),
+                self.endpoint_q.as_slice(),
                 v,
                 u,
             )
@@ -4594,9 +5252,13 @@ fn build_response_basis(
     // their span, and squaring γ removes the per-component sign null direction.
     let transform = Array2::<f64>::eye(p_shape);
 
-    // Difference penalties act directly on the I-spline shape coefficient
-    // vector. Embed them into the full response block with an unpenalized
-    // location row/column.
+    // SCOP keeps a Gaussian quadratic prior on the latent γ shape factors,
+    // not on the final non-negative I-spline coefficient α = γ². That is a
+    // deliberate latent-prior penalty: replacing it with a final-function
+    // roughness penalty would make the penalty nonlinear in β and would need
+    // a different outer objective normalizer than the quadratic REML term.
+    // Embed the latent response penalty into the full response block with an
+    // unpenalized location row/column.
     let mut resp_penalties = Vec::new();
     let add_penalty = |order: usize, penalties: &mut Vec<Array2<f64>>| -> Result<(), String> {
         if order == 0 || order >= p_shape {
@@ -5305,6 +5967,7 @@ impl KroneckerDesign {
     /// underlying `right` operator and the row-replicated Khatri-Rao image
     /// are never materialized. Storage cost matches `forward_mul`: an
     /// intermediate `n × p_resp` `right_beta` plus the `n` output.
+    #[cfg(test)]
     fn scop_affine_squared_forward(&self, beta: &Array1<f64>) -> Array1<f64> {
         match self {
             KroneckerDesign::KhatriRao { left, right } => {
@@ -6142,10 +6805,11 @@ fn build_tensor_penalties_kronecker(
     let mut shape_resp = Array2::<f64>::eye(p_resp);
     shape_resp[[0, 0]] = 0.0;
 
-    // Covariate roughness belongs to the squared monotone shape rows. The
-    // derivative-free location row is the conditional centering field itself;
-    // penalizing it by REML under-corrects broad population shifts and leaves
-    // h(Y|x) calibrated only marginally instead of conditionally.
+    // Covariate roughness is a latent γ prior on the squared monotone shape
+    // rows. The derivative-free location row is the conditional centering
+    // field itself; penalizing it by REML under-corrects broad population
+    // shifts and leaves h(Y|x) calibrated only marginally instead of
+    // conditionally.
     for s_cov in covariate_penalties {
         let right = match s_cov {
             PenaltyMatrix::Dense(right) => right,
@@ -7692,13 +8356,40 @@ mod tests {
             .mapv(|hp| hp + TRANSFORMATION_MONOTONICITY_EPS);
         let weights = family.weights.as_ref();
 
-        assert_eq!(row.h.as_ref(), &direct_h);
-        assert_eq!(row.h_prime.as_ref(), &direct_h_prime);
+        for i in 0..direct_h.len() {
+            assert!(
+                (row.h[i] - direct_h[i]).abs() <= 1.0e-14,
+                "h[{i}] mismatch: cached={} direct={}",
+                row.h[i],
+                direct_h[i]
+            );
+            assert!(
+                (row.h_prime[i] - direct_h_prime[i]).abs() <= 1.0e-14,
+                "h_prime[{i}] mismatch: cached={} direct={}",
+                row.h_prime[i],
+                direct_h_prime[i]
+            );
+        }
+
+        let p_resp = family.response_val_basis.ncols();
+        let p_cov = family.covariate_design.ncols();
+        let beta_mat = state
+            .beta
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .expect("toy beta reshape");
+        let cov = family
+            .covariate_design
+            .try_row_chunk(0..family.n_obs())
+            .expect("toy covariate rows");
+        let (h_lower, h_upper) = family
+            .scop_endpoint_values(&state.beta, beta_mat, cov.view())
+            .expect("toy endpoint values");
 
         let mut expected_ll = 0.0;
         for i in 0..direct_h.len() {
             let hp = direct_h_prime[i];
-            let log_z = log_normal_cdf_diff(row.h_upper[i], row.h_lower[i]).expect("endpoint mass");
+            let log_z = log_normal_cdf_diff(h_upper[i], h_lower[i]).expect("endpoint mass");
             expected_ll += weights[i] * (-0.5 * direct_h[i] * direct_h[i] + hp.ln() - log_z);
         }
 
@@ -7707,6 +8398,19 @@ mod tests {
             "cached log-likelihood={} expected={expected_ll}",
             row.log_likelihood
         );
+    }
+
+    #[test]
+    fn ctn_endpoint_normalizer_derivatives_are_finite_in_positive_tail() {
+        let q =
+            log_normal_cdf_diff_derivatives(38.0, 37.0).expect("positive-tail endpoint normalizer");
+        assert!(q.first[0].is_finite());
+        assert!(q.first[1].is_finite());
+        assert!(q.second[0][0].is_finite());
+        assert!(q.third[0][0][0].is_finite());
+        assert!(q.fourth[0][0][0][0].is_finite());
+        assert!(q.first[0] > 0.0);
+        assert!(q.first[1] < 0.0);
     }
 
     #[test]
@@ -7842,19 +8546,9 @@ mod tests {
 
     #[test]
     fn warm_start_absorbs_offset_into_affine_seed() {
-        // FOLLOW-UP: the SCOP squared-γ warm-start algorithm at
-        // `compute_warm_start` (src/families/transformation_normal.rs ~5126)
-        // does not yet exactly recover h(y) = (y - location)/scale even when
-        // the I-spline span contains the affine target. The closed-form
-        // γ_const = sqrt(mean_inv_tau / mean_M_sum) is only exact when the
-        // M-spline column sums are uniform across rows; on a generic basis it
-        // produces an approximate seed.
-        //
-        // This test pins the contract that warm-start must asymptotically
-        // recover the affine seed under SCOP-CTN, n=4 to satisfy
-        // `build_response_basis`'s n>=4 minimum. It is currently expected to
-        // fail; see the open follow-up task "Restore exact-affine warm-start
-        // recovery for SCOP-CTN" before relaxing the assertion tolerance.
+        // The SCOP squared-γ warm start solves the stacked value/derivative
+        // system in α-space before projecting back to γ, so representable
+        // affine targets should be recovered to numerical precision.
         let response = array![2.0, 3.0, 4.0, 5.0];
         let (val_basis, deriv_basis, knots, transform, _p_resp) = toy_response_basis(&response);
         let weights = Array1::from_elem(response.len(), 1.0);
@@ -8034,6 +8728,41 @@ mod tests {
             &analytic_hessian,
             2e-4,
             "transformation normal psi second-order Hessian",
+        );
+    }
+
+    #[test]
+    fn transformation_normal_joint_psi_first_order_matches_normalized_loglik_fd() {
+        let psi = array![0.15, -0.10];
+        let h = 1e-6;
+        let (family, derivative_blocks, state, spec) = toy_family_and_derivatives(&psi);
+        let beta = state.beta.clone();
+        let states = vec![state.clone()];
+        let specs = vec![spec];
+
+        let analytic = family
+            .exact_newton_joint_psi_terms(&states, &specs, &derivative_blocks, 0)
+            .expect("analytic psi first-order terms")
+            .expect("first-order terms should be present");
+
+        let eval_negative_loglik = |psi_eval: &Array1<f64>| {
+            let (f_eval, _, mut state_eval, _) = toy_family_and_derivatives(psi_eval);
+            state_eval.beta = beta.clone();
+            -f_eval
+                .log_likelihood_only(std::slice::from_ref(&state_eval))
+                .expect("log-likelihood at perturbed psi")
+        };
+
+        let mut psi_plus = psi.clone();
+        psi_plus[0] += h;
+        let mut psi_minus = psi.clone();
+        psi_minus[0] -= h;
+        let fd = (eval_negative_loglik(&psi_plus) - eval_negative_loglik(&psi_minus)) / (2.0 * h);
+
+        assert!(
+            (analytic.objective_psi - fd).abs() < 1e-6,
+            "normalized CTN psi objective mismatch: analytic={}, fd={fd}",
+            analytic.objective_psi
         );
     }
 
@@ -9131,11 +9860,9 @@ mod tests {
     /// `Σ_j v_j · pair(i, j)` for a fixed direction `v`, and writes the full
     /// likelihood-only result to `/tmp/ctn_pairwise_oracle.json`.
     ///
-    /// One of three independent verification paths for the CTN HVP work:
-    ///   (1) sympy proof shadow (`scripts/ctn_hvp_groundtruth.py`, task #14)
-    ///   (2) THIS oracle — current pairwise body, before the directional version
-    ///   (3) `CtnOuterHessianOperator::matvec` (when ctn-hvp-phase2 commit 2 lands)
-    /// All three must agree to ~1e-7 on the likelihood pieces.
+    /// Independent verification path for the SCOP CTN HVP work. The old Python
+    /// scripts used the pre-SCOP linear tensor likelihood and were removed so
+    /// they cannot be mistaken for ground truth.
     ///
     /// Run via:
     ///     cargo test --release ctn_pairwise_oracle_dumps_json -- --nocapture
@@ -9484,7 +10211,7 @@ pub fn build_tensor_psi_derivatives(
             response_val_basis: Arc::new(family.response_val_basis.clone()),
             covariate_design: family.covariate_design.clone(),
             covariate_derivs: covariate_psi_derivs.to_vec(),
-            covariate_dense_cache: Arc::new(Mutex::new(None)),
+            covariate_dense_cache: Arc::clone(&family.covariate_dense_cache),
             covariate_first_cache: Arc::new(
                 (0..n_axes).map(|_| Mutex::new(None)).collect::<Vec<_>>(),
             ),
