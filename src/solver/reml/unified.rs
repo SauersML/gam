@@ -60,6 +60,15 @@ pub trait HessianOperator: Send + Sync {
     /// Uses the SAME decomposition as `logdet`.
     fn trace_hinv_product(&self, a: &Array2<f64>) -> f64;
 
+    /// Exact dense spectral representation, when this backend has one.
+    ///
+    /// Outer-Hessian assembly uses this to batch all logdet-Hessian cross
+    /// traces in the eigenbasis. For CTN scale-dimension fits this avoids
+    /// projecting the same implicit ψ drift once per upper-triangular pair.
+    fn as_exact_dense_spectral(&self) -> Option<&DenseSpectralOperator> {
+        None
+    }
+
     /// tr(H₊⁻¹ B) for an operator-backed Hessian drift.
     ///
     /// Default implementation materializes `B` densely. Backends with
@@ -5218,6 +5227,39 @@ fn trace_logdet_hessian_cross_dense_drift(
     }
 }
 
+fn trace_logdet_hessian_crosses_dense_spectral_drifts(
+    dense_hop: &DenseSpectralOperator,
+    dense_drifts: &[Array2<f64>],
+    ext_drifts: &[DriftDerivResult],
+) -> Array2<f64> {
+    let total = dense_drifts.len() + ext_drifts.len();
+    let mut rotated = Vec::with_capacity(total);
+    for matrix in dense_drifts {
+        rotated.push(dense_hop.rotate_to_eigenbasis(matrix));
+    }
+    for drift in ext_drifts {
+        let projected = match drift {
+            DriftDerivResult::Dense(matrix) => dense_hop.rotate_to_eigenbasis(matrix),
+            DriftDerivResult::Operator(operator) => {
+                dense_hop.projected_operator(&dense_hop.eigenvectors, operator.as_ref())
+            }
+        };
+        rotated.push(projected);
+    }
+
+    let mut out = Array2::<f64>::zeros((total, total));
+    for i in 0..total {
+        for j in i..total {
+            let value = dense_hop.trace_logdet_hessian_cross_rotated(&rotated[i], &rotated[j]);
+            out[[i, j]] = value;
+            if i != j {
+                out[[j, i]] = value;
+            }
+        }
+    }
+    out
+}
+
 #[inline]
 fn can_use_stochastic_logdet_hinv_kernel(
     hop: &dyn HessianOperator,
@@ -5532,6 +5574,12 @@ fn compute_outer_hessian(
                 }
             }
             Some(out)
+        } else if let Some(dense_hop) = hop.as_exact_dense_spectral() {
+            Some(trace_logdet_hessian_crosses_dense_spectral_drifts(
+                dense_hop,
+                &h_k_matrices,
+                &ext_h_drifts,
+            ))
         } else {
             let total_coords = k + ext_dim;
             let mut out = Array2::<f64>::zeros((total_coords, total_coords));
@@ -8342,6 +8390,10 @@ impl HessianOperator for DenseSpectralOperator {
         self.cached_logdet
     }
 
+    fn as_exact_dense_spectral(&self) -> Option<&DenseSpectralOperator> {
+        Some(self)
+    }
+
     fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
         // tr(H_reg⁻¹ A) = Σ_j (1/r_ε(σ_j)) uⱼᵀAuⱼ
         // Computed as Σ (AW ⊙ W) where W = U diag(1/√r_ε(σ)).
@@ -9367,6 +9419,10 @@ impl HessianOperator for BlockCoupledOperator {
         self.inner.logdet()
     }
 
+    fn as_exact_dense_spectral(&self) -> Option<&DenseSpectralOperator> {
+        self.inner.as_exact_dense_spectral()
+    }
+
     fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
         self.inner.trace_hinv_product(a)
     }
@@ -9581,6 +9637,10 @@ impl HessianOperator for MatrixFreeSpdOperator {
         *self
             .cached_logdet
             .get_or_init(|| self.exact_dense_spectral().logdet())
+    }
+
+    fn as_exact_dense_spectral(&self) -> Option<&DenseSpectralOperator> {
+        Some(self.exact_dense_spectral())
     }
 
     fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
