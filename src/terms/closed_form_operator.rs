@@ -153,6 +153,27 @@ impl ClosedFormPenaltyOperator {
         }
     }
 
+    #[inline]
+    fn is_raw_layout(&self) -> bool {
+        self.kernel_nullspace.is_none()
+            && self.polynomial_block_cols == 0
+            && self.outer_identifiability.is_none()
+    }
+
+    fn raw_diagonal_value(&self) -> f64 {
+        let r0 = vec![0.0_f64; self.centers.ncols()];
+        closed_form_anisotropic_pair_value_with_powers(
+            self.q,
+            self.m,
+            self.s,
+            self.kappa,
+            &self.eta_raw,
+            &self.eta_metric_powers,
+            &r0,
+            self.diagonal_epsilon,
+        )
+    }
+
     /// Evaluate `(S w)` writing the result into `out`.
     ///
     /// With constraints composed, `S' = T^T diag(Z, I_poly)^T S_raw diag(Z, I_poly) T`.
@@ -212,6 +233,9 @@ impl ClosedFormPenaltyOperator {
     /// for diagnostics (e.g., Jacobi preconditioning), not hot paths.
     pub fn diag(&self) -> Array1<f64> {
         let n = self.dim();
+        if self.is_raw_layout() {
+            return Array1::from_elem(n, self.raw_diagonal_value());
+        }
         let mut out = Array1::<f64>::zeros(n);
         let mut e = Array1::<f64>::zeros(n);
         let mut col = Array1::<f64>::zeros(n);
@@ -227,6 +251,9 @@ impl ClosedFormPenaltyOperator {
     /// Trace `tr(S')`. Same `O(dim)` matvecs as `diag`; stored separately so
     /// callers that only need the trace don't allocate the full diagonal.
     pub fn trace(&self) -> f64 {
+        if self.is_raw_layout() {
+            return self.raw_diagonal_value() * self.dim() as f64;
+        }
         self.diag().sum()
     }
 
