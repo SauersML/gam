@@ -815,8 +815,8 @@ pub struct CanonicalPenalty {
     /// Cached at construction time for REML logdet block-factored paths.
     pub positive_eigenvalues: Vec<f64>,
     /// Optional operator-form handle bit-equivalent to `local`. Propagated
-    /// from `PenaltySpec::Block.op`. Downstream PIRLS PCG and REML SLQ log-det
-    /// route through this for dense-Gram-free matvec when present.
+    /// from `PenaltySpec::Block.op`. Downstream PIRLS and REML exact operator
+    /// algebra route through this for dense-Gram-free matvec when present.
     pub op: Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>,
 }
 

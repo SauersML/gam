@@ -15,7 +15,6 @@ use rayon::prelude::*;
 use smallvec::SmallVec;
 
 use crate::faer_ndarray::{fast_ab, fast_atb};
-use crate::linalg::utils::stochastic_lanczos_logdet_spd_operator;
 use crate::terms::basis::{
     closed_form_anisotropic_pair_block, closed_form_anisotropic_pair_value_with_powers,
     closed_form_penalty, pure_duchon_diagonal_epsilon,
@@ -257,31 +256,30 @@ impl ClosedFormPenaltyOperator {
         self.diag().sum()
     }
 
-    /// Stochastic Lanczos quadrature estimate of `log det(S' + λI)`.
+    /// Exact `log det(S' + λI)`.
     /// `S'` is rank-deficient under typical constraints (kernel/polynomial
-    /// nullspace), so the regularization `λ > 0` is mandatory for SLQ.
-    pub fn log_det_plus_lambda_i(
-        &self,
-        lambda: f64,
-        num_probes: usize,
-        lanczos_steps: usize,
-        seed: u64,
-    ) -> Result<f64, String> {
+    /// nullspace), so the regularization `λ > 0` is mandatory.
+    pub fn log_det_plus_lambda_i(&self, lambda: f64) -> Result<f64, String> {
         assert!(lambda > 0.0, "log_det_plus_lambda_i requires λ > 0");
         let n = self.dim();
-        let me = self.clone();
-        stochastic_lanczos_logdet_spd_operator(
-            n,
-            move |v: &Array1<f64>| {
-                let mut out = Array1::<f64>::zeros(n);
-                me.matvec(v.view(), out.view_mut());
-                out.zip_mut_with(v, |o, &vi| *o += lambda * vi);
-                out
-            },
-            num_probes,
-            lanczos_steps,
-            seed,
-        )
+        let mut dense = self.dense_form();
+        for i in 0..n {
+            dense[[i, i]] += lambda;
+        }
+        let (evals, _) =
+            crate::faer_ndarray::FaerEigh::eigh(&dense, faer::Side::Lower).map_err(|e| {
+                format!("ClosedFormPenaltyOperator logdet eigendecomposition failed: {e}")
+            })?;
+        let mut logdet = 0.0;
+        for (idx, &ev) in evals.iter().enumerate() {
+            if !ev.is_finite() || ev <= 0.0 {
+                return Err(format!(
+                    "ClosedFormPenaltyOperator expected SPD S+λI, eigenvalue {idx} is {ev:.3e}"
+                ));
+            }
+            logdet += ev.ln();
+        }
+        Ok(logdet)
     }
 
     /// Materialize the full constrained operator as a dense `Array2` for
@@ -598,17 +596,11 @@ mod tests {
         let op = ClosedFormPenaltyOperator::new(centers.view(), 1, 2, 1, 1.0, None, None, 0, None);
         let dense = op.dense_form();
         let n = op.dim();
-        let lambda = 0.25_f64;
-        // Dense reference: log det(S + λI) via symmetric eigendecomposition.
-        // The closed-form tension Gram is not in general PSD before
-        // constraint composition (it is a difference of inner products in the
-        // Schoenberg expansion), so `S + λI` can have small negative
-        // eigenvalues for moderate λ at this K and Cholesky on the dense
-        // reference fails. SLQ already falls back to a floored
-        // eigendecomposition for tiny systems, so we match that contract on
-        // the reference path: compute log det via eigenvalues of the
-        // symmetrized operator with the same positive-eigenvalue floor SLQ
-        // applies (`max|λ| · 1e-14`).
+        let lambda = 10.0_f64;
+        // Dense reference: exact log det(S + λI) via symmetric
+        // eigendecomposition.  λ is intentionally large enough that the
+        // regularized matrix is strictly SPD; if it is not, the operator method
+        // should error rather than flooring non-positive eigenvalues.
         let mut reg = dense.clone();
         for i in 0..n {
             reg[[i, i]] += lambda;
@@ -620,26 +612,15 @@ mod tests {
                 reg[[j, i]] = avg;
             }
         }
-        let est = op
-            .log_det_plus_lambda_i(lambda, 8, 12, 7)
-            .expect("slq logdet");
+        let est = op.log_det_plus_lambda_i(lambda).expect("exact logdet");
         use crate::faer_ndarray::FaerEigh;
         use faer::Side;
         let (evals, _) = FaerEigh::eigh(&reg, Side::Lower).expect("eigh");
-        let max_abs = evals
-            .iter()
-            .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
-            .max(1.0);
-        let floor = max_abs * 1e-14;
         let mut reference = 0.0_f64;
-        for &lam in evals.iter() {
-            let clipped = if lam.is_finite() && lam > floor {
-                lam
-            } else {
-                floor
-            };
-            reference += clipped.ln();
+        for (idx, &lam) in evals.iter().enumerate() {
+            assert!(lam > 0.0, "reference eigenvalue {idx} is {lam:.3e}");
+            reference += lam.ln();
         }
-        assert_abs_diff_eq!(est, reference, epsilon = 1e-6);
+        assert_abs_diff_eq!(est, reference, epsilon = 1e-10);
     }
 }

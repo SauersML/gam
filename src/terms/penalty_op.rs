@@ -21,7 +21,6 @@ use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1};
 
 use crate::linalg::faer_ndarray::FaerEigh;
-use crate::linalg::utils::stochastic_lanczos_logdet_spd_operator;
 use crate::terms::closed_form_operator::ClosedFormPenaltyOperator;
 
 /// Square symmetric PSD penalty operator.
@@ -45,16 +44,10 @@ pub trait PenaltyOp: Send + Sync {
         self.diag().sum()
     }
 
-    /// Stochastic Lanczos quadrature estimate of `log det(S + λI)` for `λ > 0`.
+    /// Exact `log det(S + λI)` for `λ > 0`.
     /// `S` is allowed to be rank-deficient; the regularization makes the
     /// regularized operator strictly positive definite.
-    fn log_det_plus_lambda_i(
-        &self,
-        lambda: f64,
-        num_probes: usize,
-        lanczos_steps: usize,
-        seed: u64,
-    ) -> Result<f64, String>;
+    fn log_det_plus_lambda_i(&self, lambda: f64) -> Result<f64, String>;
 
     /// Symmetric eigendecomposition `S = V diag(λ) V^T`. The default
     /// implementation materializes via `as_dense` and runs the same
@@ -99,27 +92,27 @@ impl PenaltyOp for Array2<f64> {
         d
     }
 
-    fn log_det_plus_lambda_i(
-        &self,
-        lambda: f64,
-        num_probes: usize,
-        lanczos_steps: usize,
-        seed: u64,
-    ) -> Result<f64, String> {
+    fn log_det_plus_lambda_i(&self, lambda: f64) -> Result<f64, String> {
         assert!(lambda > 0.0, "log_det_plus_lambda_i requires λ > 0");
         let n = <Self as PenaltyOp>::dim(self);
-        let mat = self.clone();
-        stochastic_lanczos_logdet_spd_operator(
-            n,
-            move |v: &Array1<f64>| {
-                let mut out = mat.dot(v);
-                out.zip_mut_with(v, |o, &vi| *o += lambda * vi);
-                out
-            },
-            num_probes,
-            lanczos_steps,
-            seed,
-        )
+        let mut regularized = self.clone();
+        for i in 0..n {
+            regularized[[i, i]] += lambda;
+        }
+        let (evals, _) = regularized.eigh(Side::Lower).map_err(|e| {
+            format!("PenaltyOp::log_det_plus_lambda_i eigendecomposition failed: {e}")
+        })?;
+        let mut logdet = 0.0;
+        for (idx, &ev) in evals.iter().enumerate() {
+            if !ev.is_finite() || ev <= 0.0 {
+                return Err(format!(
+                    "PenaltyOp::log_det_plus_lambda_i expected SPD S+λI, \
+                     eigenvalue {idx} is {ev:.3e}"
+                ));
+            }
+            logdet += ev.ln();
+        }
+        Ok(logdet)
     }
 
     fn as_dense(&self) -> Array2<f64> {
@@ -144,14 +137,8 @@ impl PenaltyOp for ClosedFormPenaltyOperator {
         self.trace()
     }
 
-    fn log_det_plus_lambda_i(
-        &self,
-        lambda: f64,
-        num_probes: usize,
-        lanczos_steps: usize,
-        seed: u64,
-    ) -> Result<f64, String> {
-        self.log_det_plus_lambda_i(lambda, num_probes, lanczos_steps, seed)
+    fn log_det_plus_lambda_i(&self, lambda: f64) -> Result<f64, String> {
+        self.log_det_plus_lambda_i(lambda)
     }
 
     fn as_dense(&self) -> Array2<f64> {
@@ -195,24 +182,12 @@ impl PenaltyOp for ScaledPenaltyOp {
         self.inner.trace() * self.scale
     }
 
-    fn log_det_plus_lambda_i(
-        &self,
-        lambda: f64,
-        num_probes: usize,
-        lanczos_steps: usize,
-        seed: u64,
-    ) -> Result<f64, String> {
+    fn log_det_plus_lambda_i(&self, lambda: f64) -> Result<f64, String> {
         // log det(scale * S + λ I) cannot be derived from log det(S + (λ/scale) I)
         // by a uniform shift unless we materialize. Materialize via as_dense and
-        // call the Array2 impl, which goes through SLQ on the scaled dense.
+        // call the exact Array2 implementation on the scaled dense matrix.
         let dense = self.as_dense();
-        <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(
-            &dense,
-            lambda,
-            num_probes,
-            lanczos_steps,
-            seed,
-        )
+        <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
     }
 
     fn as_dense(&self) -> Array2<f64> {
