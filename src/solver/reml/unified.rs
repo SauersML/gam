@@ -6288,10 +6288,6 @@ impl OuterHessianCoord {
     fn is_ext(&self) -> bool {
         self.ext_index.is_some()
     }
-
-    fn correction_sign(&self) -> f64 {
-        if self.is_ext() { -1.0 } else { 1.0 }
-    }
 }
 
 struct UnifiedOuterHessianOperator {
@@ -6373,21 +6369,6 @@ impl UnifiedOuterHessianOperator {
         }
     }
 
-    fn pair_rhs_combo_dot(
-        &self,
-        idx: usize,
-        alpha: &Array1<f64>,
-        test: ArrayView1<'_, f64>,
-    ) -> f64 {
-        let mut out = 0.0;
-        for j in 0..alpha.len() {
-            if alpha[j] != 0.0 {
-                out += alpha[j] * self.pair_rhs_dot(idx, j, test);
-            }
-        }
-        out
-    }
-
     fn scaled_add_pair_rhs(&self, row: usize, col: usize, scale: f64, out: &mut Array1<f64>) {
         if scale == 0.0 {
             return;
@@ -6459,7 +6440,6 @@ impl UnifiedOuterHessianOperator {
         idx: usize,
         alpha: &Array1<f64>,
         v_i: &Array1<f64>,
-        v_i_sign: f64,
         m_alpha: &Array1<f64>,
     ) -> Result<f64, String> {
         let z_c = self.adjoint_z_c.as_ref().ok_or_else(|| {
@@ -6481,19 +6461,28 @@ impl UnifiedOuterHessianOperator {
         let h_g = self.leverage.as_ref().ok_or_else(|| {
             "missing leverage cache for scalar outer Hessian operator".to_string()
         })?;
-        let c_trace = self.pair_rhs_combo_dot(idx, alpha, z_c.view());
+        let idx_is_ext = self.coords[idx].is_ext();
+        let mut c_trace = 0.0;
+        for (j, &alpha_j) in alpha.iter().enumerate() {
+            if alpha_j == 0.0 {
+                continue;
+            }
+            let j_is_ext = self.coords[j].is_ext();
+            let sign = if idx_is_ext || j_is_ext { -1.0 } else { 1.0 };
+            c_trace += sign * alpha_j * self.pair_rhs_dot(idx, j, z_c.view());
+        }
         let d_trace = if let Some(trace) = self.fourth_trace.as_ref() {
             let mut combo = 0.0;
             for (j, &alpha_j) in alpha.iter().enumerate() {
                 if alpha_j != 0.0 {
-                    combo += alpha_j * self.coords[j].correction_sign() * trace[[idx, j]];
+                    combo += alpha_j * trace[[idx, j]];
                 }
             }
             combo
         } else {
             compute_fourth_derivative_trace(&ingredients, v_i, m_alpha, h_g)?.unwrap_or(0.0)
         };
-        Ok(c_trace + v_i_sign * d_trace)
+        Ok(c_trace + d_trace)
     }
 
     fn callback_correction_trace(
@@ -6566,7 +6555,6 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
                             idx,
                             alpha,
                             &coord.v,
-                            coord.correction_sign(),
                             &correction_m_alpha,
                         )?,
                     OuterHessianDerivativeKernel::Callback { .. } => {
@@ -11283,11 +11271,12 @@ mod tests {
 
         for row in 0..dense.nrows() {
             for col in 0..dense.ncols() {
-                assert_relative_eq!(
-                    materialized[[row, col]],
-                    dense[[row, col]],
-                    epsilon = 1e-10,
-                    max_relative = 1e-10
+                let materialized_entry = materialized[[row, col]];
+                let dense_entry = dense[[row, col]];
+                let tolerance = 1e-10_f64.max(1e-10 * dense_entry.abs());
+                assert!(
+                    (materialized_entry - dense_entry).abs() <= tolerance,
+                    "outer Hessian operator mismatch at ({row}, {col}): materialized={materialized_entry}, dense={dense_entry}"
                 );
             }
         }
