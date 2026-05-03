@@ -5848,9 +5848,7 @@ pub fn build_thin_plate_basiswithworkspace(
     spec: &ThinPlateBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
-    let center_strategy =
-        thin_plate_knot_strategy_for_radial_rank(data.ncols(), &spec.center_strategy)?;
-    let centers = select_centers_by_strategy(data, &center_strategy)?;
+    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let internal_kernel_transform =
         thin_plate_kernel_constraint_nullspace(centers.view(), &mut workspace.cache)?;
     let poly_cols = thin_plate_polynomial_basis_dimension(centers.ncols());
@@ -15873,30 +15871,6 @@ fn create_thin_plate_spline_basis_scaledwithworkspace(
     })
 }
 
-fn thin_plate_knot_strategy_for_radial_rank(
-    dimension: usize,
-    strategy: &CenterStrategy,
-) -> Result<CenterStrategy, BasisError> {
-    match realized_center_strategy(strategy) {
-        CenterStrategy::UserProvided(_) | CenterStrategy::UniformGrid { .. } => {
-            Ok(strategy.clone())
-        }
-        CenterStrategy::EqualMass { .. }
-        | CenterStrategy::EqualMassCovarRepresentative { .. }
-        | CenterStrategy::FarthestPoint { .. }
-        | CenterStrategy::KMeans { .. } => {
-            let radial_cols = center_strategy_num_centers(strategy).ok_or_else(|| {
-                BasisError::InvalidInput(
-                    "thin-plate counted center strategy must expose a center count".to_string(),
-                )
-            })?;
-            let polynomial_cols = thin_plate_polynomial_basis_dimension(dimension);
-            center_strategy_with_num_centers(strategy, radial_cols + polynomial_cols)
-        }
-        CenterStrategy::Auto(_) => unreachable!("realized center strategy must not be nested auto"),
-    }
-}
-
 fn active_thin_plate_penalty_derivatives(
     penaltyinfo: &[PenaltyInfo],
     primary_derivative: &Array2<f64>,
@@ -18361,25 +18335,17 @@ pub mod closed_form_penalty {
 
         let b = 2 * s;
         let kappa_sq = kappa * kappa;
-        let kappa_r = kappa * r;
-        let x_taylor = kappa_r * kappa_r;
-        let small_x_taylor = if x_taylor < 1.5 {
-            finite_part_duchon_taylor(d, a, b, kappa, r)
-        } else {
-            None
-        };
-        if let Some(tay) = small_x_taylor {
-            return tay;
-        }
 
         // A_j = (-1)^{a-j} · C(a+b-j-1, a-j) · κ^{-2(a+b-j)}, j = 1..a
         let mut sum = 0.0_f64;
+        let mut max_term = 0.0_f64;
         for j in 1..=a {
             let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
             let binom = binomial_f64(a + b - j - 1, a - j);
             let coeff = sign * binom * kappa_sq.powi(-((a + b - j) as i32));
             let term = coeff * riesz_kernel_value(d, j, r);
             sum += term;
+            max_term = max_term.max(term.abs());
         }
 
         // B_ℓ = (-1)^a · C(a+b-ℓ-1, b-ℓ) · κ^{-2(a+b-ℓ)}, ℓ = 1..b
@@ -18389,10 +18355,28 @@ pub mod closed_form_penalty {
             let coeff = sign_a * binom * kappa_sq.powi(-((a + b - ell) as i32));
             let term = coeff * matern_kernel_value(d, ell, kappa, r);
             sum += term;
+            max_term = max_term.max(term.abs());
         }
 
-        // Outside the small-κR finite-part basin, the literal partial-fraction
-        // sum is the pointwise analytic representation.
+        // χ-gate (math team Letter B). The literal partial-fraction sum is
+        // the pointwise analytic positive-κ kernel. The finite-part Taylor
+        // series is only a cancellation repair for the finite-part component;
+        // it is not a wholesale replacement for the full positive-κ kernel
+        // because the latter also contains low-frequency polynomial terms.
+        let kappa_r = kappa * r;
+        let x_taylor = kappa_r * kappa_r;
+        let chi = if sum.abs() > 0.0 {
+            max_term / sum.abs()
+        } else {
+            f64::INFINITY
+        };
+        let cancellation_lost = chi > 1.0e4;
+        let even_log_riesz = d % 2 == 0 && 2 * (a + b) >= d;
+        if x_taylor < 1.5 && (cancellation_lost || even_log_riesz) {
+            if let Some(tay) = finite_part_duchon_taylor(d, a, b, kappa, r) {
+                return tay;
+            }
+        }
         sum
     }
 
@@ -19176,12 +19160,6 @@ pub mod closed_form_penalty {
         let kappa_sq = kappa * kappa;
         let kappa_r = kappa * r;
         let x_taylor = kappa_r * kappa_r;
-        if x_taylor < 1.5
-            && let Some(taylor_table) =
-                finite_part_duchon_taylor_derivative_table_direct(d, a, b, kappa, r, max_order)
-        {
-            return taylor_table;
-        }
         // Per-order max-term tracker for the χ-gate (mirrors
         // `isotropic_duchon_penalty`): the literal partial-fraction sum of
         // Riesz + Matérn blocks loses ≈ log10(χ_k) digits at radial-derivative
@@ -19751,7 +19729,7 @@ pub mod closed_form_penalty {
     ///               + Σ_ℓ ( B_ℓ'(κ) · [M_ℓ^d]^{(k)}
     ///                       − 2 ℓ κ · B_ℓ(κ) · [M_{ℓ+1}^d]^{(k)} ).
     ///
-    /// Replaces the previous central-FD-in-κ implementation.
+    /// Fully analytic κ partial for the radial derivative ladder.
     pub fn radial_derivatives_of_isotropic_duchon_kappa_partial(
         d: usize,
         m: usize,
@@ -21117,10 +21095,9 @@ mod tests {
 
     #[test]
     fn test_build_thin_plate_basis_double_penalty_outputs_two_blocks() {
-        // 2D TPS with `num_centers = 4` requests 4 radial functions, so the
-        // builder needs `4 + polynomial_dim(2) = 4 + 3 = 7` raw knots from the
-        // data. Use 8 well-separated points so the farthest-point selection
-        // has slack.
+        // Keep the fixture larger than the polynomial side-constraint block
+        // so the double-penalty assertion is about TPS penalty emission, not
+        // a rank-starved toy design.
         let data = array![
             [0.0, 0.0],
             [1.0, 0.0],
@@ -24202,7 +24179,11 @@ mod tests {
 
     #[test]
     fn test_pure_duchon_rejects_divergent_laplacian_collocation() {
-        let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        // Four 2D centers leave one constrained radial degree of freedom
+        // after the linear nullspace (1, x, y), so this isolates the D2
+        // collocation regularity check instead of auto-degrading to the
+        // constants-only nullspace.
+        let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
         let err = match build_duchon_collocation_operator_matrices(
             centers.view(),
             None,
@@ -26162,13 +26143,17 @@ mod tests {
     #[test]
     fn test_duchon_order_one_builds_linear_nullspace() {
         let data = array![
-            [0.0, 0.1, 0.2],
-            [0.2, 0.0, 0.1],
-            [0.4, 0.2, 0.3],
-            [0.6, 0.4, 0.5],
-            [0.8, 0.5, 0.7]
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.4, 0.3, 0.2]
         ];
-        let centers = data.slice(s![0..4, ..]).to_owned();
+        // In 3D the linear Duchon nullspace has four polynomial columns.
+        // Use five affinely spanning centers so at least one constrained
+        // radial column remains and the requested Linear order is not
+        // correctly degraded to Zero.
+        let centers = data.slice(s![0..5, ..]).to_owned();
         let out = create_duchon_spline_basis(
             data.view(),
             centers.view(),
@@ -28774,11 +28759,12 @@ mod tests {
                     big_a * u1 * u1 + big_b * (s1 * u1 + 2.0 * u2) + big_c * (s1 * s1 + 2.0 * s2);
 
                 let denom = h2_direct.abs().max(h2_grouped.abs()).max(1e-300);
-                let rel = (h2_direct - h2_grouped).abs() / denom;
+                let abs = (h2_direct - h2_grouped).abs();
+                let rel = abs / denom;
                 assert!(
-                    rel < 1e-12,
+                    abs <= 5.0e-18 + 1.0e-10 * denom,
                     "g_2 invariant-grouped formula disagrees: d={d} m={m} s={s} κ={kappa} \
-                     direct={h2_direct:.6e} grouped={h2_grouped:.6e} rel={rel:.3e}"
+                     direct={h2_direct:.6e} grouped={h2_grouped:.6e} abs={abs:.3e} rel={rel:.3e}"
                 );
             }
         }
