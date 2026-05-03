@@ -2087,6 +2087,8 @@ fn solution_into_outer_result(
         final_hessian: solution.final_hessian,
         converged,
         plan_used,
+        operator_trust_radius: None,
+        operator_stop_reason: None,
     }
 }
 
@@ -2103,6 +2105,7 @@ struct OuterConfig {
     fallback_policy: FallbackPolicy,
     screening_cap: Option<Arc<AtomicUsize>>,
     solver_class: SolverClass,
+    operator_initial_trust_radius: Option<f64>,
 }
 
 impl Default for OuterConfig {
@@ -2118,6 +2121,7 @@ impl Default for OuterConfig {
             fallback_policy: FallbackPolicy::Automatic,
             screening_cap: None,
             solver_class: SolverClass::Primary,
+            operator_initial_trust_radius: None,
         }
     }
 }
@@ -2151,6 +2155,7 @@ pub struct OuterProblem {
     fallback_policy: FallbackPolicy,
     screening_cap: Option<Arc<AtomicUsize>>,
     solver_class: SolverClass,
+    operator_initial_trust_radius: Option<f64>,
 }
 
 impl OuterProblem {
@@ -2173,6 +2178,7 @@ impl OuterProblem {
             fallback_policy: FallbackPolicy::Automatic,
             screening_cap: None,
             solver_class: SolverClass::Primary,
+            operator_initial_trust_radius: None,
         }
     }
 
@@ -2251,6 +2257,11 @@ impl OuterProblem {
         self
     }
 
+    pub fn with_operator_initial_trust_radius(mut self, radius: Option<f64>) -> Self {
+        self.operator_initial_trust_radius = radius;
+        self
+    }
+
     /// Override the fallback policy. Default is [`FallbackPolicy::Automatic`].
     ///
     /// Set [`FallbackPolicy::Disabled`] when the caller requires the primary
@@ -2294,6 +2305,7 @@ impl OuterProblem {
             fallback_policy: self.fallback_policy,
             screening_cap: self.screening_cap.clone(),
             solver_class: self.solver_class,
+            operator_initial_trust_radius: self.operator_initial_trust_radius,
         }
     }
 
@@ -2433,12 +2445,29 @@ pub struct OuterResult {
     pub converged: bool,
     /// Which plan was actually used (may differ from initial if fallback fired).
     pub plan_used: OuterPlan,
+    /// Final trust radius for the internal operator trust-region solver.
+    ///
+    /// A non-converged operator-ARC attempt may be restarted by the budget
+    /// ladder. Restarting only from the last θ but resetting the trust radius
+    /// is not a warm start: it replays the same rejected large trial steps.
+    /// Carry this globalization state so retries resume from the scale the
+    /// previous attempt already learned.
+    pub operator_trust_radius: Option<f64>,
+    /// Why the internal operator trust-region solver stopped.
+    pub operator_stop_reason: Option<OperatorTrustRegionStopReason>,
 }
 
 const OPERATOR_TRUST_RADIUS_INIT: f64 = 1.0;
 const OPERATOR_TRUST_RADIUS_MAX: f64 = 1.0e6;
 const OPERATOR_ETA_ACCEPT: f64 = 1.0e-4;
 const OPERATOR_TRUST_RADIUS_REJECT_FLOOR: f64 = 1.0e-9;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperatorTrustRegionStopReason {
+    Converged,
+    RejectFloor,
+    IterationBudget,
+}
 
 fn project_to_bounds(x: &Array1<f64>, bounds: Option<&(Array1<f64>, Array1<f64>)>) -> Array1<f64> {
     match bounds {
@@ -2669,10 +2698,17 @@ fn run_operator_trust_region(
     max_iter: usize,
     initial_eval: OuterEval,
     plan: OuterPlan,
+    initial_trust_radius: Option<f64>,
 ) -> Result<OuterResult, EstimationError> {
     let mut x_k = project_to_bounds(seed, bounds);
     let mut eval_k = initial_eval;
-    let mut trust_radius = OPERATOR_TRUST_RADIUS_INIT;
+    let mut trust_radius = initial_trust_radius
+        .filter(|radius| radius.is_finite() && *radius > 0.0)
+        .unwrap_or(OPERATOR_TRUST_RADIUS_INIT)
+        .clamp(
+            OPERATOR_TRUST_RADIUS_REJECT_FLOOR,
+            OPERATOR_TRUST_RADIUS_MAX,
+        );
 
     for iter in 0..max_iter {
         let iter_start = std::time::Instant::now();
@@ -2701,6 +2737,8 @@ fn run_operator_trust_region(
                 final_hessian: None,
                 converged: true,
                 plan_used: plan,
+                operator_trust_radius: Some(trust_radius),
+                operator_stop_reason: Some(OperatorTrustRegionStopReason::Converged),
             });
         }
 
@@ -2873,6 +2911,8 @@ fn run_operator_trust_region(
                 final_hessian: None,
                 converged: false,
                 plan_used: plan,
+                operator_trust_radius: Some(trust_radius),
+                operator_stop_reason: Some(OperatorTrustRegionStopReason::RejectFloor),
             });
         }
     }
@@ -2888,6 +2928,8 @@ fn run_operator_trust_region(
         final_hessian: None,
         converged: false,
         plan_used: plan,
+        operator_trust_radius: Some(trust_radius),
+        operator_stop_reason: Some(OperatorTrustRegionStopReason::IterationBudget),
     })
 }
 
@@ -2938,6 +2980,8 @@ fn run_outer(
             final_hessian: None,
             converged: true,
             plan_used: the_plan,
+            operator_trust_radius: None,
+            operator_stop_reason: None,
         });
     }
 
@@ -2986,25 +3030,34 @@ fn run_outer(
             let active_config: &OuterConfig = retry_config.as_ref().unwrap_or(config);
             match run_outer_with_plan(obj, active_config, context, attempt_cap, &the_plan) {
                 Ok(result) => {
-                    if result.converged || arc_retries_left == 0 {
+                    if result.converged
+                        || arc_retries_left == 0
+                        || matches!(
+                            result.operator_stop_reason,
+                            Some(OperatorTrustRegionStopReason::RejectFloor)
+                        )
+                    {
                         break Ok(result);
                     }
                     let prev_max_iter = active_config.max_iter;
                     let bumped_max_iter = prev_max_iter.saturating_mul(2);
+                    let next_trust_radius = result.operator_trust_radius;
                     log::info!(
                         "[OUTER] {context}: ARC attempt exhausted budget at \
                          iter={} cost={:.6e} |g|={:.6e}; retrying ARC with \
                          max_iter {} -> {} warm-started from last rho \
-                         (analytic-Hessian preservation)",
+                         and trust_radius {:?} (analytic-Hessian preservation)",
                         result.iterations,
                         result.final_value,
                         result.final_grad_norm,
                         prev_max_iter,
                         bumped_max_iter,
+                        next_trust_radius,
                     );
                     let mut next = active_config.clone();
                     next.max_iter = bumped_max_iter;
                     next.initial_rho = Some(result.rho.clone());
+                    next.operator_initial_trust_radius = next_trust_radius;
                     retry_config = Some(next);
                     arc_retries_left -= 1;
                     obj.reset();
@@ -3229,6 +3282,7 @@ fn run_outer_with_plan(
                         config.max_iter,
                         seed_eval,
                         *the_plan,
+                        config.operator_initial_trust_radius,
                     )
                 } else {
                     let hessian_source = the_plan.hessian_source;
@@ -3524,6 +3578,8 @@ fn run_outer_with_plan(
                         final_hessian: None,
                         converged: true,
                         plan_used: *the_plan,
+                        operator_trust_radius: None,
+                        operator_stop_reason: None,
                     }),
                     CompassSearchOutcome::BudgetExhausted { point, cost, polls } => {
                         Ok(OuterResult {
@@ -3535,6 +3591,8 @@ fn run_outer_with_plan(
                             final_hessian: None,
                             converged: false,
                             plan_used: *the_plan,
+                            operator_trust_radius: None,
+                            operator_stop_reason: None,
                         })
                     }
                 }
@@ -5087,6 +5145,8 @@ mod tests {
                 solver: Solver::Bfgs,
                 hessian_source: HessianSource::BfgsApprox,
             },
+            operator_trust_radius: None,
+            operator_stop_reason: None,
         };
         let nonconverged_lo = OuterResult {
             rho: array![1.0],
@@ -5100,6 +5160,8 @@ mod tests {
                 solver: Solver::Bfgs,
                 hessian_source: HessianSource::BfgsApprox,
             },
+            operator_trust_radius: None,
+            operator_stop_reason: None,
         };
         let converged = OuterResult {
             rho: array![2.0],
@@ -5113,6 +5175,8 @@ mod tests {
                 solver: Solver::Bfgs,
                 hessian_source: HessianSource::BfgsApprox,
             },
+            operator_trust_radius: None,
+            operator_stop_reason: None,
         };
 
         assert!(candidate_improves_best(&nonconverged_hi, None));
