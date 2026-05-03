@@ -3552,6 +3552,8 @@ pub(crate) struct RemlState<'a> {
     linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
     /// Relative shrinkage floor for penalized block eigenvalues (rho-independent).
     penalty_shrinkage_floor: Option<f64>,
+    /// Explicit prior on log smoothing parameters used by the REML/LAML objective.
+    rho_prior: crate::types::RhoPrior,
 
     cache_manager: EvalCacheManager,
     arena: RemlArena,

@@ -9,7 +9,7 @@ use crate::linalg::utils::{
 use crate::pirls::PirlsWorkspace;
 use crate::solver::estimate::reml::inner_strategy::HessianEvalStrategyKind;
 use crate::solver::outer_strategy::{HessianResult, OuterEval};
-use crate::types::{InverseLink, LinkFunction, SasLinkState};
+use crate::types::{InverseLink, LinkFunction, RhoPrior, SasLinkState};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1432,6 +1432,56 @@ impl<'a> RemlState<'a> {
         }
     }
 
+    fn compute_configured_rho_prior_cost(&self, rho: &Array1<f64>) -> f64 {
+        match self.rho_prior {
+            RhoPrior::Flat => 0.0,
+            RhoPrior::Normal { mean, sd } => {
+                if sd <= 0.0 || !sd.is_finite() || !mean.is_finite() {
+                    return f64::INFINITY;
+                }
+                let inv_var = 1.0 / (sd * sd);
+                0.5 * inv_var
+                    * rho
+                        .iter()
+                        .map(|&r| {
+                            let d = r - mean;
+                            d * d
+                        })
+                        .sum::<f64>()
+            }
+        }
+    }
+
+    fn compute_configured_rho_prior_grad(&self, rho: &Array1<f64>) -> Array1<f64> {
+        match self.rho_prior {
+            RhoPrior::Flat => Array1::zeros(rho.len()),
+            RhoPrior::Normal { mean, sd } => {
+                if sd <= 0.0 || !sd.is_finite() || !mean.is_finite() {
+                    return Array1::from_elem(rho.len(), f64::NAN);
+                }
+                let inv_var = 1.0 / (sd * sd);
+                rho.mapv(|r| (r - mean) * inv_var)
+            }
+        }
+    }
+
+    fn compute_configured_rho_prior_hess(&self, rho: &Array1<f64>) -> Option<Array2<f64>> {
+        match self.rho_prior {
+            RhoPrior::Flat => None,
+            RhoPrior::Normal { mean, sd } => {
+                if sd <= 0.0 || !sd.is_finite() || !mean.is_finite() {
+                    return Some(Array2::from_elem((rho.len(), rho.len()), f64::NAN));
+                }
+                let inv_var = 1.0 / (sd * sd);
+                let mut hess = Array2::<f64>::zeros((rho.len(), rho.len()));
+                for i in 0..rho.len() {
+                    hess[[i, i]] = inv_var;
+                }
+                Some(hess)
+            }
+        }
+    }
+
     /// Returns the effective Hessian and the ridge value used (if any).
     /// Uses the same Hessian matrix in both cost and gradient calculations.
     ///
@@ -1554,6 +1604,7 @@ impl<'a> RemlState<'a> {
             coefficient_lower_bounds,
             linear_constraints,
             penalty_shrinkage_floor: None,
+            rho_prior: RhoPrior::Flat,
             cache_manager: EvalCacheManager::new(),
             arena: RemlArena::new(),
             warm_start_beta: RwLock::new(None),
@@ -1637,6 +1688,10 @@ impl<'a> RemlState<'a> {
     /// non-Gaussianity in the posterior. Typical value: `Some(1e-6)`.
     pub(crate) fn set_penalty_shrinkage_floor(&mut self, floor: Option<f64>) {
         self.penalty_shrinkage_floor = floor;
+    }
+
+    pub(crate) fn set_rho_prior(&mut self, prior: RhoPrior) {
+        self.rho_prior = prior;
     }
 
     /// Creates a sanitized cache key from rho values.
@@ -3888,9 +3943,21 @@ impl<'a> RemlState<'a> {
         super::assembly::soft_prior_for_mode(
             rho,
             mode,
-            |r| self.compute_soft_priorcost(r),
-            |r| self.compute_soft_priorgrad(r),
-            |r| self.compute_soft_priorhess(r),
+            |r| self.compute_soft_priorcost(r) + self.compute_configured_rho_prior_cost(r),
+            |r| self.compute_soft_priorgrad(r) + &self.compute_configured_rho_prior_grad(r),
+            |r| {
+                let mut hess = self
+                    .compute_soft_priorhess(r)
+                    .unwrap_or_else(|| Array2::<f64>::zeros((r.len(), r.len())));
+                if let Some(configured) = self.compute_configured_rho_prior_hess(r) {
+                    hess += &configured;
+                }
+                if hess.iter().any(|&v| v != 0.0) {
+                    Some(hess)
+                } else {
+                    None
+                }
+            },
         )
     }
 

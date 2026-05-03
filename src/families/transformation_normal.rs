@@ -2466,6 +2466,7 @@ impl TransformationNormalFamily {
         beta: &Array1<f64>,
         row_quantities: &TransformationNormalRowQuantityCache,
         op: &TensorKroneckerPsiOperator,
+        op_arc: Arc<dyn CustomFamilyPsiDerivativeOperator>,
         axis: usize,
     ) -> Result<ExactNewtonJointPsiTerms, String> {
         let n = self.response_val_basis.nrows();
@@ -2504,7 +2505,6 @@ impl TransformationNormalFamily {
         let h_prime = row_quantities.h_prime.as_ref();
         let mut objective_psi = 0.0;
         let mut score_psi = Array1::<f64>::zeros(p_total);
-        let mut hessian_psi = Array2::<f64>::zeros((p_total, p_total));
 
         for i in 0..n {
             let cov_row = cov.row(i);
@@ -2516,7 +2516,6 @@ impl TransformationNormalFamily {
             let hp = h_prime[i];
             let inv_hp = 1.0 / hp;
             let inv_hp_sq = inv_hp * inv_hp;
-            let inv_hp_cu = inv_hp_sq * inv_hp;
             let q = row_quantities.endpoint_q[i];
 
             let mut gamma = vec![0.0; p_resp];
@@ -2604,105 +2603,246 @@ impl TransformationNormalFamily {
                             + endpoint_chain_second(&q, endpoint_psi, endpoint_a, endpoint_psi_a));
                 }
             }
-
-            for k in 0..p_resp {
-                for l in 0..p_resp {
-                    let same_shape = k == l && k > 0;
-                    for c in 0..p_cov {
-                        let row_idx = k * p_cov + c;
-                        let h_a = h_factor[k] * cov_row[c];
-                        let hp_a = hp_factor[k] * cov_row[c];
-                        let hpsi_a =
-                            hpsi_cov_factor[k] * cov_row[c] + hpsi_psi_factor[k] * psi_row[c];
-                        let hppsi_a =
-                            hppsi_cov_factor[k] * cov_row[c] + hppsi_psi_factor[k] * psi_row[c];
-                        for d in 0..p_cov {
-                            let col_idx = l * p_cov + d;
-                            let h_b = h_factor[l] * cov_row[d];
-                            let hp_b = hp_factor[l] * cov_row[d];
-                            let hpsi_b =
-                                hpsi_cov_factor[l] * cov_row[d] + hpsi_psi_factor[l] * psi_row[d];
-                            let hppsi_b =
-                                hppsi_cov_factor[l] * cov_row[d] + hppsi_psi_factor[l] * psi_row[d];
-                            let endpoint_a = [
-                                endpoint_factor[k][0] * cov_row[c],
-                                endpoint_factor[k][1] * cov_row[c],
-                            ];
-                            let endpoint_b = [
-                                endpoint_factor[l][0] * cov_row[d],
-                                endpoint_factor[l][1] * cov_row[d],
-                            ];
-                            let endpoint_psi_a = [
-                                endpoint_psi_cov_factor[k][0] * cov_row[c]
-                                    + endpoint_psi_psi_factor[k][0] * psi_row[c],
-                                endpoint_psi_cov_factor[k][1] * cov_row[c]
-                                    + endpoint_psi_psi_factor[k][1] * psi_row[c],
-                            ];
-                            let endpoint_psi_b = [
-                                endpoint_psi_cov_factor[l][0] * cov_row[d]
-                                    + endpoint_psi_psi_factor[l][0] * psi_row[d],
-                                endpoint_psi_cov_factor[l][1] * cov_row[d]
-                                    + endpoint_psi_psi_factor[l][1] * psi_row[d],
-                            ];
-                            let (h_ab, hp_ab, hpsi_ab, hppsi_ab) = if same_shape {
-                                (
-                                    2.0 * rv[k] * cov_row[c] * cov_row[d],
-                                    2.0 * rd[k] * cov_row[c] * cov_row[d],
-                                    2.0 * rv[k]
-                                        * (psi_row[d] * cov_row[c] + psi_row[c] * cov_row[d]),
-                                    2.0 * rd[k]
-                                        * (psi_row[d] * cov_row[c] + psi_row[c] * cov_row[d]),
-                                )
-                            } else {
-                                (0.0, 0.0, 0.0, 0.0)
-                            };
-                            let (endpoint_ab, endpoint_psi_ab) = if same_shape {
-                                (
-                                    [
-                                        2.0 * endpoint_basis[0][k] * cov_row[c] * cov_row[d],
-                                        2.0 * endpoint_basis[1][k] * cov_row[c] * cov_row[d],
-                                    ],
-                                    [
-                                        2.0 * endpoint_basis[0][k]
-                                            * (psi_row[d] * cov_row[c] + psi_row[c] * cov_row[d]),
-                                        2.0 * endpoint_basis[1][k]
-                                            * (psi_row[d] * cov_row[c] + psi_row[c] * cov_row[d]),
-                                    ],
-                                )
-                            } else {
-                                ([0.0; 2], [0.0; 2])
-                            };
-                            let value = hpsi_a * h_b
-                                + h_a * hpsi_b
-                                + h_psi * h_ab
-                                + hi * hpsi_ab
-                                + (hppsi_a * hp_b + hp_a * hppsi_b) * inv_hp_sq
-                                - 2.0 * hp_a * hp_b * hp_psi * inv_hp_cu
-                                - hppsi_ab * inv_hp
-                                + hp_ab * hp_psi * inv_hp_sq
-                                + endpoint_chain_third(
-                                    &q,
-                                    endpoint_psi,
-                                    endpoint_a,
-                                    endpoint_b,
-                                    endpoint_psi_a,
-                                    endpoint_psi_b,
-                                    endpoint_ab,
-                                    endpoint_psi_ab,
-                                );
-                            hessian_psi[[row_idx, col_idx]] += wi * value;
-                        }
-                    }
-                }
-            }
         }
+
+        let hessian_psi_operator: Arc<dyn HyperOperator> =
+            Arc::new(TransformationNormalPsiHessianOperator::new(
+                Arc::new(self.clone()),
+                beta.clone(),
+                Arc::clone(&op_arc),
+                axis,
+                Arc::clone(&row_quantities.h),
+                Arc::clone(&row_quantities.h_prime),
+                Arc::clone(&row_quantities.endpoint_q),
+            ));
 
         Ok(ExactNewtonJointPsiTerms {
             objective_psi,
             score_psi,
-            hessian_psi: 0.5 * (&hessian_psi + &hessian_psi.t()),
-            hessian_psi_operator: None,
+            hessian_psi: Array2::zeros((0, 0)),
+            hessian_psi_operator: Some(hessian_psi_operator),
         })
+    }
+
+    fn scop_psi_hessian_apply_from_operator(
+        &self,
+        beta: &Array1<f64>,
+        row_quantities: &TransformationNormalRowQuantityCache,
+        op: &TensorKroneckerPsiOperator,
+        axis: usize,
+        direction: &Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
+        let n = self.response_val_basis.nrows();
+        let p_resp = self.response_val_basis.ncols();
+        let p_cov = self.covariate_design.ncols();
+        let p_total = p_resp * p_cov;
+        if beta.len() != p_total || direction.len() != p_total {
+            return Err(format!(
+                "SCOP psi Hessian apply length mismatch: beta={}, direction={}, expected={p_total}",
+                beta.len(),
+                direction.len()
+            ));
+        }
+        let beta_mat = beta
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP psi Hessian apply beta reshape failed: {e}"))?;
+        let dir_mat = direction
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP psi Hessian apply direction reshape failed: {e}"))?;
+        let cov = self
+            .covariate_design
+            .try_row_chunk(0..n)
+            .map_err(|e| format!("SCOP psi Hessian apply requires covariate row chunk: {e}"))?;
+        let cov_psi = op
+            .materialize_cov_first_axis(axis)
+            .map_err(|e| format!("SCOP psi Hessian apply materialize_cov_first failed: {e}"))?;
+        if cov_psi.nrows() != n || cov_psi.ncols() != p_cov {
+            return Err(format!(
+                "SCOP psi Hessian apply covariate derivative shape {}x{} != expected {}x{}",
+                cov_psi.nrows(),
+                cov_psi.ncols(),
+                n,
+                p_cov
+            ));
+        }
+
+        let weights = self.weights.as_ref();
+        let h = row_quantities.h.as_ref();
+        let h_prime = row_quantities.h_prime.as_ref();
+        let endpoint_basis = [
+            self.response_upper_basis
+                .as_slice()
+                .ok_or_else(|| "SCOP endpoint upper basis is not contiguous".to_string())?,
+            self.response_lower_basis
+                .as_slice()
+                .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
+        ];
+        let mut out = Array1::<f64>::zeros(p_total);
+
+        for i in 0..n {
+            let cov_row = cov.row(i);
+            let psi_row = cov_psi.row(i);
+            let rv = self.response_val_basis.row(i);
+            let rd = self.response_deriv_basis.row(i);
+            let wi = weights[i];
+            let hi = h[i];
+            let hp = h_prime[i];
+            let inv_hp = 1.0 / hp;
+            let inv_hp_sq = inv_hp * inv_hp;
+            let inv_hp_cu = inv_hp_sq * inv_hp;
+            let q = row_quantities.endpoint_q[i];
+
+            let mut gamma = vec![0.0; p_resp];
+            let mut gamma_dir = vec![0.0; p_resp];
+            let mut gamma_psi = vec![0.0; p_resp];
+            let mut gamma_psi_dir = vec![0.0; p_resp];
+            for k in 0..p_resp {
+                gamma[k] = beta_mat.row(k).dot(&cov_row);
+                gamma_dir[k] = dir_mat.row(k).dot(&cov_row);
+                gamma_psi[k] = beta_mat.row(k).dot(&psi_row);
+                gamma_psi_dir[k] = dir_mat.row(k).dot(&psi_row);
+            }
+
+            let mut h_dir = rv[0] * gamma_dir[0];
+            let mut hp_dir = rd[0] * gamma_dir[0];
+            let mut h_psi = rv[0] * gamma_psi[0];
+            let mut hp_psi = rd[0] * gamma_psi[0];
+            let mut h_psi_dir = rv[0] * gamma_psi_dir[0];
+            let mut hp_psi_dir = rd[0] * gamma_psi_dir[0];
+            for k in 1..p_resp {
+                h_dir += 2.0 * rv[k] * gamma[k] * gamma_dir[k];
+                hp_dir += 2.0 * rd[k] * gamma[k] * gamma_dir[k];
+                h_psi += 2.0 * rv[k] * gamma[k] * gamma_psi[k];
+                hp_psi += 2.0 * rd[k] * gamma[k] * gamma_psi[k];
+                h_psi_dir +=
+                    2.0 * rv[k] * (gamma_dir[k] * gamma_psi[k] + gamma[k] * gamma_psi_dir[k]);
+                hp_psi_dir +=
+                    2.0 * rd[k] * (gamma_dir[k] * gamma_psi[k] + gamma[k] * gamma_psi_dir[k]);
+            }
+            let d_inv_hp = -hp_dir * inv_hp_sq;
+            let d_inv_hp_sq = -2.0 * hp_dir * inv_hp_cu;
+
+            let mut endpoint_psi = [0.0; 2];
+            let mut endpoint_dir = [0.0; 2];
+            let mut endpoint_psi_dir = [0.0; 2];
+            let mut endpoint_factor = vec![[0.0; 2]; p_resp];
+            let mut endpoint_factor_dir = vec![[0.0; 2]; p_resp];
+            let mut endpoint_psi_cov_factor = vec![[0.0; 2]; p_resp];
+            let mut endpoint_psi_psi_factor = vec![[0.0; 2]; p_resp];
+            let mut endpoint_psi_cov_factor_dir = vec![[0.0; 2]; p_resp];
+            let mut endpoint_psi_psi_factor_dir = vec![[0.0; 2]; p_resp];
+            for e in 0..2 {
+                let basis = endpoint_basis[e];
+                endpoint_psi[e] = basis[0] * gamma_psi[0];
+                endpoint_dir[e] = basis[0] * gamma_dir[0];
+                endpoint_psi_dir[e] = basis[0] * gamma_psi_dir[0];
+                endpoint_factor[0][e] = basis[0];
+                endpoint_psi_psi_factor[0][e] = basis[0];
+                for k in 1..p_resp {
+                    endpoint_psi[e] += 2.0 * basis[k] * gamma[k] * gamma_psi[k];
+                    endpoint_dir[e] += 2.0 * basis[k] * gamma[k] * gamma_dir[k];
+                    endpoint_psi_dir[e] += 2.0
+                        * basis[k]
+                        * (gamma_dir[k] * gamma_psi[k] + gamma[k] * gamma_psi_dir[k]);
+                    endpoint_factor[k][e] = 2.0 * basis[k] * gamma[k];
+                    endpoint_factor_dir[k][e] = 2.0 * basis[k] * gamma_dir[k];
+                    endpoint_psi_cov_factor[k][e] = 2.0 * basis[k] * gamma_psi[k];
+                    endpoint_psi_psi_factor[k][e] = 2.0 * basis[k] * gamma[k];
+                    endpoint_psi_cov_factor_dir[k][e] = 2.0 * basis[k] * gamma_psi_dir[k];
+                    endpoint_psi_psi_factor_dir[k][e] = 2.0 * basis[k] * gamma_dir[k];
+                }
+            }
+
+            let mut h_factor = vec![0.0; p_resp];
+            let mut hp_factor = vec![0.0; p_resp];
+            let mut h_factor_dir = vec![0.0; p_resp];
+            let mut hp_factor_dir = vec![0.0; p_resp];
+            let mut hpsi_cov_factor = vec![0.0; p_resp];
+            let mut hppsi_cov_factor = vec![0.0; p_resp];
+            let mut hpsi_psi_factor = vec![0.0; p_resp];
+            let mut hppsi_psi_factor = vec![0.0; p_resp];
+            let mut hpsi_cov_factor_dir = vec![0.0; p_resp];
+            let mut hppsi_cov_factor_dir = vec![0.0; p_resp];
+            let mut hpsi_psi_factor_dir = vec![0.0; p_resp];
+            let mut hppsi_psi_factor_dir = vec![0.0; p_resp];
+            h_factor[0] = rv[0];
+            hp_factor[0] = rd[0];
+            hpsi_psi_factor[0] = rv[0];
+            hppsi_psi_factor[0] = rd[0];
+            for k in 1..p_resp {
+                h_factor[k] = 2.0 * rv[k] * gamma[k];
+                hp_factor[k] = 2.0 * rd[k] * gamma[k];
+                h_factor_dir[k] = 2.0 * rv[k] * gamma_dir[k];
+                hp_factor_dir[k] = 2.0 * rd[k] * gamma_dir[k];
+                hpsi_cov_factor[k] = 2.0 * rv[k] * gamma_psi[k];
+                hppsi_cov_factor[k] = 2.0 * rd[k] * gamma_psi[k];
+                hpsi_psi_factor[k] = 2.0 * rv[k] * gamma[k];
+                hppsi_psi_factor[k] = 2.0 * rd[k] * gamma[k];
+                hpsi_cov_factor_dir[k] = 2.0 * rv[k] * gamma_psi_dir[k];
+                hppsi_cov_factor_dir[k] = 2.0 * rd[k] * gamma_psi_dir[k];
+                hpsi_psi_factor_dir[k] = 2.0 * rv[k] * gamma_dir[k];
+                hppsi_psi_factor_dir[k] = 2.0 * rd[k] * gamma_dir[k];
+            }
+
+            for k in 0..p_resp {
+                for c in 0..p_cov {
+                    let idx = k * p_cov + c;
+                    let h_a = h_factor[k] * cov_row[c];
+                    let hp_a = hp_factor[k] * cov_row[c];
+                    let h_a_dir = h_factor_dir[k] * cov_row[c];
+                    let hp_a_dir = hp_factor_dir[k] * cov_row[c];
+                    let hpsi_a = hpsi_cov_factor[k] * cov_row[c] + hpsi_psi_factor[k] * psi_row[c];
+                    let hppsi_a =
+                        hppsi_cov_factor[k] * cov_row[c] + hppsi_psi_factor[k] * psi_row[c];
+                    let hpsi_a_dir =
+                        hpsi_cov_factor_dir[k] * cov_row[c] + hpsi_psi_factor_dir[k] * psi_row[c];
+                    let hppsi_a_dir =
+                        hppsi_cov_factor_dir[k] * cov_row[c] + hppsi_psi_factor_dir[k] * psi_row[c];
+                    let endpoint_a = [
+                        endpoint_factor[k][0] * cov_row[c],
+                        endpoint_factor[k][1] * cov_row[c],
+                    ];
+                    let endpoint_a_dir = [
+                        endpoint_factor_dir[k][0] * cov_row[c],
+                        endpoint_factor_dir[k][1] * cov_row[c],
+                    ];
+                    let endpoint_psi_a = [
+                        endpoint_psi_cov_factor[k][0] * cov_row[c]
+                            + endpoint_psi_psi_factor[k][0] * psi_row[c],
+                        endpoint_psi_cov_factor[k][1] * cov_row[c]
+                            + endpoint_psi_psi_factor[k][1] * psi_row[c],
+                    ];
+                    let endpoint_psi_a_dir = [
+                        endpoint_psi_cov_factor_dir[k][0] * cov_row[c]
+                            + endpoint_psi_psi_factor_dir[k][0] * psi_row[c],
+                        endpoint_psi_cov_factor_dir[k][1] * cov_row[c]
+                            + endpoint_psi_psi_factor_dir[k][1] * psi_row[c],
+                    ];
+                    let value =
+                        h_a_dir * h_psi + h_a * h_psi_dir + h_dir * hpsi_a + hi * hpsi_a_dir
+                            - hppsi_a_dir * inv_hp
+                            - hppsi_a * d_inv_hp
+                            + hp_psi_dir * hp_a * inv_hp_sq
+                            + hp_psi * hp_a_dir * inv_hp_sq
+                            + hp_psi * hp_a * d_inv_hp_sq
+                            + endpoint_chain_third(
+                                &q,
+                                endpoint_psi,
+                                endpoint_a,
+                                endpoint_dir,
+                                endpoint_psi_a,
+                                endpoint_psi_dir,
+                                endpoint_a_dir,
+                                endpoint_psi_a_dir,
+                            );
+                    out[idx] += wi * value;
+                }
+            }
+        }
+
+        Ok(out)
     }
 
     fn scop_psi_psi_value_score_hvp_from_cov(
@@ -4715,7 +4855,13 @@ impl CustomFamily for TransformationNormalFamily {
                     .to_string()
             })?;
         let axis = deriv.implicit_axis;
-        let terms = self.scop_psi_terms(beta, &row, op, axis)?;
+        let op_arc = Arc::clone(
+            deriv
+                .implicit_operator
+                .as_ref()
+                .expect("validated CTN psi derivative operator disappeared"),
+        );
+        let terms = self.scop_psi_terms(beta, &row, op, op_arc, axis)?;
 
         log::info!(
             "[STAGE] CTN psi first-order terms axis={} psi_index={} elapsed={:.3}s",
@@ -5176,6 +5322,83 @@ impl HyperOperator for TransformationNormalD2hMatrixFreeOperator {
                 &self.row_quantities,
             )
             .expect("validated CTN d2H operator inputs should not fail")
+    }
+
+    fn is_implicit(&self) -> bool {
+        true
+    }
+}
+
+struct TransformationNormalPsiHessianOperator {
+    family: Arc<TransformationNormalFamily>,
+    beta: Array1<f64>,
+    op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+    axis: usize,
+    row_quantities: TransformationNormalRowQuantityCache,
+}
+
+impl TransformationNormalPsiHessianOperator {
+    fn new(
+        family: Arc<TransformationNormalFamily>,
+        beta: Array1<f64>,
+        op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+        axis: usize,
+        row_h: Arc<Array1<f64>>,
+        row_h_prime: Arc<Array1<f64>>,
+        endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
+    ) -> Self {
+        let log_likelihood = 0.0;
+        Self {
+            family,
+            beta: beta.clone(),
+            op,
+            axis,
+            row_quantities: TransformationNormalRowQuantityCache {
+                beta: Arc::new(beta),
+                h: row_h,
+                h_prime: row_h_prime,
+                endpoint_q,
+                log_likelihood,
+            },
+        }
+    }
+
+    fn tensor_op(&self) -> &TensorKroneckerPsiOperator {
+        self.op
+            .as_any()
+            .downcast_ref::<TensorKroneckerPsiOperator>()
+            .expect("validated CTN psi operator must remain tensor-backed")
+    }
+}
+
+impl HyperOperator for TransformationNormalPsiHessianOperator {
+    fn dim(&self) -> usize {
+        self.beta.len()
+    }
+
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        self.family
+            .scop_psi_hessian_apply_from_operator(
+                &self.beta,
+                &self.row_quantities,
+                self.tensor_op(),
+                self.axis,
+                v,
+            )
+            .expect("validated CTN psi Hessian operator inputs should not fail")
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let p = self.dim();
+        let mut dense = Array2::<f64>::zeros((p, p));
+        let mut basis = Array1::<f64>::zeros(p);
+        for col in 0..p {
+            basis[col] = 1.0;
+            let applied = self.mul_vec(&basis);
+            dense.column_mut(col).assign(&applied);
+            basis[col] = 0.0;
+        }
+        0.5 * (&dense + &dense.t())
     }
 
     fn is_implicit(&self) -> bool {
@@ -8112,6 +8335,18 @@ mod tests {
     use crate::testing::assert_matrix_derivativefd;
     use ndarray::array;
 
+    fn dense_first_order_psi_hessian(terms: &ExactNewtonJointPsiTerms) -> Array2<f64> {
+        if terms.hessian_psi.nrows() > 0 {
+            terms.hessian_psi.clone()
+        } else {
+            terms
+                .hessian_psi_operator
+                .as_ref()
+                .expect("CTN psi first-order terms must expose either dense Hessian or operator")
+                .to_dense()
+        }
+    }
+
     #[test]
     fn ctn_penalty_scale_seed_uses_likelihood_to_penalty_ratio() {
         let likelihood_gram = array![[8.0, 0.0], [0.0, 8.0]];
@@ -8816,7 +9051,9 @@ mod tests {
             );
         }
 
-        let hess_fd = (&plus.hessian_psi - &minus.hessian_psi) / (2.0 * h);
+        let hess_fd = (dense_first_order_psi_hessian(&plus)
+            - dense_first_order_psi_hessian(&minus))
+            / (2.0 * h);
         // The CTN psi-psi second-order kernel exposes its dense p_total×p_total
         // block through `hessian_psi_psi` when the family materializes it
         // eagerly, or through an operator-backed `hessian_psi_psi_operator`
@@ -8967,7 +9204,7 @@ mod tests {
         let eval_hess = |beta: &Array1<f64>| {
             let mut shifted_state = state.clone();
             shifted_state.beta = beta.clone();
-            family
+            let terms = family
                 .exact_newton_joint_psi_terms(
                     std::slice::from_ref(&shifted_state),
                     &specs,
@@ -8975,8 +9212,8 @@ mod tests {
                     0,
                 )
                 .expect("first-order psi terms at shifted beta")
-                .expect("shifted first-order terms should be present")
-                .hessian_psi
+                .expect("shifted first-order terms should be present");
+            dense_first_order_psi_hessian(&terms)
         };
 
         let beta_plus = &state.beta + &(direction.clone() * h);
