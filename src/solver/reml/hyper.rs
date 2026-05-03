@@ -990,7 +990,7 @@ impl<'a> RemlState<'a> {
 
                 super::unified::HyperCoordPair {
                     a: a_ij + a_firth,
-                    g: &g_ij - &g_firth,
+                    g: &g_firth - &g_ij,
                     b_mat: Array2::<f64>::zeros((0, 0)),
                     b_operator: Some(b_operator),
                     ld_s: ld_s_ij,
@@ -1031,7 +1031,7 @@ impl<'a> RemlState<'a> {
                         .map(|a_kt| beta_eval.dot(&a_kt.dot(beta_eval.as_ref())))
                         .unwrap_or(0.0);
                 let g_kj = a_k_tau_j
-                    .map(|a_kt| -(a_kt.dot(beta_eval.as_ref())))
+                    .map(|a_kt| a_kt.dot(beta_eval.as_ref()))
                     .unwrap_or_else(|| Array1::<f64>::zeros(p_dim));
                 let b_kj = a_k_tau_j
                     .cloned()
@@ -1445,7 +1445,7 @@ impl<'a> RemlState<'a> {
             )?;
 
             // --- a_j: fixed-β cost derivative (envelope term) ---
-            // a_j = −u^T (X_{τ_j} β̂) + 0.5 β̂^T S_{τ_j} β̂  [+ Φ_{τ_j}|_β for Firth]
+            // a_j = −u^T (X_{τ_j} β̂) + 0.5 β̂^T S_{τ_j} β̂  [− Φ_{τ_j}|_β for Firth]
             let x_tau_beta_j = if implicit_tau_available {
                 hyper_dirs[j].x_tau_original.transformed_forward_mul(
                     &reparam_result.qs,
@@ -1474,7 +1474,7 @@ impl<'a> RemlState<'a> {
                 )?;
                 let need_kernel = x_tau_j.iter().any(|v| *v != 0.0);
                 let tau_bundle = Self::firth_exact_tau_kernel(op, x_tau_j, &beta_eval, need_kernel);
-                a_j += tau_bundle.phi_tau_partial;
+                a_j -= tau_bundle.phi_tau_partial;
                 firth_g_j = Some(tau_bundle.gphi_tau.clone());
                 if need_kernel {
                     firth_tau_kernel_j = Some(tau_bundle.tau_kernel.expect(
@@ -1655,9 +1655,15 @@ impl<'a> RemlState<'a> {
                 .clone(),
             );
 
+            let stored_g_j = if let Some(firth_g_j) = firth_g_j.as_ref() {
+                -&g_j - &(2.0 * firth_g_j)
+            } else {
+                -g_j
+            };
+
             coords.push(super::unified::HyperCoord {
                 a: a_j,
-                g: g_j,
+                g: stored_g_j,
                 drift: super::unified::HyperCoordDrift::from_parts(dense_b, b_operator),
                 ld_s: ld_s_j,
                 b_depends_on_beta,
@@ -1919,7 +1925,7 @@ impl<'a> RemlState<'a> {
                 let tau_bundle =
                     Self::firth_exact_tau_kernel(op, &x_tau_dense, &beta_eval, need_kernel);
                 g_j -= &tau_bundle.gphi_tau;
-                a_j += tau_bundle.phi_tau_partial;
+                a_j -= tau_bundle.phi_tau_partial;
                 firth_g_j = Some(tau_bundle.gphi_tau.clone());
                 if let Some(kernel) = tau_bundle.tau_kernel.as_ref() {
                     let eye = Array2::<f64>::eye(p_dim);
@@ -1939,10 +1945,15 @@ impl<'a> RemlState<'a> {
             };
 
             let ld_s_j = pld.tau_gradient_component(&s_tau_j);
+            let stored_g_j = if let Some(firth_g_j) = firth_g_j.as_ref() {
+                -&g_j - &(2.0 * firth_g_j)
+            } else {
+                -g_j
+            };
 
             coords.push(super::unified::HyperCoord {
                 a: a_j,
-                g: g_j,
+                g: stored_g_j,
                 drift: super::unified::HyperCoordDrift::from_operator(std::sync::Arc::new(
                     super::unified::SparseDirectionalHyperOperator {
                         x_tau: dir.x_tau_original.clone(),

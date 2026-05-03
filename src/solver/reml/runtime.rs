@@ -505,7 +505,7 @@ impl<'a> RemlState<'a> {
                 Self::tk_active_weighted_trace(&shared.active_blocks, &x_vks[x_vk_idx], &lev_p);
             let firth_trace =
                 Self::tk_firth_beta_hessian_trace(firth_op, &beta_dirs[x_vk_idx], &p_total)?;
-            let mut eta_total = x_vks[x_vk_idx].clone();
+            let mut eta_total = x_vks[x_vk_idx].mapv(|value| -value);
             if let Some(eta_fixed) = ext_eta_fixed
                 .get(extra_idx)
                 .and_then(|value| value.as_ref())
@@ -534,7 +534,7 @@ impl<'a> RemlState<'a> {
             let direct = Self::tk_direct_gradient_from_cd_and_design(
                 x_dense, z, c_array, d_array, e_array, &eta_total, x_fixed, shared, gram,
             )?;
-            gradient[x_vk_idx] = trace_ak_p + correction_trace + firth_trace + direct;
+            gradient[x_vk_idx] = trace_ak_p - correction_trace + firth_trace + direct;
         }
 
         for g in gradient.iter_mut() {
@@ -821,7 +821,7 @@ impl<'a> RemlState<'a> {
             }
             let beta_theta = h_inv_solve(&coord.g)?;
             x_vks.push(x_dense.dot(&beta_theta));
-            beta_dirs.push(beta_theta);
+            beta_dirs.push(beta_theta.mapv(|value| -value));
             ext_drifts.push(drift);
             ext_eta_fixed.push(coord.tk_eta_fixed.clone());
             ext_x_fixed.push(coord.tk_x_fixed.clone());
