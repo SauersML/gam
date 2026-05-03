@@ -3278,7 +3278,13 @@ pub fn build_smooth_design_withworkspace(
                 // matches the original-coord kernel for uniform σ.
                 let (scales, length_scale_eff) = if let Some(s) = input_scales {
                     apply_input_standardization(&mut x, s);
-                    (Some(s.clone()), spec.length_scale)
+                    let sigma_geom = geometric_mean_scale(s);
+                    let l_eff = if sigma_geom > 0.0 && sigma_geom.is_finite() {
+                        spec.length_scale / sigma_geom
+                    } else {
+                        spec.length_scale
+                    };
+                    (Some(s.clone()), l_eff)
                 } else if let Some(s) = compute_spatial_input_scales(x.view()) {
                     let sigma_geom = geometric_mean_scale(&s);
                     apply_input_standardization(&mut x, &s);
@@ -3350,7 +3356,13 @@ pub fn build_smooth_design_withworkspace(
                 // replayable at predict time.
                 let (scales, length_scale_eff) = if let Some(s) = input_scales {
                     apply_input_standardization(&mut x, s);
-                    (Some(s.clone()), spec.length_scale)
+                    let sigma_geom = geometric_mean_scale(s);
+                    let l_eff = if sigma_geom > 0.0 && sigma_geom.is_finite() {
+                        spec.length_scale / sigma_geom
+                    } else {
+                        spec.length_scale
+                    };
+                    (Some(s.clone()), l_eff)
                 } else if let Some(s) = compute_spatial_input_scales(x.view()) {
                     let sigma_geom = geometric_mean_scale(&s);
                     apply_input_standardization(&mut x, &s);
@@ -3406,7 +3418,18 @@ pub fn build_smooth_design_withworkspace(
                 // compensation.
                 let (scales, length_scale_eff) = if let Some(s) = input_scales {
                     apply_input_standardization(&mut x, s);
-                    (Some(s.clone()), spec.length_scale)
+                    let l_eff = match spec.length_scale {
+                        Some(l_user) => {
+                            let sigma_geom = geometric_mean_scale(s);
+                            if sigma_geom > 0.0 && sigma_geom.is_finite() {
+                                Some(l_user / sigma_geom)
+                            } else {
+                                Some(l_user)
+                            }
+                        }
+                        None => None,
+                    };
+                    (Some(s.clone()), l_eff)
                 } else if let Some(s) = compute_spatial_input_scales(x.view()) {
                     let l_eff = match spec.length_scale {
                         Some(l_user) => {
