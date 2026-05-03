@@ -5453,6 +5453,14 @@ fn stable_logdet_with_ridge_policy(
         }
         RidgeDeterminantMode::Auto => unreachable!("adaptive determinant mode must resolve"),
         RidgeDeterminantMode::PositivePart => {
+            if let Some((row, col, value)) = a
+                .indexed_iter()
+                .find_map(|((row, col), &value)| (!value.is_finite()).then_some((row, col, value)))
+            {
+                return Err(format!(
+                    "smooth-regularized logdet Hessian contains non-finite entry at ({row}, {col}): {value}"
+                ));
+            }
             // Smooth-regularized logdet objective, aligned with the gradient
             // operator (`DenseSpectralOperator` in `Smooth` mode):
             //
@@ -15213,22 +15221,8 @@ mod tests {
         );
     }
 
-    //
-    // Root-cause tests for "exact-newton eigendecomposition failed: NoConvergence"
-    //
-    // Bug: ExactNewtonBlockUpdater::compute_update_step calls FaerEigh::eigh()
-    // to determine the minimum eigenvalue for ridging, but this eigendecomposition
-    // itself fails when the Hessian contains NaN/Inf (e.g. from overflow in the
-    // log_sigma block when exp(eta) overflows).  Unlike stable_logdet_with_ridge_policy
-    // which has a 4-tier fallback chain (eigh -> SVD -> ridged Cholesky -> diagonal),
-    // compute_update_step has NO fallback and propagates the error, killing the fit.
-    //
-    // The tests below prove necessity and sufficiency:
-    //   - NECESSITY: NaN/Inf in the Hessian causes the eigendecomposition to fail,
-    //     which is the sole cause of the "eigendecomposition failed" crash.
-    //   - SUFFICIENCY: The same family with finite Hessians succeeds; the same
-    //     pathological matrix succeeds through stable_logdet_with_ridge_policy.
-    //
+    // Exact analytic Hessians must be finite. Non-finite Hessians are rejected
+    // loudly instead of being masked by a surrogate update.
 
     /// A QuadraticReml family whose log_sigma block returns a Hessian containing
     /// NaN, simulating what happens when exp(eta_sigma) overflows during
@@ -15340,13 +15334,11 @@ mod tests {
     }
 
     #[test]
-    fn exact_newton_nan_hessian_survives_via_fallback() {
-        // With the Layer 2 fix, a NaN Hessian in the log_sigma block no
-        // longer crashes with "eigendecomposition failed". The fallback
-        // chain detects NaN eigenvalues (via f64::minimum) or catches
-        // eigh failure, applies a conservative ridge, and the solve
-        // proceeds. The line search will reject the NaN-contaminated
-        // step, leaving beta unchanged — a safe no-op.
+    fn exact_newton_nan_hessian_fails_loudly_before_eigendecomposition() {
+        // Exact Newton Hessians are part of the mathematical contract.  A
+        // NaN in a block Hessian means the family derivative is invalid; we
+        // should reject it at the logdet boundary instead of hiding it behind
+        // a conservative eigendecomposition fallback.
         let specs = make_two_block_specs(4);
         let per_block_log_lambdas = vec![Array1::zeros(0), Array1::zeros(0)];
         let options = BlockwiseFitOptions {
@@ -15362,17 +15354,11 @@ mod tests {
             &options,
             None,
         );
-        // The fit should survive — either Ok (step rejected by line search)
-        // or Err from a downstream cause, but NOT "eigendecomposition failed".
-        match result {
-            Ok(_) => {}
-            Err(ref msg) => {
-                assert!(
-                    !msg.contains("eigendecomposition failed"),
-                    "NaN Hessian should be handled by fallback, not crash: {msg}"
-                );
-            }
-        }
+        let err = result.expect_err("NaN exact Hessian must fail loudly");
+        assert!(
+            err.contains("smooth-regularized logdet Hessian contains non-finite entry"),
+            "expected explicit non-finite Hessian error, got: {err}"
+        );
     }
 
     #[test]
