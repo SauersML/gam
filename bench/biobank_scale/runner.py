@@ -568,17 +568,22 @@ def _mgcv_pc_smooth_term(spatial_basis: str, pc_count: int, k: int) -> str:
     Each biobank lane uses the same joint-PC contract on the mgcv side. The
     PCs enter as one mgcv smooth `s(pc1_std, ..., pcN_std, bs=..., k=...)` —
     never as independent linear terms, never combined with lat/lon.
+
+    Thin-plate (`bs='tp'`) is intentionally not supported here. Multivariate
+    `tp` requires `2m > d`, which forces `m = ceil((d+1)/2)`; the resulting
+    polynomial null space has dimension `choose(m+d-1, d)` (≈ 7.4e5 for d=16),
+    so mgcv allocates an n × M design matrix that overflows R's 32-bit length
+    limit and fails with "negative length vectors are not allowed". Use the
+    Duchon (`ds`) or Matérn (`gp`) bases for high-d joint-PC smooths instead.
     """
     pc_cols = ", ".join(_pc_std_columns(pc_count))
     if spatial_basis == "duchon":
         return f"s({pc_cols}, bs='ds', k=min({k}, nrow(train_df)-1))"
-    if spatial_basis == "thinplate":
-        return f"s({pc_cols}, bs='tp', k=min({k}, nrow(train_df)-1))"
     if spatial_basis == "matern":
         return f"s({pc_cols}, bs='gp', m=c(-4,1.0), k=min({k}, nrow(train_df)-1))"
     raise RuntimeError(
         f"unsupported mgcv joint-PC spatial basis '{spatial_basis}' "
-        "(use duchon, thinplate, or matern)"
+        "(use duchon or matern; mgcv 'tp' is ill-posed for high-d joint PC)"
     )
 
 
