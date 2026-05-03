@@ -16929,7 +16929,7 @@ mod tests {
                     feature_cols: vec![0, 1],
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
-                        length_scale: Some(1.0),
+                        length_scale: None,
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
@@ -16969,7 +16969,7 @@ mod tests {
                             [0.0, 1.0],
                             [1.0, 1.0]
                         ]),
-                        length_scale: Some(1.0),
+                        length_scale: None,
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
@@ -17016,7 +17016,7 @@ mod tests {
                             [0.0, 1.0, 0.0],
                             [0.0, 0.0, 1.0],
                         ]),
-                        length_scale: Some(1.0),
+                        length_scale: None,
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::None,
@@ -17203,7 +17203,7 @@ mod tests {
                     feature_cols: vec![0, 1, 2],
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
-                        length_scale: Some(1.0),
+                        length_scale: None,
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
