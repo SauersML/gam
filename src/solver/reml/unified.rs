@@ -3205,10 +3205,9 @@ pub(crate) fn exact_pseudo_logdet(eigenvalues: &[f64], threshold: f64) -> f64 {
 /// on that direction.
 ///
 /// Evaluating `tr(H⁻¹ · Ḣ)` then picks up a spurious null-space
-/// contribution that is absent from the cost's projected logdet derivative;
-/// this manifests as a ~3–4% FD/analytic drift on binomial-logit REML
-/// gradient tests.  For Gaussian identity, `c = 0` so `D_β H[v] = 0` and
-/// the leakage vanishes, which is why Gaussian fixtures pass untouched.
+/// contribution that is absent from the cost's projected logdet derivative.
+/// For Gaussian identity, `c = 0` so `D_β H[v] = 0` and the leakage vanishes,
+/// which is why Gaussian fixtures pass untouched.
 ///
 /// `u_s`           — p × r orthonormal basis of `range(S_+)`.
 /// `h_proj_inverse` — r × r symmetric matrix `(U_Sᵀ H U_S)⁻¹`, precomputed
@@ -3605,7 +3604,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
 /// Evaluation mode for the unified evaluator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EvalMode {
-    /// Compute cost only (e.g., for FD probes or line search).
+    /// Compute cost only (e.g., for line search).
     ValueOnly,
     /// Compute cost and gradient (the common case).
     ValueAndGradient,
@@ -4336,9 +4335,7 @@ pub fn reml_laml_evaluate(
             // gradient is their difference, which is tiny), so subtracting
             // them FIRST preserves the leading-order cancellation in f64
             // precision; adding them to `cost` independently would bury
-            // the difference below ~ULP(cost) ≈ f64::EPSILON * cost,
-            // inflating FD noise by orders of magnitude when FD ρ-gradients
-            // are computed outside this evaluator.
+            // the difference below ~ULP(cost) ≈ f64::EPSILON * cost.
             let logdet_pair_h = if *include_logdet_h { log_det_h } else { 0.0 };
             let logdet_pair_s = if *include_logdet_s { log_det_s } else { 0.0 };
             let cost_logdet_diff = 0.5 * (logdet_pair_h - logdet_pair_s);
@@ -7950,11 +7947,10 @@ pub(crate) fn spectral_regularize(sigma: f64, epsilon: f64) -> f64 {
 /// spurious ∂log|H|_reg/∂ρ contribution through the near-zero eigenvalues:
 /// for σ_j ≪ ε we have `log r_ε(σ_j) ≈ log ε`, so `d log r_ε(σ_j)/dρ`
 /// picks up `(1/ε) · dε/dρ` whenever max|σ_j| moved.  That created a
-/// first-order FD-vs-analytic mismatch in outer REML gradients (up to
-/// ~1.5% of the dominant `d log|H|/dρ` term on problems with one near-
-/// singular direction, e.g. multi-block GAMLSS wiggle models where the
-/// intercept/wiggle direction is effectively in the null space of the
-/// likelihood curvature).
+/// first-order derivative mismatch in outer REML gradients (up to ~1.5% of
+/// the dominant `d log|H|/dρ` term on problems with one near-singular
+/// direction, e.g. multi-block GAMLSS wiggle models where the intercept/wiggle
+/// direction is effectively in the null space of the likelihood curvature).
 ///
 /// The analytic gradient formula `tr(G_ε(H) · dH/dρ_k)` assumes ε is
 /// fixed; removing the ρ-coupling restores that assumption.  Scaling ε
@@ -8010,9 +8006,8 @@ pub(crate) fn spectral_epsilon(eigenvalues: &[f64]) -> f64 {
 /// with the smooth floor `r_ε(σ)` retained in place of `log σ` / `1/σ` so
 /// there is no discontinuity as an eigenvalue crosses ε.  The key property
 /// is that null-space directions drop out of both the cost and the
-/// gradient in a matched way, so FD-vs-analytic comparisons close cleanly
-/// (first-order pert theory applies only to directions that actually have
-/// curvature to perturb).
+/// gradient in a matched way; first-order perturbation theory applies only to
+/// directions that actually have curvature to perturb.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PseudoLogdetMode {
     Smooth,
@@ -8112,8 +8107,7 @@ impl DenseSpectralOperator {
         // `Smooth` is the regularized full-spectrum mode: every eigenpair stays
         // active and singular directions are handled only through
         // `r_ε(σ)`. This is the documented default semantics used by the
-        // unified REML/LAML objective and by the finite-difference reference
-        // tests in this module.
+        // unified REML/LAML objective.
         //
         // `HardPseudo` is the identified-subspace mode: eigenpairs with
         // `σ_j ≤ ε` are excluded consistently from logdet, traces, and solves.

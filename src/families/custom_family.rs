@@ -9348,10 +9348,10 @@ fn outerobjectivegradienthessian<F: CustomFamily + Clone + Send + Sync + 'static
 /// Test-only helper exposing the value+gradient outer evaluation entry point
 /// to other modules' test code.  Used by
 /// `binomial_location_scale_batched_gradient_matches_finite_difference` in
-/// `families/gamlss.rs` to pin the batched override against finite-difference
-/// truth without re-implementing the inner-fit / penalty-pseudo-logdet
-/// plumbing.  Returns only `(value, gradient)`; the warm-start is internal
-/// state with a private type and is dropped at the boundary.
+/// `families/gamlss.rs` to pin the batched override against a test oracle
+/// without re-implementing the inner-fit / penalty-pseudo-logdet plumbing.
+/// Returns only `(value, gradient)`; the warm-start is internal state with a
+/// private type and is dropped at the boundary.
 #[cfg(test)]
 pub(crate) fn test_outerobjective_andgradient<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
