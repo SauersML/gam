@@ -462,7 +462,18 @@ pub fn build_smooth_basis(
                     crate::basis::duchon_nullspace_dimension(cols.len(), degree)
                 }
             };
-            let centers = requested_centers + polynomial_cols;
+            if requested_centers <= polynomial_cols {
+                return Err(format!(
+                    "Duchon smooth '{}' requested basis dimension {} but order={:?} in {}D needs {} polynomial null-space columns; choose centers/k > {}",
+                    vars.join(", "),
+                    requested_centers,
+                    nullspace_order,
+                    cols.len(),
+                    polynomial_cols,
+                    polynomial_cols,
+                ));
+            }
+            let centers = requested_centers;
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
                 spatial_center_strategy_for_dimension(centers, cols.len())
             } else {

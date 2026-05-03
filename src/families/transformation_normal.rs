@@ -2709,6 +2709,28 @@ impl TransformationNormalFamily {
                 .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
         ];
         let mut out = Array1::<f64>::zeros(p_total);
+        let mut gamma = vec![0.0; p_resp];
+        let mut gamma_dir = vec![0.0; p_resp];
+        let mut gamma_psi = vec![0.0; p_resp];
+        let mut gamma_psi_dir = vec![0.0; p_resp];
+        let mut endpoint_factor = vec![[0.0; 2]; p_resp];
+        let mut endpoint_factor_dir = vec![[0.0; 2]; p_resp];
+        let mut endpoint_psi_cov_factor = vec![[0.0; 2]; p_resp];
+        let mut endpoint_psi_psi_factor = vec![[0.0; 2]; p_resp];
+        let mut endpoint_psi_cov_factor_dir = vec![[0.0; 2]; p_resp];
+        let mut endpoint_psi_psi_factor_dir = vec![[0.0; 2]; p_resp];
+        let mut h_factor = vec![0.0; p_resp];
+        let mut hp_factor = vec![0.0; p_resp];
+        let mut h_factor_dir = vec![0.0; p_resp];
+        let mut hp_factor_dir = vec![0.0; p_resp];
+        let mut hpsi_cov_factor = vec![0.0; p_resp];
+        let mut hppsi_cov_factor = vec![0.0; p_resp];
+        let mut hpsi_psi_factor = vec![0.0; p_resp];
+        let mut hppsi_psi_factor = vec![0.0; p_resp];
+        let mut hpsi_cov_factor_dir = vec![0.0; p_resp];
+        let mut hppsi_cov_factor_dir = vec![0.0; p_resp];
+        let mut hpsi_psi_factor_dir = vec![0.0; p_resp];
+        let mut hppsi_psi_factor_dir = vec![0.0; p_resp];
 
         for i in 0..n {
             let cov_row = cov.row(i);
@@ -2723,10 +2745,6 @@ impl TransformationNormalFamily {
             let inv_hp_cu = inv_hp_sq * inv_hp;
             let q = row_quantities.endpoint_q[i];
 
-            let mut gamma = vec![0.0; p_resp];
-            let mut gamma_dir = vec![0.0; p_resp];
-            let mut gamma_psi = vec![0.0; p_resp];
-            let mut gamma_psi_dir = vec![0.0; p_resp];
             for k in 0..p_resp {
                 gamma[k] = beta_mat.row(k).dot(&cov_row);
                 gamma_dir[k] = dir_mat.row(k).dot(&cov_row);
@@ -2756,12 +2774,12 @@ impl TransformationNormalFamily {
             let mut endpoint_psi = [0.0; 2];
             let mut endpoint_dir = [0.0; 2];
             let mut endpoint_psi_dir = [0.0; 2];
-            let mut endpoint_factor = vec![[0.0; 2]; p_resp];
-            let mut endpoint_factor_dir = vec![[0.0; 2]; p_resp];
-            let mut endpoint_psi_cov_factor = vec![[0.0; 2]; p_resp];
-            let mut endpoint_psi_psi_factor = vec![[0.0; 2]; p_resp];
-            let mut endpoint_psi_cov_factor_dir = vec![[0.0; 2]; p_resp];
-            let mut endpoint_psi_psi_factor_dir = vec![[0.0; 2]; p_resp];
+            endpoint_factor.fill([0.0; 2]);
+            endpoint_factor_dir.fill([0.0; 2]);
+            endpoint_psi_cov_factor.fill([0.0; 2]);
+            endpoint_psi_psi_factor.fill([0.0; 2]);
+            endpoint_psi_cov_factor_dir.fill([0.0; 2]);
+            endpoint_psi_psi_factor_dir.fill([0.0; 2]);
             for e in 0..2 {
                 let basis = endpoint_basis[e];
                 endpoint_psi[e] = basis[0] * gamma_psi[0];
@@ -2784,18 +2802,18 @@ impl TransformationNormalFamily {
                 }
             }
 
-            let mut h_factor = vec![0.0; p_resp];
-            let mut hp_factor = vec![0.0; p_resp];
-            let mut h_factor_dir = vec![0.0; p_resp];
-            let mut hp_factor_dir = vec![0.0; p_resp];
-            let mut hpsi_cov_factor = vec![0.0; p_resp];
-            let mut hppsi_cov_factor = vec![0.0; p_resp];
-            let mut hpsi_psi_factor = vec![0.0; p_resp];
-            let mut hppsi_psi_factor = vec![0.0; p_resp];
-            let mut hpsi_cov_factor_dir = vec![0.0; p_resp];
-            let mut hppsi_cov_factor_dir = vec![0.0; p_resp];
-            let mut hpsi_psi_factor_dir = vec![0.0; p_resp];
-            let mut hppsi_psi_factor_dir = vec![0.0; p_resp];
+            h_factor.fill(0.0);
+            hp_factor.fill(0.0);
+            h_factor_dir.fill(0.0);
+            hp_factor_dir.fill(0.0);
+            hpsi_cov_factor.fill(0.0);
+            hppsi_cov_factor.fill(0.0);
+            hpsi_psi_factor.fill(0.0);
+            hppsi_psi_factor.fill(0.0);
+            hpsi_cov_factor_dir.fill(0.0);
+            hppsi_cov_factor_dir.fill(0.0);
+            hpsi_psi_factor_dir.fill(0.0);
+            hppsi_psi_factor_dir.fill(0.0);
             h_factor[0] = rv[0];
             hp_factor[0] = rd[0];
             hpsi_psi_factor[0] = rv[0];
@@ -5398,6 +5416,34 @@ impl TransformationNormalPsiHessianOperator {
             .downcast_ref::<TensorKroneckerPsiOperator>()
             .expect("validated CTN psi operator must remain tensor-backed")
     }
+
+    fn apply_columns_with_shared_cov(
+        &self,
+        factor: &Array2<f64>,
+        cov: &Array2<f64>,
+        cov_psi: &Array2<f64>,
+    ) -> Vec<Array1<f64>> {
+        let apply_col = |col: usize| {
+            self.family
+                .scop_psi_hessian_apply_from_operator_with_cov(
+                    &self.beta,
+                    &self.row_quantities,
+                    self.axis,
+                    cov,
+                    cov_psi,
+                    &factor.column(col).to_owned(),
+                )
+                .expect("validated CTN psi Hessian operator batched input should not fail")
+        };
+
+        let k = factor.ncols();
+        if rayon::current_thread_index().is_some() {
+            (0..k).map(apply_col).collect()
+        } else {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            (0..k).into_par_iter().map(apply_col).collect()
+        }
+    }
 }
 
 impl HyperOperator for TransformationNormalPsiHessianOperator {
@@ -5419,7 +5465,6 @@ impl HyperOperator for TransformationNormalPsiHessianOperator {
 
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
         debug_assert_eq!(factor.nrows(), self.dim());
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let n = self.family.response_val_basis.nrows();
         let p = factor.nrows();
         let k = factor.ncols();
@@ -5432,21 +5477,7 @@ impl HyperOperator for TransformationNormalPsiHessianOperator {
             .tensor_op()
             .materialize_cov_first_axis(self.axis)
             .expect("validated CTN psi Hessian operator covariate derivative should not fail");
-        let cols: Vec<Array1<f64>> = (0..k)
-            .into_par_iter()
-            .map(|col| {
-                self.family
-                    .scop_psi_hessian_apply_from_operator_with_cov(
-                        &self.beta,
-                        &self.row_quantities,
-                        self.axis,
-                        &cov,
-                        &cov_psi,
-                        &factor.column(col).to_owned(),
-                    )
-                    .expect("validated CTN psi Hessian operator batched input should not fail")
-            })
-            .collect();
+        let cols = self.apply_columns_with_shared_cov(factor, &cov, &cov_psi);
         let mut out = Array2::<f64>::zeros((p, k));
         for (col, applied) in cols.into_iter().enumerate() {
             out.column_mut(col).assign(&applied);
@@ -5526,6 +5557,45 @@ impl TransformationNormalPsiPsiHessianOperator {
             .2
             .expect("CTN psi-psi operator called without HVP output")
     }
+
+    fn apply_columns_with_shared_cov(
+        &self,
+        factor: &Array2<f64>,
+        cov: &Array2<f64>,
+        cov_i: &Array2<f64>,
+        cov_j: &Array2<f64>,
+        cov_ij: &Array2<f64>,
+        row_start: usize,
+        row_end: usize,
+    ) -> Vec<Array1<f64>> {
+        let apply_col = |col: usize| {
+            let direction = factor.column(col).to_owned();
+            self.family
+                .scop_psi_psi_value_score_hvp_from_cov(
+                    &self.beta,
+                    self.row_h.slice(s![row_start..row_end]),
+                    self.row_h_prime.slice(s![row_start..row_end]),
+                    cov.view(),
+                    cov_i.view(),
+                    cov_j.view(),
+                    cov_ij.view(),
+                    row_start,
+                    &self.endpoint_q[row_start..row_end],
+                    Some(&direction),
+                )
+                .expect("validated CTN psi-psi batched HVP inputs should not fail")
+                .2
+                .expect("CTN psi-psi batched HVP must produce an HVP")
+        };
+
+        let k = factor.ncols();
+        if rayon::current_thread_index().is_some() {
+            (0..k).map(apply_col).collect()
+        } else {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            (0..k).into_par_iter().map(apply_col).collect()
+        }
+    }
 }
 
 impl HyperOperator for TransformationNormalPsiPsiHessianOperator {
@@ -5562,16 +5632,27 @@ impl HyperOperator for TransformationNormalPsiPsiHessianOperator {
 
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
         debug_assert_eq!(factor.nrows(), self.p_total());
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let p = factor.nrows();
         let k = factor.ncols();
-        let cols: Vec<Array1<f64>> = (0..k)
-            .into_par_iter()
-            .map(|c| self.apply(&factor.column(c).to_owned()))
-            .collect();
         let mut out = Array2::<f64>::zeros((p, k));
-        for (c, bv) in cols.into_iter().enumerate() {
-            out.column_mut(c).assign(&bv);
+        let n = self.family.response_val_basis.nrows();
+        let p_cov = self.family.covariate_design.ncols();
+        let rows_per_chunk = self
+            .family
+            .scop_psi_pair_rows_per_chunk(p_cov)
+            .min(n.max(1));
+
+        for start in (0..n).step_by(rows_per_chunk) {
+            let end = (start + rows_per_chunk).min(n);
+            let (cov, cov_i, cov_j, cov_ij) = self
+                .family
+                .scop_psi_pair_cov_chunks(self.tensor_op(), self.axis_i, self.axis_j, start..end)
+                .expect("validated CTN psi-psi operator covariate chunks should not fail");
+            let cols = self
+                .apply_columns_with_shared_cov(factor, &cov, &cov_i, &cov_j, &cov_ij, start, end);
+            for (c, bv) in cols.into_iter().enumerate() {
+                out.column_mut(c).scaled_add(1.0, &bv);
+            }
         }
         out
     }
