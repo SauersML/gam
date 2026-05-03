@@ -1,8 +1,4 @@
 use ndarray::{Array1, ArrayView1};
-#[cfg(test)]
-use std::fs;
-#[cfg(test)]
-use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SigmaJet1 {
@@ -286,6 +282,8 @@ pub fn logb_sigma_derivs_up_to_fourth(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::Path;
 
     fn collect_rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
         let Ok(entries) = fs::read_dir(dir) else {

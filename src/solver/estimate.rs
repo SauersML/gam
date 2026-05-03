@@ -59,9 +59,6 @@ use rayon::prelude::*;
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(test)]
-use crate::linalg::utils::StableSolver;
-
 // Note: deflateweights_by_se was removed. We now use integrated (GHQ)
 // family-dispatched likelihood updates in PIRLS instead of weight deflation.
 // The SE is passed through to PIRLS which integrates over uncertainty
@@ -4780,7 +4777,7 @@ where
 mod estimate_policy_tests {
     use super::reml::hyper::link_binomial_aux;
     use super::*;
-    use crate::linalg::utils::max_abs_diag;
+    use crate::linalg::utils::{StableSolver, max_abs_diag};
     use crate::mixture_link::{sas_inverse_link_jet, sas_inverse_link_jetwith_param_partials};
     use crate::types::LikelihoodFamily;
     use ndarray::{Array1, Array2, array};

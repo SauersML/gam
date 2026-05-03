@@ -36,9 +36,6 @@ impl SendPtr {
     }
 }
 
-#[cfg(test)]
-use approx::assert_abs_diff_eq;
-
 /// A comprehensive error type for all operations within the basis module.
 #[derive(Error, Debug)]
 pub enum BasisError {
@@ -20533,6 +20530,7 @@ pub mod closed_form_penalty {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use approx::assert_abs_diff_eq;
     use ndarray::{Array1, Array2, array};
     use num_dual::{DualNum, second_derivative};
     use std::sync::Arc;
