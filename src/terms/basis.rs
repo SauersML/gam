@@ -2174,28 +2174,34 @@ impl std::fmt::Debug for CanonicalPenaltyBlock {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BasisPsiDerivativeResult {
     pub design_derivative: Array2<f64>,
     pub penalties_derivative: Vec<Array2<f64>>,
-    /// Shared operator-backed design derivative. When present, callers may
-    /// avoid materializing or consuming the dense `design_derivative`.
+    /// Operator-backed design derivative for standalone first-derivative
+    /// callers. Bundled first+second callers receive the shared operator on
+    /// `BasisPsiDerivativeBundle` instead.
     pub implicit_operator: Option<ImplicitDesignPsiDerivative>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BasisPsiSecondDerivativeResult {
     pub designsecond_derivative: Array2<f64>,
     pub penaltiessecond_derivative: Vec<Array2<f64>>,
-    /// Shared operator-backed design derivative. When present, callers may
-    /// avoid materializing or consuming the dense `designsecond_derivative`.
+    /// Operator-backed design derivative for standalone second-derivative
+    /// callers. Bundled first+second callers receive the shared operator on
+    /// `BasisPsiDerivativeBundle` instead.
     pub implicit_operator: Option<ImplicitDesignPsiDerivative>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BasisPsiDerivativeBundle {
     pub first: BasisPsiDerivativeResult,
     pub second: BasisPsiSecondDerivativeResult,
+    /// Shared operator-backed design derivative for the first and second
+    /// psi derivatives. Bundled callers consume this once instead of storing
+    /// duplicate materialized/streaming operators in both derivative payloads.
+    pub implicit_operator: Option<ImplicitDesignPsiDerivative>,
 }
 
 /// Per-axis psi_a derivative package for anisotropic spatial terms.
@@ -12895,7 +12901,9 @@ pub fn build_matern_basis_log_kappa_derivativewithworkspace(
     spec: &MaternBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisPsiDerivativeResult, BasisError> {
-    Ok(build_matern_basis_log_kappa_derivativeswithworkspace(data, spec, workspace)?.first)
+    let mut bundle = build_matern_basis_log_kappa_derivativeswithworkspace(data, spec, workspace)?;
+    bundle.first.implicit_operator = bundle.implicit_operator;
+    Ok(bundle.first)
 }
 
 pub fn build_matern_basis_log_kappa_derivatives(
@@ -12954,13 +12962,14 @@ pub fn build_matern_basis_log_kappa_derivativeswithworkspace(
         first: BasisPsiDerivativeResult {
             design_derivative: design_derivatives.design_first,
             penalties_derivative,
-            implicit_operator: design_derivatives.implicit_operator.clone(),
+            implicit_operator: None,
         },
         second: BasisPsiSecondDerivativeResult {
             designsecond_derivative: design_derivatives.design_second_diag,
             penaltiessecond_derivative,
-            implicit_operator: design_derivatives.implicit_operator,
+            implicit_operator: None,
         },
+        implicit_operator: design_derivatives.implicit_operator,
     })
 }
 
@@ -12977,7 +12986,9 @@ pub fn build_matern_basis_log_kappasecond_derivativewithworkspace(
     spec: &MaternBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
-    Ok(build_matern_basis_log_kappa_derivativeswithworkspace(data, spec, workspace)?.second)
+    let mut bundle = build_matern_basis_log_kappa_derivativeswithworkspace(data, spec, workspace)?;
+    bundle.second.implicit_operator = bundle.implicit_operator;
+    Ok(bundle.second)
 }
 
 /// Build per-axis ψ_a design-matrix derivatives for anisotropic Matérn terms.
@@ -14727,7 +14738,9 @@ pub fn build_duchon_basis_log_kappa_derivativewithworkspace(
     spec: &DuchonBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisPsiDerivativeResult, BasisError> {
-    Ok(build_duchon_basis_log_kappa_derivativeswithworkspace(data, spec, workspace)?.first)
+    let mut bundle = build_duchon_basis_log_kappa_derivativeswithworkspace(data, spec, workspace)?;
+    bundle.first.implicit_operator = bundle.implicit_operator;
+    Ok(bundle.first)
 }
 
 pub fn build_duchon_basis_log_kappa_derivatives(
@@ -14763,13 +14776,14 @@ pub fn build_duchon_basis_log_kappa_derivativeswithworkspace(
         first: BasisPsiDerivativeResult {
             design_derivative: design_derivatives.design_first,
             penalties_derivative,
-            implicit_operator: design_derivatives.implicit_operator.clone(),
+            implicit_operator: None,
         },
         second: BasisPsiSecondDerivativeResult {
             designsecond_derivative: design_derivatives.design_second_diag,
             penaltiessecond_derivative,
-            implicit_operator: design_derivatives.implicit_operator,
+            implicit_operator: None,
         },
+        implicit_operator: design_derivatives.implicit_operator,
     })
 }
 
@@ -14786,7 +14800,9 @@ pub fn build_duchon_basis_log_kappasecond_derivativewithworkspace(
     spec: &DuchonBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
-    Ok(build_duchon_basis_log_kappa_derivativeswithworkspace(data, spec, workspace)?.second)
+    let mut bundle = build_duchon_basis_log_kappa_derivativeswithworkspace(data, spec, workspace)?;
+    bundle.second.implicit_operator = bundle.implicit_operator;
+    Ok(bundle.second)
 }
 
 /// Creates a Duchon radial basis whose kernel is derived from
@@ -15903,32 +15919,6 @@ fn active_thin_plate_penalty_derivatives(
         .collect()
 }
 
-/// Which order of psi-derivative the ThinPlate penalty builder should
-/// materialize. The penalty matrices are k × k (typically tens of KiB),
-/// not n × p, so the cost of producing the unrequested half is small;
-/// what matters is that the two top-level callers (first-derivative
-/// builder and second-derivative builder) each only consume one side and
-/// can skip the unused half cleanly. (The design-side equivalent now
-/// goes through the shared scalar streaming path and does not need this
-/// enum.)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ThinPlateDerivativeOrder {
-    First,
-    Second,
-    Both,
-}
-
-impl ThinPlateDerivativeOrder {
-    #[inline]
-    fn wants_first(self) -> bool {
-        matches!(self, Self::First | Self::Both)
-    }
-    #[inline]
-    fn wants_second(self) -> bool {
-        matches!(self, Self::Second | Self::Both)
-    }
-}
-
 // The dense per-pair ThinPlate ψ-derivative builder used to live here. It has
 // been replaced by `build_thin_plate_scalar_design_psi_derivatives`, which
 // drives the same math through the shared scalar streaming infrastructure
@@ -15940,8 +15930,7 @@ fn build_thin_plate_penalty_psi_derivativeswithworkspace(
     spec: &ThinPlateBasisSpec,
     identifiability_transform: Option<&Array2<f64>>,
     workspace: &mut BasisWorkspace,
-    order: ThinPlateDerivativeOrder,
-) -> Result<(Option<Array2<f64>>, Option<Array2<f64>>), BasisError> {
+) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
     // Match build_thin_plate_basis exactly (after the WIP Wood-TPRS rewrite):
     //
     //   M(ψ)        = Z_kernel^T Ω(ψ) Z_kernel
@@ -15960,18 +15949,12 @@ fn build_thin_plate_penalty_psi_derivativeswithworkspace(
     let total_cols = kernel_cols + poly_cols;
     let k = centers.nrows();
     let d = centers.ncols();
-    let want_first = order.wants_first();
-    let want_second = order.wants_second();
 
     // 1) Build Ω, Ω_ψ, Ω_ψψ on centers (k × k). Ω is needed to recover Λ when
     //    V is frozen and to apply Hellmann-Feynman in the fresh-V path.
     let mut omega = Array2::<f64>::zeros((k, k));
     let mut omega_psi = Array2::<f64>::zeros((k, k));
-    let mut omega_psi_psi = if want_second {
-        Some(Array2::<f64>::zeros((k, k)))
-    } else {
-        None
-    };
+    let mut omega_psi_psi = Array2::<f64>::zeros((k, k));
     for i in 0..k {
         for j in i..k {
             let mut dist2 = 0.0;
@@ -15985,19 +15968,15 @@ fn build_thin_plate_penalty_psi_derivativeswithworkspace(
             omega[[j, i]] = phi;
             omega_psi[[i, j]] = phi_psi;
             omega_psi[[j, i]] = phi_psi;
-            if let Some(ref mut buf) = omega_psi_psi {
-                buf[[i, j]] = phi_psi_psi;
-                buf[[j, i]] = phi_psi_psi;
-            }
+            omega_psi_psi[[i, j]] = phi_psi_psi;
+            omega_psi_psi[[j, i]] = phi_psi_psi;
         }
     }
 
     // 2) Project to the constrained kernel space.
     let m_constrained = symmetrize_penalty(&z_kernel.t().dot(&omega).dot(&z_kernel));
     let m_psi_constrained = symmetrize_penalty(&z_kernel.t().dot(&omega_psi).dot(&z_kernel));
-    let m_pp_constrained = omega_psi_psi
-        .as_ref()
-        .map(|m| symmetrize_penalty(&z_kernel.t().dot(m).dot(&z_kernel)));
+    let m_pp_constrained = symmetrize_penalty(&z_kernel.t().dot(&omega_psi_psi).dot(&z_kernel));
 
     // 3) Get V (frozen or fresh from eigh).
     let (v, lambda) = if let Some(frozen) = spec.radial_reparam.as_ref() {
@@ -16038,13 +16017,11 @@ fn build_thin_plate_penalty_psi_derivativeswithworkspace(
     } else {
         Array2::<f64>::zeros((0, 0))
     };
-    let a_pp = m_pp_constrained.as_ref().map(|m| {
-        if kernel_cols > 0 {
-            v.t().dot(m).dot(&v)
-        } else {
-            Array2::<f64>::zeros((0, 0))
-        }
-    });
+    let a_pp = if kernel_cols > 0 {
+        v.t().dot(&m_pp_constrained).dot(&v)
+    } else {
+        Array2::<f64>::zeros((0, 0))
+    };
 
     // 5) Build the un-normalized rotated penalty and its ψ-derivatives.
     //
@@ -16071,27 +16048,25 @@ fn build_thin_plate_penalty_psi_derivativeswithworkspace(
         }
         diag
     };
-    let s_raw_pp_kernel = a_pp.as_ref().map(|m_pp| {
-        if v_is_frozen {
-            m_pp.clone()
-        } else {
-            let mut diag = Array2::<f64>::zeros((kernel_cols, kernel_cols));
-            for i in 0..kernel_cols {
-                let mut acc = m_pp[[i, i]];
-                for k_idx in 0..kernel_cols {
-                    if k_idx == i {
-                        continue;
-                    }
-                    let denom = lambda[i] - lambda[k_idx];
-                    if denom.abs() > 1e-14 {
-                        acc += 2.0 * a_psi[[i, k_idx]].powi(2) / denom;
-                    }
+    let s_raw_pp_kernel = if v_is_frozen {
+        a_pp.clone()
+    } else {
+        let mut diag = Array2::<f64>::zeros((kernel_cols, kernel_cols));
+        for i in 0..kernel_cols {
+            let mut acc = a_pp[[i, i]];
+            for k_idx in 0..kernel_cols {
+                if k_idx == i {
+                    continue;
                 }
-                diag[[i, i]] = acc;
+                let denom = lambda[i] - lambda[k_idx];
+                if denom.abs() > 1e-14 {
+                    acc += 2.0 * a_psi[[i, k_idx]].powi(2) / denom;
+                }
             }
-            diag
+            diag[[i, i]] = acc;
         }
-    });
+        diag
+    };
 
     // 6) Pad to total_cols (poly block has zero penalty).
     let pad = |kernel_block: &Array2<f64>| -> Array2<f64> {
@@ -16104,37 +16079,22 @@ fn build_thin_plate_penalty_psi_derivativeswithworkspace(
     };
     let s_raw = pad(&s_raw_kernel);
     let s_raw_psi = pad(&s_raw_psi_kernel);
-    let s_raw_pp = s_raw_pp_kernel.as_ref().map(pad);
+    let s_raw_pp = pad(&s_raw_pp_kernel);
 
     // 7) Apply the Frobenius normalization chain rule. The build path divides
-    //    by ||S_raw||_F before applying the identifiability transform, so the
-    //    derivative must do the same in the same order. The chain rule needs
-    //    S_raw_pp to compute c''; pass zeros if only the first derivative was
-    //    requested (the first-derivative output does not depend on it).
-    let s_raw_pp_for_chain = s_raw_pp
-        .clone()
-        .unwrap_or_else(|| Array2::<f64>::zeros(s_raw.raw_dim()));
+    //    by c(ψ)=||S_raw(ψ)||_F before applying the identifiability transform.
+    //    Therefore:
+    //      S_norm'  = S_raw'/c - c' S_raw/c²
+    //      S_norm'' = S_raw''/c - 2c' S_raw'/c²
+    //                  + (2(c')²/c³ - c''/c²) S_raw,
+    //    exactly as implemented by `normalize_penaltywith_psi_derivatives`.
     let (_, s_norm_psi, s_norm_pp, _c) =
-        normalize_penaltywith_psi_derivatives(&s_raw, &s_raw_psi, &s_raw_pp_for_chain);
+        normalize_penaltywith_psi_derivatives(&s_raw, &s_raw_psi, &s_raw_pp);
 
     // 8) Apply the identifiability transform last (matches build path order:
     //    `if let Some(z) = ... { Z^T penalty_norm Z }`).
-    let s_psi_out = if want_first {
-        Some(project_penalty_matrix(
-            &s_norm_psi,
-            identifiability_transform,
-        ))
-    } else {
-        None
-    };
-    let s_psi_psi_out = if want_second && s_raw_pp.is_some() {
-        Some(project_penalty_matrix(
-            &s_norm_pp,
-            identifiability_transform,
-        ))
-    } else {
-        None
-    };
+    let s_psi_out = project_penalty_matrix(&s_norm_psi, identifiability_transform);
+    let s_psi_psi_out = project_penalty_matrix(&s_norm_pp, identifiability_transform);
 
     Ok((s_psi_out, s_psi_psi_out))
 }
@@ -16203,7 +16163,10 @@ pub fn build_thin_plate_basis_log_kappa_derivativewithworkspace(
     spec: &ThinPlateBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisPsiDerivativeResult, BasisError> {
-    Ok(build_thin_plate_basis_log_kappa_derivativeswithworkspace(data, spec, workspace)?.first)
+    let mut bundle =
+        build_thin_plate_basis_log_kappa_derivativeswithworkspace(data, spec, workspace)?;
+    bundle.first.implicit_operator = bundle.implicit_operator;
+    Ok(bundle.first)
 }
 
 pub fn build_thin_plate_basis_log_kappa_derivatives(
@@ -16254,18 +16217,9 @@ pub fn build_thin_plate_basis_log_kappa_derivativeswithworkspace(
             &derivative_spec,
             identifiability_transform.as_ref(),
             workspace,
-            ThinPlateDerivativeOrder::Both,
         )?;
-    let primary_derivative = primary_derivative_opt.ok_or_else(|| {
-        BasisError::InvalidInput(
-            "ThinPlate first-order penalty psi-derivative was not produced".to_string(),
-        )
-    })?;
-    let primarysecond_derivative = primarysecond_derivative_opt.ok_or_else(|| {
-        BasisError::InvalidInput(
-            "ThinPlate second-order penalty psi-derivative was not produced".to_string(),
-        )
-    })?;
+    let primary_derivative = primary_derivative_opt;
+    let primarysecond_derivative = primarysecond_derivative_opt;
     let penalties_derivative =
         active_thin_plate_penalty_derivatives(&base.penaltyinfo, &primary_derivative)?;
     let penaltiessecond_derivative =
@@ -16274,13 +16228,14 @@ pub fn build_thin_plate_basis_log_kappa_derivativeswithworkspace(
         first: BasisPsiDerivativeResult {
             design_derivative: scalar.design_first,
             penalties_derivative,
-            implicit_operator: scalar.implicit_operator.clone(),
+            implicit_operator: None,
         },
         second: BasisPsiSecondDerivativeResult {
             designsecond_derivative: scalar.design_second_diag,
             penaltiessecond_derivative,
-            implicit_operator: scalar.implicit_operator,
+            implicit_operator: None,
         },
+        implicit_operator: scalar.implicit_operator,
     })
 }
 
@@ -16297,7 +16252,10 @@ pub fn build_thin_plate_basis_log_kappasecond_derivativewithworkspace(
     spec: &ThinPlateBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
-    Ok(build_thin_plate_basis_log_kappa_derivativeswithworkspace(data, spec, workspace)?.second)
+    let mut bundle =
+        build_thin_plate_basis_log_kappa_derivativeswithworkspace(data, spec, workspace)?;
+    bundle.second.implicit_operator = bundle.implicit_operator;
+    Ok(bundle.second)
 }
 
 /// High-level TPS constructor: selects knots from data, then builds basis+penalty.
@@ -18405,17 +18363,25 @@ pub mod closed_form_penalty {
 
         let b = 2 * s;
         let kappa_sq = kappa * kappa;
+        let kappa_r = kappa * r;
+        let x_taylor = kappa_r * kappa_r;
+        let small_x_taylor = if x_taylor < 1.5 {
+            finite_part_duchon_taylor(d, a, b, kappa, r)
+        } else {
+            None
+        };
+        if let Some(tay) = small_x_taylor {
+            return tay;
+        }
 
         // A_j = (-1)^{a-j} · C(a+b-j-1, a-j) · κ^{-2(a+b-j)}, j = 1..a
         let mut sum = 0.0_f64;
-        let mut max_term = 0.0_f64;
         for j in 1..=a {
             let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
             let binom = binomial_f64(a + b - j - 1, a - j);
             let coeff = sign * binom * kappa_sq.powi(-((a + b - j) as i32));
             let term = coeff * riesz_kernel_value(d, j, r);
             sum += term;
-            max_term = max_term.max(term.abs());
         }
 
         // B_ℓ = (-1)^a · C(a+b-ℓ-1, b-ℓ) · κ^{-2(a+b-ℓ)}, ℓ = 1..b
@@ -18425,49 +18391,10 @@ pub mod closed_form_penalty {
             let coeff = sign_a * binom * kappa_sq.powi(-((a + b - ell) as i32));
             let term = coeff * matern_kernel_value(d, ell, kappa, r);
             sum += term;
-            max_term = max_term.max(term.abs());
         }
 
-        // χ-gate (math team Letter B). The literal partial-fraction sum is
-        // the primary path: it is a pointwise-exact partial-fraction
-        // decomposition of `1/(ρ^{2a}(κ²+ρ²)^b)` followed by term-by-term
-        // inverse FT. It is well-conditioned whenever max|term|/|sum| is
-        // moderate.
-        //
-        // As κR → 0 every individual term scales as κ^{-2(N-j)} → ∞ but
-        // they cancel into the finite analytic limit R_N^d(R). Floating-point
-        // evaluation loses ≈ log10(χ) digits of precision (χ = max|term|/|sum|).
-        // Once χ exceeds ~1e4 the literal sum has fewer than ~12 reliable
-        // digits — already enough to violate the κ→0 monotone-convergence
-        // contract that callers rely on. We then substitute the small-κ
-        // ₁F₂ / Taylor recurrence
-        //   g_fp(R; κ) = Σ_{n≥0} (-1)^n · (b)_n / n! · κ^{2n} · R_{N+n}^d(R)
-        //               = R_N^d(R) · ₁F₂(b; N, N+1-d/2; (κR)²/4),
-        // which captures the finite-part value to roundoff (no cancellation).
-        // The recurrence is exact for odd d (pure-power Riesz blocks); for
-        // even d the same recurrence is used with log-Riesz T_0 — when its
-        // precondition fails (e.g. log finite-part not yet implemented) we
-        // fall back to the leading-term R_N^d limit at very small κR.
-        //
-        // Threshold = 1e4 (12 significant digits remaining): well below the
-        // χ values seen in the convergent regime (e.g. χ ≈ 4.5 at κ=1, R=0.4
-        // for d=3, m=2, s=2, q=2; χ ≈ 25 at κ=1, R=1.3 for d=5, m=1, s=2,
-        // q=1) but above the moderate-cancellation regime
-        // (χ ≈ 2.2e4 at κ=0.1, R=1.3 where literal has lost ~13 digits).
-        let kappa_r = kappa * r;
-        let x_taylor = kappa_r * kappa_r;
-        let chi = if sum.abs() > 0.0 {
-            max_term / sum.abs()
-        } else {
-            f64::INFINITY
-        };
-        let cancellation_lost = chi > 1.0e4;
-        let even_log_riesz = d % 2 == 0 && 2 * (a + b) >= d;
-        if x_taylor < 1.5 && (cancellation_lost || even_log_riesz) {
-            if let Some(tay) = finite_part_duchon_taylor(d, a, b, kappa, r) {
-                return tay;
-            }
-        }
+        // Outside the small-κR finite-part basin, the literal partial-fraction
+        // sum is the pointwise analytic representation.
         sum
     }
 
@@ -19249,6 +19176,14 @@ pub mod closed_form_penalty {
         // Hybrid: partial-fraction expansion (mirrors isotropic_duchon_penalty).
         let b = 2 * s;
         let kappa_sq = kappa * kappa;
+        let kappa_r = kappa * r;
+        let x_taylor = kappa_r * kappa_r;
+        if x_taylor < 1.5
+            && let Some(taylor_table) =
+                finite_part_duchon_taylor_derivative_table_direct(d, a, b, kappa, r, max_order)
+        {
+            return taylor_table;
+        }
         // Per-order max-term tracker for the χ-gate (mirrors
         // `isotropic_duchon_penalty`): the literal partial-fraction sum of
         // Riesz + Matérn blocks loses ≈ log10(χ_k) digits at radial-derivative
@@ -19295,8 +19230,6 @@ pub mod closed_form_penalty {
         // lower derivatives used by the value remain well-conditioned. Use
         // the Taylor representation exactly for the orders whose literal
         // partial-fraction sum has exceeded the cancellation budget.
-        let kappa_r = kappa * r;
-        let x_taylor = kappa_r * kappa_r;
         let replace_order: Vec<bool> = total
             .iter()
             .zip(max_term_per_order.iter())
