@@ -41,7 +41,7 @@ def _require_extension() -> None:
         pytest.skip("rust extension not built")
 
 
-def _pc_duchon(centers: int = 5) -> str:
+def _pc_duchon(centers: int = 6) -> str:
     return (
         f"duchon(pc1, pc2, pc3, pc4, centers={centers}, "
         "order=1, power=2, length_scale=1)"
