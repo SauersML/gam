@@ -8092,7 +8092,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
         true,
-        true,
         |theta, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
@@ -9692,8 +9691,10 @@ mod tests {
     }
 
     #[test]
-    fn cost_gated_outer_order_combines_outer_and_inner_work() {
-        use crate::custom_family::{cost_gated_outer_order, default_coefficient_hessian_cost};
+    fn exact_outer_order_stays_second_order_at_biobank_work_scale() {
+        use crate::custom_family::{
+            default_coefficient_hessian_cost, exact_outer_order_from_capability,
+        };
         use crate::matrix::DesignMatrix;
         use ndarray::Array2;
 
@@ -9716,13 +9717,14 @@ mod tests {
             .collect();
         let small_cost = default_coefficient_hessian_cost(&small_specs);
         assert_eq!(
-            cost_gated_outer_order(&small_specs, small_cost),
+            exact_outer_order_from_capability(&small_specs, small_cost),
             ExactOuterDerivativeOrder::Second
         );
 
-        // Biobank-shape problem (K²≈400 looks fine, but n·p² ≈ 1.25e9 makes
-        // the combined K²·n·p² ≈ 5e11 prohibitive). Patch 4 routes this to
-        // first-order BFGS instead of attempting an exact outer Hessian.
+        // Biobank-shape problem. This used to demote to first-order BFGS based
+        // on a K²·n·p² work estimate. The new contract keeps exact analytic
+        // Hessians exposed; representation and runtime cost are handled by the
+        // Hessian operator layer.
         let big_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
             Array2::zeros((5_000, 500)),
         ));
@@ -9741,17 +9743,15 @@ mod tests {
             .collect();
         let big_cost = default_coefficient_hessian_cost(&big_specs);
         assert_eq!(
-            cost_gated_outer_order(&big_specs, big_cost),
-            ExactOuterDerivativeOrder::First
+            exact_outer_order_from_capability(&big_specs, big_cost),
+            ExactOuterDerivativeOrder::Second
         );
 
         // Production CTN-on-PC scenario: K=22 (ρ_dim=6 + log-κ_dim=16), n≈4·10⁵
         // observations with p_total = p_resp·p_cov ≈ 300 covers a Khatri–Rao
-        // joint Hessian whose dense build is n·p² ≈ 3.6·10¹⁰ flops. Combined
-        // with K²=484 the work exceeds 10¹³, so the gate must downgrade to
-        // first-order BFGS even though K²=484 alone fits comfortably under
-        // any element-count cap. This is the regression that the inner-cost
-        // gate exists to prevent.
+        // joint Hessian whose dense build is n·p² ≈ 3.6·10¹⁰ flops. This must
+        // still advertise second-order calculus; CTN supplies operator-form
+        // Hessian geometry so no first-order downgrade is acceptable.
         //
         // Pass the production coefficient cost directly (the gate only reads
         // K from specs; allocating a 400k×300 zero matrix would burn ~1 GB
@@ -9771,19 +9771,18 @@ mod tests {
         }];
         let ctn_cost: u64 = 400_000u64 * 300 * 300;
         assert_eq!(
-            cost_gated_outer_order(&ctn_specs, ctn_cost),
-            ExactOuterDerivativeOrder::First
+            exact_outer_order_from_capability(&ctn_specs, ctn_cost),
+            ExactOuterDerivativeOrder::Second
         );
 
-        // Same biobank-scale specs, but the available matrix-free primitive is
-        // only the inner coefficient-space Hv operator. That must not upgrade
-        // the profiled outer hyper-Hessian back to second order; without a real
-        // θ-HVP the K·coefficient-work gate still owns the decision.
-        use crate::custom_family::cost_gated_outer_order_with_outer_hvp;
+        // The declaration helper no longer uses cost or HVP presence as a
+        // downgrade policy. Callers check whether any analytic second-order
+        // representation exists before calling it.
+        use crate::custom_family::exact_outer_order_with_outer_hvp;
         assert_eq!(
-            cost_gated_outer_order_with_outer_hvp(&ctn_specs, ctn_cost, false),
-            ExactOuterDerivativeOrder::First,
-            "inner matrix-free coefficient Hv must not imply second-order outer hyper-Hessian"
+            exact_outer_order_with_outer_hvp(&ctn_specs, ctn_cost, false),
+            ExactOuterDerivativeOrder::Second,
+            "exact outer order must not be cost-demoted"
         );
         let huge_k_specs = vec![ParameterBlockSpec {
             name: "k".to_string(),
@@ -9799,9 +9798,9 @@ mod tests {
             initial_beta: None,
         }];
         assert_eq!(
-            cost_gated_outer_order_with_outer_hvp(&huge_k_specs, 0, true),
-            ExactOuterDerivativeOrder::First,
-            "K² > 16M element cap must fire even when a true outer HVP is available"
+            exact_outer_order_with_outer_hvp(&huge_k_specs, 0, true),
+            ExactOuterDerivativeOrder::Second,
+            "outer HVP support keeps the exact second-order declaration regardless of K"
         );
     }
 

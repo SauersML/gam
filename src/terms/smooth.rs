@@ -512,9 +512,9 @@ pub struct BlockwisePenalty {
     /// block-local or factorized without reverse-engineering the matrix.
     pub structure_hint: Option<PenaltyStructureHint>,
     /// Optional operator-form handle bit-equivalent to `local`. Populated when
-    /// the originating closed-form factory emitted an op-form penalty so PIRLS
-    /// PCG and REML SLQ log-det can use matvec instead of materializing the
-    /// dense `block_p × block_p` Gram. `None` for ordinary dense penalties.
+    /// the originating closed-form factory emitted an op-form penalty so exact
+    /// operator algebra can use matvec instead of materializing the dense
+    /// `block_p × block_p` Gram. `None` for ordinary dense penalties.
     pub op: Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>,
 }
 
@@ -6403,10 +6403,8 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     // Keep the exact outer Hessian whenever the adaptive family can provide it.
     // The Charbonnier pseudo-Laplace surface mixes ordinary log-lambda
     // coordinates with adaptive λ/ε coordinates; exact curvature is the best
-    // route when available. When the Hessian is cost-gated away, this builder
-    // declares only the true first-order capability; the outer runner owns the
-    // policy that disabled-fallback HybridEFS-shaped problems route directly to
-    // analytic-gradient BFGS.
+    // route when available. If a family cannot provide exact curvature, this
+    // builder declares only the true first-order capability.
     let problem = OuterProblem::new(n_theta)
         .with_gradient(Derivative::Analytic)
         .with_hessian(if analytic_outer_hessian_available {
@@ -9805,106 +9803,6 @@ fn exact_joint_spatial_outer_hessian_available(
     true
 }
 
-fn spatial_tau_tau_hessian_policy(
-    data: ArrayView2<'_, f64>,
-    spec: &TermCollectionSpec,
-    design: &TermCollectionDesign,
-    spatial_terms: &[usize],
-) -> Result<Option<crate::estimate::reml::TauTauHessianPolicy>, EstimationError> {
-    Ok(
-        try_build_spatial_log_kappa_hyper_dirs(data, spec, design, spatial_terms)?.map(
-            |hyper_dirs| {
-                crate::estimate::reml::exact_tau_tau_hessian_policy(
-                    design.design.nrows(),
-                    design.design.ncols(),
-                    &hyper_dirs,
-                )
-            },
-        ),
-    )
-}
-
-fn aggregate_tau_tau_hessian_policy(
-    policies: impl IntoIterator<Item = crate::estimate::reml::TauTauHessianPolicy>,
-) -> Option<crate::estimate::reml::TauTauHessianPolicy> {
-    let mut iter = policies.into_iter();
-    let first = iter.next()?;
-    Some(iter.fold(first, |mut acc, policy| {
-        acc.any_has_implicit |= policy.any_has_implicit;
-        acc.implicit_multidim_duchon |= policy.implicit_multidim_duchon;
-        acc.firth_pair_terms_unavailable |= policy.firth_pair_terms_unavailable;
-        acc.estimated_dense_tau_cache_bytes = acc
-            .estimated_dense_tau_cache_bytes
-            .saturating_add(policy.estimated_dense_tau_cache_bytes);
-        acc.gradient_plan.dense_x_bytes = acc
-            .gradient_plan
-            .dense_x_bytes
-            .saturating_add(policy.gradient_plan.dense_x_bytes);
-        acc.gradient_plan.first_order_tau_bytes = acc
-            .gradient_plan
-            .first_order_tau_bytes
-            .saturating_add(policy.gradient_plan.first_order_tau_bytes);
-        acc.gradient_plan.second_order_tau_bytes = acc
-            .gradient_plan
-            .second_order_tau_bytes
-            .saturating_add(policy.gradient_plan.second_order_tau_bytes);
-        acc.gradient_plan.penalty_first_bytes = acc
-            .gradient_plan
-            .penalty_first_bytes
-            .saturating_add(policy.gradient_plan.penalty_first_bytes);
-        acc.gradient_plan.penalty_pair_bytes = acc
-            .gradient_plan
-            .penalty_pair_bytes
-            .saturating_add(policy.gradient_plan.penalty_pair_bytes);
-        acc.gradient_plan.rho_tau_penalty_bytes = acc
-            .gradient_plan
-            .rho_tau_penalty_bytes
-            .saturating_add(policy.gradient_plan.rho_tau_penalty_bytes);
-        acc.gradient_plan.vector_cache_bytes = acc
-            .gradient_plan
-            .vector_cache_bytes
-            .saturating_add(policy.gradient_plan.vector_cache_bytes);
-        acc.gradient_plan.weighted_scratch_bytes = acc
-            .gradient_plan
-            .weighted_scratch_bytes
-            .saturating_add(policy.gradient_plan.weighted_scratch_bytes);
-        acc.hessian_plan.dense_x_bytes = acc
-            .hessian_plan
-            .dense_x_bytes
-            .saturating_add(policy.hessian_plan.dense_x_bytes);
-        acc.hessian_plan.first_order_tau_bytes = acc
-            .hessian_plan
-            .first_order_tau_bytes
-            .saturating_add(policy.hessian_plan.first_order_tau_bytes);
-        acc.hessian_plan.second_order_tau_bytes = acc
-            .hessian_plan
-            .second_order_tau_bytes
-            .saturating_add(policy.hessian_plan.second_order_tau_bytes);
-        acc.hessian_plan.penalty_first_bytes = acc
-            .hessian_plan
-            .penalty_first_bytes
-            .saturating_add(policy.hessian_plan.penalty_first_bytes);
-        acc.hessian_plan.penalty_pair_bytes = acc
-            .hessian_plan
-            .penalty_pair_bytes
-            .saturating_add(policy.hessian_plan.penalty_pair_bytes);
-        acc.hessian_plan.rho_tau_penalty_bytes = acc
-            .hessian_plan
-            .rho_tau_penalty_bytes
-            .saturating_add(policy.hessian_plan.rho_tau_penalty_bytes);
-        acc.hessian_plan.vector_cache_bytes = acc
-            .hessian_plan
-            .vector_cache_bytes
-            .saturating_add(policy.hessian_plan.vector_cache_bytes);
-        acc.hessian_plan.weighted_scratch_bytes = acc
-            .hessian_plan
-            .weighted_scratch_bytes
-            .saturating_add(policy.hessian_plan.weighted_scratch_bytes);
-        acc.budget_bytes = acc.budget_bytes.min(policy.budget_bytes);
-        acc
-    }))
-}
-
 fn smooth_term_penalty_index(
     spec: &TermCollectionSpec,
     design: &TermCollectionDesign,
@@ -10956,25 +10854,7 @@ fn try_exact_joint_spatial_aniso_optimization(
     let psi_dim = theta_dim - rho_dim;
     let analytic_outer_hessian_available =
         exact_joint_spatial_outer_hessian_available(family, baseline_design);
-    let tau_tau_policy = if analytic_outer_hessian_available {
-        spatial_tau_tau_hessian_policy(data, resolvedspec, baseline_design, spatial_terms)?
-    } else {
-        None
-    };
-    let tau_tau_prefers_gradient_only = tau_tau_policy
-        .is_some_and(crate::estimate::reml::TauTauHessianPolicy::prefer_gradient_only);
-    let prefer_gradient_only = analytic_outer_hessian_available && tau_tau_prefers_gradient_only;
-    if let Some(policy) = tau_tau_policy.filter(|policy| policy.prefer_gradient_only()) {
-        log::info!(
-            "[OUTER] aniso-psi joint REML: disabling exact tau-tau Hessian by default; preferring gradient-only BFGS over Arc (implicit_tau={}, implicit_multidim_duchon={}, dense_tau_cache={:.1} MiB, gradient_plan={:.1} MiB, exact_hessian_plan={:.1} MiB, budget={:.1} MiB)",
-            policy.any_has_implicit,
-            policy.implicit_multidim_duchon,
-            policy.estimated_dense_tau_cache_bytes as f64 / (1024.0 * 1024.0),
-            policy.gradient_plan.total_bytes() as f64 / (1024.0 * 1024.0),
-            policy.hessian_plan.total_bytes() as f64 / (1024.0 * 1024.0),
-            policy.budget_bytes as f64 / (1024.0 * 1024.0),
-        );
-    }
+    let prefer_gradient_only = false;
 
     log::trace!(
         "[spatial-aniso-joint] starting analytic optimization: rho_dim={}, psi_dim={}, dims_per_term={:?}",
@@ -10984,11 +10864,10 @@ fn try_exact_joint_spatial_aniso_optimization(
     );
 
     // Shared context for the optimization closures. Holds immutable references
-    // to data/spec/options and the mutable best-tracking state.
+    // to data/spec/options and the realized-design cache.
     struct AnisoJointContext<'d> {
         data: ArrayView2<'d, f64>,
         rho_dim: usize,
-        best_cost: f64,
         cache: SingleBlockExactJointDesignCache<'d>,
         evaluator: crate::estimate::ExternalJointHyperEvaluator<'d>,
     }
@@ -11112,14 +10991,7 @@ fn try_exact_joint_spatial_aniso_optimization(
             }
         }
 
-        fn track_best(&mut self, _: &Array1<f64>, cost: f64) {
-            if cost < self.best_cost {
-                self.best_cost = cost;
-            }
-        }
-
         fn reset(&mut self) {
-            self.best_cost = f64::INFINITY;
             self.cache.current_theta = None;
             self.cache.last_cost = None;
             self.cache.last_eval = None;
@@ -11129,7 +11001,6 @@ fn try_exact_joint_spatial_aniso_optimization(
     let mut ctx = AnisoJointContext {
         data,
         rho_dim,
-        best_cost: f64::INFINITY,
         cache: SingleBlockExactJointDesignCache::new(
             data,
             resolvedspec.clone(),
@@ -11178,14 +11049,11 @@ fn try_exact_joint_spatial_aniso_optimization(
                       order: OuterEvalOrder|
      -> Result<OuterEval, EstimationError> {
         match ctx.eval_full(theta, order, analytic_outer_hessian_available) {
-            Ok((cost, grad, hess)) => {
-                ctx.track_best(theta, cost);
-                Ok(OuterEval {
-                    cost,
-                    gradient: grad,
-                    hessian: hess,
-                })
-            }
+            Ok((cost, grad, hess)) => Ok(OuterEval {
+                cost,
+                gradient: grad,
+                hessian: hess,
+            }),
             Err(err) => Err(err),
         }
     };
@@ -11193,9 +11061,7 @@ fn try_exact_joint_spatial_aniso_optimization(
     let mut obj = problem.build_objective_with_eval_order(
         &mut ctx,
         |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
-            let cost = ctx.eval_cost(theta);
-            ctx.track_best(theta, cost);
-            Ok(cost)
+            Ok(ctx.eval_cost(theta))
         },
         |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
             eval_outer(
@@ -11272,25 +11138,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
     let kappa_dim = theta_dim - rho_dim;
     let analytic_outer_hessian_available =
         exact_joint_spatial_outer_hessian_available(family, baseline_design);
-    let tau_tau_policy = if analytic_outer_hessian_available {
-        spatial_tau_tau_hessian_policy(data, resolvedspec, baseline_design, spatial_terms)?
-    } else {
-        None
-    };
-    let tau_tau_prefers_gradient_only = tau_tau_policy
-        .is_some_and(crate::estimate::reml::TauTauHessianPolicy::prefer_gradient_only);
-    let prefer_gradient_only = analytic_outer_hessian_available && tau_tau_prefers_gradient_only;
-    if let Some(policy) = tau_tau_policy.filter(|policy| policy.prefer_gradient_only()) {
-        log::info!(
-            "[OUTER] iso-kappa joint REML: disabling exact tau-tau Hessian by default; preferring gradient-only BFGS over Arc (implicit_tau={}, implicit_multidim_duchon={}, dense_tau_cache={:.1} MiB, gradient_plan={:.1} MiB, exact_hessian_plan={:.1} MiB, budget={:.1} MiB)",
-            policy.any_has_implicit,
-            policy.implicit_multidim_duchon,
-            policy.estimated_dense_tau_cache_bytes as f64 / (1024.0 * 1024.0),
-            policy.gradient_plan.total_bytes() as f64 / (1024.0 * 1024.0),
-            policy.hessian_plan.total_bytes() as f64 / (1024.0 * 1024.0),
-            policy.budget_bytes as f64 / (1024.0 * 1024.0),
-        );
-    }
+    let prefer_gradient_only = false;
 
     log::trace!(
         "[spatial-iso-joint] starting analytic optimization: rho_dim={}, kappa_dim={}, dims_per_term={:?}",
@@ -11302,7 +11150,6 @@ fn try_exact_joint_spatial_isotropic_optimization(
     struct IsoJointContext<'d> {
         data: ArrayView2<'d, f64>,
         rho_dim: usize,
-        best_cost: f64,
         cache: SingleBlockExactJointDesignCache<'d>,
         evaluator: crate::estimate::ExternalJointHyperEvaluator<'d>,
     }
@@ -11433,14 +11280,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
             }
         }
 
-        fn track_best(&mut self, _: &Array1<f64>, cost: f64) {
-            if cost < self.best_cost {
-                self.best_cost = cost;
-            }
-        }
-
         fn reset(&mut self) {
-            self.best_cost = f64::INFINITY;
             self.cache.current_theta = None;
             self.cache.last_cost = None;
             self.cache.last_eval = None;
@@ -11450,7 +11290,6 @@ fn try_exact_joint_spatial_isotropic_optimization(
     let mut ctx = IsoJointContext {
         data,
         rho_dim,
-        best_cost: f64::INFINITY,
         cache: SingleBlockExactJointDesignCache::new(
             data,
             resolvedspec.clone(),
@@ -11499,14 +11338,11 @@ fn try_exact_joint_spatial_isotropic_optimization(
                       order: OuterEvalOrder|
      -> Result<OuterEval, EstimationError> {
         match ctx.eval_full(theta, order, analytic_outer_hessian_available) {
-            Ok((cost, grad, hess)) => {
-                ctx.track_best(theta, cost);
-                Ok(OuterEval {
-                    cost,
-                    gradient: grad,
-                    hessian: hess,
-                })
-            }
+            Ok((cost, grad, hess)) => Ok(OuterEval {
+                cost,
+                gradient: grad,
+                hessian: hess,
+            }),
             Err(err) => Err(err),
         }
     };
@@ -11514,9 +11350,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
     let mut obj = problem.build_objective_with_eval_order(
         &mut ctx,
         |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| {
-            let cost = ctx.eval_cost(theta);
-            ctx.track_best(theta, cost);
-            Ok(cost)
+            Ok(ctx.eval_cost(theta))
         },
         |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| {
             eval_outer(
@@ -12866,7 +12700,6 @@ pub fn optimize_spatial_length_scale_exact_joint<FitOut, FitFn, ExactFn, ExactEf
     analytic_joint_gradient_available: bool,
     analytic_joint_hessian_available: bool,
     disable_fixed_point: bool,
-    allow_tau_tau_gradient_only_preference: bool,
     mut fit_fn: FitFn,
     mut exact_fn: ExactFn,
     mut exact_efs_fn: ExactEfsFn,
@@ -12960,35 +12793,7 @@ where
         )
     })?;
     let analytic_outer_hessian_available = analytic_joint_hessian_available;
-    let tau_tau_policy =
-        if analytic_outer_hessian_available && allow_tau_tau_gradient_only_preference {
-            let per_block_policy = best_specs
-                .iter()
-                .zip(boot_designs.iter())
-                .zip(block_term_indices.iter())
-                .map(|((spec, design), terms)| {
-                    spatial_tau_tau_hessian_policy(data, spec, design, terms)
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|err| err.to_string())?;
-            aggregate_tau_tau_hessian_policy(per_block_policy.into_iter().flatten())
-        } else {
-            None
-        };
-    let tau_tau_prefers_gradient_only = tau_tau_policy
-        .is_some_and(crate::estimate::reml::TauTauHessianPolicy::prefer_gradient_only);
-    let prefer_gradient_only = analytic_outer_hessian_available && tau_tau_prefers_gradient_only;
-    if let Some(policy) = tau_tau_policy.filter(|policy| policy.prefer_gradient_only()) {
-        log::info!(
-            "[OUTER] n-block exact-joint spatial: disabling exact tau-tau Hessian by default; preferring gradient-only BFGS over Arc (implicit_tau={}, implicit_multidim_duchon={}, dense_tau_cache={:.1} MiB, gradient_plan={:.1} MiB, exact_hessian_plan={:.1} MiB, budget={:.1} MiB)",
-            policy.any_has_implicit,
-            policy.implicit_multidim_duchon,
-            policy.estimated_dense_tau_cache_bytes as f64 / (1024.0 * 1024.0),
-            policy.gradient_plan.total_bytes() as f64 / (1024.0 * 1024.0),
-            policy.hessian_plan.total_bytes() as f64 / (1024.0 * 1024.0),
-            policy.budget_bytes as f64 / (1024.0 * 1024.0),
-        );
-    }
+    let prefer_gradient_only = false;
 
     let theta_dim = theta0.len();
     let psi_dim = theta_dim - rho_dim;
@@ -13002,23 +12807,10 @@ where
         .collect();
 
     struct NBlockExactJointState<'d> {
-        best_cost: f64,
-        best_theta: Option<Array1<f64>>,
         cache: ExactJointDesignCache<'d>,
     }
 
-    impl<'d> NBlockExactJointState<'d> {
-        fn track_best(&mut self, theta: &Array1<f64>, cost: f64) {
-            if cost.is_finite() && cost < self.best_cost {
-                self.best_cost = cost;
-                self.best_theta = Some(theta.clone());
-            }
-        }
-    }
-
     let mut state = NBlockExactJointState {
-        best_cost: f64::INFINITY,
-        best_theta: None,
         cache: ExactJointDesignCache::new(data, cache_blocks, rho_dim, all_dims.clone())?,
     };
 
@@ -13070,7 +12862,6 @@ where
                     OuterEvalOrder::ValueGradientHessian => hess.is_analytic(),
                 };
                 if cached_satisfies_order {
-                    ctx.track_best(theta, cost);
                     if !cost.is_finite() {
                         return Ok(OuterEval::infeasible(theta.len()));
                     }
@@ -13104,7 +12895,6 @@ where
             match (&mut *exact_fn_cell.borrow_mut())(theta, &specs, &designs, eval_mode) {
                 Ok((cost, grad, hess)) => {
                     ctx.cache.store_eval((cost, grad.clone(), hess.clone()));
-                    ctx.track_best(theta, cost);
                     if !cost.is_finite() {
                         return Ok(OuterEval::infeasible(theta.len()));
                     }
@@ -13132,7 +12922,6 @@ where
             &mut state,
             |ctx: &mut &mut NBlockExactJointState<'_>, theta: &Array1<f64>| {
                 if let Some(cost) = ctx.cache.memoized_cost(theta) {
-                    ctx.track_best(theta, cost);
                     return Ok(cost);
                 }
                 if let Err(err) = ctx.cache.ensure_theta(theta) {
@@ -13162,7 +12951,6 @@ where
                         // memoized_cost path covers the common case where the
                         // line search returns to an accepted iterate.
                         ctx.cache.store_cost_only(theta, cost);
-                        ctx.track_best(theta, cost);
                         Ok(cost)
                     }
                     Err(err) => {
@@ -13201,7 +12989,6 @@ where
                         &designs,
                     )
                     .map_err(EstimationError::RemlOptimizationFailed)?;
-                    ctx.track_best(theta, eval.cost);
                     Ok(eval)
                 },
             ),
@@ -13212,17 +12999,7 @@ where
             .map_err(|e| e.to_string())?
     }; // obj dropped here, releasing mutable borrow on state
 
-    let theta_star = match state.best_theta.as_ref() {
-        Some(best_theta) if state.best_cost.is_finite() && state.best_cost < result.final_value => {
-            log::info!(
-                "[OUTER] n-block exact-joint spatial: using best evaluated theta cost={:.6e} over solver final cost={:.6e}",
-                state.best_cost,
-                result.final_value
-            );
-            best_theta.clone()
-        }
-        _ => result.rho,
-    };
+    let theta_star = result.rho;
 
     state.cache.ensure_theta(&theta_star)?;
 
@@ -15606,7 +15383,6 @@ mod tests {
             true,
             true,
             false,
-            true,
             |theta, specs, designs| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
@@ -15880,7 +15656,6 @@ mod tests {
             true,
             true,
             false,
-            true,
             |theta, specs, designs| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
@@ -17821,7 +17596,6 @@ mod tests {
             true,
             true,
             false,
-            true,
             |theta, specs, designs| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);

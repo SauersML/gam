@@ -416,8 +416,9 @@ pub struct OuterCapability {
     /// blocked EFS. The quantitative check allows EFS when constraints exist but
     /// the barrier curvature is negligible (coefficients far from their bounds).
     pub barrier_config: Option<BarrierConfig>,
-    /// Policy hint: even when an analytic Hessian exists, prefer a gradient-only
-    /// outer solver because each second-order evaluation is too expensive.
+    /// Policy hint for derivative-free auxiliary optimizers only. Primary REML
+    /// optimization ignores this flag when an analytic Hessian exists: exact
+    /// second-order geometry must not be hidden behind a quasi-Newton policy.
     pub prefer_gradient_only: bool,
     /// Policy hint: even when the objective implements `eval_efs()` and the
     /// coordinate structure is penalty-like, the planner must NOT select
@@ -781,11 +782,11 @@ pub struct OuterPlan {
 
 pub(crate) const EFS_FIRST_ORDER_FALLBACK_MARKER: &str = "[outer-efs-first-order-fallback]";
 
-/// Whether outer_strategy should automatically derive a downgrade ladder from
-/// the primary capability, or disable retries entirely.
+/// Whether outer_strategy should automatically derive a retry ladder from the
+/// primary capability, or disable retries entirely.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FallbackPolicy {
-    /// Centralized degradation path chosen from the declared capability.
+    /// Centralized retry path chosen from the declared capability.
     Automatic,
     /// No retries; use only the primary plan.
     Disabled,
@@ -827,16 +828,8 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
 
     match (cap.gradient, cap.declared_hessian_for_planning()) {
         (Analytic, Analytic) => OuterPlan {
-            solver: if cap.prefer_gradient_only {
-                S::Bfgs
-            } else {
-                S::Arc
-            },
-            hessian_source: if cap.prefer_gradient_only {
-                H::BfgsApprox
-            } else {
-                H::Analytic
-            },
+            solver: S::Arc,
+            hessian_source: H::Analytic,
         },
         // EFS: all penalty-like coords, no analytic Hessian, many params.
         // Multiplicative fixed-point needs only traces — no gradient evals.
@@ -960,14 +953,6 @@ fn requests_immediate_first_order_fallback(message: &str) -> bool {
     message.contains(EFS_FIRST_ORDER_FALLBACK_MARKER)
 }
 
-fn downgrade_hessian(cap: &OuterCapability) -> Option<OuterCapability> {
-    (cap.hessian == Derivative::Analytic).then(|| {
-        let mut degraded = cap.clone();
-        degraded.hessian = Derivative::Unavailable;
-        degraded
-    })
-}
-
 /// Disable the EFS/HybridEfs planner path, forcing BFGS-class solvers on the
 /// next attempt. Returns `None` if fixed-point is already disabled.
 fn disable_fixed_point(cap: &OuterCapability) -> Option<OuterCapability> {
@@ -985,9 +970,8 @@ fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
     //
     // The cascade is:
     //   1. If the primary plan is EFS/HybridEFS AND an analytic gradient is
-    //      available, retry with fixed-point disabled so BFGS can use that
-    //      declared analytic gradient directly. As an additional retry,
-    //      downgrade the (now BFGS) plan's analytic Hessian to BFGS-approx.
+    //      available, retry with fixed-point disabled so the analytic
+    //      derivative declaration is evaluated directly.
     //   2. If the primary plan is Arc (declared (Analytic, Analytic)
     //      capability), do NOT add a degraded fallback. Demoting to
     //      BFGS+BfgsApprox in this case discards the analytic outer Hessian
@@ -1008,9 +992,6 @@ fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
     {
         if let Some(no_fp_cap) = disable_fixed_point(cap) {
             attempts.push(no_fp_cap.clone());
-            if let Some(grad_cap) = downgrade_hessian(&no_fp_cap) {
-                attempts.push(grad_cap);
-            }
             return attempts;
         }
     }
@@ -1023,9 +1004,6 @@ fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
         return attempts;
     }
 
-    if let Some(grad_cap) = downgrade_hessian(cap) {
-        attempts.push(grad_cap);
-    }
     attempts
 }
 
@@ -2265,12 +2243,9 @@ impl OuterProblem {
     /// Override the fallback policy. Default is [`FallbackPolicy::Automatic`].
     ///
     /// Set [`FallbackPolicy::Disabled`] when the caller requires the primary
-    /// plan to stand on its own — callers use this when the automatic
-    /// degradation ladder would violate a hard correctness constraint (e.g.
-    /// custom-family outer must never use BFGS + Hessian approximation because
-    /// the surrogate surface is directionally hostile to rank-2 Hessian
-    /// updates, and the cascade's only remaining retry converts
-    /// `Analytic` Hessian → `Unavailable` → BFGS+BfgsApprox).
+    /// plan to stand on its own. Exact-Hessian objectives use this to ensure
+    /// failures surface on the analytic geometry instead of being reinterpreted
+    /// by a different optimizer class.
     pub fn with_fallback_policy(mut self, policy: FallbackPolicy) -> Self {
         self.fallback_policy = policy;
         self
@@ -2975,31 +2950,8 @@ fn run_operator_trust_region(
             trust_radius
         };
         let hv_applies = counter.count();
-        let elapsed = iter_start.elapsed().as_secs_f64();
-        let next_cost = if accepted { trial_cost } else { eval_k.cost };
-        log::info!(
-            "[ARC-timing] iter={iter} status={} cost={:.6e}->{:.6e} grad_norm={:.3e} \
-             rho={:.3} pred_dec={:.3e} act_dec={:.3e} trust_radius={:.3e}->{:.3e} \
-             hv_applies={} elapsed={:.3}s",
-            if accepted_by_ratio {
-                "accepted"
-            } else {
-                "rejected"
-            },
-            eval_k.cost,
-            next_cost,
-            g_norm,
-            rho,
-            pred_dec,
-            act_dec,
-            trust_radius,
-            new_trust_radius,
-            hv_applies,
-            elapsed,
-        );
-
-        trust_radius = new_trust_radius;
         if accepted {
+            let trust_radius_before_trial_eval = trust_radius;
             let eval_trial = match obj
                 .eval_with_order(&x_trial, OuterEvalOrder::ValueGradientHessian)
             {
@@ -3008,19 +2960,27 @@ fn run_operator_trust_region(
                         Ok(eval) => eval,
                         Err(ObjectiveEvalError::Recoverable { message }) => {
                             let elapsed = iter_start.elapsed().as_secs_f64();
+                            let rejected_trust_radius =
+                                (new_trust_radius * 0.25).max(1e-12);
                             log::info!(
                                 "[ARC-timing] iter={iter} status=accepted_eval_error \
-                                     cost={:.6e} grad_norm={:.3e} trust_radius={:.3e}->{:.3e} \
-                                     hv_applies={} elapsed={:.3}s reason={}",
+                                     cost={:.6e}->{:.6e} grad_norm={:.3e} rho={:.3} \
+                                     pred_dec={:.3e} act_dec={:.3e} \
+                                     trust_radius={:.3e}->{:.3e} hv_applies={} elapsed={:.3}s \
+                                     reason={}",
                                 eval_k.cost,
+                                trial_cost,
                                 g_norm,
-                                trust_radius,
-                                (trust_radius * 0.25).max(1e-12),
-                                counter.count(),
+                                rho,
+                                pred_dec,
+                                act_dec,
+                                trust_radius_before_trial_eval,
+                                rejected_trust_radius,
+                                hv_applies,
                                 elapsed,
                                 message,
                             );
-                            trust_radius = (trust_radius * 0.25).max(1e-12);
+                            trust_radius = rejected_trust_radius;
                             continue;
                         }
                         Err(ObjectiveEvalError::Fatal { message }) => {
@@ -3030,27 +2990,69 @@ fn run_operator_trust_region(
                 }
                 Err(err) => {
                     let elapsed = iter_start.elapsed().as_secs_f64();
+                    let rejected_trust_radius = (new_trust_radius * 0.25).max(1e-12);
                     log::info!(
                         "[ARC-timing] iter={iter} status=accepted_eval_error \
-                             cost={:.6e} grad_norm={:.3e} trust_radius={:.3e}->{:.3e} \
-                             hv_applies={} elapsed={:.3}s reason={}",
+                             cost={:.6e}->{:.6e} grad_norm={:.3e} rho={:.3} \
+                             pred_dec={:.3e} act_dec={:.3e} \
+                             trust_radius={:.3e}->{:.3e} hv_applies={} elapsed={:.3}s \
+                             reason={}",
                         eval_k.cost,
+                        trial_cost,
                         g_norm,
-                        trust_radius,
-                        (trust_radius * 0.25).max(1e-12),
-                        counter.count(),
+                        rho,
+                        pred_dec,
+                        act_dec,
+                        trust_radius_before_trial_eval,
+                        rejected_trust_radius,
+                        hv_applies,
                         elapsed,
                         err,
                     );
-                    trust_radius = (trust_radius * 0.25).max(1e-12);
+                    trust_radius = rejected_trust_radius;
                     continue;
                 }
             };
+            let elapsed = iter_start.elapsed().as_secs_f64();
+            log::info!(
+                "[ARC-timing] iter={iter} status=accepted cost={:.6e}->{:.6e} \
+                 grad_norm={:.3e} rho={:.3} pred_dec={:.3e} act_dec={:.3e} \
+                 trust_radius={:.3e}->{:.3e} hv_applies={} elapsed={:.3}s",
+                eval_k.cost,
+                trial_cost,
+                g_norm,
+                rho,
+                pred_dec,
+                act_dec,
+                trust_radius_before_trial_eval,
+                new_trust_radius,
+                hv_applies,
+                elapsed,
+            );
+            trust_radius = new_trust_radius;
             x_k = x_trial;
             eval_k = eval_trial;
             dense_model = None;
             materialize_dense_after_rejection = false;
-        } else if trust_radius <= OPERATOR_TRUST_RADIUS_REJECT_FLOOR {
+        } else {
+            let elapsed = iter_start.elapsed().as_secs_f64();
+            log::info!(
+                "[ARC-timing] iter={iter} status=rejected cost={:.6e}->{:.6e} \
+                 grad_norm={:.3e} rho={:.3} pred_dec={:.3e} act_dec={:.3e} \
+                 trust_radius={:.3e}->{:.3e} hv_applies={} elapsed={:.3}s",
+                eval_k.cost,
+                eval_k.cost,
+                g_norm,
+                rho,
+                pred_dec,
+                act_dec,
+                trust_radius,
+                new_trust_radius,
+                hv_applies,
+                elapsed,
+            );
+            trust_radius = new_trust_radius;
+            if trust_radius <= OPERATOR_TRUST_RADIUS_REJECT_FLOOR {
             let final_grad = projected_gradient(&x_k, &eval_k.gradient, bounds);
             let final_grad_norm = final_grad.dot(&final_grad).sqrt();
             return Ok(OuterResult {
@@ -3065,8 +3067,9 @@ fn run_operator_trust_region(
                 operator_trust_radius: Some(trust_radius),
                 operator_stop_reason: Some(OperatorTrustRegionStopReason::RejectFloor),
             });
-        } else if dense_model.is_none() {
-            materialize_dense_after_rejection = true;
+            } else if dense_model.is_none() {
+                materialize_dense_after_rejection = true;
+            }
         }
     }
 
@@ -3967,7 +3970,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_prefer_gradient_only_downgrades_analytic_hessian_to_bfgs() {
+    fn plan_prefer_gradient_only_does_not_hide_analytic_hessian() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
             hessian: Derivative::Analytic,
@@ -3979,8 +3982,8 @@ mod tests {
             disable_fixed_point: false,
         };
         let p = plan(&cap);
-        assert_eq!(p.solver, Solver::Bfgs);
-        assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
+        assert_eq!(p.solver, Solver::Arc);
+        assert_eq!(p.hessian_source, HessianSource::Analytic);
     }
 
     #[test]
@@ -4598,15 +4601,16 @@ mod tests {
     }
 
     #[test]
-    fn routing_explicit_prefer_gradient_only_still_routes_to_bfgs() {
-        // A family that explicitly opts into gradient-only (e.g. for a
-        // structurally hostile surrogate surface) keeps BFGS even with both
-        // derivatives declared analytic.
+    fn routing_explicit_prefer_gradient_only_does_not_override_exact_hessian() {
+        // The primary REML outer must never hide an analytic Hessian behind a
+        // quasi-Newton route. Auxiliary gradient-only optimizers are separate
+        // solver classes; this flag is ignored for Analytic+Analytic primary
+        // capabilities.
         let mut cap = cap_for_routing(Derivative::Analytic, Derivative::Analytic, 6);
         cap.prefer_gradient_only = true;
         let p = plan(&cap);
-        assert_eq!(p.solver, Solver::Bfgs);
-        assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
+        assert_eq!(p.solver, Solver::Arc);
+        assert_eq!(p.hessian_source, HessianSource::Analytic);
     }
 
     #[test]

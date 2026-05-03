@@ -9616,7 +9616,6 @@ pub(crate) fn fit_survival_location_scale_terms(
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
         true,
-        true,
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             let fit = fit_survival_location_scale(build_spec(

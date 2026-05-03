@@ -12073,9 +12073,8 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         // Operator-aware: the rigid K=4 RowKernel + RowKernelHessianWorkspace
         // adapter (see `exact_newton_joint_hessian_workspace`) applies joint
         // Hv at O(n · (p_time + p_marginal + p_logslope + p_flex)) per call.
-        // Reporting the dense build cost when the matrix-free path will run
-        // would push the outer planner's cost gate to first-order BFGS even
-        // though the operator path is what actually executes.
+        // Report the operator work model so diagnostics and first-order-only
+        // policies reflect the representation that actually executes.
         let n = self.n as u64;
         let p_total: u64 = specs
             .iter()
@@ -13351,7 +13350,6 @@ pub fn fit_survival_marginal_slope_terms(
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
         true,
-        true,
         |theta, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
@@ -13390,9 +13388,9 @@ pub fn fit_survival_marginal_slope_terms(
             sigma_hint.replace(sigma);
             let family = make_family(&designs[0], &designs[1], sigma);
             let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
-            // Downgrade Hessian request to gradient-only when the family
-            // can't supply an analytic Hessian; preserve ValueOnly so the
-            // line-search probes truly skip gradient assembly.
+            // Preserve ValueOnly probes and request the Hessian exactly when
+            // this realized family advertised analytic joint second-order
+            // support.
             let effective_mode = match eval_mode {
                 EvalMode::ValueGradientHessian if !analytic_joint_hessian_available => {
                     EvalMode::ValueAndGradient
