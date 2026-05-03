@@ -14754,11 +14754,11 @@ pub fn build_duchon_basis_log_kappa_derivativeswithworkspace(
     )?;
     let (penalties_derivative, penaltiessecond_derivative) =
         build_duchon_operator_penalty_psi_derivatives(
-        centers.view(),
-        spec,
-        identifiability_transform.as_ref(),
-        workspace,
-    )?;
+            centers.view(),
+            spec,
+            identifiability_transform.as_ref(),
+            workspace,
+        )?;
     Ok(BasisPsiDerivativeBundle {
         first: BasisPsiDerivativeResult {
             design_derivative: design_derivatives.design_first,
@@ -16250,12 +16250,12 @@ pub fn build_thin_plate_basis_log_kappa_derivativeswithworkspace(
     )?;
     let (primary_derivative_opt, primarysecond_derivative_opt) =
         build_thin_plate_penalty_psi_derivativeswithworkspace(
-        centers.view(),
-        &derivative_spec,
-        identifiability_transform.as_ref(),
-        workspace,
-        ThinPlateDerivativeOrder::Both,
-    )?;
+            centers.view(),
+            &derivative_spec,
+            identifiability_transform.as_ref(),
+            workspace,
+            ThinPlateDerivativeOrder::Both,
+        )?;
     let primary_derivative = primary_derivative_opt.ok_or_else(|| {
         BasisError::InvalidInput(
             "ThinPlate first-order penalty psi-derivative was not produced".to_string(),

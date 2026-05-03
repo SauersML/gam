@@ -5,11 +5,10 @@ use crate::basis::{
     MaternIdentifiability, PenaltyCandidate, PenaltyInfo, PenaltySource, SpatialIdentifiability,
     ThinPlateBasisSpec, apply_sum_to_zero_constraint, build_bspline_basis_1d, build_duchon_basis,
     build_duchon_basis_log_kappa_aniso_derivatives, build_duchon_basis_log_kappa_derivatives,
-    build_duchon_basiswithworkspace,
-    build_matern_basis, build_matern_basis_log_kappa_aniso_derivatives,
-    build_matern_basis_log_kappa_derivatives, build_matern_basiswithworkspace,
-    build_matern_collocation_operator_matrices, build_thin_plate_basis,
-    build_thin_plate_basis_log_kappa_derivatives, center_strategy_is_auto,
+    build_duchon_basiswithworkspace, build_matern_basis,
+    build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
+    build_matern_basiswithworkspace, build_matern_collocation_operator_matrices,
+    build_thin_plate_basis, build_thin_plate_basis_log_kappa_derivatives, center_strategy_is_auto,
     center_strategy_kind, center_strategy_num_centers, center_strategy_with_num_centers,
     estimate_penalty_nullity, filter_active_penalty_candidates,
     filter_active_penalty_candidates_with_ops, initial_aniso_contrasts,
@@ -10201,96 +10200,57 @@ fn try_build_spatial_term_log_kappa_derivative(
         None => return Ok(None),
     };
 
+    let derivative_bundle = match &termspec.basis {
+        SmoothBasisSpec::ThinPlate {
+            feature_cols,
+            spec,
+            input_scales,
+        } => {
+            let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+            if let Some(s) = input_scales {
+                apply_input_standardization(&mut x, s);
+            }
+            build_thin_plate_basis_log_kappa_derivatives(x.view(), spec)
+                .map_err(EstimationError::from)?
+        }
+        SmoothBasisSpec::Matern {
+            feature_cols,
+            spec,
+            input_scales,
+        } => {
+            let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+            if let Some(s) = input_scales {
+                apply_input_standardization(&mut x, s);
+            }
+            build_matern_basis_log_kappa_derivatives(x.view(), spec)
+                .map_err(EstimationError::from)?
+        }
+        SmoothBasisSpec::Duchon {
+            feature_cols,
+            spec,
+            input_scales,
+        } => {
+            let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+            if let Some(s) = input_scales {
+                apply_input_standardization(&mut x, s);
+            }
+            build_duchon_basis_log_kappa_derivatives(x.view(), spec)
+                .map_err(EstimationError::from)?
+        }
+        SmoothBasisSpec::BSpline1D { .. } | SmoothBasisSpec::TensorBSpline { .. } => {
+            return Ok(None);
+        }
+    };
     let BasisPsiDerivativeResult {
         design_derivative: local_x_psi,
         penalties_derivative: local_s_psi,
         implicit_operator: local_implicit_first,
-    } = match &termspec.basis {
-        SmoothBasisSpec::ThinPlate {
-            feature_cols,
-            spec,
-            input_scales,
-        } => {
-            let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
-            if let Some(s) = input_scales {
-                apply_input_standardization(&mut x, s);
-            }
-            build_thin_plate_basis_log_kappa_derivative(x.view(), spec)
-                .map_err(EstimationError::from)?
-        }
-        SmoothBasisSpec::Matern {
-            feature_cols,
-            spec,
-            input_scales,
-        } => {
-            let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
-            if let Some(s) = input_scales {
-                apply_input_standardization(&mut x, s);
-            }
-            build_matern_basis_log_kappa_derivative(x.view(), spec)
-                .map_err(EstimationError::from)?
-        }
-        SmoothBasisSpec::Duchon {
-            feature_cols,
-            spec,
-            input_scales,
-        } => {
-            let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
-            if let Some(s) = input_scales {
-                apply_input_standardization(&mut x, s);
-            }
-            build_duchon_basis_log_kappa_derivative(x.view(), spec)
-                .map_err(EstimationError::from)?
-        }
-        SmoothBasisSpec::BSpline1D { .. } | SmoothBasisSpec::TensorBSpline { .. } => {
-            return Ok(None);
-        }
-    };
+    } = derivative_bundle.first;
     let BasisPsiSecondDerivativeResult {
         designsecond_derivative: local_x_psi_psi,
         penaltiessecond_derivative: local_s_psi_psi,
         implicit_operator: local_implicit_second,
-    } = match &termspec.basis {
-        SmoothBasisSpec::ThinPlate {
-            feature_cols,
-            spec,
-            input_scales,
-        } => {
-            let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
-            if let Some(s) = input_scales {
-                apply_input_standardization(&mut x, s);
-            }
-            build_thin_plate_basis_log_kappasecond_derivative(x.view(), spec)
-                .map_err(EstimationError::from)?
-        }
-        SmoothBasisSpec::Matern {
-            feature_cols,
-            spec,
-            input_scales,
-        } => {
-            let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
-            if let Some(s) = input_scales {
-                apply_input_standardization(&mut x, s);
-            }
-            build_matern_basis_log_kappasecond_derivative(x.view(), spec)
-                .map_err(EstimationError::from)?
-        }
-        SmoothBasisSpec::Duchon {
-            feature_cols,
-            spec,
-            input_scales,
-        } => {
-            let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
-            if let Some(s) = input_scales {
-                apply_input_standardization(&mut x, s);
-            }
-            build_duchon_basis_log_kappasecond_derivative(x.view(), spec)
-                .map_err(EstimationError::from)?
-        }
-        SmoothBasisSpec::BSpline1D { .. } | SmoothBasisSpec::TensorBSpline { .. } => {
-            return Ok(None);
-        }
-    };
+    } = derivative_bundle.second;
     let implicit_operator = local_implicit_first
         .or(local_implicit_second)
         .map(std::sync::Arc::new);
