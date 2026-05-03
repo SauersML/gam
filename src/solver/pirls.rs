@@ -1132,8 +1132,9 @@ pub struct WorkingModelPirlsResult {
 // Math note:
 //   Objective: V(ρ) includes log|H(ρ)| with H(ρ) = X' W X + S_λ(ρ) + δ I.
 //   If δ = δ(ρ) is adaptive, V(ρ) is only piecewise-smooth and ∂V/∂ρ ignores
-//   ∂δ/∂ρ, causing analytic/FD mismatch. Using a fixed δ makes V(ρ) smooth and
-//   the standard envelope-theorem gradient valid:
+//   ∂δ/∂ρ, causing a mismatch between the optimized surface and the analytic
+//   derivative surface. Using a fixed δ makes V(ρ) smooth and the standard
+//   envelope-theorem gradient valid:
 //     dV/dρ_k = 0.5 λ_k βᵀ S_k β + 0.5 λ_k tr(H^{-1} S_k) - 0.5 det1[k].
 const FIXED_STABILIZATION_RIDGE: f64 = 1e-8;
 
@@ -7051,8 +7052,7 @@ pub fn update_glmvectors_integrated_by_family(
 ///   `c` enters dH/dρ (outer gradient), and `d` enters d²H/dρ² (outer Hessian).
 /// - When hard clamps activate, the update map is piecewise and no longer C².
 ///   Setting c_i=d_i=0 is a practical subgradient-like choice to avoid unstable
-///   explosive derivatives. In that regime analytic and central-FD gradients can
-///   diverge because FD may straddle a kink.
+///   explosive derivatives at the kink.
 fn computeworkingweight_derivatives_from_eta(
     likelihood: GlmLikelihoodSpec,
     inverse_link: &InverseLink,

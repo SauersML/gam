@@ -98,8 +98,8 @@ impl<'a> RemlState<'a> {
     pub(crate) fn analytic_outer_hessian_enabled(&self) -> bool {
         // The Tierney-Kadane skewness correction has analytic value and
         // first ρ-derivative paths (`tierney_kadane_analytic_core`), but
-        // its analytic outer-Hessian is not implemented and the
-        // production finite-difference stencils for it are disabled.
+        // its analytic outer-Hessian is not implemented. Production requires
+        // analytic second derivatives for Hessian mode.
         // `tierney_kadane_terms` therefore returns an `InvalidInput` error
         // for `ValueGradientHessian` mode whenever TK is active (Firth +
         // non-identity link). Without gating the outer evaluator that
@@ -887,7 +887,7 @@ impl<'a> RemlState<'a> {
         let compute_gradient = compute_gradient_for_tk(mode);
         if mode == super::unified::EvalMode::ValueGradientHessian {
             return Err(EstimationError::InvalidInput(
-                "Tierney-Kadane outer Hessian requires analytic second derivatives; production finite-difference stencils are disabled".to_string(),
+                "Tierney-Kadane outer Hessian requires analytic second derivatives".to_string(),
             ));
         }
         if c_array.is_empty() || d_array.is_empty() {
@@ -1228,8 +1228,8 @@ impl<'a> RemlState<'a> {
     /// where T = h₁/(φV), T_k = ∂^k T/∂η^k, and W_F = h₁ T. Everything
     /// is closed-form in h₁..h₅ (inverse-link jet plus
     /// `inverse_link_pdf{third,fourth}_derivative_for_inverse_link`)
-    /// and the variance jet V, V₁..V₄. No finite-difference stencil is
-    /// involved.
+    /// and the variance jet V, V₁..V₄. The production path is fully
+    /// analytic.
     fn hessian_cde_arrays(
         &self,
         pirls_result: &PirlsResult,
@@ -4650,7 +4650,7 @@ mod tk_math_tests {
     /// scalar (1×1) Hessian H.  Restricting to p = 1 keeps the matrix
     /// solve to a single division, which lets us evaluate the entire
     /// V_TK formula in Dual64 and read the analytic derivative directly
-    /// from the dual part — no finite differences anywhere.
+    /// from the dual part.
     ///
     /// All quantities derive from the same closed forms used by
     /// `tk_scalar_from_shared`, just expanded for the n×1 case:
@@ -4698,8 +4698,7 @@ mod tk_math_tests {
     /// (h_dot, x_dot, c_dot = d⊙η_dot, d_dot = e⊙η_dot).
     ///
     /// Reference is computed via dual-number AD on the closed-form
-    /// scalar in [`tk_scalar_dual`] — there is no finite-difference
-    /// stencil involved.  The setup uses p = 1 so the matrix solve
+    /// scalar in [`tk_scalar_dual`].  The setup uses p = 1 so the matrix solve
     /// inside H reduces to a scalar division, which Dual64 handles
     /// natively.
     #[test]
@@ -4805,7 +4804,7 @@ mod tk_math_tests {
     //  (Probit, CLogLog, SAS, BetaLogistic, Mixture).  The reference is
     //  `num_dual::third_derivative`, which evaluates W_obs(η₀+δ) in
     //  third-order dual arithmetic and extracts ∂³W_obs/∂δ³ at δ=0
-    //  symbolically – no finite differences anywhere.
+    //  symbolically.
     //
     //  The trick is that Dual3 only carries (re, v1, v2, v3) so any
     //  Taylor truncation of μ to order δ³ is propagated *exactly* through
