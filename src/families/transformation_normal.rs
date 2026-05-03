@@ -35,8 +35,8 @@ use crate::families::custom_family::{
     ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
     ExactNewtonJointPsiTerms, FamilyEvaluation, MaterializablePsiDerivativeOperator,
     ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, build_block_spatial_psi_derivatives,
-    custom_family_outer_derivatives, evaluate_custom_family_joint_hyper,
-    evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
+    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, fit_custom_family,
+    fit_custom_family_fixed_log_lambdas,
 };
 use crate::families::gamlss::{
     initializewiggle_knots_from_seed, solve_penalizedweighted_projection,
@@ -10591,14 +10591,8 @@ pub fn fit_transformation_normal(
     let rho_floor = -12.0;
     let rho_lower = Array1::<f64>::from_elem(n_penalties, rho_floor);
     let rho_upper = Array1::<f64>::from_elem(n_penalties, 12.0);
-    let probe_blocks = vec![probe_block];
-    let (_, cap_hessian) = custom_family_outer_derivatives(&probe_family, &probe_blocks, &options);
     let analytic_gradient = analytic_psi_available;
-    let analytic_hessian = analytic_gradient
-        && matches!(
-            cap_hessian,
-            crate::solver::outer_strategy::Derivative::Analytic
-        );
+    let analytic_hessian = false;
 
     let (rho0_min, rho0_max) = if rho0.is_empty() {
         (0.0, 0.0)
@@ -10730,10 +10724,12 @@ pub fn fit_transformation_normal(
         analytic_hessian,
         // Transformation-normal has β-dependent H (through 1/h'²), so the
         // EFS Wood-Fasiolo PSD invariant fails — disable fixed-point so the
-        // planner cannot pick EFS / Hybrid-EFS. CTN supplies SCOP ψ-axis
-        // second-order curvature through matrix-free HVPs, so do not let the
-        // dense tau-tau memory policy downgrade analytic Hessian planning to
-        // gradient-only BFGS; ARC can consume the operator directly.
+        // planner cannot pick EFS / Hybrid-EFS. The exact Hessian operator is
+        // numerically too brittle for CTN spatial search: finite cost steps can
+        // produce non-finite logdet cross traces and enormous gradients. Route
+        // this family through the analytic-gradient BFGS path; the gradient-only
+        // CTN evaluator is intentionally cheap and no longer assembles the dense
+        // SCOP Hessian.
         true,
         CTN_ALLOW_TAU_TAU_GRADIENT_ONLY_PREFERENCE,
         // fit_fn
