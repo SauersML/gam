@@ -3,7 +3,9 @@ use crate::faer_ndarray::{
     rrqr_nullspace_basis,
 };
 use crate::linalg::utils::KahanSum;
-use crate::matrix::{ChunkedKernelDesignOperator, CoefficientTransformOperator, DesignMatrix};
+use crate::matrix::{
+    ChunkedKernelDesignOperator, CoefficientTransformOperator, DesignMatrix, LinearOperator,
+};
 use crate::probability::{
     binomial_coefficient_f64 as binomial_f64,
     stable_polynomial_times_exp_neg as stable_nonnegative_poly_times_exp_neg,
@@ -5892,11 +5894,11 @@ pub fn build_thin_plate_basiswithworkspace(
         .map_err(BasisError::InvalidInput)?;
         let base_design =
             DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(base_op)));
-        let identifiability_transform = spatial_identifiability_transform_from_design_matrix(
-            data,
+        let identifiability_transform = thin_plate_identifiability_transform_from_design_matrix(
             &base_design,
+            internal_kernel_transform.ncols(),
+            poly_cols,
             &spec.identifiability,
-            "ThinPlate",
         )?;
         let design = if let Some(transform) = identifiability_transform.as_ref() {
             wrap_dense_design_with_transform(base_design, transform, "ThinPlate")?
@@ -5938,11 +5940,11 @@ pub fn build_thin_plate_basiswithworkspace(
             spec.radial_reparam.as_ref(),
             workspace,
         )?;
-        let identifiability_transform = spatial_identifiability_transform_from_design(
-            data,
+        let identifiability_transform = thin_plate_identifiability_transform_from_design(
             tps.basis.view(),
+            tps.num_kernel_basis,
+            tps.num_polynomial_basis,
             &spec.identifiability,
-            "ThinPlate",
         )?;
         let design = if let Some(z) = identifiability_transform.as_ref() {
             DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(fast_ab(
@@ -9372,6 +9374,96 @@ fn spatial_identifiability_transform_from_design_matrix(
         }
         SpatialIdentifiability::FrozenTransform { .. } => {
             frozen_spatial_identifiability_transform(identifiability, design.ncols(), label)
+        }
+    }
+}
+
+fn thin_plate_intercept_transform_from_column_means(
+    column_means: &Array1<f64>,
+    kernel_cols: usize,
+    poly_cols: usize,
+) -> Result<Array2<f64>, BasisError> {
+    let total_cols = kernel_cols + poly_cols;
+    if column_means.len() != total_cols {
+        return Err(BasisError::DimensionMismatch(format!(
+            "thin-plate column-mean length mismatch: got {}, expected {total_cols}",
+            column_means.len()
+        )));
+    }
+    if poly_cols == 0 {
+        return Ok(Array2::<f64>::eye(total_cols));
+    }
+    let out_cols = total_cols
+        .checked_sub(1)
+        .ok_or_else(|| BasisError::InvalidInput("thin-plate basis has no columns".to_string()))?;
+    let mut transform = Array2::<f64>::zeros((total_cols, out_cols));
+
+    for j in 0..kernel_cols {
+        transform[[j, j]] = 1.0;
+        transform[[kernel_cols, j]] = -column_means[j];
+    }
+    for poly_j in 1..poly_cols {
+        let src = kernel_cols + poly_j;
+        let dst = kernel_cols + poly_j - 1;
+        transform[[src, dst]] = 1.0;
+        transform[[kernel_cols, dst]] = -column_means[src];
+    }
+    Ok(transform)
+}
+
+fn thin_plate_identifiability_transform_from_design(
+    design: ArrayView2<'_, f64>,
+    kernel_cols: usize,
+    poly_cols: usize,
+    identifiability: &SpatialIdentifiability,
+) -> Result<Option<Array2<f64>>, BasisError> {
+    match identifiability {
+        SpatialIdentifiability::None => Ok(None),
+        SpatialIdentifiability::OrthogonalToParametric => {
+            let n = design.nrows();
+            if n == 0 {
+                return Err(BasisError::InvalidInput(
+                    "thin-plate identifiability requires at least one row".to_string(),
+                ));
+            }
+            let means = design.sum_axis(Axis(0)).mapv(|v| v / n as f64);
+            Ok(Some(thin_plate_intercept_transform_from_column_means(
+                &means,
+                kernel_cols,
+                poly_cols,
+            )?))
+        }
+        SpatialIdentifiability::FrozenTransform { .. } => {
+            frozen_spatial_identifiability_transform(identifiability, design.ncols(), "ThinPlate")
+        }
+    }
+}
+
+fn thin_plate_identifiability_transform_from_design_matrix(
+    design: &DesignMatrix,
+    kernel_cols: usize,
+    poly_cols: usize,
+    identifiability: &SpatialIdentifiability,
+) -> Result<Option<Array2<f64>>, BasisError> {
+    match identifiability {
+        SpatialIdentifiability::None => Ok(None),
+        SpatialIdentifiability::OrthogonalToParametric => {
+            let n = design.nrows();
+            if n == 0 {
+                return Err(BasisError::InvalidInput(
+                    "thin-plate identifiability requires at least one row".to_string(),
+                ));
+            }
+            let ones = Array1::<f64>::ones(n);
+            let means = design.apply_transpose(&ones).mapv(|v| v / n as f64);
+            Ok(Some(thin_plate_intercept_transform_from_column_means(
+                &means,
+                kernel_cols,
+                poly_cols,
+            )?))
+        }
+        SpatialIdentifiability::FrozenTransform { .. } => {
+            frozen_spatial_identifiability_transform(identifiability, design.ncols(), "ThinPlate")
         }
     }
 }
@@ -18310,13 +18402,152 @@ pub mod closed_form_penalty {
         pref * r.powf(nu) * kv
     }
 
+    const DUCHON_SMALL_CHI_SERIES_MAX: f64 = 0.125;
+    const DUCHON_SMALL_CHI_SERIES_MAX_TERMS: usize = 96;
+    const DUCHON_SMALL_CHI_SERIES_REL_TOL: f64 = 4.0e-16;
+
+    #[inline]
+    fn use_duchon_small_chi_riesz_series(kappa: f64, r: f64) -> bool {
+        kappa > 0.0
+            && kappa.is_finite()
+            && r > 0.0
+            && r.is_finite()
+            && (kappa * r).abs() <= DUCHON_SMALL_CHI_SERIES_MAX
+    }
+
+    /// Small-χ Riesz-series chart for
+    /// `F^{-1}{ρ^{-2a}(κ²+ρ²)^{-b}}`.
+    ///
+    /// Expanding at high frequency gives
+    ///
+    /// ```text
+    /// Σ_n (-1)^n C(b+n-1,n) κ^{2n} R_{a+b+n}^d(R).
+    /// ```
+    ///
+    /// When `d > 2(a+b)`, the low-frequency mass is uniformly integrable and
+    /// this is the true pointwise positive-κ kernel for small χ. In singular
+    /// regimes this same chart is the constrained Duchon finite-part
+    /// representative after quotienting the polynomial nullspace. Either way,
+    /// this avoids the catastrophic Riesz/Matérn partial-fraction cancellation
+    /// that appears as κR→0.
+    ///
+    /// This helper returns radial R-derivatives of that same series and,
+    /// with `kappa_derivative_order` set to 1 or 2, the corresponding
+    /// analytic κ partials. It is the shared value/η/κ source for the
+    /// cancellation basin; production never differentiates it numerically.
+    fn duchon_small_chi_riesz_series_radial_derivatives(
+        d: usize,
+        a: usize,
+        b: usize,
+        kappa: f64,
+        r: f64,
+        max_order: usize,
+        kappa_derivative_order: usize,
+    ) -> Vec<f64> {
+        debug_assert!(b >= 1);
+        debug_assert!(kappa > 0.0);
+        debug_assert!(r > 0.0);
+        debug_assert!(kappa_derivative_order <= 2);
+
+        let mut total = vec![KahanSum::default(); max_order + 1];
+        let mut coeff = 1.0_f64;
+        let kappa_sq = kappa * kappa;
+        let base = a + b;
+
+        let mut prev_term_norm = f64::INFINITY;
+        let mut saw_nonzero_term = false;
+        for n in 0..DUCHON_SMALL_CHI_SERIES_MAX_TERMS {
+            let kappa_factor = match kappa_derivative_order {
+                0 => 1.0,
+                1 => {
+                    if n == 0 {
+                        0.0
+                    } else {
+                        2.0 * n as f64 / kappa
+                    }
+                }
+                2 => {
+                    if n == 0 {
+                        0.0
+                    } else {
+                        let p = 2.0 * n as f64;
+                        p * (p - 1.0) / kappa_sq
+                    }
+                }
+                _ => unreachable!(),
+            };
+
+            let scale = coeff * kappa_factor;
+            let block = if kappa_factor == 0.0 {
+                None
+            } else {
+                Some(riesz_block_radial_derivatives(d, base + n, r, max_order))
+            };
+            let term_norm = block
+                .as_ref()
+                .map(|values| {
+                    values
+                        .iter()
+                        .map(|&value| (scale * value).abs())
+                        .fold(0.0_f64, f64::max)
+                })
+                .unwrap_or(0.0);
+
+            if term_norm > 0.0 {
+                if saw_nonzero_term && term_norm > prev_term_norm {
+                    break;
+                }
+                saw_nonzero_term = true;
+                prev_term_norm = term_norm;
+            }
+
+            if let Some(block) = block {
+                for (order, value) in block.into_iter().enumerate() {
+                    total[order].add(scale * value);
+                }
+            }
+
+            let total_norm = total
+                .iter()
+                .map(|acc| acc.sum().abs())
+                .fold(0.0_f64, f64::max);
+            if n >= 4 && term_norm <= DUCHON_SMALL_CHI_SERIES_REL_TOL * total_norm.max(1.0) {
+                break;
+            }
+
+            coeff *= -((b + n) as f64) * kappa_sq / ((n + 1) as f64);
+        }
+
+        total.iter().map(|acc| acc.sum()).collect()
+    }
+
+    fn duchon_small_chi_riesz_series_value(
+        d: usize,
+        a: usize,
+        b: usize,
+        kappa: f64,
+        r: f64,
+    ) -> f64 {
+        duchon_small_chi_riesz_series_radial_derivatives(d, a, b, kappa, r, 0, 0)[0]
+    }
+
     /// Hybrid isotropic Duchon penalty
     /// g_q^iso(R; m, s, κ) = F^{-1}{1/(ρ^{2(2m-q)} (κ² + ρ²)^{2s})}(R).
+    ///
+    /// This returns the canonical constrained Duchon representative: polynomial
+    /// nullspace components are quotiented out, and the small-κR chart evaluates
+    /// the matching finite-part Riesz series directly. The ordinary
+    /// partial-fraction Green's function and this representative differ by
+    /// nullspace terms in low-dimensional singular regimes, but the constrained
+    /// fit only sees this representative. Value, radial derivatives, and κ
+    /// partials all use the same chart switch, so production never mixes a
+    /// stable value formula with cancelled derivative formulas.
     ///
     /// Edge cases:
     /// - s = 0: g_q^iso(R) = R_{2m-q}^d(R) (no Matérn factor).
     /// - κ = 0, s ≥ 1: g_q^iso(R) = R_{2m+2s-q}^d(R) (Riesz pure).
-    /// - General: partial-fraction decomposition with a = 2m - q, b = 2s.
+    /// - General: small-κR finite-part Riesz series or, outside that chart,
+    ///   partial-fraction decomposition with a = 2m - q, b = 2s.
     ///
     /// Requires a := 2m - q ≥ 1.
     pub fn isotropic_duchon_penalty(
@@ -18338,6 +18569,10 @@ pub mod closed_form_penalty {
         }
 
         let b = 2 * s;
+        if use_duchon_small_chi_riesz_series(kappa, r) {
+            return duchon_small_chi_riesz_series_value(d, a, b, kappa, r);
+        }
+
         let kappa_sq = kappa * kappa;
 
         // A_j = (-1)^{a-j} · C(a+b-j-1, a-j) · κ^{-2(a+b-j)}, j = 1..a
@@ -18533,79 +18768,6 @@ pub mod closed_form_penalty {
             let mut term_abs = 0.0_f64;
             for k in 0..=max_order {
                 let term = c_n * block[k];
-                if !term.is_finite() {
-                    return None;
-                }
-                sum_acc[k].add(term);
-                if !sum_acc[k].sum().is_finite() {
-                    return None;
-                }
-                term_abs = term_abs.max(term.abs());
-            }
-            max_abs = max_abs.max(term_abs);
-            let sum: Vec<f64> = sum_acc.iter().map(|acc| acc.sum()).collect();
-            let scale = sum.iter().map(|v| v.abs()).fold(max_abs.max(1.0), f64::max);
-            if n >= 4 && term_abs <= 1.0e-16 * scale {
-                return Some(sum);
-            }
-            c_n *= -((b + n) as f64) * kappa_sq / ((n + 1) as f64);
-            if !c_n.is_finite() {
-                return None;
-            }
-        }
-        None
-    }
-
-    /// κ-partial table for the same finite-part Taylor representation used
-    /// by `finite_part_duchon_taylor_derivative_table_direct`.
-    ///
-    /// The only κ-dependence is in the coefficient
-    /// `C_n(κ)=(-1)^n (b)_n κ^{2n}/n!`, so `C'_n=(2n/κ) C_n` and
-    /// `C''_n=(2n)(2n-1) C_n / κ²`.
-    fn finite_part_duchon_taylor_kappa_table_direct(
-        d: usize,
-        a: usize,
-        b: usize,
-        kappa: f64,
-        r: f64,
-        max_order: usize,
-        kappa_order: usize,
-    ) -> Option<Vec<f64>> {
-        if !(r > 0.0) || !(kappa > 0.0) || !(kappa_order == 1 || kappa_order == 2) {
-            return None;
-        }
-        if a == 0 || b == 0 {
-            return None;
-        }
-        let n0 = a + b;
-        let mut c_n = 1.0_f64;
-        let mut sum_acc = vec![KahanSum::default(); max_order + 1];
-        let mut max_abs = 0.0_f64;
-        let kappa_sq = kappa * kappa;
-        let max_iters = 256usize;
-        for n in 0..max_iters {
-            let nf = n as f64;
-            let coeff = match kappa_order {
-                1 => {
-                    if n == 0 {
-                        0.0
-                    } else {
-                        (2.0 * nf / kappa) * c_n
-                    }
-                }
-                2 => {
-                    if n == 0 {
-                        0.0
-                    } else {
-                        (2.0 * nf) * (2.0 * nf - 1.0) / kappa_sq * c_n
-                    }
-                }
-                _ => unreachable!(),
-            };
-            let block = riesz_block_radial_derivatives(d, n0 + n, r, max_order);
-            let mut term_abs = 0.0_f64;
-            for k in 0..=max_order {
-                let term = coeff * block[k];
                 if !term.is_finite() {
                     return None;
                 }
@@ -19357,6 +19519,12 @@ pub mod closed_form_penalty {
 
         // Hybrid: partial-fraction expansion (mirrors isotropic_duchon_penalty).
         let b = 2 * s;
+        if use_duchon_small_chi_riesz_series(kappa, r) {
+            return duchon_small_chi_riesz_series_radial_derivatives(
+                d, a, b, kappa, r, max_order, 0,
+            );
+        }
+
         let kappa_sq = kappa * kappa;
         let kappa_r = kappa * r;
         // The PFS and the Taylor finite-part series are two representations
@@ -19515,6 +19683,35 @@ pub mod closed_form_penalty {
         eta: &[f64],
         r: &[f64],
     ) -> f64 {
+        assert_eq!(
+            eta.len(),
+            r.len(),
+            "anisotropic_duchon_penalty_radial: eta and r dimension mismatch"
+        );
+        assert!(
+            !r.is_empty(),
+            "anisotropic_duchon_penalty_radial: empty input"
+        );
+        assert!(
+            q <= 2,
+            "anisotropic_duchon_penalty_radial: q must be in {{0,1,2}}"
+        );
+
+        if let Some(common_eta) = uniform_eta_value(eta) {
+            let euclidean_r2 = squared_norm(r);
+            if let Some(value) = uniform_metric_isotropic_duchon_penalty(
+                q,
+                m,
+                s,
+                kappa,
+                eta.len(),
+                common_eta,
+                euclidean_r2,
+            ) {
+                return value;
+            }
+        }
+
         let powers = AnisoMetricPowers::new(eta);
         anisotropic_duchon_penalty_radial_with_powers(q, m, s, kappa, eta, &powers, r)
     }
@@ -19544,10 +19741,7 @@ pub mod closed_form_penalty {
         powers.assert_dim(r.len());
 
         let d = r.len();
-        // Build invariants R, s_1, s_2, u_1, u_2.
-        let (big_r, s1, s2, u1, u2) = aniso_invariants_with_powers(powers, r);
-
-        if big_r == 0.0 {
+        if is_zero_lag(r) {
             if let Some(bundle) = analytic_self_pair_bundle(q, m, s, kappa, eta) {
                 return bundle.value / eta.iter().sum::<f64>().exp();
             }
@@ -19556,11 +19750,31 @@ pub mod closed_form_penalty {
             );
         }
 
+        if let Some(common_eta) = uniform_eta_value(eta) {
+            let euclidean_r2 = squared_norm(r);
+            if let Some(value) =
+                uniform_metric_isotropic_duchon_penalty(q, m, s, kappa, d, common_eta, euclidean_r2)
+            {
+                return value;
+            }
+        }
+
+        // Build invariants R, s_1, s_2, u_1, u_2 only for genuinely
+        // anisotropic metrics. For a uniform metric B=bI,
+        //
+        //   (-Δ_B)^q f(√b |r|) = b^q · g_q^iso(√b |r|),
+        //
+        // so the q-specific isotropic kernel is the exact analytic chart.
+        // Routing uniform metrics through the general radial-derivative chain
+        // differentiates the q=0 partial-fraction expansion and can lose many
+        // digits in the small-κ cancellation basin.
+        let (big_r, s1, s2, u1, u2) = aniso_invariants_with_powers(powers, r);
+
         // Request the same radial-derivative depth used by the derivative
-        // bundle for q > 0. Positive-κ evaluation stays on the full
-        // partial-fraction kernel for every derivative order; the
-        // finite-part representative is reserved for true κ=0/log-Riesz
-        // limits and self-pair diagonals.
+        // bundle for q > 0. The radial ladder itself chooses the stable chart:
+        // partial fractions away from cancellation and the constrained
+        // finite-part Riesz series when κR is small. That keeps q>0 values and
+        // η/κ derivatives on one analytic representative.
         let max_order = if q == 0 { 0 } else { (2 * q + 2).min(6) };
         let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order);
 
@@ -19570,6 +19784,41 @@ pub mod closed_form_penalty {
             2 => anisotropic_laplacian_of_radial_second(big_r, s1, s2, u1, u2, &fr),
             _ => unreachable!(),
         }
+    }
+
+    fn uniform_metric_isotropic_duchon_penalty(
+        q: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        d: usize,
+        common_eta: f64,
+        euclidean_r2: f64,
+    ) -> Option<f64> {
+        let b = (-2.0 * common_eta).exp();
+        if !(b.is_finite() && b > 0.0) {
+            return None;
+        }
+
+        if euclidean_r2 == 0.0 {
+            return None;
+        }
+
+        let scaled_r = b.sqrt() * euclidean_r2.sqrt();
+        Some(b.powi(q as i32) * isotropic_duchon_penalty(q, d, m, s, kappa, scaled_r))
+    }
+
+    fn uniform_eta_value(eta: &[f64]) -> Option<f64> {
+        let (&first, rest) = eta.split_first()?;
+        (first.is_finite() && rest.iter().all(|&value| value == first)).then_some(first)
+    }
+
+    fn squared_norm(x: &[f64]) -> f64 {
+        x.iter().map(|&value| value * value).sum()
+    }
+
+    fn is_zero_lag(r: &[f64]) -> bool {
+        r.iter().all(|&value| value == 0.0)
     }
 
     /// Δ_B f(R) with f given by its radial derivatives `[f, f', f'', …]`.
@@ -19781,18 +20030,12 @@ pub mod closed_form_penalty {
 
         let a = 2 * m;
         let b = 2 * s;
-        // χ-gate (κ-partial). Uses the same `finite_part_taylor_replaces_literal`
-        // criterion as the value path so the bundle's analytic ∂_κ entry
-        // and finite differences of the value never sit on different
-        // representations (PFS captures the full kernel including the
-        // κ-singular contribution; Taylor captures only the κ-regular
-        // finite-part).
-        if finite_part_taylor_replaces_literal(d, a, b, kappa, r)
-            && let Some(table) =
-                finite_part_duchon_taylor_kappa_table_direct(d, a, b, kappa, r, max_order, 1)
-        {
-            return table;
+        if use_duchon_small_chi_riesz_series(kappa, r) {
+            return duchon_small_chi_riesz_series_radial_derivatives(
+                d, a, b, kappa, r, max_order, 1,
+            );
         }
+
         let kappa_sq = kappa * kappa;
         let mut total = vec![KahanSum::default(); max_order + 1];
 
@@ -19855,15 +20098,12 @@ pub mod closed_form_penalty {
 
         let a = 2 * m;
         let b = 2 * s;
-        // χ-gate (second κ-partial). Uses the same
-        // `finite_part_taylor_replaces_literal` criterion as the value /
-        // first κ-partial.
-        if finite_part_taylor_replaces_literal(d, a, b, kappa, r)
-            && let Some(table) =
-                finite_part_duchon_taylor_kappa_table_direct(d, a, b, kappa, r, max_order, 2)
-        {
-            return table;
+        if use_duchon_small_chi_riesz_series(kappa, r) {
+            return duchon_small_chi_riesz_series_radial_derivatives(
+                d, a, b, kappa, r, max_order, 2,
+            );
         }
+
         let kappa_sq = kappa * kappa;
         let mut total = vec![KahanSum::default(); max_order + 1];
 
@@ -21268,6 +21508,34 @@ mod tests {
             } => assert!(identifiability_transform.is_some()),
             other => panic!("expected thin-plate metadata, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_thin_plate_identifiability_preserves_unpenalized_linear_nullspace() {
+        let data = array![[-1.5], [-0.7], [0.2], [0.8], [1.6]];
+        let centers = array![[-1.5], [0.2], [1.6]];
+        let spec = ThinPlateBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers),
+            length_scale: 1.0,
+            double_penalty: false,
+            identifiability: SpatialIdentifiability::OrthogonalToParametric,
+            radial_reparam: None,
+        };
+
+        let result = build_thin_plate_basis(data.view(), &spec).unwrap();
+        let design = result.design.to_dense();
+
+        assert_eq!(design.ncols(), 2);
+        assert_eq!(result.penalties.len(), 1);
+        assert_eq!(estimate_penalty_nullity(&result.penalties[0]).unwrap(), 1);
+        assert_eq!(result.nullspace_dims, vec![1]);
+
+        let intercept = Array2::<f64>::ones((data.nrows(), 1));
+        let cross = design.t().dot(&intercept);
+        assert!(
+            cross.iter().all(|v| v.abs() < 1e-10),
+            "TPS basis columns must remain centered against the intercept"
+        );
     }
 
     #[test]
@@ -28083,11 +28351,16 @@ mod tests {
     #[test]
     fn test_isotropic_duchon_kappa_to_zero_limit() {
         use super::closed_form_penalty::{isotropic_duchon_penalty, riesz_kernel_value};
-        // (d=3, m=2, s=2, q=2): UV=16>7 ✓; IR=7>8 ✗ at κ→0 — pure Riesz limit
-        // R_{2m+2s-q}^d=R_6^3, but check convergence pattern as κ shrinks.
-        // Pick (d=5, m=1, s=2, q=1): UV=12>7 ✓ at κ>0; partial-fraction OK.
-        // At κ=0: g → R_{2m+2s-q}^d = R_4^5. 2j=8, d=5, 8-5=3 odd → no log ✓.
-        let d = 5usize;
+        // For positive κ,
+        //   ĝ_κ(ρ) = 1 / (ρ^{2a}(κ²+ρ²)^b),  a = 2m-q, b = 2s.
+        // The pointwise κ→0 limit equals the pure Riesz representative only
+        // when the low-frequency tail is uniformly integrable:
+        //
+        //   ∫_0^κ ρ^{d-1-2a} κ^{-2b} dρ = O(κ^{d-2a-2b}) → 0
+        //
+        // hence d > 2(a+b). Use d=13 for a=1,b=4 so the positive-κ kernel
+        // genuinely converges to R_{a+b}^d away from the origin.
+        let d = 13usize;
         let m = 1usize;
         let s = 2usize;
         let q = 1usize;
@@ -28112,6 +28385,176 @@ mod tests {
             rel < 5e-3,
             "κ→0 limit not Riesz: got={got:.6e} target={target:.6e} rel={rel:.3e}"
         );
+    }
+
+    #[test]
+    fn test_isotropic_duchon_kappa_to_zero_ir_divergence_is_quotiented_by_finite_part() {
+        use super::closed_form_penalty::{isotropic_duchon_penalty, riesz_kernel_value};
+
+        // Same (m,s,q) as the convergent test but d=5. Now a=1,b=4 and
+        // d-2a-2b = -5, so the ordinary low-frequency positive-κ Green's
+        // function carries a divergent polynomial/nullspace component. The
+        // constrained Duchon kernel is its finite-part representative; after
+        // quotienting that nullspace, the off-diagonal value converges to the
+        // κ=0 Riesz representative. The small-χ Riesz-series chart is what
+        // resolves the severe Riesz/Matérn cancellation needed to see this.
+        let d = 5usize;
+        let m = 1usize;
+        let s = 2usize;
+        let q = 1usize;
+        let r = 1.3_f64;
+        let finite_part = riesz_kernel_value(d, 2 * m + 2 * s - q, r);
+        let kappa_hi = 0.1_f64;
+        let kappa_lo = 0.01_f64;
+        let hi = isotropic_duchon_penalty(q, d, m, s, kappa_hi, r);
+        let lo = isotropic_duchon_penalty(q, d, m, s, kappa_lo, r);
+
+        assert!(
+            hi.is_finite() && lo.is_finite() && finite_part.is_finite(),
+            "test setup should stay finite away from κ=0 and r=0"
+        );
+        assert!(
+            hi.abs() > 1.0e5 * finite_part.abs(),
+            "moderate positive-κ finite-part representative should still be far from κ=0 Riesz at κ={kappa_hi}: \
+             hi={hi:.6e}, finite_part={finite_part:.6e}"
+        );
+        let lo_err = (lo - finite_part).abs();
+        assert!(
+            lo_err < 1.0e-3 * finite_part.abs(),
+            "small positive-κ finite-part representative should converge to κ=0 Riesz: \
+             κ={kappa_lo}, value={lo:.6e}, finite_part={finite_part:.6e}, err={lo_err:.6e}"
+        );
+    }
+
+    #[test]
+    fn test_small_kappa_finite_part_chart_is_shared_by_value_radial_and_kappa_partials() {
+        use super::closed_form_penalty::{
+            isotropic_duchon_penalty, radial_derivatives_of_isotropic_duchon,
+            radial_derivatives_of_isotropic_duchon_kappa_partial,
+            radial_derivatives_of_isotropic_duchon_kappa_partial2,
+        };
+
+        fn finite_part_series(
+            d: usize,
+            a: usize,
+            b: usize,
+            kappa: f64,
+            r: f64,
+            max_order: usize,
+            kappa_derivative_order: usize,
+        ) -> Vec<f64> {
+            fn odd_dim_riesz_block_from_value(
+                d: usize,
+                j: usize,
+                r: f64,
+                max_order: usize,
+            ) -> Vec<f64> {
+                debug_assert_eq!(d % 2, 1);
+                let value = super::closed_form_penalty::riesz_kernel_value(d, j, r);
+                let p = 2 * j as i32 - d as i32;
+                let mut out = Vec::with_capacity(max_order + 1);
+                out.push(value);
+                let mut coef = value;
+                for order in 1..=max_order {
+                    coef *= (p - (order as i32 - 1)) as f64 / r;
+                    out.push(coef);
+                }
+                out
+            }
+
+            let mut out = vec![0.0_f64; max_order + 1];
+            let mut coeff = 1.0_f64;
+            let kappa_sq = kappa * kappa;
+            for n in 0..96 {
+                let kappa_factor = match kappa_derivative_order {
+                    0 => 1.0,
+                    1 => {
+                        if n == 0 {
+                            0.0
+                        } else {
+                            2.0 * n as f64 / kappa
+                        }
+                    }
+                    2 => {
+                        if n == 0 {
+                            0.0
+                        } else {
+                            let p = 2.0 * n as f64;
+                            p * (p - 1.0) / kappa_sq
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                if kappa_factor != 0.0 {
+                    let block = odd_dim_riesz_block_from_value(d, a + b + n, r, max_order);
+                    for (order, value) in block.into_iter().enumerate() {
+                        out[order] += coeff * kappa_factor * value;
+                    }
+                }
+                coeff *= -((b + n) as f64) * kappa_sq / ((n + 1) as f64);
+            }
+            out
+        }
+
+        // Same singular cell that exposed the κ→0 failure, but q=0 because
+        // `radial_derivatives_of_isotropic_duchon` is the base f(R) before
+        // anisotropic Laplacians apply q. The root invariant is that every
+        // production path uses this same constrained finite-part representative:
+        // value, radial R-derivatives, and κ-partials.
+        let d = 5usize;
+        let m = 1usize;
+        let s = 2usize;
+        let a = 2 * m;
+        let b = 2 * s;
+        let kappa = 0.01_f64;
+        let r = 1.3_f64;
+        let max_order = 4usize;
+
+        let expected = finite_part_series(d, a, b, kappa, r, max_order, 0);
+        let expected_dk = finite_part_series(d, a, b, kappa, r, max_order, 1);
+        let expected_dkk = finite_part_series(d, a, b, kappa, r, max_order, 2);
+
+        let value = isotropic_duchon_penalty(0, d, m, s, kappa, r);
+        let radial = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, r, max_order);
+        let dk = radial_derivatives_of_isotropic_duchon_kappa_partial(d, m, s, kappa, r, max_order);
+        let dkk =
+            radial_derivatives_of_isotropic_duchon_kappa_partial2(d, m, s, kappa, r, max_order);
+
+        let rel0 = (value - expected[0]).abs() / expected[0].abs().max(1e-300);
+        assert!(
+            rel0 < 1e-12,
+            "small-κ value path is not the finite-part chart: got={value:.12e} expected={:.12e} rel={rel0:.3e}",
+            expected[0]
+        );
+
+        for order in 0..=max_order {
+            let denom = expected[order].abs().max(radial[order].abs()).max(1e-300);
+            let rel = (radial[order] - expected[order]).abs() / denom;
+            assert!(
+                rel < 1e-12,
+                "small-κ radial derivative order {order} mixed charts: got={:.12e} expected={:.12e} rel={rel:.3e}",
+                radial[order],
+                expected[order]
+            );
+
+            let denom = expected_dk[order].abs().max(dk[order].abs()).max(1e-300);
+            let rel = (dk[order] - expected_dk[order]).abs() / denom;
+            assert!(
+                rel < 1e-11,
+                "small-κ κ-partial radial order {order} mixed charts: got={:.12e} expected={:.12e} rel={rel:.3e}",
+                dk[order],
+                expected_dk[order]
+            );
+
+            let denom = expected_dkk[order].abs().max(dkk[order].abs()).max(1e-300);
+            let rel = (dkk[order] - expected_dkk[order]).abs() / denom;
+            assert!(
+                rel < 1e-10,
+                "small-κ κκ-partial radial order {order} mixed charts: got={:.12e} expected={:.12e} rel={rel:.3e}",
+                dkk[order],
+                expected_dkk[order]
+            );
+        }
     }
 
     #[test]
@@ -28731,7 +29174,7 @@ mod tests {
                                 let denom = iso.abs().max(radial.abs()).max(1e-300);
                                 let rel = (radial - iso).abs() / denom;
                                 assert!(
-                                    rel < 5e-3,
+                                    rel < 1e-12,
                                     "η=0 radial vs iso disagreement: q={q} d={d} m={m} \
                                      s={s} κ={kappa} R={big_r} radial={radial:.6e} \
                                      iso={iso:.6e} rel={rel:.3e}"
@@ -28747,6 +29190,34 @@ mod tests {
             tested >= 30,
             "sweep tested too few cases: tested={tested} skipped={skipped}"
         );
+    }
+
+    #[test]
+    fn test_radial_form_uniform_eta_uses_exact_isotropic_metric_identity() {
+        use super::closed_form_penalty::{
+            anisotropic_duchon_penalty_radial, isotropic_duchon_penalty,
+        };
+
+        let cases: &[(usize, usize, usize, usize, f64, f64)] = &[
+            (0, 3, 1, 2, 0.5, 0.20),
+            (1, 7, 1, 2, 0.1, -0.35),
+            (2, 5, 2, 2, 0.8, 0.15),
+        ];
+        for &(q, d, m, s, kappa, common_eta) in cases {
+            let eta = vec![common_eta; d];
+            let r: Vec<f64> = (0..d).map(|axis| 0.25 + 0.08 * axis as f64).collect();
+            let euclidean_r = r.iter().map(|&ri| ri * ri).sum::<f64>().sqrt();
+            let b = (-2.0 * common_eta).exp();
+            let expected = b.powi(q as i32)
+                * isotropic_duchon_penalty(q, d, m, s, kappa, b.sqrt() * euclidean_r);
+            let radial = anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta, &r);
+            let rel = (radial - expected).abs() / expected.abs().max(radial.abs()).max(1e-300);
+            assert!(
+                rel < 1e-12,
+                "uniform-η radial identity failed: q={q} d={d} m={m} s={s} κ={kappa} \
+                 η={common_eta} radial={radial:.16e} expected={expected:.16e} rel={rel:.3e}"
+            );
+        }
     }
 
     #[test]

@@ -87,6 +87,52 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
         self.assertGreater(len(scenarios), 0)
         self.assertGreater(len(skipped), 0)
 
+    def test_backfilled_selection_preserves_requested_ci_coverage_under_cap(self) -> None:
+        scenarios, skipped = _FUZZ.select_scenarios_backfilled(
+            seed_start=42,
+            target_count=100,
+            excluded_seeds=set(),
+            max_scenario_cost=200_000.0,
+        )
+
+        self.assertEqual(len(scenarios), 100)
+        self.assertGreater(len(skipped), 0)
+        self.assertTrue(
+            all(_FUZZ.estimate_scenario_cost(sc) <= 200_000.0 for sc in scenarios)
+        )
+
+    def test_mgcv_ps_formula_converts_rust_internal_knots_to_basis_width(self) -> None:
+        sc = _scenario(model_type="gam", basis_type="ps", knots=3)
+
+        self.assertEqual(
+            _FUZZ.mgcv_formula(["x0", "x1"], sc),
+            "y ~ s(x0, bs='ps', k=min(7, nrow(train_df)-1)) + s(x1, bs='ps', k=min(7, nrow(train_df)-1))",
+        )
+        self.assertEqual(
+            _FUZZ.mgcv_sigma_formula(["x0", "x1"], sc),
+            "~ s(x0, bs='ps', k=min(7, nrow(train_df)-1))",
+        )
+
+    def test_duchon_generation_disables_unmatched_mgcv_select_penalty(self) -> None:
+        sc = _FUZZ.generate_scenario(126)
+
+        self.assertEqual(sc.basis_type, "duchon")
+        self.assertFalse(sc.double_penalty)
+
+    def test_forced_duchon_filter_disables_unmatched_mgcv_select_penalty(self) -> None:
+        sc = _scenario(basis_type="ps", double_penalty=True, knots=8, n_smooths=3, n_obs=40)
+
+        _FUZZ._apply_basis_filter(sc, "duchon")
+
+        self.assertEqual(sc.basis_type, "duchon")
+        self.assertFalse(sc.double_penalty)
+
+    def test_mgcv_select_penalty_matches_rust_spatial_nullspace_semantics(self) -> None:
+        self.assertTrue(_FUZZ._mgcv_select_penalty(_scenario(basis_type="tps", double_penalty=False)))
+        self.assertFalse(_FUZZ._mgcv_select_penalty(_scenario(basis_type="duchon", double_penalty=True)))
+        self.assertFalse(_FUZZ._mgcv_select_penalty(_scenario(basis_type="ps", double_penalty=False)))
+        self.assertTrue(_FUZZ._mgcv_select_penalty(_scenario(basis_type="ps", double_penalty=True)))
+
     def test_duchon_extra_terms_raise_estimated_cost(self) -> None:
         # Build two synthetic Duchon scenarios at known sizes — one small
         # and cheap, one large and over-cap — instead of relying on the
