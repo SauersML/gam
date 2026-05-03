@@ -1995,8 +1995,8 @@ enum CompassSearchOutcome {
 /// Coordinate compass search with bound clamping.
 ///
 /// Why this method is correct for derivative-free aux optimization:
-/// the algorithm only compares cost values at polled points. It never
-/// constructs numerical gradients and never feeds approximations into a
+/// the algorithm only compares cost values at polled points. It never builds
+/// derivative approximations and never feeds approximations into a
 /// gradient-based optimizer. For any continuously differentiable cost
 /// bounded below on the compact box [lower, upper], compass search
 /// converges to a stationary point (Kolda-Lewis-Torczon, SIAM Review
@@ -5128,6 +5128,128 @@ mod tests {
             !result.converged,
             "test fixture is engineered so the ladder cannot converge; \
              converged=true would mean the fixture stopped exercising the ladder"
+        );
+    }
+
+    #[test]
+    fn arc_budget_retry_preserves_operator_trust_radius() {
+        struct IdentityOuterHessianOperator;
+
+        impl OuterHessianOperator for IdentityOuterHessianOperator {
+            fn dim(&self) -> usize {
+                1
+            }
+
+            fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+                Ok(v.clone())
+            }
+        }
+
+        struct RejectingArcObjective {
+            trial_abs: Arc<std::sync::Mutex<Vec<f64>>>,
+        }
+
+        impl OuterObjective for RejectingArcObjective {
+            fn capability(&self) -> OuterCapability {
+                OuterCapability {
+                    gradient: Derivative::Analytic,
+                    hessian: Derivative::Analytic,
+                    n_params: 1,
+                    psi_dim: 0,
+                    fixed_point_available: false,
+                    barrier_config: None,
+                    prefer_gradient_only: false,
+                    disable_fixed_point: false,
+                }
+            }
+
+            fn eval_cost(&mut self, theta: &Array1<f64>) -> Result<f64, EstimationError> {
+                Ok(-theta[0])
+            }
+
+            fn eval(&mut self, theta: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+                self.eval_with_order(theta, OuterEvalOrder::ValueGradientHessian)
+            }
+
+            fn eval_with_order(
+                &mut self,
+                theta: &Array1<f64>,
+                _: OuterEvalOrder,
+            ) -> Result<OuterEval, EstimationError> {
+                if theta[0] != 0.0 {
+                    self.trial_abs
+                        .lock()
+                        .expect("trial recorder mutex poisoned")
+                        .push(theta[0].abs());
+                }
+                Ok(OuterEval {
+                    cost: -theta[0],
+                    gradient: array![1.0],
+                    hessian: HessianResult::Operator(Arc::new(IdentityOuterHessianOperator)),
+                })
+            }
+
+            fn reset(&mut self) {}
+        }
+
+        let trial_abs = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+        let mut obj = RejectingArcObjective {
+            trial_abs: Arc::clone(&trial_abs),
+        };
+        let seed = array![0.0];
+        let layout = OuterThetaLayout::new(1, 0);
+        let plan = OuterPlan {
+            solver: Solver::Arc,
+            hessian_source: HessianSource::Analytic,
+        };
+        let initial_eval = obj
+            .eval_with_order(&seed, OuterEvalOrder::ValueGradientHessian)
+            .expect("initial eval");
+        let first = run_operator_trust_region(
+            &mut obj,
+            &seed,
+            layout,
+            None,
+            1e-12,
+            1,
+            initial_eval,
+            plan,
+            None,
+        )
+        .expect("first operator ARC attempt");
+        assert_eq!(
+            first.operator_stop_reason,
+            Some(OperatorTrustRegionStopReason::IterationBudget)
+        );
+
+        let retry_eval = obj
+            .eval_with_order(&first.rho, OuterEvalOrder::ValueGradientHessian)
+            .expect("retry eval");
+        let result = run_operator_trust_region(
+            &mut obj,
+            &first.rho,
+            layout,
+            None,
+            1e-12,
+            1,
+            retry_eval,
+            plan,
+            first.operator_trust_radius,
+        )
+        .expect("retry operator ARC attempt");
+        assert_eq!(
+            result.operator_stop_reason,
+            Some(OperatorTrustRegionStopReason::IterationBudget)
+        );
+        let trials = trial_abs.lock().expect("trial recorder mutex poisoned");
+        assert_eq!(trials.len(), 2, "unexpected trial evaluations: {trials:?}");
+        assert!(
+            (trials[0] - 1.0).abs() < 1e-12,
+            "first ARC attempt should use the default trust radius, got {trials:?}"
+        );
+        assert!(
+            (trials[1] - 0.5).abs() < 1e-12,
+            "retry must resume from the shrunken trust radius instead of replaying radius=1, got {trials:?}"
         );
     }
 

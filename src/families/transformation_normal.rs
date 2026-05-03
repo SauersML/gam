@@ -122,7 +122,6 @@ pub const TRANSFORMATION_MONOTONICITY_EPS: f64 = 1.0e-8;
 /// shared dense tau-tau memory policy must not downgrade analytic Hessian
 /// planning to gradient-only BFGS for this family.
 const CTN_ALLOW_TAU_TAU_GRADIENT_ONLY_PREFERENCE: bool = false;
-const CTN_COVARIATE_SECOND_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
 /// Absolute bound for feasible transformation scores on the standard-normal
 /// scale. The CTN likelihood targets `h(Y|x) ~ N(0,1)`; accepting exact-Newton
 /// iterates with finite positive `h'` but astronomical `|h|` lets curvature
@@ -2717,13 +2716,21 @@ impl TransformationNormalFamily {
         cov_i: ArrayView2<'_, f64>,
         cov_j: ArrayView2<'_, f64>,
         cov_ij: ArrayView2<'_, f64>,
+        row_start: usize,
         endpoint_q: &[LogNormalCdfDiffDerivatives],
         direction: Option<&Array1<f64>>,
     ) -> Result<(f64, Array1<f64>, Option<Array1<f64>>), String> {
-        let n = self.response_val_basis.nrows();
+        let total_n = self.response_val_basis.nrows();
+        let n = cov.nrows();
         let p_resp = self.response_val_basis.ncols();
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
+        if row_start > total_n || row_start + n > total_n {
+            return Err(format!(
+                "SCOP psi-psi row window [{row_start}, {}) exceeds n={total_n}",
+                row_start + n
+            ));
+        }
         if beta.len() != p_total {
             return Err(format!(
                 "SCOP psi-psi beta length {} != p_resp({p_resp}) * p_cov({p_cov})",
@@ -2823,8 +2830,9 @@ impl TransformationNormalFamily {
                         let cov_i_row = cov_i.row(row_idx);
                         let cov_j_row = cov_j.row(row_idx);
                         let cov_ij_row = cov_ij.row(row_idx);
-                        let rv = self.response_val_basis.row(row_idx);
-                        let rd = self.response_deriv_basis.row(row_idx);
+                        let global_row = row_start + row_idx;
+                        let rv = self.response_val_basis.row(global_row);
+                        let rd = self.response_deriv_basis.row(global_row);
 
                         for k in 0..p_resp {
                             let beta_k = beta_mat.row(k);
@@ -2881,7 +2889,7 @@ impl TransformationNormalFamily {
                         let value = h_i * h_j + h * h_ij - hp_ij * inv_hp
                             + hp_i * hp_j * inv_hp_sq
                             + endpoint_chain_second(&q, endpoint_i, endpoint_j, endpoint_ij);
-                        let wi = weights[row_idx];
+                        let wi = weights[global_row];
                         acc.objective += wi * value;
 
                         for k in 0..p_resp {
@@ -3029,8 +3037,9 @@ impl TransformationNormalFamily {
                     let cov_i_row = cov_i.row(row_idx);
                     let cov_j_row = cov_j.row(row_idx);
                     let cov_ij_row = cov_ij.row(row_idx);
-                    let rv = self.response_val_basis.row(row_idx);
-                    let rd = self.response_deriv_basis.row(row_idx);
+                    let global_row = row_start + row_idx;
+                    let rv = self.response_val_basis.row(global_row);
+                    let rd = self.response_deriv_basis.row(global_row);
 
                     for k in 0..p_resp {
                         let beta_k = beta_mat.row(k);
@@ -3093,7 +3102,7 @@ impl TransformationNormalFamily {
                     let inv_hp_sq = inv_hp * inv_hp;
                     let inv_hp_cu = inv_hp_sq * inv_hp;
                     let inv_hp_qu = inv_hp_sq * inv_hp_sq;
-                    let wi = weights[row_idx];
+                    let wi = weights[global_row];
                     let q = endpoint_q[row_idx];
                     let mut endpoint_i = [0.0; 2];
                     let mut endpoint_j = [0.0; 2];
@@ -3342,14 +3351,22 @@ impl TransformationNormalFamily {
         cov_i: ArrayView2<'_, f64>,
         cov_j: ArrayView2<'_, f64>,
         cov_ij: ArrayView2<'_, f64>,
+        row_start: usize,
         endpoint_q: &[LogNormalCdfDiffDerivatives],
         left: ArrayView1<'_, f64>,
         right: ArrayView1<'_, f64>,
     ) -> Result<f64, String> {
-        let n = self.response_val_basis.nrows();
+        let total_n = self.response_val_basis.nrows();
+        let n = cov.nrows();
         let p_resp = self.response_val_basis.ncols();
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
+        if row_start > total_n || row_start + n > total_n {
+            return Err(format!(
+                "SCOP psi-psi bilinear row window [{row_start}, {}) exceeds n={total_n}",
+                row_start + n
+            ));
+        }
         if beta.len() != p_total || left.len() != p_total || right.len() != p_total {
             return Err(format!(
                 "SCOP psi-psi bilinear length mismatch: beta={}, left={}, right={}, expected={p_total}",
@@ -3446,8 +3463,9 @@ impl TransformationNormalFamily {
                     let cov_i_row = cov_i.row(row_idx);
                     let cov_j_row = cov_j.row(row_idx);
                     let cov_ij_row = cov_ij.row(row_idx);
-                    let rv = self.response_val_basis.row(row_idx);
-                    let rd = self.response_deriv_basis.row(row_idx);
+                    let global_row = row_start + row_idx;
+                    let rv = self.response_val_basis.row(global_row);
+                    let rd = self.response_deriv_basis.row(global_row);
 
                     for k in 0..p_resp {
                         let beta_k = beta_mat.row(k);
@@ -3662,7 +3680,7 @@ impl TransformationNormalFamily {
                             endpoint_j_l_r,
                             endpoint_ij_l_r,
                         );
-                    acc.value += weights[row_idx] * value_lr;
+                    acc.value += weights[global_row] * value_lr;
                     acc
                 },
             )
@@ -3674,6 +3692,128 @@ impl TransformationNormalFamily {
                 },
             )
             .value;
+        Ok(total)
+    }
+
+    fn scop_psi_pair_rows_per_chunk(&self, p_cov: usize) -> usize {
+        let policy = ResourcePolicy::default_library();
+        crate::resource::rows_for_target_bytes(
+            policy.row_chunk_target_bytes,
+            4 * p_cov.max(1),
+        )
+        .max(1)
+    }
+
+    fn scop_psi_pair_cov_chunks(
+        &self,
+        op: &TensorKroneckerPsiOperator,
+        axis_i: usize,
+        axis_j: usize,
+        rows: std::ops::Range<usize>,
+    ) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>, Array2<f64>), String> {
+        let cov = self
+            .covariate_design
+            .try_row_chunk(rows.clone())
+            .map_err(|e| format!("SCOP psi-psi covariate row chunk failed: {e}"))?;
+        let cov_i = op
+            .cov_first_axis_row_chunk(axis_i, rows.clone())
+            .map_err(|e| format!("SCOP psi-psi covariate first-axis row chunk(i) failed: {e}"))?;
+        let cov_j = op
+            .cov_first_axis_row_chunk(axis_j, rows.clone())
+            .map_err(|e| format!("SCOP psi-psi covariate first-axis row chunk(j) failed: {e}"))?;
+        let cov_ij = op
+            .cov_second_axis_row_chunk(axis_i, axis_j, rows)
+            .map_err(|e| format!("SCOP psi-psi covariate second-axis row chunk failed: {e}"))?;
+        Ok((cov, cov_i, cov_j, cov_ij))
+    }
+
+    fn scop_psi_psi_value_score_hvp_from_operator(
+        &self,
+        beta: &Array1<f64>,
+        op: &TensorKroneckerPsiOperator,
+        axis_i: usize,
+        axis_j: usize,
+        endpoint_q: &[LogNormalCdfDiffDerivatives],
+        direction: Option<&Array1<f64>>,
+    ) -> Result<(f64, Array1<f64>, Option<Array1<f64>>), String> {
+        let n = self.response_val_basis.nrows();
+        let p_resp = self.response_val_basis.ncols();
+        let p_cov = self.covariate_design.ncols();
+        let p_total = p_resp * p_cov;
+        if endpoint_q.len() != n {
+            return Err(format!(
+                "SCOP psi-psi operator endpoint normalizer cache length {} != n={n}",
+                endpoint_q.len()
+            ));
+        }
+        let rows_per_chunk = self.scop_psi_pair_rows_per_chunk(p_cov).min(n.max(1));
+        let mut objective = 0.0;
+        let mut score = Array1::<f64>::zeros(p_total);
+        let mut hvp = direction.map(|_| Array1::<f64>::zeros(p_total));
+
+        for start in (0..n).step_by(rows_per_chunk) {
+            let end = (start + rows_per_chunk).min(n);
+            let rows = start..end;
+            let (cov, cov_i, cov_j, cov_ij) =
+                self.scop_psi_pair_cov_chunks(op, axis_i, axis_j, rows.clone())?;
+            let (obj_chunk, score_chunk, hvp_chunk) = self
+                .scop_psi_psi_value_score_hvp_from_cov(
+                    beta,
+                    cov.view(),
+                    cov_i.view(),
+                    cov_j.view(),
+                    cov_ij.view(),
+                    start,
+                    &endpoint_q[start..end],
+                    direction,
+                )?;
+            objective += obj_chunk;
+            score.scaled_add(1.0, &score_chunk);
+            if let (Some(total), Some(chunk)) = (hvp.as_mut(), hvp_chunk.as_ref()) {
+                total.scaled_add(1.0, chunk);
+            }
+        }
+
+        Ok((objective, score, hvp))
+    }
+
+    fn scop_psi_psi_bilinear_from_operator(
+        &self,
+        beta: &Array1<f64>,
+        op: &TensorKroneckerPsiOperator,
+        axis_i: usize,
+        axis_j: usize,
+        endpoint_q: &[LogNormalCdfDiffDerivatives],
+        left: ArrayView1<'_, f64>,
+        right: ArrayView1<'_, f64>,
+    ) -> Result<f64, String> {
+        let n = self.response_val_basis.nrows();
+        let p_cov = self.covariate_design.ncols();
+        if endpoint_q.len() != n {
+            return Err(format!(
+                "SCOP psi-psi bilinear operator endpoint normalizer cache length {} != n={n}",
+                endpoint_q.len()
+            ));
+        }
+        let rows_per_chunk = self.scop_psi_pair_rows_per_chunk(p_cov).min(n.max(1));
+        let mut total = 0.0;
+        for start in (0..n).step_by(rows_per_chunk) {
+            let end = (start + rows_per_chunk).min(n);
+            let rows = start..end;
+            let (cov, cov_i, cov_j, cov_ij) =
+                self.scop_psi_pair_cov_chunks(op, axis_i, axis_j, rows.clone())?;
+            total += self.scop_psi_psi_bilinear_from_cov(
+                beta,
+                cov.view(),
+                cov_i.view(),
+                cov_j.view(),
+                cov_ij.view(),
+                start,
+                &endpoint_q[start..end],
+                left,
+                right,
+            )?;
+        }
         Ok(total)
     }
 
@@ -4577,7 +4717,6 @@ impl CustomFamily for TransformationNormalFamily {
         let deriv_j = &psi_derivs[0][psi_j];
         let beta = &block_states[0].beta;
         let row = self.row_quantities(beta)?;
-        let n = row.h.len();
         let p_resp = self.response_val_basis.ncols();
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
@@ -4599,41 +4738,11 @@ impl CustomFamily for TransformationNormalFamily {
         let axis_i = deriv_i.implicit_axis;
         let axis_j = deriv_j.implicit_axis;
 
-        let cov = op
-            .materialize_covariate_dense_arc()
-            .map_err(|e| format!("SCOP psi-psi materialize covariate design failed: {e}"))?;
-        let cov_i = op
-            .materialize_cov_first_axis_arc(axis_i)
-            .map_err(|e| format!("tensor psi-psi materialize_cov_first_axis(i) failed: {e}"))?;
-        let cov_j = op
-            .materialize_cov_first_axis_arc(axis_j)
-            .map_err(|e| format!("tensor psi-psi materialize_cov_first_axis(j) failed: {e}"))?;
-        let cov_ij = op
-            .materialize_cov_second_axis_arc(axis_i, axis_j)
-            .map_err(|e| format!("tensor psi-psi materialize_cov_second_axis failed: {e}"))?;
-        for (name, mat) in [
-            ("cov", cov.as_ref()),
-            ("cov_i", cov_i.as_ref()),
-            ("cov_j", cov_j.as_ref()),
-            ("cov_ij", cov_ij.as_ref()),
-        ] {
-            if mat.nrows() != n || mat.ncols() != p_cov {
-                return Err(format!(
-                    "SCOP psi-psi {name} shape {}x{} != expected {}x{}",
-                    mat.nrows(),
-                    mat.ncols(),
-                    n,
-                    p_cov
-                ));
-            }
-        }
-
-        let (objective_psi_psi, score_psi_psi, _) = self.scop_psi_psi_value_score_hvp_from_cov(
+        let (objective_psi_psi, score_psi_psi, _) = self.scop_psi_psi_value_score_hvp_from_operator(
             beta,
-            cov.view(),
-            cov_i.view(),
-            cov_j.view(),
-            cov_ij.view(),
+            op,
+            axis_i,
+            axis_j,
             row.endpoint_q.as_slice(),
             None,
         )?;
@@ -4641,10 +4750,14 @@ impl CustomFamily for TransformationNormalFamily {
             Box::new(TransformationNormalPsiPsiHessianOperator::new(
                 Arc::new(self.clone()),
                 beta.clone(),
-                cov,
-                cov_i,
-                cov_j,
-                cov_ij,
+                Arc::clone(
+                    deriv_i
+                        .implicit_operator
+                        .as_ref()
+                        .expect("validated CTN psi derivative has an implicit operator"),
+                ),
+                axis_i,
+                axis_j,
                 Arc::clone(&row.endpoint_q),
             ));
 
@@ -5042,10 +5155,9 @@ impl HyperOperator for TransformationNormalD2hMatrixFreeOperator {
 struct TransformationNormalPsiPsiHessianOperator {
     family: Arc<TransformationNormalFamily>,
     beta: Array1<f64>,
-    cov: Arc<Array2<f64>>,
-    cov_i: Arc<Array2<f64>>,
-    cov_j: Arc<Array2<f64>>,
-    cov_ij: Arc<Array2<f64>>,
+    op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+    axis_i: usize,
+    axis_j: usize,
     endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
 }
 
@@ -5053,19 +5165,17 @@ impl TransformationNormalPsiPsiHessianOperator {
     fn new(
         family: Arc<TransformationNormalFamily>,
         beta: Array1<f64>,
-        cov: Arc<Array2<f64>>,
-        cov_i: Arc<Array2<f64>>,
-        cov_j: Arc<Array2<f64>>,
-        cov_ij: Arc<Array2<f64>>,
+        op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+        axis_i: usize,
+        axis_j: usize,
         endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
     ) -> Self {
         Self {
             family,
             beta,
-            cov,
-            cov_i,
-            cov_j,
-            cov_ij,
+            op,
+            axis_i,
+            axis_j,
             endpoint_q,
         }
     }
@@ -5074,14 +5184,20 @@ impl TransformationNormalPsiPsiHessianOperator {
         self.beta.len()
     }
 
+    fn tensor_op(&self) -> &TensorKroneckerPsiOperator {
+        self.op
+            .as_any()
+            .downcast_ref::<TensorKroneckerPsiOperator>()
+            .expect("validated CTN psi-psi operator must remain tensor-backed")
+    }
+
     fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
         self.family
-            .scop_psi_psi_value_score_hvp_from_cov(
+            .scop_psi_psi_value_score_hvp_from_operator(
                 &self.beta,
-                self.cov.view(),
-                self.cov_i.view(),
-                self.cov_j.view(),
-                self.cov_ij.view(),
+                self.tensor_op(),
+                self.axis_i,
+                self.axis_j,
                 self.endpoint_q.as_slice(),
                 Some(v),
             )
@@ -5105,12 +5221,11 @@ impl HyperOperator for TransformationNormalPsiPsiHessianOperator {
         debug_assert_eq!(v.len(), self.p_total());
         debug_assert_eq!(u.len(), self.p_total());
         self.family
-            .scop_psi_psi_bilinear_from_cov(
+            .scop_psi_psi_bilinear_from_operator(
                 &self.beta,
-                self.cov.view(),
-                self.cov_i.view(),
-                self.cov_j.view(),
-                self.cov_ij.view(),
+                self.tensor_op(),
+                self.axis_i,
+                self.axis_j,
                 self.endpoint_q.as_slice(),
                 v,
                 u,
@@ -7371,14 +7486,11 @@ fn weight_rows(x: &Array2<f64>, w: &Array1<f64>) -> Array2<f64> {
     out
 }
 
-#[derive(Clone)]
 struct TensorKroneckerPsiOperator {
     response_val_basis: Arc<Array2<f64>>,
     covariate_design: DesignMatrix,
     covariate_derivs: Vec<CustomFamilyBlockPsiDerivative>,
-    covariate_dense_cache: Arc<Mutex<Option<Arc<Array2<f64>>>>>,
     covariate_first_cache: Arc<Vec<Mutex<Option<Arc<Array2<f64>>>>>>,
-    covariate_second_cache: Arc<Vec<Mutex<Option<Arc<Array2<f64>>>>>>,
 }
 
 impl TensorKroneckerPsiOperator {
@@ -7567,30 +7679,6 @@ impl TensorKroneckerPsiOperator {
         Ok(rowwise_kronecker_views(resp, cov.view()))
     }
 
-    fn materialize_covariate_dense_arc(
-        &self,
-    ) -> Result<Arc<Array2<f64>>, crate::terms::basis::BasisError> {
-        let mut cache = self.covariate_dense_cache.lock().map_err(|_| {
-            crate::terms::basis::BasisError::InvalidInput(
-                "tensor Kronecker covariate dense cache mutex poisoned".to_string(),
-            )
-        })?;
-        if let Some(cached) = cache.as_ref() {
-            return Ok(cached.clone());
-        }
-        let dense = Arc::new(
-            self.covariate_design
-                .try_row_chunk(0..self.n_data())
-                .map_err(|e| {
-                    crate::terms::basis::BasisError::InvalidInput(format!(
-                        "tensor Kronecker covariate dense materialization failed: {e}"
-                    ))
-                })?,
-        );
-        *cache = Some(dense.clone());
-        Ok(dense)
-    }
-
     fn materialize_cov_first_axis_uncached(
         &self,
         axis: usize,
@@ -7646,19 +7734,6 @@ impl TensorKroneckerPsiOperator {
         self.materialize_cov_directional(&unit.view())
     }
 
-    fn materialize_cov_second(
-        &self,
-        axis_d: usize,
-        axis_e: usize,
-    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        let q = self.covariate_derivs.len();
-        let mut unit_d = Array1::<f64>::zeros(q);
-        let mut unit_e = Array1::<f64>::zeros(q);
-        unit_d[axis_d] = 1.0;
-        unit_e[axis_e] = 1.0;
-        self.materialize_cov_second_directional(&unit_d.view(), &unit_e.view())
-    }
-
     /// Per-axis covariate first-derivative materialization for axis `axis`,
     /// equivalent to the unit-vector dispatch through
     /// [`materialize_cov_directional`].
@@ -7667,103 +7742,6 @@ impl TensorKroneckerPsiOperator {
         axis: usize,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
         Ok((*self.materialize_cov_first_axis_arc(axis)?).clone())
-    }
-
-    /// Per-axis covariate second-derivative materialization for axis pair
-    /// `(axis_d, axis_e)`, equivalent to the unit-vector dispatch through
-    /// [`materialize_cov_second_directional`].
-    fn materialize_cov_second_axis(
-        &self,
-        axis_d: usize,
-        axis_e: usize,
-    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        let deriv_d = self.cov_deriv(axis_d)?;
-        if let Some(op) = deriv_d.implicit_operator.as_ref()
-            && deriv_d.implicit_group_id.is_some()
-            && deriv_d.implicit_group_id == self.cov_deriv(axis_e)?.implicit_group_id
-        {
-            let mat_op = op.as_materializable().ok_or_else(|| {
-                crate::terms::basis::BasisError::InvalidInput(format!(
-                    "covariate psi operator for axes {axis_d},{axis_e} does not support dense materialization"
-                ))
-            })?;
-            if deriv_d.implicit_axis == self.cov_deriv(axis_e)?.implicit_axis {
-                return mat_op.materialize_second_diag(deriv_d.implicit_axis);
-            }
-            return mat_op.materialize_second_cross(
-                deriv_d.implicit_axis,
-                self.cov_deriv(axis_e)?.implicit_axis,
-            );
-        }
-        if let Some(rows) = deriv_d.x_psi_psi.as_ref()
-            && let Some(mat) = rows.get(axis_e)
-        {
-            if mat.nrows() == self.n_data() && mat.ncols() == self.p_cov() {
-                return Ok(mat.clone());
-            }
-        }
-        Ok(Array2::<f64>::zeros((self.n_data(), self.p_cov())))
-    }
-
-    fn should_cache_cov_second_axes(&self) -> bool {
-        let n = self.n_data();
-        let p = self.p_cov();
-        let q = self.covariate_derivs.len();
-        let n_pairs = q.saturating_mul(q + 1) / 2;
-        n.saturating_mul(p)
-            .saturating_mul(std::mem::size_of::<f64>())
-            .saturating_mul(n_pairs)
-            <= CTN_COVARIATE_SECOND_CACHE_MAX_BYTES
-    }
-
-    fn cov_second_pair_key_index(
-        &self,
-        axis_d: usize,
-        axis_e: usize,
-    ) -> Result<(usize, usize, usize), crate::terms::basis::BasisError> {
-        let q = self.covariate_derivs.len();
-        if axis_d >= q || axis_e >= q {
-            return Err(crate::terms::basis::BasisError::InvalidInput(format!(
-                "tensor Kronecker second ψ axes ({axis_d}, {axis_e}) out of bounds for {q} axes",
-            )));
-        }
-        let (left, right) = if axis_d <= axis_e {
-            (axis_d, axis_e)
-        } else {
-            (axis_e, axis_d)
-        };
-        let row_start = left * q - left.saturating_mul(left.saturating_sub(1)) / 2;
-        Ok((left, right, row_start + (right - left)))
-    }
-
-    fn materialize_cov_second_axis_arc(
-        &self,
-        axis_d: usize,
-        axis_e: usize,
-    ) -> Result<Arc<Array2<f64>>, crate::terms::basis::BasisError> {
-        let (left, right, slot_idx) = self.cov_second_pair_key_index(axis_d, axis_e)?;
-        if !self.should_cache_cov_second_axes() {
-            return Ok(Arc::new(self.materialize_cov_second_axis(left, right)?));
-        }
-
-        let slot = self.covariate_second_cache.get(slot_idx).ok_or_else(|| {
-            crate::terms::basis::BasisError::InvalidInput(format!(
-                "tensor Kronecker second-derivative cache index {slot_idx} missing for axes {left},{right}",
-            ))
-        })?;
-        let mut cache = slot.lock().map_err(|_| {
-            crate::terms::basis::BasisError::InvalidInput(format!(
-                "tensor Kronecker covariate second-derivative cache mutex poisoned for axes {},{}",
-                left, right
-            ))
-        })?;
-        if let Some(cached) = cache.as_ref() {
-            return Ok(cached.clone());
-        }
-
-        let materialized = Arc::new(self.materialize_cov_second_axis(left, right)?);
-        *cache = Some(materialized.clone());
-        Ok(materialized)
     }
 
     /// Directional `Σ_j v_psi[j] · ∂C/∂ψ_j` returning an `n × p_cov` matrix.
@@ -7792,42 +7770,6 @@ impl TensorKroneckerPsiOperator {
         Ok(out)
     }
 
-    /// Bilinear directional `Σ_{j,k} v_psi[j] · w_psi[k] · ∂²C/∂ψ_j∂ψ_k`
-    /// returning an `n × p_cov` matrix. With `v_psi = e_a, w_psi = e_b`
-    /// matches [`materialize_cov_second_axis`] at `(a, b)`. Used by the
-    /// directional outer-HVP path to compute `cov_iv := Σ_j v_j · cov_ij`
-    /// in one pass per free axis i instead of materializing every cov_ij pair.
-    fn materialize_cov_second_directional(
-        &self,
-        v_psi: &ndarray::ArrayView1<'_, f64>,
-        w_psi: &ndarray::ArrayView1<'_, f64>,
-    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        let q = self.covariate_derivs.len();
-        if v_psi.len() != q || w_psi.len() != q {
-            return Err(crate::terms::basis::BasisError::InvalidInput(format!(
-                "directional ψ vectors length ({}, {}) do not match {} ψ axes",
-                v_psi.len(),
-                w_psi.len(),
-                q
-            )));
-        }
-        let mut out = Array2::<f64>::zeros((self.n_data(), self.p_cov()));
-        for j in 0..q {
-            for k in j..q {
-                let coef = if j == k {
-                    v_psi[j] * w_psi[j]
-                } else {
-                    v_psi[j] * w_psi[k] + v_psi[k] * w_psi[j]
-                };
-                if coef == 0.0 {
-                    continue;
-                }
-                let contrib = self.materialize_cov_second_axis_arc(j, k)?;
-                out.scaled_add(coef, contrib.as_ref());
-            }
-        }
-        Ok(out)
-    }
 
     fn lifted_forward(
         &self,
@@ -8230,7 +8172,7 @@ mod tests {
     }
 
     #[test]
-    fn tensor_psi_row_chunks_match_dense_materialization() {
+    fn tensor_psi_row_chunks_are_window_consistent() {
         let response = array![-1.0, -0.2, 0.6, 1.3];
         let (val_basis, deriv_basis, knots, transform, _) = toy_response_basis(&response);
         let psi = array![0.15, -0.10];
@@ -8276,26 +8218,26 @@ mod tests {
             first_dense.slice(s![rows.clone(), ..]).to_owned()
         );
 
-        let second_diag_dense = mat_op
-            .materialize_second_diag(0)
-            .expect("dense second diagonal reference");
+        let second_diag_full = op
+            .row_chunk_second_diag(0, 0..op.n_data())
+            .expect("full row-chunk second diagonal reference");
         let second_diag_chunk = op
             .row_chunk_second_diag(0, rows.clone())
             .expect("chunked second diagonal derivative");
         assert_eq!(
             second_diag_chunk,
-            second_diag_dense.slice(s![rows.clone(), ..]).to_owned()
+            second_diag_full.slice(s![rows.clone(), ..]).to_owned()
         );
 
-        let second_cross_dense = mat_op
-            .materialize_second_cross(0, 1)
-            .expect("dense second cross reference");
+        let second_cross_full = op
+            .row_chunk_second_cross(0, 1, 0..op.n_data())
+            .expect("full row-chunk second cross reference");
         let second_cross_chunk = op
             .row_chunk_second_cross(0, 1, rows.clone())
             .expect("chunked second cross derivative");
         assert_eq!(
             second_cross_chunk,
-            second_cross_dense.slice(s![rows, ..]).to_owned()
+            second_cross_full.slice(s![rows, ..]).to_owned()
         );
     }
 
@@ -10270,27 +10212,6 @@ impl MaterializablePsiDerivativeOperator for TensorKroneckerPsiOperator {
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
         Ok(self.materialize_lifted(&self.response_val_basis, &self.materialize_cov_first(axis)?))
     }
-
-    fn materialize_second_diag(
-        &self,
-        axis: usize,
-    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        Ok(self.materialize_lifted(
-            &self.response_val_basis,
-            &self.materialize_cov_second(axis, axis)?,
-        ))
-    }
-
-    fn materialize_second_cross(
-        &self,
-        axis_d: usize,
-        axis_e: usize,
-    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        Ok(self.materialize_lifted(
-            &self.response_val_basis,
-            &self.materialize_cov_second(axis_d, axis_e)?,
-        ))
-    }
 }
 
 fn extract_covariate_penalty_factor(penalty: &PenaltyMatrix) -> Result<Array2<f64>, String> {
@@ -10331,14 +10252,8 @@ pub fn build_tensor_psi_derivatives(
             response_val_basis: Arc::new(family.response_val_basis.clone()),
             covariate_design: family.covariate_design.clone(),
             covariate_derivs: covariate_psi_derivs.to_vec(),
-            covariate_dense_cache: Arc::clone(&family.covariate_dense_cache),
             covariate_first_cache: Arc::new(
                 (0..n_axes).map(|_| Mutex::new(None)).collect::<Vec<_>>(),
-            ),
-            covariate_second_cache: Arc::new(
-                (0..(n_axes.saturating_mul(n_axes + 1) / 2))
-                    .map(|_| Mutex::new(None))
-                    .collect::<Vec<_>>(),
             ),
         });
 

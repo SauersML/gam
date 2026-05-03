@@ -17780,14 +17780,13 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
     /// `β_w^⊤ B(q₀)` both shift q = q₀ + B^⊤ β_w additively, which makes the
     /// penalized joint Hessian H = H_L + S near-singular along that
     /// direction (σ_min ≈ ridge_floor ≈ 1e-10).  Under the default `Smooth`
-    /// regularization this null direction contributes a first-order FD
+    /// regularization this null direction contributes a first-order
     /// component to `d log|H|/dρ` via `φ'(σ_min) · dσ_min/dρ` that cannot
     /// be matched by the analytic `u^⊤ (dH/dρ) u` formula — the
     /// eigenvector `u` for a near-zero σ is numerically arbitrary inside
     /// the null space, so first-order perturbation theory breaks down.
     /// `HardPseudo` excludes σ ≤ ε from BOTH log|H| and its gradient
-    /// consistently, so the null direction drops out on both sides and
-    /// FD-vs-analytic comparisons close cleanly.
+    /// consistently, so the null direction drops out of the analytic geometry.
     fn pseudo_logdet_mode(&self) -> crate::custom_family::PseudoLogdetMode {
         crate::custom_family::PseudoLogdetMode::HardPseudo
     }

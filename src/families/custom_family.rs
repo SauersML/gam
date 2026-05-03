@@ -1932,25 +1932,15 @@ pub(crate) trait CustomFamilyPsiDerivativeOperator: Send + Sync + Any {
 }
 
 /// Diagnostic / small-data extension that exposes dense materialization of
-/// `\partial X / \partial \psi`, `\partial^2 X / \partial \psi_d^2`, and
-/// `\partial^2 X / \partial \psi_d \partial \psi_e`. Production exact-Hessian
-/// code MUST NOT depend on this trait — it is reserved for diagnostics, tests,
-/// and small-data fallbacks where materialization is actually safe.
+/// `\partial X / \partial \psi`. Production exact-Hessian code MUST NOT depend
+/// on dense second-derivative materialization; second-order paths use the
+/// row-chunk and matvec methods on [`CustomFamilyPsiDerivativeOperator`].
 pub(crate) trait MaterializablePsiDerivativeOperator:
     CustomFamilyPsiDerivativeOperator
 {
     fn materialize_first(
         &self,
         axis: usize,
-    ) -> Result<Array2<f64>, crate::terms::basis::BasisError>;
-    fn materialize_second_diag(
-        &self,
-        axis: usize,
-    ) -> Result<Array2<f64>, crate::terms::basis::BasisError>;
-    fn materialize_second_cross(
-        &self,
-        axis_d: usize,
-        axis_e: usize,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError>;
 }
 
@@ -2087,23 +2077,6 @@ impl MaterializablePsiDerivativeOperator for crate::terms::basis::ImplicitDesign
         axis: usize,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
         crate::terms::basis::ImplicitDesignPsiDerivative::materialize_first(self, axis)
-    }
-
-    fn materialize_second_diag(
-        &self,
-        axis: usize,
-    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        crate::terms::basis::ImplicitDesignPsiDerivative::materialize_second_diag(self, axis)
-    }
-
-    fn materialize_second_cross(
-        &self,
-        axis_d: usize,
-        axis_e: usize,
-    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        crate::terms::basis::ImplicitDesignPsiDerivative::materialize_second_cross(
-            self, axis_d, axis_e,
-        )
     }
 }
 
@@ -2280,31 +2253,6 @@ impl MaterializablePsiDerivativeOperator for EmbeddedImplicitPsiDerivativeOperat
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
         Ok(EmbeddedColumnBlock::new(
             &self.base.materialize_first(axis)?,
-            self.global_range.clone(),
-            self.total_p,
-        )
-        .materialize())
-    }
-
-    fn materialize_second_diag(
-        &self,
-        axis: usize,
-    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        Ok(EmbeddedColumnBlock::new(
-            &self.base.materialize_second_diag(axis)?,
-            self.global_range.clone(),
-            self.total_p,
-        )
-        .materialize())
-    }
-
-    fn materialize_second_cross(
-        &self,
-        axis_d: usize,
-        axis_e: usize,
-    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        Ok(EmbeddedColumnBlock::new(
-            &self.base.materialize_second_cross(axis_d, axis_e)?,
             self.global_range.clone(),
             self.total_p,
         )
@@ -2762,33 +2710,6 @@ impl MaterializablePsiDerivativeOperator for EmbeddedDensePsiDerivativeOperator 
                 .materialize(),
         )
     }
-
-    fn materialize_second_diag(
-        &self,
-        axis: usize,
-    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        self.validate_axis(axis, "embedded dense psi materialize_second_diag")?;
-        Ok(EmbeddedColumnBlock::new(
-            &self.second_diag_local,
-            self.global_range.clone(),
-            self.total_p,
-        )
-        .materialize())
-    }
-
-    fn materialize_second_cross(
-        &self,
-        axis_d: usize,
-        axis_e: usize,
-    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        self.validate_axis(axis_d, "embedded dense psi materialize_second_cross")?;
-        Ok(EmbeddedColumnBlock::new(
-            self.cross_local(axis_e, "embedded dense psi materialize_second_cross")?,
-            self.global_range.clone(),
-            self.total_p,
-        )
-        .materialize())
-    }
 }
 
 pub(crate) fn build_embedded_dense_psi_operator(
@@ -3111,45 +3032,6 @@ impl MaterializablePsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperat
             )
         })?;
         let base = base_mat.materialize_first(axis)?;
-        let blocks: Vec<Array2<f64>> = self
-            .time_bases
-            .iter()
-            .map(|basis| rowwise_kronecker_dense(&base, basis))
-            .collect();
-        Ok(stack_dense_row_blocks(&blocks))
-    }
-
-    fn materialize_second_diag(
-        &self,
-        axis: usize,
-    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        let base_mat = self.base.as_materializable().ok_or_else(|| {
-            crate::terms::basis::BasisError::Other(
-                "rowwise kronecker psi operator: base operator does not support materialization"
-                    .to_string(),
-            )
-        })?;
-        let base = base_mat.materialize_second_diag(axis)?;
-        let blocks: Vec<Array2<f64>> = self
-            .time_bases
-            .iter()
-            .map(|basis| rowwise_kronecker_dense(&base, basis))
-            .collect();
-        Ok(stack_dense_row_blocks(&blocks))
-    }
-
-    fn materialize_second_cross(
-        &self,
-        axis_d: usize,
-        axis_e: usize,
-    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        let base_mat = self.base.as_materializable().ok_or_else(|| {
-            crate::terms::basis::BasisError::Other(
-                "rowwise kronecker psi operator: base operator does not support materialization"
-                    .to_string(),
-            )
-        })?;
-        let base = base_mat.materialize_second_cross(axis_d, axis_e)?;
         let blocks: Vec<Array2<f64>> = self
             .time_bases
             .iter()
@@ -8028,8 +7910,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     // a few) damped joint Newton steps can tighten the joint residual to the
     // floor set by β magnitudes. This polishing phase is essential for the
     // outer REML gradient formula (which assumes exact β̂ stationarity); a
-    // non-converged β̂ produces large envelope-theorem violations that show
-    // up as FD-vs-analytic gradient mismatches.
+    // non-converged β̂ produces large envelope-theorem violations in the
+    // analytic outer gradient.
     if use_joint_newton && !converged {
         let ranges_joint: Vec<(usize, usize)> = {
             let mut offset = 0;
@@ -9386,8 +9268,8 @@ fn outerobjectivegradienthessian<F: CustomFamily + Clone + Send + Sync + 'static
 
 /// Test-only helper exposing the value+gradient outer evaluation entry point
 /// to other modules' test code.  Used by
-/// `binomial_location_scale_batched_gradient_matches_finite_difference` in
-/// `families/gamlss.rs` to pin the batched override against a test oracle
+/// the batched-gradient tests in `families/gamlss.rs` to pin the batched
+/// override against a test oracle
 /// without re-implementing the inner-fit / penalty-pseudo-logdet plumbing.
 /// Returns only `(value, gradient)`; the warm-start is internal state with a
 /// private type and is dropped at the boundary.
@@ -16745,7 +16627,7 @@ mod tests {
     }
 
     #[test]
-    fn rowwise_kronecker_psi_row_chunks_match_dense_materialization() {
+    fn rowwise_kronecker_psi_row_chunks_are_window_consistent() {
         let first = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
         let second_diag = array![[0.5, 1.0], [1.5, 2.0], [2.5, 3.0]];
         let second_cross = array![[-1.0, 0.25], [-1.5, 0.5], [-2.0, 0.75]];
@@ -16774,22 +16656,26 @@ mod tests {
             first_dense.slice(ndarray::s![rows.clone(), ..]).to_owned()
         );
 
-        let diag_dense = mat.materialize_second_diag(0).expect("dense diag");
+        let diag_full = op
+            .row_chunk_second_diag(0, 0..op.n_data())
+            .expect("full row-chunk diag");
         let diag_chunk = op
             .row_chunk_second_diag(0, rows.clone())
             .expect("chunk diag");
         assert_eq!(
             diag_chunk,
-            diag_dense.slice(ndarray::s![rows.clone(), ..]).to_owned()
+            diag_full.slice(ndarray::s![rows.clone(), ..]).to_owned()
         );
 
-        let cross_dense = mat.materialize_second_cross(0, 1).expect("dense cross");
+        let cross_full = op
+            .row_chunk_second_cross(0, 1, 0..op.n_data())
+            .expect("full row-chunk cross");
         let cross_chunk = op
             .row_chunk_second_cross(0, 1, rows.clone())
             .expect("chunk cross");
         assert_eq!(
             cross_chunk,
-            cross_dense.slice(ndarray::s![rows, ..]).to_owned()
+            cross_full.slice(ndarray::s![rows, ..]).to_owned()
         );
     }
 }
