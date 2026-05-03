@@ -23360,7 +23360,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_duchon_basis_uses_operator_penalty_triplet() {
+    fn test_build_scale_free_duchon_basis_uses_native_kernel_penalty() {
         let data = array![
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0],
@@ -23378,21 +23378,10 @@ mod tests {
             operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
-        assert_eq!(out.penalties.len(), 3);
-        assert_eq!(out.penaltyinfo.len(), 3);
+        assert_eq!(out.penalties.len(), 1);
+        assert_eq!(out.penaltyinfo.len(), 1);
         assert!(out.penaltyinfo.iter().all(|info| info.active));
-        assert!(matches!(
-            out.penaltyinfo[0].source,
-            PenaltySource::OperatorMass
-        ));
-        assert!(matches!(
-            out.penaltyinfo[1].source,
-            PenaltySource::OperatorTension
-        ));
-        assert!(matches!(
-            out.penaltyinfo[2].source,
-            PenaltySource::OperatorStiffness
-        ));
+        assert!(matches!(out.penaltyinfo[0].source, PenaltySource::Primary));
     }
 
     #[test]
