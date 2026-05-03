@@ -935,7 +935,10 @@ def rust_noise_terms(cols: typing.Any, sc: typing.Any) -> typing.Any:
         dims = _duchon_dims_for_centers(cols, sc, centers)
         d_cols = cols[:dims]
         return f"duchon({', '.join(d_cols)}, centers={centers}, order={sc.duchon_order}, power={sc.duchon_power})"
-    return f"s({cols[0]}, type=ps, knots={max(3, sc.knots // 2)}, double_penalty={dp})"
+    centers = max(3, sc.knots // 2)
+    if sc.basis_type == "tps":
+        return f"s({cols[0]}, type=tps, centers={centers}, double_penalty={dp})"
+    return f"s({cols[0]}, type=ps, knots={centers}, double_penalty={dp})"
 
 
 def build_rust_fit_cmd(sc: typing.Any, train_csv: typing.Any, model_json: typing.Any, cols: typing.Any) -> typing.Any:
