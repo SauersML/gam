@@ -75,6 +75,13 @@ pub fn build_termspec(
     let mut linear_terms = Vec::<LinearTermSpec>::new();
     let mut random_terms = Vec::<RandomEffectTermSpec>::new();
     let mut smooth_terms = Vec::<SmoothTermSpec>::new();
+    let smooth_coordinate_count = terms
+        .iter()
+        .map(|term| match term {
+            ParsedTerm::Smooth { vars, .. } => vars.len(),
+            _ => 0,
+        })
+        .sum::<usize>();
 
     for t in terms {
         match t {
@@ -174,8 +181,16 @@ pub fn build_termspec(
                     .iter()
                     .map(|v| resolve_col(col_map, v))
                     .collect::<Result<Vec<_>, _>>()?;
-                let basis =
-                    build_smooth_basis(*kind, vars, &cols, options, ds, inference_notes, policy)?;
+                let basis = build_smooth_basis(
+                    *kind,
+                    vars,
+                    &cols,
+                    options,
+                    ds,
+                    inference_notes,
+                    policy,
+                    smooth_coordinate_count,
+                )?;
                 smooth_terms.push(SmoothTermSpec {
                     name: label.clone(),
                     basis,
@@ -210,6 +225,7 @@ pub fn build_smooth_basis(
     ds: &Dataset,
     inference_notes: &mut Vec<String>,
     policy: &ResourcePolicy,
+    smooth_coordinate_count: usize,
 ) -> Result<SmoothBasisSpec, String> {
     let smooth_double_penalty = option_bool(options, "double_penalty").unwrap_or(true);
     let type_opt = options
@@ -235,7 +251,11 @@ pub fn build_smooth_basis(
                 .map(|&c| heuristic_knots_for_column(ds.values.column(c)))
                 .max()
                 .unwrap_or_else(|| heuristic_knots(ds.values.nrows()));
-            let (n_knots, inferred) = parse_ps_internal_knots(options, degree, default_internal)?;
+            let (mut n_knots, inferred) =
+                parse_ps_internal_knots(options, degree, default_internal)?;
+            if ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
+                n_knots = n_knots.min(1);
+            }
             if inferred {
                 inference_notes.push(format!(
                     "Automatically set {} internal knots per margin for tensor smooth '{}' (max unique/4 rule across margins, clamped to [4,20]). Override with knots=... or k=....",
@@ -279,7 +299,11 @@ pub fn build_smooth_basis(
             let (minv, maxv) = col_minmax(ds.values.column(c))?;
             let degree = option_usize(options, "degree").unwrap_or(3);
             let default_internal = heuristic_knots_for_column(ds.values.column(c));
-            let (n_knots, inferred) = parse_ps_internal_knots(options, degree, default_internal)?;
+            let (mut n_knots, inferred) =
+                parse_ps_internal_knots(options, degree, default_internal)?;
+            if ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
+                n_knots = n_knots.min(1);
+            }
             if inferred {
                 let unique = unique_count_column(ds.values.column(c));
                 inference_notes.push(format!(
@@ -473,7 +497,10 @@ pub fn build_smooth_basis(
                     polynomial_cols,
                 ));
             }
-            let centers = requested_centers;
+            let mut centers = requested_centers;
+            if ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
+                centers = centers.max(polynomial_cols + 4);
+            }
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
                 spatial_center_strategy_for_dimension(centers, cols.len())
             } else {

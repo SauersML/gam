@@ -207,7 +207,7 @@ pub enum RhoPrior {
 
 impl Default for RhoPrior {
     fn default() -> Self {
-        Self::Normal { mean: 0.0, sd: 1.5 }
+        Self::Normal { mean: 0.0, sd: 3.0 }
     }
 }
 

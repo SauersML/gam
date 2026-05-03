@@ -1240,6 +1240,14 @@ impl HyperCoordPair {
     }
 }
 
+fn canonical_ext_stationarity_rhs(coord: &HyperCoord) -> Array1<f64> {
+    if coord.tk_eta_fixed.is_some() {
+        -&coord.g
+    } else {
+        coord.g.clone()
+    }
+}
+
 /// Callback for computing M_i[u] = D_β B_i[u], the directional derivative
 /// of the fixed-β Hessian drift along direction u.
 ///
@@ -4551,10 +4559,8 @@ pub fn reml_laml_evaluate(
         // ext-coordinates: H_i = B_i + D_beta H[-v_i].
         for coord in solution.ext_coords.iter() {
             let correction = if effective_deriv.has_corrections() {
-                let v_i = hop.solve(&coord.g);
-                // Generic ext coordinates store g_i = J_{βi}; IFT gives
-                // β_i = -H^{-1}g_i.  The provider negates its argument before
-                // calling compute_dh, so passing +v_i returns D_beta H[-v_i].
+                let g_i = canonical_ext_stationarity_rhs(coord);
+                let v_i = hop.solve(&g_i);
                 effective_deriv.hessian_derivative_correction_result(&v_i)?
             } else {
                 None
@@ -4673,19 +4679,15 @@ pub fn reml_laml_evaluate(
     //
     // Uses the SAME outer_gradient_entry() formula as ρ coordinates above.
     //
-    // IFT sign convention:
-    //   H · dβ̂/dψ_j + g_j = 0, with g_j = J_{βψ_j}.
-    //   Therefore dβ̂/dψ_j = −v_j, v_j := H⁻¹g_j.
-    //
-    // The total Hessian drift is Ḣ = ∂H/∂ψ|_β + D_βH[dβ̂/dψ].
-    // `hessian_derivative_correction_result(arg)` negates `arg` before
-    // calling the family-provided D_βH closure, matching the ρ convention.
-    // Passing +v_j therefore returns the required D_βH[−v_j].
+    // All extended coordinates store canonical fixed-β stationarity
+    // derivatives g_i = F_{βi}. IFT gives β_i = -H^{-1}g_i, exactly like
+    // the ρ block.
     for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
         let grad_idx = k + ext_idx;
 
         // Mode response magnitude: v_i = H⁻¹(g_i), with β_i = −v_i.
-        let v_i = hop.solve(&coord.g);
+        let g_i = canonical_ext_stationarity_rhs(coord);
+        let v_i = hop.solve(&g_i);
 
         // Trace term: tr(K · Ḣ_i) where Ḣ_i = B_i + D_β H[−v_i].
         //
@@ -4696,8 +4698,8 @@ pub fn reml_laml_evaluate(
         //     cost `½ log|U_Sᵀ H U_S|_+` on the identified subspace, which
         //     pairs with K = U_S · (U_Sᵀ H U_S)⁻¹ · U_Sᵀ.
         //
-        // For non-Gaussian families the total drift `Ḣ_i = B_i + D_β H[−v_i]`
-        // includes `D_β H[−v_i] = −X'·diag(c ⊙ X v_i)·X`, which has non-zero
+        // For non-Gaussian families the total drift includes
+        // `D_β H[−v_i]`, which has non-zero
         // support on `null(S)` whenever `X` contains an all-ones intercept
         // column — the null direction of `S_λ`.  Using the full-space
         // `G_ε(H)` there picks up a spurious null-space contribution absent
@@ -5418,17 +5420,15 @@ fn compute_outer_hessian(
         && !effective_deriv.has_corrections()
         && solution.penalty_subspace_trace.is_none();
 
-    // Precompute ext mode responses and total Hessian drifts.
-    //
-    // Sign convention: v_i = H⁻¹(g_i) is stored POSITIVE and the actual mode
-    // response is β_i = −v_i for both ρ and ext coordinates. The derivative
-    // provider negates its argument before evaluating D_βH, so passing +v_i
-    // produces the required D_βH[−v_i].
+    // Precompute ext solve responses and total Hessian drifts. All ext
+    // coordinates use canonical fixed-β stationarity derivatives, so
+    // β_i = -H^-1 g_i and the correction provider is called with +v_i.
     let mut ext_v: Vec<Array1<f64>> = Vec::with_capacity(ext_dim);
     let mut ext_h_drifts: Vec<DriftDerivResult> = Vec::with_capacity(ext_dim);
 
     for coord in solution.ext_coords.iter() {
-        let v_i = hop.solve(&coord.g);
+        let g_i = canonical_ext_stationarity_rhs(coord);
+        let v_i = hop.solve(&g_i);
 
         let correction = if effective_deriv.has_corrections() {
             effective_deriv.hessian_derivative_correction_result(&v_i)?
@@ -5709,7 +5709,7 @@ fn compute_outer_hessian(
                         )
                     };
 
-                    // `coord.g` stores g_i = ∂_i∇βF and v_i = H⁻¹g_i, so the
+                    // `coord.g` stores g_i = F_{βi} and v_i = H⁻¹g_i, so the
                     // actual mode derivative is β_i = -v_i for both ρ and ext.
                     // Differentiating stationarity gives:
                     //   H β_{rho,ext}
@@ -5718,6 +5718,7 @@ fn compute_outer_hessian(
                     let mut rhs = -&pair.g;
                     rhs += &solution.penalty_coords[rho_idx]
                         .scaled_matvec(&ext_v[ext_idx], curvature_lambdas[rho_idx]);
+                    let beta_rho = v_ks[rho_idx].mapv(|value| -value);
                     rhs += &ext_h_drifts[ext_idx].apply(&v_ks[rho_idx]);
 
                     let base = compute_base_h2_trace(
@@ -5727,7 +5728,6 @@ fn compute_outer_hessian(
                         subspace,
                     );
 
-                    let beta_rho = v_ks[rho_idx].mapv(|value| -value);
                     let beta_ext = ext_v[ext_idx].mapv(|value| -value);
                     let m_terms = compute_drift_deriv_traces(
                         hop,
@@ -5801,7 +5801,7 @@ fn compute_outer_hessian(
                         ext_h_drifts[ii].trace_logdet_hessian_cross(&ext_h_drifts[jj], hop)
                     };
 
-                    // `coord.g` is g_i = ∂_i∇βF and v_i = H⁻¹g_i, hence
+                    // `coord.g` is g_i = F_{βi} and v_i = H⁻¹g_i, hence
                     // β_i = -v_i. Differentiating stationarity gives:
                     //   H β_{ij}
                     //     = -g_{ij} - H_i β_j - Ḣ_j β_i
@@ -6376,7 +6376,6 @@ impl UnifiedOuterHessianOperator {
         let row_coord = &self.coords[row];
         let col_coord = &self.coords[col];
         let pair_g = self.pair_g[row][col].as_ref();
-
         match (row_coord.is_ext(), col_coord.is_ext()) {
             (false, false) => {
                 col_coord
@@ -6673,7 +6672,8 @@ fn build_outer_hessian_operator(
     }
 
     for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
-        let v_i = hop.solve(&coord.g);
+        let g_i = canonical_ext_stationarity_rhs(coord);
+        let v_i = hop.solve(&g_i);
         let correction = effective_deriv.hessian_derivative_correction_result(&v_i)?;
         let (total_dense, total_operators) =
             hyper_coord_total_drift_parts(&coord.drift, correction.as_ref());
@@ -6684,7 +6684,7 @@ fn build_outer_hessian_operator(
         };
         coords.push(OuterHessianCoord {
             a: coord.a,
-            g: coord.g.clone(),
+            g: g_i,
             v: v_i,
             total_drift: StoredFirstDrift::from_parts(total_dense, dense_rotated, total_operators),
             base_drift: StoredFirstDrift::from_parts(base_dense, None, base_operators),
