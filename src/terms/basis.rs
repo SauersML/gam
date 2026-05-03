@@ -18338,14 +18338,12 @@ pub mod closed_form_penalty {
 
         // A_j = (-1)^{a-j} · C(a+b-j-1, a-j) · κ^{-2(a+b-j)}, j = 1..a
         let mut sum = 0.0_f64;
-        let mut max_term = 0.0_f64;
         for j in 1..=a {
             let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
             let binom = binomial_f64(a + b - j - 1, a - j);
             let coeff = sign * binom * kappa_sq.powi(-((a + b - j) as i32));
             let term = coeff * riesz_kernel_value(d, j, r);
             sum += term;
-            max_term = max_term.max(term.abs());
         }
 
         // B_ℓ = (-1)^a · C(a+b-ℓ-1, b-ℓ) · κ^{-2(a+b-ℓ)}, ℓ = 1..b
@@ -18355,138 +18353,9 @@ pub mod closed_form_penalty {
             let coeff = sign_a * binom * kappa_sq.powi(-((a + b - ell) as i32));
             let term = coeff * matern_kernel_value(d, ell, kappa, r);
             sum += term;
-            max_term = max_term.max(term.abs());
         }
 
-        // χ-gate (math team Letter B). The literal partial-fraction sum is
-        // the pointwise analytic positive-κ kernel. The finite-part Taylor
-        // series is only a cancellation repair for the finite-part component;
-        // it is not a wholesale replacement for the full positive-κ kernel
-        // because the latter also contains low-frequency polynomial terms.
-        let kappa_r = kappa * r;
-        let x_taylor = kappa_r * kappa_r;
-        let chi = if sum.abs() > 0.0 {
-            max_term / sum.abs()
-        } else {
-            f64::INFINITY
-        };
-        let cancellation_lost = chi > 1.0e4;
-        let even_log_riesz = d % 2 == 0 && 2 * (a + b) >= d;
-        if x_taylor < 1.5 && (cancellation_lost || even_log_riesz) {
-            if let Some(tay) = finite_part_duchon_taylor(d, a, b, kappa, r) {
-                return tay;
-            }
-        }
         sum
-    }
-
-    /// Adaptive Taylor expansion of the finite-part Duchon kernel:
-    ///
-    ///   g_fp(R; κ) = Σ_{n≥0} (-1)^n · (b)_n / n! · κ^{2n} · R_{N+n}^d(R)
-    ///              = R_N^d(R) · ₁F₂(b; N, N+1-d/2; (κR)²/4)
-    ///
-    /// where `a = 2m - q`, `b = 2s`, `N = a + b`, and `(b)_n` is the rising
-    /// Pochhammer symbol. Odd `d` uses the cheap pure-power Riesz recurrence:
-    ///
-    ///   T_{n+1} / T_n = (b + n) · x / [4 · (n + 1) · (N + n) · (N + 1 − d/2 + n)],
-    ///   x = (κR)²,
-    ///
-    /// (derived from `R_{j+1}^d / R_j^d = R² / [4 · j · (d/2 − j − 1)]`
-    /// times the Pochhammer / factorial / κ²-step) with the Fourier signs
-    /// already cancelled. Even `d` uses the same finite-part series but
-    /// evaluates `R_{N+n}^d` directly so log-Riesz polynomial constants are
-    /// preserved exactly.
-    ///
-    /// Returns `None` if the recurrence stalls (NaN / non-finite) or the
-    /// configuration is not in the expected regime.
-    fn finite_part_duchon_taylor(d: usize, a: usize, b: usize, kappa: f64, r: f64) -> Option<f64> {
-        debug_assert!(r > 0.0);
-        debug_assert!(kappa > 0.0);
-        if a == 0 || b == 0 {
-            return None;
-        }
-        if d % 2 == 0 {
-            return finite_part_duchon_taylor_direct(d, a, b, kappa, r);
-        }
-        let big_n = (a + b) as f64;
-        let half_d = d as f64 / 2.0;
-        // UV/IR integrability requires N + 1 − d/2 > 0 for any term to be
-        // nonsingular; should always hold for valid Duchon configs.
-        let denom_d = big_n + 1.0 - half_d;
-        if !(denom_d > 0.0) {
-            return None;
-        }
-
-        let x = (kappa * r) * (kappa * r);
-        // T_0 = R_N^d(R)
-        let t0 = riesz_kernel_value(d, a + b, r);
-        if !t0.is_finite() {
-            return None;
-        }
-        let mut term = t0;
-        let mut sum_acc = KahanSum::default();
-        sum_acc.add(t0);
-        let max_iters = 256usize;
-        for n in 0..max_iters {
-            let nf = n as f64;
-            let num = (b as f64 + nf) * x;
-            let den = 4.0 * (nf + 1.0) * (big_n + nf) * (denom_d + nf);
-            if !(den.is_finite()) || den == 0.0 {
-                return None;
-            }
-            term *= num / den;
-            sum_acc.add(term);
-            let sum = sum_acc.sum();
-            if !term.is_finite() || !sum.is_finite() {
-                return None;
-            }
-            // Convergence: next term is smaller than 1e-16 of the
-            // accumulated sum and a few iterations of warmup are done.
-            if n >= 4 && term.abs() <= 1.0e-16 * sum.abs().max(t0.abs()) {
-                return Some(sum);
-            }
-        }
-        // Did not converge within budget; refuse rather than return a
-        // truncated sum. The caller keeps the exact partial-fraction
-        // representation, which is already well-conditioned outside this
-        // small-κR cancellation basin.
-        None
-    }
-
-    fn finite_part_duchon_taylor_direct(
-        d: usize,
-        a: usize,
-        b: usize,
-        kappa: f64,
-        r: f64,
-    ) -> Option<f64> {
-        let n0 = a + b;
-        let mut coeff = 1.0_f64;
-        let mut sum_acc = KahanSum::default();
-        let mut max_abs = 0.0_f64;
-        let kappa_sq = kappa * kappa;
-        let max_iters = 256usize;
-        for n in 0..max_iters {
-            let riesz = riesz_kernel_value(d, n0 + n, r);
-            let term = coeff * riesz;
-            if !term.is_finite() {
-                return None;
-            }
-            sum_acc.add(term);
-            let sum = sum_acc.sum();
-            max_abs = max_abs.max(term.abs());
-            if !sum.is_finite() {
-                return None;
-            }
-            if n >= 4 && term.abs() <= 1.0e-16 * sum.abs().max(max_abs).max(1.0) {
-                return Some(sum);
-            }
-            coeff *= -((b + n) as f64) * kappa_sq / ((n + 1) as f64);
-            if !coeff.is_finite() {
-                return None;
-            }
-        }
-        None
     }
 
     /// Analytic anisotropic Duchon pair-block kernel.
@@ -19158,19 +19027,7 @@ pub mod closed_form_penalty {
         // Hybrid: partial-fraction expansion (mirrors isotropic_duchon_penalty).
         let b = 2 * s;
         let kappa_sq = kappa * kappa;
-        let kappa_r = kappa * r;
-        let x_taylor = kappa_r * kappa_r;
-        // Per-order max-term tracker for the χ-gate (mirrors
-        // `isotropic_duchon_penalty`): the literal partial-fraction sum of
-        // Riesz + Matérn blocks loses ≈ log10(χ_k) digits at radial-derivative
-        // order k when χ_k = max|term|/|sum|. Once χ_k > 1e4 the literal sum
-        // has fewer than ~12 reliable digits — already enough to violate the
-        // κ→0 monotone-convergence contract callers (and the radial g_q chain)
-        // rely on. In that regime we substitute the small-κR ₁F₂ / Taylor
-        // recurrence per derivative order, which captures the finite-part
-        // value of every order to roundoff (no cancellation).
         let mut total_acc = vec![KahanSum::default(); max_order + 1];
-        let mut max_term_per_order = vec![0.0_f64; max_order + 1];
         for j in 1..=a {
             let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
             let binom = binomial_f64(a + b - j - 1, a - j);
@@ -19179,10 +19036,6 @@ pub mod closed_form_penalty {
             for (k, v) in block.into_iter().enumerate() {
                 let term = coeff * v;
                 total_acc[k].add(term);
-                let abs_term = term.abs();
-                if abs_term > max_term_per_order[k] {
-                    max_term_per_order[k] = abs_term;
-                }
             }
         }
         let sign_a = if a % 2 == 0 { 1.0 } else { -1.0 };
@@ -19193,189 +19046,9 @@ pub mod closed_form_penalty {
             for (k, v) in block.into_iter().enumerate() {
                 let term = coeff * v;
                 total_acc[k].add(term);
-                let abs_term = term.abs();
-                if abs_term > max_term_per_order[k] {
-                    max_term_per_order[k] = abs_term;
-                }
             }
         }
-        let mut total: Vec<f64> = total_acc.iter().map(|acc| acc.sum()).collect();
-
-        // χ-gate per derivative order. Cancellation is order-specific: a
-        // high radial derivative can lose all significant digits while the
-        // lower derivatives used by the value remain well-conditioned. Use
-        // the Taylor representation exactly for the orders whose literal
-        // partial-fraction sum has exceeded the cancellation budget.
-        let replace_order: Vec<bool> = total
-            .iter()
-            .zip(max_term_per_order.iter())
-            .map(|(&sum_k, &max_term_k)| {
-                if sum_k.abs() > 0.0 {
-                    max_term_k / sum_k.abs() > 1.0e4
-                } else {
-                    true
-                }
-            })
-            .collect();
-        let cancellation_lost = replace_order.iter().any(|&replace| replace);
-        let even_log_riesz = d % 2 == 0 && 2 * (a + b) >= d;
-        if x_taylor < 1.5 && (cancellation_lost || even_log_riesz) {
-            if let Some(taylor_table) =
-                finite_part_duchon_taylor_derivative_table_direct(d, a, b, kappa, r, max_order)
-            {
-                for k in 0..=max_order {
-                    if even_log_riesz || replace_order[k] {
-                        total[k] = taylor_table[k];
-                    }
-                }
-            } else if kappa_r < 0.5 {
-                // Last-resort κ→0 limit for the orders that cannot be
-                // evaluated literally. This branch is only reached if the
-                // finite-part series refuses to produce finite terms.
-                let limit_block = riesz_block_radial_derivatives(d, a + b, r, max_order);
-                if limit_block.iter().all(|v| v.is_finite()) {
-                    for k in 0..=max_order {
-                        if even_log_riesz || replace_order[k] {
-                            total[k] = limit_block[k];
-                        }
-                    }
-                }
-            }
-        }
-
-        total
-    }
-
-    /// Direct per-derivative-order analogue of `finite_part_duchon_taylor`:
-    /// returns `[g_fp, ∂_R g_fp, …, ∂_R^max_order g_fp]`,
-    ///
-    ///   ∂_R^k g_fp(R; κ) = Σ_{n≥0} (-1)^n · (b)_n / n! · κ^{2n} · ∂_R^k R_{N+n}^d(R)
-    ///
-    /// This is deliberately shared by the value/η/κ derivative bundles. The
-    /// partial-fraction sum and the finite-part series are two representations
-    /// of the same distributional kernel; switching only the value path leaves
-    /// the derivative path exposed to the same cancellation. Evaluating the
-    /// Riesz block derivatives directly also covers even-dimensional log-Riesz
-    /// blocks with their canonical finite-part constants.
-    fn finite_part_duchon_taylor_derivative_table_direct(
-        d: usize,
-        a: usize,
-        b: usize,
-        kappa: f64,
-        r: f64,
-        max_order: usize,
-    ) -> Option<Vec<f64>> {
-        if !(r > 0.0) || !(kappa > 0.0) {
-            return None;
-        }
-        if a == 0 || b == 0 {
-            return None;
-        }
-        let n0 = a + b;
-        let mut c_n = 1.0_f64;
-        let mut sum_acc = vec![KahanSum::default(); max_order + 1];
-        let mut max_abs = 0.0_f64;
-        let kappa_sq = kappa * kappa;
-        let max_iters = 256usize;
-        for n in 0..max_iters {
-            let block = riesz_block_radial_derivatives(d, n0 + n, r, max_order);
-            let mut term_abs = 0.0_f64;
-            for k in 0..=max_order {
-                let term = c_n * block[k];
-                if !term.is_finite() {
-                    return None;
-                }
-                sum_acc[k].add(term);
-                if !sum_acc[k].sum().is_finite() {
-                    return None;
-                }
-                term_abs = term_abs.max(term.abs());
-            }
-            max_abs = max_abs.max(term_abs);
-            let sum: Vec<f64> = sum_acc.iter().map(|acc| acc.sum()).collect();
-            let scale = sum.iter().map(|v| v.abs()).fold(max_abs.max(1.0), f64::max);
-            if n >= 4 && term_abs <= 1.0e-16 * scale {
-                return Some(sum);
-            }
-            c_n *= -((b + n) as f64) * kappa_sq / ((n + 1) as f64);
-            if !c_n.is_finite() {
-                return None;
-            }
-        }
-        None
-    }
-
-    /// κ-partial table for the same finite-part Taylor representation used
-    /// by `finite_part_duchon_taylor_derivative_table_direct`.
-    ///
-    /// The only κ-dependence is in the coefficient
-    /// `C_n(κ)=(-1)^n (b)_n κ^{2n}/n!`, so
-    /// `C'_n=(2n/κ)C_n` and `C''_n=(2n)(2n-1)C_n/κ²`.
-    fn finite_part_duchon_taylor_kappa_table_direct(
-        d: usize,
-        a: usize,
-        b: usize,
-        kappa: f64,
-        r: f64,
-        max_order: usize,
-        kappa_order: usize,
-    ) -> Option<Vec<f64>> {
-        if !(r > 0.0) || !(kappa > 0.0) || !(kappa_order == 1 || kappa_order == 2) {
-            return None;
-        }
-        if a == 0 || b == 0 {
-            return None;
-        }
-        let n0 = a + b;
-        let mut c_n = 1.0_f64;
-        let mut sum_acc = vec![KahanSum::default(); max_order + 1];
-        let mut max_abs = 0.0_f64;
-        let kappa_sq = kappa * kappa;
-        let max_iters = 256usize;
-        for n in 0..max_iters {
-            let nf = n as f64;
-            let coeff = match kappa_order {
-                1 => {
-                    if n == 0 {
-                        0.0
-                    } else {
-                        (2.0 * nf / kappa) * c_n
-                    }
-                }
-                2 => {
-                    if n == 0 {
-                        0.0
-                    } else {
-                        (2.0 * nf) * (2.0 * nf - 1.0) / kappa_sq * c_n
-                    }
-                }
-                _ => unreachable!(),
-            };
-            let block = riesz_block_radial_derivatives(d, n0 + n, r, max_order);
-            let mut term_abs = 0.0_f64;
-            for k in 0..=max_order {
-                let term = coeff * block[k];
-                if !term.is_finite() {
-                    return None;
-                }
-                sum_acc[k].add(term);
-                if !sum_acc[k].sum().is_finite() {
-                    return None;
-                }
-                term_abs = term_abs.max(term.abs());
-            }
-            max_abs = max_abs.max(term_abs);
-            let sum: Vec<f64> = sum_acc.iter().map(|acc| acc.sum()).collect();
-            let scale = sum.iter().map(|v| v.abs()).fold(max_abs.max(1.0), f64::max);
-            if n >= 4 && term_abs <= 1.0e-16 * scale {
-                return Some(sum);
-            }
-            c_n *= -((b + n) as f64) * kappa_sq / ((n + 1) as f64);
-            if !c_n.is_finite() {
-                return None;
-            }
-        }
-        None
+        total_acc.iter().map(|acc| acc.sum()).collect()
     }
 
     /// Radial-form bare anisotropic Duchon pair-block penalty
@@ -19524,9 +19197,10 @@ pub mod closed_form_penalty {
         }
 
         // Request the same radial-derivative depth used by the derivative
-        // bundle for q > 0. The finite-part/Taylor gate is order-local, so a
-        // high derivative can switch representation without perturbing a
-        // well-conditioned low-order value.
+        // bundle for q > 0. Positive-κ evaluation stays on the full
+        // partial-fraction kernel for every derivative order; the
+        // finite-part representative is reserved for true κ=0/log-Riesz
+        // limits and self-pair diagonals.
         let max_order = if q == 0 { 0 } else { (2 * q + 2).min(6) };
         let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order);
 
@@ -19747,12 +19421,6 @@ pub mod closed_form_penalty {
 
         let a = 2 * m;
         let b = 2 * s;
-        if (kappa * r) * (kappa * r) < 1.5
-            && let Some(table) =
-                finite_part_duchon_taylor_kappa_table_direct(d, a, b, kappa, r, max_order, 1)
-        {
-            return table;
-        }
         let kappa_sq = kappa * kappa;
         let mut total = vec![KahanSum::default(); max_order + 1];
 
@@ -19815,12 +19483,6 @@ pub mod closed_form_penalty {
 
         let a = 2 * m;
         let b = 2 * s;
-        if (kappa * r) * (kappa * r) < 1.5
-            && let Some(table) =
-                finite_part_duchon_taylor_kappa_table_direct(d, a, b, kappa, r, max_order, 2)
-        {
-            return table;
-        }
         let kappa_sq = kappa * kappa;
         let mut total = vec![KahanSum::default(); max_order + 1];
 
