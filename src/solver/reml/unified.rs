@@ -4234,9 +4234,11 @@ fn outer_gradient_entry(
 /// - L_ij = ½ (cross_trace + h2_trace) (logdet Hessian)
 /// - P_ij = −½ pair_ld_s  (penalty logdet second derivative)
 ///
-/// The `cross_trace` is −tr(H⁻¹ Ḣ_j H⁻¹ Ḣ_i) from the spectral kernel
-/// (or stochastic estimator).  The `h2_trace` is tr(G_ε Ḧ_ij) from the
-/// second Hessian drift including IFT and fourth-derivative corrections.
+/// The `cross_trace` is the exact logdet spectral cross term. For ordinary
+/// SPD backends this is `−tr(H⁻¹ Ḣ_j H⁻¹ Ḣ_i)`; for smooth spectral logdet
+/// regularization it is the divided-difference contraction of
+/// `log r_ε(σ)`. The `h2_trace` is tr(G_ε Ḧ_ij) from the second Hessian
+/// drift including IFT and fourth-derivative corrections.
 #[inline]
 fn outer_hessian_entry(
     a_i: f64,
@@ -4546,14 +4548,14 @@ pub fn reml_laml_evaluate(
             }
         }
 
-        // ext-coordinates: H_i = B_i + D_beta H[+v_i].
+        // ext-coordinates: H_i = B_i + D_beta H[-v_i].
         for coord in solution.ext_coords.iter() {
             let correction = if effective_deriv.has_corrections() {
                 let v_i = hop.solve(&coord.g);
-                // ext mode direction beta_i = +v_i (positive convention);
-                // pass -v_i so the trait returns D_beta H[+v_i].
-                let neg_v_i = v_i.mapv(|z| -z);
-                effective_deriv.hessian_derivative_correction_result(&neg_v_i)?
+                // Generic ext coordinates store g_i = J_{βi}; IFT gives
+                // β_i = -H^{-1}g_i.  The provider negates its argument before
+                // calling compute_dh, so passing +v_i returns D_beta H[-v_i].
+                effective_deriv.hessian_derivative_correction_result(&v_i)?
             } else {
                 None
             };
@@ -4671,23 +4673,21 @@ pub fn reml_laml_evaluate(
     //
     // Uses the SAME outer_gradient_entry() formula as ρ coordinates above.
     //
-    // IFT sign conventions differ between ρ and ext coordinates:
-    //   ρ : H·dβ̂/dρ_k = +A_k β̂  ⇒  dβ̂/dρ_k = −v_k  (v_k := H⁻¹(A_k β̂))
-    //   ψ : H·dβ̂/dψ_j = +g_j    ⇒  dβ̂/dψ_j = +v_j  (v_j := H⁻¹(g_j))
+    // IFT sign convention:
+    //   H · dβ̂/dψ_j + g_j = 0, with g_j = J_{βψ_j}.
+    //   Therefore dβ̂/dψ_j = −v_j, v_j := H⁻¹g_j.
     //
-    // The total Hessian drift is Ḣ = ∂H/∂θ|_β + D_β H[dβ̂/dθ].  For ψ the
-    // IFT direction β_j = +v_j, so the required correction is
-    // D_β H[+v_j] = +X' diag(c ⊙ X v_j) X.  The trait method
-    // `hessian_derivative_correction(arg)` evaluates D_β H[−arg]
-    // (= −X' diag(c ⊙ X arg) X for scalar GLMs, plus −D(H_φ)[X·(−arg)]
-    // for Firth).  To get D_β H[+v_j] we therefore pass −v_j.
+    // The total Hessian drift is Ḣ = ∂H/∂ψ|_β + D_βH[dβ̂/dψ].
+    // `hessian_derivative_correction_result(arg)` negates `arg` before
+    // calling the family-provided D_βH closure, matching the ρ convention.
+    // Passing +v_j therefore returns the required D_βH[−v_j].
     for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
         let grad_idx = k + ext_idx;
 
-        // Mode response: v_i = H⁻¹(g_i) = +dβ̂/dψ_i.
+        // Mode response magnitude: v_i = H⁻¹(g_i), with β_i = −v_i.
         let v_i = hop.solve(&coord.g);
 
-        // Trace term: tr(K · Ḣ_i) where Ḣ_i = B_i + D_β H[+v_i].
+        // Trace term: tr(K · Ḣ_i) where Ḣ_i = B_i + D_β H[−v_i].
         //
         // Kernel choice pairs with the cost:
         //   * Default cost `½ log|H|` (or `Σ log r_ε(σ_j)` under Smooth spectral
@@ -4696,8 +4696,8 @@ pub fn reml_laml_evaluate(
         //     cost `½ log|U_Sᵀ H U_S|_+` on the identified subspace, which
         //     pairs with K = U_S · (U_Sᵀ H U_S)⁻¹ · U_Sᵀ.
         //
-        // For non-Gaussian families the total drift `Ḣ_i = B_i + D_β H[+v_i]`
-        // includes `D_β H[+v_i] = X'·diag(c ⊙ X v_i)·X`, which has non-zero
+        // For non-Gaussian families the total drift `Ḣ_i = B_i + D_β H[−v_i]`
+        // includes `D_β H[−v_i] = −X'·diag(c ⊙ X v_i)·X`, which has non-zero
         // support on `null(S)` whenever `X` contains an all-ones intercept
         // column — the null direction of `S_λ`.  Using the full-space
         // `G_ε(H)` there picks up a spurious null-space contribution absent
@@ -4711,8 +4711,7 @@ pub fn reml_laml_evaluate(
             stoch_traces[k + ext_idx]
         } else {
             let correction = if effective_deriv.has_corrections() {
-                let neg_v_i = v_i.mapv(|z| -z);
-                effective_deriv.hessian_derivative_correction_result(&neg_v_i)?
+                effective_deriv.hessian_derivative_correction_result(&v_i)?
             } else {
                 None
             };
@@ -5088,11 +5087,11 @@ fn compute_ift_correction_trace(
     }
 }
 
-/// Compute the β-dependent drift derivative traces: M_i[v_j] + M_j[v_i].
+/// Compute the β-dependent drift derivative traces: M_i[β_j] + M_j[β_i].
 ///
 /// When a coordinate's fixed-β Hessian drift B depends on β, the second
-/// Hessian drift Ḧ_{ij} includes additional terms D_β B_i[v_j] and
-/// D_β B_j[v_i].  This function computes their traces through G_ε.
+/// Hessian drift Ḧ_{ij} includes additional terms D_β B_i[β_j] and
+/// D_β B_j[β_i].  This function computes their traces through G_ε.
 ///
 /// For ρ coordinates, B_k = A_k (penalty derivative) is β-independent, so
 /// `b_depends_on_beta = false` and this returns 0.
@@ -5102,8 +5101,8 @@ fn compute_drift_deriv_traces(
     b_j_depends: bool,
     ext_i: Option<usize>,
     ext_j: Option<usize>,
-    v_i: &Array1<f64>,
-    v_j: &Array1<f64>,
+    beta_i: &Array1<f64>,
+    beta_j: &Array1<f64>,
     fixed_drift_deriv: Option<&FixedDriftDerivFn>,
     subspace: Option<&PenaltySubspaceTrace>,
 ) -> f64 {
@@ -5121,18 +5120,18 @@ fn compute_drift_deriv_traces(
         }
     };
     let mut trace = 0.0;
-    // M_i[v_j] = D_β B_i[v_j]
+    // M_i[β_j] = D_β B_i[β_j]
     if b_i_depends {
         if let (Some(ei), Some(drift_fn)) = (ext_i, fixed_drift_deriv) {
-            if let Some(result) = drift_fn(ei, v_j) {
+            if let Some(result) = drift_fn(ei, beta_j) {
                 trace += trace_via(result);
             }
         }
     }
-    // M_j[v_i] = D_β B_j[v_i]
+    // M_j[β_i] = D_β B_j[β_i]
     if b_j_depends {
         if let (Some(ej), Some(drift_fn)) = (ext_j, fixed_drift_deriv) {
-            if let Some(result) = drift_fn(ej, v_i) {
+            if let Some(result) = drift_fn(ej, beta_i) {
                 trace += trace_via(result);
             }
         }
@@ -5421,13 +5420,10 @@ fn compute_outer_hessian(
 
     // Precompute ext mode responses and total Hessian drifts.
     //
-    // Sign convention: v_i = H⁻¹(g_i) is stored POSITIVE.  Unlike ρ (where
-    // dβ̂/dρ_k = −v_k), for ext coordinates the IFT gives
-    //   dβ̂/dψ_j = +v_j
-    // because H · dβ̂/dψ = g_j with g_j = X_τ'u − X'W(X_τβ̂) − S_τβ̂ (see
-    // `build_tau_hyper_coords_original_basis`).  Consequently the correct
-    // Hessian drift correction is D_β H[+v_j], and we pass −v_j to the trait
-    // since `hessian_derivative_correction(arg)` evaluates D_β H[−arg].
+    // Sign convention: v_i = H⁻¹(g_i) is stored POSITIVE and the actual mode
+    // response is β_i = −v_i for both ρ and ext coordinates. The derivative
+    // provider negates its argument before evaluating D_βH, so passing +v_i
+    // produces the required D_βH[−v_i].
     let mut ext_v: Vec<Array1<f64>> = Vec::with_capacity(ext_dim);
     let mut ext_h_drifts: Vec<DriftDerivResult> = Vec::with_capacity(ext_dim);
 
@@ -5435,10 +5431,7 @@ fn compute_outer_hessian(
         let v_i = hop.solve(&coord.g);
 
         let correction = if effective_deriv.has_corrections() {
-            // Pass −v_i so the trait returns D_β H[+v_i], the IFT correction
-            // at the ext mode direction β_i = +v_i.
-            let neg_v_i = v_i.mapv(|z| -z);
-            effective_deriv.hessian_derivative_correction_result(&neg_v_i)?
+            effective_deriv.hessian_derivative_correction_result(&v_i)?
         } else {
             None
         };
@@ -5716,16 +5709,16 @@ fn compute_outer_hessian(
                         )
                     };
 
-                    // `coord.g` stores the positive IFT solve RHS `H β_i = g_i`,
-                    // which is the negative of the fixed-β score derivative.
-                    // Differentiating `H β_rho = -A_k β` along ext therefore
-                    // yields:
-                    //   H β_{rho,ext} = g_{rho,ext} - A_k β_ext - Ḣ_ext β_rho
-                    // with β_rho = -v_rho and β_ext = +v_ext.
-                    let mut rhs = pair.g.clone();
-                    rhs -= &solution.penalty_coords[rho_idx]
+                    // `coord.g` stores g_i = ∂_i∇βF and v_i = H⁻¹g_i, so the
+                    // actual mode derivative is β_i = -v_i for both ρ and ext.
+                    // Differentiating stationarity gives:
+                    //   H β_{rho,ext}
+                    //     = -g_{rho,ext} - H_rho β_ext - Ḣ_ext β_rho
+                    //     = -g_{rho,ext} + H_rho v_ext + Ḣ_ext v_rho.
+                    let mut rhs = -&pair.g;
+                    rhs += &solution.penalty_coords[rho_idx]
                         .scaled_matvec(&ext_v[ext_idx], curvature_lambdas[rho_idx]);
-                    rhs -= &ext_h_drifts[ext_idx].apply(&v_ks[rho_idx]);
+                    rhs += &ext_h_drifts[ext_idx].apply(&v_ks[rho_idx]);
 
                     let base = compute_base_h2_trace(
                         hop,
@@ -5734,31 +5727,32 @@ fn compute_outer_hessian(
                         subspace,
                     );
 
+                    let beta_rho = v_ks[rho_idx].mapv(|value| -value);
+                    let beta_ext = ext_v[ext_idx].mapv(|value| -value);
                     let m_terms = compute_drift_deriv_traces(
                         hop,
                         false, // ρ drift is β-independent
                         solution.ext_coords[ext_idx].b_depends_on_beta,
                         None,
                         Some(ext_idx),
-                        &v_ks[rho_idx],
-                        &ext_v[ext_idx],
+                        &beta_rho,
+                        &beta_ext,
                         solution.fixed_drift_deriv.as_ref(),
                         subspace,
                     );
 
-                    let neg_ext_v = ext_v[ext_idx].mapv(|value| -value);
                     let correction = compute_ift_correction_trace(
                         hop,
                         &rhs,
                         &v_ks[rho_idx],
-                        &neg_ext_v,
+                        &ext_v[ext_idx],
                         effective_deriv,
                         adjoint_z_c.as_ref(),
                         glm_ingredients.as_ref(),
                         leverage.as_ref(),
                         fourth_trace_matrix
                             .as_ref()
-                            .map(|trace| -trace[[rho_idx, k + ext_idx]]),
+                            .map(|trace| trace[[rho_idx, k + ext_idx]]),
                         subspace,
                     )?;
 
@@ -5807,16 +5801,16 @@ fn compute_outer_hessian(
                         ext_h_drifts[ii].trace_logdet_hessian_cross(&ext_h_drifts[jj], hop)
                     };
 
-                    // `coord.g` is the implicit-solve RHS `H β_i = g_i`, i.e.
-                    // the negative of the fixed-β score derivative. Therefore
-                    // differentiating `H β_i = g_i` along coord `j` gives:
-                    //   H β_{ij} = g_{ij} - B_i β_j - Ḣ_j β_i
-                    // with β_i = +v_i and β_j = +v_j.
-                    let mut rhs = pair.g.clone();
+                    // `coord.g` is g_i = ∂_i∇βF and v_i = H⁻¹g_i, hence
+                    // β_i = -v_i. Differentiating stationarity gives:
+                    //   H β_{ij}
+                    //     = -g_{ij} - H_i β_j - Ḣ_j β_i
+                    //     = -g_{ij} + H_i v_j + Ḣ_j v_i.
+                    let mut rhs = -&pair.g;
                     coord_i
                         .drift
-                        .scaled_add_apply(ext_v[jj].view(), -1.0, &mut rhs);
-                    rhs -= &ext_h_drifts[jj].apply(&ext_v[ii]);
+                        .scaled_add_apply(ext_v[jj].view(), 1.0, &mut rhs);
+                    rhs += &ext_h_drifts[jj].apply(&ext_v[ii]);
 
                     let base = compute_base_h2_trace(
                         hop,
@@ -5825,25 +5819,25 @@ fn compute_outer_hessian(
                         subspace,
                     );
 
+                    let beta_i = ext_v[ii].mapv(|value| -value);
+                    let beta_j = ext_v[jj].mapv(|value| -value);
                     let m_terms = compute_drift_deriv_traces(
                         hop,
                         coord_i.b_depends_on_beta,
                         coord_j.b_depends_on_beta,
                         Some(ii),
                         Some(jj),
-                        &ext_v[ii],
-                        &ext_v[jj],
+                        &beta_i,
+                        &beta_j,
                         solution.fixed_drift_deriv.as_ref(),
                         subspace,
                     );
 
-                    let neg_ext_v_i = ext_v[ii].mapv(|value| -value);
-                    let neg_ext_v_j = ext_v[jj].mapv(|value| -value);
                     let correction = compute_ift_correction_trace(
                         hop,
                         &rhs,
-                        &neg_ext_v_i,
-                        &neg_ext_v_j,
+                        &ext_v[ii],
+                        &ext_v[jj],
                         effective_deriv,
                         adjoint_z_c.as_ref(),
                         glm_ingredients.as_ref(),
@@ -6696,8 +6690,7 @@ fn build_outer_hessian_operator(
 
     for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
         let v_i = hop.solve(&coord.g);
-        let neg_v_i = v_i.mapv(|z| -z);
-        let correction = effective_deriv.hessian_derivative_correction_result(&neg_v_i)?;
+        let correction = effective_deriv.hessian_derivative_correction_result(&v_i)?;
         let (total_dense, total_operators) =
             hyper_coord_total_drift_parts(&coord.drift, correction.as_ref());
         let (base_dense, base_operators) = hyper_coord_total_drift_parts(&coord.drift, None);
@@ -6829,14 +6822,16 @@ fn build_outer_hessian_operator(
         let entries: Vec<((usize, usize), f64)> = pairs
             .into_par_iter()
             .map(|(ii, jj)| {
+                let beta_i = coords[ii].v.mapv(|value| -value);
+                let beta_j = coords[jj].v.mapv(|value| -value);
                 let trace = compute_drift_deriv_traces(
                     hop.as_ref(),
                     coords[ii].b_depends_on_beta,
                     coords[jj].b_depends_on_beta,
                     coords[ii].ext_index,
                     coords[jj].ext_index,
-                    &coords[ii].v,
-                    &coords[jj].v,
+                    &beta_i,
+                    &beta_j,
                     solution.fixed_drift_deriv.as_ref(),
                     None,
                 );
