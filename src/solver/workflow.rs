@@ -2529,6 +2529,8 @@ mod tests {
                 solver: Solver::Bfgs,
                 hessian_source: HessianSource::BfgsApprox,
             },
+            operator_trust_radius: None,
+            operator_stop_reason: None,
         }
     }
 
