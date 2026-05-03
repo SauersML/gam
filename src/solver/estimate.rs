@@ -666,8 +666,10 @@ pub(crate) fn smooth_floor_dp(dp: f64) -> (f64, f64, f64) {
 ///   - pseudo-det second derivatives in S
 ///   - and H_{kℓ} terms containing fourth-likelihood derivatives.
 ///
-/// This routine estimates V_ρ^{-1} by finite-differencing
-/// the implemented analytic gradient and then regularizing before inversion.
+/// This routine obtains V_ρ^{-1} from the analytic rho-space Hessian selected
+/// by `compute_lamlhessian_consistent`, then regularizes before inversion.
+/// If that analytic Hessian is unavailable, the correction is skipped rather
+/// than synthesized numerically.
 ///
 /// Notes on omitted higher-order terms:
 /// - The exact `E[A(rho)]` and `Var(b(rho))` can be written with the Gaussian

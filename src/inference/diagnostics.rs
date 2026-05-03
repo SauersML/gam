@@ -1,18 +1,18 @@
-//! Gradient Diagnostic Strategies for LAML/REML Optimization
+//! Analytic diagnostic helpers for LAML/REML optimization.
 //!
-//! This module implements four diagnostic strategies to identify root causes of
-//! gradient calculation mismatches between analytic and finite-difference gradients:
+//! Production diagnostics inspect analytic invariants only. Finite differences
+//! belong in `#[cfg(test)]` checks, never in fitting, prediction, or runtime
+//! diagnostic APIs. This module implements diagnostic strategies that identify
+//! root causes of gradient pathologies from quantities the optimizer already
+//! computes:
 //!
 //! 1. KKT Audit (Envelope Theorem Check): Detects violations of the stationarity
 //!    assumption used in implicit differentiation.
 //!
-//! 2. Component-wise Finite Difference: Breaks down the total cost into components
-//!    (D_p, log|H|, log|S|) and checks each gradient term separately.
-//!
-//! 3. Spectral Bleed Trace: Detects when truncated eigenspace corrections are
+//! 2. Spectral Bleed Trace: Detects when truncated eigenspace corrections are
 //!    inconsistent with the penalty's energy in that subspace.
 //!
-//! 4. Dual-Ridge Consistency Check: Verifies that the ridge used by the inner
+//! 3. Dual-Ridge Consistency Check: Verifies that the ridge used by the inner
 //!    solver (PIRLS) matches what the outer gradient calculation assumes.
 
 use ndarray::Array1;
@@ -70,8 +70,6 @@ pub fn should_emit_h_min_eig_diag(min_eig: f64) -> bool {
 pub struct DiagnosticConfig {
     /// Tolerance for KKT residual norm (envelope theorem violation)
     pub kkt_tolerance: f64,
-    /// Step size for finite difference calculations
-    pub fd_step_size: f64,
     /// Relative error threshold for flagging issues
     pub rel_error_threshold: f64,
     /// Whether to emit warnings to stderr
@@ -82,7 +80,6 @@ impl Default for DiagnosticConfig {
     fn default() -> Self {
         Self {
             kkt_tolerance: 1e-4,
-            fd_step_size: 1e-5,
             rel_error_threshold: 0.1,
             emitwarnings: true,
         }
@@ -164,12 +161,6 @@ pub struct GradientDiagnosticReport {
     pub spectral_bleed: Vec<SpectralBleedResult>,
     /// Dual-ridge consistency result
     pub dualridge: Option<DualRidgeResult>,
-    /// Total analytic gradient
-    pub analytic_gradient: Option<Array1<f64>>,
-    /// Total numeric gradient (FD)
-    pub numericgradient: Option<Array1<f64>>,
-    /// Per-component relative L2 error
-    pub component_rel_errors: Option<Array1<f64>>,
 }
 
 impl GradientDiagnosticReport {
@@ -357,15 +348,6 @@ pub fn compute_dualridge_check(
     }
 }
 
-// =============================================================================
-// Gradient-at-Perturbation Consistency Check (Bonus Strategy)
-// =============================================================================
-
-/// Check gradient internal consistency by verifying the average of gradients at
-/// perturbed points matches the FD slope.
-///
-/// If (grad(ρ+ε) + grad(ρ))/2 ≈ FD_slope but grad(ρ) alone doesn't, there's a
-/// bias term that doesn't cancel—often a sign of missing terms in the derivative.
 #[cfg(test)]
 mod tests {
     use super::*;

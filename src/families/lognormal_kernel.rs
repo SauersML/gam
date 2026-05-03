@@ -377,8 +377,7 @@ pub fn latent_cloglog_jet5(
     //
     // - mean through d5 are all derived from the same lognormal-Laplace kernel
     //   terms K_{k,1}(eta, sigma),
-    // - there is no finite-difference bridge for d2 / d3,
-    // - and every derivative order uses the same routed kernel backend.
+    // - every derivative order uses the same routed analytic kernel backend.
     let jet = latent_cloglog_inverse_link_jet5_controlled(quadctx, eta, sigma);
     Ok(LatentCLogLogJet5 {
         mean: jet.mean,

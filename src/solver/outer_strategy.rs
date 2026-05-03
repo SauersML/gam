@@ -7,8 +7,8 @@
 //!
 //! # Design invariant
 //!
-//! The planner never selects a finite-difference Hessian policy. If a path
-//! cannot provide an analytic Hessian, that fact is visible in its
+//! The planner never synthesizes numerical Hessians. If a path cannot provide
+//! an analytic Hessian, that fact is visible in its
 //! [`OuterCapability`] declaration and in the resulting [`OuterPlan`], which
 //! falls back to BFGS or an EFS variant instead of synthesizing second-order
 //! curvature numerically.
@@ -1096,7 +1096,7 @@ pub enum HessianResult {
     Operator(Arc<dyn OuterHessianOperator>),
     /// No analytic Hessian available for this model path.
     /// The runner must use the [`HessianSource`] from the [`OuterPlan`]
-    /// to decide what to do (FD, BFGS, etc.).
+    /// to choose a declared first-order or derivative-free strategy.
     Unavailable,
 }
 
@@ -1295,8 +1295,8 @@ pub struct EfsEval {
 /// - `capability()` must be stable (same result across calls).
 /// - `eval()` may return `HessianResult::Unavailable` at individual trial
 ///   points even when `capability().hessian == Analytic`; `opt` degrades that
-///   step to an FD Hessian instead of requiring the objective to fake a stale
-///   or non-finite Hessian.
+///   step to first-order behavior instead of requiring the objective to fake a
+///   stale or non-finite Hessian.
 /// - Use `eval_cost()` / `OuterEval::infeasible()` for infeasible trial points.
 ///   Return `Err(...)` for genuine evaluation breakdowns so the runner can mark
 ///   the step as a recoverable solver failure and escalate to the next declared
@@ -1996,7 +1996,7 @@ enum CompassSearchOutcome {
 ///
 /// Why this method is correct for derivative-free aux optimization:
 /// the algorithm only compares cost values at polled points. It never
-/// finite-differences a gradient and never feeds approximations into a
+/// constructs numerical gradients and never feeds approximations into a
 /// gradient-based optimizer. For any continuously differentiable cost
 /// bounded below on the compact box [lower, upper], compass search
 /// converges to a stationary point (Kolda-Lewis-Torczon, SIAM Review
@@ -2898,7 +2898,7 @@ fn run_operator_trust_region(
 ///
 /// 1. Queries and canonicalizes the objective's capability declaration.
 /// 2. Calls `plan()` to select solver + hessian source.
-/// 3. Logs the plan (so FD is never silent).
+/// 3. Logs the plan and the analytic derivative capabilities it will consume.
 /// 4. Generates seed candidates.
 /// 5. Runs the chosen solver on candidates in heuristic order up to budget.
 /// 6. If the configured fallback policy allows it, re-plans with degraded
@@ -4802,9 +4802,9 @@ mod tests {
     #[test]
     fn run_malformed_gradient_seed_surfaces_as_error() {
         // A capability that declares Analytic gradient but returns a malformed
-        // one must fail loudly. The previous FD-fallback behaviour masked the
-        // underlying bug by silently spinning a cost-only BFGS with
-        // finite-difference gradient — that path is disabled in production.
+        // one must fail loudly. The previous numerical-gradient fallback masked
+        // the underlying bug by silently spinning a cost-only BFGS; that path is
+        // disabled in production.
         let problem = OuterProblem::new(2)
             .with_gradient(Derivative::Analytic)
             .with_hessian(Derivative::Unavailable)

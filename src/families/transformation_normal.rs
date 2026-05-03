@@ -5603,6 +5603,10 @@ fn effective_response_num_internal_knots(
 ///
 /// output\[i, j * p_b + k\] = a\[i, j\] * b\[i, k\]
 fn rowwise_kronecker(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
+    rowwise_kronecker_views(a.view(), b.view())
+}
+
+fn rowwise_kronecker_views(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Array2<f64> {
     assert_eq!(a.nrows(), b.nrows());
     let n = a.nrows();
     let pa = a.ncols();
@@ -7500,6 +7504,69 @@ impl TensorKroneckerPsiOperator {
         Ok(Array1::<f64>::zeros(self.p_cov()))
     }
 
+    fn cov_first_axis_row_chunk(
+        &self,
+        axis: usize,
+        rows: std::ops::Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        let deriv = self.cov_deriv(axis)?;
+        if deriv.x_psi.nrows() == self.n_data() && deriv.x_psi.ncols() == self.p_cov() {
+            return Ok(deriv.x_psi.slice(s![rows, ..]).to_owned());
+        }
+        let Some(op) = deriv.implicit_operator.as_ref() else {
+            return Err(crate::terms::basis::BasisError::InvalidInput(format!(
+                "missing covariate psi row chunk operator for axis {axis}"
+            )));
+        };
+        op.row_chunk_first(deriv.implicit_axis, rows)
+    }
+
+    fn cov_second_axis_row_chunk(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        rows: std::ops::Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        let deriv_d = self.cov_deriv(axis_d)?;
+        let deriv_e = self.cov_deriv(axis_e)?;
+        if let Some(op) = deriv_d.implicit_operator.as_ref()
+            && deriv_d.implicit_group_id.is_some()
+            && deriv_d.implicit_group_id == deriv_e.implicit_group_id
+        {
+            if deriv_d.implicit_axis == deriv_e.implicit_axis {
+                return op.row_chunk_second_diag(deriv_d.implicit_axis, rows);
+            }
+            return op.row_chunk_second_cross(deriv_d.implicit_axis, deriv_e.implicit_axis, rows);
+        }
+        if let Some(second_rows) = deriv_d.x_psi_psi.as_ref()
+            && let Some(mat) = second_rows.get(axis_e)
+        {
+            if mat.nrows() == self.n_data() && mat.ncols() == self.p_cov() {
+                return Ok(mat.slice(s![rows, ..]).to_owned());
+            }
+        }
+        Ok(Array2::<f64>::zeros((rows.end - rows.start, self.p_cov())))
+    }
+
+    fn lifted_row_chunk_from_cov(
+        &self,
+        rows: std::ops::Range<usize>,
+        cov: &Array2<f64>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        let n_rows = rows.end - rows.start;
+        if cov.nrows() != n_rows || cov.ncols() != self.p_cov() {
+            return Err(crate::terms::basis::BasisError::InvalidInput(format!(
+                "tensor Kronecker covariate row chunk shape {}x{} != expected {}x{}",
+                cov.nrows(),
+                cov.ncols(),
+                n_rows,
+                self.p_cov()
+            )));
+        }
+        let resp = self.response_val_basis.slice(s![rows, ..]);
+        Ok(rowwise_kronecker_views(resp, cov.view()))
+    }
+
     fn materialize_covariate_dense_arc(
         &self,
     ) -> Result<Arc<Array2<f64>>, crate::terms::basis::BasisError> {
@@ -8160,6 +8227,76 @@ mod tests {
         let got_second_indices: Vec<usize> = second[0].iter().map(|(idx, _)| *idx).collect();
         assert_eq!(got_second_indices, vec![1]);
         assert_shape_penalty_component(&second[0][0].1, p_resp, &ds1_second);
+    }
+
+    #[test]
+    fn tensor_psi_row_chunks_match_dense_materialization() {
+        let response = array![-1.0, -0.2, 0.6, 1.3];
+        let (val_basis, deriv_basis, knots, transform, _) = toy_response_basis(&response);
+        let psi = array![0.15, -0.10];
+        let (cov_design, cov_derivs) = toy_covariate_design_and_derivs(&psi);
+        let weights = Array1::from_elem(response.len(), 1.0);
+        let offset = Array1::zeros(response.len());
+        let family = TransformationNormalFamily::from_prebuilt_response_basis(
+            &response,
+            val_basis,
+            deriv_basis,
+            vec![],
+            knots,
+            toy_scop_ctn_config().response_degree,
+            transform,
+            &weights,
+            &offset,
+            DesignMatrix::Dense(DenseDesignMatrix::from(cov_design)),
+            vec![],
+            &toy_scop_ctn_config(),
+            None,
+        )
+        .expect("toy transformation family");
+
+        let tensor_derivs =
+            build_tensor_psi_derivatives(&family, &cov_derivs).expect("tensor derivatives");
+        let op = tensor_derivs[0]
+            .implicit_operator
+            .as_ref()
+            .expect("tensor psi operator should be implicit");
+        let mat_op = op
+            .as_materializable()
+            .expect("toy tensor psi operator should remain materializable for reference");
+        let rows = 1..3;
+
+        let first_dense = mat_op
+            .materialize_first(0)
+            .expect("dense first derivative reference");
+        let first_chunk = op
+            .row_chunk_first(0, rows.clone())
+            .expect("chunked first derivative");
+        assert_eq!(
+            first_chunk,
+            first_dense.slice(s![rows.clone(), ..]).to_owned()
+        );
+
+        let second_diag_dense = mat_op
+            .materialize_second_diag(0)
+            .expect("dense second diagonal reference");
+        let second_diag_chunk = op
+            .row_chunk_second_diag(0, rows.clone())
+            .expect("chunked second diagonal derivative");
+        assert_eq!(
+            second_diag_chunk,
+            second_diag_dense.slice(s![rows.clone(), ..]).to_owned()
+        );
+
+        let second_cross_dense = mat_op
+            .materialize_second_cross(0, 1)
+            .expect("dense second cross reference");
+        let second_cross_chunk = op
+            .row_chunk_second_cross(0, 1, rows.clone())
+            .expect("chunked second cross derivative");
+        assert_eq!(
+            second_cross_chunk,
+            second_cross_dense.slice(s![rows, ..]).to_owned()
+        );
     }
 
     fn assert_shape_penalty_component(
@@ -10098,8 +10235,8 @@ impl CustomFamilyPsiDerivativeOperator for TensorKroneckerPsiOperator {
         axis: usize,
         rows: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        let mat = MaterializablePsiDerivativeOperator::materialize_first(self, axis)?;
-        Ok(mat.slice(ndarray::s![rows, ..]).to_owned())
+        let cov = self.cov_first_axis_row_chunk(axis, rows.clone())?;
+        self.lifted_row_chunk_from_cov(rows, &cov)
     }
 
     fn row_chunk_second_diag(
@@ -10107,8 +10244,8 @@ impl CustomFamilyPsiDerivativeOperator for TensorKroneckerPsiOperator {
         axis: usize,
         rows: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        let mat = MaterializablePsiDerivativeOperator::materialize_second_diag(self, axis)?;
-        Ok(mat.slice(ndarray::s![rows, ..]).to_owned())
+        let cov = self.cov_second_axis_row_chunk(axis, axis, rows.clone())?;
+        self.lifted_row_chunk_from_cov(rows, &cov)
     }
 
     fn row_chunk_second_cross(
@@ -10117,9 +10254,8 @@ impl CustomFamilyPsiDerivativeOperator for TensorKroneckerPsiOperator {
         axis_e: usize,
         rows: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        let mat =
-            MaterializablePsiDerivativeOperator::materialize_second_cross(self, axis_d, axis_e)?;
-        Ok(mat.slice(ndarray::s![rows, ..]).to_owned())
+        let cov = self.cov_second_axis_row_chunk(axis_d, axis_e, rows.clone())?;
+        self.lifted_row_chunk_from_cov(rows, &cov)
     }
 
     fn as_materializable(&self) -> Option<&dyn MaterializablePsiDerivativeOperator> {

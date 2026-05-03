@@ -12012,7 +12012,7 @@ fn matern_operator_psi_triplet(
     // 1/15, and 1/105.
     //
     // Then psi-derivatives are obtained exactly through
-    // exp_poly_scaled_s2_psi_triplet, avoiding finite differences.
+    // exp_poly_scaled_s2_psi_triplet.
     let (phi, phi_psi, phi_psi_psi) = maternvalue_psi_triplet(r, length_scale, nu)?;
     let kappa = 1.0 / length_scale;
     let d = dimension as f64;
@@ -15942,7 +15942,8 @@ fn build_thin_plate_penalty_psi_derivativeswithworkspace(
     // where Ω_ij(ψ) = φ(r_ij(ψ)), r_ij(ψ) = ||c_i - c_j|| · exp(ψ).
     //
     // We need d/dψ S_final and d²/dψ² S_final, applied in the same composition
-    // order as the build path so the analytic derivative matches FD of S_final.
+    // order as the build path so the analytic derivative is of the exact
+    // materialized penalty surface.
     let z_kernel = thin_plate_kernel_constraint_nullspace(centers, &mut workspace.cache)?;
     let kernel_cols = z_kernel.ncols();
     let poly_cols = thin_plate_polynomial_basis_dimension(centers.ncols());
@@ -27059,10 +27060,9 @@ mod tests {
     //
     // These tests target the `2 q G_{LR}` overlap term in
     // `ImplicitDesignPsiDerivative::transformed_second_kernel_value`. A bug
-    // in that term (e.g. missing the overlap contribution) would be silently
-    // masked by finite-difference probes because the radial kernel still
-    // produces smooth output — the overlap only shows up as an additive
-    // correction in the exact analytic second derivative.
+    // in that term (e.g. missing the overlap contribution) can hide behind a
+    // smooth radial kernel; the overlap only shows up as an additive correction
+    // in the exact analytic second derivative.
     //
     // The full formula for linear combinations
     //   L = Σ_a l_a ∂/∂ψ_a,   R = Σ_a r_a ∂/∂ψ_a

@@ -286,9 +286,9 @@ const LOGIT_MAX_TERMS: usize = 160;
 /// the caller routes to GHQ.
 ///
 /// Set to 1e-11 so that the erfcx branch only commits to a value when it
-/// can honor the sharp tolerances used by downstream consumers (oracle-
-/// match, finite-difference derivative, jet-match tests all pin to
-/// `max_relative = 1e-10`). At 1e-11 the series rejects in the central
+/// can honor the sharp tolerances used by downstream consumers. Oracle and
+/// jet-match tests pin to `max_relative = 1e-10`; at 1e-11 the series rejects
+/// in the central
 /// band near (μ=1.1, σ=0.8) where the tail bound reaches ~2.6e-5 at
 /// N=160, correctly deferring to GHQ which is accurate to ~1e-13 in that
 /// regime after the QR eigenvector fix.
@@ -2446,15 +2446,10 @@ pub fn integrated_inverse_link_jet(
         }
         LinkFunction::Probit => Ok(integrated_probit_jet(mu, sigma)),
         LinkFunction::Logit => {
-            // The scalar-backend FD path was locked out by roundoff at
-            // (μ, σ) ≈ (1.1, 0.8) where the outer 1e-10 accuracy contract
-            // bites against (1.8e-4)^2 finite-difference noise on the
-            // second derivative (~2–3 × 1e-11). Since the scalar backend is
-            // already GHQ in that regime (erfcx rejects), we close the loop
-            // by integrating the full pointwise jet directly — the same
+            // Integrate the full pointwise jet directly: the same
             // Gauss-Hermite nodes evaluate component_point_jet, so mean/d1
             // retain their scalar-backend values to rounding and d2/d3 are
-            // recovered without differencing noise.
+            // recovered analytically from the node-level jet.
             let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(quadctx, mu, sigma, |x| {
                 component_point_jet(LinkComponent::Logit, x)
             });
@@ -2506,10 +2501,9 @@ pub fn integrated_logit_inverse_link_jet_pirls(
     sigma: f64,
 ) -> Result<IntegratedInverseLinkJet, EstimationError> {
     // Direct jet integration via Gauss-Hermite: the same nodes deliver the
-    // full pointwise jet (mu, d1, d2, d3) so PIRLS receives higher
-    // derivatives without 4th-order finite-difference noise. Kept in sync
-    // with the Logit arm of `integrated_inverse_link_jet` so the PIRLS and
-    // general paths return identical values and modes.
+    // full pointwise jet (mu, d1, d2, d3). Kept in sync with the Logit arm of
+    // `integrated_inverse_link_jet` so the PIRLS and general paths return
+    // identical values and modes.
     if sigma <= 1e-10 {
         let (mean, d1, d2, d3) = component_point_jet(LinkComponent::Logit, mu);
         return Ok(IntegratedInverseLinkJet {
