@@ -990,7 +990,7 @@ impl<'a> RemlState<'a> {
 
                 super::unified::HyperCoordPair {
                     a: a_ij + a_firth,
-                    g: &g_firth - &g_ij,
+                    g: &g_ij - &g_firth,
                     b_mat: Array2::<f64>::zeros((0, 0)),
                     b_operator: Some(b_operator),
                     ld_s: ld_s_ij,
@@ -1031,7 +1031,7 @@ impl<'a> RemlState<'a> {
                         .map(|a_kt| beta_eval.dot(&a_kt.dot(beta_eval.as_ref())))
                         .unwrap_or(0.0);
                 let g_kj = a_k_tau_j
-                    .map(|a_kt| a_kt.dot(beta_eval.as_ref()))
+                    .map(|a_kt| -(a_kt.dot(beta_eval.as_ref())))
                     .unwrap_or_else(|| Array1::<f64>::zeros(p_dim));
                 let b_kj = a_k_tau_j
                     .cloned()

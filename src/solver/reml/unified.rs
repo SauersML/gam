@@ -1240,14 +1240,6 @@ impl HyperCoordPair {
     }
 }
 
-fn canonical_ext_stationarity_rhs(coord: &HyperCoord) -> Array1<f64> {
-    if coord.tk_eta_fixed.is_some() {
-        -&coord.g
-    } else {
-        coord.g.clone()
-    }
-}
-
 /// Callback for computing M_i[u] = D_β B_i[u], the directional derivative
 /// of the fixed-β Hessian drift along direction u.
 ///
@@ -4559,8 +4551,7 @@ pub fn reml_laml_evaluate(
         // ext-coordinates: H_i = B_i + D_beta H[-v_i].
         for coord in solution.ext_coords.iter() {
             let correction = if effective_deriv.has_corrections() {
-                let g_i = canonical_ext_stationarity_rhs(coord);
-                let v_i = hop.solve(&g_i);
+                let v_i = hop.solve(&coord.g);
                 effective_deriv.hessian_derivative_correction_result(&v_i)?
             } else {
                 None
@@ -4686,8 +4677,7 @@ pub fn reml_laml_evaluate(
         let grad_idx = k + ext_idx;
 
         // Mode response magnitude: v_i = H⁻¹(g_i), with β_i = −v_i.
-        let g_i = canonical_ext_stationarity_rhs(coord);
-        let v_i = hop.solve(&g_i);
+        let v_i = hop.solve(&coord.g);
 
         // Trace term: tr(K · Ḣ_i) where Ḣ_i = B_i + D_β H[−v_i].
         //
@@ -5427,8 +5417,7 @@ fn compute_outer_hessian(
     let mut ext_h_drifts: Vec<DriftDerivResult> = Vec::with_capacity(ext_dim);
 
     for coord in solution.ext_coords.iter() {
-        let g_i = canonical_ext_stationarity_rhs(coord);
-        let v_i = hop.solve(&g_i);
+        let v_i = hop.solve(&coord.g);
 
         let correction = if effective_deriv.has_corrections() {
             effective_deriv.hessian_derivative_correction_result(&v_i)?
@@ -6345,28 +6334,9 @@ impl UnifiedOuterHessianOperator {
             .map(|pair_g| pair_g.dot(&test))
             .unwrap_or(0.0);
 
-        match (row_coord.is_ext(), col_coord.is_ext()) {
-            (false, false) => {
-                col_coord.total_drift.apply_dot(row_coord.v.view(), test)
-                    + row_coord.base_drift.apply_dot(col_coord.v.view(), test)
-                    - pair_g_dot
-            }
-            (false, true) => {
-                pair_g_dot
-                    - row_coord.base_drift.apply_dot(col_coord.v.view(), test)
-                    - col_coord.total_drift.apply_dot(row_coord.v.view(), test)
-            }
-            (true, false) => {
-                pair_g_dot
-                    - col_coord.base_drift.apply_dot(row_coord.v.view(), test)
-                    - row_coord.total_drift.apply_dot(col_coord.v.view(), test)
-            }
-            (true, true) => {
-                pair_g_dot
-                    - row_coord.base_drift.apply_dot(col_coord.v.view(), test)
-                    - col_coord.total_drift.apply_dot(row_coord.v.view(), test)
-            }
-        }
+        col_coord.total_drift.apply_dot(row_coord.v.view(), test)
+            + row_coord.base_drift.apply_dot(col_coord.v.view(), test)
+            - pair_g_dot
     }
 
     fn scaled_add_pair_rhs(&self, row: usize, col: usize, scale: f64, out: &mut Array1<f64>) {
@@ -6375,52 +6345,14 @@ impl UnifiedOuterHessianOperator {
         }
         let row_coord = &self.coords[row];
         let col_coord = &self.coords[col];
-        let pair_g = self.pair_g[row][col].as_ref();
-        match (row_coord.is_ext(), col_coord.is_ext()) {
-            (false, false) => {
-                col_coord
-                    .total_drift
-                    .scaled_add_apply(row_coord.v.view(), scale, out);
-                row_coord
-                    .base_drift
-                    .scaled_add_apply(col_coord.v.view(), scale, out);
-                if let Some(pair_g) = pair_g {
-                    out.scaled_add(-scale, pair_g);
-                }
-            }
-            (false, true) => {
-                if let Some(pair_g) = pair_g {
-                    out.scaled_add(scale, pair_g);
-                }
-                row_coord
-                    .base_drift
-                    .scaled_add_apply(col_coord.v.view(), -scale, out);
-                col_coord
-                    .total_drift
-                    .scaled_add_apply(row_coord.v.view(), -scale, out);
-            }
-            (true, false) => {
-                if let Some(pair_g) = pair_g {
-                    out.scaled_add(scale, pair_g);
-                }
-                col_coord
-                    .base_drift
-                    .scaled_add_apply(row_coord.v.view(), -scale, out);
-                row_coord
-                    .total_drift
-                    .scaled_add_apply(col_coord.v.view(), -scale, out);
-            }
-            (true, true) => {
-                if let Some(pair_g) = pair_g {
-                    out.scaled_add(scale, pair_g);
-                }
-                row_coord
-                    .base_drift
-                    .scaled_add_apply(col_coord.v.view(), -scale, out);
-                col_coord
-                    .total_drift
-                    .scaled_add_apply(row_coord.v.view(), -scale, out);
-            }
+        col_coord
+            .total_drift
+            .scaled_add_apply(row_coord.v.view(), scale, out);
+        row_coord
+            .base_drift
+            .scaled_add_apply(col_coord.v.view(), scale, out);
+        if let Some(pair_g) = self.pair_g[row][col].as_ref() {
+            out.scaled_add(-scale, pair_g);
         }
     }
 
@@ -6672,8 +6604,7 @@ fn build_outer_hessian_operator(
     }
 
     for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
-        let g_i = canonical_ext_stationarity_rhs(coord);
-        let v_i = hop.solve(&g_i);
+        let v_i = hop.solve(&coord.g);
         let correction = effective_deriv.hessian_derivative_correction_result(&v_i)?;
         let (total_dense, total_operators) =
             hyper_coord_total_drift_parts(&coord.drift, correction.as_ref());
@@ -6684,7 +6615,7 @@ fn build_outer_hessian_operator(
         };
         coords.push(OuterHessianCoord {
             a: coord.a,
-            g: g_i,
+            g: coord.g.clone(),
             v: v_i,
             total_drift: StoredFirstDrift::from_parts(total_dense, dense_rotated, total_operators),
             base_drift: StoredFirstDrift::from_parts(base_dense, None, base_operators),
