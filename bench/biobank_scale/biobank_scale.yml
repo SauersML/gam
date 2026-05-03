@@ -49,15 +49,6 @@
       "include_sigma": true
     },
     {
-      "name": "r_mgcv_jointpc_thinplate60",
-      "dataset": "disease",
-      "backend": "r_mgcv",
-      "family": "binomial",
-      "spatial_basis": "thinplate",
-      "centers": 60,
-      "include_sigma": false
-    },
-    {
       "name": "r_mgcv_jointpc_duchon60",
       "dataset": "disease",
       "backend": "r_mgcv",
