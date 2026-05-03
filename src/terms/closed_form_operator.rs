@@ -227,10 +227,10 @@ impl ClosedFormPenaltyOperator {
         out.assign(&final_output);
     }
 
-    /// Diagonal `S[i,i]` for i in 0..dim. With constraint composition the
+    /// Diagonal `S[i,i]` for i in 0..dim. In the raw layout this is the
+    /// analytic self-pair repeated K times. With constraint composition the
     /// diagonal is *not* the K-space diagonal; we extract it via
-    /// `e_i^T S' e_i = matvec(e_i)[i]`. That is `O(dim)` matvecs and is meant
-    /// for diagnostics (e.g., Jacobi preconditioning), not hot paths.
+    /// `e_i^T S' e_i = matvec(e_i)[i]`.
     pub fn diag(&self) -> Array1<f64> {
         let n = self.dim();
         if self.is_raw_layout() {
@@ -248,8 +248,8 @@ impl ClosedFormPenaltyOperator {
         out
     }
 
-    /// Trace `tr(S')`. Same `O(dim)` matvecs as `diag`; stored separately so
-    /// callers that only need the trace don't allocate the full diagonal.
+    /// Trace `tr(S')`. In raw layout this is K times the analytic self-pair;
+    /// otherwise it uses the composed-basis diagonal.
     pub fn trace(&self) -> f64 {
         if self.is_raw_layout() {
             return self.raw_diagonal_value() * self.dim() as f64;
