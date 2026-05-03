@@ -1384,7 +1384,11 @@ impl Default for BSplineIdentifiability {
     }
 }
 
-/// Thin-plate center selection strategy.
+/// Spatial center selection strategy.
+///
+/// `num_centers` is the exact number of knot/center rows selected by the
+/// strategy. Polynomial nullspace columns are added separately by each basis
+/// builder and must never be folded into this count.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CenterStrategy {
     Auto(Box<CenterStrategy>),
@@ -20791,6 +20795,36 @@ mod tests {
     }
 
     #[test]
+    fn test_thin_plate_num_centers_is_exact_center_count() {
+        let data = array![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.5, 0.5],
+            [0.25, 0.75],
+            [0.75, 0.25],
+            [0.5, 0.0]
+        ];
+        let spec = ThinPlateBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+            length_scale: 1.0,
+            double_penalty: false,
+            identifiability: SpatialIdentifiability::None,
+            radial_reparam: None,
+        };
+
+        let result = build_thin_plate_basis(data.view(), &spec).unwrap();
+        match &result.metadata {
+            BasisMetadata::ThinPlate { centers, .. } => {
+                assert_eq!(centers.nrows(), 4);
+                assert_eq!(centers.ncols(), data.ncols());
+            }
+            other => panic!("expected thin-plate metadata, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_build_thin_plate_basis_switches_to_lazy_design_for_large_blocks() {
         let n = 17_000usize;
         let k = 2_000usize;
@@ -27749,8 +27783,8 @@ mod tests {
         // Same even-dimensional log-Riesz cancellation basin as the value
         // Taylor test, but through the production derivative bundle. This
         // pins the important wiring: value, η, κ, ηκ, and κκ must all use
-        // the same finite-part radial derivative table rather than mixing a
-        // stable value path with cancelled partial-fraction derivatives.
+        // one analytic positive-κ representation rather than mixing a stable
+        // value path with cancelled partial-fraction derivatives.
         let q = 1usize;
         let m = 1usize;
         let s = 2usize;

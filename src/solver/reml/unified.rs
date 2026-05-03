@@ -6875,12 +6875,9 @@ fn build_outer_hessian_operator(
             let mut ct = Array2::<f64>::zeros((total, total));
             for ((ii, jj), value) in pair_values {
                 if !value.is_finite() {
-                    log::warn!(
-                        "[OPERATOR cross_trace non-finite] cross_trace[{}, {}] = {}",
-                        ii,
-                        jj,
-                        value,
-                    );
+                    return Err(format!(
+                        "outer Hessian operator cross_trace[{ii}, {jj}] is non-finite ({value})"
+                    ));
                 }
                 ct[[ii, jj]] = value;
                 if ii != jj {

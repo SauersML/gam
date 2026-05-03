@@ -1896,6 +1896,22 @@ fn geometric_mean_scale(scales: &[f64]) -> f64 {
     log_mean.exp()
 }
 
+fn compensate_length_scale_for_standardization(length_scale: f64, scales: &[f64]) -> f64 {
+    let sigma_geom = geometric_mean_scale(scales);
+    if sigma_geom > 0.0 && sigma_geom.is_finite() {
+        length_scale / sigma_geom
+    } else {
+        length_scale
+    }
+}
+
+fn compensate_optional_length_scale_for_standardization(
+    length_scale: Option<f64>,
+    scales: &[f64],
+) -> Option<f64> {
+    length_scale.map(|l| compensate_length_scale_for_standardization(l, scales))
+}
+
 fn select_columns(data: ArrayView2<'_, f64>, cols: &[usize]) -> Result<Array2<f64>, BasisError> {
     let n = data.nrows();
     let p = data.ncols();
@@ -3278,21 +3294,13 @@ pub fn build_smooth_design_withworkspace(
                 // matches the original-coord kernel for uniform σ.
                 let (scales, length_scale_eff) = if let Some(s) = input_scales {
                     apply_input_standardization(&mut x, s);
-                    let sigma_geom = geometric_mean_scale(s);
-                    let l_eff = if sigma_geom > 0.0 && sigma_geom.is_finite() {
-                        spec.length_scale / sigma_geom
-                    } else {
-                        spec.length_scale
-                    };
-                    (Some(s.clone()), l_eff)
+                    (
+                        Some(s.clone()),
+                        compensate_length_scale_for_standardization(spec.length_scale, s),
+                    )
                 } else if let Some(s) = compute_spatial_input_scales(x.view()) {
-                    let sigma_geom = geometric_mean_scale(&s);
                     apply_input_standardization(&mut x, &s);
-                    let l_eff = if sigma_geom > 0.0 && sigma_geom.is_finite() {
-                        spec.length_scale / sigma_geom
-                    } else {
-                        spec.length_scale
-                    };
+                    let l_eff = compensate_length_scale_for_standardization(spec.length_scale, &s);
                     (Some(s), l_eff)
                 } else {
                     (None, spec.length_scale)
@@ -3356,21 +3364,13 @@ pub fn build_smooth_design_withworkspace(
                 // replayable at predict time.
                 let (scales, length_scale_eff) = if let Some(s) = input_scales {
                     apply_input_standardization(&mut x, s);
-                    let sigma_geom = geometric_mean_scale(s);
-                    let l_eff = if sigma_geom > 0.0 && sigma_geom.is_finite() {
-                        spec.length_scale / sigma_geom
-                    } else {
-                        spec.length_scale
-                    };
-                    (Some(s.clone()), l_eff)
+                    (
+                        Some(s.clone()),
+                        compensate_length_scale_for_standardization(spec.length_scale, s),
+                    )
                 } else if let Some(s) = compute_spatial_input_scales(x.view()) {
-                    let sigma_geom = geometric_mean_scale(&s);
                     apply_input_standardization(&mut x, &s);
-                    let l_eff = if sigma_geom > 0.0 && sigma_geom.is_finite() {
-                        spec.length_scale / sigma_geom
-                    } else {
-                        spec.length_scale
-                    };
+                    let l_eff = compensate_length_scale_for_standardization(spec.length_scale, &s);
                     (Some(s), l_eff)
                 } else {
                     (None, spec.length_scale)
@@ -3418,31 +3418,14 @@ pub fn build_smooth_design_withworkspace(
                 // compensation.
                 let (scales, length_scale_eff) = if let Some(s) = input_scales {
                     apply_input_standardization(&mut x, s);
-                    let l_eff = match spec.length_scale {
-                        Some(l_user) => {
-                            let sigma_geom = geometric_mean_scale(s);
-                            if sigma_geom > 0.0 && sigma_geom.is_finite() {
-                                Some(l_user / sigma_geom)
-                            } else {
-                                Some(l_user)
-                            }
-                        }
-                        None => None,
-                    };
-                    (Some(s.clone()), l_eff)
+                    (
+                        Some(s.clone()),
+                        compensate_optional_length_scale_for_standardization(spec.length_scale, s),
+                    )
                 } else if let Some(s) = compute_spatial_input_scales(x.view()) {
-                    let l_eff = match spec.length_scale {
-                        Some(l_user) => {
-                            let sigma_geom = geometric_mean_scale(&s);
-                            if sigma_geom > 0.0 && sigma_geom.is_finite() {
-                                Some(l_user / sigma_geom)
-                            } else {
-                                Some(l_user)
-                            }
-                        }
-                        None => None,
-                    };
                     apply_input_standardization(&mut x, &s);
+                    let l_eff =
+                        compensate_optional_length_scale_for_standardization(spec.length_scale, &s);
                     (Some(s), l_eff)
                 } else {
                     (None, spec.length_scale)
@@ -13522,6 +13505,25 @@ mod tests {
             .fold(0.0_f64, f64::max)
     }
 
+    fn assert_frozen_replay_matches_fit(
+        data: ArrayView2<'_, f64>,
+        spec: &TermCollectionSpec,
+        label: &str,
+    ) {
+        let fit_design = build_term_collection_design(data, spec).expect("fit-time design");
+        let frozen =
+            freeze_term_collection_from_design(spec, &fit_design).expect("freeze term collection");
+        let replay_design = build_term_collection_design(data, &frozen).expect("replay design");
+        let max_abs = max_abs_diff_matrix(
+            &fit_design.design.to_dense(),
+            &replay_design.design.to_dense(),
+        );
+        assert!(
+            max_abs <= 1e-10,
+            "{label} frozen replay changed realized design: max_abs={max_abs}"
+        );
+    }
+
     fn dense_kronecker_pseudo_logdet_reference(
         marginal_penalties: &[Array2<f64>],
         lambdas: &[f64],
@@ -14815,6 +14817,84 @@ mod tests {
             max_abs <= 1e-12,
             "frozen transform rebuild mismatch max_abs={max_abs}"
         );
+    }
+
+    #[test]
+    fn frozen_spatial_replay_preserves_standardized_length_scale_compensation() {
+        let n = 16usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = 0.07 * i as f64 + 0.02 * (3.0 * t).sin();
+            data[[i, 1]] = 4.0 * t + 0.35 * (5.0 * t).cos();
+        }
+
+        let tps_spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "tps_xy".to_string(),
+                basis: SmoothBasisSpec::ThinPlate {
+                    feature_cols: vec![0, 1],
+                    spec: ThinPlateBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
+                        length_scale: 1.3,
+                        double_penalty: true,
+                        identifiability: SpatialIdentifiability::OrthogonalToParametric,
+                        radial_reparam: None,
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        assert_frozen_replay_matches_fit(data.view(), &tps_spec, "thin-plate");
+
+        let matern_spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "matern_xy".to_string(),
+                basis: SmoothBasisSpec::Matern {
+                    feature_cols: vec![0, 1],
+                    spec: MaternBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
+                        length_scale: 1.1,
+                        nu: MaternNu::FiveHalves,
+                        include_intercept: false,
+                        double_penalty: true,
+                        identifiability: MaternIdentifiability::CenterSumToZero,
+                        aniso_log_scales: None,
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        assert_frozen_replay_matches_fit(data.view(), &matern_spec, "matern");
+
+        let duchon_spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "duchon_xy".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0, 1],
+                    spec: DuchonBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
+                        length_scale: Some(1.4),
+                        power: 5,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        identifiability: SpatialIdentifiability::OrthogonalToParametric,
+                        aniso_log_scales: None,
+                        operator_penalties: DuchonOperatorPenaltySpec::default(),
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        assert_frozen_replay_matches_fit(data.view(), &duchon_spec, "duchon");
     }
 
     #[test]
