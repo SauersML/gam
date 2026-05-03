@@ -1,3 +1,6 @@
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+use rand_distr::{Distribution, Normal};
 use statrs::distribution::{ContinuousCDF, FisherSnedecor};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -12,70 +15,88 @@ const DUCHON_POWER: usize = 8;
 const DUCHON_LENGTH: f64 = 1.0;
 const SIGNIFICANCE_ALPHA: f64 = 0.05;
 
-fn write_demo_fixture_with_python(csv_path: &Path, pop_path: &Path) {
-    let script = format!(
-        r#"
-import csv
-import sys
-from pathlib import Path
+/// Writes the demo fixture CSV (response + 5 standardized PCs) and computes
+/// the population labels used to group post-CTN z-scores. Native Rust:
+/// the test must not depend on external Python interpreters or libraries
+/// being installed in the cargo-test job.
+fn write_demo_fixture(csv_path: &Path) -> Vec<usize> {
+    let mut rng = StdRng::seed_from_u64(SEED);
+    let normal = Normal::new(0.0, 1.0).expect("standard normal must be valid");
 
-import numpy as np
-from sklearn.cluster import KMeans
+    // Draw the (N x PC_DIM) PC matrix in row-major order so that the first
+    // PC for row 0 is the first variate consumed from the deterministic
+    // RNG stream.  This keeps the generated dataset reproducible across
+    // platforms regardless of how ndarray lays out columns.
+    let mut pcs = vec![[0.0f64; PC_DIM]; N];
+    for row in pcs.iter_mut() {
+        for slot in row.iter_mut() {
+            *slot = normal.sample(&mut rng);
+        }
+    }
 
-N = {N}
-SEED = {SEED}
-N_POPS = {N_POPS}
-PC_DIM = {PC_DIM}
+    // Mirror the original numpy-defined ground truth: a smooth function of
+    // PC1 (linear + centered quadratic) plus a smooth function of PC3
+    // (linear + bounded tanh nonlinearity), then add Gaussian noise.
+    let pgs_raw: Vec<f64> = pcs
+        .iter()
+        .map(|row| {
+            let pc1 = row[0];
+            let pc3 = row[2];
+            let shift = 1.4 * pc1 + 0.6 * (pc1 * pc1 - 1.0) + 1.0 * pc3 + 0.4 * pc3.tanh();
+            shift + 0.6 * normal.sample(&mut rng)
+        })
+        .collect();
 
-csv_path = Path(sys.argv[1])
-pop_path = Path(sys.argv[2])
+    let mut writer = csv::Writer::from_path(csv_path).expect("open fixture csv for write");
+    let mut header = vec!["pgs_raw".to_string()];
+    for i in 0..PC_DIM {
+        header.push(format!("pc{}_std", i + 1));
+    }
+    writer.write_record(&header).expect("write fixture header");
+    let mut record = Vec::with_capacity(PC_DIM + 1);
+    for (i, row) in pcs.iter().enumerate() {
+        record.clear();
+        record.push(format!("{:.6}", pgs_raw[i]));
+        for &v in row.iter() {
+            record.push(format!("{v:.6}"));
+        }
+        writer.write_record(&record).expect("write fixture row");
+    }
+    writer.flush().expect("flush fixture csv");
 
-rng = np.random.default_rng(SEED)
-pcs = rng.standard_normal((N, PC_DIM))
-shift = (
-    1.4 * pcs[:, 0]
-    + 0.6 * (pcs[:, 0] ** 2 - 1.0)
-    + 1.0 * pcs[:, 2]
-    + 0.4 * np.tanh(pcs[:, 2])
-)
-pgs_raw = shift + 0.6 * rng.standard_normal(N)
-
-coords = pcs[:, [0, 2]]
-km = KMeans(n_clusters=N_POPS, n_init=10, random_state=SEED).fit(coords)
-order = np.argsort(km.cluster_centers_[:, 0] + km.cluster_centers_[:, 1])
-relabel = np.empty(N_POPS, dtype=int)
-relabel[order] = np.arange(N_POPS)
-pop = relabel[km.labels_]
-
-with csv_path.open("w", newline="") as fh:
-    writer = csv.writer(fh)
-    writer.writerow(["pgs_raw"] + ["pc%d_std" % (i + 1) for i in range(PC_DIM)])
-    for i in range(N):
-        writer.writerow(["%.6f" % pgs_raw[i]] + ["%.6f" % pcs[i, j] for j in range(PC_DIM)])
-
-with pop_path.open("w", newline="") as fh:
-    writer = csv.writer(fh)
-    writer.writerow(["pop"])
-    for value in pop:
-        writer.writerow([int(value)])
-"#
-    );
-    let mut command = Command::new("python3");
-    command.arg("-c").arg(script).arg(csv_path).arg(pop_path);
-    run_command(command, "generate aniso demo fixture");
+    assign_populations(&pcs)
 }
 
-fn read_populations(path: &Path) -> Vec<usize> {
-    let mut reader = csv::Reader::from_path(path).expect("open population csv");
-    reader
-        .records()
-        .map(|record| {
-            let record = record.expect("read population record");
-            record[0]
-                .parse::<usize>()
-                .expect("population label must be usize")
-        })
-        .collect()
+/// Partitions the synthetic individuals into `N_POPS` deterministic
+/// populations whose centers vary along the (PC1, PC3) plane that drives the
+/// ground-truth response.  We use ordered quantile bins of the score
+/// `pc1 + pc3` rather than k-means so the assignment is reproducible without
+/// pulling in a clustering library, while still producing five non-empty,
+/// monotonically-ordered groups whose covariate distributions overlap the
+/// CTN-relevant geometry.  The test only relies on the labels to group the
+/// post-CTN z-scores; CTN itself never sees them.
+fn assign_populations(pcs: &[[f64; PC_DIM]]) -> Vec<usize> {
+    let n = pcs.len();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        let sa = pcs[a][0] + pcs[a][2];
+        let sb = pcs[b][0] + pcs[b][2];
+        sa.partial_cmp(&sb).expect("PC scores must be finite")
+    });
+
+    let mut pop = vec![0usize; n];
+    let chunk = n / N_POPS;
+    let remainder = n % N_POPS;
+    let mut start = 0usize;
+    for k in 0..N_POPS {
+        let size = chunk + if k < remainder { 1 } else { 0 };
+        for &idx in &order[start..start + size] {
+            pop[idx] = k;
+        }
+        start += size;
+    }
+    debug_assert_eq!(start, n);
+    pop
 }
 
 fn formula() -> String {
@@ -286,9 +307,7 @@ fn assert_not_bit_identical(left_tag: &str, left: &[f64], right_tag: &str, right
 fn aniso_demo_population_z_scores_are_equalized_for_iso_and_aniso() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let csv_path = dir.path().join("data.csv");
-    let pop_path = dir.path().join("pop.csv");
-    write_demo_fixture_with_python(&csv_path, &pop_path);
-    let pop = read_populations(&pop_path);
+    let pop = write_demo_fixture(&csv_path);
 
     let z_iso = run_fit_predict(dir.path(), "iso", false, &csv_path);
     let z_aniso = run_fit_predict(dir.path(), "aniso", true, &csv_path);
