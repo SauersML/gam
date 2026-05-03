@@ -21117,7 +21117,20 @@ mod tests {
 
     #[test]
     fn test_build_thin_plate_basis_double_penalty_outputs_two_blocks() {
-        let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
+        // 2D TPS with `num_centers = 4` requests 4 radial functions, so the
+        // builder needs `4 + polynomial_dim(2) = 4 + 3 = 7` raw knots from the
+        // data. Use 8 well-separated points so the farthest-point selection
+        // has slack.
+        let data = array![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.5, 0.5],
+            [0.25, 0.75],
+            [0.75, 0.25],
+            [0.5, 0.0]
+        ];
         let spec = ThinPlateBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
             length_scale: 1.0,
