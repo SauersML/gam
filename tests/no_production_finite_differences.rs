@@ -4,11 +4,23 @@ use std::path::{Path, PathBuf};
 const BANNED_PRODUCTION_MARKERS: &[&str] = &[
     "finite difference",
     "finite-difference",
+    "finite_diff",
+    "finitediff",
     "central difference",
     "central fd",
+    "central_fd",
+    "central-diff",
+    "central_diff",
     "fd-vs",
+    "fd_",
+    "_fd",
+    "fd-",
+    "-fd",
+    "numdiff",
     "numerical gradient",
+    "numerical_gradient",
     "numeric gradient",
+    "numeric_gradient",
     "richardson",
 ];
 

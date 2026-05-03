@@ -9109,6 +9109,44 @@ mod tests {
             "normalized CTN psi objective mismatch: analytic={}, fd={fd}",
             analytic.objective_psi
         );
+
+        assert_eq!(analytic.hessian_psi.nrows(), 0);
+        assert_eq!(analytic.hessian_psi.ncols(), 0);
+        let op = analytic
+            .hessian_psi_operator
+            .as_ref()
+            .expect("CTN psi first-order Hessian must be operator-backed");
+        assert_eq!(op.dim(), beta.len());
+
+        let direction = toy_probe_vector(beta.len(), 407);
+        let h_beta = 1e-6;
+        let eval_score = |beta_eval: &Array1<f64>| {
+            let mut state_eval = state.clone();
+            state_eval.beta = beta_eval.clone();
+            family
+                .exact_newton_joint_psi_terms(
+                    std::slice::from_ref(&state_eval),
+                    &specs,
+                    &derivative_blocks,
+                    0,
+                )
+                .expect("first-order psi terms at shifted beta")
+                .expect("shifted first-order terms should be present")
+                .score_psi
+        };
+        let beta_plus = &beta + &(direction.clone() * h_beta);
+        let beta_minus = &beta - &(direction.clone() * h_beta);
+        let score_fd = (eval_score(&beta_plus) - eval_score(&beta_minus)) / (2.0 * h_beta);
+        let hvp = op.mul_vec(&direction);
+        for idx in 0..hvp.len() {
+            let tol = 2e-5 * score_fd[idx].abs().max(1.0);
+            assert!(
+                (hvp[idx] - score_fd[idx]).abs() <= tol,
+                "first-order psi Hessian operator mismatch at {idx}: analytic={:.6e}, fd={:.6e}",
+                hvp[idx],
+                score_fd[idx]
+            );
+        }
     }
 
     #[test]
