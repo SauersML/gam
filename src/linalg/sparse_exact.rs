@@ -1,7 +1,5 @@
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerArrayView, FaerColView};
-#[cfg(test)]
-use crate::faer_ndarray::{FaerCholesky, FaerEigh};
 use crate::solver::pirls::{PirlsWorkspace, sparse_reml_penalized_hessian};
 use faer::Side;
 use faer::linalg::solvers::Solve;
@@ -518,6 +516,7 @@ pub fn assemble_and_factor_sparse_penalized_system(
 fn build_sparse_penalty_blocks(
     s_list: &[Array2<f64>],
 ) -> Result<Option<Vec<SparsePenaltyBlock>>, EstimationError> {
+    use crate::faer_ndarray::FaerEigh;
     let mut ranges = Vec::with_capacity(s_list.len());
     for (term_index, s_k) in s_list.iter().enumerate() {
         let mut min_idx = usize::MAX;
@@ -1259,6 +1258,7 @@ pub fn trace_hinv_sk_takahashi(taka: &TakahashiInverse, penalty: &SparsePenaltyB
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::faer_ndarray::FaerCholesky;
     use ndarray::array;
 
     fn approx_eq(a: f64, b: f64, tol: f64) {
