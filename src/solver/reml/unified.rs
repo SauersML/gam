@@ -6550,13 +6550,9 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
 
             let correction = if self.incl_logdet_h {
                 match &self.kernel {
-                    OuterHessianDerivativeKernel::ScalarGlm { .. } => self
-                        .scalar_correction_trace(
-                            idx,
-                            alpha,
-                            &coord.v,
-                            &correction_m_alpha,
-                        )?,
+                    OuterHessianDerivativeKernel::ScalarGlm { .. } => {
+                        self.scalar_correction_trace(idx, alpha, &coord.v, &correction_m_alpha)?
+                    }
                     OuterHessianDerivativeKernel::Callback { .. } => {
                         let second_v = &self
                             .callback_second_modes
