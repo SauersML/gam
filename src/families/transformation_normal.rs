@@ -8064,6 +8064,7 @@ impl TensorKroneckerPsiOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::families::custom_family::custom_family_outer_derivatives;
     use crate::testing::assert_matrix_derivativefd;
     use ndarray::array;
 
