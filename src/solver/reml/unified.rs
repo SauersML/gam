@@ -5538,11 +5538,11 @@ fn compute_outer_hessian(
             reduced.push(kernel.reduce(matrix));
         }
         for drift in &ext_h_drifts {
-            let matrix = match drift {
-                DriftDerivResult::Dense(matrix) => matrix.clone(),
-                DriftDerivResult::Operator(operator) => operator.to_dense(),
+            let reduced_drift = match drift {
+                DriftDerivResult::Dense(matrix) => kernel.reduce(matrix),
+                DriftDerivResult::Operator(operator) => kernel.reduce_operator(operator.as_ref()),
             };
-            reduced.push(kernel.reduce(&matrix));
+            reduced.push(reduced_drift);
         }
         reduced
     });
