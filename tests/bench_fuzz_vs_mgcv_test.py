@@ -127,6 +127,12 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
         self.assertEqual(sc.basis_type, "duchon")
         self.assertFalse(sc.double_penalty)
 
+    def test_mgcv_select_penalty_matches_rust_spatial_nullspace_semantics(self) -> None:
+        self.assertTrue(_FUZZ._mgcv_select_penalty(_scenario(basis_type="tps", double_penalty=False)))
+        self.assertFalse(_FUZZ._mgcv_select_penalty(_scenario(basis_type="duchon", double_penalty=True)))
+        self.assertFalse(_FUZZ._mgcv_select_penalty(_scenario(basis_type="ps", double_penalty=False)))
+        self.assertTrue(_FUZZ._mgcv_select_penalty(_scenario(basis_type="ps", double_penalty=True)))
+
     def test_duchon_extra_terms_raise_estimated_cost(self) -> None:
         # Build two synthetic Duchon scenarios at known sizes — one small
         # and cheap, one large and over-cap — instead of relying on the

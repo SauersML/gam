@@ -18402,9 +18402,9 @@ pub mod closed_form_penalty {
         pref * r.powf(nu) * kv
     }
 
-    const DUCHON_SMALL_CHI_TAYLOR_MAX: f64 = 0.125;
-    const DUCHON_TAYLOR_MAX_TERMS: usize = 96;
-    const DUCHON_TAYLOR_REL_TOL: f64 = 4.0e-16;
+    const DUCHON_SMALL_CHI_SERIES_MAX: f64 = 0.125;
+    const DUCHON_SMALL_CHI_SERIES_MAX_TERMS: usize = 96;
+    const DUCHON_SMALL_CHI_SERIES_REL_TOL: f64 = 4.0e-16;
 
     #[inline]
     fn use_duchon_small_chi_riesz_series(kappa: f64, r: f64) -> bool {
@@ -18412,7 +18412,7 @@ pub mod closed_form_penalty {
             && kappa.is_finite()
             && r > 0.0
             && r.is_finite()
-            && (kappa * r).abs() <= DUCHON_SMALL_CHI_TAYLOR_MAX
+            && (kappa * r).abs() <= DUCHON_SMALL_CHI_SERIES_MAX
     }
 
     /// Small-χ Riesz-series chart for
@@ -18456,7 +18456,7 @@ pub mod closed_form_penalty {
 
         let mut prev_term_norm = f64::INFINITY;
         let mut saw_nonzero_term = false;
-        for n in 0..DUCHON_TAYLOR_MAX_TERMS {
+        for n in 0..DUCHON_SMALL_CHI_SERIES_MAX_TERMS {
             let kappa_factor = match kappa_derivative_order {
                 0 => 1.0,
                 1 => {
@@ -18511,7 +18511,7 @@ pub mod closed_form_penalty {
                 .iter()
                 .map(|acc| acc.sum().abs())
                 .fold(0.0_f64, f64::max);
-            if n >= 4 && term_norm <= DUCHON_TAYLOR_REL_TOL * total_norm.max(1.0) {
+            if n >= 4 && term_norm <= DUCHON_SMALL_CHI_SERIES_REL_TOL * total_norm.max(1.0) {
                 break;
             }
 
@@ -18534,10 +18534,20 @@ pub mod closed_form_penalty {
     /// Hybrid isotropic Duchon penalty
     /// g_q^iso(R; m, s, κ) = F^{-1}{1/(ρ^{2(2m-q)} (κ² + ρ²)^{2s})}(R).
     ///
+    /// This returns the canonical constrained Duchon representative: polynomial
+    /// nullspace components are quotiented out, and the small-κR chart evaluates
+    /// the matching finite-part Riesz series directly. The ordinary
+    /// partial-fraction Green's function and this representative differ by
+    /// nullspace terms in low-dimensional singular regimes, but the constrained
+    /// fit only sees this representative. Value, radial derivatives, and κ
+    /// partials all use the same chart switch, so production never mixes a
+    /// stable value formula with cancelled derivative formulas.
+    ///
     /// Edge cases:
     /// - s = 0: g_q^iso(R) = R_{2m-q}^d(R) (no Matérn factor).
     /// - κ = 0, s ≥ 1: g_q^iso(R) = R_{2m+2s-q}^d(R) (Riesz pure).
-    /// - General: partial-fraction decomposition with a = 2m - q, b = 2s.
+    /// - General: small-κR finite-part Riesz series or, outside that chart,
+    ///   partial-fraction decomposition with a = 2m - q, b = 2s.
     ///
     /// Requires a := 2m - q ≥ 1.
     pub fn isotropic_duchon_penalty(
@@ -19478,10 +19488,10 @@ pub mod closed_form_penalty {
         let (big_r, s1, s2, u1, u2) = aniso_invariants_with_powers(powers, r);
 
         // Request the same radial-derivative depth used by the derivative
-        // bundle for q > 0. Positive-κ evaluation stays on the full
-        // partial-fraction kernel for every derivative order; the
-        // finite-part representative is reserved for true κ=0/log-Riesz
-        // limits and self-pair diagonals.
+        // bundle for q > 0. The radial ladder itself chooses the stable chart:
+        // partial fractions away from cancellation and the constrained
+        // finite-part Riesz series when κR is small. That keeps q>0 values and
+        // η/κ derivatives on one analytic representative.
         let max_order = if q == 0 { 0 } else { (2 * q + 2).min(6) };
         let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order);
 
@@ -28131,6 +28141,137 @@ mod tests {
             "small positive-κ finite-part representative should converge to κ=0 Riesz: \
              κ={kappa_lo}, value={lo:.6e}, finite_part={finite_part:.6e}, err={lo_err:.6e}"
         );
+    }
+
+    #[test]
+    fn test_small_kappa_finite_part_chart_is_shared_by_value_radial_and_kappa_partials() {
+        use super::closed_form_penalty::{
+            isotropic_duchon_penalty, radial_derivatives_of_isotropic_duchon,
+            radial_derivatives_of_isotropic_duchon_kappa_partial,
+            radial_derivatives_of_isotropic_duchon_kappa_partial2,
+        };
+
+        fn finite_part_series(
+            d: usize,
+            a: usize,
+            b: usize,
+            kappa: f64,
+            r: f64,
+            max_order: usize,
+            kappa_derivative_order: usize,
+        ) -> Vec<f64> {
+            fn odd_dim_riesz_block_from_value(
+                d: usize,
+                j: usize,
+                r: f64,
+                max_order: usize,
+            ) -> Vec<f64> {
+                debug_assert_eq!(d % 2, 1);
+                let value = super::closed_form_penalty::riesz_kernel_value(d, j, r);
+                let p = 2 * j as i32 - d as i32;
+                let mut out = Vec::with_capacity(max_order + 1);
+                out.push(value);
+                let mut coef = value;
+                for order in 1..=max_order {
+                    coef *= (p - (order as i32 - 1)) as f64 / r;
+                    out.push(coef);
+                }
+                out
+            }
+
+            let mut out = vec![0.0_f64; max_order + 1];
+            let mut coeff = 1.0_f64;
+            let kappa_sq = kappa * kappa;
+            for n in 0..96 {
+                let kappa_factor = match kappa_derivative_order {
+                    0 => 1.0,
+                    1 => {
+                        if n == 0 {
+                            0.0
+                        } else {
+                            2.0 * n as f64 / kappa
+                        }
+                    }
+                    2 => {
+                        if n == 0 {
+                            0.0
+                        } else {
+                            let p = 2.0 * n as f64;
+                            p * (p - 1.0) / kappa_sq
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                if kappa_factor != 0.0 {
+                    let block = odd_dim_riesz_block_from_value(d, a + b + n, r, max_order);
+                    for (order, value) in block.into_iter().enumerate() {
+                        out[order] += coeff * kappa_factor * value;
+                    }
+                }
+                coeff *= -((b + n) as f64) * kappa_sq / ((n + 1) as f64);
+            }
+            out
+        }
+
+        // Same singular cell that exposed the κ→0 failure, but q=0 because
+        // `radial_derivatives_of_isotropic_duchon` is the base f(R) before
+        // anisotropic Laplacians apply q. The root invariant is that every
+        // production path uses this same constrained finite-part representative:
+        // value, radial R-derivatives, and κ-partials.
+        let d = 5usize;
+        let m = 1usize;
+        let s = 2usize;
+        let a = 2 * m;
+        let b = 2 * s;
+        let kappa = 0.01_f64;
+        let r = 1.3_f64;
+        let max_order = 4usize;
+
+        let expected = finite_part_series(d, a, b, kappa, r, max_order, 0);
+        let expected_dk = finite_part_series(d, a, b, kappa, r, max_order, 1);
+        let expected_dkk = finite_part_series(d, a, b, kappa, r, max_order, 2);
+
+        let value = isotropic_duchon_penalty(0, d, m, s, kappa, r);
+        let radial = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, r, max_order);
+        let dk = radial_derivatives_of_isotropic_duchon_kappa_partial(d, m, s, kappa, r, max_order);
+        let dkk =
+            radial_derivatives_of_isotropic_duchon_kappa_partial2(d, m, s, kappa, r, max_order);
+
+        let rel0 = (value - expected[0]).abs() / expected[0].abs().max(1e-300);
+        assert!(
+            rel0 < 1e-12,
+            "small-κ value path is not the finite-part chart: got={value:.12e} expected={:.12e} rel={rel0:.3e}",
+            expected[0]
+        );
+
+        for order in 0..=max_order {
+            let denom = expected[order].abs().max(radial[order].abs()).max(1e-300);
+            let rel = (radial[order] - expected[order]).abs() / denom;
+            assert!(
+                rel < 1e-12,
+                "small-κ radial derivative order {order} mixed charts: got={:.12e} expected={:.12e} rel={rel:.3e}",
+                radial[order],
+                expected[order]
+            );
+
+            let denom = expected_dk[order].abs().max(dk[order].abs()).max(1e-300);
+            let rel = (dk[order] - expected_dk[order]).abs() / denom;
+            assert!(
+                rel < 1e-11,
+                "small-κ κ-partial radial order {order} mixed charts: got={:.12e} expected={:.12e} rel={rel:.3e}",
+                dk[order],
+                expected_dk[order]
+            );
+
+            let denom = expected_dkk[order].abs().max(dkk[order].abs()).max(1e-300);
+            let rel = (dkk[order] - expected_dkk[order]).abs() / denom;
+            assert!(
+                rel < 1e-10,
+                "small-κ κκ-partial radial order {order} mixed charts: got={:.12e} expected={:.12e} rel={rel:.3e}",
+                dkk[order],
+                expected_dkk[order]
+            );
+        }
     }
 
     #[test]
