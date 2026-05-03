@@ -2461,12 +2461,67 @@ const OPERATOR_TRUST_RADIUS_INIT: f64 = 1.0;
 const OPERATOR_TRUST_RADIUS_MAX: f64 = 1.0e6;
 const OPERATOR_ETA_ACCEPT: f64 = 1.0e-4;
 const OPERATOR_TRUST_RADIUS_REJECT_FLOOR: f64 = 1.0e-9;
+const OPERATOR_DENSE_REUSE_MAX_DIM: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperatorTrustRegionStopReason {
     Converged,
     RejectFloor,
     IterationBudget,
+}
+
+struct BorrowedDenseOuterHessian<'a> {
+    matrix: &'a Array2<f64>,
+}
+
+impl OuterHessianOperator for BorrowedDenseOuterHessian<'_> {
+    fn dim(&self) -> usize {
+        self.matrix.nrows()
+    }
+
+    fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+        if v.len() != self.matrix.ncols() {
+            return Err(format!(
+                "dense outer Hessian matvec length mismatch: got {}, expected {}",
+                v.len(),
+                self.matrix.ncols()
+            ));
+        }
+        Ok(self.matrix.dot(v))
+    }
+}
+
+fn materialize_outer_hessian_dense_sequential(
+    op: &dyn OuterHessianOperator,
+) -> Result<Array2<f64>, String> {
+    let dim = op.dim();
+    let mut dense = Array2::<f64>::zeros((dim, dim));
+    for col in 0..dim {
+        let mut basis = Array1::<f64>::zeros(dim);
+        basis[col] = 1.0;
+        let hv = op.matvec(&basis)?;
+        if hv.len() != dim {
+            return Err(format!(
+                "outer Hessian operator column {col} length mismatch: got {}, expected {dim}",
+                hv.len()
+            ));
+        }
+        dense.column_mut(col).assign(&hv);
+    }
+    for row in 0..dim {
+        for col in (row + 1)..dim {
+            let sym = 0.5 * (dense[[row, col]] + dense[[col, row]]);
+            dense[[row, col]] = sym;
+            dense[[col, row]] = sym;
+        }
+    }
+    if !dense.iter().all(|value| value.is_finite()) {
+        return Err(
+            "outer Hessian sequential dense materialization produced non-finite entries"
+                .to_string(),
+        );
+    }
+    Ok(dense)
 }
 
 fn project_to_bounds(x: &Array1<f64>, bounds: Option<&(Array1<f64>, Array1<f64>)>) -> Array1<f64> {
@@ -2709,6 +2764,8 @@ fn run_operator_trust_region(
             OPERATOR_TRUST_RADIUS_REJECT_FLOOR,
             OPERATOR_TRUST_RADIUS_MAX,
         );
+    let mut dense_model: Option<Array2<f64>> = None;
+    let mut materialize_dense_after_rejection = false;
 
     for iter in 0..max_iter {
         let iter_start = std::time::Instant::now();
@@ -2768,9 +2825,40 @@ fn run_operator_trust_region(
                 "operator trust-region received a non-operator Hessian".to_string(),
             ));
         };
+        if materialize_dense_after_rejection
+            && dense_model.is_none()
+            && op_arc.dim() <= OPERATOR_DENSE_REUSE_MAX_DIM
+        {
+            let materialize_start = std::time::Instant::now();
+            match materialize_outer_hessian_dense_sequential(op_arc.as_ref()) {
+                Ok(dense) => {
+                    log::info!(
+                        "[ARC-timing] iter={iter} status=dense_model_ready dim={} bytes={} \
+                         elapsed={:.3}s",
+                        dense.nrows(),
+                        dense.len() * std::mem::size_of::<f64>(),
+                        materialize_start.elapsed().as_secs_f64(),
+                    );
+                    dense_model = Some(dense);
+                }
+                Err(message) => {
+                    log::debug!(
+                        "[ARC-timing] iter={iter} dense outer Hessian reuse skipped: {message}"
+                    );
+                }
+            }
+            materialize_dense_after_rejection = false;
+        }
         let counter = HvApplyCounter::new(op_arc.as_ref());
+        let dense_borrowed;
+        let step_op: &dyn OuterHessianOperator = if let Some(dense) = dense_model.as_ref() {
+            dense_borrowed = BorrowedDenseOuterHessian { matrix: dense };
+            &dense_borrowed
+        } else {
+            &counter
+        };
         let active = active_mask(&x_k, &eval_k.gradient, bounds);
-        let cg_result = steihaug_toint_step_operator(&counter, &g_proj, trust_radius, &active)
+        let cg_result = steihaug_toint_step_operator(step_op, &g_proj, trust_radius, &active)
             .map_err(EstimationError::RemlOptimizationFailed)?;
         let Some((trial_step, pred_dec_free)) = cg_result else {
             let elapsed = iter_start.elapsed().as_secs_f64();
@@ -2811,7 +2899,7 @@ fn run_operator_trust_region(
             .sqrt()
             > 1e-8 * (1.0 + trial_step.dot(&trial_step).sqrt())
         {
-            predicted_decrease_from_operator(&counter, &g_proj, &s_trial, &active)
+            predicted_decrease_from_operator(step_op, &g_proj, &s_trial, &active)
                 .map_err(EstimationError::RemlOptimizationFailed)?
         } else {
             pred_dec_free
@@ -2960,6 +3048,8 @@ fn run_operator_trust_region(
             };
             x_k = x_trial;
             eval_k = eval_trial;
+            dense_model = None;
+            materialize_dense_after_rejection = false;
         } else if trust_radius <= OPERATOR_TRUST_RADIUS_REJECT_FLOOR {
             let final_grad = projected_gradient(&x_k, &eval_k.gradient, bounds);
             let final_grad_norm = final_grad.dot(&final_grad).sqrt();
@@ -2975,6 +3065,8 @@ fn run_operator_trust_region(
                 operator_trust_radius: Some(trust_radius),
                 operator_stop_reason: Some(OperatorTrustRegionStopReason::RejectFloor),
             });
+        } else if dense_model.is_none() {
+            materialize_dense_after_rejection = true;
         }
     }
 
@@ -5400,6 +5492,101 @@ mod tests {
             full_calls.load(std::sync::atomic::Ordering::Relaxed),
             1,
             "rejected trial must not request gradient/Hessian; only initial eval should be full"
+        );
+    }
+
+    #[test]
+    fn operator_arc_reuses_dense_model_after_rejection() {
+        struct CountingIdentityOuterHessianOperator {
+            matvec_calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl OuterHessianOperator for CountingIdentityOuterHessianOperator {
+            fn dim(&self) -> usize {
+                1
+            }
+
+            fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+                self.matvec_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(v.clone())
+            }
+        }
+
+        struct RejectingObjective {
+            matvec_calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl OuterObjective for RejectingObjective {
+            fn capability(&self) -> OuterCapability {
+                OuterCapability {
+                    gradient: Derivative::Analytic,
+                    hessian: Derivative::Analytic,
+                    n_params: 1,
+                    psi_dim: 0,
+                    fixed_point_available: false,
+                    barrier_config: None,
+                    prefer_gradient_only: false,
+                    disable_fixed_point: false,
+                }
+            }
+
+            fn eval_cost(&mut self, theta: &Array1<f64>) -> Result<f64, EstimationError> {
+                Ok(theta[0].abs())
+            }
+
+            fn eval(&mut self, theta: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+                self.eval_with_order(theta, OuterEvalOrder::ValueGradientHessian)
+            }
+
+            fn eval_with_order(
+                &mut self,
+                theta: &Array1<f64>,
+                _: OuterEvalOrder,
+            ) -> Result<OuterEval, EstimationError> {
+                Ok(OuterEval {
+                    cost: theta[0].abs(),
+                    gradient: array![1.0],
+                    hessian: HessianResult::Operator(Arc::new(
+                        CountingIdentityOuterHessianOperator {
+                            matvec_calls: Arc::clone(&self.matvec_calls),
+                        },
+                    )),
+                })
+            }
+
+            fn reset(&mut self) {}
+        }
+
+        let matvec_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut obj = RejectingObjective {
+            matvec_calls: Arc::clone(&matvec_calls),
+        };
+        let seed = array![0.0];
+        let initial_eval = obj
+            .eval_with_order(&seed, OuterEvalOrder::ValueGradientHessian)
+            .expect("initial eval");
+        let result = run_operator_trust_region(
+            &mut obj,
+            &seed,
+            OuterThetaLayout::new(1, 0),
+            None,
+            1e-12,
+            3,
+            initial_eval,
+            OuterPlan {
+                solver: Solver::Arc,
+                hessian_source: HessianSource::Analytic,
+            },
+            None,
+        )
+        .expect("operator ARC attempt");
+        assert!(!result.converged);
+        assert_eq!(
+            matvec_calls.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "first rejected step uses two HVPs; dense materialization uses one \
+             sequential HVP; later rejected steps must reuse the dense model"
         );
     }
 
