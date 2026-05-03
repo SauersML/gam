@@ -894,6 +894,14 @@ def _mgcv_ps_basis_dim_from_rust_internal_knots(internal_knots: int, degree: int
     return max(degree + 1, int(internal_knots) + degree + 1)
 
 
+def _mgcv_select_penalty(sc: typing.Any) -> bool:
+    if sc.basis_type == "duchon":
+        return False
+    if sc.basis_type == "tps":
+        return True
+    return bool(sc.double_penalty)
+
+
 def _rust_mean_terms(cols: typing.Any, sc: typing.Any) -> typing.Any:
     dp = "true" if sc.double_penalty else "false"
     if sc.basis_type == "duchon":
@@ -1061,7 +1069,7 @@ def run_mgcv(sc: typing.Any, train_df: typing.Any, test_df: typing.Any, cols: ty
     test_df.to_csv(test_csv, index=False)
 
     mu_formula = mgcv_formula(cols, sc)
-    select_str = "TRUE" if sc.double_penalty and sc.basis_type != "duchon" else "FALSE"
+    select_str = "TRUE" if _mgcv_select_penalty(sc) else "FALSE"
     fam_str = "binomial(link='logit')" if sc.family == "binomial" else "gaussian(link='identity')"
 
     if sc.model_type == "gamlss" and sc.family == "gaussian":
