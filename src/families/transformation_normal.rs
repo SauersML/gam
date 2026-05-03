@@ -35,8 +35,8 @@ use crate::families::custom_family::{
     ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
     ExactNewtonJointPsiTerms, FamilyEvaluation, MaterializablePsiDerivativeOperator,
     ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, build_block_spatial_psi_derivatives,
-    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, fit_custom_family,
-    fit_custom_family_fixed_log_lambdas,
+    custom_family_outer_derivatives, evaluate_custom_family_joint_hyper,
+    evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
 };
 use crate::families::gamlss::{
     initializewiggle_knots_from_seed, solve_penalizedweighted_projection,
@@ -2712,6 +2712,8 @@ impl TransformationNormalFamily {
     fn scop_psi_psi_value_score_hvp_from_cov(
         &self,
         beta: &Array1<f64>,
+        cached_h: ArrayView1<'_, f64>,
+        cached_h_prime: ArrayView1<'_, f64>,
         cov: ArrayView2<'_, f64>,
         cov_i: ArrayView2<'_, f64>,
         cov_j: ArrayView2<'_, f64>,
@@ -2741,6 +2743,13 @@ impl TransformationNormalFamily {
             return Err(format!(
                 "SCOP psi-psi endpoint normalizer cache length {} != n={n}",
                 endpoint_q.len()
+            ));
+        }
+        if cached_h.len() != n || cached_h_prime.len() != n {
+            return Err(format!(
+                "SCOP psi-psi row-quantity cache length mismatch: h={}, h_prime={}, expected={n}",
+                cached_h.len(),
+                cached_h_prime.len()
             ));
         }
         for (name, mat) in [
@@ -2842,8 +2851,8 @@ impl TransformationNormalFamily {
                             acc.gamma_ij[k] = beta_k.dot(&cov_ij_row);
                         }
 
-                        let mut h = rv[0] * acc.gamma[0];
-                        let mut hp = rd[0] * acc.gamma[0];
+                        let h = cached_h[row_idx];
+                        let hp = cached_h_prime[row_idx];
                         let mut h_i = rv[0] * acc.gamma_i[0];
                         let mut h_j = rv[0] * acc.gamma_j[0];
                         let mut h_ij = rv[0] * acc.gamma_ij[0];
@@ -2855,8 +2864,6 @@ impl TransformationNormalFamily {
                             let gi = acc.gamma_i[k];
                             let gj = acc.gamma_j[k];
                             let gij = acc.gamma_ij[k];
-                            h += rv[k] * g * g;
-                            hp += rd[k] * g * g;
                             h_i += 2.0 * rv[k] * g * gi;
                             h_j += 2.0 * rv[k] * g * gj;
                             h_ij += 2.0 * rv[k] * (gj * gi + g * gij);
@@ -3054,8 +3061,8 @@ impl TransformationNormalFamily {
                         acc.gamma_ij_dot[k] = dir_k.dot(&cov_ij_row);
                     }
 
-                    let mut h = rv[0] * acc.gamma[0];
-                    let mut hp = rd[0] * acc.gamma[0];
+                    let h = cached_h[row_idx];
+                    let hp = cached_h_prime[row_idx];
                     let mut h_i = rv[0] * acc.gamma_i[0];
                     let mut h_j = rv[0] * acc.gamma_j[0];
                     let mut h_ij = rv[0] * acc.gamma_ij[0];
@@ -3080,8 +3087,6 @@ impl TransformationNormalFamily {
                         let ui = acc.gamma_i_dot[k];
                         let uj = acc.gamma_j_dot[k];
                         let uij = acc.gamma_ij_dot[k];
-                        h += rv[k] * g * g;
-                        hp += rd[k] * g * g;
                         h_i += 2.0 * rv[k] * g * gi;
                         h_j += 2.0 * rv[k] * g * gj;
                         h_ij += 2.0 * rv[k] * (gj * gi + g * gij);
@@ -3347,6 +3352,8 @@ impl TransformationNormalFamily {
     fn scop_psi_psi_bilinear_from_cov(
         &self,
         beta: &Array1<f64>,
+        cached_h: ArrayView1<'_, f64>,
+        cached_h_prime: ArrayView1<'_, f64>,
         cov: ArrayView2<'_, f64>,
         cov_i: ArrayView2<'_, f64>,
         cov_j: ArrayView2<'_, f64>,
@@ -3379,6 +3386,13 @@ impl TransformationNormalFamily {
             return Err(format!(
                 "SCOP psi-psi bilinear endpoint normalizer cache length {} != n={n}",
                 endpoint_q.len()
+            ));
+        }
+        if cached_h.len() != n || cached_h_prime.len() != n {
+            return Err(format!(
+                "SCOP psi-psi bilinear row-quantity cache length mismatch: h={}, h_prime={}, expected={n}",
+                cached_h.len(),
+                cached_h_prime.len()
             ));
         }
         for (name, mat) in [
@@ -3485,8 +3499,8 @@ impl TransformationNormalFamily {
                         acc.right_ij[k] = right_k.dot(&cov_ij_row);
                     }
 
-                    let mut h = rv[0] * acc.gamma[0];
-                    let mut hp = rd[0] * acc.gamma[0];
+                    let h = cached_h[row_idx];
+                    let hp = cached_h_prime[row_idx];
                     let mut h_i = rv[0] * acc.gamma_i[0];
                     let mut h_j = rv[0] * acc.gamma_j[0];
                     let mut h_ij = rv[0] * acc.gamma_ij[0];
@@ -3535,8 +3549,6 @@ impl TransformationNormalFamily {
                         let rj = acc.right_j[k];
                         let rij = acc.right_ij[k];
 
-                        h += rv[k] * g * g;
-                        hp += rd[k] * g * g;
                         h_i += 2.0 * rv[k] * g * gi;
                         h_j += 2.0 * rv[k] * g * gj;
                         h_ij += 2.0 * rv[k] * (gj * gi + g * gij);
@@ -3730,6 +3742,8 @@ impl TransformationNormalFamily {
         op: &TensorKroneckerPsiOperator,
         axis_i: usize,
         axis_j: usize,
+        cached_h: ArrayView1<'_, f64>,
+        cached_h_prime: ArrayView1<'_, f64>,
         endpoint_q: &[LogNormalCdfDiffDerivatives],
         direction: Option<&Array1<f64>>,
     ) -> Result<(f64, Array1<f64>, Option<Array1<f64>>), String> {
@@ -3741,6 +3755,13 @@ impl TransformationNormalFamily {
             return Err(format!(
                 "SCOP psi-psi operator endpoint normalizer cache length {} != n={n}",
                 endpoint_q.len()
+            ));
+        }
+        if cached_h.len() != n || cached_h_prime.len() != n {
+            return Err(format!(
+                "SCOP psi-psi operator row-quantity cache length mismatch: h={}, h_prime={}, expected={n}",
+                cached_h.len(),
+                cached_h_prime.len()
             ));
         }
         let rows_per_chunk = self.scop_psi_pair_rows_per_chunk(p_cov).min(n.max(1));
@@ -3755,6 +3776,8 @@ impl TransformationNormalFamily {
                 self.scop_psi_pair_cov_chunks(op, axis_i, axis_j, rows.clone())?;
             let (obj_chunk, score_chunk, hvp_chunk) = self.scop_psi_psi_value_score_hvp_from_cov(
                 beta,
+                cached_h.slice(s![start..end]),
+                cached_h_prime.slice(s![start..end]),
                 cov.view(),
                 cov_i.view(),
                 cov_j.view(),
@@ -3779,6 +3802,8 @@ impl TransformationNormalFamily {
         op: &TensorKroneckerPsiOperator,
         axis_i: usize,
         axis_j: usize,
+        cached_h: ArrayView1<'_, f64>,
+        cached_h_prime: ArrayView1<'_, f64>,
         endpoint_q: &[LogNormalCdfDiffDerivatives],
         left: ArrayView1<'_, f64>,
         right: ArrayView1<'_, f64>,
@@ -3791,6 +3816,13 @@ impl TransformationNormalFamily {
                 endpoint_q.len()
             ));
         }
+        if cached_h.len() != n || cached_h_prime.len() != n {
+            return Err(format!(
+                "SCOP psi-psi bilinear operator row-quantity cache length mismatch: h={}, h_prime={}, expected={n}",
+                cached_h.len(),
+                cached_h_prime.len()
+            ));
+        }
         let rows_per_chunk = self.scop_psi_pair_rows_per_chunk(p_cov).min(n.max(1));
         let mut total = 0.0;
         for start in (0..n).step_by(rows_per_chunk) {
@@ -3800,6 +3832,8 @@ impl TransformationNormalFamily {
                 self.scop_psi_pair_cov_chunks(op, axis_i, axis_j, rows.clone())?;
             total += self.scop_psi_psi_bilinear_from_cov(
                 beta,
+                cached_h.slice(s![start..end]),
+                cached_h_prime.slice(s![start..end]),
                 cov.view(),
                 cov_i.view(),
                 cov_j.view(),
@@ -4740,6 +4774,8 @@ impl CustomFamily for TransformationNormalFamily {
                 op,
                 axis_i,
                 axis_j,
+                row.h.view(),
+                row.h_prime.view(),
                 row.endpoint_q.as_slice(),
                 None,
             )?;
@@ -4755,6 +4791,8 @@ impl CustomFamily for TransformationNormalFamily {
                 ),
                 axis_i,
                 axis_j,
+                Arc::clone(&row.h),
+                Arc::clone(&row.h_prime),
                 Arc::clone(&row.endpoint_q),
             ));
 
@@ -5155,6 +5193,8 @@ struct TransformationNormalPsiPsiHessianOperator {
     op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
     axis_i: usize,
     axis_j: usize,
+    row_h: Arc<Array1<f64>>,
+    row_h_prime: Arc<Array1<f64>>,
     endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
 }
 
@@ -5165,6 +5205,8 @@ impl TransformationNormalPsiPsiHessianOperator {
         op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
         axis_i: usize,
         axis_j: usize,
+        row_h: Arc<Array1<f64>>,
+        row_h_prime: Arc<Array1<f64>>,
         endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
     ) -> Self {
         Self {
@@ -5173,6 +5215,8 @@ impl TransformationNormalPsiPsiHessianOperator {
             op,
             axis_i,
             axis_j,
+            row_h,
+            row_h_prime,
             endpoint_q,
         }
     }
@@ -5195,6 +5239,8 @@ impl TransformationNormalPsiPsiHessianOperator {
                 self.tensor_op(),
                 self.axis_i,
                 self.axis_j,
+                self.row_h.view(),
+                self.row_h_prime.view(),
                 self.endpoint_q.as_slice(),
                 Some(v),
             )
@@ -5223,6 +5269,8 @@ impl HyperOperator for TransformationNormalPsiPsiHessianOperator {
                 self.tensor_op(),
                 self.axis_i,
                 self.axis_j,
+                self.row_h.view(),
+                self.row_h_prime.view(),
                 self.endpoint_q.as_slice(),
                 v,
                 u,
@@ -8064,6 +8112,7 @@ impl TensorKroneckerPsiOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::custom_family::custom_family_outer_derivatives;
     use crate::testing::assert_matrix_derivativefd;
     use ndarray::array;
 
@@ -8724,7 +8773,9 @@ mod tests {
     fn transformation_normal_joint_psi_second_order_terms_match_fd() {
         let psi = array![0.15, -0.10];
         let h = 1e-6;
-        let (family, derivative_blocks, state, spec) = toy_family_and_derivatives(&psi);
+        let row_offset = Arc::new(array![0.70, -0.20, 0.40, -0.50]);
+        let (mut family, derivative_blocks, state, spec) = toy_family_and_derivatives(&psi);
+        family.offset = Arc::clone(&row_offset);
         let states = vec![state.clone()];
         let specs = vec![spec];
 
@@ -8734,7 +8785,9 @@ mod tests {
             .expect("psi second-order terms should be present");
 
         let eval_first = |psi_eval: &Array1<f64>| {
-            let (f_eval, deriv_eval, state_eval, spec_eval) = toy_family_and_derivatives(psi_eval);
+            let (mut f_eval, deriv_eval, state_eval, spec_eval) =
+                toy_family_and_derivatives(psi_eval);
+            f_eval.offset = Arc::clone(&row_offset);
             let states_eval = vec![state_eval];
             let specs_eval = vec![spec_eval];
             f_eval
@@ -10591,8 +10644,14 @@ pub fn fit_transformation_normal(
     let rho_floor = -12.0;
     let rho_lower = Array1::<f64>::from_elem(n_penalties, rho_floor);
     let rho_upper = Array1::<f64>::from_elem(n_penalties, 12.0);
+    let probe_blocks = vec![probe_block];
+    let (_, cap_hessian) = custom_family_outer_derivatives(&probe_family, &probe_blocks, &options);
     let analytic_gradient = analytic_psi_available;
-    let analytic_hessian = false;
+    let analytic_hessian = analytic_gradient
+        && matches!(
+            cap_hessian,
+            crate::solver::outer_strategy::Derivative::Analytic
+        );
 
     let (rho0_min, rho0_max) = if rho0.is_empty() {
         (0.0, 0.0)
@@ -10724,12 +10783,10 @@ pub fn fit_transformation_normal(
         analytic_hessian,
         // Transformation-normal has β-dependent H (through 1/h'²), so the
         // EFS Wood-Fasiolo PSD invariant fails — disable fixed-point so the
-        // planner cannot pick EFS / Hybrid-EFS. The exact Hessian operator is
-        // numerically too brittle for CTN spatial search: finite cost steps can
-        // produce non-finite logdet cross traces and enormous gradients. Route
-        // this family through the analytic-gradient BFGS path; the gradient-only
-        // CTN evaluator is intentionally cheap and no longer assembles the dense
-        // SCOP Hessian.
+        // planner cannot pick EFS / Hybrid-EFS. CTN supplies SCOP ψ-axis
+        // second-order curvature through matrix-free HVPs, so do not let the
+        // dense tau-tau memory policy downgrade analytic Hessian planning to
+        // gradient-only BFGS; ARC consumes the exact analytic Hessian operator.
         true,
         CTN_ALLOW_TAU_TAU_GRADIENT_ONLY_PREFERENCE,
         // fit_fn
