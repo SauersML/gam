@@ -696,6 +696,11 @@ def generate_scenario(seed: int, family_filter: typing.Any=None, model_type_filt
         # builds the same polyharmonic kernel against a cubic null space.
         duchon_order = 2
         duchon_power = 0
+        # Rust Duchon smooths intentionally do not implement mgcv-style
+        # `select=TRUE` nullspace shrinkage. Keep Duchon fuzz comparisons on
+        # the shared model surface instead of asking mgcv to fit a strictly
+        # different penalized model.
+        double_penalty = False
         # The cubic polynomial null space at d = 2 has C(2 + 2, 2) = 6
         # monomials. Rust requires `centers >= 6` (else
         # `duchon_effective_nullspace_order` silently auto-degrades to
@@ -737,6 +742,7 @@ def _apply_basis_filter(sc: FuzzScenario, basis_filter: Optional[str]) -> None:
         sc.n_duchon_dims = 2
         sc.duchon_order = 2
         sc.duchon_power = 0
+        sc.double_penalty = False
         min_duchon_centers = 8
         max_knots = max(min_duchon_centers, sc.n_obs // max(sc.n_smooths + 1, 2) - 2)
         sc.knots = min(max(sc.knots, min_duchon_centers), max_knots)
@@ -760,6 +766,53 @@ def select_scenarios(
             continue
         scenarios.append(sc)
     scenarios.sort(key=estimate_scenario_cost)
+    return scenarios, skipped
+
+
+def select_scenarios_backfilled(
+    *,
+    seed_start: int,
+    target_count: int,
+    excluded_seeds: set[int],
+    family_filter: Optional[str] = None,
+    model_type_filter: Optional[str] = None,
+    basis_filter: Optional[str] = None,
+    max_scenario_cost: Optional[float] = None,
+) -> tuple[list[FuzzScenario], list[tuple[FuzzScenario, float]]]:
+    """Select target_count runnable scenarios, extending the seed window as needed."""
+    scenarios: list[FuzzScenario] = []
+    skipped: list[tuple[FuzzScenario, float]] = []
+    seen: set[int] = set(excluded_seeds)
+    seed = seed_start
+    max_examined = max(target_count * 100, 10_000)
+    examined = 0
+
+    while len(scenarios) < target_count and examined < max_examined:
+        if seed in seen:
+            seed += 1
+            continue
+        seen.add(seed)
+        examined += 1
+
+        sc = generate_scenario(
+            seed,
+            family_filter=family_filter,
+            model_type_filter=model_type_filter,
+        )
+        _apply_basis_filter(sc, basis_filter)
+        cost = estimate_scenario_cost(sc)
+        if max_scenario_cost is not None and cost > max_scenario_cost:
+            skipped.append((sc, cost))
+        else:
+            scenarios.append(sc)
+        seed += 1
+
+    scenarios.sort(key=estimate_scenario_cost)
+    if len(scenarios) < target_count:
+        raise RuntimeError(
+            f"only selected {len(scenarios)}/{target_count} scenario(s) after "
+            f"examining {examined} candidate seed(s); filters or cost cap are too restrictive"
+        )
     return scenarios, skipped
 
 
@@ -836,6 +889,19 @@ def _duchon_dims_for_centers(cols: typing.Any, sc: typing.Any, centers: int) -> 
     return dims
 
 
+def _mgcv_ps_basis_dim_from_rust_internal_knots(internal_knots: int, degree: int = 3) -> int:
+    """Rust ps `knots=` is an internal-knot count; mgcv ps `k=` is basis width."""
+    return max(degree + 1, int(internal_knots) + degree + 1)
+
+
+def _mgcv_select_penalty(sc: typing.Any) -> bool:
+    if sc.basis_type == "duchon":
+        return False
+    if sc.basis_type == "tps":
+        return True
+    return bool(sc.double_penalty)
+
+
 def _rust_mean_terms(cols: typing.Any, sc: typing.Any) -> typing.Any:
     dp = "true" if sc.double_penalty else "false"
     if sc.basis_type == "duchon":
@@ -893,18 +959,15 @@ def mgcv_formula(cols: typing.Any, sc: typing.Any) -> typing.Any:
         m_vals = f"c({sc.duchon_order + 1},{sc.duchon_power})"
         k_val = sc.knots
         duchon_term = f"s({','.join(d_cols)}, bs='ds', m={m_vals}, k=min({k_val}, nrow(train_df)-1))"
-        # Match rust ps d.o.f. exactly — no +4 padding on mgcv side. The
-        # previous +4 gave mgcv ~8 extra basis functions per term and
-        # spuriously inflated the apparent gap; see the seed-138
-        # forced-duchon investigation.
-        extra = [f"s({c}, bs='ps', k=min({sc.knots}, nrow(train_df)-1))" for c in cols[dims:]]
+        ps_k = _mgcv_ps_basis_dim_from_rust_internal_knots(sc.knots)
+        extra = [f"s({c}, bs='ps', k=min({ps_k}, nrow(train_df)-1))" for c in cols[dims:]]
         return "y ~ " + " + ".join([duchon_term] + extra)
     elif sc.basis_type == "tps":
         terms = [f"s({c}, bs='tp', k=min({sc.knots}, nrow(train_df)-1))" for c in cols]
         return "y ~ " + " + ".join(terms)
     else:
-        # Match rust ps d.o.f. exactly — no +4 padding on mgcv side.
-        terms = [f"s({c}, bs='ps', k=min({sc.knots}, nrow(train_df)-1))" for c in cols]
+        ps_k = _mgcv_ps_basis_dim_from_rust_internal_knots(sc.knots)
+        terms = [f"s({c}, bs='ps', k=min({ps_k}, nrow(train_df)-1))" for c in cols]
         return "y ~ " + " + ".join(terms)
 
 
@@ -924,13 +987,10 @@ def mgcv_sigma_formula(cols: typing.Any, sc: typing.Any) -> typing.Any:
         # polyharmonic kernels.
         m_vals = f"c({sc.duchon_order + 1},{sc.duchon_power})"
         return f"~ s({','.join(d_cols)}, bs='ds', m={m_vals}, k=min({k_val}, nrow(train_df)-1))"
-    # Match rust noise-side d.o.f. exactly — rust uses
-    # `knots=max(3, sc.knots // 2)` (see rust_noise_terms above), and
-    # mgcv must use the same effective k or the comparison is unfair.
-    # Previously this added +4 in the ps branch, mirroring the
-    # since-removed mean-side asymmetry.
     k_val = max(3, sc.knots // 2)
     bs = "ps" if sc.basis_type == "ps" else "tp"
+    if bs == "ps":
+        k_val = _mgcv_ps_basis_dim_from_rust_internal_knots(k_val)
     return f"~ s({cols[0]}, bs='{bs}', k=min({k_val}, nrow(train_df)-1))"
 
 
@@ -1009,7 +1069,7 @@ def run_mgcv(sc: typing.Any, train_df: typing.Any, test_df: typing.Any, cols: ty
     test_df.to_csv(test_csv, index=False)
 
     mu_formula = mgcv_formula(cols, sc)
-    select_str = "TRUE" if sc.double_penalty else "FALSE"
+    select_str = "TRUE" if _mgcv_select_penalty(sc) else "FALSE"
     fam_str = "binomial(link='logit')" if sc.family == "binomial" else "gaussian(link='identity')"
 
     if sc.model_type == "gamlss" and sc.family == "gaussian":
@@ -1628,13 +1688,11 @@ def main() -> None:
                 existing_seeds.add(obj["scenario"]["seed"])
         print(f"Loaded {len(results)} existing results")
 
-    seeds = [args.seed_start + i for i in range(args.n_trials)]
-    seeds = [s for s in seeds if s not in existing_seeds]
-
-    if not seeds:
+    target_new_trials = max(0, args.n_trials - len(results))
+    if target_new_trials == 0:
         print_leaderboard(results, top_n=args.top); return
 
-    print(f"Running {len(seeds)} trials")
+    print(f"Running {target_new_trials} trials")
     print(f"  Smooth functions:  {len(SMOOTH_FN)} 1D + {len(SMOOTH_FN_2D)} 2D")
     print(f"  Noise types:       {len(NOISE_FN)}")
     print(f"  X distributions:   {len(XDIST_FN)}")
@@ -1647,10 +1705,12 @@ def main() -> None:
     print(f"  Scenario cost cap: {args.max_scenario_cost:g}" if args.max_scenario_cost is not None else "  Scenario cost cap: none")
     print(f"  Results: {RESULTS_FILE}\n")
 
-    # Pre-generate all scenarios so we can sort by estimated cost
-    # (smallest/cheapest first) while keeping the randomized generation
-    scenarios, skipped_scenarios = select_scenarios(
-        seeds,
+    # Pre-generate enough runnable scenarios so cost-capped skips do not
+    # lower coverage below the requested CI sample size.
+    scenarios, skipped_scenarios = select_scenarios_backfilled(
+        seed_start=args.seed_start,
+        target_count=target_new_trials,
+        excluded_seeds=existing_seeds,
         family_filter=args.family,
         model_type_filter=args.model_type,
         basis_filter=args.basis,
