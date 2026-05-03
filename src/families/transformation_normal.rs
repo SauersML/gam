@@ -5596,6 +5596,43 @@ impl TransformationNormalPsiPsiHessianOperator {
             (0..k).into_par_iter().map(apply_col).collect()
         }
     }
+
+    fn trace_columns_with_shared_cov(
+        &self,
+        factor: &Array2<f64>,
+        cov: &Array2<f64>,
+        cov_i: &Array2<f64>,
+        cov_j: &Array2<f64>,
+        cov_ij: &Array2<f64>,
+        row_start: usize,
+        row_end: usize,
+    ) -> f64 {
+        let trace_col = |col: usize| {
+            let v = factor.column(col);
+            self.family
+                .scop_psi_psi_bilinear_from_cov(
+                    &self.beta,
+                    self.row_h.slice(s![row_start..row_end]),
+                    self.row_h_prime.slice(s![row_start..row_end]),
+                    cov.view(),
+                    cov_i.view(),
+                    cov_j.view(),
+                    cov_ij.view(),
+                    row_start,
+                    &self.endpoint_q[row_start..row_end],
+                    v,
+                    v,
+                )
+                .expect("validated CTN psi-psi projected trace inputs should not fail")
+        };
+
+        if rayon::current_thread_index().is_some() {
+            (0..factor.ncols()).map(trace_col).sum()
+        } else {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            (0..factor.ncols()).into_par_iter().map(trace_col).sum()
+        }
+    }
 }
 
 impl HyperOperator for TransformationNormalPsiPsiHessianOperator {
@@ -5632,16 +5669,24 @@ impl HyperOperator for TransformationNormalPsiPsiHessianOperator {
 
     fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
         debug_assert_eq!(factor.nrows(), self.p_total());
-        let trace_col = |col: usize| {
-            let v = factor.column(col);
-            self.bilinear_view(v, v)
-        };
-        if rayon::current_thread_index().is_some() {
-            (0..factor.ncols()).map(trace_col).sum()
-        } else {
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            (0..factor.ncols()).into_par_iter().map(trace_col).sum()
+        let n = self.family.response_val_basis.nrows();
+        let p_cov = self.family.covariate_design.ncols();
+        let rows_per_chunk = self
+            .family
+            .scop_psi_pair_rows_per_chunk(p_cov)
+            .min(n.max(1));
+
+        let mut total = 0.0;
+        for start in (0..n).step_by(rows_per_chunk) {
+            let end = (start + rows_per_chunk).min(n);
+            let (cov, cov_i, cov_j, cov_ij) = self
+                .family
+                .scop_psi_pair_cov_chunks(self.tensor_op(), self.axis_i, self.axis_j, start..end)
+                .expect("validated CTN psi-psi projected trace covariate chunks should not fail");
+            total += self
+                .trace_columns_with_shared_cov(factor, &cov, &cov_i, &cov_j, &cov_ij, start, end);
         }
+        total
     }
 
     fn trace_projected_factor_cached(
