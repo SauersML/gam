@@ -55,7 +55,7 @@ use crate::smooth::{
     spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::UnifiedFitResult;
-use crate::solver::estimate::reml::unified::HyperOperator;
+use crate::solver::estimate::reml::unified::{HyperOperator, ProjectedFactorCache};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
@@ -5628,6 +5628,28 @@ impl HyperOperator for TransformationNormalPsiPsiHessianOperator {
 
     fn has_fast_bilinear_view(&self) -> bool {
         true
+    }
+
+    fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
+        debug_assert_eq!(factor.nrows(), self.p_total());
+        let trace_col = |col: usize| {
+            let v = factor.column(col);
+            self.bilinear_view(v, v)
+        };
+        if rayon::current_thread_index().is_some() {
+            (0..factor.ncols()).map(trace_col).sum()
+        } else {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            (0..factor.ncols()).into_par_iter().map(trace_col).sum()
+        }
+    }
+
+    fn trace_projected_factor_cached(
+        &self,
+        factor: &Array2<f64>,
+        _cache: &ProjectedFactorCache,
+    ) -> f64 {
+        self.trace_projected_factor(factor)
     }
 
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
