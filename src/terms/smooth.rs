@@ -4,13 +4,12 @@ use crate::basis::{
     CenterStrategyKind, DuchonBasisSpec, KroneckerFactoredBasis, MaternBasisSpec,
     MaternIdentifiability, PenaltyCandidate, PenaltyInfo, PenaltySource, SpatialIdentifiability,
     ThinPlateBasisSpec, apply_sum_to_zero_constraint, build_bspline_basis_1d, build_duchon_basis,
-    build_duchon_basis_log_kappa_aniso_derivatives, build_duchon_basis_log_kappa_derivative,
-    build_duchon_basis_log_kappasecond_derivative, build_duchon_basiswithworkspace,
+    build_duchon_basis_log_kappa_aniso_derivatives, build_duchon_basis_log_kappa_derivatives,
+    build_duchon_basiswithworkspace,
     build_matern_basis, build_matern_basis_log_kappa_aniso_derivatives,
-    build_matern_basis_log_kappa_derivative, build_matern_basis_log_kappasecond_derivative,
-    build_matern_basiswithworkspace, build_matern_collocation_operator_matrices,
-    build_thin_plate_basis, build_thin_plate_basis_log_kappa_derivative,
-    build_thin_plate_basis_log_kappasecond_derivative, center_strategy_is_auto,
+    build_matern_basis_log_kappa_derivatives, build_matern_basiswithworkspace,
+    build_matern_collocation_operator_matrices, build_thin_plate_basis,
+    build_thin_plate_basis_log_kappa_derivatives, center_strategy_is_auto,
     center_strategy_kind, center_strategy_num_centers, center_strategy_with_num_centers,
     estimate_penalty_nullity, filter_active_penalty_candidates,
     filter_active_penalty_candidates_with_ops, initial_aniso_contrasts,
@@ -4237,6 +4236,26 @@ fn smooth_has_overlapping_linear_terms(
         .any(|linear| feature_cols.contains(&linear.feature_col))
 }
 
+fn smooth_intrinsic_parametric_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
+    // Global smooth identifiability temporarily disables basis-local spatial
+    // transforms so it can compose parametric and smooth-ownership constraints
+    // in one coefficient transform. Thin-plate smooths with parametric
+    // orthogonality therefore need their own feature polynomial block restored
+    // here even when the formula has no explicit linear term for that feature.
+    match &term.basis {
+        SmoothBasisSpec::ThinPlate {
+            feature_cols, spec, ..
+        } if matches!(
+            spec.identifiability,
+            SpatialIdentifiability::OrthogonalToParametric
+        ) =>
+        {
+            feature_cols.clone()
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn apply_global_smooth_identifiability(
     smooth: RawSmoothDesign,
     data: ArrayView2<'_, f64>,
@@ -4315,6 +4334,7 @@ fn apply_global_smooth_identifiability(
             .collect::<Vec<_>>();
         let needs_parametric_block = !skip_global_transform
             && (smooth_has_overlapping_linear_terms(linear_terms, termspec)
+                || !smooth_intrinsic_parametric_feature_cols(termspec).is_empty()
                 || matches!(
                     spatial_identifiability_policy(termspec),
                     Some(SpatialIdentifiability::OrthogonalToParametric)
@@ -4576,7 +4596,14 @@ fn build_parametric_constraint_block_for_term(
     let n = data.nrows();
     let p_data = data.ncols();
     let feature_cols = smooth_term_feature_cols(termspec);
-    let mut parametric_cols = Vec::<usize>::new();
+    let mut parametric_cols = smooth_intrinsic_parametric_feature_cols(termspec);
+    for &feature_col in &parametric_cols {
+        if feature_col >= p_data {
+            return Err(BasisError::DimensionMismatch(format!(
+                "smooth term feature column {feature_col} out of bounds for {p_data} columns"
+            )));
+        }
+    }
     for linear in linear_terms
         .iter()
         .filter(|linear| feature_cols.contains(&linear.feature_col))
@@ -14238,7 +14265,7 @@ mod tests {
     }
 
     #[test]
-    fn thin_plate_default_identifiability_keeps_own_linear_nullspace_without_linear_terms() {
+    fn thin_plate_default_identifiability_uses_own_feature_nullspace_without_linear_terms() {
         let data = array![
             [-1.9, -1.2],
             [-1.3, -0.7],
@@ -14277,31 +14304,23 @@ mod tests {
         let design_dense = design.design.to_dense();
         let smooth_start = 1 + spec.linear_terms.len();
         for (term_idx, term) in design.smooth.terms.iter().enumerate() {
+            let mut c = Array2::<f64>::zeros((data.nrows(), 2));
+            c.column_mut(0).fill(1.0);
+            c.column_mut(1).assign(&data.column(term_idx));
             let block = design_dense
                 .slice(s![
                     ..,
                     (smooth_start + term.coeff_range.start)..(smooth_start + term.coeff_range.end)
                 ])
                 .to_owned();
-            let intercept = Array2::<f64>::ones((data.nrows(), 1));
-            let intercept_cross = block.t().dot(&intercept);
-            let intercept_num = intercept_cross.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let cross = block.t().dot(&c);
+            let num = cross.iter().map(|v| v * v).sum::<f64>().sqrt();
             let block_norm = block.iter().map(|v| v * v).sum::<f64>().sqrt();
-            let intercept_norm = (data.nrows() as f64).sqrt();
-            let intercept_rel = intercept_num / (block_norm * intercept_norm).max(1e-300);
+            let c_norm = c.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let rel = num / (block_norm * c_norm).max(1e-300);
             assert!(
-                intercept_rel <= 1e-10,
-                "ThinPlate term {term_idx} is not centered against the intercept: {intercept_rel:.3e}"
-            );
-
-            let x = data.column(term_idx).to_owned();
-            let cross = block.t().dot(&x);
-            let cross_norm = cross.iter().map(|v| v * v).sum::<f64>().sqrt();
-            let x_norm = x.iter().map(|v| v * v).sum::<f64>().sqrt();
-            let rel = cross_norm / (block_norm * x_norm).max(1e-300);
-            assert!(
-                rel >= 1e-3,
-                "ThinPlate term {term_idx} incorrectly removed its own linear nullspace: {rel:.3e}"
+                rel <= 1e-10,
+                "ThinPlate term {term_idx} is not orthogonal to its own [1, x] nullspace: {rel:.3e}"
             );
         }
     }

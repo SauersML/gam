@@ -17,8 +17,8 @@ use smallvec::SmallVec;
 use crate::faer_ndarray::{fast_ab, fast_atb};
 use crate::linalg::utils::stochastic_lanczos_logdet_spd_operator;
 use crate::terms::basis::{
-    closed_form_anisotropic_pair_block, closed_form_anisotropic_pair_value,
-    pure_duchon_diagonal_epsilon,
+    closed_form_anisotropic_pair_block, closed_form_anisotropic_pair_value_with_powers,
+    closed_form_penalty, pure_duchon_diagonal_epsilon,
 };
 
 /// Matrix-free closed-form anisotropic Duchon penalty operator.
@@ -41,14 +41,20 @@ pub struct ClosedFormPenaltyOperator {
     /// consumes these directly and applies the `J = exp(Σ η_k)` Jacobian
     /// internally.
     eta_raw: Vec<f64>,
+    /// Cached powers of `B = diag(exp(-2η))` for the analytic pair kernel.
+    eta_metric_powers: closed_form_penalty::AnisoMetricPowers,
     /// Optional kernel-nullspace transform Z (K × kernel_cols).
     kernel_nullspace: Option<Array2<f64>>,
     /// Number of polynomial-block columns padded after the kernel block.
     polynomial_block_cols: usize,
     /// Optional outer spatial identifiability transform T (total_pre × total).
     outer_identifiability: Option<Array2<f64>>,
-    /// Lazily-populated dense form. Populated on first call to `dense_form`,
-    /// `matvec`, `diag`, `trace`, or `log_det_plus_lambda_i`.
+    /// Diagonal epsilon convention for regimes without an exact analytic
+    /// self-pair. In the convergent closed-form regimes this is zero and is
+    /// never read by pair evaluation.
+    diagonal_epsilon: f64,
+    /// Lazily-populated dense form. Populated only by `dense_form`; the
+    /// matvec/diag/trace/log-det paths stay matrix-free.
     cached_dense: OnceLock<Array2<f64>>,
 }
 
@@ -65,9 +71,11 @@ impl Clone for ClosedFormPenaltyOperator {
             kappa: self.kappa,
             centers: self.centers.clone(),
             eta_raw: self.eta_raw.clone(),
+            eta_metric_powers: self.eta_metric_powers.clone(),
             kernel_nullspace: self.kernel_nullspace.clone(),
             polynomial_block_cols: self.polynomial_block_cols,
             outer_identifiability: self.outer_identifiability.clone(),
+            diagonal_epsilon: self.diagonal_epsilon,
             cached_dense: OnceLock::new(),
         }
     }
@@ -98,16 +106,24 @@ impl ClosedFormPenaltyOperator {
         } else {
             vec![0.0_f64; d]
         };
+        let diagonal_epsilon =
+            if closed_form_penalty::analytic_self_pair_bundle(q, m, s, kappa, &eta_raw).is_some() {
+                0.0
+            } else {
+                pure_duchon_diagonal_epsilon(centers, &eta_raw)
+            };
         Self {
             q,
             m,
             s,
             kappa,
             centers: centers.to_owned(),
+            eta_metric_powers: closed_form_penalty::AnisoMetricPowers::new(&eta_raw),
             eta_raw,
             kernel_nullspace: kernel_nullspace.cloned(),
             polynomial_block_cols,
             outer_identifiability: outer_identifiability.cloned(),
+            diagonal_epsilon,
             cached_dense: OnceLock::new(),
         }
     }
@@ -241,11 +257,10 @@ impl ClosedFormPenaltyOperator {
         )
     }
 
-    /// Materialize the full constrained operator as a dense `Array2`. Useful
-    /// as a fallback for callers that still expect dense penalties or for
-    /// validation against the existing `closed_form_operator_penalty_in_total_basis`
-    /// pipeline. Uses the internal cache: the first call builds, subsequent
-    /// calls clone from the cache.
+    /// Materialize the full constrained operator as a dense `Array2` for
+    /// callers that explicitly request a matrix or for validation against
+    /// `closed_form_operator_penalty_in_total_basis`. Uses the internal
+    /// cache: the first call builds, subsequent calls clone from the cache.
     pub fn dense_form(&self) -> Array2<f64> {
         self.ensure_dense().clone()
     }
@@ -306,7 +321,6 @@ impl ClosedFormPenaltyOperator {
         );
         let k = self.centers.nrows();
         let d = self.centers.ncols();
-        let r_eps = pure_duchon_diagonal_epsilon(self.centers.view(), &self.eta_raw);
         let rows: Vec<f64> = (0..k)
             .into_par_iter()
             .map(|i| {
@@ -318,14 +332,15 @@ impl ClosedFormPenaltyOperator {
                     for axis in 0..d {
                         r[axis] = self.centers[[i, axis]] - self.centers[[j, axis]];
                     }
-                    let gij = closed_form_anisotropic_pair_value(
+                    let gij = closed_form_anisotropic_pair_value_with_powers(
                         self.q,
                         self.m,
                         self.s,
                         self.kappa,
                         &self.eta_raw,
+                        &self.eta_metric_powers,
                         r.as_slice(),
-                        r_eps,
+                        self.diagonal_epsilon,
                     );
                     let y = gij * v[j] - correction;
                     let next = sum + y;

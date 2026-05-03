@@ -519,11 +519,18 @@ pub fn generate_rho_candidates(
     seeds
 }
 
-pub fn coarse_grid_log_lambda_seed<F>(
+/// Choose an initial log-smoothing vector by evaluating the same objective the
+/// outer optimizer will minimize on a small deterministic grid around the
+/// analytic/heuristic seed.
+///
+/// This is initialization, not a fallback: no candidate is accepted unless it
+/// has a lower finite objective value under `eval_cost`, and the returned seed
+/// is still optimized by the normal outer solver.
+pub fn select_objective_seed_on_log_lambda_grid<F>(
     rho_seed: &Array1<f64>,
     bounds: (f64, f64),
     n_smooths: usize,
-    mut eval_reml: F,
+    mut eval_cost: F,
 ) -> Array1<f64>
 where
     F: FnMut(&Array1<f64>) -> Option<f64>,
@@ -542,7 +549,7 @@ where
     };
 
     let baseline_seed = clamp_vec(rho_seed);
-    let baseline_cost = eval_reml(&baseline_seed);
+    let baseline_cost = eval_cost(&baseline_seed);
 
     let shifts: [f64; 9] = [-12.0, -9.0, -6.0, -3.0, 0.0, 3.0, 6.0, 9.0, 12.0];
     let mut best_seed = baseline_seed.clone();
@@ -556,7 +563,7 @@ where
         for i in 0..n_smooths {
             candidate[i] = clamp_to_bounds(rho_seed[i] + delta, bnds);
         }
-        let c_opt = eval_reml(&candidate);
+        let c_opt = eval_cost(&candidate);
         if let Some(c) = c_opt
             && c.is_finite()
             && best_cost.map(|b| c < b).unwrap_or(true)
@@ -573,7 +580,7 @@ where
             for &delta in &per_axis_shifts {
                 let mut candidate = anchor.clone();
                 candidate[axis] = clamp_to_bounds(anchor[axis] + delta, bnds);
-                if let Some(c) = eval_reml(&candidate)
+                if let Some(c) = eval_cost(&candidate)
                     && c.is_finite()
                     && best_cost.map(|b| c < b).unwrap_or(true)
                 {
@@ -751,5 +758,30 @@ mod tests {
         let seeds_without_aux = generate_rho_candidates(3, None, &cfg_no_aux);
         // Aux pinning causes many seeds to collapse, so fewer unique seeds.
         assert!(seeds_with_aux.len() <= seeds_without_aux.len());
+    }
+
+    #[test]
+    fn objective_grid_seed_selects_lowest_finite_cost_candidate() {
+        let base = Array1::from_vec(vec![0.0, 0.0]);
+        let selected = select_objective_seed_on_log_lambda_grid(&base, (-12.0, 12.0), 2, |rho| {
+            Some((rho[0] - 6.0).powi(2) + (rho[1] - 6.0).powi(2))
+        });
+
+        assert!((selected[0] - 6.0).abs() < 1e-12);
+        assert!((selected[1] - 6.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn objective_grid_seed_keeps_baseline_when_no_candidate_improves_cost() {
+        let base = Array1::from_vec(vec![1.0, -2.0]);
+        let selected = select_objective_seed_on_log_lambda_grid(&base, (-12.0, 12.0), 2, |rho| {
+            if (rho[0] - 1.0).abs() < 1e-12 && (rho[1] + 2.0).abs() < 1e-12 {
+                Some(0.0)
+            } else {
+                Some(1.0)
+            }
+        });
+
+        assert_eq!(selected, base);
     }
 }
