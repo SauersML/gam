@@ -8672,17 +8672,9 @@ impl SparseCholeskyOperator {
                     start,
                 )
             };
-            match diagonal_sum {
-                Ok(value) => {
-                    trace += value;
-                }
-                Err(e) => {
-                    log::warn!(
-                        "SparseCholeskyOperator::trace_hinv_operator_exact multi-solve failed: {e}"
-                    );
-                    return f64::NAN;
-                }
-            }
+            trace += diagonal_sum.unwrap_or_else(|e| {
+                panic!("SparseCholeskyOperator exact trace_hinv_operator solve failed: {e}")
+            });
             start = end;
         }
 
@@ -8801,15 +8793,9 @@ impl SparseCholeskyOperator {
                     start + local_col_start,
                 )
             };
-            match diagonal_sum {
-                Ok(value) => trace += value,
-                Err(e) => {
-                    log::warn!(
-                        "SparseCholeskyOperator::trace_hinv_block_local_exact multi-solve failed: {e}"
-                    );
-                    return f64::NAN;
-                }
-            }
+            trace += diagonal_sum.unwrap_or_else(|e| {
+                panic!("SparseCholeskyOperator exact block-local trace solve failed: {e}")
+            });
             local_col_start += cols;
         }
 
@@ -8890,15 +8876,11 @@ impl SparseCholeskyOperator {
         end: usize,
     ) -> f64 {
         let t_start = std::time::Instant::now();
-        let solved = match self.solve_block_local_rows_exact(block, scale, start, end) {
-            Ok(solved) => solved,
-            Err(e) => {
-                log::warn!(
-                    "SparseCholeskyOperator::trace_hinv_block_local_cross_exact failed: {e}"
-                );
-                return f64::NAN;
-            }
-        };
+        let solved = self
+            .solve_block_local_rows_exact(block, scale, start, end)
+            .unwrap_or_else(|e| {
+                panic!("SparseCholeskyOperator exact block-local cross solve failed: {e}")
+            });
         let result = trace_matrix_product(&solved, &solved);
         let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
         if elapsed_ms > 100.0 {
@@ -8950,15 +8932,9 @@ impl SparseCholeskyOperator {
                 crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_view)
             };
 
-            let solved_op = match solved_op {
-                Ok(sol) => sol,
-                Err(e) => {
-                    log::warn!(
-                        "SparseCholeskyOperator::trace_hinv_matrix_operator_cross_exact failed: {e}"
-                    );
-                    return f64::NAN;
-                }
-            };
+            let solved_op = solved_op.unwrap_or_else(|e| {
+                panic!("SparseCholeskyOperator exact matrix/operator cross solve failed: {e}")
+            });
 
             for local_col in 0..cols {
                 let matrix_row = start + local_col;
@@ -9002,15 +8978,11 @@ impl SparseCholeskyOperator {
                 let rhs_view = op_rhs_block.slice(ndarray::s![.., ..cols]);
                 crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_view)
             };
-            let solved_op = match solved_op {
-                Ok(sol) => sol,
-                Err(e) => {
-                    log::warn!(
-                        "SparseCholeskyOperator::trace_hinv_matrix_block_operator_cross_exact failed on operator solve: {e}"
-                    );
-                    return f64::NAN;
-                }
-            };
+            let solved_op = solved_op.unwrap_or_else(|e| {
+                panic!(
+                    "SparseCholeskyOperator exact matrix/block-operator cross operator solve failed: {e}"
+                )
+            });
 
             let solved_eye = if cols == chunk {
                 crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &eye_rhs_block)
@@ -9018,15 +8990,11 @@ impl SparseCholeskyOperator {
                 let rhs_view = eye_rhs_block.slice(ndarray::s![.., ..cols]);
                 crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_view)
             };
-            let solved_eye = match solved_eye {
-                Ok(sol) => sol,
-                Err(e) => {
-                    log::warn!(
-                        "SparseCholeskyOperator::trace_hinv_matrix_block_operator_cross_exact failed on identity solve: {e}"
-                    );
-                    return f64::NAN;
-                }
-            };
+            let solved_eye = solved_eye.unwrap_or_else(|e| {
+                panic!(
+                    "SparseCholeskyOperator exact matrix/block-operator cross identity solve failed: {e}"
+                )
+            });
 
             let selected_rows_t = matrix.t().dot(&solved_eye);
             for local_col in 0..cols {
@@ -9063,41 +9031,34 @@ impl SparseCholeskyOperator {
             .map(|(_, start, end)| (start, end))
             .unwrap_or((0, self.n_dim));
 
-        let solved_left = match self.solve_operator_column_range_rows_exact(
-            left,
-            left_start,
-            left_end,
-            right_start,
-            right_end,
-        ) {
-            Ok(sol) => sol,
-            Err(e) => {
-                log::warn!(
-                    "SparseCholeskyOperator::trace_hinv_operator_cross_exact failed on left operator: {e}"
-                );
-                return f64::NAN;
-            }
-        };
+        let solved_left = self
+            .solve_operator_column_range_rows_exact(
+                left,
+                left_start,
+                left_end,
+                right_start,
+                right_end,
+            )
+            .unwrap_or_else(|e| {
+                panic!("SparseCholeskyOperator exact operator cross left solve failed: {e}")
+            });
         let same_operator =
             std::ptr::addr_eq(left, right) && left_start == right_start && left_end == right_end;
         let solved_right = if same_operator {
             None
         } else {
-            match self.solve_operator_column_range_rows_exact(
-                right,
-                right_start,
-                right_end,
-                left_start,
-                left_end,
-            ) {
-                Ok(sol) => Some(sol),
-                Err(e) => {
-                    log::warn!(
-                        "SparseCholeskyOperator::trace_hinv_operator_cross_exact failed on right operator: {e}"
-                    );
-                    return f64::NAN;
-                }
-            }
+            Some(
+                self.solve_operator_column_range_rows_exact(
+                    right,
+                    right_start,
+                    right_end,
+                    left_start,
+                    left_end,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("SparseCholeskyOperator exact operator cross right solve failed: {e}")
+                }),
+            )
         };
 
         let right_cols = right_end - right_start;
@@ -9139,13 +9100,12 @@ impl HessianOperator for SparseCholeskyOperator {
             }
             return trace;
         }
-        match crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, a) {
-            Ok(solved) => solved.diag().sum(),
-            Err(e) => {
-                log::warn!("SparseCholeskyOperator::trace_hinv_product multi-solve failed: {e}");
-                f64::NAN
-            }
-        }
+        crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, a)
+            .unwrap_or_else(|e| {
+                panic!("SparseCholeskyOperator exact trace_hinv_product solve failed: {e}")
+            })
+            .diag()
+            .sum()
     }
 
     fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
@@ -9197,23 +9157,13 @@ impl HessianOperator for SparseCholeskyOperator {
     }
 
     fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
-        match crate::linalg::sparse_exact::solve_sparse_spd(&self.factor, rhs) {
-            Ok(sol) => sol,
-            Err(e) => {
-                log::warn!("SparseCholeskyOperator::solve failed: {e}");
-                Array1::from_elem(self.n_dim, f64::NAN)
-            }
-        }
+        crate::linalg::sparse_exact::solve_sparse_spd(&self.factor, rhs)
+            .unwrap_or_else(|e| panic!("SparseCholeskyOperator exact solve failed: {e}"))
     }
 
     fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64> {
-        match crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, rhs) {
-            Ok(sol) => sol,
-            Err(e) => {
-                log::warn!("SparseCholeskyOperator::solve_multi failed: {e}");
-                Array2::from_elem((self.n_dim, rhs.ncols()), f64::NAN)
-            }
-        }
+        crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, rhs)
+            .unwrap_or_else(|e| panic!("SparseCholeskyOperator exact multi-solve failed: {e}"))
     }
 
     fn trace_hinv_product_cross(&self, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
@@ -9541,29 +9491,31 @@ impl MatrixFreeSpdOperator {
             .get_or_init(|| self.materialize_dense_operator())
             .as_ref()
     }
+
+    fn exact_dense_spectral(&self) -> &DenseSpectralOperator {
+        self.dense_spectral().expect(
+            "MatrixFreeSpdOperator exact REML algebra requires dense spectral materialization within the configured budget",
+        )
+    }
 }
 
 impl HessianOperator for MatrixFreeSpdOperator {
     fn logdet(&self) -> f64 {
-        *self.cached_logdet.get_or_init(|| {
-            self.dense_spectral()
-                .map_or(f64::NAN, HessianOperator::logdet)
-        })
+        *self
+            .cached_logdet
+            .get_or_init(|| self.exact_dense_spectral().logdet())
     }
 
     fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
-        self.dense_spectral()
-            .map_or(f64::NAN, |dense| dense.trace_hinv_product(a))
+        self.exact_dense_spectral().trace_hinv_product(a)
     }
 
     fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
-        self.dense_spectral()
-            .map_or(f64::NAN, |dense| dense.trace_hinv_operator(op))
+        self.exact_dense_spectral().trace_hinv_operator(op)
     }
 
     fn trace_hinv_product_cross(&self, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
-        self.dense_spectral()
-            .map_or(f64::NAN, |dense| dense.trace_hinv_product_cross(a, b))
+        self.exact_dense_spectral().trace_hinv_product_cross(a, b)
     }
 
     fn trace_hinv_matrix_operator_cross(
@@ -9571,9 +9523,8 @@ impl HessianOperator for MatrixFreeSpdOperator {
         matrix: &Array2<f64>,
         op: &dyn HyperOperator,
     ) -> f64 {
-        self.dense_spectral().map_or(f64::NAN, |dense| {
-            dense.trace_hinv_matrix_operator_cross(matrix, op)
-        })
+        self.exact_dense_spectral()
+            .trace_hinv_matrix_operator_cross(matrix, op)
     }
 
     fn trace_hinv_operator_cross(
@@ -9581,28 +9532,20 @@ impl HessianOperator for MatrixFreeSpdOperator {
         left: &dyn HyperOperator,
         right: &dyn HyperOperator,
     ) -> f64 {
-        self.dense_spectral().map_or(f64::NAN, |dense| {
-            dense.trace_hinv_operator_cross(left, right)
-        })
+        self.exact_dense_spectral()
+            .trace_hinv_operator_cross(left, right)
     }
 
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
-        self.dense_spectral()
-            .map_or(f64::NAN, |dense| dense.trace_logdet_operator(op))
+        self.exact_dense_spectral().trace_logdet_operator(op)
     }
 
     fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
-        self.dense_spectral().map_or_else(
-            || Array1::from_elem(self.n_dim, f64::NAN),
-            |dense| dense.solve(rhs),
-        )
+        self.exact_dense_spectral().solve(rhs)
     }
 
     fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64> {
-        self.dense_spectral().map_or_else(
-            || Array2::from_elem((self.n_dim, rhs.ncols()), f64::NAN),
-            |dense| dense.solve_multi(rhs),
-        )
+        self.exact_dense_spectral().solve_multi(rhs)
     }
 
     fn stochastic_trace_solve(&self, rhs: &Array1<f64>, rel_tol: f64) -> Array1<f64> {
@@ -9616,15 +9559,13 @@ impl HessianOperator for MatrixFreeSpdOperator {
     }
 
     fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {
-        self.dense_spectral()
-            .map_or(f64::NAN, |dense| dense.trace_logdet_hessian_cross(h_i, h_j))
+        self.exact_dense_spectral()
+            .trace_logdet_hessian_cross(h_i, h_j)
     }
 
     fn trace_logdet_hessian_crosses(&self, matrices: &[&Array2<f64>]) -> Array2<f64> {
-        self.dense_spectral().map_or_else(
-            || Array2::from_elem((matrices.len(), matrices.len()), f64::NAN),
-            |dense| dense.trace_logdet_hessian_crosses(matrices),
-        )
+        self.exact_dense_spectral()
+            .trace_logdet_hessian_crosses(matrices)
     }
 
     fn active_rank(&self) -> usize {

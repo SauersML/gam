@@ -11060,9 +11060,7 @@ fn try_exact_joint_spatial_aniso_optimization(
 
     let mut obj = problem.build_objective_with_eval_order(
         &mut ctx,
-        |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
-            Ok(ctx.eval_cost(theta))
-        },
+        |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| Ok(ctx.eval_cost(theta)),
         |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
             eval_outer(
                 ctx,
@@ -11349,9 +11347,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
 
     let mut obj = problem.build_objective_with_eval_order(
         &mut ctx,
-        |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| {
-            Ok(ctx.eval_cost(theta))
-        },
+        |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| Ok(ctx.eval_cost(theta)),
         |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| {
             eval_outer(
                 ctx,
