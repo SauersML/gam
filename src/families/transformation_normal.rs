@@ -5967,7 +5967,6 @@ impl KroneckerDesign {
     /// underlying `right` operator and the row-replicated Khatri-Rao image
     /// are never materialized. Storage cost matches `forward_mul`: an
     /// intermediate `n × p_resp` `right_beta` plus the `n` output.
-    #[cfg(test)]
     fn scop_affine_squared_forward(&self, beta: &Array1<f64>) -> Array1<f64> {
         match self {
             KroneckerDesign::KhatriRao { left, right } => {
@@ -6907,89 +6906,72 @@ fn compute_warm_start(
         target_hp[i] = inv_tau;
     }
 
-    // LSQ-in-γ² formulation. The SCOP-CTN forward map writes
-    //   h_i  = γ_0(x_i) · I_0(y_i) + Σ_{k≥1} γ_k(x_i)² · I_k(y_i)
-    //   h'_i = γ_0(x_i) · M_0(y_i) + Σ_{k≥1} γ_k(x_i)² · M_k(y_i),
-    // which is *linear in α* with α_0(x) = γ_0(x), α_k(x) = γ_k(x)² for k≥1.
-    // We solve the joint normal equations for α_kj on the stacked design
-    //   [X_val_kron; X_deriv_kron] · α = [t_h; t_hp]
-    // with light ridge, then recover γ via elementwise sqrt with NNLS clamp.
-    // This recovers the affine seed h(y) = (y - loc)/scale exactly when the
-    // I-spline / M-spline span contains the affine pair, modulo ridge bias.
-    let policy = ResourcePolicy::default_library();
-    let gram_val = x_val_kron.weighted_gram(weights, &policy);
-    let gram_deriv = x_deriv_kron.weighted_gram(weights, &policy);
-    let mut a = gram_val + gram_deriv;
-
-    let mut weighted_t_h = Array1::<f64>::zeros(n);
-    let mut weighted_t_hp = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        weighted_t_h[i] = weights[i] * target_h[i];
-        weighted_t_hp[i] = weights[i] * target_hp[i];
+    // β-native SCOP seed. A tempting alternative is to solve a linear
+    // least-squares problem for α_k(x)=γ_k(x)^2 and then project sqrt(α_k)
+    // back into the covariate basis. That is not an invariant transformation:
+    // squaring the projected sqrt field no longer equals the solved α field,
+    // and small projection errors can explode into huge positive I-spline
+    // shape terms. Instead seed the monotone shape rows directly with a
+    // constant positive γ that matches the weighted average derivative target,
+    // then solve only the unconstrained location row in β-space.
+    let weight_sum = weights.iter().copied().sum::<f64>();
+    if !(weight_sum.is_finite() && weight_sum > 0.0) {
+        return Err("SCOP warm start requires positive finite total weight".to_string());
     }
-    let rhs = x_val_kron.transpose_mul(&weighted_t_h) + x_deriv_kron.transpose_mul(&weighted_t_hp);
-
-    let mut diag_trace = 0.0;
-    for j in 0..p_total {
-        diag_trace += a[[j, j]];
-    }
-    let ridge = if p_total > 0 {
-        (diag_trace / p_total as f64).max(1.0) * 1e-10
-    } else {
-        1e-10
-    };
-    for j in 0..p_total {
-        a[[j, j]] += ridge;
+    let mean_target_hp = weights
+        .iter()
+        .zip(target_hp.iter())
+        .map(|(&w, &hp)| w * hp)
+        .sum::<f64>()
+        / weight_sum;
+    if !(mean_target_hp.is_finite() && mean_target_hp > 0.0) {
+        return Err(format!(
+            "SCOP warm start derivative target is not positive finite: {mean_target_hp}"
+        ));
     }
 
-    use crate::faer_ndarray::FaerCholesky;
-    use faer::Side;
-    let factor = a
-        .cholesky(Side::Lower)
-        .map_err(|e| format!("warm-start joint LSQ Cholesky failed: {e:?}"))?;
-    let alpha = factor.solvevec(&rhs);
-    if alpha.iter().any(|v| !v.is_finite()) {
-        return Err("warm-start joint LSQ produced non-finite coefficients".to_string());
-    }
-
-    // Recover γ from α: row 0 is linear (γ_0 = α_0), rows k≥1 are squared
-    // (γ_k = sqrt(α_k_at_each_row)). Since α_k is parameterized as a linear
-    // combination of covariate columns, we transform in coefficient space by
-    // sqrt-ing the per-row α_k values and then re-projecting back to the
-    // covariate basis via least-squares (NNLS-style: clamp negative α to 0).
     let mut beta = Array1::<f64>::zeros(p_total);
-    // Linear k=0: γ_0(x) = α_0(x) directly.
-    for j in 0..p_cov {
-        beta[j] = alpha[j];
+    for k in 1..p_resp {
+        beta[k * p_cov] = 1.0;
     }
-    // Squared k≥1: per-row α_k(x_i), clamp to ≥0, sqrt, then re-project.
-    let alpha_view = alpha.view().into_shape_with_order((p_resp, p_cov)).unwrap();
+    let unit_shape_hp = x_deriv_kron.scop_affine_squared_forward(&beta);
+    let mean_unit_shape_hp = weights
+        .iter()
+        .zip(unit_shape_hp.iter())
+        .map(|(&w, &hp)| w * hp)
+        .sum::<f64>()
+        / weight_sum;
+    if !(mean_unit_shape_hp.is_finite() && mean_unit_shape_hp > 0.0) {
+        return Err(format!(
+            "SCOP warm start unit shape derivative is not positive finite: {mean_unit_shape_hp}"
+        ));
+    }
+    let gamma_const = (mean_target_hp / mean_unit_shape_hp).sqrt();
+    if !(gamma_const.is_finite() && gamma_const > 0.0) {
+        return Err(format!(
+            "SCOP warm start shape scale is not positive finite: {gamma_const}"
+        ));
+    }
+    beta.fill(0.0);
+    for k in 1..p_resp {
+        beta[k * p_cov] = gamma_const;
+    }
+
+    let shape_h = x_val_kron.scop_affine_squared_forward(&beta);
+    let location_target = &target_h - &shape_h;
     let zero_offset = Array1::<f64>::zeros(n);
     let log_lambdas = Array1::<f64>::zeros(covariate_penalties.len());
-    let mut alpha_row_eval = Array1::<f64>::zeros(n);
-    for k in 1..p_resp {
-        let alpha_k = alpha_view.row(k).to_owned();
-        // α_k(x_i) = b_cov(x_i) · alpha_k.
-        let row_vals = covariate_design.matrixvectormultiply(&alpha_k);
-        for i in 0..n {
-            // NNLS clamp: any negative α_k is rounded to zero before sqrt.
-            // Affine targets representable in the SCOP span give nonnegative α
-            // to working precision; only basis-incompatible targets force the
-            // clamp.
-            alpha_row_eval[i] = row_vals[i].max(0.0).sqrt();
-        }
-        let row_beta = solve_penalizedweighted_projection(
-            covariate_design,
-            &zero_offset,
-            &alpha_row_eval,
-            weights,
-            covariate_penalties,
-            &log_lambdas,
-            1e-12,
-        )?;
-        for c in 0..p_cov {
-            beta[k * p_cov + c] = row_beta[c];
-        }
+    let location_beta = solve_penalizedweighted_projection(
+        covariate_design,
+        &zero_offset,
+        &location_target,
+        weights,
+        covariate_penalties,
+        &log_lambdas,
+        1e-12,
+    )?;
+    for c in 0..p_cov {
+        beta[c] = location_beta[c];
     }
 
     if beta.iter().any(|v| !v.is_finite()) {
@@ -8546,9 +8528,11 @@ mod tests {
 
     #[test]
     fn warm_start_absorbs_offset_into_affine_seed() {
-        // The SCOP squared-γ warm start solves the stacked value/derivative
-        // system in α-space before projecting back to γ, so representable
-        // affine targets should be recovered to numerical precision.
+        // The SCOP squared-γ warm start is built directly in β-space: choose a
+        // positive constant shape seed for h', subtract its induced value
+        // contribution, then solve the unconstrained location row. The fixed
+        // monotonicity floor is part of h, so the value target includes
+        // ε(y-median) and the derivative target includes ε.
         let response = array![2.0, 3.0, 4.0, 5.0];
         let (val_basis, deriv_basis, knots, transform, _p_resp) = toy_response_basis(&response);
         let weights = Array1::from_elem(response.len(), 1.0);

@@ -10241,19 +10241,19 @@ fn try_build_spatial_term_log_kappa_derivative(
             return Ok(None);
         }
     };
+    let implicit_operator = derivative_bundle.implicit_operator.map(std::sync::Arc::new);
     let BasisPsiDerivativeResult {
         design_derivative: local_x_psi,
         penalties_derivative: local_s_psi,
-        implicit_operator: local_implicit_first,
+        implicit_operator: local_implicit_first_unused,
     } = derivative_bundle.first;
     let BasisPsiSecondDerivativeResult {
         designsecond_derivative: local_x_psi_psi,
         penaltiessecond_derivative: local_s_psi_psi,
-        implicit_operator: local_implicit_second,
+        implicit_operator: local_implicit_second_unused,
     } = derivative_bundle.second;
-    let implicit_operator = local_implicit_first
-        .or(local_implicit_second)
-        .map(std::sync::Arc::new);
+    debug_assert!(local_implicit_first_unused.is_none());
+    debug_assert!(local_implicit_second_unused.is_none());
 
     if let Some(ref op) = implicit_operator {
         if op.p_out() != smooth_term.coeff_range.len() {
@@ -16630,46 +16630,40 @@ mod tests {
 
         let smooth_term = &design.smooth.terms[0];
         let termspec = &frozenspec.smooth_terms[0];
+        let derivative_bundle = match &termspec.basis {
+            SmoothBasisSpec::Duchon {
+                feature_cols, spec, ..
+            } => {
+                let x =
+                    select_columns(data.view(), feature_cols).expect("select Duchon feature cols");
+                build_duchon_basis_log_kappa_derivatives(x.view(), spec)
+                    .expect("direct Duchon derivative bundle should build")
+            }
+            _ => panic!("expected Duchon term"),
+        };
+        let local_implicit = derivative_bundle.implicit_operator;
         let BasisPsiDerivativeResult {
             design_derivative: local_x_psi,
             penalties_derivative: local_s_psi,
-            implicit_operator: local_implicit_psi,
-        } = match &termspec.basis {
-            SmoothBasisSpec::Duchon {
-                feature_cols, spec, ..
-            } => {
-                let x =
-                    select_columns(data.view(), feature_cols).expect("select Duchon feature cols");
-                build_duchon_basis_log_kappa_derivative(x.view(), spec)
-                    .expect("direct Duchon derivative should build")
-            }
-            _ => panic!("expected Duchon term"),
-        };
+            implicit_operator: local_implicit_psi_unused,
+        } = derivative_bundle.first;
         let BasisPsiSecondDerivativeResult {
             designsecond_derivative: local_x_psi_psi,
             penaltiessecond_derivative: local_s_psi_psi,
-            implicit_operator: local_implicit_psi_psi,
-        } = match &termspec.basis {
-            SmoothBasisSpec::Duchon {
-                feature_cols, spec, ..
-            } => {
-                let x =
-                    select_columns(data.view(), feature_cols).expect("select Duchon feature cols");
-                build_duchon_basis_log_kappasecond_derivative(x.view(), spec)
-                    .expect("direct Duchon second derivative should build")
-            }
-            _ => panic!("expected Duchon term"),
-        };
+            implicit_operator: local_implicit_psi_psi_unused,
+        } = derivative_bundle.second;
+        assert!(local_implicit_psi_unused.is_none());
+        assert!(local_implicit_psi_psi_unused.is_none());
         assert_spatial_derivative_width(
             "Duchon first log-kappa",
             &local_x_psi,
-            local_implicit_psi.as_ref(),
+            local_implicit.as_ref(),
             smooth_term.coeff_range.len(),
         );
         assert_spatial_derivative_width(
             "Duchon second log-kappa",
             &local_x_psi_psi,
-            local_implicit_psi_psi.as_ref(),
+            local_implicit.as_ref(),
             smooth_term.coeff_range.len(),
         );
         assert!(!local_s_psi.is_empty());
