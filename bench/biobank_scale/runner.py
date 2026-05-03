@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import tempfile
+import traceback
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
@@ -2369,6 +2370,8 @@ def do_run_method(args: argparse.Namespace) -> int:
             **result,
         }
     except Exception as exc:
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
         payload = {
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "status": "failed",

@@ -193,13 +193,14 @@ jobs:
             --out-json "bench/biobank_scale/results/${{ matrix.name }}.json"
 
       - name: Upload method artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: biobank-scale-${{ matrix.name }}
           path: |
             bench/biobank_scale/results/${{ matrix.name }}.json
             bench/biobank_scale/runs/${{ matrix.name }}
-          if-no-files-found: error
+          if-no-files-found: warn
 
   aggregate:
     needs: benchmark
