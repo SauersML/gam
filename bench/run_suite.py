@@ -3077,7 +3077,7 @@ def _scenario_fit_mapping(scenario_name: typing.Any) -> typing.Any:
             ],
             smooth_basis="thinplate",
             linear_cols=[],
-            knots=12,
+            knots=24,
         ),
         "geo_disease_duchon": dict(
             family="binomial-logit",
@@ -3086,7 +3086,7 @@ def _scenario_fit_mapping(scenario_name: typing.Any) -> typing.Any:
             ],
             smooth_basis="duchon",
             linear_cols=[],
-            knots=12,
+            knots=24,
         ),
         "geo_disease_matern": dict(
             family="binomial-logit",
@@ -3095,7 +3095,7 @@ def _scenario_fit_mapping(scenario_name: typing.Any) -> typing.Any:
             ],
             smooth_basis="matern",
             linear_cols=[],
-            knots=12,
+            knots=24,
         ),
         "geo_disease_shrinkage": dict(
             family="binomial-logit",
@@ -3104,14 +3104,14 @@ def _scenario_fit_mapping(scenario_name: typing.Any) -> typing.Any:
             ],
             smooth_basis="thinplate",
             linear_cols=[],
-            knots=12,
+            knots=24,
         ),
         "geo_disease_ps_per_pc": dict(
             family="binomial-logit",
             smooth_cols=[f"pc{i}" for i in range(1, 17)],
             smooth_basis="ps",
             linear_cols=[],
-            knots=10,
+            knots=24,
         ),
         "geo_subpop16_randomprev_randomscale_duchonfull_k50": dict(
             family="binomial-logit",
@@ -3270,6 +3270,14 @@ def _emit_joint_pc_term(
         )
     cols = ", ".join(pc_cols)
     pc_basis = _canonical_smooth_basis(pc_basis)
+    if backend == "rust" and pc_basis == "duchon":
+        min_centers = len(pc_cols) + 2
+        if knot_count < min_centers:
+            raise RuntimeError(
+                f"joint-PC Duchon over {len(pc_cols)} PCs needs centers/k >= {min_centers} "
+                f"to leave at least one kernel degree of freedom after the linear "
+                f"polynomial nullspace; got {knot_count}"
+            )
     if backend == "rust":
         dp = ", double_penalty=true" if double_penalty else ", double_penalty=false"
         if pc_basis in {"thinplate", "tps"}:
