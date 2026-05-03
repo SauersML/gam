@@ -3978,17 +3978,18 @@ impl TransformationNormalFamily {
         }
 
         impl PsiPairTraceAccum {
-            fn new(p_resp: usize) -> Self {
+            fn new(p_resp: usize, rank: usize) -> Self {
+                let projected_len = p_resp * rank;
                 Self {
                     value: 0.0,
                     gamma: vec![0.0; p_resp],
                     gamma_i: vec![0.0; p_resp],
                     gamma_j: vec![0.0; p_resp],
                     gamma_ij: vec![0.0; p_resp],
-                    f: vec![0.0; p_resp],
-                    f_i: vec![0.0; p_resp],
-                    f_j: vec![0.0; p_resp],
-                    f_ij: vec![0.0; p_resp],
+                    f: vec![0.0; projected_len],
+                    f_i: vec![0.0; projected_len],
+                    f_j: vec![0.0; projected_len],
+                    f_ij: vec![0.0; projected_len],
                 }
             }
         }
@@ -3998,7 +3999,7 @@ impl TransformationNormalFamily {
         let total = (0..n)
             .into_par_iter()
             .fold(
-                || PsiPairTraceAccum::new(p_resp),
+                || PsiPairTraceAccum::new(p_resp, rank),
                 |mut acc, row_idx| {
                     let cov_row = cov.row(row_idx);
                     let cov_i_row = cov_i.row(row_idx);
@@ -4062,34 +4063,39 @@ impl TransformationNormalFamily {
                     let inv_hp_qu = inv_hp_sq * inv_hp_sq;
                     let wi = weights[global_row];
 
-                    for col in 0..rank {
-                        for k in 0..p_resp {
-                            let offset = k * p_cov;
-                            let mut f = 0.0;
-                            let mut f_i = 0.0;
-                            let mut f_j = 0.0;
-                            let mut f_ij = 0.0;
-                            for cidx in 0..p_cov {
-                                let coeff = factor[[offset + cidx, col]];
-                                f += coeff * cov_row[cidx];
-                                f_i += coeff * cov_i_row[cidx];
-                                f_j += coeff * cov_j_row[cidx];
-                                f_ij += coeff * cov_ij_row[cidx];
+                    acc.f.fill(0.0);
+                    acc.f_i.fill(0.0);
+                    acc.f_j.fill(0.0);
+                    acc.f_ij.fill(0.0);
+                    for k in 0..p_resp {
+                        let factor_row_base = k * p_cov;
+                        let projected_base = k * rank;
+                        for cidx in 0..p_cov {
+                            let coeff_row = factor.row(factor_row_base + cidx);
+                            let cov_v = cov_row[cidx];
+                            let cov_i_v = cov_i_row[cidx];
+                            let cov_j_v = cov_j_row[cidx];
+                            let cov_ij_v = cov_ij_row[cidx];
+                            for col in 0..rank {
+                                let coeff = coeff_row[col];
+                                let idx = projected_base + col;
+                                acc.f[idx] += coeff * cov_v;
+                                acc.f_i[idx] += coeff * cov_i_v;
+                                acc.f_j[idx] += coeff * cov_j_v;
+                                acc.f_ij[idx] += coeff * cov_ij_v;
                             }
-                            acc.f[k] = f;
-                            acc.f_i[k] = f_i;
-                            acc.f_j[k] = f_j;
-                            acc.f_ij[k] = f_ij;
                         }
+                    }
 
-                        let mut h_f = rv[0] * acc.f[0];
-                        let mut hp_f = rd[0] * acc.f[0];
-                        let mut h_i_f = rv[0] * acc.f_i[0];
-                        let mut h_j_f = rv[0] * acc.f_j[0];
-                        let mut h_ij_f = rv[0] * acc.f_ij[0];
-                        let mut hp_i_f = rd[0] * acc.f_i[0];
-                        let mut hp_j_f = rd[0] * acc.f_j[0];
-                        let mut hp_ij_f = rd[0] * acc.f_ij[0];
+                    for col in 0..rank {
+                        let mut h_f = rv[0] * acc.f[col];
+                        let mut hp_f = rd[0] * acc.f[col];
+                        let mut h_i_f = rv[0] * acc.f_i[col];
+                        let mut h_j_f = rv[0] * acc.f_j[col];
+                        let mut h_ij_f = rv[0] * acc.f_ij[col];
+                        let mut hp_i_f = rd[0] * acc.f_i[col];
+                        let mut hp_j_f = rd[0] * acc.f_j[col];
+                        let mut hp_ij_f = rd[0] * acc.f_ij[col];
 
                         let mut h_ff = 0.0;
                         let mut hp_ff = 0.0;
@@ -4105,10 +4111,11 @@ impl TransformationNormalFamily {
                             let gi = acc.gamma_i[k];
                             let gj = acc.gamma_j[k];
                             let gij = acc.gamma_ij[k];
-                            let f = acc.f[k];
-                            let fi = acc.f_i[k];
-                            let fj = acc.f_j[k];
-                            let fij = acc.f_ij[k];
+                            let projected_idx = k * rank + col;
+                            let f = acc.f[projected_idx];
+                            let fi = acc.f_i[projected_idx];
+                            let fj = acc.f_j[projected_idx];
+                            let fij = acc.f_ij[projected_idx];
 
                             h_f += 2.0 * rv[k] * g * f;
                             hp_f += 2.0 * rd[k] * g * f;
@@ -4139,20 +4146,21 @@ impl TransformationNormalFamily {
                         let mut endpoint_ij_ff = [0.0; 2];
                         for e in 0..2 {
                             let basis = endpoint_basis[e];
-                            endpoint_f[e] = basis[0] * acc.f[0];
-                            endpoint_i_f[e] = basis[0] * acc.f_i[0];
-                            endpoint_j_f[e] = basis[0] * acc.f_j[0];
-                            endpoint_ij_f[e] = basis[0] * acc.f_ij[0];
+                            endpoint_f[e] = basis[0] * acc.f[col];
+                            endpoint_i_f[e] = basis[0] * acc.f_i[col];
+                            endpoint_j_f[e] = basis[0] * acc.f_j[col];
+                            endpoint_ij_f[e] = basis[0] * acc.f_ij[col];
                             for k in 1..p_resp {
                                 let basis_k = basis[k];
                                 let g = acc.gamma[k];
                                 let gi = acc.gamma_i[k];
                                 let gj = acc.gamma_j[k];
                                 let gij = acc.gamma_ij[k];
-                                let f = acc.f[k];
-                                let fi = acc.f_i[k];
-                                let fj = acc.f_j[k];
-                                let fij = acc.f_ij[k];
+                                let projected_idx = k * rank + col;
+                                let f = acc.f[projected_idx];
+                                let fi = acc.f_i[projected_idx];
+                                let fj = acc.f_j[projected_idx];
+                                let fij = acc.f_ij[projected_idx];
                                 endpoint_f[e] += 2.0 * basis_k * g * f;
                                 endpoint_i_f[e] += 2.0 * basis_k * (f * gi + g * fi);
                                 endpoint_j_f[e] += 2.0 * basis_k * (f * gj + g * fj);
@@ -4205,7 +4213,7 @@ impl TransformationNormalFamily {
                 },
             )
             .reduce(
-                || PsiPairTraceAccum::new(p_resp),
+                || PsiPairTraceAccum::new(p_resp, rank),
                 |mut left, right| {
                     left.value += right.value;
                     left
