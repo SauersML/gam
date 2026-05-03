@@ -18617,11 +18617,6 @@ pub mod closed_form_penalty {
         );
         assert!(!r.is_empty(), "anisotropic_duchon_penalty: empty input");
         assert!(q <= 2, "anisotropic_duchon_penalty: q must be in {{0,1,2}}");
-        if eta.iter().all(|&e| e == 0.0) {
-            let d = r.len();
-            let r_sq: f64 = r.iter().map(|&ri| ri * ri).sum();
-            return isotropic_duchon_penalty(q, d, m, s, kappa, r_sq.sqrt());
-        }
         anisotropic_duchon_penalty_radial(q, m, s, kappa, eta, r)
     }
 
@@ -19413,21 +19408,6 @@ pub mod closed_form_penalty {
             "anisotropic_duchon_penalty_radial: q must be in {{0,1,2}}"
         );
 
-        if let Some(common_eta) = uniform_eta_value(eta) {
-            let euclidean_r2 = squared_norm(r);
-            if let Some(value) = uniform_metric_isotropic_duchon_penalty(
-                q,
-                m,
-                s,
-                kappa,
-                eta.len(),
-                common_eta,
-                euclidean_r2,
-            ) {
-                return value;
-            }
-        }
-
         let powers = AnisoMetricPowers::new(eta);
         anisotropic_duchon_penalty_radial_with_powers(q, m, s, kappa, eta, &powers, r)
     }
@@ -19469,7 +19449,7 @@ pub mod closed_form_penalty {
         if let Some(common_eta) = uniform_eta_value(eta) {
             let euclidean_r2 = squared_norm(r);
             if let Some(value) =
-                uniform_metric_isotropic_duchon_penalty(q, m, s, kappa, d, common_eta, euclidean_r2)
+                uniform_metric_radial_duchon_penalty(q, m, s, kappa, d, common_eta, euclidean_r2)
             {
                 return value;
             }
@@ -19502,7 +19482,7 @@ pub mod closed_form_penalty {
         }
     }
 
-    fn uniform_metric_isotropic_duchon_penalty(
+    fn uniform_metric_radial_duchon_penalty(
         q: usize,
         m: usize,
         s: usize,
@@ -19520,8 +19500,20 @@ pub mod closed_form_penalty {
             return None;
         }
 
-        let scaled_r = b.sqrt() * euclidean_r2.sqrt();
-        Some(b.powi(q as i32) * isotropic_duchon_penalty(q, d, m, s, kappa, scaled_r))
+        let big_r = (b * euclidean_r2).sqrt();
+        let max_order = if q == 0 { 0 } else { 2 * q };
+        let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order);
+        let big_r2 = big_r * big_r;
+        let s1 = (d as f64) * b;
+        let s2 = (d as f64) * b * b;
+        let u1 = b * big_r2;
+        let u2 = b * b * big_r2;
+        Some(match q {
+            0 => fr[0],
+            1 => -anisotropic_laplacian_of_radial_first(big_r, s1, u1, &fr),
+            2 => anisotropic_laplacian_of_radial_second(big_r, s1, s2, u1, u2, &fr),
+            _ => unreachable!(),
+        })
     }
 
     fn uniform_eta_value(eta: &[f64]) -> Option<f64> {
@@ -27607,28 +27599,22 @@ mod tests {
 
     #[test]
     fn test_schoenberg_isotropic_agrees_with_partial_fraction() {
-        use super::closed_form_penalty::{anisotropic_duchon_penalty, isotropic_duchon_penalty};
+        use super::closed_form_penalty::isotropic_duchon_penalty;
 
-        // At η = 0 the anisotropic kernel short-circuits to the isotropic
-        // closed form. Additionally, `isotropic_duchon_penalty`
-        // requires `2m - q ≥ 1` for the partial-fraction expansion. For q=1
-        // this is satisfied by (d=3, m=1, s=1). For q=2, use m≥2 and d≥5.
+        // `isotropic_duchon_penalty` is the separately q-loaded
+        // Riesz-Matérn partial-fraction representative. This test checks that
+        // representative directly; the anisotropic radial chain is tested
+        // against `(-Δ)^q` of the q=0 representative below.
         let cases: &[(usize, usize, usize, usize, f64, f64)] = &[
             (1, 3, 1, 1, 1.0, 0.5),
             (1, 3, 1, 1, 1.0, 2.0),
             (2, 5, 2, 2, 1.0, 1.0),
         ];
         for &(q, d, m, s, kappa, big_r) in cases {
-            let eta = vec![0.0_f64; d];
-            let mut r = vec![0.0_f64; d];
-            r[0] = big_r;
-            let aniso = anisotropic_duchon_penalty(q, m, s, kappa, &eta, &r);
             let iso = isotropic_duchon_penalty(q, d, m, s, kappa, big_r);
-            let rel = (aniso - iso).abs() / iso.abs().max(1e-300);
             assert!(
-                rel < 1e-12,
-                "eta-zero aniso/iso disagreement: q={q} d={d} m={m} s={s} kappa={kappa} R={big_r} \
-                 aniso={aniso} iso={iso} rel={rel}"
+                iso.is_finite(),
+                "isotropic q-loaded representative is non-finite: q={q} d={d} m={m} s={s} kappa={kappa} R={big_r}"
             );
         }
     }
@@ -28366,11 +28352,38 @@ mod tests {
         );
     }
 
+    fn isotropic_radial_laplacian_power_from_q0(
+        q: usize,
+        d: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        big_r: f64,
+    ) -> f64 {
+        use super::closed_form_penalty::radial_derivatives_of_isotropic_duchon;
+
+        let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, 2 * q);
+        match q {
+            0 => fr[0],
+            1 => -(fr[2] + ((d as f64) - 1.0) * fr[1] / big_r),
+            2 => {
+                let r2 = big_r * big_r;
+                let r3 = r2 * big_r;
+                let dm1 = (d as f64) - 1.0;
+                let dm3 = (d as f64) - 3.0;
+                fr[4] + 2.0 * dm1 * fr[3] / big_r + dm1 * dm3 * fr[2] / r2 - dm1 * dm3 * fr[1] / r3
+            }
+            _ => unreachable!(),
+        }
+    }
+
     #[test]
-    fn test_schoenberg_isotropic_matches_riesz_matern_strict_tolerance() {
-        use super::closed_form_penalty::{anisotropic_duchon_penalty, isotropic_duchon_penalty};
-        // At η = 0, the anisotropic operator is exactly the isotropic
-        // Riesz-Matérn partial-fraction kernel.
+    fn test_anisotropic_eta_zero_matches_q0_radial_chain_strict_tolerance() {
+        use super::closed_form_penalty::anisotropic_duchon_penalty;
+        // At η = 0, the anisotropic operator must reduce to the q-fold
+        // radial `(-Δ)^q` chain applied to the q=0 constrained Duchon
+        // representative. It must not silently switch to a separately
+        // q-loaded finite-part representative.
         let cases: &[(usize, usize, usize, usize, f64)] = &[(1, 3, 1, 2, 1.0), (2, 5, 2, 2, 1.0)];
         for &(q, d, m, s, kappa) in cases {
             for &big_r in &[0.2_f64, 0.5, 1.0, 2.0, 4.0] {
@@ -28378,20 +28391,20 @@ mod tests {
                 let mut r = vec![0.0_f64; d];
                 r[0] = big_r;
                 let aniso = anisotropic_duchon_penalty(q, m, s, kappa, &eta, &r);
-                let iso = isotropic_duchon_penalty(q, d, m, s, kappa, big_r);
-                let rel = (aniso - iso).abs() / iso.abs().max(1e-300);
+                let expected = isotropic_radial_laplacian_power_from_q0(q, d, m, s, kappa, big_r);
+                let rel = (aniso - expected).abs() / expected.abs().max(aniso.abs()).max(1e-300);
                 assert!(
                     rel < 1e-12,
-                    "strict eta-zero aniso/iso disagreement: q={q} d={d} m={m} s={s} κ={kappa} R={big_r} \
-                     aniso={aniso:.6e} iso={iso:.6e} rel={rel:.3e}"
+                    "strict eta-zero radial-chain disagreement: q={q} d={d} m={m} s={s} κ={kappa} R={big_r} \
+                     aniso={aniso:.6e} expected={expected:.6e} rel={rel:.3e}"
                 );
             }
         }
     }
 
     #[test]
-    fn test_anisotropic_public_wrapper_eta_zero_matches_isotropic() {
-        use super::closed_form_penalty::{anisotropic_duchon_penalty, isotropic_duchon_penalty};
+    fn test_anisotropic_public_wrapper_eta_zero_matches_radial_chain() {
+        use super::closed_form_penalty::anisotropic_duchon_penalty;
         let q = 1usize;
         let d = 3usize;
         let m = 1usize;
@@ -28402,12 +28415,12 @@ mod tests {
             let mut r = vec![0.0_f64; d];
             r[0] = big_r;
             let aniso = anisotropic_duchon_penalty(q, m, s, kappa, &eta, &r);
-            let iso = isotropic_duchon_penalty(q, d, m, s, kappa, big_r);
-            let rel = (aniso - iso).abs() / iso.abs().max(1e-300);
+            let expected = isotropic_radial_laplacian_power_from_q0(q, d, m, s, kappa, big_r);
+            let rel = (aniso - expected).abs() / expected.abs().max(aniso.abs()).max(1e-300);
             assert!(
                 rel < 1e-12,
-                "eta-zero aniso/iso disagreement at R={big_r}: \
-                 aniso={aniso:.6e} iso={iso:.6e} rel={rel:.3e}"
+                "eta-zero aniso/radial-chain disagreement at R={big_r}: \
+                 aniso={aniso:.6e} expected={expected:.6e} rel={rel:.3e}"
             );
         }
     }
@@ -28526,9 +28539,9 @@ mod tests {
             anisotropic_duchon_penalty, anisotropic_duchon_penalty_radial,
         };
 
-        // The public wrapper keeps the historical function name but now
-        // delegates to the analytic radial closed form for η != 0 and to the
-        // isotropic analytic closed form for η = 0.
+        // The public wrapper keeps the historical function name but delegates
+        // to the same analytic radial closed form for every metric, including
+        // uniform and η = 0 metrics.
         let cases: &[(usize, usize, usize, usize, f64)] = &[(1, 3, 1, 1, 1.0), (2, 5, 2, 2, 1.0)];
 
         for &(q, d, m, s, kappa) in cases {
@@ -28561,18 +28574,13 @@ mod tests {
     }
 
     #[test]
-    fn test_radial_form_isotropic_limit_matches_isotropic_duchon() {
+    fn test_radial_form_isotropic_limit_matches_radial_laplacian_chain() {
         // η = 0 collapses the radial-form anisotropic penalty to
-        //   J · (-Δ)^q f(R) on radial f, which equals the isotropic
-        // closed form via:
+        //   J · (-Δ)^q f(R) on the q=0 constrained radial representative:
         //   q = 0:  f(R)
         //   q = 1: -[ f''(R) + (d-1) f'(R)/R ]
         //   q = 2:  Δ²f(R) (well-known closed form on radial fns)
-        // The radial form should agree to roundoff with the isotropic
-        // closed form supplied by `isotropic_duchon_penalty(q, d, m, s, κ, R)`.
-        use super::closed_form_penalty::{
-            anisotropic_duchon_penalty_radial, isotropic_duchon_penalty,
-        };
+        use super::closed_form_penalty::anisotropic_duchon_penalty_radial;
 
         // Use parameter triples covering both Riesz-only (s=0) and
         // hybrid (s>0). All require 2m - q ≥ 1 from
@@ -28595,29 +28603,14 @@ mod tests {
                 let mut r = vec![0.0_f64; d];
                 r[0] = big_r;
                 let radial = anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta, &r);
-                // For q=0 the closed form is f(R) directly. For q ≥ 1 the
-                // anisotropic Laplacian collapses to (-Δ)^q on a radial
-                // function in d-dim flat space, which is *not* the same as
-                // the q-loaded isotropic Duchon kernel (those differ in
-                // their Fourier representation by ρ^{2q} not Δ_x^q applied
-                // to the q=0 kernel — they coincide up to sign for radial f
-                // by Plancherel since (-Δ)^q ↔ |ρ|^{2q}).
-                //
-                // Indeed the Fourier-space identity
-                //   F[(-Δ)^q f] = |ρ|^{2q} F[f]
-                // means that on radial f(r) we have, in any d,
-                //   isotropic_duchon_penalty(q, d, m, s, κ, R)
-                //   = (-Δ)^q [ isotropic_duchon_penalty(0, d, m, s, κ, ·) ](R).
-                // So our η=0 anisotropic radial form should match that
-                // same closed form (up to a sign convention on Δ).
-                let iso = isotropic_duchon_penalty(q, d, m, s, kappa, big_r);
-                let abs = (radial - iso).abs();
-                let scale = iso.abs().max(radial.abs()).max(1.0);
+                let expected = isotropic_radial_laplacian_power_from_q0(q, d, m, s, kappa, big_r);
+                let abs = (radial - expected).abs();
+                let scale = expected.abs().max(radial.abs()).max(1.0);
                 assert!(
                     abs / scale < 1e-8,
-                    "radial form (η=0) disagrees with isotropic closed form: \
+                    "radial form (η=0) disagrees with radial Laplacian chain: \
                      q={q} d={d} m={m} s={s} kappa={kappa} R={big_r} \
-                     radial={radial:.6e} iso={iso:.6e} abs={abs:.3e}"
+                     radial={radial:.6e} expected={expected:.6e} abs={abs:.3e}"
                 );
             }
         }
@@ -28844,10 +28837,8 @@ mod tests {
     }
 
     #[test]
-    fn test_radial_form_matches_isotropic_at_eta_zero_full_sweep() {
-        use super::closed_form_penalty::{
-            anisotropic_duchon_penalty_radial, isotropic_duchon_penalty,
-        };
+    fn test_radial_form_matches_q0_laplacian_chain_at_eta_zero_full_sweep() {
+        use super::closed_form_penalty::anisotropic_duchon_penalty_radial;
 
         let qs = [0_usize, 1, 2];
         let ds = [1_usize, 3, 5, 7, 9, 11];
@@ -28882,18 +28873,20 @@ mod tests {
 
                                 let radial =
                                     anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta, &r_vec);
-                                let iso = isotropic_duchon_penalty(q, d, m, s, kappa, big_r);
-                                if !radial.is_finite() || !iso.is_finite() {
+                                let expected = isotropic_radial_laplacian_power_from_q0(
+                                    q, d, m, s, kappa, big_r,
+                                );
+                                if !radial.is_finite() || !expected.is_finite() {
                                     skipped += 1;
                                     continue;
                                 }
-                                let denom = iso.abs().max(radial.abs()).max(1e-300);
-                                let rel = (radial - iso).abs() / denom;
+                                let denom = expected.abs().max(radial.abs()).max(1e-300);
+                                let rel = (radial - expected).abs() / denom;
                                 assert!(
                                     rel < 1e-12,
-                                    "η=0 radial vs iso disagreement: q={q} d={d} m={m} \
+                                    "η=0 radial vs q0-Laplacian disagreement: q={q} d={d} m={m} \
                                      s={s} κ={kappa} R={big_r} radial={radial:.6e} \
-                                     iso={iso:.6e} rel={rel:.3e}"
+                                     expected={expected:.6e} rel={rel:.3e}"
                                 );
                                 tested += 1;
                             }
@@ -28910,9 +28903,7 @@ mod tests {
 
     #[test]
     fn test_radial_form_uniform_eta_uses_exact_isotropic_metric_identity() {
-        use super::closed_form_penalty::{
-            anisotropic_duchon_penalty_radial, isotropic_duchon_penalty,
-        };
+        use super::closed_form_penalty::anisotropic_duchon_penalty_radial;
 
         let cases: &[(usize, usize, usize, usize, f64, f64)] = &[
             (0, 3, 1, 2, 0.5, 0.20),
@@ -28925,7 +28916,14 @@ mod tests {
             let euclidean_r = r.iter().map(|&ri| ri * ri).sum::<f64>().sqrt();
             let b = (-2.0 * common_eta).exp();
             let expected = b.powi(q as i32)
-                * isotropic_duchon_penalty(q, d, m, s, kappa, b.sqrt() * euclidean_r);
+                * isotropic_radial_laplacian_power_from_q0(
+                    q,
+                    d,
+                    m,
+                    s,
+                    kappa,
+                    b.sqrt() * euclidean_r,
+                );
             let radial = anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta, &r);
             let rel = (radial - expected).abs() / expected.abs().max(radial.abs()).max(1e-300);
             assert!(
