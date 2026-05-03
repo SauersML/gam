@@ -4,16 +4,16 @@
 //! operator. Two concrete implementations live alongside:
 //!   * `Array2<f64>` (via blanket `impl PenaltyOp for Array2<f64>`) — adapts a
 //!     materialized dense penalty into the operator interface.
-//!   * `ClosedFormPenaltyOperator` (in this module) — implements the trait by
-//!     delegating to its existing methods, which today amortize a dense build
-//!     via `OnceLock`.
+//!   * `ClosedFormPenaltyOperator` — implements the trait with analytic,
+//!     streaming pair-kernel matvecs and only materializes when `as_dense()` is
+//!     explicitly requested.
 //!
 //! See `matrix_free_penalty_integration_assessment.md` for why the operator
 //! does not have a "true matrix-free" backing implementation in our K range
 //! and why this trait is still worth threading through PIRLS/REML: the
-//! wallclock win lives at the *Hessian* level (PCG-against-implicit-H), not
-//! at the penalty level. Operator-form penalties slot into that PCG without
-//! needing the penalty itself to be matrix-free.
+//! wallclock win lives at the *Hessian* level (PCG-against-implicit-H). The
+//! closed-form Duchon operator is also matrix-free so large K paths avoid
+//! accidental dense Gram construction in matvec/log-det probes.
 
 use std::sync::Arc;
 

@@ -1921,16 +1921,19 @@ where
             } else {
                 Array1::from_elem(k, risk_shift.clamp(lo, hi))
             };
-            let refined = crate::seeding::coarse_grid_log_lambda_seed(&base, (lo, hi), k, |rho| {
-                reml_state.compute_cost(rho).ok().filter(|c| c.is_finite())
-            });
+            let refined = crate::seeding::select_objective_seed_on_log_lambda_grid(
+                &base,
+                (lo, hi),
+                k,
+                |rho| reml_state.compute_cost(rho).ok().filter(|c| c.is_finite()),
+            );
             if refined
                 .iter()
                 .zip(base.iter())
                 .any(|(&a, &b)| (a - b).abs() > 1e-12)
             {
                 log::info!(
-                    "[OUTER] standard REML coarse-grid pre-pass refined seed: {:?} -> {:?}",
+                    "[OUTER] standard REML objective-grid selected seed: {:?} -> {:?}",
                     base.as_slice().unwrap_or(&[]),
                     refined.as_slice().unwrap_or(&[])
                 );
