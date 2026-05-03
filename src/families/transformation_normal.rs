@@ -3922,6 +3922,9 @@ impl TransformationNormalFamily {
                 factor.nrows()
             ));
         }
+        let factor_data = factor.as_slice().ok_or_else(|| {
+            "SCOP psi-psi projected trace factor matrix must be standard contiguous".to_string()
+        })?;
         if endpoint_q.len() != n {
             return Err(format!(
                 "SCOP psi-psi projected trace endpoint normalizer cache length {} != n={n}",
@@ -4071,13 +4074,13 @@ impl TransformationNormalFamily {
                         let factor_row_base = k * p_cov;
                         let projected_base = k * rank;
                         for cidx in 0..p_cov {
-                            let coeff_row = factor.row(factor_row_base + cidx);
+                            let coeff_base = (factor_row_base + cidx) * rank;
                             let cov_v = cov_row[cidx];
                             let cov_i_v = cov_i_row[cidx];
                             let cov_j_v = cov_j_row[cidx];
                             let cov_ij_v = cov_ij_row[cidx];
                             for col in 0..rank {
-                                let coeff = coeff_row[col];
+                                let coeff = factor_data[coeff_base + col];
                                 let idx = projected_base + col;
                                 acc.f[idx] += coeff * cov_v;
                                 acc.f_i[idx] += coeff * cov_i_v;
