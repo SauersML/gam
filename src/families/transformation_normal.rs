@@ -4397,9 +4397,10 @@ impl TransformationNormalFamily {
             .covariate_design
             .try_row_chunk(0..n)
             .map_err(|e| format!("SCOP psi hessian direction requires covariate row chunk: {e}"))?;
-        let cov_psi = op
-            .materialize_cov_first_axis(axis)
+        let cov_psi_arc = op
+            .materialize_cov_first_axis_arc(axis)
             .map_err(|e| format!("SCOP psi hessian materialize_cov_first failed: {e}"))?;
+        let cov_psi = cov_psi_arc.view();
         if cov_psi.nrows() != n || cov_psi.ncols() != p_cov {
             return Err(format!(
                 "SCOP psi hessian covariate derivative shape {}x{} != expected {}x{}",
@@ -4422,6 +4423,34 @@ impl TransformationNormalFamily {
         ];
         let mut out = Array2::<f64>::zeros((p_total, p_total));
 
+        // Hoist per-row scratch buffers out of the `for i in 0..n` loop. The
+        // original code allocated ~22 fresh Vecs per row (n × ~22 = many
+        // thousands of small allocations per call); reuse via fill instead.
+        // Math is unchanged — the fills below restore the zero-init that the
+        // `vec![0.0; …]` macros previously provided.
+        let mut gamma = vec![0.0; p_resp];
+        let mut gamma_dir = vec![0.0; p_resp];
+        let mut gamma_psi = vec![0.0; p_resp];
+        let mut gamma_psi_dir = vec![0.0; p_resp];
+        let mut endpoint_factor = vec![[0.0_f64; 2]; p_resp];
+        let mut endpoint_factor_dir = vec![[0.0_f64; 2]; p_resp];
+        let mut endpoint_psi_cov_factor = vec![[0.0_f64; 2]; p_resp];
+        let mut endpoint_psi_psi_factor = vec![[0.0_f64; 2]; p_resp];
+        let mut endpoint_psi_cov_factor_dir = vec![[0.0_f64; 2]; p_resp];
+        let mut endpoint_psi_psi_factor_dir = vec![[0.0_f64; 2]; p_resp];
+        let mut h_factor = vec![0.0; p_resp];
+        let mut hp_factor = vec![0.0; p_resp];
+        let mut h_factor_dir = vec![0.0; p_resp];
+        let mut hp_factor_dir = vec![0.0; p_resp];
+        let mut hpsi_cov_factor = vec![0.0; p_resp];
+        let mut hppsi_cov_factor = vec![0.0; p_resp];
+        let mut hpsi_psi_factor = vec![0.0; p_resp];
+        let mut hppsi_psi_factor = vec![0.0; p_resp];
+        let mut hpsi_cov_factor_dir = vec![0.0; p_resp];
+        let mut hppsi_cov_factor_dir = vec![0.0; p_resp];
+        let mut hpsi_psi_factor_dir = vec![0.0; p_resp];
+        let mut hppsi_psi_factor_dir = vec![0.0; p_resp];
+
         for i in 0..n {
             let cov_row = cov.row(i);
             let psi_row = cov_psi.row(i);
@@ -4434,10 +4463,28 @@ impl TransformationNormalFamily {
             let inv_hp_cu = inv_hp_sq * inv_hp;
             let inv_hp_qu = inv_hp_sq * inv_hp_sq;
 
-            let mut gamma = vec![0.0; p_resp];
-            let mut gamma_dir = vec![0.0; p_resp];
-            let mut gamma_psi = vec![0.0; p_resp];
-            let mut gamma_psi_dir = vec![0.0; p_resp];
+            // Reset endpoint/factor buffers whose index 0 is never written
+            // explicitly below — original code relied on `vec![0.0; …]`
+            // zero-init for those slots. The four `gamma` Vecs are fully
+            // overwritten in the loop just below, so they don't need filling.
+            endpoint_factor.fill([0.0; 2]);
+            endpoint_factor_dir.fill([0.0; 2]);
+            endpoint_psi_cov_factor.fill([0.0; 2]);
+            endpoint_psi_psi_factor.fill([0.0; 2]);
+            endpoint_psi_cov_factor_dir.fill([0.0; 2]);
+            endpoint_psi_psi_factor_dir.fill([0.0; 2]);
+            h_factor.fill(0.0);
+            hp_factor.fill(0.0);
+            h_factor_dir.fill(0.0);
+            hp_factor_dir.fill(0.0);
+            hpsi_cov_factor.fill(0.0);
+            hppsi_cov_factor.fill(0.0);
+            hpsi_psi_factor.fill(0.0);
+            hppsi_psi_factor.fill(0.0);
+            hpsi_cov_factor_dir.fill(0.0);
+            hppsi_cov_factor_dir.fill(0.0);
+            hpsi_psi_factor_dir.fill(0.0);
+            hppsi_psi_factor_dir.fill(0.0);
             for k in 0..p_resp {
                 gamma[k] = beta_mat.row(k).dot(&cov_row);
                 gamma_dir[k] = dir_mat.row(k).dot(&cov_row);
@@ -4463,12 +4510,6 @@ impl TransformationNormalFamily {
             let mut endpoint_psi = [0.0; 2];
             let mut endpoint_dir = [0.0; 2];
             let mut endpoint_psi_dir = [0.0; 2];
-            let mut endpoint_factor = vec![[0.0; 2]; p_resp];
-            let mut endpoint_factor_dir = vec![[0.0; 2]; p_resp];
-            let mut endpoint_psi_cov_factor = vec![[0.0; 2]; p_resp];
-            let mut endpoint_psi_psi_factor = vec![[0.0; 2]; p_resp];
-            let mut endpoint_psi_cov_factor_dir = vec![[0.0; 2]; p_resp];
-            let mut endpoint_psi_psi_factor_dir = vec![[0.0; 2]; p_resp];
             for e in 0..2 {
                 let basis = endpoint_basis[e];
                 endpoint_psi[e] = basis[0] * gamma_psi[0];
@@ -4493,19 +4534,6 @@ impl TransformationNormalFamily {
             let d_inv_hp = -hp_dir * inv_hp_sq;
             let d_inv_hp_sq = -2.0 * hp_dir * inv_hp_cu;
             let d_inv_hp_cu = -3.0 * hp_dir * inv_hp_qu;
-
-            let mut h_factor = vec![0.0; p_resp];
-            let mut hp_factor = vec![0.0; p_resp];
-            let mut h_factor_dir = vec![0.0; p_resp];
-            let mut hp_factor_dir = vec![0.0; p_resp];
-            let mut hpsi_cov_factor = vec![0.0; p_resp];
-            let mut hppsi_cov_factor = vec![0.0; p_resp];
-            let mut hpsi_psi_factor = vec![0.0; p_resp];
-            let mut hppsi_psi_factor = vec![0.0; p_resp];
-            let mut hpsi_cov_factor_dir = vec![0.0; p_resp];
-            let mut hppsi_cov_factor_dir = vec![0.0; p_resp];
-            let mut hpsi_psi_factor_dir = vec![0.0; p_resp];
-            let mut hppsi_psi_factor_dir = vec![0.0; p_resp];
 
             h_factor[0] = rv[0];
             hp_factor[0] = rd[0];
@@ -4673,7 +4701,17 @@ impl TransformationNormalFamily {
             }
         }
 
-        Ok(0.5 * (&out + &out.t()))
+        // In-place symmetrization: avoid allocating an extra `p_total × p_total`
+        // f64 matrix for `&out + &out.t()`. Mathematically identical to
+        // `0.5 * (out + out.T)`.
+        for i in 0..p_total {
+            for j in (i + 1)..p_total {
+                let s = 0.5 * (out[[i, j]] + out[[j, i]]);
+                out[[i, j]] = s;
+                out[[j, i]] = s;
+            }
+        }
+        Ok(out)
     }
 }
 
