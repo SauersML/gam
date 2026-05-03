@@ -118,10 +118,6 @@ pub const TRANSFORMATION_GRID_RELATIVE_TOL: f64 = 1.0e-12;
 /// in sync prevents the predict path from rejecting fits that the
 /// optimizer accepted as feasible — and vice versa.
 pub const TRANSFORMATION_MONOTONICITY_EPS: f64 = 1.0e-8;
-/// SCOP-CTN supplies ψ-axis second-order curvature as matrix-free HVPs, so the
-/// shared dense tau-tau memory policy must not downgrade analytic Hessian
-/// planning to gradient-only BFGS for this family.
-const CTN_ALLOW_TAU_TAU_GRADIENT_ONLY_PREFERENCE: bool = false;
 /// Absolute bound for feasible transformation scores on the standard-normal
 /// scale. The CTN likelihood targets `h(Y|x) ~ N(0,1)`; accepting exact-Newton
 /// iterates with finite positive `h'` but astronomical `|h|` lets curvature
@@ -9170,11 +9166,6 @@ mod tests {
         let (family, derivative_blocks, _, spec) = toy_family_and_derivatives(&psi);
         let specs = std::slice::from_ref(&spec);
 
-        assert!(
-            !CTN_ALLOW_TAU_TAU_GRADIENT_ONLY_PREFERENCE,
-            "SCOP-CTN must keep analytic Hessian planning available to ARC; \
-             dense tau-tau policy must not downgrade it to gradient-only BFGS"
-        );
         assert!(family.inner_coefficient_hessian_hvp_available(specs));
         assert!(family.outer_hyper_hessian_hvp_available(specs));
         assert!(family.outer_hyper_hessian_dense_available(specs));
@@ -10784,11 +10775,9 @@ pub fn fit_transformation_normal(
         // Transformation-normal has β-dependent H (through 1/h'²), so the
         // EFS Wood-Fasiolo PSD invariant fails — disable fixed-point so the
         // planner cannot pick EFS / Hybrid-EFS. CTN supplies SCOP ψ-axis
-        // second-order curvature through matrix-free HVPs, so do not let the
-        // dense tau-tau memory policy downgrade analytic Hessian planning to
-        // gradient-only BFGS; ARC consumes the exact analytic Hessian operator.
+        // second-order curvature through matrix-free HVPs; ARC consumes the
+        // exact analytic Hessian operator.
         true,
-        CTN_ALLOW_TAU_TAU_GRADIENT_ONLY_PREFERENCE,
         // fit_fn
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             ensure_exact_geometry(&specs[0], &designs[0])?;

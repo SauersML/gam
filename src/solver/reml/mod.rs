@@ -97,14 +97,6 @@ impl TauTauHessianPolicy {
     }
 }
 
-pub(crate) fn exact_tau_tau_hessian_policy(
-    n_obs: usize,
-    p_coeff: usize,
-    hyper_dirs: &[DirectionalHyperParam],
-) -> TauTauHessianPolicy {
-    exact_tau_tau_hessian_policy_with_firth(n_obs, p_coeff, hyper_dirs, false)
-}
-
 pub(crate) fn exact_tau_tau_hessian_policy_with_firth(
     n_obs: usize,
     p_coeff: usize,
@@ -275,7 +267,7 @@ mod tests {
             None,
         )
         .expect("implicit directional hyperparam");
-        let policy = super::exact_tau_tau_hessian_policy(10, 5, &[dir]);
+        let policy = super::exact_tau_tau_hessian_policy_with_firth(10, 5, &[dir], false);
         assert!(policy.any_has_implicit);
         assert_eq!(
             policy.gradient_plan.dense_x_bytes,
@@ -319,7 +311,7 @@ mod tests {
             None,
         )
         .expect("implicit duchon directional hyperparam");
-        let policy = super::exact_tau_tau_hessian_policy(10, 5, &[dir]);
+        let policy = super::exact_tau_tau_hessian_policy_with_firth(10, 5, &[dir], false);
         assert!(policy.any_has_implicit);
         assert!(policy.implicit_multidim_duchon);
         assert!(!policy.prefer_gradient_only());
@@ -343,7 +335,7 @@ mod tests {
                 .expect("dense directional hyperparam")
             })
             .collect::<Vec<_>>();
-        let policy = super::exact_tau_tau_hessian_policy(320_000, 71, &dirs);
+        let policy = super::exact_tau_tau_hessian_policy_with_firth(320_000, 71, &dirs, false);
         assert!(!policy.any_has_implicit);
         assert!(policy.hessian_plan.total_bytes() > policy.budget_bytes);
         assert!(policy.hessian_plan.total_bytes() > policy.gradient_plan.total_bytes());

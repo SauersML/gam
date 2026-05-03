@@ -1,9 +1,6 @@
 use crate::faer_ndarray::FaerEigh;
 use crate::faer_ndarray::{FaerCholesky, fast_atb, fast_av};
-use crate::linalg::utils::{
-    StableSolver, default_slq_parameters, stochastic_lanczos_logdet_spd,
-    stochastic_lanczos_logdet_spd_operator,
-};
+use crate::linalg::utils::StableSolver;
 use crate::matrix::{
     DesignMatrix, EmbeddedColumnBlock, EmbeddedSquareBlock, LinearOperator, SymmetricMatrix,
 };
@@ -394,72 +391,33 @@ impl ExactOuterDerivativeOrder {
     }
 }
 
-/// Cost gate for second-order exact outer derivatives.
+/// Exact outer derivative order for families that expose second-order
+/// coefficient geometry.
 ///
-/// Analytic Hessian capability is not enough to select a second-order outer
-/// solve. Operator-backed families can make Hessian-vector products available
-/// without making `outer_dim` repeated applications affordable, so the gate
-/// combines the number of outer columns with the reported coefficient-space
-/// work. Large problems keep exact gradients and route to first-order/hybrid
-/// outer optimization instead of forcing ARC to evaluate an unaffordable
-/// Hessian.
-pub fn cost_gated_outer_order(
-    specs: &[ParameterBlockSpec],
-    coefficient_cost: u64,
+/// This used to be a cost gate that demoted large biobank-scale problems to
+/// first-order BFGS. That was a policy leak into the math layer: if the family
+/// supplies analytic dense Hessian blocks or an analytic profiled-Hessian HVP,
+/// the outer optimizer should see the exact second-order objective. Runtime
+/// representation choices (dense vs operator) belong below this declaration,
+/// not in a first-order downgrade.
+pub fn exact_outer_order_from_capability(
+    _specs: &[ParameterBlockSpec],
+    _coefficient_cost: u64,
 ) -> ExactOuterDerivativeOrder {
-    const OUTER_HESSIAN_MAX_ELEMENTS: u64 = 16_000_000;
-    const OUTER_HESSIAN_MAX_WORK_UNITS: u64 = 1_000_000_000;
-
-    let outer_dim = specs
-        .iter()
-        .map(|spec| spec.penalties.len() as u64)
-        .fold(0u64, |acc, k| acc.saturating_add(k));
-    if outer_dim == 0 {
-        return ExactOuterDerivativeOrder::Second;
-    }
-
-    let outer_columns = outer_dim.max(1);
-    let outer_elements = outer_dim.saturating_mul(outer_dim);
-    let materialization_work = outer_columns.saturating_mul(coefficient_cost);
-
-    if outer_elements > OUTER_HESSIAN_MAX_ELEMENTS
-        || materialization_work > OUTER_HESSIAN_MAX_WORK_UNITS
-    {
-        ExactOuterDerivativeOrder::First
-    } else {
-        ExactOuterDerivativeOrder::Second
-    }
+    ExactOuterDerivativeOrder::Second
 }
 
-/// Capability-aware variant of [`cost_gated_outer_order`].
+/// Capability-aware variant of [`exact_outer_order_from_capability`].
 ///
-/// `outer_hyper_hessian_hvp_available` means the family can apply the profiled
-/// outer Hessian itself as `v -> ∇²_theta V(theta) v`. It is deliberately not
-/// the same as an inner coefficient-space Hessian HVP. Inner matrix-free
-/// coefficient algebra keeps β-space memory under control, but it does not
-/// make the pairwise outer θθ Hessian cheap to request.
-pub fn cost_gated_outer_order_with_outer_hvp(
+/// Kept as the public declaration helper for existing family impls, but it no
+/// longer gates by cost. Once a caller has established dense or HVP analytic
+/// second-order support, the correct derivative order is `Second`.
+pub fn exact_outer_order_with_outer_hvp(
     specs: &[ParameterBlockSpec],
     coefficient_cost: u64,
-    outer_hyper_hessian_hvp_available: bool,
+    _outer_hyper_hessian_hvp_available: bool,
 ) -> ExactOuterDerivativeOrder {
-    const OUTER_HESSIAN_MAX_ELEMENTS: u64 = 16_000_000;
-
-    let outer_dim = specs
-        .iter()
-        .map(|spec| spec.penalties.len() as u64)
-        .fold(0u64, |acc, k| acc.saturating_add(k));
-    if outer_dim == 0 {
-        return ExactOuterDerivativeOrder::Second;
-    }
-    let outer_elements = outer_dim.saturating_mul(outer_dim);
-    if outer_elements > OUTER_HESSIAN_MAX_ELEMENTS {
-        return ExactOuterDerivativeOrder::First;
-    }
-    if outer_hyper_hessian_hvp_available {
-        return ExactOuterDerivativeOrder::Second;
-    }
-    cost_gated_outer_order(specs, coefficient_cost)
+    exact_outer_order_from_capability(specs, coefficient_cost)
 }
 
 /// Default coefficient-space Hessian cost: `Σ_b n_b · p_b²`, summed across
@@ -640,9 +598,10 @@ pub trait CustomFamily {
     }
 
     /// Per-evaluation arithmetic cost of forming or applying the inner
-    /// coefficient-space Hessian once, in flop-equivalent units. Used by
-    /// [`cost_gated_outer_order`] to decide whether the family can afford the
-    /// exact outer Hessian path: the combined work is `K² · this`.
+    /// coefficient-space Hessian once, in flop-equivalent units. This is used
+    /// for diagnostics, seed-budget policy, and first-order iteration caps
+    /// when a family genuinely lacks analytic second-order support. It is not
+    /// allowed to hide an analytic Hessian from the outer optimizer.
     ///
     /// The default returns `Σ_b n_b · p_b²` via [`default_coefficient_hessian_cost`],
     /// which is the honest assembly cost only when the joint Hessian is
@@ -680,13 +639,9 @@ pub trait CustomFamily {
     }
 
     /// Per-evaluation arithmetic cost of one analytic-gradient outer
-    /// evaluation, in flop-equivalent units. Used by
-    /// [`cost_gated_first_order_max_iter`] to bound the BFGS / L-BFGS
-    /// outer iteration count when [`cost_gated_outer_order`] has already
-    /// downgraded the family to first-order — without this gate the
-    /// first-order path can run for `outer_max_iter=200` iterations × ~10⁹
-    /// flops per gradient evaluation × O(line-search probes), which is the
-    /// 2400 s GAMLSS Duchon60 timeout that motivates the gate.
+    /// evaluation, in flop-equivalent units. Used only when the family
+    /// genuinely has no analytic outer Hessian and the planner must use a
+    /// first-order optimizer.
     ///
     /// The default returns `coefficient_hessian_cost / 2` (see
     /// [`default_coefficient_gradient_cost`]). Families whose gradient
@@ -703,10 +658,10 @@ pub trait CustomFamily {
     /// Declares how much exact outer calculus this family wants to expose for
     /// the current realized problem size.
     ///
-    /// The default uses [`cost_gated_outer_order`], combining outer K² with
-    /// the per-evaluation inner coefficient cost so biobank-scale fits with
-    /// small K but large n·p² are routed to first-order BFGS/L-BFGS instead
-    /// of attempting to materialize an unaffordable outer Hessian.
+    /// The default exposes exact second-order calculus whenever the family
+    /// advertises either dense outer Hessian blocks or profiled outer-Hessian
+    /// HVPs. Large problems must stay exact and select an operator
+    /// representation; they are not demoted to first-order optimizers.
     fn exact_outer_derivative_order(
         &self,
         specs: &[ParameterBlockSpec],
@@ -720,7 +675,7 @@ pub trait CustomFamily {
         {
             return ExactOuterDerivativeOrder::First;
         }
-        cost_gated_outer_order_with_outer_hvp(
+        exact_outer_order_with_outer_hvp(
             specs,
             coefficient_work,
             self.outer_hyper_hessian_hvp_available(specs),
@@ -1015,11 +970,10 @@ pub trait CustomFamily {
         false
     }
 
-    /// True when the family can expose the dense profiled outer Hessian and
-    /// the cost gate may decide whether to request it. Generic custom-family
-    /// pairwise derivative paths default to dense availability; families with
-    /// only inner HVP support should override this if dense θθ assembly is not
-    /// a valid capability for their path.
+    /// True when the family can expose the dense profiled outer Hessian.
+    /// Generic custom-family pairwise derivative paths default to dense
+    /// availability; families with only inner HVP support should override this
+    /// if dense θθ assembly is not a valid capability for their path.
     fn outer_hyper_hessian_dense_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
         true
     }
@@ -1518,10 +1472,8 @@ impl Default for BlockwiseFitOptions {
             ridge_floor: 1e-12,
             ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
             use_remlobjective: true,
-            // Default ON: families may expose exact outer Hessians when the
-            // realized cost gate says second-order work is affordable. Matrix-
-            // free support is only a storage/apply representation; it does not
-            // override cost-driven first-order routing.
+            // Default ON: families expose exact outer Hessians whenever their
+            // analytic dense or operator representation is implemented.
             use_outer_hessian: true,
             compute_covariance: false,
             screening_max_inner_iterations: None,
@@ -5499,10 +5451,6 @@ fn stable_logdet_with_ridge_policy(
             })?;
             Ok(2.0 * chol.diag().mapv(f64::ln).sum())
         }
-        RidgeDeterminantMode::StochasticLanczos => {
-            let (probes, steps) = default_slq_parameters(p);
-            stochastic_lanczos_logdet_spd(&a, probes, steps, 42)
-        }
         RidgeDeterminantMode::Auto => unreachable!("adaptive determinant mode must resolve"),
         RidgeDeterminantMode::PositivePart => {
             // Smooth-regularized logdet objective, aligned with the gradient
@@ -5523,9 +5471,6 @@ fn stable_logdet_with_ridge_policy(
             // that previously broke BFGS line search on indefinite outer
             // Hessians.
             //
-            // Fallback: escalating-ridge Cholesky when eigh fails despite the
-            // internal jitter schedule.  Cholesky is a direct algorithm so it
-            // cannot suffer QR-style convergence failures.
             match crate::faer_ndarray::FaerEigh::eigh(&a, Side::Lower) {
                 Ok((evals, _)) => {
                     let eval_vec: Vec<f64> = evals
@@ -5549,76 +5494,12 @@ fn stable_logdet_with_ridge_policy(
                         .sum();
                     Ok(logdet)
                 }
-                Err(eigh_err) => positive_part_cholesky_fallback(&a, ridge, &eigh_err),
+                Err(eigh_err) => Err(format!(
+                    "smooth-regularized logdet eigendecomposition failed: {eigh_err}"
+                )),
             }
         }
     }
-}
-
-/// Fallback for the `PositivePart` logdet branch when eigendecomposition fails
-/// despite the internal escalating-jitter schedule in `FaerEigh::eigh`.
-///
-/// Strategy: make the matrix SPD by adding progressively larger ridge, then use
-/// Cholesky (a direct, non-iterative factorization) for the logdet.
-///
-/// Mathematical justification: the positive-part surrogate is already an
-/// approximation.  For a nearly-SPD Hessian the Cholesky logdet is close to
-/// the positive-part logdet.  For a mildly indefinite Hessian the extra ridge
-/// shifts all eigenvalues positive; the resulting bias is a smooth, slowly-
-/// varying offset in the REML objective that does not corrupt gradients.
-fn positive_part_cholesky_fallback(
-    a: &Array2<f64>,
-    existing_ridge: f64,
-    eigh_err: &crate::faer_ndarray::FaerLinalgError,
-) -> Result<f64, String> {
-    if !a.iter().all(|value| value.is_finite()) {
-        log::warn!(
-            "[PositivePartFallback] eigendecomposition failed on non-finite Hessian ({eigh_err}); \
-             dropping the positive-part surrogate contribution"
-        );
-        return Ok(0.0);
-    }
-    let p = a.nrows();
-    let diag_scale = a
-        .diag()
-        .iter()
-        .copied()
-        .map(f64::abs)
-        .fold(0.0_f64, f64::max)
-        .max(1.0);
-
-    // Geometric schedule: start from a ridge that should dominate any
-    // moderate indefiniteness, and escalate if Cholesky still fails.
-    const MAX_ATTEMPTS: usize = 6;
-    let mut boost = diag_scale * 1e-6;
-    for attempt in 0..MAX_ATTEMPTS {
-        let mut candidate = a.clone();
-        for i in 0..p {
-            candidate[[i, i]] += boost;
-        }
-        if let Ok(chol) = candidate.cholesky(Side::Lower) {
-            let logdet = 2.0 * chol.diag().mapv(f64::ln).sum();
-            if logdet.is_finite() {
-                log::warn!(
-                    "[PositivePartFallback] eigendecomposition failed ({eigh_err}); \
-                     using Cholesky with boosted ridge={:.2e} (attempt {}/{MAX_ATTEMPTS}, \
-                     existing_ridge={:.2e}, p={p})",
-                    boost + existing_ridge,
-                    attempt + 1,
-                    existing_ridge,
-                );
-                return Ok(logdet);
-            }
-        }
-        boost *= 10.0;
-    }
-
-    Err(format!(
-        "positive-part surrogate eigendecomposition failed ({eigh_err}) and \
-         Cholesky fallback also failed after {MAX_ATTEMPTS} attempts \
-         (final ridge={:.2e}, p={p})",
-        boost + existing_ridge,
-    ))
 }
 
 /// Fallback for penalty pseudo-logdet when eigendecomposition fails.
@@ -5673,13 +5554,9 @@ fn penalty_logdet_cholesky_fallback(
     ))
 }
 
-const AUTO_SLQ_LOGDET_MIN_DIM: usize = 4096;
-
 fn resolved_ridge_determinant_mode(ridge_policy: RidgePolicy, dim: usize) -> RidgeDeterminantMode {
+    let _ = dim;
     match ridge_policy.determinant_mode {
-        RidgeDeterminantMode::Auto if dim >= AUTO_SLQ_LOGDET_MIN_DIM => {
-            RidgeDeterminantMode::StochasticLanczos
-        }
         RidgeDeterminantMode::Auto => RidgeDeterminantMode::Full,
         mode => mode,
     }
@@ -5763,6 +5640,28 @@ enum JointHessianSource {
     },
 }
 
+const EXACT_JOINT_HESSIAN_DENSE_MAX_BYTES: usize = 512 * 1024 * 1024;
+
+fn exact_joint_hessian_dense_bytes(total: usize) -> Result<usize, String> {
+    total
+        .checked_mul(total)
+        .and_then(|n| n.checked_mul(std::mem::size_of::<f64>()))
+        .ok_or_else(|| format!("joint Hessian dense byte count overflow for dim={total}"))
+}
+
+fn ensure_exact_joint_hessian_dense_budget(total: usize, context: &str) -> Result<(), String> {
+    let bytes = exact_joint_hessian_dense_bytes(total)?;
+    if bytes > EXACT_JOINT_HESSIAN_DENSE_MAX_BYTES {
+        return Err(format!(
+            "{context}: exact dense joint Hessian requires {:.2} GiB for dim={total}, \
+             exceeding the {:.2} GiB cap; refusing approximate determinant algebra",
+            bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            EXACT_JOINT_HESSIAN_DENSE_MAX_BYTES as f64 / (1024.0 * 1024.0 * 1024.0),
+        ));
+    }
+    Ok(())
+}
+
 struct JointHessianBundle<'a> {
     source: JointHessianSource,
     beta_flat: Array1<f64>,
@@ -5781,6 +5680,7 @@ fn materialize_joint_hessian_source(
     match source {
         JointHessianSource::Dense(matrix) => Ok(matrix.clone()),
         JointHessianSource::Operator { apply, .. } => {
+            ensure_exact_joint_hessian_dense_budget(total, context)?;
             let mut matrix = Array2::<f64>::zeros((total, total));
             let mut basis = Array1::<f64>::zeros(total);
             for col in 0..total {
@@ -6725,10 +6625,10 @@ pub(crate) fn custom_family_outer_derivatives<F: CustomFamily + ?Sized>(
     } else {
         Derivative::Unavailable
     };
-    // The analytic outer Hessian is routed to ARC only after
-    // `exact_outer_derivative_order` confirms the realized problem can afford
-    // second-order work. Matrix-free Hessian support is a representation
-    // capability, not a reason to override the cost gate.
+    // The analytic outer Hessian is routed to ARC whenever the realized family
+    // exposes second-order calculus. Matrix-free Hessian support is a
+    // representation capability used by the evaluator; it must not be hidden
+    // from the outer optimizer by a cost-based first-order policy.
     let hessian = if options.use_outer_hessian
         && include_exact_newton_logdet_h(family, options)
         && order.has_hessian()
@@ -6885,49 +6785,36 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
         } else {
             None
         };
-    if let Some(JointHessianSource::Operator { apply, diagonal: _ }) = exact_joint_source {
-        // Matrix-free logdet of H + S_λ via deterministic stochastic Lanczos.
-        // The matvec composes the family's matrix-free Hessian operator with a
-        // ridge-stabilized block-diagonal penalty add, so the dense (total ×
-        // total) Hessian is never materialized.
-        let ridge_floor = options.ridge_floor.max(0.0);
-        let ranges_vec: Vec<(usize, usize)> = ranges.to_vec();
-        let s_lambdas_owned: Vec<Array2<f64>> = s_lambdas.clone();
-        let apply_h = Arc::clone(&apply);
-        // Track consecutive matvec failures within this SLQ invocation. A single
-        // transient failure is absorbed (fall back to zeros so SLQ may still
-        // produce a usable estimate); but `JOINT_MATVEC_FAILURE_ESCALATE` in a
-        // row at the same rho indicates a structurally broken matvec — surface
-        // NaN so SLQ Lanczos non-finite guards trip and the surrounding
-        // `.map_err` propagates a hard error to the outer instead of looping
-        // forever on a flat objective (see icu_survival_los).
-        let consecutive_failures = Arc::new(AtomicUsize::new(0));
-        let apply_op = move |v: &Array1<f64>| -> Array1<f64> {
-            let mut out = match apply_h(v) {
-                Ok(out) => {
-                    consecutive_failures.store(0, Ordering::Relaxed);
-                    out
-                }
-                Err(error) => {
-                    let prev = consecutive_failures.fetch_add(1, Ordering::Relaxed);
-                    log::warn!(
-                        "joint exact-newton operator matvec failed during SLQ logdet: {error}"
-                    );
-                    if prev + 1 >= JOINT_MATVEC_FAILURE_ESCALATE {
-                        Array1::<f64>::from_elem(total, f64::NAN)
-                    } else {
-                        Array1::<f64>::zeros(total)
-                    }
-                }
-            };
-            let penalty = apply_joint_block_penalty(&ranges_vec, &s_lambdas_owned, v, ridge_floor);
-            out += &penalty;
-            out
+    if let Some(source) = exact_joint_source {
+        // Exact determinant of H + S_λ for operator-backed coefficient Hessians.
+        //
+        // The REML gradient and Hessian use analytic trace identities such as
+        // ∂ log|A(θ)| = tr(A⁻¹ A_θ).  Mixing an approximate determinant with
+        // exact traces violates that identity and gives ARC a Hessian for a
+        // different objective.  Materializing the coefficient Hessian by
+        // canonical-basis HVPs keeps the objective/derivative pair exact.  At
+        // biobank CTN scale `total` is a few hundred, so this is sub-MiB; the
+        // materializer below refuses oversized systems before allocation.
+        let mut h_joint = materialize_joint_hessian_source(
+            &source,
+            total,
+            "joint exact-newton operator dense logdet materialization",
+        )?;
+        for (b, s_lambda) in s_lambdas.iter().enumerate() {
+            let (start, end) = ranges[b];
+            h_joint
+                .slice_mut(ndarray::s![start..end, start..end])
+                .scaled_add(1.0, s_lambda);
+        }
+        let logdet_h_total = if strict_spd {
+            strict_logdet_spd_with_semidefinite_option(
+                &h_joint,
+                allow_semidefinite,
+                joint_observation_count(states),
+            )?
+        } else {
+            stable_logdet_with_ridge_policy(&h_joint, options.ridge_floor, options.ridge_policy)?
         };
-        let (probes, steps) = default_slq_parameters(total);
-        let logdet_h_total =
-            stochastic_lanczos_logdet_spd_operator(total, apply_op, probes, steps, 0xC75_5C75_5C75)
-                .map_err(|e| format!("matrix-free SLQ logdet for joint Hessian + S_lambda: {e}"))?;
         return Ok((logdet_h_total, penalty_logdet_s_total));
     }
     // Fallback: try the non-rescaled symmetrized path (for families that
@@ -8777,16 +8664,10 @@ fn joint_outer_evaluate(
             match h_joint_unpen {
                 JointHessianSource::Dense(h_joint) => {
                     let h_joint = Arc::new(h_joint);
-                    let preconditioner_diag = joint_penalty_preconditioner_diag(
-                        &h_joint.diag().to_owned(),
-                        &ranges_vec,
-                        s_lambdas.as_ref(),
-                        trace_diagonal_ridge,
-                    );
                     let apply_h = Arc::clone(&h_joint);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
-                    match MatrixFreeSpdOperator::new(total, preconditioner_diag, move |v| {
+                    Arc::new(MatrixFreeSpdOperator::new(total, move |v| {
                         let mut out = apply_h.dot(v);
                         let penalty = apply_joint_block_penalty(
                             &apply_ranges,
@@ -8796,55 +8677,20 @@ fn joint_outer_evaluate(
                         );
                         out += &penalty;
                         out
-                    }) {
-                        Ok(op) => Arc::new(op),
-                        Err(_) => {
-                            let mut j_for_traces = (*h_joint).clone();
-                            add_joint_penalty_to_matrix(
-                                &mut j_for_traces,
-                                &ranges_vec,
-                                s_lambdas.as_ref(),
-                                scaled_joint_trace_diagonal_ridge,
-                            );
-                            Arc::new(
-                                BlockCoupledOperator::from_joint_hessian_with_mode(
-                                    &j_for_traces,
-                                    pseudo_logdet_mode,
-                                )
-                                .map_err(|e| {
-                                    format!("BlockCoupledOperator from joint Hessian: {e}")
-                                })?,
-                            )
-                        }
-                    }
+                    }))
                 }
-                JointHessianSource::Operator { apply, diagonal } => {
-                    let preconditioner_diag = joint_penalty_preconditioner_diag(
-                        &diagonal,
-                        &ranges_vec,
-                        s_lambdas.as_ref(),
-                        trace_diagonal_ridge,
-                    );
+                JointHessianSource::Operator { apply, diagonal: _ } => {
                     let apply_h = Arc::clone(&apply);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
-                    let consecutive_failures = Arc::new(AtomicUsize::new(0));
-                    match MatrixFreeSpdOperator::new(total, preconditioner_diag, move |v| {
+                    Arc::new(MatrixFreeSpdOperator::new(total, move |v| {
                         let mut out = match apply_h(v) {
-                            Ok(out) => {
-                                consecutive_failures.store(0, Ordering::Relaxed);
-                                out
-                            }
+                            Ok(out) => out,
                             Err(error) => {
-                                let prev = consecutive_failures.fetch_add(1, Ordering::Relaxed);
                                 log::warn!(
                                     "joint exact-newton operator matvec failed during outer trace construction: {error}"
                                 );
-                                if prev + 1 >= JOINT_MATVEC_FAILURE_ESCALATE {
-                                    Array1::<f64>::from_elem(total, f64::NAN)
-                                } else {
-                                    Array1::<f64>::zeros(total)
-                                }
+                                Array1::<f64>::from_elem(total, f64::NAN)
                             }
                         };
                         let penalty = apply_joint_block_penalty(
@@ -8855,31 +8701,7 @@ fn joint_outer_evaluate(
                         );
                         out += &penalty;
                         out
-                    }) {
-                        Ok(op) => Arc::new(op),
-                        Err(_) => {
-                            let mut j_for_traces = materialize_joint_hessian_source(
-                                &JointHessianSource::Operator { apply, diagonal },
-                                total,
-                                "joint exact-newton operator materialization",
-                            )?;
-                            add_joint_penalty_to_matrix(
-                                &mut j_for_traces,
-                                &ranges_vec,
-                                s_lambdas.as_ref(),
-                                scaled_joint_trace_diagonal_ridge,
-                            );
-                            Arc::new(
-                                BlockCoupledOperator::from_joint_hessian_with_mode(
-                                    &j_for_traces,
-                                    pseudo_logdet_mode,
-                                )
-                                .map_err(|e| {
-                                    format!("BlockCoupledOperator from joint Hessian: {e}")
-                                })?,
-                            )
-                        }
-                    }
+                    }))
                 }
             }
         } else {
@@ -9069,16 +8891,10 @@ fn joint_outer_evaluate_efs(
             match h_joint_unpen {
                 JointHessianSource::Dense(h_joint) => {
                     let h_joint = Arc::new(h_joint);
-                    let preconditioner_diag = joint_penalty_preconditioner_diag(
-                        &h_joint.diag().to_owned(),
-                        &ranges_vec,
-                        s_lambdas.as_ref(),
-                        trace_diagonal_ridge,
-                    );
                     let apply_h = Arc::clone(&h_joint);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
-                    match MatrixFreeSpdOperator::new(total, preconditioner_diag, move |v| {
+                    Arc::new(MatrixFreeSpdOperator::new(total, move |v| {
                         let mut out = apply_h.dot(v);
                         let penalty = apply_joint_block_penalty(
                             &apply_ranges,
@@ -9088,55 +8904,20 @@ fn joint_outer_evaluate_efs(
                         );
                         out += &penalty;
                         out
-                    }) {
-                        Ok(op) => Arc::new(op),
-                        Err(_) => {
-                            let mut j_for_traces = (*h_joint).clone();
-                            add_joint_penalty_to_matrix(
-                                &mut j_for_traces,
-                                &ranges_vec,
-                                s_lambdas.as_ref(),
-                                scaled_joint_trace_diagonal_ridge,
-                            );
-                            Arc::new(
-                                BlockCoupledOperator::from_joint_hessian_with_mode(
-                                    &j_for_traces,
-                                    pseudo_logdet_mode,
-                                )
-                                .map_err(|e| {
-                                    format!("BlockCoupledOperator from joint Hessian: {e}")
-                                })?,
-                            )
-                        }
-                    }
+                    }))
                 }
-                JointHessianSource::Operator { apply, diagonal } => {
-                    let preconditioner_diag = joint_penalty_preconditioner_diag(
-                        &diagonal,
-                        &ranges_vec,
-                        s_lambdas.as_ref(),
-                        trace_diagonal_ridge,
-                    );
+                JointHessianSource::Operator { apply, diagonal: _ } => {
                     let apply_h = Arc::clone(&apply);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
-                    let consecutive_failures = Arc::new(AtomicUsize::new(0));
-                    match MatrixFreeSpdOperator::new(total, preconditioner_diag, move |v| {
+                    Arc::new(MatrixFreeSpdOperator::new(total, move |v| {
                         let mut out = match apply_h(v) {
-                            Ok(out) => {
-                                consecutive_failures.store(0, Ordering::Relaxed);
-                                out
-                            }
+                            Ok(out) => out,
                             Err(error) => {
-                                let prev = consecutive_failures.fetch_add(1, Ordering::Relaxed);
                                 log::warn!(
                                     "joint exact-newton operator matvec failed during fixed-point trace construction: {error}"
                                 );
-                                if prev + 1 >= JOINT_MATVEC_FAILURE_ESCALATE {
-                                    Array1::<f64>::from_elem(total, f64::NAN)
-                                } else {
-                                    Array1::<f64>::zeros(total)
-                                }
+                                Array1::<f64>::from_elem(total, f64::NAN)
                             }
                         };
                         let penalty = apply_joint_block_penalty(
@@ -9147,31 +8928,7 @@ fn joint_outer_evaluate_efs(
                         );
                         out += &penalty;
                         out
-                    }) {
-                        Ok(op) => Arc::new(op),
-                        Err(_) => {
-                            let mut j_for_traces = materialize_joint_hessian_source(
-                                &JointHessianSource::Operator { apply, diagonal },
-                                total,
-                                "joint exact-newton operator materialization for fixed-point evaluation",
-                            )?;
-                            add_joint_penalty_to_matrix(
-                                &mut j_for_traces,
-                                &ranges_vec,
-                                s_lambdas.as_ref(),
-                                scaled_joint_trace_diagonal_ridge,
-                            );
-                            Arc::new(
-                                BlockCoupledOperator::from_joint_hessian_with_mode(
-                                    &j_for_traces,
-                                    pseudo_logdet_mode,
-                                )
-                                .map_err(|e| {
-                                    format!("BlockCoupledOperator from joint Hessian: {e}")
-                                })?,
-                            )
-                        }
-                    }
+                    }))
                 }
             }
         } else {
@@ -11431,13 +11188,6 @@ const JOINT_MATRIX_FREE_MIN_LINEAR_WORK: usize = 4_000_000;
 const JOINT_TRACE_STABILITY_RIDGE: f64 = 1e-10;
 const JOINT_PCG_REL_TOL: f64 = 1e-8;
 const JOINT_PCG_MAX_ITER_MULTIPLIER: usize = 4;
-/// Number of consecutive matvec failures inside one SLQ logdet invocation
-/// after which the closure surfaces NaN (escalating to outer infeasibility)
-/// instead of substituting zeros. Single transient failures are still
-/// absorbed; a structurally broken matvec at the same rho — the
-/// icu_survival_los/death signature — escalates almost immediately because
-/// every probe in Lanczos calls the matvec and they all fail in succession.
-const JOINT_MATVEC_FAILURE_ESCALATE: usize = 3;
 
 pub(crate) fn joint_exact_analytic_outer_hessian_available() -> bool {
     true
@@ -11492,10 +11242,7 @@ fn apply_joint_block_penalty(
 /// preconditioner" for that reason; in code it is the single, unified
 /// preconditioner shared by all PCG callsites.
 ///
-/// Callers (PIRLS inner Newton at custom_family.rs ~7434 and the four
-/// trace-time `MatrixFreeSpdOperator::new` constructions at ~8874, 8917,
-/// 9166, 9209) feed the result as `MatrixFreeSpdOperator`'s
-/// `preconditioner_diag`, which `solve_pcg` then applies as a diagonal
+/// Callers in the PIRLS inner Newton PCG path feed the result as the diagonal
 /// rescale every CG iteration.
 fn joint_penalty_preconditioner_diag(
     base_diagonal: &Array1<f64>,
@@ -12153,43 +11900,24 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     }
     // EFS / HybridEfs structural property (`H^{-1/2} B_k H^{-1/2} ≽ 0` plus a
     // parameter-independent nullspace, Wood-Fasiolo) fails for multi-block
-    // families whose joint likelihood Hessian depends on β — e.g. GAMLSS /
-    // location-scale where cross-block penalties induce non-block-diagonal
-    // curvature that the EFS multiplicative fixed-point cannot resolve in
-    // practice. On problems of this class the fixed-point iteration
-    // stagnates far from the optimum and burns budget before BFGS gets a
-    // turn. Opt out up front so the planner goes straight to analytic-
-    // gradient BFGS instead of paying for a doomed EFS attempt first.
+    // families whose joint likelihood Hessian depends on β. Disable
+    // fixed-point only for genuinely first-order capabilities; exact-Hessian
+    // capabilities route to ARC before EFS is considered.
     let multi_block_beta_dependent =
         specs.len() > 1 && family.exact_newton_joint_hessian_beta_dependent();
-    // Re-enable the automatic fallback policy (P4 / task #9). Earlier the
-    // custom-family path used `FallbackPolicy::Disabled` to keep the cascade
-    // from converting `Analytic` Hessian → `Unavailable` → BFGS+BfgsApprox,
-    // because that downgrade was hostile to the RidgedQuadraticReml surrogate
-    // surface (directionally wrong rank-2 updates, Strong-Wolfe iter-0
-    // failures) and produced the 45-minute hangs on binomial-logit +
-    // P-spline benchmarks. The current pipeline is different in three ways
-    // that make the disable unnecessary:
-    //   1. `cost_gated_outer_order` already routes large `K² · n · p²`
-    //      problems to first-order BFGS *before* a fallback would be
-    //      considered, so the cascade no longer downgrades a working
-    //      Analytic-Hessian plan onto an unsuitable surface.
-    //   2. The first-order work gate added below caps `outer_max_iter` so a
-    //      degraded BFGS retry cannot spin forever even if the line search
-    //      misbehaves.
-    //   3. With the gate, the legitimate use of fallback — recovering from a
-    //      seed that triggers an indefinite Hessian or a non-finite Newton
-    //      direction in ARC — becomes valuable: the cascade lets the runner
-    //      retry with the BFGS-approx geometry instead of failing the whole
-    //      fit on a single bad seed.
-    // If the primary plan still fails after the cascade, the runner surfaces
-    // the `RemlOptimizationFailed` error so the user sees the underlying
-    // non-convergence rather than a silent partial result.
+    // Exact-Hessian plans must fail on their own terms rather than silently
+    // retrying on a quasi-Newton surface. First-order-only families keep the
+    // automatic cascade because there is no second-order geometry to discard.
+    let fallback_policy = if need_outer_hessian {
+        FallbackPolicy::Disabled
+    } else {
+        FallbackPolicy::Automatic
+    };
     let problem = OuterProblem::new(n_rho)
         .with_gradient(cap_gradient)
         .with_hessian(hessian)
         .with_disable_fixed_point(multi_block_beta_dependent)
-        .with_fallback_policy(FallbackPolicy::Automatic)
+        .with_fallback_policy(fallback_policy)
         .with_tolerance(options.outer_tol)
         .with_max_iter(outer_max_iter)
         .with_seed_config(family.outer_seed_config(n_rho))
@@ -12609,7 +12337,7 @@ mod tests {
     }
 
     #[test]
-    fn biobank_exact_adaptive_hessian_cost_gate_demotes_to_first_order() {
+    fn biobank_exact_adaptive_hessian_order_stays_second_order() {
         let n_train = 320_000u64;
         let p = 101usize;
         let retained_rho_dim = 3usize;
@@ -12634,8 +12362,8 @@ mod tests {
             9_792_960_000
         );
         assert_eq!(
-            cost_gated_outer_order(&[spec], coefficient_hessian_cost),
-            ExactOuterDerivativeOrder::First
+            exact_outer_order_from_capability(&[spec], coefficient_hessian_cost),
+            ExactOuterDerivativeOrder::Second
         );
     }
 
@@ -12827,7 +12555,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_family_outer_derivatives_respects_first_order_downgrade() {
+    fn custom_family_outer_derivatives_respects_missing_second_order_capability() {
         #[derive(Clone)]
         struct OneBlockFirstOrderOnlyFamily;
 
@@ -14353,7 +14081,7 @@ mod tests {
     }
 
     #[test]
-    fn slq_determinant_mode_tracks_exact_full_logdet_policy() {
+    fn auto_determinant_mode_is_exact_full_logdet_policy() {
         let h = array![[6.0, 0.8, 0.1], [0.8, 4.5, 0.4], [0.1, 0.4, 3.2]];
         let exact = stable_logdet_with_ridge_policy(
             &h,
@@ -14361,13 +14089,10 @@ mod tests {
             RidgePolicy::explicit_stabilization_full_exact(),
         )
         .expect("exact logdet");
-        let slq = stable_logdet_with_ridge_policy(
-            &h,
-            1e-8,
-            RidgePolicy::explicit_stabilization_full_slq(),
-        )
-        .expect("slq logdet");
-        assert!((slq - exact).abs() < 5e-2, "slq={slq}, exact={exact}");
+        let auto =
+            stable_logdet_with_ridge_policy(&h, 1e-8, RidgePolicy::explicit_stabilization_full())
+                .expect("auto logdet");
+        assert!((auto - exact).abs() < 1e-12, "auto={auto}, exact={exact}");
     }
 
     #[test]

@@ -2022,8 +2022,7 @@ pub struct BasisBuildResult {
     /// entry is `Some(op)` when the closed-form factory emitted an op-form
     /// penalty bit-equivalent to the dense matrix, `None` for ordinary dense
     /// penalties. Downstream consumers route through the `Some` entries to
-    /// avoid materializing dense `p x p` Grams in PCG-against-implicit-H,
-    /// SLQ log-det, and Hutchinson trace estimation.
+    /// avoid materializing dense `p x p` Grams in exact operator algebra.
     pub ops: Vec<Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>>,
 }
 
@@ -2110,9 +2109,9 @@ pub struct PenaltyCandidate {
     pub kronecker_factors: Option<Vec<Array2<f64>>>,
     /// Optional operator-form handle whose `as_dense()` matches `matrix`. When
     /// populated by the closed-form factories, this is propagated through to
-    /// `CanonicalPenaltyBlock` so downstream consumers (PCG-against-implicit-H,
-    /// SLQ log-det, Hutchinson trace) can use matvec without rebuilding the
-    /// dense Gram. When `None`, only the dense `matrix` path is available.
+    /// `CanonicalPenaltyBlock` so downstream consumers can use exact matvec
+    /// algebra without rebuilding the dense Gram. When `None`, only the dense
+    /// `matrix` path is available.
     pub op: Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>,
 }
 

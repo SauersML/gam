@@ -1867,7 +1867,6 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 analytic_joint_derivatives_available,
                 analytic_joint_derivatives_available,
                 gamlss_disable_fixed_point,
-                true,
                 |theta, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
                     let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
                     let fit = {
@@ -3115,10 +3114,6 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     let screening_cap = Arc::new(AtomicUsize::new(0));
     let mut outer_options = options.clone();
     outer_options.screening_max_inner_iterations = Some(Arc::clone(&screening_cap));
-    // This outer problem is design-moving in the spatial block, so we
-    // intentionally plan it as gradient/fixed-point rather than ARC/Newton.
-    let analytic_outer_hessian_available = false;
-
     struct MeanWiggleOuterState {
         warm_cache: Option<crate::custom_family::CustomFamilyWarmStart>,
         last_eval: Option<(
@@ -3248,6 +3243,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     //
     // Spatial log-kappa coordinates are ψ (design-moving) dimensions because
     // they rebuild the spatial basis and penalties at each outer proposal.
+    let analytic_outer_hessian_available = true;
     let mut seed_heuristic = theta0.to_vec();
     for value in &mut seed_heuristic[..rho_dim] {
         *value = value.exp();
@@ -6358,9 +6354,9 @@ impl CustomFamily for GaussianLocationScaleFamily {
         // joint Hessian path (see `use_joint_matrix_free_path`), the workspace
         // applies the joint Hessian via row-streaming Khatri-Rao matvecs at
         // O(n · (p_t + p_ℓ)) per Hv, never building the dense (p_t + p_ℓ)²
-        // matrix. Reporting the dense build cost here would cause the outer
-        // planner's cost gate to downgrade to first-order BFGS even though
-        // the operator path is what actually runs at fit time.
+        // matrix. Report the operator work model so diagnostics and
+        // first-order-only policies reflect the representation that actually
+        // runs.
         let n = self.y.len() as u64;
         let p_total: u64 = specs
             .iter()
@@ -14154,7 +14150,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         {
             return crate::custom_family::ExactOuterDerivativeOrder::First;
         }
-        crate::custom_family::cost_gated_outer_order_with_outer_hvp(
+        crate::custom_family::exact_outer_order_with_outer_hvp(
             specs,
             coefficient_work,
             self.outer_hyper_hessian_hvp_available(specs),
