@@ -1220,7 +1220,7 @@ impl SpatialLogKappaCoords {
             log::info!(
                 "[spatial-kappa] projected {n_projected}/{} ψ seed coords into data-derived bounds \
                  (worst excess={worst_delta:.3} log units); user length_scale falls outside \
-                 [1e-2/r_max, 1e2/r_min] geometry window",
+                 [2/r_max, 1e2/r_min] geometry window",
                 self.values.len()
             );
         }
@@ -1363,7 +1363,7 @@ fn spatial_term_supports_hyper_optimization(spec: &TermCollectionSpec, term_idx:
 ///
 /// Uses the same safe operating range documented in
 /// [`crate::basis::build_matern_basis`] / [`crate::basis::build_duchon_basis`]:
-///   κ ∈ [1e-2 / r_max, 1e2 / r_min]
+///   κ ∈ [2 / r_max, 1e2 / r_min]
 /// where (r_min, r_max) are pairwise-distance extrema of the term's resolved
 /// centers (post-fit) or the standardized feature data columns (pre-fit).
 /// Returns ψ-space bounds (ψ_lo = ln(κ_lo), ψ_hi = ln(κ_hi)).
@@ -1423,7 +1423,12 @@ fn spatial_term_psi_bounds(
     let Some((r_min, r_max)) = r_bounds else {
         return fallback;
     };
-    let psi_lo_data = (1e-2 / r_max).ln();
+    // Length scales substantially larger than the data diameter make radial
+    // TPS/Matern columns nearly collinear with their polynomial nullspace.
+    // The nullspace already carries constant/linear low-frequency structure,
+    // so cap the kernel range at the diameter scale instead of letting the
+    // optimizer enter a numerically degenerate basis geometry.
+    let psi_lo_data = (2.0 / r_max).ln();
     let psi_hi_data = (1e2 / r_min).ln();
     // Intersect with the options window so min/max_length_scale remain hard caps.
     let psi_lo = psi_lo_data.max(fallback.0);
