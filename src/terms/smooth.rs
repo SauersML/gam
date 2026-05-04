@@ -3338,9 +3338,21 @@ pub fn build_smooth_design_withworkspace(
                         *length_scale = spec.length_scale;
                     }
                     BasisMetadata::Duchon {
-                        input_scales: ms, ..
+                        input_scales: ms,
+                        length_scale,
+                        ..
                     } => {
                         *ms = scales;
+                        // The ThinPlate auto-promotion path delegates to
+                        // `build_duchon_basis` with `Some(spec_local.length_scale)`,
+                        // which is the σ_geom-compensated value. The metadata
+                        // therefore records the compensated kernel range, but the
+                        // freeze→replay round trip plugs that value back into a
+                        // user-facing `DuchonBasisSpec.length_scale` whose builder
+                        // applies the σ_geom compensation a second time. Restore
+                        // the user-facing scale here so replay re-compensates
+                        // exactly once and reproduces the realized fit-time basis.
+                        *length_scale = Some(spec.length_scale);
                     }
                     _ => {}
                 }
