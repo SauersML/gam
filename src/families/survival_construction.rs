@@ -987,6 +987,45 @@ pub fn build_survival_time_basis(
             )
             .map_err(|e| format!("failed to build ispline derivative basis: {e}"))?;
 
+            // Diagnostic: is `db_exit` itself non-zero coming out of
+            // `create_basis(BasisOptions::first_derivative())`?  CI evidence
+            // (commit f98a32ab) shows the downstream `x_derivative_time`
+            // ends up exactly all-zeros at biobank shape (320k × 11),
+            // which can only happen if either `db_exit` is all-zero here
+            // or the cumsum-and-keep_cols loop below wipes everything.
+            // Log once per build with shape + maxabs, plus the first row's
+            // raw values, so the next CI cycle distinguishes those cases.
+            {
+                let db_exit_view = db_exit_arc.as_ref();
+                let mut max_abs = 0.0_f64;
+                let mut nonzero_count = 0_usize;
+                for row in 0..db_exit_view.nrows() {
+                    for col in 0..db_exit_view.ncols() {
+                        let v = db_exit_view[[row, col]].abs();
+                        if v > 1e-30 {
+                            nonzero_count += 1;
+                        }
+                        if v > max_abs {
+                            max_abs = v;
+                        }
+                    }
+                }
+                let row0: Vec<(usize, f64)> = (0..db_exit_view.ncols().min(8))
+                    .map(|j| (j, db_exit_view[[0, j]]))
+                    .collect();
+                log::info!(
+                    "[ispline-build] db_exit shape={}x{}, max_abs={:.3e}, nonzero(>1e-30)={}, row0[0..8]={:?}, log_exit[0]={:.6}, knotvec[0]={:.6}, knotvec[-1]={:.6}",
+                    db_exit_view.nrows(),
+                    db_exit_view.ncols(),
+                    max_abs,
+                    nonzero_count,
+                    row0,
+                    log_exit[0],
+                    knotvec[0],
+                    knotvec[knotvec.len() - 1],
+                );
+            }
+
             // Build full-width I-spline bases inside a block scope so the
             // large Arc allocations are freed when the block ends.
             let (x_entry_time, x_exit_time, keep_cols, p_time, p_time_full) = {
