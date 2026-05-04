@@ -1097,12 +1097,19 @@ pub fn canonicalize_penalty_spec(
         }
     }
 
+    // Store the PSD reconstruction R^T R rather than the raw symmetrised input so
+    // the cached `local` matches the rank truncation embedded in `root`. Closed-
+    // form Duchon kernels at high d can leave |O(1)| negative eigenvalues in the
+    // symmetrised input that the canonical root drops; keeping them in `local`
+    // poisons the balanced-sum eigendecomposition and breaks the q_pen / q_null
+    // invariant that downstream stages require.
+    let local = root.t().dot(&root);
     Ok(Some(CanonicalPenalty {
         root,
         col_range,
         total_dim: p,
         nullity: analysis.nullity,
-        local: analysis.sym_penalty,
+        local,
         positive_eigenvalues,
         op,
     }))
