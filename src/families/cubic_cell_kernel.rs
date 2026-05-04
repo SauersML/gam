@@ -645,129 +645,150 @@ pub fn cell_fourth_derivative_from_moments(
     require_moments_degree(needed, moments, "fourth derivative")?;
 
     let fourth_term = moment_dot_with_coefficients_unchecked(fourth_coefficients_rstu, moments);
-    let mut eta_linear_term = 0.0;
-    for (e, &eta_coeff) in eta.iter().enumerate() {
-        for (i, &rst) in third_coefficients_rst.iter().enumerate() {
-            for (j, &u_coeff) in first_coefficients_u.iter().enumerate() {
-                eta_linear_term += eta_coeff * rst * u_coeff * moments[e + i + j];
-            }
-        }
-        for (i, &rsu) in third_coefficients_rsu.iter().enumerate() {
-            for (j, &t_coeff) in first_coefficients_t.iter().enumerate() {
-                eta_linear_term += eta_coeff * rsu * t_coeff * moments[e + i + j];
-            }
-        }
-        for (i, &rtu) in third_coefficients_rtu.iter().enumerate() {
-            for (j, &s_coeff) in first_coefficients_s.iter().enumerate() {
-                eta_linear_term += eta_coeff * rtu * s_coeff * moments[e + i + j];
-            }
-        }
-        for (i, &stu) in third_coefficients_stu.iter().enumerate() {
-            for (j, &r_coeff) in first_coefficients_r.iter().enumerate() {
-                eta_linear_term += eta_coeff * stu * r_coeff * moments[e + i + j];
-            }
-        }
-        for (i, &rs) in second_coefficients_rs.iter().enumerate() {
-            for (j, &tu) in second_coefficients_tu.iter().enumerate() {
-                eta_linear_term += eta_coeff * rs * tu * moments[e + i + j];
-            }
-        }
-        for (i, &rt) in second_coefficients_rt.iter().enumerate() {
-            for (j, &su) in second_coefficients_su.iter().enumerate() {
-                eta_linear_term += eta_coeff * rt * su * moments[e + i + j];
-            }
-        }
-        for (i, &ru) in second_coefficients_ru.iter().enumerate() {
-            for (j, &st) in second_coefficients_st.iter().enumerate() {
-                eta_linear_term += eta_coeff * ru * st * moments[e + i + j];
-            }
-        }
-    }
 
-    let mut eta_sq_minus_one = [0.0; 7];
+    // Capacity bound: max output length is len(eta)+len(r)+len(s)+len(t)+len(u)−4
+    // = 4+4+4+4+4−4 = 16 for the quintuple convolution; sizing to 32 absorbs
+    // larger test inputs.
+    const SCRATCH: usize = 32;
+    let mut buf_a = [0.0_f64; SCRATCH];
+    let mut buf_b = [0.0_f64; SCRATCH];
+
+    // eta_linear_term = Σ over seven (rst⊗u, rsu⊗t, rtu⊗s, stu⊗r, rs⊗tu,
+    // rt⊗su, ru⊗st) of eta⊗product · moments. Fold each triple sum into
+    // a single moment dot.
+    let conv_eta_dot =
+        |first: &[f64], second: &[f64], buf_a: &mut [f64; SCRATCH], buf_b: &mut [f64; SCRATCH]| -> f64 {
+            let m = poly_conv_into(first, second, buf_a);
+            let n = poly_conv_into(&eta, &buf_a[..m], buf_b);
+            let mut acc = 0.0;
+            for k in 0..n {
+                acc = buf_b[k].mul_add(moments[k], acc);
+            }
+            acc
+        };
+    let mut eta_linear_term = 0.0;
+    eta_linear_term += conv_eta_dot(third_coefficients_rst, first_coefficients_u, &mut buf_a, &mut buf_b);
+    eta_linear_term += conv_eta_dot(third_coefficients_rsu, first_coefficients_t, &mut buf_a, &mut buf_b);
+    eta_linear_term += conv_eta_dot(third_coefficients_rtu, first_coefficients_s, &mut buf_a, &mut buf_b);
+    eta_linear_term += conv_eta_dot(third_coefficients_stu, first_coefficients_r, &mut buf_a, &mut buf_b);
+    eta_linear_term += conv_eta_dot(second_coefficients_rs, second_coefficients_tu, &mut buf_a, &mut buf_b);
+    eta_linear_term += conv_eta_dot(second_coefficients_rt, second_coefficients_su, &mut buf_a, &mut buf_b);
+    eta_linear_term += conv_eta_dot(second_coefficients_ru, second_coefficients_st, &mut buf_a, &mut buf_b);
+
+    let mut eta_sq_minus_one = [0.0_f64; 7];
     for (i, &eta_i) in eta.iter().enumerate() {
         for (j, &eta_j) in eta.iter().enumerate() {
-            eta_sq_minus_one[i + j] += eta_i * eta_j;
+            eta_sq_minus_one[i + j] = eta_i.mul_add(eta_j, eta_sq_minus_one[i + j]);
         }
     }
     eta_sq_minus_one[0] -= 1.0;
-    let mut quad_coeff_term = 0.0;
-    for (e, &weight) in eta_sq_minus_one.iter().enumerate() {
-        for (i, &rs) in second_coefficients_rs.iter().enumerate() {
-            for (j, &t_coeff) in first_coefficients_t.iter().enumerate() {
-                for (k, &u_coeff) in first_coefficients_u.iter().enumerate() {
-                    quad_coeff_term += weight * rs * t_coeff * u_coeff * moments[e + i + j + k];
-                }
-            }
-        }
-        for (i, &rt) in second_coefficients_rt.iter().enumerate() {
-            for (j, &s_coeff) in first_coefficients_s.iter().enumerate() {
-                for (k, &u_coeff) in first_coefficients_u.iter().enumerate() {
-                    quad_coeff_term += weight * rt * s_coeff * u_coeff * moments[e + i + j + k];
-                }
-            }
-        }
-        for (i, &ru) in second_coefficients_ru.iter().enumerate() {
-            for (j, &s_coeff) in first_coefficients_s.iter().enumerate() {
-                for (k, &t_coeff) in first_coefficients_t.iter().enumerate() {
-                    quad_coeff_term += weight * ru * s_coeff * t_coeff * moments[e + i + j + k];
-                }
-            }
-        }
-        for (i, &st) in second_coefficients_st.iter().enumerate() {
-            for (j, &r_coeff) in first_coefficients_r.iter().enumerate() {
-                for (k, &u_coeff) in first_coefficients_u.iter().enumerate() {
-                    quad_coeff_term += weight * st * r_coeff * u_coeff * moments[e + i + j + k];
-                }
-            }
-        }
-        for (i, &su) in second_coefficients_su.iter().enumerate() {
-            for (j, &r_coeff) in first_coefficients_r.iter().enumerate() {
-                for (k, &t_coeff) in first_coefficients_t.iter().enumerate() {
-                    quad_coeff_term += weight * su * r_coeff * t_coeff * moments[e + i + j + k];
-                }
-            }
-        }
-        for (i, &tu) in second_coefficients_tu.iter().enumerate() {
-            for (j, &r_coeff) in first_coefficients_r.iter().enumerate() {
-                for (k, &s_coeff) in first_coefficients_s.iter().enumerate() {
-                    quad_coeff_term += weight * tu * r_coeff * s_coeff * moments[e + i + j + k];
-                }
-            }
-        }
-    }
 
-    let mut eta_sq = [0.0; 7];
+    // quad_coeff_term: six (eta²−1)⊗A⊗B⊗C · moments sums, where the (A,B,C)
+    // factors are: (rs,t,u), (rt,s,u), (ru,s,t), (st,r,u), (su,r,t), (tu,r,s).
+    let mut buf_c = [0.0_f64; SCRATCH];
+    let conv_weighted_triple_dot =
+        |weight: &[f64],
+         a: &[f64],
+         b: &[f64],
+         c: &[f64],
+         buf_a: &mut [f64; SCRATCH],
+         buf_b: &mut [f64; SCRATCH],
+         buf_c: &mut [f64; SCRATCH]|
+         -> f64 {
+            let ab_len = poly_conv_into(a, b, buf_a);
+            let abc_len = poly_conv_into(&buf_a[..ab_len], c, buf_b);
+            let final_len = poly_conv_into(weight, &buf_b[..abc_len], buf_c);
+            let mut acc = 0.0;
+            for k in 0..final_len {
+                acc = buf_c[k].mul_add(moments[k], acc);
+            }
+            acc
+        };
+    let mut quad_coeff_term = 0.0;
+    quad_coeff_term += conv_weighted_triple_dot(
+        &eta_sq_minus_one,
+        second_coefficients_rs,
+        first_coefficients_t,
+        first_coefficients_u,
+        &mut buf_a,
+        &mut buf_b,
+        &mut buf_c,
+    );
+    quad_coeff_term += conv_weighted_triple_dot(
+        &eta_sq_minus_one,
+        second_coefficients_rt,
+        first_coefficients_s,
+        first_coefficients_u,
+        &mut buf_a,
+        &mut buf_b,
+        &mut buf_c,
+    );
+    quad_coeff_term += conv_weighted_triple_dot(
+        &eta_sq_minus_one,
+        second_coefficients_ru,
+        first_coefficients_s,
+        first_coefficients_t,
+        &mut buf_a,
+        &mut buf_b,
+        &mut buf_c,
+    );
+    quad_coeff_term += conv_weighted_triple_dot(
+        &eta_sq_minus_one,
+        second_coefficients_st,
+        first_coefficients_r,
+        first_coefficients_u,
+        &mut buf_a,
+        &mut buf_b,
+        &mut buf_c,
+    );
+    quad_coeff_term += conv_weighted_triple_dot(
+        &eta_sq_minus_one,
+        second_coefficients_su,
+        first_coefficients_r,
+        first_coefficients_t,
+        &mut buf_a,
+        &mut buf_b,
+        &mut buf_c,
+    );
+    quad_coeff_term += conv_weighted_triple_dot(
+        &eta_sq_minus_one,
+        second_coefficients_tu,
+        first_coefficients_r,
+        first_coefficients_s,
+        &mut buf_a,
+        &mut buf_b,
+        &mut buf_c,
+    );
+
+    // cubic_weight = 3·eta − eta³ (same as the prior expansion: eta_sq*eta
+    // negated, plus the 3·eta linear correction).
+    let mut eta_sq = [0.0_f64; 7];
     for (i, &eta_i) in eta.iter().enumerate() {
         for (j, &eta_j) in eta.iter().enumerate() {
-            eta_sq[i + j] += eta_i * eta_j;
+            eta_sq[i + j] = eta_i.mul_add(eta_j, eta_sq[i + j]);
         }
     }
-    let mut cubic_weight = [0.0; 10];
+    let mut cubic_weight = [0.0_f64; 10];
     for (i, &eta_sq_i) in eta_sq.iter().enumerate() {
         for (j, &eta_j) in eta.iter().enumerate() {
-            cubic_weight[i + j] -= eta_sq_i * eta_j;
+            cubic_weight[i + j] = (-eta_sq_i).mul_add(eta_j, cubic_weight[i + j]);
         }
     }
     for (idx, &eta_coeff) in eta.iter().enumerate() {
         cubic_weight[idx] += 3.0 * eta_coeff;
     }
+
+    // quartic_coeff_term: cubic_weight ⊗ r ⊗ s ⊗ t ⊗ u · moments. The
+    // original quintuple loop did 10·4·4·4·4 = 2560 mul-adds per call;
+    // four sequential convolutions plus one moment dot drop this to
+    // ~16+28+40+52+16 ≈ 152 mul-adds.
+    let rs_len = poly_conv_into(first_coefficients_r, first_coefficients_s, &mut buf_a);
+    let rst_len = poly_conv_into(&buf_a[..rs_len], first_coefficients_t, &mut buf_b);
+    let rstu_len = poly_conv_into(&buf_b[..rst_len], first_coefficients_u, &mut buf_a);
+    let final_len = poly_conv_into(&cubic_weight, &buf_a[..rstu_len], &mut buf_b);
     let mut quartic_coeff_term = 0.0;
-    for (e, &weight) in cubic_weight.iter().enumerate() {
-        for (i, &r_coeff) in first_coefficients_r.iter().enumerate() {
-            for (j, &s_coeff) in first_coefficients_s.iter().enumerate() {
-                for (k, &t_coeff) in first_coefficients_t.iter().enumerate() {
-                    for (l, &u_coeff) in first_coefficients_u.iter().enumerate() {
-                        quartic_coeff_term += weight
-                            * r_coeff
-                            * s_coeff
-                            * t_coeff
-                            * u_coeff
-                            * moments[e + i + j + k + l];
-                    }
-                }
-            }
-        }
+    for k in 0..final_len {
+        quartic_coeff_term = buf_b[k].mul_add(moments[k], quartic_coeff_term);
     }
 
     Ok((fourth_term - eta_linear_term + quad_coeff_term + quartic_coeff_term) * INV_TWO_PI)
