@@ -13,15 +13,6 @@
   "upsample_batch_size": 5000,
   "methods": [
     {
-      "name": "rust_gam_jointpc_tps60",
-      "dataset": "disease",
-      "backend": "rust_gam",
-      "family": "binomial",
-      "spatial_basis": "thinplate",
-      "centers": 60,
-      "include_sigma": false
-    },
-    {
       "name": "rust_gam_jointpc_duchon60",
       "dataset": "disease",
       "backend": "rust_gam",
