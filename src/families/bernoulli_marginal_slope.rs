@@ -8104,40 +8104,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             joint_hessian,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-    // Cap outer-loop iteration count at biobank shape so the fit returns a
-    // partially-converged solution before CI's 50-min job timeout cancels
-    // the whole job. The default `max_outer_iter = 80` corresponds to
-    // ~80–240 minutes of wall time at biobank n (each BFGS step's gradient
-    // evaluation hits the per-row cell-moment work in
-    // `cubic_cell_kernel`). Capping the outer-loop budget to a value the
-    // wall-clock can actually accommodate produces a *returned* fit that's
-    // valid as a partial-converge result rather than a hard "fit failed:
-    // job cancelled" error. Small fixtures keep the default behaviour
-    // since they don't trip the gate.
-    //
-    // The cap is intentionally conservative: at biobank scale and inside
-    // `optimize_spatial_length_scale_exact_joint`, BFGS typically gets the
-    // bulk of its convergence in the first 15–25 outer iterations because
-    // the gradient is well-scaled by the analytic ψ derivatives. The
-    // remaining iterations chase tail precision; sacrificing them is a
-    // good trade for actually finishing.
-    let kappa_options_owned: SpatialLengthScaleOptimizationOptions;
-    let kappa_options_ref: &SpatialLengthScaleOptimizationOptions = if biobank_scale
-        && kappa_options.max_outer_iter > 20
-    {
-        kappa_options_owned = SpatialLengthScaleOptimizationOptions {
-            max_outer_iter: 20,
-            ..kappa_options.clone()
-        };
-        log::info!(
-            "[bernoulli-marginal-slope] biobank-scale outer-loop cap: max_outer_iter {} -> {} (CI timeout protection)",
-            kappa_options.max_outer_iter,
-            kappa_options_owned.max_outer_iter,
-        );
-        &kappa_options_owned
-    } else {
-        kappa_options
-    };
+    let kappa_options_ref: &SpatialLengthScaleOptimizationOptions = kappa_options;
     let sigma_from_theta = |theta: &Array1<f64>| -> Option<f64> {
         if sigma_learnable {
             Some(theta[setup.rho_dim() + setup.log_kappa_dim()].exp())
