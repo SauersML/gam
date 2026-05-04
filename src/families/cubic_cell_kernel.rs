@@ -409,14 +409,24 @@ pub fn cell_second_derivative_from_moments(
         ));
     }
     let second_term = moment_dot_with_coefficients_unchecked(second_coefficients_rs, moments);
+    // Fold `Σ_{e,i,j} eta[e]·r[i]·s[j]·moments[e+i+j]` into a single dot
+    // against `moments`. Convolving `eta ⊗ r ⊗ s` first turns the original
+    // `len(eta)·len(r)·len(s)` triple loop (typically 4·4·4 = 64 mul-adds
+    // per call) into `len(eta)·len(r) + (len(eta)+len(r)-1)·len(s) +
+    // len(out)` ≈ 16 + 28 + 10 = 54 mul-adds, with the inner loops now in
+    // straight-line FMA-friendly form.
     let cubic = [cell.c0, cell.c1, cell.c2, cell.c3];
+    // Capacity bound: cubic (4) + first_r (≤MAX) + first_s (≤MAX) - 2.
+    // First-coefficient slices are passed in as `[f64; 4]` from every
+    // production caller; sizing to 32 covers any realistic test input.
+    const SCRATCH: usize = 32;
+    let mut eta_r = [0.0_f64; SCRATCH];
+    let mut eta_rs = [0.0_f64; SCRATCH];
+    let er_len = poly_conv_into(&cubic, first_coefficients_r, &mut eta_r);
+    let ers_len = poly_conv_into(&eta_r[..er_len], first_coefficients_s, &mut eta_rs);
     let mut eta_term = 0.0;
-    for (e, &eta_coeff) in cubic.iter().enumerate() {
-        for (i, &lhs) in first_coefficients_r.iter().enumerate() {
-            for (j, &rhs) in first_coefficients_s.iter().enumerate() {
-                eta_term += eta_coeff * lhs * rhs * moments[e + i + j];
-            }
-        }
+    for k in 0..ers_len {
+        eta_term = eta_rs[k].mul_add(moments[k], eta_term);
     }
     Ok((second_term - eta_term) * INV_TWO_PI)
 }
@@ -442,11 +452,38 @@ fn moment_dot_with_coefficients(
 
 #[inline]
 fn moment_dot_with_coefficients_unchecked(coefficients: &[f64], moments: &[f64]) -> f64 {
-    coefficients
-        .iter()
-        .enumerate()
-        .map(|(idx, coeff)| coeff * moments[idx])
-        .sum::<f64>()
+    let mut acc = 0.0;
+    for (idx, &coeff) in coefficients.iter().enumerate() {
+        acc = coeff.mul_add(moments[idx], acc);
+    }
+    acc
+}
+
+/// Convolve two polynomial coefficient slices into a fixed-capacity output
+/// buffer. Returns the populated length (`lhs.len() + rhs.len() - 1` when
+/// both are non-empty). The buffer's tail (beyond the returned length) is
+/// not zeroed; callers must use only the returned prefix.
+///
+/// Used by the multi-derivative reductions to fold `eta · r · s · …` triple
+/// and quadruple sums into a single moment dot, eliminating the
+/// `O(deg^3)`/`O(deg^4)` inner-loop work that dominated the
+/// `cell_*_derivative_from_moments` hot leaves on biobank-scale fits.
+#[inline]
+fn poly_conv_into(lhs: &[f64], rhs: &[f64], out: &mut [f64]) -> usize {
+    if lhs.is_empty() || rhs.is_empty() {
+        return 0;
+    }
+    let len = lhs.len() + rhs.len() - 1;
+    debug_assert!(out.len() >= len);
+    for slot in out[..len].iter_mut() {
+        *slot = 0.0;
+    }
+    for (i, &lv) in lhs.iter().enumerate() {
+        for (j, &rv) in rhs.iter().enumerate() {
+            out[i + j] = lv.mul_add(rv, out[i + j]);
+        }
+    }
+    len
 }
 
 #[inline]
@@ -504,41 +541,48 @@ pub fn cell_third_derivative_from_moments(
     require_moments_degree(needed, moments, "third derivative")?;
 
     let third_term = moment_dot_with_coefficients_unchecked(third_coefficients_rst, moments);
-    let mut eta_second_term = 0.0;
-    for (e, &eta_coeff) in eta.iter().enumerate() {
-        for (i, &rs) in second_coefficients_rs.iter().enumerate() {
-            for (j, &t) in first_coefficients_t.iter().enumerate() {
-                eta_second_term += eta_coeff * rs * t * moments[e + i + j];
-            }
-        }
-        for (i, &rt) in second_coefficients_rt.iter().enumerate() {
-            for (j, &s) in first_coefficients_s.iter().enumerate() {
-                eta_second_term += eta_coeff * rt * s * moments[e + i + j];
-            }
-        }
-        for (i, &st) in second_coefficients_st.iter().enumerate() {
-            for (j, &r) in first_coefficients_r.iter().enumerate() {
-                eta_second_term += eta_coeff * st * r * moments[e + i + j];
-            }
-        }
-    }
 
-    let mut eta_sq_minus_one = [0.0; 7];
+    // Capacity bound for cubic-eta (4) ⊗ first-coefficient slices (≤4 each)
+    // ⊗ extras: max output length is 4 + 4 + 4 + 4 - 3 = 13 for the
+    // four-factor convolution in `cubic_coeff_term`. Sizing to 32 absorbs
+    // any larger test input without bounds-checking the slice path.
+    const SCRATCH: usize = 32;
+    let mut buf_a = [0.0_f64; SCRATCH];
+    let mut buf_b = [0.0_f64; SCRATCH];
+
+    // eta_second_term = Σ over (rs⊗t, rt⊗s, st⊗r) of eta⊗product · moments.
+    // Fold each of the three triple sums into a single moment dot.
+    let mut eta_second_term = 0.0;
+    let conv_dot = |first: &[f64], second: &[f64], buf_a: &mut [f64; SCRATCH], buf_b: &mut [f64; SCRATCH]| -> f64 {
+        let m = poly_conv_into(first, second, buf_a);
+        let n = poly_conv_into(&eta, &buf_a[..m], buf_b);
+        let mut acc = 0.0;
+        for k in 0..n {
+            acc = buf_b[k].mul_add(moments[k], acc);
+        }
+        acc
+    };
+    eta_second_term += conv_dot(second_coefficients_rs, first_coefficients_t, &mut buf_a, &mut buf_b);
+    eta_second_term += conv_dot(second_coefficients_rt, first_coefficients_s, &mut buf_a, &mut buf_b);
+    eta_second_term += conv_dot(second_coefficients_st, first_coefficients_r, &mut buf_a, &mut buf_b);
+
+    // cubic_coeff_term = Σ_{e,i,j,k} (eta·eta − 1)[e] · r[i] · s[j] · t[k] · moments[e+i+j+k].
+    // Convolve r⊗s, then ⊗t, then ⊗(eta·eta − 1), giving a single dot.
+    let mut eta_sq_minus_one = [0.0_f64; 7];
     for (i, &eta_i) in eta.iter().enumerate() {
         for (j, &eta_j) in eta.iter().enumerate() {
-            eta_sq_minus_one[i + j] += eta_i * eta_j;
+            eta_sq_minus_one[i + j] = eta_i.mul_add(eta_j, eta_sq_minus_one[i + j]);
         }
     }
     eta_sq_minus_one[0] -= 1.0;
+
+    let rs_len = poly_conv_into(first_coefficients_r, first_coefficients_s, &mut buf_a);
+    let rst_len = poly_conv_into(&buf_a[..rs_len], first_coefficients_t, &mut buf_b);
+    // buf_a now reused for (eta_sq_minus_one ⊗ rst).
+    let final_len = poly_conv_into(&eta_sq_minus_one, &buf_b[..rst_len], &mut buf_a);
     let mut cubic_coeff_term = 0.0;
-    for (e, &weight) in eta_sq_minus_one.iter().enumerate() {
-        for (i, &r) in first_coefficients_r.iter().enumerate() {
-            for (j, &s) in first_coefficients_s.iter().enumerate() {
-                for (k, &t) in first_coefficients_t.iter().enumerate() {
-                    cubic_coeff_term += weight * r * s * t * moments[e + i + j + k];
-                }
-            }
-        }
+    for k in 0..final_len {
+        cubic_coeff_term = buf_a[k].mul_add(moments[k], cubic_coeff_term);
     }
 
     Ok((third_term - eta_second_term + cubic_coeff_term) * INV_TWO_PI)
