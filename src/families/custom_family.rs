@@ -10664,8 +10664,11 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                                     wdxr.mapv_inplace(|v| v * wi);
                                 }
                             });
-                        correction_mat += &dx.t().dot(&wx);
-                        correction_mat += &x_dense.t().dot(&wdx);
+                        // Same X'(W·Y) pattern as the parallel sibling at
+                        // line ~9258; route through faer for SIMD GEMM
+                        // (n × p² flops at biobank moderate scale).
+                        correction_mat += &fast_atb(&dx, &wx);
+                        correction_mat += &fast_atb(&x_dense, &wdx);
                     }
                 }
 
@@ -10691,7 +10694,9 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 ndarray::Zip::from(scaled_x.rows_mut())
                     .and(&dw)
                     .par_for_each(|mut sr, &dwi| sr.mapv_inplace(|v| v * dwi));
-                correction_mat += &x_dense.t().dot(&scaled_x);
+                // X'(diag(dW)·X) outer correction term — faer route, same
+                // rationale as above.
+                correction_mat += &fast_atb(&x_dense, &scaled_x);
 
                 Ok(Some(DriftDerivResult::Dense(correction_mat)))
             }
