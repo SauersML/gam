@@ -19570,33 +19570,46 @@ pub mod closed_form_penalty {
             return riesz_block_radial_derivatives(d, a + 2 * s, r, max_order);
         }
 
-        // Hybrid case (s ≥ 1, κ > 0). For high-d cases — `d > 4m` — the
-        // alternating Riesz/Matérn partial-fraction expansion below loses
-        // most of its precision to catastrophic cancellation: individual
-        // terms have magnitudes that scale with high powers of `1/r` (Riesz
-        // factors `r^{2j-d}` for j ≪ d/2) while the combined kernel is
-        // moderate, so the cumulative sum is dominated by IEEE-754 noise.
-        // The Beta-form Schwinger integral
+        // Hybrid case (s ≥ 1, κ > 0). Three charts in priority order:
         //
-        //   1/(|w|^{4m}(κ²+|w|²)^{2s})
-        //     = (1/B(2m, 2s)) ∫_0^1 t^{2m-1}(1-t)^{2s-1}(|w|² + (1-t)κ²)^{-2(m+s)} dt
+        // 1. Small-χ Riesz series (`κr ≤ DUCHON_SMALL_CHI_SERIES_MAX`).
+        //    Exact analytic finite-part representative at small κ. Converges
+        //    spectrally in `κ²r²` so the tails decay geometrically; carries
+        //    full f64 precision when applicable. Several test fixtures
+        //    (`test_small_kappa_finite_part_chart_is_shared_by_value_radial_and_kappa_partials`)
+        //    pin the production code to this chart at the boundary
+        //    κ=0.01, r=1.3 because the value, radial-derivative, and
+        //    κ-partial code paths must all use the *same* finite-part
+        //    representative there. Dispatching to Schwinger first at high
+        //    d would re-evaluate the integrand at a near-singular Matérn
+        //    limit (κ_t = √(1-t)κ → 0) and produce wildly different
+        //    numerics. So check small-χ first.
         //
-        // termwise-IFT'd is a Beta-weighted average of Matérn kernels with
-        // strictly non-negative integrand. It is the same kernel as the PF
-        // expansion in exact arithmetic and remains well-behaved
-        // numerically. The convergence gate `d > 4m` ensures the t→1
-        // (Riesz limit) endpoint is integrable.
-        if schwinger_radial_is_convergent(d, m, s) {
-            return stable_hybrid_duchon_radial(d, m, s, kappa, r, max_order);
-        }
-
-        // Otherwise (low-d): fall back to PF. Cancellation is mild here
-        // because the Riesz-factor magnitudes stay bounded.
+        // 2. Schwinger Beta-form (`d > 4m`, fallback when small-χ does not
+        //    apply). For high-d cases the alternating Riesz/Matérn
+        //    partial-fraction expansion loses most of its precision to
+        //    catastrophic cancellation: individual terms have magnitudes
+        //    that scale with high powers of `1/r` (Riesz factors `r^{2j-d}`
+        //    for j ≪ d/2) while the combined kernel is moderate, so the
+        //    cumulative sum is dominated by IEEE-754 noise. The Beta-form
+        //    Schwinger integral
+        //      1/(|w|^{4m}(κ²+|w|²)^{2s})
+        //        = (1/B(2m, 2s)) ∫_0^1 t^{2m-1}(1-t)^{2s-1}
+        //                              (|w|² + (1-t)κ²)^{-2(m+s)} dt
+        //    termwise-IFT'd is a Beta-weighted average of Matérn kernels
+        //    with strictly non-negative integrand. The convergence gate
+        //    `d > 4m` ensures the t→1 (Riesz limit) endpoint is integrable.
+        //
+        // 3. PF (low-d, no small-χ): the original alternating Riesz/Matérn
+        //    expansion. Cancellation is mild for `d ≤ 4m`.
         let b = 2 * s;
         if use_duchon_small_chi_riesz_series(kappa, r) {
             return duchon_small_chi_riesz_series_radial_derivatives(
                 d, a, b, kappa, r, max_order, 0,
             );
+        }
+        if schwinger_radial_is_convergent(d, m, s) {
+            return stable_hybrid_duchon_radial(d, m, s, kappa, r, max_order);
         }
 
         let kappa_sq = kappa * kappa;
