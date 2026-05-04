@@ -1273,16 +1273,23 @@ impl<'a> RemlState<'a> {
             && self.runtime_mixture_link_state.is_none();
 
         if canonical_logit {
-            for i in 0..n {
-                let eta_raw = pirls_result.final_eta[i];
+            // Canonical Logit fast path: per-row 5-jet evaluation, no
+            // cross-row dependency. At biobank n the 5-jet exp/log work
+            // is the dominant cost.
+            use rayon::prelude::*;
+            let final_eta = &pirls_result.final_eta;
+            let weights = &self.weights;
+            let e_s = e_array.as_slice_mut().expect("e_array must be contiguous");
+            e_s.par_iter_mut().enumerate().for_each(|(i, e_o)| {
+                let eta_raw = final_eta[i];
                 let eta_used = eta_raw.clamp(clamp_lo, clamp_hi);
                 if eta_raw != eta_used {
-                    e_array[i] = 0.0;
+                    *e_o = 0.0;
                 } else {
                     let jet = crate::mixture_link::logit_inverse_link_jet5(eta_used);
-                    e_array[i] = self.weights[i].max(0.0) * jet.d4;
+                    *e_o = weights[i].max(0.0) * jet.d4;
                 }
-            }
+            });
             return Ok((c_array, d_array, e_array));
         }
 
@@ -1312,44 +1319,58 @@ impl<'a> RemlState<'a> {
                 mu.len(),
             )));
         }
-        for i in 0..n {
-            let eta_raw = pirls_result.final_eta[i];
-            let eta_used = eta_raw.clamp(clamp_lo, clamp_hi);
-            if eta_raw != eta_used {
-                e_array[i] = 0.0;
-                continue;
-            }
-            let h1 = dmu_deta[i];
-            let h2 = d2mu_deta2[i];
-            let h3 = d3mu_deta3[i];
-            let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
-                &inverse_link,
-                eta_used,
-            )?;
-            let h5 = crate::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
-                &inverse_link,
-                eta_used,
-            )?;
-            if !h1.is_finite()
-                || !h2.is_finite()
-                || !h3.is_finite()
-                || !h4.is_finite()
-                || !h5.is_finite()
-            {
-                e_array[i] = 0.0;
-                continue;
-            }
-            let mu_i = mu[i];
-            let vj = pirls::variance_jet_for_weight_family(weight_family, mu_i);
-            if !(vj.v.is_finite() && vj.v > 0.0) {
-                e_array[i] = 0.0;
-                continue;
-            }
-            let pw = self.weights[i].max(0.0);
-            let y_i = self.y[i];
-            let e_i = pirls::e_obs_from_jets(y_i, mu_i, h1, h2, h3, h4, h5, vj, phi, pw);
-            e_array[i] = if e_i.is_finite() { e_i } else { 0.0 };
-        }
+        // Noncanonical / GammaLog observed-information path: each row's
+        // e_i depends only on (eta[i], mu[i], priorweights[i], y[i], dmu/d2/d3
+        // jets at row i, and the inverse-link's higher-order pdf derivatives
+        // evaluated at eta_used). No carrier across rows. The h4/h5 lookup
+        // calls return Result, so we propagate first error via try_for_each.
+        use rayon::prelude::*;
+        let final_eta = &pirls_result.final_eta;
+        let weights = &self.weights;
+        let y_view = &self.y;
+        let inverse_link_ref = &inverse_link;
+        let e_s = e_array.as_slice_mut().expect("e_array must be contiguous");
+        e_s.par_iter_mut()
+            .enumerate()
+            .try_for_each(|(i, e_o)| -> Result<(), EstimationError> {
+                let eta_raw = final_eta[i];
+                let eta_used = eta_raw.clamp(clamp_lo, clamp_hi);
+                if eta_raw != eta_used {
+                    *e_o = 0.0;
+                    return Ok(());
+                }
+                let h1 = dmu_deta[i];
+                let h2 = d2mu_deta2[i];
+                let h3 = d3mu_deta3[i];
+                let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
+                    inverse_link_ref,
+                    eta_used,
+                )?;
+                let h5 = crate::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
+                    inverse_link_ref,
+                    eta_used,
+                )?;
+                if !h1.is_finite()
+                    || !h2.is_finite()
+                    || !h3.is_finite()
+                    || !h4.is_finite()
+                    || !h5.is_finite()
+                {
+                    *e_o = 0.0;
+                    return Ok(());
+                }
+                let mu_i = mu[i];
+                let vj = pirls::variance_jet_for_weight_family(weight_family, mu_i);
+                if !(vj.v.is_finite() && vj.v > 0.0) {
+                    *e_o = 0.0;
+                    return Ok(());
+                }
+                let pw = weights[i].max(0.0);
+                let y_i = y_view[i];
+                let e_i = pirls::e_obs_from_jets(y_i, mu_i, h1, h2, h3, h4, h5, vj, phi, pw);
+                *e_o = if e_i.is_finite() { e_i } else { 0.0 };
+                Ok(())
+            })?;
 
         Ok((c_array, d_array, e_array))
     }
