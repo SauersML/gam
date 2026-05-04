@@ -4188,10 +4188,36 @@ fn structural_time_coefficient_lower_bounds(
         // configuration; `validate_exact_monotonicity` plus per-row
         // feasibility checks downstream surface the violation if it
         // actually happens.
+        // Diagnostic: report column-by-column max(|.|) and total nonzero
+        // count so the next iteration can see whether the design is truly
+        // all-zero or just below `DERIVATIVE_TOL`. The cell-moment / I-spline
+        // construction silently drops `|v| ≤ 1e-15` entries, so a design
+        // that *looks* dense to the casual reader can be effectively zero
+        // here. Limit output to the first 8 columns to avoid log spam at
+        // wide bases; emit total rows/cols/nonzeros for the rest.
+        let mut col_maxes = Vec::with_capacity(p.min(8));
+        let mut total_nonzeros = 0_usize;
+        for col in 0..p {
+            let mut col_max = 0.0_f64;
+            for row in 0..design_derivative_exit.nrows() {
+                let v = design_derivative_exit[[row, col]].abs();
+                if v > 1e-30 {
+                    total_nonzeros += 1;
+                }
+                if v > col_max {
+                    col_max = v;
+                }
+            }
+            if col < 8 {
+                col_maxes.push((col, col_max));
+            }
+        }
         log::warn!(
-            "structural time coefficient bounds: no derivative-active column on this candidate's exit-time design ({} rows, {} cols); skipping the structural lower-bound ridge — fit may converge to a non-monotone-in-time hazard",
+            "structural time coefficient bounds: no derivative-active column on this candidate's exit-time design ({} rows × {} cols, total |v|>1e-30 entries: {}, first-8 col max(|.|): {:?}); skipping the structural lower-bound ridge — fit may converge to a non-monotone-in-time hazard",
             design_derivative_exit.nrows(),
             p,
+            total_nonzeros,
+            col_maxes,
         );
         return Ok(None);
     }
