@@ -1,11 +1,11 @@
 use crate::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError,
     BasisMetadata, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy,
-    CenterStrategyKind, DuchonBasisSpec, KroneckerFactoredBasis, MaternBasisSpec,
-    MaternIdentifiability, PenaltyCandidate, PenaltyInfo, PenaltySource, SpatialIdentifiability,
-    ThinPlateBasisSpec, apply_sum_to_zero_constraint, build_bspline_basis_1d, build_duchon_basis,
-    build_duchon_basis_log_kappa_aniso_derivatives, build_duchon_basis_log_kappa_derivatives,
-    build_duchon_basiswithworkspace, build_matern_basis,
+    CenterStrategyKind, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
+    KroneckerFactoredBasis, MaternBasisSpec, MaternIdentifiability, PenaltyCandidate, PenaltyInfo,
+    PenaltySource, SpatialIdentifiability, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
+    build_bspline_basis_1d, build_duchon_basis, build_duchon_basis_log_kappa_aniso_derivatives,
+    build_duchon_basis_log_kappa_derivatives, build_duchon_basiswithworkspace, build_matern_basis,
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
     build_matern_basiswithworkspace, build_matern_collocation_operator_matrices,
     build_thin_plate_basis, build_thin_plate_basis_log_kappa_derivatives, center_strategy_is_auto,
@@ -11506,6 +11506,44 @@ pub fn freeze_term_collection_from_design(
         .iter_mut()
         .zip(design.smooth.terms.iter())
     {
+        // Auto-promotion: when canonical TPS is mathematically infeasible at
+        // the requested (d, k), `build_thin_plate_basis_with_workspace`
+        // delegates to `build_duchon_basis_with_workspace` and returns
+        // `BasisMetadata::Duchon`. The user's spec, however, is still
+        // `SmoothBasisSpec::ThinPlate`. Without a rewrite the freezer's
+        // type-paired match would land on the catch-all error arm and the
+        // entire fit would fail at serialization time — even though the fit
+        // itself succeeded against the promoted Duchon basis. Rewrite the
+        // term's basis variant to Duchon so the standard (Duchon, Duchon)
+        // arm below stores the captured Duchon parameters and predict-time
+        // takes the Duchon path directly with the frozen centers/power.
+        if matches!(&term.basis, SmoothBasisSpec::ThinPlate { .. })
+            && matches!(&fitted.metadata, BasisMetadata::Duchon { .. })
+        {
+            let (feature_cols, original_identifiability) = match &term.basis {
+                SmoothBasisSpec::ThinPlate {
+                    feature_cols, spec, ..
+                } => (feature_cols.clone(), spec.identifiability.clone()),
+                _ => unreachable!("guarded by the matches! above"),
+            };
+            term.basis = SmoothBasisSpec::Duchon {
+                feature_cols,
+                spec: DuchonBasisSpec {
+                    // Center strategy / length_scale / power / nullspace_order
+                    // are placeholders — the (Duchon, Duchon) arm below
+                    // overwrites them with the frozen values from the metadata
+                    // captured during the actual basis build.
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 0 },
+                    length_scale: None,
+                    power: 0,
+                    nullspace_order: DuchonNullspaceOrder::Zero,
+                    identifiability: original_identifiability,
+                    aniso_log_scales: None,
+                    operator_penalties: DuchonOperatorPenaltySpec::default(),
+                },
+                input_scales: None,
+            };
+        }
         match (&mut term.basis, &fitted.metadata) {
             (
                 SmoothBasisSpec::BSpline1D { spec: s, .. },
@@ -13202,6 +13240,16 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         options,
     )?;
     resolvedspec = freeze_term_collection_from_design(&resolvedspec, &best.design)?;
+    // The freeze step can rewrite a term's basis variant — most notably when
+    // `build_thin_plate_basis_with_workspace` auto-promotes an infeasible
+    // canonical-TPS request to a pure Duchon spline (length_scale = None,
+    // no anisotropy). The pre-fit eligibility list was computed against the
+    // ThinPlate spec, which has length_scale set, so it included that term.
+    // After the rewrite the same term is a *pure* Duchon basis with no free
+    // length-scale parameter to optimize, and the downstream kappa solver
+    // (which assumes hybrid Duchon for log-κ derivatives) errors out. Refresh
+    // the index list so it reflects the post-freeze spec.
+    let spatial_terms = spatial_length_scale_term_indices(&resolvedspec);
     // Sync knot-cloud-derived aniso contrasts from the basis metadata back
     // into the spec so the optimizer starts from the geometry-informed η values
     // rather than the zero sentinel from --scale-dimensions.
@@ -13255,6 +13303,9 @@ mod tests {
     use crate::estimate::AdaptiveRegularizationOptions;
     use crate::faer_ndarray::{FaerEigh, FaerSvd};
     use ndarray::array;
+    use rand::RngExt;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
 
     fn assert_spatial_derivative_width(
         label: &str,
@@ -13782,6 +13833,89 @@ mod tests {
         assert!(
             matches!(metadata, BasisMetadata::Duchon { .. }),
             "expected Duchon metadata after auto-promotion, got {metadata:?}"
+        );
+    }
+
+    #[test]
+    fn freeze_term_collection_handles_thin_plate_auto_promotion_to_duchon() {
+        // Reproducer for the freezer falling into its catch-all "smooth
+        // metadata/spec type mismatch" arm whenever `build_thin_plate_basis`
+        // delegates to `build_duchon_basis` (the auto-promotion path that
+        // fires whenever canonical TPS is mathematically infeasible at the
+        // requested d, k).  Without the rewrite step in
+        // `freeze_term_collection_from_design`, the (ThinPlate spec, Duchon
+        // metadata) pairing aborts the entire fit at serialization time even
+        // though the fit itself succeeded against the promoted Duchon basis.
+        //
+        // d=5, k=10 hits the auto-promotion branch (canonical TPS at d=5 needs
+        // M(5, m=3)=21 polynomial columns, above k=10) AND the Duchon fallback
+        // is admissible (Linear nullspace at p=2 needs m_poly=6 centers, so
+        // k=10 ≥ 6, with the smallest s satisfying both 2(p+s) > d and
+        // 2s < d giving s=1).
+        let mut rng = StdRng::seed_from_u64(20260504);
+        let n = 200usize;
+        let mut data = Array2::<f64>::zeros((n, 5));
+        for i in 0..n {
+            for j in 0..5 {
+                data[[i, j]] = rng.random_range(-1.0..1.0);
+            }
+        }
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "thinplate(pc1, pc2, pc3, pc4, pc5)".to_string(),
+                basis: SmoothBasisSpec::ThinPlate {
+                    feature_cols: vec![0, 1, 2, 3, 4],
+                    spec: ThinPlateBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 10 },
+                        length_scale: 1.0,
+                        double_penalty: false,
+                        identifiability: SpatialIdentifiability::default(),
+                        radial_reparam: None,
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        let fit_design = build_term_collection_design(data.view(), &spec).expect("fit-time design");
+        // Confirm we actually exercised the auto-promotion branch.
+        let metadata = &fit_design
+            .smooth
+            .terms
+            .first()
+            .expect("at least one smooth term")
+            .metadata;
+        assert!(
+            matches!(metadata, BasisMetadata::Duchon { .. }),
+            "expected auto-promotion to Duchon, got {metadata:?}"
+        );
+
+        let frozen = freeze_term_collection_from_design(&spec, &fit_design).expect(
+            "freeze must succeed across the auto-promoted (ThinPlate spec, Duchon metadata) pair",
+        );
+        assert!(
+            matches!(frozen.smooth_terms[0].basis, SmoothBasisSpec::Duchon { .. }),
+            "frozen spec should reflect the auto-promotion as a Duchon variant"
+        );
+
+        // Predict-time replay must reproduce the fit-time design bit-for-bit:
+        // the frozen Duchon spec carries the exact centers, power, and
+        // nullspace_order that the basis builder selected during the fit.
+        let replay_design =
+            build_term_collection_design(data.view(), &frozen).expect("replay design");
+        let max_abs = fit_design
+            .design
+            .to_dense()
+            .iter()
+            .zip(replay_design.design.to_dense().iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_abs <= 1e-10,
+            "auto-promoted frozen replay changed realized design: max_abs={max_abs}"
         );
     }
 
