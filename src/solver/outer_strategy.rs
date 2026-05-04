@@ -3197,6 +3197,41 @@ fn run_operator_trust_region(
             dense_model = None;
             materialize_dense_after_rejection = false;
         } else {
+            // Smart snap on egregious rejection. When the cubic model
+            // predicts a decrease many orders of magnitude larger than
+            // the current cost (i.e., the local geometry is wildly
+            // different from the seed-iter-0 geometry — typically because
+            // an accepted earlier step landed in a steep-gradient basin),
+            // geometric halving from the current radius can cost dozens
+            // of rejected iterations. Same |cost|/‖g‖ Newton-step heuristic
+            // we use at iter=0: snap directly to a radius whose linearised
+            // first-order decrease is comparable to |cost|. Only fires
+            // when the mismatch is extreme (>1e6) so well-behaved
+            // rejections continue to use ARC's standard halving.
+            let derived_recovery_radius = {
+                let cost_scale = eval_k.cost.abs().max(1.0);
+                if g_norm.is_finite() && g_norm > 0.0 {
+                    (cost_scale / g_norm).clamp(
+                        OPERATOR_TRUST_RADIUS_REJECT_FLOOR * 10.0,
+                        OPERATOR_TRUST_RADIUS_INIT,
+                    )
+                } else {
+                    new_trust_radius
+                }
+            };
+            let cost_scale = eval_k.cost.abs().max(1.0);
+            let mismatch_ratio = if pred_dec.is_finite() && pred_dec > 0.0 {
+                pred_dec / cost_scale
+            } else {
+                0.0
+            };
+            let snapped_radius = if mismatch_ratio > 1e6
+                && derived_recovery_radius < new_trust_radius * 0.5
+            {
+                derived_recovery_radius
+            } else {
+                new_trust_radius
+            };
             let elapsed = iter_start.elapsed().as_secs_f64();
             log::info!(
                 "[ARC-timing] iter={iter} status=rejected cost={:.6e}->{:.6e} \
@@ -3209,11 +3244,21 @@ fn run_operator_trust_region(
                 pred_dec,
                 act_dec,
                 trust_radius,
-                new_trust_radius,
+                snapped_radius,
                 hv_applies,
                 elapsed,
             );
-            trust_radius = new_trust_radius;
+            if snapped_radius < new_trust_radius {
+                log::info!(
+                    "[ARC-timing] iter={iter} snap_recovery: pred_dec/|cost|={:.3e} >> 1; \
+                     snapped trust_radius {:.3e} -> {:.3e} (skipping ~{} halvings)",
+                    mismatch_ratio,
+                    new_trust_radius,
+                    snapped_radius,
+                    (new_trust_radius / snapped_radius).log2().ceil() as i64,
+                );
+            }
+            trust_radius = snapped_radius;
             if trust_radius <= OPERATOR_TRUST_RADIUS_REJECT_FLOOR {
                 let final_grad = projected_gradient(&x_k, &eval_k.gradient, bounds);
                 let final_grad_norm = final_grad.dot(&final_grad).sqrt();
