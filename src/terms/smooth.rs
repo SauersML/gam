@@ -79,7 +79,7 @@ fn rewrite_thin_plate_knots_error(
             if msg.contains("thin-plate spline requires at least")
                 && (msg.contains("centers to span") || msg.contains("knots to span")) =>
         {
-            let min_centers = feature_count + 1;
+            let min_centers = crate::basis::thin_plate_polynomial_basis_dimension(feature_count);
             let requested = describe_thin_plate_center_request(&spec.center_strategy);
             BasisError::InvalidInput(format!(
                 "joint TPS term '{termname}' over {feature_count} covariates with {requested} is invalid; minimum centers is {min_centers}"
@@ -92,7 +92,7 @@ fn rewrite_thin_plate_knots_error(
         BasisError::InvalidInput(msg)
             if msg.starts_with("requested ") && msg.contains(" knots but only ") =>
         {
-            let min_centers = feature_count + 1;
+            let min_centers = crate::basis::thin_plate_polynomial_basis_dimension(feature_count);
             let requested = describe_thin_plate_center_request(&spec.center_strategy);
             BasisError::InvalidInput(format!(
                 "joint TPS term '{termname}' over {feature_count} covariates with {requested} is invalid; minimum centers is {min_centers}"
