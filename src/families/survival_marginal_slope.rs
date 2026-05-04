@@ -13284,11 +13284,29 @@ pub fn fit_survival_marginal_slope_terms(
     let n_obs = data.nrows();
     let psi_dim = setup.log_kappa_dim();
     let biobank_scale = n_obs > 50_000 || psi_dim > 30;
+    // CRITICAL: when biobank_scale fires we ALSO override the
+    // BlockwiseFitOptions to set `use_outer_hessian=false`. The optimize-
+    // joint path consumes our local `analytic_joint_hessian_available`
+    // value and gates the planner on it; but the survival main fit also
+    // ends up running through the `fit_custom_family` blockwise outer-loop
+    // path (visible as `[OUTER] custom family: ...` in CI logs), and that
+    // path computes its Hessian capability via
+    // `custom_family_outer_derivatives` which only consults
+    // `options.use_outer_hessian` and the family's declared 2nd-order
+    // capability — bypassing our gate entirely. CI run 25338491995 showed
+    // this exact failure mode: at biobank n=320k psi_dim=23 the planner
+    // selected `solver=Arc, hessian=Analytic` despite the gate being
+    // tripped. Setting `use_outer_hessian=false` in the options bag
+    // forces both paths to declare the outer Hessian unavailable, routing
+    // to BFGS.
+    let mut options_override = options.clone();
     if biobank_scale {
+        options_override.use_outer_hessian = false;
         log::info!(
-            "[survival-marginal-slope] declining analytic outer Hessian for n={n_obs}, psi_dim={psi_dim}; routing to BFGS"
+            "[survival-marginal-slope] declining analytic outer Hessian for n={n_obs}, psi_dim={psi_dim}; routing to BFGS (use_outer_hessian=false)"
         );
     }
+    let options: &BlockwiseFitOptions = &options_override;
     let analytic_joint_hessian_available = analytic_joint_derivatives_available
         && !biobank_scale
         && matches!(
