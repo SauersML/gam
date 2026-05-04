@@ -1836,7 +1836,7 @@ def _geo_disease_eas_scenario_cfg(name: typing.Any) -> typing.Any:
     knots = max(4, int(m.group(3)))
     n_pcs = 3 if family_code == "eas3" else 16
     if basis_code == "tp":
-        joint_pcs = _joint_spatial_pc_count("geo_disease", n_pcs, "thinplate")
+        joint_pcs = _fixed_joint_spatial_pc_count("geo_disease", n_pcs)
         return {
             "smooth_basis": "thinplate",
             "smooth_cols": [f"pc{i}" for i in range(1, joint_pcs + 1)],
@@ -1846,7 +1846,7 @@ def _geo_disease_eas_scenario_cfg(name: typing.Any) -> typing.Any:
             "n_pcs": n_pcs,
         }
     if basis_code == "duchon":
-        joint_pcs = _joint_spatial_pc_count("geo_disease", n_pcs, "duchon")
+        joint_pcs = _fixed_joint_spatial_pc_count("geo_disease", n_pcs)
         return {
             "smooth_basis": "duchon",
             "smooth_cols": [f"pc{i}" for i in range(1, joint_pcs + 1)],
@@ -1856,7 +1856,7 @@ def _geo_disease_eas_scenario_cfg(name: typing.Any) -> typing.Any:
             "n_pcs": n_pcs,
         }
     if basis_code == "matern":
-        joint_pcs = _joint_spatial_pc_count("geo_disease", n_pcs, "matern")
+        joint_pcs = _fixed_joint_spatial_pc_count("geo_disease", n_pcs)
         return {
             "smooth_basis": "matern",
             "smooth_cols": [f"pc{i}" for i in range(1, joint_pcs + 1)],
@@ -1882,24 +1882,24 @@ def _scenario_downsample_factor(name: str) -> int | None:
     return max(1, int(m.group(1)))
 
 
-def _joint_spatial_pc_count(family: str, n_pcs: int, smooth_basis: str) -> int:
-    # Joint-PC contract picks the full PC count for bases whose nullspace stays
-    # tractable in high dimension (Duchon, Matern, tensor P-splines). Thin-plate
-    # splines have a polynomial-nullspace dimension M(d) = C(d+m-1, d) with
-    # m = floor(d/2)+1, so the basis must contain at least M(d) centers — which
-    # is 84 at d=6, 735_471 at d=16. Any joint TPS over the full PC vector at
-    # modest knot counts is mathematically infeasible, so TPS-over-PC scenarios
-    # pin a fixed low-dimensional embedding per family (still one joint smooth,
-    # just over the leading PCs). Other bases keep the full PC count.
+def _fixed_joint_spatial_pc_count(family: str, n_pcs: int) -> int:
+    """Number of PCs to include in the joint smooth for `family`.
+
+    The joint-PC contract says PCs always enter the model as a single multi-D
+    object — so this returns the FULL `n_pcs`. Thin-plate splines used to
+    require a separate cap because canonical TPS in d dimensions has a
+    polynomial nullspace of size C(d+m-1, d) with m=⌊d/2⌋+1, which is
+    735_471 at d=16. The Rust basis builder now auto-promotes infeasible
+    canonical-TPS requests to a pure Duchon spline (the proper Riesz-
+    fractional generalization with finite kernel at r=0 and a small
+    polynomial nullspace), so all bases — including thin-plate — can use
+    the full PC count uniformly.
+    """
     n_pcs = int(max(1, n_pcs))
     family = str(family)
-    if family not in {"geo_disease", "papuan_oce", "geo_subpop16", "geo_latlon"}:
-        raise RuntimeError(f"unsupported joint spatial benchmark family: {family}")
-    if smooth_basis == "thinplate":
-        if family == "geo_latlon":
-            return min(2, n_pcs)
-        return min(3, n_pcs)
-    return n_pcs
+    if family in {"geo_disease", "papuan_oce", "geo_subpop16", "geo_latlon"}:
+        return n_pcs
+    raise RuntimeError(f"unsupported joint spatial benchmark family: {family}")
 
 
 def _papuan_oce_scenario_cfg(name: typing.Any) -> typing.Any:
@@ -1920,7 +1920,7 @@ def _papuan_oce_scenario_cfg(name: typing.Any) -> typing.Any:
             "n_pcs": n_pcs,
         }
     smooth_basis = {"tp": "thinplate", "duchon": "duchon", "matern": "matern"}[basis_code]
-    joint_pcs = _joint_spatial_pc_count("papuan_oce", n_pcs, smooth_basis)
+    joint_pcs = _fixed_joint_spatial_pc_count("papuan_oce", n_pcs)
     return {
         "smooth_basis": smooth_basis,
         "smooth_cols": [f"pc{i}" for i in range(1, joint_pcs + 1)],
@@ -2035,7 +2035,7 @@ def _geo_subpop16_scenario_cfg(name: typing.Any) -> typing.Any:
             "n_pcs": 16,
         }
     smooth_basis = {"tp": "thinplate", "duchon": "duchon", "matern": "matern"}[basis_code]
-    joint_pcs = _joint_spatial_pc_count("geo_subpop16", 16, smooth_basis)
+    joint_pcs = _fixed_joint_spatial_pc_count("geo_subpop16", 16)
     return {
         "smooth_basis": smooth_basis,
         "smooth_cols": [f"pc{i}" for i in range(1, joint_pcs + 1)],
@@ -2064,7 +2064,7 @@ def _geo_latlon_scenario_cfg(name: typing.Any) -> typing.Any:
             "n_pcs": 6,
         }
     smooth_basis = {"tp": "thinplate", "duchon": "duchon", "matern": "matern"}[basis_code]
-    joint_pcs = _joint_spatial_pc_count("geo_latlon", 6, smooth_basis)
+    joint_pcs = _fixed_joint_spatial_pc_count("geo_latlon", 6)
     return {
         "mode_code": mode_code,
         "smooth_basis": smooth_basis,
@@ -3078,16 +3078,16 @@ def _scenario_fit_mapping(scenario_name: typing.Any) -> typing.Any:
         "geo_disease_tp": dict(
             family="binomial-logit",
             smooth_cols=[
-                f"pc{i}" for i in range(1, _joint_spatial_pc_count("geo_disease", 16, "thinplate") + 1)
+                f"pc{i}" for i in range(1, _fixed_joint_spatial_pc_count("geo_disease", 16) + 1)
             ],
             smooth_basis="thinplate",
             linear_cols=[],
-            knots=12,
+            knots=24,
         ),
         "geo_disease_duchon": dict(
             family="binomial-logit",
             smooth_cols=[
-                f"pc{i}" for i in range(1, _joint_spatial_pc_count("geo_disease", 16, "duchon") + 1)
+                f"pc{i}" for i in range(1, _fixed_joint_spatial_pc_count("geo_disease", 16) + 1)
             ],
             smooth_basis="duchon",
             linear_cols=[],
@@ -3096,7 +3096,7 @@ def _scenario_fit_mapping(scenario_name: typing.Any) -> typing.Any:
         "geo_disease_matern": dict(
             family="binomial-logit",
             smooth_cols=[
-                f"pc{i}" for i in range(1, _joint_spatial_pc_count("geo_disease", 16, "matern") + 1)
+                f"pc{i}" for i in range(1, _fixed_joint_spatial_pc_count("geo_disease", 16) + 1)
             ],
             smooth_basis="matern",
             linear_cols=[],
@@ -3105,11 +3105,11 @@ def _scenario_fit_mapping(scenario_name: typing.Any) -> typing.Any:
         "geo_disease_shrinkage": dict(
             family="binomial-logit",
             smooth_cols=[
-                f"pc{i}" for i in range(1, _joint_spatial_pc_count("geo_disease", 16, "thinplate") + 1)
+                f"pc{i}" for i in range(1, _fixed_joint_spatial_pc_count("geo_disease", 16) + 1)
             ],
             smooth_basis="thinplate",
             linear_cols=[],
-            knots=12,
+            knots=24,
         ),
         "geo_disease_ps_per_pc": dict(
             family="binomial-logit",

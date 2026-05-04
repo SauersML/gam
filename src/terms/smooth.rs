@@ -13710,7 +13710,12 @@ mod tests {
     }
 
     #[test]
-    fn build_smooth_design_rewrites_thin_plate_knot_count_errorwith_term_context() {
+    fn build_smooth_design_auto_promotes_thin_plate_below_canonical_polynomial_dimension() {
+        // d=3 with k=3 centers is below the canonical TPS polynomial-nullspace
+        // size M(3, m=2) = 4. The basis builder auto-promotes to a pure Duchon
+        // spline (Riesz-fractional generalization) — the principled fix for
+        // canonical-TPS infeasibility — instead of rejecting. The resulting
+        // metadata is Duchon, confirming the route fired.
         let data = array![
             [0.0, 0.0, 0.0],
             [0.2, 0.1, 0.3],
@@ -13733,17 +13738,13 @@ mod tests {
             shape: ShapeConstraint::None,
         }];
 
-        let err =
-            build_smooth_design(data.view(), &terms).expect_err("expected knot-count failure");
-        match err {
-            BasisError::InvalidInput(msg) => {
-                assert!(msg.contains("joint TPS term 'thinplate(pc1, pc2, pc3)'"));
-                assert!(msg.contains("over 3 covariates"));
-                assert!(msg.contains("with 3 centers"));
-                assert!(msg.contains("minimum centers is 4"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let sd = build_smooth_design(data.view(), &terms)
+            .expect("auto-promotion to Duchon should succeed at infeasible canonical (d, k)");
+        let metadata = &sd.terms.first().expect("at least one smooth term").metadata;
+        assert!(
+            matches!(metadata, BasisMetadata::Duchon { .. }),
+            "expected Duchon metadata after auto-promotion, got {metadata:?}"
+        );
     }
 
     #[test]
