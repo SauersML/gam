@@ -8537,11 +8537,13 @@ fn unified_joint_efs_eval(
         .ext_coords
         .iter()
         .any(|coord| !coord.is_penalty_like);
-    let eval_mode = if has_psi {
-        EvalMode::ValueAndGradient
-    } else {
-        EvalMode::ValueOnly
-    };
+    // Always evaluate gradient: the universal-form EFS step
+    // `Δρ = log(1 − 2·g_full / q_eff)` reads it directly from the cost
+    // gradient slot, so out-of-band cost terms (TK, prior, Firth,
+    // barrier, SAS log-δ ridge) shift the multiplicative target through
+    // their gradient contribution without needing per-augmentation
+    // post-corrections.
+    let eval_mode = EvalMode::ValueAndGradient;
     let result = crate::estimate::reml::assembly::evaluate_solution(
         &inner_solution,
         rho_slice,
@@ -8549,16 +8551,18 @@ fn unified_joint_efs_eval(
         None,
     )?;
 
+    let gradient = result.gradient.as_ref().ok_or_else(|| {
+        "EFS evaluation did not return the required gradient".to_string()
+    })?;
+    let gradient_slice = gradient
+        .as_slice()
+        .ok_or_else(|| "outer gradient must be contiguous for EFS".to_string())?;
+
     if has_psi {
-        let gradient = result.gradient.as_ref().ok_or_else(|| {
-            "hybrid EFS evaluation did not return the required gradient".to_string()
-        })?;
         let hybrid = crate::estimate::reml::unified::compute_hybrid_efs_update(
             &inner_solution,
             rho_slice,
-            gradient
-                .as_slice()
-                .ok_or_else(|| "outer gradient must be contiguous for hybrid EFS".to_string())?,
+            gradient_slice,
         );
         Ok(crate::solver::outer_strategy::EfsEval {
             cost: result.cost,
@@ -8578,7 +8582,11 @@ fn unified_joint_efs_eval(
     } else {
         Ok(crate::solver::outer_strategy::EfsEval {
             cost: result.cost,
-            steps: crate::estimate::reml::unified::compute_efs_update(&inner_solution, rho_slice),
+            steps: crate::estimate::reml::unified::compute_efs_update(
+                &inner_solution,
+                rho_slice,
+                gradient_slice,
+            ),
             beta: Some(inner_solution.beta.clone()),
             psi_gradient: None,
             psi_indices: None,
