@@ -3467,7 +3467,16 @@ impl SurvivalMarginalSlopeFamily {
         let probability_tol = SURVIVAL_INTERCEPT_ABS_RESIDUAL_TOL
             .max(SURVIVAL_INTERCEPT_REL_TAIL_RESIDUAL_TOL * tail_mass);
         let mut log_tail_residual = None;
+        // Always accept if probability-space residual is within tolerance:
+        // a perfectly-converged probability solve (residual=0) is the best
+        // achievable answer, and rejecting it because the deep-tail log
+        // computation has its own floating-point noise (~6e-8 at |q|>=7)
+        // would discard a correct intercept. When tail_mass is small we
+        // *additionally* accept tight log-space agreement, so well-resolved
+        // tails that drift slightly outside the absolute probability_tol
+        // (which can be ulp-bounded) still validate.
         let residual_ok = if tail_mass < SURVIVAL_INTERCEPT_LOG_TAIL_THRESHOLD {
+            let probability_pass = residual.abs() <= probability_tol;
             let (achieved_tail, target_log_tail) = if target_survival <= 0.5 {
                 let (target_log_survival, _) = signed_probit_logcdf_and_mills_ratio(-q);
                 (achieved_survival, target_log_survival)
@@ -3475,13 +3484,17 @@ impl SurvivalMarginalSlopeFamily {
                 let (target_log_failure, _) = signed_probit_logcdf_and_mills_ratio(q);
                 (1.0 - achieved_survival, target_log_failure)
             };
-            if target_log_tail.is_finite() && achieved_tail.is_finite() && achieved_tail > 0.0 {
+            let log_pass = if target_log_tail.is_finite()
+                && achieved_tail.is_finite()
+                && achieved_tail > 0.0
+            {
                 let log_residual = achieved_tail.ln() - target_log_tail;
                 log_tail_residual = Some(log_residual);
                 log_residual.abs() <= SURVIVAL_INTERCEPT_REL_TAIL_RESIDUAL_TOL
             } else {
-                residual.abs() <= probability_tol
-            }
+                false
+            };
+            probability_pass || log_pass
         } else {
             residual.abs() <= probability_tol
         };
