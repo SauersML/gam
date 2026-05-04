@@ -13253,7 +13253,22 @@ pub fn fit_survival_marginal_slope_terms(
             joint_gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
+    // Same biobank-scale gate as bernoulli marginal-slope — see comment block
+    // in `bernoulli_marginal_slope::fit_bernoulli_marginal_slope_terms` for
+    // the rationale. At biobank shape the per-row third/fourth-derivative
+    // outer-Hessian work dominates wall-clock; declare Hessian as
+    // `Unavailable` for large problems so the planner falls back to BFGS
+    // (gradient-only) on the analytic gradient.
+    let n_obs = data.nrows();
+    let psi_dim = setup.log_kappa_dim();
+    let biobank_scale = n_obs > 50_000 || psi_dim > 30;
+    if biobank_scale {
+        log::info!(
+            "[survival-marginal-slope] declining analytic outer Hessian for n={n_obs}, psi_dim={psi_dim}; routing to BFGS"
+        );
+    }
     let analytic_joint_hessian_available = analytic_joint_derivatives_available
+        && !biobank_scale
         && matches!(
             joint_hessian,
             crate::solver::outer_strategy::Derivative::Analytic
