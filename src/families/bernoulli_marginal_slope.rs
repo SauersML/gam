@@ -2722,65 +2722,16 @@ impl BernoulliMarginalSlopeFamily {
         )
     }
 
-    /// Halley reference implementation (degree-9 cell moments). Superseded
-    /// by [`Self::evaluate_denested_calibration_newton`] for the inner
-    /// row-intercept solver; retained for ablation / cross-checks.
-    #[allow(dead_code)]
-    fn evaluate_denested_calibration(
-        &self,
-        a: f64,
-        marginal_eta: f64,
-        slope: f64,
-        beta_h: Option<&Array1<f64>>,
-        beta_w: Option<&Array1<f64>>,
-    ) -> Result<(f64, f64, f64), String> {
-        let marginal = self.marginal_link_map(marginal_eta)?;
-        let cells = self.denested_partition_cells(a, slope, beta_h, beta_w)?;
-        let scale = self.probit_frailty_scale();
-        let mut f = -marginal.mu;
-        let mut f_a = 0.0;
-        let mut f_aa = 0.0;
-        for partition_cell in cells {
-            let cell = partition_cell.cell;
-            let state = exact_kernel::evaluate_cell_moments(cell, 9)?;
-            f += state.value;
-            let (dc_da_raw, _) = exact_kernel::denested_cell_coefficient_partials(
-                partition_cell.score_span,
-                partition_cell.link_span,
-                a,
-                slope,
-            );
-            let (d2c_da2_raw, _, _) = exact_kernel::denested_cell_second_partials(
-                partition_cell.score_span,
-                partition_cell.link_span,
-                a,
-                slope,
-            );
-            let dc_da = scale_coeff4(dc_da_raw, scale);
-            let d2c_da2 = scale_coeff4(d2c_da2_raw, scale);
-            f_a += exact_kernel::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
-            f_aa += exact_kernel::cell_second_derivative_from_moments(
-                cell,
-                &dc_da,
-                &dc_da,
-                &d2c_da2,
-                &state.moments,
-            )?;
-        }
-        Ok((f, f_a, f_aa))
-    }
-
-    /// Newton-only variant of [`Self::evaluate_denested_calibration`] used by
-    /// the inner-PIRLS row-intercept root solver.
+    /// Newton-step evaluator for the inner-PIRLS row-intercept root solver.
     ///
     /// Returns `(f, f', 0.0)`: the third slot — `F''(a)` — is reported as
     /// zero, which makes [`monotone_root::solve_monotone_root`]'s safeguarded
     /// Halley step reduce to a Newton step (the Halley denominator
     /// `2·F'² − F·F''` collapses to `2·F'²`, so the step
     /// `mid − 2·F·F'/(2·F'²) = mid − F/F'` is exactly Newton's). Newton
-    /// converges roughly twice as slowly near the root as Halley, but each
-    /// iteration is far cheaper because we compute cell moments only to
-    /// **degree 4** instead of degree 9. At `max_degree ≤ 4`,
+    /// converges roughly twice as slowly near the root as a true Halley
+    /// iteration, but each iteration is far cheaper because we compute cell
+    /// moments only to **degree 4** instead of degree 9. At `max_degree ≤ 4`,
     /// `cubic_cell_kernel::reduce_sextic_moments` (cubic_cell_kernel.rs:298)
     /// takes its fast path — slicing the affine-anchor base moments and
     /// skipping the entire sextic recurrence + boundary-term loop — and
@@ -2788,8 +2739,6 @@ impl BernoulliMarginalSlopeFamily {
     ///
     /// Used at every PIRLS iteration on every row, so even modest per-call
     /// wins compound into the dominant inner-PIRLS speed-up at biobank scale.
-    /// The converged intercept is identical (Newton and Halley find the same
-    /// root); only the path differs.
     fn evaluate_denested_calibration_newton(
         &self,
         a: f64,
