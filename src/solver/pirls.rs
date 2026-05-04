@@ -7390,50 +7390,74 @@ fn compute_observed_hessian_curvature_arrays(
     let weight_family = weight_family_for_glm_likelihood(likelihood);
     let weight_link = weight_link_for_inverse_link(inverse_link);
     let phi = fixed_glm_dispersion(likelihood);
+    // Parallel per-row weight assembly. At biobank scale (n = 320k) this loop
+    // dominates `update_with_curvature` in non-canonical paths because each
+    // row independently calls
+    // `inverse_link_pdfthird_derivative_for_inverse_link` and
+    // `observed_weight_dispatch` (function-call per row, no vectorization).
+    // Rows are fully independent, so par_iter + collect_into_vec gives a
+    // direct N-thread speedup. Errors propagate via `try_fold` -> `try_reduce`
+    // pattern with the first-encountered failure winning, matching the prior
+    // serial early-return semantics.
+    //
+    // Indexed collection via `try_fold(... |row_acc| ... )` would force a
+    // per-row Vec allocation on each thread; instead we materialize three
+    // pre-zeroed Array1 buffers and write into raw slices via
+    // chunks_mut + zip with the input chunks. This avoids any per-row heap
+    // traffic and keeps the hot path branch-free apart from the finite/positive
+    // guards.
+    let row_results: Result<Vec<(f64, f64, f64)>, EstimationError> = (0..n)
+        .into_par_iter()
+        .map(|i| -> Result<(f64, f64, f64), EstimationError> {
+            let eta_used = eta_for_observed_hessian_jet(inverse_link, eta[i]);
+            let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
+                inverse_link,
+                eta_used,
+            )?;
+            let jet = MixtureInverseLinkJet {
+                mu: mu[i],
+                d1: dmu_deta[i],
+                d2: d2mu_deta2[i],
+                d3: d3mu_deta3[i],
+            };
+            let (w_obs, c_obs, d_obs) = observed_weight_dispatch(
+                weight_family,
+                weight_link,
+                eta_used,
+                y[i],
+                mu[i],
+                phi,
+                priorweights[i].max(0.0),
+                jet,
+                h4,
+            );
+            let fisher_weight = fisher_weights[i].max(0.0);
+            // Same finite/positive guards as the prior serial loop. Solver
+            // conditioning floors are applied separately by
+            // `solver_hessian_weights`; replacing invalid observed rows with
+            // Fisher rows here would silently turn the advertised observed-LAML
+            // objective into a mixed surrogate.
+            if !(w_obs.is_finite() && w_obs > 0.0) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "observed Hessian curvature is not positive finite at row {i}: observed={w_obs}, fisher={fisher_weight}"
+                )));
+            }
+            if !c_obs.is_finite() || !d_obs.is_finite() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "observed Hessian curvature derivatives are non-finite at row {i}: c={c_obs}, d={d_obs}"
+                )));
+            }
+            Ok((w_obs, c_obs, d_obs))
+        })
+        .collect();
+    let row_results = row_results?;
     let mut hessian_weights = Array1::<f64>::zeros(n);
     let mut hessian_c = Array1::<f64>::zeros(n);
     let mut hessian_d = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let eta_used = eta_for_observed_hessian_jet(inverse_link, eta[i]);
-        let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
-            inverse_link,
-            eta_used,
-        )?;
-        let jet = MixtureInverseLinkJet {
-            mu: mu[i],
-            d1: dmu_deta[i],
-            d2: d2mu_deta2[i],
-            d3: d3mu_deta3[i],
-        };
-        let (w_obs, c_obs, d_obs) = observed_weight_dispatch(
-            weight_family,
-            weight_link,
-            eta_used,
-            y[i],
-            mu[i],
-            phi,
-            priorweights[i].max(0.0),
-            jet,
-            h4,
-        );
-        let fisher_weight = fisher_weights[i].max(0.0);
-        // Store exact observed-information curvature.  Solver conditioning
-        // floors are applied separately by `solver_hessian_weights`; replacing
-        // invalid observed rows with Fisher rows here would silently turn the
-        // advertised observed-LAML objective into a mixed surrogate.
-        if !(w_obs.is_finite() && w_obs > 0.0) {
-            return Err(EstimationError::InvalidInput(format!(
-                "observed Hessian curvature is not positive finite at row {i}: observed={w_obs}, fisher={fisher_weight}"
-            )));
-        }
-        if !c_obs.is_finite() || !d_obs.is_finite() {
-            return Err(EstimationError::InvalidInput(format!(
-                "observed Hessian curvature derivatives are non-finite at row {i}: c={c_obs}, d={d_obs}"
-            )));
-        }
-        hessian_weights[i] = w_obs;
-        hessian_c[i] = c_obs;
-        hessian_d[i] = d_obs;
+    for (i, (w, c, d)) in row_results.into_iter().enumerate() {
+        hessian_weights[i] = w;
+        hessian_c[i] = c;
+        hessian_d[i] = d;
     }
     Ok((hessian_weights, hessian_c, hessian_d))
 }
