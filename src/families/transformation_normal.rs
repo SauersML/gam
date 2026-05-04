@@ -4767,10 +4767,7 @@ impl TransformationNormalFamily {
                 scratch
             })
             .map(|s| s.out)
-            .reduce(
-                || Array2::<f64>::zeros((p_total, p_total)),
-                |a, b| a + b,
-            );
+            .reduce(|| Array2::<f64>::zeros((p_total, p_total)), |a, b| a + b);
 
         // In-place symmetrization: avoid allocating an extra `p_total × p_total`
         // f64 matrix for `&out + &out.t()`. Mathematically identical to

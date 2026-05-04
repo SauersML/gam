@@ -1784,7 +1784,6 @@ const EFS_LINESEARCH_THRESHOLD: f64 = 0.5;
 /// `EFS_COST_DESCENT_TOL · |current_cost|` of the current value.
 const EFS_COST_DESCENT_TOL: f64 = 1e-12;
 
-
 /// Maximum number of consecutive HybridEFS iterations whose ψ block was
 /// zeroed before the bridge bails out and triggers a solver switch.
 ///
@@ -1863,10 +1862,7 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
 
         let raw_step = Array1::from_vec(eval.steps);
         let psi_indices = eval.psi_indices.clone();
-        let max_step_abs = raw_step
-            .iter()
-            .map(|s| s.abs())
-            .fold(0.0_f64, f64::max);
+        let max_step_abs = raw_step.iter().map(|s| s.abs()).fold(0.0_f64, f64::max);
         let current_cost = eval.cost;
 
         // Negligible raw step — the iteration is at (or numerically
@@ -1909,9 +1905,7 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
         // pure-ρ path, the additive log-λ formula is exact only at the
         // fixed point and is otherwise just a Newton-flavoured Wood–Fasiolo
         // surrogate that benefits from line search at large iterations.
-        if let Some(scaled) =
-            self.efs_backtrack(x, &raw_step, current_cost, MAX_EFS_BACKTRACK)?
-        {
+        if let Some(scaled) = self.efs_backtrack(x, &raw_step, current_cost, MAX_EFS_BACKTRACK)? {
             if psi_indices.is_some() {
                 self.consecutive_psi_zero_iters = 0;
             }
@@ -1937,10 +1931,7 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
             for &i in psi_idx {
                 rho_only[i] = 0.0;
             }
-            let max_rho_abs = rho_only
-                .iter()
-                .map(|s| s.abs())
-                .fold(0.0_f64, f64::max);
+            let max_rho_abs = rho_only.iter().map(|s| s.abs()).fold(0.0_f64, f64::max);
             if max_rho_abs >= EFS_NEGLIGIBLE_STEP {
                 if let Some(scaled) =
                     self.efs_backtrack(x, &rho_only, current_cost, MAX_EFS_BACKTRACK)?

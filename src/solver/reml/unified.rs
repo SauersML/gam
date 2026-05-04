@@ -3982,7 +3982,6 @@ fn efs_profiling(solution: &InnerSolution<'_>) -> (f64, f64) {
     }
 }
 
-
 fn trace_hinv_cached_drift_cross(
     hop: &dyn HessianOperator,
     left_dense: Option<&Array2<f64>>,
@@ -7126,11 +7125,7 @@ const EFS_MAX_STEP: f64 = 5.0;
 ///
 /// Steps are clamped to `[-EFS_MAX_STEP, EFS_MAX_STEP]` so a single
 /// iteration cannot move λ by more than `exp(EFS_MAX_STEP)`.
-pub fn compute_efs_update(
-    solution: &InnerSolution<'_>,
-    rho: &[f64],
-    gradient: &[f64],
-) -> Vec<f64> {
+pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64], gradient: &[f64]) -> Vec<f64> {
     let k = rho.len();
     let ext_dim = solution.ext_coords.len();
     let total = k + ext_dim;
@@ -11344,7 +11339,10 @@ mod tests {
         let g_full_at_aug_opt = (augmented_q - target) / 2.0 + g_extra;
         assert!(g_full_at_aug_opt.abs() < 1e-12);
         let s_at_opt = efs_log_step_from_grad(augmented_q, g_full_at_aug_opt).unwrap();
-        assert!(s_at_opt.abs() < 1e-12, "Δρ at augmented optimum != 0: {s_at_opt}");
+        assert!(
+            s_at_opt.abs() < 1e-12,
+            "Δρ at augmented optimum != 0: {s_at_opt}"
+        );
 
         // Stable: log ratio.
         let s = efs_log_step_from_grad(2.0, 0.75).expect("stable regime");
@@ -11378,11 +11376,7 @@ mod tests {
     /// commutes with H⁻¹ — generically they differ.
     #[test]
     fn dense_spectral_block_local_cross_trace_matches_dense() {
-        let h = array![
-            [4.0, 1.0, 0.5],
-            [1.0, 3.0, 0.25],
-            [0.5, 0.25, 2.0],
-        ];
+        let h = array![[4.0, 1.0, 0.5], [1.0, 3.0, 0.25], [0.5, 0.25, 2.0],];
         let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
 
         // 2×2 block at [0..2], non-commuting with H⁻¹.

@@ -8551,9 +8551,10 @@ fn unified_joint_efs_eval(
         None,
     )?;
 
-    let gradient = result.gradient.as_ref().ok_or_else(|| {
-        "EFS evaluation did not return the required gradient".to_string()
-    })?;
+    let gradient = result
+        .gradient
+        .as_ref()
+        .ok_or_else(|| "EFS evaluation did not return the required gradient".to_string())?;
     let gradient_slice = gradient
         .as_slice()
         .ok_or_else(|| "outer gradient must be contiguous for EFS".to_string())?;
