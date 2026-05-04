@@ -2856,13 +2856,52 @@ fn run_operator_trust_region(
 ) -> Result<OuterResult, EstimationError> {
     let mut x_k = project_to_bounds(seed, bounds);
     let mut eval_k = initial_eval;
+    // If the caller didn't supply an initial trust radius, derive a Newton-
+    // step-scale default from the seed gradient. The previous unconditional
+    // `OPERATOR_TRUST_RADIUS_INIT = 1.0` produced 20-30 rejected halving
+    // iterations on problems where ‖g‖ ≫ |cost| at the seed (e.g. CTN exact-
+    // joint with warm-start β at biobank scale, where ‖g‖ ≈ 3·10¹⁷ vs
+    // |cost| ≈ 1·10¹⁰): the cubic model predicts a 3·10⁴⁹ decrease, the
+    // actual function is wildly non-quadratic at full step, the step is
+    // rejected and the radius halved. Halving a thousand-fold-too-big radius
+    // until it fits the local geometry costs ~10s per iter on biobank-scale
+    // CTN evaluation — about 4 minutes per CTN preprocessing call.
+    //
+    // Picking radius = |cost|/‖g‖ makes the linearised first-order decrease
+    // |g|·radius comparable to |cost|, which is the right scale for a first
+    // probe. Clamp into [REJECT_FLOOR·10, INIT] so we never start below the
+    // floor and never go above the existing default — preserving previous
+    // behaviour when ‖g‖ is small (the typical case).
+    let derived_initial_radius = {
+        let g_seed = projected_gradient(&x_k, &eval_k.gradient, bounds);
+        let g_norm = g_seed.dot(&g_seed).sqrt();
+        let cost_scale = eval_k.cost.abs().max(1.0);
+        if g_norm.is_finite() && g_norm > 0.0 {
+            (cost_scale / g_norm).clamp(
+                OPERATOR_TRUST_RADIUS_REJECT_FLOOR * 10.0,
+                OPERATOR_TRUST_RADIUS_INIT,
+            )
+        } else {
+            OPERATOR_TRUST_RADIUS_INIT
+        }
+    };
     let mut trust_radius = initial_trust_radius
         .filter(|radius| radius.is_finite() && *radius > 0.0)
-        .unwrap_or(OPERATOR_TRUST_RADIUS_INIT)
+        .unwrap_or(derived_initial_radius)
         .clamp(
             OPERATOR_TRUST_RADIUS_REJECT_FLOOR,
             OPERATOR_TRUST_RADIUS_MAX,
         );
+    if initial_trust_radius.is_none() && derived_initial_radius < OPERATOR_TRUST_RADIUS_INIT {
+        log::info!(
+            "[ARC-timing] iter=0 derived initial trust_radius={:.3e} from \
+             |cost|={:.3e} / ‖g‖={:.3e} (default {:.3e} would have wasted halving iters)",
+            trust_radius,
+            eval_k.cost.abs(),
+            eval_k.gradient.dot(&eval_k.gradient).sqrt(),
+            OPERATOR_TRUST_RADIUS_INIT,
+        );
+    }
     let mut dense_model: Option<Array2<f64>> = None;
     let mut materialize_dense_after_rejection = false;
 
