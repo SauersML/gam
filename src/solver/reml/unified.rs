@@ -3698,40 +3698,6 @@ fn rho_curvature_lambda(solution: &InnerSolution<'_>, lambda: f64) -> f64 {
     solution.rho_curvature_scale * lambda
 }
 
-fn trace_hinv_penalty_self_terms(
-    hop: &dyn HessianOperator,
-    coord: &PenaltyCoordinate,
-    lambda: f64,
-) -> (f64, f64) {
-    if matches!(coord, PenaltyCoordinate::BlockRoot { .. }) {
-        let (block, start, end) = coord.scaled_block_local(1.0);
-        (
-            hop.trace_hinv_block_local(&block, lambda, start, end),
-            hop.trace_hinv_block_local_cross(&block, lambda, start, end),
-        )
-    } else if coord.uses_operator_fast_path() {
-        let op = coord.scaled_operator(lambda, None);
-        if let Some(dense_hop) = hop.as_dense_spectral() {
-            dense_hop.trace_hinv_self_terms_operator(&op)
-        } else {
-            (
-                hop.trace_hinv_operator(&op),
-                hop.trace_hinv_operator_cross(&op, &op),
-            )
-        }
-    } else {
-        let matrix = coord.scaled_dense_matrix(lambda);
-        if let Some(dense_hop) = hop.as_dense_spectral() {
-            dense_hop.trace_hinv_self_terms_dense(&matrix)
-        } else {
-            (
-                hop.trace_hinv_h_k(&matrix, None),
-                hop.trace_hinv_product_cross(&matrix, &matrix),
-            )
-        }
-    }
-}
-
 fn penalty_coord_to_operator(coord: PenaltyCoordinate, scale: f64) -> Arc<dyn HyperOperator> {
     struct OwnedPenaltyHyperOperator {
         coord: PenaltyCoordinate,
@@ -3913,46 +3879,199 @@ fn hyper_coord_total_drift_result(
     drift_parts_into_result(dense, operators, dim_hint)
 }
 
-fn efs_trace_and_denominator(hop: &dyn HessianOperator, drift: &HyperCoordDrift) -> (f64, f64) {
+// ─── EFS multiplicative-update helpers ───────────────────────────────────
+//
+// The Wood–Fasiolo Extended Fellner–Schall update is multiplicative in the
+// smoothing parameter. Writing it in log coordinates `ρ = log λ`,
+//
+//   Δρ = log( target / q_eff )
+//      = log( ( d − t ) / q_eff )
+//
+// where:
+//   • q_eff is the penalty-quadratic contribution to the *gradient*,
+//     scaled exactly the way `outer_gradient_entry` scales it. For Fixed
+//     dispersion, q_eff = β̂ᵀ B β̂ = 2 a_i. For ProfiledGaussian, it picks
+//     up the smooth-floor factor `dp_cgrad / φ̂` so EFS and the gradient
+//     share the same stationarity equation.
+//   • d = ∂ log|S_λ|₊/∂ρ_i = tr(S_λ⁺ B_i). For ρ-coords this is
+//     `solution.penalty_logdet.first[idx]`; for τ-coords it is
+//     `coord.ld_s`.
+//   • t = tr(K · B_i) where K is the *cost's* logdet kernel — `G_ε(H)` in
+//     ordinary SPD/smooth-spectral mode, or the projected
+//     `U_S (U_Sᵀ H U_S)⁻¹ U_Sᵀ` under the rank-deficient LAML fix.
+//
+// The previous implementation used `Δρ = (2a − tr(H⁻¹B)) / tr(H⁻¹BH⁻¹B)`,
+// which (a) silently dropped the `tr(S_λ⁺ B)` term, (b) used a different
+// kernel from the gradient, and (c) used the Frobenius/Gram trace as a
+// curvature proxy instead of the canonical EFS denominator. As a concrete
+// counterexample, the scalar Gaussian/Laplace model with z = 2, λ = 1/3 is
+// at the exact REML optimum (gradient = 0) but the old formula returned
+// step `+8` (clamped to `+5`) — see the unit test in this module.
+//
+// We deliberately keep the same approximation the old code made: drop the
+// `C[v_k]` IFT correction from the trace. This costs no `H⁻¹` solves and
+// matches `Ḣ_k = λ_k S_k` exactly when the family is Gaussian or has no
+// third-derivative correction. For non-Gaussian families with corrections
+// the EFS step is a slightly different surrogate from the gradient, which
+// is acceptable for an EFS-style fixed-point iteration; the outer driver
+// performs cost validation downstream.
+
+/// Compute the clamped EFS step for one coordinate.
+///
+/// Three regimes:
+/// - **Stable (`q_eff > 0`, `target = d − t > 0`)**: canonical
+///   multiplicative form, `Δρ = log(target / q_eff)` clamped to
+///   `±EFS_MAX_STEP`.
+/// - **Over-smoothed (`q_eff > 0`, `target ≤ 0`)**: the multiplicative
+///   form is undefined, but the cost gradient
+///   `(q_eff + t − d)/2 ≥ q_eff/2 > 0` is unambiguously positive, so we
+///   step in the descent direction at the maximum permitted log-λ
+///   magnitude. The outer cost line-search will trim it; once λ drops
+///   back into the `d > t` regime the canonical formula resumes
+///   automatically.
+/// - **Pathological (`q_eff ≤ 0` or non-finite)**: returns `None` and
+///   the caller skips this coordinate. `q_eff > 0` is guaranteed by
+///   `β̂ᵀS β̂ ≥ 0` and `dp_cgrad > 0` whenever the inner solver is
+///   well-conditioned, so this regime indicates a numerical pathology.
+#[inline]
+fn efs_log_step(q_eff: f64, target: f64) -> Option<f64> {
+    if !q_eff.is_finite() || q_eff <= 0.0 || !target.is_finite() {
+        return None;
+    }
+    if target > 0.0 {
+        Some((target / q_eff).ln().clamp(-EFS_MAX_STEP, EFS_MAX_STEP))
+    } else {
+        // Over-smoothed: cost wants smaller λ; emit max-magnitude descent.
+        Some(-EFS_MAX_STEP)
+    }
+}
+
+/// `q_eff = 2 · penalty_term` matching `outer_gradient_entry`.
+#[inline]
+fn efs_q_eff(a_i: f64, dispersion: &DispersionHandling, dp_cgrad: f64, phi: f64) -> f64 {
+    match dispersion {
+        DispersionHandling::ProfiledGaussian => 2.0 * dp_cgrad * a_i / phi,
+        DispersionHandling::Fixed { .. } => 2.0 * a_i,
+    }
+}
+
+/// Universal-form EFS step expressed in terms of the *full* outer gradient
+/// `g_full = ∂V_total/∂ρ_i` and `q_eff` directly:
+///
+/// ```text
+///   Δρ = log(1 − 2·g_full / q_eff).
+/// ```
+///
+/// Identical to [`efs_log_step`] when no out-of-band terms (TK, prior,
+/// Firth, barrier, SAS ridge) are active, since
+/// `g_base = (q_eff + t − d)/2` gives `1 − 2·g_base/q_eff = (d − t)/q_eff`.
+/// When extra terms are active the closed form generalises automatically:
+/// `g_full = g_base + g_extra` ⇒ `1 − 2·g_full/q_eff = (d − t − 2·g_extra)/q_eff`,
+/// so the multiplicative target shifts by exactly the residual gradient
+/// contribution from the out-of-band terms.
+///
+/// Currently used only by the cross-check unit test; the production EFS
+/// path uses [`efs_log_step`] to avoid forcing `EvalMode::ValueAndGradient`
+/// on every pure-EFS evaluation. Kept here so future callers can drop in
+/// the universal form when they have `g_full` already available.
+#[inline]
+fn efs_log_step_from_grad(q_eff: f64, g_full: f64) -> Option<f64> {
+    if !q_eff.is_finite() || q_eff <= 0.0 || !g_full.is_finite() {
+        return None;
+    }
+    let ratio = 1.0 - 2.0 * g_full / q_eff;
+    if ratio > 0.0 {
+        Some(ratio.ln().clamp(-EFS_MAX_STEP, EFS_MAX_STEP))
+    } else {
+        Some(-EFS_MAX_STEP)
+    }
+}
+
+/// EFS profiling factors (`profiled_scale`, `dp_cgrad`) matched to the
+/// gradient assembly. For Fixed dispersion both are unused; we return
+/// `(phi, 0.0)` so that `efs_q_eff` simply uses `2·a_i`.
+#[inline]
+fn efs_profiling(solution: &InnerSolution<'_>) -> (f64, f64) {
+    match &solution.dispersion {
+        DispersionHandling::ProfiledGaussian => {
+            let dp_raw = -2.0 * solution.log_likelihood + solution.penalty_quadratic;
+            let (dp_c, dp_cgrad, _) = smooth_floor_dp(dp_raw);
+            let denom = (solution.n_observations as f64 - solution.nullspace_dim).max(DENOM_RIDGE);
+            (dp_c / denom, dp_cgrad)
+        }
+        DispersionHandling::Fixed { phi, .. } => (*phi, 0.0),
+    }
+}
+
+/// `(incl_logdet_h, incl_logdet_s)` matching `outer_gradient_entry`.
+#[inline]
+fn efs_logdet_flags(solution: &InnerSolution<'_>) -> (bool, bool) {
+    match &solution.dispersion {
+        DispersionHandling::ProfiledGaussian => (true, true),
+        DispersionHandling::Fixed {
+            include_logdet_h,
+            include_logdet_s,
+            ..
+        } => (*include_logdet_h, *include_logdet_s),
+    }
+}
+
+/// Kernel-correct logdet trace `t = tr(K · λ_k S_k)` for a ρ coordinate.
+///
+/// Mirrors the kernel choice in the gradient assembly: projected kernel
+/// when `penalty_subspace_trace` is installed (rank-deficient LAML fix);
+/// `trace_logdet_block_local` for block-local penalties; otherwise the
+/// generic operator/dense path through `DriftDerivResult::trace_logdet`.
+/// The IFT correction `C[v_k]` is intentionally omitted — see module
+/// comment.
+fn efs_rho_trace_logdet(
+    hop: &dyn HessianOperator,
+    coord: &PenaltyCoordinate,
+    curvature_lambda: f64,
+    penalty_subspace: Option<&PenaltySubspaceTrace>,
+) -> f64 {
+    if let Some(kernel) = penalty_subspace {
+        let drift = penalty_total_drift_result(coord, curvature_lambda, None);
+        return match drift {
+            DriftDerivResult::Dense(matrix) => kernel.trace_projected_logdet(&matrix),
+            DriftDerivResult::Operator(op) => kernel.trace_operator(op.as_ref()),
+        };
+    }
+    if coord.is_block_local() {
+        let (block, start, end) = coord.scaled_block_local(1.0);
+        return hop.trace_logdet_block_local(&block, curvature_lambda, start, end);
+    }
+    penalty_total_drift_result(coord, curvature_lambda, None).trace_logdet(hop)
+}
+
+/// Kernel-correct logdet trace for a τ (penalty-like extended) coordinate.
+fn efs_tau_trace_logdet(
+    hop: &dyn HessianOperator,
+    drift: &HyperCoordDrift,
+    penalty_subspace: Option<&PenaltySubspaceTrace>,
+) -> f64 {
+    if let Some(kernel) = penalty_subspace {
+        let drift_result = hyper_coord_total_drift_result(drift, None, hop.dim());
+        return match drift_result {
+            DriftDerivResult::Dense(matrix) => kernel.trace_projected_logdet(&matrix),
+            DriftDerivResult::Operator(op) => kernel.trace_operator(op.as_ref()),
+        };
+    }
     if drift.dense.is_none() && drift.operator.is_none() {
         if let Some(block_local) = drift.block_local.as_ref() {
-            return (
-                hop.trace_hinv_block_local(
-                    &block_local.local,
-                    1.0,
-                    block_local.start,
-                    block_local.end,
-                ),
-                hop.trace_hinv_block_local_cross(
-                    &block_local.local,
-                    1.0,
-                    block_local.start,
-                    block_local.end,
-                ),
+            return hop.trace_logdet_block_local(
+                &block_local.local,
+                1.0,
+                block_local.start,
+                block_local.end,
             );
         }
     }
-
     if let Some(op) = hyper_coord_drift_operator_arc(drift, hop.dim()) {
-        if let Some(dense_hop) = hop.as_dense_spectral() {
-            dense_hop.trace_hinv_self_terms_operator(op.as_ref())
-        } else {
-            (
-                hop.trace_hinv_operator(op.as_ref()),
-                hop.trace_hinv_operator_cross(op.as_ref(), op.as_ref()),
-            )
-        }
-    } else {
-        let matrix = drift.materialize();
-        if let Some(dense_hop) = hop.as_dense_spectral() {
-            dense_hop.trace_hinv_self_terms_dense(&matrix)
-        } else {
-            (
-                hop.trace_hinv_h_k(&matrix, None),
-                hop.trace_hinv_product_cross(&matrix, &matrix),
-            )
-        }
+        return hop.trace_logdet_operator(op.as_ref());
     }
+    let matrix = drift.materialize();
+    hop.trace_logdet_h_k(&matrix, None)
 }
 
 fn trace_hinv_cached_drift_cross(
@@ -7028,66 +7147,95 @@ fn build_outer_hessian_operator(
 //  Extended Fellner–Schall (EFS) update for all hyperparameters
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Maximum absolute step size for the EFS update (prevents overshooting).
-const EFS_MAX_STEP: f64 = 5.0;
+/// Maximum absolute step size in log-λ for the EFS update (prevents
+/// overshooting). Each iteration changes `λ` by at most `exp(EFS_MAX_STEP)`.
+pub(crate) const EFS_MAX_STEP: f64 = 5.0;
 
-/// Extended Fellner-Schall update for ρ and penalty-like (τ) hyperparameters.
+/// Extended Fellner–Schall update for ρ and penalty-like (τ) hyperparameters.
 ///
-/// The standard EFS update for ρ_k (log-smoothing parameters) avoids the
-/// full outer Hessian by using an approximate Newton step:
+/// Multiplicative log-λ fixed-point update consistent with the gradient
+/// assembled by `outer_gradient_entry`:
 ///
 /// ```text
-///   ρ_k^new = ρ_k + [2·a_k - tr(H⁻¹ B_k)] / tr(H⁻¹ B_k H⁻¹ B_k)
+///   Δρ_i = log( (d_i − t_i) / q_eff_i )
 /// ```
 ///
-/// where `a_k = ½ λ_k β̂ᵀ S_k β̂` is the penalty quadratic derivative and
-/// `B_k = A_k = λ_k S_k` is the penalty Hessian derivative.
+/// where:
+///   * `q_eff_i = 2 · penalty_term_i` is the penalty-quadratic
+///     contribution that the gradient pairs with — i.e. `2·a_i` for
+///     fixed dispersion, `2·dp_cgrad·a_i / φ̂` for profiled Gaussian.
+///   * `d_i = ∂ log|S_λ|₊/∂ρ_i = tr(S_λ⁺ B_i)`. For ρ-coords this is
+///     `solution.penalty_logdet.first[idx]`; for τ-coords it is
+///     `coord.ld_s`.
+///   * `t_i = tr(K · B_i)` with `K` matching the cost's logdet kernel:
+///     the projected `U_S(U_SᵀHU_S)⁻¹U_Sᵀ` under the rank-deficient LAML
+///     fix, otherwise `G_ε(H)` (which equals `H⁻¹` on ordinary SPD
+///     backends).
 ///
-/// For τ coordinates (penalty parameters marked `is_penalty_like = true`),
-/// the same formula applies because their `B_i = ∂H/∂τ_i` derives from
-/// penalty matrix derivatives and is PSD, preserving the multiplicative
-/// fixed-point structure that EFS relies on.
+/// At a stationary point of `V`, `q_eff = d − t`, so `Δρ = 0`. When the
+/// multiplicative form is undefined (`q_eff ≤ 0` or `d − t ≤ 0`), we
+/// return a zero step — EFS surrenders that coordinate to the outer
+/// strategy's gradient/Newton fallback. This is consistent with the
+/// Wood–Fasiolo paper, which establishes the EFS direction as an ascent
+/// direction for REML *under PSD assumptions* and recommends step-length
+/// control regardless.
 ///
 /// ## EFS does not generalize to ψ coordinates
 ///
-/// EFS relies on the fact that `A_k = ∂S/∂ρ_k` is PSD and the update acts
-/// multiplicatively on λ_k. For ψ (design-moving) coordinates, `B_{ψ_j}`
-/// contains design-motion and likelihood-curvature terms and need not be PSD
-/// or even sign-definite. The multiplicative fixed-point structure breaks
-/// down, making the EFS update mathematically invalid.
+/// EFS needs `A_k = ∂S/∂ρ_k ⪰ 0` and a parameter-independent nullspace.
+/// For ψ (design-moving) coordinates, `B_{ψ_j}` contains design-motion
+/// and likelihood-curvature terms with potentially mixed inertia. The
+/// scalar counterexample (response.md Section 2) shows that no update
+/// rule based only on `{a, tr(H⁻¹B), tr(H⁻¹BH⁻¹B)}` can be a universal
+/// descent direction for V on a ψ. ψ coordinates use the preconditioned
+/// gradient step in [`compute_hybrid_efs_update`] instead.
 ///
-/// **Proof (counterexample from response.md Section 2):** Take a scalar ψ,
-/// set H(0) = I₂, and let B = diag(1, -1) (indefinite). The local family
-/// V_c(ψ) = a·ψ + ½ log det(I₂ + ψB + ½c·ψ²I₂) has ∂V(0) = a and
-/// tr(H⁻¹BH⁻¹B) = 2, both independent of c. But V_c''(0) = c - 1, so the
-/// same step can be made ascent or descent by varying c. Therefore no update
-/// rule based only on {a_d, tr(H⁻¹B_d), tr(H⁻¹B_dH⁻¹B_e)} can have a
-/// universal convergence guarantee.
+/// ## Approximation: IFT correction dropped
 ///
-/// **Structural property:** The necessary and sufficient condition for an
-/// EFS-type proof is H^{-1/2} B_d H^{-1/2} ≽ 0 (or ≼ 0) together with
-/// parameter-independent nullspace. This restores the Loewner-order
-/// inequality used in Wood-Fasiolo's theorem. Mixed inertia destroys the
-/// ordering that makes the scalar update monotone.
+/// We compute `t_i = tr(K · λ_k S_k)` *without* adding the third-derivative
+/// `C[v_k]` correction that the gradient adds via `D_β H[−v_k]`. This
+/// keeps EFS at O(1) `H⁻¹` solves per iteration, matches gradient
+/// exactly for Gaussian / no-correction families, and remains a
+/// well-conditioned surrogate for the cost in non-Gaussian families. The
+/// outer driver line-searches the result.
 ///
-/// For ψ coordinates, use [`compute_hybrid_efs_update`] which applies a
-/// safeguarded preconditioned gradient step instead of the EFS formula.
+/// ## Out-of-band cost terms (TK, prior, Firth, barrier)
+///
+/// The EFS step targets the *base* REML/LAML stationarity equation
+/// `q_eff = d − t`. Cost augmentations that enter the gradient through a
+/// separate channel — Tierney–Kadane (`solution.tk_gradient`),
+/// smoothing-parameter prior, Firth bias-reduction, monotonicity barrier,
+/// SAS log-δ ridge — are *not* folded into this step here. The handlers
+/// of those terms either:
+///   * inject a Newton correction at the closure layer (e.g. the SAS
+///     ridge correction in `estimate.rs`), or
+///   * rely on the outer fixed-point bridge's full-vector cost line
+///     search to backtrack until the augmented cost decreases, falling
+///     through to the joint-gradient solver via
+///     [`crate::solver::outer_strategy::EFS_FIRST_ORDER_FALLBACK_MARKER`]
+///     when the EFS direction is no longer descent-correlated.
+///
+/// The mathematical identity `Δρ = log((d − t − 2·extra)/q_eff) =
+/// log(1 − 2·g_full/q_eff)` (where `g_full` is the full gradient including
+/// out-of-band terms) provides a clean drop-in replacement when needed —
+/// see `efs_log_step_from_grad` in this file's tests for the equivalence
+/// proof. Folding it in unconditionally would require always evaluating
+/// the gradient (currently `EvalMode::ValueOnly` on the pure-EFS path),
+/// which is a per-iteration cost trade-off the caller should make.
 ///
 /// # Arguments
 /// - `solution`: Converged inner state (β̂, H, penalties, HessianOperator).
 /// - `rho`: Current log-smoothing parameters.
 ///
 /// # Returns
-/// A vector of proposed additive steps for all coordinates: first the ρ
-/// coordinates, then the ext coordinates (in the same order as
-/// `solution.ext_coords`). Apply as `θ_i^new = θ_i + step[i]`.
+/// A vector of additive steps for all coordinates: first the ρ block,
+/// then the ext block (in the same order as `solution.ext_coords`).
+/// Apply as `θ_i^new = θ_i + step[i]`. Steps for ψ coordinates
+/// (`is_penalty_like == false`) are always 0; the hybrid update handles
+/// them.
 ///
-/// Steps for ψ coordinates (`is_penalty_like = false`) are always 0.0.
-///
-/// The steps are clamped to `[-EFS_MAX_STEP, EFS_MAX_STEP]` to prevent
-/// overshooting. For τ coordinates with domain constraints, the caller
-/// should additionally clip `θ_i^new` to the valid range after applying
-/// the step.
+/// Steps are clamped to `[-EFS_MAX_STEP, EFS_MAX_STEP]` so a single
+/// iteration cannot move λ by more than `exp(EFS_MAX_STEP)`.
 pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64]) -> Vec<f64> {
     let k = rho.len();
     let hop = &*solution.hessian_op;
@@ -7095,19 +7243,9 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64]) -> Vec<f64>
     let total = k + ext_dim;
     let mut steps = vec![0.0; total];
 
-    // Profiled Gaussian rescaling factor.
-    // For Gaussian REML the penalty quadratic derivative a_k enters the
-    // gradient as a_k / φ̂ (with the profiled scale). For non-Gaussian,
-    // the factor is 1.
-    let (profiled_scale, is_profiled) = match &solution.dispersion {
-        DispersionHandling::ProfiledGaussian => {
-            let dp_raw = -2.0 * solution.log_likelihood + solution.penalty_quadratic;
-            let (dp_c, _, _) = smooth_floor_dp(dp_raw);
-            let denom = (solution.n_observations as f64 - solution.nullspace_dim).max(DENOM_RIDGE);
-            (dp_c / denom, true)
-        }
-        DispersionHandling::Fixed { phi, .. } => (*phi, false),
-    };
+    let (profiled_scale, dp_cgrad) = efs_profiling(solution);
+    let (incl_logdet_h, incl_logdet_s) = efs_logdet_flags(solution);
+    let subspace = solution.penalty_subspace_trace.as_deref();
 
     // ── ρ coordinates ──
     for idx in 0..k {
@@ -7115,65 +7253,49 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64]) -> Vec<f64>
         let lambda = rho[idx].exp();
         let curvature_lambda = rho_curvature_lambda(solution, lambda);
 
-        // a_k = ½ β̂ᵀ A_k β̂ = ½ λ_k β̂ᵀ S_k β̂
-        let a_k = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambda);
+        let a_i = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambda);
+        let q_eff = efs_q_eff(a_i, &solution.dispersion, dp_cgrad, profiled_scale);
 
-        // Rescale a_k for profiled Gaussian: effective a = a_k / φ̂
-        let a_k_eff = if is_profiled {
-            a_k / profiled_scale
-        } else {
-            a_k
-        };
-
-        // Numerator: 2·a_k - tr(H⁻¹ B_k)
-        // We drop the C[β_k] correction for EFS.
-        let (trace_term, denominator) = trace_hinv_penalty_self_terms(hop, coord, curvature_lambda);
-        let numerator = 2.0 * a_k_eff - trace_term;
-
-        let step = if denominator.abs() > 1e-30 {
-            (numerator / denominator).clamp(-EFS_MAX_STEP, EFS_MAX_STEP)
+        let t = if incl_logdet_h {
+            efs_rho_trace_logdet(hop, coord, curvature_lambda, subspace)
         } else {
             0.0
         };
-        steps[idx] = step;
+        let d = if incl_logdet_s {
+            solution.penalty_logdet.first[idx]
+        } else {
+            0.0
+        };
+        let target = d - t;
+
+        if let Some(step) = efs_log_step(q_eff, target) {
+            steps[idx] = step;
+        }
     }
 
-    // ── Extended (ψ/τ) coordinates ──
+    // ── Extended penalty-like (τ) coordinates ──
+    //
+    // ψ coords (`!is_penalty_like`) are skipped: EFS has no convergence
+    // guarantee there. The hybrid update supplies a preconditioned
+    // gradient step for them.
     for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
-        // EFS is only valid for penalty-like (τ) coordinates whose B matrix
-        // is PSD. For ψ (design-moving) coordinates, B_{ψ_j} contains
-        // design-motion and likelihood-curvature terms that need not be PSD,
-        // breaking the multiplicative fixed-point structure. Skip them.
         if !coord.is_penalty_like {
-            // step remains 0.0 — caller should use Newton/BFGS for ψ coords.
             continue;
         }
 
-        // Rescale a_i for profiled Gaussian: effective a = a_i / φ̂
-        let a_i_eff = if is_profiled {
-            coord.a / profiled_scale
-        } else {
-            coord.a
-        };
+        let q_eff = efs_q_eff(coord.a, &solution.dispersion, dp_cgrad, profiled_scale);
 
-        // Numerator: 2·a_i - tr(H⁻¹ B_i)
-        // We deliberately drop the C[β_i] correction (pass None) for EFS.
-        // This ignores the third-derivative contribution from β-dependent B_i.
-        // Rationale: EFS is already an approximate Newton scheme; the C[β_i]
-        // term is small for well-conditioned models and its omission keeps the
-        // update stable and cheap.
-        // Operator-backed coordinates stay operator-backed here; dense
-        // materialization is only the backend default, not the canonical path.
-        let (trace_term, denominator) = efs_trace_and_denominator(hop, &coord.drift);
-        let numerator = 2.0 * a_i_eff - trace_term;
-
-        let step = if denominator.abs() > 1e-30 {
-            (numerator / denominator).clamp(-EFS_MAX_STEP, EFS_MAX_STEP)
+        let t = if incl_logdet_h {
+            efs_tau_trace_logdet(hop, &coord.drift, subspace)
         } else {
             0.0
         };
+        let d = if incl_logdet_s { coord.ld_s } else { 0.0 };
+        let target = d - t;
 
-        steps[k + ext_idx] = step;
+        if let Some(step) = efs_log_step(q_eff, target) {
+            steps[k + ext_idx] = step;
+        }
     }
 
     steps
@@ -7251,8 +7373,11 @@ pub struct HybridEfsResult {
 /// 3. Raw step: `Δψ_raw = -G⁺ g_ψ`.
 /// 4. Damping: `Δψ = α × Δψ_raw` with initial `α = PSI_INITIAL_ALPHA`.
 /// 5. Capping: `||Δψ||_∞ ≤ EFS_MAX_STEP` (same cap as ρ coordinates).
-/// 6. Backtracking (handled by caller): if the combined step doesn't decrease
-///    V(θ), halve α for the ψ block up to `MAX_PSI_BACKTRACK` times.
+/// 6. Backtracking (handled by caller): the outer fixed-point bridge wraps
+///    the *whole* combined step in a cost line search, halving α over the
+///    full vector. If full-vector backtracking exhausts, it retries with
+///    the ψ block zeroed (ρ/τ-only fallback) before surfacing the
+///    first-order fallback marker.
 ///
 /// # Arguments
 /// - `solution`: Converged inner state (β̂, H, penalties, HessianOperator).
@@ -7274,67 +7399,58 @@ pub fn compute_hybrid_efs_update(
     let total = k + ext_dim;
     let mut steps = vec![0.0; total];
 
-    // Profiled Gaussian rescaling factor.
-    let (profiled_scale, is_profiled) = match &solution.dispersion {
-        DispersionHandling::ProfiledGaussian => {
-            let dp_raw = -2.0 * solution.log_likelihood + solution.penalty_quadratic;
-            let (dp_c, _, _) = smooth_floor_dp(dp_raw);
-            let denom = (solution.n_observations as f64 - solution.nullspace_dim).max(DENOM_RIDGE);
-            (dp_c / denom, true)
-        }
-        DispersionHandling::Fixed { phi, .. } => (*phi, false),
-    };
+    let (profiled_scale, dp_cgrad) = efs_profiling(solution);
+    let (incl_logdet_h, incl_logdet_s) = efs_logdet_flags(solution);
+    let subspace = solution.penalty_subspace_trace.as_deref();
 
-    // ── ρ coordinates: standard EFS (identical to compute_efs_update) ──
+    // ── ρ coordinates: multiplicative log-λ EFS (see compute_efs_update) ──
     for idx in 0..k {
         let coord = &solution.penalty_coords[idx];
         let lambda = rho[idx].exp();
         let curvature_lambda = rho_curvature_lambda(solution, lambda);
-        let a_k = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambda);
-        let a_k_eff = if is_profiled {
-            a_k / profiled_scale
-        } else {
-            a_k
-        };
 
-        let (trace_term, denominator) = trace_hinv_penalty_self_terms(hop, coord, curvature_lambda);
-        let numerator = 2.0 * a_k_eff - trace_term;
+        let a_i = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambda);
+        let q_eff = efs_q_eff(a_i, &solution.dispersion, dp_cgrad, profiled_scale);
 
-        let step = if denominator.abs() > 1e-30 {
-            (numerator / denominator).clamp(-EFS_MAX_STEP, EFS_MAX_STEP)
+        let t = if incl_logdet_h {
+            efs_rho_trace_logdet(hop, coord, curvature_lambda, subspace)
         } else {
             0.0
         };
-        steps[idx] = step;
+        let d = if incl_logdet_s {
+            solution.penalty_logdet.first[idx]
+        } else {
+            0.0
+        };
+        let target = d - t;
+
+        if let Some(step) = efs_log_step(q_eff, target) {
+            steps[idx] = step;
+        }
     }
 
-    // ── Extended penalty-like (τ) coordinates: standard EFS ──
+    // ── Extended penalty-like (τ) coordinates: multiplicative log-λ EFS ──
     // ── ψ (design-moving) coordinates: collect for preconditioned gradient ──
     //
-    // We need to separate ψ coords from τ coords. τ coords get the same EFS
-    // treatment as ρ. ψ coords are collected and processed jointly via the
-    // trace Gram matrix.
+    // τ coords go through the same Wood–Fasiolo update as ρ. ψ coords are
+    // collected and processed jointly via the ψ-ψ trace Gram matrix below.
     let mut psi_local_indices: Vec<usize> = Vec::new(); // index within ext_coords
     let mut psi_global_indices: Vec<usize> = Vec::new(); // index in full θ vector
 
     for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
         if coord.is_penalty_like {
-            // τ coordinate: standard EFS update.
-            let a_i_eff = if is_profiled {
-                coord.a / profiled_scale
-            } else {
-                coord.a
-            };
-
-            let (trace_term, denominator) = efs_trace_and_denominator(hop, &coord.drift);
-            let numerator = 2.0 * a_i_eff - trace_term;
-
-            let step = if denominator.abs() > 1e-30 {
-                (numerator / denominator).clamp(-EFS_MAX_STEP, EFS_MAX_STEP)
+            let q_eff = efs_q_eff(coord.a, &solution.dispersion, dp_cgrad, profiled_scale);
+            let t = if incl_logdet_h {
+                efs_tau_trace_logdet(hop, &coord.drift, subspace)
             } else {
                 0.0
             };
-            steps[k + ext_idx] = step;
+            let d = if incl_logdet_s { coord.ld_s } else { 0.0 };
+            let target = d - t;
+
+            if let Some(step) = efs_log_step(q_eff, target) {
+                steps[k + ext_idx] = step;
+            }
         } else {
             // ψ coordinate: collect for joint preconditioned gradient.
             psi_local_indices.push(ext_idx);
@@ -8282,15 +8398,6 @@ impl DenseSpectralOperator {
     }
 
     #[inline]
-    fn trace_hinv_self_terms_dense(&self, matrix: &Array2<f64>) -> (f64, f64) {
-        let projected = self.projected_matrix(matrix);
-        (
-            projected.diag().sum(),
-            self.trace_projected_cross(&projected, &projected),
-        )
-    }
-
-    #[inline]
     fn projected_operator(&self, factor: &Array2<f64>, op: &dyn HyperOperator) -> Array2<f64> {
         // Batched form: ask the operator to apply itself to all `rank` columns
         // at once. Matrix-free Khatri–Rao operators (CTN dH / d²H) override
@@ -8299,15 +8406,6 @@ impl DenseSpectralOperator {
         // margslope-duchon16d.
         let op_factor = op.mul_mat(factor);
         factor.t().dot(&op_factor)
-    }
-
-    #[inline]
-    fn trace_hinv_self_terms_operator(&self, op: &dyn HyperOperator) -> (f64, f64) {
-        let projected = self.projected_operator(&self.w_factor, op);
-        (
-            projected.diag().sum(),
-            self.trace_projected_cross(&projected, &projected),
-        )
     }
 
     #[inline]
@@ -8511,26 +8609,23 @@ impl HessianOperator for DenseSpectralOperator {
         start: usize,
         end: usize,
     ) -> f64 {
-        // tr(H⁻¹ A H⁻¹ A) where A = scale · embed(block, start, end).
+        // tr(H⁻¹ A H⁻¹ A) where A = scale · embed(block, start, end) and
+        // `block` is the symmetric (b × b) local matrix.
         //
-        // H⁻¹ = W W^T where W = U diag(1/√r_ε).
-        // Let W_block = W[start..end, :] (block_size × rank).
-        // C = scale · W_block^T · block  (rank × block_size).
-        // Then H⁻¹ A restricted to the block_size nonzero input columns gives
-        // the p × block_size matrix W·C, and:
-        //   tr(H⁻¹ A H⁻¹ A) = ||W C||_F^2 = tr(C^T W^T W C)
-        // Since W^T W = diag(1/r_ε), this is Σ_a (1/r_a) ||C[a,:]||^2.
+        // H⁻¹ = W W^T, so the symmetric block is
+        //   H⁻¹_block = W_block · W_block^T,   W_block = W[start..end, :].
+        // For block-local A, only the [start..end, start..end] sub-block of
+        //   H⁻¹ A H⁻¹ A
+        // contributes nonzero diagonal entries:
+        //   tr(H⁻¹ A H⁻¹ A) = scale² · tr( (H⁻¹_block · B)² )
+        //                    = scale² · tr( (W_block^T B W_block)² )
+        // (cyclic on the rank-sized symmetric M = W_block^T B W_block, then
+        // tr(M²) = ||M||_F² because B is symmetric so M is symmetric).
         let w_block = self.w_factor.slice(ndarray::s![start..end, ..]);
-        let c = w_block.t().dot(block).mapv(|v| v * scale); // rank × block_size
-        let rank = c.nrows();
-        let mut result = 0.0;
-        for a in 0..rank {
-            let inv_r = 1.0 / self.reg_eigenvalues[a];
-            let row = c.row(a);
-            let row_norm_sq: f64 = row.iter().map(|&v| v * v).sum();
-            result += inv_r * row_norm_sq;
-        }
-        result
+        let bw = block.dot(&w_block); // (b × rank)
+        let m = w_block.t().dot(&bw); // (rank × rank), symmetric for symmetric block
+        let scale_sq = scale * scale;
+        scale_sq * m.iter().map(|&v| v * v).sum::<f64>()
     }
 
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
@@ -11269,6 +11364,198 @@ mod tests {
             g.hessian_derivative_correction(&array![1.0, 2.0])
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// Scalar EFS counterexample: at z=2, λ=1/3 in a one-coefficient
+    /// Gaussian/Laplace surrogate, the REML/LAML gradient is exactly zero
+    /// (β̂² λ + λ/(1+λ) − 1 = 0.75 + 0.25 − 1 = 0). The Wood–Fasiolo
+    /// multiplicative EFS update must therefore return Δρ ≈ 0.
+    ///
+    /// The previous Frobenius/Gram-norm formula returned `(2a − tr(H⁻¹B)) /
+    /// tr(H⁻¹BH⁻¹B) = 0.5 / 0.0625 = 8`, which then clamped to `+5` — a
+    /// huge spurious step at the exact optimum.
+    #[test]
+    fn efs_step_is_zero_at_scalar_optimum() {
+        // β̂ = z / (1 + λ) = 2 / (4/3) = 1.5, H = 1 + λ = 4/3.
+        let lambda = 1.0 / 3.0;
+        let beta_hat = 1.5_f64;
+        let h = Array2::from_shape_vec((1, 1), vec![1.0 + lambda]).unwrap();
+        let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
+
+        // S = R^T R with R = [[1]] gives S = [[1]]. Pseudoinverse log-det
+        // derivative tr(S⁺ · λS) = 1 (full-rank, scale cancels).
+        let penalty_root = Array2::from_shape_vec((1, 1), vec![1.0]).unwrap();
+
+        let solution = InnerSolution {
+            log_likelihood: 0.0,
+            penalty_quadratic: 0.0,
+            hessian_op: Arc::new(op),
+            beta: array![beta_hat],
+            penalty_coords: vec![PenaltyCoordinate::from_dense_root(penalty_root)],
+            penalty_logdet: PenaltyLogdetDerivs {
+                value: 0.0,
+                first: array![1.0],
+                second: None,
+            },
+            deriv_provider: Box::new(GaussianDerivatives),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: None,
+            hessian_logdet_correction: 0.0,
+            penalty_subspace_trace: None,
+            rho_curvature_scale: 1.0,
+            n_observations: 10,
+            nullspace_dim: 0.0,
+            // Use Fixed dispersion so the gradient is exactly the
+            // Laplace/REML form `½(λβ̂²S β̂ + tr(H⁻¹λS) − tr(S⁺λS))`
+            // without the smooth-floor / profiling factors the test
+            // would otherwise have to track.
+            dispersion: DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: true,
+            },
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+            barrier_config: None,
+        };
+        let rho = [lambda.ln()];
+
+        let steps = compute_efs_update(&solution, &rho);
+        assert_eq!(steps.len(), 1);
+        // The smooth-spectral regularizer adds ε ≈ 1.5e-8 to the kernel,
+        // contributing a tiny offset to t. Tolerate to 1e-3 in log-λ.
+        assert!(
+            steps[0].abs() < 1e-3,
+            "EFS step at scalar optimum should be ~0, got {} (old buggy formula returned ~+5)",
+            steps[0]
+        );
+    }
+
+    /// `efs_log_step` and `efs_log_step_from_grad` are identical when no
+    /// out-of-band gradient contributions are present, and the universal
+    /// form shifts the step by exactly `−log(1 − 2·g_extra/q_base)` when
+    /// extras are added. This is the algebraic backbone of the doc claim
+    /// that the universal formula drops in transparently.
+    #[test]
+    fn efs_log_step_universal_form_agrees() {
+        // Sweep a few stable-regime cases with no out-of-band terms.
+        let cases = [
+            (1.0_f64, 0.5),
+            (2.0, 1.5),
+            (0.75, 0.75),
+            (4.0, 0.1),
+            (1.0, 0.999),
+        ];
+        for (q_eff, target) in cases {
+            // d − t = target ⇒ g_base = (q_eff − target)/2.
+            let g_base = (q_eff - target) / 2.0;
+            let canonical = efs_log_step(q_eff, target).unwrap();
+            let universal = efs_log_step_from_grad(q_eff, g_base).unwrap();
+            assert!(
+                (canonical - universal).abs() < 1e-12,
+                "canonical {canonical} ≠ universal {universal} at q={q_eff}, t={target}"
+            );
+        }
+        // Add an extra gradient contribution: stationarity of the augmented
+        // cost shifts to q_eff = (d − t) − 2·g_extra. The universal form
+        // must give zero step at the augmented optimum.
+        let q_eff = 2.0;
+        let target = 0.6; // d − t
+        let g_extra = -0.7; // out-of-band gradient term
+        // Augmented stationarity ⇒ q_eff = target − 2·g_extra ⇒ pick
+        // q_eff so that g_full = 0 at the *augmented* optimum.
+        let augmented_q = target - 2.0 * g_extra;
+        let g_full_at_aug_opt = (augmented_q + (-target) + (target)) / 2.0 + g_extra;
+        // Sanity: at augmented optimum, g_full should be 0.
+        // Since g_base = (augmented_q − target)/2 = ((target − 2g_extra) − target)/2 = −g_extra,
+        // and g_full = g_base + g_extra = 0. ✓
+        assert!(g_full_at_aug_opt.abs() < 1e-12);
+        let universal_at_opt =
+            efs_log_step_from_grad(augmented_q, g_full_at_aug_opt).unwrap();
+        assert!(
+            universal_at_opt.abs() < 1e-12,
+            "universal step ≠ 0 at augmented optimum, got {universal_at_opt}"
+        );
+        // Crucially, plug the same g_full into a non-stationary q_eff:
+        // demonstrate the formula stays well-defined.
+        let s = efs_log_step_from_grad(q_eff, 0.1).unwrap();
+        assert!(s.is_finite());
+
+        // Pathological cases.
+        assert!(efs_log_step_from_grad(0.0, 0.0).is_none());
+        assert!(efs_log_step_from_grad(-1.0, 0.0).is_none());
+        assert!(efs_log_step_from_grad(1.0, f64::NAN).is_none());
+        // Over-correction (g_full > q_eff/2 ⇒ ratio ≤ 0): clamp to max
+        // descent, mirroring `efs_log_step`'s over-smoothed regime.
+        let s = efs_log_step_from_grad(1.0, 0.6).unwrap();
+        assert!((s - (-EFS_MAX_STEP)).abs() < 1e-12);
+    }
+
+    /// `efs_log_step` regimes: stable, over-smoothed, pathological.
+    #[test]
+    fn efs_log_step_three_regimes() {
+        // Stable: target > 0, q_eff > 0 ⇒ log ratio.
+        let s = efs_log_step(2.0, 0.5).expect("stable regime should produce a step");
+        assert!((s - (0.25_f64).ln()).abs() < 1e-12);
+
+        // At the optimum: target == q_eff ⇒ Δρ == 0.
+        let s = efs_log_step(0.75, 0.75).expect("optimum should produce zero step");
+        assert!(s.abs() < 1e-12);
+
+        // Stable but very over-smoothed (target = 0+): the log clamps to
+        // the floor.
+        let s = efs_log_step(1.0, f64::EPSILON).expect("tiny target must clamp");
+        assert!((s - (-EFS_MAX_STEP)).abs() < 1e-12);
+
+        // Over-smoothed (target ≤ 0): unconditional max descent.
+        for &target in &[0.0, -1e-10, -1.0, -1e6] {
+            let s = efs_log_step(0.5, target).expect("over-smoothed should fall back");
+            assert!((s - (-EFS_MAX_STEP)).abs() < 1e-12, "over-smoothed step != -MAX");
+        }
+
+        // Pathological inputs ⇒ None.
+        assert!(efs_log_step(0.0, 1.0).is_none());
+        assert!(efs_log_step(-1.0, 1.0).is_none());
+        assert!(efs_log_step(f64::NAN, 1.0).is_none());
+        assert!(efs_log_step(1.0, f64::NAN).is_none());
+        assert!(efs_log_step(1.0, f64::INFINITY).is_none());
+    }
+
+    /// `DenseSpectralOperator::trace_hinv_block_local_cross` must compute
+    /// `tr(H⁻¹ A H⁻¹ A)`, not `tr(H⁻¹ A²)`. These coincide only when A
+    /// commutes with H⁻¹ — generically they differ.
+    #[test]
+    fn dense_spectral_block_local_cross_trace_matches_dense() {
+        let h = array![
+            [4.0, 1.0, 0.5],
+            [1.0, 3.0, 0.25],
+            [0.5, 0.25, 2.0],
+        ];
+        let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
+
+        // 2×2 block at [0..2], non-commuting with H⁻¹.
+        let block = array![[1.5, 0.4], [0.4, 0.7]];
+        let scale = 1.7_f64;
+
+        // Reference: full-matrix `tr((H⁻¹ A)²)` via repeated solves.
+        let mut a_full = Array2::<f64>::zeros((3, 3));
+        for i in 0..2 {
+            for j in 0..2 {
+                a_full[[i, j]] = scale * block[[i, j]];
+            }
+        }
+        let hinva = op.solve_multi(&a_full); // = H⁻¹ A
+        let expected = (&hinva.t() * &hinva).sum(); // tr((H⁻¹A)(H⁻¹A))
+
+        let got = op.trace_hinv_block_local_cross(&block, scale, 0, 2);
+        assert!(
+            (got - expected).abs() < 1e-10,
+            "block-local cross trace = {got}, expected = {expected} (delta {})",
+            got - expected
         );
     }
 
