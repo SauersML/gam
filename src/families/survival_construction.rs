@@ -1013,7 +1013,7 @@ pub fn build_survival_time_basis(
                 let row0: Vec<(usize, f64)> = (0..db_exit_view.ncols().min(8))
                     .map(|j| (j, db_exit_view[[0, j]]))
                     .collect();
-                log::info!(
+                log::warn!(
                     "[ispline-build] db_exit shape={}x{}, max_abs={:.3e}, nonzero(>1e-30)={}, row0[0..8]={:?}, log_exit[0]={:.6}, knotvec[0]={:.6}, knotvec[-1]={:.6}",
                     db_exit_view.nrows(),
                     db_exit_view.ncols(),
