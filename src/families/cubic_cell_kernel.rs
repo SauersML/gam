@@ -1353,7 +1353,8 @@ pub fn affine_anchor_moment_vector(
         // C(n, k+1) = C(n, k) · (n − k) / (k + 1).
         let mut binom = 1.0;
         for k in 0..=n {
-            acc += binom * mu_pow[n - k] * inv_s_pow[k] * t[k];
+            let term = binom * mu_pow[n - k] * inv_s_pow[k];
+            acc = term.mul_add(t[k], acc);
             if k < n {
                 binom = binom * (n - k) as f64 / (k + 1) as f64;
             }
@@ -1659,9 +1660,11 @@ fn evaluate_non_affine_transport_step(
     for n in 0..n_eval {
         for m in 0..=order {
             let poly = &transport_polys[m];
+            let slice = poly.as_slice();
+            let moments_window = &current_full[n..n + slice.len()];
             let mut coeff = 0.0;
-            for (deg, poly_coeff) in poly.as_slice().iter().enumerate() {
-                coeff += poly_coeff * current_full[n + deg];
+            for (poly_coeff, moment) in slice.iter().zip(moments_window.iter()) {
+                coeff = poly_coeff.mul_add(*moment, coeff);
             }
             moment_series[n][m] = coeff;
         }
