@@ -221,18 +221,26 @@ class RunSuiteMappingTests(unittest.TestCase):
         self.assertEqual(len(cfg["smooth_cols"]), expected_dim)
         self.assertEqual(cfg["knots"], expected_knots)
 
-    def test_geo_disease_eas_tp_keeps_three_dimensional_joint_embedding(self) -> None:
-        self.assert_joint_mapping("geo_disease_eas_tp_k6", expected_dim=3, expected_knots=6)
-        self.assert_joint_mapping("geo_disease_eas_tp_k12", expected_dim=3, expected_knots=12)
-        self.assert_joint_mapping("geo_disease_eas_tp_k24", expected_dim=3, expected_knots=24)
+    def test_geo_disease_eas_tp_uses_full_joint_embedding(self) -> None:
+        # Joint-PC contract: TPS-over-PCs uses the full PC count uniformly
+        # (16 for `eas`, 3 for `eas3`). Canonical TPS at d=16 with k≤24 is
+        # mathematically infeasible, but the Rust basis builder auto-
+        # promotes such requests to a pure Duchon spline (Riesz-fractional
+        # generalization) with finite kernel diagonal — see
+        # `duchon_thin_plate_fallback_params` in src/terms/basis.rs.
+        self.assert_joint_mapping("geo_disease_eas_tp_k6", expected_dim=16, expected_knots=6)
+        self.assert_joint_mapping("geo_disease_eas_tp_k12", expected_dim=16, expected_knots=12)
+        self.assert_joint_mapping("geo_disease_eas_tp_k24", expected_dim=16, expected_knots=24)
+        self.assert_joint_mapping("geo_disease_eas3_tp_k6", expected_dim=3, expected_knots=6)
+        self.assert_joint_mapping("geo_disease_eas3_tp_k24", expected_dim=3, expected_knots=24)
 
-    def test_geo_latlon_tp_keeps_two_dimensional_joint_embedding(self) -> None:
-        self.assert_joint_mapping("geo_latlon_equatornoise_tp_k12", expected_dim=2, expected_knots=12)
-        self.assert_joint_mapping("geo_latlon_superpopnoise_tp_k24", expected_dim=2, expected_knots=24)
+    def test_geo_latlon_tp_uses_full_joint_embedding(self) -> None:
+        self.assert_joint_mapping("geo_latlon_equatornoise_tp_k12", expected_dim=6, expected_knots=12)
+        self.assert_joint_mapping("geo_latlon_superpopnoise_tp_k24", expected_dim=6, expected_knots=24)
 
-    def test_papuan_and_subpop_tp_keep_fixed_joint_embedding(self) -> None:
-        self.assert_joint_mapping("papuan_oce4_tp_k12", expected_dim=3, expected_knots=12)
-        self.assert_joint_mapping("geo_subpop16_tp_k24", expected_dim=3, expected_knots=24)
+    def test_papuan_and_subpop_tp_use_full_joint_embedding(self) -> None:
+        self.assert_joint_mapping("papuan_oce4_tp_k12", expected_dim=4, expected_knots=12)
+        self.assert_joint_mapping("geo_subpop16_tp_k24", expected_dim=16, expected_knots=24)
 
     def test_geo_subpop16_dataset_builds_without_external_pc_file(self) -> None:
         ds = _RUN_SUITE.dataset_for_scenario({"name": "geo_subpop16_tp_k6"})
@@ -246,12 +254,16 @@ class RunSuiteMappingTests(unittest.TestCase):
         self.assertEqual(ds["features"], [f"pc{i}" for i in range(1, 7)])
         self.assertGreater(len(ds["rows"]), 0)
 
-    def test_legacy_geo_disease_tp_scenarios_use_fixed_joint_embedding(self) -> None:
+    def test_legacy_geo_disease_tp_scenarios_use_full_joint_embedding(self) -> None:
+        # Both legacy TPS scenarios route through the joint-PC contract (full
+        # 16-PC smooth, k=24). Canonical TPS in d=16 needs M(16, m=9)=735_471
+        # centers, far above k=24; the Rust builder auto-promotes to a pure
+        # Duchon spline so these scenarios remain runnable end-to-end.
         for scenario_name in ("geo_disease_tp", "geo_disease_shrinkage"):
             cfg = _RUN_SUITE._scenario_fit_mapping(scenario_name)
             self.assertEqual(cfg["smooth_basis"], "thinplate")
-            self.assertEqual(cfg["smooth_cols"], ["pc1", "pc2", "pc3"])
-            self.assertEqual(cfg["knots"], 12)
+            self.assertEqual(cfg["smooth_cols"], [f"pc{i}" for i in range(1, 17)])
+            self.assertEqual(cfg["knots"], 24)
 
     def test_geo_subpop16_marginal_slope_aniso_keeps_16d_duchon_mapping(self) -> None:
         cfg = _RUN_SUITE._scenario_fit_mapping("geo_subpop16_margslope_aniso_duchon16d_k50")
