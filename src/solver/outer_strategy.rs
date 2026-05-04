@@ -4240,8 +4240,7 @@ mod tests {
         let halve_default = 0.5_f64;
 
         // NaN pred_dec: mismatch_ratio = 0, no snap.
-        let r =
-            snap_recovery_radius_on_rejection(cost, f64::NAN, derived_radius, halve_default);
+        let r = snap_recovery_radius_on_rejection(cost, f64::NAN, derived_radius, halve_default);
         assert_eq!(r, halve_default);
 
         // Negative pred_dec (shouldn't happen, but defensive): no snap.

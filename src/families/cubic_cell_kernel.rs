@@ -555,7 +555,11 @@ pub fn cell_third_derivative_from_moments(
     // eta_second_term = Σ over (rs⊗t, rt⊗s, st⊗r) of eta⊗product · moments.
     // Fold each of the three triple sums into a single moment dot.
     let mut eta_second_term = 0.0;
-    let conv_dot = |first: &[f64], second: &[f64], buf_a: &mut [f64; SCRATCH], buf_b: &mut [f64; SCRATCH]| -> f64 {
+    let conv_dot = |first: &[f64],
+                    second: &[f64],
+                    buf_a: &mut [f64; SCRATCH],
+                    buf_b: &mut [f64; SCRATCH]|
+     -> f64 {
         let m = poly_conv_into(first, second, buf_a);
         let n = poly_conv_into(&eta, &buf_a[..m], buf_b);
         let mut acc = 0.0;
@@ -564,9 +568,24 @@ pub fn cell_third_derivative_from_moments(
         }
         acc
     };
-    eta_second_term += conv_dot(second_coefficients_rs, first_coefficients_t, &mut buf_a, &mut buf_b);
-    eta_second_term += conv_dot(second_coefficients_rt, first_coefficients_s, &mut buf_a, &mut buf_b);
-    eta_second_term += conv_dot(second_coefficients_st, first_coefficients_r, &mut buf_a, &mut buf_b);
+    eta_second_term += conv_dot(
+        second_coefficients_rs,
+        first_coefficients_t,
+        &mut buf_a,
+        &mut buf_b,
+    );
+    eta_second_term += conv_dot(
+        second_coefficients_rt,
+        first_coefficients_s,
+        &mut buf_a,
+        &mut buf_b,
+    );
+    eta_second_term += conv_dot(
+        second_coefficients_st,
+        first_coefficients_r,
+        &mut buf_a,
+        &mut buf_b,
+    );
 
     // cubic_coeff_term = Σ_{e,i,j,k} (eta·eta − 1)[e] · r[i] · s[j] · t[k] · moments[e+i+j+k].
     // Convolve r⊗s, then ⊗t, then ⊗(eta·eta − 1), giving a single dot.
@@ -659,24 +678,62 @@ pub fn cell_fourth_derivative_from_moments(
     // eta_linear_term = Σ over seven (rst⊗u, rsu⊗t, rtu⊗s, stu⊗r, rs⊗tu,
     // rt⊗su, ru⊗st) of eta⊗product · moments. Fold each triple sum into
     // a single moment dot.
-    let conv_eta_dot =
-        |first: &[f64], second: &[f64], buf_a: &mut [f64; SCRATCH], buf_b: &mut [f64; SCRATCH]| -> f64 {
-            let m = poly_conv_into(first, second, buf_a);
-            let n = poly_conv_into(&eta, &buf_a[..m], buf_b);
-            let mut acc = 0.0;
-            for k in 0..n {
-                acc = buf_b[k].mul_add(moments[k], acc);
-            }
-            acc
-        };
+    let conv_eta_dot = |first: &[f64],
+                        second: &[f64],
+                        buf_a: &mut [f64; SCRATCH],
+                        buf_b: &mut [f64; SCRATCH]|
+     -> f64 {
+        let m = poly_conv_into(first, second, buf_a);
+        let n = poly_conv_into(&eta, &buf_a[..m], buf_b);
+        let mut acc = 0.0;
+        for k in 0..n {
+            acc = buf_b[k].mul_add(moments[k], acc);
+        }
+        acc
+    };
     let mut eta_linear_term = 0.0;
-    eta_linear_term += conv_eta_dot(third_coefficients_rst, first_coefficients_u, &mut buf_a, &mut buf_b);
-    eta_linear_term += conv_eta_dot(third_coefficients_rsu, first_coefficients_t, &mut buf_a, &mut buf_b);
-    eta_linear_term += conv_eta_dot(third_coefficients_rtu, first_coefficients_s, &mut buf_a, &mut buf_b);
-    eta_linear_term += conv_eta_dot(third_coefficients_stu, first_coefficients_r, &mut buf_a, &mut buf_b);
-    eta_linear_term += conv_eta_dot(second_coefficients_rs, second_coefficients_tu, &mut buf_a, &mut buf_b);
-    eta_linear_term += conv_eta_dot(second_coefficients_rt, second_coefficients_su, &mut buf_a, &mut buf_b);
-    eta_linear_term += conv_eta_dot(second_coefficients_ru, second_coefficients_st, &mut buf_a, &mut buf_b);
+    eta_linear_term += conv_eta_dot(
+        third_coefficients_rst,
+        first_coefficients_u,
+        &mut buf_a,
+        &mut buf_b,
+    );
+    eta_linear_term += conv_eta_dot(
+        third_coefficients_rsu,
+        first_coefficients_t,
+        &mut buf_a,
+        &mut buf_b,
+    );
+    eta_linear_term += conv_eta_dot(
+        third_coefficients_rtu,
+        first_coefficients_s,
+        &mut buf_a,
+        &mut buf_b,
+    );
+    eta_linear_term += conv_eta_dot(
+        third_coefficients_stu,
+        first_coefficients_r,
+        &mut buf_a,
+        &mut buf_b,
+    );
+    eta_linear_term += conv_eta_dot(
+        second_coefficients_rs,
+        second_coefficients_tu,
+        &mut buf_a,
+        &mut buf_b,
+    );
+    eta_linear_term += conv_eta_dot(
+        second_coefficients_rt,
+        second_coefficients_su,
+        &mut buf_a,
+        &mut buf_b,
+    );
+    eta_linear_term += conv_eta_dot(
+        second_coefficients_ru,
+        second_coefficients_st,
+        &mut buf_a,
+        &mut buf_b,
+    );
 
     let mut eta_sq_minus_one = [0.0_f64; 7];
     for (i, &eta_i) in eta.iter().enumerate() {
@@ -689,24 +746,23 @@ pub fn cell_fourth_derivative_from_moments(
     // quad_coeff_term: six (eta²−1)⊗A⊗B⊗C · moments sums, where the (A,B,C)
     // factors are: (rs,t,u), (rt,s,u), (ru,s,t), (st,r,u), (su,r,t), (tu,r,s).
     let mut buf_c = [0.0_f64; SCRATCH];
-    let conv_weighted_triple_dot =
-        |weight: &[f64],
-         a: &[f64],
-         b: &[f64],
-         c: &[f64],
-         buf_a: &mut [f64; SCRATCH],
-         buf_b: &mut [f64; SCRATCH],
-         buf_c: &mut [f64; SCRATCH]|
-         -> f64 {
-            let ab_len = poly_conv_into(a, b, buf_a);
-            let abc_len = poly_conv_into(&buf_a[..ab_len], c, buf_b);
-            let final_len = poly_conv_into(weight, &buf_b[..abc_len], buf_c);
-            let mut acc = 0.0;
-            for k in 0..final_len {
-                acc = buf_c[k].mul_add(moments[k], acc);
-            }
-            acc
-        };
+    let conv_weighted_triple_dot = |weight: &[f64],
+                                    a: &[f64],
+                                    b: &[f64],
+                                    c: &[f64],
+                                    buf_a: &mut [f64; SCRATCH],
+                                    buf_b: &mut [f64; SCRATCH],
+                                    buf_c: &mut [f64; SCRATCH]|
+     -> f64 {
+        let ab_len = poly_conv_into(a, b, buf_a);
+        let abc_len = poly_conv_into(&buf_a[..ab_len], c, buf_b);
+        let final_len = poly_conv_into(weight, &buf_b[..abc_len], buf_c);
+        let mut acc = 0.0;
+        for k in 0..final_len {
+            acc = buf_c[k].mul_add(moments[k], acc);
+        }
+        acc
+    };
     let mut quad_coeff_term = 0.0;
     quad_coeff_term += conv_weighted_triple_dot(
         &eta_sq_minus_one,
