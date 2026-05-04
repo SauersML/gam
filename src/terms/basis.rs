@@ -17674,19 +17674,7 @@ pub fn evaluate_bspline_derivative_scalar_into(
             0.0
         };
 
-        let deriv = k * (left_term - right_term);
-        out[i] = if deriv.abs() < 1e-10 { 0.0 } else { deriv };
-    }
-
-    // Stabilize reverse cumulative sums used by I-spline derivative identities.
-    // Tiny cancellation residuals are rounded to exact zero at accumulation points.
-    let mut running = 0.0_f64;
-    for j in (0..num_basis).rev() {
-        running += out[j];
-        if running.abs() < 1e-12 {
-            out[j] -= running;
-            running = 0.0;
-        }
+        out[i] = k * (left_term - right_term);
     }
 
     Ok(())
