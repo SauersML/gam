@@ -5859,15 +5859,14 @@ pub fn build_thin_plate_basiswithworkspace(
     // 735_471, well above any practical knot count. When the requested
     // knot count is below M(d), canonical TPS is mathematically infeasible
     // (the constraint P(C)^T α = 0 is overdetermined). Rather than reject,
-    // delegate to a pure Duchon spline — TPS's proper generalization with
-    // an additional Riesz fractional smoothness s — using parameters that
-    // satisfy Duchon's two well-posedness conditions:
-    //   (1) 2s < d                CPD-vs-nullspace adequacy
-    //   (2) 2(p + s) > d          pointwise kernel existence (kernel finite at r=0)
+    // delegate to a hybrid Matern-Duchon spline — TPS's proper generalization
+    // with an additional Riesz fractional smoothness s and a Matern-blended
+    // spectrum — using parameters that satisfy Duchon's collocation gates:
+    //   2(p + s) > d + max_op   pointwise kernel + collocation existence
     // We pick p = 2 (Linear nullspace, M' = d+1, well below typical k) and
-    // the smallest s satisfying both: s = (d-2)/2 (integer division). Both
-    // gates hold for every d ≥ 4. The resulting basis is conditionally PSD
-    // with finite kernel diagonal — the principled fix mgcv lacks.
+    // the smallest s satisfying the gate. Hybrid (length_scale=Some) is used
+    // rather than pure Duchon so the spatial-scale optimizer's log-κ
+    // derivatives have a tunable kernel parameter (pure Duchon has none).
     if d_canonical_tps_infeasible(data.ncols(), centers.nrows())
         && let Some((nullspace_order, s)) =
             duchon_thin_plate_fallback_params(data.ncols(), centers.nrows())
@@ -5875,7 +5874,7 @@ pub fn build_thin_plate_basiswithworkspace(
         let d = data.ncols();
         let duchon_spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
-            length_scale: None,
+            length_scale: Some(spec.length_scale),
             power: s,
             nullspace_order,
             identifiability: spec.identifiability.clone(),
@@ -5883,7 +5882,7 @@ pub fn build_thin_plate_basiswithworkspace(
             operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         log::info!(
-            "thin-plate basis auto-promoted to Duchon ({:?}, s={}) in d={}: \
+            "thin-plate basis auto-promoted to hybrid Duchon ({:?}, s={}) in d={}: \
              canonical TPS would need {} centers but got {} — using Duchon's \
              Riesz-fractional generalization with finite kernel at r=0",
             nullspace_order,
@@ -15814,22 +15813,22 @@ fn d_canonical_tps_infeasible(dimension: usize, num_centers: usize) -> bool {
 }
 
 /// Pick Duchon parameters for the TPS auto-promotion at infeasible (d, k).
-/// Returns `Some((nullspace_order, power))` when a pure-Duchon spec exists
-/// satisfying the two well-posedness gates:
-///   (1) 2s < d          — CPD-vs-nullspace adequacy
-///   (2) 2(p + s) > d    — pointwise kernel existence (kernel finite at r=0)
-/// where p is the polynomial-block order (Linear → p=2, Zero → p=1).
+/// Returns `Some((nullspace_order, power))` when a hybrid-Duchon spec exists
+/// satisfying the collocation gate `2(p + s) > d + max_op` for max_op = 2
+/// (default operator penalties: mass + tension + stiffness). The hybrid
+/// kernel (Matern-blended) sidesteps the pure-Duchon `2s < d` gate, leaving
+/// only the collocation/spectral-existence condition.
 ///
 /// Strategy: prefer Linear nullspace (M' = d+1) so the polynomial trend
-/// retains the affine span; fall back to Zero (M' = 1) when k < d+1. We pick
-/// the smallest admissible s in each case (largest penalty roughness, most
-/// TPS-like behavior). Returns None when no admissible spec exists — caller
-/// should surface the original "minimum centers" rejection.
+/// retains the affine span; fall back to Zero (M' = 1) when k < d+1. The
+/// smallest admissible s in each case gives the most TPS-like behavior
+/// (largest spectral roughness for a given polynomial nullspace).
 fn duchon_thin_plate_fallback_params(
     dimension: usize,
     num_centers: usize,
 ) -> Option<(DuchonNullspaceOrder, usize)> {
     let d = dimension;
+    let max_op = 2usize; // mass + tension + stiffness collocation
     for (order, p, m_poly) in [
         (DuchonNullspaceOrder::Linear, 2usize, d + 1),
         (DuchonNullspaceOrder::Zero, 1usize, 1usize),
@@ -15837,21 +15836,14 @@ fn duchon_thin_plate_fallback_params(
         if num_centers < m_poly {
             continue;
         }
-        // Smallest integer s with 2(p + s) > d:
-        //   d > 2p → s_min = (d - 2p)/2 + 1
-        //   d == 2p → s_min = 1
-        //   d < 2p → s_min = 0  (canonical-TPS-equivalent for low d)
-        let s_min = if d > 2 * p {
-            (d - 2 * p) / 2 + 1
-        } else if d == 2 * p {
-            1
-        } else {
+        // Smallest integer s with 2(p + s) > d + max_op.
+        let target = d + max_op;
+        let s_min = if 2 * p > target {
             0
+        } else {
+            (target - 2 * p) / 2 + 1
         };
-        // CPD-vs-nullspace gate: 2s < d (strict).
-        if 2 * s_min < d {
-            return Some((order, s_min));
-        }
+        return Some((order, s_min));
     }
     None
 }

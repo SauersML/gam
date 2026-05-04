@@ -11552,6 +11552,44 @@ pub fn freeze_term_collection_from_design(
                 *input_scales = meta_scales.clone();
             }
             (
+                SmoothBasisSpec::ThinPlate { feature_cols, .. },
+                BasisMetadata::Duchon {
+                    centers,
+                    length_scale,
+                    power,
+                    nullspace_order,
+                    identifiability_transform,
+                    input_scales: meta_scales,
+                    aniso_log_scales: meta_aniso,
+                },
+            ) => {
+                // Auto-promotion path: the basis builder rewrote a canonical-TPS
+                // request to a pure Duchon spline because k < polynomial-nullspace
+                // size at this dimension. Bake the resolved Duchon parameters into
+                // the spec so predict-time goes through the same Duchon code path.
+                let identifiability = match identifiability_transform {
+                    Some(z) => SpatialIdentifiability::FrozenTransform {
+                        transform: z.clone(),
+                    },
+                    None => SpatialIdentifiability::None,
+                };
+                term.basis = SmoothBasisSpec::Duchon {
+                    feature_cols: feature_cols.clone(),
+                    spec: DuchonBasisSpec {
+                        center_strategy: crate::basis::CenterStrategy::UserProvided(
+                            centers.clone(),
+                        ),
+                        length_scale: *length_scale,
+                        power: *power,
+                        nullspace_order: *nullspace_order,
+                        identifiability,
+                        aniso_log_scales: meta_aniso.clone(),
+                        operator_penalties: Default::default(),
+                    },
+                    input_scales: meta_scales.clone(),
+                };
+            }
+            (
                 SmoothBasisSpec::Matern {
                     spec: s,
                     input_scales,
