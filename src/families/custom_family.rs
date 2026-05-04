@@ -7104,8 +7104,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         for cycle in 0..inner_max_cycles {
             // Fires at the top of each inner joint-Newton cycle so CI logs can
             // distinguish "inner spin" (thousands of these) from "outer-assembly
-            // spin" (zero of these).
-            log::debug!(
+            // spin" (zero of these). Emitted at info-level so the silent-grind
+            // failure mode (e.g. CI hitting cmd timeout while PIRLS quietly
+            // chews on the first outer-iter at biobank scale) is visible
+            // without enabling debug logs.
+            log::info!(
                 "[PIRLS/blockwise joint-Newton] cycle {:>3}/{} | -loglik {:.6e} | penalty {:.6e} | objective {:.6e}",
                 cycle,
                 inner_max_cycles,
@@ -7505,8 +7508,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     for cycle in 0..inner_max_cycles {
         // Fires at the top of each blockwise coordinate cycle so we can count
         // iterations from CI logs when a benchmark hangs inside the first
-        // outer-eval.
-        log::debug!(
+        // outer-eval. Emitted at info-level: same rationale as the joint-Newton
+        // sibling above — silent-grind diagnosis without debug logs.
+        log::info!(
             "[PIRLS/blockwise coord] cycle {:>3}/{} | -loglik {:.6e} | penalty {:.6e} | objective {:.6e}",
             cycle,
             inner_max_cycles,
