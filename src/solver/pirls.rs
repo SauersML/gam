@@ -7080,30 +7080,72 @@ fn computeworkingweight_derivatives_from_eta(
         }
         GlmLikelihoodFamily::PoissonLog => {
             const MIN_WEIGHT: f64 = 1e-12;
-            for i in 0..n {
-                let eta_used = eta[i].clamp(-700.0, 700.0);
-                let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
-                let raw_weight = priorweights[i].max(0.0) * jet.mu;
-                let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
-                if eta[i] != eta_used || floor_active {
-                    c[i] = 0.0;
-                    d[i] = 0.0;
-                } else {
-                    c[i] = raw_weight;
-                    d[i] = raw_weight;
-                }
-                dmu_deta[i] = jet.d1;
-                d2mu_deta2[i] = jet.d2;
-                d3mu_deta3[i] = jet.d3;
-            }
+            // Per-row independent: jet/weight depend only on eta[i] and
+            // priorweights[i]. Parallel write into the five output slices
+            // matches the `update_glmvectors` pattern. `try_for_each` keeps
+            // first-error semantics from the prior `?` early return.
+            let c_s = c.as_slice_mut().expect("c must be contiguous");
+            let d_s = d.as_slice_mut().expect("d must be contiguous");
+            let dmu_s = dmu_deta
+                .as_slice_mut()
+                .expect("dmu_deta must be contiguous");
+            let d2_s = d2mu_deta2
+                .as_slice_mut()
+                .expect("d2mu_deta2 must be contiguous");
+            let d3_s = d3mu_deta3
+                .as_slice_mut()
+                .expect("d3mu_deta3 must be contiguous");
+            c_s.par_iter_mut()
+                .zip(d_s.par_iter_mut())
+                .zip(dmu_s.par_iter_mut())
+                .zip(d2_s.par_iter_mut())
+                .zip(d3_s.par_iter_mut())
+                .enumerate()
+                .try_for_each(
+                    |(i, ((((c_o, d_o), dmu_o), d2_o), d3_o))| -> Result<(), EstimationError> {
+                        let eta_used = eta[i].clamp(-700.0, 700.0);
+                        let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
+                        let raw_weight = priorweights[i].max(0.0) * jet.mu;
+                        let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
+                        if eta[i] != eta_used || floor_active {
+                            *c_o = 0.0;
+                            *d_o = 0.0;
+                        } else {
+                            *c_o = raw_weight;
+                            *d_o = raw_weight;
+                        }
+                        *dmu_o = jet.d1;
+                        *d2_o = jet.d2;
+                        *d3_o = jet.d3;
+                        Ok(())
+                    },
+                )?;
         }
         GlmLikelihoodFamily::GammaLog => {
-            for i in 0..n {
-                let jet = standard_inverse_link_jet(inverse_link, eta[i].clamp(-700.0, 700.0))?;
-                dmu_deta[i] = jet.d1;
-                d2mu_deta2[i] = jet.d2;
-                d3mu_deta3[i] = jet.d3;
-            }
+            let dmu_s = dmu_deta
+                .as_slice_mut()
+                .expect("dmu_deta must be contiguous");
+            let d2_s = d2mu_deta2
+                .as_slice_mut()
+                .expect("d2mu_deta2 must be contiguous");
+            let d3_s = d3mu_deta3
+                .as_slice_mut()
+                .expect("d3mu_deta3 must be contiguous");
+            dmu_s
+                .par_iter_mut()
+                .zip(d2_s.par_iter_mut())
+                .zip(d3_s.par_iter_mut())
+                .enumerate()
+                .try_for_each(
+                    |(i, ((dmu_o, d2_o), d3_o))| -> Result<(), EstimationError> {
+                        let jet =
+                            standard_inverse_link_jet(inverse_link, eta[i].clamp(-700.0, 700.0))?;
+                        *dmu_o = jet.d1;
+                        *d2_o = jet.d2;
+                        *d3_o = jet.d3;
+                        Ok(())
+                    },
+                )?;
         }
         GlmLikelihoodFamily::BinomialLogit
         | GlmLikelihoodFamily::BinomialProbit
@@ -7114,42 +7156,72 @@ fn computeworkingweight_derivatives_from_eta(
             let link = inverse_link.link_function();
             let zero_on_nonsmooth =
                 matches!(link, LinkFunction::Logit) && LOGIT_ZERO_HIGHER_DERIVATIVES_ON_NONSMOOTH;
-            for i in 0..n {
-                let eta_used = match link {
-                    LinkFunction::Logit => eta[i].clamp(-700.0, 700.0),
-                    LinkFunction::Probit
-                    | LinkFunction::CLogLog
-                    | LinkFunction::Sas
-                    | LinkFunction::BetaLogistic => eta[i].clamp(-30.0, 30.0),
-                    LinkFunction::Log => eta[i].clamp(-700.0, 700.0),
-                    LinkFunction::Identity => eta[i],
-                };
-                if matches!(link, LinkFunction::Logit) {
-                    let jet = logit_inverse_link_jet5(eta_used);
-                    let geom = bernoulli_logit_geometry_from_jet(
-                        eta[i],
-                        eta_used,
-                        jet.mu,
-                        priorweights[i],
-                        jet,
-                        zero_on_nonsmooth,
-                    );
-                    c[i] = geom.c;
-                    d[i] = geom.d;
-                    dmu_deta[i] = jet.d1;
-                    d2mu_deta2[i] = jet.d2;
-                    d3mu_deta3[i] = jet.d3;
-                } else {
-                    let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
-                    let geom =
-                        bernoulli_geometry_from_jet(eta[i], eta_used, jet.mu, priorweights[i], jet);
-                    c[i] = geom.c;
-                    d[i] = geom.d;
-                    dmu_deta[i] = jet.d1;
-                    d2mu_deta2[i] = jet.d2;
-                    d3mu_deta3[i] = jet.d3;
-                }
-            }
+            // Five independent per-row writes: same parallelization shape as
+            // `update_glmvectors` above. Note the `jet.mu` argument is reused
+            // here as the response (matching the original serial code) — this
+            // is the score-derivative path where y is replaced by mu so the
+            // (y - mu) residual term vanishes by construction.
+            let c_s = c.as_slice_mut().expect("c must be contiguous");
+            let d_s = d.as_slice_mut().expect("d must be contiguous");
+            let dmu_s = dmu_deta
+                .as_slice_mut()
+                .expect("dmu_deta must be contiguous");
+            let d2_s = d2mu_deta2
+                .as_slice_mut()
+                .expect("d2mu_deta2 must be contiguous");
+            let d3_s = d3mu_deta3
+                .as_slice_mut()
+                .expect("d3mu_deta3 must be contiguous");
+            c_s.par_iter_mut()
+                .zip(d_s.par_iter_mut())
+                .zip(dmu_s.par_iter_mut())
+                .zip(d2_s.par_iter_mut())
+                .zip(d3_s.par_iter_mut())
+                .enumerate()
+                .try_for_each(
+                    |(i, ((((c_o, d_o), dmu_o), d2_o), d3_o))| -> Result<(), EstimationError> {
+                        let eta_used = match link {
+                            LinkFunction::Logit => eta[i].clamp(-700.0, 700.0),
+                            LinkFunction::Probit
+                            | LinkFunction::CLogLog
+                            | LinkFunction::Sas
+                            | LinkFunction::BetaLogistic => eta[i].clamp(-30.0, 30.0),
+                            LinkFunction::Log => eta[i].clamp(-700.0, 700.0),
+                            LinkFunction::Identity => eta[i],
+                        };
+                        if matches!(link, LinkFunction::Logit) {
+                            let jet = logit_inverse_link_jet5(eta_used);
+                            let geom = bernoulli_logit_geometry_from_jet(
+                                eta[i],
+                                eta_used,
+                                jet.mu,
+                                priorweights[i],
+                                jet,
+                                zero_on_nonsmooth,
+                            );
+                            *c_o = geom.c;
+                            *d_o = geom.d;
+                            *dmu_o = jet.d1;
+                            *d2_o = jet.d2;
+                            *d3_o = jet.d3;
+                        } else {
+                            let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
+                            let geom = bernoulli_geometry_from_jet(
+                                eta[i],
+                                eta_used,
+                                jet.mu,
+                                priorweights[i],
+                                jet,
+                            );
+                            *c_o = geom.c;
+                            *d_o = geom.d;
+                            *dmu_o = jet.d1;
+                            *d2_o = jet.d2;
+                            *d3_o = jet.d3;
+                        }
+                        Ok(())
+                    },
+                )?;
         }
     }
     Ok((c, d, dmu_deta, d2mu_deta2, d3mu_deta3))
