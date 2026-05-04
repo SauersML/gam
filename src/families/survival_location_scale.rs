@@ -4142,8 +4142,11 @@ fn structural_time_coefficient_lower_bounds(
             ));
         }
     }
+    let mut col_maxes: Vec<(usize, f64)> = Vec::with_capacity(p.min(8));
+    let mut total_subtol_nonzeros = 0_usize;
     for col in 0..p {
         let mut has_positive_support = false;
+        let mut col_max = 0.0_f64;
         for row in 0..design_derivative_exit.nrows() {
             let value = design_derivative_exit[[row, col]];
             if !value.is_finite() {
@@ -4159,70 +4162,64 @@ fn structural_time_coefficient_lower_bounds(
             if value > DERIVATIVE_TOL {
                 has_positive_support = true;
             }
+            let abs_value = value.abs();
+            if abs_value > col_max {
+                col_max = abs_value;
+            }
+            if abs_value > 1e-30 && abs_value <= DERIVATIVE_TOL {
+                total_subtol_nonzeros += 1;
+            }
         }
         if has_positive_support {
             lower_bounds[col] = 0.0;
             has_structural_support = true;
+        }
+        if col < 8 {
+            col_maxes.push((col, col_max));
         }
     }
 
     if !has_structural_support {
         // No derivative-active column on this candidate's exit-time design.
         //
-        // This is the **expected** state when `learn_timewiggle = true`:
-        // the survival path then routes through `SurvivalTimeBasisConfig::
-        // None` (see `main.rs:3846`), which builds an `(n, 0)` empty
-        // time-basis on purpose because the parametric baseline + the
-        // timewiggle block together carry the entire time structure. The
-        // `prepare_survival_time_stack` helper still appends `tw.ncols`
-        // **zero** tail columns to the exit-derivative design so the
-        // shapes line up with the timewiggle-extended coefficient vector,
-        // and those zero tail columns correctly carry no exit-derivative
-        // signal — the exit-time derivative information lives in
-        // `derivative_offset_exit` (the parametric baseline's
-        // contribution), not in any basis column. The original `Err`
-        // was a false alarm in this regime: there's nothing to put a
-        // structural lower bound on, because there are no time-coefficient
-        // basis columns whose sign matters for monotone-in-time hazard at
-        // exit. Returning `Ok(None)` is the right answer.
+        // Two distinct regimes reach this branch and only one of them is
+        // surprising:
         //
-        // For the non-timewiggle path (e.g. `--time-basis ispline`
-        // without timewiggle), reaching this branch would still indicate
-        // a real degenerate basis. The diagnostic below distinguishes
-        // the two: with timewiggle the design is *exactly* zeros across
-        // all rows and columns; with a degenerate ispline build it would
-        // typically have small-but-nonzero entries below `DERIVATIVE_TOL`.
-        // Diagnostic: report column-by-column max(|.|) and total nonzero
-        // count so the next iteration can see whether the design is truly
-        // all-zero or just below `DERIVATIVE_TOL`. The cell-moment / I-spline
-        // construction silently drops `|v| ≤ 1e-15` entries, so a design
-        // that *looks* dense to the casual reader can be effectively zero
-        // here. Limit output to the first 8 columns to avoid log spam at
-        // wide bases; emit total rows/cols/nonzeros for the rest.
-        let mut col_maxes = Vec::with_capacity(p.min(8));
-        let mut total_nonzeros = 0_usize;
-        for col in 0..p {
-            let mut col_max = 0.0_f64;
-            for row in 0..design_derivative_exit.nrows() {
-                let v = design_derivative_exit[[row, col]].abs();
-                if v > 1e-30 {
-                    total_nonzeros += 1;
-                }
-                if v > col_max {
-                    col_max = v;
-                }
-            }
-            if col < 8 {
-                col_maxes.push((col, col_max));
-            }
+        // 1. `learn_timewiggle = true` (the biobank-scale survival
+        //    marginal-slope path). `main.rs:3846` deliberately routes to
+        //    `SurvivalTimeBasisConfig::None`, which produces an `(n, 0)`
+        //    empty time-basis: the parametric baseline plus the timewiggle
+        //    block carry the entire time structure, and the exit-time
+        //    derivative information lives in `derivative_offset_exit`,
+        //    not in any basis column. `prepare_survival_time_stack` then
+        //    appends `tw.ncols` **exactly zero** tail columns to keep
+        //    shapes aligned with the timewiggle-extended coefficient
+        //    vector. Those tail zeros correctly carry no exit-derivative
+        //    signal, there is nothing to constrain with a structural
+        //    lower-bound ridge, and the right answer is `Ok(None)`.
+        //
+        // 2. `--time-basis ispline` (or bspline) without timewiggle. Here
+        //    the basis was *intended* to span exit-time variation; a
+        //    degenerate build that produces only sub-tolerance entries
+        //    points at a real numerical bug upstream (knot inference,
+        //    cell-moment construction, derivative formula, etc.).
+        //
+        // The two regimes differentiate by whether the design has any
+        // entry whose magnitude exceeds 1e-30 but stays at or below
+        // `DERIVATIVE_TOL`. Regime 1 leaves the tail columns at exact
+        // zero (no entry passes 1e-30); regime 2 leaves residual
+        // float-scale entries from the upstream basis builder. We log
+        // warn-level only in the surprising regime.
+        if total_subtol_nonzeros > 0 {
+            log::warn!(
+                "structural time coefficient bounds: no derivative-active column on this candidate's exit-time design ({} rows × {} cols, sub-tolerance nonzero entries (1e-30 < |v| ≤ {:.0e}): {}, first-8 col max(|.|): {:?}); skipping the structural lower-bound ridge — fit may converge to a non-monotone-in-time hazard",
+                design_derivative_exit.nrows(),
+                p,
+                DERIVATIVE_TOL,
+                total_subtol_nonzeros,
+                col_maxes,
+            );
         }
-        log::warn!(
-            "structural time coefficient bounds: no derivative-active column on this candidate's exit-time design ({} rows × {} cols, total |v|>1e-30 entries: {}, first-8 col max(|.|): {:?}); skipping the structural lower-bound ridge — fit may converge to a non-monotone-in-time hazard",
-            design_derivative_exit.nrows(),
-            p,
-            total_nonzeros,
-            col_maxes,
-        );
         return Ok(None);
     }
     Ok(Some(lower_bounds))
