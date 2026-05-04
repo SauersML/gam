@@ -389,6 +389,7 @@ pub fn cell_polynomial_integral_from_moments(
     Ok(value * INV_TWO_PI)
 }
 
+#[inline]
 pub fn cell_second_derivative_from_moments(
     cell: DenestedCubicCell,
     first_coefficients_r: &[f64],
@@ -510,6 +511,7 @@ fn first_coefficients_degree(label: &str, coefficients: &[f64]) -> Result<usize,
         .ok_or_else(|| format!("{label} first-derivative coefficients must be non-empty"))
 }
 
+#[inline]
 pub fn cell_third_derivative_from_moments(
     cell: DenestedCubicCell,
     first_coefficients_r: &[f64],
@@ -588,6 +590,7 @@ pub fn cell_third_derivative_from_moments(
     Ok((third_term - eta_second_term + cubic_coeff_term) * INV_TWO_PI)
 }
 
+#[inline]
 pub fn cell_fourth_derivative_from_moments(
     cell: DenestedCubicCell,
     first_coefficients_r: &[f64],
