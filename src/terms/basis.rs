@@ -18422,9 +18422,8 @@ pub mod closed_form_penalty {
         let p_eff = 2 * m;
         let q_eff = 2 * s;
         let matern_order = p_eff + q_eff;
-        let log_beta = ln_gamma(p_eff as f64)
-            + ln_gamma(q_eff as f64)
-            - ln_gamma((p_eff + q_eff) as f64);
+        let log_beta =
+            ln_gamma(p_eff as f64) + ln_gamma(q_eff as f64) - ln_gamma((p_eff + q_eff) as f64);
         let inv_beta = (-log_beta).exp();
 
         let mut accum = vec![KahanSum::default(); max_order + 1];
@@ -18447,10 +18446,7 @@ pub mod closed_form_penalty {
                 accum[k].add(weight * v);
             }
         }
-        accum
-            .iter()
-            .map(|acc| inv_beta * acc.sum())
-            .collect()
+        accum.iter().map(|acc| inv_beta * acc.sum()).collect()
     }
 
     const EULER_GAMMA: f64 = 0.577_215_664_901_532_9_f64;
@@ -20858,12 +20854,9 @@ mod tests {
         ] {
             for &kappa in &[0.5_f64, 1.0, 2.0] {
                 for &r in &[0.4_f64, 1.0, 2.5] {
-                    let stable = closed_form_penalty::stable_hybrid_duchon_radial(
-                        d, m, s, kappa, r, 0,
-                    )[0];
-                    let pf = closed_form_penalty::isotropic_duchon_penalty(
-                        0, d, m, s, kappa, r,
-                    );
+                    let stable =
+                        closed_form_penalty::stable_hybrid_duchon_radial(d, m, s, kappa, r, 0)[0];
+                    let pf = closed_form_penalty::isotropic_duchon_penalty(0, d, m, s, kappa, r);
                     let scale = stable.abs().max(pf.abs()).max(1e-300);
                     let rel = (stable - pf).abs() / scale;
                     // After `t = 1 - u²` substitution the integrand is
