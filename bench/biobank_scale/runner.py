@@ -735,7 +735,22 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
     if len(train_rows) > PGS_CTN_FIT_SUBSAMPLE_N:
         rng = np.random.default_rng(PGS_CTN_FIT_SUBSAMPLE_SEED)
         pc_cols = _pc_std_columns(spec.pc_count)
-        per_axis_keep = max(1, PGS_CTN_FIT_SUBSAMPLE_N // (4 * max(len(pc_cols), 1)))
+        # Cap per-axis-keep at a small fixed number, NOT (SUBSAMPLE_N // 4 //
+        # n_pcs). Why: with the prior formula at SUBSAMPLE_N=5000, pc_count=16
+        # we forced 78 rows from each end of every PC. At local n=16k this
+        # picks rows at the 0.49% quantile, which the CTN can fit cleanly
+        # (kurt(z) ≈ 7.7 in test runs). At biobank n=320k the SAME 78 rows
+        # land at the 0.024% quantile — 20× further into the tail — so the
+        # CTN training distribution is dominated by extreme outliers and the
+        # fitted basis cannot generalize to interior PCs (CI run 25338491995
+        # observed kurt(z) ≈ 3733, skew ≈ 65 on the bernoulli margslope
+        # heldout split, vs ≈ 7.7 locally).
+        #
+        # Fixed cap of 20 per axis-end keeps the forced-extreme contribution
+        # to ~640 rows out of 5000 (13%, vs the prior 50%). Coverage of the
+        # per-axis envelope is still guaranteed; the predict-time CTN clamp
+        # (5a306369) catches any predict rows beyond that envelope.
+        per_axis_keep = max(2, min(20, PGS_CTN_FIT_SUBSAMPLE_N // (16 * max(len(pc_cols), 1))))
         forced_idx: set[int] = set()
         for col in pc_cols:
             values = np.array([float(row[col]) for row in train_rows], dtype=float)
