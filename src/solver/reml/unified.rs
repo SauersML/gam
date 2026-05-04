@@ -3974,6 +3974,7 @@ fn efs_q_eff(a_i: f64, dispersion: &DispersionHandling, dp_cgrad: f64, phi: f64)
 /// path uses [`efs_log_step`] to avoid forcing `EvalMode::ValueAndGradient`
 /// on every pure-EFS evaluation. Kept here so future callers can drop in
 /// the universal form when they have `g_full` already available.
+#[allow(dead_code)]
 #[inline]
 fn efs_log_step_from_grad(q_eff: f64, g_full: f64) -> Option<f64> {
     if !q_eff.is_finite() || q_eff <= 0.0 || !g_full.is_finite() {
@@ -11469,8 +11470,9 @@ mod tests {
         // Augmented stationarity ⇒ q_eff = target − 2·g_extra ⇒ pick
         // q_eff so that g_full = 0 at the *augmented* optimum.
         let augmented_q = target - 2.0 * g_extra;
-        let g_full_at_aug_opt: f64 =
-            (augmented_q + (-target) + target) / 2.0 + g_extra;
+        // g_base = (q_eff − (d − t))/2 = (augmented_q − target)/2,
+        // g_full = g_base + g_extra. At augmented stationarity g_full = 0.
+        let g_full_at_aug_opt: f64 = (augmented_q - target) / 2.0 + g_extra;
         // Sanity: at augmented optimum, g_full should be 0.
         // Since g_base = (augmented_q − target)/2 = ((target − 2g_extra) − target)/2 = −g_extra,
         // and g_full = g_base + g_extra = 0. ✓
