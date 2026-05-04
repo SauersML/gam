@@ -8093,11 +8093,22 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let n_obs = data_view.nrows();
     let psi_dim = setup.log_kappa_dim();
     let biobank_scale = n_obs > 50_000 || psi_dim > 30;
+    // CRITICAL (same fix as survival_marginal_slope.rs): the gate value
+    // alone is insufficient because the bernoulli main fit also runs
+    // through `fit_custom_family`'s blockwise outer-loop, which derives
+    // Hessian capability from `options.use_outer_hessian` rather than
+    // our local gate. CI run 25338491995 showed bernoulli at biobank
+    // n=320k psi_dim=32 routing to ARC + analytic Hessian and hitting
+    // 50-min job timeout. Override the options bag so the planner sees
+    // `use_outer_hessian=false`, forcing BFGS.
+    let mut options_override = options.clone();
     if biobank_scale {
+        options_override.use_outer_hessian = false;
         log::info!(
-            "[bernoulli-marginal-slope] declining analytic outer Hessian for n={n_obs}, psi_dim={psi_dim}; routing to BFGS"
+            "[bernoulli-marginal-slope] declining analytic outer Hessian for n={n_obs}, psi_dim={psi_dim}; routing to BFGS (use_outer_hessian=false)"
         );
     }
+    let options: &BlockwiseFitOptions = &options_override;
     let analytic_joint_hessian_available = analytic_joint_derivatives_available
         && !biobank_scale
         && matches!(
