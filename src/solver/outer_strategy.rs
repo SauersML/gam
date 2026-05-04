@@ -2954,6 +2954,21 @@ fn run_operator_trust_region(
     }
     let mut dense_model: Option<Array2<f64>> = None;
     let mut materialize_dense_after_rejection = false;
+    // Cliff diagnostics: at biobank scale the cubic-model step direction can
+    // point straight into a bound, so projection clamps the trial point to
+    // the same corner of the box on every halving. Across many rejected
+    // iters at the same x_k (eval_k unchanged on rejection), the unclamped
+    // axes scale with trust_radius and contribute negligibly to the trial
+    // cost as r → 0; the trial value asymptotes to the cost AT THE CORNER.
+    // Result: act_dec is bit-for-bit constant across consecutive rejections,
+    // even though pred_dec is shrinking like r². This is the
+    // `act_dec=-46.65 EXACTLY` pattern observed in CTN ARC at biobank
+    // scale. Detect it: track how many consecutive rejections produce
+    // (relative-)identical act_dec.
+    let mut last_rejection_act_dec: Option<f64> = None;
+    let mut consecutive_corner_clamps: usize = 0;
+    const CORNER_CLAMP_REPORT_THRESHOLD: usize = 4;
+    let mut corner_clamp_reported_for_run: bool = false;
 
     for iter in 0..max_iter {
         let iter_start = std::time::Instant::now();
@@ -3246,6 +3261,11 @@ fn run_operator_trust_region(
             eval_k = eval_trial;
             dense_model = None;
             materialize_dense_after_rejection = false;
+            // Accepting any step exits the corner-clamp regime: x_k moved,
+            // so the next rejection's trial cost is no longer comparable to
+            // the prior corner's cost. Reset the cliff tracker.
+            last_rejection_act_dec = None;
+            consecutive_corner_clamps = 0;
         } else {
             // Smart snap on egregious rejection. When the cubic model
             // predicts a decrease many orders of magnitude larger than
@@ -3297,6 +3317,49 @@ fn run_operator_trust_region(
                     snapped_radius,
                     (new_trust_radius / snapped_radius).log2().ceil() as i64,
                 );
+            }
+            // Cliff / corner-clamp diagnostic. If consecutive rejections
+            // produce act_dec values that are equal to within float noise
+            // *relative to the cost scale*, the trial point is asymptoting
+            // to a constant point as trust_radius shrinks — almost certainly
+            // because the unconstrained step direction points across one or
+            // more bounds and projection is clamping to the same corner of
+            // the box every time. Surface this once per run so it shows up
+            // in CI logs without spamming.
+            if act_dec.is_finite() {
+                let cost_floor = eval_k.cost.abs().max(1.0);
+                let near_equal = match last_rejection_act_dec {
+                    Some(prev) => {
+                        let scale = prev.abs().max(act_dec.abs()).max(cost_floor) * 1e-9;
+                        (act_dec - prev).abs() <= scale
+                    }
+                    None => false,
+                };
+                if near_equal {
+                    consecutive_corner_clamps += 1;
+                    if !corner_clamp_reported_for_run
+                        && consecutive_corner_clamps >= CORNER_CLAMP_REPORT_THRESHOLD
+                    {
+                        log::warn!(
+                            "[ARC-timing] iter={iter} corner_clamp_detected: act_dec={:.6e} \
+                             stable across {} consecutive rejected halvings (trust_radius now \
+                             {:.3e}); the unconstrained cubic-model step direction is crossing \
+                             one or more box bounds, projection clamps the trial point to a \
+                             constant corner regardless of step magnitude, so cost(trial) is \
+                             constant and act_dec stops carrying useful information. The \
+                             optimizer will geometrically halve to the reject floor without \
+                             learning anything. Caller's bounds may be too tight or the \
+                             gradient/Hessian at this x_k may have a degenerate component.",
+                            act_dec,
+                            consecutive_corner_clamps + 1,
+                            snapped_radius,
+                        );
+                        corner_clamp_reported_for_run = true;
+                    }
+                } else {
+                    consecutive_corner_clamps = 0;
+                }
+                last_rejection_act_dec = Some(act_dec);
             }
             trust_radius = snapped_radius;
             if trust_radius <= OPERATOR_TRUST_RADIUS_REJECT_FLOOR {
