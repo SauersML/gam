@@ -5868,22 +5868,25 @@ pub fn build_thin_plate_basiswithworkspace(
     // the smallest s satisfying both: s = (d-2)/2 (integer division). Both
     // gates hold for every d ≥ 4. The resulting basis is conditionally PSD
     // with finite kernel diagonal — the principled fix mgcv lacks.
-    if d_canonical_tps_infeasible(data.ncols(), centers.nrows()) {
+    if d_canonical_tps_infeasible(data.ncols(), centers.nrows())
+        && let Some((nullspace_order, s)) =
+            duchon_thin_plate_fallback_params(data.ncols(), centers.nrows())
+    {
         let d = data.ncols();
-        let s = duchon_thin_plate_fallback_power(d);
         let duchon_spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
             length_scale: None,
             power: s,
-            nullspace_order: DuchonNullspaceOrder::Linear,
+            nullspace_order,
             identifiability: spec.identifiability.clone(),
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         log::info!(
-            "thin-plate basis auto-promoted to Duchon (p=2, s={}) in d={}: \
+            "thin-plate basis auto-promoted to Duchon ({:?}, s={}) in d={}: \
              canonical TPS would need {} centers but got {} — using Duchon's \
              Riesz-fractional generalization with finite kernel at r=0",
+            nullspace_order,
             s,
             d,
             thin_plate_polynomial_basis_dimension(d),
@@ -15810,24 +15813,47 @@ fn d_canonical_tps_infeasible(dimension: usize, num_centers: usize) -> bool {
     num_centers < thin_plate_polynomial_basis_dimension(dimension)
 }
 
-/// Pure-Duchon Riesz fractional smoothness `s` for the TPS auto-promotion at
-/// nullspace order p=2 (Linear). Solves the smallest integer `s` jointly
-/// satisfying Duchon's CPD-vs-nullspace gate `2s < d` and the spectral
-/// kernel-existence gate `2(p + s) > d` for `p = 2`:
+/// Pick Duchon parameters for the TPS auto-promotion at infeasible (d, k).
+/// Returns `Some((nullspace_order, power))` when a pure-Duchon spec exists
+/// satisfying the two well-posedness gates:
+///   (1) 2s < d          — CPD-vs-nullspace adequacy
+///   (2) 2(p + s) > d    — pointwise kernel existence (kernel finite at r=0)
+/// where p is the polynomial-block order (Linear → p=2, Zero → p=1).
 ///
-///   2s < d           → s ≤ ⌊(d-1)/2⌋
-///   2(2 + s) > d     → s ≥ ⌈d/2⌉ − 1
-///
-/// For d ≥ 4 both bounds are simultaneously satisfiable and the smallest
-/// admissible s is `⌈(d-3)/2⌉ = (d - 2) / 2` (integer division). For d ≤ 3,
-/// canonical TPS is never infeasible at any non-trivial knot count, so
-/// callers should not invoke this helper there; we return 0 defensively.
-#[inline(always)]
-fn duchon_thin_plate_fallback_power(dimension: usize) -> usize {
-    if dimension < 4 {
-        return 0;
+/// Strategy: prefer Linear nullspace (M' = d+1) so the polynomial trend
+/// retains the affine span; fall back to Zero (M' = 1) when k < d+1. We pick
+/// the smallest admissible s in each case (largest penalty roughness, most
+/// TPS-like behavior). Returns None when no admissible spec exists — caller
+/// should surface the original "minimum centers" rejection.
+fn duchon_thin_plate_fallback_params(
+    dimension: usize,
+    num_centers: usize,
+) -> Option<(DuchonNullspaceOrder, usize)> {
+    let d = dimension;
+    for (order, p, m_poly) in [
+        (DuchonNullspaceOrder::Linear, 2usize, d + 1),
+        (DuchonNullspaceOrder::Zero, 1usize, 1usize),
+    ] {
+        if num_centers < m_poly {
+            continue;
+        }
+        // Smallest integer s with 2(p + s) > d:
+        //   d > 2p → s_min = (d - 2p)/2 + 1
+        //   d == 2p → s_min = 1
+        //   d < 2p → s_min = 0  (canonical-TPS-equivalent for low d)
+        let s_min = if d > 2 * p {
+            (d - 2 * p) / 2 + 1
+        } else if d == 2 * p {
+            1
+        } else {
+            0
+        };
+        // CPD-vs-nullspace gate: 2s < d (strict).
+        if 2 * s_min < d {
+            return Some((order, s_min));
+        }
     }
-    (dimension - 2) / 2
+    None
 }
 
 #[inline(always)]
