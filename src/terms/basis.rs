@@ -15592,7 +15592,7 @@ fn thin_plate_polynomial_block(points: ArrayView2<'_, f64>) -> Array2<f64> {
     monomial_basis_block(points, thin_plate_polynomial_degree(points.ncols()))
 }
 
-fn thin_plate_polynomial_basis_dimension(dimension: usize) -> usize {
+pub fn thin_plate_polynomial_basis_dimension(dimension: usize) -> usize {
     monomial_exponents(dimension, thin_plate_polynomial_degree(dimension)).len()
 }
 
