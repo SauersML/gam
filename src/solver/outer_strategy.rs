@@ -1761,6 +1761,29 @@ const MAX_EFS_BACKTRACK: usize = 8;
 /// numerically clean (no spurious cost decreases from ULP noise).
 const EFS_NEGLIGIBLE_STEP: f64 = 1e-12;
 
+/// Maximum infinity-norm of the EFS step (in θ-space) at which we skip the
+/// cost line search and trust the multiplicative formula's quadratic
+/// convergence. Above this, we always backtrack.
+///
+/// At small step magnitudes the canonical formula `Δρ = log((d−t)/q_eff)`
+/// is itself a Newton step on the REML stationarity equation, with
+/// quadratic local convergence. Under Wood–Fasiolo's Loewner-order
+/// assumptions on the penalty derivative, sufficiently small steps are
+/// always descent on `V`, so the line search would add an inner P-IRLS
+/// solve per outer iteration with essentially zero chance of finding a
+/// halving that beats the full step. The threshold is set to ~exp(0.5)
+/// ≈ 1.65× change in any single λ_i (well inside the local-convergence
+/// regime) and gates only the line-search call — the step itself is
+/// applied unchanged, so correctness is preserved.
+const EFS_LINESEARCH_THRESHOLD: f64 = 0.5;
+
+/// Relative tolerance for the descent condition `c < current_cost` during
+/// EFS backtracking. Without this, ULP-level cost noise near a fixed point
+/// can cause spurious backtracking even when the step is mathematically
+/// correct. We accept any trial whose cost is within
+/// `EFS_COST_DESCENT_TOL · |current_cost|` of the current value.
+const EFS_COST_DESCENT_TOL: f64 = 1e-12;
+
 
 /// Maximum number of consecutive HybridEFS iterations whose ψ block was
 /// zeroed before the bridge bails out and triggers a solver switch.
@@ -1851,6 +1874,23 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
         // outer step-norm convergence check fires; no point evaluating the
         // cost at x + 1e-30·s to chase ULP-level "improvements".
         if max_step_abs < EFS_NEGLIGIBLE_STEP {
+            if psi_indices.is_some() {
+                self.consecutive_psi_zero_iters = 0;
+            }
+            return Ok(FixedPointSample {
+                value: current_cost,
+                step: raw_step,
+                status,
+            });
+        }
+
+        // Small-step fast path. The canonical Wood–Fasiolo formula is
+        // locally quadratically convergent, so once we are inside the
+        // multiplicative-Newton basin (`||Δθ||∞ < EFS_LINESEARCH_THRESHOLD`)
+        // a halving is essentially never accepted over the full step. Skip
+        // the inner P-IRLS solve we'd otherwise burn on backtracking. For
+        // hybrid runs we still need to reset the ψ-stagnation counter.
+        if max_step_abs < EFS_LINESEARCH_THRESHOLD {
             if psi_indices.is_some() {
                 self.consecutive_psi_zero_iters = 0;
             }
@@ -2005,12 +2045,16 @@ impl OuterFixedPointBridge<'_> {
         current_cost: f64,
         max_halvings: usize,
     ) -> Result<Option<Array1<f64>>, ObjectiveEvalError> {
+        // Relaxed Armijo: accept any trial within ULP noise of the current
+        // cost. Pure `<` rejects ULP-noise dithering on flat regions of V
+        // and forces unnecessary halvings.
+        let cost_floor = current_cost + EFS_COST_DESCENT_TOL * current_cost.abs().max(1.0);
         let mut alpha = 1.0_f64;
         for bt in 0..=max_halvings {
             let trial_step = raw_step * alpha;
             let trial = x + &trial_step;
             match self.obj.eval_cost(&trial) {
-                Ok(c) if c.is_finite() && c < current_cost => {
+                Ok(c) if c.is_finite() && c <= cost_floor => {
                     if bt > 0 {
                         log::debug!(
                             "[EFS] backtrack accepted at α=2^-{bt}={alpha:.4e} \
