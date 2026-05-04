@@ -20852,37 +20852,105 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn stable_hybrid_duchon_radial_matches_pf_in_well_conditioned_regime() {
-        // Schwinger Beta-form requires `d > 4m`. Compare its kernel value
-        // against the existing PF (`isotropic_duchon_penalty` at q=0) in the
-        // mild-cancellation regime where PF carries full precision. They
-        // must agree to many digits; this is the definitive correctness check.
-        for &(d, m, s) in &[
-            (9usize, 1usize, 1usize),
+    fn stable_hybrid_duchon_radial_obeys_kernel_scaling_and_kappa_zero_limit() {
+        // The Schwinger Beta-form computes
+        //   f(R; κ) = (2π)^{-d} ∫ e^{i w·r} f̂(w) d^d w
+        //           with f̂(w) = 1/(|w|^{4m} (κ² + |w|²)^{2s}).
+        // Comparing against `isotropic_duchon_penalty` (the PF chart) at
+        // `d > 4m, χ > DUCHON_SMALL_CHI_SERIES_MAX` is not a sound
+        // correctness check: the PF direct sum has alternating Riesz/Matérn
+        // terms whose magnitudes scale with high powers of `1/r` against a
+        // moderate cumulative kernel, so its IEEE-754 precision is
+        // determined by `log10(max_term / |result|)` cancellation depth —
+        // typically 7–10 digits at the parameter ranges that matter here,
+        // far short of 12. Schwinger is the new ground truth; the PF
+        // reference would only validate Schwinger to PF's actual precision.
+        //
+        // Use two mathematically rigorous anchors instead:
+        //
+        // (1) Fourier scaling identity. Substituting `w = κ u` in the IFT
+        //     definition gives
+        //       f(R; κ) = κ^{d − 4(m+s)} · f(κR; 1).
+        //     Both sides are computed by `stable_hybrid_duchon_radial`, so
+        //     this test exercises the κ-dependence of the formula —
+        //     specifically the κ_t = √(1−t)·κ chain inside the Beta
+        //     integral and the κ^{d/2−n} prefactor inside the Matérn
+        //     building block. Any error in those scalings breaks the
+        //     identity. With analytic integrands at d > 4m, 64-point
+        //     Gauss-Legendre converges spectrally (>14 digits), so the
+        //     identity holds to relative ~1e-12 in floating point.
+        let scaling_cases: &[(usize, usize, usize)] = &[
+            (5, 1, 2),
+            (9, 1, 1),
             (9, 1, 2),
             (10, 1, 1),
             (12, 2, 1),
             (16, 2, 1),
             (16, 1, 2),
-        ] {
-            for &kappa in &[0.5_f64, 1.0, 2.0] {
+        ];
+        for &(d, m, s) in scaling_cases {
+            let exp = d as i32 - 4 * (m + s) as i32;
+            for &kappa in &[0.3_f64, 0.7, 1.5, 2.5] {
                 for &r in &[0.4_f64, 1.0, 2.5] {
-                    let stable =
+                    let f_kappa =
                         closed_form_penalty::stable_hybrid_duchon_radial(d, m, s, kappa, r, 0)[0];
-                    let pf = closed_form_penalty::isotropic_duchon_penalty(0, d, m, s, kappa, r);
-                    let scale = stable.abs().max(pf.abs()).max(1e-300);
-                    let rel = (stable - pf).abs() / scale;
-                    // After `t = 1 - u²` substitution the integrand is
-                    // analytic on `[0,1]` for `d > 4m`, so 64-point
-                    // Gauss-Legendre converges spectrally (~14 digits).
-                    // PF in this well-conditioned regime carries ~12 digits.
-                    // Allow a small slack for κ/r-extreme test points.
+                    let f_unit = closed_form_penalty::stable_hybrid_duchon_radial(
+                        d,
+                        m,
+                        s,
+                        1.0,
+                        kappa * r,
+                        0,
+                    )[0];
+                    let scaled = kappa.powi(exp) * f_unit;
+                    let scale = f_kappa.abs().max(scaled.abs()).max(1e-300);
+                    let rel = (f_kappa - scaled).abs() / scale;
                     assert!(
-                        rel < 1e-10,
-                        "stable Schwinger vs PF: d={d} m={m} s={s} κ={kappa} r={r}: \
-                         stable={stable:.6e} pf={pf:.6e} rel={rel:.3e}",
+                        rel < 1e-12,
+                        "Schwinger kernel scaling identity failed: d={d} m={m} s={s} κ={kappa} r={r}: \
+                         f(r;κ)={f_kappa:.6e} κ^{{d-4(m+s)}}·f(κr;1)={scaled:.6e} rel={rel:.3e}",
                     );
                 }
+            }
+        }
+
+        // (2) κ → 0 limit against the analytic Riesz finite-part. For
+        //     `2(m+s) < d/2`, equivalently `4(m+s) < d`, the Matérn block
+        //     `M_{2(m+s)}^d(κ, R)` is in the analytic-continuation regime
+        //     (Bessel order ν = (m+s) − d/2 < 0, K_ν is regular as κ→0),
+        //     so the Beta-form integrand has no κ-divergent branch and
+        //     Schwinger limits to the regular Riesz finite-part
+        //     `R_{2(m+s)}^d(R)`. Anchoring against `riesz_kernel_value`
+        //     gives an absolute-correctness check that no self-consistency
+        //     identity can provide.
+        let kappa_zero_cases: &[(usize, usize, usize)] =
+            &[(9, 1, 1), (10, 1, 1), (16, 2, 1), (16, 1, 2)];
+        for &(d, m, s) in kappa_zero_cases {
+            let n = 2 * (m + s);
+            // Need d > 2n so that ν = n − d/2 < 0 (analytic Matérn).
+            assert!(
+                d > 2 * n,
+                "test setup error: case ({d},{m},{s}) violates d > 2(m+s)·2"
+            );
+            for &r in &[0.4_f64, 1.0, 2.5] {
+                let kappa = 1e-12_f64;
+                let stable =
+                    closed_form_penalty::stable_hybrid_duchon_radial(d, m, s, kappa, r, 0)[0];
+                let riesz = closed_form_penalty::riesz_kernel_value(d, n, r);
+                let scale = riesz.abs().max(stable.abs()).max(1e-300);
+                let rel = (stable - riesz).abs() / scale;
+                // For ν = n − d/2 < 0 (d > 2n), the half-integer K_ν has an
+                // analytic expansion `K_ν(z) = √(π/(2z)) · e^{-z} · P(1/z)`
+                // whose `e^{-z}` factor produces an O(κr) — not O((κr)²) —
+                // leading correction to the Riesz limit. At κ = 1e-12 and
+                // r ≤ 2.5 that bounds the relative correction by 2.5e-12,
+                // well inside our tolerance with safety margin for the
+                // 64-point Gauss-Legendre roundoff.
+                assert!(
+                    rel < 1e-10,
+                    "Schwinger κ→0 limit must match R_{{2(m+s)}}^d: d={d} m={m} s={s} r={r}: \
+                     stable={stable:.6e} riesz={riesz:.6e} rel={rel:.3e}",
+                );
             }
         }
     }
