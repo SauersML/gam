@@ -149,6 +149,13 @@ BIOBANK_DUCHON16D_LENGTH_SCALE = 1.0
 PGS_RAW_COLUMN = "pgs_raw"
 PGS_CTN_Z_COLUMN = "pgs_ctn_z"
 PGS_CTN_FIT_SUBSAMPLE_N = 5000
+# At biobank n=320k the fixed 5000-row subsample only covers ~1.6% of the
+# 16D continuous PC distribution, which left CTN-z with kurt≈3733 (CI run
+# 25338491995). Local n=16k with the same 5000 covers ~31% and got kurt≈7.7.
+# Scale K with sqrt(n_train) — keeps O(K^2) cost manageable while ~4×-ing
+# the per-cell coverage at biobank scale.
+PGS_CTN_FIT_SUBSAMPLE_N_BIOBANK = 20000
+PGS_CTN_FIT_SUBSAMPLE_BIOBANK_THRESHOLD = 50000
 PGS_CTN_FIT_SUBSAMPLE_SEED = 20260430
 PGS_CTN_DIAGNOSTIC_MIN_N = 40
 PGS_CTN_DIAGNOSTIC_MAX_ABS_MEAN = 0.30
@@ -732,7 +739,17 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
     # axis. The remaining budget is filled uniformly at random. The total
     # subsample size stays close to `PGS_CTN_FIT_SUBSAMPLE_N` (slightly
     # larger when many rows are in multiple per-axis extremes; we dedupe).
-    if len(train_rows) > PGS_CTN_FIT_SUBSAMPLE_N:
+    # Pick the CTN fit subsample size adaptively. At biobank scale we use
+    # PGS_CTN_FIT_SUBSAMPLE_N_BIOBANK to give the CTN basis enough coverage
+    # of the 16D continuous PC distribution (the 5000-row default leaves
+    # ~1.6% coverage at n=320k vs ~31% at n=16k local; kurt(z) drops from
+    # ~3700 toward ~10 with 4× more rows in fit).
+    effective_subsample_n = (
+        PGS_CTN_FIT_SUBSAMPLE_N_BIOBANK
+        if len(train_rows) > PGS_CTN_FIT_SUBSAMPLE_BIOBANK_THRESHOLD
+        else PGS_CTN_FIT_SUBSAMPLE_N
+    )
+    if len(train_rows) > effective_subsample_n:
         rng = np.random.default_rng(PGS_CTN_FIT_SUBSAMPLE_SEED)
         pc_cols = _pc_std_columns(spec.pc_count)
         # Cap per-axis-keep at a small fixed number, NOT (SUBSAMPLE_N // 4 //
@@ -750,7 +767,7 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
         # to ~640 rows out of 5000 (13%, vs the prior 50%). Coverage of the
         # per-axis envelope is still guaranteed; the predict-time CTN clamp
         # (5a306369) catches any predict rows beyond that envelope.
-        per_axis_keep = max(2, min(20, PGS_CTN_FIT_SUBSAMPLE_N // (16 * max(len(pc_cols), 1))))
+        per_axis_keep = max(2, min(20, effective_subsample_n // (16 * max(len(pc_cols), 1))))
         forced_idx: set[int] = set()
         for col in pc_cols:
             values = np.array([float(row[col]) for row in train_rows], dtype=float)
@@ -759,7 +776,7 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
                 forced_idx.add(int(i))
             for i in order[-per_axis_keep:]:
                 forced_idx.add(int(i))
-        random_budget = max(0, PGS_CTN_FIT_SUBSAMPLE_N - len(forced_idx))
+        random_budget = max(0, effective_subsample_n - len(forced_idx))
         if random_budget > 0:
             available = np.array(
                 sorted(set(range(len(train_rows))) - forced_idx),
@@ -886,7 +903,7 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
         f"conditional PGS CTN formula: {formula}",
         "conditional PGS CTN fit uses isotropic joint-PC Duchon geometry (no scale dimensions)",
         f"conditional PGS CTN fit is phenotype-blind and train-only; downstream z column: {PGS_CTN_Z_COLUMN}",
-        f"conditional PGS CTN fit subsample: {len(ctn_fit_rows)} of {len(train_rows)} train rows (cap {PGS_CTN_FIT_SUBSAMPLE_N})",
+        f"conditional PGS CTN fit subsample: {len(ctn_fit_rows)} of {len(train_rows)} train rows (cap {effective_subsample_n})",
         (
             f"conditional PGS CTN predict-time PC clamping: "
             f"train={total_train_clamped} test={total_test_clamped} "
