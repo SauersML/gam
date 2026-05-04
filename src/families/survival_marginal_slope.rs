@@ -3986,6 +3986,7 @@ impl SurvivalMarginalSlopeFamily {
                 )?;
             }
             for u in 0..p {
+                let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
                 for v in u..p {
                     let second_coeff = if u == primary.g {
                         fixed.coeff_bu[v]
@@ -3994,7 +3995,6 @@ impl SurvivalMarginalSlopeFamily {
                     } else {
                         [0.0; 4]
                     };
-                    let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
                     let neg_coeff_v = fixed.coeff_u[v].map(|value| -value);
                     let neg_second_coeff = second_coeff.map(|value| -value);
                     let value = exact_kernel::cell_second_derivative_from_moments(
