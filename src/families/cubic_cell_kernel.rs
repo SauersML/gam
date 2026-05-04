@@ -1260,19 +1260,25 @@ pub fn affine_anchor_moment_vector(
         s * (right - mu)
     };
     let anchor = (-alpha * alpha / (2.0 * s * s)).exp() / s;
-    let mut t = vec![0.0; max_degree + 1];
-    fill_truncated_gaussian_moments(y_left, y_right, &mut t);
+    debug_assert!(
+        max_degree <= MAX_AFFINE_ANCHOR_DEGREE,
+        "affine_anchor_moment_vector max_degree {} exceeds compile-time bound {}",
+        max_degree,
+        MAX_AFFINE_ANCHOR_DEGREE
+    );
+    let mut t = [0.0_f64; MAX_AFFINE_ANCHOR_DEGREE + 1];
+    fill_truncated_gaussian_moments(y_left, y_right, &mut t[..=max_degree]);
     // Build mu^k and s^{-k} tables once. The inner sum is the binomial
     // expansion of the affine change-of-variables, and computing the
     // binomial coefficient via Pascal's row recurrence + carrying mu/s
     // powers eliminates the per-(n, k) `powi` and binomial calls that
     // otherwise dominated the inner loop at large `max_degree`.
-    let mut mu_pow = vec![1.0_f64; max_degree + 1];
+    let mut mu_pow = [1.0_f64; MAX_AFFINE_ANCHOR_DEGREE + 1];
     for k in 1..=max_degree {
         mu_pow[k] = mu_pow[k - 1] * mu;
     }
     let inv_s = 1.0 / s;
-    let mut inv_s_pow = vec![1.0_f64; max_degree + 1];
+    let mut inv_s_pow = [1.0_f64; MAX_AFFINE_ANCHOR_DEGREE + 1];
     for k in 1..=max_degree {
         inv_s_pow[k] = inv_s_pow[k - 1] * inv_s;
     }
@@ -1357,6 +1363,10 @@ struct TransportCellState {
 const TRANSPORT_ORDER: usize = 10;
 const MAX_TRANSPORT_POLY_LEN: usize = 6 * TRANSPORT_ORDER + 1;
 const MAX_TRANSPORT_SERIES_LEN: usize = TRANSPORT_ORDER + 1;
+// Upper bound on max_degree passed to `affine_anchor_moment_vector`.
+// Public callers use 24; the transport step's required-degree budget is
+// `4 + 6 * TRANSPORT_ORDER = 64`, which dominates.
+const MAX_AFFINE_ANCHOR_DEGREE: usize = 4 + 6 * TRANSPORT_ORDER;
 const MAX_TRANSPORT_BASIS_LEN: usize = 5;
 
 #[derive(Clone, Copy, Debug)]
