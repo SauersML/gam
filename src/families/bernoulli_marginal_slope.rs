@@ -2722,6 +2722,10 @@ impl BernoulliMarginalSlopeFamily {
         )
     }
 
+    /// Halley reference implementation (degree-9 cell moments). Superseded
+    /// by [`Self::evaluate_denested_calibration_newton`] for the inner
+    /// row-intercept solver; retained for ablation / cross-checks.
+    #[allow(dead_code)]
     fn evaluate_denested_calibration(
         &self,
         a: f64,
@@ -2764,6 +2768,59 @@ impl BernoulliMarginalSlopeFamily {
             )?;
         }
         Ok((f, f_a, f_aa))
+    }
+
+    /// Newton-only variant of [`Self::evaluate_denested_calibration`] used by
+    /// the inner-PIRLS row-intercept root solver.
+    ///
+    /// Returns `(f, f', 0.0)`: the third slot — `F''(a)` — is reported as
+    /// zero, which makes [`monotone_root::solve_monotone_root`]'s safeguarded
+    /// Halley step reduce to a Newton step (the Halley denominator
+    /// `2·F'² − F·F''` collapses to `2·F'²`, so the step
+    /// `mid − 2·F·F'/(2·F'²) = mid − F/F'` is exactly Newton's). Newton
+    /// converges roughly twice as slowly near the root as Halley, but each
+    /// iteration is far cheaper because we compute cell moments only to
+    /// **degree 4** instead of degree 9. At `max_degree ≤ 4`,
+    /// `cubic_cell_kernel::reduce_sextic_moments` (cubic_cell_kernel.rs:298)
+    /// takes its fast path — slicing the affine-anchor base moments and
+    /// skipping the entire sextic recurrence + boundary-term loop — and
+    /// `affine_anchor_moment_vector` (O(max_degree²)) drops by ~4×.
+    ///
+    /// Used at every PIRLS iteration on every row, so even modest per-call
+    /// wins compound into the dominant inner-PIRLS speed-up at biobank scale.
+    /// The converged intercept is identical (Newton and Halley find the same
+    /// root); only the path differs.
+    fn evaluate_denested_calibration_newton(
+        &self,
+        a: f64,
+        marginal_eta: f64,
+        slope: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+    ) -> Result<(f64, f64, f64), String> {
+        let marginal = self.marginal_link_map(marginal_eta)?;
+        let cells = self.denested_partition_cells(a, slope, beta_h, beta_w)?;
+        let scale = self.probit_frailty_scale();
+        let mut f = -marginal.mu;
+        let mut f_a = 0.0;
+        for partition_cell in cells {
+            let cell = partition_cell.cell;
+            // Degree 4 covers both the cell integral `value` and the
+            // `dot(dc_da, moments)` first-derivative computation
+            // (`dc_da` is a length-4 coefficient vector ⇒ degree 3, plus one
+            // slot of safety).
+            let state = exact_kernel::evaluate_cell_moments(cell, 4)?;
+            f += state.value;
+            let (dc_da_raw, _) = exact_kernel::denested_cell_coefficient_partials(
+                partition_cell.score_span,
+                partition_cell.link_span,
+                a,
+                slope,
+            );
+            let dc_da = scale_coeff4(dc_da_raw, scale);
+            f_a += exact_kernel::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
+        }
+        Ok((f, f_a, 0.0))
     }
 
     fn flex_active(&self) -> bool {
@@ -2826,8 +2883,13 @@ impl BernoulliMarginalSlopeFamily {
         beta_w: Option<&Array1<f64>>,
     ) -> Result<(f64, f64), String> {
         let marginal = self.marginal_link_map(marginal_eta)?;
+        // Use the Newton-only calibration evaluator: `solve_monotone_root`
+        // safely degrades its Halley step to Newton when `F''(a) = 0`, and
+        // dropping the second derivative lets us skip the order-9
+        // cell-moment work in favour of degree-4 moments. See the comment
+        // on `evaluate_denested_calibration_newton`.
         let eval = |a: f64| -> Result<(f64, f64, f64), String> {
-            self.evaluate_denested_calibration(a, marginal_eta, slope, beta_h, beta_w)
+            self.evaluate_denested_calibration_newton(a, marginal_eta, slope, beta_h, beta_w)
         };
 
         let probit_scale = self.probit_frailty_scale();
@@ -9621,6 +9683,7 @@ mod tests {
                 score_warp: None,
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                intercept_warm_starts: None,
             };
 
         let a = 0.35;
@@ -9785,6 +9848,7 @@ mod tests {
                 score_warp: Some(score_prepared.runtime),
                 link_dev: None,
                 policy: crate::resource::ResourcePolicy::default_library(),
+                intercept_warm_starts: None,
             };
         let specs = vec![
             dummy_blockspec(1, 3),
@@ -10821,6 +10885,7 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                intercept_warm_starts: None,
             };
         let block_states = vec![
             ParameterBlockState {
@@ -10969,6 +11034,7 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                intercept_warm_starts: None,
             };
         let block_states = vec![
             ParameterBlockState {
@@ -11226,6 +11292,7 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                intercept_warm_starts: None,
             };
         let block_states = vec![
             ParameterBlockState {
@@ -11309,6 +11376,7 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                intercept_warm_starts: None,
             };
         let block_states = vec![
             ParameterBlockState {
@@ -11414,6 +11482,7 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                intercept_warm_starts: None,
             };
         let block_states = vec![
             ParameterBlockState {
@@ -11538,6 +11607,7 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                intercept_warm_starts: None,
             };
         let block_states = vec![
             ParameterBlockState {
@@ -12101,6 +12171,7 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                intercept_warm_starts: None,
             };
         let block_states = vec![
             ParameterBlockState {
@@ -12225,6 +12296,7 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                intercept_warm_starts: None,
             };
         let block_states = vec![
             ParameterBlockState {
@@ -12336,6 +12408,7 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                intercept_warm_starts: None,
             };
         let block_states = vec![
             ParameterBlockState {
@@ -12445,6 +12518,7 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                intercept_warm_starts: None,
             };
         let block_states = vec![
             ParameterBlockState {
@@ -12792,6 +12866,7 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                intercept_warm_starts: None,
             };
         let block_states = vec![
             ParameterBlockState {
@@ -13519,6 +13594,7 @@ mod tests {
                 score_warp: None,
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                intercept_warm_starts: None,
             };
         let beta_w = Array1::from_iter(
             (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
@@ -13627,6 +13703,7 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: None,
                 policy: crate::resource::ResourcePolicy::default_library(),
+                intercept_warm_starts: None,
             };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
@@ -13744,6 +13821,7 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                intercept_warm_starts: None,
             };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
@@ -13886,6 +13964,7 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                intercept_warm_starts: None,
             };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
@@ -14055,6 +14134,7 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                intercept_warm_starts: None,
             };
         let block_states = vec![
             ParameterBlockState {
@@ -14122,6 +14202,7 @@ mod tests {
                 score_warp: None,
                 link_dev: None,
                 policy: crate::resource::ResourcePolicy::default_library(),
+                intercept_warm_starts: None,
             };
         let family = make_family(sigma);
         let block_states = vec![
