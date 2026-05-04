@@ -4013,9 +4013,10 @@ impl<'a> RemlState<'a> {
         )
         .map_err(EstimationError::InvalidInput)?;
         let cost_result = self.apply_tk_to_result(cost_result, tk_terms)?;
-        let gradient = cost_result.gradient.as_ref().expect(
-            "EFS requires gradient (ValueAndGradient mode should have computed it)",
-        );
+        let gradient = cost_result
+            .gradient
+            .as_ref()
+            .expect("EFS requires gradient (ValueAndGradient mode should have computed it)");
 
         let efs_eval = if has_psi {
             let hybrid = compute_hybrid_efs_update(
