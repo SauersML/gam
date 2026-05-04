@@ -643,7 +643,8 @@ pub fn parse_countwith_basis_alias(
     default_count: usize,
 ) -> Result<usize, String> {
     let primary = option_usize(options, primarykey);
-    let basis_dim = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"]);
+    let basis_dim =
+        option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim", "knots"]);
     if primary.is_some() && basis_dim.is_some() {
         return Err(format!(
             "specify either {}=<count> or k=<basis_dim> (not both)",
@@ -658,7 +659,7 @@ fn has_explicit_countwith_basis_alias(
     primarykey: &str,
 ) -> bool {
     options.contains_key(primarykey)
-        || ["k", "basis_dim", "basis-dim", "basisdim"]
+        || ["k", "basis_dim", "basis-dim", "basisdim", "knots"]
             .iter()
             .any(|alias| options.contains_key(*alias))
 }
