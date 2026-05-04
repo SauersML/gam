@@ -265,6 +265,24 @@ struct BernoulliMarginalSlopeFamily {
     /// runs pick up the caller's analytic-operator preference instead of an
     /// inline default.
     policy: crate::resource::ResourcePolicy,
+    /// Per-row warm-start cache for the scalar intercept root-finder
+    /// (`solve_row_intercept_base`). The intercept `a` is solved per row at
+    /// every inner PIRLS iteration; without a warm start, each call burns
+    /// ~10–20 root-solver iterations re-deriving the same answer from the
+    /// closed-form rigid/affine seed. Across consecutive PIRLS iterations β
+    /// moves only a little, so the previous iter's converged `a` is an
+    /// excellent initial guess and typically lets the root-solver finish in
+    /// 1–2 iterations.
+    ///
+    /// Slots are initialised to `NaN` (sentinel for "not yet solved") and
+    /// overwritten with the converged intercept on every successful call.
+    /// `Mutex<Vec<f64>>` granularity is fine here: the interior critical
+    /// sections are O(1) Vec reads/writes amortised over the dominant
+    /// cell-moment work in the root-solver body. Set to `None` for unit-test
+    /// fixtures that build a `BernoulliMarginalSlopeFamily` directly without
+    /// running the full fit pipeline; production paths go through
+    /// `make_family` which initialises the cache to length-`n` NaN.
+    intercept_warm_starts: Option<Arc<std::sync::Mutex<Vec<f64>>>>,
 }
 
 #[derive(Clone, Default)]
@@ -2801,6 +2819,7 @@ impl BernoulliMarginalSlopeFamily {
 
     fn solve_row_intercept_base(
         &self,
+        row: usize,
         marginal_eta: f64,
         slope: f64,
         beta_h: Option<&Array1<f64>>,
@@ -2813,39 +2832,73 @@ impl BernoulliMarginalSlopeFamily {
 
         let probit_scale = self.probit_frailty_scale();
 
-        // Initial guess: closed-form for rigid probit in pre-scale denested
-        // coordinates:
+        // Closed-form fallback initial guess: rigid probit in pre-scale
+        // denested coordinates:
         //   a₀ = q·√(1 + (s_f b)²) / s_f,  s_f = 1/√(1+σ²).
         // When link deviation is active, upgrade to affine-link warm start:
         //   s_f·L(u) ≈ s_f·(ℓ₀ + ℓ₁·u)
         //   ⟹  a = (q·√(1 + (s_f ℓ₁ b)²) / s_f − ℓ₀) / ℓ₁
-        let a_rigid_pre_scale =
-            rigid_intercept_from_marginal(marginal.q, slope, probit_scale) / probit_scale;
-        let a_init = if beta_w.is_some() {
-            let v = Array1::from_vec(vec![a_rigid_pre_scale]);
-            let (l_val, l_d1) = self.link_terms_value_d1(&v, beta_w)?;
-            let ell1 = l_d1[0];
-            if ell1 > 1e-8 {
-                let ell0 = l_val[0] - ell1 * a_rigid_pre_scale;
-                let observed_logslope = probit_scale * ell1 * slope;
-                (marginal.q * (1.0 + observed_logslope * observed_logslope).sqrt() / probit_scale
-                    - ell0)
-                    / ell1
+        let a_closed_form = {
+            let a_rigid_pre_scale =
+                rigid_intercept_from_marginal(marginal.q, slope, probit_scale) / probit_scale;
+            if beta_w.is_some() {
+                let v = Array1::from_vec(vec![a_rigid_pre_scale]);
+                let (l_val, l_d1) = self.link_terms_value_d1(&v, beta_w)?;
+                let ell1 = l_d1[0];
+                if ell1 > 1e-8 {
+                    let ell0 = l_val[0] - ell1 * a_rigid_pre_scale;
+                    let observed_logslope = probit_scale * ell1 * slope;
+                    (marginal.q * (1.0 + observed_logslope * observed_logslope).sqrt()
+                        / probit_scale
+                        - ell0)
+                        / ell1
+                } else {
+                    a_rigid_pre_scale
+                }
             } else {
                 a_rigid_pre_scale
             }
-        } else {
-            a_rigid_pre_scale
         };
 
-        let (a, abs_deriv, f_best) = super::monotone_root::solve_monotone_root(
+        // Prefer the previous PIRLS iter's converged intercept as the
+        // initial guess; β changes only a little between consecutive PIRLS
+        // iterations, so the previous answer is typically within a few
+        // root-solver steps of the new one. If the cache slot is NaN
+        // (uninitialised) or non-finite (stale), fall back to the closed-
+        // form seed.
+        let cached_a = self.intercept_warm_starts.as_ref().and_then(|cache| {
+            cache.lock().ok().and_then(|guard| {
+                let value = guard.get(row).copied()?;
+                value.is_finite().then_some(value)
+            })
+        });
+        let a_init = cached_a.unwrap_or(a_closed_form);
+
+        let mut solve_result = super::monotone_root::solve_monotone_root(
             eval,
             a_init,
             "bernoulli intercept",
             1e-10,
             64,
             48,
-        )?;
+        );
+
+        // If the warm-started solve failed, retry once from the closed-form
+        // seed. Cached `a` from a prior PIRLS iter can be far enough from
+        // the current root (e.g., after a large β step) that the bracketing
+        // search exhausts; the closed-form seed always sits in the correct
+        // basin.
+        if cached_a.is_some() && solve_result.is_err() {
+            solve_result = super::monotone_root::solve_monotone_root(
+                eval,
+                a_closed_form,
+                "bernoulli intercept",
+                1e-10,
+                64,
+                48,
+            );
+        }
+        let (a, abs_deriv, f_best) = solve_result?;
 
         // Adaptive tolerance: for extreme slopes the intercept equation
         // becomes numerically flat and tight absolute precision is not
@@ -2858,6 +2911,14 @@ impl BernoulliMarginalSlopeFamily {
                 "bernoulli marginal-slope intercept solve failed: \
                  residual={f_best:.3e} at a={a:.6}, target mu={target:.6}"
             ));
+        }
+
+        // Cache the converged intercept for the next PIRLS iter.
+        if let Some(cache) = self.intercept_warm_starts.as_ref()
+            && let Ok(mut guard) = cache.lock()
+            && let Some(slot) = guard.get_mut(row)
+        {
+            *slot = a;
         }
 
         Ok((a, abs_deriv))
@@ -2875,7 +2936,7 @@ impl BernoulliMarginalSlopeFamily {
         let beta_h = self.score_beta(block_states)?;
         let beta_w = self.link_beta(block_states)?;
         let (intercept, m_a) = if self.effective_flex_active(block_states)? {
-            self.solve_row_intercept_base(marginal_eta, slope, beta_h, beta_w)?
+            self.solve_row_intercept_base(row, marginal_eta, slope, beta_h, beta_w)?
         } else {
             (
                 rigid_intercept_from_marginal(marginal.q, slope, self.probit_frailty_scale()),
@@ -7032,6 +7093,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                     for row in start..end {
                         let intercept = self
                             .solve_row_intercept_base(
+                                row,
                                 block_states[0].eta[row],
                                 block_states[1].eta[row],
                                 beta_h,
@@ -7960,6 +8022,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
                        logslope_design: &TermCollectionDesign,
                        sigma: Option<f64>|
      -> BernoulliMarginalSlopeFamily {
+        let n_rows = y.len();
         BernoulliMarginalSlopeFamily {
             y: Arc::clone(&y),
             weights: Arc::clone(&weights),
@@ -7971,6 +8034,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             score_warp: score_warp_runtime.clone(),
             link_dev: link_dev_runtime.clone(),
             policy: policy.clone(),
+            intercept_warm_starts: Some(Arc::new(std::sync::Mutex::new(vec![f64::NAN; n_rows]))),
         }
     };
 
@@ -8489,6 +8553,7 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -8603,6 +8668,7 @@ mod tests {
             score_warp: Some(score_prepared.runtime.clone()),
             link_dev: Some(link_prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -8669,6 +8735,7 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -8723,6 +8790,7 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let current = Array1::<f64>::zeros(score_dim);
         let mut proposed = current.clone();
@@ -9874,6 +9942,7 @@ mod tests {
             score_warp: None,
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let specs = vec![
             ParameterBlockSpec {
@@ -9928,6 +9997,7 @@ mod tests {
             score_warp: None,
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let states_at = |q: f64, g: f64| {
             vec![
@@ -10059,6 +10129,7 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
 
         // Three blocks: marginal (dim 0), logslope (dim 0), link_dev.
@@ -10157,6 +10228,7 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
 
         let block_states = vec![
@@ -10250,6 +10322,7 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -10386,6 +10459,7 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -10491,6 +10565,7 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
 
         let block_states = vec![
@@ -10616,6 +10691,7 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
 
         let block_states = vec![
@@ -10994,6 +11070,7 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -11072,6 +11149,7 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -11607,6 +11685,7 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -11705,6 +11784,7 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -11803,6 +11883,7 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -11912,6 +11993,7 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -12496,6 +12578,7 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -12603,6 +12686,7 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -12829,6 +12913,7 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -12910,6 +12995,7 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -12991,6 +13077,7 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -13077,6 +13164,7 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -13163,6 +13251,7 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -13238,6 +13327,7 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -13313,6 +13403,7 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let slices = block_slices(&family);
         let zero = Array1::<f64>::zeros(slices.total);
@@ -13375,6 +13466,7 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
         };
         let slices = block_slices(&family);
         let zero = Array1::<f64>::zeros(slices.total);
