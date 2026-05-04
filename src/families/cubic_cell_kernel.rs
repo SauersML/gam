@@ -300,10 +300,46 @@ pub fn reduce_sextic_moments(
     }
     let d = sextic_qprime_coefficients(cell.c0, cell.c1, cell.c2, cell.c3);
     let lead = d[5];
-    if !lead.is_finite() || lead.abs() <= 1e-18 {
+    if !lead.is_finite() {
         return Err(format!(
-            "sextic moment reduction requires nonzero leading coefficient, got {lead:.3e}"
+            "sextic moment reduction encountered non-finite leading coefficient: {lead:.3e}"
         ));
+    }
+    // The sextic recurrence divides by `lead = 3·c3²`. `branch_cell`
+    // routes a cell here when its **normalized** non-affine coefficient
+    // `k3 = c3 · (width/2)³` exceeds `NORMALIZED_CELL_BRANCH_TOL = 1e-10`,
+    // which can correspond to a raw `c3` as small as ≈ 1e-10 when the cell
+    // half-width is ≈ 1 — yielding `lead ≈ 3·1e-20 ≈ 1e-19`. Strict raw-
+    // magnitude checks (e.g. `lead > 1e-18`) and the dispatcher's
+    // normalized check disagree at exactly that scale, so a cell can pass
+    // dispatch as Sextic but fail the recurrence's stability bar.
+    //
+    // Use the dispatcher's normalized criterion here too: when the sextic
+    // contribution at the cell's geometric scale is at-or-below the same
+    // `NORMALIZED_CELL_BRANCH_TOL` that decided "non-affine", we know the
+    // sextic correction is below floating-point precision relative to the
+    // cell's scale, and the cleanest answer is the affine moment vector
+    // evaluated at this cell directly (closed form, all degrees, no
+    // unstable division).
+    let half_width = 0.5 * (cell.right - cell.left);
+    let normalized_k3 = if half_width.is_finite() {
+        cell.c3 * half_width.powi(3)
+    } else {
+        cell.c3
+    };
+    if normalized_k3.abs() <= NORMALIZED_CELL_BRANCH_TOL || lead.abs() <= 1e-18 {
+        return evaluate_affine_cell_state(
+            DenestedCubicCell {
+                left: cell.left,
+                right: cell.right,
+                c0: cell.c0,
+                c1: cell.c1,
+                c2: 0.0,
+                c3: 0.0,
+            },
+            max_degree,
+        )
+        .map(|state| state.moments);
     }
     let mut moments = vec![0.0; max_degree + 1];
     for (idx, value) in base_m0_m4.into_iter().enumerate() {
