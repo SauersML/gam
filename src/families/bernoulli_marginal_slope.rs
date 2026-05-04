@@ -14003,11 +14003,15 @@ mod tests {
     fn latent_z_normalization_rejects_extreme_non_gaussian_scores() {
         let z = array![0.0, 0.0, 0.0, 0.0, 10.0, -10.0];
         let weights = Array1::from_elem(6, 1.0);
+        let strict_policy = LatentZPolicy {
+            check_mode: LatentZCheckMode::Strict,
+            ..LatentZPolicy::default()
+        };
         let err = standardize_latent_z_with_policy(
             &z,
             &weights,
             "bernoulli-marginal-slope",
-            &LatentZPolicy::default(),
+            &strict_policy,
         )
         .expect_err("expected non-gaussian rejection");
         assert!(err.contains("approximately latent N(0,1)"));
