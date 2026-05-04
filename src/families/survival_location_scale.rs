@@ -4169,25 +4169,29 @@ fn structural_time_coefficient_lower_bounds(
     if !has_structural_support {
         // No derivative-active column on this candidate's exit-time design.
         //
-        // **Caveat — this is a relaxation, not a clean fix.** The lower
-        // bounds returned here would have forced the time-coefficient
-        // sub-vector into `β ≥ 0` on every derivative-active column, which
-        // is what guarantees a monotone-in-time hazard at exit. Dropping
-        // them lets `β` go negative on those columns, in which case the
-        // implied exit-derivative becomes negative and the marginal-slope
-        // likelihood's monotonicity assumption is violated.
+        // This is the **expected** state when `learn_timewiggle = true`:
+        // the survival path then routes through `SurvivalTimeBasisConfig::
+        // None` (see `main.rs:3846`), which builds an `(n, 0)` empty
+        // time-basis on purpose because the parametric baseline + the
+        // timewiggle block together carry the entire time structure. The
+        // `prepare_survival_time_stack` helper still appends `tw.ncols`
+        // **zero** tail columns to the exit-derivative design so the
+        // shapes line up with the timewiggle-extended coefficient vector,
+        // and those zero tail columns correctly carry no exit-derivative
+        // signal — the exit-time derivative information lives in
+        // `derivative_offset_exit` (the parametric baseline's
+        // contribution), not in any basis column. The original `Err`
+        // was a false alarm in this regime: there's nothing to put a
+        // structural lower bound on, because there are no time-coefficient
+        // basis columns whose sign matters for monotone-in-time hazard at
+        // exit. Returning `Ok(None)` is the right answer.
         //
-        // We do this anyway because at biobank scale every survival-
-        // marginal-slope baseline candidate hits a degenerate exit-time
-        // design, which means the seed ladder cannot produce any accepted
-        // candidate and the entire fit aborts. The right fix is to find
-        // out why the exit-time derivative basis ends up with no positive
-        // support across all candidates; that lives in the time-stack-prep
-        // code path and is not addressed in this commit. With this
-        // relaxation a fit *can* converge to a non-monotone-time
-        // configuration; `validate_exact_monotonicity` plus per-row
-        // feasibility checks downstream surface the violation if it
-        // actually happens.
+        // For the non-timewiggle path (e.g. `--time-basis ispline`
+        // without timewiggle), reaching this branch would still indicate
+        // a real degenerate basis. The diagnostic below distinguishes
+        // the two: with timewiggle the design is *exactly* zeros across
+        // all rows and columns; with a degenerate ispline build it would
+        // typically have small-but-nonzero entries below `DERIVATIVE_TOL`.
         // Diagnostic: report column-by-column max(|.|) and total nonzero
         // count so the next iteration can see whether the design is truly
         // all-zero or just below `DERIVATIVE_TOL`. The cell-moment / I-spline
