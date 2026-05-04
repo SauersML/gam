@@ -3991,11 +3991,15 @@ impl<'a> RemlState<'a> {
 
         let beta_for_barrier = assembly.beta.clone();
         let has_psi = assembly.ext_coords.iter().any(|c| !c.is_penalty_like);
-        let eval_mode = if has_psi {
-            super::unified::EvalMode::ValueAndGradient
-        } else {
-            super::unified::EvalMode::ValueOnly
-        };
+        // Always evaluate cost + gradient: the EFS update uses the
+        // universal-form `Δρ = log(1 − 2·g_full / q_eff)` for ρ and τ
+        // coordinates, which folds Tierney–Kadane corrections, smoothing-
+        // parameter priors, Firth bias-reduction, monotonicity barriers,
+        // and SAS log-δ ridge contributions into the multiplicative
+        // target through their gradient channel. Without the gradient
+        // the EFS step targets the wrong stationarity equation whenever
+        // any of those terms are active.
+        let eval_mode = super::unified::EvalMode::ValueAndGradient;
         self.validate_tk_ext_coords(eval_mode, &assembly.ext_coords)?;
         let tk_terms = self.tierney_kadane_terms(rho, bundle, eval_mode, &assembly.ext_coords)?;
         let inner_solution = assembly.build();
@@ -4009,11 +4013,11 @@ impl<'a> RemlState<'a> {
         )
         .map_err(EstimationError::InvalidInput)?;
         let cost_result = self.apply_tk_to_result(cost_result, tk_terms)?;
+        let gradient = cost_result.gradient.as_ref().expect(
+            "EFS requires gradient (ValueAndGradient mode should have computed it)",
+        );
 
         let efs_eval = if has_psi {
-            let gradient = cost_result.gradient.as_ref().expect(
-                "hybrid EFS requires gradient (ValueAndGradient mode should have computed it)",
-            );
             let hybrid = compute_hybrid_efs_update(
                 &inner_solution,
                 rho.as_slice().unwrap(),
@@ -4037,7 +4041,11 @@ impl<'a> RemlState<'a> {
                 psi_indices,
             }
         } else {
-            let steps = compute_efs_update(&inner_solution, rho.as_slice().unwrap());
+            let steps = compute_efs_update(
+                &inner_solution,
+                rho.as_slice().unwrap(),
+                gradient.as_slice().unwrap(),
+            );
             crate::solver::outer_strategy::EfsEval {
                 cost: cost_result.cost,
                 steps,

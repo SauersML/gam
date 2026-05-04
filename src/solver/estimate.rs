@@ -2213,39 +2213,14 @@ where
                         }
                     }
 
-                    // SAS ridge + edge barrier: these terms enter the cost
-                    // (`sas_ridge_cost`) and the gradient (estimate.rs:2170+),
-                    // but the EFS τ step for `log_delta` only targets the
-                    // REML stationarity. Without the correction below, the
-                    // outer line-search keeps shrinking α to bleed off the
-                    // ridge gradient instead of letting log_delta progress.
-                    // Append the Newton step for the extra terms — both
-                    // contributions have a positive curvature, so this is
-                    // a proper descent move on the augmented cost.
-                    if use_sas && !use_beta_logistic && sasridgeweight > 0.0
-                        && efs_eval.steps.len() > k + 1
-                    {
-                        let log_delta = theta[k + 1];
-                        if log_delta.is_finite() {
-                            let bound = sas_log_delta_bound().max(f64::EPSILON);
-                            let w = sas_log_delta_edge_barrierweight();
-                            let t = (log_delta / bound).tanh();
-                            let sech2 = (1.0 - t * t).max(1e-12);
-                            let extra_grad =
-                                sasridgeweight * log_delta + (2.0 * w / bound) * t;
-                            let extra_curv = sasridgeweight
-                                + (2.0 * w / (bound * bound)) * sech2;
-                            if extra_curv > 0.0 {
-                                let correction = -(extra_grad / extra_curv);
-                                let capped = correction.clamp(
-                                    -self::reml::unified::EFS_MAX_STEP,
-                                    self::reml::unified::EFS_MAX_STEP,
-                                );
-                                efs_eval.steps[k + 1] += capped;
-                            }
-                        }
-                    }
-
+                    // SAS log-δ ridge + edge barrier: their gradients enter
+                    // `result.gradient` from the unified evaluator (estimate.rs
+                    // 2170+), and `compute_efs_steps_with_link_ext` runs the
+                    // universal-form EFS step `Δρ = log(1 − 2·g_full/q_eff)`
+                    // which absorbs them automatically. We only need to
+                    // mirror that contribution into the *cost* slot here so
+                    // the outer fixed-point bridge's line search compares
+                    // augmented-cost trial points consistently.
                     efs_eval.cost += sas_ridge_cost(theta);
                     Ok(efs_eval)
                 },
