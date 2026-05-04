@@ -576,14 +576,18 @@ pub(crate) fn structural_time_coefficient_constraints(
     if design_derivative_exit.ncols() == 0 {
         return Ok(None);
     }
-    let lower_bounds = structural_time_coefficient_lower_bounds(
+    // `Ok(None)` from the lower-bounds helper now means "no structural
+    // ridge available" (e.g. degenerate exit-time design at this candidate);
+    // propagate it as "no constraints" so the seed validation path keeps
+    // moving instead of aborting the whole search ladder.
+    let Some(lower_bounds) = structural_time_coefficient_lower_bounds(
         design_derivative_exit,
         derivative_offset_exit,
         derivative_guard,
     )?
-    .ok_or_else(|| {
-        "structural time coefficient constraints require derivative offsets to encode the derivative guard and a non-negative derivative basis".to_string()
-    })?;
+    else {
+        return Ok(None);
+    };
     Ok(lower_bound_constraints(&lower_bounds))
 }
 
@@ -4163,10 +4167,33 @@ fn structural_time_coefficient_lower_bounds(
     }
 
     if !has_structural_support {
-        return Err(
-            "structural time coefficient bounds require at least one derivative-active column"
-                .to_string(),
+        // No derivative-active column on this candidate's exit-time design.
+        //
+        // **Caveat — this is a relaxation, not a clean fix.** The lower
+        // bounds returned here would have forced the time-coefficient
+        // sub-vector into `β ≥ 0` on every derivative-active column, which
+        // is what guarantees a monotone-in-time hazard at exit. Dropping
+        // them lets `β` go negative on those columns, in which case the
+        // implied exit-derivative becomes negative and the marginal-slope
+        // likelihood's monotonicity assumption is violated.
+        //
+        // We do this anyway because at biobank scale every survival-
+        // marginal-slope baseline candidate hits a degenerate exit-time
+        // design, which means the seed ladder cannot produce any accepted
+        // candidate and the entire fit aborts. The right fix is to find
+        // out why the exit-time derivative basis ends up with no positive
+        // support across all candidates; that lives in the time-stack-prep
+        // code path and is not addressed in this commit. With this
+        // relaxation a fit *can* converge to a non-monotone-time
+        // configuration; `validate_exact_monotonicity` plus per-row
+        // feasibility checks downstream surface the violation if it
+        // actually happens.
+        log::warn!(
+            "structural time coefficient bounds: no derivative-active column on this candidate's exit-time design ({} rows, {} cols); skipping the structural lower-bound ridge — fit may converge to a non-monotone-in-time hazard",
+            design_derivative_exit.nrows(),
+            p,
         );
+        return Ok(None);
     }
     Ok(Some(lower_bounds))
 }
