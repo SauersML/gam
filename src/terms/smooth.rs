@@ -3324,15 +3324,25 @@ pub fn build_smooth_design_withworkspace(
                 // Inject input scales into metadata; also restore the user's
                 // original length_scale (not the σ_geom-compensated one) so a
                 // metadata-driven rebuild that re-applies compensation does not
-                // double-divide.
-                if let BasisMetadata::ThinPlate {
-                    input_scales,
-                    length_scale,
-                    ..
-                } = &mut result.metadata
-                {
-                    *input_scales = scales;
-                    *length_scale = spec.length_scale;
+                // double-divide. The build may auto-promote to Duchon when
+                // canonical TPS is infeasible (k < polynomial-nullspace size);
+                // in that case patch the Duchon metadata variant so predict-time
+                // round-trips through the same standardized data path.
+                match &mut result.metadata {
+                    BasisMetadata::ThinPlate {
+                        input_scales: ms,
+                        length_scale,
+                        ..
+                    } => {
+                        *ms = scales;
+                        *length_scale = spec.length_scale;
+                    }
+                    BasisMetadata::Duchon {
+                        input_scales: ms, ..
+                    } => {
+                        *ms = scales;
+                    }
+                    _ => {}
                 }
                 result
             }

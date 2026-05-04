@@ -5854,6 +5854,43 @@ pub fn build_thin_plate_basiswithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    // Canonical TPS in dimension d uses penalty order m = ⌊d/2⌋+1 and a
+    // polynomial nullspace of size M(d) = C(d+m-1, d). For d=16 this is
+    // 735_471, well above any practical knot count. When the requested
+    // knot count is below M(d), canonical TPS is mathematically infeasible
+    // (the constraint P(C)^T α = 0 is overdetermined). Rather than reject,
+    // delegate to a pure Duchon spline — TPS's proper generalization with
+    // an additional Riesz fractional smoothness s — using parameters that
+    // satisfy Duchon's two well-posedness conditions:
+    //   (1) 2s < d                CPD-vs-nullspace adequacy
+    //   (2) 2(p + s) > d          pointwise kernel existence (kernel finite at r=0)
+    // We pick p = 2 (Linear nullspace, M' = d+1, well below typical k) and
+    // the smallest s satisfying both: s = (d-2)/2 (integer division). Both
+    // gates hold for every d ≥ 4. The resulting basis is conditionally PSD
+    // with finite kernel diagonal — the principled fix mgcv lacks.
+    if d_canonical_tps_infeasible(data.ncols(), centers.nrows()) {
+        let d = data.ncols();
+        let s = duchon_thin_plate_fallback_power(d);
+        let duchon_spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers.clone()),
+            length_scale: None,
+            power: s,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: spec.identifiability.clone(),
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+        };
+        log::info!(
+            "thin-plate basis auto-promoted to Duchon (p=2, s={}) in d={}: \
+             canonical TPS would need {} centers but got {} — using Duchon's \
+             Riesz-fractional generalization with finite kernel at r=0",
+            s,
+            d,
+            thin_plate_polynomial_basis_dimension(d),
+            centers.nrows(),
+        );
+        return build_duchon_basiswithworkspace(data, &duchon_spec, workspace);
+    }
     let internal_kernel_transform =
         thin_plate_kernel_constraint_nullspace(centers.view(), &mut workspace.cache)?;
     let poly_cols = thin_plate_polynomial_basis_dimension(centers.ncols());
@@ -15763,6 +15800,34 @@ fn thin_plate_penalty_order(dimension: usize) -> usize {
         1..=3 => 2,
         _ => dimension / 2 + 1,
     }
+}
+
+/// True when canonical TPS is mathematically infeasible at this (d, k) — the
+/// polynomial nullspace P(C) has more columns than centers, so the side
+/// constraint `P(C)^T α = 0` is overdetermined and the basis collapses.
+#[inline(always)]
+fn d_canonical_tps_infeasible(dimension: usize, num_centers: usize) -> bool {
+    num_centers < thin_plate_polynomial_basis_dimension(dimension)
+}
+
+/// Pure-Duchon Riesz fractional smoothness `s` for the TPS auto-promotion at
+/// nullspace order p=2 (Linear). Solves the smallest integer `s` jointly
+/// satisfying Duchon's CPD-vs-nullspace gate `2s < d` and the spectral
+/// kernel-existence gate `2(p + s) > d` for `p = 2`:
+///
+///   2s < d           → s ≤ ⌊(d-1)/2⌋
+///   2(2 + s) > d     → s ≥ ⌈d/2⌉ − 1
+///
+/// For d ≥ 4 both bounds are simultaneously satisfiable and the smallest
+/// admissible s is `⌈(d-3)/2⌉ = (d - 2) / 2` (integer division). For d ≤ 3,
+/// canonical TPS is never infeasible at any non-trivial knot count, so
+/// callers should not invoke this helper there; we return 0 defensively.
+#[inline(always)]
+fn duchon_thin_plate_fallback_power(dimension: usize) -> usize {
+    if dimension < 4 {
+        return 0;
+    }
+    (dimension - 2) / 2
 }
 
 #[inline(always)]
