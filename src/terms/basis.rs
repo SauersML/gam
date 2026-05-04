@@ -18278,6 +18278,180 @@ pub mod closed_form_penalty {
     use crate::linalg::utils::KahanSum;
     use crate::probability::binomial_coefficient_f64 as binomial_f64;
     use statrs::function::gamma::{gamma as gamma_fn, ln_gamma};
+    use std::sync::OnceLock;
+
+    /// Gauss-Legendre nodes and weights on `[-1, 1]` for `n` points,
+    /// computed via Newton iteration on Legendre polynomial roots
+    /// (Bonnet's recurrence). Returns `(nodes, weights)` ascending.
+    fn compute_gauss_legendre(n: usize) -> (Vec<f64>, Vec<f64>) {
+        let mut tmp: Vec<(f64, f64)> = Vec::with_capacity(n);
+        let half = n.div_ceil(2);
+        for i in 0..half {
+            let mut z = (std::f64::consts::PI * (i as f64 + 0.75) / (n as f64 + 0.5)).cos();
+            let mut pp = 0.0_f64;
+            for _ in 0..200 {
+                let mut p1 = 1.0_f64;
+                let mut p2 = 0.0_f64;
+                for j in 0..n {
+                    let p3 = p2;
+                    p2 = p1;
+                    p1 = ((2.0 * j as f64 + 1.0) * z * p2 - j as f64 * p3) / (j as f64 + 1.0);
+                }
+                pp = n as f64 * (z * p1 - p2) / (z * z - 1.0);
+                let z_prev = z;
+                z = z_prev - p1 / pp;
+                if (z - z_prev).abs() < 1e-15 {
+                    break;
+                }
+            }
+            let w = 2.0 / ((1.0 - z * z) * pp * pp);
+            // For odd n the central node is at z = 0; record once.
+            if !n.is_multiple_of(2) && i == half - 1 {
+                tmp.push((0.0, w));
+            } else {
+                tmp.push((-z.abs(), w));
+                tmp.push((z.abs(), w));
+            }
+        }
+        tmp.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut nodes = Vec::with_capacity(n);
+        let mut weights = Vec::with_capacity(n);
+        for (z, w) in tmp.into_iter().take(n) {
+            nodes.push(z);
+            weights.push(w);
+        }
+        (nodes, weights)
+    }
+
+    fn gauss_legendre_64() -> &'static (Vec<f64>, Vec<f64>) {
+        static CACHE: OnceLock<(Vec<f64>, Vec<f64>)> = OnceLock::new();
+        CACHE.get_or_init(|| compute_gauss_legendre(64))
+    }
+
+    /// True when the Beta-form Schwinger integral
+    ///
+    /// ```text
+    /// f(R) = (1/B(2m, 2s)) ∫_0^1 t^{2m-1}(1-t)^{2s-1} M_{2(m+s)}^d(√(1-t)·κ, R) dt
+    /// ```
+    ///
+    /// for the hybrid Duchon kernel
+    /// `1/(|w|^{4m}(κ²+|w|²)^{2s})` is integrable everywhere on `[0,1]`. The
+    /// only issue is the Matérn factor at `t→1` (Riesz limit κ_t → 0). For
+    /// Matérn order `n = 2(m+s)` in dimension `d`:
+    ///   * `2n > d`: M ~ κ_t^{d-2n}, the (1-t)^{2s-1} factor must absorb the
+    ///     exponent `(d-2n)/2`. Integrability at t=1 requires
+    ///     `(2s - 1) + (d - 2n)/2 > -1`, i.e. `d > 4m`.
+    ///   * `2n ≤ d`: M stays bounded; integrability is automatic.
+    /// Combining, the Schwinger integrand is everywhere bounded iff `d > 4m`
+    /// or `4(m+s) ≤ d`. The latter never coincides with the convergent
+    /// regime of canonical TPS, so we use `d > 4m` as the dispatch gate.
+    #[inline]
+    fn schwinger_radial_is_convergent(d: usize, m: usize, s: usize) -> bool {
+        let _ = s;
+        d > 4 * m
+    }
+
+    /// Numerically-stable evaluation of `[f, f', …, f^{(max_order)}](R)` for
+    /// the hybrid Duchon kernel
+    ///
+    /// ```text
+    /// f̂(w) = 1 / (|w|^{4m} · (κ² + |w|²)^{2s})
+    /// ```
+    ///
+    /// matching the codebase's PF convention (Riesz factor exponent `4m` is
+    /// `2·a` with `a = 2m`, Matérn factor exponent `2s` is the `b = 2s` from
+    /// `isotropic_duchon_penalty`). Computed via Schwinger parametrization
+    ///
+    /// ```text
+    /// 1 / (A^p B^q) = (1/B(p,q)) · ∫_0^1 t^{p-1}(1-t)^{q-1} (tA + (1-t)B)^{-(p+q)} dt
+    /// ```
+    ///
+    /// with `A = |w|²`, `B = κ² + |w|²`, `p = 2m`, `q = 2s`. The bracket
+    /// simplifies to `|w|² + (1-t)κ²`, so each integrand point is the Matérn
+    /// spectrum of order `2(m+s)` with effective inverse-length
+    /// `κ_t = √(1-t)·κ`. Inverse Fourier termwise:
+    ///
+    /// ```text
+    /// f(R) = (1/B(2m, 2s)) · ∫_0^1 t^{2m-1}(1-t)^{2s-1} · M_{2(m+s)}^d(√(1-t)·κ, R) dt
+    /// ```
+    ///
+    /// Replacing the partial-fraction expansion with this representation
+    /// eliminates the catastrophic cancellation between alternating Riesz
+    /// and Matérn blocks at high `d`: every quadrature contribution carries
+    /// its full IEEE-754 precision because the integrand is smooth and
+    /// bounded for `R > 0` (precondition `d > 4m` ensures integrability at
+    /// `t→1`; Gauss-Legendre nodes are open on `[0,1]` so `t = 1` is never
+    /// evaluated).
+    ///
+    /// Differentiation under the integral sign moves into the Matérn factor;
+    /// `M^{(k)}_{2(m+s)}^d(κ_t, R)` is computed by `matern_block_radial_derivatives`.
+    pub(crate) fn stable_hybrid_duchon_radial(
+        d: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        r: f64,
+        max_order: usize,
+    ) -> Vec<f64> {
+        debug_assert!(m >= 1, "stable_hybrid_duchon_radial: m ≥ 1");
+        debug_assert!(s >= 1, "stable_hybrid_duchon_radial: s ≥ 1");
+        debug_assert!(kappa > 0.0, "stable_hybrid_duchon_radial: κ > 0");
+        debug_assert!(r > 0.0, "stable_hybrid_duchon_radial: r > 0");
+        debug_assert!(max_order <= 6);
+        debug_assert!(
+            schwinger_radial_is_convergent(d, m, s),
+            "stable_hybrid_duchon_radial: requires d > 4m"
+        );
+
+        // Substitute `t = 1 - u²` to make the integrand analytic at the
+        // Riesz endpoint. With `p = 2m`, `q = 2s`, `n = 2(m+s)`:
+        //
+        //   ∫_0^1 t^{p-1}(1-t)^{q-1} M_n^d(√(1-t)·κ, R) dt
+        //     = 2 ∫_0^1 (1-u²)^{p-1} · u^{2q-1} · M_n^d(u·κ, R) du
+        //
+        // At `u→0`, `M_n^d(uκ, R) ∝ (uκ)^{d-2n}`, so the combined
+        // u-exponent of the integrand is `(2q-1) + (d-2n) = d - 4m - 1`.
+        // Under the convergence gate `d > 4m` this is a non-negative
+        // integer (`d`, `m` integers), so the integrand is analytic on
+        // `[0,1]`, restoring spectral Gauss-Legendre convergence (~14-16
+        // digits at 64 points). Without this substitution the original
+        // `(1-t)^{q-1}` factor combines with the diverging Matérn into
+        // `(1-t)^{(d-1)/2 - m + s}`, half-integer for odd d, which kills
+        // Gauss-Legendre's spectral rate down to 4-5 digits.
+        let (nodes, weights) = gauss_legendre_64();
+        let p_eff = 2 * m;
+        let q_eff = 2 * s;
+        let matern_order = p_eff + q_eff;
+        let log_beta = ln_gamma(p_eff as f64)
+            + ln_gamma(q_eff as f64)
+            - ln_gamma((p_eff + q_eff) as f64);
+        let inv_beta = (-log_beta).exp();
+
+        let mut accum = vec![KahanSum::default(); max_order + 1];
+        for (xi, wi) in nodes.iter().zip(weights.iter()) {
+            // Map [-1, 1] -> [0, 1] via u = (1 + ξ)/2; Jacobian du/dξ = 1/2.
+            let u = 0.5 * (1.0 + xi);
+            if u <= 0.0 || u >= 1.0 {
+                continue;
+            }
+            let kappa_u = u * kappa; // sqrt(1-t)·κ with 1-t = u²
+            let one_minus_u2 = 1.0 - u * u;
+            let one_minus_u2_pow = one_minus_u2.powi((p_eff - 1) as i32);
+            let u_pow = u.powi((2 * q_eff - 1) as i32);
+            // The factor of 2 from the t = 1-u² Jacobian, combined with
+            // 1/2 from the [-1,1]→[0,1] map, leaves the unit prefactor wi.
+            let weight = wi * one_minus_u2_pow * u_pow;
+            let matern_derivs =
+                matern_block_radial_derivatives(d, matern_order, kappa_u, r, max_order);
+            for (k, v) in matern_derivs.iter().enumerate() {
+                accum[k].add(weight * v);
+            }
+        }
+        accum
+            .iter()
+            .map(|acc| inv_beta * acc.sum())
+            .collect()
+    }
 
     const EULER_GAMMA: f64 = 0.577_215_664_901_532_9_f64;
 
@@ -19400,7 +19574,28 @@ pub mod closed_form_penalty {
             return riesz_block_radial_derivatives(d, a + 2 * s, r, max_order);
         }
 
-        // Hybrid: partial-fraction expansion (mirrors isotropic_duchon_penalty).
+        // Hybrid case (s ≥ 1, κ > 0). For high-d cases — `d > 4m` — the
+        // alternating Riesz/Matérn partial-fraction expansion below loses
+        // most of its precision to catastrophic cancellation: individual
+        // terms have magnitudes that scale with high powers of `1/r` (Riesz
+        // factors `r^{2j-d}` for j ≪ d/2) while the combined kernel is
+        // moderate, so the cumulative sum is dominated by IEEE-754 noise.
+        // The Beta-form Schwinger integral
+        //
+        //   1/(|w|^{4m}(κ²+|w|²)^{2s})
+        //     = (1/B(2m, 2s)) ∫_0^1 t^{2m-1}(1-t)^{2s-1}(|w|² + (1-t)κ²)^{-2(m+s)} dt
+        //
+        // termwise-IFT'd is a Beta-weighted average of Matérn kernels with
+        // strictly non-negative integrand. It is the same kernel as the PF
+        // expansion in exact arithmetic and remains well-behaved
+        // numerically. The convergence gate `d > 4m` ensures the t→1
+        // (Riesz limit) endpoint is integrable.
+        if schwinger_radial_is_convergent(d, m, s) {
+            return stable_hybrid_duchon_radial(d, m, s, kappa, r, max_order);
+        }
+
+        // Otherwise (low-d): fall back to PF. Cancellation is mild here
+        // because the Riesz-factor magnitudes stay bounded.
         let b = 2 * s;
         if use_duchon_small_chi_riesz_series(kappa, r) {
             return duchon_small_chi_riesz_series_radial_derivatives(
@@ -20646,6 +20841,81 @@ mod tests {
     use ndarray::{Array1, Array2, array};
     use num_dual::{DualNum, second_derivative};
     use std::sync::Arc;
+
+    #[test]
+    fn stable_hybrid_duchon_radial_matches_pf_in_well_conditioned_regime() {
+        // Schwinger Beta-form requires `d > 4m`. Compare its kernel value
+        // against the existing PF (`isotropic_duchon_penalty` at q=0) in the
+        // mild-cancellation regime where PF carries full precision. They
+        // must agree to many digits; this is the definitive correctness check.
+        for &(d, m, s) in &[
+            (9usize, 1usize, 1usize),
+            (9, 1, 2),
+            (10, 1, 1),
+            (12, 2, 1),
+            (16, 2, 1),
+            (16, 1, 2),
+        ] {
+            for &kappa in &[0.5_f64, 1.0, 2.0] {
+                for &r in &[0.4_f64, 1.0, 2.5] {
+                    let stable = closed_form_penalty::stable_hybrid_duchon_radial(
+                        d, m, s, kappa, r, 0,
+                    )[0];
+                    let pf = closed_form_penalty::isotropic_duchon_penalty(
+                        0, d, m, s, kappa, r,
+                    );
+                    let scale = stable.abs().max(pf.abs()).max(1e-300);
+                    let rel = (stable - pf).abs() / scale;
+                    // After `t = 1 - u²` substitution the integrand is
+                    // analytic on `[0,1]` for `d > 4m`, so 64-point
+                    // Gauss-Legendre converges spectrally (~14 digits).
+                    // PF in this well-conditioned regime carries ~12 digits.
+                    // Allow a small slack for κ/r-extreme test points.
+                    assert!(
+                        rel < 1e-10,
+                        "stable Schwinger vs PF: d={d} m={m} s={s} κ={kappa} r={r}: \
+                         stable={stable:.6e} pf={pf:.6e} rel={rel:.3e}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stable_hybrid_duchon_gram_is_psd_at_high_dimension() {
+        // The PF expansion at the bench's `d=16, m=2, s=8` parameters
+        // produces a Gram matrix dominated by f64 noise (sum_neg ≈ sum_pos).
+        // The stable Schwinger form must produce a PSD Gram by construction
+        // — Bochner's theorem applied to the Beta-weighted sum of strictly
+        // positive Matérn kernels.
+        let kappa = 1.0_f64;
+        let n_centers = 24;
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        for &(d, m, s) in &[(10usize, 2usize, 5usize), (16, 2, 8)] {
+            let mut centers = Array2::<f64>::zeros((n_centers, d));
+            for i in 0..n_centers {
+                for j in 0..d {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    centers[[i, j]] = ((seed >> 33) as f64) / ((1u64 << 31) as f64);
+                }
+            }
+            let g = closed_form_anisotropic_pair_block(centers.view(), 0, m, s, kappa, None);
+            let sym = symmetrize(&g);
+            let (_, evals, _) = spectral_summary(&sym).unwrap();
+            let max_ev = evals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let min_ev = evals.iter().copied().fold(f64::INFINITY, f64::min);
+            assert!(
+                max_ev > 0.0,
+                "max eigenvalue should be positive at d={d} m={m} s={s}; got {max_ev:.3e}",
+            );
+            let neg_ratio = (-min_ev) / max_ev;
+            assert!(
+                neg_ratio < 1e-6,
+                "Gram has substantial negative eigenvalues at d={d} m={m} s={s}: \
+                 max={max_ev:.3e} min={min_ev:.3e} ratio={neg_ratio:.3e}",
+            );
+        }
+    }
 
     fn dense_orthogonality_relative_residual(
         basis_matrix: ArrayView2<'_, f64>,
