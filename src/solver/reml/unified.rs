@@ -11469,7 +11469,8 @@ mod tests {
         // Augmented stationarity ⇒ q_eff = target − 2·g_extra ⇒ pick
         // q_eff so that g_full = 0 at the *augmented* optimum.
         let augmented_q = target - 2.0 * g_extra;
-        let g_full_at_aug_opt = (augmented_q + (-target) + (target)) / 2.0 + g_extra;
+        let g_full_at_aug_opt: f64 =
+            (augmented_q + (-target) + target) / 2.0 + g_extra;
         // Sanity: at augmented optimum, g_full should be 0.
         // Since g_base = (augmented_q − target)/2 = ((target − 2g_extra) − target)/2 = −g_extra,
         // and g_full = g_base + g_extra = 0. ✓
