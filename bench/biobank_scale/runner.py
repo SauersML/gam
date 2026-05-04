@@ -767,6 +767,63 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
         )
     else:
         ctn_fit_rows = train_rows
+    # Predict-time PC clamping. Why this is needed even with the stratified
+    # fit subsample:
+    #
+    # The Duchon-order-1 basis has a polynomial nullspace of order 1 (linear
+    # in PCs). Outside the convex hull of the fit-time PCs the fitted surface
+    # extrapolates linearly *without bound* — the radial basis kernels decay
+    # but the linear nullspace term grows. The stratified subsample
+    # guarantees coverage of the per-axis PC extremes so the train/test PC
+    # envelopes match per axis, but a row could still sit outside the
+    # multi-axis hull (e.g. extreme on PC1 *and* PC4 simultaneously when no
+    # fit row is). For CTN preprocessing we only need
+    # `Φ⁻¹(F(pgs|PCs)) ≈ standard normal`; we have no scientific need to
+    # extrapolate F outside the fit-time PC support, so it is safe — and
+    # standard practice in GAM prediction — to clamp out-of-range PC values
+    # to the fit envelope. Rows inside the box are unaffected; rows outside
+    # are answered with the model's value at the nearest boundary instead of
+    # an unbounded linear extrapolation. PGS_RAW is the response and is
+    # never clamped here.
+    pc_cols_for_clamp = _pc_std_columns(spec.pc_count)
+    fit_pc_min: dict[str, float] = {}
+    fit_pc_max: dict[str, float] = {}
+    for col in pc_cols_for_clamp:
+        vals = np.array([float(row[col]) for row in ctn_fit_rows], dtype=float)
+        fit_pc_min[col] = float(np.min(vals))
+        fit_pc_max[col] = float(np.max(vals))
+
+    def _clamped_rows(rows: list[dict]) -> tuple[list[dict], dict[str, int]]:
+        clamp_counts: dict[str, int] = {col: 0 for col in pc_cols_for_clamp}
+        out_rows: list[dict] = []
+        for row in rows:
+            new_row = {key: row[key] for key in ctn_columns}
+            for col in pc_cols_for_clamp:
+                v = float(row[col])
+                lo = fit_pc_min[col]
+                hi = fit_pc_max[col]
+                if v < lo:
+                    new_row[col] = repr(lo)
+                    clamp_counts[col] += 1
+                elif v > hi:
+                    new_row[col] = repr(hi)
+                    clamp_counts[col] += 1
+                else:
+                    new_row[col] = row[col]
+            out_rows.append(new_row)
+        return out_rows, clamp_counts
+
+    train_clamped, train_clamp_counts = _clamped_rows(train_rows)
+    test_clamped, test_clamp_counts = _clamped_rows(test_rows)
+    total_train_clamped = sum(train_clamp_counts.values())
+    total_test_clamped = sum(test_clamp_counts.values())
+    print(
+        f"[CTN clamp] fit-time PC envelope clamps "
+        f"train={total_train_clamped} test={total_test_clamped} "
+        f"(per-axis: train={train_clamp_counts} test={test_clamp_counts})",
+        file=sys.stderr,
+        flush=True,
+    )
     write_csv_rows(
         ctn_fit_input_path,
         [{key: row[key] for key in ctn_columns} for row in ctn_fit_rows],
@@ -774,12 +831,12 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
     )
     write_csv_rows(
         ctn_train_input_path,
-        [{key: row[key] for key in ctn_columns} for row in train_rows],
+        train_clamped,
         ctn_columns,
     )
     write_csv_rows(
         ctn_test_input_path,
-        [{key: row[key] for key in ctn_columns} for row in test_rows],
+        test_clamped,
         ctn_columns,
     )
     fit_cmd = [
@@ -815,6 +872,12 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
         "conditional PGS CTN fit uses isotropic joint-PC Duchon geometry (no scale dimensions)",
         f"conditional PGS CTN fit is phenotype-blind and train-only; downstream z column: {PGS_CTN_Z_COLUMN}",
         f"conditional PGS CTN fit subsample: {len(ctn_fit_rows)} of {len(train_rows)} train rows (cap {PGS_CTN_FIT_SUBSAMPLE_N})",
+        (
+            f"conditional PGS CTN predict-time PC clamping: "
+            f"train={total_train_clamped} test={total_test_clamped} "
+            f"clamp events to fit envelope "
+            f"({2 * len(pc_cols_for_clamp)} bounds = per-axis min/max from {len(ctn_fit_rows)} fit rows)"
+        ),
     ]
     diagnostics.extend(
         _z_moment_report(train_aug, z_column=PGS_CTN_Z_COLUMN, pc_columns=pc_cols, split_label="train")
