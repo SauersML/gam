@@ -2623,6 +2623,69 @@ fn materialize_outer_hessian_dense_sequential(
     Ok(dense)
 }
 
+/// Pick the post-rejection trust radius. If the cubic model just
+/// predicted a decrease >1e6 × |cost| (i.e. the local function is wildly
+/// non-quadratic at the proposed step), and a Newton-step-scale derived
+/// radius is materially smaller than the post-halving default, snap to
+/// the derived radius — this avoids 20+ wasted halvings when an accepted
+/// step lands in a steep-gradient basin mid-loop. Otherwise return the
+/// caller's `default_radius` (standard ARC geometric backoff).
+///
+/// `pred_dec` is the cubic model's predicted decrease at the rejected step,
+/// `default_radius` is what plain halving would set (typically
+/// `trust_radius * 0.5`), and `derived_radius` is the
+/// `|cost|/‖g‖`-derived target.
+#[inline]
+fn snap_recovery_radius_on_rejection(
+    cost: f64,
+    pred_dec: f64,
+    derived_radius: f64,
+    default_radius: f64,
+) -> f64 {
+    let cost_scale = cost.abs().max(1.0);
+    let mismatch_ratio = if pred_dec.is_finite() && pred_dec > 0.0 {
+        pred_dec / cost_scale
+    } else {
+        0.0
+    };
+    if mismatch_ratio > 1e6 && derived_radius < default_radius * 0.5 {
+        derived_radius
+    } else {
+        default_radius
+    }
+}
+
+/// Newton-step-scale initial trust radius derivation for the operator
+/// trust-region solver.
+///
+/// Given the seed cost and projected-gradient norm, return a trust radius
+/// such that the linearised first-order decrease `|g|·radius` is comparable
+/// to `|cost|`. This lands the first cubic-model probe near the right local
+/// geometry instead of forcing the optimizer to halve a thousand-fold-too-
+/// big default.
+///
+/// The result is clamped to `[OPERATOR_TRUST_RADIUS_REJECT_FLOOR · 10,
+/// OPERATOR_TRUST_RADIUS_INIT]`:
+/// - lower bound keeps us strictly above the reject-floor (so the first
+///   iter actually attempts a step rather than terminating immediately),
+/// - upper bound preserves the previous default when `‖g‖` is small (the
+///   typical, well-conditioned case): we never start more aggressively
+///   than `OPERATOR_TRUST_RADIUS_INIT`.
+///
+/// Non-finite or zero `g_norm` → fall back to `OPERATOR_TRUST_RADIUS_INIT`.
+#[inline]
+fn derive_initial_trust_radius_from_seed(cost: f64, g_norm: f64) -> f64 {
+    let cost_scale = cost.abs().max(1.0);
+    if g_norm.is_finite() && g_norm > 0.0 {
+        (cost_scale / g_norm).clamp(
+            OPERATOR_TRUST_RADIUS_REJECT_FLOOR * 10.0,
+            OPERATOR_TRUST_RADIUS_INIT,
+        )
+    } else {
+        OPERATOR_TRUST_RADIUS_INIT
+    }
+}
+
 fn project_to_bounds(x: &Array1<f64>, bounds: Option<&(Array1<f64>, Array1<f64>)>) -> Array1<f64> {
     match bounds {
         Some((lower, upper)) => {
@@ -2865,26 +2928,13 @@ fn run_operator_trust_region(
     // actual function is wildly non-quadratic at full step, the step is
     // rejected and the radius halved. Halving a thousand-fold-too-big radius
     // until it fits the local geometry costs ~10s per iter on biobank-scale
-    // CTN evaluation — about 4 minutes per CTN preprocessing call.
-    //
-    // Picking radius = |cost|/‖g‖ makes the linearised first-order decrease
-    // |g|·radius comparable to |cost|, which is the right scale for a first
-    // probe. Clamp into [REJECT_FLOOR·10, INIT] so we never start below the
-    // floor and never go above the existing default — preserving previous
-    // behaviour when ‖g‖ is small (the typical case).
-    let derived_initial_radius = {
-        let g_seed = projected_gradient(&x_k, &eval_k.gradient, bounds);
-        let g_norm = g_seed.dot(&g_seed).sqrt();
-        let cost_scale = eval_k.cost.abs().max(1.0);
-        if g_norm.is_finite() && g_norm > 0.0 {
-            (cost_scale / g_norm).clamp(
-                OPERATOR_TRUST_RADIUS_REJECT_FLOOR * 10.0,
-                OPERATOR_TRUST_RADIUS_INIT,
-            )
-        } else {
-            OPERATOR_TRUST_RADIUS_INIT
-        }
-    };
+    // CTN evaluation — about 4 minutes per CTN preprocessing call. The
+    // derivation is factored out into `derive_initial_trust_radius_from_seed`
+    // so it can be unit-tested without a full optimizer harness.
+    let g_seed_for_init = projected_gradient(&x_k, &eval_k.gradient, bounds);
+    let g_norm_for_init = g_seed_for_init.dot(&g_seed_for_init).sqrt();
+    let derived_initial_radius =
+        derive_initial_trust_radius_from_seed(eval_k.cost, g_norm_for_init);
     let mut trust_radius = initial_trust_radius
         .filter(|radius| radius.is_finite() && *radius > 0.0)
         .unwrap_or(derived_initial_radius)
@@ -3208,30 +3258,14 @@ fn run_operator_trust_region(
             // first-order decrease is comparable to |cost|. Only fires
             // when the mismatch is extreme (>1e6) so well-behaved
             // rejections continue to use ARC's standard halving.
-            let derived_recovery_radius = {
-                let cost_scale = eval_k.cost.abs().max(1.0);
-                if g_norm.is_finite() && g_norm > 0.0 {
-                    (cost_scale / g_norm).clamp(
-                        OPERATOR_TRUST_RADIUS_REJECT_FLOOR * 10.0,
-                        OPERATOR_TRUST_RADIUS_INIT,
-                    )
-                } else {
-                    new_trust_radius
-                }
-            };
-            let cost_scale = eval_k.cost.abs().max(1.0);
-            let mismatch_ratio = if pred_dec.is_finite() && pred_dec > 0.0 {
-                pred_dec / cost_scale
-            } else {
-                0.0
-            };
-            let snapped_radius = if mismatch_ratio > 1e6
-                && derived_recovery_radius < new_trust_radius * 0.5
-            {
-                derived_recovery_radius
-            } else {
-                new_trust_radius
-            };
+            let derived_recovery_radius =
+                derive_initial_trust_radius_from_seed(eval_k.cost, g_norm);
+            let snapped_radius = snap_recovery_radius_on_rejection(
+                eval_k.cost,
+                pred_dec,
+                derived_recovery_radius,
+                new_trust_radius,
+            );
             let elapsed = iter_start.elapsed().as_secs_f64();
             log::info!(
                 "[ARC-timing] iter={iter} status=rejected cost={:.6e}->{:.6e} \
@@ -3249,10 +3283,16 @@ fn run_operator_trust_region(
                 elapsed,
             );
             if snapped_radius < new_trust_radius {
+                let cost_scale_for_log = eval_k.cost.abs().max(1.0);
+                let mismatch_ratio_for_log = if pred_dec.is_finite() && pred_dec > 0.0 {
+                    pred_dec / cost_scale_for_log
+                } else {
+                    0.0
+                };
                 log::info!(
                     "[ARC-timing] iter={iter} snap_recovery: pred_dec/|cost|={:.3e} >> 1; \
                      snapped trust_radius {:.3e} -> {:.3e} (skipping ~{} halvings)",
-                    mismatch_ratio,
+                    mismatch_ratio_for_log,
                     new_trust_radius,
                     snapped_radius,
                     (new_trust_radius / snapped_radius).log2().ceil() as i64,
@@ -4079,6 +4119,135 @@ mod tests {
     use ndarray::array;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// Smart initial trust radius: when ‖g‖ ≫ |cost| (the CTN warm-start
+    /// pathology where ‖g‖ ≈ 3·10¹⁷ vs |cost| ≈ 1·10¹⁰), the derived
+    /// radius is `|cost|/‖g‖` clamped to the floor. The previous
+    /// unconditional default of 1.0 wasted ~25 halving iters on this
+    /// pattern.
+    #[test]
+    fn derive_initial_trust_radius_clamps_huge_gradient_to_floor() {
+        // Pathological CTN warm-start: |cost|=1.1e10, ‖g‖=3.3e17.
+        // Newton-scale would be ≈ 3.3e-8, well above the floor.
+        let r = derive_initial_trust_radius_from_seed(-1.1e10, 3.3e17);
+        let expected = 1.1e10 / 3.3e17;
+        assert!(
+            (r - expected).abs() < expected * 1e-10,
+            "expected {expected:.3e}, got {r:.3e}"
+        );
+        assert!(r >= OPERATOR_TRUST_RADIUS_REJECT_FLOOR * 10.0);
+        assert!(r <= OPERATOR_TRUST_RADIUS_INIT);
+
+        // Even more pathological: ‖g‖ astronomical relative to cost.
+        // Should be clamped to REJECT_FLOOR · 10, not below.
+        let clamped = derive_initial_trust_radius_from_seed(1.0, 1e30);
+        assert!((clamped - OPERATOR_TRUST_RADIUS_REJECT_FLOOR * 10.0).abs() < 1e-15);
+    }
+
+    /// Smart initial trust radius: when ‖g‖ is small (the well-conditioned
+    /// case), the derivation must NOT shrink the radius below the existing
+    /// default — otherwise we'd regress problems that previously converged
+    /// quickly with the 1.0 default.
+    #[test]
+    fn derive_initial_trust_radius_preserves_default_for_small_gradient() {
+        // |cost| = 10, ‖g‖ = 0.1: Newton-scale = 100, but capped at INIT.
+        let r = derive_initial_trust_radius_from_seed(10.0, 0.1);
+        assert!((r - OPERATOR_TRUST_RADIUS_INIT).abs() < 1e-15);
+
+        // |cost| ≈ ‖g‖: derived radius is exactly 1.0, equal to default.
+        let r = derive_initial_trust_radius_from_seed(5.0, 5.0);
+        assert!((r - 1.0).abs() < 1e-15);
+    }
+
+    /// Defensive: degenerate gradient (zero, NaN, infinity) must fall
+    /// back to the default radius rather than producing 0 or non-finite.
+    #[test]
+    fn derive_initial_trust_radius_handles_degenerate_gradient() {
+        // Zero gradient: function is at stationary point — fall back to default.
+        let r = derive_initial_trust_radius_from_seed(100.0, 0.0);
+        assert!((r - OPERATOR_TRUST_RADIUS_INIT).abs() < 1e-15);
+
+        // NaN gradient: degenerate, fall back.
+        let r = derive_initial_trust_radius_from_seed(100.0, f64::NAN);
+        assert!((r - OPERATOR_TRUST_RADIUS_INIT).abs() < 1e-15);
+
+        // Infinite gradient: nonfinite, fall back (we'd otherwise produce 0).
+        let r = derive_initial_trust_radius_from_seed(100.0, f64::INFINITY);
+        assert!((r - OPERATOR_TRUST_RADIUS_INIT).abs() < 1e-15);
+    }
+
+    /// Snap-on-rejection: when pred_dec catastrophically overestimates the
+    /// local function (>1e6 × |cost|) and the derived recovery radius is
+    /// substantially smaller than what halving would produce, snap to it.
+    /// Saves 20+ wasted halvings when an accepted step lands in a
+    /// steep-gradient basin mid-loop.
+    #[test]
+    fn snap_on_rejection_fires_for_catastrophic_pred_dec() {
+        let cost = 3.124e6_f64;
+        let pred_dec = 2.548e36_f64; // mismatch ratio ≈ 8e29, far above 1e6
+        let derived_radius = 1e-7_f64; // |cost|/‖g‖ for ‖g‖≈3e13
+        let halve_default = 0.15_f64; // trust_radius * 0.5
+
+        let r = snap_recovery_radius_on_rejection(cost, pred_dec, derived_radius, halve_default);
+        assert_eq!(
+            r, derived_radius,
+            "snap should jump to derived radius when mismatch is extreme"
+        );
+    }
+
+    /// Snap-on-rejection: well-behaved rejections (small/no model mismatch)
+    /// must use plain ARC halving, not snap. Otherwise we'd over-aggressively
+    /// shrink in normal trust-region operation.
+    #[test]
+    fn snap_on_rejection_no_op_for_normal_rejection() {
+        // Normal rejection: pred_dec is small relative to cost (within 1000×).
+        // mismatch_ratio = pred_dec / max(|cost|, 1) = 100.0. Below 1e6 threshold.
+        let cost = 1.0_f64;
+        let pred_dec = 100.0_f64;
+        let derived_radius = 1e-3_f64;
+        let halve_default = 0.5_f64;
+
+        let r = snap_recovery_radius_on_rejection(cost, pred_dec, derived_radius, halve_default);
+        assert_eq!(
+            r, halve_default,
+            "snap must NOT fire for normal-magnitude rejections"
+        );
+    }
+
+    /// Snap-on-rejection: even with extreme pred_dec, snap is suppressed
+    /// when the derived radius isn't materially smaller than what halving
+    /// would produce. Avoids redundant snaps when both paths agree.
+    #[test]
+    fn snap_on_rejection_no_op_when_derived_close_to_halve() {
+        let cost = 1e6_f64;
+        let pred_dec = 1e20_f64; // mismatch huge
+        let derived_radius = 0.4_f64; // close to halve_default
+        let halve_default = 0.5_f64;
+
+        let r = snap_recovery_radius_on_rejection(cost, pred_dec, derived_radius, halve_default);
+        assert_eq!(
+            r, halve_default,
+            "snap requires derived < default*0.5 to fire"
+        );
+    }
+
+    /// Snap-on-rejection: degenerate pred_dec (non-finite or non-positive)
+    /// must not produce a spurious snap.
+    #[test]
+    fn snap_on_rejection_handles_degenerate_pred_dec() {
+        let cost = 100.0_f64;
+        let derived_radius = 1e-6_f64;
+        let halve_default = 0.5_f64;
+
+        // NaN pred_dec: mismatch_ratio = 0, no snap.
+        let r =
+            snap_recovery_radius_on_rejection(cost, f64::NAN, derived_radius, halve_default);
+        assert_eq!(r, halve_default);
+
+        // Negative pred_dec (shouldn't happen, but defensive): no snap.
+        let r = snap_recovery_radius_on_rejection(cost, -1e10, derived_radius, halve_default);
+        assert_eq!(r, halve_default);
+    }
 
     /// `outer_scaled_tolerance` reduces to the base tolerance for trivial
     /// cost and scales as `τ · (1 + |V|)` for biobank-scale cost. This is
