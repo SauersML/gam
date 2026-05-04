@@ -76,3 +76,14 @@ harness = false
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Iteration profile — drops `lto=thin` and uses 16 codegen units to cut
+# rebuild time from ~5 min to ~90 s while keeping `opt-level = 3`. Use via
+# `cargo build --profile release-dev --bin gam`. Runtime perf is typically
+# ~85–95% of full release (LTO is the main loss); good enough for local
+# timing comparisons that aren't differentiating sub-10% perf wins.
+[profile.release-dev]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug = false
