@@ -13273,28 +13273,7 @@ pub fn fit_survival_marginal_slope_terms(
             joint_hessian,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-    // Same biobank-scale outer-loop cap as bernoulli marginal-slope — see
-    // the matching comment in `bernoulli_marginal_slope.rs` for the
-    // rationale. Default `max_outer_iter = 80` doesn't fit in the 50-min
-    // CI job budget; cap to 20 so the fit returns a partially-converged
-    // solution rather than getting cancelled.
-    let kappa_options_owned: SpatialLengthScaleOptimizationOptions;
-    let kappa_options_ref: &SpatialLengthScaleOptimizationOptions = if biobank_scale
-        && kappa_options.max_outer_iter > 20
-    {
-        kappa_options_owned = SpatialLengthScaleOptimizationOptions {
-            max_outer_iter: 20,
-            ..kappa_options.clone()
-        };
-        log::info!(
-            "[survival-marginal-slope] biobank-scale outer-loop cap: max_outer_iter {} -> {} (CI timeout protection)",
-            kappa_options.max_outer_iter,
-            kappa_options_owned.max_outer_iter,
-        );
-        &kappa_options_owned
-    } else {
-        kappa_options
-    };
+    let kappa_options_ref: &SpatialLengthScaleOptimizationOptions = kappa_options;
     let derivative_block_cache = RefCell::new(
         None::<(
             Array1<f64>,

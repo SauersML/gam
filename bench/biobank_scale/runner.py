@@ -707,10 +707,64 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
     ctn_test_pred_path = out_dir / f"{spec.name}.pgs_ctn.test_pred.csv"
     formula = _ctn_formula(spec.pc_count, centers)
     ctn_columns = [PGS_RAW_COLUMN, *_pc_std_columns(spec.pc_count)]
+    # Why this isn't a uniform random subsample any more:
+    #
+    # Previously: pick N=5000 rows uniformly at random, fit CTN on those,
+    # predict z on the full 320k train + 80k test. The Duchon basis we use
+    # for the conditional-CDF surface has a polynomial nullspace (order=1
+    # in 16D ⇒ 17-dim linear nullspace), which extrapolates *linearly* and
+    # without bound outside the basis-support region. With 320k rows the
+    # most extreme PC values sit at the 1/320,000 ≈ 3e-6 quantile; with a
+    # 5000-row uniform subsample they're at the 1/5,000 ≈ 2e-4 quantile —
+    # **64× further into the tail** in the full data than in any uniform
+    # subsample. Predict-time rows beyond the fit-time PC envelope get
+    # linearly extrapolated, which sends the conditional CDF estimate to
+    # ~0 or ~1 spuriously, and `z = Φ⁻¹(F)` then blows up: at biobank
+    # scale we measured `sd(z) ≈ 1.88`, `skew(z) ≈ 209`,
+    # `excess_kurt(z) ≈ 19711` — a few-row tail of |z| ~ 20+ that the
+    # downstream marginal-slope BFGS gradient cannot escape from in the
+    # CI 50-min budget.
+    #
+    # Fix: stratified subsample that *guarantees* the per-PC extremes are
+    # in the CTN fit set. For each `pc{i}_std` column we take the K rows
+    # with smallest values and the K rows with largest values, so the
+    # fitted basis envelope matches the prediction envelope on every
+    # axis. The remaining budget is filled uniformly at random. The total
+    # subsample size stays close to `PGS_CTN_FIT_SUBSAMPLE_N` (slightly
+    # larger when many rows are in multiple per-axis extremes; we dedupe).
     if len(train_rows) > PGS_CTN_FIT_SUBSAMPLE_N:
         rng = np.random.default_rng(PGS_CTN_FIT_SUBSAMPLE_SEED)
-        idx = rng.choice(len(train_rows), size=PGS_CTN_FIT_SUBSAMPLE_N, replace=False)
-        ctn_fit_rows = [train_rows[int(i)] for i in idx]
+        pc_cols = _pc_std_columns(spec.pc_count)
+        per_axis_keep = max(1, PGS_CTN_FIT_SUBSAMPLE_N // (4 * max(len(pc_cols), 1)))
+        forced_idx: set[int] = set()
+        for col in pc_cols:
+            values = np.array([float(row[col]) for row in train_rows], dtype=float)
+            order = np.argsort(values, kind="stable")
+            for i in order[:per_axis_keep]:
+                forced_idx.add(int(i))
+            for i in order[-per_axis_keep:]:
+                forced_idx.add(int(i))
+        random_budget = max(0, PGS_CTN_FIT_SUBSAMPLE_N - len(forced_idx))
+        if random_budget > 0:
+            available = np.array(
+                sorted(set(range(len(train_rows))) - forced_idx),
+                dtype=np.int64,
+            )
+            if available.size > random_budget:
+                random_pick = rng.choice(available, size=random_budget, replace=False)
+                forced_idx.update(int(i) for i in random_pick)
+            else:
+                forced_idx.update(int(i) for i in available)
+        idx_list = sorted(forced_idx)
+        rng.shuffle(idx_list)
+        ctn_fit_rows = [train_rows[i] for i in idx_list]
+        print(
+            f"[CTN subsample] {len(ctn_fit_rows)} rows total: "
+            f"{2 * per_axis_keep * len(pc_cols)} per-axis-extremes (max), "
+            f"rest uniform random; covers full PC envelope on every axis",
+            file=sys.stderr,
+            flush=True,
+        )
     else:
         ctn_fit_rows = train_rows
     write_csv_rows(
