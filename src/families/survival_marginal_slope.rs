@@ -51,8 +51,17 @@ use crate::solver::estimate::reml::unified::HyperOperator;
 use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::prelude::*;
+use smallvec::{SmallVec, smallvec};
 use std::cell::RefCell;
 use std::sync::Arc;
+
+/// Inline-stored polynomial coefficient vector for survival marginal-slope
+/// integrand assembly. `poly_*` helpers in this module routinely build
+/// degree ≤ ~28 polynomials (max product of four affine cell coefficient
+/// arrays of length 4) inside per-row hot loops; the previous `Vec<f64>`
+/// returns drove millions of mallocs per outer iteration on biobank-scale
+/// fits. Thirty-two inline slots cover every observed shape.
+type PolyVec = SmallVec<[f64; 32]>;
 
 // ── Spec and result types ─────────────────────────────────────────────
 
@@ -532,11 +541,11 @@ fn unit_primary_direction_ref(idx: usize) -> &'static Array1<f64> {
     &unit_primary_direction_table()[idx]
 }
 
-fn poly_mul(lhs: &[f64], rhs: &[f64]) -> Vec<f64> {
+fn poly_mul(lhs: &[f64], rhs: &[f64]) -> PolyVec {
     if lhs.is_empty() || rhs.is_empty() {
-        return Vec::new();
+        return PolyVec::new();
     }
-    let mut out = vec![0.0; lhs.len() + rhs.len() - 1];
+    let mut out: PolyVec = smallvec![0.0; lhs.len() + rhs.len() - 1];
     for (i, &lv) in lhs.iter().enumerate() {
         for (j, &rv) in rhs.iter().enumerate() {
             out[i + j] += lv * rv;
@@ -545,8 +554,8 @@ fn poly_mul(lhs: &[f64], rhs: &[f64]) -> Vec<f64> {
     out
 }
 
-fn poly_sub(lhs: &[f64], rhs: &[f64]) -> Vec<f64> {
-    let mut out = vec![0.0; lhs.len().max(rhs.len())];
+fn poly_sub(lhs: &[f64], rhs: &[f64]) -> PolyVec {
+    let mut out: PolyVec = smallvec![0.0; lhs.len().max(rhs.len())];
     for (idx, value) in lhs.iter().enumerate() {
         out[idx] += value;
     }
@@ -556,8 +565,8 @@ fn poly_sub(lhs: &[f64], rhs: &[f64]) -> Vec<f64> {
     out
 }
 
-fn poly_add(lhs: &[f64], rhs: &[f64]) -> Vec<f64> {
-    let mut out = vec![0.0; lhs.len().max(rhs.len())];
+fn poly_add(lhs: &[f64], rhs: &[f64]) -> PolyVec {
+    let mut out: PolyVec = smallvec![0.0; lhs.len().max(rhs.len())];
     for (idx, value) in lhs.iter().enumerate() {
         out[idx] += value;
     }
@@ -567,7 +576,7 @@ fn poly_add(lhs: &[f64], rhs: &[f64]) -> Vec<f64> {
     out
 }
 
-fn poly_scale(poly: &[f64], scale: f64) -> Vec<f64> {
+fn poly_scale(poly: &[f64], scale: f64) -> PolyVec {
     poly.iter().map(|value| scale * value).collect()
 }
 
@@ -4149,8 +4158,8 @@ impl SurvivalMarginalSlopeFamily {
                 let chi_poly = fixed.dc_da.to_vec();
                 let eta_aa_poly = fixed.dc_daa.to_vec();
                 let eta_aaa_poly = fixed.dc_daaa.to_vec();
-                let mut eta_u_poly = vec![Vec::new(); p];
-                let mut chi_u_poly = vec![Vec::new(); p];
+                let mut eta_u_poly = vec![PolyVec::new(); p];
+                let mut chi_u_poly = vec![PolyVec::new(); p];
                 for u in 0..p {
                     eta_u_poly[u] = poly_add(&poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u]);
                     chi_u_poly[u] = poly_add(&poly_scale(&eta_aa_poly, a_u[u]), &fixed.coeff_au[u]);
@@ -5761,8 +5770,8 @@ impl SurvivalMarginalSlopeFamily {
             let chi_poly = fixed.dc_da.to_vec();
             let eta_aa_poly = fixed.dc_daa.to_vec();
 
-            let mut eta_u_poly = vec![Vec::new(); p];
-            let mut chi_u_poly = vec![Vec::new(); p];
+            let mut eta_u_poly = vec![PolyVec::new(); p];
+            let mut chi_u_poly = vec![PolyVec::new(); p];
             for u in 0..p {
                 eta_u_poly[u] =
                     poly_add(&poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u].to_vec());
@@ -5857,8 +5866,8 @@ impl SurvivalMarginalSlopeFamily {
                 let eta_aa_poly = fixed.dc_daa.to_vec();
                 let eta_aaa_poly = fixed.dc_daaa.to_vec();
 
-                let mut eta_u_poly = vec![Vec::new(); p];
-                let mut chi_u_poly = vec![Vec::new(); p];
+                let mut eta_u_poly = vec![PolyVec::new(); p];
+                let mut chi_u_poly = vec![PolyVec::new(); p];
                 for u in 0..p {
                     eta_u_poly[u] =
                         poly_add(&poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u].to_vec());
@@ -13544,7 +13553,10 @@ mod tests {
     fn poly_mul_treats_empty_inputs_as_zero_polynomials() {
         assert!(poly_mul(&[], &[1.0, 2.0]).is_empty());
         assert!(poly_mul(&[1.0, 2.0], &[]).is_empty());
-        assert_eq!(poly_mul(&[1.0, 2.0], &[3.0, 4.0]), vec![3.0, 10.0, 8.0]);
+        assert_eq!(
+            poly_mul(&[1.0, 2.0], &[3.0, 4.0]).as_slice(),
+            &[3.0, 10.0, 8.0][..]
+        );
     }
 
     fn dummy_blockspec(cols: usize) -> ParameterBlockSpec {
