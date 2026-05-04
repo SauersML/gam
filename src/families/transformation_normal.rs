@@ -4421,37 +4421,92 @@ impl TransformationNormalFamily {
                 .as_slice()
                 .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
         ];
-        let mut out = Array2::<f64>::zeros((p_total, p_total));
+        // Parallelise the outer `for i in 0..n` row accumulation across
+        // Rayon threads. The inner k×l×c×d loop dominates wall-clock at
+        // biobank scale; per-row contributions to `out` are independent
+        // (each row only contributes additively), so a thread-local
+        // accumulator + reduction is safe and gives ~Nthreads× wall-clock
+        // win. Per-thread scratch buffers are created once via
+        // `fold(|| init, …)` and reused across all rows assigned to that
+        // thread.
+        struct Scratch {
+            out: Array2<f64>,
+            gamma: Vec<f64>,
+            gamma_dir: Vec<f64>,
+            gamma_psi: Vec<f64>,
+            gamma_psi_dir: Vec<f64>,
+            endpoint_factor: Vec<[f64; 2]>,
+            endpoint_factor_dir: Vec<[f64; 2]>,
+            endpoint_psi_cov_factor: Vec<[f64; 2]>,
+            endpoint_psi_psi_factor: Vec<[f64; 2]>,
+            endpoint_psi_cov_factor_dir: Vec<[f64; 2]>,
+            endpoint_psi_psi_factor_dir: Vec<[f64; 2]>,
+            h_factor: Vec<f64>,
+            hp_factor: Vec<f64>,
+            h_factor_dir: Vec<f64>,
+            hp_factor_dir: Vec<f64>,
+            hpsi_cov_factor: Vec<f64>,
+            hppsi_cov_factor: Vec<f64>,
+            hpsi_psi_factor: Vec<f64>,
+            hppsi_psi_factor: Vec<f64>,
+            hpsi_cov_factor_dir: Vec<f64>,
+            hppsi_cov_factor_dir: Vec<f64>,
+            hpsi_psi_factor_dir: Vec<f64>,
+            hppsi_psi_factor_dir: Vec<f64>,
+        }
+        let init_scratch = || Scratch {
+            out: Array2::<f64>::zeros((p_total, p_total)),
+            gamma: vec![0.0; p_resp],
+            gamma_dir: vec![0.0; p_resp],
+            gamma_psi: vec![0.0; p_resp],
+            gamma_psi_dir: vec![0.0; p_resp],
+            endpoint_factor: vec![[0.0_f64; 2]; p_resp],
+            endpoint_factor_dir: vec![[0.0_f64; 2]; p_resp],
+            endpoint_psi_cov_factor: vec![[0.0_f64; 2]; p_resp],
+            endpoint_psi_psi_factor: vec![[0.0_f64; 2]; p_resp],
+            endpoint_psi_cov_factor_dir: vec![[0.0_f64; 2]; p_resp],
+            endpoint_psi_psi_factor_dir: vec![[0.0_f64; 2]; p_resp],
+            h_factor: vec![0.0; p_resp],
+            hp_factor: vec![0.0; p_resp],
+            h_factor_dir: vec![0.0; p_resp],
+            hp_factor_dir: vec![0.0; p_resp],
+            hpsi_cov_factor: vec![0.0; p_resp],
+            hppsi_cov_factor: vec![0.0; p_resp],
+            hpsi_psi_factor: vec![0.0; p_resp],
+            hppsi_psi_factor: vec![0.0; p_resp],
+            hpsi_cov_factor_dir: vec![0.0; p_resp],
+            hppsi_cov_factor_dir: vec![0.0; p_resp],
+            hpsi_psi_factor_dir: vec![0.0; p_resp],
+            hppsi_psi_factor_dir: vec![0.0; p_resp],
+        };
 
-        // Hoist per-row scratch buffers out of the `for i in 0..n` loop. The
-        // original code allocated ~22 fresh Vecs per row (n × ~22 = many
-        // thousands of small allocations per call); reuse via fill instead.
-        // Math is unchanged — the fills below restore the zero-init that the
-        // `vec![0.0; …]` macros previously provided.
-        let mut gamma = vec![0.0; p_resp];
-        let mut gamma_dir = vec![0.0; p_resp];
-        let mut gamma_psi = vec![0.0; p_resp];
-        let mut gamma_psi_dir = vec![0.0; p_resp];
-        let mut endpoint_factor = vec![[0.0_f64; 2]; p_resp];
-        let mut endpoint_factor_dir = vec![[0.0_f64; 2]; p_resp];
-        let mut endpoint_psi_cov_factor = vec![[0.0_f64; 2]; p_resp];
-        let mut endpoint_psi_psi_factor = vec![[0.0_f64; 2]; p_resp];
-        let mut endpoint_psi_cov_factor_dir = vec![[0.0_f64; 2]; p_resp];
-        let mut endpoint_psi_psi_factor_dir = vec![[0.0_f64; 2]; p_resp];
-        let mut h_factor = vec![0.0; p_resp];
-        let mut hp_factor = vec![0.0; p_resp];
-        let mut h_factor_dir = vec![0.0; p_resp];
-        let mut hp_factor_dir = vec![0.0; p_resp];
-        let mut hpsi_cov_factor = vec![0.0; p_resp];
-        let mut hppsi_cov_factor = vec![0.0; p_resp];
-        let mut hpsi_psi_factor = vec![0.0; p_resp];
-        let mut hppsi_psi_factor = vec![0.0; p_resp];
-        let mut hpsi_cov_factor_dir = vec![0.0; p_resp];
-        let mut hppsi_cov_factor_dir = vec![0.0; p_resp];
-        let mut hpsi_psi_factor_dir = vec![0.0; p_resp];
-        let mut hppsi_psi_factor_dir = vec![0.0; p_resp];
-
-        for i in 0..n {
+        use rayon::prelude::*;
+        let process_row = |scratch: &mut Scratch, i: usize| {
+            let Scratch {
+                out,
+                gamma,
+                gamma_dir,
+                gamma_psi,
+                gamma_psi_dir,
+                endpoint_factor,
+                endpoint_factor_dir,
+                endpoint_psi_cov_factor,
+                endpoint_psi_psi_factor,
+                endpoint_psi_cov_factor_dir,
+                endpoint_psi_psi_factor_dir,
+                h_factor,
+                hp_factor,
+                h_factor_dir,
+                hp_factor_dir,
+                hpsi_cov_factor,
+                hppsi_cov_factor,
+                hpsi_psi_factor,
+                hppsi_psi_factor,
+                hpsi_cov_factor_dir,
+                hppsi_cov_factor_dir,
+                hpsi_psi_factor_dir,
+                hppsi_psi_factor_dir,
+            } = scratch;
             let cov_row = cov.row(i);
             let psi_row = cov_psi.row(i);
             let rv = self.response_val_basis.row(i);
@@ -4699,7 +4754,23 @@ impl TransformationNormalFamily {
                     }
                 }
             }
-        }
+        };
+
+        // Drive the per-row work in parallel. Each Rayon thread accumulates
+        // into its own Scratch (out + scratch buffers); we then reduce the
+        // per-thread `out` matrices by summation. Only `out` needs reducing —
+        // the other scratch fields are temporaries.
+        let mut out: Array2<f64> = (0..n)
+            .into_par_iter()
+            .fold(init_scratch, |mut scratch, i| {
+                process_row(&mut scratch, i);
+                scratch
+            })
+            .map(|s| s.out)
+            .reduce(
+                || Array2::<f64>::zeros((p_total, p_total)),
+                |a, b| a + b,
+            );
 
         // In-place symmetrization: avoid allocating an extra `p_total × p_total`
         // f64 matrix for `&out + &out.t()`. Mathematically identical to

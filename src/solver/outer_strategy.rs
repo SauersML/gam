@@ -1741,14 +1741,26 @@ struct OuterFixedPointBridge<'a> {
     consecutive_psi_zero_iters: usize,
 }
 
-/// Maximum number of backtracking halvings for the ψ block in the hybrid
-/// EFS+preconditioned-gradient iteration.
+/// Maximum number of α halvings for the cost line search wrapping the EFS
+/// step.
 ///
-/// If after this many halvings the combined (ρ-EFS, ψ-gradient) step still
-/// doesn't decrease V(θ), the ψ step is zeroed out and only the ρ-EFS step
-/// is applied. This preserves the EFS convergence guarantee for ρ coords
-/// even when the ψ step is too aggressive.
-const MAX_PSI_BACKTRACK: usize = 8;
+/// The Wood–Fasiolo paper proves that the EFS update direction is an *ascent
+/// direction* for REML/LAML on penalty-like coordinates, but full-step
+/// monotonicity is not guaranteed — both the original Fellner–Schall paper
+/// and the extension recommend step-length control. We backtrack the entire
+/// θ vector by halving α ∈ {1, 1/2, …, 1/2⁸ ≈ 0.004}, accepting the first
+/// trial point with a strictly lower cost. With 8 halvings the smallest
+/// trial step is ≈ 0.4% of the raw EFS step in every coordinate, which is
+/// enough to clear pathologies near the identifiability boundary while
+/// staying inside one cache-warm Hessian factorization budget.
+const MAX_EFS_BACKTRACK: usize = 8;
+
+/// Step components below this threshold (in θ-space) are treated as zero
+/// for backtracking purposes — there is no point line-searching a step of
+/// magnitude `1e-12`, and skipping the trial keeps the convergence path
+/// numerically clean (no spurious cost decreases from ULP noise).
+const EFS_NEGLIGIBLE_STEP: f64 = 1e-12;
+
 
 /// Maximum number of consecutive HybridEFS iterations whose ψ block was
 /// zeroed before the bridge bails out and triggers a solver switch.
@@ -1818,134 +1830,211 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
             FixedPointStatus::Continue
         };
 
-        let step = if matches!(status, FixedPointStatus::Stop) {
-            Array1::zeros(x.len())
-        } else if eval.psi_indices.is_some() && eval.psi_gradient.is_some() {
-            // ── Hybrid EFS+preconditioned-gradient path ──
-            //
-            // The step vector contains EFS steps for ρ/τ coordinates and
-            // preconditioned gradient steps for ψ coordinates. We perform
-            // backtracking on the ψ block to ensure the combined step
-            // decreases V(θ).
-            //
-            // Backtracking strategy:
-            // 1. Try the full combined step.
-            // 2. If it doesn't decrease V(θ), halve only the ψ portion.
-            // 3. Repeat up to MAX_PSI_BACKTRACK times.
-            // 4. If still no decrease, zero out the ψ step entirely.
-            //
-            // This preserves the EFS convergence guarantee for ρ coords:
-            // the ρ-EFS step is always applied in full, and only the ψ
-            // portion is adjusted. The ρ-EFS step has its own monotonicity
-            // guarantee from the Wood-Fasiolo theorem (valid because ρ
-            // coords satisfy the PSD + fixed-nullspace structural property).
-            let psi_indices = eval.psi_indices.as_ref().unwrap();
-            let current_cost = eval.cost;
-            let mut combined_step = Array1::from_vec(eval.steps);
+        if matches!(status, FixedPointStatus::Stop) {
+            return Ok(FixedPointSample {
+                value: eval.cost,
+                step: Array1::zeros(x.len()),
+                status,
+            });
+        }
 
-            // Save the original ψ step magnitudes for halving.
-            let original_psi_steps: Vec<f64> =
-                psi_indices.iter().map(|&i| combined_step[i]).collect();
+        let raw_step = Array1::from_vec(eval.steps);
+        let psi_indices = eval.psi_indices.clone();
+        let max_step_abs = raw_step
+            .iter()
+            .map(|s| s.abs())
+            .fold(0.0_f64, f64::max);
+        let current_cost = eval.cost;
 
-            let mut accepted = false;
-            for bt in 0..MAX_PSI_BACKTRACK {
-                // Evaluate cost at the trial point.
-                let trial = x + &combined_step;
-                match self.obj.eval_cost(&trial) {
-                    Ok(trial_cost) if trial_cost.is_finite() && trial_cost < current_cost => {
-                        // Step accepted — the combined step decreases V(θ).
-                        if bt > 0 {
-                            log::debug!(
-                                "[HYBRID-EFS] ψ backtrack accepted after {bt} halvings \
-                                 (cost: {current_cost:.6} → {trial_cost:.6})"
-                            );
-                        }
-                        accepted = true;
-                        break;
-                    }
-                    Ok(trial_cost) => {
-                        // Step rejected — halve the ψ portion.
-                        log::debug!(
-                            "[HYBRID-EFS] ψ backtrack {bt}: trial cost {trial_cost:.6} >= \
-                             current {current_cost:.6}, halving ψ step"
-                        );
-                        for (j, &i) in psi_indices.iter().enumerate() {
-                            let halved = original_psi_steps[j] * 0.5_f64.powi((bt + 1) as i32);
-                            combined_step[i] = halved;
-                        }
-                    }
-                    Err(_) => {
-                        // Evaluation failed — halve ψ step and retry.
-                        log::debug!(
-                            "[HYBRID-EFS] ψ backtrack {bt}: trial eval failed, halving ψ step"
-                        );
-                        for (j, &i) in psi_indices.iter().enumerate() {
-                            let halved = original_psi_steps[j] * 0.5_f64.powi((bt + 1) as i32);
-                            combined_step[i] = halved;
-                        }
-                    }
-                }
-            }
-
-            if !accepted {
-                // All backtracking attempts exhausted. Zero out the ψ step
-                // and rely solely on the ρ-EFS step for this iteration.
-                log::info!(
-                    "[HYBRID-EFS] ψ backtrack exhausted ({MAX_PSI_BACKTRACK} halvings). \
-                     Zeroing ψ step; applying ρ-EFS step only."
-                );
-                for &i in psi_indices {
-                    combined_step[i] = 0.0;
-                }
-                self.consecutive_psi_zero_iters = self.consecutive_psi_zero_iters.saturating_add(1);
-                if self.consecutive_psi_zero_iters >= MAX_CONSECUTIVE_PSI_STAGNATION {
-                    // Persistent ψ stagnation: the EFS ψ step direction is no
-                    // longer descent-correlated at this iterate. Continuing on
-                    // ρ alone with Δψ=0 cannot enforce ∇_ψ V = 0 (Duchon60
-                    // 1181-second slow-success). Surface the runtime
-                    // first-order fallback marker so the runner aborts the
-                    // HybridEFS attempt and the fallback ladder routes to a
-                    // joint gradient-based solver (BFGS / Arc) where ψ
-                    // stationarity is part of the optimality condition.
-                    log::info!(
-                        "[STAGE] HybridEFS -> joint gradient (BFGS/L-BFGS) fallback: \
-                         {} consecutive ψ-zero iterations after exhausted backtracking \
-                         (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e}); \
-                         warm-starting at current (β, ψ)",
-                        self.consecutive_psi_zero_iters,
-                        self.layout.rho_dim(),
-                        self.layout.psi_dim,
-                        self.layout.n_params,
-                        eval.cost,
-                    );
-                    return Err(ObjectiveEvalError::recoverable(format!(
-                        "{} HybridEFS ψ stagnation: {} consecutive iterations \
-                         exhausted backtracking and zeroed ψ step \
-                         (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e})",
-                        EFS_FIRST_ORDER_FALLBACK_MARKER,
-                        self.consecutive_psi_zero_iters,
-                        self.layout.rho_dim(),
-                        self.layout.psi_dim,
-                        self.layout.n_params,
-                        eval.cost,
-                    )));
-                }
-            } else {
+        // Negligible raw step — the iteration is at (or numerically
+        // indistinguishable from) a fixed point. Pass it through so the
+        // outer step-norm convergence check fires; no point evaluating the
+        // cost at x + 1e-30·s to chase ULP-level "improvements".
+        if max_step_abs < EFS_NEGLIGIBLE_STEP {
+            if psi_indices.is_some() {
                 self.consecutive_psi_zero_iters = 0;
             }
+            return Ok(FixedPointSample {
+                value: current_cost,
+                step: raw_step,
+                status,
+            });
+        }
 
-            combined_step
-        } else {
-            // Pure EFS path: no ψ coordinates, no backtracking needed.
-            self.consecutive_psi_zero_iters = 0;
-            Array1::from_vec(eval.steps)
-        };
+        // ── Stage 1: full-vector cost backtracking ──
+        //
+        // Wood–Fasiolo gives ascent in the EFS direction but not full-step
+        // monotonicity, so backtrack α ∈ {1, 1/2, …} on the *whole* step
+        // vector (not just ψ). This is a uniform requirement: even on the
+        // pure-ρ path, the additive log-λ formula is exact only at the
+        // fixed point and is otherwise just a Newton-flavoured Wood–Fasiolo
+        // surrogate that benefits from line search at large iterations.
+        if let Some(scaled) =
+            self.efs_backtrack(x, &raw_step, current_cost, MAX_EFS_BACKTRACK)?
+        {
+            if psi_indices.is_some() {
+                self.consecutive_psi_zero_iters = 0;
+            }
+            return Ok(FixedPointSample {
+                value: current_cost,
+                step: scaled,
+                status,
+            });
+        }
 
-        Ok(FixedPointSample {
-            value: eval.cost,
-            step,
-            status,
-        })
+        // ── Stage 2 (hybrid only): ψ-zeroed retry ──
+        //
+        // Full-vector backtracking exhausted means *every* α we tried gave
+        // a worse cost. On the hybrid path, the most common cause is a
+        // bad ψ direction polluting an otherwise-good ρ step (preconditioned
+        // gradient step on a near-singular ψ-ψ Gram matrix overshoots).
+        // Try the ρ/τ block alone with the same backtracking schedule. If
+        // that succeeds, we make progress on ρ this iteration; the ψ
+        // stagnation counter advances and triggers the joint-solver
+        // fallback once it crosses MAX_CONSECUTIVE_PSI_STAGNATION.
+        if let Some(psi_idx) = psi_indices.as_ref() {
+            let mut rho_only = raw_step.clone();
+            for &i in psi_idx {
+                rho_only[i] = 0.0;
+            }
+            let max_rho_abs = rho_only
+                .iter()
+                .map(|s| s.abs())
+                .fold(0.0_f64, f64::max);
+            if max_rho_abs >= EFS_NEGLIGIBLE_STEP {
+                if let Some(scaled) =
+                    self.efs_backtrack(x, &rho_only, current_cost, MAX_EFS_BACKTRACK)?
+                {
+                    self.consecutive_psi_zero_iters =
+                        self.consecutive_psi_zero_iters.saturating_add(1);
+                    log::info!(
+                        "[HYBRID-EFS] full-vector backtrack exhausted; ρ/τ-only step \
+                         accepted. Consecutive ψ-zero iters = {}",
+                        self.consecutive_psi_zero_iters,
+                    );
+                    if self.consecutive_psi_zero_iters >= MAX_CONSECUTIVE_PSI_STAGNATION {
+                        log::info!(
+                            "[STAGE] HybridEFS -> joint gradient (BFGS/L-BFGS) fallback: \
+                             {} consecutive ψ-zero iterations after exhausted backtracking \
+                             (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e})",
+                            self.consecutive_psi_zero_iters,
+                            self.layout.rho_dim(),
+                            self.layout.psi_dim,
+                            self.layout.n_params,
+                            current_cost,
+                        );
+                        return Err(ObjectiveEvalError::recoverable(format!(
+                            "{} HybridEFS ψ stagnation: {} consecutive iterations \
+                             exhausted backtracking and zeroed ψ step \
+                             (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e})",
+                            EFS_FIRST_ORDER_FALLBACK_MARKER,
+                            self.consecutive_psi_zero_iters,
+                            self.layout.rho_dim(),
+                            self.layout.psi_dim,
+                            self.layout.n_params,
+                            current_cost,
+                        )));
+                    }
+                    return Ok(FixedPointSample {
+                        value: current_cost,
+                        step: scaled,
+                        status,
+                    });
+                }
+            }
+            // ρ/τ-only backtracking also failed — surface the joint-solver
+            // fallback marker so the runner abandons EFS for this attempt.
+            log::info!(
+                "[STAGE] HybridEFS -> joint gradient fallback: ρ/τ-only step also \
+                 failed all {} halvings (rho_dim={}, psi_dim={}, n_params={}, \
+                 cost={:.6e})",
+                MAX_EFS_BACKTRACK,
+                self.layout.rho_dim(),
+                self.layout.psi_dim,
+                self.layout.n_params,
+                current_cost,
+            );
+            return Err(ObjectiveEvalError::recoverable(format!(
+                "{} HybridEFS step rejected after {} halvings on full vector \
+                 and {} halvings on ρ/τ-only fallback \
+                 (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e})",
+                EFS_FIRST_ORDER_FALLBACK_MARKER,
+                MAX_EFS_BACKTRACK,
+                MAX_EFS_BACKTRACK,
+                self.layout.rho_dim(),
+                self.layout.psi_dim,
+                self.layout.n_params,
+                current_cost,
+            )));
+        }
+
+        // Pure-EFS path with full backtracking exhausted: there is no ψ
+        // block to escape to. Surface the same fallback marker so the
+        // runner switches to a gradient-based solver instead of looping.
+        log::info!(
+            "[STAGE] EFS -> gradient fallback: no α ∈ {{1, …, 2^-{}}} decreased the \
+             cost (rho_dim={}, n_params={}, cost={:.6e})",
+            MAX_EFS_BACKTRACK,
+            self.layout.rho_dim(),
+            self.layout.n_params,
+            current_cost,
+        );
+        Err(ObjectiveEvalError::recoverable(format!(
+            "{} EFS step rejected after {} halvings on pure-ρ vector \
+             (rho_dim={}, n_params={}, cost={:.6e})",
+            EFS_FIRST_ORDER_FALLBACK_MARKER,
+            MAX_EFS_BACKTRACK,
+            self.layout.rho_dim(),
+            self.layout.n_params,
+            current_cost,
+        )))
+    }
+}
+
+impl OuterFixedPointBridge<'_> {
+    /// Backtrack the cost along `raw_step` by halving α ∈ {1, 1/2, …, 2^-k}
+    /// up to `max_halvings` times. Returns `Some(α·raw_step)` for the first
+    /// α that yields a strictly lower finite cost, `None` if every trial
+    /// failed or evaluation errored. Eval errors at trial points are
+    /// treated as step rejection (a common pathology in inner solves at
+    /// over-aggressive λ jumps), not propagated.
+    fn efs_backtrack(
+        &mut self,
+        x: &Array1<f64>,
+        raw_step: &Array1<f64>,
+        current_cost: f64,
+        max_halvings: usize,
+    ) -> Result<Option<Array1<f64>>, ObjectiveEvalError> {
+        let mut alpha = 1.0_f64;
+        for bt in 0..=max_halvings {
+            let trial_step = raw_step * alpha;
+            let trial = x + &trial_step;
+            match self.obj.eval_cost(&trial) {
+                Ok(c) if c.is_finite() && c < current_cost => {
+                    if bt > 0 {
+                        log::debug!(
+                            "[EFS] backtrack accepted at α=2^-{bt}={alpha:.4e} \
+                             after {bt} halvings (cost: {current_cost:.6e} → {c:.6e})"
+                        );
+                    }
+                    return Ok(Some(trial_step));
+                }
+                Ok(c) => {
+                    log::trace!(
+                        "[EFS] backtrack α=2^-{bt}={alpha:.4e}: trial cost {c:.6e} \
+                         not below current {current_cost:.6e}, halving"
+                    );
+                }
+                Err(err) => {
+                    log::trace!(
+                        "[EFS] backtrack α=2^-{bt}={alpha:.4e}: trial eval failed \
+                         ({err}), halving"
+                    );
+                }
+            }
+            alpha *= 0.5;
+        }
+        Ok(None)
     }
 }
 
