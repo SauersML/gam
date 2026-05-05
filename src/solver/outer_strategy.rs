@@ -1601,7 +1601,16 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         // and the screening cap (combined via min).
         if let Some(cap_arc) = self.outer_inner_cap.as_ref() {
             let cap = first_order_inner_cap_schedule(self.iter_count);
-            cap_arc.store(cap, Ordering::Relaxed);
+            let prev = cap_arc.swap(cap, Ordering::Relaxed);
+            if prev != cap {
+                log::info!(
+                    "[OUTER schedule] inner-PIRLS cap transition iter={} prev={} new={} ({})",
+                    self.iter_count,
+                    prev,
+                    cap,
+                    if cap == 0 { "uncapped" } else { "capped" }
+                );
+            }
         }
         let stage_start = std::time::Instant::now();
         log::info!(
@@ -1725,7 +1734,16 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
         self.layout.validate_point_len(x, "outer eval failed")?;
         if let Some(cap_arc) = self.outer_inner_cap.as_ref() {
             let cap = first_order_inner_cap_schedule(self.eval_count);
-            cap_arc.store(cap, Ordering::Relaxed);
+            let prev = cap_arc.swap(cap, Ordering::Relaxed);
+            if prev != cap {
+                log::info!(
+                    "[OUTER schedule] inner-PIRLS cap transition (ARC bridge) eval_count={} prev={} new={} ({})",
+                    self.eval_count,
+                    prev,
+                    cap,
+                    if cap == 0 { "uncapped" } else { "capped" }
+                );
+            }
         }
         let stage_start = std::time::Instant::now();
         log::info!(
@@ -1763,7 +1781,16 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
         self.layout.validate_point_len(x, "outer eval failed")?;
         if let Some(cap_arc) = self.outer_inner_cap.as_ref() {
             let cap = first_order_inner_cap_schedule(self.eval_count);
-            cap_arc.store(cap, Ordering::Relaxed);
+            let prev = cap_arc.swap(cap, Ordering::Relaxed);
+            if prev != cap {
+                log::info!(
+                    "[OUTER schedule] inner-PIRLS cap transition (ARC bridge) eval_count={} prev={} new={} ({})",
+                    self.eval_count,
+                    prev,
+                    cap,
+                    if cap == 0 { "uncapped" } else { "capped" }
+                );
+            }
         }
         let stage_start = std::time::Instant::now();
         log::info!(

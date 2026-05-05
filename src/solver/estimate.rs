@@ -1991,9 +1991,14 @@ where
         // 5/10/20 rather than the full inner budget. Reset the cap to 0
         // and run one final cost eval at the converged ρ so the cached
         // β is at full inner tolerance.
-        reml_state
+        let prev_cap = reml_state
             .outer_inner_cap
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        if prev_cap != 0 {
+            log::info!(
+                "[OUTER guard] convergence-guard re-eval at converged ρ (prev_cap={prev_cap}, refit at full inner tolerance)"
+            );
+        }
         let _ = reml_state.compute_cost(&strategy_result.rho);
         (
             strategy_result.rho.clone(),
@@ -2248,9 +2253,14 @@ where
         // converged ρ so the cached warm-start β is at full inner
         // tolerance regardless of where the BFGS schedule was when the
         // optimizer terminated.
-        reml_state
+        let prev_cap_mix = reml_state
             .outer_inner_cap
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        if prev_cap_mix != 0 {
+            log::info!(
+                "[OUTER guard] convergence-guard re-eval at converged ρ (mixture/SAS arm; prev_cap={prev_cap_mix})"
+            );
+        }
         let _ = reml_state.compute_cost(&outer_result.rho);
         let final_rho = outer_result.rho.slice(s![..k]).to_owned();
         let final_mix_state = if use_mixture {
