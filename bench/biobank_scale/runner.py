@@ -7,6 +7,7 @@ import importlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1520,7 +1521,32 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, s
     captured_stderr = "".join(err_buf)
     if (routing_path := _routing_log_path()) is not None:
         _append_routing_lines(routing_path, captured_stderr)
+    # Emit a per-phase wall-clock summary parsed from the gam binary's
+    # `[PHASE]` markers so CI logs end with a quick-glance breakdown of
+    # CTN / margslope / standard-GAM / location-scale phase timings.
+    _emit_phase_summary(captured_stderr, preview)
     return rc, "".join(out_buf), captured_stderr
+
+
+_PHASE_END_PATTERN = re.compile(
+    r"\[PHASE\]\s+([\w\-]+(?:\([\w\-/]+\))?)\s+(?:fit\s+)?(?:end|done)\s+elapsed=([\d.]+)s"
+)
+
+
+def _emit_phase_summary(captured_stderr: str, cmd_preview: str) -> None:
+    matches = _PHASE_END_PATTERN.findall(captured_stderr)
+    if not matches:
+        return
+    total = sum(float(secs) for _, secs in matches)
+    by_phase: dict[str, float] = {}
+    for name, secs in matches:
+        by_phase[name] = by_phase.get(name, 0.0) + float(secs)
+    parts = [f"{name}={secs:.1f}s" for name, secs in by_phase.items()]
+    print(
+        f"[PHASE summary] cmd='{cmd_preview}' total={total:.1f}s {' '.join(parts)}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def tool_exists(name: str) -> bool:
