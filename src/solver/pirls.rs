@@ -3881,12 +3881,27 @@ where
             }
             Err(err) => return Err(err),
         };
+        let mut curvature_total = curvature_start.elapsed();
         log::info!(
             "[STAGE] PIRLS update_with_curvature iter={} curvature={:?} elapsed={:.3}s",
             iter,
             preferred_curvature,
-            curvature_start.elapsed().as_secs_f64(),
+            curvature_total.as_secs_f64(),
         );
+        // Per-iter LM-loop accumulators. Surface where the inner Newton
+        // spends time when the LM has to halve repeatedly: solve-direction
+        // work (assemble + factorize + back-solve), candidate evaluation
+        // (model.update_candidate — for FLEX margslope this is the per-row
+        // sextic-kernel intercept root-find, the dominant cost at biobank
+        // shape per memory/scaling_law_margslope_inner_pirls.md), and the
+        // predicted-reduction quadratic form. The breakdown emits at
+        // iter-end alongside the existing [PIRLS iter-end] line, giving a
+        // structured signal we can aggregate across the run to identify
+        // which sub-phase to optimize next.
+        let mut lm_solve_total = std::time::Duration::ZERO;
+        let mut lm_candidate_total = std::time::Duration::ZERO;
+        let mut lm_predred_total = std::time::Duration::ZERO;
+        let mut lm_attempts_done = 0usize;
         let current_penalized = penalizedobjective(&state);
         if current_penalized.is_finite() && current_penalized < min_penalized_deviance {
             min_penalized_deviance = current_penalized;
@@ -3948,6 +3963,8 @@ where
 
         loop {
             attempts += 1;
+            lm_attempts_done += 1;
+            let attempt_solve_start = std::time::Instant::now();
 
             // 1. Solve (H + λI)δ = -g
             // Update diagonal in-place: add (loop_lambda - applied_lambda) to diagonal
@@ -4015,6 +4032,7 @@ where
                     }
                     // Singular even with ridge (unlikely unless huge). Increase lambda.
                     if lm_can_retry(loop_lambda) {
+                        lm_solve_total += attempt_solve_start.elapsed();
                         loop_lambda *= lambda_factor;
                         continue;
                     } else {
@@ -4025,6 +4043,7 @@ where
                     }
                 }
             };
+            lm_solve_total += attempt_solve_start.elapsed();
             if !array1_is_finite(direction) {
                 if lm_can_retry(loop_lambda) {
                     loop_lambda *= lambda_factor;
@@ -4045,6 +4064,7 @@ where
             // Actually, we should check against the model: m(0) - m(δ)
             // m(δ) = L_old + g'δ + 0.5 δ'Hδ.
             // Reduction = -(g'δ + 0.5 δ'Hδ)
+            let predred_start = std::time::Instant::now();
             let q_term = if let Some(sparse_reg) = cached_sparse_regularized.as_ref() {
                 sparse_symmetric_upper_matvec_public(sparse_reg, direction)
             } else {
@@ -4053,6 +4073,7 @@ where
             let quad = 0.5 * direction.dot(&q_term);
             let lin = state.gradient.dot(direction);
             let predicted_reduction = -(lin + quad);
+            lm_predred_total += predred_start.elapsed();
 
             // 3. Compute Actual Reduction
             let mut candidatevec = &*beta + direction;
@@ -4062,7 +4083,11 @@ where
                 project_coefficients_to_lower_bounds(&mut candidatevec, lb);
             }
             let candidate_beta = Coefficients::new(candidatevec);
-            match model.update_candidate(&candidate_beta, state.hessian_curvature) {
+            let candidate_eval_start = std::time::Instant::now();
+            let candidate_eval_result =
+                model.update_candidate(&candidate_beta, state.hessian_curvature);
+            lm_candidate_total += candidate_eval_start.elapsed();
+            match candidate_eval_result {
                 Ok(candidate_state) => {
                     let screening_penalized = penalizedobjective(&candidate_state);
                     let screening_reduction = current_penalized - screening_penalized;
@@ -4105,9 +4130,11 @@ where
                         && eta_ok
                     {
                         let accepted_state = if options.firth_bias_reduction {
-                            match model
-                                .update_with_curvature(&candidate_beta, state.hessian_curvature)
-                            {
+                            let firth_curv_start = std::time::Instant::now();
+                            let firth_curv_result =
+                                model.update_with_curvature(&candidate_beta, state.hessian_curvature);
+                            curvature_total += firth_curv_start.elapsed();
+                            match firth_curv_result {
                                 Ok(state) => state,
                                 Err(err) => {
                                     if !is_lm_retriable_candidate_error(&err) {
@@ -4324,8 +4351,10 @@ where
                             if consecutive_fisher_fallbacks > 2 {
                                 force_fisher_for_rest = true;
                             }
+                            let fisher_fallback_start = std::time::Instant::now();
                             state =
                                 model.update_with_curvature(&beta, HessianCurvatureKind::Fisher)?;
+                            curvature_total += fisher_fallback_start.elapsed();
                             regularized = state.hessian.clone();
                             applied_lambda = 0.0;
                             cached_sparse_regularized = None;
@@ -4438,7 +4467,9 @@ where
                         if consecutive_fisher_fallbacks > 2 {
                             force_fisher_for_rest = true;
                         }
+                        let fisher_err_start = std::time::Instant::now();
                         state = model.update_with_curvature(&beta, HessianCurvatureKind::Fisher)?;
+                        curvature_total += fisher_err_start.elapsed();
                         regularized = state.hessian.clone();
                         applied_lambda = 0.0;
                         cached_sparse_regularized = None;
@@ -4474,14 +4505,38 @@ where
         // is currently hardcoded; once we have per-iter timing we can
         // exit early when the iteration is cheap (small change) AND
         // the residual is small.
+        let iter_elapsed = iter_start.elapsed();
         log::info!(
             "[PIRLS iter-end] iter={:>3} elapsed={:.4}s lm_lambda={:.2e} g_norm={:.3e} last_dev_change={:.3e} last_halving={}",
             iter,
-            iter_start.elapsed().as_secs_f64(),
+            iter_elapsed.as_secs_f64(),
             lambda,
             lastgradient_norm,
             last_deviance_change,
             last_step_halving,
+        );
+        // Per-iter LM-loop breakdown: tells us where the inner Newton
+        // spent time. Sum of (curvature + solve + predred + candidate) is
+        // a lower bound on iter_elapsed; the residual is everything else
+        // (bookkeeping, soft-acceptance checks, KKT certification, etc).
+        // For FLEX margslope at biobank shape we expect candidate to
+        // dominate (per-row sextic-kernel intercept root-find, see
+        // memory/scaling_law_margslope_inner_pirls.md). For dense
+        // standard-GAM with no per-row Newton inner, solve typically
+        // dominates because of the O(p³) Cholesky in the LM solve.
+        // Knowing which path is hot tells us where the next principled
+        // optimization should land.
+        let timed_total = curvature_total + lm_solve_total + lm_predred_total + lm_candidate_total;
+        let other_total = iter_elapsed.saturating_sub(timed_total);
+        log::info!(
+            "[PIRLS iter-breakdown] iter={:>3} attempts={} curvature={:.3}s solve={:.3}s predred={:.3}s candidate={:.3}s other={:.3}s",
+            iter,
+            lm_attempts_done,
+            curvature_total.as_secs_f64(),
+            lm_solve_total.as_secs_f64(),
+            lm_predred_total.as_secs_f64(),
+            lm_candidate_total.as_secs_f64(),
+            other_total.as_secs_f64(),
         );
     }
 
