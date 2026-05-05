@@ -3337,19 +3337,6 @@ impl PenaltySubspaceTrace {
         self.trace_projected_logdet_reduced(&self.reduce_operator(a))
     }
 
-    /// Reduced rank `r` of the identified subspace (the column count of
-    /// `U_S`).  At biobank scale `r << p` typically, so reductions
-    /// through this kernel cost `O(p·r)` rather than `O(p²)`.
-    ///
-    /// `#[allow(dead_code)]` until priority item (c) wires it into the
-    /// matrix-free outer-Hessian operator (the projected-kernel
-    /// extension to `build_outer_hessian_operator`); covered by
-    /// `penalty_subspace_trace_apply_matches_dense_kernel` test.
-    #[allow(dead_code)]
-    pub fn rank(&self) -> usize {
-        self.u_s.ncols()
-    }
-
     /// Apply the projected kernel `K = U_S · H_proj⁻¹ · U_Sᵀ` to a vector
     /// without materializing `K`.  Three steps:
     ///
@@ -12773,9 +12760,6 @@ mod tests {
             u_s: u_s.clone(),
             h_proj_inverse: h_proj_inverse.clone(),
         };
-
-        // rank() reports the column count of U_S.
-        assert_eq!(trace.rank(), 2);
 
         // Materialize K = U_S · H_proj⁻¹ · U_Sᵀ for the reference.
         let temp = u_s.dot(&h_proj_inverse); // 4×2
