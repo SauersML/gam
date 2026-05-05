@@ -654,6 +654,7 @@ fn rank_seeds_with_screening(
     let mut rejected = 0usize;
     let mut final_cap_used = initial_cap;
     let mut stages_consumed = 0usize;
+    let cascade_start = std::time::Instant::now();
 
     for (stage, &cap) in cascade_caps.iter().enumerate() {
         screening_cap.store(cap, Ordering::Relaxed);
@@ -689,6 +690,14 @@ fn rank_seeds_with_screening(
 
     screening_cap.store(previous_cap, Ordering::Relaxed);
     obj.reset();
+    log::info!(
+        "[OUTER] {context}: seed screening cascade complete elapsed={:.3}s stages_used={} final_cap={} ranked={}/{}",
+        cascade_start.elapsed().as_secs_f64(),
+        stages_consumed,
+        if final_cap_used == 0 { "uncapped".to_string() } else { final_cap_used.to_string() },
+        ranked.len(),
+        seeds.len(),
+    );
 
     if ranked.is_empty() {
         log::info!(
