@@ -749,6 +749,35 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         )
         self.assertEqual(v, "MARGINAL", f"detail={d}")
 
+    def test_phase_summary_aggregates_outer_nonfinite_warnings(self) -> None:
+        # `[OUTER non-finite]` is a bug signal — the REML unified
+        # evaluator hit a NaN / Inf in an intermediate. Should be 0 in
+        # healthy fits; any non-zero count must surface prominently in
+        # the summary so a CI reviewer sees it.
+        stderr = "\n".join([
+            "[OUTER non-finite] rho_a_vals[2] at (2, 2) = NaN",
+            "[OUTER non-finite] penalty_a_k_betas[1] has non-finite",
+            "[OUTER non-finite] penalty_a_k_betas[3] has non-finite",
+            "[OUTER non-finite] leverage h^G has non-finite entries",
+            "[PHASE] my-fit fit end elapsed=10.0s",
+        ])
+        out = self._run_summary(stderr)
+        # Total count surfaces.
+        self.assertIn("outer_nonfinite=4", out)
+        # Per-intermediate breakdown groups by name (sorted).
+        self.assertIn("outer_nonfinite_at=[", out)
+        self.assertIn("penalty_a_k_betas[1]=1", out)
+        self.assertIn("penalty_a_k_betas[3]=1", out)
+        # The first-token capture covers the field-name token before
+        # the parenthesized indices.
+
+    def test_phase_summary_omits_outer_nonfinite_when_count_is_zero(self) -> None:
+        # Healthy fit: no [OUTER non-finite] markers. Aggregation should
+        # not emit the field at all (rather than `outer_nonfinite=0`).
+        stderr = "[PHASE] my-fit fit end elapsed=10.0s\n"
+        out = self._run_summary(stderr)
+        self.assertNotIn("outer_nonfinite", out)
+
     def test_phase_summary_aggregates_tangent_line_predicts_and_rejects(self) -> None:
         # Pin down that [TANGENT-PREDICT] / [TANGENT-REJECTED] markers
         # roll up into the [PHASE summary] line and surface the

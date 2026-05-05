@@ -1506,6 +1506,7 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, s
                             "[PHASE]" in line
                             or "[OUTER summary]" in line
                             or "[OUTER guard]" in line
+                            or "[OUTER non-finite]" in line
                             or "[PIRLS iter-end]" in line
                             or "[PIRLS solve-end]" in line
                             or "[KAPPA-PHASE" in line
@@ -1654,6 +1655,16 @@ _IFT_NOOP_PATTERN = re.compile(r"\[IFT-NOOP\]\s+reason=(\w+)")
 # failed entirely → both predictors fell through to flat".
 _TANGENT_PREDICT_PATTERN = re.compile(r"\[TANGENT-PREDICT\]\s+alpha=")
 _TANGENT_REJECTED_PATTERN = re.compile(r"\[TANGENT-REJECTED\]\s+reason=(\w+)")
+
+# `[OUTER non-finite]` warnings from the REML unified evaluator. Each
+# line records a NaN / Inf in an intermediate of the outer-Hessian /
+# leverage / adjoint computation. In a healthy fit the count is zero;
+# any non-zero count is a bug signal pointing to penalty drift, cross-
+# trace overflow, or similar numerical instability that would degrade
+# the fit. Emitted only as `log::warn!` so stderr captures it; the
+# field-name capture lets the runner show WHICH intermediate was
+# affected without having to dump the full warning lines.
+_OUTER_NONFINITE_PATTERN = re.compile(r"\[OUTER non-finite\]\s+(\S+)")
 
 
 _PHASE_START_PATTERN = re.compile(r"\[PHASE\]\s+([\w\-]+(?:\([\w\-/]+\))?)\s+(?:fit\s+)?start")
@@ -1839,6 +1850,25 @@ def _emit_phase_summary(
             parts.append(
                 f"ift_h_logdet_min={l_min:.2e} ift_h_logdet_max={l_max:.2e}"
             )
+    # `[OUTER non-finite]` warnings: NaN / Inf in the REML unified
+    # evaluator's intermediate computations. Should be 0 in a healthy
+    # biobank fit; any non-zero count is a real bug signal worth
+    # surfacing prominently (penalty drift, cross-trace overflow,
+    # adjoint/leverage instability). Group by the affected
+    # intermediate's name so the source is debuggable without
+    # spelunking through stderr.
+    outer_nonfinite = _OUTER_NONFINITE_PATTERN.findall(captured_stderr)
+    if outer_nonfinite:
+        intermediate_counts: dict[str, int] = {}
+        for name in outer_nonfinite:
+            intermediate_counts[name] = intermediate_counts.get(name, 0) + 1
+        intermediates_str = ",".join(
+            f"{n}={c}" for n, c in sorted(intermediate_counts.items())
+        )
+        parts.append(
+            f"outer_nonfinite={len(outer_nonfinite)} "
+            f"outer_nonfinite_at=[{intermediates_str}]"
+        )
     # Tangent-line predictor activity (the fallback path when IFT
     # rejects). Surface accept count + rejection-reason histogram so
     # a degenerate "both predictors fell through to flat" run is
