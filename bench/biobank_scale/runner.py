@@ -1502,7 +1502,12 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, s
                     total = sum(len(x) for x in capture)
                 if phase_capture is not None:
                     for line in text.splitlines(keepends=True):
-                        if "[PHASE]" in line or "[OUTER summary]" in line or "[OUTER guard]" in line:
+                        if (
+                            "[PHASE]" in line
+                            or "[OUTER summary]" in line
+                            or "[OUTER guard]" in line
+                            or "[PIRLS iter-end]" in line
+                        ):
                             phase_capture.append(line)
         finally:
             pipe.close()
@@ -1569,6 +1574,13 @@ _SCHEDULE_TRANSITION_PATTERN = re.compile(
 _BIOBANK_GATE_PATTERN = re.compile(
     r"\[(?:transformation-normal|gamlss-location-scale|latent-survival|latent-binary|gamlss-binomial-mean-wiggle|survival-marginal-slope|survival-location-scale|bernoulli-marginal-slope)\]\s+declining analytic outer Hessian for n=(\d+)"
 )
+# Per-iter PIRLS timing from `[PIRLS iter-end] iter=N elapsed=Xs ...`
+# (commit 90bccf8a). Lets us histogram inner-Newton wall-time per iter
+# at biobank scale — answers "is inner-PIRLS the dominant cost?"
+# without needing a separate scaling probe.
+_PIRLS_ITER_END_PATTERN = re.compile(
+    r"\[PIRLS iter-end\]\s+iter=\s*(\d+)\s+elapsed=([\d.]+)s"
+)
 
 
 _PHASE_START_PATTERN = re.compile(r"\[PHASE\]\s+([\w\-]+(?:\([\w\-/]+\))?)\s+(?:fit\s+)?start")
@@ -1610,6 +1622,23 @@ def _emit_phase_summary(
     gate_firings = _BIOBANK_GATE_PATTERN.findall(captured_stderr)
     if gate_firings:
         parts.append(f"biobank_gates_fired={len(gate_firings)}")
+    # Per-iter PIRLS wall-time histogram. Surfaces whether inner-Newton
+    # is the dominant biobank cost (current bandaid hypothesis behind
+    # path #3 schedule) by reporting count + total + p50/p95/max.
+    pirls_iter_secs = [
+        float(secs) for _iter, secs in _PIRLS_ITER_END_PATTERN.findall(captured_stderr)
+    ]
+    if pirls_iter_secs:
+        n = len(pirls_iter_secs)
+        sorted_secs = sorted(pirls_iter_secs)
+        total_pirls = sum(pirls_iter_secs)
+        p50 = sorted_secs[n // 2]
+        p95 = sorted_secs[min(n - 1, int(0.95 * n))]
+        pmax = sorted_secs[-1]
+        parts.append(
+            f"pirls_iters={n} pirls_total={total_pirls:.1f}s "
+            f"pirls_p50={p50:.3f}s pirls_p95={p95:.3f}s pirls_max={pmax:.3f}s"
+        )
     suffix = ""
     if pending:
         suffix = f" pending={','.join(pending)}"
