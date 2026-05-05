@@ -116,6 +116,23 @@ impl<'a> RemlState<'a> {
         {
             return false;
         }
+        // Biobank-scale gate: at very large n the per-outer-iter cost of
+        // assembling the analytic outer Hessian (`k² · n · p²` for the
+        // LAML pairwise inner-derived terms) dominates wall-clock —
+        // observed at CI run 25354126629 (2026-05-04): one outer iter of
+        // standard-GAM probit at n=320k, p=42 hit the 40-min cmd timeout
+        // with the only emitted PHASE marker being `standard-GAM fit
+        // start`. Mirrors the gates in survival_marginal_slope.rs:13286
+        // / bernoulli_marginal_slope.rs:8095 / latent_survival.rs etc.
+        // for the custom-family path; this gate covers the standard-GAM
+        // path that goes through `fit_gam` rather than `fit_custom_family`.
+        let n_obs = self.x.nrows();
+        if n_obs > 50_000 {
+            log::info!(
+                "[standard-GAM] declining analytic outer Hessian for n={n_obs}; routing to BFGS"
+            );
+            return false;
+        }
         true
     }
 
