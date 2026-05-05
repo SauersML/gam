@@ -1856,8 +1856,48 @@ def _emit_phase_summary(
     if bfgs_runs:
         n = len(bfgs_runs)
         bfgs_total = sum(float(secs) for _, _, secs in bfgs_runs)
-        converged = sum(1 for status, _, _ in bfgs_runs if status == "converged")
-        parts.append(f"bfgs_runs={n}({converged}_conv) bfgs_total={bfgs_total:.1f}s")
+        # Per-status counts: distinguishes "BFGS optimizer converged"
+        # from "hit max_iter cap" (legitimate failure mode at biobank
+        # scale where the cmd timeout limits iter count) from
+        # "line-search failed" (numerical pathology) from generic
+        # "failed". The mix tells us at a glance whether the BFGS
+        # tolerance is well-calibrated or whether a particular failure
+        # mode is dominating.
+        status_counts: dict[str, int] = {}
+        for status, _iters, _secs in bfgs_runs:
+            status_counts[status] = status_counts.get(status, 0) + 1
+        converged = status_counts.get("converged", 0)
+        # BFGS iter-count distribution: how many outer iters did each
+        # successful run take? Iters is captured only when the regex's
+        # optional `in N iters` group matched (i.e., status != "failed"
+        # and the runtime emitted the iter count). p50 + max of this
+        # distribution complement the convergence-rate count: p50=2
+        # means most runs converge fast (warm-start working); p50≥10
+        # means each run grinds through many iters and the warm-start
+        # is degrading.
+        bfgs_iters_list: list[int] = []
+        for _status, iters_str, _secs in bfgs_runs:
+            if iters_str:
+                try:
+                    bfgs_iters_list.append(int(iters_str))
+                except ValueError:
+                    pass
+        iter_pieces = ""
+        if bfgs_iters_list:
+            sorted_iters = sorted(bfgs_iters_list)
+            n_i = len(sorted_iters)
+            p50 = sorted_iters[n_i // 2]
+            pmax = sorted_iters[-1]
+            iter_pieces = f" bfgs_iters_p50={p50} bfgs_iters_max={pmax}"
+        # Per-status breakdown (sorted for stable ordering).
+        status_pieces = " ".join(
+            f"bfgs_{status.replace(' ', '_').replace('-', '_')}={count}"
+            for status, count in sorted(status_counts.items())
+        )
+        parts.append(
+            f"bfgs_runs={n}({converged}_conv) bfgs_total={bfgs_total:.1f}s "
+            f"{status_pieces}{iter_pieces}"
+        )
     # Aggregate convergence-guard refits
     guard_runs = _GUARD_PATTERN.findall(captured_stderr)
     if guard_runs:
