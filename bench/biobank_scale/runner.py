@@ -2062,6 +2062,67 @@ def _emit_phase_summary(
             file=sys.stderr,
             flush=True,
         )
+    # PIRLS health verdict — separate from warm-start because the
+    # inner Newton's convergence behavior is independent of predictor
+    # quality (PIRLS could be slow even with a perfect warm-start
+    # when the geometry is hard, or fast even with a flat warm-start
+    # when the geometry is benign). Aggregated from [PIRLS solve-end]
+    # markers (commit 517f1b02). Tier policy in `_pirls_health_verdict`.
+    if pirls_solve_matches:
+        pirls_rates: list[float] = []
+        for _iters, _elapsed, rate_str in pirls_solve_matches:
+            try:
+                r = float(rate_str)
+            except (ValueError, TypeError):
+                continue
+            if r == r:
+                pirls_rates.append(r)
+        if pirls_rates:
+            pirls_verdict, pirls_detail = _pirls_health_verdict(rates=pirls_rates)
+            print(
+                f"[PIRLS health] cmd='{cmd_preview}' verdict={pirls_verdict} {pirls_detail}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
+def _pirls_health_verdict(*, rates: list[float]) -> tuple[str, str]:
+    """Classify the inner-Newton's per-solve geometric convergence
+    rates into HEALTHY / MARGINAL / DEGRADED. Each `rate_i = (g_final /
+    g_initial)^(1/iters)` from one PIRLS solve; healthy Newton
+    geometry yields rate < 0.5 (gradient halves at least once per
+    iter on average); rate ≥ 0.7 signals struggle (less than ~30%
+    geometric reduction per iter — the inner solver is grinding).
+
+    Tier policy:
+      HEALTHY   max(rate) < 0.5
+                (every solve was strongly converging; mission-aligned
+                trace at biobank scale).
+      MARGINAL  p50(rate) < 0.5 AND max(rate) < 0.85
+                (most solves fast, occasional struggling solve under
+                the saturation threshold).
+      DEGRADED  otherwise
+                (consistent geometry struggle across solves; warm-start
+                may be collapsing toward flat or hitting near-singular
+                Hessian regions).
+
+    Returns (verdict, detail_string).
+    """
+    if not rates:
+        return ("NO-DATA", "n_solves=0")
+    n = len(rates)
+    sorted_r = sorted(rates)
+    p50 = sorted_r[n // 2]
+    p95 = sorted_r[min(n - 1, int(0.95 * n))]
+    rmax = sorted_r[-1]
+    detail = (
+        f"n_solves={n} p50={p50:.3f} p95={p95:.3f} max={rmax:.3f}"
+    )
+    if rmax < 0.5:
+        return ("HEALTHY", detail)
+    if p50 < 0.5 and rmax < 0.85:
+        return ("MARGINAL", detail)
+    return ("DEGRADED", detail)
 
 
 def _warm_start_health_verdict(
