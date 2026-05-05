@@ -826,12 +826,43 @@ pub fn assert_outer_only(
 
 /// Auto-enable threshold for the biobank-scale outer-score subsample.
 pub const BIOBANK_OUTER_SUBSAMPLE_THRESHOLD: usize = 50_000;
+/// Lower bound on the auto-derived subsample size — below this the
+/// stratified estimator becomes too noisy for the outer optimizer.
+pub const BIOBANK_OUTER_SUBSAMPLE_K_MIN: usize = 4_000;
+/// Upper bound on the auto-derived subsample size — above this the
+/// per-iter savings from subsampling diminish (and memory cost grows).
+pub const BIOBANK_OUTER_SUBSAMPLE_K_MAX: usize = 40_000;
 /// Default subsample size targeted at biobank scale; mgcv::bam(discrete=TRUE)
-/// regime, ample for stable score / Hessian sums.
+/// regime, ample for stable score / Hessian sums. Retained as a public
+/// reference point and as the value used by tests; the runtime gate uses
+/// [`auto_outer_subsample_k`] instead.
 pub const BIOBANK_OUTER_SUBSAMPLE_K: usize = 20_000;
 /// Deterministic seed for the auto-enabled subsample. Tests rely on this
 /// being stable across runs.
 pub const BIOBANK_OUTER_SUBSAMPLE_SEED: u64 = 0xC0FFEE_5EED;
+
+/// Auto-derive the outer-score subsample size from the data row count.
+///
+/// "Magic by default": no CLI flag, no env var. The runtime picks a K that
+/// targets ≈6% of n (so subsample work is ≈16× cheaper than full-data work)
+/// with a floor of 4_000 (statistical adequacy for stratified score sums)
+/// and a ceiling of 40_000 (diminishing returns + memory).
+///
+/// At the canonical anchor points:
+/// - n = 50_000 (threshold) → K = 4_000   (8% of n; floor binds)
+/// - n = 100_000             → K = 6_250
+/// - n = 320_000 (biobank)   → K = 20_000  (matches prior hardcoded default)
+/// - n = 1_000_000           → K = 40_000  (ceiling binds; ≈4% of n)
+///
+/// The 1/16 ratio is the sweet spot per Wood's `mgcv::bam(discrete=TRUE)`
+/// experiments — the outer-score gradient SE is dominated by the constant
+/// stratification contribution rather than the subsample variance, so K
+/// can grow sub-linearly with n without losing precision.
+pub fn auto_outer_subsample_k(n: usize) -> usize {
+    (n / 16)
+        .max(BIOBANK_OUTER_SUBSAMPLE_K_MIN)
+        .min(BIOBANK_OUTER_SUBSAMPLE_K_MAX)
+}
 
 /// Install a stratified outer-score subsample on `opts` when `n` exceeds the
 /// biobank-scale threshold and no subsample is already configured. Returns
@@ -861,12 +892,9 @@ pub fn inject_biobank_outer_subsample(
         // out instead so the legacy full-data path keeps running.
         return false;
     }
-    let subsample = build_outer_score_subsample(
-        z,
-        secondary,
-        BIOBANK_OUTER_SUBSAMPLE_K,
-        BIOBANK_OUTER_SUBSAMPLE_SEED,
-    );
+    let k = auto_outer_subsample_k(n);
+    let subsample =
+        build_outer_score_subsample(z, secondary, k, BIOBANK_OUTER_SUBSAMPLE_SEED);
     log::info!(
         "[biobank-scale] constructed outer-score subsample: n={} k={} weight_scale={:.3} seed={:#x}",
         n,
@@ -903,6 +931,51 @@ pub fn inject_biobank_outer_subsample_from_arrays(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_outer_subsample_k_anchor_points() {
+        // The anchors documented in the docstring should match the
+        // implementation. If the heuristic changes, update both.
+        assert_eq!(auto_outer_subsample_k(50_000), 4_000);
+        assert_eq!(auto_outer_subsample_k(100_000), 6_250);
+        assert_eq!(auto_outer_subsample_k(320_000), 20_000);
+        assert_eq!(auto_outer_subsample_k(1_000_000), 40_000);
+    }
+
+    #[test]
+    fn auto_outer_subsample_k_floor_binds_below_threshold_x16() {
+        // Below n = K_MIN * 16 = 64_000, the n/16 term is below the floor.
+        assert_eq!(auto_outer_subsample_k(0), BIOBANK_OUTER_SUBSAMPLE_K_MIN);
+        assert_eq!(auto_outer_subsample_k(60_000), BIOBANK_OUTER_SUBSAMPLE_K_MIN);
+        assert_eq!(auto_outer_subsample_k(64_000), BIOBANK_OUTER_SUBSAMPLE_K_MIN);
+    }
+
+    #[test]
+    fn auto_outer_subsample_k_ceiling_binds_above_threshold_x16() {
+        // Above n = K_MAX * 16 = 640_000, the n/16 term is above the ceiling.
+        assert_eq!(
+            auto_outer_subsample_k(640_000),
+            BIOBANK_OUTER_SUBSAMPLE_K_MAX
+        );
+        assert_eq!(
+            auto_outer_subsample_k(10_000_000),
+            BIOBANK_OUTER_SUBSAMPLE_K_MAX
+        );
+    }
+
+    #[test]
+    fn auto_outer_subsample_k_is_monotone_non_decreasing() {
+        // Sanity: more rows never asks for fewer subsample rows.
+        let mut prev = 0usize;
+        for n in (0..2_000_000).step_by(7919) {
+            let k = auto_outer_subsample_k(n);
+            assert!(
+                k >= prev,
+                "auto_outer_subsample_k regressed at n={n}: prev={prev} k={k}"
+            );
+            prev = k;
+        }
+    }
 
     #[test]
     fn subsample_full_n_equals_no_subsample() {
