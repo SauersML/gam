@@ -23,7 +23,49 @@ use ::opt::{
 };
 use ndarray::{Array1, Array2, ArrayView2};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+/// Bidirectional inner-PIRLS feedback channel.
+///
+/// The outer-loop scheduler (BFGS or ARC bridge) writes a coarsened
+/// iteration cap into `cap` before each accepted gradient/Hessian eval,
+/// and the inner solver (`execute_pirls_if_needed`) writes back into
+/// `last_iters` / `last_converged` after each NON-screening solve so the
+/// next outer iter's schedule can adapt to the inner solver's actual
+/// convergence behavior rather than a hardcoded iter-count tier.
+///
+/// All three atomics are owned by `RemlObjectiveState`; the bridges hold
+/// `Arc` clones. `last_iters == 0` means "no signal yet" — the schedule
+/// falls back to the coarse iter-count tier for the first outer iter.
+#[derive(Clone, Debug)]
+pub struct InnerProgressFeedback {
+    pub cap: Arc<AtomicUsize>,
+    pub last_iters: Arc<AtomicUsize>,
+    pub last_converged: Arc<AtomicBool>,
+}
+
+impl InnerProgressFeedback {
+    /// Snapshot the read-back atomics for the cap schedule. Returns `None`
+    /// when no inner solve has reported yet (`last_iters == 0`); the
+    /// schedule then falls back to the coarse iter-count tier.
+    fn snapshot(&self) -> Option<InnerProgressSnapshot> {
+        let iters = self.last_iters.load(Ordering::Relaxed);
+        if iters == 0 {
+            None
+        } else {
+            Some(InnerProgressSnapshot {
+                last_iters: iters,
+                last_converged: self.last_converged.load(Ordering::Relaxed),
+            })
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InnerProgressSnapshot {
+    last_iters: usize,
+    last_converged: bool,
+}
 
 /// Matrix-free outer Hessian operator.
 ///
@@ -1583,7 +1625,7 @@ struct OuterFirstOrderBridge<'a> {
     /// in `eval_cost` so line-search probes within an outer iter see a
     /// stable inner tolerance — Wolfe conditions assume constant cost
     /// noise within a bracket.
-    outer_inner_cap: Option<Arc<AtomicUsize>>,
+    outer_inner_cap: Option<InnerProgressFeedback>,
     /// Counts accepted gradient evaluations (one per BFGS outer iter).
     iter_count: usize,
     /// First observed `‖g‖` from `eval_grad`. Used by the schedule to
@@ -1620,22 +1662,28 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         // never touches the atomic). A cap of 0 means "no cap from this
         // source"; the inner solver still honors `pirls_max_iterations`
         // and the screening cap (combined via min).
-        if let Some(cap_arc) = self.outer_inner_cap.as_ref() {
+        if let Some(feedback) = self.outer_inner_cap.as_ref() {
             let g_ratio = match (self.last_g_norm, self.g_norm_initial) {
                 (Some(g), Some(g0)) if g0 > 0.0 => Some(g / g0),
                 _ => None,
             };
-            let cap = first_order_inner_cap_schedule(self.iter_count, g_ratio);
-            let prev = cap_arc.swap(cap, Ordering::Relaxed);
+            let snapshot = feedback.snapshot();
+            let cap = first_order_inner_cap_schedule(self.iter_count, g_ratio, snapshot);
+            let prev = feedback.cap.swap(cap, Ordering::Relaxed);
             if prev != cap {
                 let ratio_str = match g_ratio {
                     Some(r) => format!("{:.3e}", r),
                     None => "n/a".to_string(),
                 };
+                let snap_str = match snapshot {
+                    Some(s) => format!("last_iters={} converged={}", s.last_iters, s.last_converged),
+                    None => "no-history".to_string(),
+                };
                 log::info!(
-                    "[OUTER schedule] inner-PIRLS cap transition iter={} g_ratio={} prev={} new={} ({})",
+                    "[OUTER schedule] inner-PIRLS cap transition iter={} g_ratio={} {} prev={} new={} ({})",
                     self.iter_count,
                     ratio_str,
+                    snap_str,
                     prev,
                     cap,
                     if cap == 0 { "uncapped" } else { "capped" }
@@ -1675,119 +1723,141 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
     }
 }
 
-/// Coarsen-then-tighten inner-PIRLS cap schedule for the outer first-order
-/// (BFGS) path. Combines a fallback iter-count tier with a gradient-ratio
-/// gate so the cap responds to ACTUAL convergence progress rather than
-/// just iter count.
+/// Adaptive inner-PIRLS cap schedule. Replaces the older hardcoded
+/// iter-tier (3/5/10/20) and ratio-tier (0.50/0.20/0.05/0.01) schedule
+/// with a cap driven by the inner solver's actual convergence behavior
+/// — Eisenstat-Walker style for the inner Newton.
 ///
-/// At biobank scale (n ≈ 320k) the inner Newton solve dominates wall-clock
-/// — a full 30-iter solve costs ~20 minutes per outer iter. The schedule
-/// keeps the inner cap shallow during the first few outer iters when ρ
-/// is far from converged (the outer descent direction depends on a coarse
-/// cost/gradient that 5–10 inner iters reproduce within Wolfe tolerance),
-/// then lifts back to full as the optimizer approaches convergence.
-///
-/// `g_ratio = ‖g_now‖ / ‖g_initial‖` is the gradient-norm decay since the
-/// seed. When this ratio drops below ~5%, the optimizer is essentially
-/// converged and the inner cap MUST lift to full so the cached β is at
-/// full tolerance (the convergence guard re-evaluates with full inner
-/// cap on completion, so this is belt-and-suspenders, but it avoids
-/// burning a final outer iter at low cap).
+/// Inputs:
+/// - `iter_count`: outer iter index, used only as a fallback when no
+///   inner-progress feedback has arrived yet (first 1-2 outer iters).
+/// - `g_ratio`: outer gradient-norm decay `‖g_now‖ / ‖g_initial‖`. When
+///   this drops below 1% the outer is essentially converged; we lift
+///   the cap fully so the cached β is at full inner tolerance and the
+///   convergence guard does not have to re-pay a full inner solve.
+/// - `last`: snapshot from `InnerProgressFeedback`. When present and
+///   the previous solve converged, we set the cap to `last_iters + 2`
+///   (a small margin in case ρ moved enough to need a couple more
+///   iters); when the previous solve hit the cap, we double — a
+///   geometric backoff that recovers from too-tight a cap without
+///   thrashing.
 ///
 /// A cap of 0 means "no cap from this source"; the inner solver still
-/// honors the user's `pirls_max_iterations` and the screening cap.
-///
-/// The schedule is monotone non-decreasing in `iter_count` (the
-/// fallback path) so the inner noise floor only loosens; the
-/// gradient-ratio path can lift earlier than the iter-count would
-/// suggest, but never tightens. The cap stays fixed within a single
-/// outer iter (line-search probes go through `eval_cost`, which does
-/// NOT touch the cap atomic).
-fn first_order_inner_cap_schedule(iter_count: usize, g_ratio: Option<f64>) -> usize {
-    // Iter-count fallback. Used as the lower-bound cap when no g_ratio
-    // is available (first iter), or when g_ratio hasn't decayed yet.
-    let iter_cap = match iter_count {
+/// honors `pirls_max_iterations` and the screening cap. The cap is
+/// floored at 3 (anything less is below noise) and ceilinged at 64
+/// (the inner noise floor at biobank scale; further iters would be
+/// pure waste).
+fn first_order_inner_cap_schedule(
+    iter_count: usize,
+    g_ratio: Option<f64>,
+    last: Option<InnerProgressSnapshot>,
+) -> usize {
+    // Convergence override: when the outer is essentially converged the
+    // cached β must be at full inner tolerance. This belt-and-suspenders
+    // path is independent of inner-progress history because the outer
+    // re-evaluation guard pays a full inner solve anyway — uncapping
+    // here just avoids one wasted iter at low cap before the guard.
+    if matches!(g_ratio, Some(r) if r < 0.01) {
+        return 0;
+    }
+
+    // Adaptive path: drive the cap from the inner solver's prior iter
+    // count rather than a hardcoded tier.
+    if let Some(snap) = last {
+        let next = if snap.last_converged {
+            // Converged in `last_iters` last time; allow a small
+            // margin for ρ-step variability. The +2 absorbs typical
+            // inner-Newton iter-count noise (one extra LM halving,
+            // one extra Wolfe probe).
+            snap.last_iters.saturating_add(2)
+        } else {
+            // Hit the cap. Geometric backoff so we don't thrash on a
+            // marginally-too-tight cap, but enforce floor of
+            // last_iters+4 to actually grow.
+            snap.last_iters
+                .saturating_mul(2)
+                .max(snap.last_iters.saturating_add(4))
+        };
+        return next.clamp(3, 64);
+    }
+
+    // No feedback yet (first outer iter, or right after a screening
+    // bundle reset). Coarse iter-count fallback for the first 1-2
+    // outer iters so the cold-start cap is shallow even before the
+    // adaptive signal kicks in.
+    match iter_count {
         0 => 3,
         1 => 5,
-        2 | 3 => 10,
-        4 | 5 => 20,
-        _ => 0,
-    };
-    // Gradient-ratio override: lift cap earlier than the iter schedule
-    // would suggest when convergence is nearing. Threshold values are
-    // chosen so the lift happens 1-2 outer iters before the iter-count
-    // schedule would otherwise lift, capturing the typical
-    // "converging fast" regime without prematurely burning inner cost
-    // on still-coarse iterates.
-    let ratio_cap = match g_ratio {
-        Some(r) if r < 0.01 => 0,        // ~converged → full
-        Some(r) if r < 0.05 => 20,
-        Some(r) if r < 0.20 => 10,
-        Some(r) if r < 0.50 => 5,
-        _ => 3,                           // still far from converged → coarsest
-    };
-    // Take the LARGER of the two (looser cap = more inner work). Both
-    // signals can independently say "loosen up" — we never tighten
-    // beyond what either signal would allow. Cap=0 (full) is the loosest;
-    // when either signal returns 0, the result is 0.
-    if iter_cap == 0 || ratio_cap == 0 {
-        0
-    } else {
-        iter_cap.max(ratio_cap)
+        _ => 10,
     }
 }
 
 #[cfg(test)]
 mod outer_inner_cap_schedule_tests {
-    use super::first_order_inner_cap_schedule;
+    use super::{InnerProgressSnapshot, first_order_inner_cap_schedule};
 
-    #[test]
-    fn schedule_is_shallow_at_start() {
-        // No g_ratio yet (first iter) → iter-count tier governs.
-        assert_eq!(first_order_inner_cap_schedule(0, None), 3);
-        assert_eq!(first_order_inner_cap_schedule(1, None), 5);
+    fn snap(last_iters: usize, last_converged: bool) -> Option<InnerProgressSnapshot> {
+        Some(InnerProgressSnapshot {
+            last_iters,
+            last_converged,
+        })
     }
 
     #[test]
-    fn schedule_loosens_in_middle() {
-        assert_eq!(first_order_inner_cap_schedule(2, None), 10);
-        assert_eq!(first_order_inner_cap_schedule(3, None), 10);
-        assert_eq!(first_order_inner_cap_schedule(4, None), 20);
-        assert_eq!(first_order_inner_cap_schedule(5, None), 20);
+    fn schedule_falls_back_to_iter_tier_without_feedback() {
+        // No inner-progress history yet → coarse iter-count fallback so
+        // the cold-start cap is shallow even before the adaptive signal
+        // arrives.
+        assert_eq!(first_order_inner_cap_schedule(0, None, None), 3);
+        assert_eq!(first_order_inner_cap_schedule(1, None, None), 5);
+        assert_eq!(first_order_inner_cap_schedule(2, None, None), 10);
+        assert_eq!(first_order_inner_cap_schedule(20, None, None), 10);
     }
 
     #[test]
-    fn schedule_lifts_to_full_after_iter_5() {
-        assert_eq!(first_order_inner_cap_schedule(6, None), 0);
-        assert_eq!(first_order_inner_cap_schedule(20, None), 0);
+    fn schedule_uses_last_iters_plus_margin_when_converged() {
+        // Inner converged in 4 iters last time → cap = 4+2 = 6.
+        assert_eq!(first_order_inner_cap_schedule(2, None, snap(4, true)), 6);
+        // Inner converged in 12 → cap = 14.
+        assert_eq!(first_order_inner_cap_schedule(5, None, snap(12, true)), 14);
     }
 
     #[test]
-    fn schedule_lifts_early_when_gradient_ratio_small() {
-        // Even at iter 0 (where iter-tier would give cap=3), if the
-        // gradient has decayed to <1% of initial, lift to full.
-        assert_eq!(first_order_inner_cap_schedule(0, Some(0.005)), 0);
-        // At iter 1 with ratio 4% → ratio_cap=20, iter_cap=5 → max=20
-        assert_eq!(first_order_inner_cap_schedule(1, Some(0.04)), 20);
-        // At iter 2 with ratio 30% → ratio_cap=10, iter_cap=10 → 10
-        assert_eq!(first_order_inner_cap_schedule(2, Some(0.30)), 10);
+    fn schedule_geometric_backoff_when_last_hit_cap() {
+        // Last hit cap at 5 → 2*5=10, max(10, 5+4=9) = 10.
+        assert_eq!(first_order_inner_cap_schedule(2, None, snap(5, false)), 10);
+        // Last hit cap at 1 → 2*1=2, max(2, 1+4=5) = 5.
+        assert_eq!(first_order_inner_cap_schedule(2, None, snap(1, false)), 5);
+        // Last hit cap at 30 → would be 60 but ceiling is 64, so 60.
+        assert_eq!(first_order_inner_cap_schedule(2, None, snap(30, false)), 60);
     }
 
     #[test]
-    fn schedule_takes_max_of_both_caps() {
-        // iter_cap=20 (iter 4), ratio_cap=3 (ratio 60% → no tier hit, default 3)
-        // → max=20 (looser).
-        assert_eq!(first_order_inner_cap_schedule(4, Some(0.60)), 20);
-        // iter_cap=3 (iter 0), ratio_cap=5 (ratio 30% → r<0.50 tier) → max=5.
-        assert_eq!(first_order_inner_cap_schedule(0, Some(0.30)), 5);
-        // iter_cap=10 (iter 2), ratio_cap=10 (ratio 15% → r<0.20 tier) → 10.
-        assert_eq!(first_order_inner_cap_schedule(2, Some(0.15)), 10);
+    fn schedule_clamps_floor_and_ceiling() {
+        // Last converged in 0 (degenerate; should never happen because
+        // the producer only writes nonzero, but defensively check the
+        // floor of 3).
+        assert_eq!(first_order_inner_cap_schedule(2, None, snap(0, true)), 3);
+        // Last converged in 100 → ceiling 64.
+        assert_eq!(first_order_inner_cap_schedule(2, None, snap(100, true)), 64);
     }
 
     #[test]
-    fn schedule_full_overrides_finite_cap() {
-        // ratio < 1% → ratio_cap=0 (full); even with iter_cap=3, result is 0.
-        assert_eq!(first_order_inner_cap_schedule(0, Some(0.0001)), 0);
+    fn schedule_uncaps_when_outer_converged() {
+        // g_ratio < 1% trumps everything: cached β must be at full
+        // inner tolerance for the convergence guard.
+        assert_eq!(first_order_inner_cap_schedule(0, Some(0.0001), None), 0);
+        assert_eq!(first_order_inner_cap_schedule(0, Some(0.005), snap(4, true)), 0);
+        assert_eq!(first_order_inner_cap_schedule(20, Some(0.001), snap(50, false)), 0);
+    }
+
+    #[test]
+    fn schedule_ignores_modest_g_ratio_decay() {
+        // Old schedule had tiered ratio caps at 0.50/0.20/0.05; the new
+        // schedule only special-cases the deep-convergence threshold
+        // (<1%). Modest decay no longer overrides the adaptive cap.
+        assert_eq!(first_order_inner_cap_schedule(2, Some(0.30), snap(4, true)), 6);
+        assert_eq!(first_order_inner_cap_schedule(2, Some(0.05), snap(4, true)), 6);
     }
 }
 
@@ -1814,7 +1884,7 @@ struct OuterSecondOrderBridge<'a> {
     /// line-search probes within an outer iter see a stable inner
     /// tolerance (Wolfe / trust-region acceptance both assume constant
     /// cost noise within a bracket).
-    outer_inner_cap: Option<Arc<AtomicUsize>>,
+    outer_inner_cap: Option<InnerProgressFeedback>,
     /// First observed `‖g‖` from `eval_grad`/`eval_hessian`. Used by the
     /// schedule's gradient-ratio gate so the cap lifts when the optimizer
     /// is approaching convergence, not just when iter count says so.
@@ -1840,7 +1910,7 @@ impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
 impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
-        if let Some(cap_arc) = self.outer_inner_cap.as_ref() {
+        if let Some(feedback) = self.outer_inner_cap.as_ref() {
             // The ARC bridge increments `eval_count` in BOTH `eval_grad` and
             // `eval_hessian`. ARC calls both per outer iter, so `eval_count
             // / 2` is the correct iter index for the schedule. Without this
@@ -1851,17 +1921,23 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
                 (Some(g), Some(g0)) if g0 > 0.0 => Some(g / g0),
                 _ => None,
             };
-            let cap = first_order_inner_cap_schedule(arc_iter, g_ratio);
-            let prev = cap_arc.swap(cap, Ordering::Relaxed);
+            let snapshot = feedback.snapshot();
+            let cap = first_order_inner_cap_schedule(arc_iter, g_ratio, snapshot);
+            let prev = feedback.cap.swap(cap, Ordering::Relaxed);
             if prev != cap {
                 let ratio_str = match g_ratio {
                     Some(r) => format!("{:.3e}", r),
                     None => "n/a".to_string(),
                 };
+                let snap_str = match snapshot {
+                    Some(s) => format!("last_iters={} converged={}", s.last_iters, s.last_converged),
+                    None => "no-history".to_string(),
+                };
                 log::info!(
-                    "[OUTER schedule] inner-PIRLS cap transition (ARC bridge) arc_iter={} g_ratio={} prev={} new={} ({})",
+                    "[OUTER schedule] inner-PIRLS cap transition (ARC bridge) arc_iter={} g_ratio={} {} prev={} new={} ({})",
                     arc_iter,
                     ratio_str,
+                    snap_str,
                     prev,
                     cap,
                     if cap == 0 { "uncapped" } else { "capped" }
@@ -1908,23 +1984,29 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
 impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_hessian(&mut self, x: &Array1<f64>) -> Result<SecondOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
-        if let Some(cap_arc) = self.outer_inner_cap.as_ref() {
+        if let Some(feedback) = self.outer_inner_cap.as_ref() {
             let arc_iter = self.eval_count / 2;
             let g_ratio = match (self.last_g_norm, self.g_norm_initial) {
                 (Some(g), Some(g0)) if g0 > 0.0 => Some(g / g0),
                 _ => None,
             };
-            let cap = first_order_inner_cap_schedule(arc_iter, g_ratio);
-            let prev = cap_arc.swap(cap, Ordering::Relaxed);
+            let snapshot = feedback.snapshot();
+            let cap = first_order_inner_cap_schedule(arc_iter, g_ratio, snapshot);
+            let prev = feedback.cap.swap(cap, Ordering::Relaxed);
             if prev != cap {
                 let ratio_str = match g_ratio {
                     Some(r) => format!("{:.3e}", r),
                     None => "n/a".to_string(),
                 };
+                let snap_str = match snapshot {
+                    Some(s) => format!("last_iters={} converged={}", s.last_iters, s.last_converged),
+                    None => "no-history".to_string(),
+                };
                 log::info!(
-                    "[OUTER schedule] inner-PIRLS cap transition (ARC bridge) arc_iter={} g_ratio={} prev={} new={} ({})",
+                    "[OUTER schedule] inner-PIRLS cap transition (ARC bridge) arc_iter={} g_ratio={} {} prev={} new={} ({})",
                     arc_iter,
                     ratio_str,
+                    snap_str,
                     prev,
                     cap,
                     if cap == 0 { "uncapped" } else { "capped" }
@@ -2480,7 +2562,7 @@ struct OuterConfig {
     /// does NOT suppress cache writes / warm-start updates / KKT
     /// enforcement; it is purely a budget. See
     /// `RemlObjectiveState::outer_inner_cap` for dual-cap semantics.
-    outer_inner_cap: Option<Arc<AtomicUsize>>,
+    outer_inner_cap: Option<InnerProgressFeedback>,
     solver_class: SolverClass,
     operator_initial_trust_radius: Option<f64>,
 }
@@ -2532,7 +2614,7 @@ pub struct OuterProblem {
     initial_rho: Option<Array1<f64>>,
     fallback_policy: FallbackPolicy,
     screening_cap: Option<Arc<AtomicUsize>>,
-    outer_inner_cap: Option<Arc<AtomicUsize>>,
+    outer_inner_cap: Option<InnerProgressFeedback>,
     solver_class: SolverClass,
     operator_initial_trust_radius: Option<f64>,
 }
@@ -2626,17 +2708,21 @@ impl OuterProblem {
         self.screening_cap = Some(screening_cap);
         self
     }
-    /// Wire the outer-aware inner-PIRLS iteration cap.
+    /// Wire the bidirectional inner-PIRLS feedback channel.
     ///
-    /// When set, the BFGS bridge drives this atomic on every accepted
-    /// gradient evaluation so the inner Newton solve can be coarsened at
-    /// early outer iterations (when smoothing parameters are far from
-    /// converged) and lifted back to full as convergence approaches. The
-    /// caller typically passes `Arc::clone(&reml_state.outer_inner_cap)`
-    /// so the inner solver and the outer scheduler observe the same
-    /// atomic.
-    pub fn with_outer_inner_cap(mut self, outer_inner_cap: Arc<AtomicUsize>) -> Self {
-        self.outer_inner_cap = Some(outer_inner_cap);
+    /// The outer bridge writes a coarsened iteration cap into
+    /// `feedback.cap` on every accepted gradient/Hessian eval; the inner
+    /// solver writes back into `feedback.last_iters` /
+    /// `feedback.last_converged` after each non-screening solve so the
+    /// next outer iter's schedule can adapt to the inner solver's
+    /// actual convergence behavior. Typical caller passes
+    /// `InnerProgressFeedback {
+    ///     cap: Arc::clone(&reml_state.outer_inner_cap),
+    ///     last_iters: Arc::clone(&reml_state.last_inner_iters),
+    ///     last_converged: Arc::clone(&reml_state.last_inner_converged),
+    /// }` so the inner and outer observe the same atomics.
+    pub fn with_outer_inner_cap(mut self, feedback: InnerProgressFeedback) -> Self {
+        self.outer_inner_cap = Some(feedback);
         self
     }
     /// Opt into a specific solver class. The default is

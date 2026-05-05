@@ -1863,7 +1863,9 @@ where
             "simultaneous mixture and SAS optimization is not supported".to_string(),
         ));
     } else if mixture_dim == 0 && sas_dim == 0 {
-        use crate::solver::outer_strategy::{Derivative, OuterEvalOrder, OuterProblem};
+        use crate::solver::outer_strategy::{
+            Derivative, InnerProgressFeedback, OuterEvalOrder, OuterProblem,
+        };
 
         let analytic_outer_hessian_available = reml_state.analytic_outer_hessian_enabled();
         // Standard-GAM dense problem dimensions configure both cost models
@@ -1895,7 +1897,11 @@ where
             .with_max_iter(reml_max_iter)
             .with_seed_config(reml_seed_config.clone())
             .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
-            .with_outer_inner_cap(Arc::clone(&reml_state.outer_inner_cap))
+            .with_outer_inner_cap(InnerProgressFeedback {
+                cap: Arc::clone(&reml_state.outer_inner_cap),
+                last_iters: Arc::clone(&reml_state.last_inner_iters),
+                last_converged: Arc::clone(&reml_state.last_inner_converged),
+            })
             .with_rho_bound(crate::estimate::RHO_BOUND);
         let problem = if let Some(ref h) = heuristic_lambdas {
             problem.with_heuristic_lambdas(h.to_vec())
@@ -2058,7 +2064,9 @@ where
         let aux_dim_outer = if use_mixture { mixture_dim } else { sas_dim };
         let mut reml_seed_config_mix = reml_seed_config.clone();
         reml_seed_config_mix.num_auxiliary_trailing = aux_dim_outer;
-        use crate::solver::outer_strategy::{Derivative, HessianResult, OuterEval, OuterProblem};
+        use crate::solver::outer_strategy::{
+            Derivative, HessianResult, InnerProgressFeedback, OuterEval, OuterProblem,
+        };
         let initial_link_kind = cfg.link_kind.clone();
         let problem = OuterProblem::new(theta_dim)
             .with_gradient(Derivative::Analytic)
@@ -2071,7 +2079,11 @@ where
             .with_max_iter(reml_max_iter)
             .with_seed_config(reml_seed_config_mix.clone())
             .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
-            .with_outer_inner_cap(Arc::clone(&reml_state.outer_inner_cap))
+            .with_outer_inner_cap(InnerProgressFeedback {
+                cap: Arc::clone(&reml_state.outer_inner_cap),
+                last_iters: Arc::clone(&reml_state.last_inner_iters),
+                last_converged: Arc::clone(&reml_state.last_inner_converged),
+            })
             .with_rho_bound(crate::estimate::RHO_BOUND);
         let problem = if let Some(h) = heuristic_theta_ref {
             problem.with_heuristic_lambdas(h.to_vec())

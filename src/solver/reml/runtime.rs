@@ -11,7 +11,7 @@ use crate::solver::estimate::reml::inner_strategy::HessianEvalStrategyKind;
 use crate::solver::outer_strategy::{HessianResult, OuterEval};
 use crate::types::{InverseLink, LinkFunction, RhoPrior, SasLinkState};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const TK_BLOCK_SIZE: usize = 128;
 const TK_MAX_OBSERVATIONS: usize = 20_000;
@@ -1672,6 +1672,8 @@ impl<'a> RemlState<'a> {
             warm_start_enabled: AtomicBool::new(true),
             screening_max_inner_iterations: Arc::new(AtomicUsize::new(0)),
             outer_inner_cap: Arc::new(AtomicUsize::new(0)),
+            last_inner_iters: Arc::new(AtomicUsize::new(0)),
+            last_inner_converged: Arc::new(AtomicBool::new(false)),
             kronecker_penalty_system: None,
             kronecker_factored: None,
         })
@@ -1721,6 +1723,13 @@ impl<'a> RemlState<'a> {
         self.kronecker_factored = kronecker_factored;
         self.cache_manager.clear_eval_and_factor_caches();
         self.cache_manager.pirls_cache.write().unwrap().clear();
+        // Inner-PIRLS feedback signals belong to the previous fit's
+        // surface — at the new surface the inner solver's iter count
+        // and convergence behavior may differ, so reset to "no
+        // history" and let the schedule fall back to its iter-count
+        // tier on the first outer iter.
+        self.last_inner_iters.store(0, Ordering::Relaxed);
+        self.last_inner_converged.store(false, Ordering::Relaxed);
         Ok(())
     }
 
@@ -2778,6 +2787,14 @@ impl<'a> RemlState<'a> {
                     // failure); recording here is harmless on failure
                     // because the warm_start_beta will be None.
                     self.record_warm_start_rho(rho);
+                    // Inner-PIRLS feedback signal for the adaptive cap
+                    // schedule: record actual iteration count and
+                    // converged flag. Only written for non-screening
+                    // solves so the screening 3-iter cap doesn't
+                    // poison the schedule's history.
+                    self.last_inner_iters
+                        .store(pirls_result.iteration, Ordering::Relaxed);
+                    self.last_inner_converged.store(true, Ordering::Relaxed);
                     // Cache only if key is valid (not NaN).
                     if use_cache && let Some(key) = key_opt {
                         self.cache_manager
@@ -2852,6 +2869,13 @@ impl<'a> RemlState<'a> {
                         pirls_result.lastgradient_norm,
                         pirls_result.iteration
                     );
+                    // Adaptive-cap feedback: cap was hit. Geometric
+                    // backoff on the next outer iter's cap. Only write
+                    // outside screening so the 3-iter screening cap
+                    // does not corrupt the production schedule history.
+                    self.last_inner_iters
+                        .store(pirls_result.iteration, Ordering::Relaxed);
+                    self.last_inner_converged.store(false, Ordering::Relaxed);
                 }
                 Err(EstimationError::PirlsDidNotConverge {
                     max_iterations: pirls_result.iteration,
