@@ -1829,7 +1829,16 @@ def _emit_phase_summary(
         n_unconv = sum(1 for q in sched_quality if q[1] == "false")
         n_poor_ift = 0
         n_poor_rho = 0
-        for _last_iters, _conv, ift_str, rho_str, _prev, _new in sched_quality:
+        # Count of cap-hit transitions where accept_rho was *very* poor
+        # (`< 0.3`) — the trigger for the ×3 escalation policy
+        # (commit 96e043aa). This is a STRICT subset of `sched_unconv`
+        # AND a strict subset of `sched_poor_accept_rho`. Tracking it
+        # separately tells a CI reviewer how often the most aggressive
+        # backoff branch fired (useful for diagnosing whether the
+        # geometry is truly hard, or whether the policy is firing
+        # spuriously and bloating the cap unnecessarily).
+        n_x3_escalation = 0
+        for _last_iters, conv, ift_str, rho_str, _prev, _new in sched_quality:
             if ift_str != "n/a":
                 try:
                     if float(ift_str) >= 0.10:
@@ -1838,15 +1847,19 @@ def _emit_phase_summary(
                     pass
             if rho_str != "n/a":
                 try:
-                    if float(rho_str) < 0.5:
+                    rho_val = float(rho_str)
+                    if rho_val < 0.5:
                         n_poor_rho += 1
+                    if conv == "false" and rho_val < 0.3:
+                        n_x3_escalation += 1
                 except ValueError:
                     pass
         parts.append(
             f"sched_quality_n={n_q} "
             f"sched_unconv={n_unconv} "
             f"sched_poor_ift={n_poor_ift} "
-            f"sched_poor_accept_rho={n_poor_rho}"
+            f"sched_poor_accept_rho={n_poor_rho} "
+            f"sched_x3_escalation={n_x3_escalation}"
         )
     # Biobank-scale gate firings (path #2)
     gate_firings = _BIOBANK_GATE_PATTERN.findall(captured_stderr)
@@ -1979,7 +1992,16 @@ def _emit_phase_summary(
     if lm_traj:
         ratios: list[float] = []
         rhos: list[float] = []
-        for _it, _start, _final, ratio_str, rho_str, _att in lm_traj:
+        # Per-iter LM attempt count. p50 and p95 of this distribution
+        # tell a CI reviewer whether the LM loop is mostly clean
+        # (p50=1: most iters accept on first attempt) or struggle-y
+        # (p50≥3: most iters need multiple LM halvings). The textbook
+        # Madsen ×2 rejection trajectory (commit d37626e6) gives more
+        # shots near the trust radius, so we expect p95 to be modest
+        # even for hard problems — a high p95 indicates either a
+        # genuinely-hard surface or a regression.
+        attempts: list[int] = []
+        for _it, _start, _final, ratio_str, rho_str, att_str in lm_traj:
             try:
                 r = float(ratio_str)
                 if r == r:  # filter NaN
@@ -1990,6 +2012,10 @@ def _emit_phase_summary(
                 rho = float(rho_str)
                 if rho == rho:
                     rhos.append(rho)
+            except ValueError:
+                pass
+            try:
+                attempts.append(int(att_str))
             except ValueError:
                 pass
         ratio_pieces = []
@@ -2010,9 +2036,19 @@ def _emit_phase_summary(
             rho_pieces.append(
                 f"lm_accept_rho_p05={rhos_sorted[max(0, int(0.05 * n_p))]:.2f}"
             )
-        if ratio_pieces or rho_pieces:
+        attempt_pieces = []
+        if attempts:
+            attempts_sorted = sorted(attempts)
+            n_a = len(attempts_sorted)
+            attempt_pieces.append(f"lm_attempts_p50={attempts_sorted[n_a // 2]}")
+            attempt_pieces.append(
+                f"lm_attempts_p95={attempts_sorted[min(n_a - 1, int(0.95 * n_a))]}"
+            )
+            attempt_pieces.append(f"lm_attempts_max={attempts_sorted[-1]}")
+        if ratio_pieces or rho_pieces or attempt_pieces:
             parts.append(
-                f"lm_iters={len(lm_traj)} " + " ".join(ratio_pieces + rho_pieces)
+                f"lm_iters={len(lm_traj)} "
+                + " ".join(ratio_pieces + rho_pieces + attempt_pieces)
             )
     # Per-solve geometric convergence rate. A healthy biobank fit ends
     # with most PIRLS solves at rate < 0.5; a struggling fit shows
