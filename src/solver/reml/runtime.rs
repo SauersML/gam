@@ -3234,6 +3234,21 @@ pub(crate) fn predict_warm_start_beta_ift_from_cache(
         // and slightly better than the tangent-line predictor (which the
         // caller would otherwise try), since the IFT cache reflects a
         // genuinely converged solve.
+        //
+        // Emit a structured no-op marker so the bench runner's accept /
+        // reject ratio (commit fec27c97) can distinguish:
+        //   accept  → predictor produced a non-identity β prediction
+        //   reject  → predictor fell through to caller's tangent-line / flat
+        //   noop    → predictor returned identity (this branch). The outer
+        //             made an effectively-zero ρ-step; warm-start was free.
+        // Without this marker, "noop" calls would inflate the accept count
+        // because the predictor returns Some(β) — masking how often the
+        // outer is actually exercising the linearization.
+        log::info!(
+            "[IFT-NOOP] reason=all_drho_below_eps max_drho={:.3e} drho_dim={}",
+            max_abs_drho,
+            k,
+        );
         return Some(Coefficients::new(beta_cur.clone()));
     }
 
