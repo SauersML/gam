@@ -169,3 +169,53 @@ fn outer_row_indices_and_scale_round_trip_to_full_n_when_no_subsample() {
     let expected: Vec<usize> = (0..n).collect();
     assert_eq!(indices, expected);
 }
+
+#[test]
+fn subsample_mask_arc_is_pinned_after_inject() {
+    // Critical invariant for the path #1 design plan: the mask installed
+    // by `inject_biobank_outer_subsample` must remain stable across
+    // subsequent reads via the cloned options. The outer optimizer's
+    // BFGS line search assumes constant cost noise within a bracket, so
+    // the mask must NOT vary between outer iterations.
+    use gam::families::custom_family::BlockwiseFitOptions;
+    use std::sync::Arc;
+    let n = BIOBANK_OUTER_SUBSAMPLE_THRESHOLD + 50_000;
+    let z: Vec<f64> = (0..n).map(|i| i as f64 / n as f64).collect();
+    let secondary: Vec<u8> = (0..n).map(|i| (i % 4 == 0) as u8).collect();
+    let mut opts = BlockwiseFitOptions::default();
+    let installed = inject_biobank_outer_subsample(&mut opts, &z, &secondary);
+    assert!(installed);
+    let original_arc = opts
+        .outer_score_subsample
+        .as_ref()
+        .expect("subsample installed")
+        .clone();
+    let original_ptr = Arc::as_ptr(&original_arc);
+
+    for iter in 0..10 {
+        let cloned = opts.clone();
+        let cloned_arc = cloned
+            .outer_score_subsample
+            .as_ref()
+            .expect("subsample preserved across clone")
+            .clone();
+        assert_eq!(
+            Arc::as_ptr(&cloned_arc),
+            original_ptr,
+            "iter {iter}: subsample Arc identity must be preserved across BlockwiseFitOptions::clone()",
+        );
+    }
+}
+
+#[test]
+fn auto_k_monotone_non_decreasing_in_n() {
+    let mut prev = 0usize;
+    for n in (0..2_000_000).step_by(7919) {
+        let k = auto_outer_subsample_k(n);
+        assert!(
+            k >= prev,
+            "auto_outer_subsample_k regressed at n={n}: prev={prev} k={k}"
+        );
+        prev = k;
+    }
+}
