@@ -3560,6 +3560,21 @@ pub(crate) struct RemlState<'a> {
     pub(crate) warm_start_beta: RwLock<Option<Coefficients>>,
     warm_start_enabled: AtomicBool,
     pub(crate) screening_max_inner_iterations: Arc<AtomicUsize>,
+    /// Outer-aware inner-PIRLS iteration cap for the main descent loop.
+    ///
+    /// Distinct from `screening_max_inner_iterations`, which is used during
+    /// seed selection and toggles a side-effect bundle (cache writes,
+    /// warm-start updates, KKT enforcement all suppressed). This atomic is
+    /// purely a cap — when nonzero, the inner Newton loop is capped at
+    /// `min(this, full_max_iterations)`, but cache writes and warm-start
+    /// updates remain enabled. Driven by the outer optimizer to coarsen
+    /// inner solves at early outer iterations when ρ is far from converged,
+    /// and lifted back to full at the final accepted iter (otherwise the
+    /// returned β would be biased by the loose cap).
+    ///
+    /// Both atomics are honored together as `min(screening_cap, outer_cap)`
+    /// when both are nonzero. Default 0 (no cap from this source).
+    pub(crate) outer_inner_cap: Arc<AtomicUsize>,
 
     /// When set, the penalties have Kronecker (tensor-product) structure and
     /// the REML evaluator can use O(∏q_j) logdet instead of O(p³) eigendecomposition.
