@@ -6691,6 +6691,72 @@ mod ift_warm_start_tests {
                 "wrong-length precompute fell back incorrectly at index {i}",
             );
         }
+
+        // Exercise the `_with_factor` production path: build the
+        // factor manually, pass it in, verify the output matches the
+        // inline-factorize path. This covers the H_pen factor cache
+        // (commit ec18559d) which the integration tests only touch
+        // transitively.
+        let pre_built_factor = SymmetricMatrix::Dense(h_pen.clone())
+            .factorize()
+            .expect("factorize for _with_factor test");
+        let predicted_via_factor = predict_warm_start_beta_ift_with_factor(
+            &cache_inline,
+            &canonical,
+            &new_rho,
+            p,
+            None,
+            pre_built_factor.as_ref(),
+        )
+        .expect("with_factor predict");
+        for i in 0..p {
+            let diff = (predicted_inline.0[i] - predicted_via_factor.0[i]).abs();
+            assert!(
+                diff < 1e-12,
+                "_with_factor and inline paths diverged at index {i}: \
+                 inline={} factor={} diff={:.3e}",
+                predicted_inline.0[i],
+                predicted_via_factor.0[i],
+                diff,
+            );
+        }
+
+        // Negative test: pass a DIFFERENT factor than the one matching
+        // cache.penalized_hessian_transformed, and verify the predictor
+        // actually USES it (vs silently ignoring and re-factorizing
+        // internally). With a perturbed H, the prediction must
+        // differ measurably from the inline-path prediction.
+        let mut h_perturbed = h_pen.clone();
+        for i in 0..p {
+            // Add 5× to diagonal — produces a factor that maps
+            // back-solves to noticeably smaller magnitudes.
+            h_perturbed[[i, i]] *= 5.0;
+        }
+        let perturbed_factor = SymmetricMatrix::Dense(h_perturbed)
+            .factorize()
+            .expect("factorize perturbed H");
+        let predicted_with_wrong_factor = predict_warm_start_beta_ift_with_factor(
+            &cache_inline,
+            &canonical,
+            &new_rho,
+            p,
+            None,
+            perturbed_factor.as_ref(),
+        )
+        .expect("with_factor predict (wrong factor)");
+        let mut max_diff = 0.0_f64;
+        for i in 0..p {
+            let diff = (predicted_inline.0[i] - predicted_with_wrong_factor.0[i]).abs();
+            if diff > max_diff {
+                max_diff = diff;
+            }
+        }
+        assert!(
+            max_diff > 1e-3,
+            "wrong factor produced bit-identical output (max_diff={:.3e}); \
+             _with_factor path is silently ignoring its factor argument",
+            max_diff,
+        );
     }
 
     /// Verify the basis-conversion path: when frame_was_original=false,
