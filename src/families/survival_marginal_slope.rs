@@ -8442,6 +8442,29 @@ impl SurvivalMarginalSlopeFamily {
         psi_index: usize,
         cache: Option<&EvalCache>,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        self.psi_terms_inner_with_options(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            cache,
+            &BlockwiseFitOptions::default(),
+        )
+    }
+
+    /// Outer-aware variant of `psi_terms_inner`. When
+    /// `options.outer_score_subsample` is `None`, iterates all rows and is
+    /// bit-for-bit equivalent to the legacy implementation. When `Some`, only
+    /// the masked rows contribute and every row-summed component (objective
+    /// scalar, per-block score vectors, Hessian operator blocks) is rescaled
+    /// by `weight_scale = n_full / |mask|` (Horvitz-Thompson).
+    pub(crate) fn psi_terms_inner_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        cache: Option<&EvalCache>,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         let flex_active = self.effective_flex_active(block_states)?;
         let flex_primary = flex_active.then(|| flex_primary_slices(self));
         let slices = block_slices(self, block_states);
@@ -8506,7 +8529,9 @@ impl SurvivalMarginalSlopeFamily {
             )
         };
 
-        let (objective_psi, score_t, score_m, score_g, score_h, score_w, acc) = (0..self.n)
+        let row_iter = outer_row_indices(options, self.n).to_vec();
+        let outer_scale = outer_score_scale(options, self.n);
+        let (mut objective_psi, mut score_t, mut score_m, mut score_g, mut score_h, mut score_w, mut acc) = row_iter
             .into_par_iter()
             .try_fold(make_acc, |mut a, row| -> Result<Acc, String> {
                 let psi_row = psi_map
@@ -8632,6 +8657,16 @@ impl SurvivalMarginalSlopeFamily {
                 Ok(a)
             })?;
 
+        if outer_scale != 1.0 {
+            objective_psi *= outer_scale;
+            score_t.mapv_inplace(|v| v * outer_scale);
+            score_m.mapv_inplace(|v| v * outer_scale);
+            score_g.mapv_inplace(|v| v * outer_scale);
+            score_h.mapv_inplace(|v| v * outer_scale);
+            score_w.mapv_inplace(|v| v * outer_scale);
+            acc.scale_assign(outer_scale);
+        }
+
         // Assemble score into flat vector
         let mut score_psi = Array1::zeros(slices.total);
         score_psi
@@ -8674,6 +8709,27 @@ impl SurvivalMarginalSlopeFamily {
         psi_i: usize,
         psi_j: usize,
         cache: Option<&EvalCache>,
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        self.psi_second_order_terms_inner_with_options(
+            block_states,
+            derivative_blocks,
+            psi_i,
+            psi_j,
+            cache,
+            &BlockwiseFitOptions::default(),
+        )
+    }
+
+    /// Outer-aware variant of `psi_second_order_terms_inner`. See
+    /// `psi_terms_inner_with_options` for the row-iter / rescaling contract.
+    pub(crate) fn psi_second_order_terms_inner_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_i: usize,
+        psi_j: usize,
+        cache: Option<&EvalCache>,
+        options: &BlockwiseFitOptions,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
         let flex_active = self.effective_flex_active(block_states)?;
         let flex_primary = flex_active.then(|| flex_primary_slices(self));
@@ -8777,7 +8833,9 @@ impl SurvivalMarginalSlopeFamily {
             )
         };
 
-        let (objective_psi_psi, score_t, score_m, score_g, score_h, score_w, acc) = (0..self.n)
+        let row_iter = outer_row_indices(options, self.n).to_vec();
+        let outer_scale = outer_score_scale(options, self.n);
+        let (mut objective_psi_psi, mut score_t, mut score_m, mut score_g, mut score_h, mut score_w, mut acc) = row_iter
             .into_par_iter()
             .try_fold(make_acc, |mut a, row| -> Result<Acc, String> {
                 // Compute psi design rows once; derive directions from them.
@@ -9040,6 +9098,16 @@ impl SurvivalMarginalSlopeFamily {
                 a.6.add(&b.6);
                 Ok(a)
             })?;
+
+        if outer_scale != 1.0 {
+            objective_psi_psi *= outer_scale;
+            score_t.mapv_inplace(|v| v * outer_scale);
+            score_m.mapv_inplace(|v| v * outer_scale);
+            score_g.mapv_inplace(|v| v * outer_scale);
+            score_h.mapv_inplace(|v| v * outer_scale);
+            score_w.mapv_inplace(|v| v * outer_scale);
+            acc.scale_assign(outer_scale);
+        }
 
         let mut score_psi_psi = Array1::zeros(slices.total);
         score_psi_psi
@@ -9811,11 +9879,12 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
                 &self.options,
             );
         }
-        self.family.psi_terms_inner(
+        self.family.psi_terms_inner_with_options(
             &self.block_states,
             &self.derivative_blocks,
             psi_index,
             self.cache.as_ref(),
+            &self.options,
         )
     }
 
@@ -9841,12 +9910,13 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
             }
             return Ok(None);
         }
-        self.family.psi_second_order_terms_inner(
+        self.family.psi_second_order_terms_inner_with_options(
             &self.block_states,
             &self.derivative_blocks,
             psi_i,
             psi_j,
             self.cache.as_ref(),
+            &self.options,
         )
     }
 
@@ -16434,5 +16504,311 @@ mod tests {
         let exp = &raw * factor;
         let rel = rel_diff_array2_survival(&scaled, &exp);
         assert!(rel < 1e-12, "drift rel {}", rel);
+    }
+
+    /// Multi-row test family with non-empty marginal/logslope designs but no
+    /// score_warp / link_dev / time_wiggle. Drives the rigid block path of
+    /// `psi_terms_inner` so we can subsample-check Horvitz-Thompson scaling.
+    fn make_block_psi_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
+        let event: Array1<f64> =
+            Array1::from_iter((0..n).map(|i| if (i * 31 + 7) % 5 >= 3 { 1.0 } else { 0.0 }));
+        let weights: Array1<f64> =
+            Array1::from_iter((0..n).map(|i| 0.5 + ((i * 13 + 4) % 5) as f64 * 0.1));
+        let z: Array1<f64> = Array1::from_iter(
+            (0..n).map(|i| -1.0 + 2.0 * (((i * 17 + 5) % n) as f64 + 0.5) / (n as f64)),
+        );
+        let offset_entry: Array1<f64> = Array1::from_iter(
+            (0..n).map(|i| -0.4 + 0.7 * (((i * 11 + 3) % n) as f64 + 0.5) / (n as f64)),
+        );
+        let offset_exit: Array1<f64> = Array1::from_iter(
+            (0..n).map(|i| 0.1 + 0.6 * (((i * 19 + 7) % n) as f64 + 0.5) / (n as f64)),
+        );
+        let derivative_offset_exit: Array1<f64> = Array1::from_iter(
+            (0..n).map(|i| 0.5 + 0.05 * ((i * 23 + 1) % 3) as f64),
+        );
+        // Single-column marginal/logslope designs with row-varying entries.
+        let marginal_design = Array2::from_shape_fn((n, 1), |(i, _)| {
+            0.3 + 0.4 * (((i * 29 + 11) % n) as f64) / (n as f64)
+        });
+        let logslope_design = Array2::from_shape_fn((n, 1), |(i, _)| {
+            0.2 + 0.5 * (((i * 37 + 9) % n) as f64) / (n as f64)
+        });
+        SurvivalMarginalSlopeFamily {
+            n,
+            event: Arc::new(event),
+            weights: Arc::new(weights),
+            z: Arc::new(z),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::zeros((n, 0))),
+            design_exit: DesignMatrix::from(Array2::zeros((n, 0))),
+            design_derivative_exit: DesignMatrix::from(Array2::zeros((n, 0))),
+            offset_entry: Arc::new(offset_entry),
+            offset_exit: Arc::new(offset_exit),
+            derivative_offset_exit: Arc::new(derivative_offset_exit),
+            marginal_design: DesignMatrix::from(marginal_design),
+            logslope_design: DesignMatrix::from(logslope_design),
+            score_warp: None,
+            link_dev: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+        }
+    }
+
+    fn block_psi_test_block_states(
+        family: &SurvivalMarginalSlopeFamily,
+        m_beta: f64,
+        g_beta: f64,
+    ) -> Vec<ParameterBlockState> {
+        let n = family.n;
+        let m_design = family.marginal_design.to_dense().to_owned();
+        let g_design = family.logslope_design.to_dense().to_owned();
+        let m_eta = m_design.dot(&array![m_beta]);
+        let g_eta = g_design.dot(&array![g_beta]);
+        vec![
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: Array1::zeros(n),
+            },
+            ParameterBlockState {
+                beta: array![m_beta],
+                eta: m_eta,
+            },
+            ParameterBlockState {
+                beta: array![g_beta],
+                eta: g_eta,
+            },
+        ]
+    }
+
+    /// Derivative blocks with a single ψ on the marginal block (block_idx=1).
+    /// `x_psi` has shape (n, 1) so the test family gets a per-row psi map.
+    fn block_psi_test_marginal_derivative_blocks(
+        n: usize,
+    ) -> Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>> {
+        let x_psi = Array2::from_shape_fn((n, 1), |(i, _)| {
+            0.4 + 0.3 * (((i * 41 + 13) % n) as f64) / (n as f64)
+        });
+        vec![
+            Vec::new(),
+            vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                None,
+                x_psi,
+                Array2::zeros((1, 1)),
+                None,
+                None,
+                None,
+                None,
+            )],
+            Vec::new(),
+        ]
+    }
+
+    /// Derivative blocks with one ψ on marginal (block 1) and one on logslope
+    /// (block 2), so second-order terms can mix.
+    fn block_psi_test_dual_derivative_blocks(
+        n: usize,
+    ) -> Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>> {
+        let x_psi_m = Array2::from_shape_fn((n, 1), |(i, _)| {
+            0.4 + 0.3 * (((i * 41 + 13) % n) as f64) / (n as f64)
+        });
+        let x_psi_g = Array2::from_shape_fn((n, 1), |(i, _)| {
+            0.2 + 0.5 * (((i * 43 + 17) % n) as f64) / (n as f64)
+        });
+        vec![
+            Vec::new(),
+            vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                None,
+                x_psi_m,
+                Array2::zeros((1, 1)),
+                None,
+                None,
+                None,
+                None,
+            )],
+            vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                None,
+                x_psi_g,
+                Array2::zeros((1, 1)),
+                None,
+                None,
+                None,
+                None,
+            )],
+        ]
+    }
+
+    #[test]
+    fn survival_psi_terms_inner_subsample_full_equals_unsampled() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_block_psi_test_family(n);
+        let states = block_psi_test_block_states(&family, 0.15, 0.25);
+        let derivative_blocks = block_psi_test_marginal_derivative_blocks(n);
+
+        let baseline = family
+            .psi_terms_inner(&states, &derivative_blocks, 0, None)
+            .expect("baseline psi terms")
+            .expect("some");
+
+        let mut opts_full = BlockwiseFitOptions::default();
+        opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            (0..n).collect(),
+            n,
+            0xDEADBEEF,
+        )));
+        let with_full = family
+            .psi_terms_inner_with_options(&states, &derivative_blocks, 0, None, &opts_full)
+            .expect("with full mask")
+            .expect("some");
+
+        let obj_rel = ((with_full.objective_psi - baseline.objective_psi)
+            / baseline.objective_psi.abs().max(1.0))
+        .abs();
+        assert!(obj_rel < 1e-12, "objective_psi rel {}", obj_rel);
+        let score_rel = rel_diff_array1_survival(&with_full.score_psi, &baseline.score_psi);
+        assert!(score_rel < 1e-12, "score_psi rel {}", score_rel);
+    }
+
+    #[test]
+    fn survival_psi_terms_inner_subsample_half_scales_correctly() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_block_psi_test_family(n);
+        let states = block_psi_test_block_states(&family, 0.15, 0.25);
+        let derivative_blocks = block_psi_test_marginal_derivative_blocks(n);
+
+        let even_mask: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
+        let m = even_mask.len();
+
+        let mut opts_half = BlockwiseFitOptions::default();
+        opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            even_mask.clone(),
+            n,
+            0xCAFE,
+        )));
+        let scaled = family
+            .psi_terms_inner_with_options(&states, &derivative_blocks, 0, None, &opts_half)
+            .expect("scaled")
+            .expect("some");
+
+        let mut opts_raw = BlockwiseFitOptions::default();
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
+            mask: Arc::new(even_mask),
+            n_full: m,
+            weight_scale: 1.0,
+            seed: 0,
+        }));
+        let raw = family
+            .psi_terms_inner_with_options(&states, &derivative_blocks, 0, None, &opts_raw)
+            .expect("raw")
+            .expect("some");
+
+        let factor = n as f64 / m as f64;
+        let exp_obj = factor * raw.objective_psi;
+        let obj_rel = ((scaled.objective_psi - exp_obj) / exp_obj.abs().max(1.0)).abs();
+        assert!(obj_rel < 1e-12, "objective_psi rel {}", obj_rel);
+        let exp_score = &raw.score_psi * factor;
+        let score_rel = rel_diff_array1_survival(&scaled.score_psi, &exp_score);
+        assert!(score_rel < 1e-12, "score_psi rel {}", score_rel);
+    }
+
+    #[test]
+    fn survival_psi_second_order_terms_inner_subsample_full_equals_unsampled() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_block_psi_test_family(n);
+        let states = block_psi_test_block_states(&family, 0.15, 0.25);
+        let derivative_blocks = block_psi_test_dual_derivative_blocks(n);
+
+        let baseline = family
+            .psi_second_order_terms_inner(&states, &derivative_blocks, 0, 1, None)
+            .expect("baseline psi second-order")
+            .expect("some");
+
+        let mut opts_full = BlockwiseFitOptions::default();
+        opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            (0..n).collect(),
+            n,
+            0xDEADBEEF,
+        )));
+        let with_full = family
+            .psi_second_order_terms_inner_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                1,
+                None,
+                &opts_full,
+            )
+            .expect("with full")
+            .expect("some");
+
+        let obj_rel = ((with_full.objective_psi_psi - baseline.objective_psi_psi)
+            / baseline.objective_psi_psi.abs().max(1.0))
+        .abs();
+        assert!(obj_rel < 1e-12, "objective rel {}", obj_rel);
+        let score_rel =
+            rel_diff_array1_survival(&with_full.score_psi_psi, &baseline.score_psi_psi);
+        assert!(score_rel < 1e-12, "score rel {}", score_rel);
+    }
+
+    #[test]
+    fn survival_psi_second_order_terms_inner_subsample_half_scales_correctly() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_block_psi_test_family(n);
+        let states = block_psi_test_block_states(&family, 0.15, 0.25);
+        let derivative_blocks = block_psi_test_dual_derivative_blocks(n);
+
+        let even_mask: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
+        let m = even_mask.len();
+
+        let mut opts_half = BlockwiseFitOptions::default();
+        opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            even_mask.clone(),
+            n,
+            0xCAFE,
+        )));
+        let scaled = family
+            .psi_second_order_terms_inner_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                1,
+                None,
+                &opts_half,
+            )
+            .expect("scaled")
+            .expect("some");
+
+        let mut opts_raw = BlockwiseFitOptions::default();
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
+            mask: Arc::new(even_mask),
+            n_full: m,
+            weight_scale: 1.0,
+            seed: 0,
+        }));
+        let raw = family
+            .psi_second_order_terms_inner_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                1,
+                None,
+                &opts_raw,
+            )
+            .expect("raw")
+            .expect("some");
+
+        let factor = n as f64 / m as f64;
+        let exp_obj = factor * raw.objective_psi_psi;
+        let obj_rel = ((scaled.objective_psi_psi - exp_obj) / exp_obj.abs().max(1.0)).abs();
+        assert!(obj_rel < 1e-12, "objective rel {}", obj_rel);
+        let exp_score = &raw.score_psi_psi * factor;
+        let score_rel = rel_diff_array1_survival(&scaled.score_psi_psi, &exp_score);
+        assert!(score_rel < 1e-12, "score rel {}", score_rel);
     }
 }
