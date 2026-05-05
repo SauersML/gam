@@ -3837,15 +3837,25 @@ where
     };
 
     // Initial Levenberg-Marquardt damping. Seeded from the caller's
-    // `initial_lm_lambda` hint when present (clamped to a conservative
-    // [1e-6, 1e-3] window: an over-large seed costs at most three
-    // halving steps to recover, while the cold default `1e-6` wastes
-    // 4-6 iterations rediscovering damping the previous PIRLS call
-    // already paid for). When the hint is absent, falls back to the
-    // historical cold start at 1e-6.
+    // `initial_lm_lambda` hint when present, with a safety clamp into
+    // [1e-9, 1.0]:
+    //   * floor 1e-9 matches the LM-internal accept-side floor
+    //     (madsen_lm_accept_factor caps shrink at λ → λ/3, and the
+    //     post-multiply `.max(1e-9)` enforces this absolute lower bound),
+    //     so any positive cached value gets through unchanged.
+    //   * ceiling 1.0 covers the gradient-descent regime; values above
+    //     that are pathological (the LM_MAX_LAMBDA = 1e12 ceiling is the
+    //     LM exit condition, well above any sensible warm-start).
+    // The runtime layer (`solver/reml/runtime.rs::execute_pirls_if_needed`)
+    // applies an *adaptive* clamp before this one, narrowing the range
+    // based on the previous solve's halving history (Newton-friendly →
+    // [1e-9, 1e-3], default → [1e-6, 1e-3], hard-fit → [1e-3, 1.0]).
+    // This PIRLS clamp is defense in depth — it catches a pathological
+    // hint from any caller that bypasses the runtime adaptive layer.
+    // Cold default `1e-6` matches the original.
     let mut lambda = options
         .initial_lm_lambda
-        .map(|v| v.clamp(1e-6, 1e-3))
+        .map(|v| v.clamp(1e-9, 1.0))
         .unwrap_or(1e-6);
     let lm_max_attempts = options.max_step_halving.max(1);
     // Convergence is decided by `WorkingState::certifies_kkt` /
