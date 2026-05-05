@@ -4458,6 +4458,20 @@ where
                             if consecutive_fisher_fallbacks > 2 {
                                 force_fisher_for_rest = true;
                             }
+                            // Mid-LM-loop Fisher fallback: the Observed
+                            // curvature succeeded at iter-start but the
+                            // candidate evaluation produced a bad gain
+                            // ratio (or non-finite gradient / extreme
+                            // eta), suggesting the Observed Hessian is
+                            // unreliable for this β region. Distinct
+                            // signal from iter-start Fisher fallback
+                            // (Observed assembly itself failed). Tagged
+                            // with `gain_rejection` so the runner
+                            // aggregator can count both reasons.
+                            log::info!(
+                                "[PIRLS] mid-iter Fisher fallback iter={} reason=gain_rejection",
+                                iter,
+                            );
                             let fisher_fallback_start = std::time::Instant::now();
                             state =
                                 model.update_with_curvature(&beta, HessianCurvatureKind::Fisher)?;
@@ -4578,6 +4592,18 @@ where
                         if consecutive_fisher_fallbacks > 2 {
                             force_fisher_for_rest = true;
                         }
+                        // Mid-LM-loop Fisher fallback: the candidate
+                        // evaluation itself returned Err (e.g., model
+                        // overflowed at the proposed β + δ). Tagged with
+                        // `candidate_err` to distinguish from the
+                        // gain-rejection variant above; both indicate
+                        // mid-iter Observed-curvature unreliability,
+                        // but candidate_err is a stronger signal
+                        // (numerical breakdown, not just bad gain).
+                        log::info!(
+                            "[PIRLS] mid-iter Fisher fallback iter={} reason=candidate_err",
+                            iter,
+                        );
                         let fisher_err_start = std::time::Instant::now();
                         state = model.update_with_curvature(&beta, HessianCurvatureKind::Fisher)?;
                         curvature_total += fisher_err_start.elapsed();

@@ -1650,6 +1650,22 @@ _PIRLS_CURVATURE_KIND_PATTERN = re.compile(
     r"\[STAGE\] PIRLS update_with_curvature iter=\d+\s+curvature=(\w+)"
 )
 
+# Per-iter mid-LM-loop Fisher fallback markers. Distinct from the
+# iter-start Observed→Fisher transition captured by
+# `_PIRLS_CURVATURE_KIND_PATTERN`: these fire when the iter-start
+# Observed assembly succeeded but mid-LM-loop the inner Newton
+# triggered a Fisher retry. Two reasons:
+#   gain_rejection: the candidate evaluation produced a bad gain
+#                   ratio / non-finite gradient / extreme eta —
+#                   Observed Hessian unreliable for this β region.
+#   candidate_err : update_candidate itself returned Err (numerical
+#                   breakdown). Stronger signal than gain_rejection.
+# Aggregating both surfaces how much of the curvature work in a fit
+# is going through the Fisher retry path.
+_PIRLS_MID_ITER_FISHER_PATTERN = re.compile(
+    r"\[PIRLS\] mid-iter Fisher fallback iter=(\d+)\s+reason=(\w+)"
+)
+
 # Per-iter LM trajectory: validates the textbook Madsen accept (commit
 # 58ae42d1) and reject (d37626e6) updates plus the runtime adaptive λ
 # clamp (43be42be) are moving the trust region in useful directions at
@@ -2134,6 +2150,19 @@ def _emit_phase_summary(
         parts.append(
             f"pirls_curv_n={n_curv_total} {kind_pieces} "
             f"pirls_fisher_frac={fisher_frac:.2f}"
+        )
+    # Mid-LM-loop Fisher-fallback events, distinct from iter-start.
+    # When non-zero, indicates the Observed curvature was reliable at
+    # iter-start but unreliable mid-LM-loop — a more subtle pathology
+    # than wholesale Observed-failure (which iter-start captures).
+    mid_iter_fisher = _PIRLS_MID_ITER_FISHER_PATTERN.findall(captured_stderr)
+    if mid_iter_fisher:
+        gain_rejection_count = sum(1 for m in mid_iter_fisher if m[1] == "gain_rejection")
+        candidate_err_count = sum(1 for m in mid_iter_fisher if m[1] == "candidate_err")
+        parts.append(
+            f"pirls_mid_iter_fisher_n={len(mid_iter_fisher)} "
+            f"pirls_mid_iter_gain_rejection={gain_rejection_count} "
+            f"pirls_mid_iter_candidate_err={candidate_err_count}"
         )
     pirls_breakdown_matches = _PIRLS_ITER_BREAKDOWN_PATTERN.findall(captured_stderr)
     if pirls_breakdown_matches:
