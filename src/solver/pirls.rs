@@ -1133,6 +1133,17 @@ pub struct WorkingModelPirlsResult {
     /// at the same outer fit, avoiding 4-6 iters of damping rediscovery
     /// when the geometry calls for `λ_LM > 1e-6`.
     pub final_lm_lambda: f64,
+    /// Gain ratio (`actual_reduction / predicted_reduction`) at the
+    /// last accepted inner iter. `None` when no step was accepted
+    /// (rejection-exhausted, MaxIterationsReached without acceptance).
+    /// Programmatic counterpart to the per-iter `[PIRLS lm-trajectory]`
+    /// log line's `accept_rho` field — the log is grep-only, this
+    /// field is queryable by the outer schedule and convergence guard.
+    /// Values near 1.0 indicate the quadratic model is faithful;
+    /// values much smaller indicate the LM model is over-stating
+    /// predicted reduction and the inner Newton may benefit from
+    /// shorter steps.
+    pub final_accept_rho: Option<f64>,
     /// Minimum penalized deviance (`state.deviance + state.penalty_term`)
     /// observed across all iterations whose state was computed during the
     /// inner P-IRLS loop. Penalized deviance is monotonically decreasing
@@ -3786,6 +3797,11 @@ where
     let mut last_deviance_change = f64::INFINITY;
     let mut last_step_size = 0.0;
     let mut last_step_halving = 0usize;
+    // Tracks the gain ratio of the most-recently-accepted step across
+    // PIRLS iters. Populates the result's `final_accept_rho` field so
+    // outer consumers (cap schedule, convergence guard) can query the
+    // inner Newton's last model-fidelity measurement programmatically.
+    let mut last_iter_accept_rho: Option<f64> = None;
     let mut max_abs_eta = 0.0;
     let mut status = PirlsStatus::MaxIterationsReached;
     let mut iterations = 0usize;
@@ -4271,8 +4287,12 @@ where
                         }
                         // Accept Step.
                         // Stash the accepted gain ratio for the
-                        // [PIRLS lm-trajectory] log emitted at iter-end.
+                        // [PIRLS lm-trajectory] log emitted at iter-end
+                        // AND the result's `final_accept_rho` field so
+                        // outer consumers can query model fidelity
+                        // programmatically.
                         lm_accept_rho = Some(rho);
+                        last_iter_accept_rho = Some(rho);
                         // Update Trust Region (Lambda) — Madsen-Nielsen-Tingleff
                         // smooth Marquardt update. See `madsen_lm_accept_factor`
                         // for the textbook derivation and canonical values.
@@ -4755,6 +4775,7 @@ where
         max_abs_eta,
         min_penalized_deviance,
         final_lm_lambda: lambda,
+        final_accept_rho: last_iter_accept_rho,
     })
 }
 
@@ -4938,6 +4959,14 @@ pub struct PirlsResult {
     /// same outer optimization can seed `λ_LM` to this value instead
     /// of cold-starting at `1e-6`. Mirrors `WorkingModelPirlsResult::final_lm_lambda`.
     pub final_lm_lambda: f64,
+    /// Gain ratio of the last accepted LM step inside this PIRLS solve,
+    /// `None` when no step was accepted (e.g. zero-iteration synthesis,
+    /// rejection-exhausted, MaxIterations without acceptance). Mirrors
+    /// `WorkingModelPirlsResult::final_accept_rho`. Programmatic
+    /// counterpart to the per-iter `[PIRLS lm-trajectory]` log line's
+    /// `accept_rho` field, queryable by outer consumers (cap schedule,
+    /// convergence guard) for inner-Newton model-fidelity decisions.
+    pub final_accept_rho: Option<f64>,
     /// Optional KKT diagnostics when inequality constraints were active.
     pub constraint_kkt: Option<ConstraintKktDiagnostics>,
     /// Linear inequality system enforced in transformed PIRLS coordinates:
@@ -5011,6 +5040,7 @@ impl PirlsResult {
             last_step_halving: self.last_step_halving,
             hessian_curvature: self.hessian_curvature,
             final_lm_lambda: self.final_lm_lambda,
+            final_accept_rho: self.final_accept_rho,
             constraint_kkt: self.constraint_kkt.clone(),
             linear_constraints_transformed: self.linear_constraints_transformed.clone(),
             reparam_result: self.reparam_result.clone(),
@@ -5097,6 +5127,7 @@ impl PirlsResult {
             last_step_halving: self.last_step_halving,
             hessian_curvature: self.hessian_curvature,
             final_lm_lambda: self.final_lm_lambda,
+            final_accept_rho: self.final_accept_rho,
             constraint_kkt: self.constraint_kkt.clone(),
             linear_constraints_transformed: self.linear_constraints_transformed.clone(),
             reparam_result: self.reparam_result.clone(),
@@ -5169,6 +5200,7 @@ fn assemble_pirls_result(
         last_step_halving: working_summary.last_step_halving,
         hessian_curvature: working_summary.state.hessian_curvature,
         final_lm_lambda: working_summary.final_lm_lambda,
+        final_accept_rho: working_summary.final_accept_rho,
         constraint_kkt: working_summary.constraint_kkt.clone(),
         linear_constraints_transformed,
         reparam_result,
@@ -5766,6 +5798,8 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             // Zero-iteration synthesis: no LM damping was exercised, so
             // hand the next solve the cold default.
             final_lm_lambda: 1e-6,
+            // Zero-iteration synthesis: no LM gain ratio was measured.
+            final_accept_rho: None,
         };
 
         let (solve_c_array, solve_d_array, solve_dmu_deta, solve_d2mu_deta2, solve_d3mu_deta3) =
@@ -5812,6 +5846,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             last_step_halving: 0,
             hessian_curvature: HessianCurvatureKind::Fisher,
             final_lm_lambda: working_summary.final_lm_lambda,
+        final_accept_rho: working_summary.final_accept_rho,
             constraint_kkt: working_summary.constraint_kkt.clone(),
             linear_constraints_transformed: linear_constraints.clone(),
             reparam_result,
