@@ -9620,10 +9620,18 @@ impl SurvivalMarginalSlopeFamily {
         ))
     }
 
-    fn exact_newton_joint_hessian_directional_derivative_operator_flex_no_wiggle(
+    /// Outer-aware operator builder for the flex-no-wiggle joint-Hessian
+    /// directional derivative. The default-options shim is omitted because
+    /// the `SurvivalMarginalSlopeExactNewtonJointHessianWorkspace` always
+    /// threads its own `BlockwiseFitOptions`. When `options.outer_score_subsample` is
+    /// `Some`, only the masked rows are visited and the accumulator is
+    /// rescaled by the Horvitz-Thompson `weight_scale` before being wrapped
+    /// in the `HyperOperator`.
+    pub(crate) fn exact_newton_joint_hessian_directional_derivative_operator_flex_no_wiggle_with_options(
         &self,
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
+        options: &BlockwiseFitOptions,
     ) -> Result<Arc<dyn HyperOperator>, String> {
         let slices = block_slices(self, block_states);
         let primary = flex_primary_slices(self);
@@ -9632,7 +9640,9 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
-        let acc = (0..self.n)
+        let row_iter = outer_row_indices(options, self.n).to_vec();
+        let outer_scale = outer_score_scale(options, self.n);
+        let mut acc = row_iter
             .into_par_iter()
             .try_fold(
                 || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
@@ -9666,14 +9676,25 @@ impl SurvivalMarginalSlopeFamily {
                     Ok(a)
                 },
             )?;
+        if outer_scale != 1.0 {
+            acc.scale_assign(outer_scale);
+        }
         Ok(Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>)
     }
 
-    fn exact_newton_joint_hessiansecond_directional_derivative_operator_flex_no_wiggle(
+    /// Outer-aware operator builder for the flex-no-wiggle joint-Hessian
+    /// second directional derivative. The default-options shim is omitted
+    /// because the `SurvivalMarginalSlopeExactNewtonJointHessianWorkspace`
+    /// always threads its own `BlockwiseFitOptions`. When `options.outer_score_subsample` is
+    /// `Some`, only the masked rows are visited and the accumulator is
+    /// rescaled by the Horvitz-Thompson `weight_scale` before being wrapped
+    /// in the `HyperOperator`.
+    pub(crate) fn exact_newton_joint_hessiansecond_directional_derivative_operator_flex_no_wiggle_with_options(
         &self,
         block_states: &[ParameterBlockState],
         d_u: &Array1<f64>,
         d_v: &Array1<f64>,
+        options: &BlockwiseFitOptions,
     ) -> Result<Arc<dyn HyperOperator>, String> {
         let slices = block_slices(self, block_states);
         let p_t = slices.time.len();
@@ -9681,7 +9702,9 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
-        let acc = (0..self.n)
+        let row_iter = outer_row_indices(options, self.n).to_vec();
+        let outer_scale = outer_score_scale(options, self.n);
+        let mut acc = row_iter
             .into_par_iter()
             .try_fold(
                 || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
@@ -9715,6 +9738,9 @@ impl SurvivalMarginalSlopeFamily {
                     Ok(a)
                 },
             )?;
+        if outer_scale != 1.0 {
+            acc.scale_assign(outer_scale);
+        }
         Ok(Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>)
     }
 }
@@ -9743,12 +9769,20 @@ struct SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
     /// derivative reuse.  Built once during workspace construction so that
     /// repeated directional-derivative calls do not recompute them.
     eval_cache: Option<EvalCache>,
+    /// Outer-only joint-Hessian directional-derivative options. The
+    /// `outer_score_subsample` field is the row mask threaded through the
+    /// `_with_options` directional-derivative helpers so the cached joint
+    /// Hessian Hv-action paths can downscale to the stratified subsample at
+    /// biobank scale. When `None`, the row iteration is identical to the
+    /// legacy full-data path.
+    options: BlockwiseFitOptions,
 }
 
 impl SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
     fn new(
         family: SurvivalMarginalSlopeFamily,
         block_states: Vec<ParameterBlockState>,
+        options: BlockwiseFitOptions,
     ) -> Result<Self, String> {
         let (joint_hessian_operator, joint_hessian_diagonal) =
             family.exact_newton_joint_hessian_operator(&block_states)?;
@@ -9763,6 +9797,7 @@ impl SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
             joint_hessian_operator,
             joint_hessian_diagonal,
             eval_cache,
+            options,
         })
     }
 }
@@ -9785,9 +9820,10 @@ impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointH
         {
             return self
                 .family
-                .exact_newton_joint_hessian_directional_derivative_operator_flex_no_wiggle(
+                .exact_newton_joint_hessian_directional_derivative_operator_flex_no_wiggle_with_options(
                     &self.block_states,
                     d_beta_flat,
+                    &self.options,
                 )
                 .map(Some);
         }
@@ -9844,10 +9880,11 @@ impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointH
         {
             return self
                 .family
-                .exact_newton_joint_hessiansecond_directional_derivative_operator_flex_no_wiggle(
+                .exact_newton_joint_hessiansecond_directional_derivative_operator_flex_no_wiggle_with_options(
                     &self.block_states,
                     d_beta_u_flat,
                     d_beta_v_flat,
+                    &self.options,
                 )
                 .map(Some);
         }
@@ -12467,6 +12504,31 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             SurvivalMarginalSlopeExactNewtonJointHessianWorkspace::new(
                 self.clone(),
                 block_states.to_vec(),
+                BlockwiseFitOptions::default(),
+            )?,
+        )))
+    }
+
+    fn exact_newton_joint_hessian_workspace_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        if !self.effective_flex_active(block_states)? && !self.flex_timewiggle_active() {
+            // Rigid path: RowKernel<4> operator. The rigid path does not yet
+            // have a subsample-aware cache, so options are currently ignored
+            // here (full-data behavior preserved bit-for-bit).
+            let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
+            return Ok(Some(Arc::new(RowKernelHessianWorkspace::new(kern)?)));
+        }
+        // Flex / timewiggle path: store the options on the workspace so the
+        // directional-derivative methods can pick up the outer-row subsample.
+        Ok(Some(Arc::new(
+            SurvivalMarginalSlopeExactNewtonJointHessianWorkspace::new(
+                self.clone(),
+                block_states.to_vec(),
+                options.clone(),
             )?,
         )))
     }
@@ -17050,5 +17112,189 @@ mod tests {
         let exp = &raw_dense * factor;
         let rel = rel_diff_array2_survival(&scaled_dense, &exp);
         assert!(rel < 1e-12, "operator drift rel {}", rel);
+    }
+
+    // ── Phase 7: joint-Hessian flex-no-wiggle directional-derivative
+    // operator subsample tests. The flex-no-wiggle helpers are the path
+    // taken by the joint-Hessian workspace's `directional_derivative_operator`
+    // when `effective_flex_active(states)` is true and timewiggle is off.
+    // We exercise the helpers directly through a flex-active fixture so the
+    // outer subsample threading is verified end-to-end.
+
+    fn make_flex_no_wiggle_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
+        let score_runtime = test_deviation_runtime();
+        let event: Array1<f64> =
+            Array1::from_iter((0..n).map(|i| if (i * 31 + 7) % 5 >= 3 { 1.0 } else { 0.0 }));
+        let weights: Array1<f64> =
+            Array1::from_iter((0..n).map(|i| 0.5 + ((i * 13 + 4) % 5) as f64 * 0.1));
+        let z: Array1<f64> = Array1::from_iter(
+            (0..n).map(|i| -1.0 + 2.0 * (((i * 17 + 5) % n) as f64 + 0.5) / (n as f64)),
+        );
+        let offset_entry: Array1<f64> = Array1::from_iter(
+            (0..n).map(|i| -0.4 + 0.7 * (((i * 11 + 3) % n) as f64 + 0.5) / (n as f64)),
+        );
+        let offset_exit: Array1<f64> = Array1::from_iter(
+            (0..n).map(|i| 0.1 + 0.6 * (((i * 19 + 7) % n) as f64 + 0.5) / (n as f64)),
+        );
+        let derivative_offset_exit: Array1<f64> = Array1::from_iter(
+            (0..n).map(|i| 0.5 + 0.05 * ((i * 23 + 1) % 3) as f64),
+        );
+        let marginal_design = Array2::from_shape_fn((n, 1), |(i, _)| {
+            0.3 + 0.4 * (((i * 29 + 11) % n) as f64) / (n as f64)
+        });
+        let logslope_design = Array2::from_shape_fn((n, 1), |(i, _)| {
+            0.2 + 0.5 * (((i * 37 + 9) % n) as f64) / (n as f64)
+        });
+        SurvivalMarginalSlopeFamily {
+            n,
+            event: Arc::new(event),
+            weights: Arc::new(weights),
+            z: Arc::new(z),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::zeros((n, 0))),
+            design_exit: DesignMatrix::from(Array2::zeros((n, 0))),
+            design_derivative_exit: DesignMatrix::from(Array2::zeros((n, 0))),
+            offset_entry: Arc::new(offset_entry),
+            offset_exit: Arc::new(offset_exit),
+            derivative_offset_exit: Arc::new(derivative_offset_exit),
+            marginal_design: DesignMatrix::from(marginal_design),
+            logslope_design: DesignMatrix::from(logslope_design),
+            score_warp: Some(score_runtime),
+            link_dev: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+        }
+    }
+
+    fn flex_no_wiggle_test_block_states(
+        family: &SurvivalMarginalSlopeFamily,
+    ) -> Vec<ParameterBlockState> {
+        let n = family.n;
+        let m_design = family.marginal_design.to_dense().to_owned();
+        let g_design = family.logslope_design.to_dense().to_owned();
+        let m_beta = 0.15_f64;
+        let g_beta = 0.25_f64;
+        let m_eta = m_design.dot(&array![m_beta]);
+        let g_eta = g_design.dot(&array![g_beta]);
+        let score_dim = family
+            .score_warp
+            .as_ref()
+            .map(|w| w.basis_dim())
+            .unwrap_or(0);
+        vec![
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: Array1::zeros(n),
+            },
+            ParameterBlockState {
+                beta: array![m_beta],
+                eta: m_eta,
+            },
+            ParameterBlockState {
+                beta: array![g_beta],
+                eta: g_eta,
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(score_dim),
+                eta: Array1::zeros(n),
+            },
+        ]
+    }
+
+    #[test]
+    fn survival_jointhessian_flex_no_wiggle_operator_subsample_full_equals_unsampled() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 40usize;
+        let family = make_flex_no_wiggle_test_family(n);
+        let states = flex_no_wiggle_test_block_states(&family);
+        assert!(family.effective_flex_active(&states).unwrap());
+        assert!(!family.flex_timewiggle_active());
+        let slices = block_slices(&family, &states);
+        let mut d_beta_flat = Array1::<f64>::zeros(slices.total);
+        d_beta_flat[slices.marginal.start] = 0.05;
+        d_beta_flat[slices.logslope.start] = -0.04;
+
+        let baseline = family
+            .exact_newton_joint_hessian_directional_derivative_operator_flex_no_wiggle_with_options(
+                &states,
+                &d_beta_flat,
+                &BlockwiseFitOptions::default(),
+            )
+            .expect("baseline operator");
+        let baseline_dense = baseline.to_dense();
+
+        let mut opts_full = BlockwiseFitOptions::default();
+        opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            (0..n).collect(),
+            n,
+            0xDEADBEEF,
+        )));
+        let with_full = family
+            .exact_newton_joint_hessian_directional_derivative_operator_flex_no_wiggle_with_options(
+                &states,
+                &d_beta_flat,
+                &opts_full,
+            )
+            .expect("with full mask");
+        let with_full_dense = with_full.to_dense();
+
+        let rel = rel_diff_array2_survival(&with_full_dense, &baseline_dense);
+        assert!(rel < 1e-10, "joint Hessian flex-no-wiggle dH operator drift rel {}", rel);
+    }
+
+    #[test]
+    fn survival_jointhessian_flex_no_wiggle_operator_subsample_half_scales_correctly() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 40usize;
+        let family = make_flex_no_wiggle_test_family(n);
+        let states = flex_no_wiggle_test_block_states(&family);
+        assert!(family.effective_flex_active(&states).unwrap());
+        assert!(!family.flex_timewiggle_active());
+        let slices = block_slices(&family, &states);
+        let mut d_beta_flat = Array1::<f64>::zeros(slices.total);
+        d_beta_flat[slices.marginal.start] = 0.05;
+        d_beta_flat[slices.logslope.start] = -0.04;
+
+        let even_mask: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
+        let m = even_mask.len();
+
+        let mut opts_half = BlockwiseFitOptions::default();
+        opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            even_mask.clone(),
+            n,
+            0xCAFE,
+        )));
+        let scaled = family
+            .exact_newton_joint_hessian_directional_derivative_operator_flex_no_wiggle_with_options(
+                &states,
+                &d_beta_flat,
+                &opts_half,
+            )
+            .expect("scaled");
+        let scaled_dense = scaled.to_dense();
+
+        let mut opts_raw = BlockwiseFitOptions::default();
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
+            mask: Arc::new(even_mask),
+            n_full: m,
+            weight_scale: 1.0,
+            seed: 0,
+        }));
+        let raw = family
+            .exact_newton_joint_hessian_directional_derivative_operator_flex_no_wiggle_with_options(
+                &states,
+                &d_beta_flat,
+                &opts_raw,
+            )
+            .expect("raw");
+        let raw_dense = raw.to_dense();
+
+        let factor = n as f64 / m as f64;
+        let exp = &raw_dense * factor;
+        let rel = rel_diff_array2_survival(&scaled_dense, &exp);
+        assert!(rel < 1e-10, "joint Hessian flex-no-wiggle dH operator HT rel {}", rel);
     }
 }
