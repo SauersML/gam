@@ -2869,8 +2869,23 @@ def _emit_phase_summary(
         ws_label = warm_start_verdict if warm_start_verdict else "ABSENT"
         pirls_label = pirls_verdict if pirls_verdict else "ABSENT"
         cv_label = curvature_verdict if curvature_verdict else "ABSENT"
+        # `dominant_axis` field surfaces the axis name that drove the
+        # combined verdict — useful for CI scrapers that want to
+        # alert on the specific failing axis without re-implementing
+        # the worst-of-three computation. Tie-breaking: prefer pirls
+        # over warm_start over curvature (lexically reverse-sorted),
+        # matching the "PIRLS is the central inner-Newton diagnostic"
+        # convention from the older 2-axis verdict. When all three
+        # axes are NO-DATA / ABSENT, we report `dominant_axis=none`.
+        dominant_axis = _dominant_axis_for_verdict(
+            combined,
+            warm_start=warm_start_verdict,
+            pirls=pirls_verdict,
+            curvature=curvature_verdict,
+        )
         print(
             f"[FIT health] cmd='{cmd_preview}' verdict={combined} "
+            f"dominant_axis={dominant_axis} "
             f"warm_start={ws_label} pirls={pirls_label} curvature={cv_label}",
             file=sys.stderr,
             flush=True,
@@ -2909,6 +2924,44 @@ def _combine_fit_verdicts(
     p_rank = rank.get(pirls or "NO-DATA", 0)
     c_rank = rank.get(curvature or "NO-DATA", 0)
     return inv_rank[max(ws_rank, p_rank, c_rank)]
+
+
+def _dominant_axis_for_verdict(
+    combined: str,
+    *,
+    warm_start: str | None,
+    pirls: str | None,
+    curvature: str | None,
+) -> str:
+    """Return the axis name (`warm_start` / `pirls` / `curvature` /
+    `none`) that drove the combined verdict via worst-of-three.
+
+    When `combined == "NO-DATA"`, all three axes were missing → `none`.
+
+    Tie-breaking among axes at the same tier: prefer `pirls` first (the
+    central inner-Newton diagnostic, matching the older 2-axis verdict
+    convention), then `warm_start`, then `curvature`. So a tie at
+    DEGRADED across all three reports `dominant_axis=pirls`.
+
+    `None` inputs are treated as `NO-DATA` for ranking, matching
+    `_combine_fit_verdicts` semantics.
+    """
+    if combined == "NO-DATA":
+        return "none"
+    rank = {"DEGRADED": 3, "MARGINAL": 2, "HEALTHY": 1, "NO-DATA": 0}
+    target = rank[combined]
+    # Tie-break order matches the documented preference.
+    candidates = (
+        ("pirls", pirls),
+        ("warm_start", warm_start),
+        ("curvature", curvature),
+    )
+    for name, verdict in candidates:
+        if rank.get(verdict or "NO-DATA", 0) == target:
+            return name
+    # Should be unreachable: combined comes from max(rank values), so
+    # one of the inputs MUST have that rank. Fall back gracefully.
+    return "none"
 
 
 def _curvature_health_verdict(

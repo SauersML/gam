@@ -1132,6 +1132,59 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         self.assertEqual(combine(None, None, "DEGRADED"), "DEGRADED")
         self.assertEqual(combine(None, None, None), "NO-DATA")
 
+    def test_dominant_axis_for_verdict_resolves_correctly(self) -> None:
+        # Locks the contract for `_dominant_axis_for_verdict`: returns
+        # the axis name (warm_start / pirls / curvature / none) that
+        # drove the combined verdict via worst-of-three. Tie-breaking
+        # at the same tier prefers pirls > warm_start > curvature.
+        dom = _RUNNER._dominant_axis_for_verdict
+        # Single-axis DEGRADED → that axis is dominant.
+        self.assertEqual(
+            dom("DEGRADED", warm_start="HEALTHY", pirls="HEALTHY", curvature="DEGRADED"),
+            "curvature",
+        )
+        self.assertEqual(
+            dom("DEGRADED", warm_start="DEGRADED", pirls="HEALTHY", curvature="HEALTHY"),
+            "warm_start",
+        )
+        self.assertEqual(
+            dom("DEGRADED", warm_start="HEALTHY", pirls="DEGRADED", curvature="HEALTHY"),
+            "pirls",
+        )
+        # Tie-break: all three at DEGRADED → pirls wins.
+        self.assertEqual(
+            dom("DEGRADED", warm_start="DEGRADED", pirls="DEGRADED", curvature="DEGRADED"),
+            "pirls",
+        )
+        # Tie at DEGRADED between warm_start and curvature → warm_start
+        # wins (preference order pirls > warm_start > curvature).
+        self.assertEqual(
+            dom("DEGRADED", warm_start="DEGRADED", pirls="HEALTHY", curvature="DEGRADED"),
+            "warm_start",
+        )
+        # MARGINAL combined: curvature is the only MARGINAL, so it's
+        # dominant.
+        self.assertEqual(
+            dom("MARGINAL", warm_start="HEALTHY", pirls="HEALTHY", curvature="MARGINAL"),
+            "curvature",
+        )
+        # All HEALTHY → pirls wins the tie.
+        self.assertEqual(
+            dom("HEALTHY", warm_start="HEALTHY", pirls="HEALTHY", curvature="HEALTHY"),
+            "pirls",
+        )
+        # NO-DATA combined → none.
+        self.assertEqual(
+            dom("NO-DATA", warm_start=None, pirls=None, curvature=None),
+            "none",
+        )
+        # None inputs are treated as NO-DATA for ranking. With combined
+        # MARGINAL and only pirls at MARGINAL, the result is pirls.
+        self.assertEqual(
+            dom("MARGINAL", warm_start=None, pirls="MARGINAL", curvature=None),
+            "pirls",
+        )
+
     def test_curvature_health_verdict_classifies_tiers(self) -> None:
         # Tier policy from `_curvature_health_verdict`:
         #   HEALTHY    fisher_frac < 0.05 AND force_fisher_n == 0
@@ -1259,6 +1312,10 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         self.assertIn("pirls=HEALTHY", fit_lines[0])
         # The curvature axis is the one driving DEGRADED.
         self.assertIn("curvature=DEGRADED", fit_lines[0])
+        # The new `dominant_axis` field surfaces the offending axis
+        # name directly, so CI scrapers can alert on the specific
+        # failing axis without re-implementing worst-of-three.
+        self.assertIn("dominant_axis=curvature", fit_lines[0])
 
     def test_pirls_health_verdict_classifies_tiers(self) -> None:
         # HEALTHY: 95% of solves at rate < 0.5 (each Newton iter at
