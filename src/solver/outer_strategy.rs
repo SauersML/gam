@@ -2889,6 +2889,112 @@ fn steihaug_toint_step_operator(
     Ok((pred.is_finite() && pred > 0.0).then_some((p, pred)))
 }
 
+/// Bound-pinned axis mask used by the corner-clamp escape.
+///
+/// An axis is "pinned" iff `x[i]` is at either bound, measured with a
+/// per-axis tolerance `1e-12 · max(upper - lower, 1)`. This is a strictly
+/// geometric test — distinct from `active_mask` which additionally
+/// inspects the gradient direction. We need the geometric test for the
+/// active-set escape because the corner-clamp pathology can wedge axes
+/// that aren't strictly "active" in the KKT sense (gradient may flip sign
+/// after the inner-PIRLS update changes the local Hessian).
+fn pinned_axes_mask(
+    x: &Array1<f64>,
+    bounds: Option<&(Array1<f64>, Array1<f64>)>,
+) -> Vec<bool> {
+    match bounds {
+        Some((lower, upper)) => (0..x.len())
+            .map(|idx| {
+                let span = (upper[idx] - lower[idx]).abs().max(1.0);
+                let tol = 1e-12 * span;
+                (x[idx] - lower[idx]).abs() <= tol || (upper[idx] - x[idx]).abs() <= tol
+            })
+            .collect(),
+        None => vec![false; x.len()],
+    }
+}
+
+/// Mask of axes whose unconstrained trial step was clipped by
+/// `project_to_bounds`. These are the axes responsible for the
+/// corner-clamp pathology: as the trust radius shrinks, they keep getting
+/// clipped to the same bound, so `x_trial` (and therefore `act_dec`) is
+/// constant across consecutive halvings.
+fn clipped_axes_mask(x_raw: &Array1<f64>, x_projected: &Array1<f64>) -> Vec<bool> {
+    debug_assert_eq!(x_raw.len(), x_projected.len());
+    (0..x_raw.len())
+        .map(|idx| (x_raw[idx] - x_projected[idx]).abs() > 0.0)
+        .collect()
+}
+
+/// Build the union of the existing KKT-style active mask and the
+/// geometric pinned-axes mask, used as the active set for the
+/// corner-clamp escape step.
+fn union_active_with_pinned(
+    base_active: &[bool],
+    pinned: &[bool],
+) -> Vec<bool> {
+    debug_assert_eq!(base_active.len(), pinned.len());
+    base_active
+        .iter()
+        .zip(pinned.iter())
+        .map(|(a, p)| *a || *p)
+        .collect()
+}
+
+/// Reduced-space ("active-set") trust-region escape from a corner clamp.
+///
+/// When the unconstrained Steihaug-Toint step is being repeatedly clipped
+/// by `project_to_bounds`, halving the trust radius produces bit-identical
+/// `act_dec` because all the clipped axes still hit the same bound and
+/// the unclipped axes contribute negligibly. This helper forces the
+/// clipped (and any pinned) axes to take a zero step, then re-solves the
+/// trust-region subproblem on the unpinned subspace using the existing
+/// Steihaug-Toint solver with an extended active mask.
+///
+/// Returns `None` when:
+/// - all axes are pinned (genuine corner — no feasible descent direction);
+/// - the reduced-space CG fails to find a step;
+/// - the resulting step has zero norm.
+///
+/// On success, the returned step has zero entries at every pinned axis
+/// and obeys the trust-region radius in the reduced subspace. Caller is
+/// responsible for evaluating it and applying the standard accept/reject
+/// ratio test.
+fn compute_active_set_step(
+    op: &dyn OuterHessianOperator,
+    g_proj: &Array1<f64>,
+    base_active: &[bool],
+    pinned_or_clipped: &[bool],
+    trust_radius: f64,
+) -> Result<Option<(Array1<f64>, f64, Vec<bool>)>, String> {
+    let extended = union_active_with_pinned(base_active, pinned_or_clipped);
+    if extended.iter().all(|flag| *flag) {
+        return Ok(None);
+    }
+    // If `extended` is identical to `base_active`, the Steihaug-Toint
+    // solver has already been called with this mask in the main loop and
+    // returned the step that triggered the corner clamp. Re-running it
+    // would loop. Caller should fall back to halving in that case.
+    if extended
+        .iter()
+        .zip(base_active.iter())
+        .all(|(e, b)| *e == *b)
+    {
+        return Ok(None);
+    }
+    match steihaug_toint_step_operator(op, g_proj, trust_radius, &extended)? {
+        Some((step, pred)) => {
+            let s_norm = step.dot(&step).sqrt();
+            if !s_norm.is_finite() || s_norm <= 1e-16 {
+                Ok(None)
+            } else {
+                Ok(Some((step, pred, extended)))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
 /// Scale-invariant tolerance for the outer REML/LAML optimizer.
 ///
 /// V_LAML(ρ) is dominated by an O(n) likelihood term at biobank scale, so
@@ -3326,6 +3432,7 @@ fn run_operator_trust_region(
             // more bounds and projection is clamping to the same corner of
             // the box every time. Surface this once per run so it shows up
             // in CI logs without spamming.
+            let mut corner_clamp_just_detected = false;
             if act_dec.is_finite() {
                 let cost_floor = eval_k.cost.abs().max(1.0);
                 let near_equal = match last_rejection_act_dec {
@@ -3337,6 +3444,9 @@ fn run_operator_trust_region(
                 };
                 if near_equal {
                     consecutive_corner_clamps += 1;
+                    if consecutive_corner_clamps >= CORNER_CLAMP_REPORT_THRESHOLD {
+                        corner_clamp_just_detected = true;
+                    }
                     if !corner_clamp_reported_for_run
                         && consecutive_corner_clamps >= CORNER_CLAMP_REPORT_THRESHOLD
                     {
@@ -3346,10 +3456,8 @@ fn run_operator_trust_region(
                              {:.3e}); the unconstrained cubic-model step direction is crossing \
                              one or more box bounds, projection clamps the trial point to a \
                              constant corner regardless of step magnitude, so cost(trial) is \
-                             constant and act_dec stops carrying useful information. The \
-                             optimizer will geometrically halve to the reject floor without \
-                             learning anything. Caller's bounds may be too tight or the \
-                             gradient/Hessian at this x_k may have a degenerate component.",
+                             constant and act_dec stops carrying useful information. \
+                             Attempting active-set escape (reduced-subspace step).",
                             act_dec,
                             consecutive_corner_clamps + 1,
                             snapped_radius,
@@ -3360,6 +3468,157 @@ fn run_operator_trust_region(
                     consecutive_corner_clamps = 0;
                 }
                 last_rejection_act_dec = Some(act_dec);
+            }
+
+            // Active-set escape. When the corner-clamp condition fires,
+            // build an extended active mask containing every axis that
+            // (a) was already KKT-active, plus (b) was clipped during
+            // `project_to_bounds(x_k + trial_step)`, plus (c) sits at a
+            // bound to within `1e-12 · span` numerically. Force those
+            // axes to take a zero step and re-solve the trust-region
+            // subproblem on the unpinned subspace. If the resulting step
+            // produces a valid descent (rho > OPERATOR_ETA_ACCEPT), accept
+            // it and continue from the new x_k. Otherwise fall through to
+            // the standard halving path.
+            if corner_clamp_just_detected {
+                let clipped = clipped_axes_mask(&x_trial_raw, &x_trial);
+                let pinned = pinned_axes_mask(&x_k, bounds);
+                let extra_active: Vec<bool> = clipped
+                    .iter()
+                    .zip(pinned.iter())
+                    .map(|(c, p)| *c || *p)
+                    .collect();
+                match compute_active_set_step(
+                    step_op,
+                    &g_proj,
+                    &active,
+                    &extra_active,
+                    snapped_radius.max(trust_radius),
+                ) {
+                    Ok(Some((reduced_step, reduced_pred, extended_active))) => {
+                        let x_trial_red_raw = &x_k + &reduced_step;
+                        let x_trial_red = project_to_bounds(&x_trial_red_raw, bounds);
+                        let s_red = &x_trial_red - &x_k;
+                        let s_red_norm = s_red.dot(&s_red).sqrt();
+                        if s_red_norm.is_finite() && s_red_norm > 1e-16 {
+                            let red_pred = if (&s_red - &reduced_step)
+                                .dot(&(&s_red - &reduced_step))
+                                .sqrt()
+                                > 1e-8 * (1.0 + reduced_step.dot(&reduced_step).sqrt())
+                            {
+                                predicted_decrease_from_operator(
+                                    step_op,
+                                    &g_proj,
+                                    &s_red,
+                                    &extended_active,
+                                )
+                                .unwrap_or(reduced_pred)
+                            } else {
+                                reduced_pred
+                            };
+                            if red_pred.is_finite() && red_pred > 0.0 {
+                                let red_trial_cost = obj.eval_cost(&x_trial_red);
+                                if let Ok(red_trial_cost) = red_trial_cost {
+                                    if red_trial_cost.is_finite() {
+                                        let red_act_dec = eval_k.cost - red_trial_cost;
+                                        let red_rho = red_act_dec / red_pred;
+                                        if red_rho > OPERATOR_ETA_ACCEPT {
+                                            // Accept the active-set step.
+                                            match obj.eval_with_order(
+                                                &x_trial_red,
+                                                OuterEvalOrder::ValueGradientHessian,
+                                            ) {
+                                                Ok(eval_red) => {
+                                                    if let Ok(eval_red) =
+                                                        finite_outer_eval_or_error(
+                                                            "outer operator active-set eval failed",
+                                                            layout,
+                                                            eval_red,
+                                                        )
+                                                    {
+                                                        log::warn!(
+                                                            "[ARC-timing] iter={iter} \
+                                                             active_set_escape_accepted: \
+                                                             cost={:.6e}->{:.6e} red_rho={:.3} \
+                                                             red_pred={:.3e} red_act_dec={:.3e} \
+                                                             axes_pinned={}/{} \
+                                                             trust_radius={:.3e}",
+                                                            eval_k.cost,
+                                                            red_trial_cost,
+                                                            red_rho,
+                                                            red_pred,
+                                                            red_act_dec,
+                                                            extended_active
+                                                                .iter()
+                                                                .filter(|f| **f)
+                                                                .count(),
+                                                            extended_active.len(),
+                                                            snapped_radius,
+                                                        );
+                                                        x_k = x_trial_red;
+                                                        eval_k = eval_red;
+                                                        // Reset corner-clamp tracker; we're
+                                                        // now at a new x_k, so prior act_decs
+                                                        // are no longer comparable.
+                                                        last_rejection_act_dec = None;
+                                                        consecutive_corner_clamps = 0;
+                                                        corner_clamp_reported_for_run = false;
+                                                        // Keep trust radius at the snap target
+                                                        // — we don't want to reset to seed
+                                                        // scale and replay long halvings.
+                                                        trust_radius = snapped_radius
+                                                            .max(OPERATOR_TRUST_RADIUS_REJECT_FLOOR
+                                                                * 10.0);
+                                                        dense_model = None;
+                                                        materialize_dense_after_rejection = false;
+                                                        continue;
+                                                    }
+                                                }
+                                                Err(_) => {
+                                                    // Eval failed; fall through to halving.
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // Either all axes pinned (true corner) or extended
+                        // mask matches base — nothing new to try, fall
+                        // through to halving with a higher floor.
+                    }
+                    Err(_) => {
+                        // Operator matvec error; fall through.
+                    }
+                }
+                // Active-set escape failed or didn't apply. Force the
+                // trust radius floor up so the global optimizer can
+                // terminate cleanly rather than spinning into the
+                // reject floor with no useful progress.
+                trust_radius = snapped_radius.max(OPERATOR_TRUST_RADIUS_REJECT_FLOOR * 10.0);
+                let final_grad = projected_gradient(&x_k, &eval_k.gradient, bounds);
+                let final_grad_norm = final_grad.dot(&final_grad).sqrt();
+                log::warn!(
+                    "[ARC-timing] iter={iter} active_set_escape_unavailable: \
+                     terminating at corner with trust_radius={:.3e} \
+                     grad_norm={:.3e}",
+                    trust_radius,
+                    final_grad_norm,
+                );
+                return Ok(OuterResult {
+                    rho: x_k,
+                    final_value: eval_k.cost,
+                    iterations: iter + 1,
+                    final_grad_norm,
+                    final_gradient: Some(eval_k.gradient),
+                    final_hessian: None,
+                    converged: false,
+                    plan_used: plan,
+                    operator_trust_radius: Some(trust_radius),
+                    operator_stop_reason: Some(OperatorTrustRegionStopReason::RejectFloor),
+                });
             }
             trust_radius = snapped_radius;
             if trust_radius <= OPERATOR_TRUST_RADIUS_REJECT_FLOOR {
@@ -4354,6 +4613,194 @@ mod tests {
             (ratio_base - ratio_scaled).abs() < 1e-15,
             "scale ratio must be invariant: base={ratio_base:.3e}  scaled={ratio_scaled:.3e}"
         );
+    }
+
+    /// `pinned_axes_mask`: an axis is geometrically at a bound when it is
+    /// within `1e-12 · max(span, 1)` of either lower or upper. Distinct
+    /// from `active_mask` which also examines gradient direction.
+    #[test]
+    fn pinned_axes_mask_detects_corner_points() {
+        let lower = array![0.0, 0.0, -10.0, 0.0];
+        let upper = array![1.0, 1.0, 10.0, 1.0];
+        let bounds = (lower, upper);
+
+        // x[0] at lower, x[1] at upper, x[2] interior, x[3] within tol of upper.
+        let x = array![0.0, 1.0, 0.0, 1.0 - 1e-15];
+        let mask = pinned_axes_mask(&x, Some(&bounds));
+        assert_eq!(mask, vec![true, true, false, true]);
+
+        // No bounds → all unpinned.
+        assert_eq!(pinned_axes_mask(&x, None), vec![false; 4]);
+    }
+
+    /// `clipped_axes_mask`: detects axes whose unconstrained step would
+    /// have crossed a bound and was therefore clipped during projection.
+    #[test]
+    fn clipped_axes_mask_marks_projection_changes() {
+        let raw = array![1.5, 0.5, -0.2, 0.7];
+        let projected = array![1.0, 0.5, 0.0, 0.7];
+        let mask = clipped_axes_mask(&raw, &projected);
+        assert_eq!(mask, vec![true, false, true, false]);
+
+        // Raw == projected means nothing was clipped.
+        let mask = clipped_axes_mask(&projected, &projected);
+        assert_eq!(mask, vec![false; 4]);
+    }
+
+    /// `union_active_with_pinned`: the active set used by the
+    /// corner-clamp escape is the OR of the existing KKT active mask
+    /// and the geometric pinned mask.
+    #[test]
+    fn union_active_with_pinned_is_logical_or() {
+        let base = vec![false, true, false, false];
+        let pinned = vec![false, false, true, false];
+        let merged = union_active_with_pinned(&base, &pinned);
+        assert_eq!(merged, vec![false, true, true, false]);
+    }
+
+    /// Active-set escape on a synthetic 4D quadratic that simulates the
+    /// corner-clamp pathology. The proposed unconstrained step crosses
+    /// axis 0's upper bound, so projection clips axis 0 — but axis 0 is
+    /// strictly interior at `x_k`, so the standard KKT `active_mask`
+    /// (which uses gradient sign at the bound) does NOT mark axis 0 as
+    /// active. The corner-clamp escape extends the active set by axis 0
+    /// (because it was clipped) and re-solves the trust-region
+    /// subproblem on axes 1..3, which has a strictly positive predicted
+    /// decrease and a step that is exactly zero on axis 0. Without the
+    /// extension, the Steihaug-Toint solve would return the same
+    /// unconstrained step that triggered the clamp.
+    #[test]
+    fn active_set_step_unblocks_corner_clamp_on_4d_quadratic() {
+        struct IdHess(usize);
+        impl OuterHessianOperator for IdHess {
+            fn dim(&self) -> usize {
+                self.0
+            }
+            fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+                Ok(v.clone())
+            }
+        }
+
+        let n = 4;
+        let op = IdHess(n);
+
+        // Bounds: axis 0 in [0, 1], others in [-10, 10].
+        let lower = array![0.0, -10.0, -10.0, -10.0];
+        let upper = array![1.0, 10.0, 10.0, 10.0];
+        let bounds = (lower.clone(), upper.clone());
+
+        // x_k strictly INTERIOR on every axis (axis 0 not at a bound).
+        let x_k = array![0.5, 0.0, 0.0, 0.0];
+
+        // Gradient: small on every axis. Axis 0 is interior, so the KKT
+        // active mask returns false everywhere.
+        let g = array![-0.3, 0.5, -0.5, 0.3];
+        let g_proj = projected_gradient(&x_k, &g, Some(&bounds));
+        // Interior x_k → projected gradient is unchanged.
+        for idx in 0..n {
+            assert!((g_proj[idx] - g[idx]).abs() < 1e-15);
+        }
+
+        let base_active = active_mask(&x_k, &g, Some(&bounds));
+        assert_eq!(
+            base_active,
+            vec![false; n],
+            "interior x_k must yield empty KKT active mask"
+        );
+
+        // Simulate the corner-clamp pathology: an unconstrained step
+        // that crosses axis 0's upper bound. (In real ARC this can
+        // come from the cubic model's coupling between axes; here we
+        // construct it directly.)
+        let s_unclipped = array![1.0, -0.2, 0.2, -0.1];
+        let x_raw = &x_k + &s_unclipped;
+        let x_proj = project_to_bounds(&x_raw, Some(&bounds));
+        let clipped = clipped_axes_mask(&x_raw, &x_proj);
+        let pinned = pinned_axes_mask(&x_k, Some(&bounds));
+        let extra: Vec<bool> = clipped
+            .iter()
+            .zip(pinned.iter())
+            .map(|(c, p)| *c || *p)
+            .collect();
+        // Axis 0 was clipped (raw=1.5 → projected=1.0); other axes unaffected.
+        assert_eq!(extra, vec![true, false, false, false]);
+
+        let trust_radius = 0.5_f64;
+        let result = compute_active_set_step(&op, &g_proj, &base_active, &extra, trust_radius)
+            .expect("compute_active_set_step must not error");
+        let (step, pred, extended) = result.expect(
+            "active-set step must produce a feasible reduced-space step on this 4D quadratic",
+        );
+        // Extended mask differs from base (axis 0 newly added).
+        assert_eq!(extended, vec![true, false, false, false]);
+        // Step on axis 0 must be exactly zero (it is in the active set).
+        assert_eq!(step[0], 0.0, "active-set step must be zero on pinned axis");
+        // Predicted decrease must be strictly positive (we have a
+        // non-zero gradient on axes 1..3 and identity Hessian).
+        assert!(pred > 0.0, "expected positive predicted decrease, got {pred}");
+        // Step must respect the trust radius.
+        let s_norm = step.dot(&step).sqrt();
+        assert!(
+            s_norm <= trust_radius * (1.0 + 1e-9),
+            "active-set step must respect trust radius: ‖s‖={s_norm:.3e} > Δ={trust_radius:.3e}"
+        );
+        // The reduced step must move at least one of axes 1..3
+        // (since g_proj is non-zero on those axes).
+        let reduced_norm =
+            (1..n).map(|i| step[i] * step[i]).sum::<f64>().sqrt();
+        assert!(
+            reduced_norm > 0.0,
+            "active-set step must produce non-zero motion in the unpinned subspace"
+        );
+    }
+
+    /// When every axis is already pinned (true corner), the active-set
+    /// step must return `None` so the caller can terminate cleanly
+    /// rather than spinning.
+    #[test]
+    fn active_set_step_returns_none_at_true_corner() {
+        struct IdHess(usize);
+        impl OuterHessianOperator for IdHess {
+            fn dim(&self) -> usize {
+                self.0
+            }
+            fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+                Ok(v.clone())
+            }
+        }
+
+        let op = IdHess(2);
+        let g = array![1.0, -1.0];
+        let base = vec![true, true];
+        let extra = vec![true, true];
+        let result = compute_active_set_step(&op, &g, &base, &extra, 0.5)
+            .expect("must not error");
+        assert!(result.is_none());
+    }
+
+    /// When the extended mask doesn't add any new active axes (i.e. the
+    /// base KKT active set already matches), the helper must return
+    /// `None` to avoid looping with the same Steihaug-Toint solve.
+    #[test]
+    fn active_set_step_returns_none_when_extended_matches_base() {
+        struct IdHess(usize);
+        impl OuterHessianOperator for IdHess {
+            fn dim(&self) -> usize {
+                self.0
+            }
+            fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+                Ok(v.clone())
+            }
+        }
+
+        let op = IdHess(3);
+        let g = array![0.1, -0.2, 0.3];
+        let base = vec![true, false, false];
+        let extra = vec![false, false, false];
+        // Union(base, extra) == base, so escape is a no-op.
+        let result = compute_active_set_step(&op, &g, &base, &extra, 0.5)
+            .expect("must not error");
+        assert!(result.is_none());
     }
 
     struct FailingSeedMaterializationOperator {
