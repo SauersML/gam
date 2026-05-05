@@ -28,6 +28,45 @@ const FIRTH_MAX_COEFFICIENTS: usize = 256;
 const FIRTH_MAX_LINEAR_WORK: usize = 2_000_000;
 const FIRTH_MAX_QUADRATIC_WORK: usize = 100_000_000;
 
+/// Cached state from the most recent successful PIRLS solve, populated by
+/// `updatewarm_start_from` and consumed by the IFT-based warm-start
+/// predictor. See the field doc on
+/// `RemlObjectiveState::ift_warm_start_cache` for the math.
+///
+/// Fields are `#[allow(dead_code)]` because the predictor lives in a
+/// follow-up commit; this struct fixes the cache layout / lifecycle so
+/// the predictor implementation has a stable surface to plug into. All
+/// fields are intentionally unused for now — the writer/clear paths
+/// in `runtime.rs` are real (populate after each PIRLS converge,
+/// invalidate on reset_surface / invalidate_link_dependent_state /
+/// failed solve), so the lifecycle is exercised even before the
+/// reader exists.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub(crate) struct IftWarmStartCache {
+    /// β at the converged solve, in ORIGINAL basis. Mirror of
+    /// `warm_start_beta` stashed alongside the H factor for atomic
+    /// consistency under concurrent reads (the predictor needs both
+    /// β and H from the SAME solve; reading them from two locks risks
+    /// a torn pair if a fresh solve lands between reads).
+    pub beta_original: ndarray::Array1<f64>,
+    /// ρ at which the solve occurred. Mirror of `warm_start_rho`,
+    /// stashed for the same atomic-consistency reason.
+    pub rho: ndarray::Array1<f64>,
+    /// Penalized Hessian H_pen at the converged β, in TRANSFORMED basis.
+    /// The IFT predictor factors this on demand; basis transforms run in
+    /// transformed basis for numerical stability.
+    pub penalized_hessian_transformed: crate::linalg::matrix::SymmetricMatrix,
+    /// Reparameterization matrix qs converting between transformed
+    /// (column) basis and original basis: `β_orig = qs · β_tfd`,
+    /// `H_orig = qs · H_tfd · qs^T`.
+    pub qs: ndarray::Array2<f64>,
+    /// True when the PIRLS result was already in original basis
+    /// (`OriginalSparseNative`) — in which case `qs` is the identity
+    /// and the IFT predictor can skip the basis-conversion ops.
+    pub frame_was_original: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TauTauPlanEstimate {
     pub(crate) dense_x_bytes: usize,
@@ -3602,6 +3641,23 @@ pub(crate) struct RemlState<'a> {
     /// iter falls back to a coarse iter-count tier).
     pub(crate) last_inner_iters: Arc<AtomicUsize>,
     pub(crate) last_inner_converged: Arc<AtomicBool>,
+
+    /// Cached state from the most recent successful PIRLS solve, used by
+    /// the IFT-based warm-start predictor.
+    ///
+    /// The implicit-function theorem applied to the FOC ∇_β F(β,ρ)=0
+    /// gives `dβ/dρ_k = -H_pen^{-1} · (e^{ρ_k} · S_k · β)`. A first-order
+    /// Taylor predictor reads
+    /// `β_predict(ρ_new) = β_cur − Σ_k Δρ_k · H_pen^{-1} · (e^{ρ_cur_k} · S_k · β_cur)`.
+    /// This is a strict superset of the tangent-line predictor's
+    /// requirements: works after a single successful solve (tangent-line
+    /// needs two prior fits), and gives the EXACT first-order Jacobian
+    /// of the implicit β(ρ) trajectory rather than a finite-difference
+    /// proxy along one ρ-direction.
+    ///
+    /// Populated in `updatewarm_start_from` when PIRLS converges; cleared
+    /// on failure, on `reset_surface`, and on link-state changes.
+    pub(crate) ift_warm_start_cache: RwLock<Option<IftWarmStartCache>>,
 
     /// When set, the penalties have Kronecker (tensor-product) structure and
     /// the REML evaluator can use O(∏q_j) logdet instead of O(p³) eigendecomposition.

@@ -1198,6 +1198,10 @@ impl<'a> RemlState<'a> {
         self.cache_manager.clear_eval_and_factor_caches();
         self.cache_manager.pirls_cache.write().unwrap().clear();
         self.warm_start_beta.write().unwrap().take();
+        // IFT cache holds H_pen at the previous link's working weights;
+        // with a different link the working weights change so the
+        // factorization is no longer the right Jacobian seed.
+        self.ift_warm_start_cache.write().unwrap().take();
     }
 
     pub(crate) fn set_link_states(
@@ -1674,6 +1678,7 @@ impl<'a> RemlState<'a> {
             outer_inner_cap: Arc::new(AtomicUsize::new(0)),
             last_inner_iters: Arc::new(AtomicUsize::new(0)),
             last_inner_converged: Arc::new(AtomicBool::new(false)),
+            ift_warm_start_cache: RwLock::new(None),
             kronecker_penalty_system: None,
             kronecker_factored: None,
         })
@@ -1730,6 +1735,10 @@ impl<'a> RemlState<'a> {
         // tier on the first outer iter.
         self.last_inner_iters.store(0, Ordering::Relaxed);
         self.last_inner_converged.store(false, Ordering::Relaxed);
+        // The IFT warm-start cache (β, H_pen, qs at last converged solve)
+        // is keyed to the previous design / penalty system; the new
+        // surface invalidates all three, so clear the slot.
+        self.ift_warm_start_cache.write().unwrap().take();
         Ok(())
     }
 
@@ -2172,6 +2181,10 @@ impl<'a> RemlState<'a> {
         }
         match pr.status {
             pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
+                let frame_was_original = matches!(
+                    pr.coordinate_frame,
+                    pirls::PirlsCoordinateFrame::OriginalSparseNative
+                );
                 let beta_original = match pr.coordinate_frame {
                     pirls::PirlsCoordinateFrame::OriginalSparseNative => {
                         pr.beta_transformed.as_ref().clone()
@@ -2191,7 +2204,26 @@ impl<'a> RemlState<'a> {
                     let mut cur_rho_w = self.warm_start_rho.write().unwrap();
                     *prev_beta_w = cur_beta_w.take();
                     *prev_rho_w = cur_rho_w.take();
-                    cur_beta_w.replace(Coefficients::new(beta_original));
+                    cur_beta_w.replace(Coefficients::new(beta_original.clone()));
+                }
+                // IFT warm-start cache: stash β / H_pen / qs from this
+                // solve so the next outer iter's predictor can apply
+                // `dβ/dρ_k = -H^{-1}(e^{ρ_k} S_k β)` directly. ρ is
+                // populated by `record_warm_start_rho` immediately
+                // after this call returns; until then the slot holds
+                // an empty `rho` placeholder that the predictor
+                // detects and skips.
+                {
+                    let mut cache_w = self.ift_warm_start_cache.write().unwrap();
+                    cache_w.replace(super::IftWarmStartCache {
+                        beta_original,
+                        rho: ndarray::Array1::zeros(0),
+                        penalized_hessian_transformed: pr
+                            .penalized_hessian_transformed
+                            .clone(),
+                        qs: pr.reparam_result.qs.clone(),
+                        frame_was_original,
+                    });
                 }
             }
             _ => {
@@ -2201,6 +2233,7 @@ impl<'a> RemlState<'a> {
                 self.warm_start_rho.write().unwrap().take();
                 self.prev_warm_start_beta.write().unwrap().take();
                 self.prev_warm_start_rho.write().unwrap().take();
+                self.ift_warm_start_cache.write().unwrap().take();
             }
         }
     }
@@ -2213,6 +2246,14 @@ impl<'a> RemlState<'a> {
             return;
         }
         self.warm_start_rho.write().unwrap().replace(rho.to_owned());
+        // Stamp the IFT cache's ρ slot so the predictor can compute
+        // Δρ = ρ_new − ρ_cache. Skipped if the slot was cleared in
+        // between (e.g. a concurrent failure path); the predictor will
+        // see an empty `rho` (length 0) and fall back to the
+        // tangent-line / flat warm-start path.
+        if let Some(cache) = self.ift_warm_start_cache.write().unwrap().as_mut() {
+            cache.rho = rho.to_owned();
+        }
     }
 
     /// Predict β at `new_rho` via tangent-line extrapolation across the
