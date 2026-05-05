@@ -4221,6 +4221,33 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
         Ok(None)
     }
 
+    /// Write-into variant of `hessian_matvec`. The default implementation
+    /// delegates to the legacy owned-return form and copies the result into
+    /// `out`, providing back-compat without per-impl work. Concrete impls in
+    /// the inner-Newton biobank-scale hot path (Bernoulli marginal-slope and
+    /// survival marginal-slope) override this to write directly into the
+    /// caller-owned buffer, eliminating per-PCG-iter `Array1` allocations.
+    fn hessian_matvec_into(
+        &self,
+        v: &Array1<f64>,
+        out: &mut Array1<f64>,
+    ) -> Result<bool, String> {
+        match self.hessian_matvec(v)? {
+            Some(result) => {
+                if result.len() != out.len() {
+                    return Err(format!(
+                        "hessian_matvec_into: result length {} != out length {}",
+                        result.len(),
+                        out.len()
+                    ));
+                }
+                out.assign(&result);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
         Ok(None)
     }
@@ -5696,6 +5723,13 @@ enum JointHessianSource {
     Dense(Array2<f64>),
     Operator {
         apply: Arc<dyn Fn(&Array1<f64>) -> Result<Array1<f64>, String> + Send + Sync>,
+        /// Write-into matvec used by the inner-Newton PCG hot path so the
+        /// matvec result no longer allocates an `Array1<f64>` per CG iter.
+        /// At biobank scale (~6400 inner CG iters per outer iter, p~200) this
+        /// removes thousands of small Vec<f64> allocations from the tightest
+        /// loop. Wired from `workspace.hessian_matvec_into`.
+        apply_into:
+            Arc<dyn Fn(&Array1<f64>, &mut Array1<f64>) -> Result<(), String> + Send + Sync>,
         diagonal: Array1<f64>,
     },
 }
@@ -5806,12 +5840,19 @@ fn exact_newton_joint_hessian_source_from_workspace(
     }
 
     let workspace_apply = Arc::clone(workspace);
+    let workspace_apply_into = Arc::clone(workspace);
     Ok(Some(JointHessianSource::Operator {
         apply: Arc::new(move |v: &Array1<f64>| {
             let Some(out) = workspace_apply.hessian_matvec(v)? else {
                 return Err("joint exact-newton operator matvec unavailable".to_string());
             };
             Ok(out)
+        }),
+        apply_into: Arc::new(move |v: &Array1<f64>, out: &mut Array1<f64>| {
+            if !workspace_apply_into.hessian_matvec_into(v, out)? {
+                return Err("joint exact-newton operator matvec unavailable".to_string());
+            }
+            Ok(())
         }),
         diagonal,
     }))
@@ -7323,43 +7364,20 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // PCG closure so each CG iter (called hundreds-to-
                     // thousands of times per outer iter at biobank scale)
                     // reuses the buffer instead of allocating per call.
-                    // RefCell because solve_spd_pcg expects `Fn` (immutable
+                    // RefCell because solve_spd_pcg* expects `Fn` (immutable
                     // borrow of captures) and we need interior mutability
                     // to write into the workspace.
                     let penalty_workspace = RefCell::new(Array1::<f64>::zeros(total_p));
                     match &joint_hessian_source {
-                        JointHessianSource::Dense(h_joint) => crate::linalg::utils::solve_spd_pcg(
-                            |v| {
-                                let mut out = h_joint.dot(v);
-                                let mut pen = penalty_workspace.borrow_mut();
-                                apply_joint_block_penalty_into(
-                                    &ranges,
-                                    &s_lambdas,
-                                    v,
-                                    trace_diagonal_ridge,
-                                    &mut pen,
-                                );
-                                out += &*pen;
-                                out
-                            },
-                            &rhs,
-                            &preconditioner_diag,
-                            JOINT_PCG_REL_TOL,
-                            JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1),
-                        ),
-                        JointHessianSource::Operator { apply, .. } => {
-                            let apply_h = Arc::clone(apply);
-                            crate::linalg::utils::solve_spd_pcg(
-                                |v| {
-                                    let mut out = match apply_h(v) {
-                                        Ok(out) => out,
-                                        Err(error) => {
-                                            log::warn!(
-                                                "joint Newton inner operator matvec failed: {error}"
-                                            );
-                                            Array1::<f64>::zeros(total_p)
-                                        }
-                                    };
+                        JointHessianSource::Dense(h_joint) => {
+                            crate::linalg::utils::solve_spd_pcg_into(
+                                |v, out| {
+                                    // h_joint * v -> out (faer-backed, no alloc)
+                                    crate::faer_ndarray::fast_av_view_into(
+                                        h_joint,
+                                        v,
+                                        out.view_mut(),
+                                    );
                                     let mut pen = penalty_workspace.borrow_mut();
                                     apply_joint_block_penalty_into(
                                         &ranges,
@@ -7368,8 +7386,33 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                         trace_diagonal_ridge,
                                         &mut pen,
                                     );
-                                    out += &*pen;
-                                    out
+                                    *out += &*pen;
+                                },
+                                &rhs,
+                                &preconditioner_diag,
+                                JOINT_PCG_REL_TOL,
+                                JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1),
+                            )
+                        }
+                        JointHessianSource::Operator { apply_into, .. } => {
+                            let apply_h_into = Arc::clone(apply_into);
+                            crate::linalg::utils::solve_spd_pcg_into(
+                                |v, out| {
+                                    if let Err(error) = apply_h_into(v, out) {
+                                        log::warn!(
+                                            "joint Newton inner operator matvec failed: {error}"
+                                        );
+                                        out.fill(0.0);
+                                    }
+                                    let mut pen = penalty_workspace.borrow_mut();
+                                    apply_joint_block_penalty_into(
+                                        &ranges,
+                                        &s_lambdas,
+                                        v,
+                                        trace_diagonal_ridge,
+                                        &mut pen,
+                                    );
+                                    *out += &*pen;
                                 },
                                 &rhs,
                                 &preconditioner_diag,
@@ -8770,7 +8813,7 @@ fn joint_outer_evaluate(
                         out
                     }))
                 }
-                JointHessianSource::Operator { apply, diagonal: _ } => {
+                JointHessianSource::Operator { apply, .. } => {
                     let apply_h = Arc::clone(&apply);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
@@ -8997,7 +9040,7 @@ fn joint_outer_evaluate_efs(
                         out
                     }))
                 }
-                JointHessianSource::Operator { apply, diagonal: _ } => {
+                JointHessianSource::Operator { apply, .. } => {
                     let apply_h = Arc::clone(&apply);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
