@@ -1935,7 +1935,7 @@ def _emit_phase_summary(
     # we have IFT-QUALITY data; absent otherwise so a fit that
     # legitimately doesn't exercise the warm-start path doesn't get
     # tagged.
-    if ift_quality_matches:
+    if ift_quality_matches or outer_nonfinite:
         residuals_for_verdict = [
             float(m[0]) for m in ift_quality_matches if float(m[0]) == float(m[0])
         ]
@@ -1944,6 +1944,7 @@ def _emit_phase_summary(
             n_rejects=n_rejects,
             n_noops=n_noops,
             residuals=residuals_for_verdict,
+            n_outer_nonfinite=len(outer_nonfinite),
         )
         print(
             f"[WARM-START health] cmd='{cmd_preview}' verdict={verdict} {detail}",
@@ -1958,6 +1959,7 @@ def _warm_start_health_verdict(
     n_rejects: int,
     n_noops: int,
     residuals: list[float],
+    n_outer_nonfinite: int = 0,
 ) -> tuple[str, str]:
     """Combine the warm-start machinery's quality signals into a single
     verdict. Two axes:
@@ -1970,8 +1972,19 @@ def _warm_start_health_verdict(
 
     Verdict tiers:
       HEALTHY   coverage ≥ 0.70 AND p50_resid < 0.05
+                AND no outer-non-finite signals
       MARGINAL  coverage ≥ 0.30 OR p50_resid < 0.30
-      DEGRADED  otherwise
+                AND no outer-non-finite signals
+      DEGRADED  otherwise, OR any outer-non-finite signals
+                (the geometry itself is broken — predictor
+                faithfulness is moot)
+
+    `n_outer_nonfinite` is the count of [OUTER non-finite] warnings
+    captured during the fit. A non-zero count means at least one
+    intermediate of the outer-Hessian / leverage / adjoint computation
+    produced NaN / Inf — a strict bug-signal override on any
+    HEALTHY / MARGINAL classification, since broken intermediates
+    invalidate the predictor-faithfulness measurements.
 
     Returns (verdict, detail_string). The detail string carries the
     actual numbers so reviewers can verify the verdict.
@@ -1985,8 +1998,17 @@ def _warm_start_health_verdict(
         p50_resid = float("nan")
     detail = (
         f"coverage={coverage:.2f} p50_resid={p50_resid:.2e} "
-        f"n_accepts={n_accepts} n_rejects={n_rejects} n_noops={n_noops}"
+        f"n_accepts={n_accepts} n_rejects={n_rejects} n_noops={n_noops} "
+        f"n_outer_nonfinite={n_outer_nonfinite}"
     )
+    # Override: outer-non-finite signals trump every other axis. Broken
+    # geometry invalidates the predictor-faithfulness measurements
+    # regardless of how clean the residuals look on their face. In
+    # extremis a fit could produce healthy-looking IFT residuals on
+    # the iters BEFORE the geometry broke, but the broken iters'
+    # outputs are unreliable — the verdict must reflect that.
+    if n_outer_nonfinite > 0:
+        return ("DEGRADED", detail)
     if not residuals:
         # No accepted predictions to assess faithfulness against. Even
         # if rejects/noops dominate, we can only judge coverage.
