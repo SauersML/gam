@@ -12977,12 +12977,7 @@ where
         let theta_norm = theta.iter().map(|v| v * v).sum::<f64>().sqrt();
         let log_kappa_norm = if kphase_log_kappa_dim > 0 && theta.len() >= kphase_log_kappa_dim {
             let start = theta.len() - kphase_log_kappa_dim;
-            theta
-                .iter()
-                .skip(start)
-                .map(|v| v * v)
-                .sum::<f64>()
-                .sqrt()
+            theta.iter().skip(start).map(|v| v * v).sum::<f64>().sqrt()
         } else {
             0.0
         };

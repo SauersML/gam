@@ -4239,8 +4239,8 @@ where
                     {
                         let accepted_state = if options.firth_bias_reduction {
                             let firth_curv_start = std::time::Instant::now();
-                            let firth_curv_result =
-                                model.update_with_curvature(&candidate_beta, state.hessian_curvature);
+                            let firth_curv_result = model
+                                .update_with_curvature(&candidate_beta, state.hessian_curvature);
                             curvature_total += firth_curv_start.elapsed();
                             match firth_curv_result {
                                 Ok(state) => state,
@@ -5895,7 +5895,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             last_step_halving: 0,
             hessian_curvature: HessianCurvatureKind::Fisher,
             final_lm_lambda: working_summary.final_lm_lambda,
-        final_accept_rho: working_summary.final_accept_rho,
+            final_accept_rho: working_summary.final_accept_rho,
             constraint_kkt: working_summary.constraint_kkt.clone(),
             linear_constraints_transformed: linear_constraints.clone(),
             reparam_result,
@@ -8945,7 +8945,11 @@ mod tests {
             (1.0, 1.0 / 3.0, "rho=1: floored at 1/3 (cube=1, 1-cube=0)"),
             (0.75, 0.875, "rho=0.75: 1 - (0.5)^3 = 0.875 (slight shrink)"),
             (0.5, 1.0, "rho=0.5: 1 - 0 = 1.0 (no change)"),
-            (0.25, 1.125, "rho=0.25: 1 - (-0.5)^3 = 1.125 (slight expand)"),
+            (
+                0.25,
+                1.125,
+                "rho=0.25: 1 - (-0.5)^3 = 1.125 (slight expand)",
+            ),
         ];
         for (rho, expected, why) in cases {
             let got = madsen_lm_accept_factor(*rho);
@@ -9308,7 +9312,7 @@ mod tests {
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
-                    initial_lm_lambda: None,
+            initial_lm_lambda: None,
         };
 
         let (fit, _) = fit_model_for_fixed_rho(
@@ -9523,7 +9527,7 @@ mod tests {
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
-                    initial_lm_lambda: None,
+            initial_lm_lambda: None,
         };
 
         let (result, _) = fit_model_for_fixed_rho(
@@ -9595,7 +9599,7 @@ mod tests {
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
-                    initial_lm_lambda: None,
+            initial_lm_lambda: None,
         };
 
         let (fit, _) = fit_model_for_fixed_rho(
@@ -10112,7 +10116,7 @@ mod root_cause_tests {
                 a: array![[1.0]],
                 b: array![0.0],
             }),
-                    initial_lm_lambda: None,
+            initial_lm_lambda: None,
         };
 
         let summary =
@@ -10363,7 +10367,7 @@ mod root_cause_tests {
             firth_bias_reduction: false,
             coefficient_lower_bounds: None,
             linear_constraints: None,
-                    initial_lm_lambda: None,
+            initial_lm_lambda: None,
         };
 
         let err = match runworking_model_pirls(
@@ -10422,7 +10426,7 @@ mod root_cause_tests {
             firth_bias_reduction: false,
             coefficient_lower_bounds: None,
             linear_constraints: None,
-                    initial_lm_lambda: None,
+            initial_lm_lambda: None,
         };
 
         let err = match runworking_model_pirls(
@@ -10462,7 +10466,7 @@ mod root_cause_tests {
             firth_bias_reduction: true,
             coefficient_lower_bounds: None,
             linear_constraints: None,
-                    initial_lm_lambda: None,
+            initial_lm_lambda: None,
         };
 
         let err = match runworking_model_pirls(
@@ -10512,7 +10516,7 @@ mod root_cause_tests {
             firth_bias_reduction: false,
             coefficient_lower_bounds: None,
             linear_constraints: None,
-                    initial_lm_lambda: None,
+            initial_lm_lambda: None,
         };
 
         let result =
@@ -10549,7 +10553,7 @@ mod root_cause_tests {
             firth_bias_reduction: false,
             coefficient_lower_bounds: None,
             linear_constraints: None,
-                    initial_lm_lambda: None,
+            initial_lm_lambda: None,
         };
 
         let result =
@@ -10639,7 +10643,7 @@ mod root_cause_tests {
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
-                    initial_lm_lambda: None,
+            initial_lm_lambda: None,
         };
 
         let (result, trace) = super::test_support::capture_pirls_penalized_deviance(|| {
@@ -10717,7 +10721,7 @@ mod root_cause_tests {
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
-                    initial_lm_lambda: None,
+            initial_lm_lambda: None,
         };
 
         let (result, trace) = super::test_support::capture_pirls_penalized_deviance(|| {
@@ -10815,7 +10819,7 @@ mod root_cause_tests {
                 max_iterations: 100,
                 convergence_tolerance: 1e-8,
                 firth_bias_reduction: false,
-                            initial_lm_lambda: None,
+                initial_lm_lambda: None,
             };
 
             let (result, trace) = super::test_support::capture_pirls_penalized_deviance(|| {

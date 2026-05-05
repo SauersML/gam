@@ -700,11 +700,7 @@ mod tests {
 
     #[test]
     fn solve_spd_pcg_into_matches_legacy_owned_variant() {
-        let h = array![
-            [4.0, 1.0, 0.5],
-            [1.0, 3.0, 0.25],
-            [0.5, 0.25, 2.0]
-        ];
+        let h = array![[4.0, 1.0, 0.5], [1.0, 3.0, 0.25], [0.5, 0.25, 2.0]];
         let b = array![1.0, 2.0, -0.5];
         let m = Array1::from_vec(vec![4.0, 3.0, 2.0]);
         let owned = solve_spd_pcg(|v| h.dot(v), &b, &m, 1e-12, 50).expect("legacy pcg");

@@ -93,10 +93,18 @@ impl InnerProgressFeedback {
             // → Some). Matches the IFT predictor's reader semantics.
             let residual_bits = self.ift_residual.load(Ordering::Relaxed);
             let r = f64::from_bits(residual_bits);
-            let last_ift_residual = if r.is_finite() && r >= 0.0 { Some(r) } else { None };
+            let last_ift_residual = if r.is_finite() && r >= 0.0 {
+                Some(r)
+            } else {
+                None
+            };
             let accept_rho_bits = self.accept_rho.load(Ordering::Relaxed);
             let ar = f64::from_bits(accept_rho_bits);
-            let last_accept_rho = if ar.is_finite() && ar >= 0.0 { Some(ar) } else { None };
+            let last_accept_rho = if ar.is_finite() && ar >= 0.0 {
+                Some(ar)
+            } else {
+                None
+            };
             Some(InnerProgressSnapshot {
                 last_iters: iters,
                 last_converged: self.last_converged.load(Ordering::Relaxed),
@@ -1950,12 +1958,12 @@ mod outer_inner_cap_schedule_tests {
     fn snapshot_distinguishes_zero_residual_from_no_signal() {
         use super::InnerProgressFeedback;
         use crate::solver::estimate::reml::runtime::IFT_RESIDUAL_NO_SIGNAL_BITS;
-        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
         // Helper to build a feedback channel with concrete values.
-        let make_feedback = |iters: usize, converged: bool, residual_bits: u64| {
-            InnerProgressFeedback {
+        let make_feedback =
+            |iters: usize, converged: bool, residual_bits: u64| InnerProgressFeedback {
                 cap: Arc::new(AtomicUsize::new(0)),
                 last_iters: Arc::new(AtomicUsize::new(iters)),
                 last_converged: Arc::new(AtomicBool::new(converged)),
@@ -1963,8 +1971,7 @@ mod outer_inner_cap_schedule_tests {
                 accept_rho: Arc::new(AtomicU64::new(
                     crate::solver::estimate::reml::runtime::IFT_RESIDUAL_NO_SIGNAL_BITS,
                 )),
-            }
-        };
+            };
 
         // Sentinel → no IFT signal (last_ift_residual = None).
         let fb = make_feedback(5, true, IFT_RESIDUAL_NO_SIGNAL_BITS);
@@ -2041,8 +2048,14 @@ mod outer_inner_cap_schedule_tests {
         // g_ratio < 1% trumps everything: cached β must be at full
         // inner tolerance for the convergence guard.
         assert_eq!(first_order_inner_cap_schedule(0, Some(0.0001), None), 0);
-        assert_eq!(first_order_inner_cap_schedule(0, Some(0.005), snap(4, true)), 0);
-        assert_eq!(first_order_inner_cap_schedule(20, Some(0.001), snap(50, false)), 0);
+        assert_eq!(
+            first_order_inner_cap_schedule(0, Some(0.005), snap(4, true)),
+            0
+        );
+        assert_eq!(
+            first_order_inner_cap_schedule(20, Some(0.001), snap(50, false)),
+            0
+        );
     }
 
     #[test]
@@ -2050,8 +2063,14 @@ mod outer_inner_cap_schedule_tests {
         // Old schedule had tiered ratio caps at 0.50/0.20/0.05; the new
         // schedule only special-cases the deep-convergence threshold
         // (<1%). Modest decay no longer overrides the adaptive cap.
-        assert_eq!(first_order_inner_cap_schedule(2, Some(0.30), snap(4, true)), 6);
-        assert_eq!(first_order_inner_cap_schedule(2, Some(0.05), snap(4, true)), 6);
+        assert_eq!(
+            first_order_inner_cap_schedule(2, Some(0.30), snap(4, true)),
+            6
+        );
+        assert_eq!(
+            first_order_inner_cap_schedule(2, Some(0.05), snap(4, true)),
+            6
+        );
     }
 
     #[test]
@@ -3936,7 +3955,7 @@ fn run_operator_trust_region(
             // (matrix-free outer Hessian) — once the operator form is
             // universally available the disagreement disappears.
             let observed_shape = match &eval_k.hessian {
-                HessianResult::Operator(_) => "Operator",  // (unreachable here)
+                HessianResult::Operator(_) => "Operator", // (unreachable here)
                 HessianResult::Analytic(_) => "Analytic(dense)",
                 HessianResult::Unavailable => "Unavailable",
             };

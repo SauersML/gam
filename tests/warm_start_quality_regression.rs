@@ -23,9 +23,7 @@
 
 use gam::construction::CanonicalPenalty;
 use gam::estimate::PenaltySpec;
-use gam::pirls::{
-    PenaltyConfig, PirlsConfig, PirlsProblem, PirlsStatus, fit_model_for_fixed_rho,
-};
+use gam::pirls::{PenaltyConfig, PirlsConfig, PirlsProblem, PirlsStatus, fit_model_for_fixed_rho};
 use gam::types::{
     Coefficients, GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LinkFunction,
     LogSmoothingParamsView,
@@ -91,8 +89,7 @@ fn fit_at_rho(
     rho: f64,
     warm: Option<&Coefficients>,
 ) -> (Coefficients, usize, PirlsStatus) {
-    let (beta, iters, status, _final_lambda) =
-        fit_at_rho_full(x, y, w, penalties, rho, warm, None);
+    let (beta, iters, status, _final_lambda) = fit_at_rho_full(x, y, w, penalties, rho, warm, None);
     (beta, iters, status)
 }
 
@@ -151,9 +148,10 @@ fn fit_at_rho_full(
         gam::pirls::PirlsCoordinateFrame::OriginalSparseNative => {
             result.beta_transformed.as_ref().clone()
         }
-        gam::pirls::PirlsCoordinateFrame::TransformedQs => {
-            result.reparam_result.qs.dot(result.beta_transformed.as_ref())
-        }
+        gam::pirls::PirlsCoordinateFrame::TransformedQs => result
+            .reparam_result
+            .qs
+            .dot(result.beta_transformed.as_ref()),
     };
     (
         Coefficients::new(beta_original),
@@ -194,8 +192,7 @@ fn warm_start_with_nearby_rho_seed_converges_to_cold_beta() {
         status_a
     );
 
-    let (beta_b_cold, iter_b_cold, status_b_cold) =
-        fit_at_rho(&x, &y, &w, &penalties, rho_b, None);
+    let (beta_b_cold, iter_b_cold, status_b_cold) = fit_at_rho(&x, &y, &w, &penalties, rho_b, None);
     let (beta_b_warm, iter_b_warm, status_b_warm) =
         fit_at_rho(&x, &y, &w, &penalties, rho_b, Some(&beta_a));
     assert!(matches!(
@@ -234,8 +231,7 @@ fn warm_start_with_far_rho_seed_still_converges_to_cold_beta() {
         PirlsStatus::Converged | PirlsStatus::StalledAtValidMinimum
     ));
 
-    let (beta_b_cold, iter_b_cold, status_b_cold) =
-        fit_at_rho(&x, &y, &w, &penalties, rho_b, None);
+    let (beta_b_cold, iter_b_cold, status_b_cold) = fit_at_rho(&x, &y, &w, &penalties, rho_b, None);
     let (beta_b_warm, iter_b_warm, status_b_warm) =
         fit_at_rho(&x, &y, &w, &penalties, rho_b, Some(&beta_a));
     assert!(matches!(
@@ -340,10 +336,9 @@ fn pirls_result_exposes_final_accept_rho_in_unit_interval() {
         result.status,
         PirlsStatus::Converged | PirlsStatus::StalledAtValidMinimum
     ));
-    let rho =
-        result.final_accept_rho.expect(
-            "PirlsResult::final_accept_rho must be Some after a converged inner-Newton fit",
-        );
+    let rho = result
+        .final_accept_rho
+        .expect("PirlsResult::final_accept_rho must be Some after a converged inner-Newton fit");
     assert!(
         rho.is_finite(),
         "final_accept_rho must be finite, got {rho}"
