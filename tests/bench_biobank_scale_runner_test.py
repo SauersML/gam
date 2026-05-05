@@ -1030,6 +1030,38 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         out = self._run_summary(stderr)
         self.assertNotIn("tangent_marker_drift", out)
 
+    def test_phase_summary_kappa_complete_surfaces_per_phase_max_and_p95(self) -> None:
+        # COMPLETE κ optimization: both [KAPPA-PHASE] per-call markers
+        # AND [KAPPA-PHASE-SUMMARY] are present. The summary's totals
+        # are authoritative, but the per-call distribution (max/p95)
+        # surfaces alongside to disambiguate single-outlier vs uniform-
+        # slow workload — same rationale as the INCOMPLETE branch.
+        stderr_lines = []
+        # 30 fast eval_outer calls + 1 slow one.
+        for i in range(30):
+            stderr_lines.append(
+                f"[KAPPA-PHASE] phase=eval_outer call={i+1} order=ValueGradientHessian "
+                f"theta_norm=1.0e+00 log_kappa_norm=1.0e+00 elapsed_s=0.3"
+            )
+        stderr_lines.append(
+            "[KAPPA-PHASE] phase=eval_outer call=31 order=ValueGradientHessian "
+            "theta_norm=1.0e+00 log_kappa_norm=1.0e+00 elapsed_s=15.0"
+        )
+        stderr_lines.append(
+            "[KAPPA-PHASE-SUMMARY] log_kappa_dim=2 n_cost=0 cost_total_s=0.0 "
+            "n_eval=31 eval_total_s=24.0 n_efs=0 efs_total_s=0.0 optim_total_s=24.0"
+        )
+        stderr_lines.append("[PHASE] my-fit fit end elapsed=24.0s")
+        out = self._run_summary("\n".join(stderr_lines))
+        # Both the summary's totals AND the per-call distribution
+        # appear.
+        self.assertIn("kappa_eval_calls=31", out)
+        self.assertIn("kappa_eval_total=24.0s", out)
+        self.assertIn("kappa_eval_outer_max=15.00s", out)
+        # p95 = sorted[min(30, 29)] = sorted[29] = 0.3 (excludes the
+        # single outlier at index 30 = 15.0).
+        self.assertIn("kappa_eval_outer_p95=0.30s", out)
+
     def test_phase_summary_kappa_incomplete_surfaces_per_phase_max_and_p95(self) -> None:
         # κ-optimization interrupted by timeout: per-call [KAPPA-PHASE]
         # lines but no [KAPPA-PHASE-SUMMARY]. The runner now surfaces
