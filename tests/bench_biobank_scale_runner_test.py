@@ -865,6 +865,56 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         self.assertNotIn("ift_p50=1.50e-02", out)
         self.assertNotIn("ift_p50=2.50e-02", out)
 
+    def test_phase_summary_surfaces_tangent_alpha_distribution(self) -> None:
+        # The [TANGENT-PREDICT] alpha values now feed a p50/max
+        # distribution. Reviewers can see whether the fallback fires
+        # at modest extrapolations (α ≈ 1, healthy) or pushes the
+        # adaptive cap (α near 1.5+, marginal).
+        stderr = "\n".join([
+            "[TANGENT-PREDICT] alpha=8.000e-01 cap=1.500e+00 drho_step_norm_sq=2.345e-02 drho_prev_norm_sq=4.567e-02",
+            "[TANGENT-PREDICT] alpha=1.200e+00 cap=1.500e+00 drho_step_norm_sq=3.000e-02 drho_prev_norm_sq=4.000e-02",
+            "[TANGENT-PREDICT] alpha=1.450e+00 cap=1.500e+00 drho_step_norm_sq=4.000e-02 drho_prev_norm_sq=3.000e-02",
+            "[PHASE] my-fit fit end elapsed=10.0s",
+        ])
+        out = self._run_summary(stderr)
+        self.assertIn("tangent_predicts=3", out)
+        # Sorted [0.8, 1.2, 1.45]; p50 (index 1) = 1.20, max = 1.45.
+        self.assertIn("tangent_alpha_p50=1.20", out)
+        self.assertIn("tangent_alpha_max=1.45", out)
+
+    def test_phase_summary_flags_tangent_marker_drift(self) -> None:
+        # Every successful [TANGENT-PREDICT] should pair with a
+        # downstream [TANGENT-QUALITY] from the post-PIRLS residual
+        # block (commit 99424b47). If counts diverge by >1, the
+        # instrumentation chain is silently dropping markers — a
+        # regression signal worth surfacing.
+        stderr = "\n".join([
+            # 5 PREDICTs but only 2 QUALITY → drift signal fires.
+            "[TANGENT-PREDICT] alpha=1.000e+00 cap=1.500e+00 drho_step_norm_sq=2.0e-02 drho_prev_norm_sq=2.0e-02",
+            "[TANGENT-PREDICT] alpha=1.100e+00 cap=1.500e+00 drho_step_norm_sq=2.0e-02 drho_prev_norm_sq=2.0e-02",
+            "[TANGENT-PREDICT] alpha=1.200e+00 cap=1.500e+00 drho_step_norm_sq=2.0e-02 drho_prev_norm_sq=2.0e-02",
+            "[TANGENT-PREDICT] alpha=1.300e+00 cap=1.500e+00 drho_step_norm_sq=2.0e-02 drho_prev_norm_sq=2.0e-02",
+            "[TANGENT-PREDICT] alpha=1.400e+00 cap=1.500e+00 drho_step_norm_sq=2.0e-02 drho_prev_norm_sq=2.0e-02",
+            "[TANGENT-QUALITY] residual=1.0e-03 converged_norm=1.0 predicted_norm=1.0 iters=4",
+            "[TANGENT-QUALITY] residual=2.0e-03 converged_norm=1.0 predicted_norm=1.0 iters=4",
+            "[PHASE] my-fit fit end elapsed=10.0s",
+        ])
+        out = self._run_summary(stderr)
+        self.assertIn("tangent_marker_drift=predict=5_vs_quality=2", out)
+
+    def test_phase_summary_tolerates_off_by_one_tangent_marker_drift(self) -> None:
+        # Off-by-one between PREDICT and QUALITY counts is normal at
+        # command timeout (PIRLS still running, predict was logged
+        # but quality block hadn't fired). Don't flag.
+        stderr = "\n".join([
+            "[TANGENT-PREDICT] alpha=1.000e+00 cap=1.500e+00 drho_step_norm_sq=2.0e-02 drho_prev_norm_sq=2.0e-02",
+            "[TANGENT-PREDICT] alpha=1.100e+00 cap=1.500e+00 drho_step_norm_sq=2.0e-02 drho_prev_norm_sq=2.0e-02",
+            "[TANGENT-QUALITY] residual=1.0e-03 converged_norm=1.0 predicted_norm=1.0 iters=4",
+            "[PHASE] my-fit fit end elapsed=10.0s",
+        ])
+        out = self._run_summary(stderr)
+        self.assertNotIn("tangent_marker_drift", out)
+
     def test_phase_summary_aggregates_outer_nonfinite_warnings(self) -> None:
         # `[OUTER non-finite]` is a bug signal — the REML unified
         # evaluator hit a NaN / Inf in an intermediate. Should be 0 in

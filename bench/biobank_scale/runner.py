@@ -1663,7 +1663,9 @@ _IFT_NOOP_PATTERN = re.compile(r"\[IFT-NOOP\]\s+reason=(\w+)")
 # also degenerates to flat warm-start. A high tangent-reject rate
 # alongside high IFT-reject rate signals "linear predictor stack
 # failed entirely → both predictors fell through to flat".
-_TANGENT_PREDICT_PATTERN = re.compile(r"\[TANGENT-PREDICT\]\s+alpha=")
+_TANGENT_PREDICT_PATTERN = re.compile(
+    r"\[TANGENT-PREDICT\]\s+alpha=([\deE.+\-]+)\s+cap=([\deE.+\-]+)\s+drho_step_norm_sq=([\deE.+\-]+)\s+drho_prev_norm_sq=([\deE.+\-]+)"
+)
 _TANGENT_REJECTED_PATTERN = re.compile(r"\[TANGENT-REJECTED\]\s+reason=(\w+)")
 
 # `[OUTER non-finite]` warnings from the REML unified evaluator. Each
@@ -1908,6 +1910,25 @@ def _emit_phase_summary(
     if tangent_predict_hits or tangent_rejected:
         t_predicts = len(tangent_predict_hits)
         t_rejects = len(tangent_rejected)
+        # Surface alpha distribution from accepted tangent-line
+        # predictions: tells us whether the fallback fires at modest
+        # extrapolations (α ≈ 1, healthy) or pushes the adaptive cap
+        # (α near alpha_cap, marginal). Combined with the residual
+        # distribution from [TANGENT-QUALITY] this tells us how
+        # aggressive the fallback is at biobank Δρ scales.
+        alphas = [
+            float(m[0])
+            for m in tangent_predict_hits
+            if float(m[0]) == float(m[0])
+        ]
+        if alphas:
+            n_a = len(alphas)
+            sorted_a = sorted(alphas)
+            a_p50 = sorted_a[n_a // 2]
+            a_max = sorted_a[-1]
+            tangent_alpha_str = f" tangent_alpha_p50={a_p50:.2f} tangent_alpha_max={a_max:.2f}"
+        else:
+            tangent_alpha_str = ""
         if tangent_rejected:
             t_reason_counts: dict[str, int] = {}
             for r in tangent_rejected:
@@ -1917,10 +1938,26 @@ def _emit_phase_summary(
             )
             parts.append(
                 f"tangent_predicts={t_predicts} tangent_rejects={t_rejects} "
-                f"tangent_reasons=[{t_reasons_str}]"
+                f"tangent_reasons=[{t_reasons_str}]{tangent_alpha_str}"
             )
         else:
-            parts.append(f"tangent_predicts={t_predicts}")
+            parts.append(f"tangent_predicts={t_predicts}{tangent_alpha_str}")
+    # Consistency cross-check: every successful [TANGENT-PREDICT]
+    # produces a downstream [TANGENT-QUALITY] from the post-PIRLS
+    # residual computation in execute_pirls_if_needed (commit 99424b47).
+    # If counts diverge, instrumentation drift is silently dropping
+    # markers — a regression signal worth surfacing as a separate
+    # field rather than burying inside the existing aggregations.
+    if tangent_predict_hits and tangent_quality_matches is not None:
+        n_predicts = len(tangent_predict_hits)
+        n_quality = len(tangent_quality_matches)
+        # Allow off-by-one in case the run was truncated mid-fit
+        # (PIRLS still running when the command timed out — TANGENT-PREDICT
+        # was emitted but TANGENT-QUALITY hadn't yet).
+        if abs(n_predicts - n_quality) > 1:
+            parts.append(
+                f"tangent_marker_drift=predict={n_predicts}_vs_quality={n_quality}"
+            )
     if n_rejects > 0 or n_noops > 0:
         # Count distinct rejection reasons so the bench log shows which
         # failure mode dominates: large_drho is the expected biobank
