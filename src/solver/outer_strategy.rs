@@ -1867,8 +1867,24 @@ fn first_order_inner_cap_schedule(
             // Hit the cap. Geometric backoff so we don't thrash on a
             // marginally-too-tight cap, but enforce floor of
             // last_iters+4 to actually grow.
+            //
+            // LM-fidelity escalation: if the previous solve's accepted
+            // gain ratio was VERY poor (`accept_rho < 0.3`), the LM
+            // model is severely mis-calibrated — doubling the cap may
+            // not give the inner Newton enough headroom to find a
+            // usable trust radius. Triple instead of doubling so we
+            // don't waste another cycle hitting the cap. The 0.3
+            // threshold is tighter than the +2-margin trigger (0.5)
+            // because here we ALREADY know the iter budget was
+            // insufficient AND the model was poor — both signals
+            // pointing the same way.
+            let multiplier = if matches!(snap.last_accept_rho, Some(r) if r < 0.3) {
+                3
+            } else {
+                2
+            };
             snap.last_iters
-                .saturating_mul(2)
+                .saturating_mul(multiplier)
                 .max(snap.last_iters.saturating_add(4))
         };
         return next.clamp(3, 64);
@@ -2111,6 +2127,60 @@ mod outer_inner_cap_schedule_tests {
             first_order_inner_cap_schedule(2, None, snap_with_accept_rho(4, true, 0.49)),
             8
         );
+    }
+
+    #[test]
+    fn schedule_escalates_geometric_backoff_on_very_poor_accept_rho() {
+        // Cap-hit (last_converged=false) with VERY poor LM model
+        // (accept_rho < 0.3): triple instead of double the cap, so the
+        // next solve has materially more iter budget when the model is
+        // both insufficient (cap-hit) AND mis-calibrated (poor rho).
+        // last_iters=4 → 4*3 = 12, vs 4*2=8 with doubling.
+        let snap = Some(InnerProgressSnapshot {
+            last_iters: 4,
+            last_converged: false,
+            last_ift_residual: None,
+            last_accept_rho: Some(0.15),
+        });
+        assert_eq!(first_order_inner_cap_schedule(2, None, snap), 12);
+        // Cap-hit with moderately-poor accept_rho (0.3 ≤ r < 0.5):
+        // standard doubling. The threshold for escalation is 0.3, not
+        // 0.5, because the +2-margin path (commit 04b30163) already
+        // covers the 0.3-0.5 case for the converged branch.
+        let snap = Some(InnerProgressSnapshot {
+            last_iters: 4,
+            last_converged: false,
+            last_ift_residual: None,
+            last_accept_rho: Some(0.4),
+        });
+        assert_eq!(first_order_inner_cap_schedule(2, None, snap), 8);
+        // Cap-hit with healthy accept_rho ≥ 0.5: standard doubling.
+        // The previous solve hit the cap because it needed more iters,
+        // not because the LM was mis-calibrated.
+        let snap = Some(InnerProgressSnapshot {
+            last_iters: 4,
+            last_converged: false,
+            last_ift_residual: None,
+            last_accept_rho: Some(0.9),
+        });
+        assert_eq!(first_order_inner_cap_schedule(2, None, snap), 8);
+        // Cap-hit with no accept_rho signal: standard doubling. No
+        // escalation when we don't have evidence of LM trouble.
+        let snap = Some(InnerProgressSnapshot {
+            last_iters: 4,
+            last_converged: false,
+            last_ift_residual: None,
+            last_accept_rho: None,
+        });
+        assert_eq!(first_order_inner_cap_schedule(2, None, snap), 8);
+        // Boundary at exactly 0.3: NOT escalated (`< 0.3` is strict).
+        let snap = Some(InnerProgressSnapshot {
+            last_iters: 4,
+            last_converged: false,
+            last_ift_residual: None,
+            last_accept_rho: Some(0.3),
+        });
+        assert_eq!(first_order_inner_cap_schedule(2, None, snap), 8);
     }
 
     #[test]
