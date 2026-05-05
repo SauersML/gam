@@ -2262,12 +2262,22 @@ fn run_predict_model(
 fn run_predict(args: PredictArgs) -> Result<(), String> {
     let mut progress = gam::visualizer::VisualizerSession::new(true);
     progress.start_workflow("Predict", 5);
+    let phase_start = std::time::Instant::now();
     progress.set_stage("predict", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
+    log::info!(
+        "[PHASE] predict load-model done elapsed={:.3}s",
+        phase_start.elapsed().as_secs_f64()
+    );
     progress.advance_workflow(1);
     let schema = model.require_data_schema()?;
     progress.set_stage("predict", "loading new data");
     let ds = load_datasetwith_schema(&args.new_data, schema)?;
+    log::info!(
+        "[PHASE] predict load-data done elapsed={:.3}s n={}",
+        phase_start.elapsed().as_secs_f64(),
+        ds.values.nrows()
+    );
     let id_values = args
         .id_column
         .as_ref()
