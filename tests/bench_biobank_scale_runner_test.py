@@ -642,10 +642,11 @@ class MarkerPatternTests(unittest.TestCase):
         )
         matches = _RUNNER._PIRLS_SOLVE_END_PATTERN.findall(sample)
         self.assertEqual(len(matches), 1)
-        iters, elapsed, rate = matches[0]
+        iters, elapsed, rate, status = matches[0]
         self.assertEqual(iters, "12")
         self.assertEqual(elapsed, "0.0345")
         self.assertEqual(rate, "2.345e-01")
+        self.assertEqual(status, "Converged")
         # NaN convergence rate (single-iter solves produce NaN: 1**(1/1)
         # is fine but degenerate cases could yield NaN). Pattern must
         # accept the token; the runner filters via `r == r`.
@@ -656,6 +657,32 @@ class MarkerPatternTests(unittest.TestCase):
         nan_matches = _RUNNER._PIRLS_SOLVE_END_PATTERN.findall(nan_sample)
         self.assertEqual(len(nan_matches), 1)
         self.assertEqual(nan_matches[0][2], "NaN")
+        self.assertEqual(nan_matches[0][3], "Converged")
+        # All five PirlsStatus enum variants must be captured by the
+        # status group so the runner's per-status aggregation can
+        # distinguish them. Locks the contract that adding a new
+        # variant in the rust enum requires updating this regex too —
+        # without that update, the new variant would parse as `None`
+        # and silently disappear from the verdict.
+        for status_variant in [
+            "Converged",
+            "MaxIterationsReached",
+            "StalledAtValidMinimum",
+            "LmStepSearchExhausted",
+            "Unstable",
+        ]:
+            line = (
+                f"[PIRLS solve-end] iters=5 elapsed=0.001s "
+                f"g_norm_initial=1e-3 g_norm_final=1e-9 "
+                f"convergence_rate=0.3 status={status_variant}"
+            )
+            matched = _RUNNER._PIRLS_SOLVE_END_PATTERN.findall(line)
+            self.assertEqual(
+                len(matched),
+                1,
+                f"PirlsStatus variant {status_variant!r} did not parse",
+            )
+            self.assertEqual(matched[0][3], status_variant)
 
     def test_kappa_phase_patterns_parse_per_call_and_summary(self) -> None:
         per_call_lines = [

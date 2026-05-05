@@ -2703,7 +2703,9 @@ def _emit_phase_summary(
     # markers (commit 517f1b02). Tier policy in `_pirls_health_verdict`.
     if pirls_solve_matches:
         pirls_rates: list[float] = []
-        for _iters, _elapsed, rate_str in pirls_solve_matches:
+        # The regex captures four groups (iters, elapsed, rate, status)
+        # since commit bb42aeb0; this aggregator only reads `rate_str`.
+        for _iters, _elapsed, rate_str, _status in pirls_solve_matches:
             try:
                 r = float(rate_str)
             except (ValueError, TypeError):
