@@ -767,10 +767,21 @@ fn fit_survival_location_scale_model(
 fn fit_bernoulli_marginal_slope_model(
     request: BernoulliMarginalSlopeFitRequest<'_>,
 ) -> Result<BernoulliMarginalSlopeFitResult, String> {
+    // Phase 4: at biobank scale, auto-install a stratified outer-score
+    // subsample so outer-only score / Hessian sweeps run on ~K rows instead
+    // of ~n. Inner-PIRLS and final-covariance passes still use full data
+    // because they don't consult `outer_score_subsample`. The helper is a
+    // no-op below the biobank threshold or when a subsample is already set.
+    let mut options = request.options.clone();
+    crate::families::marginal_slope_shared::inject_biobank_outer_subsample_from_arrays(
+        &mut options,
+        request.spec.z.as_slice().expect("z is contiguous"),
+        request.spec.y.as_slice().expect("y is contiguous"),
+    );
     fit_bernoulli_marginal_slope_terms(
         request.data,
         request.spec,
-        &request.options,
+        &options,
         &request.kappa_options,
         &request.policy,
     )
@@ -779,10 +790,23 @@ fn fit_bernoulli_marginal_slope_model(
 fn fit_survival_marginal_slope_model(
     request: SurvivalMarginalSlopeFitRequest<'_>,
 ) -> Result<SurvivalMarginalSlopeFitResult, String> {
+    // Phase 4: see `fit_bernoulli_marginal_slope_model` above. Survival
+    // stratifies on the event indicator (`event_target`), which is the
+    // canonical {0,1} secondary class for right-censored survival.
+    let mut options = request.options.clone();
+    crate::families::marginal_slope_shared::inject_biobank_outer_subsample_from_arrays(
+        &mut options,
+        request.spec.z.as_slice().expect("z is contiguous"),
+        request
+            .spec
+            .event_target
+            .as_slice()
+            .expect("event_target is contiguous"),
+    );
     fit_survival_marginal_slope_terms(
         request.data,
         request.spec,
-        &request.options,
+        &options,
         &request.kappa_options,
     )
 }
