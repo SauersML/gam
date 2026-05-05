@@ -1727,6 +1727,11 @@ fn run_fitwith_predict_noise(
         let y_scaled = y.mapv(|v| v / response_scale);
         let options = blockwise_options_from_fit_args(args)?;
         progress.set_stage("fit", "optimizing gaussian location-scale model");
+        let phase_start = std::time::Instant::now();
+        log::info!(
+            "[PHASE] gaussian-location-scale fit start n={}",
+            ds.values.nrows()
+        );
         let solved = match fit_model(FitRequest::GaussianLocationScale(
             GaussianLocationScaleFitRequest {
                 data: ds.values.view(),
@@ -1748,7 +1753,13 @@ fn run_fitwith_predict_noise(
                 kappa_options: kappa_options.clone(),
             },
         )) {
-            Ok(FitResult::GaussianLocationScale(result)) => result,
+            Ok(FitResult::GaussianLocationScale(result)) => {
+                log::info!(
+                    "[PHASE] gaussian-location-scale fit end elapsed={:.3}s",
+                    phase_start.elapsed().as_secs_f64()
+                );
+                result
+            }
             Ok(_) => {
                 emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
                 return Err(
@@ -1894,6 +1905,11 @@ fn run_fitwith_predict_noise(
 
     let options = blockwise_options_from_fit_args(args)?;
     progress.set_stage("fit", "optimizing binomial location-scale model");
+    let phase_start = std::time::Instant::now();
+    log::info!(
+        "[PHASE] binomial-location-scale fit start n={}",
+        ds.values.nrows()
+    );
     let solved = match fit_model(FitRequest::BinomialLocationScale(
         BinomialLocationScaleFitRequest {
             data: ds.values.view(),
@@ -1916,7 +1932,13 @@ fn run_fitwith_predict_noise(
             kappa_options: kappa_options.clone(),
         },
     )) {
-        Ok(FitResult::BinomialLocationScale(result)) => result,
+        Ok(FitResult::BinomialLocationScale(result)) => {
+            log::info!(
+                "[PHASE] binomial-location-scale fit end elapsed={:.3}s",
+                phase_start.elapsed().as_secs_f64()
+            );
+            result
+        }
         Ok(_) => {
             emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
             return Err(
