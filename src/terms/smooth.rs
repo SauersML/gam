@@ -12950,6 +12950,45 @@ where
     let exact_fn_cell = std::cell::RefCell::new(&mut exact_fn);
     let exact_efs_fn_cell = std::cell::RefCell::new(&mut exact_efs_fn);
 
+    // ── κ-optimization scaling instrumentation ──
+    //
+    // Per-phase wall-clock counters for the three kinds of evaluator
+    // invocation the κ outer drives: cost-only line-search probes,
+    // value-and-gradient(/Hessian) evaluations at accepted iterates, and
+    // EFS fixed-point evaluations. Each invocation emits one
+    // `[KAPPA-PHASE]` log line with a per-call elapsed time, plus the
+    // running call counter and a summary `theta_norm` /
+    // `log_kappa_norm` so the bench runner can attribute cost to
+    // particular trajectory regions. A single `[KAPPA-PHASE-SUMMARY]`
+    // line is emitted on optimization exit. Grepping these is the
+    // production-fit κ-scaling probe (task #32) — measurement happens
+    // in real biobank fits rather than a synthetic harness, so the
+    // scaling law reflects the actual workload.
+    use std::cell::Cell;
+    let kphase_cost_calls: Cell<usize> = Cell::new(0);
+    let kphase_cost_total_s: Cell<f64> = Cell::new(0.0);
+    let kphase_eval_calls: Cell<usize> = Cell::new(0);
+    let kphase_eval_total_s: Cell<f64> = Cell::new(0.0);
+    let kphase_efs_calls: Cell<usize> = Cell::new(0);
+    let kphase_efs_total_s: Cell<f64> = Cell::new(0.0);
+    let kphase_optim_start = std::time::Instant::now();
+    let kphase_log_kappa_dim = log_kappa_dim;
+    let kphase_log_norms = |theta: &Array1<f64>| -> (f64, f64) {
+        let theta_norm = theta.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let log_kappa_norm = if kphase_log_kappa_dim > 0 && theta.len() >= kphase_log_kappa_dim {
+            let start = theta.len() - kphase_log_kappa_dim;
+            theta
+                .iter()
+                .skip(start)
+                .map(|v| v * v)
+                .sum::<f64>()
+                .sqrt()
+        } else {
+            0.0
+        };
+        (theta_norm, log_kappa_norm)
+    };
+
     use crate::solver::outer_strategy::{Derivative, OuterEval, OuterEvalOrder};
 
     let problem = exact_joint_multistart_outer_problem(
@@ -13025,7 +13064,21 @@ where
             } else {
                 crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient
             };
-            match (&mut *exact_fn_cell.borrow_mut())(theta, &specs, &designs, eval_mode) {
+            let _t0 = std::time::Instant::now();
+            let result = (&mut *exact_fn_cell.borrow_mut())(theta, &specs, &designs, eval_mode);
+            let elapsed_s = _t0.elapsed().as_secs_f64();
+            kphase_eval_calls.set(kphase_eval_calls.get() + 1);
+            kphase_eval_total_s.set(kphase_eval_total_s.get() + elapsed_s);
+            let (theta_norm, log_kappa_norm) = kphase_log_norms(theta);
+            log::info!(
+                "[KAPPA-PHASE] phase=eval_outer call={} order={:?} theta_norm={:.4e} log_kappa_norm={:.4e} elapsed_s={:.4}",
+                kphase_eval_calls.get(),
+                order,
+                theta_norm,
+                log_kappa_norm,
+                elapsed_s,
+            );
+            match result {
                 Ok((cost, grad, hess)) => {
                     ctx.cache.store_eval((cost, grad.clone(), hess.clone()));
                     if !cost.is_finite() {
@@ -13071,12 +13124,25 @@ where
                 // gradient construction (≈ 6.5·10⁹ FLOPs per CTN step at
                 // n=320 000, n_grid=293, p_resp=32, p_cov=23) is now paid only
                 // when the outer evaluator actually requests it.
-                match (&mut *exact_fn_cell.borrow_mut())(
+                let _t0 = std::time::Instant::now();
+                let result = (&mut *exact_fn_cell.borrow_mut())(
                     theta,
                     &specs,
                     &designs,
                     crate::solver::estimate::reml::unified::EvalMode::ValueOnly,
-                ) {
+                );
+                let elapsed_s = _t0.elapsed().as_secs_f64();
+                kphase_cost_calls.set(kphase_cost_calls.get() + 1);
+                kphase_cost_total_s.set(kphase_cost_total_s.get() + elapsed_s);
+                let (theta_norm, log_kappa_norm) = kphase_log_norms(theta);
+                log::info!(
+                    "[KAPPA-PHASE] phase=cost call={} theta_norm={:.4e} log_kappa_norm={:.4e} elapsed_s={:.4}",
+                    kphase_cost_calls.get(),
+                    theta_norm,
+                    log_kappa_norm,
+                    elapsed_s,
+                );
+                match result {
                     Ok((cost, _grad, _hess)) => {
                         // Don't `store_eval`: that path is only valid when the
                         // closure produced a real gradient. The next outer-eval
@@ -13116,12 +13182,24 @@ where
                         .map_err(EstimationError::InvalidInput)?;
                     let specs = collect_specs(&ctx.cache);
                     let designs = collect_designs(&ctx.cache);
-                    let eval = (&mut *exact_efs_fn_cell.borrow_mut())(
+                    let _t0 = std::time::Instant::now();
+                    let eval_result = (&mut *exact_efs_fn_cell.borrow_mut())(
                         theta,
                         &specs,
                         &designs,
-                    )
-                    .map_err(EstimationError::RemlOptimizationFailed)?;
+                    );
+                    let elapsed_s = _t0.elapsed().as_secs_f64();
+                    kphase_efs_calls.set(kphase_efs_calls.get() + 1);
+                    kphase_efs_total_s.set(kphase_efs_total_s.get() + elapsed_s);
+                    let (theta_norm, log_kappa_norm) = kphase_log_norms(theta);
+                    log::info!(
+                        "[KAPPA-PHASE] phase=efs call={} theta_norm={:.4e} log_kappa_norm={:.4e} elapsed_s={:.4}",
+                        kphase_efs_calls.get(),
+                        theta_norm,
+                        log_kappa_norm,
+                        elapsed_s,
+                    );
+                    let eval = eval_result.map_err(EstimationError::RemlOptimizationFailed)?;
                     Ok(eval)
                 },
             ),
@@ -13131,6 +13209,26 @@ where
             .run(&mut obj, "n-block exact-joint spatial")
             .map_err(|e| e.to_string())?
     }; // obj dropped here, releasing mutable borrow on state
+
+    // ── κ-optimization scaling summary ──
+    //
+    // Single line summarizing all per-call wall-clock counters
+    // accumulated above. The bench runner / scaling-law analyzer
+    // can pivot on this directly without parsing the per-call
+    // [KAPPA-PHASE] markers (which remain available for
+    // attribution).
+    let kphase_total_s = kphase_optim_start.elapsed().as_secs_f64();
+    log::info!(
+        "[KAPPA-PHASE-SUMMARY] log_kappa_dim={} n_cost={} cost_total_s={:.4} n_eval={} eval_total_s={:.4} n_efs={} efs_total_s={:.4} optim_total_s={:.4}",
+        kphase_log_kappa_dim,
+        kphase_cost_calls.get(),
+        kphase_cost_total_s.get(),
+        kphase_eval_calls.get(),
+        kphase_eval_total_s.get(),
+        kphase_efs_calls.get(),
+        kphase_efs_total_s.get(),
+        kphase_total_s,
+    );
 
     let theta_star = result.rho;
 
