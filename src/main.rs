@@ -1567,6 +1567,14 @@ fn run_fit_transformation_normal(
     };
 
     progress.set_stage("fit", "optimizing transformation-normal model");
+    let phase_start = std::time::Instant::now();
+    log::info!(
+        "[PHASE] CTN(transformation-normal) fit start n={} cov_terms={}",
+        ds.values.nrows(),
+        covariate_spec.linear_terms.len()
+            + covariate_spec.smooth_terms.len()
+            + covariate_spec.random_effect_terms.len()
+    );
     let solved = match fit_model(FitRequest::TransformationNormal(
         TransformationNormalFitRequest {
             data: ds.values.view(),
@@ -1593,6 +1601,10 @@ fn run_fit_transformation_normal(
             return Err(format!("transformation-normal fit failed: {e}"));
         }
     };
+    log::info!(
+        "[PHASE] CTN(transformation-normal) fit end elapsed={:.3}s",
+        phase_start.elapsed().as_secs_f64()
+    );
     progress.advance_workflow(3);
 
     let frozen_covariate = solved.covariate_spec_resolved.clone();
