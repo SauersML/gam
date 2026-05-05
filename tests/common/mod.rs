@@ -51,6 +51,37 @@ pub struct PowerLawFit {
     pub n_points: usize,
 }
 
+/// One extrapolation row in a `PowerLawReport`: at `x_target`, the fit
+/// predicts `pred_y`, which compares to `budget_y` as `verdict`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum BudgetVerdict {
+    /// `pred_y <= budget_y`.
+    Fits,
+    /// `pred_y >  budget_y`.
+    OverBudget,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct PowerLawExtrapolation {
+    pub label: String,
+    pub x_target: f64,
+    pub pred_y: f64,
+    pub verdict: BudgetVerdict,
+}
+
+/// Structured result of `report_power_law` — the fit plus per-target
+/// extrapolation predictions and budget verdicts. Returned alongside
+/// the side-effect printing so callers (tests, downstream analyzers)
+/// can assert against the verdicts directly instead of parsing stderr.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct PowerLawReport {
+    pub fit: PowerLawFit,
+    pub extrapolations: Vec<PowerLawExtrapolation>,
+}
+
 /// Fit `y = a · x^α` to `(x, y)` pairs via log-log OLS. Returns `None`
 /// when there are fewer than 3 points (insufficient for an honest
 /// fit). Used by the scaling-law probes (`tests/standard_gam_scaling.rs`,
@@ -129,6 +160,21 @@ pub fn report_power_law(
     extrapolate: &[(&str, f64)],
     budget_y: f64,
 ) -> Option<PowerLawFit> {
+    report_power_law_full(tag, points, extrapolate, budget_y).map(|r| r.fit)
+}
+
+/// Like `report_power_law` but returns the full structured report
+/// (fit + per-target extrapolations + per-target verdicts) instead of
+/// just the fit. Side-effect printing is unchanged. Tests use this
+/// variant to assert against `BudgetVerdict::Fits` /
+/// `BudgetVerdict::OverBudget` directly rather than parsing stderr.
+#[allow(dead_code)]
+pub fn report_power_law_full(
+    tag: &str,
+    points: &[(f64, f64)],
+    extrapolate: &[(&str, f64)],
+    budget_y: f64,
+) -> Option<PowerLawReport> {
     let Some(fit) = fit_power_law(points) else {
         eprintln!(
             "{tag} INSUFFICIENT DATA: {} points (need ≥3 for an honest fit)",
@@ -154,6 +200,7 @@ pub fn report_power_law(
     eprintln!("{tag} budget: {:.1}", budget_y);
     let max_x: f64 = points.iter().map(|(x, _)| *x).fold(0.0_f64, f64::max);
     let min_x: f64 = points.iter().map(|(x, _)| *x).fold(f64::INFINITY, f64::min);
+    let mut extrapolations = Vec::with_capacity(extrapolate.len());
     for (label, x_target) in extrapolate {
         let pred = fit.a * x_target.powf(fit.alpha);
         let stretch = x_target / max_x;
@@ -167,15 +214,19 @@ pub fn report_power_law(
         } else {
             String::new()
         };
-        let verdict = if pred <= budget_y {
-            format!("FITS ({:.0}× headroom)", budget_y / pred)
+        let verdict_enum = if pred <= budget_y {
+            BudgetVerdict::Fits
         } else {
-            format!(
+            BudgetVerdict::OverBudget
+        };
+        let verdict_str = match verdict_enum {
+            BudgetVerdict::Fits => format!("FITS ({:.0}× headroom)", budget_y / pred.max(f64::MIN_POSITIVE)),
+            BudgetVerdict::OverBudget => format!(
                 "OVER BUDGET by {:.0}s ({:.1} min, {:.2}× over)",
                 pred - budget_y,
                 (pred - budget_y) / 60.0,
-                pred / budget_y
-            )
+                pred / budget_y.max(f64::MIN_POSITIVE)
+            ),
         };
         eprintln!(
             "{tag} extrap @ {label} (x={:.1e}): pred={:.1}s ({:.2} min){} → {}",
@@ -183,8 +234,17 @@ pub fn report_power_law(
             pred,
             pred / 60.0,
             stretch_note,
-            verdict,
+            verdict_str,
         );
+        extrapolations.push(PowerLawExtrapolation {
+            label: (*label).to_string(),
+            x_target: *x_target,
+            pred_y: pred,
+            verdict: verdict_enum,
+        });
     }
-    Some(fit)
+    Some(PowerLawReport {
+        fit,
+        extrapolations,
+    })
 }
