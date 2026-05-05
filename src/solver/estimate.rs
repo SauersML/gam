@@ -2005,6 +2005,10 @@ where
                 "[OUTER guard] convergence-guard re-eval at converged ρ done (prev_cap={prev_cap}, elapsed={:.3}s)",
                 guard_start.elapsed().as_secs_f64()
             );
+        } else {
+            log::debug!(
+                "[OUTER guard] schedule never lifted (prev_cap=0); skipping refit"
+            );
         }
         (
             strategy_result.rho.clone(),
