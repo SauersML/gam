@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::{fit_power_law, PowerLawFit};
+use common::{fit_power_law, report_power_law_full, BudgetVerdict, PowerLawFit};
 
 /// Fit a clean `y = 2 · x^1.5` line and verify recovery to ~10 significant
 /// figures (log-log OLS on noiseless data is exact up to roundoff).
@@ -119,4 +119,102 @@ fn power_law_fit_struct_roundtrips() {
     assert_eq!(cloned.alpha, original.alpha);
     let dbg = format!("{:?}", original); // requires Debug
     assert!(dbg.contains("PowerLawFit"));
+}
+
+/// Verdict reflects budget comparison correctly across the boundary.
+/// Build clean `y = 0.001 · n^1.0` (one second per thousand). At
+/// budget_y = 60 s, n = 30_000 should FIT (pred = 30 s) and
+/// n = 90_000 should be OVER BUDGET (pred = 90 s).
+#[test]
+fn report_extrapolation_verdicts_track_budget_boundary() {
+    let xs = [1_000.0_f64, 5_000.0, 10_000.0, 50_000.0, 100_000.0];
+    let alpha_true = 1.0_f64;
+    let a_true = 0.001_f64;
+    let points: Vec<(f64, f64)> = xs.iter().map(|&x| (x, a_true * x.powf(alpha_true))).collect();
+    let extrapolate = [("under", 30_000.0), ("over", 90_000.0)];
+    let report = report_power_law_full("[BOUNDARY]", &points, &extrapolate, 60.0)
+        .expect("clean fit should produce a report");
+    assert_eq!(report.extrapolations.len(), 2);
+    let under = &report.extrapolations[0];
+    assert_eq!(under.label, "under");
+    assert_eq!(under.x_target, 30_000.0);
+    assert_eq!(under.verdict, BudgetVerdict::Fits);
+    assert!(
+        (under.pred_y - 30.0).abs() < 1e-6,
+        "pred_y at n=30k should be ~30s, got {}",
+        under.pred_y
+    );
+    let over = &report.extrapolations[1];
+    assert_eq!(over.label, "over");
+    assert_eq!(over.x_target, 90_000.0);
+    assert_eq!(over.verdict, BudgetVerdict::OverBudget);
+    assert!(
+        (over.pred_y - 90.0).abs() < 1e-6,
+        "pred_y at n=90k should be ~90s, got {}",
+        over.pred_y
+    );
+}
+
+/// Refuse-to-extrapolate gate: when the fit's max-residual exceeds the
+/// 0.5-in-log-space honesty threshold, `report_power_law_full` returns
+/// `None` and emits "REFUSING EXTRAPOLATION", regardless of how strong
+/// the budget would have looked under the noise-driven fit. Critical
+/// invariant — the mission's MEASURE FIRST rule depends on this gate.
+#[test]
+fn report_refuses_extrapolation_when_fit_poor() {
+    // Two-cluster pattern that fits a near-zero α (slope) but with
+    // huge residuals: the same x range produces wildly different y.
+    let points = [
+        (1.0, 1.0),
+        (2.0, 100.0),
+        (3.0, 1.0),
+        (4.0, 100.0),
+        (5.0, 1.0),
+    ];
+    let extrapolate = [("biobank", 320_000.0)];
+    let report = report_power_law_full("[NOISY]", &points, &extrapolate, 1e9);
+    assert!(
+        report.is_none(),
+        "report must refuse extrapolation when fit's max log-resid > 0.5; got {:?}",
+        report
+    );
+}
+
+/// Random parameters should round-trip through the analyzer to within
+/// a few orders of magnitude of floating-point noise. This is a
+/// property check on the OLS fit's correctness — bugs in the closed-
+/// form `(α, a)` formula would cause systematic drift on noiseless
+/// data, which we can detect by sampling many random parameter
+/// combinations and asserting recovery on each.
+#[test]
+fn fit_recovers_random_clean_power_laws() {
+    // Deterministic LCG so the test is reproducible without pulling
+    // in a full RNG dependency.
+    let mut seed = 0xDEAD_BEEFu64;
+    let mut next = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as u32) as f64 / (u32::MAX as f64)
+    };
+    let mut max_alpha_err = 0.0_f64;
+    let mut max_a_err = 0.0_f64;
+    for _ in 0..50 {
+        // alpha in [-2, 2], a in [1e-3, 1e3].
+        let alpha_true = -2.0 + 4.0 * next();
+        let a_true = 1e-3 * (1e6_f64).powf(next());
+        // 6 x values in [1, 1000].
+        let xs: Vec<f64> = (0..6).map(|i| 1.0 + (1000.0 - 1.0) * (i as f64 / 5.0)).collect();
+        let points: Vec<(f64, f64)> = xs.iter().map(|&x| (x, a_true * x.powf(alpha_true))).collect();
+        let fit = fit_power_law(&points)
+            .unwrap_or_else(|| panic!("clean random fit must succeed: alpha={alpha_true}, a={a_true}"));
+        max_alpha_err = max_alpha_err.max((fit.alpha - alpha_true).abs());
+        max_a_err = max_a_err.max((fit.a - a_true).abs() / a_true.abs());
+    }
+    assert!(
+        max_alpha_err < 1e-9,
+        "alpha drift across 50 random clean fits: {max_alpha_err}"
+    );
+    assert!(
+        max_a_err < 1e-9,
+        "a relative drift across 50 random clean fits: {max_a_err}"
+    );
 }
