@@ -1741,6 +1741,20 @@ _TANGENT_QUALITY_PATTERN = re.compile(
 # being USED at the magnitudes the outer optimizer takes?"
 _IFT_REJECTED_PATTERN = re.compile(r"\[IFT-REJECTED\]\s+reason=(\w+)")
 
+# IFT factor-cache hit/miss instrumentation. Every predict call either
+# reuses the cached H_pen factor (hit) or pays a fresh Cholesky (miss).
+# At biobank scale the dense Cholesky is O(p³)/3, multiple seconds at
+# p ≈ several thousand, so a high hit rate validates that the factor
+# cache (commit ec18559d) is paying off. The miss line additionally
+# reports the elapsed factorization wall-clock so we can size the
+# avoided cost. Aggregating gives:
+#   ift_cache_hits / ift_cache_total → hit rate
+#   sum(ift_cache_miss_elapsed)      → cumulative Cholesky cost paid
+_IFT_CACHE_HIT_PATTERN = re.compile(r"\[IFT-CACHE\]\s+outcome=hit\s+drho_dim=(\d+)")
+_IFT_CACHE_MISS_PATTERN = re.compile(
+    r"\[IFT-CACHE\]\s+outcome=miss\s+drho_dim=(\d+)\s+elapsed=([\d.]+)s"
+)
+
 # IFT predictor identity / no-op counter. Emitted when all Δρ_k are
 # below the numerical-noise floor — the outer made an effectively-zero
 # ρ-step and the predictor returned the cached β unchanged. The
@@ -2162,6 +2176,23 @@ def _emit_phase_summary(
     n_quality = len(ift_quality_matches)
     n_noops = len(ift_noop_matches)
     n_rejects = len(ift_rejected_matches)
+    # IFT factor-cache hit/miss verdict. The H_pen Cholesky is multiple
+    # seconds at biobank scale (p ≈ several thousand → O(p³)/3 flops),
+    # so a high hit rate validates commit ec18559d's cache. A miss
+    # rate near 1.0 indicates the cache is being invalidated too
+    # aggressively — typically by warm-start clears between outer
+    # iters — and represents avoidable wall-clock at biobank scale.
+    ift_cache_hits = _IFT_CACHE_HIT_PATTERN.findall(captured_stderr)
+    ift_cache_misses = _IFT_CACHE_MISS_PATTERN.findall(captured_stderr)
+    n_cache_total = len(ift_cache_hits) + len(ift_cache_misses)
+    if n_cache_total > 0:
+        hit_rate = len(ift_cache_hits) / n_cache_total
+        miss_secs_total = sum(float(m[1]) for m in ift_cache_misses)
+        parts.append(
+            f"ift_cache_n={n_cache_total} "
+            f"ift_cache_hit_rate={hit_rate:.2f} "
+            f"ift_cache_miss_secs={miss_secs_total:.2f}"
+        )
     # As of the runtime change accompanying this commit, [IFT-QUALITY]
     # is suppressed on noop calls (predictor returned β_cur unchanged
     # because all Δρ were below the numerical floor). So every
