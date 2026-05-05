@@ -3035,6 +3035,32 @@ impl<'a> RemlState<'a> {
                 // does not reflect production solve geometry.
                 if !in_screening {
                     if let Some(predicted) = predicted_warm_start.as_ref() {
+                        // Detect noop predictions (predictor returned the
+                        // cached β unchanged because all Δρ were below the
+                        // numerical floor). On noop the residual measures
+                        // inner-Newton movement after a zero-step seed,
+                        // NOT predictor faithfulness, and including it in
+                        // the IFT-QUALITY residual distribution biases
+                        // the percentiles toward whatever β-shift PIRLS
+                        // produced from a free warm-start. The [IFT-NOOP]
+                        // marker (commit d437aed1) already counts these
+                        // calls separately, so we skip the [IFT-QUALITY]
+                        // emission here for cleanliness.
+                        let was_noop = self
+                            .ift_warm_start_cache
+                            .read()
+                            .ok()
+                            .and_then(|guard| {
+                                guard.as_ref().map(|c| {
+                                    predicted.0.len() == c.beta_original.len()
+                                        && predicted
+                                            .0
+                                            .iter()
+                                            .zip(c.beta_original.iter())
+                                            .all(|(a, b)| a == b)
+                                })
+                            })
+                            .unwrap_or(false);
                         let converged_original = match pirls_result.coordinate_frame {
                             pirls::PirlsCoordinateFrame::OriginalSparseNative => {
                                 pirls_result.beta_transformed.as_ref().clone()
@@ -3044,7 +3070,7 @@ impl<'a> RemlState<'a> {
                                 .qs
                                 .dot(pirls_result.beta_transformed.as_ref()),
                         };
-                        if predicted.0.len() == converged_original.len() {
+                        if !was_noop && predicted.0.len() == converged_original.len() {
                             let mut diff_sq = 0.0_f64;
                             let mut conv_sq = 0.0_f64;
                             let mut pred_sq = 0.0_f64;
