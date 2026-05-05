@@ -1511,6 +1511,7 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, s
                             or "[KAPPA-PHASE" in line
                             or "[IFT-QUALITY]" in line
                             or "[IFT-REJECTED]" in line
+                            or "[IFT-NOOP]" in line
                         ):
                             phase_capture.append(line)
         finally:
@@ -1632,6 +1633,15 @@ _IFT_QUALITY_PATTERN = re.compile(
 # biobank scale — the empirical answer to "is the warm-start machinery
 # being USED at the magnitudes the outer optimizer takes?"
 _IFT_REJECTED_PATTERN = re.compile(r"\[IFT-REJECTED\]\s+reason=(\w+)")
+
+# IFT predictor identity / no-op counter. Emitted when all Δρ_k are
+# below the numerical-noise floor — the outer made an effectively-zero
+# ρ-step and the predictor returned the cached β unchanged. The
+# [IFT-QUALITY] residual for these calls is exactly zero, which would
+# inflate the apparent accept count if not separated. Distinguishing
+# noop from accept tells us how often the outer is actually exercising
+# the linearization.
+_IFT_NOOP_PATTERN = re.compile(r"\[IFT-NOOP\]\s+reason=(\w+)")
 
 
 _PHASE_START_PATTERN = re.compile(r"\[PHASE\]\s+([\w\-]+(?:\([\w\-/]+\))?)\s+(?:fit\s+)?start")
@@ -1761,8 +1771,15 @@ def _emit_phase_summary(
     # collapsing to flat warm-start and we should investigate.
     ift_quality_matches = _IFT_QUALITY_PATTERN.findall(captured_stderr)
     ift_rejected_matches = _IFT_REJECTED_PATTERN.findall(captured_stderr)
-    n_accepts = len(ift_quality_matches)
+    ift_noop_matches = _IFT_NOOP_PATTERN.findall(captured_stderr)
+    n_quality = len(ift_quality_matches)
+    n_noops = len(ift_noop_matches)
     n_rejects = len(ift_rejected_matches)
+    # An [IFT-QUALITY] line is emitted on EVERY accepted predict call
+    # whose β was consumed by PIRLS. Some of those calls are no-ops
+    # (all Δρ below eps → predicted = β_cur) which now also emit a
+    # separate [IFT-NOOP] marker. Subtract to get the real accept count.
+    n_accepts = max(n_quality - n_noops, 0)
     if ift_quality_matches:
         residuals = [float(m[0]) for m in ift_quality_matches if float(m[0]) == float(m[0])]
         if residuals:
@@ -1774,7 +1791,7 @@ def _emit_phase_summary(
             parts.append(
                 f"ift_predicts={n} ift_p50={p50:.2e} ift_p95={p95:.2e} ift_max={rmax:.2e}"
             )
-    if n_rejects > 0:
+    if n_rejects > 0 or n_noops > 0:
         # Count distinct rejection reasons so the bench log shows which
         # failure mode dominates: large_drho is the expected biobank
         # case (predictor's adaptive cap firing on outer steps that
@@ -1787,10 +1804,14 @@ def _emit_phase_summary(
         reasons_str = ",".join(
             f"{reason}={count}" for reason, count in sorted(reason_counts.items())
         )
-        accept_rate = n_accepts / max(n_accepts + n_rejects, 1)
+        # Accept rate excludes both rejects (predictor fell through) and
+        # no-ops (predictor returned identity); only "real" predict calls
+        # where the linearization actually moved β count toward accept.
+        denom = max(n_accepts + n_rejects + n_noops, 1)
+        accept_rate = n_accepts / denom
         parts.append(
-            f"ift_rejects={n_rejects} ift_accept_rate={accept_rate:.2f} "
-            f"ift_reasons=[{reasons_str}]"
+            f"ift_rejects={n_rejects} ift_noops={n_noops} "
+            f"ift_accept_rate={accept_rate:.2f} ift_reasons=[{reasons_str}]"
         )
     suffix = ""
     if pending:
