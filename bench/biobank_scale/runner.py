@@ -1557,6 +1557,12 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, s
 _PHASE_END_PATTERN = re.compile(
     r"\[PHASE\]\s+([\w\-]+(?:\([\w\-/]+\))?)\s+(?:fit\s+)?(?:end|done)\s+elapsed=([\d.]+)s"
 )
+_BFGS_SUMMARY_PATTERN = re.compile(
+    r"\[OUTER summary\]\s+BFGS\s+(converged|hit max_iter|line-search failed|failed)(?:\s+in\s+(\d+))?\s+elapsed=([\d.]+)s"
+)
+_GUARD_PATTERN = re.compile(
+    r"\[OUTER guard\]\s+convergence-guard re-eval at converged ρ done.*?elapsed=([\d.]+)s"
+)
 
 
 _PHASE_START_PATTERN = re.compile(r"\[PHASE\]\s+([\w\-]+(?:\([\w\-/]+\))?)\s+(?:fit\s+)?start")
@@ -1578,6 +1584,18 @@ def _emit_phase_summary(
         by_phase[name] = by_phase.get(name, 0.0) + float(secs)
     total = sum(by_phase.values())
     parts = [f"{name}={secs:.1f}s" for name, secs in by_phase.items()]
+    # Aggregate BFGS run summaries (per inner phase that uses BFGS)
+    bfgs_runs = _BFGS_SUMMARY_PATTERN.findall(captured_stderr)
+    if bfgs_runs:
+        n = len(bfgs_runs)
+        bfgs_total = sum(float(secs) for _, _, secs in bfgs_runs)
+        converged = sum(1 for status, _, _ in bfgs_runs if status == "converged")
+        parts.append(f"bfgs_runs={n}({converged}_conv) bfgs_total={bfgs_total:.1f}s")
+    # Aggregate convergence-guard refits
+    guard_runs = _GUARD_PATTERN.findall(captured_stderr)
+    if guard_runs:
+        guard_total = sum(float(secs) for secs in guard_runs)
+        parts.append(f"guard_refits={len(guard_runs)} guard_total={guard_total:.1f}s")
     suffix = ""
     if pending:
         suffix = f" pending={','.join(pending)}"
