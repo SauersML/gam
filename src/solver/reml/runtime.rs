@@ -11,7 +11,7 @@ use crate::solver::estimate::reml::inner_strategy::HessianEvalStrategyKind;
 use crate::solver::outer_strategy::{HessianResult, OuterEval};
 use crate::types::{InverseLink, LinkFunction, RhoPrior, SasLinkState};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 const TK_BLOCK_SIZE: usize = 128;
 const TK_MAX_OBSERVATIONS: usize = 20_000;
@@ -1679,6 +1679,7 @@ impl<'a> RemlState<'a> {
             last_inner_iters: Arc::new(AtomicUsize::new(0)),
             last_inner_converged: Arc::new(AtomicBool::new(false)),
             ift_warm_start_cache: RwLock::new(None),
+            last_pirls_lm_lambda: Arc::new(AtomicU64::new(0)),
             kronecker_penalty_system: None,
             kronecker_factored: None,
         })
@@ -1739,6 +1740,11 @@ impl<'a> RemlState<'a> {
         // is keyed to the previous design / penalty system; the new
         // surface invalidates all three, so clear the slot.
         self.ift_warm_start_cache.write().unwrap().take();
+        // The persisted LM damping is calibrated to the previous
+        // surface's geometry — different design / penalty / link
+        // produces different curvature, so a stale hint here would
+        // be biased rather than informative.
+        self.last_pirls_lm_lambda.store(0, Ordering::Relaxed);
         Ok(())
     }
 
@@ -2777,6 +2783,19 @@ impl<'a> RemlState<'a> {
             } else {
                 InverseLink::Standard(self.config.link_function())
             };
+            // Levenberg-Marquardt damping warm-start. Read the cached
+            // λ from the previous successful PIRLS solve at this
+            // surface (0 = no hint), and seed the inner solver. The
+            // PIRLS layer clamps any positive hint into [1e-6, 1e-3]
+            // before use, so a pathological cache can lose at most
+            // three halving steps relative to the cold default.
+            let cached_lambda_bits = self.last_pirls_lm_lambda.load(Ordering::Relaxed);
+            if cached_lambda_bits != 0 {
+                let cached_lambda = f64::from_bits(cached_lambda_bits);
+                if cached_lambda.is_finite() && cached_lambda > 0.0 {
+                    pirls_config.initial_lm_lambda = Some(cached_lambda);
+                }
+            }
             let problem = pirls::PirlsProblem {
                 x: &self.x,
                 offset: self.offset.view(),
@@ -2877,6 +2896,18 @@ impl<'a> RemlState<'a> {
                     self.last_inner_iters
                         .store(pirls_result.iteration, Ordering::Relaxed);
                     self.last_inner_converged.store(true, Ordering::Relaxed);
+                    // Persist the converged λ_LM so the next PIRLS call
+                    // at this surface can seed near the right damping.
+                    // Only stash finite-positive values; failure modes
+                    // (NaN, ≤0) fall through to the cold default.
+                    if pirls_result.final_lm_lambda.is_finite()
+                        && pirls_result.final_lm_lambda > 0.0
+                    {
+                        self.last_pirls_lm_lambda.store(
+                            pirls_result.final_lm_lambda.to_bits(),
+                            Ordering::Relaxed,
+                        );
+                    }
                     // Cache only if key is valid (not NaN).
                     if use_cache && let Some(key) = key_opt {
                         self.cache_manager
@@ -2958,6 +2989,10 @@ impl<'a> RemlState<'a> {
                     self.last_inner_iters
                         .store(pirls_result.iteration, Ordering::Relaxed);
                     self.last_inner_converged.store(false, Ordering::Relaxed);
+                    // A failed solve says nothing useful about the
+                    // right damping for the next call; reset the LM
+                    // hint to "no signal" so the next solve cold-starts.
+                    self.last_pirls_lm_lambda.store(0, Ordering::Relaxed);
                 }
                 Err(EstimationError::PirlsDidNotConverge {
                     max_iterations: pirls_result.iteration,

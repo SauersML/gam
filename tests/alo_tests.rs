@@ -52,6 +52,7 @@ fn fit_unpenalized(
         max_iterations: 100,
         convergence_tolerance: 1e-10,
         firth_bias_reduction: matches!(link, LinkFunction::Logit),
+        initial_lm_lambda: None,
     };
     let (res, _) = pirls::fit_model_for_fixed_rho(
         LogSmoothingParamsView::new(rho.view()),

@@ -9,7 +9,7 @@ use crate::types::SasLinkState;
 use ndarray::s;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
 pub(crate) mod assembly;
 mod cache;
@@ -3648,6 +3648,19 @@ pub(crate) struct RemlState<'a> {
     /// Populated in `updatewarm_start_from` when PIRLS converges; cleared
     /// on failure, on `reset_surface`, and on link-state changes.
     pub(crate) ift_warm_start_cache: RwLock<Option<IftWarmStartCache>>,
+
+    /// Persisted Levenberg-Marquardt damping coefficient from the most
+    /// recent successful PIRLS solve, bit-packed into an `AtomicU64`
+    /// (`f64::to_bits` low 64 bits). Read at the start of
+    /// `execute_pirls_if_needed` and written into the
+    /// `PirlsConfig::initial_lm_lambda` hint so the inner Newton seeds
+    /// `λ_LM` near the damping the previous solve discovered, instead
+    /// of cold-starting at `1e-6` and burning 4-6 halving steps to
+    /// recover. `0` (the default) signals "no hint"; the inner solver
+    /// clamps any positive hint into `[1e-6, 1e-3]` so a stale value
+    /// cannot destabilize the next solve. Reset on `reset_surface` and
+    /// on failed solves.
+    pub(crate) last_pirls_lm_lambda: Arc<AtomicU64>,
 
     /// When set, the penalties have Kronecker (tensor-product) structure and
     /// the REML evaluator can use O(∏q_j) logdet instead of O(p³) eigendecomposition.

@@ -1091,6 +1091,20 @@ pub struct WorkingModelPirlsOptions {
     /// Optional linear inequality constraints in current coefficient coordinates:
     ///   A * beta >= b.
     pub linear_constraints: Option<LinearInequalityConstraints>,
+    /// Optional warm-start hint for the Levenberg-Marquardt damping
+    /// coefficient. When set, the inner solver seeds `λ_LM` to this
+    /// value instead of the default `1e-6`. Clamped on consumption to
+    /// `[1e-6, 1e-3]` so a stale or pathological hint cannot poison the
+    /// solve: the upper bound costs at most three damping halvings
+    /// versus the cold default, which is dwarfed by the savings when
+    /// the hint is informative.
+    ///
+    /// Used by `execute_pirls_if_needed` (in `solver::reml::runtime`)
+    /// to persist the converged λ across consecutive PIRLS calls in a
+    /// single REML outer optimization, so the inner Newton does not
+    /// have to rediscover problem-specific damping at every accepted
+    /// outer iterate.
+    pub initial_lm_lambda: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -1114,6 +1128,11 @@ pub struct WorkingModelPirlsResult {
     pub last_step_halving: usize,
     pub max_abs_eta: f64,
     pub constraint_kkt: Option<ConstraintKktDiagnostics>,
+    /// Levenberg-Marquardt damping coefficient at the last accepted
+    /// inner iter. Used by the REML runtime to seed the next PIRLS call
+    /// at the same outer fit, avoiding 4-6 iters of damping rediscovery
+    /// when the geometry calls for `λ_LM > 1e-6`.
+    pub final_lm_lambda: f64,
     /// Minimum penalized deviance (`state.deviance + state.penalty_term`)
     /// observed across all iterations whose state was computed during the
     /// inner P-IRLS loop. Penalized deviance is monotonically decreasing
@@ -3775,7 +3794,17 @@ where
         value
     };
 
-    let mut lambda = 1e-6; // Initial damping (Levenberg-Marquardt parameter)
+    // Initial Levenberg-Marquardt damping. Seeded from the caller's
+    // `initial_lm_lambda` hint when present (clamped to a conservative
+    // [1e-6, 1e-3] window: an over-large seed costs at most three
+    // halving steps to recover, while the cold default `1e-6` wastes
+    // 4-6 iterations rediscovering damping the previous PIRLS call
+    // already paid for). When the hint is absent, falls back to the
+    // historical cold start at 1e-6.
+    let mut lambda = options
+        .initial_lm_lambda
+        .map(|v| v.clamp(1e-6, 1e-3))
+        .unwrap_or(1e-6);
     let lambda_factor = 10.0;
     let lm_max_attempts = options.max_step_halving.max(1);
     // Convergence is decided by `WorkingState::certifies_kkt` /
@@ -4500,6 +4529,7 @@ where
         last_step_halving,
         max_abs_eta,
         min_penalized_deviance,
+        final_lm_lambda: lambda,
     })
 }
 
@@ -4678,6 +4708,11 @@ pub struct PirlsResult {
     pub last_deviance_change: f64,
     pub last_step_halving: usize,
     pub hessian_curvature: HessianCurvatureKind,
+    /// Levenberg-Marquardt damping coefficient at the converged inner
+    /// iter. Cached by the REML runtime so the next PIRLS call in the
+    /// same outer optimization can seed `λ_LM` to this value instead
+    /// of cold-starting at `1e-6`. Mirrors `WorkingModelPirlsResult::final_lm_lambda`.
+    pub final_lm_lambda: f64,
     /// Optional KKT diagnostics when inequality constraints were active.
     pub constraint_kkt: Option<ConstraintKktDiagnostics>,
     /// Linear inequality system enforced in transformed PIRLS coordinates:
@@ -4750,6 +4785,7 @@ impl PirlsResult {
             last_deviance_change: self.last_deviance_change,
             last_step_halving: self.last_step_halving,
             hessian_curvature: self.hessian_curvature,
+            final_lm_lambda: self.final_lm_lambda,
             constraint_kkt: self.constraint_kkt.clone(),
             linear_constraints_transformed: self.linear_constraints_transformed.clone(),
             reparam_result: self.reparam_result.clone(),
@@ -4835,6 +4871,7 @@ impl PirlsResult {
             last_deviance_change: self.last_deviance_change,
             last_step_halving: self.last_step_halving,
             hessian_curvature: self.hessian_curvature,
+            final_lm_lambda: self.final_lm_lambda,
             constraint_kkt: self.constraint_kkt.clone(),
             linear_constraints_transformed: self.linear_constraints_transformed.clone(),
             reparam_result: self.reparam_result.clone(),
@@ -4906,6 +4943,7 @@ fn assemble_pirls_result(
         last_deviance_change: working_summary.last_deviance_change,
         last_step_halving: working_summary.last_step_halving,
         hessian_curvature: working_summary.state.hessian_curvature,
+        final_lm_lambda: working_summary.final_lm_lambda,
         constraint_kkt: working_summary.constraint_kkt.clone(),
         linear_constraints_transformed,
         reparam_result,
@@ -5500,6 +5538,9 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             } else {
                 f64::INFINITY
             },
+            // Zero-iteration synthesis: no LM damping was exercised, so
+            // hand the next solve the cold default.
+            final_lm_lambda: 1e-6,
         };
 
         let (solve_c_array, solve_d_array, solve_dmu_deta, solve_d2mu_deta2, solve_d3mu_deta3) =
@@ -5545,6 +5586,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             last_deviance_change: 0.0,
             last_step_halving: 0,
             hessian_curvature: HessianCurvatureKind::Fisher,
+            final_lm_lambda: working_summary.final_lm_lambda,
             constraint_kkt: working_summary.constraint_kkt.clone(),
             linear_constraints_transformed: linear_constraints.clone(),
             reparam_result,
@@ -5624,6 +5666,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         firth_bias_reduction: firth_active,
         coefficient_lower_bounds: None,
         linear_constraints: linear_constraints.clone(),
+        initial_lm_lambda: config.initial_lm_lambda,
     };
 
     let mut iteration_logger = |info: &WorkingModelIterationInfo| {
@@ -5762,6 +5805,11 @@ pub struct PirlsConfig {
     pub max_iterations: usize,
     pub convergence_tolerance: f64,
     pub firth_bias_reduction: bool,
+    /// Optional warm-start hint for `WorkingModelPirlsOptions::initial_lm_lambda`.
+    /// Forwarded directly when `fit_model_for_fixed_rho` builds its
+    /// internal options. See the field doc on `WorkingModelPirlsOptions`
+    /// for the seeding semantics.
+    pub initial_lm_lambda: Option<f64>,
 }
 
 impl PirlsConfig {
@@ -8870,6 +8918,7 @@ mod tests {
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
+                    initial_lm_lambda: None,
         };
 
         let (fit, _) = fit_model_for_fixed_rho(
@@ -9084,6 +9133,7 @@ mod tests {
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
+                    initial_lm_lambda: None,
         };
 
         let (result, _) = fit_model_for_fixed_rho(
@@ -9155,6 +9205,7 @@ mod tests {
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
+                    initial_lm_lambda: None,
         };
 
         let (fit, _) = fit_model_for_fixed_rho(
@@ -9671,6 +9722,7 @@ mod root_cause_tests {
                 a: array![[1.0]],
                 b: array![0.0],
             }),
+                    initial_lm_lambda: None,
         };
 
         let summary =
@@ -9921,6 +9973,7 @@ mod root_cause_tests {
             firth_bias_reduction: false,
             coefficient_lower_bounds: None,
             linear_constraints: None,
+                    initial_lm_lambda: None,
         };
 
         let err = match runworking_model_pirls(
@@ -9979,6 +10032,7 @@ mod root_cause_tests {
             firth_bias_reduction: false,
             coefficient_lower_bounds: None,
             linear_constraints: None,
+                    initial_lm_lambda: None,
         };
 
         let err = match runworking_model_pirls(
@@ -10018,6 +10072,7 @@ mod root_cause_tests {
             firth_bias_reduction: true,
             coefficient_lower_bounds: None,
             linear_constraints: None,
+                    initial_lm_lambda: None,
         };
 
         let err = match runworking_model_pirls(
@@ -10067,6 +10122,7 @@ mod root_cause_tests {
             firth_bias_reduction: false,
             coefficient_lower_bounds: None,
             linear_constraints: None,
+                    initial_lm_lambda: None,
         };
 
         let result =
@@ -10103,6 +10159,7 @@ mod root_cause_tests {
             firth_bias_reduction: false,
             coefficient_lower_bounds: None,
             linear_constraints: None,
+                    initial_lm_lambda: None,
         };
 
         let result =
@@ -10192,6 +10249,7 @@ mod root_cause_tests {
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
+                    initial_lm_lambda: None,
         };
 
         let (result, trace) = super::test_support::capture_pirls_penalized_deviance(|| {
@@ -10269,6 +10327,7 @@ mod root_cause_tests {
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
+                    initial_lm_lambda: None,
         };
 
         let (result, trace) = super::test_support::capture_pirls_penalized_deviance(|| {
@@ -10366,6 +10425,7 @@ mod root_cause_tests {
                 max_iterations: 100,
                 convergence_tolerance: 1e-8,
                 firth_bias_reduction: false,
+                            initial_lm_lambda: None,
             };
 
             let (result, trace) = super::test_support::capture_pirls_penalized_deviance(|| {

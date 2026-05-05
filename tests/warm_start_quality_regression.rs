@@ -102,6 +102,7 @@ fn fit_at_rho(
         // 200-iter cap is comfortable.
         convergence_tolerance: 1e-10,
         firth_bias_reduction: false,
+        initial_lm_lambda: None,
     };
     let (result, _working) = fit_model_for_fixed_rho(
         LogSmoothingParamsView::new(array![rho].view()),
