@@ -3702,6 +3702,22 @@ pub(crate) struct RemlState<'a> {
     /// Reset on `reset_surface` and on failed solves.
     pub(crate) last_ift_prediction_residual: Arc<AtomicU64>,
 
+    /// Last observed gain ratio of the accepted LM step
+    /// (`actual_reduction / predicted_reduction`) from the most recent
+    /// non-screening PIRLS solve. Bit-packed `f64` with the same NaN
+    /// sentinel discipline as `last_ift_prediction_residual`: NaN bits
+    /// (`IFT_RESIDUAL_NO_SIGNAL_BITS`) encode "no signal yet" so a
+    /// recorded ratio of exactly 0 (degenerate but possible) doesn't
+    /// collide with the no-signal token.
+    ///
+    /// Used by `first_order_inner_cap_schedule` as a third quality
+    /// signal alongside `last_iters` and `last_converged`. A small
+    /// `accept_rho` (model overstating predicted reduction) is a hint
+    /// the next iter's inner Newton may need extra margin even when
+    /// the previous solve converged in few iters. Reset on
+    /// `reset_surface` and on failed solves.
+    pub(crate) last_pirls_accept_rho: Arc<AtomicU64>,
+
     /// Cached Cholesky factorization of `IftWarmStartCache::penalized_hessian_transformed`.
     /// Lazily computed on the first IFT predict call after a fresh
     /// `updatewarm_start_from`, then reused by every subsequent
