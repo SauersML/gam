@@ -950,6 +950,28 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         out_old = self._run_summary(stderr_old)
         self.assertIn("ift_iters_p50=3", out_old)
 
+    def test_phase_summary_aggregates_tangent_iters_distribution(self) -> None:
+        # Parallel to test_phase_summary_aggregates_ift_iters_distribution:
+        # the tangent-line path's [TANGENT-QUALITY] markers also carry
+        # `iters=K` and the runner now aggregates them into
+        # tangent_iters_p50/p95/max so reviewers see whether
+        # tangent-line predictions reduce the inner-Newton iter count
+        # or PIRLS still has to grind through them.
+        stderr = "\n".join([
+            "[TANGENT-QUALITY] residual=1.0e-03 converged_norm=1.0 predicted_norm=1.0 iters=4",
+            "[TANGENT-QUALITY] residual=2.0e-03 converged_norm=1.0 predicted_norm=1.0 iters=5",
+            "[TANGENT-QUALITY] residual=3.0e-03 converged_norm=1.0 predicted_norm=1.0 iters=6",
+            "[TANGENT-QUALITY] residual=4.0e-03 converged_norm=1.0 predicted_norm=1.0 iters=8",
+            "[TANGENT-QUALITY] residual=5.0e-03 converged_norm=1.0 predicted_norm=1.0 iters=15",
+            "[PHASE] my-fit fit end elapsed=10.0s",
+        ])
+        out = self._run_summary(stderr)
+        # Sorted iters [4, 5, 6, 8, 15]; p50 (index 2) = 6,
+        # p95 (index 4) = 15, max = 15.
+        self.assertIn("tangent_iters_p50=6", out)
+        self.assertIn("tangent_iters_p95=15", out)
+        self.assertIn("tangent_iters_max=15", out)
+
     def test_phase_summary_aggregates_tangent_quality_separately_from_ift(self) -> None:
         # Pin down that [TANGENT-QUALITY] residuals roll up into a
         # SEPARATE distribution from [IFT-QUALITY] (commit 99424b47).
