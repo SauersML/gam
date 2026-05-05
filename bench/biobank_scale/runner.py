@@ -1781,6 +1781,31 @@ def _emit_phase_summary(
             f"kappa_eval_calls={n_eval_total} kappa_eval_total={eval_s_total:.1f}s "
             f"kappa_efs_calls={n_efs_total} kappa_efs_total={efs_s_total:.1f}s"
         )
+        # Per-call distribution disambiguates "single outlier" from
+        # "uniformly-slow workload" — same rationale as the
+        # kappa_optim_INCOMPLETE branch (commit 361e47b5). The summary
+        # line's totals are authoritative; the per-call max/p95 are
+        # best-effort distribution data computed from [KAPPA-PHASE]
+        # lines that survived stderr capture. When stderr buffer rolled
+        # over and dropped some per-call lines (rare), max/p95 may be
+        # under-reported but never over-reported.
+        if kappa_calls:
+            phase_secs: dict[str, list[float]] = {}
+            for phase_name, _call_idx, secs in kappa_calls:
+                phase_secs.setdefault(phase_name, []).append(float(secs))
+            dist_pieces = []
+            for phase_name in sorted(phase_secs.keys()):
+                secs_list = phase_secs[phase_name]
+                n_p = len(secs_list)
+                sorted_p = sorted(secs_list)
+                phase_max = sorted_p[-1]
+                phase_p95 = sorted_p[min(n_p - 1, int(0.95 * n_p))]
+                dist_pieces.append(
+                    f"kappa_{phase_name}_p95={phase_p95:.2f}s "
+                    f"kappa_{phase_name}_max={phase_max:.2f}s"
+                )
+            if dist_pieces:
+                parts.append(" ".join(dist_pieces))
     elif kappa_calls:
         # Got per-call markers but no summary (κ optimization didn't
         # finish — e.g. interrupted by command timeout). Surface the
