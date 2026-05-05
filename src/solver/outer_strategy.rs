@@ -64,7 +64,7 @@ impl InnerProgressFeedback {
     /// schedule then falls back to the coarse iter-count tier.
     ///
     /// The IFT residual decoding uses the same NaN-sentinel discipline
-    /// as `RemlState::predict_warm_start_beta_ift` — see commit
+    /// as `RemlState::predict_warm_start_beta_ift_with_outcome` — see commit
     /// `748cc066` for the rationale. A residual of exactly 0 (every
     /// β_predicted_i bit-equal to β_converged_i) must NOT be confused
     /// with "no signal yet"; the NaN sentinel + `is_finite()` check
