@@ -15699,4 +15699,149 @@ mod tests {
         let rel = rel_diff_array2(&scaled, &exp);
         assert!(rel < 1e-12, "joint Hessian dH HT rel {}", rel);
     }
+
+    /// Scaling-law probe for the margslope sigma ψ first-order path —
+    /// the per-row hot loop the path #1 subsample-outer fix targets.
+    /// `#[ignore]`-gated; run with:
+    ///   `cargo test --release --lib -- --ignored --nocapture margslope_sigma_psi_scaling_law`
+    ///
+    /// Fits y = a · n^α to (n, wall-time) at full data and at the
+    /// auto-K subsample. Reports R², max log-residual, and verdicts at
+    /// biobank n=320k against an 80s/call budget (≈30 ψ-eval calls per
+    /// 2400s cmd budget, with ~10 BFGS outer × ~3 ψ-evals/outer).
+    #[test]
+    #[ignore]
+    fn margslope_sigma_psi_scaling_law() {
+        use crate::families::marginal_slope_shared::{
+            OuterScoreSubsample, auto_outer_subsample_k,
+        };
+        use std::time::Instant;
+
+        let ns: Vec<usize> = vec![5_000, 10_000, 25_000, 50_000, 100_000, 200_000, 320_000];
+        let per_call_budget = 80.0_f64;
+        const REPS: usize = 3;
+
+        eprintln!("\n[MS-SCALING] header n full_s subsample_s K speedup");
+        let mut full_pts: Vec<(f64, f64)> = Vec::new();
+        let mut sub_pts: Vec<(f64, f64)> = Vec::new();
+
+        for &n in &ns {
+            let family = make_sigma_aware_test_family(n);
+            let states = rigid_block_states(&family, 0.3, 0.4);
+            let specs = vec![dummy_blockspec(1, n), dummy_blockspec(1, n)];
+
+            let opts_full = BlockwiseFitOptions::default();
+            let mut full_samples: Vec<f64> = Vec::with_capacity(REPS);
+            for _ in 0..REPS {
+                let t0 = Instant::now();
+                let _ = family
+                    .sigma_exact_joint_psi_terms_with_options(&states, &specs, &opts_full)
+                    .expect("sigma terms full")
+                    .expect("some");
+                full_samples.push(t0.elapsed().as_secs_f64());
+            }
+            full_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let t_full = full_samples[full_samples.len() / 2];
+
+            let k = auto_outer_subsample_k(n);
+            let mask: Vec<usize> = (0..n).step_by((n / k).max(1)).take(k).collect();
+            let mut opts_sub = BlockwiseFitOptions::default();
+            opts_sub.outer_score_subsample =
+                Some(Arc::new(OuterScoreSubsample::new(mask, n, 0xC0FFEE_5EED)));
+            let mut sub_samples: Vec<f64> = Vec::with_capacity(REPS);
+            for _ in 0..REPS {
+                let t0 = Instant::now();
+                let _ = family
+                    .sigma_exact_joint_psi_terms_with_options(&states, &specs, &opts_sub)
+                    .expect("sigma terms sub")
+                    .expect("some");
+                sub_samples.push(t0.elapsed().as_secs_f64());
+            }
+            sub_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let t_sub = sub_samples[sub_samples.len() / 2];
+
+            let speedup = if t_sub > 0.0 { t_full / t_sub } else { f64::NAN };
+            eprintln!(
+                "[MS-SCALING] row n={n} full_s={t_full:.5} subsample_s={t_sub:.5} K={k} speedup={speedup:.2}x"
+            );
+            full_pts.push((n as f64, t_full));
+            sub_pts.push((n as f64, t_sub));
+        }
+        eprintln!();
+        report_power_law(
+            "[MS-SCALING-FULL]",
+            &full_pts,
+            &[("n=320k", 320_000.0), ("n=1M", 1_000_000.0)],
+            per_call_budget,
+        );
+        eprintln!();
+        report_power_law(
+            "[MS-SCALING-SUBSAMPLE]",
+            &sub_pts,
+            &[("n=320k", 320_000.0), ("n=1M", 1_000_000.0)],
+            per_call_budget,
+        );
+    }
+
+    /// Honest power-law fit + R² + extrapolation verdicts. Refuses to
+    /// extrapolate when the fit is poor (R²<0.85 or any log-residual >0.5).
+    fn report_power_law(
+        tag: &str,
+        points: &[(f64, f64)],
+        extrapolate: &[(&str, f64)],
+        budget_y: f64,
+    ) {
+        if points.len() < 3 {
+            eprintln!("{tag} INSUFFICIENT DATA: {} points (need ≥3)", points.len());
+            return;
+        }
+        let logs: Vec<(f64, f64)> = points.iter().map(|(x, y)| (x.ln(), y.ln())).collect();
+        let n = logs.len() as f64;
+        let sx: f64 = logs.iter().map(|(x, _)| x).sum();
+        let sy: f64 = logs.iter().map(|(_, y)| y).sum();
+        let sxx: f64 = logs.iter().map(|(x, _)| x * x).sum();
+        let sxy: f64 = logs.iter().map(|(x, y)| x * y).sum();
+        let alpha = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+        let log_a = (sy - alpha * sx) / n;
+        let a = log_a.exp();
+        let mean_y = sy / n;
+        let ss_tot: f64 = logs.iter().map(|(_, y)| (y - mean_y).powi(2)).sum();
+        let ss_res: f64 = logs
+            .iter()
+            .map(|(x, y)| {
+                let pred = log_a + alpha * x;
+                (y - pred).powi(2)
+            })
+            .sum();
+        let r2 = if ss_tot > 0.0 { 1.0 - ss_res / ss_tot } else { 0.0 };
+        let max_abs_log_resid: f64 = logs
+            .iter()
+            .map(|(x, y)| (y - (log_a + alpha * x)).abs())
+            .fold(0.0_f64, f64::max);
+        eprintln!(
+            "{tag} fit: y ≈ {:.3e} · x^{:.3}  | R²={:.4}  max|log-resid|={:.3} (×{:.2})",
+            a,
+            alpha,
+            r2,
+            max_abs_log_resid,
+            max_abs_log_resid.exp()
+        );
+        if r2 < 0.85 || max_abs_log_resid > 0.5 {
+            eprintln!("{tag} REFUSING EXTRAPOLATION (R²<0.85 or max log-resid >0.5)");
+            return;
+        }
+        eprintln!("{tag} budget per call: {:.1}s", budget_y);
+        for (label, x_target) in extrapolate {
+            let pred = a * x_target.powf(alpha);
+            let verdict = if pred <= budget_y {
+                format!("FITS ({:.0}× headroom)", budget_y / pred)
+            } else {
+                format!("OVER by {:.1}× ({:.0}s)", pred / budget_y, pred)
+            };
+            eprintln!(
+                "{tag} extrap @ {label} (x={:.1e}): pred={:.4}s → {}",
+                x_target, pred, verdict
+            );
+        }
+    }
 }

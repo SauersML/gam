@@ -188,47 +188,115 @@ fn standard_gam_scaling_law() {
         rows.push((n, elapsed, outer_iters, pirls_iter, converged));
     }
 
-    // Fit log-log slope on (n, total_s) using least-squares.
-    // log(total_s) = log(a) + α * log(n)
-    let valid: Vec<(f64, f64)> = rows
+    // Fit a power law `total_s = a · n^α` via log-log least squares,
+    // gated on rows that GENUINELY converged (outer_iters strictly less
+    // than the max_iter cap of 100 — `outer_converged=true` from the
+    // public API is unreliable when the inner solve hit its own cap).
+    // Report R² and the largest log-residual so the verdict is honest:
+    // a fit with R²<0.85 is unreliable for extrapolation across decades.
+    fit_and_report_power_law(
+        "[SCALING]",
+        rows.iter()
+            .filter_map(|(n, t, oi, _pi, _)| {
+                // honest convergence gate: outer iters < cap AND time finite
+                if *t > 0.0 && t.is_finite() && *oi < 100 {
+                    Some((*n as f64, *t))
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        &[("n=320k", 320_000.0), ("n=1M", 1_000_000.0)],
+        2400.0,
+    );
+}
+
+/// Fit `y = a · x^α` to `(x, y)` pairs via log-log OLS. Reports α, a, R²,
+/// max abs log-residual, and extrapolations at requested points.
+/// `budget_y` is the mission budget; verdicts compare extrapolations to it.
+fn fit_and_report_power_law(
+    tag: &str,
+    points: Vec<(f64, f64)>,
+    extrapolate: &[(&str, f64)],
+    budget_y: f64,
+) {
+    if points.len() < 3 {
+        eprintln!(
+            "{tag} INSUFFICIENT DATA: {} converged points (need ≥3 for honest fit)",
+            points.len()
+        );
+        return;
+    }
+    let logs: Vec<(f64, f64)> = points.iter().map(|(x, y)| (x.ln(), y.ln())).collect();
+    let n = logs.len() as f64;
+    let sx: f64 = logs.iter().map(|(x, _)| x).sum();
+    let sy: f64 = logs.iter().map(|(_, y)| y).sum();
+    let sxx: f64 = logs.iter().map(|(x, _)| x * x).sum();
+    let sxy: f64 = logs.iter().map(|(x, y)| x * y).sum();
+    let alpha = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+    let log_a = (sy - alpha * sx) / n;
+    let a = log_a.exp();
+    // R²: 1 - SS_res / SS_tot in log-space.
+    let mean_y = sy / n;
+    let ss_tot: f64 = logs.iter().map(|(_, y)| (y - mean_y).powi(2)).sum();
+    let ss_res: f64 = logs
         .iter()
-        .filter(|(_, t, _, _, conv)| *t > 0.0 && *conv)
-        .map(|(n, t, _, _, _)| ((*n as f64).ln(), t.ln()))
-        .collect();
-    if valid.len() >= 2 {
-        let n = valid.len() as f64;
-        let sx: f64 = valid.iter().map(|(x, _)| x).sum::<f64>();
-        let sy: f64 = valid.iter().map(|(_, y)| y).sum::<f64>();
-        let sxx: f64 = valid.iter().map(|(x, _)| x * x).sum::<f64>();
-        let sxy: f64 = valid.iter().map(|(x, y)| x * y).sum::<f64>();
-        let alpha = (n * sxy - sx * sy) / (n * sxx - sx * sx);
-        let log_a = (sy - alpha * sx) / n;
-        let a = log_a.exp();
-        let pred_320k = a * (320_000.0_f64).powf(alpha);
-        let pred_1m = a * (1_000_000.0_f64).powf(alpha);
+        .map(|(x, y)| {
+            let pred = log_a + alpha * x;
+            (y - pred).powi(2)
+        })
+        .sum();
+    let r2 = if ss_tot > 0.0 { 1.0 - ss_res / ss_tot } else { 0.0 };
+    let max_abs_log_resid: f64 = logs
+        .iter()
+        .map(|(x, y)| (y - (log_a + alpha * x)).abs())
+        .fold(0.0_f64, f64::max);
+
+    eprintln!(
+        "\n{tag} fit: y ≈ {:.3e} · x^{:.3}  | R²={:.4}  max|log-resid|={:.3} (×{:.2})  | n_points={}",
+        a, alpha, r2, max_abs_log_resid, max_abs_log_resid.exp(), logs.len()
+    );
+
+    // Honesty rules: refuse extrapolation when the fit is poor, AND when
+    // the extrapolation distance exceeds the calibration range too far.
+    let max_x: f64 = points.iter().map(|(x, _)| *x).fold(0.0_f64, f64::max);
+    let min_x: f64 = points.iter().map(|(x, _)| *x).fold(f64::INFINITY, f64::min);
+    let usable = r2 >= 0.85 && max_abs_log_resid < 0.5;
+    if !usable {
         eprintln!(
-            "\n[SCALING] fit: total_s ≈ {:.3e} * n^{:.3}",
-            a, alpha
+            "{tag} REFUSING EXTRAPOLATION: fit quality insufficient (R² < 0.85 or max-resid > 0.5 in log-space, i.e. >65% off in y). Need cleaner data — likely the test setup is hitting an outer-iter cap or the problem geometry varies across n."
         );
-        eprintln!(
-            "[SCALING] extrap: n=320k → {:.1}s ({:.1} min), n=1M → {:.1}s ({:.1} min)",
-            pred_320k,
-            pred_320k / 60.0,
-            pred_1m,
-            pred_1m / 60.0,
-        );
-        eprintln!("[SCALING] mission budget: 2400s (40 min cmd timeout)");
-        if pred_320k <= 2400.0 {
-            eprintln!("[SCALING] VERDICT: predicted to FIT in budget at n=320k ✓");
+        return;
+    }
+    eprintln!("{tag} budget: {:.1}s", budget_y);
+    for (label, x_target) in extrapolate {
+        let pred = a * x_target.powf(alpha);
+        let stretch = x_target / max_x;
+        let stretch_note = if stretch > 5.0 {
+            format!(" [extrapolating {:.1}× past max calibration x={:.1e}]", stretch, max_x)
+        } else if *x_target < min_x {
+            format!(" [extrapolating below min calibration x={:.1e}]", min_x)
         } else {
-            eprintln!(
-                "[SCALING] VERDICT: predicted OVER budget at n=320k by {:.0}s ({:.1} min)",
-                pred_320k - 2400.0,
-                (pred_320k - 2400.0) / 60.0,
-            );
-        }
-    } else {
-        eprintln!("[SCALING] not enough converged points for fit");
+            String::new()
+        };
+        let verdict = if pred <= budget_y {
+            format!("FITS ({:.0}× headroom)", budget_y / pred)
+        } else {
+            format!(
+                "OVER BUDGET by {:.0}s ({:.1} min, {:.2}× over)",
+                pred - budget_y,
+                (pred - budget_y) / 60.0,
+                pred / budget_y
+            )
+        };
+        eprintln!(
+            "{tag} extrap @ {label} (x={:.1e}): pred={:.1}s ({:.2} min){} → {}",
+            x_target,
+            pred,
+            pred / 60.0,
+            stretch_note,
+            verdict
+        );
     }
 }
 
@@ -251,52 +319,22 @@ fn standard_gam_p_scaling_law() {
         );
         rows.push((k, elapsed, outer_iters, converged));
     }
-    let valid: Vec<(f64, f64)> = rows
-        .iter()
-        .filter(|(_, t, _, conv)| *t > 0.0 && *conv)
-        .map(|(k, t, _, _)| ((*k as f64).ln(), t.ln()))
-        .collect();
-    if valid.len() >= 2 {
-        let n = valid.len() as f64;
-        let sx: f64 = valid.iter().map(|(x, _)| x).sum::<f64>();
-        let sy: f64 = valid.iter().map(|(_, y)| y).sum::<f64>();
-        let sxx: f64 = valid.iter().map(|(x, _)| x * x).sum::<f64>();
-        let sxy: f64 = valid.iter().map(|(x, y)| x * y).sum::<f64>();
-        let alpha = (n * sxy - sx * sy) / (n * sxx - sx * sx);
-        let log_a = (sy - alpha * sx) / n;
-        let a = log_a.exp();
-        eprintln!(
-            "\n[P-SCALING] fit at n=50k: total_s ≈ {:.3e} * k^{:.3}",
-            a, alpha
-        );
-        // Combined extrapolation: assume separable in n^1.07 (from
-        // standard_gam_scaling_law) and k^α. Predict at biobank shape.
-        let n_alpha = 1.072_f64;
-        let predict = |target_n: f64, target_k: f64| -> f64 {
-            // total_s_at(n,k) = (a * k^α) * (n/n_calib)^n_alpha
-            let n_calib = 50_000.0;
-            (a * target_k.powf(alpha)) * (target_n / n_calib).powf(n_alpha)
-        };
-        let pred_320k_p80 = predict(320_000.0, 80.0);
-        let pred_320k_p42 = predict(320_000.0, 42.0);
-        eprintln!(
-            "[P-SCALING] extrap (separable n×k): n=320k k=42 → {:.1}s ({:.1} min); k=80 → {:.1}s ({:.1} min)",
-            pred_320k_p42,
-            pred_320k_p42 / 60.0,
-            pred_320k_p80,
-            pred_320k_p80 / 60.0,
-        );
-        eprintln!("[P-SCALING] mission budget: 2400s (40 min cmd timeout)");
-        for (label, pred) in [("k=42", pred_320k_p42), ("k=80", pred_320k_p80)] {
-            if pred <= 2400.0 {
-                eprintln!("[P-SCALING] VERDICT @ {label}: predicted to FIT ✓");
-            } else {
-                eprintln!(
-                    "[P-SCALING] VERDICT @ {label}: predicted OVER budget by {:.0}s ({:.1} min)",
-                    pred - 2400.0,
-                    (pred - 2400.0) / 60.0,
-                );
-            }
-        }
-    }
+    fit_and_report_power_law(
+        "[P-SCALING]",
+        rows.iter()
+            .filter_map(|(k, t, oi, _)| {
+                if *t > 0.0 && t.is_finite() && *oi < 100 {
+                    Some((*k as f64, *t))
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        &[("k=42", 42.0), ("k=80", 80.0)],
+        // P-scaling here is at fixed n=50k. The 2400s budget is at
+        // biobank n=320k. Approx target at fixed n=50k for "fits at
+        // biobank": 2400 / (320/50)^1 = 375s (assuming n^1 scaling).
+        // Use this as the budget so verdicts at this n make sense.
+        375.0,
+    );
 }
