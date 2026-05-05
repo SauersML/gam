@@ -1089,7 +1089,7 @@ fn resolve_external_family(
                 "optimize_external_design requires a GLM family; {msg}"
             ))
         })?),
-        firth_override.unwrap_or_else(|| family.supports_firth()) && family.supports_firth(),
+        firth_override.unwrap_or(false) && family.supports_firth(),
     ))
 }
 
