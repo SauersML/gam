@@ -3693,6 +3693,40 @@ fn solve_intercept_for_prevalence(
     Some(0.5 * (lo + hi))
 }
 
+/// Madsen-Nielsen-Tingleff smooth Marquardt trust-region update (eq 3.17 in
+/// "Methods for non-linear least squares problems", IMM Tech Univ Denmark,
+/// 2nd ed 2004) for the LM accept branch. Replaces the older binary
+/// `if rho > 0.25 { /10 } else { keep }` rule.
+///
+/// The accepted-step damping update is
+///   λ_next = λ_loop · max(1/3, 1 − (2ρ − 1)³)
+/// where ρ = actual_reduction / predicted_reduction is the gain ratio.
+/// The cubic expression interpolates smoothly across the gain-ratio scale:
+///
+/// | ρ      | factor | rationale                                        |
+/// |--------|-------:|--------------------------------------------------|
+/// | 1.0    | 1/3    | good Newton match — mild shrink (was ÷10 before, |
+/// |        |        | which over-shot to 1e-9 and forced the next      |
+/// |        |        | iter to discover the over-trust by rejection)    |
+/// | 0.75   | 0.875  | slight shrink                                    |
+/// | 0.5    | 1.0    | no change — the model is "fine"                  |
+/// | 0.25   | 1.125  | slight EXPAND on marginal accepts (new behavior; |
+/// |        |        | the binary rule held lambda flat here, then the  |
+/// |        |        | next iter often needed extra halvings)           |
+/// | →0⁺    | →2.0   | capped at 2.0 so a just-barely-accepted step     |
+/// |        |        | bumps λ toward gradient-descent at most ×2       |
+///
+/// Cap at 2.0 (vs unbounded `1 − (2ρ − 1)³` which diverges as ρ→−∞) is
+/// safety: this branch only fires for accepted (ρ > 0) steps, but the
+/// post-accept ρ can be as small as `noise_floor / predicted_reduction`,
+/// where the cubic blow-up isn't physical.
+#[inline]
+fn madsen_lm_accept_factor(rho: f64) -> f64 {
+    let two_rho_minus_one = 2.0 * rho - 1.0;
+    let cube = two_rho_minus_one * two_rho_minus_one * two_rho_minus_one;
+    (1.0 - cube).clamp(1.0 / 3.0, 2.0)
+}
+
 pub fn runworking_model_pirls<M, F>(
     model: &mut M,
     mut beta: Coefficients,
@@ -4188,16 +4222,10 @@ where
                             }
                         }
                         // Accept Step
-
-                        // Update Trust Region (Lambda)
-                        // Heuristic: if good step, decrease lambda (more Newton-like)
-                        // if barely acceptable, keep or increase?
-                        // Marquardt: if rho is high, decrease lambda.
-                        if rho > 0.25 {
-                            lambda = (loop_lambda / lambda_factor).max(1e-9);
-                        } else {
-                            lambda = loop_lambda;
-                        }
+                        // Update Trust Region (Lambda) — Madsen-Nielsen-Tingleff
+                        // smooth Marquardt update. See `madsen_lm_accept_factor`
+                        // for the textbook derivation and canonical values.
+                        lambda = (loop_lambda * madsen_lm_accept_factor(rho)).max(1e-9);
 
                         // Updates for next iteration
                         beta = candidate_beta;
@@ -8639,9 +8667,10 @@ mod tests {
         LinearInequalityConstraints, PenaltyConfig, PirlsConfig, PirlsLinearSolvePath,
         PirlsProblem, PirlsWorkspace, bernoulli_geometry_from_jet, calculate_deviance,
         compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays,
-        default_beta_guess_external, fit_model_for_fixed_rho, should_log_pirls_decision_summary,
-        should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints,
-        solve_newton_directionwith_lower_bounds, update_glmvectors,
+        default_beta_guess_external, fit_model_for_fixed_rho, madsen_lm_accept_factor,
+        should_log_pirls_decision_summary, should_use_sparse_native_pirls,
+        solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
+        update_glmvectors,
     };
     use crate::matrix::DesignMatrix;
     use crate::mixture_link::InverseLinkJet as MixtureInverseLinkJet;
@@ -8689,6 +8718,46 @@ mod tests {
                 (weighted_rss / (effective_n - edf).max(1.0)).sqrt()
             }
         }
+    }
+
+    #[test]
+    fn madsen_lm_accept_factor_matches_canonical_textbook_values() {
+        // Madsen-Nielsen-Tingleff Eq 3.17 canonical values. Locks the
+        // implementation against silent regression to the older binary
+        // `if rho > 0.25 { /lambda_factor } else { keep }` rule.
+        let cases: &[(f64, f64, &str)] = &[
+            (1.0, 1.0 / 3.0, "rho=1: floored at 1/3 (cube=1, 1-cube=0)"),
+            (0.75, 0.875, "rho=0.75: 1 - (0.5)^3 = 0.875 (slight shrink)"),
+            (0.5, 1.0, "rho=0.5: 1 - 0 = 1.0 (no change)"),
+            (0.25, 1.125, "rho=0.25: 1 - (-0.5)^3 = 1.125 (slight expand)"),
+        ];
+        for (rho, expected, why) in cases {
+            let got = madsen_lm_accept_factor(*rho);
+            assert!(
+                (got - expected).abs() < 1e-12,
+                "madsen_lm_accept_factor({rho}) = {got:.6}, expected {expected:.6} — {why}"
+            );
+        }
+        // Marginal-accept (rho → 0⁺): cube → -1, 1 - cube → 2.0.
+        // Capped at 2.0 so a barely-accepted step bumps lambda by at
+        // most ×2 — the texbook upper bound (vs unbounded growth as
+        // rho continues to drop, which never fires in this branch
+        // because rho ≤ 0 routes through the rejection path).
+        let small_positive = madsen_lm_accept_factor(1e-9);
+        assert!(
+            (small_positive - 2.0).abs() < 1e-6,
+            "rho ≈ 0⁺ must approach the 2.0 cap; got {small_positive:.6}"
+        );
+        // Hypothetical rho < 0 still yields a well-defined cap so the
+        // function is total — this protects against numeric corner
+        // cases producing NaN even though the LM loop never calls us
+        // there.
+        assert_eq!(madsen_lm_accept_factor(-100.0), 2.0);
+        assert_eq!(madsen_lm_accept_factor(100.0), 1.0 / 3.0);
+        // Floor + ceiling are exact (no roundoff slop on the clamp).
+        assert!(madsen_lm_accept_factor(0.99).is_finite());
+        assert!(madsen_lm_accept_factor(0.01) <= 2.0 + 1e-15);
+        assert!(madsen_lm_accept_factor(0.99) >= 1.0 / 3.0 - 1e-15);
     }
 
     #[test]
