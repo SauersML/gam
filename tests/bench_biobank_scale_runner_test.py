@@ -840,6 +840,72 @@ class MarkerPatternTests(unittest.TestCase):
             self.assertEqual(reason, expected_reason)
             self.assertEqual(elapsed, expected_elapsed)
 
+    def test_outer_eval_end_pattern_captures_order_and_elapsed(self) -> None:
+        # The outer-eval-end pattern feeds the `outer_eval_n`,
+        # `outer_eval_total`, and per-order breakdown
+        # (`outer_eval_<KIND>=count@total_secs`) aggregations. Lock
+        # all three EvalOrder variants the rust side emits, plus
+        # the BFGS-bridge variant with the trailing `(first-order
+        # bridge, iter=N)` annotation that the regex must NOT
+        # require (older binaries didn't emit it).
+        cases = [
+            (
+                "[STAGE] outer eval end order=ValueAndGradient elapsed=2.345s "
+                "cost=1.23e3 |g|=4.5e-2 (first-order bridge, iter=3)",
+                "ValueAndGradient", "2.345",
+            ),
+            (
+                "[STAGE] outer eval end order=ValueGradientHessian elapsed=12.789s "
+                "cost=1.23e3 |g|=4.5e-2",
+                "ValueGradientHessian", "12.789",
+            ),
+            (
+                "[STAGE] outer eval end order=ValueAndGradient elapsed=0.001s "
+                "cost=1.23e3 |g|=4.5e-2",
+                "ValueAndGradient", "0.001",
+            ),
+        ]
+        for line, expected_order, expected_elapsed in cases:
+            matches = _RUNNER._OUTER_EVAL_END_PATTERN.findall(line)
+            self.assertEqual(
+                len(matches),
+                1,
+                f"order {expected_order!r} did not parse: {line}",
+            )
+            order, elapsed = matches[0]
+            self.assertEqual(order, expected_order)
+            self.assertEqual(elapsed, expected_elapsed)
+
+    def test_seed_cascade_pattern_captures_cascade_summary(self) -> None:
+        # The seed-cascade pattern feeds the `seed_cascade_*`
+        # aggregations. Lock both `final_cap=N` (numeric, when the
+        # final stage was capped) and `final_cap=uncapped` (literal,
+        # when the cascade reached full inner budget).
+        cases = [
+            (
+                "[OUTER] biobank_fit_001: seed screening cascade complete "
+                "elapsed=12.345s stages_used=2 final_cap=uncapped ranked=8/10",
+                "12.345", "2", "uncapped", "8", "10",
+            ),
+            (
+                "[OUTER] survival-marginal-slope/biobank-1: seed screening cascade complete "
+                "elapsed=0.500s stages_used=1 final_cap=10 ranked=4/4",
+                "0.500", "1", "10", "4", "4",
+            ),
+        ]
+        for line, exp_elapsed, exp_stages, exp_cap, exp_ranked, exp_seeds in cases:
+            matches = _RUNNER._SEED_CASCADE_PATTERN.findall(line)
+            self.assertEqual(
+                len(matches), 1,
+                f"cascade did not parse: {line}",
+            )
+            elapsed, stages, cap, ranked, seeds = matches[0]
+            self.assertEqual(elapsed, exp_elapsed)
+            self.assertEqual(stages, exp_stages)
+            self.assertEqual(cap, exp_cap)
+            self.assertEqual(ranked, exp_ranked)
+            self.assertEqual(seeds, exp_seeds)
+
     def test_pirls_curvature_kind_pattern_captures_observed_and_fisher(self) -> None:
         # The curvature-kind log emits the ACTUAL curvature used by the
         # inner PIRLS step (after any Fisher fallback). The two enum
