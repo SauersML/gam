@@ -9411,11 +9411,19 @@ fn fit_survival_location_scale(
     spec: SurvivalLocationScaleSpec,
 ) -> Result<UnifiedFitResult, String> {
     let prepared = prepare_survival_location_scale_model(&spec)?;
-    let fit = fit_custom_family(
-        &prepared.family,
-        &prepared.blockspecs,
-        &survival_blockwise_fit_options(&spec),
-    )?;
+    // Same biobank-scale outer-Hessian gate as the marginal-slope and
+    // gamlss families. At biobank n the analytic outer Hessian dominates
+    // wall-clock; route to BFGS on the analytic gradient instead.
+    let n_obs = spec.age_entry.len();
+    let biobank_scale = n_obs > 50_000;
+    let mut options = survival_blockwise_fit_options(&spec);
+    if biobank_scale && options.use_outer_hessian {
+        options.use_outer_hessian = false;
+        log::info!(
+            "[survival-location-scale] declining analytic outer Hessian for n={n_obs}; routing to BFGS"
+        );
+    }
+    let fit = fit_custom_family(&prepared.family, &prepared.blockspecs, &options)?;
     finalize_survival_location_scale_fit(&prepared, &fit)
 }
 
