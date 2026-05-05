@@ -3676,6 +3676,19 @@ pub(crate) struct RemlState<'a> {
     /// Reset on `reset_surface` and on failed solves.
     pub(crate) last_ift_prediction_residual: Arc<AtomicU64>,
 
+    /// Cached Cholesky factorization of `IftWarmStartCache::penalized_hessian_transformed`.
+    /// Lazily computed on the first IFT predict call after a fresh
+    /// `updatewarm_start_from`, then reused by every subsequent
+    /// predict call until the IFT cache is invalidated. At biobank
+    /// scale where p can reach several thousand, the dense Cholesky
+    /// is O(p³)/3 — multiple seconds per refactor — so caching saves
+    /// real wall time across the typical 5-10 IFT predict calls per
+    /// outer fit. Reset jointly with `ift_warm_start_cache` (on
+    /// reset_surface, on link-state changes, on failed PIRLS solves,
+    /// and whenever a new H_pen replaces the cached one).
+    pub(crate) ift_cached_factor:
+        RwLock<Option<Arc<dyn crate::linalg::matrix::FactorizedSystem>>>,
+
     /// When set, the penalties have Kronecker (tensor-product) structure and
     /// the REML evaluator can use O(∏q_j) logdet instead of O(p³) eigendecomposition.
     /// Populated via `set_kronecker_penalty_system` after construction.
