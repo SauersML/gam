@@ -703,6 +703,36 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
             _RUNNER._emit_phase_summary(captured_stderr, "cmd-preview", timed_out=False, rc=0)
         return buf.getvalue()
 
+    def test_warm_start_health_verdict_outer_nonfinite_overrides_to_degraded(self) -> None:
+        # Even with HEALTHY-looking IFT signals, a single
+        # [OUTER non-finite] warning during the fit must override the
+        # verdict to DEGRADED. Broken geometry invalidates the
+        # predictor-faithfulness measurements regardless of how clean
+        # the residuals look.
+        v, d = _RUNNER._warm_start_health_verdict(
+            n_accepts=10, n_rejects=0, n_noops=0,
+            residuals=[1e-5] * 10,
+            n_outer_nonfinite=1,
+        )
+        self.assertEqual(v, "DEGRADED", f"detail={d}")
+        self.assertIn("n_outer_nonfinite=1", d)
+        # Without the override, this would have been HEALTHY.
+        v_no_override, _ = _RUNNER._warm_start_health_verdict(
+            n_accepts=10, n_rejects=0, n_noops=0,
+            residuals=[1e-5] * 10,
+            n_outer_nonfinite=0,
+        )
+        self.assertEqual(v_no_override, "HEALTHY")
+        # NO-DATA case under override: no residuals + outer_nonfinite > 0
+        # should still return DEGRADED (override fires before NO-DATA).
+        v, d = _RUNNER._warm_start_health_verdict(
+            n_accepts=0, n_rejects=2, n_noops=0,
+            residuals=[],
+            n_outer_nonfinite=3,
+        )
+        self.assertEqual(v, "DEGRADED")
+        self.assertIn("n_outer_nonfinite=3", d)
+
     def test_warm_start_health_verdict_classifies_tiers_correctly(self) -> None:
         # HEALTHY: coverage ≥ 0.70 AND p50_resid < 0.05
         v, d = _RUNNER._warm_start_health_verdict(
