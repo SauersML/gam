@@ -1666,6 +1666,21 @@ _PIRLS_MID_ITER_FISHER_PATTERN = re.compile(
     r"\[PIRLS\] mid-iter Fisher fallback iter=(\d+)\s+reason=(\w+)"
 )
 
+# `force_fisher_for_rest` engagement marker. Fires once per PIRLS
+# solve at most — when consecutive_fisher_fallbacks > 2 the inner
+# solver gives up on Observed for the rest of the solve and locks
+# into Fisher. The reason field captures WHICH branch's increment
+# pushed the count over the threshold (iter_start vs gain_rejection
+# vs candidate_err). A non-zero count of these markers across a fit
+# means at least one PIRLS solve fully transitioned to Fisher;
+# combined with the existing `pirls_fisher_frac` aggregator, this
+# tells us whether the high Fisher fraction is one-shot fallbacks
+# or a sustained Fisher-only state.
+_PIRLS_FORCE_FISHER_PATTERN = re.compile(
+    r"\[PIRLS\] force_fisher_for_rest engaged at iter=(\d+)\s+"
+    r"\(consecutive_fisher_fallbacks=(\d+)\)\s+reason=(\w+)"
+)
+
 # Per-iter LM trajectory: validates the textbook Madsen accept (commit
 # 58ae42d1) and reject (d37626e6) updates plus the runtime adaptive λ
 # clamp (43be42be) are moving the trust region in useful directions at
@@ -2163,6 +2178,28 @@ def _emit_phase_summary(
             f"pirls_mid_iter_fisher_n={len(mid_iter_fisher)} "
             f"pirls_mid_iter_gain_rejection={gain_rejection_count} "
             f"pirls_mid_iter_candidate_err={candidate_err_count}"
+        )
+    # `force_fisher_for_rest` engagement: fires at most once per PIRLS
+    # solve, when the inner solver locks into Fisher for the rest of
+    # the solve. A non-zero count means at least one solve fully
+    # transitioned to Fisher-only — different signal from
+    # `pirls_fisher_frac` (which counts iter-start Fisher uses,
+    # whether or not the lock-in fired).
+    force_fisher = _PIRLS_FORCE_FISHER_PATTERN.findall(captured_stderr)
+    if force_fisher:
+        # Per-reason counts: which branch's increment pushed the
+        # count over the threshold. iter_start = Observed assembly
+        # itself failed too many times; gain_rejection / candidate_err
+        # = mid-LM-loop Observed retries failed too many times.
+        force_reasons: dict[str, int] = {}
+        for _iter, _count, reason in force_fisher:
+            force_reasons[reason] = force_reasons.get(reason, 0) + 1
+        reason_pieces = " ".join(
+            f"pirls_force_fisher_{reason}={count}"
+            for reason, count in sorted(force_reasons.items())
+        )
+        parts.append(
+            f"pirls_force_fisher_n={len(force_fisher)} {reason_pieces}"
         )
     pirls_breakdown_matches = _PIRLS_ITER_BREAKDOWN_PATTERN.findall(captured_stderr)
     if pirls_breakdown_matches:

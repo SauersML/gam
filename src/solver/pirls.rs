@@ -3933,7 +3933,12 @@ where
             Err(_) if preferred_curvature == HessianCurvatureKind::Observed => {
                 used_fisher_fallback_this_iter = true;
                 consecutive_fisher_fallbacks += 1;
-                if consecutive_fisher_fallbacks > 2 {
+                if consecutive_fisher_fallbacks > 2 && !force_fisher_for_rest {
+                    log::info!(
+                        "[PIRLS] force_fisher_for_rest engaged at iter={} (consecutive_fisher_fallbacks={}) reason=iter_start",
+                        iter,
+                        consecutive_fisher_fallbacks,
+                    );
                     force_fisher_for_rest = true;
                 }
                 model.update_with_curvature(&beta, HessianCurvatureKind::Fisher)?
@@ -4455,7 +4460,12 @@ where
                         {
                             used_fisher_fallback_this_iter = true;
                             consecutive_fisher_fallbacks += 1;
-                            if consecutive_fisher_fallbacks > 2 {
+                            if consecutive_fisher_fallbacks > 2 && !force_fisher_for_rest {
+                                log::info!(
+                                    "[PIRLS] force_fisher_for_rest engaged at iter={} (consecutive_fisher_fallbacks={}) reason=gain_rejection",
+                                    iter,
+                                    consecutive_fisher_fallbacks,
+                                );
                                 force_fisher_for_rest = true;
                             }
                             // Mid-LM-loop Fisher fallback: the Observed
@@ -4589,7 +4599,12 @@ where
                     {
                         used_fisher_fallback_this_iter = true;
                         consecutive_fisher_fallbacks += 1;
-                        if consecutive_fisher_fallbacks > 2 {
+                        if consecutive_fisher_fallbacks > 2 && !force_fisher_for_rest {
+                            log::info!(
+                                "[PIRLS] force_fisher_for_rest engaged at iter={} (consecutive_fisher_fallbacks={}) reason=candidate_err",
+                                iter,
+                                consecutive_fisher_fallbacks,
+                            );
                             force_fisher_for_rest = true;
                         }
                         // Mid-LM-loop Fisher fallback: the candidate
