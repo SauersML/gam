@@ -6138,6 +6138,31 @@ impl BernoulliMarginalSlopeFamily {
         d_beta_flat: &Array1<f64>,
         cache: &BernoulliMarginalSlopeExactEvalCache,
     ) -> Result<Option<Array2<f64>>, String> {
+        self.exact_newton_joint_psihessian_directional_derivative_from_cache_with_options(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            d_beta_flat,
+            cache,
+            &BlockwiseFitOptions::default(),
+        )
+    }
+
+    /// Outer-aware variant of `exact_newton_joint_psihessian_directional_derivative_from_cache`.
+    /// When `options.outer_score_subsample` is `Some`, only the masked rows
+    /// are visited and the accumulated dense Hessian-action matrix is rescaled
+    /// by the Horvitz-Thompson `weight_scale`. See
+    /// `exact_newton_joint_psi_terms_from_cache_with_options` for the
+    /// row-iter / rescaling contract.
+    pub(crate) fn exact_newton_joint_psihessian_directional_derivative_from_cache_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Array2<f64>>, String> {
         let slices = &cache.slices;
         let primary = &cache.primary;
         let Some((block_idx, local_idx)) = psi_derivative_location(derivative_blocks, psi_index)
@@ -6173,73 +6198,71 @@ impl BernoulliMarginalSlopeFamily {
             &self.policy,
         )?;
 
-        let block_acc = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+        let row_iter = outer_row_indices(options, n).to_vec();
+        let outer_scale = outer_score_scale(options, n);
+        let mut block_acc = row_iter
             .into_par_iter()
             .try_fold(
                 || BernoulliBlockHessianAccumulator::new(slices),
-                |mut acc, chunk_idx| -> Result<_, String> {
-                    let start = chunk_idx * ROW_CHUNK_SIZE;
-                    let end = (start + ROW_CHUNK_SIZE).min(n);
-                    for row in start..end {
-                        let row_dir = self.row_primary_direction_from_flat(
-                            row,
-                            slices,
-                            primary,
-                            d_beta_flat,
-                        )?;
-                        let psi_dir = self.row_primary_psi_direction_from_map(
-                            row,
-                            block_idx,
-                            &psi_map,
-                            block_states,
-                            primary,
-                        )?;
-                        let psi_action = self.row_primary_psi_action_on_direction_from_map(
-                            row,
-                            block_idx,
-                            &psi_map,
-                            slices,
-                            d_beta_flat,
-                            primary,
-                        )?;
-                        let row_ctx = Self::row_ctx(cache, row);
-                        let third_beta = self.row_primary_third_contracted_recompute(
-                            row,
-                            block_states,
-                            cache,
-                            row_ctx,
-                            &row_dir,
-                        )?;
-                        let fourth = self.row_primary_fourth_contracted_recompute(
-                            row,
-                            block_states,
-                            cache,
-                            row_ctx,
-                            &row_dir,
-                            &psi_dir,
-                        )?;
-                        let psi_row =
-                            self.block_psi_row_from_map(row, block_idx, &psi_map, slices)?;
-                        let right_primary = third_beta.row(idx_primary).to_owned();
-                        acc.add_rank1_psi_cross(
-                            self,
-                            row,
-                            slices,
-                            primary,
-                            psi_row.block_idx,
-                            &psi_row.local_vec,
-                            &right_primary,
-                        );
-                        acc.add_pullback(self, row, slices, primary, &fourth);
-                        let third_action = self.row_primary_third_contracted_recompute(
-                            row,
-                            block_states,
-                            cache,
-                            row_ctx,
-                            &psi_action,
-                        )?;
-                        acc.add_pullback(self, row, slices, primary, &third_action);
-                    }
+                |mut acc, row| -> Result<_, String> {
+                    let row_dir = self.row_primary_direction_from_flat(
+                        row,
+                        slices,
+                        primary,
+                        d_beta_flat,
+                    )?;
+                    let psi_dir = self.row_primary_psi_direction_from_map(
+                        row,
+                        block_idx,
+                        &psi_map,
+                        block_states,
+                        primary,
+                    )?;
+                    let psi_action = self.row_primary_psi_action_on_direction_from_map(
+                        row,
+                        block_idx,
+                        &psi_map,
+                        slices,
+                        d_beta_flat,
+                        primary,
+                    )?;
+                    let row_ctx = Self::row_ctx(cache, row);
+                    let third_beta = self.row_primary_third_contracted_recompute(
+                        row,
+                        block_states,
+                        cache,
+                        row_ctx,
+                        &row_dir,
+                    )?;
+                    let fourth = self.row_primary_fourth_contracted_recompute(
+                        row,
+                        block_states,
+                        cache,
+                        row_ctx,
+                        &row_dir,
+                        &psi_dir,
+                    )?;
+                    let psi_row =
+                        self.block_psi_row_from_map(row, block_idx, &psi_map, slices)?;
+                    let right_primary = third_beta.row(idx_primary).to_owned();
+                    acc.add_rank1_psi_cross(
+                        self,
+                        row,
+                        slices,
+                        primary,
+                        psi_row.block_idx,
+                        &psi_row.local_vec,
+                        &right_primary,
+                    );
+                    acc.add_pullback(self, row, slices, primary, &fourth);
+                    let third_action = self.row_primary_third_contracted_recompute(
+                        row,
+                        block_states,
+                        cache,
+                        row_ctx,
+                        &psi_action,
+                    )?;
+                    acc.add_pullback(self, row, slices, primary, &third_action);
                     Ok(acc)
                 },
             )
@@ -6250,16 +6273,30 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(left)
                 },
             )?;
+        if outer_scale != 1.0 {
+            block_acc.scale_assign(outer_scale);
+        }
         Ok(Some(block_acc.to_dense(slices)))
     }
 
-    fn exact_newton_joint_psihessian_directional_derivative_operator_from_cache(
+    /// Outer-aware operator builder for the Hessian directional derivative
+    /// from a cached eval. The default-options variant is unused (the
+    /// workspace always threads its own `BlockwiseFitOptions`), so the legacy
+    /// non-`_with_options` shim is omitted.
+    /// When `options.outer_score_subsample` is `Some`, only the masked rows
+    /// are visited and the accumulated block Hessian operator is rescaled by
+    /// the Horvitz-Thompson `weight_scale` before being wrapped in the
+    /// `HyperOperator`. See
+    /// `exact_newton_joint_psi_terms_from_cache_with_options` for the
+    /// row-iter / rescaling contract.
+    pub(crate) fn exact_newton_joint_psihessian_directional_derivative_operator_from_cache_with_options(
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
         cache: &BernoulliMarginalSlopeExactEvalCache,
+        options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
         let slices = &cache.slices;
         let primary = &cache.primary;
@@ -6296,73 +6333,71 @@ impl BernoulliMarginalSlopeFamily {
             &self.policy,
         )?;
 
-        let block_acc = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+        let row_iter = outer_row_indices(options, n).to_vec();
+        let outer_scale = outer_score_scale(options, n);
+        let mut block_acc = row_iter
             .into_par_iter()
             .try_fold(
                 || BernoulliBlockHessianAccumulator::new(slices),
-                |mut acc, chunk_idx| -> Result<_, String> {
-                    let start = chunk_idx * ROW_CHUNK_SIZE;
-                    let end = (start + ROW_CHUNK_SIZE).min(n);
-                    for row in start..end {
-                        let row_dir = self.row_primary_direction_from_flat(
-                            row,
-                            slices,
-                            primary,
-                            d_beta_flat,
-                        )?;
-                        let psi_dir = self.row_primary_psi_direction_from_map(
-                            row,
-                            block_idx,
-                            &psi_map,
-                            block_states,
-                            primary,
-                        )?;
-                        let psi_action = self.row_primary_psi_action_on_direction_from_map(
-                            row,
-                            block_idx,
-                            &psi_map,
-                            slices,
-                            d_beta_flat,
-                            primary,
-                        )?;
-                        let row_ctx = Self::row_ctx(cache, row);
-                        let third_beta = self.row_primary_third_contracted_recompute(
-                            row,
-                            block_states,
-                            cache,
-                            row_ctx,
-                            &row_dir,
-                        )?;
-                        let fourth = self.row_primary_fourth_contracted_recompute(
-                            row,
-                            block_states,
-                            cache,
-                            row_ctx,
-                            &row_dir,
-                            &psi_dir,
-                        )?;
-                        let psi_row =
-                            self.block_psi_row_from_map(row, block_idx, &psi_map, slices)?;
-                        let right_primary = third_beta.row(idx_primary).to_owned();
-                        acc.add_rank1_psi_cross(
-                            self,
-                            row,
-                            slices,
-                            primary,
-                            psi_row.block_idx,
-                            &psi_row.local_vec,
-                            &right_primary,
-                        );
-                        acc.add_pullback(self, row, slices, primary, &fourth);
-                        let third_action = self.row_primary_third_contracted_recompute(
-                            row,
-                            block_states,
-                            cache,
-                            row_ctx,
-                            &psi_action,
-                        )?;
-                        acc.add_pullback(self, row, slices, primary, &third_action);
-                    }
+                |mut acc, row| -> Result<_, String> {
+                    let row_dir = self.row_primary_direction_from_flat(
+                        row,
+                        slices,
+                        primary,
+                        d_beta_flat,
+                    )?;
+                    let psi_dir = self.row_primary_psi_direction_from_map(
+                        row,
+                        block_idx,
+                        &psi_map,
+                        block_states,
+                        primary,
+                    )?;
+                    let psi_action = self.row_primary_psi_action_on_direction_from_map(
+                        row,
+                        block_idx,
+                        &psi_map,
+                        slices,
+                        d_beta_flat,
+                        primary,
+                    )?;
+                    let row_ctx = Self::row_ctx(cache, row);
+                    let third_beta = self.row_primary_third_contracted_recompute(
+                        row,
+                        block_states,
+                        cache,
+                        row_ctx,
+                        &row_dir,
+                    )?;
+                    let fourth = self.row_primary_fourth_contracted_recompute(
+                        row,
+                        block_states,
+                        cache,
+                        row_ctx,
+                        &row_dir,
+                        &psi_dir,
+                    )?;
+                    let psi_row =
+                        self.block_psi_row_from_map(row, block_idx, &psi_map, slices)?;
+                    let right_primary = third_beta.row(idx_primary).to_owned();
+                    acc.add_rank1_psi_cross(
+                        self,
+                        row,
+                        slices,
+                        primary,
+                        psi_row.block_idx,
+                        &psi_row.local_vec,
+                        &right_primary,
+                    );
+                    acc.add_pullback(self, row, slices, primary, &fourth);
+                    let third_action = self.row_primary_third_contracted_recompute(
+                        row,
+                        block_states,
+                        cache,
+                        row_ctx,
+                        &psi_action,
+                    )?;
+                    acc.add_pullback(self, row, slices, primary, &third_action);
                     Ok(acc)
                 },
             )
@@ -6373,6 +6408,9 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(left)
                 },
             )?;
+        if outer_scale != 1.0 {
+            block_acc.scale_assign(outer_scale);
+        }
         Ok(Some(
             Arc::new(block_acc.into_operator(slices)) as Arc<dyn HyperOperator>
         ))
@@ -7936,12 +7974,13 @@ impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiW
                 });
         }
         self.family
-            .exact_newton_joint_psihessian_directional_derivative_operator_from_cache(
+            .exact_newton_joint_psihessian_directional_derivative_operator_from_cache_with_options(
                 &self.block_states,
                 &self.derivative_blocks,
                 psi_index,
                 d_beta_flat,
                 &self.cache,
+                &self.options,
             )
             .map(|result| {
                 result.map(crate::solver::estimate::reml::unified::DriftDerivResult::Operator)
@@ -15236,5 +15275,228 @@ mod tests {
         let exp_score = &raw.score_psi_psi * factor;
         let score_rel = rel_diff_array1(&scaled.score_psi_psi, &exp_score);
         assert!(score_rel < 1e-12, "score rel {}", score_rel);
+    }
+
+    #[test]
+    fn bernoulli_psihessian_directional_derivative_from_cache_subsample_full_equals_unsampled() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_block_psi_test_family(n);
+        let states = block_psi_test_block_states(&family, 0.15, 0.25);
+        let derivative_blocks = block_psi_test_marginal_derivative_blocks(n);
+        let cache = family
+            .build_exact_eval_cache(&states)
+            .expect("exact eval cache");
+        let slices = &cache.slices;
+        let mut d_beta_flat = Array1::<f64>::zeros(slices.total);
+        d_beta_flat[slices.marginal.start] = 0.05;
+        d_beta_flat[slices.logslope.start] = -0.04;
+
+        let baseline = family
+            .exact_newton_joint_psihessian_directional_derivative_from_cache(
+                &states,
+                &derivative_blocks,
+                0,
+                &d_beta_flat,
+                &cache,
+            )
+            .expect("baseline")
+            .expect("some");
+
+        let mut opts_full = BlockwiseFitOptions::default();
+        opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            (0..n).collect(),
+            n,
+            0xDEADBEEF,
+        )));
+        let with_full = family
+            .exact_newton_joint_psihessian_directional_derivative_from_cache_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                &d_beta_flat,
+                &cache,
+                &opts_full,
+            )
+            .expect("with full")
+            .expect("some");
+
+        let rel = rel_diff_array2(&with_full, &baseline);
+        assert!(rel < 1e-12, "drift rel {}", rel);
+    }
+
+    #[test]
+    fn bernoulli_psihessian_directional_derivative_from_cache_subsample_half_scales_correctly() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_block_psi_test_family(n);
+        let states = block_psi_test_block_states(&family, 0.15, 0.25);
+        let derivative_blocks = block_psi_test_marginal_derivative_blocks(n);
+        let cache = family
+            .build_exact_eval_cache(&states)
+            .expect("exact eval cache");
+        let slices = &cache.slices;
+        let mut d_beta_flat = Array1::<f64>::zeros(slices.total);
+        d_beta_flat[slices.marginal.start] = 0.05;
+        d_beta_flat[slices.logslope.start] = -0.04;
+
+        let even_mask: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
+        let m = even_mask.len();
+
+        let mut opts_half = BlockwiseFitOptions::default();
+        opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            even_mask.clone(),
+            n,
+            0xCAFE,
+        )));
+        let scaled = family
+            .exact_newton_joint_psihessian_directional_derivative_from_cache_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                &d_beta_flat,
+                &cache,
+                &opts_half,
+            )
+            .expect("scaled")
+            .expect("some");
+
+        let mut opts_raw = BlockwiseFitOptions::default();
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
+            mask: Arc::new(even_mask),
+            n_full: m,
+            weight_scale: 1.0,
+            seed: 0,
+        }));
+        let raw = family
+            .exact_newton_joint_psihessian_directional_derivative_from_cache_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                &d_beta_flat,
+                &cache,
+                &opts_raw,
+            )
+            .expect("raw")
+            .expect("some");
+
+        let factor = n as f64 / m as f64;
+        let exp = &raw * factor;
+        let rel = rel_diff_array2(&scaled, &exp);
+        assert!(rel < 1e-12, "drift rel {}", rel);
+    }
+
+    #[test]
+    fn bernoulli_psihessian_operator_from_cache_subsample_full_equals_unsampled() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_block_psi_test_family(n);
+        let states = block_psi_test_block_states(&family, 0.15, 0.25);
+        let derivative_blocks = block_psi_test_marginal_derivative_blocks(n);
+        let cache = family
+            .build_exact_eval_cache(&states)
+            .expect("exact eval cache");
+        let slices = &cache.slices;
+        let mut d_beta_flat = Array1::<f64>::zeros(slices.total);
+        d_beta_flat[slices.marginal.start] = 0.05;
+        d_beta_flat[slices.logslope.start] = -0.04;
+
+        let baseline = family
+            .exact_newton_joint_psihessian_directional_derivative_operator_from_cache_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                &d_beta_flat,
+                &cache,
+                &BlockwiseFitOptions::default(),
+            )
+            .expect("baseline operator")
+            .expect("some");
+        let baseline_dense = baseline.to_dense();
+
+        let mut opts_full = BlockwiseFitOptions::default();
+        opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            (0..n).collect(),
+            n,
+            0xDEADBEEF,
+        )));
+        let with_full = family
+            .exact_newton_joint_psihessian_directional_derivative_operator_from_cache_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                &d_beta_flat,
+                &cache,
+                &opts_full,
+            )
+            .expect("with full")
+            .expect("some");
+        let with_full_dense = with_full.to_dense();
+
+        let rel = rel_diff_array2(&with_full_dense, &baseline_dense);
+        assert!(rel < 1e-12, "operator drift rel {}", rel);
+    }
+
+    #[test]
+    fn bernoulli_psihessian_operator_from_cache_subsample_half_scales_correctly() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_block_psi_test_family(n);
+        let states = block_psi_test_block_states(&family, 0.15, 0.25);
+        let derivative_blocks = block_psi_test_marginal_derivative_blocks(n);
+        let cache = family
+            .build_exact_eval_cache(&states)
+            .expect("exact eval cache");
+        let slices = &cache.slices;
+        let mut d_beta_flat = Array1::<f64>::zeros(slices.total);
+        d_beta_flat[slices.marginal.start] = 0.05;
+        d_beta_flat[slices.logslope.start] = -0.04;
+
+        let even_mask: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
+        let m = even_mask.len();
+
+        let mut opts_half = BlockwiseFitOptions::default();
+        opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            even_mask.clone(),
+            n,
+            0xCAFE,
+        )));
+        let scaled = family
+            .exact_newton_joint_psihessian_directional_derivative_operator_from_cache_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                &d_beta_flat,
+                &cache,
+                &opts_half,
+            )
+            .expect("scaled")
+            .expect("some");
+        let scaled_dense = scaled.to_dense();
+
+        let mut opts_raw = BlockwiseFitOptions::default();
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
+            mask: Arc::new(even_mask),
+            n_full: m,
+            weight_scale: 1.0,
+            seed: 0,
+        }));
+        let raw = family
+            .exact_newton_joint_psihessian_directional_derivative_operator_from_cache_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                &d_beta_flat,
+                &cache,
+                &opts_raw,
+            )
+            .expect("raw")
+            .expect("some");
+        let raw_dense = raw.to_dense();
+
+        let factor = n as f64 / m as f64;
+        let exp = &raw_dense * factor;
+        let rel = rel_diff_array2(&scaled_dense, &exp);
+        assert!(rel < 1e-12, "operator drift rel {}", rel);
     }
 }
