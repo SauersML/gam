@@ -1558,7 +1558,7 @@ _PHASE_END_PATTERN = re.compile(
     r"\[PHASE\]\s+([\w\-]+(?:\([\w\-/]+\))?)\s+(?:fit\s+)?(?:end|done)\s+elapsed=([\d.]+)s"
 )
 _BFGS_SUMMARY_PATTERN = re.compile(
-    r"\[OUTER summary\]\s+BFGS\s+(converged|hit max_iter|line-search failed|failed)(?:\s+in\s+(\d+))?\s+elapsed=([\d.]+)s"
+    r"\[OUTER summary\]\s+BFGS\s+(converged|hit max_iter|line-search failed|failed)(?:\s+in\s+(\d+)\s+iters)?\s+elapsed=([\d.]+)s"
 )
 _GUARD_PATTERN = re.compile(
     r"\[OUTER guard\]\s+convergence-guard re-eval at converged ρ done.*?elapsed=([\d.]+)s"

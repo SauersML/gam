@@ -4296,7 +4296,7 @@ fn run_outer_with_plan(
                 let bfgs_elapsed = bfgs_start.elapsed().as_secs_f64();
                 match &outcome {
                     Ok(sol) => log::info!(
-                        "[OUTER summary] BFGS converged in {:?} elapsed={:.3}s final_value={:.6e}",
+                        "[OUTER summary] BFGS converged in {} iters elapsed={:.3}s final_value={:.6e}",
                         sol.iterations, bfgs_elapsed, sol.final_value
                     ),
                     Err(BfgsError::MaxIterationsReached { last_solution }) => log::info!(
