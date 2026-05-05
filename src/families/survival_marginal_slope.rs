@@ -1430,6 +1430,30 @@ impl BlockHessianAccumulator {
         self.h_hw += &other.h_hw;
     }
 
+    /// Scale every accumulated block in place by `scale`. Used to apply the
+    /// Horvitz-Thompson rescaling when the accumulator was populated from a
+    /// stratified subsample of rows (outer-only score / Hessian passes).
+    fn scale_assign(&mut self, scale: f64) {
+        if scale == 1.0 {
+            return;
+        }
+        self.h_tt.mapv_inplace(|v| v * scale);
+        self.h_mm.mapv_inplace(|v| v * scale);
+        self.h_gg.mapv_inplace(|v| v * scale);
+        self.h_hh.mapv_inplace(|v| v * scale);
+        self.h_ww.mapv_inplace(|v| v * scale);
+        self.h_tm.mapv_inplace(|v| v * scale);
+        self.h_tg.mapv_inplace(|v| v * scale);
+        self.h_th.mapv_inplace(|v| v * scale);
+        self.h_tw.mapv_inplace(|v| v * scale);
+        self.h_mg.mapv_inplace(|v| v * scale);
+        self.h_mh.mapv_inplace(|v| v * scale);
+        self.h_mw.mapv_inplace(|v| v * scale);
+        self.h_gh.mapv_inplace(|v| v * scale);
+        self.h_gw.mapv_inplace(|v| v * scale);
+        self.h_hw.mapv_inplace(|v| v * scale);
+    }
+
     fn diagonal(&self, slices: &BlockSlices) -> Array1<f64> {
         let mut out = Array1::zeros(slices.total);
         out.slice_mut(s![slices.time.clone()])
@@ -2778,7 +2802,26 @@ impl SurvivalMarginalSlopeFamily {
     fn sigma_exact_joint_psi_terms(
         &self,
         block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        self.sigma_exact_joint_psi_terms_with_options(
+            block_states,
+            specs,
+            &BlockwiseFitOptions::default(),
+        )
+    }
+
+    /// Outer-aware variant of `sigma_exact_joint_psi_terms`. When
+    /// `options.outer_score_subsample` is `None`, iterates all rows and is
+    /// bit-for-bit equivalent to the legacy implementation. When `Some`, only
+    /// the masked rows contribute and every row-summed component (objective
+    /// scalar, per-block score vectors, Hessian operator blocks) is rescaled
+    /// by `weight_scale = n_full / |mask|` (Horvitz-Thompson).
+    pub(crate) fn sigma_exact_joint_psi_terms_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
         _specs: &[ParameterBlockSpec],
+        options: &BlockwiseFitOptions,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         if self.flex_active() {
             return Err(
@@ -2792,7 +2835,9 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
-        let (objective_psi, score_t, score_m, score_g, score_h, score_w, acc) = (0..self.n)
+        let row_iter = outer_row_indices(options, self.n).to_vec();
+        let outer_scale = outer_score_scale(options, self.n);
+        let (mut objective_psi, mut score_t, mut score_m, mut score_g, mut score_h, mut score_w, mut acc) = row_iter
             .into_par_iter()
             .try_fold(
                 || {
@@ -2842,6 +2887,16 @@ impl SurvivalMarginalSlopeFamily {
                 },
             )?;
 
+        if outer_scale != 1.0 {
+            objective_psi *= outer_scale;
+            score_t.mapv_inplace(|v| v * outer_scale);
+            score_m.mapv_inplace(|v| v * outer_scale);
+            score_g.mapv_inplace(|v| v * outer_scale);
+            score_h.mapv_inplace(|v| v * outer_scale);
+            score_w.mapv_inplace(|v| v * outer_scale);
+            acc.scale_assign(outer_scale);
+        }
+
         let mut score_psi = Array1::zeros(slices.total);
         score_psi
             .slice_mut(s![slices.time.clone()])
@@ -2871,6 +2926,20 @@ impl SurvivalMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        self.sigma_exact_joint_psisecond_order_terms_with_options(
+            block_states,
+            &BlockwiseFitOptions::default(),
+        )
+    }
+
+    /// Outer-aware variant of `sigma_exact_joint_psisecond_order_terms`. See
+    /// `sigma_exact_joint_psi_terms_with_options` for the row-iter / rescaling
+    /// contract.
+    pub(crate) fn sigma_exact_joint_psisecond_order_terms_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
         if self.flex_active() {
             return Ok(None);
         }
@@ -2880,55 +2949,68 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
-        let (objective_psi_psi, score_t, score_m, score_g, score_h, score_w, acc) = (0..self.n)
-            .into_par_iter()
-            .try_fold(
-                || {
-                    (
-                        0.0,
-                        Array1::zeros(p_t),
-                        Array1::zeros(p_m),
-                        Array1::zeros(p_g),
-                        Array1::zeros(p_h),
-                        Array1::zeros(p_w),
-                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-                    )
-                },
-                |mut a, row| -> Result<_, String> {
-                    let (obj, grad, hess) =
-                        self.row_sigma_primary_terms(row, block_states, true)?;
-                    a.0 += obj;
-                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-                    self.accumulate_score_with_q_geometry(
-                        row, &q_geom, &grad, &mut a.1, &mut a.2, &mut a.3,
-                    )?;
-                    a.6.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess)?;
-                    Ok(a)
-                },
-            )
-            .try_reduce(
-                || {
-                    (
-                        0.0,
-                        Array1::zeros(p_t),
-                        Array1::zeros(p_m),
-                        Array1::zeros(p_g),
-                        Array1::zeros(p_h),
-                        Array1::zeros(p_w),
-                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-                    )
-                },
-                |mut a, b| {
-                    a.0 += b.0;
-                    a.1 += &b.1;
-                    a.2 += &b.2;
-                    a.3 += &b.3;
-                    a.4 += &b.4;
-                    a.5 += &b.5;
-                    a.6.add(&b.6);
-                    Ok(a)
-                },
-            )?;
+        let row_iter = outer_row_indices(options, self.n).to_vec();
+        let outer_scale = outer_score_scale(options, self.n);
+        let (mut objective_psi_psi, mut score_t, mut score_m, mut score_g, mut score_h, mut score_w, mut acc) =
+            row_iter
+                .into_par_iter()
+                .try_fold(
+                    || {
+                        (
+                            0.0,
+                            Array1::zeros(p_t),
+                            Array1::zeros(p_m),
+                            Array1::zeros(p_g),
+                            Array1::zeros(p_h),
+                            Array1::zeros(p_w),
+                            BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                        )
+                    },
+                    |mut a, row| -> Result<_, String> {
+                        let (obj, grad, hess) =
+                            self.row_sigma_primary_terms(row, block_states, true)?;
+                        a.0 += obj;
+                        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                        self.accumulate_score_with_q_geometry(
+                            row, &q_geom, &grad, &mut a.1, &mut a.2, &mut a.3,
+                        )?;
+                        a.6.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess)?;
+                        Ok(a)
+                    },
+                )
+                .try_reduce(
+                    || {
+                        (
+                            0.0,
+                            Array1::zeros(p_t),
+                            Array1::zeros(p_m),
+                            Array1::zeros(p_g),
+                            Array1::zeros(p_h),
+                            Array1::zeros(p_w),
+                            BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                        )
+                    },
+                    |mut a, b| {
+                        a.0 += b.0;
+                        a.1 += &b.1;
+                        a.2 += &b.2;
+                        a.3 += &b.3;
+                        a.4 += &b.4;
+                        a.5 += &b.5;
+                        a.6.add(&b.6);
+                        Ok(a)
+                    },
+                )?;
+
+        if outer_scale != 1.0 {
+            objective_psi_psi *= outer_scale;
+            score_t.mapv_inplace(|v| v * outer_scale);
+            score_m.mapv_inplace(|v| v * outer_scale);
+            score_g.mapv_inplace(|v| v * outer_scale);
+            score_h.mapv_inplace(|v| v * outer_scale);
+            score_w.mapv_inplace(|v| v * outer_scale);
+            acc.scale_assign(outer_scale);
+        }
 
         let mut score_psi_psi = Array1::zeros(slices.total);
         score_psi_psi
@@ -2960,6 +3042,23 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        self.sigma_exact_joint_psihessian_directional_derivative_with_options(
+            block_states,
+            d_beta_flat,
+            &BlockwiseFitOptions::default(),
+        )
+    }
+
+    /// Outer-aware variant of `sigma_exact_joint_psihessian_directional_derivative`.
+    /// See `sigma_exact_joint_psi_terms_with_options` for the row-iter /
+    /// rescaling contract — the returned dense Hessian-derivative matrix is
+    /// rescaled element-wise by `weight_scale` when a subsample is active.
+    pub(crate) fn sigma_exact_joint_psihessian_directional_derivative_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Array2<f64>>, String> {
         if self.flex_active() {
             return Ok(None);
         }
@@ -2970,7 +3069,9 @@ impl SurvivalMarginalSlopeFamily {
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
         let primary_dim = N_PRIMARY;
-        let acc = (0..self.n)
+        let row_iter = outer_row_indices(options, self.n).to_vec();
+        let outer_scale = outer_score_scale(options, self.n);
+        let mut acc = row_iter
             .into_par_iter()
             .try_fold(
                 || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
@@ -3020,6 +3121,9 @@ impl SurvivalMarginalSlopeFamily {
                     Ok(a)
                 },
             )?;
+        if outer_scale != 1.0 {
+            acc.scale_assign(outer_scale);
+        }
         Ok(Some(acc.to_dense(&slices)))
     }
 
@@ -16036,5 +16140,269 @@ mod tests {
             psi_dim,
             path.display()
         );
+    }
+
+    /// Closed-form test family with `gaussian_frailty_sd` set so the sigma-aware
+    /// joint psi paths fire. Same pseudo-random row layout as
+    /// `make_closed_form_test_family` so half-row subsamples remain
+    /// representative.
+    fn make_sigma_aware_closed_form_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
+        let mut family = make_closed_form_test_family(n);
+        family.gaussian_frailty_sd = Some(0.6);
+        family
+    }
+
+    fn rel_diff_array1_survival(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
+        let mut max = 0.0f64;
+        for i in 0..a.len() {
+            let d = (a[i] - b[i]).abs() / b[i].abs().max(1.0);
+            if d > max {
+                max = d;
+            }
+        }
+        max
+    }
+
+    fn rel_diff_array2_survival(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+        let mut max = 0.0f64;
+        for ((i, j), &av) in a.indexed_iter() {
+            let bv = b[[i, j]];
+            let d = (av - bv).abs() / bv.abs().max(1.0);
+            if d > max {
+                max = d;
+            }
+        }
+        max
+    }
+
+    #[test]
+    fn survival_sigma_psi_terms_subsample_full_equals_unsampled() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_sigma_aware_closed_form_test_family(n);
+        let states = closed_form_block_states(&family, 0.25);
+        let specs = vec![dummy_blockspec(0), dummy_blockspec(0), dummy_blockspec(0)];
+
+        let baseline = family
+            .sigma_exact_joint_psi_terms(&states, &specs)
+            .expect("baseline psi terms")
+            .expect("some");
+
+        let mut opts_full = BlockwiseFitOptions::default();
+        opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            (0..n).collect(),
+            n,
+            0xDEADBEEF,
+        )));
+        let with_full = family
+            .sigma_exact_joint_psi_terms_with_options(&states, &specs, &opts_full)
+            .expect("with full mask")
+            .expect("some");
+
+        let obj_rel = ((with_full.objective_psi - baseline.objective_psi)
+            / baseline.objective_psi.abs().max(1.0))
+        .abs();
+        assert!(obj_rel < 1e-12, "objective_psi rel {}", obj_rel);
+        let score_rel = rel_diff_array1_survival(&with_full.score_psi, &baseline.score_psi);
+        assert!(score_rel < 1e-12, "score_psi rel {}", score_rel);
+    }
+
+    #[test]
+    fn survival_sigma_psi_terms_subsample_half_scales_correctly() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_sigma_aware_closed_form_test_family(n);
+        let states = closed_form_block_states(&family, 0.25);
+        let specs = vec![dummy_blockspec(0), dummy_blockspec(0), dummy_blockspec(0)];
+
+        let even_mask: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
+        let m = even_mask.len();
+
+        let mut opts_half = BlockwiseFitOptions::default();
+        opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            even_mask.clone(),
+            n,
+            0xCAFE,
+        )));
+        let scaled = family
+            .sigma_exact_joint_psi_terms_with_options(&states, &specs, &opts_half)
+            .expect("scaled")
+            .expect("some");
+
+        let mut opts_raw = BlockwiseFitOptions::default();
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
+            mask: Arc::new(even_mask),
+            n_full: m,
+            weight_scale: 1.0,
+            seed: 0,
+        }));
+        let raw = family
+            .sigma_exact_joint_psi_terms_with_options(&states, &specs, &opts_raw)
+            .expect("raw")
+            .expect("some");
+
+        let factor = n as f64 / m as f64;
+        let exp_obj = factor * raw.objective_psi;
+        let obj_rel = ((scaled.objective_psi - exp_obj) / exp_obj.abs().max(1.0)).abs();
+        assert!(obj_rel < 1e-12, "objective_psi rel {}", obj_rel);
+        let exp_score = &raw.score_psi * factor;
+        let score_rel = rel_diff_array1_survival(&scaled.score_psi, &exp_score);
+        assert!(score_rel < 1e-12, "score_psi rel {}", score_rel);
+    }
+
+    #[test]
+    fn survival_sigma_psi_second_order_subsample_full_equals_unsampled() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_sigma_aware_closed_form_test_family(n);
+        let states = closed_form_block_states(&family, 0.25);
+
+        let baseline = family
+            .sigma_exact_joint_psisecond_order_terms(&states)
+            .expect("baseline")
+            .expect("some");
+
+        let mut opts_full = BlockwiseFitOptions::default();
+        opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            (0..n).collect(),
+            n,
+            0xDEADBEEF,
+        )));
+        let with_full = family
+            .sigma_exact_joint_psisecond_order_terms_with_options(&states, &opts_full)
+            .expect("with full mask")
+            .expect("some");
+
+        let obj_rel = ((with_full.objective_psi_psi - baseline.objective_psi_psi)
+            / baseline.objective_psi_psi.abs().max(1.0))
+        .abs();
+        assert!(obj_rel < 1e-12, "objective rel {}", obj_rel);
+        let score_rel =
+            rel_diff_array1_survival(&with_full.score_psi_psi, &baseline.score_psi_psi);
+        assert!(score_rel < 1e-12, "score rel {}", score_rel);
+    }
+
+    #[test]
+    fn survival_sigma_psi_second_order_subsample_half_scales_correctly() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_sigma_aware_closed_form_test_family(n);
+        let states = closed_form_block_states(&family, 0.25);
+
+        let even_mask: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
+        let m = even_mask.len();
+
+        let mut opts_half = BlockwiseFitOptions::default();
+        opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            even_mask.clone(),
+            n,
+            0xCAFE,
+        )));
+        let scaled = family
+            .sigma_exact_joint_psisecond_order_terms_with_options(&states, &opts_half)
+            .expect("scaled")
+            .expect("some");
+
+        let mut opts_raw = BlockwiseFitOptions::default();
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
+            mask: Arc::new(even_mask),
+            n_full: m,
+            weight_scale: 1.0,
+            seed: 0,
+        }));
+        let raw = family
+            .sigma_exact_joint_psisecond_order_terms_with_options(&states, &opts_raw)
+            .expect("raw")
+            .expect("some");
+
+        let factor = n as f64 / m as f64;
+        let exp_obj = factor * raw.objective_psi_psi;
+        let obj_rel = ((scaled.objective_psi_psi - exp_obj) / exp_obj.abs().max(1.0)).abs();
+        assert!(obj_rel < 1e-12, "objective rel {}", obj_rel);
+        let exp_score = &raw.score_psi_psi * factor;
+        let score_rel = rel_diff_array1_survival(&scaled.score_psi_psi, &exp_score);
+        assert!(score_rel < 1e-12, "score rel {}", score_rel);
+    }
+
+    #[test]
+    fn survival_sigma_psihessian_directional_derivative_subsample_full_equals_unsampled() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_sigma_aware_closed_form_test_family(n);
+        let states = closed_form_block_states(&family, 0.25);
+        let slices = block_slices(&family, &states);
+        let d_beta_flat = Array1::<f64>::zeros(slices.total);
+
+        let baseline = family
+            .sigma_exact_joint_psihessian_directional_derivative(&states, &d_beta_flat)
+            .expect("baseline")
+            .expect("some");
+
+        let mut opts_full = BlockwiseFitOptions::default();
+        opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            (0..n).collect(),
+            n,
+            0xDEADBEEF,
+        )));
+        let with_full = family
+            .sigma_exact_joint_psihessian_directional_derivative_with_options(
+                &states,
+                &d_beta_flat,
+                &opts_full,
+            )
+            .expect("with full")
+            .expect("some");
+
+        let rel = rel_diff_array2_survival(&with_full, &baseline);
+        assert!(rel < 1e-12, "drift rel {}", rel);
+    }
+
+    #[test]
+    fn survival_sigma_psihessian_directional_derivative_subsample_half_scales_correctly() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_sigma_aware_closed_form_test_family(n);
+        let states = closed_form_block_states(&family, 0.25);
+        let slices = block_slices(&family, &states);
+        let d_beta_flat = Array1::<f64>::zeros(slices.total);
+
+        let even_mask: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
+        let m = even_mask.len();
+
+        let mut opts_half = BlockwiseFitOptions::default();
+        opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            even_mask.clone(),
+            n,
+            0xCAFE,
+        )));
+        let scaled = family
+            .sigma_exact_joint_psihessian_directional_derivative_with_options(
+                &states,
+                &d_beta_flat,
+                &opts_half,
+            )
+            .expect("scaled")
+            .expect("some");
+
+        let mut opts_raw = BlockwiseFitOptions::default();
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
+            mask: Arc::new(even_mask),
+            n_full: m,
+            weight_scale: 1.0,
+            seed: 0,
+        }));
+        let raw = family
+            .sigma_exact_joint_psihessian_directional_derivative_with_options(
+                &states,
+                &d_beta_flat,
+                &opts_raw,
+            )
+            .expect("raw")
+            .expect("some");
+
+        let factor = n as f64 / m as f64;
+        let exp = &raw * factor;
+        let rel = rel_diff_array2_survival(&scaled, &exp);
+        assert!(rel < 1e-12, "drift rel {}", rel);
     }
 }
