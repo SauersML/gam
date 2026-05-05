@@ -1252,6 +1252,11 @@ impl<'a> RemlState<'a> {
         // — is not confused with "no signal yet".
         self.last_ift_prediction_residual
             .store(IFT_RESIDUAL_NO_SIGNAL_BITS, Ordering::Relaxed);
+        // Same NaN-sentinel discipline as last_ift_prediction_residual:
+        // a recorded gain ratio of exactly 0 (degenerate but possible
+        // for noise-floor steps) must not collide with "no signal yet".
+        self.last_pirls_accept_rho
+            .store(IFT_RESIDUAL_NO_SIGNAL_BITS, Ordering::Relaxed);
     }
 
     pub(crate) fn set_link_states(
@@ -1731,6 +1736,7 @@ impl<'a> RemlState<'a> {
             ift_warm_start_cache: RwLock::new(None),
             last_pirls_lm_lambda: Arc::new(AtomicU64::new(0)),
             last_ift_prediction_residual: Arc::new(AtomicU64::new(IFT_RESIDUAL_NO_SIGNAL_BITS)),
+            last_pirls_accept_rho: Arc::new(AtomicU64::new(IFT_RESIDUAL_NO_SIGNAL_BITS)),
             ift_cached_factor: RwLock::new(None),
             kronecker_penalty_system: None,
             kronecker_factored: None,
@@ -3401,6 +3407,22 @@ impl<'a> RemlState<'a> {
                             pirls_result.final_lm_lambda.to_bits(),
                             Ordering::Relaxed,
                         );
+                    }
+                    // Persist the accepted gain ratio so the cap
+                    // schedule can adapt to inner Newton model fidelity
+                    // alongside `last_iters` and `last_converged`. The
+                    // LM accept-branch invariant (rho > 0 is necessary
+                    // for acceptance) means a finite-positive value is
+                    // the only "meaningful signal" outcome; anything
+                    // else (None, NaN) leaves the NaN sentinel in
+                    // place so the schedule falls back to the
+                    // default margin.
+                    if let Some(rho) = pirls_result.final_accept_rho
+                        && rho.is_finite()
+                        && rho >= 0.0
+                    {
+                        self.last_pirls_accept_rho
+                            .store(rho.to_bits(), Ordering::Relaxed);
                     }
                     // Cache only if key is valid (not NaN).
                     if use_cache && let Some(key) = key_opt {

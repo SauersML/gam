@@ -56,6 +56,16 @@ pub struct InnerProgressFeedback {
     /// collapsed to flat warm-start and the inner Newton has more
     /// recovery work, so +4 is appropriate. `0` means "no signal yet".
     pub ift_residual: Arc<AtomicU64>,
+    /// Bit-packed `f64` accepted gain ratio
+    /// (`actual_reduction / predicted_reduction`) from the most recent
+    /// non-screening PIRLS solve. NaN bits encode "no signal yet"
+    /// (matches `ift_residual`'s sentinel discipline). Used by
+    /// `first_order_inner_cap_schedule` as a third quality signal
+    /// alongside `last_iters` and `last_converged`: a small accept_rho
+    /// (model overstating predicted reduction) is a hint the next
+    /// iter's inner Newton may need extra margin even when the
+    /// previous solve converged in few iters.
+    pub accept_rho: Arc<AtomicU64>,
 }
 
 impl InnerProgressFeedback {
@@ -84,10 +94,14 @@ impl InnerProgressFeedback {
             let residual_bits = self.ift_residual.load(Ordering::Relaxed);
             let r = f64::from_bits(residual_bits);
             let last_ift_residual = if r.is_finite() && r >= 0.0 { Some(r) } else { None };
+            let accept_rho_bits = self.accept_rho.load(Ordering::Relaxed);
+            let ar = f64::from_bits(accept_rho_bits);
+            let last_accept_rho = if ar.is_finite() && ar >= 0.0 { Some(ar) } else { None };
             Some(InnerProgressSnapshot {
                 last_iters: iters,
                 last_converged: self.last_converged.load(Ordering::Relaxed),
                 last_ift_residual,
+                last_accept_rho,
             })
         }
     }
@@ -103,6 +117,11 @@ struct InnerProgressSnapshot {
     /// solve fell back to flat warm-start (no IFT prediction
     /// consumed).
     last_ift_residual: Option<f64>,
+    /// Most-recent accepted LM gain ratio (see field doc on
+    /// `InnerProgressFeedback::accept_rho`). `None` when no step was
+    /// accepted in the previous solve (rejection-exhausted) or when
+    /// the cache was reset.
+    last_accept_rho: Option<f64>,
 }
 
 /// Matrix-free outer Hessian operator.
@@ -1815,11 +1834,22 @@ fn first_order_inner_cap_schedule(
             //   None             → no signal yet → +2 (default).
             // This wires the [IFT-QUALITY] feedback directly into the
             // adaptive cap, replacing the previous fixed +2.
-            let margin = match snap.last_ift_residual {
+            let mut margin = match snap.last_ift_residual {
                 Some(r) if r < 0.01 => 1usize,
                 Some(r) if r >= 0.10 => 4usize,
                 _ => 2usize,
             };
+            // LM model fidelity (commit 6445c079): if the previous
+            // solve's accepted gain ratio was poor (model overstating
+            // predicted reduction), the inner Newton's quadratic model
+            // is unreliable. Bump margin by +2 — even a fast-converged
+            // previous iter (small `last_iters`) provides weaker
+            // evidence about the next solve's required effort when the
+            // model is mis-calibrated. Threshold 0.5 is the textbook
+            // "good agreement" cutoff for trust-region gain ratios.
+            if matches!(snap.last_accept_rho, Some(r) if r < 0.5) {
+                margin = margin.saturating_add(2);
+            }
             snap.last_iters.saturating_add(margin)
         } else {
             // Hit the cap. Geometric backoff so we don't thrash on a
@@ -1852,6 +1882,20 @@ mod outer_inner_cap_schedule_tests {
             last_iters,
             last_converged,
             last_ift_residual: None,
+            last_accept_rho: None,
+        })
+    }
+
+    fn snap_with_accept_rho(
+        last_iters: usize,
+        last_converged: bool,
+        accept_rho: f64,
+    ) -> Option<InnerProgressSnapshot> {
+        Some(InnerProgressSnapshot {
+            last_iters,
+            last_converged,
+            last_ift_residual: None,
+            last_accept_rho: Some(accept_rho),
         })
     }
 
@@ -1864,6 +1908,7 @@ mod outer_inner_cap_schedule_tests {
             last_iters,
             last_converged,
             last_ift_residual: Some(residual),
+            last_accept_rho: None,
         })
     }
 
@@ -1887,6 +1932,9 @@ mod outer_inner_cap_schedule_tests {
                 last_iters: Arc::new(AtomicUsize::new(iters)),
                 last_converged: Arc::new(AtomicBool::new(converged)),
                 ift_residual: Arc::new(AtomicU64::new(residual_bits)),
+                accept_rho: Arc::new(AtomicU64::new(
+                    crate::solver::estimate::reml::runtime::IFT_RESIDUAL_NO_SIGNAL_BITS,
+                )),
             }
         };
 
@@ -2018,6 +2066,63 @@ mod outer_inner_cap_schedule_tests {
                 "ift-residual margin policy regressed monotonicity: {caps:?}"
             );
         }
+    }
+
+    #[test]
+    fn schedule_bumps_margin_on_poor_lm_accept_rho() {
+        // Healthy LM model fidelity (accept_rho ≥ 0.5): margin
+        // unchanged from the no-accept-rho baseline (+2 default).
+        // last_iters=4, default margin=2 → cap=6.
+        assert_eq!(
+            first_order_inner_cap_schedule(2, None, snap_with_accept_rho(4, true, 0.95)),
+            6
+        );
+        assert_eq!(
+            first_order_inner_cap_schedule(2, None, snap_with_accept_rho(4, true, 0.5)),
+            6
+        );
+        // Poor LM model fidelity (accept_rho < 0.5): +2 margin bump
+        // beyond the IFT-residual base. last_iters=4, default base=2,
+        // accept_rho<0.5 bump=+2 → margin=4 → cap=8.
+        assert_eq!(
+            first_order_inner_cap_schedule(2, None, snap_with_accept_rho(4, true, 0.4)),
+            8
+        );
+        assert_eq!(
+            first_order_inner_cap_schedule(2, None, snap_with_accept_rho(4, true, 0.1)),
+            8
+        );
+        // accept_rho saturation guard: `r < 0.5` is the strict
+        // textbook "good agreement" cutoff for trust-region gain
+        // ratios. Boundary at 0.5 admits, just below 0.5 bumps.
+        assert_eq!(
+            first_order_inner_cap_schedule(2, None, snap_with_accept_rho(4, true, 0.49)),
+            8
+        );
+    }
+
+    #[test]
+    fn schedule_combines_ift_residual_and_lm_accept_rho() {
+        // When BOTH signals fire (poor IFT prediction AND poor LM
+        // accept_rho), the bumps compose: IFT base = 4, accept_rho
+        // bump = +2 → total margin = 6, cap = last_iters + 6.
+        let snap = Some(InnerProgressSnapshot {
+            last_iters: 4,
+            last_converged: true,
+            last_ift_residual: Some(0.30),
+            last_accept_rho: Some(0.20),
+        });
+        assert_eq!(first_order_inner_cap_schedule(2, None, snap), 10);
+        // When only LM accept_rho is poor (IFT residual is excellent),
+        // the bumps still compose: IFT base = 1 (excellent), accept_rho
+        // bump = +2 → margin = 3, cap = 4 + 3 = 7.
+        let snap = Some(InnerProgressSnapshot {
+            last_iters: 4,
+            last_converged: true,
+            last_ift_residual: Some(0.005),
+            last_accept_rho: Some(0.30),
+        });
+        assert_eq!(first_order_inner_cap_schedule(2, None, snap), 7);
     }
 }
 
