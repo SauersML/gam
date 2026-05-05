@@ -1612,6 +1612,24 @@ _PIRLS_ITER_BREAKDOWN_PATTERN = re.compile(
     r"\s+candidate=([\d.]+)s\s+other=([\d.]+)s"
 )
 
+# Per-iter LM trajectory: validates the textbook Madsen accept (commit
+# 58ae42d1) and reject (d37626e6) updates plus the runtime adaptive λ
+# clamp (43be42be) are moving the trust region in useful directions at
+# biobank scale. Aggregating log10_ratio across iters reveals the LM's
+# global behavior:
+#   median ratio < 0  → LM is shrinking λ (Newton-friendly trajectory)
+#   median ratio ≈ 0  → LM is stationary (problem is at the radius)
+#   median ratio > 0  → LM is expanding λ (rejection-heavy)
+# Aggregating accept_rho reveals model fidelity:
+#   median accept_rho ≈ 1  → quadratic model is faithful
+#   median accept_rho << 1 → model over-states predicted reduction
+_PIRLS_LM_TRAJECTORY_PATTERN = re.compile(
+    r"\[PIRLS lm-trajectory\]\s+iter=\s*(\d+)\s+"
+    r"start_lambda=([\d.eE+\-]+)\s+final_lambda=([\d.eE+\-]+)\s+"
+    r"log10_ratio=([\d.eE+\-nNaA]+)\s+accept_rho=([\d.eE+\-nNaA]+)\s+"
+    r"attempts=(\d+)"
+)
+
 # Outer-Hessian routing decision and assembly cost. Two markers per outer
 # Hessian build:
 #   [OUTER hessian-route]    : decision (operator vs dense) + which clause
@@ -1883,6 +1901,59 @@ def _emit_phase_summary(
                 f"pirls_curv={curv_total:.1f}s pirls_solve={solve_total:.1f}s "
                 f"pirls_predred={predred_total:.1f}s pirls_cand={cand_total:.1f}s "
                 f"pirls_other={other_total:.1f}s"
+            )
+    # Per-iter LM trajectory: median + p95 of (log10 of final/start λ)
+    # and accept_rho across iters. This is the validation signal for
+    # the textbook LM updates (Madsen accept commit 58ae42d1, Madsen
+    # reject d37626e6, adaptive runtime clamp 43be42be):
+    #
+    #   * lm_log10_ratio_p50 < 0  → LM is shrinking λ on accepted iters
+    #     (Newton-friendly), as expected when the geometry is healthy
+    #   * lm_log10_ratio_p50 > 0  → LM is expanding λ on accepted iters
+    #     (geometry is fighting; the Madsen accept side's marginal-
+    #     accept ×1.125-2.0 expansion is firing, which is correct
+    #     behavior for hard problems but indicates extra work)
+    #   * lm_accept_rho_p50 ≈ 1   → quadratic model faithful
+    #   * lm_accept_rho_p50 << 1  → model over-states predicted
+    #     reduction; smaller steps should be tried
+    lm_traj = _PIRLS_LM_TRAJECTORY_PATTERN.findall(captured_stderr)
+    if lm_traj:
+        ratios: list[float] = []
+        rhos: list[float] = []
+        for _it, _start, _final, ratio_str, rho_str, _att in lm_traj:
+            try:
+                r = float(ratio_str)
+                if r == r:  # filter NaN
+                    ratios.append(r)
+            except ValueError:
+                pass
+            try:
+                rho = float(rho_str)
+                if rho == rho:
+                    rhos.append(rho)
+            except ValueError:
+                pass
+        ratio_pieces = []
+        if ratios:
+            ratios_sorted = sorted(ratios)
+            n_r = len(ratios_sorted)
+            ratio_pieces.append(
+                f"lm_log10_ratio_p50={ratios_sorted[n_r // 2]:.2f}"
+            )
+            ratio_pieces.append(
+                f"lm_log10_ratio_p95={ratios_sorted[min(n_r - 1, int(0.95 * n_r))]:.2f}"
+            )
+        rho_pieces = []
+        if rhos:
+            rhos_sorted = sorted(rhos)
+            n_p = len(rhos_sorted)
+            rho_pieces.append(f"lm_accept_rho_p50={rhos_sorted[n_p // 2]:.2f}")
+            rho_pieces.append(
+                f"lm_accept_rho_p05={rhos_sorted[max(0, int(0.05 * n_p))]:.2f}"
+            )
+        if ratio_pieces or rho_pieces:
+            parts.append(
+                f"lm_iters={len(lm_traj)} " + " ".join(ratio_pieces + rho_pieces)
             )
     # Per-solve geometric convergence rate. A healthy biobank fit ends
     # with most PIRLS solves at rate < 0.5; a struggling fit shows
