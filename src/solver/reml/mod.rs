@@ -3659,8 +3659,8 @@ pub(crate) struct RemlState<'a> {
     /// This is a strict superset of the tangent-line predictor's
     /// requirements: works after a single successful solve (tangent-line
     /// needs two prior fits), and gives the EXACT first-order Jacobian
-    /// of the implicit β(ρ) trajectory rather than a finite-difference
-    /// proxy along one ρ-direction.
+    /// of the implicit β(ρ) trajectory rather than a two-point secant
+    /// approximation along one ρ-direction.
     ///
     /// Populated in `updatewarm_start_from` when PIRLS converges; cleared
     /// on failure, on `reset_surface`, and on link-state changes.
