@@ -26,8 +26,8 @@ use crate::families::marginal_slope_shared::{
     add_optional_vector, add_scaled_coeff4, add_two_surface_psi_outer,
     build_denested_partition_cells as shared_denested_partition_cells, eval_coeff4_at,
     is_sigma_aux_index as shared_is_sigma_aux_index,
-    observed_denested_cell_partials as shared_observed_denested_cell_partials,
-    outer_row_indices, outer_score_scale, probit_frailty_scale, probit_frailty_scale_multi_dir_jet,
+    observed_denested_cell_partials as shared_observed_denested_cell_partials, outer_row_indices,
+    outer_score_scale, probit_frailty_scale, probit_frailty_scale_multi_dir_jet,
     psi_derivative_location, scale_coeff4,
 };
 use crate::families::row_kernel::{
@@ -2837,7 +2837,15 @@ impl SurvivalMarginalSlopeFamily {
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let outer_scale = outer_score_scale(options, self.n);
-        let (mut objective_psi, mut score_t, mut score_m, mut score_g, mut score_h, mut score_w, mut acc) = row_iter
+        let (
+            mut objective_psi,
+            mut score_t,
+            mut score_m,
+            mut score_g,
+            mut score_h,
+            mut score_w,
+            mut acc,
+        ) = row_iter
             .into_par_iter()
             .try_fold(
                 || {
@@ -2951,56 +2959,63 @@ impl SurvivalMarginalSlopeFamily {
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let outer_scale = outer_score_scale(options, self.n);
-        let (mut objective_psi_psi, mut score_t, mut score_m, mut score_g, mut score_h, mut score_w, mut acc) =
-            row_iter
-                .into_par_iter()
-                .try_fold(
-                    || {
-                        (
-                            0.0,
-                            Array1::zeros(p_t),
-                            Array1::zeros(p_m),
-                            Array1::zeros(p_g),
-                            Array1::zeros(p_h),
-                            Array1::zeros(p_w),
-                            BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-                        )
-                    },
-                    |mut a, row| -> Result<_, String> {
-                        let (obj, grad, hess) =
-                            self.row_sigma_primary_terms(row, block_states, true)?;
-                        a.0 += obj;
-                        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-                        self.accumulate_score_with_q_geometry(
-                            row, &q_geom, &grad, &mut a.1, &mut a.2, &mut a.3,
-                        )?;
-                        a.6.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess)?;
-                        Ok(a)
-                    },
-                )
-                .try_reduce(
-                    || {
-                        (
-                            0.0,
-                            Array1::zeros(p_t),
-                            Array1::zeros(p_m),
-                            Array1::zeros(p_g),
-                            Array1::zeros(p_h),
-                            Array1::zeros(p_w),
-                            BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-                        )
-                    },
-                    |mut a, b| {
-                        a.0 += b.0;
-                        a.1 += &b.1;
-                        a.2 += &b.2;
-                        a.3 += &b.3;
-                        a.4 += &b.4;
-                        a.5 += &b.5;
-                        a.6.add(&b.6);
-                        Ok(a)
-                    },
-                )?;
+        let (
+            mut objective_psi_psi,
+            mut score_t,
+            mut score_m,
+            mut score_g,
+            mut score_h,
+            mut score_w,
+            mut acc,
+        ) = row_iter
+            .into_par_iter()
+            .try_fold(
+                || {
+                    (
+                        0.0,
+                        Array1::zeros(p_t),
+                        Array1::zeros(p_m),
+                        Array1::zeros(p_g),
+                        Array1::zeros(p_h),
+                        Array1::zeros(p_w),
+                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                    )
+                },
+                |mut a, row| -> Result<_, String> {
+                    let (obj, grad, hess) =
+                        self.row_sigma_primary_terms(row, block_states, true)?;
+                    a.0 += obj;
+                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    self.accumulate_score_with_q_geometry(
+                        row, &q_geom, &grad, &mut a.1, &mut a.2, &mut a.3,
+                    )?;
+                    a.6.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess)?;
+                    Ok(a)
+                },
+            )
+            .try_reduce(
+                || {
+                    (
+                        0.0,
+                        Array1::zeros(p_t),
+                        Array1::zeros(p_m),
+                        Array1::zeros(p_g),
+                        Array1::zeros(p_h),
+                        Array1::zeros(p_w),
+                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                    )
+                },
+                |mut a, b| {
+                    a.0 += b.0;
+                    a.1 += &b.1;
+                    a.2 += &b.2;
+                    a.3 += &b.3;
+                    a.4 += &b.4;
+                    a.5 += &b.5;
+                    a.6.add(&b.6);
+                    Ok(a)
+                },
+            )?;
 
         if outer_scale != 1.0 {
             objective_psi_psi *= outer_scale;
@@ -8531,7 +8546,15 @@ impl SurvivalMarginalSlopeFamily {
 
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let outer_scale = outer_score_scale(options, self.n);
-        let (mut objective_psi, mut score_t, mut score_m, mut score_g, mut score_h, mut score_w, mut acc) = row_iter
+        let (
+            mut objective_psi,
+            mut score_t,
+            mut score_m,
+            mut score_g,
+            mut score_h,
+            mut score_w,
+            mut acc,
+        ) = row_iter
             .into_par_iter()
             .try_fold(make_acc, |mut a, row| -> Result<Acc, String> {
                 let psi_row = psi_map
@@ -8835,7 +8858,15 @@ impl SurvivalMarginalSlopeFamily {
 
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let outer_scale = outer_score_scale(options, self.n);
-        let (mut objective_psi_psi, mut score_t, mut score_m, mut score_g, mut score_h, mut score_w, mut acc) = row_iter
+        let (
+            mut objective_psi_psi,
+            mut score_t,
+            mut score_m,
+            mut score_g,
+            mut score_h,
+            mut score_w,
+            mut acc,
+        ) = row_iter
             .into_par_iter()
             .try_fold(make_acc, |mut a, row| -> Result<Acc, String> {
                 // Compute psi design rows once; derive directions from them.
@@ -13915,9 +13946,8 @@ mod tests {
             (0..n).map(|i| 0.1 + 0.6 * (((i * 19 + 7) % n) as f64 + 0.5) / (n as f64)),
         );
         // qd1 must remain strictly above the derivative guard.
-        let derivative_offset_exit: Array1<f64> = Array1::from_iter(
-            (0..n).map(|i| 0.5 + 0.05 * ((i * 23 + 1) % 3) as f64),
-        );
+        let derivative_offset_exit: Array1<f64> =
+            Array1::from_iter((0..n).map(|i| 0.5 + 0.05 * ((i * 23 + 1) % 3) as f64));
         SurvivalMarginalSlopeFamily {
             n,
             event: Arc::new(event),
@@ -13944,8 +13974,10 @@ mod tests {
         }
     }
 
-    fn closed_form_block_states(family: &SurvivalMarginalSlopeFamily, g: f64)
-    -> Vec<ParameterBlockState> {
+    fn closed_form_block_states(
+        family: &SurvivalMarginalSlopeFamily,
+        g: f64,
+    ) -> Vec<ParameterBlockState> {
         let n = family.n;
         vec![
             // Time block: empty beta; per-row eta entries unused (designs
@@ -14042,9 +14074,7 @@ mod tests {
         );
 
         // Horvitz-Thompson check: 2 * Σ_even ≈ full-data sum.
-        let baseline = family
-            .log_likelihood_only(&states)
-            .expect("baseline ll");
+        let baseline = family.log_likelihood_only(&states).expect("baseline ll");
         let ht_rel = ((scaled - baseline) / baseline.abs().max(1.0)).abs();
         assert!(
             ht_rel < 0.05,
@@ -16481,8 +16511,7 @@ mod tests {
             / baseline.objective_psi_psi.abs().max(1.0))
         .abs();
         assert!(obj_rel < 1e-12, "objective rel {}", obj_rel);
-        let score_rel =
-            rel_diff_array1_survival(&with_full.score_psi_psi, &baseline.score_psi_psi);
+        let score_rel = rel_diff_array1_survival(&with_full.score_psi_psi, &baseline.score_psi_psi);
         assert!(score_rel < 1e-12, "score rel {}", score_rel);
     }
 
@@ -16627,9 +16656,8 @@ mod tests {
         let offset_exit: Array1<f64> = Array1::from_iter(
             (0..n).map(|i| 0.1 + 0.6 * (((i * 19 + 7) % n) as f64 + 0.5) / (n as f64)),
         );
-        let derivative_offset_exit: Array1<f64> = Array1::from_iter(
-            (0..n).map(|i| 0.5 + 0.05 * ((i * 23 + 1) % 3) as f64),
-        );
+        let derivative_offset_exit: Array1<f64> =
+            Array1::from_iter((0..n).map(|i| 0.5 + 0.05 * ((i * 23 + 1) % 3) as f64));
         // Single-column marginal/logslope designs with row-varying entries.
         let marginal_design = Array2::from_shape_fn((n, 1), |(i, _)| {
             0.3 + 0.4 * (((i * 29 + 11) % n) as f64) / (n as f64)
@@ -16854,8 +16882,7 @@ mod tests {
             / baseline.objective_psi_psi.abs().max(1.0))
         .abs();
         assert!(obj_rel < 1e-12, "objective rel {}", obj_rel);
-        let score_rel =
-            rel_diff_array1_survival(&with_full.score_psi_psi, &baseline.score_psi_psi);
+        let score_rel = rel_diff_array1_survival(&with_full.score_psi_psi, &baseline.score_psi_psi);
         assert!(score_rel < 1e-12, "score rel {}", score_rel);
     }
 
@@ -17136,9 +17163,8 @@ mod tests {
         let offset_exit: Array1<f64> = Array1::from_iter(
             (0..n).map(|i| 0.1 + 0.6 * (((i * 19 + 7) % n) as f64 + 0.5) / (n as f64)),
         );
-        let derivative_offset_exit: Array1<f64> = Array1::from_iter(
-            (0..n).map(|i| 0.5 + 0.05 * ((i * 23 + 1) % 3) as f64),
-        );
+        let derivative_offset_exit: Array1<f64> =
+            Array1::from_iter((0..n).map(|i| 0.5 + 0.05 * ((i * 23 + 1) % 3) as f64));
         let marginal_design = Array2::from_shape_fn((n, 1), |(i, _)| {
             0.3 + 0.4 * (((i * 29 + 11) % n) as f64) / (n as f64)
         });
@@ -17242,7 +17268,11 @@ mod tests {
         let with_full_dense = with_full.to_dense();
 
         let rel = rel_diff_array2_survival(&with_full_dense, &baseline_dense);
-        assert!(rel < 1e-10, "joint Hessian flex-no-wiggle dH operator drift rel {}", rel);
+        assert!(
+            rel < 1e-10,
+            "joint Hessian flex-no-wiggle dH operator drift rel {}",
+            rel
+        );
     }
 
     #[test]
@@ -17295,6 +17325,10 @@ mod tests {
         let factor = n as f64 / m as f64;
         let exp = &raw_dense * factor;
         let rel = rel_diff_array2_survival(&scaled_dense, &exp);
-        assert!(rel < 1e-10, "joint Hessian flex-no-wiggle dH operator HT rel {}", rel);
+        assert!(
+            rel < 1e-10,
+            "joint Hessian flex-no-wiggle dH operator HT rel {}",
+            rel
+        );
     }
 }
