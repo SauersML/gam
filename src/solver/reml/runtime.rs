@@ -2476,6 +2476,31 @@ impl<'a> RemlState<'a> {
         if !self.warm_start_enabled.load(Ordering::Relaxed) {
             return;
         }
+        // Whenever an external caller substitutes the warm-start β
+        // (e.g. a multi-start seed selector), every other piece of
+        // warm-start state was calibrated to the OLD β at the OLD ρ
+        // and is now stale: the IFT cache's H_pen and qs were assembled
+        // against the old β; the cached factor is the Cholesky of the
+        // OLD H_pen; the ρ pair (warm_start_rho, prev_*) was the OLD β's
+        // ρ-trajectory; the LM-λ hint was the damping that worked at
+        // the OLD geometry; the inner-PIRLS feedback signals reflect
+        // the OLD solve's convergence behavior; the IFT residual was
+        // measured against the OLD predictor.
+        //
+        // Without this wipe, the IFT predictor would seed PIRLS with
+        // `β_new − H_old^{-1} · (e^{ρ_old_k} S_k · β_new)` — using the
+        // new β as a substitute for the old β in a Jacobian
+        // calibrated against the old β. That is mathematically wrong
+        // and would produce arbitrary predictions, not just degraded
+        // ones. Similarly the LM-λ hint would clamp to a value
+        // calibrated to a curvature that no longer applies.
+        //
+        // Wipe everything EXCEPT `warm_start_beta` (which we are
+        // about to replace), then write the new β. The order matters:
+        // `clear_warm_start_predictor_state` clears `warm_start_beta`
+        // too, so we replace afterwards.
+        self.clear_warm_start_predictor_state();
+        self.clear_warm_start_adaptive_signals();
         match beta_original {
             Some(beta) if beta.len() == self.p => {
                 self.warm_start_beta
@@ -2484,7 +2509,8 @@ impl<'a> RemlState<'a> {
                     .replace(Coefficients::new(beta.to_owned()));
             }
             _ => {
-                self.warm_start_beta.write().unwrap().take();
+                // already cleared by `clear_warm_start_predictor_state`;
+                // nothing more to do.
             }
         }
     }
