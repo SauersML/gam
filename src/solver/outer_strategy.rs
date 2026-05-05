@@ -4270,7 +4270,28 @@ fn run_outer_with_plan(
                     .with_bounds(bounds)
                     .with_tolerance(tol)
                     .with_max_iterations(max_iter);
-                match optimizer.run() {
+                let bfgs_start = std::time::Instant::now();
+                let outcome = optimizer.run();
+                let bfgs_elapsed = bfgs_start.elapsed().as_secs_f64();
+                match &outcome {
+                    Ok(sol) => log::info!(
+                        "[OUTER summary] BFGS converged in {:?} elapsed={:.3}s final_value={:.6e}",
+                        sol.iterations, bfgs_elapsed, sol.final_value
+                    ),
+                    Err(BfgsError::MaxIterationsReached { last_solution }) => log::info!(
+                        "[OUTER summary] BFGS hit max_iter elapsed={:.3}s final_value={:.6e}",
+                        bfgs_elapsed, last_solution.final_value
+                    ),
+                    Err(BfgsError::LineSearchFailed { last_solution, .. }) => log::info!(
+                        "[OUTER summary] BFGS line-search failed elapsed={:.3}s final_value={:.6e}",
+                        bfgs_elapsed, last_solution.final_value
+                    ),
+                    Err(e) => log::info!(
+                        "[OUTER summary] BFGS failed elapsed={:.3}s err={:?}",
+                        bfgs_elapsed, e
+                    ),
+                }
+                match outcome {
                     Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
                     Err(BfgsError::MaxIterationsReached { last_solution }) => {
                         Ok(solution_into_outer_result(*last_solution, false, *the_plan))
