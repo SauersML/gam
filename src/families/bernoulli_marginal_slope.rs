@@ -1388,6 +1388,70 @@ struct PrimarySlices {
     total: usize,
 }
 
+/// Deterministic-order parallel reduction over a list of rows.
+///
+/// Splits `rows` into a fixed number of contiguous chunks (`TARGET_CHUNK_COUNT`),
+/// applies `process_row` sequentially within each chunk in parallel across
+/// chunks, then combines the per-chunk states sequentially in chunk-index
+/// order. The result is bit-deterministic for a fixed `rows.len()` regardless
+/// of rayon's runtime thread-pool size or work-stealing decisions.
+///
+/// `try_fold/try_reduce` over `rows.into_par_iter()` does not have this
+/// property: rayon's adaptive splitter sets chunk boundaries based on
+/// `current_num_threads()` and runtime work-stealing, so two calls with
+/// identical inputs can return ULP-different floating-point sums when the
+/// rayon pool has different concurrent activity. Tests that compare two
+/// reductions and rely on bit-for-bit equality (e.g. workspace-vs-direct
+/// subsample threading checks) flake under load with that pattern.
+fn sigma_chunked_row_reduction<F>(
+    rows: &[usize],
+    slices: &BlockSlices,
+    process_row: F,
+) -> Result<(f64, Array1<f64>, BernoulliBlockHessianAccumulator), String>
+where
+    F: Fn(usize, &mut (f64, Array1<f64>, BernoulliBlockHessianAccumulator)) -> Result<(), String>
+        + Sync,
+{
+    const TARGET_CHUNK_COUNT: usize = 32;
+    let n = rows.len();
+    if n == 0 {
+        return Ok((
+            0.0,
+            Array1::<f64>::zeros(slices.total),
+            BernoulliBlockHessianAccumulator::new(slices),
+        ));
+    }
+    let chunk_size = n.div_ceil(TARGET_CHUNK_COUNT).max(1);
+    let n_chunks = n.div_ceil(chunk_size);
+    let chunk_states: Vec<(f64, Array1<f64>, BernoulliBlockHessianAccumulator)> = (0..n_chunks)
+        .into_par_iter()
+        .map(|chunk_idx| -> Result<_, String> {
+            let start = chunk_idx * chunk_size;
+            let end = (start + chunk_size).min(n);
+            let mut acc = (
+                0.0,
+                Array1::<f64>::zeros(slices.total),
+                BernoulliBlockHessianAccumulator::new(slices),
+            );
+            for &row in &rows[start..end] {
+                process_row(row, &mut acc)?;
+            }
+            Ok(acc)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let (mut obj_acc, mut score_acc, mut h_acc) = (
+        0.0,
+        Array1::<f64>::zeros(slices.total),
+        BernoulliBlockHessianAccumulator::new(slices),
+    );
+    for chunk in chunk_states {
+        obj_acc += chunk.0;
+        score_acc += &chunk.1;
+        h_acc.add(&chunk.2);
+    }
+    Ok((obj_acc, score_acc, h_acc))
+}
+
 fn primary_slices(slices: &BlockSlices) -> PrimarySlices {
     let q = 0usize;
     let logslope = 1usize;
@@ -2459,41 +2523,16 @@ impl BernoulliMarginalSlopeFamily {
         let n = self.y.len();
         let row_iter = outer_row_indices(options, n).to_vec();
         let scale = outer_score_scale(options, n);
-        let (mut objective_psi, mut score_psi, mut acc) = row_iter
-            .into_par_iter()
-            .try_fold(
-                || {
-                    (
-                        0.0,
-                        Array1::<f64>::zeros(slices.total),
-                        BernoulliBlockHessianAccumulator::new(&slices),
-                    )
-                },
-                |mut acc, row| -> Result<_, String> {
-                    let (obj, grad, hess) =
-                        self.row_sigma_primary_terms(row, block_states, false)?;
-                    acc.0 += obj;
-                    self.accumulate_rigid_sigma_pullback(
-                        row, &slices, &grad, &hess, &mut acc.1, &mut acc.2,
-                    )?;
-                    Ok(acc)
-                },
-            )
-            .try_reduce(
-                || {
-                    (
-                        0.0,
-                        Array1::<f64>::zeros(slices.total),
-                        BernoulliBlockHessianAccumulator::new(&slices),
-                    )
-                },
-                |mut left, right| -> Result<_, String> {
-                    left.0 += right.0;
-                    left.1 += &right.1;
-                    left.2.add(&right.2);
-                    Ok(left)
-                },
-            )?;
+        // Bit-deterministic reduction: see `sigma_chunked_row_reduction`.
+        let (mut objective_psi, mut score_psi, mut acc) =
+            sigma_chunked_row_reduction(row_iter.as_slice(), &slices, |row, acc| {
+                let (obj, grad, hess) = self.row_sigma_primary_terms(row, block_states, false)?;
+                acc.0 += obj;
+                self.accumulate_rigid_sigma_pullback(
+                    row, &slices, &grad, &hess, &mut acc.1, &mut acc.2,
+                )?;
+                Ok(())
+            })?;
         if scale != 1.0 {
             objective_psi *= scale;
             score_psi.mapv_inplace(|v| v * scale);
@@ -2538,41 +2577,16 @@ impl BernoulliMarginalSlopeFamily {
         let n = self.y.len();
         let row_iter = outer_row_indices(options, n).to_vec();
         let scale = outer_score_scale(options, n);
-        let (mut objective_psi_psi, mut score_psi_psi, mut acc) = row_iter
-            .into_par_iter()
-            .try_fold(
-                || {
-                    (
-                        0.0,
-                        Array1::<f64>::zeros(slices.total),
-                        BernoulliBlockHessianAccumulator::new(&slices),
-                    )
-                },
-                |mut acc, row| -> Result<_, String> {
-                    let (obj, grad, hess) =
-                        self.row_sigma_primary_terms(row, block_states, true)?;
-                    acc.0 += obj;
-                    self.accumulate_rigid_sigma_pullback(
-                        row, &slices, &grad, &hess, &mut acc.1, &mut acc.2,
-                    )?;
-                    Ok(acc)
-                },
-            )
-            .try_reduce(
-                || {
-                    (
-                        0.0,
-                        Array1::<f64>::zeros(slices.total),
-                        BernoulliBlockHessianAccumulator::new(&slices),
-                    )
-                },
-                |mut left, right| -> Result<_, String> {
-                    left.0 += right.0;
-                    left.1 += &right.1;
-                    left.2.add(&right.2);
-                    Ok(left)
-                },
-            )?;
+        // Bit-deterministic reduction: see `sigma_chunked_row_reduction`.
+        let (mut objective_psi_psi, mut score_psi_psi, mut acc) =
+            sigma_chunked_row_reduction(row_iter.as_slice(), &slices, |row, acc| {
+                let (obj, grad, hess) = self.row_sigma_primary_terms(row, block_states, true)?;
+                acc.0 += obj;
+                self.accumulate_rigid_sigma_pullback(
+                    row, &slices, &grad, &hess, &mut acc.1, &mut acc.2,
+                )?;
+                Ok(())
+            })?;
         if scale != 1.0 {
             objective_psi_psi *= scale;
             score_psi_psi.mapv_inplace(|v| v * scale);
