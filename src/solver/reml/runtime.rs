@@ -6465,6 +6465,144 @@ mod ift_warm_start_tests {
         );
     }
 
+    /// The lambda_s_beta_blocks precompute path (commit 2f2670b7) must
+    /// produce BIT-EQUIVALENT output to the inline-mat-vec fallback.
+    /// The 4 existing IFT tests pass `None` for the precompute field,
+    /// leaving the fast path untested. This test populates the field
+    /// from the same penalties the fallback would use and asserts both
+    /// β_predict are identical to ~floating-point round-off.
+    #[test]
+    fn ift_predictor_precompute_path_matches_inline_path() {
+        let p = 5usize;
+        let s1 = Array2::from_shape_vec(
+            (p, p),
+            vec![
+                1.0, 0.2, 0.0, 0.0, 0.0,
+                0.2, 1.5, 0.1, 0.0, 0.0,
+                0.0, 0.1, 1.3, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+        )
+        .unwrap();
+        let s2 = Array2::from_shape_vec(
+            (p, p),
+            vec![
+                0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 1.1, 0.05, 0.0,
+                0.0, 0.0, 0.05, 1.7, 0.0,
+                0.0, 0.0, 0.0, 0.0, 2.1,
+            ],
+        )
+        .unwrap();
+        let cp1 = dense_canonical_from_local(s1, p);
+        let cp2 = dense_canonical_from_local(s2, p);
+        let canonical = vec![cp1.clone(), cp2.clone()];
+
+        let beta_cur = ndarray::array![0.4_f64, -0.7, 0.2, 0.9, -0.3];
+        let rho_cur = ndarray::array![0.2_f64, -0.1];
+
+        // Build H_pen consistently with the cached solve.
+        let mut h_pen = Array2::<f64>::eye(p);
+        for (k_idx, cp) in canonical.iter().enumerate() {
+            let lam = rho_cur[k_idx].exp();
+            for i in 0..p {
+                for j in 0..p {
+                    h_pen[[i, j]] += lam * cp.local[[i, j]];
+                }
+            }
+        }
+
+        // Precompute the per-penalty `S_k · β_cur` blocks the same way
+        // updatewarm_start_from does at cache-write time.
+        let lambda_s_beta_blocks: Vec<ndarray::Array1<f64>> = canonical
+            .iter()
+            .map(|cp| {
+                let r = &cp.col_range;
+                let beta_block = beta_cur.slice(s![r.start..r.end]);
+                cp.local.dot(&beta_block)
+            })
+            .collect();
+
+        let cache_inline = super::super::IftWarmStartCache {
+            beta_original: beta_cur.clone(),
+            rho: rho_cur.clone(),
+            penalized_hessian_transformed: SymmetricMatrix::Dense(h_pen.clone()),
+            qs: Array2::eye(p),
+            frame_was_original: true,
+            lambda_s_beta_blocks: None,
+        };
+        let cache_precompute = super::super::IftWarmStartCache {
+            beta_original: beta_cur.clone(),
+            rho: rho_cur.clone(),
+            penalized_hessian_transformed: SymmetricMatrix::Dense(h_pen.clone()),
+            qs: Array2::eye(p),
+            frame_was_original: true,
+            lambda_s_beta_blocks: Some(lambda_s_beta_blocks),
+        };
+
+        let new_rho = ndarray::array![0.25_f64, -0.05];
+        let predicted_inline = predict_warm_start_beta_ift_from_cache(
+            &cache_inline,
+            &canonical,
+            &new_rho,
+            p,
+            None,
+        )
+        .expect("inline-path predict");
+        let predicted_precompute = predict_warm_start_beta_ift_from_cache(
+            &cache_precompute,
+            &canonical,
+            &new_rho,
+            p,
+            None,
+        )
+        .expect("precompute-path predict");
+
+        // Bit-equivalent: the precompute path multiplies and accumulates
+        // in the same order as the inline path, so the two should agree
+        // to round-off at most a few ULPs.
+        for i in 0..p {
+            let diff = (predicted_inline.0[i] - predicted_precompute.0[i]).abs();
+            assert!(
+                diff < 1e-12,
+                "precompute and inline IFT paths diverged at index {i}: \
+                 inline={} precompute={} diff={:.3e}",
+                predicted_inline.0[i],
+                predicted_precompute.0[i],
+                diff,
+            );
+        }
+
+        // Defensive: if the precompute length disagrees with
+        // canonical_penalties.len(), the predictor must fall back to
+        // inline-mat-vec rather than mis-indexing.
+        let cache_wrong_len = super::super::IftWarmStartCache {
+            beta_original: beta_cur.clone(),
+            rho: rho_cur.clone(),
+            penalized_hessian_transformed: SymmetricMatrix::Dense(h_pen.clone()),
+            qs: Array2::eye(p),
+            frame_was_original: true,
+            lambda_s_beta_blocks: Some(vec![ndarray::Array1::zeros(0)]), // length 1, expected 2
+        };
+        let predicted_fallback = predict_warm_start_beta_ift_from_cache(
+            &cache_wrong_len,
+            &canonical,
+            &new_rho,
+            p,
+            None,
+        )
+        .expect("wrong-length precompute should still predict via inline fallback");
+        for i in 0..p {
+            let diff = (predicted_inline.0[i] - predicted_fallback.0[i]).abs();
+            assert!(
+                diff < 1e-12,
+                "wrong-length precompute fell back incorrectly at index {i}",
+            );
+        }
+    }
+
     /// Verify the basis-conversion path: when frame_was_original=false,
     /// solving with H in transformed basis and round-tripping through qs
     /// (which is orthogonal) must produce the SAME prediction as solving
