@@ -1265,6 +1265,53 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         self.assertIn("pirls=DEGRADED", fit_lines[0])
         self.assertIn("curvature=ABSENT", fit_lines[0])
 
+    def test_phase_summary_tangent_accept_rate_split_matches_ift(self) -> None:
+        # End-to-end symmetric to the IFT-rate split: tangent fires
+        # only when IFT rejected, so a fit producing tangent markers
+        # also has IFT rejects upstream. Exercise the tangent
+        # aggregator: 3 tangent_predicts + 1 tangent_reject + 2
+        # tangent_noops:
+        #   tangent_accept_rate        = 3 / 6 = 0.50
+        #   tangent_accept_rate_active = 3 / 4 = 0.75
+        stderr_lines = [
+            # Upstream IFT context — tangent only fires when IFT rejected.
+            "[IFT-REJECTED] reason=large_drho",
+            "[IFT-REJECTED] reason=large_drho",
+            "[IFT-REJECTED] reason=large_drho",
+            "[IFT-REJECTED] reason=large_drho",
+            "[IFT-REJECTED] reason=large_drho",
+            "[IFT-REJECTED] reason=large_drho",
+            # Tangent: 3 predicts (alpha values within range). The
+            # regex requires alpha + cap + drho_step_norm_sq +
+            # drho_prev_norm_sq fields (see _TANGENT_PREDICT_PATTERN).
+            "[TANGENT-PREDICT] alpha=0.500 cap=1.500 drho_step_norm_sq=1.0e-2 drho_prev_norm_sq=4.0e-2",
+            "[TANGENT-PREDICT] alpha=0.700 cap=1.500 drho_step_norm_sq=2.0e-2 drho_prev_norm_sq=4.0e-2",
+            "[TANGENT-PREDICT] alpha=1.200 cap=1.500 drho_step_norm_sq=5.0e-2 drho_prev_norm_sq=4.0e-2",
+            # Tangent: 1 reject.
+            "[TANGENT-REJECTED] reason=alpha_above_cap",
+            # Tangent: 2 noops.
+            "[TANGENT-NOOP] reason=alpha_below_eps",
+            "[TANGENT-NOOP] reason=alpha_below_eps",
+            # Tangent quality follows from each successful predict.
+            "[TANGENT-QUALITY] residual=1.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=3",
+            "[TANGENT-QUALITY] residual=2.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=3",
+            "[TANGENT-QUALITY] residual=3.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=3",
+            "[PHASE] my-fit fit end elapsed=10.0s",
+        ]
+        stderr = "\n".join(stderr_lines)
+        out = self._run_summary(stderr)
+        # Find the line with the tangent rate metrics.
+        rate_lines = [
+            line for line in out.splitlines()
+            if "tangent_accept_rate=" in line
+        ]
+        self.assertEqual(len(rate_lines), 1, f"expected 1 rate line, got {rate_lines}")
+        line = rate_lines[0]
+        # accept_rate (with noops) = 3 / 6 = 0.50
+        self.assertIn("tangent_accept_rate=0.50", line)
+        # accept_rate_active (excluding noops) = 3 / 4 = 0.75
+        self.assertIn("tangent_accept_rate_active=0.75", line)
+
     def test_phase_summary_distinguishes_accept_rate_from_active(self) -> None:
         # End-to-end: when the outer optimizer makes many zero-step
         # calls (noops), `ift_accept_rate` (denominator includes

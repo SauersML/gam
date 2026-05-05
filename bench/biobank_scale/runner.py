@@ -2706,6 +2706,27 @@ def _emit_phase_summary(
             # otherwise) AND the resulting Δρ landed in a regime
             # where the tangent step is numerically negligible.
             parts.append(f"tangent_noops={len(tangent_noops)}")
+        # Tangent accept-rate metrics, symmetric to the IFT metrics
+        # (commit 962210f3). Two complementary denominators:
+        #
+        #   tangent_accept_rate         = predicts / (predicts +
+        #                                  rejects + noops)
+        #   tangent_accept_rate_active  = predicts / (predicts +
+        #                                  rejects)  ← noops EXCLUDED
+        #
+        # Same rationale as the IFT split: noops in the denominator
+        # conflate predictor effectiveness with outer-optimizer
+        # behavior (zero-step calls). Surfacing both lets a CI
+        # reviewer separate "tangent predictor is bad" from "outer
+        # is calling tangent unnecessarily".
+        n_t_noops = len(tangent_noops) if tangent_noops else 0
+        denom_total = max(t_predicts + t_rejects + n_t_noops, 1)
+        denom_active = max(t_predicts + t_rejects, 1)
+        if t_predicts > 0 or t_rejects > 0 or n_t_noops > 0:
+            parts.append(
+                f"tangent_accept_rate={t_predicts / denom_total:.2f} "
+                f"tangent_accept_rate_active={t_predicts / denom_active:.2f}"
+            )
     # Consistency cross-check: every successful [TANGENT-PREDICT]
     # produces a downstream [TANGENT-QUALITY] from the post-PIRLS
     # residual computation in execute_pirls_if_needed (commit 99424b47).
