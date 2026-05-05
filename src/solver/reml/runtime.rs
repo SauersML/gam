@@ -1680,6 +1680,7 @@ impl<'a> RemlState<'a> {
             last_inner_converged: Arc::new(AtomicBool::new(false)),
             ift_warm_start_cache: RwLock::new(None),
             last_pirls_lm_lambda: Arc::new(AtomicU64::new(0)),
+            last_ift_prediction_residual: Arc::new(AtomicU64::new(0)),
             kronecker_penalty_system: None,
             kronecker_factored: None,
         })
@@ -1745,6 +1746,8 @@ impl<'a> RemlState<'a> {
         // produces different curvature, so a stale hint here would
         // be biased rather than informative.
         self.last_pirls_lm_lambda.store(0, Ordering::Relaxed);
+        self.last_ift_prediction_residual
+            .store(0, Ordering::Relaxed);
         Ok(())
     }
 
@@ -2287,11 +2290,19 @@ impl<'a> RemlState<'a> {
         }
         let cache_guard = self.ift_warm_start_cache.read().unwrap();
         let cache = cache_guard.as_ref()?;
+        let last_residual_bits = self.last_ift_prediction_residual.load(Ordering::Relaxed);
+        let last_residual = if last_residual_bits == 0 {
+            None
+        } else {
+            let r = f64::from_bits(last_residual_bits);
+            if r.is_finite() && r >= 0.0 { Some(r) } else { None }
+        };
         predict_warm_start_beta_ift_from_cache(
             cache,
             self.canonical_penalties.as_ref(),
             new_rho,
             self.p,
+            last_residual,
         )
     }
 
@@ -2921,6 +2932,18 @@ impl<'a> RemlState<'a> {
                                 pred_norm,
                                 pirls_result.iteration,
                             );
+                            // Feed the residual back into the adaptive
+                            // |Δρ| cap so the next predict call reflects
+                            // the empirical faithfulness of the linearization
+                            // at this surface's scale. Only stash finite
+                            // non-negative values; anything else (NaN
+                            // from divide-by-zero, e.g. trivial β) leaves
+                            // the cache untouched so the predictor falls
+                            // back to its default 2.0 cap.
+                            if residual.is_finite() && residual >= 0.0 {
+                                self.last_ift_prediction_residual
+                                    .store(residual.to_bits(), Ordering::Relaxed);
+                            }
                         }
                     }
                     self.updatewarm_start_from(pirls_result.as_ref());
@@ -3035,6 +3058,12 @@ impl<'a> RemlState<'a> {
                     // right damping for the next call; reset the LM
                     // hint to "no signal" so the next solve cold-starts.
                     self.last_pirls_lm_lambda.store(0, Ordering::Relaxed);
+                    // A failed solve also invalidates the IFT residual
+                    // signal — there's no meaningful "predicted vs
+                    // converged" datum to feed back. Reset so the next
+                    // predict call uses the default 2.0 cap.
+                    self.last_ift_prediction_residual
+                        .store(0, Ordering::Relaxed);
                 }
                 Err(EstimationError::PirlsDidNotConverge {
                     max_iterations: pirls_result.iteration,
@@ -3045,13 +3074,57 @@ impl<'a> RemlState<'a> {
     }
 }
 
-/// Maximum |Δρ_k| beyond which the IFT linear predictor is rejected.
+/// Default cap on |Δρ_k| beyond which the IFT linear predictor rejects.
 /// Δρ = log(λ_new / λ_old); 2.0 corresponds to a 7.4× change in λ along
 /// any single penalty direction — well outside the regime where the local
-/// first-order Jacobian dβ/dρ is faithful. At larger steps the inner
-/// PIRLS Newton handles the move better starting from the cached β
-/// directly than from a wildly extrapolated point.
-const IFT_WARM_START_MAX_DRHO: f64 = 2.0;
+/// first-order Jacobian dβ/dρ is faithful. The cap is now ADAPTIVE: see
+/// `adaptive_ift_max_drho` for the empirical-quality-driven loosening /
+/// tightening policy. This default is used when no IFT-quality history
+/// is available yet (the first PIRLS solve at a fresh surface).
+const IFT_WARM_START_DEFAULT_MAX_DRHO: f64 = 2.0;
+
+/// Adaptive |Δρ| cap for the IFT predictor, driven by the residual of
+/// the previous IFT prediction (see `last_ift_prediction_residual`).
+///
+/// `last_residual = ‖β_converged − β_predicted‖ / ‖β_converged‖`:
+/// - `r < 0.01` → linearization was excellent; allow Δρ up to **4.0**
+///   (54× λ-step). At this regime the local Jacobian is faithful and
+///   tightening to 2.0 leaves performance on the table at biobank Δρ
+///   magnitudes (where outer optimizers commonly take ρ-jumps of ~1).
+/// - `0.01 ≤ r < 0.05` → very good; modest expansion to **3.0**.
+/// - `0.05 ≤ r < 0.20` → ok; default **2.0** (the original constant).
+/// - `0.20 ≤ r < 0.50` → marginal; tighten to **1.0** (2.7× λ-step).
+/// - `r ≥ 0.50` → poor; tighten to **0.5** (1.6× λ-step). The IFT
+///   prediction is not paying off at biobank Δρ; fall back to flat
+///   warm-start (β_cur) for any non-trivial outer step.
+/// - `None` → no signal yet (first PIRLS solve at this surface) → default 2.0.
+///
+/// The thresholds are deliberately one-step-per-decade-of-residual so
+/// the policy remains stable under noise; small fluctuations in
+/// `last_residual` don't whipsaw the cap.
+fn adaptive_ift_max_drho(last_residual: Option<f64>) -> f64 {
+    let Some(r) = last_residual else {
+        return IFT_WARM_START_DEFAULT_MAX_DRHO;
+    };
+    // Defensive: NaN or negative residuals indicate corrupted state
+    // (bit-pattern unpacking from the atomic encountered an unwritten
+    // slot, or norm-ratio division produced a non-physical value).
+    // Fall back to the documented default rather than committing to
+    // a tier based on garbage. Note: INFINITY is not rejected here —
+    // it represents a catastrophic prediction (predicted_norm finite
+    // but ‖Δβ‖ overflowed), so falling through to the catch-all 0.5
+    // (tightest cap) is the right policy.
+    if r.is_nan() || r < 0.0 {
+        return IFT_WARM_START_DEFAULT_MAX_DRHO;
+    }
+    match r {
+        r if r < 0.01 => 4.0,
+        r if r < 0.05 => 3.0,
+        r if r < 0.20 => 2.0,
+        r if r < 0.50 => 1.0,
+        _ => 0.5,
+    }
+}
 
 /// Below this magnitude in any Δρ_k, the per-component IFT contribution is
 /// numerically negligible and skipped (saves one back-solve per inactive
@@ -3079,6 +3152,7 @@ pub(crate) fn predict_warm_start_beta_ift_from_cache(
     canonical_penalties: &[crate::construction::CanonicalPenalty],
     new_rho: &Array1<f64>,
     p: usize,
+    last_ift_residual: Option<f64>,
 ) -> Option<Coefficients> {
     // Cache populated but ρ not yet stamped (happens between
     // updatewarm_start_from and record_warm_start_rho on the first solve).
@@ -3110,7 +3184,8 @@ pub(crate) fn predict_warm_start_beta_ift_from_cache(
             d
         })
         .collect();
-    if !max_abs_drho.is_finite() || max_abs_drho > IFT_WARM_START_MAX_DRHO {
+    let max_drho_cap = adaptive_ift_max_drho(last_ift_residual);
+    if !max_abs_drho.is_finite() || max_abs_drho > max_drho_cap {
         return None;
     }
 
@@ -5885,6 +5960,7 @@ mod ift_warm_start_tests {
             &canonical,
             &new_rho,
             p,
+            None,
         )
         .expect("IFT predictor should accept small Δρ");
 
@@ -6010,6 +6086,7 @@ mod ift_warm_start_tests {
             &canonical,
             &new_rho,
             p,
+            None,
         )
         .expect("tfd predict");
         let predicted_orig = predict_warm_start_beta_ift_from_cache(
@@ -6017,6 +6094,7 @@ mod ift_warm_start_tests {
             &canonical,
             &new_rho,
             p,
+            None,
         )
         .expect("orig predict");
 
@@ -6052,14 +6130,37 @@ mod ift_warm_start_tests {
             qs: Array2::eye(p),
             frame_was_original: true,
         };
-        // |Δρ| = 3 > IFT_WARM_START_MAX_DRHO = 2.0 → reject.
+        // |Δρ| = 3 > IFT_WARM_START_DEFAULT_MAX_DRHO = 2.0 → reject under
+        // default cap (no quality history).
         let new_rho = ndarray::array![3.0_f64];
         let predicted =
-            predict_warm_start_beta_ift_from_cache(&cache, &canonical, &new_rho, p);
+            predict_warm_start_beta_ift_from_cache(&cache, &canonical, &new_rho, p, None);
         assert!(
             predicted.is_none(),
-            "predictor should reject Δρ above cap, got {:?}",
+            "predictor should reject Δρ above default cap, got {:?}",
             predicted
+        );
+        // With excellent prior quality (residual=0.005) the adaptive cap
+        // expands to 4.0, so |Δρ|=3 is now ACCEPTED.
+        let predicted_good_history = predict_warm_start_beta_ift_from_cache(
+            &cache,
+            &canonical,
+            &new_rho,
+            p,
+            Some(0.005),
+        );
+        assert!(
+            predicted_good_history.is_some(),
+            "predictor should accept Δρ=3 under expanded cap (good prior quality)",
+        );
+        // With poor prior quality (residual=0.6) the adaptive cap
+        // tightens to 0.5, so even modest |Δρ|=1 is REJECTED.
+        let modest_rho = ndarray::array![1.0_f64];
+        let predicted_bad_history =
+            predict_warm_start_beta_ift_from_cache(&cache, &canonical, &modest_rho, p, Some(0.6));
+        assert!(
+            predicted_bad_history.is_none(),
+            "predictor should reject Δρ=1 under tightened cap (poor prior quality)",
         );
     }
 
@@ -6078,7 +6179,44 @@ mod ift_warm_start_tests {
         };
         let new_rho = ndarray::array![0.1_f64];
         let predicted =
-            predict_warm_start_beta_ift_from_cache(&cache, &[], &new_rho, p);
+            predict_warm_start_beta_ift_from_cache(&cache, &[], &new_rho, p, None);
         assert!(predicted.is_none());
+    }
+
+    /// `adaptive_ift_max_drho` must follow the documented piecewise
+    /// policy: small residual → looser cap; large residual → tighter
+    /// cap; non-finite or missing residual → default 2.0.
+    #[test]
+    fn adaptive_ift_max_drho_follows_quality_tiers() {
+        use super::adaptive_ift_max_drho;
+        // No history (first solve at this surface) → default 2.0.
+        assert_eq!(adaptive_ift_max_drho(None), 2.0);
+        // Pathological residuals (NaN, negative) → default 2.0.
+        assert_eq!(adaptive_ift_max_drho(Some(f64::NAN)), 2.0);
+        assert_eq!(adaptive_ift_max_drho(Some(-1.0)), 2.0);
+        assert_eq!(adaptive_ift_max_drho(Some(f64::INFINITY)), 0.5);
+        // Tier boundaries.
+        assert_eq!(adaptive_ift_max_drho(Some(0.0)), 4.0);
+        assert_eq!(adaptive_ift_max_drho(Some(0.005)), 4.0);
+        assert_eq!(adaptive_ift_max_drho(Some(0.01)), 3.0);
+        assert_eq!(adaptive_ift_max_drho(Some(0.04)), 3.0);
+        assert_eq!(adaptive_ift_max_drho(Some(0.05)), 2.0);
+        assert_eq!(adaptive_ift_max_drho(Some(0.10)), 2.0);
+        assert_eq!(adaptive_ift_max_drho(Some(0.20)), 1.0);
+        assert_eq!(adaptive_ift_max_drho(Some(0.30)), 1.0);
+        assert_eq!(adaptive_ift_max_drho(Some(0.50)), 0.5);
+        assert_eq!(adaptive_ift_max_drho(Some(1.5)), 0.5);
+        // Policy is monotone non-increasing in residual.
+        let residuals = [0.001, 0.02, 0.10, 0.30, 0.80];
+        let caps: Vec<f64> = residuals
+            .iter()
+            .map(|&r| adaptive_ift_max_drho(Some(r)))
+            .collect();
+        for w in caps.windows(2) {
+            assert!(
+                w[0] >= w[1],
+                "adaptive cap is not monotone non-increasing in residual: {caps:?}"
+            );
+        }
     }
 }
