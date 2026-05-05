@@ -1815,6 +1815,14 @@ struct OuterSecondOrderBridge<'a> {
     /// tolerance (Wolfe / trust-region acceptance both assume constant
     /// cost noise within a bracket).
     outer_inner_cap: Option<Arc<AtomicUsize>>,
+    /// First observed `‖g‖` from `eval_grad`/`eval_hessian`. Used by the
+    /// schedule's gradient-ratio gate so the cap lifts when the optimizer
+    /// is approaching convergence, not just when iter count says so.
+    g_norm_initial: Option<f64>,
+    /// `‖g‖` from the most recent eval. See `OuterFirstOrderBridge` for
+    /// the staleness rationale: monotone-decreasing g_norm means the cap
+    /// is conservatively LARGER than truly needed, never smaller.
+    last_g_norm: Option<f64>,
 }
 
 impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
@@ -1839,14 +1847,21 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
             // divisor the schedule would lift to full inner-cap at ARC iter
             // 3 instead of iter 6.
             let arc_iter = self.eval_count / 2;
-            // ARC bridge currently doesn't track g_norm_initial; pass None
-            // so the schedule falls back to its iter-count tier path.
-            let cap = first_order_inner_cap_schedule(arc_iter, None);
+            let g_ratio = match (self.last_g_norm, self.g_norm_initial) {
+                (Some(g), Some(g0)) if g0 > 0.0 => Some(g / g0),
+                _ => None,
+            };
+            let cap = first_order_inner_cap_schedule(arc_iter, g_ratio);
             let prev = cap_arc.swap(cap, Ordering::Relaxed);
             if prev != cap {
+                let ratio_str = match g_ratio {
+                    Some(r) => format!("{:.3e}", r),
+                    None => "n/a".to_string(),
+                };
                 log::info!(
-                    "[OUTER schedule] inner-PIRLS cap transition (ARC bridge) arc_iter={} prev={} new={} ({})",
+                    "[OUTER schedule] inner-PIRLS cap transition (ARC bridge) arc_iter={} g_ratio={} prev={} new={} ({})",
                     arc_iter,
+                    ratio_str,
                     prev,
                     cap,
                     if cap == 0 { "uncapped" } else { "capped" }
@@ -1865,6 +1880,12 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
         let eval = finite_outer_first_order_eval_or_error("outer eval failed", self.layout, eval)?;
         self.eval_count += 1;
         let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if self.g_norm_initial.is_none() && g_norm.is_finite() && g_norm > 0.0 {
+            self.g_norm_initial = Some(g_norm);
+        }
+        if g_norm.is_finite() {
+            self.last_g_norm = Some(g_norm);
+        }
         log::info!(
             "[STAGE] outer eval end order=ValueAndGradient elapsed={:.3}s cost={:.6e} |g|={:.3e}",
             stage_start.elapsed().as_secs_f64(),
@@ -1888,20 +1909,22 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_hessian(&mut self, x: &Array1<f64>) -> Result<SecondOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
         if let Some(cap_arc) = self.outer_inner_cap.as_ref() {
-            // The ARC bridge increments `eval_count` in BOTH `eval_grad` and
-            // `eval_hessian`. ARC calls both per outer iter, so `eval_count
-            // / 2` is the correct iter index for the schedule. Without this
-            // divisor the schedule would lift to full inner-cap at ARC iter
-            // 3 instead of iter 6.
             let arc_iter = self.eval_count / 2;
-            // ARC bridge currently doesn't track g_norm_initial; pass None
-            // so the schedule falls back to its iter-count tier path.
-            let cap = first_order_inner_cap_schedule(arc_iter, None);
+            let g_ratio = match (self.last_g_norm, self.g_norm_initial) {
+                (Some(g), Some(g0)) if g0 > 0.0 => Some(g / g0),
+                _ => None,
+            };
+            let cap = first_order_inner_cap_schedule(arc_iter, g_ratio);
             let prev = cap_arc.swap(cap, Ordering::Relaxed);
             if prev != cap {
+                let ratio_str = match g_ratio {
+                    Some(r) => format!("{:.3e}", r),
+                    None => "n/a".to_string(),
+                };
                 log::info!(
-                    "[OUTER schedule] inner-PIRLS cap transition (ARC bridge) arc_iter={} prev={} new={} ({})",
+                    "[OUTER schedule] inner-PIRLS cap transition (ARC bridge) arc_iter={} g_ratio={} prev={} new={} ({})",
                     arc_iter,
+                    ratio_str,
                     prev,
                     cap,
                     if cap == 0 { "uncapped" } else { "capped" }
@@ -1920,6 +1943,12 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
         let eval = finite_outer_eval_or_error("outer eval failed", self.layout, eval)?;
         self.eval_count += 1;
         let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if self.g_norm_initial.is_none() && g_norm.is_finite() && g_norm > 0.0 {
+            self.g_norm_initial = Some(g_norm);
+        }
+        if g_norm.is_finite() {
+            self.last_g_norm = Some(g_norm);
+        }
         log::info!(
             "[STAGE] outer eval end order=ValueGradientHessian elapsed={:.3}s cost={:.6e} |g|={:.3e}",
             stage_start.elapsed().as_secs_f64(),
@@ -4323,6 +4352,8 @@ fn run_outer_with_plan(
                         materialize_operator_max_dim: OUTER_HVP_MATERIALIZE_MAX_DIM,
                         eval_count: 0,
                         outer_inner_cap: config.outer_inner_cap.clone(),
+                        g_norm_initial: None,
+                        last_g_norm: None,
                     };
 
                     let (lo, hi) = &bounds_template;
@@ -5671,6 +5702,8 @@ mod tests {
             materialize_operator_max_dim: OUTER_HVP_MATERIALIZE_MAX_DIM,
             eval_count: 0,
             outer_inner_cap: None,
+            g_norm_initial: None,
+            last_g_norm: None,
         };
         let grad_sample =
             FirstOrderObjective::eval_grad(&mut bridge, &array![1.0]).expect("grad eval");
