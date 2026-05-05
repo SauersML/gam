@@ -2346,7 +2346,10 @@ impl<'a> RemlState<'a> {
     }
 
     /// Predict β at `new_rho` via the implicit-function-theorem first-order
-    /// expansion `β_predict = β_cur − Σ_k Δρ_k · H_pen^{-1} · (e^{ρ_cur_k} S_k β_cur)`.
+    /// expansion `β_predict = β_cur − Σ_k Δρ_k · H_pen^{-1} · (e^{ρ_cur_k} S_k β_cur)`,
+    /// surfacing the outcome (Predicted vs Noop) so callers can map directly
+    /// onto `WarmStartPredictionSource` without re-deriving noop-ness via an
+    /// O(p) array comparison against the cached β.
     ///
     /// Returns `None` (caller falls back to tangent-line / flat warm-start) when:
     /// * the IFT cache is empty (no prior converged solve, or one was invalidated),
@@ -2364,10 +2367,10 @@ impl<'a> RemlState<'a> {
     /// the dense Cholesky is O(p³)/3 — multiple seconds per refactor —
     /// so caching saves real wall time across the typical 5-10 IFT
     /// predict calls per outer fit.
-    pub(crate) fn predict_warm_start_beta_ift(
+    pub(crate) fn predict_warm_start_beta_ift_with_outcome(
         &self,
         new_rho: &Array1<f64>,
-    ) -> Option<Coefficients> {
+    ) -> Option<(Coefficients, IftPredictionOutcome)> {
         if !self.warm_start_enabled.load(Ordering::Relaxed) {
             return None;
         }
@@ -2419,13 +2422,13 @@ impl<'a> RemlState<'a> {
                 }
             }
         };
-        predict_warm_start_beta_ift_with_factor(
+        predict_warm_start_beta_ift_inner_with_outcome(
             cache,
             self.canonical_penalties.as_ref(),
             new_rho,
             self.p,
             last_residual,
-            factor_arc.as_ref(),
+            Some(factor_arc.as_ref()),
         )
     }
 
@@ -2479,34 +2482,18 @@ impl<'a> RemlState<'a> {
         // Source disambiguation: IFT returns Some(β_cur) on noop (all
         // Δρ_k below the per-component eps floor). The tangent-line
         // path makes the same distinction explicit by tagging Flat
-        // (commit 1b77588b). Mirror that here: detect the noop by
-        // comparing predicted to the IFT cache's β_original; if equal,
-        // tag Flat. The downstream [IFT-QUALITY] block already
-        // suppresses on the same condition (commit 52372fd5), so the
-        // observable behavior is unchanged — but the source tag now
-        // accurately reflects "this is a flat/identity warm-start"
-        // rather than mislabeling it as a real IFT prediction.
-        if let Some(predicted) = self.predict_warm_start_beta_ift(new_rho) {
+        // (commit 1b77588b). The IFT inner predictor exposes the
+        // outcome directly via `predict_warm_start_beta_ift_with_outcome`,
+        // eliminating the O(p) array-comparison-against-cached-β that
+        // the prior implementation needed to re-derive noop-ness here.
+        // Map outcome → source enum without further work.
+        if let Some((predicted, outcome)) =
+            self.predict_warm_start_beta_ift_with_outcome(new_rho)
+        {
             log::debug!("[warm-start] IFT prediction accepted");
-            let was_noop = self
-                .ift_warm_start_cache
-                .read()
-                .ok()
-                .and_then(|guard| {
-                    guard.as_ref().map(|c| {
-                        predicted.0.len() == c.beta_original.len()
-                            && predicted
-                                .0
-                                .iter()
-                                .zip(c.beta_original.iter())
-                                .all(|(a, b)| a == b)
-                    })
-                })
-                .unwrap_or(false);
-            let source = if was_noop {
-                WarmStartPredictionSource::Flat
-            } else {
-                WarmStartPredictionSource::Ift
+            let source = match outcome {
+                IftPredictionOutcome::Predicted => WarmStartPredictionSource::Ift,
+                IftPredictionOutcome::Noop => WarmStartPredictionSource::Flat,
             };
             return Some((predicted, source));
         }
@@ -3599,6 +3586,24 @@ fn adaptive_tangent_alpha_cap(last_residual: Option<f64>) -> f64 {
     }
 }
 
+/// What the IFT predictor's inner computation actually did with the
+/// β it returned. Surfaced by the inner predictor so callers don't
+/// need to re-derive noop-ness via O(p) array comparison against
+/// the cached β. Production callers map this onto the higher-level
+/// `WarmStartPredictionSource` enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IftPredictionOutcome {
+    /// The predictor computed a real Δβ (`any_active=true`) and the
+    /// returned Coefficients differs from the cached β.
+    Predicted,
+    /// All Δρ_k were below the per-component eps floor, so the
+    /// predictor returned the cached β unchanged. The
+    /// [IFT-NOOP] marker has already been emitted at the inner
+    /// predictor's noop branch; callers should NOT re-emit a
+    /// quality probe on the returned β.
+    Noop,
+}
+
 /// Tag identifying which branch of the warm-start linear-predictor
 /// stack actually produced the β returned by
 /// `predict_warm_start_beta_with_source`. Used by the caller in
@@ -3690,9 +3695,12 @@ pub(crate) fn predict_warm_start_beta_ift_from_cache(
 
 /// Variant taking a pre-built `&dyn FactorizedSystem` so the caller can
 /// reuse a cached Cholesky factor across successive predict calls. See
-/// `RemlState::predict_warm_start_beta_ift` for the cache invalidation
-/// invariants. When `factor_override` is `None`, the function factorizes
-/// inline (same behavior as `predict_warm_start_beta_ift_from_cache`).
+/// `RemlState::predict_warm_start_beta_ift_with_outcome` for the cache
+/// invalidation invariants. Test-only after the production wrapper was
+/// refactored to call `_inner_with_outcome` directly; retained because
+/// the negative-test at line ~6911 still verifies the factor argument
+/// is actually consumed (vs silently ignored).
+#[cfg(test)]
 pub(crate) fn predict_warm_start_beta_ift_with_factor(
     cache: &super::IftWarmStartCache,
     canonical_penalties: &[crate::construction::CanonicalPenalty],
@@ -3719,6 +3727,25 @@ fn predict_warm_start_beta_ift_inner(
     last_ift_residual: Option<f64>,
     factor_override: Option<&dyn crate::linalg::matrix::FactorizedSystem>,
 ) -> Option<Coefficients> {
+    predict_warm_start_beta_ift_inner_with_outcome(
+        cache,
+        canonical_penalties,
+        new_rho,
+        p,
+        last_ift_residual,
+        factor_override,
+    )
+    .map(|(coef, _outcome)| coef)
+}
+
+fn predict_warm_start_beta_ift_inner_with_outcome(
+    cache: &super::IftWarmStartCache,
+    canonical_penalties: &[crate::construction::CanonicalPenalty],
+    new_rho: &Array1<f64>,
+    p: usize,
+    last_ift_residual: Option<f64>,
+    factor_override: Option<&dyn crate::linalg::matrix::FactorizedSystem>,
+) -> Option<(Coefficients, IftPredictionOutcome)> {
     // Cache populated but ρ not yet stamped (happens between
     // updatewarm_start_from and record_warm_start_rho on the first solve).
     // This is the *expected* race window during normal operation — silent
@@ -3868,7 +3895,7 @@ fn predict_warm_start_beta_ift_inner(
             max_abs_drho,
             k,
         );
-        return Some(Coefficients::new(beta_cur.clone()));
+        return Some((Coefficients::new(beta_cur.clone()), IftPredictionOutcome::Noop));
     }
 
     if !rhs_original.iter().all(|v| v.is_finite()) {
@@ -3965,7 +3992,7 @@ fn predict_warm_start_beta_ift_inner(
         rhs_in_h_basis.dot(&rhs_in_h_basis).sqrt(),
         solution_original.dot(&solution_original).sqrt(),
     );
-    Some(Coefficients::new(predicted))
+    Some((Coefficients::new(predicted), IftPredictionOutcome::Predicted))
 }
 
 impl<'a> RemlState<'a> {
