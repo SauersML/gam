@@ -1416,6 +1416,11 @@ fn run_fit_bernoulli_marginal_slope(
         opts
     };
     progress.set_stage("fit", "optimizing bernoulli marginal-slope model");
+    let phase_start = std::time::Instant::now();
+    log::info!(
+        "[PHASE] bernoulli-margslope fit start n={}",
+        ds.values.nrows()
+    );
     let solved = match fit_model(FitRequest::BernoulliMarginalSlope(
         BernoulliMarginalSlopeFitRequest {
             data: ds.values.view(),
@@ -1438,7 +1443,13 @@ fn run_fit_bernoulli_marginal_slope(
             policy: gam::resource::ResourcePolicy::default_library(),
         },
     )) {
-        Ok(FitResult::BernoulliMarginalSlope(result)) => result,
+        Ok(FitResult::BernoulliMarginalSlope(result)) => {
+            log::info!(
+                "[PHASE] bernoulli-margslope fit end elapsed={:.3}s",
+                phase_start.elapsed().as_secs_f64()
+            );
+            result
+        }
         Ok(_) => {
             emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
             return Err(
@@ -4525,6 +4536,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             None,
         )?;
         progress.set_stage("fit", "running survival marginal-slope optimization");
+        let phase_start = std::time::Instant::now();
+        log::info!(
+            "[PHASE] survival-margslope fit start n={}",
+            ds.values.nrows()
+        );
         let fit = match fit_model(FitRequest::SurvivalMarginalSlope(
             SurvivalMarginalSlopeFitRequest {
                 data: ds.values.view(),
@@ -4533,7 +4549,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 kappa_options,
             },
         )) {
-            Ok(FitResult::SurvivalMarginalSlope(result)) => result,
+            Ok(FitResult::SurvivalMarginalSlope(result)) => {
+                log::info!(
+                    "[PHASE] survival-margslope fit end elapsed={:.3}s",
+                    phase_start.elapsed().as_secs_f64()
+                );
+                result
+            }
             Ok(_) => {
                 return Err(
                     "internal survival marginal-slope workflow returned the wrong result variant"
