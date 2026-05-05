@@ -741,6 +741,115 @@ class MarkerPatternTests(unittest.TestCase):
         self.assertEqual(m[0][0], "hit max_iter")
         self.assertIn(m[0][1], ("", None))
 
+    def test_outer_hessian_route_pattern_covers_all_reasons(self) -> None:
+        # The routing decision is the entry point for outer Hessian
+        # cost analysis. Lock the contract that all 6 reasons + the 2
+        # choice values + the `irrelevant` token (family_op branch)
+        # parse correctly. A future commit that adds a new reason
+        # without updating this regex would silently disappear it
+        # from the runner's `outer_h_dom_reason` aggregation.
+        cases = [
+            # kernel-based routing — `scale_prefers_operator=true|false`
+            (
+                "[OUTER hessian-route] choice=operator reason=large_k "
+                "n=320000 p=128 k=32 callback_kernel=false subspace_trace=false "
+                "scale_prefers_operator=true",
+                "operator", "large_k",
+            ),
+            (
+                "[OUTER hessian-route] choice=operator reason=large_p "
+                "n=20000 p=512 k=8 callback_kernel=false subspace_trace=false "
+                "scale_prefers_operator=true",
+                "operator", "large_p",
+            ),
+            (
+                "[OUTER hessian-route] choice=dense reason=below_crossover "
+                "n=1000 p=20 k=4 callback_kernel=false subspace_trace=false "
+                "scale_prefers_operator=false",
+                "dense", "below_crossover",
+            ),
+            (
+                "[OUTER hessian-route] choice=dense reason=subspace_forced_dense "
+                "n=320000 p=101 k=32 callback_kernel=false subspace_trace=true "
+                "scale_prefers_operator=true",
+                "dense", "subspace_forced_dense",
+            ),
+            (
+                "[OUTER hessian-route] choice=dense reason=kernel_absent "
+                "n=1000 p=10 k=2 callback_kernel=false subspace_trace=false "
+                "scale_prefers_operator=false",
+                "dense", "kernel_absent",
+            ),
+            # family-op branch — `scale_prefers_operator=irrelevant`
+            (
+                "[OUTER hessian-route] choice=operator reason=family_op "
+                "n=320000 p=128 k=23 callback_kernel=false subspace_trace=false "
+                "scale_prefers_operator=irrelevant",
+                "operator", "family_op",
+            ),
+        ]
+        for line, expected_choice, expected_reason in cases:
+            matches = _RUNNER._OUTER_HESSIAN_ROUTE_PATTERN.findall(line)
+            self.assertEqual(
+                len(matches),
+                1,
+                f"reason {expected_reason!r} did not parse: {line}",
+            )
+            self.assertEqual(matches[0][0], expected_choice)
+            self.assertEqual(matches[0][1], expected_reason)
+
+    def test_outer_hessian_elapsed_pattern_extracts_timing(self) -> None:
+        # The elapsed marker is paired with the route marker; together
+        # they let the runner build `outer_h_total` and
+        # `outer_h_subspace_total`. Lock both kernel-based and family-op
+        # variants.
+        cases = [
+            (
+                "[OUTER hessian-elapsed] choice=dense reason=subspace_forced_dense "
+                "n=320000 p=101 k=32 elapsed=12.347s",
+                "dense", "subspace_forced_dense", "12.347",
+            ),
+            (
+                "[OUTER hessian-elapsed] choice=operator reason=family_op "
+                "n=320000 p=128 k=23 elapsed=0.123s",
+                "operator", "family_op", "0.123",
+            ),
+        ]
+        for line, expected_choice, expected_reason, expected_elapsed in cases:
+            matches = _RUNNER._OUTER_HESSIAN_ELAPSED_PATTERN.findall(line)
+            self.assertEqual(len(matches), 1)
+            choice, reason, _n, _p, _k, elapsed = matches[0]
+            self.assertEqual(choice, expected_choice)
+            self.assertEqual(reason, expected_reason)
+            self.assertEqual(elapsed, expected_elapsed)
+
+    def test_pirls_lm_trajectory_pattern_handles_finite_and_nan_rho(self) -> None:
+        # The trajectory pattern captures `accept_rho` as a numeric or
+        # the literal `NaN` string (rejection-exhausted iters). The
+        # runner aggregator filters NaN via `r == r`; the regex must
+        # accept BOTH so the iter is captured at all (otherwise
+        # rejection-exhausted iters would be invisible to the
+        # aggregator's `lm_attempts_max` distribution too).
+        finite_line = (
+            "[PIRLS lm-trajectory] iter=  3 start_lambda=1.000e-6 "
+            "final_lambda=3.333e-7 log10_ratio=-0.477 accept_rho=0.985 attempts=1"
+        )
+        nan_line = (
+            "[PIRLS lm-trajectory] iter= 10 start_lambda=1.000e-3 "
+            "final_lambda=2.000e-3 log10_ratio=0.301 accept_rho=NaN attempts=8"
+        )
+        finite_matches = _RUNNER._PIRLS_LM_TRAJECTORY_PATTERN.findall(finite_line)
+        self.assertEqual(len(finite_matches), 1)
+        # Tuple layout: (iter, start, final, ratio, rho, attempts).
+        _iter, _start, _final, ratio, rho, attempts = finite_matches[0]
+        self.assertEqual(ratio, "-0.477")
+        self.assertEqual(rho, "0.985")
+        self.assertEqual(attempts, "1")
+        nan_matches = _RUNNER._PIRLS_LM_TRAJECTORY_PATTERN.findall(nan_line)
+        self.assertEqual(len(nan_matches), 1)
+        self.assertEqual(nan_matches[0][4], "NaN")
+        self.assertEqual(nan_matches[0][5], "8")
+
     def test_kappa_phase_patterns_parse_per_call_and_summary(self) -> None:
         per_call_lines = [
             "[KAPPA-PHASE] phase=cost call=12 theta_norm=3.4500e+00 log_kappa_norm=1.2000e+00 elapsed_s=0.4321",
