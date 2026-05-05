@@ -2251,7 +2251,7 @@ where
         reml_state
             .outer_inner_cap
             .store(0, std::sync::atomic::Ordering::Relaxed);
-        let _ = reml_state.compute_cost(&outer_result.rho.slice(s![..k]).to_owned());
+        let _ = reml_state.compute_cost(&outer_result.rho);
         let final_rho = outer_result.rho.slice(s![..k]).to_owned();
         let final_mix_state = if use_mixture {
             let final_mix_rho = outer_result.rho.slice(s![k..(k + mixture_dim)]).to_owned();
