@@ -2187,11 +2187,41 @@ def _emit_phase_summary(
     n_cache_total = len(ift_cache_hits) + len(ift_cache_misses)
     if n_cache_total > 0:
         hit_rate = len(ift_cache_hits) / n_cache_total
-        miss_secs_total = sum(float(m[1]) for m in ift_cache_misses)
+        miss_secs_list = [float(m[1]) for m in ift_cache_misses]
+        miss_secs_total = sum(miss_secs_list)
+        # Per-miss Cholesky cost distribution. A single slow Cholesky
+        # (one outer iter on a wide / ill-conditioned H) might dominate
+        # `miss_secs_total`; p50 / max distinguishes that case from a
+        # uniformly-slow miss workload, where every cache miss pays a
+        # substantial Cholesky. The two regimes have different fixes:
+        # uniform slowness needs faster factorization (or fewer
+        # invalidations); single-spike slowness needs investigation of
+        # the offending iter's Hessian.
+        miss_secs_p50 = 0.0
+        miss_secs_max = 0.0
+        if miss_secs_list:
+            miss_sorted = sorted(miss_secs_list)
+            miss_secs_p50 = miss_sorted[len(miss_sorted) // 2]
+            miss_secs_max = miss_sorted[-1]
+        # Factor-paid-then-rejected count: predictions that passed the
+        # wrapper's early short-circuit (noop and large_drho gates from
+        # commits 8395848d and 28bfa0e1) but then failed deeper in the
+        # inner predictor (rho/beta dim mismatch, non_finite_rhs,
+        # non_finite_predicted, or post-factor `factorize_failed`).
+        # `ift_cache_n - n_accepts` gives this directly: every factor
+        # lookup either accepted (counted in `[IFT-QUALITY]` →
+        # n_quality) or rejected after the lookup. A non-zero value
+        # here represents avoidable Cholesky cost that the current
+        # early short-circuits don't cover; large values would justify
+        # extending the short-circuit further.
+        factor_paid_rejects = max(0, n_cache_total - len(ift_quality_matches))
         parts.append(
             f"ift_cache_n={n_cache_total} "
             f"ift_cache_hit_rate={hit_rate:.2f} "
-            f"ift_cache_miss_secs={miss_secs_total:.2f}"
+            f"ift_cache_miss_secs={miss_secs_total:.2f} "
+            f"ift_cache_miss_p50={miss_secs_p50:.2f}s "
+            f"ift_cache_miss_max={miss_secs_max:.2f}s "
+            f"ift_cache_paid_rejects={factor_paid_rejects}"
         )
     # As of the runtime change accompanying this commit, [IFT-QUALITY]
     # is suppressed on noop calls (predictor returned β_cur unchanged
