@@ -1906,6 +1906,7 @@ where
                 last_iters: Arc::clone(&reml_state.last_inner_iters),
                 last_converged: Arc::clone(&reml_state.last_inner_converged),
                 ift_residual: Arc::clone(&reml_state.last_ift_prediction_residual),
+                accept_rho: Arc::clone(&reml_state.last_pirls_accept_rho),
             })
             .with_rho_bound(crate::estimate::RHO_BOUND);
         let problem = if let Some(ref h) = heuristic_lambdas {
@@ -2089,6 +2090,7 @@ where
                 last_iters: Arc::clone(&reml_state.last_inner_iters),
                 last_converged: Arc::clone(&reml_state.last_inner_converged),
                 ift_residual: Arc::clone(&reml_state.last_ift_prediction_residual),
+                accept_rho: Arc::clone(&reml_state.last_pirls_accept_rho),
             })
             .with_rho_bound(crate::estimate::RHO_BOUND);
         let problem = if let Some(h) = heuristic_theta_ref {
