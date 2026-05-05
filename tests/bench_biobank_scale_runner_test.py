@@ -703,6 +703,42 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
             _RUNNER._emit_phase_summary(captured_stderr, "cmd-preview", timed_out=False, rc=0)
         return buf.getvalue()
 
+    def test_warm_start_health_verdict_detail_includes_tangent_stats(self) -> None:
+        # Tangent-line accepts surface in the verdict's detail string
+        # so reviewers see both predictor distributions in one glance.
+        # The verdict tier itself is unchanged (IFT-driven), but
+        # n_tangent_accepts and tangent_p50 should appear when
+        # tangent-line fired at all.
+        v, d = _RUNNER._warm_start_health_verdict(
+            n_accepts=8, n_rejects=2, n_noops=0,
+            residuals=[1e-3] * 8,
+            n_tangent_accepts=2,
+            tangent_p50=0.025,
+        )
+        # IFT signals dominate the tier: 8 accepts, p50 < 0.05 → HEALTHY.
+        self.assertEqual(v, "HEALTHY")
+        self.assertIn("n_tangent_accepts=2", d)
+        self.assertIn("tangent_p50=2.50e-02", d)
+        # Tangent count of 0 suppresses the tangent fields entirely
+        # to keep the common-case detail string clean.
+        v, d = _RUNNER._warm_start_health_verdict(
+            n_accepts=8, n_rejects=0, n_noops=2,
+            residuals=[1e-3] * 8,
+            n_tangent_accepts=0,
+            tangent_p50=None,
+        )
+        self.assertNotIn("tangent_", d)
+        # When tangent fires but no finite p50 is available (e.g.
+        # all NaN residuals), the count appears without a p50 field.
+        v, d = _RUNNER._warm_start_health_verdict(
+            n_accepts=4, n_rejects=2, n_noops=0,
+            residuals=[1e-3] * 4,
+            n_tangent_accepts=2,
+            tangent_p50=None,
+        )
+        self.assertIn("n_tangent_accepts=2", d)
+        self.assertNotIn("tangent_p50=", d)
+
     def test_warm_start_health_verdict_outer_nonfinite_overrides_to_degraded(self) -> None:
         # Even with HEALTHY-looking IFT signals, a single
         # [OUTER non-finite] warning during the fit must override the
@@ -798,6 +834,36 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
             residuals=[0.10, 0.10, 0.10, 0.10, 0.10, 0.10],
         )
         self.assertEqual(v, "MARGINAL", f"detail={d}")
+
+    def test_phase_summary_aggregates_tangent_quality_separately_from_ift(self) -> None:
+        # Pin down that [TANGENT-QUALITY] residuals roll up into a
+        # SEPARATE distribution from [IFT-QUALITY] (commit 99424b47).
+        # Mixing them in one percentile would skew the IFT verdict
+        # whenever the tangent-line fallback fires with a different
+        # residual character.
+        stderr = "\n".join([
+            # 4 IFT accepts at clean residuals
+            "[IFT-QUALITY] residual=1.000e-04 converged_norm=1.000e+00 predicted_norm=1.000e+00 iters=3",
+            "[IFT-QUALITY] residual=2.000e-04 converged_norm=1.000e+00 predicted_norm=1.000e+00 iters=3",
+            "[IFT-QUALITY] residual=5.000e-04 converged_norm=1.000e+00 predicted_norm=1.000e+00 iters=3",
+            "[IFT-QUALITY] residual=1.000e-03 converged_norm=1.000e+00 predicted_norm=1.000e+00 iters=4",
+            # 2 tangent-line accepts at MUCH worse residuals (would
+            # have skewed an unsegregated p50 from ~3e-4 to ~1e-2)
+            "[TANGENT-QUALITY] residual=1.500e-02 converged_norm=1.000e+00 predicted_norm=9.985e-01 iters=5",
+            "[TANGENT-QUALITY] residual=2.500e-02 converged_norm=1.000e+00 predicted_norm=9.975e-01 iters=6",
+            "[PHASE] my-fit fit end elapsed=10.0s",
+        ])
+        out = self._run_summary(stderr)
+        # IFT distribution untouched by tangent-line residuals.
+        self.assertIn("ift_predicts=4", out)
+        # IFT p50 stays small — clean residuals only.
+        self.assertIn("ift_p50=5.00e-04", out)
+        # Tangent-line distribution is its own field.
+        self.assertIn("tangent_quality_predicts=2", out)
+        self.assertIn("tangent_p50=", out)
+        # The bad tangent residuals don't bleed into ift_p50.
+        self.assertNotIn("ift_p50=1.50e-02", out)
+        self.assertNotIn("ift_p50=2.50e-02", out)
 
     def test_phase_summary_aggregates_outer_nonfinite_warnings(self) -> None:
         # `[OUTER non-finite]` is a bug signal — the REML unified

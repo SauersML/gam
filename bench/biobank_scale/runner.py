@@ -1965,16 +1965,32 @@ def _emit_phase_summary(
     # we have IFT-QUALITY data; absent otherwise so a fit that
     # legitimately doesn't exercise the warm-start path doesn't get
     # tagged.
-    if ift_quality_matches or outer_nonfinite:
+    if ift_quality_matches or outer_nonfinite or tangent_quality_matches:
         residuals_for_verdict = [
             float(m[0]) for m in ift_quality_matches if float(m[0]) == float(m[0])
         ]
+        # Tangent-line residuals are tracked separately (commit 99424b47)
+        # but also surface in the verdict's detail string so a reviewer
+        # sees BOTH predictor distributions in one glance. The verdict
+        # tier itself stays IFT-driven (the IFT predictor is the primary
+        # path; tangent-line is only a fallback), so this is purely
+        # informational.
+        tangent_resids = [
+            float(m[0])
+            for m in tangent_quality_matches
+            if float(m[0]) == float(m[0])
+        ]
+        tangent_p50 = (
+            sorted(tangent_resids)[len(tangent_resids) // 2] if tangent_resids else None
+        )
         verdict, detail = _warm_start_health_verdict(
             n_accepts=n_accepts,
             n_rejects=n_rejects,
             n_noops=n_noops,
             residuals=residuals_for_verdict,
             n_outer_nonfinite=len(outer_nonfinite),
+            n_tangent_accepts=len(tangent_resids),
+            tangent_p50=tangent_p50,
         )
         print(
             f"[WARM-START health] cmd='{cmd_preview}' verdict={verdict} {detail}",
@@ -1990,6 +2006,8 @@ def _warm_start_health_verdict(
     n_noops: int,
     residuals: list[float],
     n_outer_nonfinite: int = 0,
+    n_tangent_accepts: int = 0,
+    tangent_p50: float | None = None,
 ) -> tuple[str, str]:
     """Combine the warm-start machinery's quality signals into a single
     verdict. Two axes:
@@ -2042,6 +2060,17 @@ def _warm_start_health_verdict(
         f"n_accepts={n_accepts} n_rejects={n_rejects} n_noops={n_noops} "
         f"n_outer_nonfinite={n_outer_nonfinite}"
     )
+    if n_tangent_accepts > 0:
+        # Append tangent-line stats so reviewers see both predictor
+        # distributions in the verdict's detail string. Tangent-line
+        # is the fallback path; non-zero n_tangent_accepts means the
+        # IFT predictor rejected at least once and the fallback
+        # recovered the prediction. tangent_p50 may be None when
+        # no finite residuals were captured (degenerate case).
+        if tangent_p50 is not None and tangent_p50 == tangent_p50:
+            detail += f" n_tangent_accepts={n_tangent_accepts} tangent_p50={tangent_p50:.2e}"
+        else:
+            detail += f" n_tangent_accepts={n_tangent_accepts}"
     # Override: outer-non-finite signals trump every other axis. Broken
     # geometry invalidates the predictor-faithfulness measurements
     # regardless of how clean the residuals look on their face. In
