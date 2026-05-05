@@ -1563,6 +1563,12 @@ _BFGS_SUMMARY_PATTERN = re.compile(
 _GUARD_PATTERN = re.compile(
     r"\[OUTER guard\]\s+convergence-guard re-eval at converged ρ done.*?elapsed=([\d.]+)s"
 )
+_SCHEDULE_TRANSITION_PATTERN = re.compile(
+    r"\[OUTER schedule\]\s+inner-PIRLS cap transition.*?prev=(\d+)\s+new=(\d+)"
+)
+_BIOBANK_GATE_PATTERN = re.compile(
+    r"\[(?:transformation-normal|gamlss-location-scale|latent-survival|latent-binary|gamlss-binomial-mean-wiggle|survival-marginal-slope|survival-location-scale|bernoulli-marginal-slope)\]\s+declining analytic outer Hessian for n=(\d+)"
+)
 
 
 _PHASE_START_PATTERN = re.compile(r"\[PHASE\]\s+([\w\-]+(?:\([\w\-/]+\))?)\s+(?:fit\s+)?start")
@@ -1596,6 +1602,14 @@ def _emit_phase_summary(
     if guard_runs:
         guard_total = sum(float(secs) for secs in guard_runs)
         parts.append(f"guard_refits={len(guard_runs)} guard_total={guard_total:.1f}s")
+    # Schedule transition count (path #3 firing)
+    schedule_transitions = _SCHEDULE_TRANSITION_PATTERN.findall(captured_stderr)
+    if schedule_transitions:
+        parts.append(f"sched_transitions={len(schedule_transitions)}")
+    # Biobank-scale gate firings (path #2)
+    gate_firings = _BIOBANK_GATE_PATTERN.findall(captured_stderr)
+    if gate_firings:
+        parts.append(f"biobank_gates_fired={len(gate_firings)}")
     suffix = ""
     if pending:
         suffix = f" pending={','.join(pending)}"
