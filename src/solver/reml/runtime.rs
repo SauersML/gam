@@ -2390,6 +2390,45 @@ impl<'a> RemlState<'a> {
         let last_residual_bits = self.last_ift_prediction_residual.load(Ordering::Relaxed);
         let r = f64::from_bits(last_residual_bits);
         let last_residual = if r.is_finite() && r >= 0.0 { Some(r) } else { None };
+        // Early noop detection: when the outer optimizer takes an
+        // effectively-zero ρ-step (every |Δρ_k| below the numerical-
+        // noise floor), the IFT predictor would compute identity. The
+        // inner function detects this and returns Noop, but only AFTER
+        // the factor cache lookup — which on a miss pays a fresh
+        // O(p³)/3 Cholesky (multiple seconds at biobank-scale p).
+        // Skipping the factor lookup on noop saves that work entirely.
+        // The dim-check guards mirror the inner function's so an
+        // ambiguous case (rho-not-stamped, dim mismatch) falls through
+        // and lets the inner function emit its precise rejection
+        // marker, preserving the single-source-of-truth contract.
+        if !cache.rho.is_empty() && cache.rho.len() == new_rho.len() {
+            let mut all_below_eps = true;
+            let mut max_abs_drho = 0.0_f64;
+            for i in 0..cache.rho.len() {
+                let d = new_rho[i] - cache.rho[i];
+                if !d.is_finite() || d.abs() > IFT_WARM_START_DRHO_EPS {
+                    all_below_eps = false;
+                    break;
+                }
+                if d.abs() > max_abs_drho {
+                    max_abs_drho = d.abs();
+                }
+            }
+            if all_below_eps {
+                // Same NOOP marker the inner function would emit, so the
+                // bench runner aggregator's count is preserved across
+                // both the early-out path and the post-factor path.
+                log::info!(
+                    "[IFT-NOOP] reason=all_drho_below_eps max_drho={:.3e} drho_dim={}",
+                    max_abs_drho,
+                    cache.rho.len(),
+                );
+                return Some((
+                    Coefficients::new(cache.beta_original.clone()),
+                    IftPredictionOutcome::Noop,
+                ));
+            }
+        }
         // Get the cached factor or lazily compute it. Holding the
         // ift_warm_start_cache read lock while we acquire the factor's
         // lock is safe: cache invalidation (writer) takes the cache
@@ -7280,6 +7319,52 @@ mod ift_warm_start_tests {
             predicted_bad_history.is_none(),
             "predictor should reject Δρ=1 under tightened cap (poor prior quality)",
         );
+    }
+
+    /// All Δρ below the eps floor (effectively-zero outer step) must
+    /// return Some(β_cur, Noop) — preserving the cached β unchanged.
+    /// Regression-locks the wrapper-side early-noop short-circuit
+    /// (commit shipping with this test) which avoids paying a fresh
+    /// O(p³)/3 Cholesky for an identity prediction. The inner function
+    /// also has its own noop check, so this test exercises the noop
+    /// CONTRACT regardless of which path detects it first.
+    #[test]
+    fn ift_predictor_returns_noop_when_all_drho_below_eps() {
+        use crate::estimate::reml::IftWarmStartCache;
+
+        let p = 3usize;
+        let s1 = Array2::from_shape_vec(
+            (p, p),
+            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        )
+        .unwrap();
+        let cp1 = dense_canonical_from_local(s1, p);
+        let canonical = vec![cp1];
+        let beta_cur = ndarray::array![0.5_f64, -0.3, 1.7];
+        let rho_cur = ndarray::array![0.0_f64];
+        let h_pen = Array2::<f64>::eye(p) * 2.0;
+        let cache = IftWarmStartCache {
+            beta_original: beta_cur.clone(),
+            rho: rho_cur,
+            penalized_hessian_transformed: SymmetricMatrix::Dense(h_pen),
+            qs: Array2::eye(p),
+            frame_was_original: true,
+            lambda_s_beta_blocks: None,
+        };
+        // Δρ = 1e-15 is well below IFT_WARM_START_DRHO_EPS (1e-12);
+        // every component of the new ρ is essentially the cached ρ.
+        let new_rho = ndarray::array![1e-15_f64];
+        let predicted = super::predict_warm_start_beta_ift_from_cache(
+            &cache, &canonical, &new_rho, p, None,
+        )
+        .expect("noop must return Some(β_cur)");
+        for i in 0..p {
+            assert_eq!(
+                predicted.0[i], beta_cur[i],
+                "noop must return cached β bit-equal at idx {i}: got {} vs cached {}",
+                predicted.0[i], beta_cur[i]
+            );
+        }
     }
 
     /// Empty ρ in the cache (the in-between state where
