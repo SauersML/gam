@@ -1564,6 +1564,18 @@ fn finite_efs_eval_or_error(
 struct OuterFirstOrderBridge<'a> {
     obj: &'a mut dyn OuterObjective,
     layout: OuterThetaLayout,
+    /// Outer-aware inner-PIRLS cap atomic. When `Some`, the bridge stores
+    /// a coarsen-then-tighten cap into it on every accepted gradient eval
+    /// (see `first_order_inner_cap_schedule`). The cap is NEVER touched
+    /// in `eval_cost` so line-search probes within an outer iter see a
+    /// stable inner tolerance — Wolfe conditions assume constant cost
+    /// noise within a bracket.
+    outer_inner_cap: Option<Arc<AtomicUsize>>,
+    /// Counts accepted gradient evaluations (one per BFGS outer iter).
+    iter_count: usize,
+    /// First observed `‖g‖` from `eval_grad`. Reserved for a follow-up
+    /// gradient-ratio gate; not yet consumed by the schedule.
+    g_norm_initial: Option<f64>,
 }
 
 impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
@@ -1581,10 +1593,21 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
 impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
+        // Drive the outer-aware inner-PIRLS cap based on the iter count,
+        // BEFORE invoking the inner solve. Cap stays fixed within a single
+        // outer iter (line-search probes go through `eval_cost`, which
+        // never touches the atomic). A cap of 0 means "no cap from this
+        // source"; the inner solver still honors `pirls_max_iterations`
+        // and the screening cap (combined via min).
+        if let Some(cap_arc) = self.outer_inner_cap.as_ref() {
+            let cap = first_order_inner_cap_schedule(self.iter_count);
+            cap_arc.store(cap, Ordering::Relaxed);
+        }
         let stage_start = std::time::Instant::now();
         log::info!(
-            "[STAGE] outer eval start order=ValueAndGradient dim={} (first-order bridge)",
-            x.len()
+            "[STAGE] outer eval start order=ValueAndGradient dim={} (first-order bridge, iter={})",
+            x.len(),
+            self.iter_count
         );
         let eval = self
             .obj
@@ -1592,16 +1615,70 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
             .map_err(|err| into_objective_error("outer eval failed", err))?;
         let eval = finite_outer_first_order_eval_or_error("outer eval failed", self.layout, eval)?;
         let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if self.g_norm_initial.is_none() && g_norm.is_finite() && g_norm > 0.0 {
+            self.g_norm_initial = Some(g_norm);
+        }
         log::info!(
-            "[STAGE] outer eval end order=ValueAndGradient elapsed={:.3}s cost={:.6e} |g|={:.3e} (first-order bridge)",
+            "[STAGE] outer eval end order=ValueAndGradient elapsed={:.3}s cost={:.6e} |g|={:.3e} (first-order bridge, iter={})",
             stage_start.elapsed().as_secs_f64(),
             eval.cost,
             g_norm,
+            self.iter_count,
         );
+        self.iter_count = self.iter_count.saturating_add(1);
         Ok(FirstOrderSample {
             value: eval.cost,
             gradient: eval.gradient,
         })
+    }
+}
+
+/// Coarsen-then-tighten inner-PIRLS cap schedule for the outer first-order
+/// (BFGS) path.
+///
+/// At biobank scale (n ≈ 320k) the inner Newton solve dominates wall-clock
+/// — a full 30-iter solve costs ~20 minutes per outer iter. The schedule
+/// keeps the inner cap shallow during the first few outer iters when ρ
+/// is far from converged (the outer descent direction depends on a coarse
+/// cost/gradient that 5–10 inner iters reproduce within Wolfe tolerance),
+/// then lifts back to full as the optimizer approaches convergence. A
+/// cap of 0 means "no cap from this source"; the inner solver still
+/// honors the user's `pirls_max_iterations` and the screening cap.
+///
+/// Monotone non-decreasing in `iter_count` so the inner noise floor only
+/// loosens. The cap stays fixed within a single outer iter (line-search
+/// probes go through `eval_cost`, which does NOT touch the cap atomic).
+fn first_order_inner_cap_schedule(iter_count: usize) -> usize {
+    match iter_count {
+        0 | 1 => 5,
+        2 | 3 => 10,
+        4 | 5 => 20,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod outer_inner_cap_schedule_tests {
+    use super::first_order_inner_cap_schedule;
+
+    #[test]
+    fn schedule_is_shallow_at_start() {
+        assert_eq!(first_order_inner_cap_schedule(0), 5);
+        assert_eq!(first_order_inner_cap_schedule(1), 5);
+    }
+
+    #[test]
+    fn schedule_loosens_in_middle() {
+        assert_eq!(first_order_inner_cap_schedule(2), 10);
+        assert_eq!(first_order_inner_cap_schedule(3), 10);
+        assert_eq!(first_order_inner_cap_schedule(4), 20);
+        assert_eq!(first_order_inner_cap_schedule(5), 20);
+    }
+
+    #[test]
+    fn schedule_lifts_to_full_after_iter_5() {
+        assert_eq!(first_order_inner_cap_schedule(6), 0);
+        assert_eq!(first_order_inner_cap_schedule(20), 0);
     }
 }
 
@@ -2206,6 +2283,15 @@ struct OuterConfig {
     initial_rho: Option<Array1<f64>>,
     fallback_policy: FallbackPolicy,
     screening_cap: Option<Arc<AtomicUsize>>,
+    /// Outer-aware inner-PIRLS iteration cap (sibling of `screening_cap`).
+    /// When set, the BFGS bridge drives this atomic on every accepted
+    /// gradient eval to coarsen the inner Newton solve at early outer iters
+    /// (when ρ is far from converged) and lift it back to full as
+    /// convergence approaches. Distinct from `screening_cap` in that it
+    /// does NOT suppress cache writes / warm-start updates / KKT
+    /// enforcement; it is purely a budget. See
+    /// `RemlObjectiveState::outer_inner_cap` for dual-cap semantics.
+    outer_inner_cap: Option<Arc<AtomicUsize>>,
     solver_class: SolverClass,
     operator_initial_trust_radius: Option<f64>,
 }
@@ -2222,6 +2308,7 @@ impl Default for OuterConfig {
             initial_rho: None,
             fallback_policy: FallbackPolicy::Automatic,
             screening_cap: None,
+            outer_inner_cap: None,
             solver_class: SolverClass::Primary,
             operator_initial_trust_radius: None,
         }
@@ -2256,6 +2343,7 @@ pub struct OuterProblem {
     initial_rho: Option<Array1<f64>>,
     fallback_policy: FallbackPolicy,
     screening_cap: Option<Arc<AtomicUsize>>,
+    outer_inner_cap: Option<Arc<AtomicUsize>>,
     solver_class: SolverClass,
     operator_initial_trust_radius: Option<f64>,
 }
@@ -2279,6 +2367,7 @@ impl OuterProblem {
             initial_rho: None,
             fallback_policy: FallbackPolicy::Automatic,
             screening_cap: None,
+            outer_inner_cap: None,
             solver_class: SolverClass::Primary,
             operator_initial_trust_radius: None,
         }
@@ -2348,6 +2437,19 @@ impl OuterProblem {
         self.screening_cap = Some(screening_cap);
         self
     }
+    /// Wire the outer-aware inner-PIRLS iteration cap.
+    ///
+    /// When set, the BFGS bridge drives this atomic on every accepted
+    /// gradient evaluation so the inner Newton solve can be coarsened at
+    /// early outer iterations (when smoothing parameters are far from
+    /// converged) and lifted back to full as convergence approaches. The
+    /// caller typically passes `Arc::clone(&reml_state.outer_inner_cap)`
+    /// so the inner solver and the outer scheduler observe the same
+    /// atomic.
+    pub fn with_outer_inner_cap(mut self, outer_inner_cap: Arc<AtomicUsize>) -> Self {
+        self.outer_inner_cap = Some(outer_inner_cap);
+        self
+    }
     /// Opt into a specific solver class. The default is
     /// [`SolverClass::Primary`] (the main REML outer). Setting
     /// [`SolverClass::AuxiliaryGradientFree`] unlocks
@@ -2403,6 +2505,7 @@ impl OuterProblem {
             initial_rho: self.initial_rho.clone(),
             fallback_policy: self.fallback_policy,
             screening_cap: self.screening_cap.clone(),
+            outer_inner_cap: self.outer_inner_cap.clone(),
             solver_class: self.solver_class,
             operator_initial_trust_radius: self.operator_initial_trust_radius,
         }
@@ -4104,7 +4207,13 @@ fn run_outer_with_plan(
                 let tol = Tolerance::new(scaled_tol).expect("outer tolerance must be valid");
                 let max_iter =
                     MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
-                let objective = OuterFirstOrderBridge { obj, layout };
+                let objective = OuterFirstOrderBridge {
+                    obj,
+                    layout,
+                    outer_inner_cap: config.outer_inner_cap.clone(),
+                    iter_count: 0,
+                    g_norm_initial: None,
+                };
                 let mut optimizer = Bfgs::new(seed.clone(), objective)
                     .with_bounds(bounds)
                     .with_tolerance(tol)

@@ -1895,6 +1895,7 @@ where
             .with_max_iter(reml_max_iter)
             .with_seed_config(reml_seed_config.clone())
             .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
+            .with_outer_inner_cap(Arc::clone(&reml_state.outer_inner_cap))
             .with_rho_bound(crate::estimate::RHO_BOUND);
         let problem = if let Some(ref h) = heuristic_lambdas {
             problem.with_heuristic_lambdas(h.to_vec())
@@ -2044,6 +2045,7 @@ where
             .with_max_iter(reml_max_iter)
             .with_seed_config(reml_seed_config_mix.clone())
             .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
+            .with_outer_inner_cap(Arc::clone(&reml_state.outer_inner_cap))
             .with_rho_bound(crate::estimate::RHO_BOUND);
         let problem = if let Some(h) = heuristic_theta_ref {
             problem.with_heuristic_lambdas(h.to_vec())
