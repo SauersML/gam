@@ -23,7 +23,7 @@ use ::opt::{
 };
 use ndarray::{Array1, Array2, ArrayView2};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Bidirectional inner-PIRLS feedback channel.
 ///
@@ -34,14 +34,28 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// next outer iter's schedule can adapt to the inner solver's actual
 /// convergence behavior rather than a hardcoded iter-count tier.
 ///
-/// All three atomics are owned by `RemlObjectiveState`; the bridges hold
-/// `Arc` clones. `last_iters == 0` means "no signal yet" — the schedule
-/// falls back to the coarse iter-count tier for the first outer iter.
+/// All atomics are owned by `RemlObjectiveState`; the bridges hold
+/// `Arc` clones. `last_iters == 0` means "no inner-Newton signal yet" —
+/// the schedule falls back to the coarse iter-count tier for the first
+/// outer iter. `ift_residual_bits == 0` means "no IFT-predictor quality
+/// signal yet" — the schedule's +margin reverts to the conservative
+/// default. The two signals are independent: the IFT residual may be
+/// missing even after a successful inner solve (when the predictor was
+/// rejected by the |Δρ| cap and a flat warm-start was used instead).
 #[derive(Clone, Debug)]
 pub struct InnerProgressFeedback {
     pub cap: Arc<AtomicUsize>,
     pub last_iters: Arc<AtomicUsize>,
     pub last_converged: Arc<AtomicBool>,
+    /// Bit-packed `f64` residual `‖β_converged − β_predicted‖ /
+    /// ‖β_converged‖` from the previous IFT-predicted PIRLS solve.
+    /// Used to tighten or loosen the cap's `+margin` when the
+    /// predictor's empirical faithfulness is known: a small residual
+    /// means the inner Newton starts very close to the KKT β and only
+    /// needs +1 iter of margin; a large residual means the prediction
+    /// collapsed to flat warm-start and the inner Newton has more
+    /// recovery work, so +4 is appropriate. `0` means "no signal yet".
+    pub ift_residual: Arc<AtomicU64>,
 }
 
 impl InnerProgressFeedback {
@@ -53,9 +67,17 @@ impl InnerProgressFeedback {
         if iters == 0 {
             None
         } else {
+            let residual_bits = self.ift_residual.load(Ordering::Relaxed);
+            let last_ift_residual = if residual_bits == 0 {
+                None
+            } else {
+                let r = f64::from_bits(residual_bits);
+                if r.is_finite() && r >= 0.0 { Some(r) } else { None }
+            };
             Some(InnerProgressSnapshot {
                 last_iters: iters,
                 last_converged: self.last_converged.load(Ordering::Relaxed),
+                last_ift_residual,
             })
         }
     }
@@ -65,6 +87,12 @@ impl InnerProgressFeedback {
 struct InnerProgressSnapshot {
     last_iters: usize,
     last_converged: bool,
+    /// Most-recent IFT predictor residual (see field doc on
+    /// `InnerProgressFeedback`). `None` when the predictor has not
+    /// reported yet, when the cache was reset, or when the previous
+    /// solve fell back to flat warm-start (no IFT prediction
+    /// consumed).
+    last_ift_residual: Option<f64>,
 }
 
 /// Matrix-free outer Hessian operator.
@@ -1765,11 +1793,24 @@ fn first_order_inner_cap_schedule(
     // count rather than a hardcoded tier.
     if let Some(snap) = last {
         let next = if snap.last_converged {
-            // Converged in `last_iters` last time; allow a small
-            // margin for ρ-step variability. The +2 absorbs typical
-            // inner-Newton iter-count noise (one extra LM halving,
-            // one extra Wolfe probe).
-            snap.last_iters.saturating_add(2)
+            // Converged in `last_iters` last time; pick a small margin
+            // for ρ-step variability. The IFT predictor's residual
+            // tells us how close the warm-start was to the KKT point:
+            //   residual < 0.01  → next solve starts essentially AT the
+            //                      KKT β, so +1 iter of margin suffices.
+            //   residual < 0.10  → +2 (default, current behavior).
+            //   residual ≥ 0.10  → predictor was poor (or fell back to
+            //                      flat); the inner Newton has more
+            //                      recovery work, so +4 to be safe.
+            //   None             → no signal yet → +2 (default).
+            // This wires the [IFT-QUALITY] feedback directly into the
+            // adaptive cap, replacing the previous fixed +2.
+            let margin = match snap.last_ift_residual {
+                Some(r) if r < 0.01 => 1usize,
+                Some(r) if r >= 0.10 => 4usize,
+                _ => 2usize,
+            };
+            snap.last_iters.saturating_add(margin)
         } else {
             // Hit the cap. Geometric backoff so we don't thrash on a
             // marginally-too-tight cap, but enforce floor of
@@ -1800,6 +1841,19 @@ mod outer_inner_cap_schedule_tests {
         Some(InnerProgressSnapshot {
             last_iters,
             last_converged,
+            last_ift_residual: None,
+        })
+    }
+
+    fn snap_with_residual(
+        last_iters: usize,
+        last_converged: bool,
+        residual: f64,
+    ) -> Option<InnerProgressSnapshot> {
+        Some(InnerProgressSnapshot {
+            last_iters,
+            last_converged,
+            last_ift_residual: Some(residual),
         })
     }
 
@@ -1858,6 +1912,48 @@ mod outer_inner_cap_schedule_tests {
         // (<1%). Modest decay no longer overrides the adaptive cap.
         assert_eq!(first_order_inner_cap_schedule(2, Some(0.30), snap(4, true)), 6);
         assert_eq!(first_order_inner_cap_schedule(2, Some(0.05), snap(4, true)), 6);
+    }
+
+    #[test]
+    fn schedule_uses_ift_residual_to_pick_margin() {
+        // Excellent IFT prediction (residual < 0.01): warm-start lands
+        // essentially AT the KKT β, so +1 of margin suffices.
+        assert_eq!(
+            first_order_inner_cap_schedule(2, None, snap_with_residual(4, true, 0.005)),
+            5
+        );
+        assert_eq!(
+            first_order_inner_cap_schedule(2, None, snap_with_residual(4, true, 0.0001)),
+            5
+        );
+        // Default zone (0.01 ≤ residual < 0.10): +2, current behavior.
+        assert_eq!(
+            first_order_inner_cap_schedule(2, None, snap_with_residual(4, true, 0.05)),
+            6
+        );
+        // Poor IFT prediction (residual ≥ 0.10): +4, the inner Newton
+        // has more recovery work after a near-flat warm-start.
+        assert_eq!(
+            first_order_inner_cap_schedule(2, None, snap_with_residual(4, true, 0.20)),
+            8
+        );
+        assert_eq!(
+            first_order_inner_cap_schedule(2, None, snap_with_residual(4, true, 0.80)),
+            8
+        );
+        // Margin policy is monotone non-decreasing in residual: a worse
+        // predictor never produces a tighter cap than a better one.
+        let residuals = [0.001, 0.05, 0.30];
+        let caps: Vec<usize> = residuals
+            .iter()
+            .map(|&r| first_order_inner_cap_schedule(2, None, snap_with_residual(4, true, r)))
+            .collect();
+        for w in caps.windows(2) {
+            assert!(
+                w[0] <= w[1],
+                "ift-residual margin policy regressed monotonicity: {caps:?}"
+            );
+        }
     }
 }
 
