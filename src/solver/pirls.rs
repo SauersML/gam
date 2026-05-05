@@ -3768,6 +3768,14 @@ where
     let mut plateau_streak = 0usize;
     let mut min_penalized_deviance = f64::INFINITY;
     let mut final_state: Option<WorkingState> = None;
+    // Initial gradient norm captured at iter 1 so the post-loop
+    // `[PIRLS solve-end]` summary can report the geometric reduction
+    // factor `(g_end / g_start)^(1/iters)` — the per-iter convergence
+    // rate. r ≪ 0.5 means the inner Newton is converging fast; r > 0.7
+    // means it's struggling. Bench runner aggregates this across
+    // accepted PIRLS solves to give a per-fit diagnostic.
+    let mut initial_gradient_norm: Option<f64> = None;
+    let inner_solve_start = std::time::Instant::now();
     let mut newton_direction = Array1::<f64>::zeros(beta.len());
     let mut linear_active_hint: Option<Vec<usize>> =
         options.linear_constraints.as_ref().map(|_| Vec::new());
@@ -3885,6 +3893,22 @@ where
         }
         #[cfg(test)]
         test_support::record_penalized_deviance(current_penalized);
+
+        // Capture the initial gradient norm at iter 1 (the first iter
+        // where `state.gradient` has been computed by `update_with_curvature`).
+        // Used by the [PIRLS solve-end] summary log to report the
+        // geometric reduction factor.
+        if initial_gradient_norm.is_none() {
+            let g0_sq: f64 = state
+                .gradient
+                .iter()
+                .map(|g| if g.is_finite() { g * g } else { 0.0 })
+                .sum();
+            let g0 = g0_sq.sqrt();
+            if g0.is_finite() && g0 > 0.0 {
+                initial_gradient_norm = Some(g0);
+            }
+        }
 
         // Early exit: if the current state has non-finite gradient, the
         // model evaluation has overflowed (eta too extreme).  No Newton
@@ -4451,14 +4475,40 @@ where
         // exit early when the iteration is cheap (small change) AND
         // the residual is small.
         log::info!(
-            "[PIRLS iter-end] iter={:>3} elapsed={:.4}s lm_lambda={:.2e} last_dev_change={:.3e} last_halving={}",
+            "[PIRLS iter-end] iter={:>3} elapsed={:.4}s lm_lambda={:.2e} g_norm={:.3e} last_dev_change={:.3e} last_halving={}",
             iter,
             iter_start.elapsed().as_secs_f64(),
             lambda,
+            lastgradient_norm,
             last_deviance_change,
             last_step_halving,
         );
     }
+
+    // Solve-end summary: one line per accepted (or rescued) PIRLS solve
+    // capturing the per-iter geometric convergence rate and total
+    // wall-clock. The bench runner aggregates these across all PIRLS
+    // solves in a fit so CI logs end with a per-fit verdict on inner-
+    // Newton convergence health: rate < 0.5 = healthy Newton; rate ≥ 0.7
+    // = struggling (likely stuck near singular geometry or a
+    // flat-warm-start that the predictor failed to refine).
+    let total_iters = iterations.max(1) as f64;
+    let convergence_rate = match initial_gradient_norm {
+        Some(g0) if g0 > 0.0 && lastgradient_norm.is_finite() => {
+            let ratio = (lastgradient_norm / g0).max(1e-30);
+            ratio.powf(1.0 / total_iters)
+        }
+        _ => f64::NAN,
+    };
+    log::info!(
+        "[PIRLS solve-end] iters={} elapsed={:.4}s g_norm_initial={:.3e} g_norm_final={:.3e} convergence_rate={:.3e} status={:?}",
+        iterations,
+        inner_solve_start.elapsed().as_secs_f64(),
+        initial_gradient_norm.unwrap_or(f64::NAN),
+        lastgradient_norm,
+        convergence_rate,
+        status,
+    );
 
     let state = final_state.ok_or(EstimationError::PirlsDidNotConverge {
         max_iterations: options.max_iterations,
