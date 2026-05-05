@@ -1612,6 +1612,33 @@ _PIRLS_ITER_BREAKDOWN_PATTERN = re.compile(
     r"\s+candidate=([\d.]+)s\s+other=([\d.]+)s"
 )
 
+# Outer-Hessian routing decision and assembly cost. Two markers per outer
+# Hessian build:
+#   [OUTER hessian-route]    : decision (operator vs dense) + which clause
+#   [OUTER hessian-elapsed]  : wall-clock for the chosen path
+#
+# Surfaces priority item (d) — the routing edge case at k≥32 with a
+# rank-deficient penalty (subspace_trace=true) forces the dense
+# `compute_outer_hessian` path even though scale prefers operator. The
+# `reason=subspace_forced_dense` label fires *only* when both:
+#   (1) scale_prefers_operator (any of large_p / large_n_moderate_p /
+#       large_linear_work / large_k), AND
+#   (2) penalty_subspace_trace is installed (rank-deficient LAML fix).
+# Aggregating the count + total elapsed for that label answers
+# empirically: is the architectural matrix-free-projected outer Hessian
+# (priority c) actually load-bearing at biobank scale, or are we
+# spending tractable time on the dense path despite the routing scare?
+_OUTER_HESSIAN_ROUTE_PATTERN = re.compile(
+    r"\[OUTER hessian-route\]\s+choice=(\w+)\s+reason=(\w+)\s+"
+    r"n=(\d+)\s+p=(\d+)\s+k=(\d+)\s+"
+    r"callback_kernel=(true|false)\s+subspace_trace=(true|false)\s+"
+    r"scale_prefers_operator=(true|false)"
+)
+_OUTER_HESSIAN_ELAPSED_PATTERN = re.compile(
+    r"\[OUTER hessian-elapsed\]\s+choice=(\w+)\s+reason=(\w+)\s+"
+    r"n=(\d+)\s+p=(\d+)\s+k=(\d+)\s+elapsed=([\d.]+)s"
+)
+
 # Solve-end summary: one line per completed PIRLS solve carrying the
 # geometric convergence rate of the inner Newton:
 #     rate = (g_norm_final / g_norm_initial) ^ (1 / iters)
@@ -1770,6 +1797,54 @@ def _emit_phase_summary(
     # overhead is non-trivial. Total LM attempt count surfaces LM-halving
     # pressure: attempts ≫ iters indicates the trust region is fighting
     # the geometry, often a sign that warm-starting is degrading.
+    # Outer-Hessian routing distribution + assembly cost. The verdict
+    # answers two questions: (1) is the operator path actually being
+    # selected at biobank scale, and (2) when we fall through to dense,
+    # how much wall-clock are we paying — specifically distinguishing
+    # the `subspace_forced_dense` case (item d) from the cheap
+    # `below_crossover` case where dense is fine.
+    outer_h_route = _OUTER_HESSIAN_ROUTE_PATTERN.findall(captured_stderr)
+    outer_h_elapsed = _OUTER_HESSIAN_ELAPSED_PATTERN.findall(captured_stderr)
+    # If route fired but elapsed didn't, the assembly errored or the
+    # process was killed mid-build — surfacing the gap is worth a tag.
+    outer_h_route_no_elapsed = max(0, len(outer_h_route) - len(outer_h_elapsed))
+    if outer_h_elapsed:
+        n_outer_h = len(outer_h_elapsed)
+        total_outer_h = sum(float(m[5]) for m in outer_h_elapsed)
+        choice_counts: dict[str, int] = {}
+        reason_counts: dict[str, int] = {}
+        reason_secs: dict[str, float] = {}
+        for choice, reason, _n, _p, _k, secs in outer_h_elapsed:
+            choice_counts[choice] = choice_counts.get(choice, 0) + 1
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            reason_secs[reason] = reason_secs.get(reason, 0.0) + float(secs)
+        # The single dominant reason gets a callout in the summary line so
+        # the verdict is readable at a glance; if the run hit the routing
+        # edge case at all (subspace_forced_dense > 0), surface it
+        # explicitly with its time share so the (d) signal isn't
+        # collapsed into a generic counter.
+        choice_pieces = " ".join(f"{c}={n}" for c, n in sorted(choice_counts.items()))
+        subspace_forced = reason_counts.get("subspace_forced_dense", 0)
+        subspace_secs = reason_secs.get("subspace_forced_dense", 0.0)
+        parts.append(
+            f"outer_h_calls={n_outer_h} outer_h_total={total_outer_h:.1f}s "
+            f"outer_h_{choice_pieces} "
+            f"outer_h_subspace_forced={subspace_forced} "
+            f"outer_h_subspace_total={subspace_secs:.1f}s "
+            f"outer_h_route_no_elapsed={outer_h_route_no_elapsed}"
+        )
+    elif outer_h_route:
+        # Route fired but no assembly completed (errored or killed).
+        # Still surface the count + dominant reason so we don't lose
+        # signal that the routing ran.
+        reason_counts_only: dict[str, int] = {}
+        for _choice, reason, *_rest in outer_h_route:
+            reason_counts_only[reason] = reason_counts_only.get(reason, 0) + 1
+        dom_reason = max(reason_counts_only, key=lambda r: reason_counts_only[r])
+        parts.append(
+            f"outer_h_INCOMPLETE outer_h_routes={len(outer_h_route)} "
+            f"outer_h_dom_reason={dom_reason}"
+        )
     pirls_breakdown_matches = _PIRLS_ITER_BREAKDOWN_PATTERN.findall(captured_stderr)
     if pirls_breakdown_matches:
         curv_total = sum(float(m[2]) for m in pirls_breakdown_matches)

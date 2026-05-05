@@ -4824,10 +4824,53 @@ pub fn reml_laml_evaluate(
             hessian_kernel,
             Some(OuterHessianDerivativeKernel::Callback { .. })
         );
+        // Decompose the routing decision so the [OUTER hessian-route] log
+        // can attribute *which* clause selected the path, including the
+        // rank-deficient fall-through (subspace_trace forces dense even at
+        // biobank-shape large k). This is the empirical evidence we need
+        // for priority item (d) — without these markers the routing edge
+        // case at k≥32 + rank-deficient penalties is invisible.
+        let large_p = p_dim >= MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD;
+        let large_n_and_moderate_p = n_obs >= MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD
+            && p_dim >= MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N;
+        let large_linear_work =
+            n_obs.saturating_mul(p_dim) >= MATRIX_FREE_OUTER_HESSIAN_NP_THRESHOLD;
+        let large_k = k_outer >= MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD;
+        let scale_prefers_operator = large_p || large_n_and_moderate_p || large_linear_work || large_k;
+        let subspace_forces_dense = solution.penalty_subspace_trace.is_some();
         let use_operator = hessian_kernel.is_some()
-            && (callback_operator_kernel || prefer_outer_hessian_operator(n_obs, p_dim, k_outer))
-            && solution.penalty_subspace_trace.is_none();
-        if use_operator {
+            && (callback_operator_kernel || scale_prefers_operator)
+            && !subspace_forces_dense;
+        // Reason mnemonic: which clause carried the routing.  Ordered so
+        // the most specific reason wins; "kernel_absent" wins over
+        // everything else because that disables the operator path
+        // unconditionally.
+        let route_reason = if hessian_kernel.is_none() {
+            "kernel_absent"
+        } else if subspace_forces_dense && scale_prefers_operator {
+            "subspace_forced_dense"
+        } else if callback_operator_kernel {
+            "callback_kernel"
+        } else if large_k {
+            "large_k"
+        } else if large_p {
+            "large_p"
+        } else if large_n_and_moderate_p {
+            "large_n_moderate_p"
+        } else if large_linear_work {
+            "large_linear_work"
+        } else {
+            "below_crossover"
+        };
+        let route_choice = if use_operator { "operator" } else { "dense" };
+        log::info!(
+            "[OUTER hessian-route] choice={route_choice} reason={route_reason} \
+             n={n_obs} p={p_dim} k={k_outer} \
+             callback_kernel={callback_operator_kernel} subspace_trace={subspace_forces_dense} \
+             scale_prefers_operator={scale_prefers_operator}"
+        );
+        let assembly_start = std::time::Instant::now();
+        let result = if use_operator {
             match build_outer_hessian_operator(
                 solution,
                 &lambdas,
@@ -4864,7 +4907,13 @@ pub fn reml_laml_evaluate(
                 }
                 Err(err) => return Err(err),
             }
-        }
+        };
+        log::info!(
+            "[OUTER hessian-elapsed] choice={route_choice} reason={route_reason} \
+             n={n_obs} p={p_dim} k={k_outer} elapsed={:.3}s",
+            assembly_start.elapsed().as_secs_f64(),
+        );
+        result
     } else {
         crate::solver::outer_strategy::HessianResult::Unavailable
     };
