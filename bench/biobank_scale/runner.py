@@ -2154,6 +2154,7 @@ def _warm_start_health_verdict(
 
     Verdict tiers:
       HEALTHY   coverage ≥ 0.70 AND p50_resid < 0.05
+                AND p95_resid < 0.20
                 AND no outer-non-finite signals
       MARGINAL  coverage ≥ 0.30 OR p50_resid < 0.30
                 AND no outer-non-finite signals
@@ -2172,6 +2173,16 @@ def _warm_start_health_verdict(
                 (e.g. a non-REML code path), so there's nothing
                 to assess
 
+    The HEALTHY tier's `p95_resid < 0.20` saturation guard is the
+    same kind of central-tendency-safe rule as the PIRLS verdict's
+    p95 threshold (commit efc54eca). A fit where p50_resid is clean
+    (< 0.05) but p95_resid is in the marginal/degraded tier
+    (≥ 0.20 = the same threshold the adaptive |Δρ| cap uses to mark
+    "marginal" predictor faithfulness) has a tail of poor predictions
+    that we don't want to claim as HEALTHY — even if the median is
+    fine, ~5% of solves are starting from poor warm-starts and
+    contributing extra inner-Newton work.
+
     `n_outer_nonfinite` is the count of [OUTER non-finite] warnings
     captured during the fit. A non-zero count means at least one
     intermediate of the outer-Hessian / leverage / adjoint computation
@@ -2186,11 +2197,15 @@ def _warm_start_health_verdict(
     coverage = n_accepts / denom
     if residuals:
         sorted_res = sorted(residuals)
-        p50_resid = sorted_res[len(sorted_res) // 2]
+        n_res = len(sorted_res)
+        p50_resid = sorted_res[n_res // 2]
+        p95_resid = sorted_res[min(n_res - 1, int(0.95 * n_res))]
     else:
         p50_resid = float("nan")
+        p95_resid = float("nan")
     detail = (
         f"coverage={coverage:.2f} p50_resid={p50_resid:.2e} "
+        f"p95_resid={p95_resid:.2e} "
         f"n_accepts={n_accepts} n_rejects={n_rejects} n_noops={n_noops} "
         f"n_outer_nonfinite={n_outer_nonfinite}"
     )
@@ -2226,7 +2241,7 @@ def _warm_start_health_verdict(
         # signal — the warm-start machinery is not delivering at
         # this surface even though the path is being exercised.
         return ("DEGRADED", detail)
-    if coverage >= 0.70 and p50_resid < 0.05:
+    if coverage >= 0.70 and p50_resid < 0.05 and p95_resid < 0.20:
         return ("HEALTHY", detail)
     if coverage >= 0.30 or p50_resid < 0.30:
         return ("MARGINAL", detail)

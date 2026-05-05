@@ -796,6 +796,32 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         # All three rates < 0.5 → HEALTHY.
         self.assertIn("verdict=HEALTHY", out.splitlines()[-1])
 
+    def test_warm_start_health_verdict_p95_saturation_guard(self) -> None:
+        # Even when p50_resid is clean (well below 0.05), a poor
+        # p95_resid (≥ 0.20) drops the verdict from HEALTHY to
+        # MARGINAL. Same central-tendency-safe rule as the PIRLS
+        # verdict's p95 threshold (commit efc54eca): a tail of bad
+        # predictions hidden behind a clean median is still a
+        # degradation signal.
+        #
+        # 80 clean residuals (1e-3) + 20 outliers at 0.5: n=100,
+        # p95 = sorted[95] = 0.5 (well above 0.20).
+        v, d = _RUNNER._warm_start_health_verdict(
+            n_accepts=100, n_rejects=0, n_noops=0,
+            residuals=[1e-3] * 80 + [0.5] * 20,
+        )
+        self.assertEqual(v, "MARGINAL", f"detail={d}")
+        self.assertIn("p95_resid=5.00e-01", d)
+        # Same fit but only 3 outliers (in 100): p95 = sorted[95] is
+        # still in the clean range. Verdict goes back to HEALTHY.
+        v, d = _RUNNER._warm_start_health_verdict(
+            n_accepts=100, n_rejects=0, n_noops=0,
+            residuals=[1e-3] * 97 + [0.5] * 3,
+        )
+        self.assertEqual(v, "HEALTHY", f"detail={d}")
+        self.assertIn("p50_resid=1.00e-03", d)
+        self.assertIn("p95_resid=1.00e-03", d)
+
     def test_warm_start_health_verdict_outer_nonfinite_overrides_to_degraded(self) -> None:
         # Even with HEALTHY-looking IFT signals, a single
         # [OUTER non-finite] warning during the fit must override the
