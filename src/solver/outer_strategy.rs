@@ -1695,8 +1695,17 @@ struct OuterSecondOrderBridge<'a> {
     /// when the upstream `opt` solver does not emit per-iteration logs of its
     /// own. Emitted at INFO from `eval_grad` and `eval_hessian` (the calls
     /// that gate one optimizer step); skipped on `eval_cost` so linesearch
-    /// trial points do not flood the log.
+    /// trial points do not flood the log. Also drives the outer-aware
+    /// inner-PIRLS cap schedule (see `first_order_inner_cap_schedule`).
     eval_count: usize,
+    /// Outer-aware inner-PIRLS cap atomic. When `Some`, the bridge stores
+    /// a coarsen-then-tighten cap into it on every accepted eval_grad /
+    /// eval_hessian call. Mirrors the BFGS-side wiring in
+    /// `OuterFirstOrderBridge`. Cap is NEVER touched in `eval_cost` so
+    /// line-search probes within an outer iter see a stable inner
+    /// tolerance (Wolfe / trust-region acceptance both assume constant
+    /// cost noise within a bracket).
+    outer_inner_cap: Option<Arc<AtomicUsize>>,
 }
 
 impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
@@ -1714,6 +1723,10 @@ impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
 impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
+        if let Some(cap_arc) = self.outer_inner_cap.as_ref() {
+            let cap = first_order_inner_cap_schedule(self.eval_count);
+            cap_arc.store(cap, Ordering::Relaxed);
+        }
         let stage_start = std::time::Instant::now();
         log::info!(
             "[STAGE] outer eval start order=ValueAndGradient dim={}",
@@ -1748,6 +1761,10 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
 impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_hessian(&mut self, x: &Array1<f64>) -> Result<SecondOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
+        if let Some(cap_arc) = self.outer_inner_cap.as_ref() {
+            let cap = first_order_inner_cap_schedule(self.eval_count);
+            cap_arc.store(cap, Ordering::Relaxed);
+        }
         let stage_start = std::time::Instant::now();
         log::info!(
             "[STAGE] outer eval start order=ValueGradientHessian dim={}",
@@ -4120,6 +4137,7 @@ fn run_outer_with_plan(
                         hessian_source,
                         materialize_operator_max_dim: OUTER_HVP_MATERIALIZE_MAX_DIM,
                         eval_count: 0,
+                        outer_inner_cap: config.outer_inner_cap.clone(),
                     };
 
                     let (lo, hi) = &bounds_template;
@@ -5440,6 +5458,7 @@ mod tests {
             hessian_source: HessianSource::Analytic,
             materialize_operator_max_dim: OUTER_HVP_MATERIALIZE_MAX_DIM,
             eval_count: 0,
+            outer_inner_cap: None,
         };
         let grad_sample =
             FirstOrderObjective::eval_grad(&mut bridge, &array![1.0]).expect("grad eval");
