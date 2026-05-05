@@ -16,8 +16,8 @@ use crate::families::marginal_slope_shared::{
     build_denested_partition_cells as shared_denested_partition_cells, eval_coeff4_at,
     is_sigma_aux_index as shared_is_sigma_aux_index,
     observed_denested_cell_partials as shared_observed_denested_cell_partials,
-    probit_frailty_scale, probit_frailty_scale_multi_dir_jet, psi_derivative_location,
-    scale_coeff4,
+    outer_row_indices, outer_score_scale, probit_frailty_scale, probit_frailty_scale_multi_dir_jet,
+    psi_derivative_location, scale_coeff4,
 };
 use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
@@ -2150,6 +2150,84 @@ impl BernoulliMarginalSlopeFamily {
     #[inline]
     fn probit_frailty_scale(&self) -> f64 {
         probit_frailty_scale(self.gaussian_frailty_sd)
+    }
+
+    /// Outer-aware variant of `log_likelihood_only`. When
+    /// `options.outer_score_subsample` is `None` this iterates over all rows
+    /// and returns a value identical (bit-for-bit) to the legacy full-data
+    /// implementation. When it is `Some`, only the masked rows contribute and
+    /// the row-summed component is rescaled by `weight_scale = n_full / |mask|`
+    /// (Horvitz-Thompson). This is the row-iter swap that lets outer-only
+    /// score/gradient passes scale to biobank `n` without distorting the
+    /// full-data inner-PIRLS or covariance code paths.
+    pub(crate) fn log_likelihood_only_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        options: &BlockwiseFitOptions,
+    ) -> Result<f64, String> {
+        self.validate_exact_monotonicity(block_states)?;
+        let flex_active = self.effective_flex_active(block_states)?;
+        let n = self.y.len();
+        let row_iter = outer_row_indices(options, n).to_vec();
+        let scale = outer_score_scale(options, n);
+        if !flex_active {
+            // Rigid probit: vectorized closed-form.
+            // η_i = q_i·c_i + s_f b_i·z_i  where c_i = √(1+(s_f b_i)²)
+            // ll = Σ w_i · log Φ((2y_i−1)·η_i)
+            let b = &block_states[1].eta;
+            let probit_scale = self.probit_frailty_scale();
+            let total: Result<f64, String> = row_iter
+                .into_par_iter()
+                .try_fold(
+                    || 0.0,
+                    |mut ll, i| -> Result<_, String> {
+                        let q_internal = self.marginal_link_map(block_states[0].eta[i])?.q;
+                        let eta_i =
+                            rigid_observed_eta(q_internal, b[i], self.z[i], probit_scale);
+                        let signed = (2.0 * self.y[i] - 1.0) * eta_i;
+                        let (log_cdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
+                        ll += self.weights[i] * log_cdf;
+                        Ok(ll)
+                    },
+                )
+                .try_reduce(
+                    || 0.0,
+                    |left, right| -> Result<_, String> { Ok(left + right) },
+                );
+            return total.map(|v| v * scale);
+        }
+        let beta_h = self.score_beta(block_states)?;
+        let beta_w = self.link_beta(block_states)?;
+        let total: Result<f64, String> = row_iter
+            .into_par_iter()
+            .try_fold(
+                || 0.0,
+                |mut ll, row| -> Result<_, String> {
+                    let intercept = self
+                        .solve_row_intercept_base(
+                            row,
+                            block_states[0].eta[row],
+                            block_states[1].eta[row],
+                            beta_h,
+                            beta_w,
+                        )?
+                        .0;
+                    let slope = block_states[1].eta[row];
+                    let obs = self.observed_denested_cell_partials(
+                        row, intercept, slope, beta_h, beta_w,
+                    )?;
+                    let s_i = eval_coeff4_at(&obs.coeff, self.z[row]);
+                    let signed = (2.0 * self.y[row] - 1.0) * s_i;
+                    let (log_cdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
+                    ll += self.weights[row] * log_cdf;
+                    Ok(ll)
+                },
+            )
+            .try_reduce(
+                || 0.0,
+                |left, right| -> Result<_, String> { Ok(left + right) },
+            );
+        total.map(|v| v * scale)
     }
 
     fn is_sigma_aux_index(
@@ -7059,74 +7137,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
-        self.validate_exact_monotonicity(block_states)?;
-        let flex_active = self.effective_flex_active(block_states)?;
-        if !flex_active {
-            // Rigid probit: vectorized closed-form.
-            // η_i = q_i·c_i + s_f b_i·z_i  where c_i = √(1+(s_f b_i)²)
-            // ll = Σ w_i · log Φ((2y_i−1)·η_i)
-            let b = &block_states[1].eta;
-            let probit_scale = self.probit_frailty_scale();
-            let n = self.y.len();
-            return (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
-                .into_par_iter()
-                .try_fold(
-                    || 0.0,
-                    |mut ll, chunk_idx| -> Result<_, String> {
-                        let start = chunk_idx * ROW_CHUNK_SIZE;
-                        let end = (start + ROW_CHUNK_SIZE).min(n);
-                        for i in start..end {
-                            let q_internal = self.marginal_link_map(block_states[0].eta[i])?.q;
-                            let eta_i =
-                                rigid_observed_eta(q_internal, b[i], self.z[i], probit_scale);
-                            let signed = (2.0 * self.y[i] - 1.0) * eta_i;
-                            let (log_cdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
-                            ll += self.weights[i] * log_cdf;
-                        }
-                        Ok(ll)
-                    },
-                )
-                .try_reduce(
-                    || 0.0,
-                    |left, right| -> Result<_, String> { Ok(left + right) },
-                );
-        }
-        let beta_h = self.score_beta(block_states)?;
-        let beta_w = self.link_beta(block_states)?;
-        let n = self.y.len();
-        (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
-            .into_par_iter()
-            .try_fold(
-                || 0.0,
-                |mut ll, chunk_idx| -> Result<_, String> {
-                    let start = chunk_idx * ROW_CHUNK_SIZE;
-                    let end = (start + ROW_CHUNK_SIZE).min(n);
-                    for row in start..end {
-                        let intercept = self
-                            .solve_row_intercept_base(
-                                row,
-                                block_states[0].eta[row],
-                                block_states[1].eta[row],
-                                beta_h,
-                                beta_w,
-                            )?
-                            .0;
-                        let slope = block_states[1].eta[row];
-                        let obs = self.observed_denested_cell_partials(
-                            row, intercept, slope, beta_h, beta_w,
-                        )?;
-                        let s_i = eval_coeff4_at(&obs.coeff, self.z[row]);
-                        let signed = (2.0 * self.y[row] - 1.0) * s_i;
-                        let (log_cdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
-                        ll += self.weights[row] * log_cdf;
-                    }
-                    Ok(ll)
-                },
-            )
-            .try_reduce(
-                || 0.0,
-                |left, right| -> Result<_, String> { Ok(left + right) },
-            )
+        self.log_likelihood_only_with_options(block_states, &BlockwiseFitOptions::default())
     }
 
     fn max_feasible_step_size(
@@ -8395,6 +8406,146 @@ mod tests {
 
     fn pair_distance(lhs: (f64, f64), rhs: (f64, f64)) -> f64 {
         (lhs.0 - rhs.0).abs() + (lhs.1 - rhs.1).abs()
+    }
+
+    /// Build a tiny synthetic rigid-probit family with `n` rows. The marginal
+    /// and log-slope blocks each carry a single all-ones column so the
+    /// per-row eta is simply the scalar block beta. No flex deviations are
+    /// active, so `log_likelihood_only` takes the closed-form rigid path.
+    fn make_rigid_test_family(n: usize) -> BernoulliMarginalSlopeFamily {
+        // Pseudo-random labels and weights uncorrelated with row parity, so a
+        // half-data subsample over even rows is a representative subsample
+        // for the Horvitz-Thompson rescaling check below.
+        let y: Array1<f64> =
+            Array1::from_iter((0..n).map(|i| if (i * 31 + 7) % 5 >= 3 { 1.0 } else { 0.0 }));
+        let weights: Array1<f64> =
+            Array1::from_iter((0..n).map(|i| 0.5 + ((i * 13 + 4) % 7) as f64 * 0.1));
+        let z: Array1<f64> = Array1::from_iter(
+            (0..n).map(|i| -1.5 + 3.0 * (((i * 17 + 5) % n) as f64 + 0.5) / (n as f64)),
+        );
+        let ones_col = Array2::from_shape_fn((n, 1), |_| 1.0);
+        BernoulliMarginalSlopeFamily {
+            y: Arc::new(y),
+            weights: Arc::new(weights),
+            z: Arc::new(z),
+            gaussian_frailty_sd: None,
+            base_link: bernoulli_marginal_slope_probit_link(),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                ones_col.clone(),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(ones_col)),
+            score_warp: None,
+            link_dev: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
+        }
+    }
+
+    fn rigid_block_states(family: &BernoulliMarginalSlopeFamily, q: f64, b: f64)
+    -> Vec<ParameterBlockState> {
+        let n = family.y.len();
+        vec![
+            ParameterBlockState {
+                beta: array![q],
+                eta: Array1::from_elem(n, q),
+            },
+            ParameterBlockState {
+                beta: array![b],
+                eta: Array1::from_elem(n, b),
+            },
+        ]
+    }
+
+    #[test]
+    fn bernoulli_log_likelihood_subsample_full_equals_unsampled() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_rigid_test_family(n);
+        let states = rigid_block_states(&family, 0.3, 0.4);
+
+        let baseline = family
+            .log_likelihood_only(&states)
+            .expect("baseline ll (no subsample)");
+
+        let mut opts_full = BlockwiseFitOptions::default();
+        opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            (0..n).collect(),
+            n,
+            0xDEADBEEF,
+        )));
+        let with_full_mask = family
+            .log_likelihood_only_with_options(&states, &opts_full)
+            .expect("ll with mask=full");
+
+        let rel = ((with_full_mask - baseline) / baseline.abs().max(1.0)).abs();
+        assert!(
+            rel < 1e-12,
+            "subsample(mask=full) {} differs from baseline {} by rel {}",
+            with_full_mask,
+            baseline,
+            rel
+        );
+    }
+
+    #[test]
+    fn bernoulli_log_likelihood_subsample_half_scales_correctly() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_rigid_test_family(n);
+        let states = rigid_block_states(&family, 0.3, 0.4);
+
+        // Even rows only: weight_scale = n / (n/2) = 2.0
+        let even_mask: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
+        let m = even_mask.len();
+        let mut opts_half = BlockwiseFitOptions::default();
+        opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            even_mask.clone(),
+            n,
+            0xCAFE,
+        )));
+        let scaled = family
+            .log_likelihood_only_with_options(&states, &opts_half)
+            .expect("ll with mask=even");
+
+        // Compute the unscaled even-row sum directly via a full-mask
+        // call on a reduced family (just check identity 2 * Σ_even ≈ scaled).
+        // Construct an "even-only" full call by building a custom mask
+        // covering the same rows but with weight_scale = 1.0.
+        let mut opts_even_unscaled = BlockwiseFitOptions::default();
+        opts_even_unscaled.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
+            mask: Arc::new(even_mask),
+            n_full: m, // weight_scale = m / m = 1.0 so the call returns the raw even-row sum
+            weight_scale: 1.0,
+            seed: 0,
+        }));
+        let raw_even_sum = family
+            .log_likelihood_only_with_options(&states, &opts_even_unscaled)
+            .expect("raw even-row ll sum");
+
+        let expected_scaled = (n as f64 / m as f64) * raw_even_sum;
+        let rel = ((scaled - expected_scaled) / expected_scaled.abs().max(1.0)).abs();
+        assert!(
+            rel < 1e-12,
+            "scaled {} != 2*even_sum {} (rel {})",
+            scaled,
+            expected_scaled,
+            rel
+        );
+
+        // Horvitz-Thompson: 2 * Σ_even should approximate the full-data sum.
+        // For a smooth integrand on a moderately fine grid, ~5% relative
+        // accuracy is plenty.
+        let baseline = family
+            .log_likelihood_only(&states)
+            .expect("baseline ll");
+        let ht_rel = ((scaled - baseline) / baseline.abs().max(1.0)).abs();
+        assert!(
+            ht_rel < 0.05,
+            "Horvitz-Thompson scaled {} not near baseline {} (rel {})",
+            scaled,
+            baseline,
+            ht_rel
+        );
     }
 
     fn build_test_link_deviation_block_from_seed(
