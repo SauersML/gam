@@ -2390,31 +2390,36 @@ impl<'a> RemlState<'a> {
         let last_residual_bits = self.last_ift_prediction_residual.load(Ordering::Relaxed);
         let r = f64::from_bits(last_residual_bits);
         let last_residual = if r.is_finite() && r >= 0.0 { Some(r) } else { None };
-        // Early noop detection: when the outer optimizer takes an
-        // effectively-zero ρ-step (every |Δρ_k| below the numerical-
-        // noise floor), the IFT predictor would compute identity. The
-        // inner function detects this and returns Noop, but only AFTER
-        // the factor cache lookup — which on a miss pays a fresh
-        // O(p³)/3 Cholesky (multiple seconds at biobank-scale p).
-        // Skipping the factor lookup on noop saves that work entirely.
+        // Early short-circuit: detect both the no-op case (every
+        // |Δρ_k| below the numerical-noise floor → predictor reduces
+        // to identity) AND the large-Δρ rejection case (|Δρ| exceeds
+        // the adaptive cap → predictor would reject) BEFORE acquiring
+        // the H_pen factor. The inner function detects both cases and
+        // returns the same outcome, but only AFTER the factor cache
+        // lookup — which on a miss pays a fresh O(p³)/3 Cholesky
+        // (multiple seconds at biobank-scale p) for a prediction
+        // that's about to be discarded.
+        //
         // The dim-check guards mirror the inner function's so an
         // ambiguous case (rho-not-stamped, dim mismatch) falls through
         // and lets the inner function emit its precise rejection
         // marker, preserving the single-source-of-truth contract.
         if !cache.rho.is_empty() && cache.rho.len() == new_rho.len() {
-            let mut all_below_eps = true;
             let mut max_abs_drho = 0.0_f64;
+            let mut any_non_finite = false;
             for i in 0..cache.rho.len() {
                 let d = new_rho[i] - cache.rho[i];
-                if !d.is_finite() || d.abs() > IFT_WARM_START_DRHO_EPS {
-                    all_below_eps = false;
+                if !d.is_finite() {
+                    any_non_finite = true;
+                    max_abs_drho = f64::INFINITY;
                     break;
                 }
                 if d.abs() > max_abs_drho {
                     max_abs_drho = d.abs();
                 }
             }
-            if all_below_eps {
+            // No-op case: every |Δρ_k| below the eps floor.
+            if !any_non_finite && max_abs_drho <= IFT_WARM_START_DRHO_EPS {
                 // Same NOOP marker the inner function would emit, so the
                 // bench runner aggregator's count is preserved across
                 // both the early-out path and the post-factor path.
@@ -2427,6 +2432,22 @@ impl<'a> RemlState<'a> {
                     Coefficients::new(cache.beta_original.clone()),
                     IftPredictionOutcome::Noop,
                 ));
+            }
+            // Large-Δρ rejection: |Δρ| exceeds the adaptive cap.
+            // `adaptive_ift_max_drho` reads the same `last_residual`
+            // signal we already loaded above. Same marker as the inner
+            // function emits so the rejection-rate aggregator
+            // (`_IFT_REJECTED_PATTERN` in runner.py) is preserved
+            // across both paths.
+            let max_drho_cap = adaptive_ift_max_drho(last_residual);
+            if !max_abs_drho.is_finite() || max_abs_drho > max_drho_cap {
+                log::info!(
+                    "[IFT-REJECTED] reason=large_drho max_drho={:.3e} cap={:.3e} drho_dim={}",
+                    max_abs_drho,
+                    max_drho_cap,
+                    cache.rho.len(),
+                );
+                return None;
             }
         }
         // Get the cached factor or lazily compute it. Holding the
