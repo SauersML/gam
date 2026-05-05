@@ -2258,6 +2258,30 @@ impl<'a> RemlState<'a> {
                 // after this call returns; until then the slot holds
                 // an empty `rho` placeholder that the predictor
                 // detects and skips.
+                // Precompute the per-penalty `S_k · β_cur` block-local
+                // mat-vecs once at cache-write time so the IFT
+                // predictor's per-call rhs construction skips the
+                // `O(block²)` mat-vec on every penalty. At biobank-scale
+                // CTN this saves a few ms per predict call; combined
+                // with the H_pen factor cache (commit ec18559d) the
+                // predictor's per-call work is now dominated by the
+                // back-solve plus the `O(p)` rhs accumulation.
+                let lambda_s_beta_blocks: Option<Vec<ndarray::Array1<f64>>> = {
+                    let blocks: Vec<ndarray::Array1<f64>> = self
+                        .canonical_penalties
+                        .iter()
+                        .map(|cp| {
+                            let r = &cp.col_range;
+                            let beta_block = beta_original.slice(s![r.start..r.end]);
+                            cp.local.dot(&beta_block)
+                        })
+                        .collect();
+                    if blocks.is_empty() {
+                        None
+                    } else {
+                        Some(blocks)
+                    }
+                };
                 {
                     let mut cache_w = self.ift_warm_start_cache.write().unwrap();
                     cache_w.replace(super::IftWarmStartCache {
@@ -2268,6 +2292,7 @@ impl<'a> RemlState<'a> {
                             .clone(),
                         qs: pr.reparam_result.qs.clone(),
                         frame_was_original,
+                        lambda_s_beta_blocks,
                     });
                 }
                 // The factor cache holds the Cholesky of the PREVIOUS
@@ -3527,6 +3552,16 @@ fn predict_warm_start_beta_ift_inner(
     let beta_cur = &cache.beta_original;
     let mut rhs_original = Array1::<f64>::zeros(p);
     let mut any_active = false;
+    // Use the precomputed `S_k · β_cur` blocks (cache write-time
+    // hook) when available. Falls back to recomputing the local
+    // mat-vec when the cache predates this commit's writer hook
+    // (None) or the precomputation length disagrees with the
+    // current canonical_penalties (defensive: guards against
+    // racing replace events).
+    let precomputed_ok = match &cache.lambda_s_beta_blocks {
+        Some(blocks) => blocks.len() == canonical_penalties.len(),
+        None => false,
+    };
     for (idx, cp) in canonical_penalties.iter().enumerate() {
         let dr = drho[idx];
         if dr.abs() <= IFT_WARM_START_DRHO_EPS {
@@ -3536,10 +3571,26 @@ fn predict_warm_start_beta_ift_inner(
         let r = &cp.col_range;
         // S_k · β_cur is block-local: only β_cur[r] contributes, and the
         // result lives in r as well.
-        let beta_block = beta_cur.slice(s![r.start..r.end]);
-        let sb_block = cp.local.dot(&beta_block);
         let scale = dr * cache.rho[idx].exp();
         let mut rhs_slice = rhs_original.slice_mut(s![r.start..r.end]);
+        if precomputed_ok {
+            // SAFE: precomputed_ok guarantees Some + length match.
+            let blocks = cache.lambda_s_beta_blocks.as_ref().unwrap();
+            let sb_block = &blocks[idx];
+            // Defensive: a fresh canonical_penalty may have a different
+            // col_range size than the cache's precomputation captured.
+            // If so, fall through to the recompute path for this
+            // index. (Should not happen in practice — the cache is
+            // invalidated whenever the penalty layout changes.)
+            if sb_block.len() == rhs_slice.len() {
+                for (target, src) in rhs_slice.iter_mut().zip(sb_block.iter()) {
+                    *target += scale * *src;
+                }
+                continue;
+            }
+        }
+        let beta_block = beta_cur.slice(s![r.start..r.end]);
+        let sb_block = cp.local.dot(&beta_block);
         for (target, src) in rhs_slice.iter_mut().zip(sb_block.iter()) {
             *target += scale * *src;
         }
@@ -6340,6 +6391,7 @@ mod ift_warm_start_tests {
             penalized_hessian_transformed: SymmetricMatrix::Dense(h_pen.clone()),
             qs: Array2::eye(p),
             frame_was_original: true,
+            lambda_s_beta_blocks: None,
         };
 
         // Small Δρ — well within the 2.0 cap.
@@ -6460,6 +6512,7 @@ mod ift_warm_start_tests {
             penalized_hessian_transformed: SymmetricMatrix::Dense(h_tfd),
             qs: qs.clone(),
             frame_was_original: false,
+            lambda_s_beta_blocks: None,
         };
         let cache_orig = super::super::IftWarmStartCache {
             beta_original: beta_cur.clone(),
@@ -6467,6 +6520,7 @@ mod ift_warm_start_tests {
             penalized_hessian_transformed: SymmetricMatrix::Dense(h_orig.clone()),
             qs: Array2::eye(p),
             frame_was_original: true,
+            lambda_s_beta_blocks: None,
         };
 
         let new_rho = ndarray::array![0.3_f64];
@@ -6518,6 +6572,7 @@ mod ift_warm_start_tests {
             penalized_hessian_transformed: SymmetricMatrix::Dense(h_pen),
             qs: Array2::eye(p),
             frame_was_original: true,
+            lambda_s_beta_blocks: None,
         };
         // |Δρ| = 3 > IFT_WARM_START_DEFAULT_MAX_DRHO = 2.0 → reject under
         // default cap (no quality history).
@@ -6565,6 +6620,7 @@ mod ift_warm_start_tests {
             penalized_hessian_transformed: SymmetricMatrix::Dense(Array2::eye(p)),
             qs: Array2::eye(p),
             frame_was_original: true,
+            lambda_s_beta_blocks: None,
         };
         let new_rho = ndarray::array![0.1_f64];
         let predicted =
