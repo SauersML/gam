@@ -1849,6 +1849,34 @@ def _emit_phase_summary(
             parts.append(
                 f"ift_predicts={n} ift_p50={p50:.2e} ift_p95={p95:.2e} ift_max={rmax:.2e}"
             )
+        # Inner-iter distribution per accepted IFT predict. The
+        # captured `iters` field is PIRLS's iteration count from
+        # `pirls_result.iteration` — i.e. how many Newton iters the
+        # inner solver took after starting from the IFT-predicted β.
+        # Combined with `ift_p50_resid` this tells the full warm-start
+        # value story:
+        #   small p50_resid + small ift_iters_p50 → predictor accurate AND
+        #     PIRLS converged fast (warm-start delivering correctness +
+        #     speed; mission-aligned biobank trace).
+        #   small p50_resid + large ift_iters_p50 → predictor accurate
+        #     but PIRLS still struggled (hard geometry; warm-start
+        #     correct but speed-bound elsewhere).
+        #   large p50_resid + large ift_iters_p50 → predictor poor and
+        #     PIRLS slow (warm-start collapsing toward flat).
+        ift_iters = [
+            int(m[5])
+            for m in ift_quality_matches
+            if m[5]
+        ]
+        if ift_iters:
+            n_i = len(ift_iters)
+            sorted_i = sorted(ift_iters)
+            i_p50 = sorted_i[n_i // 2]
+            i_p95 = sorted_i[min(n_i - 1, int(0.95 * n_i))]
+            i_max = sorted_i[-1]
+            parts.append(
+                f"ift_iters_p50={i_p50} ift_iters_p95={i_p95} ift_iters_max={i_max}"
+            )
         # Δρ-step distribution: how big a ρ-jump is the predictor
         # being asked to handle? Combined with residual quartiles
         # this answers "did large residuals come from large jumps
