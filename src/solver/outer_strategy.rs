@@ -1658,8 +1658,15 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
 /// loosens. The cap stays fixed within a single outer iter (line-search
 /// probes go through `eval_cost`, which does NOT touch the cap atomic).
 fn first_order_inner_cap_schedule(iter_count: usize) -> usize {
+    // First outer iter starts from the seed (cold warm-start, ill-conditioned),
+    // so its inner solve is the slowest. Cap aggressively at 3 — matches
+    // mgcv's "screening" inner budget — so a first-iter inner solve at
+    // biobank n=320k (≈30s/iter) takes ~90s rather than ~150s. Subsequent
+    // iters relax as the warm-start improves and the cubic model
+    // stabilizes.
     match iter_count {
-        0 | 1 => 5,
+        0 => 3,
+        1 => 5,
         2 | 3 => 10,
         4 | 5 => 20,
         _ => 0,
@@ -1672,7 +1679,7 @@ mod outer_inner_cap_schedule_tests {
 
     #[test]
     fn schedule_is_shallow_at_start() {
-        assert_eq!(first_order_inner_cap_schedule(0), 5);
+        assert_eq!(first_order_inner_cap_schedule(0), 3);
         assert_eq!(first_order_inner_cap_schedule(1), 5);
     }
 
