@@ -739,6 +739,51 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         self.assertIn("n_tangent_accepts=2", d)
         self.assertNotIn("tangent_p50=", d)
 
+    def test_pirls_health_verdict_classifies_tiers(self) -> None:
+        # HEALTHY: every solve converged at rate < 0.5 (each Newton
+        # iter at least halved the gradient on average).
+        v, d = _RUNNER._pirls_health_verdict(rates=[0.1, 0.2, 0.3, 0.4, 0.45])
+        self.assertEqual(v, "HEALTHY", f"detail={d}")
+        self.assertIn("max=0.450", d)
+        # MARGINAL: most solves fast (p50 < 0.5) but some struggled
+        # (max in [0.5, 0.85)).
+        v, d = _RUNNER._pirls_health_verdict(
+            rates=[0.1, 0.2, 0.3, 0.4, 0.6, 0.7, 0.8],
+        )
+        self.assertEqual(v, "MARGINAL", f"detail={d}")
+        # DEGRADED: p50 ≥ 0.5 (median solve grinding).
+        v, d = _RUNNER._pirls_health_verdict(rates=[0.5, 0.6, 0.7, 0.8])
+        self.assertEqual(v, "DEGRADED", f"detail={d}")
+        # DEGRADED: max ≥ 0.85 even when p50 is fine (one solve
+        # essentially failed to converge).
+        v, d = _RUNNER._pirls_health_verdict(
+            rates=[0.1, 0.2, 0.3, 0.95],
+        )
+        self.assertEqual(v, "DEGRADED", f"detail={d}")
+        # NO-DATA: empty rates list (no PIRLS solves emitted markers).
+        v, d = _RUNNER._pirls_health_verdict(rates=[])
+        self.assertEqual(v, "NO-DATA")
+        self.assertIn("n_solves=0", d)
+
+    def test_phase_summary_emits_pirls_health_verdict_alongside_warm_start(self) -> None:
+        # End-to-end: stderr containing [PIRLS solve-end] markers
+        # produces a [PIRLS health] line in addition to the existing
+        # [WARM-START health] line.
+        stderr = "\n".join([
+            "[PIRLS solve-end] iters=4 elapsed=0.001s g_norm_initial=1.0e+01 g_norm_final=1.0e-04 convergence_rate=2.500e-01 status=Converged",
+            "[PIRLS solve-end] iters=5 elapsed=0.001s g_norm_initial=1.0e+01 g_norm_final=1.0e-05 convergence_rate=1.585e-01 status=Converged",
+            "[PIRLS solve-end] iters=3 elapsed=0.001s g_norm_initial=1.0e+01 g_norm_final=3.0e-02 convergence_rate=4.000e-01 status=Converged",
+            # Healthy IFT-QUALITY data drives the warm-start verdict
+            "[IFT-QUALITY] residual=1.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=3",
+            "[IFT-QUALITY] residual=2.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=4",
+            "[PHASE] my-fit fit end elapsed=10.0s",
+        ])
+        out = self._run_summary(stderr)
+        self.assertIn("[WARM-START health]", out)
+        self.assertIn("[PIRLS health]", out)
+        # All three rates < 0.5 → HEALTHY.
+        self.assertIn("verdict=HEALTHY", out.splitlines()[-1])
+
     def test_warm_start_health_verdict_outer_nonfinite_overrides_to_degraded(self) -> None:
         # Even with HEALTHY-looking IFT signals, a single
         # [OUTER non-finite] warning during the fit must override the
