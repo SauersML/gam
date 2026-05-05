@@ -2475,9 +2475,40 @@ impl<'a> RemlState<'a> {
         // Jacobian of β(ρ) at the cached solve and beats the tangent-line
         // predictor whenever a converged H_pen is available — which is
         // every call after the first successful PIRLS solve.
+        //
+        // Source disambiguation: IFT returns Some(β_cur) on noop (all
+        // Δρ_k below the per-component eps floor). The tangent-line
+        // path makes the same distinction explicit by tagging Flat
+        // (commit 1b77588b). Mirror that here: detect the noop by
+        // comparing predicted to the IFT cache's β_original; if equal,
+        // tag Flat. The downstream [IFT-QUALITY] block already
+        // suppresses on the same condition (commit 52372fd5), so the
+        // observable behavior is unchanged — but the source tag now
+        // accurately reflects "this is a flat/identity warm-start"
+        // rather than mislabeling it as a real IFT prediction.
         if let Some(predicted) = self.predict_warm_start_beta_ift(new_rho) {
             log::debug!("[warm-start] IFT prediction accepted");
-            return Some((predicted, WarmStartPredictionSource::Ift));
+            let was_noop = self
+                .ift_warm_start_cache
+                .read()
+                .ok()
+                .and_then(|guard| {
+                    guard.as_ref().map(|c| {
+                        predicted.0.len() == c.beta_original.len()
+                            && predicted
+                                .0
+                                .iter()
+                                .zip(c.beta_original.iter())
+                                .all(|(a, b)| a == b)
+                    })
+                })
+                .unwrap_or(false);
+            let source = if was_noop {
+                WarmStartPredictionSource::Flat
+            } else {
+                WarmStartPredictionSource::Ift
+            };
+            return Some((predicted, source));
         }
         let cur_beta = self.warm_start_beta.read().unwrap().clone()?;
         let cur_rho = self.warm_start_rho.read().unwrap().clone();
@@ -3212,21 +3243,22 @@ impl<'a> RemlState<'a> {
                         // marker (commit d437aed1) already counts these
                         // calls separately, so we skip the [IFT-QUALITY]
                         // emission here for cleanliness.
-                        let was_noop = self
-                            .ift_warm_start_cache
-                            .read()
-                            .ok()
-                            .and_then(|guard| {
-                                guard.as_ref().map(|c| {
-                                    predicted.0.len() == c.beta_original.len()
-                                        && predicted
-                                            .0
-                                            .iter()
-                                            .zip(c.beta_original.iter())
-                                            .all(|(a, b)| a == b)
-                                })
-                            })
-                            .unwrap_or(false);
+                        // Noop detection: the predictor's source enum
+                        // already marks Flat returns unambiguously
+                        // (commit 1b77588b for tangent-line + this
+                        // commit's IFT alignment). When source=Flat,
+                        // the predictor returned the cached β unchanged
+                        // — the QUALITY block would emit a residual
+                        // that measures inner-Newton β movement at a
+                        // zero-step seed, NOT predictor faithfulness.
+                        // Skip the emission entirely on Flat. Older
+                        // array-comparison `was_noop` check is now
+                        // redundant; the source enum is the single
+                        // source of truth.
+                        let was_noop = matches!(
+                            prediction_source,
+                            Some(WarmStartPredictionSource::Flat),
+                        );
                         let converged_original = match pirls_result.coordinate_frame {
                             pirls::PirlsCoordinateFrame::OriginalSparseNative => {
                                 pirls_result.beta_transformed.as_ref().clone()
@@ -3295,13 +3327,18 @@ impl<'a> RemlState<'a> {
                             // bench runner's residual percentile aggregation
                             // is correctly attributed: tangent-line predictions
                             // get [TANGENT-QUALITY] rather than mistakenly
-                            // landing in [IFT-QUALITY] stats. Flat returns
-                            // (predicted == β_cur) are noops, already filtered
-                            // by `was_noop` above; if we reach this point with
-                            // source=Flat the source must have come from a
-                            // path the noop check missed — log under IFT for
-                            // backwards compatibility, but a non-zero count
-                            // would be a regression signal.
+                            // landing in [IFT-QUALITY] stats. The Flat
+                            // case is already short-circuited by the
+                            // was_noop check above (the source enum is
+                            // the single source of truth), so we
+                            // shouldn't reach this dispatch with
+                            // source=Flat. The Flat arm here is
+                            // defensive — the marker name match is
+                            // exhaustive because the enum is closed,
+                            // and emitting under [IFT-QUALITY] for an
+                            // unexpected Flat would surface as a
+                            // residual entry that the bench runner
+                            // could investigate.
                             let marker = match prediction_source {
                                 Some(WarmStartPredictionSource::Ift) => "[IFT-QUALITY]",
                                 Some(WarmStartPredictionSource::TangentLine) => "[TANGENT-QUALITY]",
