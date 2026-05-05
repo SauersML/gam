@@ -1638,6 +1638,18 @@ _PIRLS_ITER_BREAKDOWN_PATTERN = re.compile(
     r"\s+candidate=([\d.]+)s\s+other=([\d.]+)s"
 )
 
+# Per-iter curvature-kind log emitted by `runworking_model_pirls`'s
+# `update_with_curvature` block. The `curvature=<KIND>` token is the
+# Debug format of the `HessianCurvatureKind` enum: `Observed` or
+# `Fisher`. Aggregating tells us how often the Fisher fallback fires,
+# which is a direct signal of observed-Hessian PD failures at biobank
+# scale (the Observed-curvature path is preferred for non-canonical
+# links because it converges faster, but it's not guaranteed PD; on
+# failure, the inner solver retries with Fisher).
+_PIRLS_CURVATURE_KIND_PATTERN = re.compile(
+    r"\[STAGE\] PIRLS update_with_curvature iter=\d+\s+curvature=(\w+)"
+)
+
 # Per-iter LM trajectory: validates the textbook Madsen accept (commit
 # 58ae42d1) and reject (d37626e6) updates plus the runtime adaptive λ
 # clamp (43be42be) are moving the trust region in useful directions at
@@ -2094,6 +2106,34 @@ def _emit_phase_summary(
         parts.append(
             f"outer_eval_n={n_evals_total} outer_eval_total={secs_total:.1f}s "
             f"{order_pieces}"
+        )
+    # Per-iter curvature-kind aggregation. Counts `Observed` and
+    # `Fisher` invocations of `update_with_curvature` across the run.
+    # The Observed path is preferred for non-canonical links because
+    # it converges faster, but it can fail (non-PD) — when it fails,
+    # the inner solver falls back to Fisher. A high Fisher fraction
+    # at biobank scale is a direct signal of observed-Hessian PD
+    # failures, which is actionable diagnostic info.
+    curvature_kinds = _PIRLS_CURVATURE_KIND_PATTERN.findall(captured_stderr)
+    if curvature_kinds:
+        kind_counts: dict[str, int] = {}
+        for kind in curvature_kinds:
+            kind_counts[kind] = kind_counts.get(kind, 0) + 1
+        n_curv_total = len(curvature_kinds)
+        # Stable ordering for the verdict line.
+        kind_pieces = " ".join(
+            f"pirls_curv_{kind}={count}"
+            for kind, count in sorted(kind_counts.items())
+        )
+        # Fisher fraction = Fisher / (Observed + Fisher). High value
+        # (e.g., >0.2) indicates the observed Hessian is frequently
+        # non-PD; the curvature-kind contract documents that this
+        # forces a fallback that's slower-converging per iter.
+        fisher_count = kind_counts.get("Fisher", 0)
+        fisher_frac = fisher_count / max(n_curv_total, 1)
+        parts.append(
+            f"pirls_curv_n={n_curv_total} {kind_pieces} "
+            f"pirls_fisher_frac={fisher_frac:.2f}"
         )
     pirls_breakdown_matches = _PIRLS_ITER_BREAKDOWN_PATTERN.findall(captured_stderr)
     if pirls_breakdown_matches:
