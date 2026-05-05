@@ -1784,16 +1784,28 @@ def _emit_phase_summary(
     elif kappa_calls:
         # Got per-call markers but no summary (κ optimization didn't
         # finish — e.g. interrupted by command timeout). Surface the
-        # partial count + per-phase totals from the per-call lines.
+        # partial count + per-phase totals AND per-call distribution
+        # (max + p95) from the per-call lines, so a reviewer can tell
+        # which phase had a slow call vs which was just called many
+        # times. Mission-relevant: a single eval_outer that took most
+        # of the budget is a different signal from many fast eval_outer
+        # calls accumulating; the totals collapse those into one number
+        # but the max/p95 disambiguate.
         per_phase_secs: dict[str, list[float]] = {}
         for phase_name, _call_idx, secs in kappa_calls:
             per_phase_secs.setdefault(phase_name, []).append(float(secs))
         kphase_pieces = []
         for phase_name in sorted(per_phase_secs.keys()):
             secs_list = per_phase_secs[phase_name]
+            n_p = len(secs_list)
+            sorted_p = sorted(secs_list)
+            phase_max = sorted_p[-1]
+            phase_p95 = sorted_p[min(n_p - 1, int(0.95 * n_p))]
             kphase_pieces.append(
-                f"kappa_{phase_name}_calls={len(secs_list)} "
-                f"kappa_{phase_name}_total={sum(secs_list):.1f}s"
+                f"kappa_{phase_name}_calls={n_p} "
+                f"kappa_{phase_name}_total={sum(secs_list):.1f}s "
+                f"kappa_{phase_name}_p95={phase_p95:.2f}s "
+                f"kappa_{phase_name}_max={phase_max:.2f}s"
             )
         parts.append(f"kappa_optim_INCOMPLETE {' '.join(kphase_pieces)}")
     # IFT-quality probe distribution. Each marker records the residual

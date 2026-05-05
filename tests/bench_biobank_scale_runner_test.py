@@ -1030,6 +1030,44 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         out = self._run_summary(stderr)
         self.assertNotIn("tangent_marker_drift", out)
 
+    def test_phase_summary_kappa_incomplete_surfaces_per_phase_max_and_p95(self) -> None:
+        # κ-optimization interrupted by timeout: per-call [KAPPA-PHASE]
+        # lines but no [KAPPA-PHASE-SUMMARY]. The runner now surfaces
+        # max/p95 per phase alongside count + total, so a reviewer can
+        # tell whether a slow phase had ONE big call or MANY small
+        # ones.
+        stderr_lines = []
+        # 50 fast eval_outer calls (each 0.5s) + 1 slow one (60s)
+        # would total 85s with one outlier dominating.
+        for i in range(50):
+            stderr_lines.append(
+                f"[KAPPA-PHASE] phase=eval_outer call={i+1} order=ValueGradientHessian "
+                f"theta_norm=1.0e+00 log_kappa_norm=1.0e+00 elapsed_s=0.5"
+            )
+        stderr_lines.append(
+            "[KAPPA-PHASE] phase=eval_outer call=51 order=ValueGradientHessian "
+            "theta_norm=1.0e+00 log_kappa_norm=1.0e+00 elapsed_s=60.0"
+        )
+        # 5 cost calls, all fast.
+        for i in range(5):
+            stderr_lines.append(
+                f"[KAPPA-PHASE] phase=cost call={i+1} theta_norm=1.0e+00 "
+                f"log_kappa_norm=1.0e+00 elapsed_s=0.1"
+            )
+        stderr_lines.append("[PHASE] my-fit fit end elapsed=10.0s")
+        out = self._run_summary("\n".join(stderr_lines))
+        self.assertIn("kappa_optim_INCOMPLETE", out)
+        # eval_outer: 51 calls, total ~85s, max 60s, p95 = sorted[48] = 0.5
+        # (since 51-call list sorted has 50 values at 0.5 and 1 at 60;
+        # p95 = sorted[min(50, 48)] = sorted[48] = 0.5; the outlier
+        # is excluded from p95 but still flagged in max).
+        self.assertIn("kappa_eval_outer_calls=51", out)
+        self.assertIn("kappa_eval_outer_max=60.00s", out)
+        self.assertIn("kappa_eval_outer_p95=0.50s", out)
+        # cost: 5 calls, all 0.1s; max = p95 = 0.10.
+        self.assertIn("kappa_cost_calls=5", out)
+        self.assertIn("kappa_cost_max=0.10s", out)
+
     def test_phase_summary_aggregates_outer_nonfinite_warnings(self) -> None:
         # `[OUTER non-finite]` is a bug signal — the REML unified
         # evaluator hit a NaN / Inf in an intermediate. Should be 0 in
