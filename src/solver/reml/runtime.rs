@@ -2448,12 +2448,33 @@ impl<'a> RemlState<'a> {
         let prev_rho = self.prev_warm_start_rho.read().unwrap().clone();
         let (cur_rho, prev_beta, prev_rho) = match (cur_rho, prev_beta, prev_rho) {
             (Some(cr), Some(pb), Some(pr)) => (cr, pb, pr),
-            _ => return Some(cur_beta), // no history yet — flat warm-start
+            // No history yet — first call after a fresh successful
+            // solve (only one (ρ, β) pair stashed). Silent fallback
+            // is the right behavior; emitting a marker here would
+            // just be noise on every first call.
+            _ => return Some(cur_beta),
         };
+        // Dimension mismatch paths below are bug signals: state-machine
+        // inconsistency between (β, ρ) cache and current state. Emit
+        // structured markers so the bench runner can detect non-zero
+        // counts as a regression signal. The wipe helpers from commit
+        // 6f7cbfc8 should have cleared these slots before the layout
+        // shifted; non-zero count indicates a missed invalidation.
         if cur_rho.len() != new_rho.len() || cur_rho.len() != prev_rho.len() {
+            log::info!(
+                "[TANGENT-REJECTED] reason=rho_dim_mismatch new_rho_dim={} cur_rho_dim={} prev_rho_dim={}",
+                new_rho.len(),
+                cur_rho.len(),
+                prev_rho.len(),
+            );
             return Some(cur_beta);
         }
         if cur_beta.0.len() != prev_beta.0.len() {
+            log::info!(
+                "[TANGENT-REJECTED] reason=beta_dim_mismatch cur_beta_dim={} prev_beta_dim={}",
+                cur_beta.0.len(),
+                prev_beta.0.len(),
+            );
             return Some(cur_beta);
         }
         // d_rho = ρ_k − ρ_{k-1}; step_rho = ρ_new − ρ_k.
@@ -2463,6 +2484,15 @@ impl<'a> RemlState<'a> {
             .map(|(c, p)| (c - p) * (c - p))
             .sum();
         if !d_rho_norm_sq.is_finite() || d_rho_norm_sq <= 1e-24 {
+            // Degenerate Δρ direction (the previous ρ-step had zero or
+            // unfinite length). Diagnostic rather than bug: this fires
+            // when the outer optimizer landed on a flat region or the
+            // ρ history collapsed. Surfacing the case lets the bench
+            // runner see flat-region traces.
+            log::info!(
+                "[TANGENT-REJECTED] reason=degenerate_drho d_rho_norm_sq={:.3e}",
+                d_rho_norm_sq,
+            );
             return Some(cur_beta);
         }
         let step_dot_d: f64 = new_rho
@@ -2473,6 +2503,13 @@ impl<'a> RemlState<'a> {
             .sum();
         let alpha = step_dot_d / d_rho_norm_sq;
         if !alpha.is_finite() {
+            // Non-finite α (NaN or Inf). Real bug signal — the
+            // numerator or denominator overflowed. Should never happen
+            // if d_rho_norm_sq passed the prior finiteness check.
+            log::info!(
+                "[TANGENT-REJECTED] reason=nonfinite_alpha step_dot_d={:.3e} d_rho_norm_sq={:.3e}",
+                step_dot_d, d_rho_norm_sq,
+            );
             return Some(cur_beta);
         }
         // Don't extrapolate against the previous step direction (α<0).

@@ -790,13 +790,21 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
             "[TANGENT-REJECTED] reason=alpha_above_cap alpha=2.345e+00 cap=1.500e+00",
             "[TANGENT-REJECTED] reason=alpha_negative alpha=-1.234e-01 cap=1.500e+00",
             "[TANGENT-REJECTED] reason=alpha_above_cap alpha=3.000e+00 cap=1.500e+00",
+            # New dim-mismatch / non-finite-α reasons.
+            "[TANGENT-REJECTED] reason=rho_dim_mismatch new_rho_dim=4 cur_rho_dim=3 prev_rho_dim=3",
+            "[TANGENT-REJECTED] reason=beta_dim_mismatch cur_beta_dim=10 prev_beta_dim=12",
+            "[TANGENT-REJECTED] reason=degenerate_drho d_rho_norm_sq=1.000e-30",
+            "[TANGENT-REJECTED] reason=nonfinite_alpha step_dot_d=NaN d_rho_norm_sq=2.345e-02",
             "[PHASE] my-fit fit end elapsed=10.0s",
         ])
         out = self._run_summary(stderr)
         self.assertIn("tangent_predicts=2", out)
-        self.assertIn("tangent_rejects=3", out)
+        self.assertIn("tangent_rejects=7", out)
         # Reasons sorted alphabetically by name.
-        self.assertIn("tangent_reasons=[alpha_above_cap=2,alpha_negative=1]", out)
+        self.assertIn(
+            "tangent_reasons=[alpha_above_cap=2,alpha_negative=1,beta_dim_mismatch=1,degenerate_drho=1,nonfinite_alpha=1,rho_dim_mismatch=1]",
+            out,
+        )
 
     def test_phase_summary_aggregates_ift_accept_reject_noop_independently(self) -> None:
         stderr = "\n".join([
