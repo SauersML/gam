@@ -2392,9 +2392,11 @@ impl<'a> RemlState<'a> {
     /// Predict β at `new_rho` via tangent-line extrapolation across the
     /// last two (ρ, β) pairs. Returns `None` if either pair is missing,
     /// the ρ-step direction is degenerate, or the extrapolation step
-    /// `α` exceeds the safety cap (1.5 — i.e. we don't extrapolate more
-    /// than 50% beyond the previous step length, where the linear-FOC
-    /// approximation likely breaks down).
+    /// `α` exceeds the adaptive safety cap (default 1.5 — see
+    /// `adaptive_tangent_alpha_cap` for the residual-driven policy
+    /// that loosens to 2.0 when prior IFT predictions were excellent
+    /// and tightens to 0.5 when the local linear approximation has
+    /// been shown to collapse toward flat warm-start).
     ///
     /// Falls back to the stored `warm_start_beta` (which is `β(ρ_k)` —
     /// the standard "use last β as-is" warm start) when no prediction
@@ -2448,10 +2450,26 @@ impl<'a> RemlState<'a> {
         if !alpha.is_finite() {
             return Some(cur_beta);
         }
-        // Don't extrapolate against the previous step direction (α<0)
-        // or beyond a safety cap (α>1.5). In those regimes the linear
-        // tangent is unlikely to be accurate.
-        if alpha <= 0.0 || alpha > 1.5 {
+        // Don't extrapolate against the previous step direction (α<0).
+        // The upper cap is adaptive: the same IFT residual signal that
+        // drives `adaptive_ift_max_drho` (commit 06888a1e) and the cap-
+        // schedule margin (commit 4eb3686a) is the most direct proxy
+        // for "how trustworthy is the local linear approximation" —
+        // and the tangent-line predictor IS a local linear
+        // approximation (just along the previous ρ-step direction
+        // rather than the IFT Jacobian's full direction). When the
+        // most recent IFT prediction was excellent, the tangent
+        // approximation can be trusted for slightly larger α; when
+        // it was poor, tighten.
+        let last_residual_bits = self.last_ift_prediction_residual.load(Ordering::Relaxed);
+        let last_residual = if last_residual_bits == 0 {
+            None
+        } else {
+            let r = f64::from_bits(last_residual_bits);
+            if r.is_finite() && r >= 0.0 { Some(r) } else { None }
+        };
+        let alpha_cap = adaptive_tangent_alpha_cap(last_residual);
+        if alpha <= 0.0 || alpha > alpha_cap {
             return Some(cur_beta);
         }
         let mut predicted = cur_beta.0.clone();
@@ -3323,6 +3341,55 @@ fn adaptive_ift_max_drho(last_residual: Option<f64>) -> f64 {
         r if r < 0.01 => 4.0,
         r if r < 0.05 => 3.0,
         r if r < 0.20 => 2.0,
+        r if r < 0.50 => 1.0,
+        _ => 0.5,
+    }
+}
+
+/// Default upper cap on the tangent-line predictor's α (extrapolation
+/// fraction beyond the previous ρ-step). 1.5 means "we permit at most
+/// 50% extrapolation past the last step length"; the original hardcoded
+/// constant from commit dcacf9ee. Used when no IFT-quality history is
+/// available (typically right after the first successful PIRLS solve
+/// at a fresh surface — IFT cache exists but tangent-line history
+/// pair is being assembled). Adaptive policy in
+/// `adaptive_tangent_alpha_cap` adjusts this based on the IFT
+/// residual signal when present.
+const TANGENT_ALPHA_DEFAULT_CAP: f64 = 1.5;
+
+/// Adaptive α-cap for the tangent-line predictor, sharing the IFT
+/// residual signal as a proxy for "how trustworthy is the local linear
+/// approximation". The tangent line IS a local linear approximation
+/// (just along the previous ρ-step direction rather than the IFT
+/// Jacobian's full direction), so the same residual that gates
+/// `adaptive_ift_max_drho` informs the right cap here too:
+///
+/// - `r < 0.01`  → linearization excellent → α_cap = 2.0 (1.5×
+///                  the default; permits a full step beyond the
+///                  previous one)
+/// - `r < 0.05`  → very good → α_cap = 1.75
+/// - `r < 0.20`  → ok → α_cap = 1.5 (the original constant)
+/// - `r < 0.50`  → marginal → α_cap = 1.0 (no extrapolation past
+///                  the previous step length)
+/// - `r ≥ 0.50`  → poor → α_cap = 0.5 (only HALF the previous step;
+///                  the linear approximation has been shown to
+///                  collapse toward flat warm-start at this surface)
+/// - `None` (no signal yet) → default 1.5
+///
+/// Same tier-stable, monotone-non-increasing-in-residual shape as
+/// `adaptive_ift_max_drho`; the two predictors share a single quality
+/// signal so their caps move together.
+fn adaptive_tangent_alpha_cap(last_residual: Option<f64>) -> f64 {
+    let Some(r) = last_residual else {
+        return TANGENT_ALPHA_DEFAULT_CAP;
+    };
+    if r.is_nan() || r < 0.0 {
+        return TANGENT_ALPHA_DEFAULT_CAP;
+    }
+    match r {
+        r if r < 0.01 => 2.0,
+        r if r < 0.05 => 1.75,
+        r if r < 0.20 => 1.5,
         r if r < 0.50 => 1.0,
         _ => 0.5,
     }
@@ -6538,6 +6605,48 @@ mod ift_warm_start_tests {
             assert!(
                 w[0] >= w[1],
                 "adaptive cap is not monotone non-increasing in residual: {caps:?}"
+            );
+        }
+    }
+
+    /// `adaptive_tangent_alpha_cap` follows the same quality-tier
+    /// pattern as `adaptive_ift_max_drho`, but with values calibrated
+    /// to the tangent-line predictor's α scale (multiples of the
+    /// previous ρ-step). Pin down each tier transition + defensive
+    /// handling.
+    #[test]
+    fn adaptive_tangent_alpha_cap_follows_quality_tiers() {
+        use super::adaptive_tangent_alpha_cap;
+        // No history → default 1.5 (the original hardcoded constant).
+        assert_eq!(adaptive_tangent_alpha_cap(None), 1.5);
+        // NaN / negative → default (defensive against torn atomics).
+        assert_eq!(adaptive_tangent_alpha_cap(Some(f64::NAN)), 1.5);
+        assert_eq!(adaptive_tangent_alpha_cap(Some(-1.0)), 1.5);
+        // INFINITY → tightest tier (catastrophic prediction).
+        assert_eq!(adaptive_tangent_alpha_cap(Some(f64::INFINITY)), 0.5);
+        // Tier boundaries.
+        assert_eq!(adaptive_tangent_alpha_cap(Some(0.0)), 2.0);
+        assert_eq!(adaptive_tangent_alpha_cap(Some(0.005)), 2.0);
+        assert_eq!(adaptive_tangent_alpha_cap(Some(0.01)), 1.75);
+        assert_eq!(adaptive_tangent_alpha_cap(Some(0.04)), 1.75);
+        assert_eq!(adaptive_tangent_alpha_cap(Some(0.05)), 1.5);
+        assert_eq!(adaptive_tangent_alpha_cap(Some(0.10)), 1.5);
+        assert_eq!(adaptive_tangent_alpha_cap(Some(0.20)), 1.0);
+        assert_eq!(adaptive_tangent_alpha_cap(Some(0.49)), 1.0);
+        assert_eq!(adaptive_tangent_alpha_cap(Some(0.50)), 0.5);
+        assert_eq!(adaptive_tangent_alpha_cap(Some(2.0)), 0.5);
+        // Monotone non-increasing in residual: same shape as
+        // adaptive_ift_max_drho. The two predictors share the
+        // residual signal so their caps move together.
+        let residuals = [0.001, 0.02, 0.10, 0.30, 0.80];
+        let caps: Vec<f64> = residuals
+            .iter()
+            .map(|&r| adaptive_tangent_alpha_cap(Some(r)))
+            .collect();
+        for w in caps.windows(2) {
+            assert!(
+                w[0] >= w[1],
+                "tangent α cap is not monotone non-increasing in residual: {caps:?}"
             );
         }
     }
