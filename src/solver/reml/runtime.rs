@@ -3522,14 +3522,42 @@ fn predict_warm_start_beta_ift_inner(
 ) -> Option<Coefficients> {
     // Cache populated but ρ not yet stamped (happens between
     // updatewarm_start_from and record_warm_start_rho on the first solve).
+    // This is the *expected* race window during normal operation — silent
+    // None is correct; emitting a marker would just be noise on every
+    // first call.
     if cache.rho.is_empty() {
         return None;
     }
     let k = cache.rho.len();
-    if new_rho.len() != k
-        || canonical_penalties.len() != k
-        || cache.beta_original.len() != p
-    {
+    // Dimension consistency check. A mismatch here is a state-machine
+    // bug signal — the cache was populated under a different penalty
+    // layout than the predictor is being asked to use. Emit a structured
+    // [IFT-REJECTED] marker so the bench runner counts these. If the
+    // count is ever non-zero in production, we have a real inconsistency
+    // in the cache invalidation chain; reset_surface, link change, and
+    // similar should have wiped the cache before the layout shifted.
+    if new_rho.len() != k {
+        log::info!(
+            "[IFT-REJECTED] reason=rho_dim_mismatch new_rho_dim={} cache_rho_dim={}",
+            new_rho.len(),
+            k,
+        );
+        return None;
+    }
+    if canonical_penalties.len() != k {
+        log::info!(
+            "[IFT-REJECTED] reason=penalty_dim_mismatch penalties_dim={} cache_rho_dim={}",
+            canonical_penalties.len(),
+            k,
+        );
+        return None;
+    }
+    if cache.beta_original.len() != p {
+        log::info!(
+            "[IFT-REJECTED] reason=beta_dim_mismatch cache_beta_dim={} expected_p={}",
+            cache.beta_original.len(),
+            p,
+        );
         return None;
     }
 
@@ -6825,6 +6853,54 @@ mod ift_warm_start_tests {
                 "adaptive cap is not monotone non-increasing in residual: {caps:?}"
             );
         }
+    }
+
+    /// Dim-mismatch rejection paths must return None (so the caller
+    /// falls through to tangent-line / flat warm-start) rather than
+    /// dereferencing into mismatched arrays. The new structured
+    /// markers added in this commit make these silent failure modes
+    /// visible in production logs as bug signals.
+    #[test]
+    fn ift_predictor_rejects_dim_mismatches() {
+        let p = 3usize;
+        let s1 = Array2::from_shape_vec(
+            (p, p),
+            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        )
+        .unwrap();
+        let cp1 = dense_canonical_from_local(s1, p);
+        let canonical = vec![cp1];
+        let beta_cur = ndarray::array![1.0_f64, 1.0, 1.0];
+        let rho_cur = ndarray::array![0.0_f64];
+        let cache = super::super::IftWarmStartCache {
+            beta_original: beta_cur,
+            rho: rho_cur,
+            penalized_hessian_transformed: SymmetricMatrix::Dense(
+                Array2::<f64>::eye(p) * 2.0,
+            ),
+            qs: Array2::eye(p),
+            frame_was_original: true,
+            lambda_s_beta_blocks: None,
+        };
+        // new_rho dim mismatch: cache has 1 ρ, caller passes 2.
+        let bad_new_rho = ndarray::array![0.1_f64, 0.2];
+        assert!(
+            predict_warm_start_beta_ift_from_cache(&cache, &canonical, &bad_new_rho, p, None)
+                .is_none(),
+            "new_rho dim mismatch must reject",
+        );
+        // penalty_penalties dim mismatch: cache has 1 ρ, caller passes 0 penalties.
+        let new_rho = ndarray::array![0.1_f64];
+        assert!(
+            predict_warm_start_beta_ift_from_cache(&cache, &[], &new_rho, p, None).is_none(),
+            "penalty dim mismatch must reject",
+        );
+        // beta dim mismatch: cache has p=3 β, caller passes p=4.
+        assert!(
+            predict_warm_start_beta_ift_from_cache(&cache, &canonical, &new_rho, 4, None)
+                .is_none(),
+            "beta dim mismatch must reject",
+        );
     }
 
     /// `adaptive_tangent_alpha_cap` follows the same quality-tier
