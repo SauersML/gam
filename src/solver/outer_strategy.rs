@@ -1733,7 +1733,19 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
                     None => "n/a".to_string(),
                 };
                 let snap_str = match snapshot {
-                    Some(s) => format!("last_iters={} converged={}", s.last_iters, s.last_converged),
+                    Some(s) => format!(
+                        "last_iters={} converged={} ift_residual={} accept_rho={}",
+                        s.last_iters,
+                        s.last_converged,
+                        match s.last_ift_residual {
+                            Some(r) => format!("{:.3e}", r),
+                            None => "n/a".to_string(),
+                        },
+                        match s.last_accept_rho {
+                            Some(r) => format!("{:.3}", r),
+                            None => "n/a".to_string(),
+                        },
+                    ),
                     None => "no-history".to_string(),
                 };
                 log::info!(
@@ -2102,6 +2114,42 @@ mod outer_inner_cap_schedule_tests {
     }
 
     #[test]
+    fn schedule_skips_lm_accept_rho_bump_when_signal_absent() {
+        // None for last_accept_rho means "no signal yet" — the schedule
+        // must NOT bump the margin in that case (otherwise a fresh
+        // surface with the NaN sentinel would get penalty cap inflation
+        // for no reason). last_iters=4, last_ift_residual=None →
+        // default base margin=2 → cap=6, regardless of accept_rho being
+        // unset.
+        let snap = Some(InnerProgressSnapshot {
+            last_iters: 4,
+            last_converged: true,
+            last_ift_residual: None,
+            last_accept_rho: None,
+        });
+        assert_eq!(first_order_inner_cap_schedule(2, None, snap), 6);
+        // Regression-lock the boundary: accept_rho exactly at 0.5
+        // (textbook good-agreement cutoff) does NOT bump (`< 0.5` is
+        // strict). cap = 4 + 2 = 6.
+        let snap = Some(InnerProgressSnapshot {
+            last_iters: 4,
+            last_converged: true,
+            last_ift_residual: None,
+            last_accept_rho: Some(0.5),
+        });
+        assert_eq!(first_order_inner_cap_schedule(2, None, snap), 6);
+        // accept_rho = 1.0 is the textbook "perfect agreement" — never
+        // bumps. cap = 4 + 2 = 6.
+        let snap = Some(InnerProgressSnapshot {
+            last_iters: 4,
+            last_converged: true,
+            last_ift_residual: None,
+            last_accept_rho: Some(1.0),
+        });
+        assert_eq!(first_order_inner_cap_schedule(2, None, snap), 6);
+    }
+
+    #[test]
     fn schedule_combines_ift_residual_and_lm_accept_rho() {
         // When BOTH signals fire (poor IFT prediction AND poor LM
         // accept_rho), the bumps compose: IFT base = 4, accept_rho
@@ -2195,7 +2243,19 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
                     None => "n/a".to_string(),
                 };
                 let snap_str = match snapshot {
-                    Some(s) => format!("last_iters={} converged={}", s.last_iters, s.last_converged),
+                    Some(s) => format!(
+                        "last_iters={} converged={} ift_residual={} accept_rho={}",
+                        s.last_iters,
+                        s.last_converged,
+                        match s.last_ift_residual {
+                            Some(r) => format!("{:.3e}", r),
+                            None => "n/a".to_string(),
+                        },
+                        match s.last_accept_rho {
+                            Some(r) => format!("{:.3}", r),
+                            None => "n/a".to_string(),
+                        },
+                    ),
                     None => "no-history".to_string(),
                 };
                 log::info!(
@@ -2264,7 +2324,19 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
                     None => "n/a".to_string(),
                 };
                 let snap_str = match snapshot {
-                    Some(s) => format!("last_iters={} converged={}", s.last_iters, s.last_converged),
+                    Some(s) => format!(
+                        "last_iters={} converged={} ift_residual={} accept_rho={}",
+                        s.last_iters,
+                        s.last_converged,
+                        match s.last_ift_residual {
+                            Some(r) => format!("{:.3e}", r),
+                            None => "n/a".to_string(),
+                        },
+                        match s.last_accept_rho {
+                            Some(r) => format!("{:.3}", r),
+                            None => "n/a".to_string(),
+                        },
+                    ),
                     None => "no-history".to_string(),
                 };
                 log::info!(
