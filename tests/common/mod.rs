@@ -69,7 +69,17 @@ pub fn fit_power_law(points: &[(f64, f64)]) -> Option<PowerLawFit> {
     let sxx: f64 = logs.iter().map(|(x, _)| x * x).sum();
     let sxy: f64 = logs.iter().map(|(x, y)| x * y).sum();
     let denom = n * sxx - sx * sx;
-    if !denom.is_finite() || denom.abs() < 1e-30 {
+    // Refuse the fit when the log-space x-variance has collapsed —
+    // either because all input x are identical (n*sxx == sx² exactly)
+    // or because they are within numerical noise of each other (n*sxx
+    // and sx² are equal up to catastrophic-cancellation residue). An
+    // absolute threshold like `< 1e-30` is wrong here: at x≈2 the
+    // cancellation residue is on the order of `(ln 2)² · n · ε ≈ 1e-3`,
+    // which would slip through and produce a noise-driven `α`. Use a
+    // relative threshold against the magnitude of the contributing
+    // terms so the gate fires correctly at any x scale.
+    let denom_scale = (n * sxx).abs().max((sx * sx).abs()).max(1.0);
+    if !denom.is_finite() || denom.abs() < 1e-12 * denom_scale {
         return None;
     }
     let alpha = (n * sxy - sx * sy) / denom;
