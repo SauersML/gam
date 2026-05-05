@@ -292,6 +292,73 @@ fn pirls_result_exposes_finite_positive_final_lm_lambda() {
 }
 
 #[test]
+fn pirls_result_exposes_final_accept_rho_in_unit_interval() {
+    // Cold fit must populate `final_accept_rho` with Some(rho) where
+    // rho is finite. The accepted gain ratio (actual/predicted) must
+    // satisfy rho > 0 by the LM accept-branch invariant; expect rho
+    // close to 1.0 for well-conditioned problems (the model is
+    // predicting the actual reduction well). Guards against
+    // regressions where the field is silently left at None.
+    // Use the existing top-of-file imports — re-importing from
+    // gam::pirls fails because these types are reexported via
+    // gam::types, not gam::pirls.
+    let (x, y, w, penalties) = make_problem();
+    let p = x.ncols();
+    let offset = Array1::<f64>::zeros(y.len());
+    let cfg = PirlsConfig {
+        likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+        link_kind: InverseLink::Standard(LinkFunction::Logit),
+        max_iterations: 200,
+        convergence_tolerance: 1e-10,
+        firth_bias_reduction: false,
+        initial_lm_lambda: None,
+    };
+    let (result, _) = fit_model_for_fixed_rho(
+        LogSmoothingParamsView::new(array![0.0].view()),
+        PirlsProblem {
+            x: x.view(),
+            offset: offset.view(),
+            y: y.view(),
+            priorweights: w.view(),
+            covariate_se: None,
+        },
+        PenaltyConfig {
+            canonical_penalties: &penalties,
+            balanced_penalty_root: None,
+            reparam_invariant: None,
+            p,
+            coefficient_lower_bounds: None,
+            linear_constraints_original: None,
+            penalty_shrinkage_floor: None,
+            kronecker_factored: None,
+        },
+        &cfg,
+        None,
+    )
+    .expect("fit_model_for_fixed_rho");
+    assert!(matches!(
+        result.status,
+        PirlsStatus::Converged | PirlsStatus::StalledAtValidMinimum
+    ));
+    let rho =
+        result.final_accept_rho.expect(
+            "PirlsResult::final_accept_rho must be Some after a converged inner-Newton fit",
+        );
+    assert!(
+        rho.is_finite(),
+        "final_accept_rho must be finite, got {rho}"
+    );
+    assert!(
+        rho > 0.0,
+        "final_accept_rho must be > 0 (LM accept-branch invariant), got {rho}"
+    );
+    eprintln!(
+        "[accept-rho regression] cold fit converged with final_accept_rho={:.4}",
+        rho
+    );
+}
+
+#[test]
 fn lm_lambda_warm_start_hint_preserves_kkt_beta_and_does_not_increase_iters() {
     // End-to-end test of the LM-λ persistence path (commit ba4dc931):
     // pull `final_lm_lambda` out of one fit, pass it as the
