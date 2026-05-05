@@ -55,6 +55,23 @@ pub(crate) struct IftWarmStartCache {
     /// (`OriginalSparseNative`) — in which case `qs` is the identity
     /// and the IFT predictor can skip the basis-conversion ops.
     pub frame_was_original: bool,
+    /// Per-penalty precomputation `S_k · β_cur[cp.col_range]`,
+    /// indexed in lockstep with `RemlObjectiveState::canonical_penalties`.
+    /// Each entry is the local-block mat-vec the IFT predictor would
+    /// otherwise recompute on every predict call. With H_pen factor
+    /// caching (commit ec18559d) the per-call cost dropped from
+    /// `O(p³)` Cholesky to `O(p²) ≈ k · O(block²)` rhs construction;
+    /// at biobank-scale CTN (p ≈ several thousand) that's several ms
+    /// per predict call still being paid. By stashing `S_k · β_cur`
+    /// at cache-write time the predictor's per-call work drops to
+    /// just the `Δρ_k · e^{ρ_k} · sb_block` accumulation, which is
+    /// `O(p)` rather than `O(p²)`.
+    ///
+    /// `None` when the cache predates this commit's writer hook (e.g.,
+    /// transient state during invalidation); the predictor falls back
+    /// to recomputing the mat-vec when this is `None` or the length
+    /// mismatches `canonical_penalties.len()`.
+    pub lambda_s_beta_blocks: Option<Vec<ndarray::Array1<f64>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
