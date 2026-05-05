@@ -9838,6 +9838,30 @@ impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointH
         Ok(Some(self.joint_hessian_operator.mul_vec(beta_flat)))
     }
 
+    fn hessian_matvec_into(
+        &self,
+        v: &Array1<f64>,
+        out: &mut Array1<f64>,
+    ) -> Result<bool, String> {
+        // Forward to HyperOperator's existing `mul_vec_into`, which writes the
+        // matvec result directly into the caller-owned buffer with no
+        // intermediate allocation. Used by inner-Newton PCG so each CG iter
+        // avoids a fresh Array1<f64> on the survival biobank-scale hot path.
+        if v.len() != self.joint_hessian_operator.dim()
+            || out.len() != self.joint_hessian_operator.dim()
+        {
+            return Err(format!(
+                "hessian_matvec_into: dim mismatch v={} out={} op={}",
+                v.len(),
+                out.len(),
+                self.joint_hessian_operator.dim()
+            ));
+        }
+        self.joint_hessian_operator
+            .mul_vec_into(v.view(), out.view_mut());
+        Ok(true)
+    }
+
     fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
         Ok(Some(self.joint_hessian_diagonal.clone()))
     }
