@@ -1666,6 +1666,9 @@ impl<'a> RemlState<'a> {
             cache_manager: EvalCacheManager::new(),
             arena: RemlArena::new(),
             warm_start_beta: RwLock::new(None),
+            warm_start_rho: RwLock::new(None),
+            prev_warm_start_beta: RwLock::new(None),
+            prev_warm_start_rho: RwLock::new(None),
             warm_start_enabled: AtomicBool::new(true),
             screening_max_inner_iterations: Arc::new(AtomicUsize::new(0)),
             outer_inner_cap: Arc::new(AtomicUsize::new(0)),
@@ -2168,15 +2171,114 @@ impl<'a> RemlState<'a> {
                         pr.reparam_result.qs.dot(pr.beta_transformed.as_ref())
                     }
                 };
-                self.warm_start_beta
-                    .write()
-                    .unwrap()
-                    .replace(Coefficients::new(beta_original));
+                // Shift the (ρ, β) history one step before storing the new
+                // pair, so the previous-pair slot always holds the
+                // pre-most-recent solve. Used by `predict_warm_start_beta`
+                // for tangent-line extrapolation across outer iterations.
+                {
+                    let mut prev_beta_w = self.prev_warm_start_beta.write().unwrap();
+                    let mut prev_rho_w = self.prev_warm_start_rho.write().unwrap();
+                    let mut cur_beta_w = self.warm_start_beta.write().unwrap();
+                    let mut cur_rho_w = self.warm_start_rho.write().unwrap();
+                    *prev_beta_w = cur_beta_w.take();
+                    *prev_rho_w = cur_rho_w.take();
+                    cur_beta_w.replace(Coefficients::new(beta_original));
+                }
             }
             _ => {
+                // On a failed solve, drop both the current pair AND the
+                // history — the tangent prediction would be misleading.
                 self.warm_start_beta.write().unwrap().take();
+                self.warm_start_rho.write().unwrap().take();
+                self.prev_warm_start_beta.write().unwrap().take();
+                self.prev_warm_start_rho.write().unwrap().take();
             }
         }
+    }
+
+    /// Record the ρ at which the most recent successful warm-start β was
+    /// obtained. Called immediately after `updatewarm_start_from` succeeds
+    /// (the caller knows the ρ that produced the inner solve).
+    pub(super) fn record_warm_start_rho(&self, rho: &Array1<f64>) {
+        if !self.warm_start_enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.warm_start_rho.write().unwrap().replace(rho.to_owned());
+    }
+
+    /// Predict β at `new_rho` via tangent-line extrapolation across the
+    /// last two (ρ, β) pairs. Returns `None` if either pair is missing,
+    /// the ρ-step direction is degenerate, or the extrapolation step
+    /// `α` exceeds the safety cap (1.5 — i.e. we don't extrapolate more
+    /// than 50% beyond the previous step length, where the linear-FOC
+    /// approximation likely breaks down).
+    ///
+    /// Falls back to the stored `warm_start_beta` (which is `β(ρ_k)` —
+    /// the standard "use last β as-is" warm start) when no prediction
+    /// is possible. So this is strictly an improvement: when prediction
+    /// is safe, we use it; otherwise we use the existing flat warm-start.
+    pub(crate) fn predict_warm_start_beta(
+        &self,
+        new_rho: &Array1<f64>,
+    ) -> Option<Coefficients> {
+        if !self.warm_start_enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let cur_beta = self.warm_start_beta.read().unwrap().clone()?;
+        let cur_rho = self.warm_start_rho.read().unwrap().clone();
+        let prev_beta = self.prev_warm_start_beta.read().unwrap().clone();
+        let prev_rho = self.prev_warm_start_rho.read().unwrap().clone();
+        let (cur_rho, prev_beta, prev_rho) = match (cur_rho, prev_beta, prev_rho) {
+            (Some(cr), Some(pb), Some(pr)) => (cr, pb, pr),
+            _ => return Some(cur_beta), // no history yet — flat warm-start
+        };
+        if cur_rho.len() != new_rho.len() || cur_rho.len() != prev_rho.len() {
+            return Some(cur_beta);
+        }
+        if cur_beta.0.len() != prev_beta.0.len() {
+            return Some(cur_beta);
+        }
+        // d_rho = ρ_k − ρ_{k-1}; step_rho = ρ_new − ρ_k.
+        let d_rho_norm_sq: f64 = cur_rho
+            .iter()
+            .zip(prev_rho.iter())
+            .map(|(c, p)| (c - p) * (c - p))
+            .sum();
+        if !d_rho_norm_sq.is_finite() || d_rho_norm_sq <= 1e-24 {
+            return Some(cur_beta);
+        }
+        let step_dot_d: f64 = new_rho
+            .iter()
+            .zip(cur_rho.iter())
+            .zip(prev_rho.iter())
+            .map(|((n, c), p)| (n - c) * (c - p))
+            .sum();
+        let alpha = step_dot_d / d_rho_norm_sq;
+        if !alpha.is_finite() {
+            return Some(cur_beta);
+        }
+        // Don't extrapolate against the previous step direction (α<0)
+        // or beyond a safety cap (α>1.5). In those regimes the linear
+        // tangent is unlikely to be accurate.
+        if alpha <= 0.0 || alpha > 1.5 {
+            return Some(cur_beta);
+        }
+        let mut predicted = cur_beta.0.clone();
+        for ((p, c), pp) in predicted
+            .iter_mut()
+            .zip(cur_beta.0.iter())
+            .zip(prev_beta.0.iter())
+        {
+            *p = c + alpha * (c - pp);
+        }
+        if !predicted.iter().all(|v: &f64| v.is_finite()) {
+            return Some(cur_beta);
+        }
+        log::debug!(
+            "[warm-start] tangent prediction: α={:.3} (‖dρ_step‖²={:.3e}, ‖dρ_prev‖²={:.3e})",
+            alpha, step_dot_d.abs(), d_rho_norm_sq,
+        );
+        Some(Coefficients::new(predicted))
     }
 
     pub(crate) fn setwarm_start_original_beta(&self, beta_original: Option<ArrayView1<'_, f64>>) {
@@ -2531,14 +2633,27 @@ impl<'a> RemlState<'a> {
         let outer_cap = self.outer_inner_cap.load(Ordering::Relaxed);
 
         // Run P-IRLS with original matrices to perform fresh reparameterization
-        // The returned result will include the transformation matrix qs
+        // The returned result will include the transformation matrix qs.
+        //
+        // Warm-start: try the tangent-line prediction first (uses last
+        // two (ρ, β) pairs to extrapolate β at the new ρ; falls back to
+        // the flat last-β when no history). Either path produces a
+        // `Coefficients` value used as the inner Newton's seed.
+        let predicted_warm_start = if self.warm_start_enabled.load(Ordering::Relaxed) {
+            self.predict_warm_start_beta(rho)
+        } else {
+            None
+        };
         let pirls_result = {
             let warm_start_holder = self.warm_start_beta.read().unwrap();
-            let warm_start_ref = if self.warm_start_enabled.load(Ordering::Relaxed) {
+            let fallback_warm_start_ref = if self.warm_start_enabled.load(Ordering::Relaxed) {
                 warm_start_holder.as_ref()
             } else {
                 None
             };
+            let warm_start_ref = predicted_warm_start
+                .as_ref()
+                .or(fallback_warm_start_ref);
             let mut pirls_config = self.config.as_pirls_config();
             let original_cap = pirls_config.max_iterations;
             if in_screening {
@@ -2657,6 +2772,12 @@ impl<'a> RemlState<'a> {
                 // contract held by the caller.
                 if !in_screening {
                     self.updatewarm_start_from(pirls_result.as_ref());
+                    // Record the ρ that produced this β so the next call
+                    // can extrapolate. Only meaningful after a successful
+                    // solve (updatewarm_start_from clears history on
+                    // failure); recording here is harmless on failure
+                    // because the warm_start_beta will be None.
+                    self.record_warm_start_rho(rho);
                     // Cache only if key is valid (not NaN).
                     if use_cache && let Some(key) = key_opt {
                         self.cache_manager
