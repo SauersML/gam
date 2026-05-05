@@ -4192,6 +4192,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         )?;
         let time_design_exit = prepared.time_design_exit.clone();
         progress.set_stage("fit", "running survival location-scale optimization");
+        let phase_start = std::time::Instant::now();
+        log::info!(
+            "[PHASE] survival-location-scale fit start n={}",
+            ds.values.nrows()
+        );
         let fit = match fit_model(FitRequest::SurvivalLocationScale(
             SurvivalLocationScaleFitRequest {
                 data: ds.values.view(),
@@ -4206,7 +4211,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 optimize_inverse_link,
             },
         )) {
-            Ok(FitResult::SurvivalLocationScale(result)) => result,
+            Ok(FitResult::SurvivalLocationScale(result)) => {
+                log::info!(
+                    "[PHASE] survival-location-scale fit end elapsed={:.3}s",
+                    phase_start.elapsed().as_secs_f64()
+                );
+                result
+            }
             Ok(_) => {
                 return Err(
                     "internal survival location-scale workflow returned the wrong result variant"
