@@ -2826,19 +2826,52 @@ def _emit_phase_summary(
                 file=sys.stderr,
                 flush=True,
             )
-    # Top-level [FIT health] verdict combines the warm-start and PIRLS
-    # verdicts into a single glance-readable tier so reviewers don't
-    # have to mentally combine the two. Combination is "worst tier
-    # wins" with a documented total ordering — DEGRADED >
-    # MARGINAL > HEALTHY > NO-DATA. Emitted only when at least one
-    # sub-verdict was determined.
-    if warm_start_verdict is not None or pirls_verdict is not None:
-        combined = _combine_fit_verdicts(warm_start_verdict, pirls_verdict)
+    # Curvature health verdict, third axis added in this commit.
+    # Combines the Fisher-fallback aggregators into a single tier
+    # capturing observed-Hessian reliability across the fit. Computed
+    # whenever the curvature-kind markers fired (i.e. PIRLS ran at
+    # least once); else NO-DATA / None. We re-extract the counts
+    # here rather than reusing the upstream `kind_counts`/`n_curv_total`
+    # which are scoped to the aggregator's emit block above.
+    curvature_verdict: str | None = None
+    curvature_detail = ""
+    if curvature_kinds:
+        cv_kind_counts: dict[str, int] = {}
+        for kind in curvature_kinds:
+            cv_kind_counts[kind] = cv_kind_counts.get(kind, 0) + 1
+        cv_total = len(curvature_kinds)
+        cv_fisher_frac = cv_kind_counts.get("Fisher", 0) / max(cv_total, 1)
+        cv_force_n = len(force_fisher) if force_fisher else 0
+        curvature_verdict, curvature_detail = _curvature_health_verdict(
+            fisher_frac=cv_fisher_frac,
+            force_fisher_n=cv_force_n,
+        )
+        print(
+            f"[CURVATURE health] cmd='{cmd_preview}' "
+            f"verdict={curvature_verdict} {curvature_detail}",
+            file=sys.stderr,
+            flush=True,
+        )
+    # Top-level [FIT health] verdict combines warm-start, PIRLS, and
+    # curvature health verdicts into a single glance-readable tier so
+    # reviewers don't have to mentally combine the three. Combination
+    # is "worst tier wins" with a documented total ordering —
+    # DEGRADED > MARGINAL > HEALTHY > NO-DATA. Emitted only when at
+    # least one sub-verdict was determined.
+    if (
+        warm_start_verdict is not None
+        or pirls_verdict is not None
+        or curvature_verdict is not None
+    ):
+        combined = _combine_fit_verdicts(
+            warm_start_verdict, pirls_verdict, curvature_verdict
+        )
         ws_label = warm_start_verdict if warm_start_verdict else "ABSENT"
         pirls_label = pirls_verdict if pirls_verdict else "ABSENT"
+        cv_label = curvature_verdict if curvature_verdict else "ABSENT"
         print(
             f"[FIT health] cmd='{cmd_preview}' verdict={combined} "
-            f"warm_start={ws_label} pirls={pirls_label}",
+            f"warm_start={ws_label} pirls={pirls_label} curvature={cv_label}",
             file=sys.stderr,
             flush=True,
         )
@@ -2847,27 +2880,71 @@ def _emit_phase_summary(
 def _combine_fit_verdicts(
     warm_start: str | None,
     pirls: str | None,
+    curvature: str | None = None,
 ) -> str:
-    """Combine the warm-start and PIRLS health verdicts into a single
-    top-level fit verdict via a worst-wins total ordering:
+    """Combine the warm-start, PIRLS, and curvature health verdicts
+    into a single top-level fit verdict via a worst-wins total
+    ordering:
 
       DEGRADED  > MARGINAL > HEALTHY > NO-DATA
 
-    Either input may be `None` (sub-verdict was not emitted because
+    Any input may be `None` (sub-verdict was not emitted because
     its source markers were absent); a `None` is treated as if the
     sub-verdict were NO-DATA. The combined verdict reflects the
-    WORST tier seen across the two axes — a fit that's HEALTHY on
-    one axis but DEGRADED on the other is overall DEGRADED, not
+    WORST tier seen across the axes — a fit that's HEALTHY on
+    one axis but DEGRADED on another is overall DEGRADED, not
     "averaged" to MARGINAL. The independent sub-verdicts remain
-    visible in the [FIT health] line's `warm_start=` and `pirls=`
-    fields so reviewers can see which axis tripped the combined
-    verdict.
+    visible in the [FIT health] line's `warm_start=` / `pirls=` /
+    `curvature=` fields so reviewers can see which axis tripped
+    the combined verdict.
+
+    The `curvature` axis is the third health signal added in this
+    commit: it captures observed-Hessian reliability via the
+    Fisher-fallback aggregators. Defaults to None for backward-
+    compatibility with callers that only have warm-start + PIRLS.
     """
     rank = {"DEGRADED": 3, "MARGINAL": 2, "HEALTHY": 1, "NO-DATA": 0}
     inv_rank = {v: k for k, v in rank.items()}
     ws_rank = rank.get(warm_start or "NO-DATA", 0)
     p_rank = rank.get(pirls or "NO-DATA", 0)
-    return inv_rank[max(ws_rank, p_rank)]
+    c_rank = rank.get(curvature or "NO-DATA", 0)
+    return inv_rank[max(ws_rank, p_rank, c_rank)]
+
+
+def _curvature_health_verdict(
+    *,
+    fisher_frac: float | None,
+    force_fisher_n: int,
+) -> tuple[str, str]:
+    """Classify the observed-Hessian reliability based on the
+    Fisher-fallback aggregators (commits 971e67ad, 8ffa7225,
+    dea37b05). Returns (verdict, detail_string).
+
+    Tier policy:
+      HEALTHY    fisher_frac < 0.05 AND force_fisher_n == 0
+                 (Fisher fallback rarely needed; observed Hessian
+                 is reliable across the run).
+      MARGINAL   fisher_frac < 0.20 AND force_fisher_n == 0
+                 (some Fisher use, but no sustained Fisher-only
+                 state; Observed is mostly reliable with occasional
+                 transient fallbacks).
+      DEGRADED   fisher_frac >= 0.20 OR force_fisher_n > 0
+                 (high Fisher use OR at least one solve fully
+                 transitioned to Fisher-only — observed Hessian
+                 has sustained reliability problems).
+      NO-DATA    fisher_frac is None
+                 (curvature-kind log markers absent; e.g., the
+                 fit didn't run PIRLS at all, or pre-instrumentation
+                 binary).
+    """
+    if fisher_frac is None:
+        return ("NO-DATA", "fisher_frac=n/a force_fisher_n=0")
+    detail = f"fisher_frac={fisher_frac:.2f} force_fisher_n={force_fisher_n}"
+    if force_fisher_n > 0 or fisher_frac >= 0.20:
+        return ("DEGRADED", detail)
+    if fisher_frac >= 0.05:
+        return ("MARGINAL", detail)
+    return ("HEALTHY", detail)
 
 
 def _pirls_health_verdict(*, rates: list[float]) -> tuple[str, str]:

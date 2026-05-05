@@ -1097,8 +1097,8 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
     def test_combine_fit_verdicts_worst_wins(self) -> None:
         # DEGRADED > MARGINAL > HEALTHY > NO-DATA total ordering.
         # The combined verdict reflects the WORST tier across the
-        # two axes — a fit that's HEALTHY on one axis but DEGRADED
-        # on the other is overall DEGRADED.
+        # axes — a fit that's HEALTHY on one axis but DEGRADED
+        # on another is overall DEGRADED.
         combine = _RUNNER._combine_fit_verdicts
         # Both HEALTHY → HEALTHY.
         self.assertEqual(combine("HEALTHY", "HEALTHY"), "HEALTHY")
@@ -1119,6 +1119,63 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         self.assertEqual(combine(None, "HEALTHY"), "HEALTHY")
         self.assertEqual(combine("MARGINAL", None), "MARGINAL")
         self.assertEqual(combine(None, None), "NO-DATA")
+        # Third axis (curvature) is the new optional arg. Default None
+        # is backward-compatible: existing callers that pass only 2
+        # args get the same behavior as before. New callers that pass
+        # 3 args get worst-of-three.
+        self.assertEqual(combine("HEALTHY", "HEALTHY", "HEALTHY"), "HEALTHY")
+        self.assertEqual(combine("HEALTHY", "HEALTHY", "DEGRADED"), "DEGRADED")
+        self.assertEqual(combine("HEALTHY", "HEALTHY", "MARGINAL"), "MARGINAL")
+        self.assertEqual(combine("DEGRADED", "HEALTHY", "MARGINAL"), "DEGRADED")
+        self.assertEqual(combine("HEALTHY", "MARGINAL", "DEGRADED"), "DEGRADED")
+        self.assertEqual(combine("HEALTHY", None, "MARGINAL"), "MARGINAL")
+        self.assertEqual(combine(None, None, "DEGRADED"), "DEGRADED")
+        self.assertEqual(combine(None, None, None), "NO-DATA")
+
+    def test_curvature_health_verdict_classifies_tiers(self) -> None:
+        # Tier policy from `_curvature_health_verdict`:
+        #   HEALTHY    fisher_frac < 0.05 AND force_fisher_n == 0
+        #   MARGINAL   0.05 ≤ fisher_frac < 0.20 AND force_fisher_n == 0
+        #   DEGRADED   fisher_frac ≥ 0.20 OR force_fisher_n > 0
+        #   NO-DATA    fisher_frac is None
+        verdict = _RUNNER._curvature_health_verdict
+        # HEALTHY tier
+        self.assertEqual(
+            verdict(fisher_frac=0.0, force_fisher_n=0)[0], "HEALTHY"
+        )
+        self.assertEqual(
+            verdict(fisher_frac=0.04, force_fisher_n=0)[0], "HEALTHY"
+        )
+        # MARGINAL tier
+        self.assertEqual(
+            verdict(fisher_frac=0.05, force_fisher_n=0)[0], "MARGINAL"
+        )
+        self.assertEqual(
+            verdict(fisher_frac=0.19, force_fisher_n=0)[0], "MARGINAL"
+        )
+        # DEGRADED tier — high fisher_frac
+        self.assertEqual(
+            verdict(fisher_frac=0.20, force_fisher_n=0)[0], "DEGRADED"
+        )
+        self.assertEqual(
+            verdict(fisher_frac=0.50, force_fisher_n=0)[0], "DEGRADED"
+        )
+        # DEGRADED tier — any force_fisher engagement (even with low frac)
+        self.assertEqual(
+            verdict(fisher_frac=0.0, force_fisher_n=1)[0], "DEGRADED"
+        )
+        self.assertEqual(
+            verdict(fisher_frac=0.04, force_fisher_n=1)[0], "DEGRADED"
+        )
+        # NO-DATA — fisher_frac=None
+        self.assertEqual(
+            verdict(fisher_frac=None, force_fisher_n=0)[0], "NO-DATA"
+        )
+        # Detail string carries both signals at the right precision.
+        v, d = verdict(fisher_frac=0.123, force_fisher_n=2)
+        self.assertEqual(v, "DEGRADED")
+        self.assertIn("fisher_frac=0.12", d)
+        self.assertIn("force_fisher_n=2", d)
 
     def test_phase_summary_emits_fit_health_combining_warm_start_and_pirls(self) -> None:
         # End-to-end: when both [WARM-START health] and [PIRLS health]
