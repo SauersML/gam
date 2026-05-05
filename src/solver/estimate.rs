@@ -1994,12 +1994,14 @@ where
         let prev_cap = reml_state
             .outer_inner_cap
             .swap(0, std::sync::atomic::Ordering::Relaxed);
+        let guard_start = std::time::Instant::now();
+        let _ = reml_state.compute_cost(&strategy_result.rho);
         if prev_cap != 0 {
             log::info!(
-                "[OUTER guard] convergence-guard re-eval at converged ρ (prev_cap={prev_cap}, refit at full inner tolerance)"
+                "[OUTER guard] convergence-guard re-eval at converged ρ done (prev_cap={prev_cap}, elapsed={:.3}s)",
+                guard_start.elapsed().as_secs_f64()
             );
         }
-        let _ = reml_state.compute_cost(&strategy_result.rho);
         (
             strategy_result.rho.clone(),
             cfg.link_kind.mixture_state().cloned(),
@@ -2256,12 +2258,14 @@ where
         let prev_cap_mix = reml_state
             .outer_inner_cap
             .swap(0, std::sync::atomic::Ordering::Relaxed);
+        let guard_start_mix = std::time::Instant::now();
+        let _ = reml_state.compute_cost(&outer_result.rho);
         if prev_cap_mix != 0 {
             log::info!(
-                "[OUTER guard] convergence-guard re-eval at converged ρ (mixture/SAS arm; prev_cap={prev_cap_mix})"
+                "[OUTER guard] convergence-guard re-eval at converged ρ done (mixture/SAS arm; prev_cap={prev_cap_mix}, elapsed={:.3}s)",
+                guard_start_mix.elapsed().as_secs_f64()
             );
         }
-        let _ = reml_state.compute_cost(&outer_result.rho);
         let final_rho = outer_result.rho.slice(s![..k]).to_owned();
         let final_mix_state = if use_mixture {
             let final_mix_rho = outer_result.rho.slice(s![k..(k + mixture_dim)]).to_owned();
