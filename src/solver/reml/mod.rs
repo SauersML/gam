@@ -3558,6 +3558,18 @@ pub(crate) struct RemlState<'a> {
     cache_manager: EvalCacheManager,
     arena: RemlArena,
     pub(crate) warm_start_beta: RwLock<Option<Coefficients>>,
+    /// Two-point ρ-trajectory used for second-order warm-start
+    /// extrapolation: when the outer optimizer asks for a fit at a new
+    /// ρ, we have `β(ρ_k)` (in `warm_start_beta`) and `β(ρ_{k-1})` (in
+    /// `prev_warm_start_beta`). The implicit β(ρ) trajectory is locally
+    /// linear under the FOC ∇F(β,ρ)=0, so a tangent-line prediction
+    /// `β_predict(ρ_new) = β_k + α · (β_k − β_{k-1})` where α is the
+    /// projection of `(ρ_new − ρ_k)` onto `(ρ_k − ρ_{k-1})` gives a
+    /// better seed than the flat `β_k` alone — replacing PIRLS warm-
+    /// start "use last β as-is" with a real tangent-prediction step.
+    pub(crate) warm_start_rho: RwLock<Option<Array1<f64>>>,
+    pub(crate) prev_warm_start_beta: RwLock<Option<Coefficients>>,
+    pub(crate) prev_warm_start_rho: RwLock<Option<Array1<f64>>>,
     warm_start_enabled: AtomicBool,
     pub(crate) screening_max_inner_iterations: Arc<AtomicUsize>,
     /// Outer-aware inner-PIRLS iteration cap for the main descent loop.
