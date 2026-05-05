@@ -2431,10 +2431,32 @@ impl<'a> RemlState<'a> {
     /// the standard "use last β as-is" warm start) when no prediction
     /// is possible. So this is strictly an improvement: when prediction
     /// is safe, we use it; otherwise we use the existing flat warm-start.
+    /// Discard-source wrapper around `predict_warm_start_beta_with_source`.
+    /// Production callers (`execute_pirls_if_needed`) use the
+    /// `_with_source` variant directly so they can route per-predictor
+    /// quality markers; this thin wrapper is kept for the smaller call
+    /// sites and forward-compat documentation pointers (e.g. comments
+    /// throughout the runtime referencing "predict_warm_start_beta"
+    /// continue to make sense).
+    #[allow(dead_code)]
     pub(crate) fn predict_warm_start_beta(
         &self,
         new_rho: &Array1<f64>,
     ) -> Option<Coefficients> {
+        self.predict_warm_start_beta_with_source(new_rho)
+            .map(|(c, _)| c)
+    }
+
+    /// Predict β with a tag identifying which predictor produced it.
+    /// The wrapper above discards the tag; callers that need to emit
+    /// per-predictor quality markers (the [IFT-QUALITY] /
+    /// [TANGENT-QUALITY] chain in `execute_pirls_if_needed`) consume
+    /// this richer return so each marker is attributed correctly to
+    /// the predictor that actually produced the β.
+    pub(crate) fn predict_warm_start_beta_with_source(
+        &self,
+        new_rho: &Array1<f64>,
+    ) -> Option<(Coefficients, WarmStartPredictionSource)> {
         if !self.warm_start_enabled.load(Ordering::Relaxed) {
             return None;
         }
@@ -2444,7 +2466,7 @@ impl<'a> RemlState<'a> {
         // every call after the first successful PIRLS solve.
         if let Some(predicted) = self.predict_warm_start_beta_ift(new_rho) {
             log::debug!("[warm-start] IFT prediction accepted");
-            return Some(predicted);
+            return Some((predicted, WarmStartPredictionSource::Ift));
         }
         let cur_beta = self.warm_start_beta.read().unwrap().clone()?;
         let cur_rho = self.warm_start_rho.read().unwrap().clone();
@@ -2456,7 +2478,7 @@ impl<'a> RemlState<'a> {
             // solve (only one (ρ, β) pair stashed). Silent fallback
             // is the right behavior; emitting a marker here would
             // just be noise on every first call.
-            _ => return Some(cur_beta),
+            _ => return Some((cur_beta, WarmStartPredictionSource::Flat)),
         };
         // Dimension mismatch paths below are bug signals: state-machine
         // inconsistency between (β, ρ) cache and current state. Emit
@@ -2471,7 +2493,7 @@ impl<'a> RemlState<'a> {
                 cur_rho.len(),
                 prev_rho.len(),
             );
-            return Some(cur_beta);
+            return Some((cur_beta, WarmStartPredictionSource::Flat));
         }
         if cur_beta.0.len() != prev_beta.0.len() {
             log::info!(
@@ -2479,7 +2501,7 @@ impl<'a> RemlState<'a> {
                 cur_beta.0.len(),
                 prev_beta.0.len(),
             );
-            return Some(cur_beta);
+            return Some((cur_beta, WarmStartPredictionSource::Flat));
         }
         // d_rho = ρ_k − ρ_{k-1}; step_rho = ρ_new − ρ_k.
         let d_rho_norm_sq: f64 = cur_rho
@@ -2497,7 +2519,7 @@ impl<'a> RemlState<'a> {
                 "[TANGENT-REJECTED] reason=degenerate_drho d_rho_norm_sq={:.3e}",
                 d_rho_norm_sq,
             );
-            return Some(cur_beta);
+            return Some((cur_beta, WarmStartPredictionSource::Flat));
         }
         let step_dot_d: f64 = new_rho
             .iter()
@@ -2514,7 +2536,7 @@ impl<'a> RemlState<'a> {
                 "[TANGENT-REJECTED] reason=nonfinite_alpha step_dot_d={:.3e} d_rho_norm_sq={:.3e}",
                 step_dot_d, d_rho_norm_sq,
             );
-            return Some(cur_beta);
+            return Some((cur_beta, WarmStartPredictionSource::Flat));
         }
         // Don't extrapolate against the previous step direction (α<0).
         // The upper cap is adaptive: the same IFT residual signal that
@@ -2551,7 +2573,7 @@ impl<'a> RemlState<'a> {
                 "[TANGENT-REJECTED] reason={} alpha={:.3e} cap={:.3e}",
                 reason, alpha, alpha_cap,
             );
-            return Some(cur_beta);
+            return Some((cur_beta, WarmStartPredictionSource::Flat));
         }
         let mut predicted = cur_beta.0.clone();
         for ((p, c), pp) in predicted
@@ -2566,7 +2588,7 @@ impl<'a> RemlState<'a> {
                 "[TANGENT-REJECTED] reason=non_finite_predicted alpha={:.3e} cap={:.3e}",
                 alpha, alpha_cap,
             );
-            return Some(cur_beta);
+            return Some((cur_beta, WarmStartPredictionSource::Flat));
         }
         log::info!(
             "[TANGENT-PREDICT] alpha={:.3e} cap={:.3e} drho_step_norm_sq={:.3e} drho_prev_norm_sq={:.3e}",
@@ -2575,7 +2597,7 @@ impl<'a> RemlState<'a> {
             step_dot_d.abs(),
             d_rho_norm_sq,
         );
-        Some(Coefficients::new(predicted))
+        Some((Coefficients::new(predicted), WarmStartPredictionSource::TangentLine))
     }
 
     pub(crate) fn setwarm_start_original_beta(&self, beta_original: Option<ArrayView1<'_, f64>>) {
@@ -2990,11 +3012,17 @@ impl<'a> RemlState<'a> {
         // two (ρ, β) pairs to extrapolate β at the new ρ; falls back to
         // the flat last-β when no history). Either path produces a
         // `Coefficients` value used as the inner Newton's seed.
-        let predicted_warm_start = if self.warm_start_enabled.load(Ordering::Relaxed) {
-            self.predict_warm_start_beta(rho)
+        let predicted_warm_start_with_source = if self.warm_start_enabled.load(Ordering::Relaxed) {
+            self.predict_warm_start_beta_with_source(rho)
         } else {
             None
         };
+        let predicted_warm_start = predicted_warm_start_with_source
+            .as_ref()
+            .map(|(c, _)| c.clone());
+        let prediction_source = predicted_warm_start_with_source
+            .as_ref()
+            .map(|(_, s)| *s);
         let pirls_result = {
             let warm_start_holder = self.warm_start_beta.read().unwrap();
             let fallback_warm_start_ref = if self.warm_start_enabled.load(Ordering::Relaxed) {
@@ -3231,8 +3259,25 @@ impl<'a> RemlState<'a> {
                                 Ok(guard) => guard.as_ref().map(|f| f.logdet()).unwrap_or(f64::NAN),
                                 Err(_) => f64::NAN,
                             };
+                            // Route the marker by predictor source so the
+                            // bench runner's residual percentile aggregation
+                            // is correctly attributed: tangent-line predictions
+                            // get [TANGENT-QUALITY] rather than mistakenly
+                            // landing in [IFT-QUALITY] stats. Flat returns
+                            // (predicted == β_cur) are noops, already filtered
+                            // by `was_noop` above; if we reach this point with
+                            // source=Flat the source must have come from a
+                            // path the noop check missed — log under IFT for
+                            // backwards compatibility, but a non-zero count
+                            // would be a regression signal.
+                            let marker = match prediction_source {
+                                Some(WarmStartPredictionSource::Ift) => "[IFT-QUALITY]",
+                                Some(WarmStartPredictionSource::TangentLine) => "[TANGENT-QUALITY]",
+                                Some(WarmStartPredictionSource::Flat) | None => "[IFT-QUALITY]",
+                            };
                             log::info!(
-                                "[IFT-QUALITY] residual={:.3e} converged_norm={:.3e} predicted_norm={:.3e} drho_norm={:.3e} h_pen_logdet={:.3e} iters={}",
+                                "{} residual={:.3e} converged_norm={:.3e} predicted_norm={:.3e} drho_norm={:.3e} h_pen_logdet={:.3e} iters={}",
+                                marker,
                                 residual,
                                 conv_norm,
                                 pred_norm,
@@ -3483,6 +3528,29 @@ fn adaptive_tangent_alpha_cap(last_residual: Option<f64>) -> f64 {
         r if r < 0.50 => 1.0,
         _ => 0.5,
     }
+}
+
+/// Tag identifying which branch of the warm-start linear-predictor
+/// stack actually produced the β returned by
+/// `predict_warm_start_beta_with_source`. Used by the caller in
+/// `execute_pirls_if_needed` to emit per-predictor quality markers
+/// (`[IFT-QUALITY]` vs `[TANGENT-QUALITY]`) so the bench runner's
+/// residual percentile aggregations are correctly attributed instead
+/// of mistakenly bucketing tangent-line predictions into IFT stats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WarmStartPredictionSource {
+    /// The IFT predictor produced a non-identity β (the cache was
+    /// populated and Δρ stayed within the adaptive |Δρ| cap).
+    Ift,
+    /// The tangent-line predictor produced a non-identity β (the IFT
+    /// predictor returned None for non-cache reasons, so the
+    /// fallback chain reached tangent-line and it accepted).
+    TangentLine,
+    /// Both predictors fell through (no history, dim mismatch,
+    /// large Δρ, non-finite intermediate, etc.) — the returned
+    /// β is the cached `warm_start_beta` unchanged. Same outcome
+    /// as the original "use last β as-is" warm start.
+    Flat,
 }
 
 /// Below this magnitude in any Δρ_k, the per-component IFT contribution is

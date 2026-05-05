@@ -1515,6 +1515,7 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, s
                             or "[IFT-NOOP]" in line
                             or "[TANGENT-PREDICT]" in line
                             or "[TANGENT-REJECTED]" in line
+                            or "[TANGENT-QUALITY]" in line
                         ):
                             phase_capture.append(line)
         finally:
@@ -1627,6 +1628,15 @@ _KAPPA_PHASE_SUMMARY_PATTERN = re.compile(
 # probe identified as the dominant cost regime).
 _IFT_QUALITY_PATTERN = re.compile(
     r"\[IFT-QUALITY\]\s+residual=([\deE.+-]+)\s+converged_norm=([\deE.+-]+)\s+predicted_norm=([\deE.+-]+)(?:\s+drho_norm=([\deE.+\-nNaA]+)\s+h_pen_logdet=([\deE.+\-nNaA]+))?\s+iters=(\d+)"
+)
+# Tangent-line quality probe — same field layout as IFT-QUALITY.
+# Emitted when the tangent-line predictor (rather than IFT) produced
+# the β consumed by PIRLS. Tagged separately so the bench runner's
+# residual percentile aggregation correctly attributes the predictor
+# that fired, instead of misclassifying tangent-line predictions as
+# IFT predictions in the aggregate.
+_TANGENT_QUALITY_PATTERN = re.compile(
+    r"\[TANGENT-QUALITY\]\s+residual=([\deE.+-]+)\s+converged_norm=([\deE.+-]+)\s+predicted_norm=([\deE.+-]+)(?:\s+drho_norm=([\deE.+\-nNaA]+)\s+h_pen_logdet=([\deE.+\-nNaA]+))?\s+iters=(\d+)"
 )
 
 # IFT predictor rejection counter. Emitted by `predict_warm_start_beta_ift_from_cache`
@@ -1806,6 +1816,26 @@ def _emit_phase_summary(
     # n_quality count is the real accept count directly — no
     # subtraction needed.
     n_accepts = n_quality
+    # Tangent-line quality probe — separate distribution from IFT.
+    # When tangent-line fires (only as IFT's fallback), its residuals
+    # report a different predictor's faithfulness, so mixing them into
+    # the IFT distribution would skew the percentiles. Aggregate
+    # independently.
+    tangent_quality_matches = _TANGENT_QUALITY_PATTERN.findall(captured_stderr)
+    if tangent_quality_matches:
+        t_residuals = [
+            float(m[0]) for m in tangent_quality_matches if float(m[0]) == float(m[0])
+        ]
+        if t_residuals:
+            n = len(t_residuals)
+            sorted_t = sorted(t_residuals)
+            t_p50 = sorted_t[n // 2]
+            t_p95 = sorted_t[min(n - 1, int(0.95 * n))]
+            t_max = sorted_t[-1]
+            parts.append(
+                f"tangent_quality_predicts={n} tangent_p50={t_p50:.2e} "
+                f"tangent_p95={t_p95:.2e} tangent_max={t_max:.2e}"
+            )
     if ift_quality_matches:
         residuals = [float(m[0]) for m in ift_quality_matches if float(m[0]) == float(m[0])]
         if residuals:
