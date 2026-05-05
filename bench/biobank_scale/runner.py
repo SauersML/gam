@@ -1507,6 +1507,7 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, s
                             or "[OUTER summary]" in line
                             or "[OUTER guard]" in line
                             or "[PIRLS iter-end]" in line
+                            or "[KAPPA-PHASE" in line
                         ):
                             phase_capture.append(line)
         finally:
@@ -1582,6 +1583,21 @@ _PIRLS_ITER_END_PATTERN = re.compile(
     r"\[PIRLS iter-end\]\s+iter=\s*(\d+)\s+elapsed=([\d.]+)s"
 )
 
+# κ-optimization scaling instrumentation from commit cd89625f. The
+# `optimize_spatial_length_scale_exact_joint` driver wraps each closure
+# invocation (cost-only, value+grad(/Hessian), EFS) with a stopwatch and
+# emits one `[KAPPA-PHASE]` line per call plus a `[KAPPA-PHASE-SUMMARY]`
+# at exit. Parsing both gives us a production-fit κ-scaling probe
+# (task #32) without a separate synthetic harness — the markers surface
+# the actual workload split between cost-only line-search probes,
+# full-eval iterations, and EFS calls during real biobank fits.
+_KAPPA_PHASE_PATTERN = re.compile(
+    r"\[KAPPA-PHASE\]\s+phase=(\w+)\s+call=(\d+)(?:\s+order=\S+)?\s+theta_norm=\S+\s+log_kappa_norm=\S+\s+elapsed_s=([\d.]+)"
+)
+_KAPPA_PHASE_SUMMARY_PATTERN = re.compile(
+    r"\[KAPPA-PHASE-SUMMARY\]\s+log_kappa_dim=(\d+)\s+n_cost=(\d+)\s+cost_total_s=([\d.]+)\s+n_eval=(\d+)\s+eval_total_s=([\d.]+)\s+n_efs=(\d+)\s+efs_total_s=([\d.]+)\s+optim_total_s=([\d.]+)"
+)
+
 
 _PHASE_START_PATTERN = re.compile(r"\[PHASE\]\s+([\w\-]+(?:\([\w\-/]+\))?)\s+(?:fit\s+)?start")
 
@@ -1639,6 +1655,42 @@ def _emit_phase_summary(
             f"pirls_iters={n} pirls_total={total_pirls:.1f}s "
             f"pirls_p50={p50:.3f}s pirls_p95={p95:.3f}s pirls_max={pmax:.3f}s"
         )
+    # κ-optimization driver wall-time. Per-call markers feed the
+    # distribution; summary lines feed the totals. Multiple κ
+    # optimizations may run within a single command (e.g. CTN
+    # bootstrap then refit) so we accumulate across all summary lines.
+    kappa_calls = _KAPPA_PHASE_PATTERN.findall(captured_stderr)
+    kappa_summaries = _KAPPA_PHASE_SUMMARY_PATTERN.findall(captured_stderr)
+    if kappa_summaries:
+        n_summaries = len(kappa_summaries)
+        n_cost_total = sum(int(s[1]) for s in kappa_summaries)
+        cost_s_total = sum(float(s[2]) for s in kappa_summaries)
+        n_eval_total = sum(int(s[3]) for s in kappa_summaries)
+        eval_s_total = sum(float(s[4]) for s in kappa_summaries)
+        n_efs_total = sum(int(s[5]) for s in kappa_summaries)
+        efs_s_total = sum(float(s[6]) for s in kappa_summaries)
+        optim_s_total = sum(float(s[7]) for s in kappa_summaries)
+        parts.append(
+            f"kappa_optims={n_summaries} kappa_optim_total={optim_s_total:.1f}s "
+            f"kappa_cost_calls={n_cost_total} kappa_cost_total={cost_s_total:.1f}s "
+            f"kappa_eval_calls={n_eval_total} kappa_eval_total={eval_s_total:.1f}s "
+            f"kappa_efs_calls={n_efs_total} kappa_efs_total={efs_s_total:.1f}s"
+        )
+    elif kappa_calls:
+        # Got per-call markers but no summary (κ optimization didn't
+        # finish — e.g. interrupted by command timeout). Surface the
+        # partial count + per-phase totals from the per-call lines.
+        per_phase_secs: dict[str, list[float]] = {}
+        for phase_name, _call_idx, secs in kappa_calls:
+            per_phase_secs.setdefault(phase_name, []).append(float(secs))
+        kphase_pieces = []
+        for phase_name in sorted(per_phase_secs.keys()):
+            secs_list = per_phase_secs[phase_name]
+            kphase_pieces.append(
+                f"kappa_{phase_name}_calls={len(secs_list)} "
+                f"kappa_{phase_name}_total={sum(secs_list):.1f}s"
+            )
+        parts.append(f"kappa_optim_INCOMPLETE {' '.join(kphase_pieces)}")
     suffix = ""
     if pending:
         suffix = f" pending={','.join(pending)}"
