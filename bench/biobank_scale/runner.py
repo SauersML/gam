@@ -2735,14 +2735,39 @@ def _emit_phase_summary(
         reasons_str = ",".join(
             f"{reason}={count}" for reason, count in sorted(reason_counts.items())
         )
-        # Accept rate excludes both rejects (predictor fell through) and
-        # no-ops (predictor returned identity); only "real" predict calls
-        # where the linearization actually moved β count toward accept.
-        denom = max(n_accepts + n_rejects + n_noops, 1)
-        accept_rate = n_accepts / denom
+        # Two complementary accept-rate metrics:
+        #
+        # `ift_accept_rate` — accepts / total predict calls (incl. noops).
+        # This is the historical metric. It conflates predictor
+        # effectiveness with outer-optimizer behavior: a fit where the
+        # outer makes many zero-step calls (e.g. during convergence
+        # checks) shows lower accept_rate even when the predictor
+        # itself is working perfectly on every "real" call.
+        #
+        # `ift_accept_rate_active` — accepts / (accepts + rejects),
+        # EXCLUDING noops. This is the predictor-quality-only signal:
+        # of the predict calls where the linearization actually had
+        # work to do (max|Δρ| > eps), how many succeeded? A value
+        # near 1.0 means "the predictor is reliable on every real
+        # step"; a low value means "the outer is taking steps the
+        # adaptive cap rejects" (typically large Δρ near a transition
+        # in the cost surface, or poor IFT residual driving cap to
+        # tighten).
+        #
+        # Surfacing both lets a CI reviewer separate these two
+        # signals: a fit with high noops + low accept_rate but high
+        # accept_rate_active has a healthy predictor that the outer
+        # is just calling unnecessarily; a fit with low both is a
+        # genuine predictor problem.
+        denom_total = max(n_accepts + n_rejects + n_noops, 1)
+        accept_rate = n_accepts / denom_total
+        denom_active = max(n_accepts + n_rejects, 1)
+        accept_rate_active = n_accepts / denom_active
         parts.append(
             f"ift_rejects={n_rejects} ift_noops={n_noops} "
-            f"ift_accept_rate={accept_rate:.2f} ift_reasons=[{reasons_str}]"
+            f"ift_accept_rate={accept_rate:.2f} "
+            f"ift_accept_rate_active={accept_rate_active:.2f} "
+            f"ift_reasons=[{reasons_str}]"
         )
     suffix = ""
     if pending:

@@ -1265,6 +1265,51 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         self.assertIn("pirls=DEGRADED", fit_lines[0])
         self.assertIn("curvature=ABSENT", fit_lines[0])
 
+    def test_phase_summary_distinguishes_accept_rate_from_active(self) -> None:
+        # End-to-end: when the outer optimizer makes many zero-step
+        # calls (noops), `ift_accept_rate` (denominator includes
+        # noops) DROPS while `ift_accept_rate_active` (denominator
+        # excludes noops) stays HIGH. This separates "predictor is
+        # bad" from "outer is calling predictor unnecessarily".
+        #
+        # 4 accepts (IFT-QUALITY) + 1 reject + 5 noops:
+        #   accept_rate        = 4 / 10 = 0.40
+        #   accept_rate_active = 4 / 5 = 0.80
+        # The 2× difference confirms the metrics are independent.
+        stderr_lines = [
+            # 4 accepts.
+            "[IFT-QUALITY] residual=1.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=3",
+            "[IFT-QUALITY] residual=2.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=3",
+            "[IFT-QUALITY] residual=3.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=3",
+            "[IFT-QUALITY] residual=4.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=3",
+            # 1 reject.
+            "[IFT-REJECTED] reason=large_drho",
+            # 5 noops.
+            "[IFT-NOOP] reason=all_drho_below_eps",
+            "[IFT-NOOP] reason=all_drho_below_eps",
+            "[IFT-NOOP] reason=all_drho_below_eps",
+            "[IFT-NOOP] reason=all_drho_below_eps",
+            "[IFT-NOOP] reason=all_drho_below_eps",
+            "[PHASE] my-fit fit end elapsed=10.0s",
+        ]
+        stderr = "\n".join(stderr_lines)
+        out = self._run_summary(stderr)
+        # Find the line with the IFT accept rates.
+        lines_with_rate = [
+            line for line in out.splitlines()
+            if "ift_accept_rate=" in line
+        ]
+        self.assertEqual(len(lines_with_rate), 1)
+        line = lines_with_rate[0]
+        # Accept rate (with noops in denominator) = 4 / 10 = 0.40.
+        self.assertIn("ift_accept_rate=0.40", line)
+        # Active accept rate (noops EXCLUDED) = 4 / 5 = 0.80.
+        self.assertIn("ift_accept_rate_active=0.80", line)
+        # The order matters too: active comes after standard.
+        i_accept = line.index("ift_accept_rate=")
+        i_active = line.index("ift_accept_rate_active=")
+        self.assertLess(i_accept, i_active)
+
     def test_phase_summary_curvature_healthy_when_fisher_frac_low(self) -> None:
         # End-to-end: curvature HEALTHY when fisher_frac < 0.05 AND
         # no force_fisher engagement. With all three axes HEALTHY,
