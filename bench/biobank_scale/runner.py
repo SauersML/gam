@@ -1632,7 +1632,10 @@ _OUTER_HESSIAN_ROUTE_PATTERN = re.compile(
     r"\[OUTER hessian-route\]\s+choice=(\w+)\s+reason=(\w+)\s+"
     r"n=(\d+)\s+p=(\d+)\s+k=(\d+)\s+"
     r"callback_kernel=(true|false)\s+subspace_trace=(true|false)\s+"
-    r"scale_prefers_operator=(true|false)"
+    # `scale_prefers_operator` is `true|false` for the kernel-based path,
+    # but `irrelevant` for the family-op early-return branch (whose
+    # routing decision doesn't consult the (n,p,k) crossover at all).
+    r"scale_prefers_operator=(true|false|irrelevant)"
 )
 _OUTER_HESSIAN_ELAPSED_PATTERN = re.compile(
     r"\[OUTER hessian-elapsed\]\s+choice=(\w+)\s+reason=(\w+)\s+"
@@ -1826,11 +1829,23 @@ def _emit_phase_summary(
         choice_pieces = " ".join(f"{c}={n}" for c, n in sorted(choice_counts.items()))
         subspace_forced = reason_counts.get("subspace_forced_dense", 0)
         subspace_secs = reason_secs.get("subspace_forced_dense", 0.0)
+        family_op_calls = reason_counts.get("family_op", 0)
+        family_op_secs = reason_secs.get("family_op", 0.0)
+        # Dominant reason by elapsed time: tells a reviewer at a glance
+        # which routing path consumed the most outer-Hessian wall-clock.
+        # When family_op dominates, CTN/survival/GAMLSS exact-Hv path is
+        # the bottleneck. When subspace_forced_dense dominates, priority
+        # (c) is load-bearing. When below_crossover dominates, the dense
+        # path is fine and matrix-free isn't worth the lift.
+        dom_reason_by_secs = max(reason_secs, key=lambda r: reason_secs[r])
         parts.append(
             f"outer_h_calls={n_outer_h} outer_h_total={total_outer_h:.1f}s "
             f"outer_h_{choice_pieces} "
+            f"outer_h_dom_reason={dom_reason_by_secs}@{reason_secs[dom_reason_by_secs]:.1f}s "
             f"outer_h_subspace_forced={subspace_forced} "
             f"outer_h_subspace_total={subspace_secs:.1f}s "
+            f"outer_h_family_op={family_op_calls} "
+            f"outer_h_family_op_total={family_op_secs:.1f}s "
             f"outer_h_route_no_elapsed={outer_h_route_no_elapsed}"
         )
     elif outer_h_route:
