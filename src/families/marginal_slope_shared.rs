@@ -3,6 +3,7 @@ use crate::families::cubic_cell_kernel::{self, DenestedPartitionCell, LocalSpanC
 use crate::families::jet_partitions::MultiDirJet;
 use ndarray::{Array1, Array2, Axis};
 use std::ops::Range;
+use std::sync::Arc;
 
 #[inline]
 pub fn eval_coeff4_at(coefficients: &[f64; 4], z: f64) -> f64 {
@@ -536,5 +537,376 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
             return out;
         }
         [0.0; 4]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Outer-only stratified row subsample (Phase 1 scaffolding).
+//
+// The biobank-scale outer-loop score/gradient passes do O(n) work per outer
+// evaluation, which dominates wall-clock once n grows past ~10^5. To keep
+// outer-loop iterations tractable while leaving the inner PIRLS solve and the
+// final covariance assembly untouched, outer-only hot loops can be redirected
+// to iterate over a small stratified subsample with a constant rescaling
+// factor, sampled once per fit and shared via `Arc`. The subsample is
+// stratified by event/outcome × z-deciles (≤ 200 strata) so that the rescaled
+// estimator inherits the same support coverage as the full-data estimator.
+//
+// This module defines only the types and helpers; Phase 2 wires them into
+// per-row hot loops. Default state (`outer_score_subsample = None`) keeps the
+// legacy full-data behavior bit-for-bit.
+
+/// Stratified row index subsample shared across outer-loop evaluations.
+///
+/// `mask` is sorted, deduplicated, and never empty in practice (enforced by
+/// `build_outer_score_subsample`). `weight_scale = n_full / mask.len()` is the
+/// constant rescaling factor that outer-only passes apply per-row so that
+/// linear-in-row sums approximate full-data sums in expectation.
+#[derive(Debug, Clone)]
+pub struct OuterScoreSubsample {
+    pub mask: Arc<Vec<usize>>,
+    pub n_full: usize,
+    pub weight_scale: f64,
+    pub seed: u64,
+}
+
+impl OuterScoreSubsample {
+    /// Wrap a precomputed mask. The caller is responsible for sortedness and
+    /// uniqueness; `build_outer_score_subsample` is the canonical builder.
+    pub fn new(mask: Vec<usize>, n_full: usize, seed: u64) -> Self {
+        let m = mask.len();
+        let weight_scale = if m == 0 {
+            1.0
+        } else {
+            n_full as f64 / m as f64
+        };
+        Self {
+            mask: Arc::new(mask),
+            n_full,
+            weight_scale,
+            seed,
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.mask.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.mask.is_empty()
+    }
+}
+
+/// Splitmix64: deterministic single-u64 expansion. Local copy so this module
+/// stays self-contained; matches the constants used elsewhere in the crate.
+#[inline]
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+/// Build a deterministic stratified row subsample of size ≥ `k` from
+/// `(z, stratum_secondary)`.
+///
+/// Stratification: 100 z-deciles × distinct values of `stratum_secondary`
+/// (typically the {0,1} event/outcome indicator, giving ≤ 200 strata).
+/// Each non-empty stratum contributes `ceil(k * stratum_size / n)` rows
+/// drawn via a splitmix64-keyed Fisher-Yates partial shuffle so the result
+/// is reproducible from `(seed, stratum_id)`.
+///
+/// The returned mask is sorted, deduplicated, and never empty when `n > 0`.
+/// `weight_scale = n_full / mask.len()` (computed by `OuterScoreSubsample::new`).
+///
+/// Panics if `z.len() != stratum_secondary.len()`.
+pub fn build_outer_score_subsample(
+    z: &[f64],
+    stratum_secondary: &[u8],
+    k: usize,
+    seed: u64,
+) -> OuterScoreSubsample {
+    let n = z.len();
+    assert_eq!(
+        n,
+        stratum_secondary.len(),
+        "build_outer_score_subsample: z and stratum_secondary must have equal length",
+    );
+
+    if n == 0 {
+        return OuterScoreSubsample::new(Vec::new(), 0, seed);
+    }
+
+    // If the requested subsample covers the full dataset (or more), short-
+    // circuit to the full row set. weight_scale = 1.0 and this becomes a
+    // no-op compared to the legacy full-data path.
+    if k >= n {
+        let mask: Vec<usize> = (0..n).collect();
+        return OuterScoreSubsample::new(mask, n, seed);
+    }
+
+    // Q = 100 z-deciles. Sort indices by z and split into Q ~equal chunks.
+    const Q: usize = 100;
+    let mut z_order: Vec<usize> = (0..n).collect();
+    z_order.sort_by(|&a, &b| {
+        z[a].partial_cmp(&z[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    // decile[i] = bin index in 0..Q for row i
+    let mut decile = vec![0u16; n];
+    for (rank, &row) in z_order.iter().enumerate() {
+        // Map rank in 0..n to bin in 0..Q. Using floor((rank * Q) / n)
+        // keeps bin sizes within ±1 row of n/Q.
+        let bin = (rank * Q) / n;
+        let bin = bin.min(Q - 1);
+        decile[row] = bin as u16;
+    }
+
+    // Distinct secondary values (the canonical use case is {0,1}, but the
+    // general u8 alphabet is supported transparently).
+    let mut distinct_secondary: Vec<u8> = stratum_secondary.to_vec();
+    distinct_secondary.sort_unstable();
+    distinct_secondary.dedup();
+    // stratum index = secondary_rank * Q + decile, where secondary_rank is
+    // the position of the row's secondary value in `distinct_secondary`.
+    let mut secondary_rank = vec![0u16; 256];
+    for (rank, &val) in distinct_secondary.iter().enumerate() {
+        secondary_rank[val as usize] = rank as u16;
+    }
+    let n_strata = distinct_secondary.len() * Q;
+
+    // Bucket rows by stratum.
+    let mut strata: Vec<Vec<usize>> = vec![Vec::new(); n_strata];
+    for i in 0..n {
+        let s = secondary_rank[stratum_secondary[i] as usize] as usize * Q + decile[i] as usize;
+        strata[s].push(i);
+    }
+
+    // For each non-empty stratum, draw ceil(k * stratum_size / n) rows.
+    let mut picked: Vec<usize> = Vec::with_capacity(k + n_strata);
+    for (stratum_id, rows) in strata.iter().enumerate() {
+        if rows.is_empty() {
+            continue;
+        }
+        let take = ((k as u128 * rows.len() as u128 + n as u128 - 1) / n as u128) as usize;
+        let take = take.max(1).min(rows.len());
+
+        // Deterministic key from (seed, stratum_id).
+        let mut state = seed ^ (stratum_id as u64).wrapping_mul(0x9E3779B97F4A7C15);
+        // Mix once so even seed=0, stratum_id=0 produces a non-trivial state.
+        let _ = splitmix64(&mut state);
+
+        if take == rows.len() {
+            picked.extend_from_slice(rows);
+        } else {
+            // Fisher-Yates partial shuffle: produce `take` distinct rows.
+            let mut buf: Vec<usize> = rows.clone();
+            let m = buf.len();
+            for i in 0..take {
+                let r = splitmix64(&mut state);
+                let j = i + (r as usize) % (m - i);
+                buf.swap(i, j);
+            }
+            picked.extend_from_slice(&buf[..take]);
+        }
+    }
+
+    // Sort + dedup. Strata are disjoint by construction so dedup is a no-op,
+    // but we sort regardless to satisfy the OuterScoreSubsample contract.
+    picked.sort_unstable();
+    picked.dedup();
+
+    OuterScoreSubsample::new(picked, n, seed)
+}
+
+// ---------------------------------------------------------------------------
+// Outer-row iteration helpers.
+//
+// These wrap the choice between "iterate 0..n" (default) and "iterate
+// `subsample.mask`" so per-row hot loops in Phase 2 can call a single helper
+// rather than branch by hand. We expose both an enum that callers can match
+// on directly (cheap path: a `Range` plus a `Arc<Vec<usize>>`) and a
+// `Vec<usize>`-returning convenience that satisfies
+// `IntoParallelIterator<Item = usize>` via `Vec`'s rayon impl.
+
+/// Row-index iteration choice for outer-only score/gradient passes.
+#[derive(Debug, Clone)]
+pub enum OuterRowIter {
+    /// Full data: iterate `0..n`.
+    All { n: usize },
+    /// Subsample: iterate `subsample.mask`.
+    Subset { mask: Arc<Vec<usize>> },
+}
+
+impl OuterRowIter {
+    /// Number of rows this iterator covers.
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            OuterRowIter::All { n } => *n,
+            OuterRowIter::Subset { mask } => mask.len(),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Materialize the row indices as a `Vec<usize>`. Useful for callers
+    /// that want a `IntoParallelIterator<Item = usize>` source — `Vec<usize>`
+    /// satisfies that trait via rayon's blanket impl.
+    pub fn to_vec(&self) -> Vec<usize> {
+        match self {
+            OuterRowIter::All { n } => (0..*n).collect(),
+            OuterRowIter::Subset { mask } => mask.as_ref().clone(),
+        }
+    }
+}
+
+/// Choose the row-iteration strategy for an outer-only pass. When
+/// `opts.outer_score_subsample` is `Some`, returns the subsample mask;
+/// otherwise returns the full range `0..n`.
+pub fn outer_row_indices(
+    opts: &crate::custom_family::BlockwiseFitOptions,
+    n: usize,
+) -> OuterRowIter {
+    match opts.outer_score_subsample.as_ref() {
+        Some(s) => OuterRowIter::Subset {
+            mask: Arc::clone(&s.mask),
+        },
+        None => OuterRowIter::All { n },
+    }
+}
+
+/// Per-row rescaling factor for outer-only sums. Returns
+/// `subsample.weight_scale` when a subsample is active and `1.0` otherwise.
+#[inline]
+pub fn outer_score_scale(
+    opts: &crate::custom_family::BlockwiseFitOptions,
+    _n: usize,
+) -> f64 {
+    match opts.outer_score_subsample.as_ref() {
+        Some(s) => s.weight_scale,
+        None => 1.0,
+    }
+}
+
+/// Phase-2 placeholder. The intent is to debug-assert (in callers that are
+/// known to be _outer-only_ score/gradient passes) that no inner-PIRLS
+/// codepath consults the subsample. For Phase 1 this is a no-op so the
+/// signature can be threaded into Phase-2 hot loops without touching call
+/// sites later.
+#[inline]
+pub fn assert_outer_only(
+    _opts: &crate::custom_family::BlockwiseFitOptions,
+    _context: &str,
+) {
+    // intentionally empty in Phase 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subsample_full_n_equals_no_subsample() {
+        // mask = (0..n) — the all-rows subsample should have weight_scale 1.0
+        // and outer_row_indices should yield the same sorted set in both
+        // Some(mask=full) and None modes.
+        let n: usize = 1024;
+        let z: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let secondary: Vec<u8> = (0..n).map(|i| (i % 2) as u8).collect();
+        let s = build_outer_score_subsample(&z, &secondary, n, 0xDEADBEEF);
+        assert_eq!(s.len(), n);
+        assert!((s.weight_scale - 1.0).abs() < 1e-12);
+
+        let mut full = crate::custom_family::BlockwiseFitOptions::default();
+        let from_none = outer_row_indices(&full, n).to_vec();
+        full.outer_score_subsample = Some(Arc::new(s));
+        let from_some = outer_row_indices(&full, n).to_vec();
+
+        let mut a = from_none.clone();
+        let mut b = from_some.clone();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b);
+        assert_eq!(a, (0..n).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn stratification_covers_all_strata() {
+        // Synthetic with 2 secondary classes × 100 z-deciles. Every
+        // non-empty (secondary, decile) stratum must contribute ≥ 1 row.
+        let n: usize = 20_000;
+        let z: Vec<f64> = (0..n).map(|i| (i as f64) * 0.001).collect();
+        let secondary: Vec<u8> = (0..n).map(|i| (i % 2) as u8).collect();
+        let k = 2_000;
+        let s = build_outer_score_subsample(&z, &secondary, k, 12345);
+        assert!(s.len() >= k, "subsample size {} < k {}", s.len(), k);
+
+        // Recompute deciles to label rows.
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| z[a].partial_cmp(&z[b]).unwrap());
+        let mut decile = vec![0usize; n];
+        for (rank, &row) in order.iter().enumerate() {
+            decile[row] = ((rank * 100) / n).min(99);
+        }
+        // For each (sec, dec), is there at least one row in mask?
+        let mut covered = vec![false; 200];
+        for &row in s.mask.iter() {
+            let stratum = secondary[row] as usize * 100 + decile[row];
+            covered[stratum] = true;
+        }
+        // All 200 strata are non-empty in this synthetic, so all must be
+        // covered.
+        for (stratum, &c) in covered.iter().enumerate() {
+            assert!(c, "stratum {} uncovered", stratum);
+        }
+    }
+
+    #[test]
+    fn deterministic_seed() {
+        // Same inputs + seed must produce identical masks; different seeds
+        // produce different masks (with overwhelming probability for these
+        // sizes).
+        let n: usize = 5_000;
+        let z: Vec<f64> = (0..n).map(|i| (i as f64).sin()).collect();
+        let secondary: Vec<u8> = (0..n).map(|i| (i % 2) as u8).collect();
+        let k = 800;
+        let a = build_outer_score_subsample(&z, &secondary, k, 0xABCDEF);
+        let b = build_outer_score_subsample(&z, &secondary, k, 0xABCDEF);
+        let c = build_outer_score_subsample(&z, &secondary, k, 0xFEDCBA);
+        assert_eq!(a.mask.as_ref(), b.mask.as_ref());
+        assert_ne!(a.mask.as_ref(), c.mask.as_ref());
+    }
+
+    #[test]
+    fn weight_scale_correct() {
+        // n=10000, k=2000 → weight_scale ≈ 5.0 (allow small overshoot from
+        // ceil(k * stratum_size / n) summed across strata).
+        let n: usize = 10_000;
+        let z: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let secondary: Vec<u8> = (0..n).map(|i| (i % 2) as u8).collect();
+        let k = 2_000;
+        let s = build_outer_score_subsample(&z, &secondary, k, 7);
+        assert!(s.len() >= k);
+        // overshoot bounded by number of strata (one extra row per stratum
+        // from the ceil); for 2 × 100 = 200 strata, overshoot ≤ 200.
+        assert!(
+            s.len() <= k + 200,
+            "subsample {} much larger than expected",
+            s.len()
+        );
+        let scale = s.weight_scale;
+        // expected ≈ 5.0; allow ±10% for the ceiling overshoot.
+        assert!(
+            (scale - 5.0).abs() < 0.5,
+            "weight_scale {} not near 5.0",
+            scale
+        );
     }
 }
