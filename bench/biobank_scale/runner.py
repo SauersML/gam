@@ -1516,6 +1516,7 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, s
                             or "[TANGENT-PREDICT]" in line
                             or "[TANGENT-REJECTED]" in line
                             or "[TANGENT-QUALITY]" in line
+                            or "[TANGENT-NOOP]" in line
                         ):
                             phase_capture.append(line)
         finally:
@@ -1667,6 +1668,13 @@ _TANGENT_PREDICT_PATTERN = re.compile(
     r"\[TANGENT-PREDICT\]\s+alpha=([\deE.+\-]+)\s+cap=([\deE.+\-]+)\s+drho_step_norm_sq=([\deE.+\-]+)\s+drho_prev_norm_sq=([\deE.+\-]+)"
 )
 _TANGENT_REJECTED_PATTERN = re.compile(r"\[TANGENT-REJECTED\]\s+reason=(\w+)")
+# Tangent-line identity / no-op counter — symmetric to _IFT_NOOP_PATTERN.
+# Emitted when α is below the numerical-noise floor; predictor
+# returned the cached β unchanged. Tagged separately from rejects
+# (which are bug-signal failure modes) and predicts (which moved β
+# meaningfully) so the bench runner can distinguish a genuinely
+# inactive tangent-line path from a degenerate one.
+_TANGENT_NOOP_PATTERN = re.compile(r"\[TANGENT-NOOP\]\s+reason=(\w+)")
 
 # `[OUTER non-finite]` warnings from the REML unified evaluator. Each
 # line records a NaN / Inf in an intermediate of the outer-Hessian /
@@ -1995,7 +2003,8 @@ def _emit_phase_summary(
     # visible at a glance.
     tangent_predict_hits = _TANGENT_PREDICT_PATTERN.findall(captured_stderr)
     tangent_rejected = _TANGENT_REJECTED_PATTERN.findall(captured_stderr)
-    if tangent_predict_hits or tangent_rejected:
+    tangent_noops = _TANGENT_NOOP_PATTERN.findall(captured_stderr)
+    if tangent_predict_hits or tangent_rejected or tangent_noops:
         t_predicts = len(tangent_predict_hits)
         t_rejects = len(tangent_rejected)
         # Surface alpha distribution from accepted tangent-line
@@ -2030,6 +2039,14 @@ def _emit_phase_summary(
             )
         else:
             parts.append(f"tangent_predicts={t_predicts}{tangent_alpha_str}")
+        if tangent_noops:
+            # Symmetric to ift_noops: tangent-line returned identity
+            # because α was below the numerical-noise floor. Surfaces
+            # the rate at biobank scale; non-zero count here means
+            # the IFT path rejected (tangent-line wouldn't have fired
+            # otherwise) AND the resulting Δρ landed in a regime
+            # where the tangent step is numerically negligible.
+            parts.append(f"tangent_noops={len(tangent_noops)}")
     # Consistency cross-check: every successful [TANGENT-PREDICT]
     # produces a downstream [TANGENT-QUALITY] from the post-PIRLS
     # residual computation in execute_pirls_if_needed (commit 99424b47).

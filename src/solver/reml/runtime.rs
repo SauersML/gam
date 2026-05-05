@@ -2586,6 +2586,27 @@ impl<'a> RemlState<'a> {
             );
             return Some((cur_beta, WarmStartPredictionSource::Flat));
         }
+        // Tangent noop short-circuit: when α is below the
+        // numerical-noise floor, `c + α · (c − pp) ≈ c` to machine
+        // precision and the per-coefficient mat-add is wasted work.
+        // Symmetric to the IFT-NOOP path (commit d437aed1 / 52372fd5)
+        // and tagged with the same `[TANGENT-NOOP]` marker so the
+        // bench runner can distinguish "tangent-line ran with
+        // negligible step" from "tangent-line produced a real
+        // prediction" without inferring it from the alpha
+        // distribution. Returns Flat source so the
+        // [TANGENT-QUALITY] block in execute_pirls_if_needed
+        // doesn't fire on a near-identity prediction (would
+        // contaminate the residual percentile distribution with
+        // ~zero residuals — same bug class as commit 52372fd5).
+        const TANGENT_ALPHA_NOOP_EPS: f64 = 1e-12;
+        if alpha.abs() <= TANGENT_ALPHA_NOOP_EPS {
+            log::info!(
+                "[TANGENT-NOOP] reason=alpha_below_eps alpha={:.3e} eps={:.3e}",
+                alpha, TANGENT_ALPHA_NOOP_EPS,
+            );
+            return Some((cur_beta, WarmStartPredictionSource::Flat));
+        }
         let mut predicted = cur_beta.0.clone();
         for ((p, c), pp) in predicted
             .iter_mut()

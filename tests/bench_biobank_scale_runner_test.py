@@ -1005,6 +1005,31 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         out_old = self._run_summary(stderr_old)
         self.assertIn("ift_iters_p50=3", out_old)
 
+    def test_phase_summary_aggregates_tangent_noop_marker(self) -> None:
+        # The tangent-line predictor's α-below-eps short-circuit
+        # emits [TANGENT-NOOP], symmetric with [IFT-NOOP]. The runner
+        # surfaces the count separately from predicts/rejects so a
+        # reviewer can distinguish:
+        #   - tangent-line accepted with real Δβ → tangent_predicts
+        #   - tangent-line returned identity (Δρ collapse)  → tangent_noops
+        #   - tangent-line fell through to flat (cap/dim)   → tangent_rejects
+        stderr = "\n".join([
+            "[TANGENT-PREDICT] alpha=1.000e+00 cap=1.500e+00 drho_step_norm_sq=2.0e-02 drho_prev_norm_sq=2.0e-02",
+            "[TANGENT-PREDICT] alpha=1.100e+00 cap=1.500e+00 drho_step_norm_sq=2.0e-02 drho_prev_norm_sq=2.0e-02",
+            "[TANGENT-NOOP] reason=alpha_below_eps alpha=1.000e-15 eps=1.000e-12",
+            "[TANGENT-NOOP] reason=alpha_below_eps alpha=5.000e-16 eps=1.000e-12",
+            "[TANGENT-NOOP] reason=alpha_below_eps alpha=1.000e-14 eps=1.000e-12",
+            "[TANGENT-REJECTED] reason=alpha_above_cap alpha=2.500e+00 cap=1.500e+00",
+            "[PHASE] my-fit fit end elapsed=10.0s",
+        ])
+        out = self._run_summary(stderr)
+        self.assertIn("tangent_predicts=2", out)
+        self.assertIn("tangent_rejects=1", out)
+        self.assertIn("tangent_noops=3", out)
+        # The reasons aggregation should still include only the
+        # rejected reason, not the noop reason (different bucket).
+        self.assertIn("tangent_reasons=[alpha_above_cap=1]", out)
+
     def test_phase_summary_aggregates_tangent_iters_distribution(self) -> None:
         # Parallel to test_phase_summary_aggregates_ift_iters_distribution:
         # the tangent-line path's [TANGENT-QUALITY] markers also carry
