@@ -4957,12 +4957,29 @@ fn run_outer_with_plan(
                         sol.final_value
                     ),
                     Err(BfgsError::MaxIterationsReached { last_solution }) => log::info!(
-                        "[OUTER summary] BFGS hit max_iter elapsed={:.3}s final_value={:.6e}",
+                        // Include `in N iters` for symmetry with the
+                        // converged log line — the runner aggregator
+                        // (commit afd66d6a) reads the optional iters
+                        // group to build `bfgs_iters_p50/_max` across
+                        // both successful and cap-hit runs. Without
+                        // this, the iter-count distribution would be
+                        // biased toward fast-converged runs.
+                        "[OUTER summary] BFGS hit max_iter in {} iters elapsed={:.3}s final_value={:.6e}",
+                        last_solution.iterations,
                         bfgs_elapsed,
                         last_solution.final_value
                     ),
                     Err(BfgsError::LineSearchFailed { last_solution, .. }) => log::info!(
-                        "[OUTER summary] BFGS line-search failed elapsed={:.3}s final_value={:.6e}",
+                        // Same rationale as the MaxIterationsReached
+                        // arm: surface `in N iters` so the runner can
+                        // include line-search-failed runs in the
+                        // iter-count distribution. A line-search
+                        // failure at iter 1 (cold start collapses
+                        // immediately) is a different signal from
+                        // failure at iter 50 (the optimizer made
+                        // substantial progress before stalling).
+                        "[OUTER summary] BFGS line-search failed in {} iters elapsed={:.3}s final_value={:.6e}",
+                        last_solution.iterations,
                         bfgs_elapsed,
                         last_solution.final_value
                     ),
