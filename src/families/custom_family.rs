@@ -25,6 +25,7 @@ use crate::types::{RidgeDeterminantMode, RidgePolicy};
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, s};
 use std::any::Any;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7317,17 +7318,27 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             )
                         }
                     };
+                    // Pre-allocate the penalty workspace ONCE outside the
+                    // PCG closure so each CG iter (called hundreds-to-
+                    // thousands of times per outer iter at biobank scale)
+                    // reuses the buffer instead of allocating per call.
+                    // RefCell because solve_spd_pcg expects `Fn` (immutable
+                    // borrow of captures) and we need interior mutability
+                    // to write into the workspace.
+                    let penalty_workspace = RefCell::new(Array1::<f64>::zeros(total_p));
                     match &joint_hessian_source {
                         JointHessianSource::Dense(h_joint) => crate::linalg::utils::solve_spd_pcg(
                             |v| {
                                 let mut out = h_joint.dot(v);
-                                let penalty = apply_joint_block_penalty(
+                                let mut pen = penalty_workspace.borrow_mut();
+                                apply_joint_block_penalty_into(
                                     &ranges,
                                     &s_lambdas,
                                     v,
                                     trace_diagonal_ridge,
+                                    &mut pen,
                                 );
-                                out += &penalty;
+                                out += &*pen;
                                 out
                             },
                             &rhs,
@@ -7348,13 +7359,15 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                             Array1::<f64>::zeros(total_p)
                                         }
                                     };
-                                    let penalty = apply_joint_block_penalty(
+                                    let mut pen = penalty_workspace.borrow_mut();
+                                    apply_joint_block_penalty_into(
                                         &ranges,
                                         &s_lambdas,
                                         v,
                                         trace_diagonal_ridge,
+                                        &mut pen,
                                     );
-                                    out += &penalty;
+                                    out += &*pen;
                                     out
                                 },
                                 &rhs,
