@@ -17,6 +17,18 @@ sys.modules[_SPEC.name] = _RUNNER
 _SPEC.loader.exec_module(_RUNNER)
 
 
+def _has_lifelines() -> bool:
+    """Detect whether the optional `lifelines` dependency is installed.
+
+    The runner's `_survival_null_curve` requires lifelines for
+    Kaplan-Meier estimation (used by survival-scoring tests). Local
+    dev environments often don't have it — gating the affected tests
+    on this check keeps the suite green where lifelines isn't present
+    while still running the test in CI where it IS installed.
+    """
+    return importlib.util.find_spec("lifelines") is not None
+
+
 def _write_csv(path: Path, rows: typing.Sequence[typing.Mapping[str, object]]) -> None:
     fieldnames = list(rows[0].keys())
     with path.open("w", encoding="utf-8", newline="") as fh:
@@ -364,6 +376,11 @@ class BiobankScaleRunnerTests(unittest.TestCase):
             }
         ]
 
+    @unittest.skipUnless(
+        _has_lifelines(),
+        "lifelines optional dep not installed; survival-scoring "
+        "test path requires it for Kaplan-Meier null-curve construction",
+    )
     def test_run_rust_survival_uses_explicit_survival_contract(self) -> None:
         spec = _RUNNER.MethodSpec(
             name="rust_gamlss_survival_ps",
@@ -822,6 +839,43 @@ class MarkerPatternTests(unittest.TestCase):
             self.assertEqual(choice, expected_choice)
             self.assertEqual(reason, expected_reason)
             self.assertEqual(elapsed, expected_elapsed)
+
+    def test_pirls_iter_breakdown_pattern_extracts_all_seven_subphases(self) -> None:
+        # The breakdown pattern captures iter + attempts + 5 wall-clock
+        # sub-phases (curvature, solve, predred, candidate, other).
+        # Lock the layout: a future commit that reorders or renames the
+        # subphases — or adds a new one without updating the regex —
+        # would silently break the runner's `pirls_dom` aggregation,
+        # which is the headline diagnostic for "where is inner-Newton
+        # spending wall-clock at biobank scale?".
+        line = (
+            "[PIRLS iter-breakdown] iter=  3 attempts=2 curvature=0.012s "
+            "solve=0.003s predred=0.000s candidate=0.045s other=0.001s"
+        )
+        matches = _RUNNER._PIRLS_ITER_BREAKDOWN_PATTERN.findall(line)
+        self.assertEqual(len(matches), 1)
+        # Tuple layout: (iter, attempts, curvature, solve, predred,
+        # candidate, other). Verify each field comes through correctly.
+        iter_str, attempts, curv, solve, predred, candidate, other = matches[0]
+        self.assertEqual(iter_str, "3")
+        self.assertEqual(attempts, "2")
+        self.assertEqual(curv, "0.012")
+        self.assertEqual(solve, "0.003")
+        self.assertEqual(predred, "0.000")
+        self.assertEqual(candidate, "0.045")
+        self.assertEqual(other, "0.001")
+        # Edge case: zero-padded iter numbers (the rust formatter uses
+        # `iter={:>3}` for alignment), high attempts count, and large
+        # subphase values — make sure the regex copes with all.
+        wide_line = (
+            "[PIRLS iter-breakdown] iter=200 attempts=64 curvature=12.345s "
+            "solve=678.901s predred=1234.567s candidate=89.012s other=0.500s"
+        )
+        wide_matches = _RUNNER._PIRLS_ITER_BREAKDOWN_PATTERN.findall(wide_line)
+        self.assertEqual(len(wide_matches), 1)
+        self.assertEqual(wide_matches[0][0], "200")
+        self.assertEqual(wide_matches[0][1], "64")
+        self.assertEqual(wide_matches[0][3], "678.901")
 
     def test_pirls_lm_trajectory_pattern_handles_finite_and_nan_rho(self) -> None:
         # The trajectory pattern captures `accept_rho` as a numeric or
