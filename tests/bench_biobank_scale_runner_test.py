@@ -740,13 +740,25 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         self.assertNotIn("tangent_p50=", d)
 
     def test_pirls_health_verdict_classifies_tiers(self) -> None:
-        # HEALTHY: every solve converged at rate < 0.5 (each Newton
-        # iter at least halved the gradient on average).
+        # HEALTHY: 95% of solves at rate < 0.5 (each Newton iter at
+        # least halved the gradient on average for the bulk of the
+        # distribution). The earlier max < 0.5 rule was too strict;
+        # this test exercises the new p95-based gate.
         v, d = _RUNNER._pirls_health_verdict(rates=[0.1, 0.2, 0.3, 0.4, 0.45])
         self.assertEqual(v, "HEALTHY", f"detail={d}")
         self.assertIn("max=0.450", d)
-        # MARGINAL: most solves fast (p50 < 0.5) but some struggled
-        # (max in [0.5, 0.85)).
+        # HEALTHY tolerates a few outliers: 97 clean rates + 3
+        # outliers at 0.6. With n=100, p95 is sorted[95] which is
+        # still a clean rate (the 3 outliers occupy indices 97-99,
+        # outside the top-5% slot). So the verdict stays HEALTHY
+        # despite the outliers. Earlier max-based rule would have
+        # flipped to MARGINAL on a SINGLE such outlier.
+        rates_with_outliers = [0.1] * 25 + [0.2] * 25 + [0.3] * 25 + [0.4] * 22 + [0.6] * 3
+        v, d = _RUNNER._pirls_health_verdict(rates=rates_with_outliers)
+        self.assertEqual(v, "HEALTHY", f"detail={d}")
+        self.assertIn("max=0.600", d)
+        # MARGINAL: most solves fast (p50 < 0.5) but enough struggling
+        # that p95 ≥ 0.5.
         v, d = _RUNNER._pirls_health_verdict(
             rates=[0.1, 0.2, 0.3, 0.4, 0.6, 0.7, 0.8],
         )
@@ -755,7 +767,7 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         v, d = _RUNNER._pirls_health_verdict(rates=[0.5, 0.6, 0.7, 0.8])
         self.assertEqual(v, "DEGRADED", f"detail={d}")
         # DEGRADED: max ≥ 0.85 even when p50 is fine (one solve
-        # essentially failed to converge).
+        # essentially failed to converge — saturation regime).
         v, d = _RUNNER._pirls_health_verdict(
             rates=[0.1, 0.2, 0.3, 0.95],
         )
