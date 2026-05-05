@@ -2249,8 +2249,9 @@ impl<'a> RemlState<'a> {
                 };
                 // Shift the (ρ, β) history one step before storing the new
                 // pair, so the previous-pair slot always holds the
-                // pre-most-recent solve. Used by `predict_warm_start_beta`
-                // for tangent-line extrapolation across outer iterations.
+                // pre-most-recent solve. Used by
+                // `predict_warm_start_beta_with_source` for tangent-line
+                // extrapolation across outer iterations.
                 {
                     let mut prev_beta_w = self.prev_warm_start_beta.write().unwrap();
                     let mut prev_rho_w = self.prev_warm_start_rho.write().unwrap();
@@ -2519,38 +2520,24 @@ impl<'a> RemlState<'a> {
         )
     }
 
-    /// Predict β at `new_rho` via tangent-line extrapolation across the
-    /// last two (ρ, β) pairs. Returns `None` if either pair is missing,
-    /// the ρ-step direction is degenerate, or the extrapolation step
-    /// `α` exceeds the adaptive safety cap (default 1.5 — see
-    /// `adaptive_tangent_alpha_cap` for the residual-driven policy
-    /// that loosens to 2.0 when prior IFT predictions were excellent
-    /// and tightens to 0.5 when the local linear approximation has
-    /// been shown to collapse toward flat warm-start).
+    /// Predict β at `new_rho` via the IFT-based predictor, falling back to
+    /// tangent-line extrapolation across the last two (ρ, β) pairs.
+    /// Returns `None` if either pair is missing, the ρ-step direction is
+    /// degenerate, or the extrapolation step `α` exceeds the adaptive
+    /// safety cap (default 1.5 — see `adaptive_tangent_alpha_cap` for
+    /// the residual-driven policy that loosens to 2.0 when prior IFT
+    /// predictions were excellent and tightens to 0.5 when the local
+    /// linear approximation has been shown to collapse toward flat
+    /// warm-start). Falls back to the stored `warm_start_beta` (which is
+    /// `β(ρ_k)` — the standard "use last β as-is" warm start) when no
+    /// prediction is possible. So this is strictly an improvement: when
+    /// prediction is safe, we use it; otherwise we use the existing flat
+    /// warm-start.
     ///
-    /// Falls back to the stored `warm_start_beta` (which is `β(ρ_k)` —
-    /// the standard "use last β as-is" warm start) when no prediction
-    /// is possible. So this is strictly an improvement: when prediction
-    /// is safe, we use it; otherwise we use the existing flat warm-start.
-    /// Discard-source wrapper around `predict_warm_start_beta_with_source`.
-    /// Production callers (`execute_pirls_if_needed`) use the
-    /// `_with_source` variant directly so they can route per-predictor
-    /// quality markers; this thin wrapper is kept for the smaller call
-    /// sites and forward-compat documentation pointers (e.g. comments
-    /// throughout the runtime referencing "predict_warm_start_beta"
-    /// continue to make sense).
-    #[allow(dead_code)]
-    pub(crate) fn predict_warm_start_beta(&self, new_rho: &Array1<f64>) -> Option<Coefficients> {
-        self.predict_warm_start_beta_with_source(new_rho)
-            .map(|(c, _)| c)
-    }
-
-    /// Predict β with a tag identifying which predictor produced it.
-    /// The wrapper above discards the tag; callers that need to emit
-    /// per-predictor quality markers (the [IFT-QUALITY] /
-    /// [TANGENT-QUALITY] chain in `execute_pirls_if_needed`) consume
-    /// this richer return so each marker is attributed correctly to
-    /// the predictor that actually produced the β.
+    /// The returned tag identifies which predictor produced the β, so
+    /// callers (the [IFT-QUALITY] / [TANGENT-QUALITY] chain in
+    /// `execute_pirls_if_needed`) can emit per-predictor quality markers
+    /// attributed correctly to the predictor that actually produced the β.
     pub(crate) fn predict_warm_start_beta_with_source(
         &self,
         new_rho: &Array1<f64>,
@@ -3775,27 +3762,6 @@ const IFT_WARM_START_DRHO_EPS: f64 = 1e-12;
 /// drops the adaptive cap-margin signal.
 pub(crate) const IFT_RESIDUAL_NO_SIGNAL_BITS: u64 = 0x7ff8_0000_0000_0000;
 
-/// Free-function form of the IFT warm-start predictor. Operates purely on
-/// the cache + canonical penalties + new ρ, so it is testable without
-/// instantiating a full `RemlState`.
-///
-/// Math (see field doc on `RemlState::ift_warm_start_cache`):
-/// `β_predict(ρ_new) = β_cur − Σ_k Δρ_k · H_pen^{-1} · (e^{ρ_cur_k} S_k β_cur)`
-/// where Δρ = ρ_new − ρ_cur and H_pen, β are taken at the cached solve.
-///
-/// Basis handling: S_k and β_cur live in the ORIGINAL basis (the cache
-/// stashes β_original). H_pen, however, is cached in the TRANSFORMED basis
-/// (it comes from `PirlsResult.penalized_hessian_transformed`). When the
-/// PIRLS solve was run in original-sparse-native mode (`frame_was_original`),
-/// `qs = I` and we solve directly. Otherwise we round-trip through qs:
-/// `qs · H_tfd · qs^T · u = v` ⟹ `u = qs · (H_tfd \ (qs^T · v))`. qs is
-/// orthogonal by construction (`stable_reparameterizationwith_invariant`
-/// builds it from orthogonal eigenvector matrices), so qs^{-1} = qs^T.
-/// Test-only thin wrapper: factorize H_pen inline and call the inner
-/// predictor. Production callers use `RemlState::predict_warm_start_beta_ift`,
-/// which routes through `predict_warm_start_beta_ift_with_factor` so the
-/// dense Cholesky is cached across successive predict calls. The
-/// `dead_code` allow keeps the inline-factorize path callable from the
 /// Adaptive clamp for the `initial_lm_lambda` warm-start hint passed
 /// from `execute_pirls_if_needed` into PIRLS. Selects one of three
 /// principled regimes based on the previous PIRLS solve's halving
@@ -3838,70 +3804,22 @@ pub(crate) fn adaptive_lm_lambda_hint(
     Some(cached_lambda.clamp(floor, ceiling))
 }
 
-/// `ift_warm_start_tests` module without penalty.
-#[allow(dead_code)]
-pub(crate) fn predict_warm_start_beta_ift_from_cache(
-    cache: &super::IftWarmStartCache,
-    canonical_penalties: &[crate::construction::CanonicalPenalty],
-    new_rho: &Array1<f64>,
-    p: usize,
-    last_ift_residual: Option<f64>,
-) -> Option<Coefficients> {
-    predict_warm_start_beta_ift_inner(
-        cache,
-        canonical_penalties,
-        new_rho,
-        p,
-        last_ift_residual,
-        None,
-    )
-}
-
-/// Variant taking a pre-built `&dyn FactorizedSystem` so the caller can
-/// reuse a cached Cholesky factor across successive predict calls. See
-/// `RemlState::predict_warm_start_beta_ift_with_outcome` for the cache
-/// invalidation invariants. Test-only after the production wrapper was
-/// refactored to call `_inner_with_outcome` directly; retained because
-/// the negative-test at line ~6911 still verifies the factor argument
-/// is actually consumed (vs silently ignored).
-#[cfg(test)]
-pub(crate) fn predict_warm_start_beta_ift_with_factor(
-    cache: &super::IftWarmStartCache,
-    canonical_penalties: &[crate::construction::CanonicalPenalty],
-    new_rho: &Array1<f64>,
-    p: usize,
-    last_ift_residual: Option<f64>,
-    factor_override: &dyn crate::linalg::matrix::FactorizedSystem,
-) -> Option<Coefficients> {
-    predict_warm_start_beta_ift_inner(
-        cache,
-        canonical_penalties,
-        new_rho,
-        p,
-        last_ift_residual,
-        Some(factor_override),
-    )
-}
-
-fn predict_warm_start_beta_ift_inner(
-    cache: &super::IftWarmStartCache,
-    canonical_penalties: &[crate::construction::CanonicalPenalty],
-    new_rho: &Array1<f64>,
-    p: usize,
-    last_ift_residual: Option<f64>,
-    factor_override: Option<&dyn crate::linalg::matrix::FactorizedSystem>,
-) -> Option<Coefficients> {
-    predict_warm_start_beta_ift_inner_with_outcome(
-        cache,
-        canonical_penalties,
-        new_rho,
-        p,
-        last_ift_residual,
-        factor_override,
-    )
-    .map(|(coef, _outcome)| coef)
-}
-
+/// Free-function form of the IFT warm-start predictor. Operates purely on
+/// the cache + canonical penalties + new ρ, so it is testable without
+/// instantiating a full `RemlState`.
+///
+/// Math (see field doc on `RemlState::ift_warm_start_cache`):
+/// `β_predict(ρ_new) = β_cur − Σ_k Δρ_k · H_pen^{-1} · (e^{ρ_cur_k} S_k β_cur)`
+/// where Δρ = ρ_new − ρ_cur and H_pen, β are taken at the cached solve.
+///
+/// Basis handling: S_k and β_cur live in the ORIGINAL basis (the cache
+/// stashes β_original). H_pen, however, is cached in the TRANSFORMED basis
+/// (it comes from `PirlsResult.penalized_hessian_transformed`). When the
+/// PIRLS solve was run in original-sparse-native mode (`frame_was_original`),
+/// `qs = I` and we solve directly. Otherwise we round-trip through qs:
+/// `qs · H_tfd · qs^T · u = v` ⟹ `u = qs · (H_tfd \ (qs^T · v))`. qs is
+/// orthogonal by construction (`stable_reparameterizationwith_invariant`
+/// builds it from orthogonal eigenvector matrices), so qs^{-1} = qs^T.
 fn predict_warm_start_beta_ift_inner_with_outcome(
     cache: &super::IftWarmStartCache,
     canonical_penalties: &[crate::construction::CanonicalPenalty],
@@ -6835,6 +6753,48 @@ mod ift_warm_start_tests {
     use crate::linalg::matrix::SymmetricMatrix;
     use ndarray::Array2;
 
+    /// Test helper: factorize H_pen inline (no factor cache) and call the
+    /// inner predictor, discarding the `IftPredictionOutcome` tag.
+    fn predict_warm_start_beta_ift_from_cache(
+        cache: &super::IftWarmStartCache,
+        canonical_penalties: &[CanonicalPenalty],
+        new_rho: &Array1<f64>,
+        p: usize,
+        last_ift_residual: Option<f64>,
+    ) -> Option<Coefficients> {
+        super::predict_warm_start_beta_ift_inner_with_outcome(
+            cache,
+            canonical_penalties,
+            new_rho,
+            p,
+            last_ift_residual,
+            None,
+        )
+        .map(|(coef, _outcome)| coef)
+    }
+
+    /// Test helper: variant taking a pre-built `&dyn FactorizedSystem` so
+    /// the negative-test can verify the factor argument is actually
+    /// consumed (vs silently ignored).
+    fn predict_warm_start_beta_ift_with_factor(
+        cache: &super::IftWarmStartCache,
+        canonical_penalties: &[CanonicalPenalty],
+        new_rho: &Array1<f64>,
+        p: usize,
+        last_ift_residual: Option<f64>,
+        factor_override: &dyn crate::linalg::matrix::FactorizedSystem,
+    ) -> Option<Coefficients> {
+        super::predict_warm_start_beta_ift_inner_with_outcome(
+            cache,
+            canonical_penalties,
+            new_rho,
+            p,
+            last_ift_residual,
+            Some(factor_override),
+        )
+        .map(|(coef, _outcome)| coef)
+    }
+
     /// Build a CanonicalPenalty from a dense p×p SPD-ish penalty matrix by
     /// taking its eigendecomposition and packing the positive-eigenvalue
     /// components into the `rank × p` root.
@@ -7330,7 +7290,7 @@ mod ift_warm_start_tests {
         // every component of the new ρ is essentially the cached ρ.
         let new_rho = ndarray::array![1e-15_f64];
         let predicted =
-            super::predict_warm_start_beta_ift_from_cache(&cache, &canonical, &new_rho, p, None)
+            predict_warm_start_beta_ift_from_cache(&cache, &canonical, &new_rho, p, None)
                 .expect("noop must return Some(β_cur)");
         for i in 0..p {
             assert_eq!(
