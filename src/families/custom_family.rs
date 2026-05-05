@@ -1372,6 +1372,26 @@ pub trait CustomFamily {
         Ok(None)
     }
 
+    /// Outer-aware variant of `exact_newton_joint_psi_workspace`.
+    ///
+    /// Families that consume the optional outer-only stratified row subsample
+    /// (`options.outer_score_subsample`) override this method so the workspace
+    /// can be constructed with the subsample mask attached. Generic families
+    /// can stick with the default implementation, which simply forwards to
+    /// the legacy no-options method and ignores the options. This keeps full
+    /// backward compatibility with existing implementors while letting the
+    /// marginal-slope families thread the subsample down into the cached
+    /// per-evaluation ψ calculus.
+    fn exact_newton_joint_psi_workspace_with_options(
+        &self,
+        states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivs: &[Vec<CustomFamilyBlockPsiDerivative>],
+        _options: &BlockwiseFitOptions,
+    ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        self.exact_newton_joint_psi_workspace(states, specs, derivs)
+    }
+
     /// Whether the family's exact joint ψ workspace should also be built for
     /// first-order ψ terms during outer gradient evaluation.
     ///
@@ -10263,10 +10283,11 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             && (eval_mode == EvalMode::ValueGradientHessian
                 || family.exact_newton_joint_psi_workspace_for_first_order_terms())
         {
-            family.exact_newton_joint_psi_workspace(
+            family.exact_newton_joint_psi_workspace_with_options(
                 synced_joint_states.as_ref(),
                 specs,
                 derivative_blocks.as_ref(),
+                options,
             )?
         } else {
             None
@@ -10993,10 +11014,11 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
 
     let hessian_beta_independent = !family.exact_newton_joint_hessian_beta_dependent();
     let psi_workspace = if family.exact_newton_joint_psi_workspace_for_first_order_terms() {
-        family.exact_newton_joint_psi_workspace(
+        family.exact_newton_joint_psi_workspace_with_options(
             synced_joint_states.as_ref(),
             specs,
             derivative_blocks.as_ref(),
+            options,
         )?
     } else {
         None
