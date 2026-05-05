@@ -4027,19 +4027,18 @@ where
         // the textbook LM updates (commits 58ae42d1, d37626e6) are
         // actually moving λ in useful directions at biobank scale.
         let lm_start_lambda = lambda;
-        // Track the gain ratio of the accepted step. None on the
-        // rejection-exhausted path (no step was ever accepted this iter).
-        // Aggregating ρ accepted across iters tells us whether the LM
+        // Track the gain ratio of the accepted step. The trajectory log
+        // is emitted only on iter-end fall-through via the unlabeled
+        // `break;` from the LM loop, which is reached only after the
+        // accept block has assigned this. Every other LM-loop exit is
+        // either `continue;`, a `return Err(...)`, or a labeled
+        // `break 'pirls_loop;` that skips the trajectory log entirely.
+        // Definite-assignment proves the read site sees the accept
+        // value, so this is `f64`, not `Option<f64>` with a defensive
+        // sentinel. Aggregating ρ across iters tells us whether the LM
         // model is well-calibrated: ρ ≈ 1 throughout = healthy Newton;
-        // ρ << 1 = model over-states predicted reduction. The
-        // `unused_assignments` allow is justified: the trajectory log
-        // is emitted only on iter-end fall-through (via `break;` from
-        // the LM loop), which always passes through the accept-step
-        // assignment. The initial `None` is the safety value if a
-        // future code path adds a different fall-through; defending
-        // that case is cheap.
-        #[allow(unused_assignments)]
-        let mut lm_accept_rho: Option<f64> = None;
+        // ρ << 1 = model over-states predicted reduction.
+        let lm_accept_rho: f64;
         // Madsen-Nielsen-Tingleff stateful rejection factor (eq 3.16 in
         // "Methods for non-linear least squares problems", IMM Tech Univ
         // Denmark, 2nd ed 2004): v starts at 2 and doubles on every
@@ -4304,7 +4303,7 @@ where
                         // AND the result's `final_accept_rho` field so
                         // outer consumers can query model fidelity
                         // programmatically.
-                        lm_accept_rho = Some(rho);
+                        lm_accept_rho = rho;
                         last_iter_accept_rho = Some(rho);
                         // Update Trust Region (Lambda) — Madsen-Nielsen-Tingleff
                         // smooth Marquardt update. See `madsen_lm_accept_factor`
@@ -4711,7 +4710,9 @@ where
         //   accept_rho    : gain ratio of the accepted step. ≈1 means
         //                   the quadratic model was faithful; <0.5
         //                   means it overstated the predicted
-        //                   reduction. NaN on rejection-exhausted.
+        //                   reduction. Always finite here: this log
+        //                   only runs after the accept-step assignment
+        //                   on the unlabeled `break;` path.
         let lambda_ratio_log10 = if lm_start_lambda > 0.0 && lambda > 0.0 {
             (lambda / lm_start_lambda).log10()
         } else {
@@ -4724,7 +4725,7 @@ where
             lm_start_lambda,
             lambda,
             lambda_ratio_log10,
-            lm_accept_rho.unwrap_or(f64::NAN),
+            lm_accept_rho,
             lm_attempts_done,
         );
     }
