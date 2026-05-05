@@ -1133,6 +1133,12 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         )
     } else {
         progress.set_stage("fit", "optimizing penalized likelihood");
+        let phase_start = std::time::Instant::now();
+        log::info!(
+            "[PHASE] standard-GAM fit start n={} family={:?}",
+            ds.values.nrows(),
+            family
+        );
         let fitted = match fit_model(FitRequest::Standard(StandardFitRequest {
             data: ds.values.view(),
             y: y.clone(),
@@ -1152,7 +1158,13 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 None
             },
         })) {
-            Ok(FitResult::Standard(result)) => result,
+            Ok(FitResult::Standard(result)) => {
+                log::info!(
+                    "[PHASE] standard-GAM fit end elapsed={:.3}s",
+                    phase_start.elapsed().as_secs_f64()
+                );
+                result
+            }
             Ok(_) => {
                 emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
                 return Err(
