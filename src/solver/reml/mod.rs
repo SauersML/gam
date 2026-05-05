@@ -3682,7 +3682,16 @@ pub(crate) struct RemlState<'a> {
     /// Last observed IFT-prediction residual (`‖β_converged − β_predicted‖
     /// / ‖β_converged‖`) from the most recent non-screening solve where
     /// the predictor was actually consumed. Bit-packed `f64` (low 64
-    /// bits via `f64::to_bits`); `0` means "no signal yet".
+    /// bits via `f64::to_bits`).
+    ///
+    /// "No signal yet" is encoded as a NaN bit-pattern
+    /// (`IFT_RESIDUAL_NO_SIGNAL_BITS`). The original `0` sentinel
+    /// collided with `f64::to_bits(0.0) == 0` — a true residual of
+    /// exactly 0 (degenerate but mathematically possible if every
+    /// β_predicted_i matched β_converged_i to bit-equality) would
+    /// have been indistinguishable from "predictor never reported".
+    /// NaN's self-inequality makes the sentinel unambiguous: any
+    /// stored finite non-negative value is genuine signal.
     ///
     /// Read by `predict_warm_start_beta_ift` to drive the adaptive
     /// |Δρ| cap (`adaptive_ift_max_drho`): a small residual loosens
