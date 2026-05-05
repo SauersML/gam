@@ -3941,10 +3941,18 @@ where
             Err(err) => return Err(err),
         };
         let mut curvature_total = curvature_start.elapsed();
+        // Log the ACTUAL curvature used, not the preferred one. When
+        // Fisher-fallback fires (Observed assembly failed → retried with
+        // Fisher), `state.hessian_curvature` correctly reports `Fisher`
+        // while `preferred_curvature` is still `Observed`. Logging
+        // preferred_curvature here would systematically under-count
+        // Fisher fallbacks for the bench runner's `pirls_fisher_frac`
+        // diagnostic (commit 971e67ad), masking observed-Hessian PD
+        // failures at biobank scale.
         log::info!(
             "[STAGE] PIRLS update_with_curvature iter={} curvature={:?} elapsed={:.3}s",
             iter,
-            preferred_curvature,
+            state.hessian_curvature,
             curvature_total.as_secs_f64(),
         );
         // Per-iter LM-loop accumulators. Surface where the inner Newton

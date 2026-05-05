@@ -840,6 +840,41 @@ class MarkerPatternTests(unittest.TestCase):
             self.assertEqual(reason, expected_reason)
             self.assertEqual(elapsed, expected_elapsed)
 
+    def test_pirls_curvature_kind_pattern_captures_observed_and_fisher(self) -> None:
+        # The curvature-kind log emits the ACTUAL curvature used by the
+        # inner PIRLS step (after any Fisher fallback). The two enum
+        # variants the rust solver emits are `Observed` and `Fisher`.
+        # Lock both so a future commit that adds a third
+        # `HessianCurvatureKind` variant (or renames one) without
+        # updating the regex would silently disappear it from the
+        # runner's `pirls_fisher_frac` diagnostic.
+        cases = [
+            (
+                "[STAGE] PIRLS update_with_curvature iter=1 "
+                "curvature=Observed elapsed=0.045s",
+                "Observed",
+            ),
+            (
+                "[STAGE] PIRLS update_with_curvature iter=2 "
+                "curvature=Fisher elapsed=0.037s",
+                "Fisher",
+            ),
+            # Edge: large iter index from the rust formatter.
+            (
+                "[STAGE] PIRLS update_with_curvature iter=200 "
+                "curvature=Fisher elapsed=12.345s",
+                "Fisher",
+            ),
+        ]
+        for line, expected_kind in cases:
+            matches = _RUNNER._PIRLS_CURVATURE_KIND_PATTERN.findall(line)
+            self.assertEqual(
+                len(matches),
+                1,
+                f"curvature kind {expected_kind!r} did not parse: {line}",
+            )
+            self.assertEqual(matches[0], expected_kind)
+
     def test_pirls_iter_breakdown_pattern_extracts_all_seven_subphases(self) -> None:
         # The breakdown pattern captures iter + attempts + 5 wall-clock
         # sub-phases (curvature, solve, predred, candidate, other).
