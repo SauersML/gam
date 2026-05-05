@@ -1510,6 +1510,7 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, s
                             or "[PIRLS solve-end]" in line
                             or "[KAPPA-PHASE" in line
                             or "[IFT-QUALITY]" in line
+                            or "[IFT-REJECTED]" in line
                         ):
                             phase_capture.append(line)
         finally:
@@ -1623,6 +1624,14 @@ _KAPPA_PHASE_SUMMARY_PATTERN = re.compile(
 _IFT_QUALITY_PATTERN = re.compile(
     r"\[IFT-QUALITY\]\s+residual=([\deE.+-]+)\s+converged_norm=([\deE.+-]+)\s+predicted_norm=([\deE.+-]+)\s+iters=(\d+)"
 )
+
+# IFT predictor rejection counter. Emitted by `predict_warm_start_beta_ift_from_cache`
+# whenever the predictor falls through (large Δρ, factorization failure,
+# non-finite output, basis dim mismatch). Combined with the accept count
+# from [IFT-QUALITY] this gives the production accept/reject ratio at
+# biobank scale — the empirical answer to "is the warm-start machinery
+# being USED at the magnitudes the outer optimizer takes?"
+_IFT_REJECTED_PATTERN = re.compile(r"\[IFT-REJECTED\]\s+reason=(\w+)")
 
 
 _PHASE_START_PATTERN = re.compile(r"\[PHASE\]\s+([\w\-]+(?:\([\w\-/]+\))?)\s+(?:fit\s+)?start")
@@ -1751,6 +1760,9 @@ def _emit_phase_summary(
     # is doing its job; a large p50 (~1) means the prediction is
     # collapsing to flat warm-start and we should investigate.
     ift_quality_matches = _IFT_QUALITY_PATTERN.findall(captured_stderr)
+    ift_rejected_matches = _IFT_REJECTED_PATTERN.findall(captured_stderr)
+    n_accepts = len(ift_quality_matches)
+    n_rejects = len(ift_rejected_matches)
     if ift_quality_matches:
         residuals = [float(m[0]) for m in ift_quality_matches if float(m[0]) == float(m[0])]
         if residuals:
@@ -1762,6 +1774,24 @@ def _emit_phase_summary(
             parts.append(
                 f"ift_predicts={n} ift_p50={p50:.2e} ift_p95={p95:.2e} ift_max={rmax:.2e}"
             )
+    if n_rejects > 0:
+        # Count distinct rejection reasons so the bench log shows which
+        # failure mode dominates: large_drho is the expected biobank
+        # case (predictor's adaptive cap firing on outer steps that
+        # genuinely outrun the linearization); the others
+        # (hessian_factorize_failed, non_finite_*, qs_dim_mismatch) are
+        # bug signals if non-zero.
+        reason_counts: dict[str, int] = {}
+        for reason in ift_rejected_matches:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        reasons_str = ",".join(
+            f"{reason}={count}" for reason, count in sorted(reason_counts.items())
+        )
+        accept_rate = n_accepts / max(n_accepts + n_rejects, 1)
+        parts.append(
+            f"ift_rejects={n_rejects} ift_accept_rate={accept_rate:.2f} "
+            f"ift_reasons=[{reasons_str}]"
+        )
     suffix = ""
     if pending:
         suffix = f" pending={','.join(pending)}"
