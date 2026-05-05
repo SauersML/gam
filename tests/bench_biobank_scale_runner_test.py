@@ -698,6 +698,52 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
             _RUNNER._emit_phase_summary(captured_stderr, "cmd-preview", timed_out=False, rc=0)
         return buf.getvalue()
 
+    def test_warm_start_health_verdict_classifies_tiers_correctly(self) -> None:
+        # HEALTHY: coverage ≥ 0.70 AND p50_resid < 0.05
+        v, d = _RUNNER._warm_start_health_verdict(
+            n_accepts=8, n_rejects=1, n_noops=1,
+            residuals=[1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 2e-2, 3e-2, 4e-2],
+        )
+        self.assertEqual(v, "HEALTHY", f"detail={d}")
+        self.assertIn("coverage=0.80", d)
+        # MARGINAL: coverage 0.50, p50_resid moderately bad → still MARGINAL
+        v, d = _RUNNER._warm_start_health_verdict(
+            n_accepts=4, n_rejects=2, n_noops=2,
+            residuals=[0.05, 0.10, 0.15, 0.20],
+        )
+        self.assertEqual(v, "MARGINAL", f"detail={d}")
+        # DEGRADED: low coverage AND high residual → DEGRADED
+        v, d = _RUNNER._warm_start_health_verdict(
+            n_accepts=1, n_rejects=8, n_noops=1,
+            residuals=[0.6],
+        )
+        self.assertEqual(v, "DEGRADED", f"detail={d}")
+        # NO-DATA: rejects-only run (predictor never accepted)
+        v, d = _RUNNER._warm_start_health_verdict(
+            n_accepts=0, n_rejects=5, n_noops=0,
+            residuals=[],
+        )
+        self.assertEqual(v, "NO-DATA", f"detail={d}")
+        # Edge: HEALTHY threshold boundary — coverage exactly 0.70, p50 = 0.04 → HEALTHY
+        v, _ = _RUNNER._warm_start_health_verdict(
+            n_accepts=7, n_rejects=2, n_noops=1,
+            residuals=[0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04],
+        )
+        self.assertEqual(v, "HEALTHY")
+        # Edge: just-below HEALTHY → MARGINAL (coverage <0.70 OR p50≥0.05)
+        v, _ = _RUNNER._warm_start_health_verdict(
+            n_accepts=7, n_rejects=2, n_noops=1,
+            residuals=[0.04, 0.04, 0.04, 0.04, 0.06, 0.06, 0.06],
+        )
+        # p50 of 7 sorted values is index 3 = 0.04 → still HEALTHY actually.
+        # Use a clearer marginal case: coverage=0.6 → drops out of HEALTHY,
+        # falls into MARGINAL because coverage ≥ 0.30 even though p50 ≥ 0.05.
+        v, d = _RUNNER._warm_start_health_verdict(
+            n_accepts=6, n_rejects=2, n_noops=2,
+            residuals=[0.10, 0.10, 0.10, 0.10, 0.10, 0.10],
+        )
+        self.assertEqual(v, "MARGINAL", f"detail={d}")
+
     def test_phase_summary_aggregates_ift_accept_reject_noop_independently(self) -> None:
         stderr = "\n".join([
             # 4 accepts at varying residuals
