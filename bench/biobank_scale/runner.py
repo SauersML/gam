@@ -1477,10 +1477,15 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, s
     )
     out_buf: list[str] = []
     err_buf: list[str] = []
+    # Dedicated buffer for [PHASE] / [OUTER summary] markers so they
+    # survive stderr-buffer rollover when a long-running cmd produces
+    # >MAX_CAPTURE_CHARS of HEARTBEAT noise. Lets `_emit_phase_summary`
+    # still find the markers even after a 40-min run.
+    phase_buf: list[str] = []
     stop_event = threading.Event()
     preview = " ".join(cmd[:5]) + (" ..." if len(cmd) > 5 else "")
 
-    def pump(pipe: Any, sink: Any, capture: list[str]) -> None:
+    def pump(pipe: Any, sink: Any, capture: list[str], phase_capture: list[str] | None = None) -> None:
         total = 0
         try:
             while True:
@@ -1495,11 +1500,15 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, s
                 if total > MAX_CAPTURE_CHARS:
                     del capture[0]
                     total = sum(len(x) for x in capture)
+                if phase_capture is not None:
+                    for line in text.splitlines(keepends=True):
+                        if "[PHASE]" in line or "[OUTER summary]" in line or "[OUTER guard]" in line:
+                            phase_capture.append(line)
         finally:
             pipe.close()
 
     t_out = threading.Thread(target=pump, args=(proc.stdout, sys.stdout, out_buf), daemon=True)
-    t_err = threading.Thread(target=pump, args=(proc.stderr, sys.stderr, err_buf), daemon=True)
+    t_err = threading.Thread(target=pump, args=(proc.stderr, sys.stderr, err_buf, phase_buf), daemon=True)
     t_hb = threading.Thread(target=heartbeat_loop, args=(proc, preview, stop_event), daemon=True)
     t_out.start()
     t_err.start()
@@ -1531,16 +1540,17 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, s
         print(msg, file=sys.stderr, flush=True)
         # Emit the phase summary EVEN ON TIMEOUT — the most useful place
         # to see WHICH phase was running when the budget ran out.
-        captured_stderr_timeout = "".join(err_buf)
-        _emit_phase_summary(captured_stderr_timeout, preview, timed_out=True, rc=124)
+        _emit_phase_summary("".join(phase_buf), preview, timed_out=True, rc=124)
         raise TimeoutError(msg)
     captured_stderr = "".join(err_buf)
     if (routing_path := _routing_log_path()) is not None:
         _append_routing_lines(routing_path, captured_stderr)
     # Emit a per-phase wall-clock summary parsed from the gam binary's
     # `[PHASE]` markers so CI logs end with a quick-glance breakdown of
-    # CTN / margslope / standard-GAM / location-scale phase timings.
-    _emit_phase_summary(captured_stderr, preview, timed_out=False, rc=rc)
+    # CTN / margslope / standard-GAM / location-scale phase timings. We
+    # parse the dedicated `phase_buf` (which retains all [PHASE] markers
+    # even after stderr buffer rollover) rather than `captured_stderr`.
+    _emit_phase_summary("".join(phase_buf), preview, timed_out=False, rc=rc)
     return rc, "".join(out_buf), captured_stderr
 
 
