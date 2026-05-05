@@ -803,12 +803,7 @@ fn fit_survival_marginal_slope_model(
             .as_slice()
             .expect("event_target is contiguous"),
     );
-    fit_survival_marginal_slope_terms(
-        request.data,
-        request.spec,
-        &options,
-        &request.kappa_options,
-    )
+    fit_survival_marginal_slope_terms(request.data, request.spec, &options, &request.kappa_options)
 }
 
 fn fit_latent_survival_model(

@@ -1508,7 +1508,8 @@ pub struct BlockwiseFitOptions {
     /// consulted only by outer-only call sites. Default `None` preserves
     /// the legacy full-data behavior. Wrapping in `Arc` keeps `Clone` cheap
     /// across the many places `BlockwiseFitOptions` is duplicated per-eval.
-    pub outer_score_subsample: Option<Arc<crate::families::marginal_slope_shared::OuterScoreSubsample>>,
+    pub outer_score_subsample:
+        Option<Arc<crate::families::marginal_slope_shared::OuterScoreSubsample>>,
 }
 
 impl Default for BlockwiseFitOptions {
@@ -10514,9 +10515,13 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 && batch.trace_h_inv_hdot.len() == expected
                 && batch.trace_s_pinv_sdot.len() == expected
             {
-                if let Some(joint_bundle_value_only) =
-                    build_joint_hessian_closures(family, &inner.block_states, specs, total, options)?
-                {
+                if let Some(joint_bundle_value_only) = build_joint_hessian_closures(
+                    family,
+                    &inner.block_states,
+                    specs,
+                    total,
+                    options,
+                )? {
                     let JointHessianBundle {
                         source: h_joint_unpen,
                         beta_flat,

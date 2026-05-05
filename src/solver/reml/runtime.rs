@@ -2515,7 +2515,11 @@ impl<'a> RemlState<'a> {
                     "[PIRLS cap] inner_max_iterations={} (full={} screening={} outer={})",
                     pirls_config.max_iterations,
                     original_cap,
-                    if in_screening { screening_cap as i64 } else { -1 },
+                    if in_screening {
+                        screening_cap as i64
+                    } else {
+                        -1
+                    },
                     if outer_cap > 0 { outer_cap as i64 } else { -1 },
                 );
             }
