@@ -1593,6 +1593,25 @@ _PIRLS_ITER_END_PATTERN = re.compile(
     r"\[PIRLS iter-end\]\s+iter=\s*(\d+)\s+elapsed=([\d.]+)s"
 )
 
+# Per-iter PIRLS LM-loop breakdown. Splits each inner-Newton iter's
+# wall-time into the four sub-phases that drive cost:
+#   curvature : model.update_with_curvature (gradient + Hessian assembly,
+#               XᵀWX + per-row work, the bulk for FLEX margslope)
+#   solve     : (H + λI)·δ = -g linear solve (LM-loop body; O(p³)/3
+#               dense Cholesky or sparse SPD factor)
+#   predred   : predicted-reduction quadratic form (O(p²) matvec)
+#   candidate : model.update_candidate (gain-ratio test; for FLEX margslope
+#               this is the per-row sextic-kernel intercept root-find)
+# Summed over all iters in a fit, the dominant phase identifies which
+# principled optimization to ship next: candidate-heavy → inner-row
+# kernel; solve-heavy → matrix-free / iterative inner solve;
+# curvature-heavy → assembly fusion or sparser representations.
+_PIRLS_ITER_BREAKDOWN_PATTERN = re.compile(
+    r"\[PIRLS iter-breakdown\]\s+iter=\s*(\d+)\s+attempts=(\d+)"
+    r"\s+curvature=([\d.]+)s\s+solve=([\d.]+)s\s+predred=([\d.]+)s"
+    r"\s+candidate=([\d.]+)s\s+other=([\d.]+)s"
+)
+
 # Solve-end summary: one line per completed PIRLS solve carrying the
 # geometric convergence rate of the inner Newton:
 #     rate = (g_norm_final / g_norm_initial) ^ (1 / iters)
@@ -1743,6 +1762,38 @@ def _emit_phase_summary(
             f"pirls_iters={n} pirls_total={total_pirls:.1f}s "
             f"pirls_p50={p50:.3f}s pirls_p95={p95:.3f}s pirls_max={pmax:.3f}s"
         )
+    # Per-iter LM-loop sub-phase aggregation. Surfaces the dominant
+    # inner-Newton hot spot in one verdict line so the next principled
+    # optimization knows where to land. The percentages are computed
+    # against (curv + solve + predred + candidate); "other" is reported
+    # absolutely so a reviewer can see whether bookkeeping/KKT-cert
+    # overhead is non-trivial. Total LM attempt count surfaces LM-halving
+    # pressure: attempts ≫ iters indicates the trust region is fighting
+    # the geometry, often a sign that warm-starting is degrading.
+    pirls_breakdown_matches = _PIRLS_ITER_BREAKDOWN_PATTERN.findall(captured_stderr)
+    if pirls_breakdown_matches:
+        curv_total = sum(float(m[2]) for m in pirls_breakdown_matches)
+        solve_total = sum(float(m[3]) for m in pirls_breakdown_matches)
+        predred_total = sum(float(m[4]) for m in pirls_breakdown_matches)
+        cand_total = sum(float(m[5]) for m in pirls_breakdown_matches)
+        other_total = sum(float(m[6]) for m in pirls_breakdown_matches)
+        attempts_total = sum(int(m[1]) for m in pirls_breakdown_matches)
+        timed_sum = curv_total + solve_total + predred_total + cand_total
+        if timed_sum > 0.0:
+            phase_pct = {
+                "curv": curv_total / timed_sum,
+                "solve": solve_total / timed_sum,
+                "predred": predred_total / timed_sum,
+                "cand": cand_total / timed_sum,
+            }
+            dom_phase = max(phase_pct, key=lambda k: phase_pct[k])
+            parts.append(
+                f"pirls_attempts={attempts_total} "
+                f"pirls_dom={dom_phase}@{phase_pct[dom_phase] * 100:.0f}% "
+                f"pirls_curv={curv_total:.1f}s pirls_solve={solve_total:.1f}s "
+                f"pirls_predred={predred_total:.1f}s pirls_cand={cand_total:.1f}s "
+                f"pirls_other={other_total:.1f}s"
+            )
     # Per-solve geometric convergence rate. A healthy biobank fit ends
     # with most PIRLS solves at rate < 0.5; a struggling fit shows
     # consistent rate ≥ 0.7 across solves (inner Newton stuck near
