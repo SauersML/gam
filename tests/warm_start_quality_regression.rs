@@ -91,6 +91,23 @@ fn fit_at_rho(
     rho: f64,
     warm: Option<&Coefficients>,
 ) -> (Coefficients, usize, PirlsStatus) {
+    let (beta, iters, status, _final_lambda) =
+        fit_at_rho_full(x, y, w, penalties, rho, warm, None);
+    (beta, iters, status)
+}
+
+/// Parametric variant exposing both the LM-λ warm-start hint and the
+/// converged final λ. Used by tests that exercise the
+/// `initial_lm_lambda` plumbing wired in commit `ba4dc931`.
+fn fit_at_rho_full(
+    x: &Array2<f64>,
+    y: &Array1<f64>,
+    w: &Array1<f64>,
+    penalties: &[CanonicalPenalty],
+    rho: f64,
+    warm: Option<&Coefficients>,
+    initial_lm_lambda: Option<f64>,
+) -> (Coefficients, usize, PirlsStatus, f64) {
     let p = x.ncols();
     let offset = Array1::<f64>::zeros(y.len());
     let cfg = PirlsConfig {
@@ -102,7 +119,7 @@ fn fit_at_rho(
         // 200-iter cap is comfortable.
         convergence_tolerance: 1e-10,
         firth_bias_reduction: false,
-        initial_lm_lambda: None,
+        initial_lm_lambda,
     };
     let (result, _working) = fit_model_for_fixed_rho(
         LogSmoothingParamsView::new(array![rho].view()),
@@ -142,6 +159,7 @@ fn fit_at_rho(
         Coefficients::new(beta_original),
         result.iteration,
         result.status,
+        result.final_lm_lambda,
     )
 }
 
@@ -238,5 +256,103 @@ fn warm_start_with_far_rho_seed_still_converges_to_cold_beta() {
         drift < 1e-5,
         "warm-start fit (far seed) drifted from cold-start fit beyond convergence tolerance: {:.3e}",
         drift
+    );
+}
+
+#[test]
+fn pirls_result_exposes_finite_positive_final_lm_lambda() {
+    // Cold fit must populate `final_lm_lambda` with a finite, positive
+    // value so the REML runtime can persist it as the next-call hint.
+    // Guards against regressions where the field is left at NaN or 0.
+    let (x, y, w, penalties) = make_problem();
+    let (_beta, iter, status, final_lambda) =
+        fit_at_rho_full(&x, &y, &w, &penalties, 0.0, None, None);
+    assert!(matches!(
+        status,
+        PirlsStatus::Converged | PirlsStatus::StalledAtValidMinimum
+    ));
+    eprintln!(
+        "[lm-lambda regression] cold fit converged in {} iters, final_lm_lambda={:.3e}",
+        iter, final_lambda
+    );
+    assert!(
+        final_lambda.is_finite() && final_lambda > 0.0,
+        "PirlsResult::final_lm_lambda must be finite and positive, got {:.3e}",
+        final_lambda
+    );
+    // Sanity: the converged damping cannot have escaped the LM ceiling
+    // (1e12) — that would mean the inner solver halted on a non-SPD
+    // step, which contradicts the Converged / StalledAtValidMinimum
+    // statuses asserted above.
+    assert!(
+        final_lambda < 1e12,
+        "PirlsResult::final_lm_lambda escaped LM ceiling at converged state: {:.3e}",
+        final_lambda
+    );
+}
+
+#[test]
+fn lm_lambda_warm_start_hint_preserves_kkt_beta_and_does_not_increase_iters() {
+    // End-to-end test of the LM-λ persistence path (commit ba4dc931):
+    // pull `final_lm_lambda` out of one fit, pass it as the
+    // `initial_lm_lambda` hint of the next, and verify
+    //   1. β converges to the same KKT point as the cold path,
+    //   2. iter count is non-increasing (a hint that's clamped to the
+    //      same value as the cold default at minimum produces equal
+    //      iters; an informative hint produces fewer).
+    let (x, y, w, penalties) = make_problem();
+    let rho_a = 0.0_f64;
+    let rho_b = 1.0_f64;
+
+    // Anchor solve at ρ_a — captures the converged λ.
+    let (_beta_a, _iter_a, status_a, lambda_a) =
+        fit_at_rho_full(&x, &y, &w, &penalties, rho_a, None, None);
+    assert!(matches!(
+        status_a,
+        PirlsStatus::Converged | PirlsStatus::StalledAtValidMinimum
+    ));
+    assert!(
+        lambda_a.is_finite() && lambda_a > 0.0,
+        "anchor fit must expose a usable lambda hint; got {:.3e}",
+        lambda_a
+    );
+
+    // Cold solve at ρ_b: no λ hint, no β warm-start.
+    let (beta_b_cold, iter_b_cold, status_b_cold, _lambda_b_cold) =
+        fit_at_rho_full(&x, &y, &w, &penalties, rho_b, None, None);
+    assert!(matches!(
+        status_b_cold,
+        PirlsStatus::Converged | PirlsStatus::StalledAtValidMinimum
+    ));
+
+    // Hinted solve at ρ_b: λ hint plumbed through PirlsConfig, no β
+    // warm-start (so the hint's effect is isolated).
+    let (beta_b_hinted, iter_b_hinted, status_b_hinted, _lambda_b_hinted) =
+        fit_at_rho_full(&x, &y, &w, &penalties, rho_b, None, Some(lambda_a));
+    assert!(matches!(
+        status_b_hinted,
+        PirlsStatus::Converged | PirlsStatus::StalledAtValidMinimum
+    ));
+
+    let drift = relative_l2(&beta_b_hinted, &beta_b_cold);
+    eprintln!(
+        "[lm-lambda regression] cold_iters={} hinted_iters={} (lambda_hint={:.3e}) drift={:.3e}",
+        iter_b_cold, iter_b_hinted, lambda_a, drift,
+    );
+    assert!(
+        drift < 1e-5,
+        "lm-lambda hint caused beta drift beyond convergence tolerance: {:.3e}",
+        drift
+    );
+    // Non-regression: the hint must not slow the solve down. When the
+    // converged λ from ρ_a is at the cold-default floor the runtime
+    // clamps it to 1e-6, so iter counts will match. When the geometry
+    // genuinely needed damping the hint accelerates the next solve;
+    // either way iter_b_hinted ≤ iter_b_cold.
+    assert!(
+        iter_b_hinted <= iter_b_cold,
+        "lm-lambda hint regressed iter count: cold={} hinted={}",
+        iter_b_cold,
+        iter_b_hinted
     );
 }
