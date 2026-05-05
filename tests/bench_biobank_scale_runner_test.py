@@ -684,6 +684,63 @@ class MarkerPatternTests(unittest.TestCase):
             )
             self.assertEqual(matched[0][3], status_variant)
 
+    def test_bfgs_summary_pattern_covers_all_outcome_variants(self) -> None:
+        # Locks the regex contract that all four BFGS outcomes parse
+        # correctly: converged + max_iter + line-search failed (with
+        # iter counts since commit b4e8b436) and generic failed
+        # (no iter count). Adding a new BFGS outcome variant in the
+        # opt crate / outer_strategy.rs without updating this regex
+        # would silently disappear it from the verdict's status mix.
+        cases = [
+            (
+                "[OUTER summary] BFGS converged in 12 iters elapsed=145.234s "
+                "final_value=1.23e3",
+                "converged", "12", "145.234",
+            ),
+            (
+                "[OUTER summary] BFGS hit max_iter in 100 iters elapsed=2398.0s "
+                "final_value=1.23e3",
+                "hit max_iter", "100", "2398.0",
+            ),
+            (
+                "[OUTER summary] BFGS line-search failed in 47 iters "
+                "elapsed=87.654s final_value=1.23e3",
+                "line-search failed", "47", "87.654",
+            ),
+            (
+                "[OUTER summary] BFGS failed elapsed=12.0s err=SomeErr",
+                "failed", None, "12.0",
+            ),
+        ]
+        for line, expected_status, expected_iters, expected_elapsed in cases:
+            matches = _RUNNER._BFGS_SUMMARY_PATTERN.findall(line)
+            self.assertEqual(
+                len(matches),
+                1,
+                f"BFGS outcome {expected_status!r} did not parse: {line}",
+            )
+            status, iters, elapsed = matches[0]
+            self.assertEqual(status, expected_status)
+            # The optional `(?:\s+in\s+(\d+)\s+iters)?` group yields
+            # "" (empty string) on regex non-match, NOT None. Guard
+            # against both for the no-iters case so the test stays
+            # robust to regex-engine behavior across CPython versions.
+            if expected_iters is None:
+                self.assertIn(iters, ("", None))
+            else:
+                self.assertEqual(iters, expected_iters)
+            self.assertEqual(elapsed, expected_elapsed)
+        # Backward-compat: older logs (pre-b4e8b436) emitted
+        # max_iter / line-search failed WITHOUT the `in N iters`
+        # field. Regex's optional group must still match these.
+        old_max_iter = (
+            "[OUTER summary] BFGS hit max_iter elapsed=2398.0s final_value=1.23e3"
+        )
+        m = _RUNNER._BFGS_SUMMARY_PATTERN.findall(old_max_iter)
+        self.assertEqual(len(m), 1)
+        self.assertEqual(m[0][0], "hit max_iter")
+        self.assertIn(m[0][1], ("", None))
+
     def test_kappa_phase_patterns_parse_per_call_and_summary(self) -> None:
         per_call_lines = [
             "[KAPPA-PHASE] phase=cost call=12 theta_norm=3.4500e+00 log_kappa_norm=1.2000e+00 elapsed_s=0.4321",
