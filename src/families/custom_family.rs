@@ -1459,6 +1459,15 @@ pub struct BlockwiseFitOptions {
     /// Shared cap engaged during seed screening so cost-only evaluations can
     /// stop inner iterations early without affecting the full solve.
     pub screening_max_inner_iterations: Option<Arc<AtomicUsize>>,
+    /// Optional stratified row subsample used by outer-only score/gradient
+    /// passes. When `Some(s)`, outer score/gradient hot loops should iterate
+    /// only over `s.mask` and rescale per-row contributions by
+    /// `s.weight_scale = n_full / mask.len()`. Inner-PIRLS and final
+    /// covariance passes always run on the full data, so this field is
+    /// consulted only by outer-only call sites. Default `None` preserves
+    /// the legacy full-data behavior. Wrapping in `Arc` keeps `Clone` cheap
+    /// across the many places `BlockwiseFitOptions` is duplicated per-eval.
+    pub outer_score_subsample: Option<Arc<crate::families::marginal_slope_shared::OuterScoreSubsample>>,
 }
 
 impl Default for BlockwiseFitOptions {
@@ -1477,6 +1486,7 @@ impl Default for BlockwiseFitOptions {
             use_outer_hessian: true,
             compute_covariance: false,
             screening_max_inner_iterations: None,
+            outer_score_subsample: None,
         }
     }
 }
@@ -13529,6 +13539,7 @@ mod tests {
             compute_covariance: false,
             use_outer_hessian: false,
             screening_max_inner_iterations: None,
+            outer_score_subsample: None,
         };
 
         let result = fit_custom_family(&OneBlockIdentityFamily, &[spec], &options)
@@ -13568,6 +13579,7 @@ mod tests {
             compute_covariance: false,
             use_outer_hessian: false,
             screening_max_inner_iterations: None,
+            outer_score_subsample: None,
         };
         let per_block_log_lambdas = vec![array![10.0_f64.ln()]];
         let inner = inner_blockwise_fit(&family, &[spec], &per_block_log_lambdas, &options, None)
@@ -13610,6 +13622,7 @@ mod tests {
             compute_covariance: false,
             use_outer_hessian: false,
             screening_max_inner_iterations: None,
+            outer_score_subsample: None,
         };
         let inner = inner_blockwise_fit(&family, &[spec], &[Array1::zeros(0)], &options, None)
             .expect("inner blockwise fit should succeed");
