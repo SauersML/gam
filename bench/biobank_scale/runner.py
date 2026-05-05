@@ -1517,6 +1517,10 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, s
             f"pid={proc.pid} cmd='{preview}'"
         )
         print(msg, file=sys.stderr, flush=True)
+        # Emit the phase summary EVEN ON TIMEOUT — the most useful place
+        # to see WHICH phase was running when the budget ran out.
+        captured_stderr_timeout = "".join(err_buf)
+        _emit_phase_summary(captured_stderr_timeout, preview, timed_out=True, rc=124)
         raise TimeoutError(msg)
     captured_stderr = "".join(err_buf)
     if (routing_path := _routing_log_path()) is not None:
@@ -1524,7 +1528,7 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, s
     # Emit a per-phase wall-clock summary parsed from the gam binary's
     # `[PHASE]` markers so CI logs end with a quick-glance breakdown of
     # CTN / margslope / standard-GAM / location-scale phase timings.
-    _emit_phase_summary(captured_stderr, preview)
+    _emit_phase_summary(captured_stderr, preview, timed_out=False, rc=rc)
     return rc, "".join(out_buf), captured_stderr
 
 
@@ -1533,17 +1537,34 @@ _PHASE_END_PATTERN = re.compile(
 )
 
 
-def _emit_phase_summary(captured_stderr: str, cmd_preview: str) -> None:
-    matches = _PHASE_END_PATTERN.findall(captured_stderr)
-    if not matches:
-        return
-    total = sum(float(secs) for _, secs in matches)
+_PHASE_START_PATTERN = re.compile(r"\[PHASE\]\s+([\w\-]+(?:\([\w\-/]+\))?)\s+(?:fit\s+)?start")
+
+
+def _emit_phase_summary(
+    captured_stderr: str,
+    cmd_preview: str,
+    *,
+    timed_out: bool = False,
+    rc: int = 0,
+) -> None:
+    end_matches = _PHASE_END_PATTERN.findall(captured_stderr)
+    start_phases = _PHASE_START_PATTERN.findall(captured_stderr)
+    completed = {name for name, _ in end_matches}
+    pending = [p for p in start_phases if p not in completed]
     by_phase: dict[str, float] = {}
-    for name, secs in matches:
+    for name, secs in end_matches:
         by_phase[name] = by_phase.get(name, 0.0) + float(secs)
+    total = sum(by_phase.values())
     parts = [f"{name}={secs:.1f}s" for name, secs in by_phase.items()]
+    suffix = ""
+    if pending:
+        suffix = f" pending={','.join(pending)}"
+    if timed_out or rc == 124:
+        suffix += " [TIMEOUT]"
+    if not parts and not suffix:
+        return
     print(
-        f"[PHASE summary] cmd='{cmd_preview}' total={total:.1f}s {' '.join(parts)}",
+        f"[PHASE summary] cmd='{cmd_preview}' total={total:.1f}s {' '.join(parts)}{suffix}",
         file=sys.stderr,
         flush=True,
     )
