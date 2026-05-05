@@ -9151,6 +9151,28 @@ impl SurvivalMarginalSlopeFamily {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        self.psi_hessian_directional_derivative_with_options(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            d_beta_flat,
+            &BlockwiseFitOptions::default(),
+        )
+    }
+
+    /// Outer-aware variant of `psi_hessian_directional_derivative` that
+    /// returns the dense block Hessian directional derivative. When
+    /// `options.outer_score_subsample` is `Some`, only the masked rows are
+    /// visited and the accumulator is rescaled by the Horvitz-Thompson
+    /// `weight_scale` before being densified.
+    pub(crate) fn psi_hessian_directional_derivative_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Array2<f64>>, String> {
         let flex_active = self.effective_flex_active(block_states)?;
         let flex_primary = flex_active.then(|| flex_primary_slices(self));
         let slices = block_slices(self, block_states);
@@ -9194,7 +9216,9 @@ impl SurvivalMarginalSlopeFamily {
             &policy,
         )?;
 
-        let acc = (0..self.n)
+        let row_iter = outer_row_indices(options, self.n).to_vec();
+        let outer_scale = outer_score_scale(options, self.n);
+        let mut acc = row_iter
             .into_par_iter()
             .try_fold(
                 || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
@@ -9332,15 +9356,25 @@ impl SurvivalMarginalSlopeFamily {
                 },
             )?;
 
+        if outer_scale != 1.0 {
+            acc.scale_assign(outer_scale);
+        }
+
         Ok(Some(acc.to_dense(&slices)))
     }
 
-    fn psi_hessian_directional_derivative_operator(
+    /// Outer-aware operator builder for the per-ψ Hessian directional
+    /// derivative. When `options.outer_score_subsample` is `Some`, only the
+    /// masked rows are visited and the accumulator is rescaled by the
+    /// Horvitz-Thompson `weight_scale` before being wrapped in the
+    /// `HyperOperator`.
+    pub(crate) fn psi_hessian_directional_derivative_operator_with_options(
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
+        options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
         let flex_active = self.effective_flex_active(block_states)?;
         let flex_primary = flex_active.then(|| flex_primary_slices(self));
@@ -9385,7 +9419,9 @@ impl SurvivalMarginalSlopeFamily {
             &policy,
         )?;
 
-        let acc = (0..self.n)
+        let row_iter = outer_row_indices(options, self.n).to_vec();
+        let outer_scale = outer_score_scale(options, self.n);
+        let mut acc = row_iter
             .into_par_iter()
             .try_fold(
                 || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
@@ -9520,6 +9556,10 @@ impl SurvivalMarginalSlopeFamily {
                     Ok(a)
                 },
             )?;
+
+        if outer_scale != 1.0 {
+            acc.scale_assign(outer_scale);
+        }
 
         Ok(Some(
             Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>
@@ -9943,11 +9983,12 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
                 });
         }
         self.family
-            .psi_hessian_directional_derivative_operator(
+            .psi_hessian_directional_derivative_operator_with_options(
                 &self.block_states,
                 &self.derivative_blocks,
                 psi_index,
                 d_beta_flat,
+                &self.options,
             )
             .map(|result| {
                 result.map(crate::solver::estimate::reml::unified::DriftDerivResult::Operator)
@@ -16178,11 +16219,12 @@ mod tests {
         let mut op_records = Vec::new();
         for i in 0..psi_dim {
             let op = family
-                .psi_hessian_directional_derivative_operator(
+                .psi_hessian_directional_derivative_operator_with_options(
                     &block_states,
                     &derivative_blocks,
                     i,
                     &d_beta_flat,
+                    &BlockwiseFitOptions::default(),
                 )
                 .expect("operator call ok")
                 .expect("operator returns Some");
@@ -16810,5 +16852,203 @@ mod tests {
         let exp_score = &raw.score_psi_psi * factor;
         let score_rel = rel_diff_array1_survival(&scaled.score_psi_psi, &exp_score);
         assert!(score_rel < 1e-12, "score rel {}", score_rel);
+    }
+
+    #[test]
+    fn survival_psi_hessian_directional_derivative_subsample_full_equals_unsampled() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_block_psi_test_family(n);
+        let states = block_psi_test_block_states(&family, 0.15, 0.25);
+        let derivative_blocks = block_psi_test_marginal_derivative_blocks(n);
+        let slices = block_slices(&family, &states);
+        let mut d_beta_flat = Array1::<f64>::zeros(slices.total);
+        d_beta_flat[slices.marginal.start] = 0.05;
+        d_beta_flat[slices.logslope.start] = -0.04;
+
+        let baseline = family
+            .psi_hessian_directional_derivative(&states, &derivative_blocks, 0, &d_beta_flat)
+            .expect("baseline psi-Hessian directional derivative")
+            .expect("some");
+
+        let mut opts_full = BlockwiseFitOptions::default();
+        opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            (0..n).collect(),
+            n,
+            0xDEADBEEF,
+        )));
+        let with_full = family
+            .psi_hessian_directional_derivative_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                &d_beta_flat,
+                &opts_full,
+            )
+            .expect("with full mask")
+            .expect("some");
+
+        let rel = rel_diff_array2_survival(&with_full, &baseline);
+        assert!(rel < 1e-12, "drift rel {}", rel);
+    }
+
+    #[test]
+    fn survival_psi_hessian_directional_derivative_subsample_half_scales_correctly() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_block_psi_test_family(n);
+        let states = block_psi_test_block_states(&family, 0.15, 0.25);
+        let derivative_blocks = block_psi_test_marginal_derivative_blocks(n);
+        let slices = block_slices(&family, &states);
+        let mut d_beta_flat = Array1::<f64>::zeros(slices.total);
+        d_beta_flat[slices.marginal.start] = 0.05;
+        d_beta_flat[slices.logslope.start] = -0.04;
+
+        let even_mask: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
+        let m = even_mask.len();
+
+        let mut opts_half = BlockwiseFitOptions::default();
+        opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            even_mask.clone(),
+            n,
+            0xCAFE,
+        )));
+        let scaled = family
+            .psi_hessian_directional_derivative_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                &d_beta_flat,
+                &opts_half,
+            )
+            .expect("scaled")
+            .expect("some");
+
+        let mut opts_raw = BlockwiseFitOptions::default();
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
+            mask: Arc::new(even_mask),
+            n_full: m,
+            weight_scale: 1.0,
+            seed: 0,
+        }));
+        let raw = family
+            .psi_hessian_directional_derivative_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                &d_beta_flat,
+                &opts_raw,
+            )
+            .expect("raw")
+            .expect("some");
+
+        let factor = n as f64 / m as f64;
+        let exp = &raw * factor;
+        let rel = rel_diff_array2_survival(&scaled, &exp);
+        assert!(rel < 1e-12, "drift rel {}", rel);
+    }
+
+    #[test]
+    fn survival_psi_hessian_directional_derivative_operator_subsample_full_equals_unsampled() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_block_psi_test_family(n);
+        let states = block_psi_test_block_states(&family, 0.15, 0.25);
+        let derivative_blocks = block_psi_test_marginal_derivative_blocks(n);
+        let slices = block_slices(&family, &states);
+        let mut d_beta_flat = Array1::<f64>::zeros(slices.total);
+        d_beta_flat[slices.marginal.start] = 0.05;
+        d_beta_flat[slices.logslope.start] = -0.04;
+
+        let baseline = family
+            .psi_hessian_directional_derivative_operator_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                &d_beta_flat,
+                &BlockwiseFitOptions::default(),
+            )
+            .expect("baseline operator")
+            .expect("some");
+        let baseline_dense = baseline.to_dense();
+
+        let mut opts_full = BlockwiseFitOptions::default();
+        opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            (0..n).collect(),
+            n,
+            0xDEADBEEF,
+        )));
+        let with_full = family
+            .psi_hessian_directional_derivative_operator_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                &d_beta_flat,
+                &opts_full,
+            )
+            .expect("with full mask")
+            .expect("some");
+        let with_full_dense = with_full.to_dense();
+
+        let rel = rel_diff_array2_survival(&with_full_dense, &baseline_dense);
+        assert!(rel < 1e-12, "operator drift rel {}", rel);
+    }
+
+    #[test]
+    fn survival_psi_hessian_directional_derivative_operator_subsample_half_scales_correctly() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_block_psi_test_family(n);
+        let states = block_psi_test_block_states(&family, 0.15, 0.25);
+        let derivative_blocks = block_psi_test_marginal_derivative_blocks(n);
+        let slices = block_slices(&family, &states);
+        let mut d_beta_flat = Array1::<f64>::zeros(slices.total);
+        d_beta_flat[slices.marginal.start] = 0.05;
+        d_beta_flat[slices.logslope.start] = -0.04;
+
+        let even_mask: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
+        let m = even_mask.len();
+
+        let mut opts_half = BlockwiseFitOptions::default();
+        opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            even_mask.clone(),
+            n,
+            0xCAFE,
+        )));
+        let scaled = family
+            .psi_hessian_directional_derivative_operator_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                &d_beta_flat,
+                &opts_half,
+            )
+            .expect("scaled")
+            .expect("some");
+        let scaled_dense = scaled.to_dense();
+
+        let mut opts_raw = BlockwiseFitOptions::default();
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
+            mask: Arc::new(even_mask),
+            n_full: m,
+            weight_scale: 1.0,
+            seed: 0,
+        }));
+        let raw = family
+            .psi_hessian_directional_derivative_operator_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                &d_beta_flat,
+                &opts_raw,
+            )
+            .expect("raw")
+            .expect("some");
+        let raw_dense = raw.to_dense();
+
+        let factor = n as f64 / m as f64;
+        let exp = &raw_dense * factor;
+        let rel = rel_diff_array2_survival(&scaled_dense, &exp);
+        assert!(rel < 1e-12, "operator drift rel {}", rel);
     }
 }
