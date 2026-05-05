@@ -1202,6 +1202,7 @@ impl<'a> RemlState<'a> {
         // with a different link the working weights change so the
         // factorization is no longer the right Jacobian seed.
         self.ift_warm_start_cache.write().unwrap().take();
+        self.ift_cached_factor.write().unwrap().take();
     }
 
     pub(crate) fn set_link_states(
@@ -1681,6 +1682,7 @@ impl<'a> RemlState<'a> {
             ift_warm_start_cache: RwLock::new(None),
             last_pirls_lm_lambda: Arc::new(AtomicU64::new(0)),
             last_ift_prediction_residual: Arc::new(AtomicU64::new(0)),
+            ift_cached_factor: RwLock::new(None),
             kronecker_penalty_system: None,
             kronecker_factored: None,
         })
@@ -1748,6 +1750,7 @@ impl<'a> RemlState<'a> {
         self.last_pirls_lm_lambda.store(0, Ordering::Relaxed);
         self.last_ift_prediction_residual
             .store(0, Ordering::Relaxed);
+        self.ift_cached_factor.write().unwrap().take();
         Ok(())
     }
 
@@ -2234,6 +2237,11 @@ impl<'a> RemlState<'a> {
                         frame_was_original,
                     });
                 }
+                // The factor cache holds the Cholesky of the PREVIOUS
+                // H_pen; replacing the IFT cache invalidates it. Drop
+                // here so the next predict call lazily refactors the
+                // new H_pen and stashes the new factor.
+                self.ift_cached_factor.write().unwrap().take();
             }
             _ => {
                 // On a failed solve, drop both the current pair AND the
@@ -2243,6 +2251,7 @@ impl<'a> RemlState<'a> {
                 self.prev_warm_start_beta.write().unwrap().take();
                 self.prev_warm_start_rho.write().unwrap().take();
                 self.ift_warm_start_cache.write().unwrap().take();
+                self.ift_cached_factor.write().unwrap().take();
             }
         }
     }
@@ -2277,10 +2286,13 @@ impl<'a> RemlState<'a> {
     ///   is descriptive),
     /// * factorization or back-solve fails / produces non-finite output.
     ///
-    /// The factorization is recomputed every call (one Cholesky per outer
-    /// iter, O(p³)). At p≈100–200 this is sub-millisecond and is dwarfed by
-    /// the inner Newton's per-iter cost, so caching the factor is not worth
-    /// the extra interior-mutability plumbing.
+    /// The factor is cached at `self.ift_cached_factor` and reused across
+    /// successive predict calls until the IFT cache itself is replaced (a
+    /// new `updatewarm_start_from`) or invalidated (failed solve, link
+    /// change, surface reset). At biobank scale (p ≈ several thousand)
+    /// the dense Cholesky is O(p³)/3 — multiple seconds per refactor —
+    /// so caching saves real wall time across the typical 5-10 IFT
+    /// predict calls per outer fit.
     pub(crate) fn predict_warm_start_beta_ift(
         &self,
         new_rho: &Array1<f64>,
@@ -2297,12 +2309,51 @@ impl<'a> RemlState<'a> {
             let r = f64::from_bits(last_residual_bits);
             if r.is_finite() && r >= 0.0 { Some(r) } else { None }
         };
-        predict_warm_start_beta_ift_from_cache(
+        // Get the cached factor or lazily compute it. Holding the
+        // ift_warm_start_cache read lock while we acquire the factor's
+        // lock is safe: cache invalidation (writer) takes the cache
+        // write lock first, then the factor write lock, so a reader
+        // holding the cache lock prevents the writer from advancing
+        // and we never observe a factor that doesn't match the cached
+        // matrix.
+        let factor_arc: Arc<dyn crate::linalg::matrix::FactorizedSystem> = {
+            let read_guard = self.ift_cached_factor.read().unwrap();
+            if let Some(arc) = read_guard.as_ref() {
+                Arc::clone(arc)
+            } else {
+                drop(read_guard);
+                let new_factor = match cache.penalized_hessian_transformed.factorize() {
+                    Ok(f) => f,
+                    Err(_) => {
+                        log::info!(
+                            "[IFT-REJECTED] reason=hessian_factorize_failed_cached drho_dim={}",
+                            new_rho.len(),
+                        );
+                        return None;
+                    }
+                };
+                let arc: Arc<dyn crate::linalg::matrix::FactorizedSystem> =
+                    Arc::from(new_factor);
+                let mut write_guard = self.ift_cached_factor.write().unwrap();
+                // Race window: another reader may have populated the
+                // slot between our drop(read_guard) and the write lock
+                // acquisition. Prefer the existing entry to keep the
+                // single-factor invariant and avoid tearing.
+                if let Some(existing) = write_guard.as_ref() {
+                    Arc::clone(existing)
+                } else {
+                    *write_guard = Some(Arc::clone(&arc));
+                    arc
+                }
+            }
+        };
+        predict_warm_start_beta_ift_with_factor(
             cache,
             self.canonical_penalties.as_ref(),
             new_rho,
             self.p,
             last_residual,
+            factor_arc.as_ref(),
         )
     }
 
@@ -3147,12 +3198,60 @@ const IFT_WARM_START_DRHO_EPS: f64 = 1e-12;
 /// `qs · H_tfd · qs^T · u = v` ⟹ `u = qs · (H_tfd \ (qs^T · v))`. qs is
 /// orthogonal by construction (`stable_reparameterizationwith_invariant`
 /// builds it from orthogonal eigenvector matrices), so qs^{-1} = qs^T.
+/// Test-only thin wrapper: factorize H_pen inline and call the inner
+/// predictor. Production callers use `RemlState::predict_warm_start_beta_ift`,
+/// which routes through `predict_warm_start_beta_ift_with_factor` so the
+/// dense Cholesky is cached across successive predict calls. The
+/// `dead_code` allow keeps the inline-factorize path callable from the
+/// `ift_warm_start_tests` module without penalty.
+#[allow(dead_code)]
 pub(crate) fn predict_warm_start_beta_ift_from_cache(
     cache: &super::IftWarmStartCache,
     canonical_penalties: &[crate::construction::CanonicalPenalty],
     new_rho: &Array1<f64>,
     p: usize,
     last_ift_residual: Option<f64>,
+) -> Option<Coefficients> {
+    predict_warm_start_beta_ift_inner(
+        cache,
+        canonical_penalties,
+        new_rho,
+        p,
+        last_ift_residual,
+        None,
+    )
+}
+
+/// Variant taking a pre-built `&dyn FactorizedSystem` so the caller can
+/// reuse a cached Cholesky factor across successive predict calls. See
+/// `RemlState::predict_warm_start_beta_ift` for the cache invalidation
+/// invariants. When `factor_override` is `None`, the function factorizes
+/// inline (same behavior as `predict_warm_start_beta_ift_from_cache`).
+pub(crate) fn predict_warm_start_beta_ift_with_factor(
+    cache: &super::IftWarmStartCache,
+    canonical_penalties: &[crate::construction::CanonicalPenalty],
+    new_rho: &Array1<f64>,
+    p: usize,
+    last_ift_residual: Option<f64>,
+    factor_override: &dyn crate::linalg::matrix::FactorizedSystem,
+) -> Option<Coefficients> {
+    predict_warm_start_beta_ift_inner(
+        cache,
+        canonical_penalties,
+        new_rho,
+        p,
+        last_ift_residual,
+        Some(factor_override),
+    )
+}
+
+fn predict_warm_start_beta_ift_inner(
+    cache: &super::IftWarmStartCache,
+    canonical_penalties: &[crate::construction::CanonicalPenalty],
+    new_rho: &Array1<f64>,
+    p: usize,
+    last_ift_residual: Option<f64>,
+    factor_override: Option<&dyn crate::linalg::matrix::FactorizedSystem>,
 ) -> Option<Coefficients> {
     // Cache populated but ρ not yet stamped (happens between
     // updatewarm_start_from and record_warm_start_rho on the first solve).
@@ -3279,18 +3378,27 @@ pub(crate) fn predict_warm_start_beta_ift_from_cache(
         cache.qs.t().dot(&rhs_original)
     };
 
-    let factor = match cache.penalized_hessian_transformed.factorize() {
-        Ok(f) => f,
-        Err(_) => {
-            log::info!(
-                "[IFT-REJECTED] reason=hessian_factorize_failed max_drho={:.3e} drho_dim={}",
-                max_abs_drho,
-                k,
-            );
-            return None;
+    // Use the caller's pre-built factor when present (the method-level
+    // wrapper threads in a cached Cholesky); otherwise factorize inline.
+    let owned_factor;
+    let factor_ref: &dyn crate::linalg::matrix::FactorizedSystem = match factor_override {
+        Some(f) => f,
+        None => {
+            owned_factor = match cache.penalized_hessian_transformed.factorize() {
+                Ok(f) => f,
+                Err(_) => {
+                    log::info!(
+                        "[IFT-REJECTED] reason=hessian_factorize_failed max_drho={:.3e} drho_dim={}",
+                        max_abs_drho,
+                        k,
+                    );
+                    return None;
+                }
+            };
+            owned_factor.as_ref()
         }
     };
-    let solution_in_h_basis = match factor.solve(&rhs_in_h_basis) {
+    let solution_in_h_basis = match factor_ref.solve(&rhs_in_h_basis) {
         Ok(u) => u,
         Err(_) => {
             log::info!(
