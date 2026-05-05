@@ -4227,11 +4227,7 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
     /// the inner-Newton biobank-scale hot path (Bernoulli marginal-slope and
     /// survival marginal-slope) override this to write directly into the
     /// caller-owned buffer, eliminating per-PCG-iter `Array1` allocations.
-    fn hessian_matvec_into(
-        &self,
-        v: &Array1<f64>,
-        out: &mut Array1<f64>,
-    ) -> Result<bool, String> {
+    fn hessian_matvec_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<bool, String> {
         match self.hessian_matvec(v)? {
             Some(result) => {
                 if result.len() != out.len() {
@@ -5728,8 +5724,7 @@ enum JointHessianSource {
         /// At biobank scale (~6400 inner CG iters per outer iter, p~200) this
         /// removes thousands of small Vec<f64> allocations from the tightest
         /// loop. Wired from `workspace.hessian_matvec_into`.
-        apply_into:
-            Arc<dyn Fn(&Array1<f64>, &mut Array1<f64>) -> Result<(), String> + Send + Sync>,
+        apply_into: Arc<dyn Fn(&Array1<f64>, &mut Array1<f64>) -> Result<(), String> + Send + Sync>,
         diagonal: Array1<f64>,
     },
 }

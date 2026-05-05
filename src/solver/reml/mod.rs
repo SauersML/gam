@@ -3728,8 +3728,7 @@ pub(crate) struct RemlState<'a> {
     /// outer fit. Reset jointly with `ift_warm_start_cache` (on
     /// reset_surface, on link-state changes, on failed PIRLS solves,
     /// and whenever a new H_pen replaces the cached one).
-    pub(crate) ift_cached_factor:
-        RwLock<Option<Arc<dyn crate::linalg::matrix::FactorizedSystem>>>,
+    pub(crate) ift_cached_factor: RwLock<Option<Arc<dyn crate::linalg::matrix::FactorizedSystem>>>,
 
     /// When set, the penalties have Kronecker (tensor-product) structure and
     /// the REML evaluator can use O(∏q_j) logdet instead of O(p³) eigendecomposition.
