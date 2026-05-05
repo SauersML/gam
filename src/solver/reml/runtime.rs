@@ -3186,6 +3186,19 @@ pub(crate) fn predict_warm_start_beta_ift_from_cache(
         .collect();
     let max_drho_cap = adaptive_ift_max_drho(last_ift_residual);
     if !max_abs_drho.is_finite() || max_abs_drho > max_drho_cap {
+        // Emit a structured reject marker so the bench runner can
+        // count predictor rejections alongside accepts (the
+        // `[IFT-QUALITY]` markers count only the accepts). The
+        // accept/reject ratio at biobank scale tells us how often
+        // the warm-start machinery is actually delivering, vs
+        // falling through to flat warm-start at every accepted
+        // outer iter.
+        log::info!(
+            "[IFT-REJECTED] reason=large_drho max_drho={:.3e} cap={:.3e} drho_dim={}",
+            max_abs_drho,
+            max_drho_cap,
+            k,
+        );
         return None;
     }
 
@@ -3225,6 +3238,11 @@ pub(crate) fn predict_warm_start_beta_ift_from_cache(
     }
 
     if !rhs_original.iter().all(|v| v.is_finite()) {
+        log::info!(
+            "[IFT-REJECTED] reason=non_finite_rhs max_drho={:.3e} drho_dim={}",
+            max_abs_drho,
+            k,
+        );
         return None;
     }
 
@@ -3235,6 +3253,12 @@ pub(crate) fn predict_warm_start_beta_ift_from_cache(
     } else {
         // rhs_tfd = qs^T · rhs_original. Dimension check: qs is p×p.
         if cache.qs.nrows() != p || cache.qs.ncols() != p {
+            log::info!(
+                "[IFT-REJECTED] reason=qs_dim_mismatch qs_dim={}x{} expected_p={}",
+                cache.qs.nrows(),
+                cache.qs.ncols(),
+                p,
+            );
             return None;
         }
         cache.qs.t().dot(&rhs_original)
@@ -3242,11 +3266,25 @@ pub(crate) fn predict_warm_start_beta_ift_from_cache(
 
     let factor = match cache.penalized_hessian_transformed.factorize() {
         Ok(f) => f,
-        Err(_) => return None,
+        Err(_) => {
+            log::info!(
+                "[IFT-REJECTED] reason=hessian_factorize_failed max_drho={:.3e} drho_dim={}",
+                max_abs_drho,
+                k,
+            );
+            return None;
+        }
     };
     let solution_in_h_basis = match factor.solve(&rhs_in_h_basis) {
         Ok(u) => u,
-        Err(_) => return None,
+        Err(_) => {
+            log::info!(
+                "[IFT-REJECTED] reason=hessian_solve_failed max_drho={:.3e} drho_dim={}",
+                max_abs_drho,
+                k,
+            );
+            return None;
+        }
     };
     let solution_original = if solve_in_original {
         solution_in_h_basis
@@ -3255,6 +3293,11 @@ pub(crate) fn predict_warm_start_beta_ift_from_cache(
     };
 
     if !solution_original.iter().all(|v| v.is_finite()) {
+        log::info!(
+            "[IFT-REJECTED] reason=non_finite_solution max_drho={:.3e} drho_dim={}",
+            max_abs_drho,
+            k,
+        );
         return None;
     }
 
@@ -3266,6 +3309,11 @@ pub(crate) fn predict_warm_start_beta_ift_from_cache(
         *target -= correction;
     }
     if !predicted.iter().all(|v| v.is_finite()) {
+        log::info!(
+            "[IFT-REJECTED] reason=non_finite_predicted max_drho={:.3e} drho_dim={}",
+            max_abs_drho,
+            k,
+        );
         return None;
     }
     log::debug!(
