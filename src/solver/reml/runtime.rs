@@ -2400,9 +2400,20 @@ impl<'a> RemlState<'a> {
         let factor_arc: Arc<dyn crate::linalg::matrix::FactorizedSystem> = {
             let read_guard = self.ift_cached_factor.read().unwrap();
             if let Some(arc) = read_guard.as_ref() {
+                // Cache hit: H_pen factor was already computed by an
+                // earlier predict call at the same surface. The
+                // [IFT-CACHE] marker validates that the factor cache
+                // (commit ec18559d) is paying off at biobank scale —
+                // every cache hit avoids a fresh O(p³)/3 Cholesky,
+                // which is multiple seconds at p ≈ several thousand.
+                log::info!(
+                    "[IFT-CACHE] outcome=hit drho_dim={}",
+                    new_rho.len(),
+                );
                 Arc::clone(arc)
             } else {
                 drop(read_guard);
+                let factorize_start = std::time::Instant::now();
                 let new_factor = match cache.penalized_hessian_transformed.factorize() {
                     Ok(f) => f,
                     Err(_) => {
@@ -2413,6 +2424,13 @@ impl<'a> RemlState<'a> {
                         return None;
                     }
                 };
+                // Cache miss: paid the Cholesky once. Subsequent predict
+                // calls at the same surface will hit the cache.
+                log::info!(
+                    "[IFT-CACHE] outcome=miss drho_dim={} elapsed={:.3}s",
+                    new_rho.len(),
+                    factorize_start.elapsed().as_secs_f64(),
+                );
                 let arc: Arc<dyn crate::linalg::matrix::FactorizedSystem> =
                     Arc::from(new_factor);
                 let mut write_guard = self.ift_cached_factor.write().unwrap();
