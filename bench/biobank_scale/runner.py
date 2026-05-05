@@ -1861,6 +1861,77 @@ def _emit_phase_summary(
         file=sys.stderr,
         flush=True,
     )
+    # Single-line warm-start health verdict — aggregates the multiple
+    # signals above into HEALTHY / MARGINAL / DEGRADED so CI reviewers
+    # don't have to mentally combine ift_predicts / ift_p50 /
+    # ift_accept_rate on every run. The verdict combines two
+    # axes — predictor coverage (how often does it accept?) and
+    # predictor faithfulness (how close to KKT is the prediction?) —
+    # via the policy in `_warm_start_health_verdict`. Emitted only when
+    # we have IFT-QUALITY data; absent otherwise so a fit that
+    # legitimately doesn't exercise the warm-start path doesn't get
+    # tagged.
+    if ift_quality_matches:
+        residuals_for_verdict = [
+            float(m[0]) for m in ift_quality_matches if float(m[0]) == float(m[0])
+        ]
+        verdict, detail = _warm_start_health_verdict(
+            n_accepts=n_accepts,
+            n_rejects=n_rejects,
+            n_noops=n_noops,
+            residuals=residuals_for_verdict,
+        )
+        print(
+            f"[WARM-START health] cmd='{cmd_preview}' verdict={verdict} {detail}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _warm_start_health_verdict(
+    *,
+    n_accepts: int,
+    n_rejects: int,
+    n_noops: int,
+    residuals: list[float],
+) -> tuple[str, str]:
+    """Combine the warm-start machinery's quality signals into a single
+    verdict. Two axes:
+
+      coverage   = n_accepts / (n_accepts + n_rejects + n_noops)
+                   (1.0 = predictor accepted every call; 0 = predictor
+                    fell through every time)
+      p50_resid  = median of accepted-call residuals (0.0 = perfect
+                   linearization; ≥0.5 = no better than flat warm-start)
+
+    Verdict tiers:
+      HEALTHY   coverage ≥ 0.70 AND p50_resid < 0.05
+      MARGINAL  coverage ≥ 0.30 OR p50_resid < 0.30
+      DEGRADED  otherwise
+
+    Returns (verdict, detail_string). The detail string carries the
+    actual numbers so reviewers can verify the verdict.
+    """
+    denom = max(n_accepts + n_rejects + n_noops, 1)
+    coverage = n_accepts / denom
+    if residuals:
+        sorted_res = sorted(residuals)
+        p50_resid = sorted_res[len(sorted_res) // 2]
+    else:
+        p50_resid = float("nan")
+    detail = (
+        f"coverage={coverage:.2f} p50_resid={p50_resid:.2e} "
+        f"n_accepts={n_accepts} n_rejects={n_rejects} n_noops={n_noops}"
+    )
+    if not residuals:
+        # No accepted predictions to assess faithfulness against. Even
+        # if rejects/noops dominate, we can only judge coverage.
+        return ("NO-DATA", detail)
+    if coverage >= 0.70 and p50_resid < 0.05:
+        return ("HEALTHY", detail)
+    if coverage >= 0.30 or p50_resid < 0.30:
+        return ("MARGINAL", detail)
+    return ("DEGRADED", detail)
 
 
 def tool_exists(name: str) -> bool:
