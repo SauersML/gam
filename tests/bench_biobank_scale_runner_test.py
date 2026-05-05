@@ -835,6 +835,38 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         )
         self.assertEqual(v, "MARGINAL", f"detail={d}")
 
+    def test_phase_summary_aggregates_ift_iters_distribution(self) -> None:
+        # The [IFT-QUALITY] marker carries `iters=K` (PIRLS iters
+        # consumed after the warm-start). The runner now aggregates
+        # this into ift_iters_p50/p95/max so reviewers can see the
+        # combined warm-start value: small residual + small iters
+        # = predictor delivering correctness AND speed.
+        stderr = "\n".join([
+            "[IFT-QUALITY] residual=1.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=3",
+            "[IFT-QUALITY] residual=2.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=4",
+            "[IFT-QUALITY] residual=3.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=5",
+            "[IFT-QUALITY] residual=4.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=6",
+            "[IFT-QUALITY] residual=5.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=12",
+            "[PHASE] my-fit fit end elapsed=10.0s",
+        ])
+        out = self._run_summary(stderr)
+        # Sorted iters [3, 4, 5, 6, 12]; p50 (index 2) = 5,
+        # p95 (index 4) = 12, max = 12.
+        self.assertIn("ift_iters_p50=5", out)
+        self.assertIn("ift_iters_p95=12", out)
+        self.assertIn("ift_iters_max=12", out)
+        # Old-format (no drho/logdet fields) lines should also
+        # contribute their iters — this exercises the regex's
+        # backwards compat.
+        stderr_old = "\n".join([
+            "[IFT-QUALITY] residual=1.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=2",
+            "[IFT-QUALITY] residual=2.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=3",
+            "[IFT-QUALITY] residual=3.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=4",
+            "[PHASE] my-fit fit end elapsed=10.0s",
+        ])
+        out_old = self._run_summary(stderr_old)
+        self.assertIn("ift_iters_p50=3", out_old)
+
     def test_phase_summary_aggregates_tangent_quality_separately_from_ift(self) -> None:
         # Pin down that [TANGENT-QUALITY] residuals roll up into a
         # SEPARATE distribution from [IFT-QUALITY] (commit 99424b47).
