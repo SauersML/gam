@@ -14980,14 +14980,26 @@ mod tests {
     #[test]
     fn duchon_linear_nullspace_builds_and_reports_nullspace_dim() {
         // DuchonNullspaceOrder::Linear in dimension d needs at least d+1
-        // affinely independent centers to span [1, x_1, ..., x_d].
+        // affinely independent centers to span [1, x_1, ..., x_d]. Data must
+        // also genuinely vary along all d axes (not collapse to a 1-D
+        // manifold) so FarthestPoint sampling can find ≥ d+1 affinely
+        // independent centers; otherwise the polynomial-block rank drops
+        // below d+1 at the centers and the radial kernel block over-
+        // parameterizes the basis.
         let n = 20usize;
         let d = 10usize;
         let mut data = Array2::<f64>::zeros((n, d));
         for i in 0..n {
             for j in 0..d {
-                let jitter = ((i * 7 + j * 5) % 13) as f64 * 0.011;
-                data[[i, j]] = (i as f64) * 0.07 + (j as f64) * 0.05 + jitter;
+                // Independent per-(i,j) values via splitmix64-like mixing —
+                // gives full d-rank data without the additive (i*c1 + j*c2)
+                // collapse that puts rows on a 1-D affine manifold.
+                let mut key = (i as u64).wrapping_mul(0x9E3779B97F4A7C15);
+                key ^= (j as u64).wrapping_mul(0xBF58476D1CE4E5B9);
+                key = (key ^ (key >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                key = (key ^ (key >> 27)).wrapping_mul(0x94D049BB133111EB);
+                let v = ((key ^ (key >> 31)) as f64) / (u64::MAX as f64);
+                data[[i, j]] = v;
             }
         }
 
