@@ -3317,10 +3317,29 @@ fn run_operator_trust_region(
             // different solver. Previously this branch panicked the whole
             // REML fit (observed at k≥32, n=50k in the
             // standard_gam_p_scaling_law probe).
+            //
+            // ROOT CAUSE: the planner at `:4168` decides routing by
+            // inspecting `seed_eval.hessian` at the first eval. It assumes
+            // all subsequent eval_k.hessian will also be Operator, but
+            // `HessianResult` is an enum (Operator | Analytic | Unavailable)
+            // and nothing forces per-call consistency. Families return
+            // whatever's most efficient for the current ρ. The clean fix
+            // is to extend the `CustomFamily` / outer-eval contract with
+            // a `declared_hessian_shape()` const method and route on that,
+            // not on the runtime eval. Tracked as part of task #28
+            // (matrix-free outer Hessian) — once the operator form is
+            // universally available the disagreement disappears.
+            let observed_shape = match &eval_k.hessian {
+                HessianResult::Operator(_) => "Operator",  // (unreachable here)
+                HessianResult::Analytic(_) => "Analytic(dense)",
+                HessianResult::Unavailable => "Unavailable",
+            };
             log::warn!(
                 "[ARC] iter={iter}: family returned non-operator Hessian mid-flight \
-                 (planner expected operator throughout); returning best-effort x_k \
-                 cost={:.6e} grad_norm={:.3e}",
+                 (planner expected Operator throughout, got {observed_shape}); \
+                 returning best-effort x_k cost={:.6e} grad_norm={:.3e}. \
+                 Routing decision was made on seed_eval.hessian shape; family \
+                 should declare a consistent shape via its capability surface.",
                 eval_k.cost,
                 g_norm
             );
