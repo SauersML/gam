@@ -1507,6 +1507,7 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, s
                             or "[OUTER summary]" in line
                             or "[OUTER guard]" in line
                             or "[PIRLS iter-end]" in line
+                            or "[PIRLS solve-end]" in line
                             or "[KAPPA-PHASE" in line
                             or "[IFT-QUALITY]" in line
                         ):
@@ -1577,11 +1578,23 @@ _BIOBANK_GATE_PATTERN = re.compile(
     r"\[(?:transformation-normal|gamlss-location-scale|latent-survival|latent-binary|gamlss-binomial-mean-wiggle|survival-marginal-slope|survival-location-scale|bernoulli-marginal-slope)\]\s+declining analytic outer Hessian for n=(\d+)"
 )
 # Per-iter PIRLS timing from `[PIRLS iter-end] iter=N elapsed=Xs ...`
-# (commit 90bccf8a). Lets us histogram inner-Newton wall-time per iter
-# at biobank scale — answers "is inner-PIRLS the dominant cost?"
-# without needing a separate scaling probe.
+# (commit 90bccf8a, extended to include g_norm in this commit). Lets us
+# histogram inner-Newton wall-time per iter at biobank scale — answers
+# "is inner-PIRLS the dominant cost?" without needing a separate
+# scaling probe.
 _PIRLS_ITER_END_PATTERN = re.compile(
     r"\[PIRLS iter-end\]\s+iter=\s*(\d+)\s+elapsed=([\d.]+)s"
+)
+
+# Solve-end summary: one line per completed PIRLS solve carrying the
+# geometric convergence rate of the inner Newton:
+#     rate = (g_norm_final / g_norm_initial) ^ (1 / iters)
+# Aggregated by the runner so CI logs end with a per-fit answer to
+# "is the inner Newton converging healthily, or is it stuck?"
+# Healthy Newton: rate < 0.5. Stuck near a near-singular geometry or
+# starting from a poor warm-start: rate ≥ 0.7.
+_PIRLS_SOLVE_END_PATTERN = re.compile(
+    r"\[PIRLS solve-end\]\s+iters=(\d+)\s+elapsed=([\d.]+)s\s+g_norm_initial=\S+\s+g_norm_final=\S+\s+convergence_rate=([\deE.+\-nNaA]+)\s+status="
 )
 
 # κ-optimization scaling instrumentation from commit cd89625f. The
@@ -1668,6 +1681,31 @@ def _emit_phase_summary(
             f"pirls_iters={n} pirls_total={total_pirls:.1f}s "
             f"pirls_p50={p50:.3f}s pirls_p95={p95:.3f}s pirls_max={pmax:.3f}s"
         )
+    # Per-solve geometric convergence rate. A healthy biobank fit ends
+    # with most PIRLS solves at rate < 0.5; a struggling fit shows
+    # consistent rate ≥ 0.7 across solves (inner Newton stuck near
+    # singular geometry, or flat warm-start that the predictor failed
+    # to refine). Surface count + p50 + max so the verdict is a glance.
+    pirls_solve_matches = _PIRLS_SOLVE_END_PATTERN.findall(captured_stderr)
+    if pirls_solve_matches:
+        rates: list[float] = []
+        for _iters, _elapsed, rate_str in pirls_solve_matches:
+            try:
+                r = float(rate_str)
+            except (ValueError, TypeError):
+                continue
+            if r == r:  # filter NaN
+                rates.append(r)
+        if rates:
+            n = len(rates)
+            sorted_r = sorted(rates)
+            p50 = sorted_r[n // 2]
+            p95 = sorted_r[min(n - 1, int(0.95 * n))]
+            rmax = sorted_r[-1]
+            parts.append(
+                f"pirls_solves={n} pirls_conv_p50={p50:.3f} "
+                f"pirls_conv_p95={p95:.3f} pirls_conv_max={rmax:.3f}"
+            )
     # κ-optimization driver wall-time. Per-call markers feed the
     # distribution; summary lines feed the totals. Multiple κ
     # optimizations may run within a single command (e.g. CTN
