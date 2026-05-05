@@ -875,6 +875,79 @@ class MarkerPatternTests(unittest.TestCase):
             )
             self.assertEqual(matches[0], expected_kind)
 
+    def test_pirls_mid_iter_fisher_pattern_captures_both_reasons(self) -> None:
+        # Mid-LM-loop Fisher fallback markers (commit 8ffa7225) fire
+        # at TWO sites in the LM loop: one for the gain-rejection
+        # branch and one for the candidate-eval-Err branch. Lock both
+        # reason variants so adding a third LM-loop fallback site
+        # without updating the regex (or this test) would silently
+        # disappear it from the runner's
+        # `pirls_mid_iter_gain_rejection` / `pirls_mid_iter_candidate_err`
+        # diagnostics.
+        cases = [
+            (
+                "[PIRLS] mid-iter Fisher fallback iter=3 reason=gain_rejection",
+                "3", "gain_rejection",
+            ),
+            (
+                "[PIRLS] mid-iter Fisher fallback iter=12 reason=candidate_err",
+                "12", "candidate_err",
+            ),
+            # Edge: large iter (>100, the typical PIRLS max_iter cap).
+            (
+                "[PIRLS] mid-iter Fisher fallback iter=200 reason=candidate_err",
+                "200", "candidate_err",
+            ),
+        ]
+        for line, expected_iter, expected_reason in cases:
+            matches = _RUNNER._PIRLS_MID_ITER_FISHER_PATTERN.findall(line)
+            self.assertEqual(
+                len(matches),
+                1,
+                f"reason {expected_reason!r} did not parse: {line}",
+            )
+            self.assertEqual(matches[0][0], expected_iter)
+            self.assertEqual(matches[0][1], expected_reason)
+
+    def test_pirls_force_fisher_pattern_captures_all_three_reasons(self) -> None:
+        # `force_fisher_for_rest engaged` markers (commit dea37b05) fire
+        # at AT MOST ONCE per PIRLS solve from THREE distinct sites
+        # depending on which branch's increment crossed the
+        # `consecutive_fisher_fallbacks > 2` threshold. Lock all three
+        # reason variants:
+        #   iter_start     — the original Fisher-fallback path
+        #                    (Observed assembly itself failed)
+        #   gain_rejection — mid-LM-loop accept-failed Fisher retry
+        #   candidate_err  — mid-LM-loop candidate-eval-Err Fisher retry
+        cases = [
+            (
+                "[PIRLS] force_fisher_for_rest engaged at iter=5 "
+                "(consecutive_fisher_fallbacks=3) reason=iter_start",
+                "5", "3", "iter_start",
+            ),
+            (
+                "[PIRLS] force_fisher_for_rest engaged at iter=12 "
+                "(consecutive_fisher_fallbacks=4) reason=gain_rejection",
+                "12", "4", "gain_rejection",
+            ),
+            (
+                "[PIRLS] force_fisher_for_rest engaged at iter=2 "
+                "(consecutive_fisher_fallbacks=3) reason=candidate_err",
+                "2", "3", "candidate_err",
+            ),
+        ]
+        for line, expected_iter, expected_count, expected_reason in cases:
+            matches = _RUNNER._PIRLS_FORCE_FISHER_PATTERN.findall(line)
+            self.assertEqual(
+                len(matches),
+                1,
+                f"reason {expected_reason!r} did not parse: {line}",
+            )
+            iter_str, count, reason = matches[0]
+            self.assertEqual(iter_str, expected_iter)
+            self.assertEqual(count, expected_count)
+            self.assertEqual(reason, expected_reason)
+
     def test_pirls_iter_breakdown_pattern_extracts_all_seven_subphases(self) -> None:
         # The breakdown pattern captures iter + attempts + 5 wall-clock
         # sub-phases (curvature, solve, predred, candidate, other).
