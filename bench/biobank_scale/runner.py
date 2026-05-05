@@ -2095,16 +2095,24 @@ def _pirls_health_verdict(*, rates: list[float]) -> tuple[str, str]:
     geometric reduction per iter — the inner solver is grinding).
 
     Tier policy:
-      HEALTHY   max(rate) < 0.5
-                (every solve was strongly converging; mission-aligned
-                trace at biobank scale).
+      HEALTHY   p95(rate) < 0.5
+                (95% of solves strongly converging; tolerates a few
+                outliers without flipping the verdict — e.g. one slow
+                solve in a 100-solve fit doesn't drop the trace from
+                HEALTHY to MARGINAL when the rest are clean).
       MARGINAL  p50(rate) < 0.5 AND max(rate) < 0.85
-                (most solves fast, occasional struggling solve under
-                the saturation threshold).
+                (median solve fast, no individual solve in the
+                saturation regime).
       DEGRADED  otherwise
                 (consistent geometry struggle across solves; warm-start
                 may be collapsing toward flat or hitting near-singular
                 Hessian regions).
+
+    The earlier `max(rate) < 0.5` for HEALTHY was too strict: a fit
+    with rates uniformly in [0.05, 0.45] plus one 0.52 outlier landed
+    in MARGINAL even though 99% of solves were strongly converging.
+    `p95 < 0.5` is the right granularity — outliers visible in the
+    `max=` field, but the verdict reflects the central tendency.
 
     Returns (verdict, detail_string).
     """
@@ -2118,7 +2126,7 @@ def _pirls_health_verdict(*, rates: list[float]) -> tuple[str, str]:
     detail = (
         f"n_solves={n} p50={p50:.3f} p95={p95:.3f} max={rmax:.3f}"
     )
-    if rmax < 0.5:
+    if p95 < 0.5:
         return ("HEALTHY", detail)
     if p50 < 0.5 and rmax < 0.85:
         return ("MARGINAL", detail)
