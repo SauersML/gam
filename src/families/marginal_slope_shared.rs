@@ -833,6 +833,34 @@ pub const BIOBANK_OUTER_SUBSAMPLE_K: usize = 20_000;
 /// being stable across runs.
 pub const BIOBANK_OUTER_SUBSAMPLE_SEED: u64 = 0xC0FFEE_5EED;
 
+/// Environment-variable resolver for the biobank-scale subsample size.
+/// `GAM_OUTER_SUBSAMPLE_K` overrides the default `BIOBANK_OUTER_SUBSAMPLE_K`
+/// when set to a positive integer. Lets the bench runner sweep K without
+/// recompiling — useful for measuring the K-vs-mission-completion trade-off
+/// in CI.
+pub fn resolve_biobank_outer_subsample_k() -> usize {
+    std::env::var("GAM_OUTER_SUBSAMPLE_K")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&k| k > 0)
+        .unwrap_or(BIOBANK_OUTER_SUBSAMPLE_K)
+}
+
+/// Environment-variable resolver for the biobank-scale subsample seed.
+/// `GAM_OUTER_SUBSAMPLE_SEED` accepts decimal or `0x`-prefixed hex.
+pub fn resolve_biobank_outer_subsample_seed() -> u64 {
+    std::env::var("GAM_OUTER_SUBSAMPLE_SEED")
+        .ok()
+        .and_then(|s| {
+            if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                u64::from_str_radix(hex, 16).ok()
+            } else {
+                s.parse::<u64>().ok()
+            }
+        })
+        .unwrap_or(BIOBANK_OUTER_SUBSAMPLE_SEED)
+}
+
 /// Install a stratified outer-score subsample on `opts` when `n` exceeds the
 /// biobank-scale threshold and no subsample is already configured. Returns
 /// `true` when a subsample was installed, `false` otherwise.
@@ -861,18 +889,15 @@ pub fn inject_biobank_outer_subsample(
         // out instead so the legacy full-data path keeps running.
         return false;
     }
-    let subsample = build_outer_score_subsample(
-        z,
-        secondary,
-        BIOBANK_OUTER_SUBSAMPLE_K,
-        BIOBANK_OUTER_SUBSAMPLE_SEED,
-    );
+    let k = resolve_biobank_outer_subsample_k();
+    let seed = resolve_biobank_outer_subsample_seed();
+    let subsample = build_outer_score_subsample(z, secondary, k, seed);
     log::info!(
         "[biobank-scale] constructed outer-score subsample: n={} k={} weight_scale={:.3} seed={:#x}",
         n,
         subsample.len(),
         subsample.weight_scale,
-        BIOBANK_OUTER_SUBSAMPLE_SEED,
+        seed,
     );
     opts.outer_score_subsample = Some(Arc::new(subsample));
     true
