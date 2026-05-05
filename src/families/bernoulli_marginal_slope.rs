@@ -1654,6 +1654,21 @@ impl BernoulliBlockHessianAccumulator {
         }
     }
 
+    /// Scale every accumulated block in place by `scale`. Used to apply the
+    /// Horvitz-Thompson rescaling when the accumulator was populated from a
+    /// stratified subsample of rows (outer-only score / Hessian passes).
+    fn scale_assign(&mut self, scale: f64) {
+        if scale == 1.0 {
+            return;
+        }
+        self.h_mm.mapv_inplace(|v| v * scale);
+        self.h_gg.mapv_inplace(|v| v * scale);
+        self.h_mg.mapv_inplace(|v| v * scale);
+        if let Some(ref mut dc) = self.dense_correction {
+            dc.mapv_inplace(|v| v * scale);
+        }
+    }
+
     fn to_dense(&self, slices: &BlockSlices) -> Array2<f64> {
         let mut out = Array2::zeros((slices.total, slices.total));
         out.slice_mut(s![slices.marginal.clone(), slices.marginal.clone()])
@@ -2400,7 +2415,26 @@ impl BernoulliMarginalSlopeFamily {
     fn sigma_exact_joint_psi_terms(
         &self,
         block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        self.sigma_exact_joint_psi_terms_with_options(
+            block_states,
+            specs,
+            &BlockwiseFitOptions::default(),
+        )
+    }
+
+    /// Outer-aware variant of `sigma_exact_joint_psi_terms`. When
+    /// `options.outer_score_subsample` is `None`, iterates all rows and is
+    /// bit-for-bit equivalent to the legacy implementation. When `Some`, only
+    /// the masked rows contribute and every row-summed component (objective
+    /// scalar, score vector, Hessian operator blocks) is rescaled by
+    /// `weight_scale = n_full / |mask|` (Horvitz-Thompson).
+    pub(crate) fn sigma_exact_joint_psi_terms_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
         _specs: &[ParameterBlockSpec],
+        options: &BlockwiseFitOptions,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         if self.effective_flex_active(block_states)? {
             return Err(
@@ -2413,7 +2447,9 @@ impl BernoulliMarginalSlopeFamily {
         }
         let slices = block_slices(self);
         let n = self.y.len();
-        let (objective_psi, score_psi, acc) = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+        let row_iter = outer_row_indices(options, n).to_vec();
+        let scale = outer_score_scale(options, n);
+        let (mut objective_psi, mut score_psi, mut acc) = row_iter
             .into_par_iter()
             .try_fold(
                 || {
@@ -2423,17 +2459,13 @@ impl BernoulliMarginalSlopeFamily {
                         BernoulliBlockHessianAccumulator::new(&slices),
                     )
                 },
-                |mut acc, chunk_idx| -> Result<_, String> {
-                    let start = chunk_idx * ROW_CHUNK_SIZE;
-                    let end = (start + ROW_CHUNK_SIZE).min(n);
-                    for row in start..end {
-                        let (obj, grad, hess) =
-                            self.row_sigma_primary_terms(row, block_states, false)?;
-                        acc.0 += obj;
-                        self.accumulate_rigid_sigma_pullback(
-                            row, &slices, &grad, &hess, &mut acc.1, &mut acc.2,
-                        )?;
-                    }
+                |mut acc, row| -> Result<_, String> {
+                    let (obj, grad, hess) =
+                        self.row_sigma_primary_terms(row, block_states, false)?;
+                    acc.0 += obj;
+                    self.accumulate_rigid_sigma_pullback(
+                        row, &slices, &grad, &hess, &mut acc.1, &mut acc.2,
+                    )?;
                     Ok(acc)
                 },
             )
@@ -2452,6 +2484,11 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(left)
                 },
             )?;
+        if scale != 1.0 {
+            objective_psi *= scale;
+            score_psi.mapv_inplace(|v| v * scale);
+            acc.scale_assign(scale);
+        }
         Ok(Some(ExactNewtonJointPsiTerms {
             objective_psi,
             score_psi,
@@ -2464,6 +2501,20 @@ impl BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        self.sigma_exact_joint_psisecond_order_terms_with_options(
+            block_states,
+            &BlockwiseFitOptions::default(),
+        )
+    }
+
+    /// Outer-aware variant of `sigma_exact_joint_psisecond_order_terms`. See
+    /// `sigma_exact_joint_psi_terms_with_options` for the row-iter / rescaling
+    /// contract.
+    pub(crate) fn sigma_exact_joint_psisecond_order_terms_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
         if self.effective_flex_active(block_states)? {
             return Err(
                 "bernoulli marginal-slope second log-sigma hyperderivatives are implemented for the rigid probit marginal-slope kernel; flexible score/link kernels require the analytic denested cell-tensor sigma path"
@@ -2475,8 +2526,9 @@ impl BernoulliMarginalSlopeFamily {
         }
         let slices = block_slices(self);
         let n = self.y.len();
-        let (objective_psi_psi, score_psi_psi, acc) = (0..((n + ROW_CHUNK_SIZE - 1)
-            / ROW_CHUNK_SIZE))
+        let row_iter = outer_row_indices(options, n).to_vec();
+        let scale = outer_score_scale(options, n);
+        let (mut objective_psi_psi, mut score_psi_psi, mut acc) = row_iter
             .into_par_iter()
             .try_fold(
                 || {
@@ -2486,17 +2538,13 @@ impl BernoulliMarginalSlopeFamily {
                         BernoulliBlockHessianAccumulator::new(&slices),
                     )
                 },
-                |mut acc, chunk_idx| -> Result<_, String> {
-                    let start = chunk_idx * ROW_CHUNK_SIZE;
-                    let end = (start + ROW_CHUNK_SIZE).min(n);
-                    for row in start..end {
-                        let (obj, grad, hess) =
-                            self.row_sigma_primary_terms(row, block_states, true)?;
-                        acc.0 += obj;
-                        self.accumulate_rigid_sigma_pullback(
-                            row, &slices, &grad, &hess, &mut acc.1, &mut acc.2,
-                        )?;
-                    }
+                |mut acc, row| -> Result<_, String> {
+                    let (obj, grad, hess) =
+                        self.row_sigma_primary_terms(row, block_states, true)?;
+                    acc.0 += obj;
+                    self.accumulate_rigid_sigma_pullback(
+                        row, &slices, &grad, &hess, &mut acc.1, &mut acc.2,
+                    )?;
                     Ok(acc)
                 },
             )
@@ -2515,6 +2563,11 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(left)
                 },
             )?;
+        if scale != 1.0 {
+            objective_psi_psi *= scale;
+            score_psi_psi.mapv_inplace(|v| v * scale);
+            acc.scale_assign(scale);
+        }
         Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
             objective_psi_psi,
             score_psi_psi,
@@ -2527,6 +2580,23 @@ impl BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.sigma_exact_joint_psihessian_directional_derivative_with_options(
+            block_states,
+            d_beta_flat,
+            &BlockwiseFitOptions::default(),
+        )
+    }
+
+    /// Outer-aware variant of `sigma_exact_joint_psihessian_directional_derivative`.
+    /// See `sigma_exact_joint_psi_terms_with_options` for the row-iter /
+    /// rescaling contract — the returned dense Hessian-derivative matrix is
+    /// rescaled element-wise by `weight_scale` when a subsample is active.
+    pub(crate) fn sigma_exact_joint_psihessian_directional_derivative_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+        options: &BlockwiseFitOptions,
     ) -> Result<Option<Array2<f64>>, String> {
         if self.effective_flex_active(block_states)? {
             return Err(
@@ -2547,53 +2617,51 @@ impl BernoulliMarginalSlopeFamily {
         }
         let n = self.y.len();
         let primary = primary_slices(&slices);
-        let acc = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+        let row_iter = outer_row_indices(options, n).to_vec();
+        let outer_scale = outer_score_scale(options, n);
+        let mut acc = row_iter
             .into_par_iter()
             .try_fold(
                 || BernoulliBlockHessianAccumulator::new(&slices),
-                |mut acc, chunk_idx| -> Result<_, String> {
-                    let start = chunk_idx * ROW_CHUNK_SIZE;
-                    let end = (start + ROW_CHUNK_SIZE).min(n);
-                    for row in start..end {
-                        let row_dir = self.row_primary_direction_from_flat(
+                |mut acc, row| -> Result<_, String> {
+                    let row_dir = self.row_primary_direction_from_flat(
+                        row,
+                        &slices,
+                        &primary,
+                        d_beta_flat,
+                    )?;
+                    let zero = Array1::<f64>::zeros(primary.total);
+                    let mut grad = Array1::<f64>::zeros(primary.total);
+                    for a in 0..primary.total {
+                        let mut da = Array1::<f64>::zeros(primary.total);
+                        da[a] = 1.0;
+                        let scale = self.sigma_scale_jet(3, &[1], &[])?;
+                        grad[a] = self.row_neglog_directional_with_scale_jet(
                             row,
-                            &slices,
-                            &primary,
-                            d_beta_flat,
+                            block_states,
+                            &[zero.clone(), row_dir.clone(), da],
+                            &scale,
                         )?;
-                        let zero = Array1::<f64>::zeros(primary.total);
-                        let mut grad = Array1::<f64>::zeros(primary.total);
-                        for a in 0..primary.total {
-                            let mut da = Array1::<f64>::zeros(primary.total);
-                            da[a] = 1.0;
-                            let scale = self.sigma_scale_jet(3, &[1], &[])?;
-                            grad[a] = self.row_neglog_directional_with_scale_jet(
+                    }
+                    let mut hess = Array2::<f64>::zeros((primary.total, primary.total));
+                    for a in 0..primary.total {
+                        let mut da = Array1::<f64>::zeros(primary.total);
+                        da[a] = 1.0;
+                        for b in a..primary.total {
+                            let mut db = Array1::<f64>::zeros(primary.total);
+                            db[b] = 1.0;
+                            let scale = self.sigma_scale_jet(4, &[1], &[])?;
+                            let value = self.row_neglog_directional_with_scale_jet(
                                 row,
                                 block_states,
-                                &[zero.clone(), row_dir.clone(), da],
+                                &[zero.clone(), row_dir.clone(), da.clone(), db],
                                 &scale,
                             )?;
+                            hess[[a, b]] = value;
+                            hess[[b, a]] = value;
                         }
-                        let mut hess = Array2::<f64>::zeros((primary.total, primary.total));
-                        for a in 0..primary.total {
-                            let mut da = Array1::<f64>::zeros(primary.total);
-                            da[a] = 1.0;
-                            for b in a..primary.total {
-                                let mut db = Array1::<f64>::zeros(primary.total);
-                                db[b] = 1.0;
-                                let scale = self.sigma_scale_jet(4, &[1], &[])?;
-                                let value = self.row_neglog_directional_with_scale_jet(
-                                    row,
-                                    block_states,
-                                    &[zero.clone(), row_dir.clone(), da.clone(), db],
-                                    &scale,
-                                )?;
-                                hess[[a, b]] = value;
-                                hess[[b, a]] = value;
-                            }
-                        }
-                        acc.add_pullback(self, row, &slices, &primary, &hess);
                     }
+                    acc.add_pullback(self, row, &slices, &primary, &hess);
                     Ok(acc)
                 },
             )
@@ -2604,6 +2672,9 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(left)
                 },
             )?;
+        if outer_scale != 1.0 {
+            acc.scale_assign(outer_scale);
+        }
         Ok(Some(acc.into_operator(&slices).to_dense()))
     }
 
@@ -8546,6 +8617,280 @@ mod tests {
             baseline,
             ht_rel
         );
+    }
+
+    /// Same shape as `make_rigid_test_family` but with a non-zero
+    /// gaussian_frailty_sd so the sigma-aware joint psi paths fire.
+    fn make_sigma_aware_test_family(n: usize) -> BernoulliMarginalSlopeFamily {
+        let mut family = make_rigid_test_family(n);
+        family.gaussian_frailty_sd = Some(0.7);
+        family
+    }
+
+    fn rel_diff_array1(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
+        let mut max = 0.0f64;
+        for i in 0..a.len() {
+            let d = (a[i] - b[i]).abs() / b[i].abs().max(1.0);
+            if d > max {
+                max = d;
+            }
+        }
+        max
+    }
+
+    fn rel_diff_array2(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+        let mut max = 0.0f64;
+        for ((i, j), &av) in a.indexed_iter() {
+            let bv = b[[i, j]];
+            let d = (av - bv).abs() / bv.abs().max(1.0);
+            if d > max {
+                max = d;
+            }
+        }
+        max
+    }
+
+    #[test]
+    fn bernoulli_sigma_psi_terms_subsample_full_equals_unsampled() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_sigma_aware_test_family(n);
+        let states = rigid_block_states(&family, 0.3, 0.4);
+        let specs = vec![dummy_blockspec(1, n), dummy_blockspec(1, n)];
+
+        let baseline = family
+            .sigma_exact_joint_psi_terms(&states, &specs)
+            .expect("baseline psi terms")
+            .expect("baseline some");
+
+        let mut opts_full = BlockwiseFitOptions::default();
+        opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            (0..n).collect(),
+            n,
+            0xDEADBEEF,
+        )));
+        let with_full = family
+            .sigma_exact_joint_psi_terms_with_options(&states, &specs, &opts_full)
+            .expect("psi terms with full mask")
+            .expect("some");
+
+        let obj_rel = ((with_full.objective_psi - baseline.objective_psi)
+            / baseline.objective_psi.abs().max(1.0))
+        .abs();
+        assert!(obj_rel < 1e-12, "objective_psi rel {}", obj_rel);
+        let score_rel = rel_diff_array1(&with_full.score_psi, &baseline.score_psi);
+        assert!(score_rel < 1e-12, "score_psi rel {}", score_rel);
+        let h_full = with_full
+            .hessian_psi_operator
+            .as_ref()
+            .expect("op")
+            .to_dense();
+        let h_baseline = baseline
+            .hessian_psi_operator
+            .as_ref()
+            .expect("op")
+            .to_dense();
+        let h_rel = rel_diff_array2(&h_full, &h_baseline);
+        assert!(h_rel < 1e-12, "hessian rel {}", h_rel);
+    }
+
+    #[test]
+    fn bernoulli_sigma_psi_terms_subsample_half_scales_correctly() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_sigma_aware_test_family(n);
+        let states = rigid_block_states(&family, 0.3, 0.4);
+        let specs = vec![dummy_blockspec(1, n), dummy_blockspec(1, n)];
+
+        let even_mask: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
+        let m = even_mask.len();
+
+        let mut opts_half = BlockwiseFitOptions::default();
+        opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            even_mask.clone(),
+            n,
+            0xCAFE,
+        )));
+        let scaled = family
+            .sigma_exact_joint_psi_terms_with_options(&states, &specs, &opts_half)
+            .expect("scaled")
+            .expect("some");
+
+        let mut opts_raw = BlockwiseFitOptions::default();
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
+            mask: Arc::new(even_mask),
+            n_full: m,
+            weight_scale: 1.0,
+            seed: 0,
+        }));
+        let raw = family
+            .sigma_exact_joint_psi_terms_with_options(&states, &specs, &opts_raw)
+            .expect("raw")
+            .expect("some");
+
+        let factor = n as f64 / m as f64;
+        let exp_obj = factor * raw.objective_psi;
+        let obj_rel = ((scaled.objective_psi - exp_obj) / exp_obj.abs().max(1.0)).abs();
+        assert!(obj_rel < 1e-12, "objective_psi rel {}", obj_rel);
+        let exp_score = &raw.score_psi * factor;
+        let score_rel = rel_diff_array1(&scaled.score_psi, &exp_score);
+        assert!(score_rel < 1e-12, "score_psi rel {}", score_rel);
+        let h_scaled = scaled
+            .hessian_psi_operator
+            .as_ref()
+            .expect("op")
+            .to_dense();
+        let h_raw = raw.hessian_psi_operator.as_ref().expect("op").to_dense();
+        let h_exp = &h_raw * factor;
+        let h_rel = rel_diff_array2(&h_scaled, &h_exp);
+        assert!(h_rel < 1e-12, "hessian rel {}", h_rel);
+    }
+
+    #[test]
+    fn bernoulli_sigma_psi_second_order_subsample_full_equals_unsampled() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_sigma_aware_test_family(n);
+        let states = rigid_block_states(&family, 0.3, 0.4);
+
+        let baseline = family
+            .sigma_exact_joint_psisecond_order_terms(&states)
+            .expect("baseline")
+            .expect("some");
+
+        let mut opts_full = BlockwiseFitOptions::default();
+        opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            (0..n).collect(),
+            n,
+            0xDEADBEEF,
+        )));
+        let with_full = family
+            .sigma_exact_joint_psisecond_order_terms_with_options(&states, &opts_full)
+            .expect("with full mask")
+            .expect("some");
+
+        let obj_rel = ((with_full.objective_psi_psi - baseline.objective_psi_psi)
+            / baseline.objective_psi_psi.abs().max(1.0))
+        .abs();
+        assert!(obj_rel < 1e-12, "objective rel {}", obj_rel);
+        let score_rel = rel_diff_array1(&with_full.score_psi_psi, &baseline.score_psi_psi);
+        assert!(score_rel < 1e-12, "score rel {}", score_rel);
+    }
+
+    #[test]
+    fn bernoulli_sigma_psi_second_order_subsample_half_scales_correctly() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_sigma_aware_test_family(n);
+        let states = rigid_block_states(&family, 0.3, 0.4);
+
+        let even_mask: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
+        let m = even_mask.len();
+
+        let mut opts_half = BlockwiseFitOptions::default();
+        opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            even_mask.clone(),
+            n,
+            0xCAFE,
+        )));
+        let scaled = family
+            .sigma_exact_joint_psisecond_order_terms_with_options(&states, &opts_half)
+            .expect("scaled")
+            .expect("some");
+
+        let mut opts_raw = BlockwiseFitOptions::default();
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
+            mask: Arc::new(even_mask),
+            n_full: m,
+            weight_scale: 1.0,
+            seed: 0,
+        }));
+        let raw = family
+            .sigma_exact_joint_psisecond_order_terms_with_options(&states, &opts_raw)
+            .expect("raw")
+            .expect("some");
+
+        let factor = n as f64 / m as f64;
+        let exp_obj = factor * raw.objective_psi_psi;
+        let obj_rel = ((scaled.objective_psi_psi - exp_obj) / exp_obj.abs().max(1.0)).abs();
+        assert!(obj_rel < 1e-12, "objective rel {}", obj_rel);
+        let exp_score = &raw.score_psi_psi * factor;
+        let score_rel = rel_diff_array1(&scaled.score_psi_psi, &exp_score);
+        assert!(score_rel < 1e-12, "score rel {}", score_rel);
+    }
+
+    #[test]
+    fn bernoulli_sigma_psihessian_directional_derivative_subsample_full_equals_unsampled() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_sigma_aware_test_family(n);
+        let states = rigid_block_states(&family, 0.3, 0.4);
+        let dir = array![0.1, -0.2];
+
+        let baseline = family
+            .sigma_exact_joint_psihessian_directional_derivative(&states, &dir)
+            .expect("baseline")
+            .expect("some");
+
+        let mut opts_full = BlockwiseFitOptions::default();
+        opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            (0..n).collect(),
+            n,
+            0xDEADBEEF,
+        )));
+        let with_full = family
+            .sigma_exact_joint_psihessian_directional_derivative_with_options(
+                &states, &dir, &opts_full,
+            )
+            .expect("with full")
+            .expect("some");
+
+        let rel = rel_diff_array2(&with_full, &baseline);
+        assert!(rel < 1e-12, "drift rel {}", rel);
+    }
+
+    #[test]
+    fn bernoulli_sigma_psihessian_directional_derivative_subsample_half_scales_correctly() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_sigma_aware_test_family(n);
+        let states = rigid_block_states(&family, 0.3, 0.4);
+        let dir = array![0.1, -0.2];
+
+        let even_mask: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
+        let m = even_mask.len();
+
+        let mut opts_half = BlockwiseFitOptions::default();
+        opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            even_mask.clone(),
+            n,
+            0xCAFE,
+        )));
+        let scaled = family
+            .sigma_exact_joint_psihessian_directional_derivative_with_options(
+                &states, &dir, &opts_half,
+            )
+            .expect("scaled")
+            .expect("some");
+
+        let mut opts_raw = BlockwiseFitOptions::default();
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
+            mask: Arc::new(even_mask),
+            n_full: m,
+            weight_scale: 1.0,
+            seed: 0,
+        }));
+        let raw = family
+            .sigma_exact_joint_psihessian_directional_derivative_with_options(
+                &states, &dir, &opts_raw,
+            )
+            .expect("raw")
+            .expect("some");
+
+        let factor = n as f64 / m as f64;
+        let exp = &raw * factor;
+        let rel = rel_diff_array2(&scaled, &exp);
+        assert!(rel < 1e-12, "drift rel {}", rel);
     }
 
     fn build_test_link_deviation_block_from_seed(
