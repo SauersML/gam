@@ -4790,10 +4790,37 @@ pub fn reml_laml_evaluate(
         // families that implement a directional θθ HVP will return Some(op)
         // here and skip the kernel-based dispatch entirely.
         if let Some(family_op) = effective_deriv.family_outer_hessian_operator() {
+            // Family's own exact Hv operator. Emit the same routing markers
+            // as the kernel-based path so the bench runner's outer_h
+            // aggregation captures this route too — without these the
+            // family-op count silently disappears from the verdict, and
+            // CTN/survival/GAMLSS fits look like they never built an outer
+            // Hessian at all. The "family_op" reason is distinguishable
+            // from the kernel-based reasons so the analyzer can tell which
+            // representation a particular fit actually used.
+            let n_obs = effective_deriv
+                .scalar_glm_ingredients()
+                .map(|ing| ing.x.nrows())
+                .unwrap_or(solution.n_observations);
+            let p_dim = hop.dim();
+            let k_outer = k + solution.ext_coords.len();
+            log::info!(
+                "[OUTER hessian-route] choice=operator reason=family_op \
+                 n={n_obs} p={p_dim} k={k_outer} \
+                 callback_kernel=false subspace_trace={subspace} \
+                 scale_prefers_operator=irrelevant",
+                subspace = solution.penalty_subspace_trace.is_some(),
+            );
+            let assembly_start = std::time::Instant::now();
             let mut hessian = crate::solver::outer_strategy::HessianResult::Operator(family_op);
             if let Some((_, _, Some(ref ph))) = prior_cost_gradient {
                 hessian.add_rho_block_dense(ph)?;
             }
+            log::info!(
+                "[OUTER hessian-elapsed] choice=operator reason=family_op \
+                 n={n_obs} p={p_dim} k={k_outer} elapsed={:.3}s",
+                assembly_start.elapsed().as_secs_f64(),
+            );
             return Ok(RemlLamlResult {
                 cost,
                 gradient: Some(grad),
