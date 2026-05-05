@@ -8,7 +8,7 @@ pub use faer::linalg::solvers::{
 use faer::linalg::svd::{self, ComputeSvdVectors};
 use faer::prelude::ReborrowMut;
 use faer::{Auto, Conj, Mat, MatMut, MatRef, Par, Side, Spec, get_global_parallelism};
-use ndarray::{Array1, Array2, ArrayBase, Data, Ix1, Ix2};
+use ndarray::{Array1, Array2, ArrayBase, ArrayViewMut1, Data, Ix1, Ix2};
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use thiserror::Error;
@@ -347,6 +347,51 @@ pub fn fast_av_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let v_ref = vview.as_ref();
     let par = matmul_parallelism(n, 1, p);
     matmul(outview.as_mut(), Accum::Replace, a_ref, v_ref, 1.0, par);
+}
+
+/// Compute A * v into a pre-allocated `ArrayViewMut1` slice. Like
+/// [`fast_av_into`] but accepts a writable slice rather than `&mut Array1`,
+/// so callers can write directly into a sub-range of a larger buffer
+/// without intermediate allocation.
+///
+/// `out` must have length n where A is (n, p) and v is length p.
+#[inline]
+pub fn fast_av_view_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    a: &ArrayBase<S1, Ix2>,
+    v: &ArrayBase<S2, Ix1>,
+    mut out: ArrayViewMut1<'_, f64>,
+) {
+    use faer::Accum;
+    use faer::linalg::matmul::matmul;
+
+    let (n, p) = a.dim();
+    debug_assert_eq!(v.len(), p, "vector length must match A cols");
+    debug_assert_eq!(out.len(), n, "output length must match A rows");
+
+    if !should_use_faer_matmul(n, 1, p) {
+        let prod = a.dot(v);
+        out.assign(&prod);
+        return;
+    }
+
+    let len = out.len();
+    let stride = out.strides()[0];
+    let outview = unsafe {
+        MatMut::from_raw_parts_mut(
+            out.as_mut_ptr(),
+            len,
+            1,
+            stride,
+            0, // col stride irrelevant for 1 column
+        )
+    };
+
+    let aview = FaerArrayView::new(a);
+    let vview = FaerColView::new(v);
+    let a_ref = aview.as_ref();
+    let v_ref = vview.as_ref();
+    let par = matmul_parallelism(n, 1, p);
+    matmul(outview, Accum::Replace, a_ref, v_ref, 1.0, par);
 }
 
 /// Compute A^T * v using faer's SIMD-optimized GEMV.
