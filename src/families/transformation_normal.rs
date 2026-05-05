@@ -11431,7 +11431,19 @@ pub fn fit_transformation_normal(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
     warm_start: Option<&TransformationWarmStart>,
 ) -> Result<TransformationNormalFitResult, String> {
-    let options = options.clone();
+    let mut options = options.clone();
+    // Same biobank-scale outer-Hessian gate as the marginal-slope families
+    // (see survival_marginal_slope.rs:13286). At biobank n the analytic
+    // outer Hessian dominates wall-clock; route to BFGS instead.
+    let n_obs = covariate_data.nrows();
+    let biobank_scale = n_obs > 50_000;
+    if biobank_scale && options.use_outer_hessian {
+        options.use_outer_hessian = false;
+        log::info!(
+            "[transformation-normal] declining analytic outer Hessian for n={n_obs}; routing to BFGS"
+        );
+    }
+    let options = options;
     let covariate_spec = covariate_spec.clone();
 
     // 1. Build a bootstrap covariate design first so the response basis can
