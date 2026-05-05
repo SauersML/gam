@@ -1197,7 +1197,12 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         self.assertIn("[PIRLS health]", out)
         self.assertIn("[FIT health]", out)
         # Combined verdict is DEGRADED (PIRLS axis wins) and the
-        # detail shows BOTH sub-verdicts.
+        # detail shows ALL THREE sub-verdicts: warm_start, pirls, and
+        # curvature. The stderr above doesn't include any curvature-
+        # kind markers ([STAGE] PIRLS update_with_curvature ... never
+        # emitted), so curvature should be ABSENT — locking the
+        # contract that absent markers map to ABSENT, not NO-DATA, in
+        # the visible label.
         fit_lines = [
             line for line in out.splitlines() if line.startswith("[FIT health]")
         ]
@@ -1205,6 +1210,55 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         self.assertIn("verdict=DEGRADED", fit_lines[0])
         self.assertIn("warm_start=", fit_lines[0])
         self.assertIn("pirls=DEGRADED", fit_lines[0])
+        self.assertIn("curvature=ABSENT", fit_lines[0])
+
+    def test_phase_summary_curvature_degraded_drives_fit_health(self) -> None:
+        # End-to-end: when curvature markers fire and indicate
+        # DEGRADED reliability (Fisher-fallback engagement), the
+        # [CURVATURE health] line emits AND the [FIT health] line
+        # picks up DEGRADED via the worst-of-three combination, even
+        # when PIRLS and warm-start are both HEALTHY.
+        stderr = "\n".join([
+            # Healthy IFT (warm_start = HEALTHY).
+            "[IFT-QUALITY] residual=1.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=3",
+            "[IFT-QUALITY] residual=2.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=3",
+            # Healthy PIRLS rates (p95 < 0.5 → HEALTHY).
+            "[PIRLS solve-end] iters=4 elapsed=0.001s g_norm_initial=1.0e+01 g_norm_final=1.0e-02 convergence_rate=2.000e-01 status=Converged",
+            "[PIRLS solve-end] iters=5 elapsed=0.001s g_norm_initial=1.0e+01 g_norm_final=1.0e-02 convergence_rate=2.500e-01 status=Converged",
+            "[PIRLS solve-end] iters=4 elapsed=0.001s g_norm_initial=1.0e+01 g_norm_final=1.0e-02 convergence_rate=2.300e-01 status=Converged",
+            # Curvature markers: 5 Observed iters + 5 Fisher iters
+            # → fisher_frac = 0.5 (≥ 0.20 threshold → DEGRADED).
+            "[STAGE] PIRLS update_with_curvature iter=1 curvature=Observed elapsed=0.01s",
+            "[STAGE] PIRLS update_with_curvature iter=2 curvature=Observed elapsed=0.01s",
+            "[STAGE] PIRLS update_with_curvature iter=3 curvature=Observed elapsed=0.01s",
+            "[STAGE] PIRLS update_with_curvature iter=4 curvature=Observed elapsed=0.01s",
+            "[STAGE] PIRLS update_with_curvature iter=5 curvature=Observed elapsed=0.01s",
+            "[STAGE] PIRLS update_with_curvature iter=6 curvature=Fisher elapsed=0.01s",
+            "[STAGE] PIRLS update_with_curvature iter=7 curvature=Fisher elapsed=0.01s",
+            "[STAGE] PIRLS update_with_curvature iter=8 curvature=Fisher elapsed=0.01s",
+            "[STAGE] PIRLS update_with_curvature iter=9 curvature=Fisher elapsed=0.01s",
+            "[STAGE] PIRLS update_with_curvature iter=10 curvature=Fisher elapsed=0.01s",
+            "[PHASE] my-fit fit end elapsed=10.0s",
+        ])
+        out = self._run_summary(stderr)
+        # [CURVATURE health] line emits with DEGRADED.
+        curv_lines = [
+            line for line in out.splitlines() if line.startswith("[CURVATURE health]")
+        ]
+        self.assertEqual(len(curv_lines), 1)
+        self.assertIn("verdict=DEGRADED", curv_lines[0])
+        self.assertIn("fisher_frac=0.50", curv_lines[0])
+        # [FIT health] line picks up DEGRADED via worst-of-three.
+        fit_lines = [
+            line for line in out.splitlines() if line.startswith("[FIT health]")
+        ]
+        self.assertEqual(len(fit_lines), 1)
+        self.assertIn("verdict=DEGRADED", fit_lines[0])
+        # The OTHER two axes are HEALTHY.
+        self.assertIn("warm_start=HEALTHY", fit_lines[0])
+        self.assertIn("pirls=HEALTHY", fit_lines[0])
+        # The curvature axis is the one driving DEGRADED.
+        self.assertIn("curvature=DEGRADED", fit_lines[0])
 
     def test_pirls_health_verdict_classifies_tiers(self) -> None:
         # HEALTHY: 95% of solves at rate < 0.5 (each Newton iter at
