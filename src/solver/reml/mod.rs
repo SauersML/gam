@@ -18,7 +18,7 @@ mod firth;
 pub(crate) mod hyper;
 mod inner_strategy;
 pub(crate) mod penalty_logdet;
-mod runtime;
+pub(crate) mod runtime;
 mod trace;
 pub(crate) mod unified;
 

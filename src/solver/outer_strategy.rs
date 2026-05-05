@@ -62,18 +62,28 @@ impl InnerProgressFeedback {
     /// Snapshot the read-back atomics for the cap schedule. Returns `None`
     /// when no inner solve has reported yet (`last_iters == 0`); the
     /// schedule then falls back to the coarse iter-count tier.
+    ///
+    /// The IFT residual decoding uses the same NaN-sentinel discipline
+    /// as `RemlState::predict_warm_start_beta_ift` — see commit
+    /// `748cc066` for the rationale. A residual of exactly 0 (every
+    /// β_predicted_i bit-equal to β_converged_i) must NOT be confused
+    /// with "no signal yet"; the NaN sentinel + `is_finite()` check
+    /// distinguishes the two cleanly. Both ends of the atomic share
+    /// `crate::solver::reml::runtime::IFT_RESIDUAL_NO_SIGNAL_BITS`
+    /// implicitly via the same bit pattern.
     fn snapshot(&self) -> Option<InnerProgressSnapshot> {
         let iters = self.last_iters.load(Ordering::Relaxed);
         if iters == 0 {
             None
         } else {
+            // NaN sentinel + is_finite() check covers three cases in
+            // one expression: "no signal yet" (sentinel decodes to NaN,
+            // fails is_finite), "corrupted state" (any non-finite or
+            // negative residual), and "real signal" (finite non-negative
+            // → Some). Matches the IFT predictor's reader semantics.
             let residual_bits = self.ift_residual.load(Ordering::Relaxed);
-            let last_ift_residual = if residual_bits == 0 {
-                None
-            } else {
-                let r = f64::from_bits(residual_bits);
-                if r.is_finite() && r >= 0.0 { Some(r) } else { None }
-            };
+            let r = f64::from_bits(residual_bits);
+            let last_ift_residual = if r.is_finite() && r >= 0.0 { Some(r) } else { None };
             Some(InnerProgressSnapshot {
                 last_iters: iters,
                 last_converged: self.last_converged.load(Ordering::Relaxed),
@@ -1855,6 +1865,60 @@ mod outer_inner_cap_schedule_tests {
             last_converged,
             last_ift_residual: Some(residual),
         })
+    }
+
+    /// The bridge's snapshot reader must distinguish "no signal yet"
+    /// (NaN sentinel, encoded as `IFT_RESIDUAL_NO_SIGNAL_BITS`) from
+    /// "residual was 0.0" (a real signal). Previously the bridge used
+    /// `bits == 0` to detect no-signal, which collided with
+    /// `f64::to_bits(0.0) == 0`. This test pins down the new
+    /// NaN-sentinel discipline at the bridge layer.
+    #[test]
+    fn snapshot_distinguishes_zero_residual_from_no_signal() {
+        use super::InnerProgressFeedback;
+        use crate::solver::estimate::reml::runtime::IFT_RESIDUAL_NO_SIGNAL_BITS;
+        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+        use std::sync::Arc;
+
+        // Helper to build a feedback channel with concrete values.
+        let make_feedback = |iters: usize, converged: bool, residual_bits: u64| {
+            InnerProgressFeedback {
+                cap: Arc::new(AtomicUsize::new(0)),
+                last_iters: Arc::new(AtomicUsize::new(iters)),
+                last_converged: Arc::new(AtomicBool::new(converged)),
+                ift_residual: Arc::new(AtomicU64::new(residual_bits)),
+            }
+        };
+
+        // Sentinel → no IFT signal (last_ift_residual = None).
+        let fb = make_feedback(5, true, IFT_RESIDUAL_NO_SIGNAL_BITS);
+        let snap = fb.snapshot().expect("iters > 0, snapshot present");
+        assert!(
+            snap.last_ift_residual.is_none(),
+            "sentinel must decode to None"
+        );
+
+        // 0.0 residual → genuine signal (last_ift_residual = Some(0.0)).
+        // This is the bug: previously the reader treated `bits == 0` as
+        // no-signal, dropping the genuine 0.0 residual.
+        let fb = make_feedback(5, true, 0.0_f64.to_bits());
+        let snap = fb.snapshot().expect("iters > 0, snapshot present");
+        assert_eq!(
+            snap.last_ift_residual,
+            Some(0.0),
+            "residual of exactly 0.0 must round-trip as a real signal, \
+             not be confused with the no-signal sentinel",
+        );
+
+        // Modest finite residual round-trips.
+        let fb = make_feedback(5, true, 0.05_f64.to_bits());
+        let snap = fb.snapshot().expect("snapshot present");
+        assert_eq!(snap.last_ift_residual, Some(0.05));
+
+        // last_iters == 0 → entire snapshot is None (no inner-Newton
+        // signal yet at all). Sentinel residual irrelevant.
+        let fb = make_feedback(0, false, IFT_RESIDUAL_NO_SIGNAL_BITS);
+        assert!(fb.snapshot().is_none());
     }
 
     #[test]

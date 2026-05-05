@@ -3502,7 +3502,14 @@ const IFT_WARM_START_DRHO_EPS: f64 = 1e-12;
 /// indistinguishable from "predictor never reported". Any standard
 /// quiet-NaN bit pattern works; we use the one Rust's `f64::NAN`
 /// canonicalizes to (mantissa MSB = 1, sign = 0, exponent = all 1s).
-const IFT_RESIDUAL_NO_SIGNAL_BITS: u64 = 0x7ff8_0000_0000_0000;
+///
+/// `pub(crate)` so the bridge's `InnerProgressFeedback::snapshot` (in
+/// `crate::solver::outer_strategy`) can reference the same constant —
+/// both ends of this atomic must use the same sentinel discipline,
+/// otherwise a residual-of-zero round-trips correctly through the
+/// writer but the reader treats it as "no signal" and silently
+/// drops the adaptive cap-margin signal.
+pub(crate) const IFT_RESIDUAL_NO_SIGNAL_BITS: u64 = 0x7ff8_0000_0000_0000;
 
 /// Free-function form of the IFT warm-start predictor. Operates purely on
 /// the cache + canonical penalties + new ρ, so it is testable without
