@@ -2467,8 +2467,9 @@ impl<'a> RemlState<'a> {
                 // every cache hit avoids a fresh O(p³)/3 Cholesky,
                 // which is multiple seconds at p ≈ several thousand.
                 log::info!(
-                    "[IFT-CACHE] outcome=hit drho_dim={}",
+                    "[IFT-CACHE] outcome=hit drho_dim={} p={}",
                     new_rho.len(),
+                    self.p,
                 );
                 Arc::clone(arc)
             } else {
@@ -2487,8 +2488,9 @@ impl<'a> RemlState<'a> {
                 // Cache miss: paid the Cholesky once. Subsequent predict
                 // calls at the same surface will hit the cache.
                 log::info!(
-                    "[IFT-CACHE] outcome=miss drho_dim={} elapsed={:.3}s",
+                    "[IFT-CACHE] outcome=miss drho_dim={} p={} elapsed={:.3}s",
                     new_rho.len(),
+                    self.p,
                     factorize_start.elapsed().as_secs_f64(),
                 );
                 let arc: Arc<dyn crate::linalg::matrix::FactorizedSystem> =
