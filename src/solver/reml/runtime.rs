@@ -2871,16 +2871,58 @@ impl<'a> RemlState<'a> {
         // Check the status returned by the P-IRLS routine.
         match pirls_result.status {
             pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
-                // Screening-time fits run under a 3-iteration cap and skip
-                // KKT certification. Even when PIRLS reports Converged, the
-                // result is one rank-ordering datum, not a vetted production
-                // mode: keep it strictly out of cross-call state so it can
-                // never leak into the actual fit. The screening loop in
-                // `rank_seeds_with_screening` invalidates the bundle slot and
-                // warm start between seeds anyway, but suppressing the writes
-                // here makes the isolation a local invariant rather than a
-                // contract held by the caller.
+                // IFT-quality probe: when the predictor produced a β
+                // (any non-screening solve after the first cache fill
+                // typically does), measure how close the prediction was
+                // to the converged β. Logged as
+                // `[IFT-QUALITY] residual=X converged_norm=Y predicted_norm=Z iters=K`
+                // so the bench runner / scaling-law analyzer can
+                // empirically validate the IFT linearization at biobank
+                // scale. A residual ≪ 1 means the linear predictor is
+                // faithful (warm-start is paying off); a residual ≈ 1
+                // means the prediction was no better than flat (and
+                // the adaptive cap / next outer iter should treat the
+                // hint as unreliable). Only emitted outside screening
+                // because screening's intentionally-truncated PIRLS
+                // does not reflect production solve geometry.
                 if !in_screening {
+                    if let Some(predicted) = predicted_warm_start.as_ref() {
+                        let converged_original = match pirls_result.coordinate_frame {
+                            pirls::PirlsCoordinateFrame::OriginalSparseNative => {
+                                pirls_result.beta_transformed.as_ref().clone()
+                            }
+                            pirls::PirlsCoordinateFrame::TransformedQs => pirls_result
+                                .reparam_result
+                                .qs
+                                .dot(pirls_result.beta_transformed.as_ref()),
+                        };
+                        if predicted.0.len() == converged_original.len() {
+                            let mut diff_sq = 0.0_f64;
+                            let mut conv_sq = 0.0_f64;
+                            let mut pred_sq = 0.0_f64;
+                            for (p_val, c_val) in predicted.0.iter().zip(converged_original.iter())
+                            {
+                                let d = c_val - p_val;
+                                diff_sq += d * d;
+                                conv_sq += c_val * c_val;
+                                pred_sq += p_val * p_val;
+                            }
+                            let conv_norm = conv_sq.sqrt();
+                            let pred_norm = pred_sq.sqrt();
+                            let residual = if conv_norm > 0.0 {
+                                diff_sq.sqrt() / conv_norm
+                            } else {
+                                f64::NAN
+                            };
+                            log::info!(
+                                "[IFT-QUALITY] residual={:.3e} converged_norm={:.3e} predicted_norm={:.3e} iters={}",
+                                residual,
+                                conv_norm,
+                                pred_norm,
+                                pirls_result.iteration,
+                            );
+                        }
+                    }
                     self.updatewarm_start_from(pirls_result.as_ref());
                     // Record the ρ that produced this β so the next call
                     // can extrapolate. Only meaningful after a successful
