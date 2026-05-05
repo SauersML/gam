@@ -1508,6 +1508,7 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, s
                             or "[OUTER guard]" in line
                             or "[PIRLS iter-end]" in line
                             or "[KAPPA-PHASE" in line
+                            or "[IFT-QUALITY]" in line
                         ):
                             phase_capture.append(line)
         finally:
@@ -1596,6 +1597,18 @@ _KAPPA_PHASE_PATTERN = re.compile(
 )
 _KAPPA_PHASE_SUMMARY_PATTERN = re.compile(
     r"\[KAPPA-PHASE-SUMMARY\]\s+log_kappa_dim=(\d+)\s+n_cost=(\d+)\s+cost_total_s=([\d.]+)\s+n_eval=(\d+)\s+eval_total_s=([\d.]+)\s+n_efs=(\d+)\s+efs_total_s=([\d.]+)\s+optim_total_s=([\d.]+)"
+)
+
+# IFT predictor quality probe. Emitted by `execute_pirls_if_needed` after
+# every successful non-screening PIRLS solve when a warm-start prediction
+# was actually used. residual = ‖β_converged − β_predicted‖ / ‖β_converged‖
+# — close to 0 when the linearization was faithful, close to 1 when the
+# prediction was no better than flat. The bench runner / analyzer pivots
+# this so we can empirically validate whether the IFT predictor is
+# actually paying off at biobank scale (which the inner-PIRLS scaling
+# probe identified as the dominant cost regime).
+_IFT_QUALITY_PATTERN = re.compile(
+    r"\[IFT-QUALITY\]\s+residual=([\deE.+-]+)\s+converged_norm=([\deE.+-]+)\s+predicted_norm=([\deE.+-]+)\s+iters=(\d+)"
 )
 
 
@@ -1691,6 +1704,26 @@ def _emit_phase_summary(
                 f"kappa_{phase_name}_total={sum(secs_list):.1f}s"
             )
         parts.append(f"kappa_optim_INCOMPLETE {' '.join(kphase_pieces)}")
+    # IFT-quality probe distribution. Each marker records the residual
+    # ‖β_converged − β_predicted‖ / ‖β_converged‖ for one accepted
+    # PIRLS solve where a warm-start prediction was used. We surface
+    # the count, p50, p95, and max so the bench logs end with a
+    # one-line answer to "is the IFT predictor faithful at biobank
+    # scale?". A small p50 (~1e-3 or below) means the linearization
+    # is doing its job; a large p50 (~1) means the prediction is
+    # collapsing to flat warm-start and we should investigate.
+    ift_quality_matches = _IFT_QUALITY_PATTERN.findall(captured_stderr)
+    if ift_quality_matches:
+        residuals = [float(m[0]) for m in ift_quality_matches if float(m[0]) == float(m[0])]
+        if residuals:
+            n = len(residuals)
+            sorted_res = sorted(residuals)
+            p50 = sorted_res[n // 2]
+            p95 = sorted_res[min(n - 1, int(0.95 * n))]
+            rmax = sorted_res[-1]
+            parts.append(
+                f"ift_predicts={n} ift_p50={p50:.2e} ift_p95={p95:.2e} ift_max={rmax:.2e}"
+            )
     suffix = ""
     if pending:
         suffix = f" pending={','.join(pending)}"
