@@ -11432,15 +11432,25 @@ pub fn fit_transformation_normal(
     warm_start: Option<&TransformationWarmStart>,
 ) -> Result<TransformationNormalFitResult, String> {
     let mut options = options.clone();
-    // Same biobank-scale outer-Hessian gate as the marginal-slope families
-    // (see survival_marginal_slope.rs:13286). At biobank n the analytic
-    // outer Hessian dominates wall-clock; route to BFGS instead.
+    // Outer-Hessian gate, tuned specifically for CTN. CTN's analytic outer
+    // Hessian is response_dim × covariate_dim, which becomes O(thousands)
+    // even on the n=20k stratified subsample used at biobank scale —
+    // 7-min ARC iters observed in CI run 25351074828 (margslope job log,
+    // 2026-05-04). The biobank-scale margslope jobs invoke CTN as a
+    // preprocessing step on a subsample and then move on, so accuracy on
+    // smoothing parameters is less critical than wall-clock here.
+    //
+    // We use a tighter threshold than the marginal-slope families
+    // (n > 10_000 vs > 50_000) because CTN's per-row work is dominated by
+    // the outer-product (resp_basis ⊗ cov_basis) which scales much faster
+    // with n than a single GLM column does.
     let n_obs = covariate_data.nrows();
-    let biobank_scale = n_obs > 50_000;
+    let ctn_biobank_threshold = 10_000usize;
+    let biobank_scale = n_obs > ctn_biobank_threshold;
     if biobank_scale && options.use_outer_hessian {
         options.use_outer_hessian = false;
         log::info!(
-            "[transformation-normal] declining analytic outer Hessian for n={n_obs}; routing to BFGS"
+            "[transformation-normal] declining analytic outer Hessian for n={n_obs} (CTN gate at >{ctn_biobank_threshold}); routing to BFGS"
         );
     }
     let options = options;
