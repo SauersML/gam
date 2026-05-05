@@ -1786,6 +1786,21 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<BlockwiseTermFitResult, String> {
+    // Same biobank-scale outer-Hessian gate as the marginal-slope families
+    // (see survival_marginal_slope.rs:13286). At biobank n the analytic
+    // outer Hessian dominates wall-clock; route to BFGS on the analytic
+    // gradient instead.
+    let n_obs = data.nrows();
+    let biobank_scale = n_obs > 50_000;
+    let mut options_override = options.clone();
+    if biobank_scale && options_override.use_outer_hessian {
+        options_override.use_outer_hessian = false;
+        log::info!(
+            "[gamlss-location-scale] declining analytic outer Hessian for n={n_obs}; routing to BFGS"
+        );
+    }
+    let options: &BlockwiseFitOptions = &options_override;
+
     let mut mean_beta_hint: Option<Array1<f64>> = None;
     let mut noise_beta_hint: Option<Array1<f64>> = None;
     let extra_rho0 = builder.extra_rho0()?;
