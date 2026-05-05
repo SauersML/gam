@@ -918,6 +918,26 @@ pub trait CustomFamily {
         Ok(None)
     }
 
+    /// Outer-aware variant of `exact_newton_joint_hessian_workspace`.
+    ///
+    /// Families that consume the optional outer-only stratified row subsample
+    /// (`options.outer_score_subsample`) override this method so the joint
+    /// Hessian workspace can be constructed with the subsample mask attached.
+    /// Generic families can stick with the default implementation, which
+    /// simply forwards to the legacy no-options method and ignores the
+    /// options. This keeps full backward compatibility with existing
+    /// implementors while letting the marginal-slope families thread the
+    /// subsample down into the cached per-evaluation joint-Hessian directional
+    /// derivative paths.
+    fn exact_newton_joint_hessian_workspace_with_options(
+        &self,
+        states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        _options: &BlockwiseFitOptions,
+    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        self.exact_newton_joint_hessian_workspace(states, specs)
+    }
+
     /// Optional batched analytic-gradient hook.
     ///
     /// Returns the K per-θ_j gradient contributions ([`BatchedOuterGradientTerms`])
@@ -5828,6 +5848,7 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
     block_states: &'a [ParameterBlockState],
     specs: &'a [ParameterBlockSpec],
     total: usize,
+    options: &BlockwiseFitOptions,
 ) -> Result<Option<JointHessianBundle<'a>>, String> {
     // Path 1: exact Newton joint Hessian (preferred).
     let beta_flat = flatten_state_betas(block_states, specs);
@@ -5837,7 +5858,11 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
         block_states,
         &beta_flat,
     )?);
-    let hessian_workspace = family.exact_newton_joint_hessian_workspace(synced.as_ref(), specs)?;
+    let hessian_workspace = family.exact_newton_joint_hessian_workspace_with_options(
+        synced.as_ref(),
+        specs,
+        options,
+    )?;
     if let Some(curvature) = family.exact_newton_outer_curvature(block_states)? {
         let h_joint_unpen = JointHessianSource::Dense(symmetrized_square_matrix(
             curvature.hessian,
@@ -6809,7 +6834,7 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
     let exact_joint_source =
         if !strict_spd && use_joint_matrix_free_path(total, joint_observation_count(states)) {
             family
-                .exact_newton_joint_hessian_workspace(states, specs)?
+                .exact_newton_joint_hessian_workspace_with_options(states, specs, options)?
                 .as_ref()
                 .map(|workspace| {
                     exact_newton_joint_hessian_source_from_workspace(
@@ -7013,7 +7038,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     // Cholesky path — keep them on blockwise.
     let (has_joint_exacthessian, has_workspace_source) =
         if use_joint_matrix_free_path(total_joint_p, total_joint_n) {
-            let workspace = family.exact_newton_joint_hessian_workspace(&states, specs)?;
+            let workspace = family
+                .exact_newton_joint_hessian_workspace_with_options(&states, specs, options)?;
             if let Some(workspace) = workspace.as_ref() {
                 if exact_newton_joint_hessian_source_from_workspace(
                     workspace,
@@ -7152,7 +7178,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // Get joint Hessian and block gradients from the current evaluation.
             let joint_hessian_source = if use_joint_matrix_free_path(total_p, total_joint_n) {
                 family
-                    .exact_newton_joint_hessian_workspace(&states, specs)?
+                    .exact_newton_joint_hessian_workspace_with_options(&states, specs, options)?
                     .as_ref()
                     .map(|workspace| {
                         exact_newton_joint_hessian_source_from_workspace(
@@ -9134,7 +9160,7 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
 
     let efs_eval = {
         if let Some(joint_bundle) =
-            build_joint_hessian_closures(family, &inner.block_states, specs, total)?
+            build_joint_hessian_closures(family, &inner.block_states, specs, total, options)?
         {
             let JointHessianBundle {
                 source: h_joint_unpen,
@@ -10175,8 +10201,11 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             &inner.block_states,
             &beta_flat,
         )?);
-        let hessian_workspace =
-            family.exact_newton_joint_hessian_workspace(synced_joint_states.as_ref(), specs)?;
+        let hessian_workspace = family.exact_newton_joint_hessian_workspace_with_options(
+            synced_joint_states.as_ref(),
+            specs,
+            options,
+        )?;
         let (
             h_joint_unpen,
             rho_curvature_scale,
@@ -10450,7 +10479,11 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             &beta_flat_for_batch,
         )?;
         let workspace_for_batch = family
-            .exact_newton_joint_hessian_workspace(&synced_states_for_batch, specs)
+            .exact_newton_joint_hessian_workspace_with_options(
+                &synced_states_for_batch,
+                specs,
+                options,
+            )
             .ok()
             .flatten();
         let derivative_blocks_for_batch =
@@ -10469,7 +10502,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 && batch.trace_s_pinv_sdot.len() == expected
             {
                 if let Some(joint_bundle_value_only) =
-                    build_joint_hessian_closures(family, &inner.block_states, specs, total)?
+                    build_joint_hessian_closures(family, &inner.block_states, specs, total, options)?
                 {
                     let JointHessianBundle {
                         source: h_joint_unpen,
@@ -10541,7 +10574,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     // surrogate Hessian sources, then call joint_outer_evaluate with no
     // extended coordinates.
     if let Some(joint_bundle) =
-        build_joint_hessian_closures(family, &inner.block_states, specs, total)?
+        build_joint_hessian_closures(family, &inner.block_states, specs, total, options)?
     {
         let JointHessianBundle {
             source: h_joint_unpen,
@@ -10913,8 +10946,11 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         &inner.block_states,
         &beta_flat,
     )?);
-    let hessian_workspace =
-        family.exact_newton_joint_hessian_workspace(synced_joint_states.as_ref(), specs)?;
+    let hessian_workspace = family.exact_newton_joint_hessian_workspace_with_options(
+        synced_joint_states.as_ref(),
+        specs,
+        options,
+    )?;
     let (
         h_joint_unpen,
         rho_curvature_scale,
