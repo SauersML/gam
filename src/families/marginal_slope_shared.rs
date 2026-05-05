@@ -1077,6 +1077,9 @@ mod tests {
     fn inject_biobank_outer_subsample_fires_at_biobank_scale() {
         // n=100k > 50k threshold → subsample should be installed and the
         // mask length should be roughly K (within stratification overshoot).
+        // The runtime gate uses `auto_outer_subsample_k(n)` (≈ n/16 with a
+        // K_MIN/K_MAX clamp), not the historical `BIOBANK_OUTER_SUBSAMPLE_K`
+        // constant; at n=100k the auto-derived target is 6_250.
         let n: usize = 100_000;
         let z: Vec<f64> = (0..n).map(|i| (i as f64) * 1e-3).collect();
         let secondary: Vec<u8> = (0..n).map(|i| (i % 2) as u8).collect();
@@ -1088,22 +1091,29 @@ mod tests {
             .outer_score_subsample
             .as_ref()
             .expect("subsample present");
-        // K with 200-stratum overshoot bound.
+        let expected_k = auto_outer_subsample_k(n);
+        // K with 200-stratum overshoot bound (2 secondary classes × 100 z-deciles).
         assert!(
-            s.len() >= BIOBANK_OUTER_SUBSAMPLE_K,
-            "mask len {} below K {}",
+            s.len() >= expected_k,
+            "mask len {} below auto-derived K {}",
             s.len(),
-            BIOBANK_OUTER_SUBSAMPLE_K
+            expected_k
         );
         assert!(
-            s.len() <= BIOBANK_OUTER_SUBSAMPLE_K + 200,
-            "mask len {} much larger than K {} + 200",
+            s.len() <= expected_k + 200,
+            "mask len {} much larger than auto-derived K {} + 200",
             s.len(),
-            BIOBANK_OUTER_SUBSAMPLE_K
+            expected_k
         );
         assert_eq!(s.n_full, n);
-        // weight_scale ≈ n / mask.len() ≈ 5.
-        assert!((s.weight_scale - 5.0).abs() < 0.5);
+        // weight_scale = n / mask.len() ≈ n / expected_k.
+        let expected_scale = (n as f64) / (s.len() as f64);
+        assert!(
+            (s.weight_scale - expected_scale).abs() < 1e-9,
+            "weight_scale {} disagrees with n/len {}",
+            s.weight_scale,
+            expected_scale
+        );
         assert_eq!(s.seed, BIOBANK_OUTER_SUBSAMPLE_SEED);
     }
 
@@ -1154,7 +1164,8 @@ mod tests {
             .outer_score_subsample
             .as_ref()
             .expect("subsample present");
-        assert!(s.len() >= BIOBANK_OUTER_SUBSAMPLE_K);
+        // Auto-derived K, not the historical constant: gate uses auto_outer_subsample_k(n).
+        assert!(s.len() >= auto_outer_subsample_k(n));
     }
 
     #[test]
