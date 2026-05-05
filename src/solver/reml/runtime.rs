@@ -1247,8 +1247,11 @@ impl<'a> RemlState<'a> {
         self.last_inner_iters.store(0, Ordering::Relaxed);
         self.last_inner_converged.store(false, Ordering::Relaxed);
         self.last_pirls_lm_lambda.store(0, Ordering::Relaxed);
+        // Use the NaN sentinel (not literal 0) so a residual of exactly
+        // 0.0 — possible if β_predicted matched β_converged element-wise
+        // — is not confused with "no signal yet".
         self.last_ift_prediction_residual
-            .store(0, Ordering::Relaxed);
+            .store(IFT_RESIDUAL_NO_SIGNAL_BITS, Ordering::Relaxed);
     }
 
     pub(crate) fn set_link_states(
@@ -1727,7 +1730,7 @@ impl<'a> RemlState<'a> {
             last_inner_converged: Arc::new(AtomicBool::new(false)),
             ift_warm_start_cache: RwLock::new(None),
             last_pirls_lm_lambda: Arc::new(AtomicU64::new(0)),
-            last_ift_prediction_residual: Arc::new(AtomicU64::new(0)),
+            last_ift_prediction_residual: Arc::new(AtomicU64::new(IFT_RESIDUAL_NO_SIGNAL_BITS)),
             ift_cached_factor: RwLock::new(None),
             kronecker_penalty_system: None,
             kronecker_factored: None,
@@ -2359,13 +2362,14 @@ impl<'a> RemlState<'a> {
         }
         let cache_guard = self.ift_warm_start_cache.read().unwrap();
         let cache = cache_guard.as_ref()?;
+        // The NaN sentinel + the is_finite() check together cover three
+        // cases in one expression: "no signal yet" (sentinel decodes to
+        // NaN, which fails is_finite), "corrupted state" (any non-finite
+        // or negative residual stored by mistake), and "real signal"
+        // (finite non-negative residual → Some).
         let last_residual_bits = self.last_ift_prediction_residual.load(Ordering::Relaxed);
-        let last_residual = if last_residual_bits == 0 {
-            None
-        } else {
-            let r = f64::from_bits(last_residual_bits);
-            if r.is_finite() && r >= 0.0 { Some(r) } else { None }
-        };
+        let r = f64::from_bits(last_residual_bits);
+        let last_residual = if r.is_finite() && r >= 0.0 { Some(r) } else { None };
         // Get the cached factor or lazily compute it. Holding the
         // ift_warm_start_cache read lock while we acquire the factor's
         // lock is safe: cache invalidation (writer) takes the cache
@@ -2523,13 +2527,11 @@ impl<'a> RemlState<'a> {
         // most recent IFT prediction was excellent, the tangent
         // approximation can be trusted for slightly larger α; when
         // it was poor, tighten.
+        // Same NaN-sentinel discipline as the IFT predictor's reader
+        // — see the comment there for the encoding rationale.
         let last_residual_bits = self.last_ift_prediction_residual.load(Ordering::Relaxed);
-        let last_residual = if last_residual_bits == 0 {
-            None
-        } else {
-            let r = f64::from_bits(last_residual_bits);
-            if r.is_finite() && r >= 0.0 { Some(r) } else { None }
-        };
+        let r = f64::from_bits(last_residual_bits);
+        let last_residual = if r.is_finite() && r >= 0.0 { Some(r) } else { None };
         let alpha_cap = adaptive_tangent_alpha_cap(last_residual);
         if alpha <= 0.0 || alpha > alpha_cap {
             // Emit a structured reject marker so the bench runner can
@@ -3367,9 +3369,11 @@ impl<'a> RemlState<'a> {
                     // A failed solve also invalidates the IFT residual
                     // signal — there's no meaningful "predicted vs
                     // converged" datum to feed back. Reset so the next
-                    // predict call uses the default 2.0 cap.
+                    // predict call uses the default 2.0 cap. NaN
+                    // sentinel rather than literal 0 — see
+                    // `IFT_RESIDUAL_NO_SIGNAL_BITS`.
                     self.last_ift_prediction_residual
-                        .store(0, Ordering::Relaxed);
+                        .store(IFT_RESIDUAL_NO_SIGNAL_BITS, Ordering::Relaxed);
                 }
                 Err(EstimationError::PirlsDidNotConverge {
                     max_iterations: pirls_result.iteration,
@@ -3485,6 +3489,20 @@ fn adaptive_tangent_alpha_cap(last_residual: Option<f64>) -> f64 {
 /// numerically negligible and skipped (saves one back-solve per inactive
 /// component).
 const IFT_WARM_START_DRHO_EPS: f64 = 1e-12;
+
+/// Bit-pattern sentinel used by `RemlObjectiveState::last_ift_prediction_residual`
+/// to encode "no signal yet" unambiguously. Decodes via `f64::from_bits`
+/// to a quiet NaN — readers detect the sentinel via NaN's
+/// self-inequality (NaN.is_finite() == false), so no value-comparison
+/// trickery is needed.
+///
+/// The original `0` sentinel collided with `f64::to_bits(0.0) == 0`,
+/// which would have made a true residual of exactly 0 (mathematically
+/// possible if β_predicted matched β_converged element-wise) silently
+/// indistinguishable from "predictor never reported". Any standard
+/// quiet-NaN bit pattern works; we use the one Rust's `f64::NAN`
+/// canonicalizes to (mantissa MSB = 1, sign = 0, exponent = all 1s).
+const IFT_RESIDUAL_NO_SIGNAL_BITS: u64 = 0x7ff8_0000_0000_0000;
 
 /// Free-function form of the IFT warm-start predictor. Operates purely on
 /// the cache + canonical penalties + new ρ, so it is testable without
@@ -6889,6 +6907,47 @@ mod ift_warm_start_tests {
                 w[0] >= w[1],
                 "adaptive cap is not monotone non-increasing in residual: {caps:?}"
             );
+        }
+    }
+
+    /// Pin down the NaN-sentinel discipline for the IFT residual
+    /// atomic. The `0` sentinel previously used would have collided
+    /// with `f64::to_bits(0.0) == 0`, making a residual of exactly 0
+    /// indistinguishable from "no signal yet". The new sentinel
+    /// (`IFT_RESIDUAL_NO_SIGNAL_BITS`, a quiet-NaN bit pattern)
+    /// encodes "no signal" via NaN's self-inequality, so any finite
+    /// non-negative value is unambiguously genuine signal.
+    #[test]
+    fn ift_residual_sentinel_is_distinguishable_from_zero() {
+        use super::IFT_RESIDUAL_NO_SIGNAL_BITS;
+        // Sentinel decodes to NaN.
+        assert!(
+            f64::from_bits(IFT_RESIDUAL_NO_SIGNAL_BITS).is_nan(),
+            "sentinel must decode to NaN so reads can detect 'no signal yet'",
+        );
+        // 0.0 round-trips as 0 bits — distinct from the sentinel, so
+        // a stored residual of 0.0 would not be confused with the
+        // no-signal state.
+        assert_eq!(0.0_f64.to_bits(), 0, "f64::to_bits(0.0) is 0 by IEEE 754");
+        assert_ne!(
+            IFT_RESIDUAL_NO_SIGNAL_BITS, 0,
+            "sentinel must not collide with f64::to_bits(0.0)",
+        );
+        // The reader's `r.is_finite() && r >= 0.0` predicate accepts
+        // 0.0 (a real signal) and rejects the NaN sentinel.
+        let r_zero = f64::from_bits(0.0_f64.to_bits());
+        assert!(r_zero.is_finite() && r_zero >= 0.0, "0.0 is genuine signal");
+        let r_sentinel = f64::from_bits(IFT_RESIDUAL_NO_SIGNAL_BITS);
+        assert!(
+            !(r_sentinel.is_finite() && r_sentinel >= 0.0),
+            "sentinel must fail the reader's accept predicate",
+        );
+        // Any finite non-negative residual round-trips through
+        // `to_bits` / `from_bits` losslessly.
+        for &val in &[0.0_f64, 1e-10, 0.05, 0.5, 4.0] {
+            let bits = val.to_bits();
+            let back = f64::from_bits(bits);
+            assert_eq!(back, val, "round-trip failed for {val}");
         }
     }
 
