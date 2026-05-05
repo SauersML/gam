@@ -2503,14 +2503,36 @@ impl<'a> RemlState<'a> {
         self.clear_warm_start_adaptive_signals();
         match beta_original {
             Some(beta) if beta.len() == self.p => {
+                if !beta.iter().all(|v: &f64| v.is_finite()) {
+                    // Caller supplied a β with NaN / Inf entries — would
+                    // poison the next PIRLS solve immediately. Refuse
+                    // (slot remains cleared) and log so the source of
+                    // the bad seed is debuggable.
+                    log::warn!(
+                        "[warm-start] external β setter rejected non-finite seed (len={}); slot left empty",
+                        beta.len(),
+                    );
+                    return;
+                }
                 self.warm_start_beta
                     .write()
                     .unwrap()
                     .replace(Coefficients::new(beta.to_owned()));
             }
-            _ => {
-                // already cleared by `clear_warm_start_predictor_state`;
-                // nothing more to do.
+            Some(beta) => {
+                // Length mismatch — common bug when a caller forgets to
+                // re-derive β under a basis transformation. Surface it
+                // rather than silently dropping; the slot is already
+                // cleared.
+                log::warn!(
+                    "[warm-start] external β setter rejected length mismatch: got {}, expected {}",
+                    beta.len(),
+                    self.p,
+                );
+            }
+            None => {
+                // Caller asked for an explicit clear — already done by
+                // `clear_warm_start_predictor_state`; nothing more to do.
             }
         }
     }
