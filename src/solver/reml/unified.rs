@@ -3373,10 +3373,13 @@ impl PenaltySubspaceTrace {
     /// the dense `compute_outer_hessian` path; see the
     /// `subspace_forced_dense` reason in `[OUTER hessian-route]`).
     ///
-    /// `#[allow(dead_code)]` until the teammate's matrix-free projected
-    /// kernel work consumes it; covered by
-    /// `penalty_subspace_trace_apply_matches_dense_kernel` test.
-    #[allow(dead_code)]
+    /// Wired into `build_outer_hessian_operator`'s `dispatch_solve`
+    /// closure as of this commit; the `#[allow(dead_code)]` previously
+    /// guarded against the lib-only build flagging it dead has been
+    /// removed since the helper is now reachable from production
+    /// code (although the routing gate still blocks subspace cases
+    /// from reaching this code in production today, the call site
+    /// is real lib code, satisfying the dead_code lint).
     pub fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
         let v_proj: Array1<f64> = self.u_s.t().dot(v);
         let y_proj: Array1<f64> = self.h_proj_inverse.dot(&v_proj);
@@ -6714,11 +6717,32 @@ fn build_outer_hessian_operator(
 
     let mut coords = Vec::with_capacity(total);
     let mut rho_penalty_a_k_betas: Vec<Array1<f64>> = Vec::with_capacity(k);
+    // Dispatch helper for the per-coord `H⁻¹ · v` solve. When the
+    // solution carries a `PenaltySubspaceTrace` (rank-deficient LAML
+    // fix), the projected kernel `K = U_S · H_proj⁻¹ · U_Sᵀ` should
+    // be applied instead of the full-space inverse — see
+    // `PenaltySubspaceTrace::apply`. The routing gate in the caller
+    // (`compute_reml_or_laml_with_mode`) currently blocks subspace
+    // cases from reaching `build_outer_hessian_operator`, so the
+    // `subspace.is_some()` branch is unreachable in production today;
+    // wiring the dispatch site sets up the structure for the
+    // (planned) gate relaxation that finally routes the rank-
+    // deficient case through the matrix-free path. Until that
+    // happens, behavior is bit-identical to the previous direct
+    // `hop.solve(...)` call.
+    let subspace = solution.penalty_subspace_trace.as_deref();
+    let dispatch_solve = |v: &Array1<f64>| -> Array1<f64> {
+        if let Some(s) = subspace {
+            s.apply(v)
+        } else {
+            hop.solve(v)
+        }
+    };
     for idx in 0..k {
         let coord = &solution.penalty_coords[idx];
         let penalty_a_k_beta_vec = penalty_a_k_beta(coord, &solution.beta, lambdas[idx]);
         let curvature_a_k_beta = penalty_a_k_beta(coord, &solution.beta, curvature_lambdas[idx]);
-        let v_k = hop.solve(&curvature_a_k_beta);
+        let v_k = dispatch_solve(&curvature_a_k_beta);
         let correction = effective_deriv.hessian_derivative_correction_result(&v_k)?;
         let mut total_dense = None;
         let mut total_operators = Vec::new();
@@ -6750,7 +6774,7 @@ fn build_outer_hessian_operator(
     }
 
     for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
-        let v_i = hop.solve(&coord.g);
+        let v_i = dispatch_solve(&coord.g);
         let correction = effective_deriv.hessian_derivative_correction_result(&v_i)?;
         let (total_dense, total_operators) =
             hyper_coord_total_drift_parts(&coord.drift, correction.as_ref());
