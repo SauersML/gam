@@ -1750,9 +1750,11 @@ _IFT_REJECTED_PATTERN = re.compile(r"\[IFT-REJECTED\]\s+reason=(\w+)")
 # avoided cost. Aggregating gives:
 #   ift_cache_hits / ift_cache_total → hit rate
 #   sum(ift_cache_miss_elapsed)      → cumulative Cholesky cost paid
-_IFT_CACHE_HIT_PATTERN = re.compile(r"\[IFT-CACHE\]\s+outcome=hit\s+drho_dim=(\d+)")
+_IFT_CACHE_HIT_PATTERN = re.compile(
+    r"\[IFT-CACHE\]\s+outcome=hit\s+drho_dim=(\d+)(?:\s+p=(\d+))?"
+)
 _IFT_CACHE_MISS_PATTERN = re.compile(
-    r"\[IFT-CACHE\]\s+outcome=miss\s+drho_dim=(\d+)\s+elapsed=([\d.]+)s"
+    r"\[IFT-CACHE\]\s+outcome=miss\s+drho_dim=(\d+)(?:\s+p=(\d+))?\s+elapsed=([\d.]+)s"
 )
 
 # Outer eval wall-clock per order kind. Aggregating tells us how the
@@ -2316,7 +2318,11 @@ def _emit_phase_summary(
     n_cache_total = len(ift_cache_hits) + len(ift_cache_misses)
     if n_cache_total > 0:
         hit_rate = len(ift_cache_hits) / n_cache_total
-        miss_secs_list = [float(m[1]) for m in ift_cache_misses]
+        # Tuple layout: (drho_dim, p_optional, elapsed). `p` is the
+        # optional group from the regex (older logs without `p=N` still
+        # match with p as empty string); we don't need it here, but we
+        # use it below for the per-fit p signature.
+        miss_secs_list = [float(m[2]) for m in ift_cache_misses]
         miss_secs_total = sum(miss_secs_list)
         # Per-miss Cholesky cost distribution. A single slow Cholesky
         # (one outer iter on a wide / ill-conditioned H) might dominate
@@ -2344,13 +2350,29 @@ def _emit_phase_summary(
         # early short-circuits don't cover; large values would justify
         # extending the short-circuit further.
         factor_paid_rejects = max(0, n_cache_total - len(ift_quality_matches))
+        # Matrix dim observed across cache misses. With `p=N` added to
+        # the marker, we can surface the matrix size driving the
+        # Cholesky cost; this lets a CI reviewer correlate
+        # `ift_cache_miss_secs` with the Cholesky's `O(p³)/3` regime.
+        # Older logs without the `p=N` field land in p_observed=[]; in
+        # that case we skip the size field for backwards compatibility.
+        miss_ps: list[int] = []
+        for m in ift_cache_misses:
+            if m[1]:
+                try:
+                    miss_ps.append(int(m[1]))
+                except ValueError:
+                    pass
+        size_piece = ""
+        if miss_ps:
+            size_piece = f" ift_cache_miss_max_p={max(miss_ps)}"
         parts.append(
             f"ift_cache_n={n_cache_total} "
             f"ift_cache_hit_rate={hit_rate:.2f} "
             f"ift_cache_miss_secs={miss_secs_total:.2f} "
             f"ift_cache_miss_p50={miss_secs_p50:.2f}s "
             f"ift_cache_miss_max={miss_secs_max:.2f}s "
-            f"ift_cache_paid_rejects={factor_paid_rejects}"
+            f"ift_cache_paid_rejects={factor_paid_rejects}{size_piece}"
         )
     # As of the runtime change accompanying this commit, [IFT-QUALITY]
     # is suppressed on noop calls (predictor returned β_cur unchanged
