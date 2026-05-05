@@ -694,7 +694,11 @@ fn rank_seeds_with_screening(
         "[OUTER] {context}: seed screening cascade complete elapsed={:.3}s stages_used={} final_cap={} ranked={}/{}",
         cascade_start.elapsed().as_secs_f64(),
         stages_consumed,
-        if final_cap_used == 0 { "uncapped".to_string() } else { final_cap_used.to_string() },
+        if final_cap_used == 0 {
+            "uncapped".to_string()
+        } else {
+            final_cap_used.to_string()
+        },
         ranked.len(),
         seeds.len(),
     );
@@ -3073,10 +3077,7 @@ fn steihaug_toint_step_operator(
 /// active-set escape because the corner-clamp pathology can wedge axes
 /// that aren't strictly "active" in the KKT sense (gradient may flip sign
 /// after the inner-PIRLS update changes the local Hessian).
-fn pinned_axes_mask(
-    x: &Array1<f64>,
-    bounds: Option<&(Array1<f64>, Array1<f64>)>,
-) -> Vec<bool> {
+fn pinned_axes_mask(x: &Array1<f64>, bounds: Option<&(Array1<f64>, Array1<f64>)>) -> Vec<bool> {
     match bounds {
         Some((lower, upper)) => (0..x.len())
             .map(|idx| {
@@ -3104,10 +3105,7 @@ fn clipped_axes_mask(x_raw: &Array1<f64>, x_projected: &Array1<f64>) -> Vec<bool
 /// Build the union of the existing KKT-style active mask and the
 /// geometric pinned-axes mask, used as the active set for the
 /// corner-clamp escape step.
-fn union_active_with_pinned(
-    base_active: &[bool],
-    pinned: &[bool],
-) -> Vec<bool> {
+fn union_active_with_pinned(base_active: &[bool], pinned: &[bool]) -> Vec<bool> {
     debug_assert_eq!(base_active.len(), pinned.len());
     base_active
         .iter()
@@ -3704,13 +3702,11 @@ fn run_operator_trust_region(
                                                 OuterEvalOrder::ValueGradientHessian,
                                             ) {
                                                 Ok(eval_red) => {
-                                                    if let Ok(eval_red) =
-                                                        finite_outer_eval_or_error(
-                                                            "outer operator active-set eval failed",
-                                                            layout,
-                                                            eval_red,
-                                                        )
-                                                    {
+                                                    if let Ok(eval_red) = finite_outer_eval_or_error(
+                                                        "outer operator active-set eval failed",
+                                                        layout,
+                                                        eval_red,
+                                                    ) {
                                                         log::warn!(
                                                             "[ARC-timing] iter={iter} \
                                                              active_set_escape_accepted: \
@@ -3741,9 +3737,10 @@ fn run_operator_trust_region(
                                                         // Keep trust radius at the snap target
                                                         // — we don't want to reset to seed
                                                         // scale and replay long halvings.
-                                                        trust_radius = snapped_radius
-                                                            .max(OPERATOR_TRUST_RADIUS_REJECT_FLOOR
-                                                                * 10.0);
+                                                        trust_radius = snapped_radius.max(
+                                                            OPERATOR_TRUST_RADIUS_REJECT_FLOOR
+                                                                * 10.0,
+                                                        );
                                                         dense_model = None;
                                                         materialize_dense_after_rejection = false;
                                                         continue;
@@ -4297,19 +4294,24 @@ fn run_outer_with_plan(
                 match &outcome {
                     Ok(sol) => log::info!(
                         "[OUTER summary] BFGS converged in {} iters elapsed={:.3}s final_value={:.6e}",
-                        sol.iterations, bfgs_elapsed, sol.final_value
+                        sol.iterations,
+                        bfgs_elapsed,
+                        sol.final_value
                     ),
                     Err(BfgsError::MaxIterationsReached { last_solution }) => log::info!(
                         "[OUTER summary] BFGS hit max_iter elapsed={:.3}s final_value={:.6e}",
-                        bfgs_elapsed, last_solution.final_value
+                        bfgs_elapsed,
+                        last_solution.final_value
                     ),
                     Err(BfgsError::LineSearchFailed { last_solution, .. }) => log::info!(
                         "[OUTER summary] BFGS line-search failed elapsed={:.3}s final_value={:.6e}",
-                        bfgs_elapsed, last_solution.final_value
+                        bfgs_elapsed,
+                        last_solution.final_value
                     ),
                     Err(e) => log::info!(
                         "[OUTER summary] BFGS failed elapsed={:.3}s err={:?}",
-                        bfgs_elapsed, e
+                        bfgs_elapsed,
+                        e
                     ),
                 }
                 match outcome {
@@ -4940,7 +4942,10 @@ mod tests {
         assert_eq!(step[0], 0.0, "active-set step must be zero on pinned axis");
         // Predicted decrease must be strictly positive (we have a
         // non-zero gradient on axes 1..3 and identity Hessian).
-        assert!(pred > 0.0, "expected positive predicted decrease, got {pred}");
+        assert!(
+            pred > 0.0,
+            "expected positive predicted decrease, got {pred}"
+        );
         // Step must respect the trust radius.
         let s_norm = step.dot(&step).sqrt();
         assert!(
@@ -4949,8 +4954,7 @@ mod tests {
         );
         // The reduced step must move at least one of axes 1..3
         // (since g_proj is non-zero on those axes).
-        let reduced_norm =
-            (1..n).map(|i| step[i] * step[i]).sum::<f64>().sqrt();
+        let reduced_norm = (1..n).map(|i| step[i] * step[i]).sum::<f64>().sqrt();
         assert!(
             reduced_norm > 0.0,
             "active-set step must produce non-zero motion in the unpinned subspace"
@@ -4976,8 +4980,7 @@ mod tests {
         let g = array![1.0, -1.0];
         let base = vec![true, true];
         let extra = vec![true, true];
-        let result = compute_active_set_step(&op, &g, &base, &extra, 0.5)
-            .expect("must not error");
+        let result = compute_active_set_step(&op, &g, &base, &extra, 0.5).expect("must not error");
         assert!(result.is_none());
     }
 
@@ -5001,8 +5004,7 @@ mod tests {
         let base = vec![true, false, false];
         let extra = vec![false, false, false];
         // Union(base, extra) == base, so escape is a no-op.
-        let result = compute_active_set_step(&op, &g, &base, &extra, 0.5)
-            .expect("must not error");
+        let result = compute_active_set_step(&op, &g, &base, &extra, 0.5).expect("must not error");
         assert!(result.is_none());
     }
 

@@ -651,10 +651,7 @@ pub fn build_outer_score_subsample(
     // Q = 100 z-deciles. Sort indices by z and split into Q ~equal chunks.
     const Q: usize = 100;
     let mut z_order: Vec<usize> = (0..n).collect();
-    z_order.sort_by(|&a, &b| {
-        z[a].partial_cmp(&z[b])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    z_order.sort_by(|&a, &b| z[a].partial_cmp(&z[b]).unwrap_or(std::cmp::Ordering::Equal));
     // decile[i] = bin index in 0..Q for row i
     let mut decile = vec![0u16; n];
     for (rank, &row) in z_order.iter().enumerate() {
@@ -785,10 +782,7 @@ pub fn outer_row_indices(
 /// Per-row rescaling factor for outer-only sums. Returns
 /// `subsample.weight_scale` when a subsample is active and `1.0` otherwise.
 #[inline]
-pub fn outer_score_scale(
-    opts: &crate::custom_family::BlockwiseFitOptions,
-    _n: usize,
-) -> f64 {
+pub fn outer_score_scale(opts: &crate::custom_family::BlockwiseFitOptions, _n: usize) -> f64 {
     match opts.outer_score_subsample.as_ref() {
         Some(s) => s.weight_scale,
         None => 1.0,
@@ -801,10 +795,7 @@ pub fn outer_score_scale(
 /// signature can be threaded into Phase-2 hot loops without touching call
 /// sites later.
 #[inline]
-pub fn assert_outer_only(
-    _opts: &crate::custom_family::BlockwiseFitOptions,
-    _context: &str,
-) {
+pub fn assert_outer_only(_opts: &crate::custom_family::BlockwiseFitOptions, _context: &str) {
     // intentionally empty in Phase 1
 }
 
@@ -893,8 +884,7 @@ pub fn inject_biobank_outer_subsample(
         return false;
     }
     let k = auto_outer_subsample_k(n);
-    let subsample =
-        build_outer_score_subsample(z, secondary, k, BIOBANK_OUTER_SUBSAMPLE_SEED);
+    let subsample = build_outer_score_subsample(z, secondary, k, BIOBANK_OUTER_SUBSAMPLE_SEED);
     log::info!(
         "[biobank-scale] constructed outer-score subsample: n={} k={} weight_scale={:.3} seed={:#x}",
         n,
@@ -946,8 +936,14 @@ mod tests {
     fn auto_outer_subsample_k_floor_binds_below_threshold_x16() {
         // Below n = K_MIN * 16 = 64_000, the n/16 term is below the floor.
         assert_eq!(auto_outer_subsample_k(0), BIOBANK_OUTER_SUBSAMPLE_K_MIN);
-        assert_eq!(auto_outer_subsample_k(60_000), BIOBANK_OUTER_SUBSAMPLE_K_MIN);
-        assert_eq!(auto_outer_subsample_k(64_000), BIOBANK_OUTER_SUBSAMPLE_K_MIN);
+        assert_eq!(
+            auto_outer_subsample_k(60_000),
+            BIOBANK_OUTER_SUBSAMPLE_K_MIN
+        );
+        assert_eq!(
+            auto_outer_subsample_k(64_000),
+            BIOBANK_OUTER_SUBSAMPLE_K_MIN
+        );
     }
 
     #[test]
@@ -1152,11 +1148,7 @@ mod tests {
         // Mix of 0.0 and 1.0 — exercises the standard binary case.
         let secondary_f64: Vec<f64> = (0..n).map(|i| (i % 2) as f64).collect();
         let mut opts = crate::custom_family::BlockwiseFitOptions::default();
-        let installed = inject_biobank_outer_subsample_from_arrays(
-            &mut opts,
-            &z,
-            &secondary_f64,
-        );
+        let installed = inject_biobank_outer_subsample_from_arrays(&mut opts, &z, &secondary_f64);
         assert!(installed);
         let s = opts
             .outer_score_subsample

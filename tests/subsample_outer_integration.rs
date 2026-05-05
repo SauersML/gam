@@ -16,9 +16,10 @@
 //! All tests run on synthetic small-n data so the suite stays fast (<1s).
 
 use gam::families::marginal_slope_shared::{
-    BIOBANK_OUTER_SUBSAMPLE_K_MAX, BIOBANK_OUTER_SUBSAMPLE_K_MIN, BIOBANK_OUTER_SUBSAMPLE_THRESHOLD,
-    auto_outer_subsample_k, build_outer_score_subsample, inject_biobank_outer_subsample,
-    inject_biobank_outer_subsample_from_arrays, outer_row_indices, outer_score_scale,
+    BIOBANK_OUTER_SUBSAMPLE_K_MAX, BIOBANK_OUTER_SUBSAMPLE_K_MIN,
+    BIOBANK_OUTER_SUBSAMPLE_THRESHOLD, auto_outer_subsample_k, build_outer_score_subsample,
+    inject_biobank_outer_subsample, inject_biobank_outer_subsample_from_arrays, outer_row_indices,
+    outer_score_scale,
 };
 
 #[test]
@@ -36,7 +37,10 @@ fn auto_k_anchors_match_documented_values() {
 fn auto_k_clamps_at_floor_and_ceiling() {
     // n below floor*16 → K = floor (statistical adequacy guard).
     assert_eq!(auto_outer_subsample_k(0), BIOBANK_OUTER_SUBSAMPLE_K_MIN);
-    assert_eq!(auto_outer_subsample_k(60_000), BIOBANK_OUTER_SUBSAMPLE_K_MIN);
+    assert_eq!(
+        auto_outer_subsample_k(60_000),
+        BIOBANK_OUTER_SUBSAMPLE_K_MIN
+    );
     // n above ceiling*16 → K = ceiling (memory + diminishing returns).
     assert_eq!(
         auto_outer_subsample_k(640_000),
@@ -99,7 +103,10 @@ fn inject_preserves_caller_supplied_subsample() {
     let preset = OuterScoreSubsample::new(vec![0, 1, 2, 3], n, 0xBEEF);
     opts.outer_score_subsample = Some(Arc::new(preset));
     let installed = inject_biobank_outer_subsample(&mut opts, &z, &secondary);
-    assert!(!installed, "inject must not overwrite caller-supplied subsample");
+    assert!(
+        !installed,
+        "inject must not overwrite caller-supplied subsample"
+    );
     let s = opts.outer_score_subsample.as_ref().unwrap();
     assert_eq!(s.seed, 0xBEEF);
     assert_eq!(s.mask.len(), 4);
@@ -121,11 +128,7 @@ fn inject_from_arrays_handles_event_indicator_correctly() {
     let s = opts.outer_score_subsample.as_ref().unwrap();
     // Stratification key = (z-decile × event), so events get represented.
     // With 5% event rate, expect ≥1 event row in the mask.
-    let event_rows: usize = s
-        .mask
-        .iter()
-        .filter(|&&i| secondary_f64[i] == 1.0)
-        .count();
+    let event_rows: usize = s.mask.iter().filter(|&&i| secondary_f64[i] == 1.0).count();
     assert!(
         event_rows > 0,
         "subsample mask has no event rows out of {} masked",
@@ -154,7 +157,10 @@ fn build_outer_score_subsample_is_deterministic_per_seed() {
     let s2 = build_outer_score_subsample(&z, &secondary, 1000, 0x123456789ABCDEF);
     assert_eq!(s1.mask, s2.mask, "same seed must produce identical mask");
     let s3 = build_outer_score_subsample(&z, &secondary, 1000, 0xDEADBEEF);
-    assert_ne!(s1.mask, s3.mask, "different seeds must produce different masks");
+    assert_ne!(
+        s1.mask, s3.mask,
+        "different seeds must produce different masks"
+    );
 }
 
 #[test]
@@ -163,7 +169,10 @@ fn outer_row_indices_and_scale_round_trip_to_full_n_when_no_subsample() {
     let opts = BlockwiseFitOptions::default();
     let n = 100;
     let scale = outer_score_scale(&opts, n);
-    assert!((scale - 1.0).abs() < 1e-12, "no-subsample scale must be 1.0");
+    assert!(
+        (scale - 1.0).abs() < 1e-12,
+        "no-subsample scale must be 1.0"
+    );
     let indices = outer_row_indices(&opts, n).to_vec();
     assert_eq!(indices.len(), n);
     let expected: Vec<usize> = (0..n).collect();

@@ -15,8 +15,8 @@ use crate::families::marginal_slope_shared::{
     add_optional_vector, add_two_surface_psi_outer,
     build_denested_partition_cells as shared_denested_partition_cells, eval_coeff4_at,
     is_sigma_aux_index as shared_is_sigma_aux_index,
-    observed_denested_cell_partials as shared_observed_denested_cell_partials,
-    outer_row_indices, outer_score_scale, probit_frailty_scale, probit_frailty_scale_multi_dir_jet,
+    observed_denested_cell_partials as shared_observed_denested_cell_partials, outer_row_indices,
+    outer_score_scale, probit_frailty_scale, probit_frailty_scale_multi_dir_jet,
     psi_derivative_location, scale_coeff4,
 };
 use crate::families::row_kernel::{
@@ -2209,8 +2209,7 @@ impl BernoulliMarginalSlopeFamily {
                     || 0.0,
                     |mut ll, i| -> Result<_, String> {
                         let q_internal = self.marginal_link_map(block_states[0].eta[i])?.q;
-                        let eta_i =
-                            rigid_observed_eta(q_internal, b[i], self.z[i], probit_scale);
+                        let eta_i = rigid_observed_eta(q_internal, b[i], self.z[i], probit_scale);
                         let signed = (2.0 * self.y[i] - 1.0) * eta_i;
                         let (log_cdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
                         ll += self.weights[i] * log_cdf;
@@ -2240,9 +2239,8 @@ impl BernoulliMarginalSlopeFamily {
                         )?
                         .0;
                     let slope = block_states[1].eta[row];
-                    let obs = self.observed_denested_cell_partials(
-                        row, intercept, slope, beta_h, beta_w,
-                    )?;
+                    let obs = self
+                        .observed_denested_cell_partials(row, intercept, slope, beta_h, beta_w)?;
                     let s_i = eval_coeff4_at(&obs.coeff, self.z[row]);
                     let signed = (2.0 * self.y[row] - 1.0) * s_i;
                     let (log_cdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
@@ -2636,12 +2634,8 @@ impl BernoulliMarginalSlopeFamily {
             .try_fold(
                 || BernoulliBlockHessianAccumulator::new(&slices),
                 |mut acc, row| -> Result<_, String> {
-                    let row_dir = self.row_primary_direction_from_flat(
-                        row,
-                        &slices,
-                        &primary,
-                        d_beta_flat,
-                    )?;
+                    let row_dir =
+                        self.row_primary_direction_from_flat(row, &slices, &primary, d_beta_flat)?;
                     let zero = Array1::<f64>::zeros(primary.total);
                     let mut grad = Array1::<f64>::zeros(primary.total);
                     for a in 0..primary.total {
@@ -5776,18 +5770,13 @@ impl BernoulliMarginalSlopeFamily {
                         row_ctx,
                         &dir,
                     )?;
-                    let psi_row =
-                        self.block_psi_row_from_map(row, block_idx, &psi_map, slices)?;
+                    let psi_row = self.block_psi_row_from_map(row, block_idx, &psi_map, slices)?;
                     acc.0 += f_pi.dot(&dir);
                     acc.1
                         .slice_mut(s![psi_row.range.clone()])
                         .scaled_add(f_pi[idx_primary], &psi_row.local_vec);
-                    acc.1 += &self.pullback_primary_vector(
-                        row,
-                        slices,
-                        primary,
-                        &f_pipi.dot(&dir),
-                    )?;
+                    acc.1 +=
+                        &self.pullback_primary_vector(row, slices, primary, &f_pipi.dot(&dir))?;
 
                     // psi_row outer pullback(f_pipi[idx_primary,:]) + transpose
                     let right_primary = f_pipi.row(idx_primary).to_owned();
@@ -6212,12 +6201,8 @@ impl BernoulliMarginalSlopeFamily {
             .try_fold(
                 || BernoulliBlockHessianAccumulator::new(slices),
                 |mut acc, row| -> Result<_, String> {
-                    let row_dir = self.row_primary_direction_from_flat(
-                        row,
-                        slices,
-                        primary,
-                        d_beta_flat,
-                    )?;
+                    let row_dir =
+                        self.row_primary_direction_from_flat(row, slices, primary, d_beta_flat)?;
                     let psi_dir = self.row_primary_psi_direction_from_map(
                         row,
                         block_idx,
@@ -6249,8 +6234,7 @@ impl BernoulliMarginalSlopeFamily {
                         &row_dir,
                         &psi_dir,
                     )?;
-                    let psi_row =
-                        self.block_psi_row_from_map(row, block_idx, &psi_map, slices)?;
+                    let psi_row = self.block_psi_row_from_map(row, block_idx, &psi_map, slices)?;
                     let right_primary = third_beta.row(idx_primary).to_owned();
                     acc.add_rank1_psi_cross(
                         self,
@@ -6347,12 +6331,8 @@ impl BernoulliMarginalSlopeFamily {
             .try_fold(
                 || BernoulliBlockHessianAccumulator::new(slices),
                 |mut acc, row| -> Result<_, String> {
-                    let row_dir = self.row_primary_direction_from_flat(
-                        row,
-                        slices,
-                        primary,
-                        d_beta_flat,
-                    )?;
+                    let row_dir =
+                        self.row_primary_direction_from_flat(row, slices, primary, d_beta_flat)?;
                     let psi_dir = self.row_primary_psi_direction_from_map(
                         row,
                         block_idx,
@@ -6384,8 +6364,7 @@ impl BernoulliMarginalSlopeFamily {
                         &row_dir,
                         &psi_dir,
                     )?;
-                    let psi_row =
-                        self.block_psi_row_from_map(row, block_idx, &psi_map, slices)?;
+                    let psi_row = self.block_psi_row_from_map(row, block_idx, &psi_map, slices)?;
                     let right_primary = third_beta.row(idx_primary).to_owned();
                     acc.add_rank1_psi_cross(
                         self,
@@ -6503,12 +6482,8 @@ impl BernoulliMarginalSlopeFamily {
             .try_fold(
                 || BernoulliBlockHessianAccumulator::new(slices),
                 |mut acc, row| -> Result<_, String> {
-                    let row_dir = self.row_primary_direction_from_flat(
-                        row,
-                        slices,
-                        primary,
-                        d_beta_flat,
-                    )?;
+                    let row_dir =
+                        self.row_primary_direction_from_flat(row, slices, primary, d_beta_flat)?;
                     let row_ctx = Self::row_ctx(cache, row);
                     let third = self.row_primary_third_contracted_recompute(
                         row,
@@ -6602,12 +6577,8 @@ impl BernoulliMarginalSlopeFamily {
             .try_fold(
                 || BernoulliBlockHessianAccumulator::new(slices),
                 |mut acc, row| -> Result<_, String> {
-                    let row_dir = self.row_primary_direction_from_flat(
-                        row,
-                        slices,
-                        primary,
-                        d_beta_flat,
-                    )?;
+                    let row_dir =
+                        self.row_primary_direction_from_flat(row, slices, primary, d_beta_flat)?;
                     let row_ctx = Self::row_ctx(cache, row);
                     let third = self.row_primary_third_contracted_recompute(
                         row,
@@ -8004,13 +7975,14 @@ impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiW
                 &self.options,
             );
         }
-        self.family.exact_newton_joint_psi_terms_from_cache_with_options(
-            &self.block_states,
-            &self.derivative_blocks,
-            psi_index,
-            &self.cache,
-            &self.options,
-        )
+        self.family
+            .exact_newton_joint_psi_terms_from_cache_with_options(
+                &self.block_states,
+                &self.derivative_blocks,
+                psi_index,
+                &self.cache,
+                &self.options,
+            )
     }
 
     fn second_order_terms(
@@ -8738,8 +8710,11 @@ mod tests {
         }
     }
 
-    fn rigid_block_states(family: &BernoulliMarginalSlopeFamily, q: f64, b: f64)
-    -> Vec<ParameterBlockState> {
+    fn rigid_block_states(
+        family: &BernoulliMarginalSlopeFamily,
+        q: f64,
+        b: f64,
+    ) -> Vec<ParameterBlockState> {
         let n = family.y.len();
         vec![
             ParameterBlockState {
@@ -8832,9 +8807,7 @@ mod tests {
         // Horvitz-Thompson: 2 * Σ_even should approximate the full-data sum.
         // For a smooth integrand on a moderately fine grid, ~5% relative
         // accuracy is plenty.
-        let baseline = family
-            .log_likelihood_only(&states)
-            .expect("baseline ll");
+        let baseline = family.log_likelihood_only(&states).expect("baseline ll");
         let ht_rel = ((scaled - baseline) / baseline.abs().max(1.0)).abs();
         assert!(
             ht_rel < 0.05,
@@ -8961,11 +8934,7 @@ mod tests {
         let exp_score = &raw.score_psi * factor;
         let score_rel = rel_diff_array1(&scaled.score_psi, &exp_score);
         assert!(score_rel < 1e-12, "score_psi rel {}", score_rel);
-        let h_scaled = scaled
-            .hessian_psi_operator
-            .as_ref()
-            .expect("op")
-            .to_dense();
+        let h_scaled = scaled.hessian_psi_operator.as_ref().expect("op").to_dense();
         let h_raw = raw.hessian_psi_operator.as_ref().expect("op").to_dense();
         let h_exp = &h_raw * factor;
         let h_rel = rel_diff_array2(&h_scaled, &h_exp);
@@ -9229,8 +9198,7 @@ mod tests {
         // within a factor of (n/m)*2 of the full-data result, as a coarse
         // sanity check that we haven't accidentally double-scaled.
         let ratio_bound = (n_f / m_f) * 2.0 + 1.0;
-        let ratio = (via_ws.objective_psi.abs() + 1.0)
-            / (via_ws_full.objective_psi.abs() + 1.0);
+        let ratio = (via_ws.objective_psi.abs() + 1.0) / (via_ws_full.objective_psi.abs() + 1.0);
         assert!(
             ratio < ratio_bound && (1.0 / ratio) < ratio_bound,
             "subsample/full ratio {} outside coarse bound {}",
