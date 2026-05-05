@@ -1755,6 +1755,22 @@ _IFT_CACHE_MISS_PATTERN = re.compile(
     r"\[IFT-CACHE\]\s+outcome=miss\s+drho_dim=(\d+)\s+elapsed=([\d.]+)s"
 )
 
+# Outer eval wall-clock per order kind. Aggregating tells us how the
+# outer optimizer's time distributes across:
+#   ValueAndGradient    — BFGS-style eval (most common at biobank scale
+#                         where the gates route to BFGS)
+#   ValueGradientHessian — ARC eval (used at smaller scale or when
+#                         analytic outer Hessian is available)
+#   ValueOnly           — line-search probes (typically cheaper)
+# The verdict line surfaces count + total per order so a CI reviewer
+# can see where the outer optimizer spent time vs the per-stage
+# breakdowns (`pirls_total`, `outer_h_total`). The gap between
+# `outer_eval_total` and (`pirls_total` + `outer_h_total`) is the
+# OTHER work — score computation, gradient assembly, IFT predict, etc.
+_OUTER_EVAL_END_PATTERN = re.compile(
+    r"\[STAGE\] outer eval end order=(\w+) elapsed=([\d.]+)s"
+)
+
 # IFT predictor identity / no-op counter. Emitted when all Δρ_k are
 # below the numerical-noise floor — the outer made an effectively-zero
 # ρ-step and the predictor returned the cached β unchanged. The
@@ -1963,6 +1979,32 @@ def _emit_phase_summary(
         parts.append(
             f"outer_h_INCOMPLETE outer_h_routes={len(outer_h_route)} "
             f"outer_h_dom_reason={dom_reason}"
+        )
+    # Outer-eval wall-clock distribution per order kind. Counts how
+    # often each evaluation order fired (BFGS = ValueAndGradient at
+    # biobank scale; ARC = ValueGradientHessian at smaller scale; line-
+    # search probes = ValueOnly) and totals the wall-clock per order.
+    # The gap between `outer_eval_total` and (`pirls_total` +
+    # `outer_h_total`) is the OTHER work (score computation, IFT
+    # predict, gradient assembly, etc.); when significant, that gap
+    # itself is a hint about where to optimize next.
+    outer_eval_ends = _OUTER_EVAL_END_PATTERN.findall(captured_stderr)
+    if outer_eval_ends:
+        per_order_counts: dict[str, int] = {}
+        per_order_secs: dict[str, float] = {}
+        for order, secs_str in outer_eval_ends:
+            per_order_counts[order] = per_order_counts.get(order, 0) + 1
+            per_order_secs[order] = per_order_secs.get(order, 0.0) + float(secs_str)
+        n_evals_total = len(outer_eval_ends)
+        secs_total = sum(per_order_secs.values())
+        # Sort by name for stable output ordering.
+        order_pieces = " ".join(
+            f"outer_eval_{order}={per_order_counts[order]}@{per_order_secs[order]:.1f}s"
+            for order in sorted(per_order_counts.keys())
+        )
+        parts.append(
+            f"outer_eval_n={n_evals_total} outer_eval_total={secs_total:.1f}s "
+            f"{order_pieces}"
         )
     pirls_breakdown_matches = _PIRLS_ITER_BREAKDOWN_PATTERN.findall(captured_stderr)
     if pirls_breakdown_matches:
