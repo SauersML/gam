@@ -1775,11 +1775,14 @@ def _emit_phase_summary(
     n_quality = len(ift_quality_matches)
     n_noops = len(ift_noop_matches)
     n_rejects = len(ift_rejected_matches)
-    # An [IFT-QUALITY] line is emitted on EVERY accepted predict call
-    # whose β was consumed by PIRLS. Some of those calls are no-ops
-    # (all Δρ below eps → predicted = β_cur) which now also emit a
-    # separate [IFT-NOOP] marker. Subtract to get the real accept count.
-    n_accepts = max(n_quality - n_noops, 0)
+    # As of the runtime change accompanying this commit, [IFT-QUALITY]
+    # is suppressed on noop calls (predictor returned β_cur unchanged
+    # because all Δρ were below the numerical floor). So every
+    # [IFT-QUALITY] line corresponds to a "real" predict call whose
+    # residual reflects the linearization's actual faithfulness. The
+    # n_quality count is the real accept count directly — no
+    # subtraction needed.
+    n_accepts = n_quality
     if ift_quality_matches:
         residuals = [float(m[0]) for m in ift_quality_matches if float(m[0]) == float(m[0])]
         if residuals:
