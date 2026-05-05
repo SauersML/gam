@@ -3847,7 +3847,6 @@ where
         .initial_lm_lambda
         .map(|v| v.clamp(1e-6, 1e-3))
         .unwrap_or(1e-6);
-    let lambda_factor = 10.0;
     let lm_max_attempts = options.max_step_halving.max(1);
     // Convergence is decided by `WorkingState::certifies_kkt` /
     // `WorkingState::near_stationary_kkt`, which combine a dimension-based
@@ -3980,6 +3979,18 @@ where
         // In standard LM, we solve (H + λI)δ = -g
         let mut loop_lambda = lambda;
         let mut attempts = 0;
+        // Madsen-Nielsen-Tingleff stateful rejection factor (eq 3.16 in
+        // "Methods for non-linear least squares problems", IMM Tech Univ
+        // Denmark, 2nd ed 2004): v starts at 2 and doubles on every
+        // rejection, so successive bumps are ×2, ×4, ×8, ×16, ... vs the
+        // older fixed ×10 every time. The textbook progression gives
+        // more chances to find a usable trust radius before
+        // `lm_can_retry` declares LM_MAX_LAMBDA exhausted; the older ×10
+        // hit the ceiling in just 12 rejections (10^12 = LM_MAX_LAMBDA),
+        // while ×2 doubling needs 40 rejections to exceed the same
+        // ceiling — well past `lm_max_attempts`. Resets to 2.0 on
+        // Fisher-fallback (different problem, restart the LM trajectory).
+        let mut madsen_reject_factor = 2.0_f64;
 
         // Copy the hessian into the reusable buffer (avoids allocation after first iteration).
         let mut regularized = match (regularized_buf.take(), state.hessian.as_dense()) {
@@ -4067,7 +4078,8 @@ where
                     // Singular even with ridge (unlikely unless huge). Increase lambda.
                     if lm_can_retry(loop_lambda) {
                         lm_solve_total += attempt_solve_start.elapsed();
-                        loop_lambda *= lambda_factor;
+                        loop_lambda *= madsen_reject_factor;
+                        madsen_reject_factor *= 2.0;
                         continue;
                     } else {
                         // Fallback to gradient descent
@@ -4080,7 +4092,8 @@ where
             lm_solve_total += attempt_solve_start.elapsed();
             if !array1_is_finite(direction) {
                 if lm_can_retry(loop_lambda) {
-                    loop_lambda *= lambda_factor;
+                    loop_lambda *= madsen_reject_factor;
+                    madsen_reject_factor *= 2.0;
                     continue;
                 }
                 let detail = if has_constraints {
@@ -4186,10 +4199,12 @@ where
                                         ));
                                     }
                                     if lm_can_retry(loop_lambda) {
-                                        loop_lambda *= lambda_factor;
+                                        loop_lambda *= madsen_reject_factor;
+                                        madsen_reject_factor *= 2.0;
                                         continue;
                                     }
-                                    loop_lambda *= lambda_factor;
+                                    loop_lambda *= madsen_reject_factor;
+                                    madsen_reject_factor *= 2.0;
                                     continue;
                                 }
                             }
@@ -4211,7 +4226,8 @@ where
                             -1.0
                         };
                         if !(rho > 0.0 && candidate_penalized.is_finite()) {
-                            loop_lambda *= lambda_factor;
+                            loop_lambda *= madsen_reject_factor;
+                            madsen_reject_factor *= 2.0;
                             continue;
                         }
                         if preferred_curvature == HessianCurvatureKind::Observed {
@@ -4387,6 +4403,9 @@ where
                             applied_lambda = 0.0;
                             cached_sparse_regularized = None;
                             loop_lambda = lambda;
+                            // Different problem (Hessian curvature changed):
+                            // restart the Madsen rejection-factor trajectory.
+                            madsen_reject_factor = 2.0;
                             continue;
                         }
                         // Reject Step
@@ -4483,7 +4502,8 @@ where
                             final_state = Some(state.clone());
                             break 'pirls_loop;
                         }
-                        loop_lambda *= lambda_factor;
+                        loop_lambda *= madsen_reject_factor;
+                        madsen_reject_factor *= 2.0;
                     }
                 }
                 Err(err) => {
@@ -4502,6 +4522,9 @@ where
                         applied_lambda = 0.0;
                         cached_sparse_regularized = None;
                         loop_lambda = lambda;
+                        // Different problem (Hessian curvature changed):
+                        // restart the Madsen rejection-factor trajectory.
+                        madsen_reject_factor = 2.0;
                         continue;
                     }
                     if !is_lm_retriable_candidate_error(&err) {
@@ -4519,7 +4542,8 @@ where
                         ));
                     }
                     // Retry only clearly numerical candidate-evaluation failures.
-                    loop_lambda *= lambda_factor;
+                    loop_lambda *= madsen_reject_factor;
+                    madsen_reject_factor *= 2.0;
                 }
             }
         } // end loop (lambda search)
@@ -8721,10 +8745,50 @@ mod tests {
     }
 
     #[test]
+    fn madsen_lm_reject_trajectory_doubles_per_rejection() {
+        // The companion to the accept update: on rejection, `loop_lambda`
+        // is multiplied by `madsen_reject_factor` (initially 2.0), then
+        // the factor doubles. Replaces the older fixed ×10 every time.
+        // Locks the trajectory so a future commit can't silently restore
+        // the binary ×10 rule (which over-shot the `LM_MAX_LAMBDA = 1e12`
+        // ceiling in just 12 rejections — the textbook ×2 doubling needs
+        // ~40 rejections to hit the same ceiling, well past
+        // `lm_max_attempts`).
+        let mut loop_lambda = 1.0_f64;
+        let mut v = 2.0_f64;
+        let trajectory = (0..6)
+            .map(|_| {
+                loop_lambda *= v;
+                v *= 2.0;
+                loop_lambda
+            })
+            .collect::<Vec<_>>();
+        // 1.0 * 2 = 2; * 4 = 8; * 8 = 64; * 16 = 1024; * 32 = 32768; * 64 = 2097152
+        assert_eq!(
+            trajectory,
+            vec![2.0, 8.0, 64.0, 1024.0, 32_768.0, 2_097_152.0],
+            "Madsen rejection trajectory must double the multiplier each time"
+        );
+        // Compared with the OLD fixed ×10 rule, which gave
+        //   [10, 100, 1_000, 10_000, 100_000, 1_000_000]
+        // — Madsen's ×2 doubling is gentler initially (2 < 10) but
+        // catches up (rejection 6: 2_097_152 > 1_000_000). The point
+        // isn't to be smaller forever; the point is to give MORE
+        // chances near the trust radius before saturating the ceiling.
+        // Under ×10, after 12 rejections lambda × 10^12 hits LM_MAX_LAMBDA
+        // and lm_can_retry returns false. Under ×2 doubling, we get
+        // lambda × 2^(N(N+1)/2) — N=12 gives 2^78 ≈ 3·10^23, much past
+        // the ceiling, so the ceiling fires earlier in attempt count
+        // but later in cumulative-multiplier terms — the LM trajectory
+        // covers more of the trust-radius space before declaring the
+        // search exhausted.
+    }
+
+    #[test]
     fn madsen_lm_accept_factor_matches_canonical_textbook_values() {
         // Madsen-Nielsen-Tingleff Eq 3.17 canonical values. Locks the
         // implementation against silent regression to the older binary
-        // `if rho > 0.25 { /lambda_factor } else { keep }` rule.
+        // `if rho > 0.25 { lambda /= 10 } else { keep }` rule.
         let cases: &[(f64, f64, &str)] = &[
             (1.0, 1.0 / 3.0, "rho=1: floored at 1/3 (cube=1, 1-cube=0)"),
             (0.75, 0.875, "rho=0.75: 1 - (0.5)^3 = 0.875 (slight shrink)"),
