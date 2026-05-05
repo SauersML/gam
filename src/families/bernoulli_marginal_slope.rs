@@ -2159,6 +2159,11 @@ struct BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
     specs: Vec<ParameterBlockSpec>,
     derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
     cache: BernoulliMarginalSlopeExactEvalCache,
+    /// Outer-only ψ-calculus options. The `outer_score_subsample` field is
+    /// the row mask threaded through `sigma_exact_joint_psi_terms_with_options`
+    /// and the second-order / Hessian-drift counterparts to make the cached
+    /// ψ calculus subsample-aware.
+    options: BlockwiseFitOptions,
 }
 
 impl BernoulliMarginalSlopeFamily {
@@ -7590,6 +7595,25 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 block_states.to_vec(),
                 specs.to_vec(),
                 derivative_blocks.to_vec(),
+                BlockwiseFitOptions::default(),
+            )?,
+        )))
+    }
+
+    fn exact_newton_joint_psi_workspace_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        Ok(Some(Arc::new(
+            BernoulliMarginalSlopeExactNewtonJointPsiWorkspace::new(
+                self.clone(),
+                block_states.to_vec(),
+                specs.to_vec(),
+                derivative_blocks.to_vec(),
+                options.clone(),
             )?,
         )))
     }
@@ -7760,6 +7784,7 @@ impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
         block_states: Vec<ParameterBlockState>,
         specs: Vec<ParameterBlockSpec>,
         derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
+        options: BlockwiseFitOptions,
     ) -> Result<Self, String> {
         let cache = family.build_exact_eval_cache(&block_states)?;
         Ok(Self {
@@ -7768,6 +7793,7 @@ impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
             specs,
             derivative_blocks,
             cache,
+            options,
         })
     }
 }
@@ -7781,9 +7807,11 @@ impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiW
             .family
             .is_sigma_aux_index(&self.derivative_blocks, psi_index)
         {
-            return self
-                .family
-                .sigma_exact_joint_psi_terms(&self.block_states, &self.specs);
+            return self.family.sigma_exact_joint_psi_terms_with_options(
+                &self.block_states,
+                &self.specs,
+                &self.options,
+            );
         }
         self.family.exact_newton_joint_psi_terms_from_cache(
             &self.block_states,
@@ -7814,7 +7842,10 @@ impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiW
             {
                 return self
                     .family
-                    .sigma_exact_joint_psisecond_order_terms(&self.block_states);
+                    .sigma_exact_joint_psisecond_order_terms_with_options(
+                        &self.block_states,
+                        &self.options,
+                    );
             }
             return Err(
                 "bernoulli marginal-slope mixed log-sigma/spatial psi second derivatives require cross auxiliary terms; only pure log-sigma second derivatives are supported"
@@ -7842,9 +7873,10 @@ impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiW
         {
             return self
                 .family
-                .sigma_exact_joint_psihessian_directional_derivative(
+                .sigma_exact_joint_psihessian_directional_derivative_with_options(
                     &self.block_states,
                     d_beta_flat,
+                    &self.options,
                 )
                 .map(|result| {
                     result.map(crate::solver::estimate::reml::unified::DriftDerivResult::Dense)
@@ -8891,6 +8923,126 @@ mod tests {
         let exp = &raw * factor;
         let rel = rel_diff_array2(&scaled, &exp);
         assert!(rel < 1e-12, "drift rel {}", rel);
+    }
+
+    #[test]
+    fn bernoulli_psi_workspace_with_options_threads_subsample_to_first_order() {
+        use crate::custom_family::CustomFamilyBlockPsiDerivative;
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+
+        // Build a sigma-aware family at n=200 with the sigma-aux derivative
+        // entry on the logslope block (last block).
+        let n = 200usize;
+        let family = make_sigma_aware_test_family(n);
+        let states = rigid_block_states(&family, 0.3, 0.4);
+        let specs = vec![dummy_blockspec(1, n), dummy_blockspec(1, n)];
+        let derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>> = vec![
+            Vec::new(),
+            vec![CustomFamilyBlockPsiDerivative::new(
+                None,
+                Array2::zeros((0, 0)),
+                Array2::zeros((0, 0)),
+                None,
+                None,
+                None,
+                None,
+            )],
+        ];
+
+        // Build a half-mask of even rows (factor = 2.0).
+        let even_mask: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
+        let m = even_mask.len();
+        let mut opts_half = BlockwiseFitOptions::default();
+        opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            even_mask.clone(),
+            n,
+            0xBEEF_CAFE,
+        )));
+
+        // Reference: call the family-level subsample-aware sigma path directly.
+        let direct = family
+            .sigma_exact_joint_psi_terms_with_options(&states, &specs, &opts_half)
+            .expect("direct sigma terms with options")
+            .expect("direct some");
+
+        // Workspace path: build via the new outer-aware trait method and call
+        // first_order_terms at the sigma-aux psi index. The subsample must
+        // arrive intact through the workspace boundary.
+        let ws = family
+            .exact_newton_joint_psi_workspace_with_options(
+                &states,
+                &specs,
+                &derivative_blocks,
+                &opts_half,
+            )
+            .expect("workspace with options")
+            .expect("workspace some");
+        let psi_total: usize = derivative_blocks.iter().map(Vec::len).sum();
+        let sigma_psi = psi_total - 1;
+        let via_ws = ws
+            .first_order_terms(sigma_psi)
+            .expect("ws first_order_terms")
+            .expect("some");
+
+        // Bit-for-bit equality is the right contract here: both paths take the
+        // same masked rows, the same Horvitz-Thompson rescaling, and the same
+        // fixed RNG seed-derived weight scale.
+        assert_eq!(via_ws.objective_psi, direct.objective_psi);
+        let score_rel = rel_diff_array1(&via_ws.score_psi, &direct.score_psi);
+        assert!(score_rel == 0.0, "score_psi diverged: rel {}", score_rel);
+        let h_ws = via_ws
+            .hessian_psi_operator
+            .as_ref()
+            .expect("ws hessian op")
+            .to_dense();
+        let h_direct = direct
+            .hessian_psi_operator
+            .as_ref()
+            .expect("direct hessian op")
+            .to_dense();
+        let h_rel = rel_diff_array2(&h_ws, &h_direct);
+        assert!(h_rel == 0.0, "hessian diverged: rel {}", h_rel);
+
+        // Sanity: confirm the half-mask path is actually scaled relative to
+        // the unsampled (full-data) workspace, so we know the subsample took
+        // effect rather than silently being ignored.
+        let ws_full = family
+            .exact_newton_joint_psi_workspace_with_options(
+                &states,
+                &specs,
+                &derivative_blocks,
+                &BlockwiseFitOptions::default(),
+            )
+            .expect("workspace full")
+            .expect("some");
+        let via_ws_full = ws_full
+            .first_order_terms(sigma_psi)
+            .expect("ws_full first_order_terms")
+            .expect("some");
+        // The half-mask subsample should give a different (rescaled) value
+        // than the full-data path; if it matched bit-for-bit, the subsample
+        // never made it through.
+        assert!(
+            (via_ws.objective_psi - via_ws_full.objective_psi).abs() > 1e-9,
+            "subsample objective {} too close to full-data {} (subsample not threaded?)",
+            via_ws.objective_psi,
+            via_ws_full.objective_psi
+        );
+        let m_f = m as f64;
+        let n_f = n as f64;
+        // The rescaling magnitude should be of order n/m relative to half-mask
+        // raw row sum; we simply require the subsample-aware result to be
+        // within a factor of (n/m)*2 of the full-data result, as a coarse
+        // sanity check that we haven't accidentally double-scaled.
+        let ratio_bound = (n_f / m_f) * 2.0 + 1.0;
+        let ratio = (via_ws.objective_psi.abs() + 1.0)
+            / (via_ws_full.objective_psi.abs() + 1.0);
+        assert!(
+            ratio < ratio_bound && (1.0 / ratio) < ratio_bound,
+            "subsample/full ratio {} outside coarse bound {}",
+            ratio,
+            ratio_bound
+        );
     }
 
     fn build_test_link_deviation_block_from_seed(

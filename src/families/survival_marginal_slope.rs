@@ -9619,6 +9619,11 @@ struct SurvivalMarginalSlopePsiWorkspace {
     specs: Vec<ParameterBlockSpec>,
     derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
     cache: Option<EvalCache>,
+    /// Outer-only ψ-calculus options. The `outer_score_subsample` field is
+    /// the row mask threaded through `sigma_exact_joint_psi_terms_with_options`
+    /// and the second-order / Hessian-drift counterparts to make the cached
+    /// ψ calculus subsample-aware.
+    options: BlockwiseFitOptions,
 }
 
 struct SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
@@ -9773,6 +9778,7 @@ impl SurvivalMarginalSlopePsiWorkspace {
         block_states: Vec<ParameterBlockState>,
         specs: Vec<ParameterBlockSpec>,
         derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
+        options: BlockwiseFitOptions,
     ) -> Result<Self, String> {
         let cache = if family.flex_active() {
             None
@@ -9785,6 +9791,7 @@ impl SurvivalMarginalSlopePsiWorkspace {
             specs,
             derivative_blocks,
             cache,
+            options,
         })
     }
 }
@@ -9798,9 +9805,11 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
             .family
             .is_sigma_aux_index(&self.derivative_blocks, psi_index)
         {
-            return self
-                .family
-                .sigma_exact_joint_psi_terms(&self.block_states, &self.specs);
+            return self.family.sigma_exact_joint_psi_terms_with_options(
+                &self.block_states,
+                &self.specs,
+                &self.options,
+            );
         }
         self.family.psi_terms_inner(
             &self.block_states,
@@ -9825,7 +9834,10 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
             if psi_i == psi_j {
                 return self
                     .family
-                    .sigma_exact_joint_psisecond_order_terms(&self.block_states);
+                    .sigma_exact_joint_psisecond_order_terms_with_options(
+                        &self.block_states,
+                        &self.options,
+                    );
             }
             return Ok(None);
         }
@@ -9849,9 +9861,10 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
         {
             return self
                 .family
-                .sigma_exact_joint_psihessian_directional_derivative(
+                .sigma_exact_joint_psihessian_directional_derivative_with_options(
                     &self.block_states,
                     d_beta_flat,
+                    &self.options,
                 )
                 .map(|result| {
                     result.map(|matrix| {
@@ -12493,6 +12506,23 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             block_states.to_vec(),
             specs.to_vec(),
             derivative_blocks.to_vec(),
+            BlockwiseFitOptions::default(),
+        )?)))
+    }
+
+    fn exact_newton_joint_psi_workspace_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        Ok(Some(Arc::new(SurvivalMarginalSlopePsiWorkspace::new(
+            self.clone(),
+            block_states.to_vec(),
+            specs.to_vec(),
+            derivative_blocks.to_vec(),
+            options.clone(),
         )?)))
     }
 
