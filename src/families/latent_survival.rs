@@ -328,6 +328,20 @@ pub fn fit_latent_survival_terms(
     if latent_sd.is_none() {
         blocks.push(build_log_sigma_blockspec(0.5));
     }
+    // Same biobank-scale outer-Hessian gate as the marginal-slope families
+    // (see survival_marginal_slope.rs:13286). At biobank n the analytic
+    // outer Hessian dominates wall-clock; route to BFGS on the analytic
+    // gradient instead.
+    let n_obs = data.nrows();
+    let biobank_scale = n_obs > 50_000;
+    let mut options_override = options.clone();
+    if biobank_scale && options_override.use_outer_hessian {
+        options_override.use_outer_hessian = false;
+        log::info!(
+            "[latent-survival] declining analytic outer Hessian for n={n_obs}; routing to BFGS"
+        );
+    }
+    let options: &BlockwiseFitOptions = &options_override;
     let fit = fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())?;
     let latent_sd = family.latent_sd(&fit.block_states)?;
     Ok(LatentSurvivalTermFitResult {
@@ -370,6 +384,17 @@ pub fn fit_latent_binary_terms(
         build_time_blockspec(&time_prepared, &spec.time_block),
         build_mean_blockspec(&mean_design, spec.mean_offset.clone()),
     ];
+    // Same biobank-scale outer-Hessian gate as latent-survival above.
+    let n_obs = data.nrows();
+    let biobank_scale = n_obs > 50_000;
+    let mut options_override = options.clone();
+    if biobank_scale && options_override.use_outer_hessian {
+        options_override.use_outer_hessian = false;
+        log::info!(
+            "[latent-binary] declining analytic outer Hessian for n={n_obs}; routing to BFGS"
+        );
+    }
+    let options: &BlockwiseFitOptions = &options_override;
     let fit = fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())?;
     Ok(LatentBinaryTermFitResult {
         fit,

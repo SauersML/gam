@@ -1631,6 +1631,7 @@ impl<'a> RemlState<'a> {
             warm_start_beta: RwLock::new(None),
             warm_start_enabled: AtomicBool::new(true),
             screening_max_inner_iterations: Arc::new(AtomicUsize::new(0)),
+            outer_inner_cap: Arc::new(AtomicUsize::new(0)),
             kronecker_penalty_system: None,
             kronecker_factored: None,
         })
@@ -2484,6 +2485,13 @@ impl<'a> RemlState<'a> {
         // between the two derivations.
         let screening_cap = self.screening_max_inner_iterations.load(Ordering::Relaxed);
         let in_screening = screening_cap > 0;
+        // Outer-aware cap: a sibling atomic that only caps the inner Newton
+        // iteration count. Unlike `screening_cap`, it does NOT suppress
+        // cache writes / warm-start updates / KKT enforcement — it is purely
+        // a budget. Driven by the outer optimizer to coarsen early-iter
+        // inner solves when ρ is far from converged. Both caps are honored
+        // jointly via `min` when both are nonzero.
+        let outer_cap = self.outer_inner_cap.load(Ordering::Relaxed);
 
         // Run P-IRLS with original matrices to perform fresh reparameterization
         // The returned result will include the transformation matrix qs
@@ -2497,6 +2505,9 @@ impl<'a> RemlState<'a> {
             let mut pirls_config = self.config.as_pirls_config();
             if in_screening {
                 pirls_config.max_iterations = pirls_config.max_iterations.min(screening_cap);
+            }
+            if outer_cap > 0 {
+                pirls_config.max_iterations = pirls_config.max_iterations.min(outer_cap);
             }
             pirls_config.link_kind = if let Some(state) = self.runtime_mixture_link_state.clone() {
                 InverseLink::Mixture(state)

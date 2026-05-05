@@ -2961,6 +2961,21 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     )?;
     validate_binomial_response(y, "fit_binomial_mean_wiggle_terms_with_selected_basis")?;
 
+    // Same biobank-scale outer-Hessian gate as the marginal-slope families
+    // (see survival_marginal_slope.rs:13286). At biobank n the analytic
+    // outer Hessian dominates wall-clock; route to BFGS on the analytic
+    // gradient instead.
+    let n_obs = data.nrows();
+    let biobank_scale = n_obs > 50_000;
+    let mut options_override = options.clone();
+    if biobank_scale && options_override.use_outer_hessian {
+        options_override.use_outer_hessian = false;
+        log::info!(
+            "[gamlss-binomial-mean-wiggle] declining analytic outer Hessian for n={n_obs}; routing to BFGS"
+        );
+    }
+    let options: &BlockwiseFitOptions = &options_override;
+
     let SelectedWiggleBasis {
         knots: wiggle_knots,
         degree: wiggle_degree,
