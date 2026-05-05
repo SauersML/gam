@@ -1875,6 +1875,29 @@ def _emit_phase_summary(
                 f"tangent_quality_predicts={n} tangent_p50={t_p50:.2e} "
                 f"tangent_p95={t_p95:.2e} tangent_max={t_max:.2e}"
             )
+        # PIRLS-iters distribution after tangent-line predictions —
+        # parallel to the IFT path's `ift_iters_*` aggregation
+        # (commit 69011666). When a tangent-line prediction is poor,
+        # the inner Newton has to recover from a worse starting
+        # point, so iters tends to be higher; surfacing this lets a
+        # reviewer see whether tangent-line is contributing useful
+        # warm-start work or just a slightly-better-than-flat seed
+        # that PIRLS still has to grind through.
+        t_iters = [
+            int(m[5])
+            for m in tangent_quality_matches
+            if m[5]
+        ]
+        if t_iters:
+            n_i = len(t_iters)
+            sorted_i = sorted(t_iters)
+            i_p50 = sorted_i[n_i // 2]
+            i_p95 = sorted_i[min(n_i - 1, int(0.95 * n_i))]
+            i_max = sorted_i[-1]
+            parts.append(
+                f"tangent_iters_p50={i_p50} tangent_iters_p95={i_p95} "
+                f"tangent_iters_max={i_max}"
+            )
     if ift_quality_matches:
         residuals = [float(m[0]) for m in ift_quality_matches if float(m[0]) == float(m[0])]
         if residuals:
