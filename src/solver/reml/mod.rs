@@ -3693,7 +3693,7 @@ pub(crate) struct RemlState<'a> {
     /// NaN's self-inequality makes the sentinel unambiguous: any
     /// stored finite non-negative value is genuine signal.
     ///
-    /// Read by `predict_warm_start_beta_ift` to drive the adaptive
+    /// Read by `predict_warm_start_beta_ift_with_outcome` to drive the adaptive
     /// |Δρ| cap (`adaptive_ift_max_drho`): a small residual loosens
     /// the cap, a large one tightens it. Replaces the previous
     /// hardcoded `IFT_WARM_START_MAX_DRHO = 2.0` constant with a
