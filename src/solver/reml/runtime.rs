@@ -1203,6 +1203,28 @@ impl<'a> RemlState<'a> {
         // factorization is no longer the right Jacobian seed.
         self.ift_warm_start_cache.write().unwrap().take();
         self.ift_cached_factor.write().unwrap().take();
+        // The IFT residual signal was measured against the OLD link's
+        // prediction; under the new link the geometry changes and the
+        // signal would mislead the adaptive |Δρ| cap and the cap-
+        // schedule margin policy. Reset to "no signal" so the next
+        // predict reverts to the conservative defaults.
+        self.last_ift_prediction_residual
+            .store(0, Ordering::Relaxed);
+        // Same reasoning for the LM damping warm-start hint: the
+        // damping the previous link's solve discovered is not
+        // calibrated to the new link's curvature.
+        self.last_pirls_lm_lambda.store(0, Ordering::Relaxed);
+        // The inner-PIRLS adaptive cap signals also reflect the old
+        // link's convergence behavior; under the new link the inner
+        // Newton may need a different iter count and the schedule
+        // should fall back to its iter-count tier on the first solve.
+        self.last_inner_iters.store(0, Ordering::Relaxed);
+        self.last_inner_converged.store(false, Ordering::Relaxed);
+        // History pair for the tangent-line predictor: same staleness
+        // argument — the previous (β, ρ) pairs are at the OLD link.
+        self.warm_start_rho.write().unwrap().take();
+        self.prev_warm_start_beta.write().unwrap().take();
+        self.prev_warm_start_rho.write().unwrap().take();
     }
 
     pub(crate) fn set_link_states(
@@ -2460,6 +2482,21 @@ impl<'a> RemlState<'a> {
     pub(crate) fn reset_outer_seed_state(&self) {
         self.cache_manager.invalidate_eval_bundle();
         self.warm_start_beta.write().unwrap().take();
+        // The outer is restarting from a fresh seed — the previous
+        // trajectory's warm-start signals are calibrated to a
+        // different ρ-path and would mislead both predictors and the
+        // adaptive cap policies. Wipe them all so the first solve at
+        // the new seed starts cold.
+        self.warm_start_rho.write().unwrap().take();
+        self.prev_warm_start_beta.write().unwrap().take();
+        self.prev_warm_start_rho.write().unwrap().take();
+        self.ift_warm_start_cache.write().unwrap().take();
+        self.ift_cached_factor.write().unwrap().take();
+        self.last_pirls_lm_lambda.store(0, Ordering::Relaxed);
+        self.last_inner_iters.store(0, Ordering::Relaxed);
+        self.last_inner_converged.store(false, Ordering::Relaxed);
+        self.last_ift_prediction_residual
+            .store(0, Ordering::Relaxed);
     }
 
     // Accessor methods for private fields
