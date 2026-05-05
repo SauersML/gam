@@ -611,13 +611,18 @@ class MarkerPatternTests(unittest.TestCase):
     def test_ift_rejected_and_noop_patterns_capture_reason(self) -> None:
         # Each rejection reason from runtime.rs should round-trip via
         # the runner's reason-name capture. Spot-check the canonical
-        # ones; the exhaustive enumeration is in the commit message
-        # for fec27c97.
+        # ones; the exhaustive enumeration is in the commit messages
+        # for fec27c97 (initial set) and the dim-mismatch additions
+        # in the current commit.
         reasons = [
             ("[IFT-REJECTED] reason=large_drho max_drho=3.456e+00 cap=2.000e+00 drho_dim=4", "large_drho"),
             ("[IFT-REJECTED] reason=hessian_factorize_failed drho_dim=4", "hessian_factorize_failed"),
             ("[IFT-REJECTED] reason=non_finite_solution max_drho=1.234e+00 drho_dim=4", "non_finite_solution"),
             ("[IFT-REJECTED] reason=qs_dim_mismatch qs_dim=10x10 expected_p=8", "qs_dim_mismatch"),
+            # New dim-mismatch reasons.
+            ("[IFT-REJECTED] reason=rho_dim_mismatch new_rho_dim=2 cache_rho_dim=1", "rho_dim_mismatch"),
+            ("[IFT-REJECTED] reason=penalty_dim_mismatch penalties_dim=0 cache_rho_dim=1", "penalty_dim_mismatch"),
+            ("[IFT-REJECTED] reason=beta_dim_mismatch cache_beta_dim=3 expected_p=4", "beta_dim_mismatch"),
         ]
         for line, expected in reasons:
             matches = _RUNNER._IFT_REJECTED_PATTERN.findall(line)
