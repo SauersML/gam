@@ -1581,6 +1581,32 @@ _GUARD_PATTERN = re.compile(
 _SCHEDULE_TRANSITION_PATTERN = re.compile(
     r"\[OUTER schedule\]\s+inner-PIRLS cap transition.*?prev=(\d+)\s+new=(\d+)"
 )
+
+# Richer schedule-transition pattern that captures the quality signals
+# alongside the prev/new cap. Each transition fires the cap-margin
+# policy in `first_order_inner_cap_schedule` (commits 06888a1e,
+# 04b30163, 58cccdcc); aggregating the quality signals across all
+# transitions tells us how often each policy branch fired:
+#
+#   * accept_rho<0.5 fraction → how often did the "poor LM model
+#     fidelity" branch bump the margin?
+#   * ift_residual≥0.10 fraction → how often did the "poor IFT
+#     prediction" branch enlarge margin to +4?
+#   * not-converged fraction → how often did the geometric-backoff
+#     branch fire (last solve hit the cap)?
+#
+# These are independent of WHETHER the transition happened (always
+# logged) — a fit with stable cap won't generate transitions but the
+# quality-signal distribution within the transitions that DID fire is
+# the actionable signal. Numeric fields use the full `\S+` regex
+# (instead of strict numeric) so the `n/a` case for missing signals
+# is captured as a literal string, distinguishable from `0.0`.
+_SCHEDULE_QUALITY_PATTERN = re.compile(
+    r"\[OUTER schedule\]\s+inner-PIRLS cap transition.*?"
+    r"last_iters=(\d+)\s+converged=(true|false)\s+"
+    r"ift_residual=(\S+)\s+accept_rho=(\S+)\s+"
+    r"prev=(\d+)\s+new=(\d+)"
+)
 _BIOBANK_GATE_PATTERN = re.compile(
     r"\[(?:transformation-normal|gamlss-location-scale|latent-survival|latent-binary|gamlss-binomial-mean-wiggle|survival-marginal-slope|survival-location-scale|bernoulli-marginal-slope)\]\s+declining analytic outer Hessian for n=(\d+)"
 )
@@ -1789,6 +1815,39 @@ def _emit_phase_summary(
     schedule_transitions = _SCHEDULE_TRANSITION_PATTERN.findall(captured_stderr)
     if schedule_transitions:
         parts.append(f"sched_transitions={len(schedule_transitions)}")
+    # Schedule-transition quality-signal distribution. For each
+    # transition, the snapshot captured at decision time is logged with
+    # the quality signals that drove the margin computation. Aggregating
+    # tells us how often each policy branch fired: poor LM model
+    # fidelity (`accept_rho < 0.5`), poor IFT prediction (`ift_residual
+    # >= 0.10`), or geometric backoff (`converged=false`). The fractions
+    # let a CI reviewer see at a glance whether the schedule's adaptive
+    # branches are doing useful work or sitting at the default.
+    sched_quality = _SCHEDULE_QUALITY_PATTERN.findall(captured_stderr)
+    if sched_quality:
+        n_q = len(sched_quality)
+        n_unconv = sum(1 for q in sched_quality if q[1] == "false")
+        n_poor_ift = 0
+        n_poor_rho = 0
+        for _last_iters, _conv, ift_str, rho_str, _prev, _new in sched_quality:
+            if ift_str != "n/a":
+                try:
+                    if float(ift_str) >= 0.10:
+                        n_poor_ift += 1
+                except ValueError:
+                    pass
+            if rho_str != "n/a":
+                try:
+                    if float(rho_str) < 0.5:
+                        n_poor_rho += 1
+                except ValueError:
+                    pass
+        parts.append(
+            f"sched_quality_n={n_q} "
+            f"sched_unconv={n_unconv} "
+            f"sched_poor_ift={n_poor_ift} "
+            f"sched_poor_accept_rho={n_poor_rho}"
+        )
     # Biobank-scale gate firings (path #2)
     gate_firings = _BIOBANK_GATE_PATTERN.findall(captured_stderr)
     if gate_firings:
