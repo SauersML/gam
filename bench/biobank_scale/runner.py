@@ -1623,7 +1623,7 @@ _KAPPA_PHASE_SUMMARY_PATTERN = re.compile(
 # actually paying off at biobank scale (which the inner-PIRLS scaling
 # probe identified as the dominant cost regime).
 _IFT_QUALITY_PATTERN = re.compile(
-    r"\[IFT-QUALITY\]\s+residual=([\deE.+-]+)\s+converged_norm=([\deE.+-]+)\s+predicted_norm=([\deE.+-]+)\s+iters=(\d+)"
+    r"\[IFT-QUALITY\]\s+residual=([\deE.+-]+)\s+converged_norm=([\deE.+-]+)\s+predicted_norm=([\deE.+-]+)(?:\s+drho_norm=([\deE.+\-nNaA]+)\s+h_pen_logdet=([\deE.+\-nNaA]+))?\s+iters=(\d+)"
 )
 
 # IFT predictor rejection counter. Emitted by `predict_warm_start_beta_ift_from_cache`
@@ -1790,6 +1790,39 @@ def _emit_phase_summary(
             rmax = sorted_res[-1]
             parts.append(
                 f"ift_predicts={n} ift_p50={p50:.2e} ift_p95={p95:.2e} ift_max={rmax:.2e}"
+            )
+        # Δρ-step distribution: how big a ρ-jump is the predictor
+        # being asked to handle? Combined with residual quartiles
+        # this answers "did large residuals come from large jumps
+        # (expected) or small jumps (predictor faithfulness regression)?"
+        drhos = [
+            float(m[3])
+            for m in ift_quality_matches
+            if m[3] and float(m[3]) == float(m[3])  # filter NaN / missing
+        ]
+        if drhos:
+            n_d = len(drhos)
+            sorted_d = sorted(drhos)
+            d_p50 = sorted_d[n_d // 2]
+            d_p95 = sorted_d[min(n_d - 1, int(0.95 * n_d))]
+            d_max = sorted_d[-1]
+            parts.append(
+                f"ift_drho_p50={d_p50:.2e} ift_drho_p95={d_p95:.2e} ift_drho_max={d_max:.2e}"
+            )
+        # log|H_pen| spread: tracks penalized-Hessian conditioning
+        # across solves. Sudden jumps in min/max indicate a flat
+        # direction opening up or a near-singular geometry — both
+        # often precede PIRLS failures or large IFT residuals.
+        logdets = [
+            float(m[4])
+            for m in ift_quality_matches
+            if m[4] and float(m[4]) == float(m[4])
+        ]
+        if logdets:
+            l_min = min(logdets)
+            l_max = max(logdets)
+            parts.append(
+                f"ift_h_logdet_min={l_min:.2e} ift_h_logdet_max={l_max:.2e}"
             )
     if n_rejects > 0 or n_noops > 0:
         # Count distinct rejection reasons so the bench log shows which
