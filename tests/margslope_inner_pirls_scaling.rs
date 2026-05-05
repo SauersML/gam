@@ -58,6 +58,8 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use std::time::Instant;
 
+mod common;
+
 const SEED: u64 = 0x5CA1_AB1E_5C0F_E5A1;
 
 /// Builds a synthetic margslope problem with one cubic B-spline smooth on
@@ -451,58 +453,8 @@ fn report_power_law(
     extrapolate: &[(&str, f64)],
     budget_y: f64,
 ) -> Option<(f64, f64, f64)> {
-    if points.len() < 3 {
-        eprintln!("{tag} INSUFFICIENT DATA: {} points (need ≥3)", points.len());
-        return None;
-    }
-    let logs: Vec<(f64, f64)> = points.iter().map(|(x, y)| (x.ln(), y.ln())).collect();
-    let n = logs.len() as f64;
-    let sx: f64 = logs.iter().map(|(x, _)| x).sum();
-    let sy: f64 = logs.iter().map(|(_, y)| y).sum();
-    let sxx: f64 = logs.iter().map(|(x, _)| x * x).sum();
-    let sxy: f64 = logs.iter().map(|(x, y)| x * y).sum();
-    let alpha = (n * sxy - sx * sy) / (n * sxx - sx * sx);
-    let log_a = (sy - alpha * sx) / n;
-    let a = log_a.exp();
-    let mean_y = sy / n;
-    let ss_tot: f64 = logs.iter().map(|(_, y)| (y - mean_y).powi(2)).sum();
-    let ss_res: f64 = logs
-        .iter()
-        .map(|(x, y)| {
-            let pred = log_a + alpha * x;
-            (y - pred).powi(2)
-        })
-        .sum();
-    let r2 = if ss_tot > 0.0 { 1.0 - ss_res / ss_tot } else { 0.0 };
-    let max_abs_log_resid: f64 = logs
-        .iter()
-        .map(|(x, y)| (y - (log_a + alpha * x)).abs())
-        .fold(0.0_f64, f64::max);
-    eprintln!(
-        "{tag} fit: y ≈ {:.3e} · x^{:.3}  | R²={:.4}  max|log-resid|={:.3} (×{:.2})  | n_points={}",
-        a,
-        alpha,
-        r2,
-        max_abs_log_resid,
-        max_abs_log_resid.exp(),
-        logs.len()
-    );
-    if r2 < 0.85 || max_abs_log_resid > 0.5 {
-        eprintln!("{tag} REFUSING EXTRAPOLATION (R²<0.85 or max log-resid >0.5)");
-        return None;
-    }
-    eprintln!("{tag} budget: {:.1}", budget_y);
-    for (label, x_target) in extrapolate {
-        let pred = a * x_target.powf(alpha);
-        let verdict = if pred <= budget_y {
-            format!("FITS ({:.1}× headroom)", budget_y / pred)
-        } else {
-            format!("OVER by {:.1}× ({:.1})", pred / budget_y, pred)
-        };
-        eprintln!(
-            "{tag} extrap @ {label} (x={:.1e}): pred={:.4} → {}",
-            x_target, pred, verdict
-        );
-    }
-    Some((alpha, a, r2))
+    // Thin wrapper around the shared analyzer in tests/common; preserves
+    // the (alpha, a, r²) return tuple this probe's caller expects.
+    let fit = common::report_power_law(tag, points, extrapolate, budget_y)?;
+    Some((fit.alpha, fit.a, fit.r2))
 }
