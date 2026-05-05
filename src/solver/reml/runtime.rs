@@ -116,20 +116,40 @@ impl<'a> RemlState<'a> {
         {
             return false;
         }
-        // Biobank-scale gate: at very large n the per-outer-iter cost of
-        // assembling the analytic outer Hessian (`k² · n · p²` for the
-        // LAML pairwise inner-derived terms) dominates wall-clock —
-        // observed at CI run 25354126629 (2026-05-04): one outer iter of
-        // standard-GAM probit at n=320k, p=42 hit the 40-min cmd timeout
-        // with the only emitted PHASE marker being `standard-GAM fit
-        // start`. Mirrors the gates in survival_marginal_slope.rs:13286
-        // / bernoulli_marginal_slope.rs:8095 / latent_survival.rs etc.
-        // for the custom-family path; this gate covers the standard-GAM
-        // path that goes through `fit_gam` rather than `fit_custom_family`.
+        // Biobank-scale fallback: the analytic outer Hessian is only safe
+        // at biobank scale when the unified evaluator can express it as a
+        // matrix-free Hv operator (`build_outer_hessian_operator` /
+        // `HessianResult::Operator`) instead of materializing the full
+        // `O(K · n · p²)` dense pairwise LAML Hessian. The operator
+        // representation is selected by `prefer_outer_hessian_operator`
+        // when `(n, p, K)` cross the assembly-cost crossover.
+        //
+        // This formalizes the previous unconditional `n > 50_000` bandaid
+        // (CI run 25354126629, 2026-05-04: standard-GAM probit at n=320k,
+        // p=42 hit the 40-min cmd timeout) as: "decline analytic Hessian
+        // when the dense `compute_outer_hessian` path would run AND `n` is
+        // biobank-scale." Whenever the operator path is available the
+        // optimizer keeps analytic curvature; whenever the operator path
+        // is unavailable (small `n·p`, narrow basis, or
+        // `penalty_subspace_trace.is_some()` forcing the projected dense
+        // kernel) at biobank scale, we fall back to BFGS instead of
+        // running the `O(K² · n · p²)` dense assembly.
+        //
+        // Mirrors the gates in survival_marginal_slope.rs / bernoulli_
+        // marginal_slope.rs / latent_survival.rs etc. for the custom-
+        // family path; this gate covers the standard-GAM path that goes
+        // through `fit_gam` rather than `fit_custom_family`.
         let n_obs = self.x.nrows();
-        if n_obs > 50_000 {
+        let p_dim = self.x.ncols();
+        let k_outer = self.canonical_penalties.len();
+        let operator_path_available =
+            super::unified::prefer_outer_hessian_operator(n_obs, p_dim, k_outer);
+        if n_obs > 50_000 && !operator_path_available {
             log::info!(
-                "[standard-GAM] declining analytic outer Hessian for n={n_obs}; routing to BFGS"
+                "[standard-GAM] declining analytic outer Hessian for \
+                 n={n_obs} p={p_dim} k={k_outer} (matrix-free operator \
+                 path unavailable, dense LAML pairwise assembly is \
+                 O(k²·n·p²)); routing to BFGS"
             );
             return false;
         }
