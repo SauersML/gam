@@ -572,3 +572,156 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         pc2 = [float(r["pc2"]) for r in rows[:30]]
         self.assertGreater(len(set(round(v, 6) for v in pc1)), 10)
         self.assertGreater(len(set(round(v, 6) for v in pc2)), 10)
+
+
+class MarkerPatternTests(unittest.TestCase):
+    """Lock down the runner's regex patterns for the structured markers
+    emitted by the gam binary. Each marker has had a regression in
+    development (additional fields, format drift), so a direct test of
+    `findall` against representative sample lines is the cheapest guard
+    against future format changes silently breaking aggregation."""
+
+    def test_ift_quality_pattern_parses_old_and_new_field_layout(self) -> None:
+        # Old layout (pre-44d3c482): no drho_norm / h_pen_logdet.
+        old = "[IFT-QUALITY] residual=3.456e-04 converged_norm=1.234e+00 predicted_norm=1.234e+00 iters=4"
+        # New layout (44d3c482+): adds drho_norm and h_pen_logdet.
+        new = "[IFT-QUALITY] residual=3.456e-04 converged_norm=1.234e+00 predicted_norm=1.234e+00 drho_norm=5.678e-01 h_pen_logdet=2.345e+01 iters=4"
+        # NaN tokens (when the cache is empty / unstamped at the
+        # emission point — defensive paths in runtime.rs).
+        nan = "[IFT-QUALITY] residual=3.456e-04 converged_norm=1.234e+00 predicted_norm=1.234e+00 drho_norm=NaN h_pen_logdet=NaN iters=4"
+
+        old_match = _RUNNER._IFT_QUALITY_PATTERN.findall(old)
+        self.assertEqual(len(old_match), 1)
+        self.assertEqual(old_match[0][0], "3.456e-04")
+        self.assertEqual(old_match[0][3], "")  # drho_norm absent
+        self.assertEqual(old_match[0][4], "")  # h_pen_logdet absent
+        self.assertEqual(old_match[0][5], "4")
+
+        new_match = _RUNNER._IFT_QUALITY_PATTERN.findall(new)
+        self.assertEqual(len(new_match), 1)
+        self.assertEqual(new_match[0][3], "5.678e-01")
+        self.assertEqual(new_match[0][4], "2.345e+01")
+
+        nan_match = _RUNNER._IFT_QUALITY_PATTERN.findall(nan)
+        self.assertEqual(len(nan_match), 1)
+        # NaN tokens should parse but be filtered downstream by the
+        # `float(x) == float(x)` self-equality check.
+        self.assertEqual(nan_match[0][3], "NaN")
+
+    def test_ift_rejected_and_noop_patterns_capture_reason(self) -> None:
+        # Each rejection reason from runtime.rs should round-trip via
+        # the runner's reason-name capture. Spot-check the canonical
+        # ones; the exhaustive enumeration is in the commit message
+        # for fec27c97.
+        reasons = [
+            ("[IFT-REJECTED] reason=large_drho max_drho=3.456e+00 cap=2.000e+00 drho_dim=4", "large_drho"),
+            ("[IFT-REJECTED] reason=hessian_factorize_failed drho_dim=4", "hessian_factorize_failed"),
+            ("[IFT-REJECTED] reason=non_finite_solution max_drho=1.234e+00 drho_dim=4", "non_finite_solution"),
+            ("[IFT-REJECTED] reason=qs_dim_mismatch qs_dim=10x10 expected_p=8", "qs_dim_mismatch"),
+        ]
+        for line, expected in reasons:
+            matches = _RUNNER._IFT_REJECTED_PATTERN.findall(line)
+            self.assertEqual(matches, [expected], f"failed to extract reason from: {line!r}")
+
+        noop_line = "[IFT-NOOP] reason=all_drho_below_eps max_drho=5.000e-15 drho_dim=4"
+        self.assertEqual(
+            _RUNNER._IFT_NOOP_PATTERN.findall(noop_line),
+            ["all_drho_below_eps"],
+        )
+
+    def test_pirls_solve_end_pattern_captures_iters_elapsed_rate(self) -> None:
+        sample = (
+            "2026-05-05T03:14:15Z INFO  gam::solver::pirls: "
+            "[PIRLS solve-end] iters=12 elapsed=0.0345s g_norm_initial=1.234e+01 "
+            "g_norm_final=4.567e-08 convergence_rate=2.345e-01 status=Converged"
+        )
+        matches = _RUNNER._PIRLS_SOLVE_END_PATTERN.findall(sample)
+        self.assertEqual(len(matches), 1)
+        iters, elapsed, rate = matches[0]
+        self.assertEqual(iters, "12")
+        self.assertEqual(elapsed, "0.0345")
+        self.assertEqual(rate, "2.345e-01")
+        # NaN convergence rate (single-iter solves produce NaN: 1**(1/1)
+        # is fine but degenerate cases could yield NaN). Pattern must
+        # accept the token; the runner filters via `r == r`.
+        nan_sample = (
+            "[PIRLS solve-end] iters=1 elapsed=0.0001s g_norm_initial=NaN "
+            "g_norm_final=NaN convergence_rate=NaN status=Converged"
+        )
+        nan_matches = _RUNNER._PIRLS_SOLVE_END_PATTERN.findall(nan_sample)
+        self.assertEqual(len(nan_matches), 1)
+        self.assertEqual(nan_matches[0][2], "NaN")
+
+    def test_kappa_phase_patterns_parse_per_call_and_summary(self) -> None:
+        per_call_lines = [
+            "[KAPPA-PHASE] phase=cost call=12 theta_norm=3.4500e+00 log_kappa_norm=1.2000e+00 elapsed_s=0.4321",
+            "[KAPPA-PHASE] phase=eval_outer call=5 order=ValueGradientHessian theta_norm=3.4500e+00 log_kappa_norm=1.2000e+00 elapsed_s=8.7654",
+            "[KAPPA-PHASE] phase=efs call=2 theta_norm=3.4500e+00 log_kappa_norm=1.2000e+00 elapsed_s=2.1098",
+        ]
+        all_matches = []
+        for line in per_call_lines:
+            all_matches.extend(_RUNNER._KAPPA_PHASE_PATTERN.findall(line))
+        # Three rows: (phase, call, elapsed). The `eval_outer` row has
+        # an order=... field between call and theta_norm; the regex
+        # makes it optional.
+        self.assertEqual(len(all_matches), 3)
+        self.assertEqual([m[0] for m in all_matches], ["cost", "eval_outer", "efs"])
+        self.assertEqual([m[1] for m in all_matches], ["12", "5", "2"])
+        self.assertEqual(
+            [m[2] for m in all_matches],
+            ["0.4321", "8.7654", "2.1098"],
+        )
+
+        summary = (
+            "[KAPPA-PHASE-SUMMARY] log_kappa_dim=2 n_cost=12 cost_total_s=5.1840 "
+            "n_eval=5 eval_total_s=43.8270 n_efs=2 efs_total_s=4.2196 optim_total_s=53.2306"
+        )
+        sm = _RUNNER._KAPPA_PHASE_SUMMARY_PATTERN.findall(summary)
+        self.assertEqual(len(sm), 1)
+        log_kappa_dim, n_cost, cost_s, n_eval, eval_s, n_efs, efs_s, optim_s = sm[0]
+        self.assertEqual(log_kappa_dim, "2")
+        self.assertEqual(n_cost, "12")
+        self.assertAlmostEqual(float(cost_s), 5.1840)
+        self.assertAlmostEqual(float(optim_s), 53.2306)
+
+
+class PhaseSummaryAggregationTests(unittest.TestCase):
+    """End-to-end test of `_emit_phase_summary`'s aggregation logic.
+    The function is print-side-effect-only, so we capture stderr and
+    assert against the emitted summary string."""
+
+    def _run_summary(self, captured_stderr: str) -> str:
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            _RUNNER._emit_phase_summary(captured_stderr, "cmd-preview", timed_out=False, rc=0)
+        return buf.getvalue()
+
+    def test_phase_summary_aggregates_ift_accept_reject_noop_independently(self) -> None:
+        stderr = "\n".join([
+            # 4 accepts at varying residuals
+            "[IFT-QUALITY] residual=1.000e-04 converged_norm=1.000e+00 predicted_norm=1.000e+00 iters=3",
+            "[IFT-QUALITY] residual=2.000e-03 converged_norm=1.000e+00 predicted_norm=1.000e+00 iters=4",
+            "[IFT-QUALITY] residual=5.000e-02 converged_norm=1.000e+00 predicted_norm=1.000e+00 iters=5",
+            "[IFT-QUALITY] residual=8.000e-01 converged_norm=1.000e+00 predicted_norm=1.000e+00 iters=6",
+            # 1 reject (large_drho — typical biobank case)
+            "[IFT-REJECTED] reason=large_drho max_drho=3.000e+00 cap=2.000e+00 drho_dim=4",
+            # 2 noops
+            "[IFT-NOOP] reason=all_drho_below_eps max_drho=5.000e-15 drho_dim=4",
+            "[IFT-NOOP] reason=all_drho_below_eps max_drho=4.000e-15 drho_dim=4",
+            "[PHASE] my-fit fit end elapsed=10.0s",
+        ])
+        out = self._run_summary(stderr)
+        # Core aggregation fields surface.
+        self.assertIn("ift_predicts=4", out)
+        self.assertIn("ift_rejects=1", out)
+        self.assertIn("ift_noops=2", out)
+        self.assertIn("ift_reasons=[large_drho=1]", out)
+        # The accept rate denominator is accepts + rejects + noops.
+        # 4 / (4 + 1 + 2) = 0.571... → printed as 0.57.
+        self.assertIn("ift_accept_rate=0.57", out)
+
+
+if __name__ == "__main__":
+    unittest.main()
