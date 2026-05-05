@@ -1197,34 +1197,58 @@ impl<'a> RemlState<'a> {
     fn invalidate_link_dependent_state(&self) {
         self.cache_manager.clear_eval_and_factor_caches();
         self.cache_manager.pirls_cache.write().unwrap().clear();
+        // Under a link change the previous link's working-weight
+        // curvature differs from the new link's, so the previous
+        // solve's β / H_pen / Cholesky factor / damping / iter-count
+        // / IFT residual / tangent-line history are all calibrated to
+        // the wrong geometry. Wipe in lockstep — see
+        // `clear_warm_start_predictor_state` and
+        // `clear_warm_start_adaptive_signals` for the per-slot
+        // staleness arguments.
+        self.clear_warm_start_predictor_state();
+        self.clear_warm_start_adaptive_signals();
+    }
+
+    /// Wipe every RwLock-guarded slot used by the warm-start
+    /// predictors (tangent-line and IFT). Called on link change, on
+    /// surface reset, on outer-seed restart, on failed PIRLS solve,
+    /// and any other event where the cached `(β, ρ, H_pen, qs,
+    /// factor)` is no longer calibrated to the geometry the next
+    /// solve will see.
+    ///
+    /// Single source of truth: any new warm-start RwLock added to
+    /// `RemlObjectiveState` MUST be wiped here, otherwise the
+    /// warm-start machinery can leak stale state across the
+    /// invalidation boundary and produce β-drift regressions
+    /// (caught by `tests/warm_start_quality_regression.rs`).
+    fn clear_warm_start_predictor_state(&self) {
         self.warm_start_beta.write().unwrap().take();
-        // IFT cache holds H_pen at the previous link's working weights;
-        // with a different link the working weights change so the
-        // factorization is no longer the right Jacobian seed.
-        self.ift_warm_start_cache.write().unwrap().take();
-        self.ift_cached_factor.write().unwrap().take();
-        // The IFT residual signal was measured against the OLD link's
-        // prediction; under the new link the geometry changes and the
-        // signal would mislead the adaptive |Δρ| cap and the cap-
-        // schedule margin policy. Reset to "no signal" so the next
-        // predict reverts to the conservative defaults.
-        self.last_ift_prediction_residual
-            .store(0, Ordering::Relaxed);
-        // Same reasoning for the LM damping warm-start hint: the
-        // damping the previous link's solve discovered is not
-        // calibrated to the new link's curvature.
-        self.last_pirls_lm_lambda.store(0, Ordering::Relaxed);
-        // The inner-PIRLS adaptive cap signals also reflect the old
-        // link's convergence behavior; under the new link the inner
-        // Newton may need a different iter count and the schedule
-        // should fall back to its iter-count tier on the first solve.
-        self.last_inner_iters.store(0, Ordering::Relaxed);
-        self.last_inner_converged.store(false, Ordering::Relaxed);
-        // History pair for the tangent-line predictor: same staleness
-        // argument — the previous (β, ρ) pairs are at the OLD link.
         self.warm_start_rho.write().unwrap().take();
         self.prev_warm_start_beta.write().unwrap().take();
         self.prev_warm_start_rho.write().unwrap().take();
+        self.ift_warm_start_cache.write().unwrap().take();
+        self.ift_cached_factor.write().unwrap().take();
+    }
+
+    /// Wipe every atomic-bit-packed signal used by the adaptive
+    /// policies (inner-cap schedule margin, IFT |Δρ| cap, LM-λ
+    /// hint clamp). Called from the same invalidation paths as
+    /// `clear_warm_start_predictor_state`, plus from
+    /// `execute_pirls_if_needed`'s failure branch.
+    ///
+    /// Single source of truth: any new adaptive-policy atomic added
+    /// to `RemlObjectiveState` MUST be wiped here. The β-drift
+    /// regression tests will catch correctness bugs from a stale
+    /// β / H, but stale POLICY signals only surface as performance
+    /// regressions (the inner solve takes longer than it should),
+    /// which the bench runner's [PHASE summary] line catches via
+    /// the `pirls_conv_*` and `ift_*` fields.
+    fn clear_warm_start_adaptive_signals(&self) {
+        self.last_inner_iters.store(0, Ordering::Relaxed);
+        self.last_inner_converged.store(false, Ordering::Relaxed);
+        self.last_pirls_lm_lambda.store(0, Ordering::Relaxed);
+        self.last_ift_prediction_residual
+            .store(0, Ordering::Relaxed);
     }
 
     pub(crate) fn set_link_states(
@@ -1754,25 +1778,12 @@ impl<'a> RemlState<'a> {
         self.kronecker_factored = kronecker_factored;
         self.cache_manager.clear_eval_and_factor_caches();
         self.cache_manager.pirls_cache.write().unwrap().clear();
-        // Inner-PIRLS feedback signals belong to the previous fit's
-        // surface — at the new surface the inner solver's iter count
-        // and convergence behavior may differ, so reset to "no
-        // history" and let the schedule fall back to its iter-count
-        // tier on the first outer iter.
-        self.last_inner_iters.store(0, Ordering::Relaxed);
-        self.last_inner_converged.store(false, Ordering::Relaxed);
-        // The IFT warm-start cache (β, H_pen, qs at last converged solve)
-        // is keyed to the previous design / penalty system; the new
-        // surface invalidates all three, so clear the slot.
-        self.ift_warm_start_cache.write().unwrap().take();
-        // The persisted LM damping is calibrated to the previous
-        // surface's geometry — different design / penalty / link
-        // produces different curvature, so a stale hint here would
-        // be biased rather than informative.
-        self.last_pirls_lm_lambda.store(0, Ordering::Relaxed);
-        self.last_ift_prediction_residual
-            .store(0, Ordering::Relaxed);
-        self.ift_cached_factor.write().unwrap().take();
+        // The new surface has a different design / penalty system /
+        // working-weight curvature, so every warm-start signal calibrated
+        // to the previous surface is now stale. Wipe in lockstep — see
+        // the helpers' doc-comments for the per-slot staleness arguments.
+        self.clear_warm_start_predictor_state();
+        self.clear_warm_start_adaptive_signals();
         Ok(())
     }
 
@@ -2268,12 +2279,11 @@ impl<'a> RemlState<'a> {
             _ => {
                 // On a failed solve, drop both the current pair AND the
                 // history — the tangent prediction would be misleading.
-                self.warm_start_beta.write().unwrap().take();
-                self.warm_start_rho.write().unwrap().take();
-                self.prev_warm_start_beta.write().unwrap().take();
-                self.prev_warm_start_rho.write().unwrap().take();
-                self.ift_warm_start_cache.write().unwrap().take();
-                self.ift_cached_factor.write().unwrap().take();
+                // Adaptive signals are wiped by `execute_pirls_if_needed`'s
+                // failure branch (where `pirls_result.iteration` is
+                // available for the schedule's geometric backoff
+                // accounting), so we only clear predictor state here.
+                self.clear_warm_start_predictor_state();
             }
         }
     }
@@ -2481,22 +2491,13 @@ impl<'a> RemlState<'a> {
 
     pub(crate) fn reset_outer_seed_state(&self) {
         self.cache_manager.invalidate_eval_bundle();
-        self.warm_start_beta.write().unwrap().take();
         // The outer is restarting from a fresh seed — the previous
-        // trajectory's warm-start signals are calibrated to a
-        // different ρ-path and would mislead both predictors and the
-        // adaptive cap policies. Wipe them all so the first solve at
-        // the new seed starts cold.
-        self.warm_start_rho.write().unwrap().take();
-        self.prev_warm_start_beta.write().unwrap().take();
-        self.prev_warm_start_rho.write().unwrap().take();
-        self.ift_warm_start_cache.write().unwrap().take();
-        self.ift_cached_factor.write().unwrap().take();
-        self.last_pirls_lm_lambda.store(0, Ordering::Relaxed);
-        self.last_inner_iters.store(0, Ordering::Relaxed);
-        self.last_inner_converged.store(false, Ordering::Relaxed);
-        self.last_ift_prediction_residual
-            .store(0, Ordering::Relaxed);
+        // trajectory's warm-start signals are calibrated to a different
+        // ρ-path and would mislead both predictors and the adaptive cap
+        // policies. Wipe in lockstep so the first solve at the new
+        // seed starts fully cold.
+        self.clear_warm_start_predictor_state();
+        self.clear_warm_start_adaptive_signals();
     }
 
     // Accessor methods for private fields
