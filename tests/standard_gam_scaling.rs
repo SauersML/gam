@@ -24,6 +24,9 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use std::time::Instant;
 
+mod common;
+use common::report_power_law as fit_and_report_power_law_inner;
+
 const K: usize = 8;
 const SEED: u64 = 0x5CA1_AB1E;
 
@@ -211,93 +214,16 @@ fn standard_gam_scaling_law() {
     );
 }
 
-/// Fit `y = a · x^α` to `(x, y)` pairs via log-log OLS. Reports α, a, R²,
-/// max abs log-residual, and extrapolations at requested points.
-/// `budget_y` is the mission budget; verdicts compare extrapolations to it.
+/// Thin wrapper preserving the v1 call site (`Vec<(f64, f64)>`,
+/// fire-and-forget). The body lives in `tests/common/mod.rs` —
+/// see `common::report_power_law` for the policy.
 fn fit_and_report_power_law(
     tag: &str,
     points: Vec<(f64, f64)>,
     extrapolate: &[(&str, f64)],
     budget_y: f64,
 ) {
-    if points.len() < 3 {
-        eprintln!(
-            "{tag} INSUFFICIENT DATA: {} converged points (need ≥3 for honest fit)",
-            points.len()
-        );
-        return;
-    }
-    let logs: Vec<(f64, f64)> = points.iter().map(|(x, y)| (x.ln(), y.ln())).collect();
-    let n = logs.len() as f64;
-    let sx: f64 = logs.iter().map(|(x, _)| x).sum();
-    let sy: f64 = logs.iter().map(|(_, y)| y).sum();
-    let sxx: f64 = logs.iter().map(|(x, _)| x * x).sum();
-    let sxy: f64 = logs.iter().map(|(x, y)| x * y).sum();
-    let alpha = (n * sxy - sx * sy) / (n * sxx - sx * sx);
-    let log_a = (sy - alpha * sx) / n;
-    let a = log_a.exp();
-    // R²: 1 - SS_res / SS_tot in log-space.
-    let mean_y = sy / n;
-    let ss_tot: f64 = logs.iter().map(|(_, y)| (y - mean_y).powi(2)).sum();
-    let ss_res: f64 = logs
-        .iter()
-        .map(|(x, y)| {
-            let pred = log_a + alpha * x;
-            (y - pred).powi(2)
-        })
-        .sum();
-    let r2 = if ss_tot > 0.0 { 1.0 - ss_res / ss_tot } else { 0.0 };
-    let max_abs_log_resid: f64 = logs
-        .iter()
-        .map(|(x, y)| (y - (log_a + alpha * x)).abs())
-        .fold(0.0_f64, f64::max);
-
-    eprintln!(
-        "\n{tag} fit: y ≈ {:.3e} · x^{:.3}  | R²={:.4}  max|log-resid|={:.3} (×{:.2})  | n_points={}",
-        a, alpha, r2, max_abs_log_resid, max_abs_log_resid.exp(), logs.len()
-    );
-
-    // Honesty rules: refuse extrapolation when the fit is poor, AND when
-    // the extrapolation distance exceeds the calibration range too far.
-    let max_x: f64 = points.iter().map(|(x, _)| *x).fold(0.0_f64, f64::max);
-    let min_x: f64 = points.iter().map(|(x, _)| *x).fold(f64::INFINITY, f64::min);
-    let usable = r2 >= 0.85 && max_abs_log_resid < 0.5;
-    if !usable {
-        eprintln!(
-            "{tag} REFUSING EXTRAPOLATION: fit quality insufficient (R² < 0.85 or max-resid > 0.5 in log-space, i.e. >65% off in y). Need cleaner data — likely the test setup is hitting an outer-iter cap or the problem geometry varies across n."
-        );
-        return;
-    }
-    eprintln!("{tag} budget: {:.1}s", budget_y);
-    for (label, x_target) in extrapolate {
-        let pred = a * x_target.powf(alpha);
-        let stretch = x_target / max_x;
-        let stretch_note = if stretch > 5.0 {
-            format!(" [extrapolating {:.1}× past max calibration x={:.1e}]", stretch, max_x)
-        } else if *x_target < min_x {
-            format!(" [extrapolating below min calibration x={:.1e}]", min_x)
-        } else {
-            String::new()
-        };
-        let verdict = if pred <= budget_y {
-            format!("FITS ({:.0}× headroom)", budget_y / pred)
-        } else {
-            format!(
-                "OVER BUDGET by {:.0}s ({:.1} min, {:.2}× over)",
-                pred - budget_y,
-                (pred - budget_y) / 60.0,
-                pred / budget_y
-            )
-        };
-        eprintln!(
-            "{tag} extrap @ {label} (x={:.1e}): pred={:.1}s ({:.2} min){} → {}",
-            x_target,
-            pred,
-            pred / 60.0,
-            stretch_note,
-            verdict
-        );
-    }
+    let _ = fit_and_report_power_law_inner(tag, &points, extrapolate, budget_y);
 }
 
 #[test]
