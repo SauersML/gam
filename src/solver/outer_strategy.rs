@@ -2746,6 +2746,11 @@ pub enum OperatorTrustRegionStopReason {
     Converged,
     RejectFloor,
     IterationBudget,
+    /// Family returned a non-operator Hessian mid-flight after routing into
+    /// the operator path. Best-effort `x_k` returned with this reason; the
+    /// caller should consider re-fitting under a different solver class
+    /// (e.g. BFGS gradient-only) instead of trusting the partial result.
+    RoutingMismatch,
 }
 
 struct BorrowedDenseOuterHessian<'a> {
@@ -3303,9 +3308,34 @@ fn run_operator_trust_region(
         }
 
         let HessianResult::Operator(op_arc) = &eval_k.hessian else {
-            return Err(EstimationError::RemlOptimizationFailed(
-                "operator trust-region received a non-operator Hessian".to_string(),
-            ));
+            // Graceful fallback: a family that returned an operator Hessian
+            // at the seed but a different shape (Analytic/Unavailable)
+            // mid-iteration is a planner-vs-family disagreement, not a fatal
+            // error. The current x_k has a valid cost + gradient — return
+            // it as the best-effort result with a `RoutingMismatch` stop
+            // reason so the caller can decide whether to retry under a
+            // different solver. Previously this branch panicked the whole
+            // REML fit (observed at k≥32, n=50k in the
+            // standard_gam_p_scaling_law probe).
+            log::warn!(
+                "[ARC] iter={iter}: family returned non-operator Hessian mid-flight \
+                 (planner expected operator throughout); returning best-effort x_k \
+                 cost={:.6e} grad_norm={:.3e}",
+                eval_k.cost,
+                g_norm
+            );
+            return Ok(OuterResult {
+                rho: x_k,
+                final_value: eval_k.cost,
+                iterations: iter,
+                final_grad_norm: g_norm,
+                final_gradient: Some(eval_k.gradient),
+                final_hessian: None,
+                converged: false,
+                plan_used: plan,
+                operator_trust_radius: Some(trust_radius),
+                operator_stop_reason: Some(OperatorTrustRegionStopReason::RoutingMismatch),
+            });
         };
         if materialize_dense_after_rejection
             && dense_model.is_none()
