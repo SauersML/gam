@@ -1512,6 +1512,8 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, s
                             or "[IFT-QUALITY]" in line
                             or "[IFT-REJECTED]" in line
                             or "[IFT-NOOP]" in line
+                            or "[TANGENT-PREDICT]" in line
+                            or "[TANGENT-REJECTED]" in line
                         ):
                             phase_capture.append(line)
         finally:
@@ -1642,6 +1644,16 @@ _IFT_REJECTED_PATTERN = re.compile(r"\[IFT-REJECTED\]\s+reason=(\w+)")
 # noop from accept tells us how often the outer is actually exercising
 # the linearization.
 _IFT_NOOP_PATTERN = re.compile(r"\[IFT-NOOP\]\s+reason=(\w+)")
+
+# Tangent-line predictor markers. The tangent-line path only fires
+# when the IFT predictor returned None for non-cache reasons (large
+# Δρ, factor failed, etc.), so [TANGENT-*] markers tell us how often
+# the FALLBACK path is being exercised — and whether it succeeds or
+# also degenerates to flat warm-start. A high tangent-reject rate
+# alongside high IFT-reject rate signals "linear predictor stack
+# failed entirely → both predictors fell through to flat".
+_TANGENT_PREDICT_PATTERN = re.compile(r"\[TANGENT-PREDICT\]\s+alpha=")
+_TANGENT_REJECTED_PATTERN = re.compile(r"\[TANGENT-REJECTED\]\s+reason=(\w+)")
 
 
 _PHASE_START_PATTERN = re.compile(r"\[PHASE\]\s+([\w\-]+(?:\([\w\-/]+\))?)\s+(?:fit\s+)?start")
@@ -1827,6 +1839,28 @@ def _emit_phase_summary(
             parts.append(
                 f"ift_h_logdet_min={l_min:.2e} ift_h_logdet_max={l_max:.2e}"
             )
+    # Tangent-line predictor activity (the fallback path when IFT
+    # rejects). Surface accept count + rejection-reason histogram so
+    # a degenerate "both predictors fell through to flat" run is
+    # visible at a glance.
+    tangent_predict_hits = _TANGENT_PREDICT_PATTERN.findall(captured_stderr)
+    tangent_rejected = _TANGENT_REJECTED_PATTERN.findall(captured_stderr)
+    if tangent_predict_hits or tangent_rejected:
+        t_predicts = len(tangent_predict_hits)
+        t_rejects = len(tangent_rejected)
+        if tangent_rejected:
+            t_reason_counts: dict[str, int] = {}
+            for r in tangent_rejected:
+                t_reason_counts[r] = t_reason_counts.get(r, 0) + 1
+            t_reasons_str = ",".join(
+                f"{r}={c}" for r, c in sorted(t_reason_counts.items())
+            )
+            parts.append(
+                f"tangent_predicts={t_predicts} tangent_rejects={t_rejects} "
+                f"tangent_reasons=[{t_reasons_str}]"
+            )
+        else:
+            parts.append(f"tangent_predicts={t_predicts}")
     if n_rejects > 0 or n_noops > 0:
         # Count distinct rejection reasons so the bench log shows which
         # failure mode dominates: large_drho is the expected biobank
