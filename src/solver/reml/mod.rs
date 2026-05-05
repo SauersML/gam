@@ -3588,6 +3588,21 @@ pub(crate) struct RemlState<'a> {
     /// when both are nonzero. Default 0 (no cap from this source).
     pub(crate) outer_inner_cap: Arc<AtomicUsize>,
 
+    /// Inner-PIRLS feedback signal driven by `execute_pirls_if_needed` after
+    /// each NON-screening solve. Stores the iteration count at which the
+    /// inner Newton stopped, plus a flag indicating whether it converged
+    /// (vs. hit the iteration cap). The outer first-/second-order bridges
+    /// read these atomics to drive an adaptive `inner_cap_schedule`: the
+    /// next outer iter's inner cap becomes `last_iters + small_margin`
+    /// when the previous solve converged, or a geometric backoff when it
+    /// hit the cap. This replaces the older hardcoded iter-tier schedule
+    /// (3/5/10/20) with a cap that follows the inner solver's actual
+    /// convergence behavior — Eisenstat-Walker style for the inner
+    /// quadratic loop. Default 0 / false (no signal yet — first outer
+    /// iter falls back to a coarse iter-count tier).
+    pub(crate) last_inner_iters: Arc<AtomicUsize>,
+    pub(crate) last_inner_converged: Arc<AtomicBool>,
+
     /// When set, the penalties have Kronecker (tensor-product) structure and
     /// the REML evaluator can use O(∏q_j) logdet instead of O(p³) eigendecomposition.
     /// Populated via `set_kronecker_penalty_system` after construction.
