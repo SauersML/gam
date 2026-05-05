@@ -1749,12 +1749,18 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
         if let Some(cap_arc) = self.outer_inner_cap.as_ref() {
-            let cap = first_order_inner_cap_schedule(self.eval_count);
+            // The ARC bridge increments `eval_count` in BOTH `eval_grad` and
+            // `eval_hessian`. ARC calls both per outer iter, so `eval_count
+            // / 2` is the correct iter index for the schedule. Without this
+            // divisor the schedule would lift to full inner-cap at ARC iter
+            // 3 instead of iter 6.
+            let arc_iter = self.eval_count / 2;
+            let cap = first_order_inner_cap_schedule(arc_iter);
             let prev = cap_arc.swap(cap, Ordering::Relaxed);
             if prev != cap {
                 log::info!(
-                    "[OUTER schedule] inner-PIRLS cap transition (ARC bridge) eval_count={} prev={} new={} ({})",
-                    self.eval_count,
+                    "[OUTER schedule] inner-PIRLS cap transition (ARC bridge) arc_iter={} prev={} new={} ({})",
+                    arc_iter,
                     prev,
                     cap,
                     if cap == 0 { "uncapped" } else { "capped" }
@@ -1796,12 +1802,18 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_hessian(&mut self, x: &Array1<f64>) -> Result<SecondOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
         if let Some(cap_arc) = self.outer_inner_cap.as_ref() {
-            let cap = first_order_inner_cap_schedule(self.eval_count);
+            // The ARC bridge increments `eval_count` in BOTH `eval_grad` and
+            // `eval_hessian`. ARC calls both per outer iter, so `eval_count
+            // / 2` is the correct iter index for the schedule. Without this
+            // divisor the schedule would lift to full inner-cap at ARC iter
+            // 3 instead of iter 6.
+            let arc_iter = self.eval_count / 2;
+            let cap = first_order_inner_cap_schedule(arc_iter);
             let prev = cap_arc.swap(cap, Ordering::Relaxed);
             if prev != cap {
                 log::info!(
-                    "[OUTER schedule] inner-PIRLS cap transition (ARC bridge) eval_count={} prev={} new={} ({})",
-                    self.eval_count,
+                    "[OUTER schedule] inner-PIRLS cap transition (ARC bridge) arc_iter={} prev={} new={} ({})",
+                    arc_iter,
                     prev,
                     cap,
                     if cap == 0 { "uncapped" } else { "capped" }
