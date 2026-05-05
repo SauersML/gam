@@ -2503,11 +2503,21 @@ impl<'a> RemlState<'a> {
                 None
             };
             let mut pirls_config = self.config.as_pirls_config();
+            let original_cap = pirls_config.max_iterations;
             if in_screening {
                 pirls_config.max_iterations = pirls_config.max_iterations.min(screening_cap);
             }
             if outer_cap > 0 {
                 pirls_config.max_iterations = pirls_config.max_iterations.min(outer_cap);
+            }
+            if pirls_config.max_iterations != original_cap {
+                log::debug!(
+                    "[PIRLS cap] inner_max_iterations={} (full={} screening={} outer={})",
+                    pirls_config.max_iterations,
+                    original_cap,
+                    if in_screening { screening_cap as i64 } else { -1 },
+                    if outer_cap > 0 { outer_cap as i64 } else { -1 },
+                );
             }
             pirls_config.link_kind = if let Some(state) = self.runtime_mixture_link_state.clone() {
                 InverseLink::Mixture(state)
