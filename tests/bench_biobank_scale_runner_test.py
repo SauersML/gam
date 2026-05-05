@@ -744,6 +744,26 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         )
         self.assertEqual(v, "MARGINAL", f"detail={d}")
 
+    def test_phase_summary_aggregates_tangent_line_predicts_and_rejects(self) -> None:
+        # Pin down that [TANGENT-PREDICT] / [TANGENT-REJECTED] markers
+        # roll up into the [PHASE summary] line and surface the
+        # rejection-reason histogram. A "both predictors fell through
+        # to flat" pattern (high IFT-reject + high tangent-reject)
+        # should be visible at a glance.
+        stderr = "\n".join([
+            "[TANGENT-PREDICT] alpha=1.234e+00 cap=1.500e+00 drho_step_norm_sq=2.345e-02 drho_prev_norm_sq=4.567e-02",
+            "[TANGENT-PREDICT] alpha=8.765e-01 cap=1.500e+00 drho_step_norm_sq=2.345e-02 drho_prev_norm_sq=4.567e-02",
+            "[TANGENT-REJECTED] reason=alpha_above_cap alpha=2.345e+00 cap=1.500e+00",
+            "[TANGENT-REJECTED] reason=alpha_negative alpha=-1.234e-01 cap=1.500e+00",
+            "[TANGENT-REJECTED] reason=alpha_above_cap alpha=3.000e+00 cap=1.500e+00",
+            "[PHASE] my-fit fit end elapsed=10.0s",
+        ])
+        out = self._run_summary(stderr)
+        self.assertIn("tangent_predicts=2", out)
+        self.assertIn("tangent_rejects=3", out)
+        # Reasons sorted alphabetically by name.
+        self.assertIn("tangent_reasons=[alpha_above_cap=2,alpha_negative=1]", out)
+
     def test_phase_summary_aggregates_ift_accept_reject_noop_independently(self) -> None:
         stderr = "\n".join([
             # 4 accepts at varying residuals

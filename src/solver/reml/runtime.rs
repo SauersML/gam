@@ -2495,6 +2495,23 @@ impl<'a> RemlState<'a> {
         };
         let alpha_cap = adaptive_tangent_alpha_cap(last_residual);
         if alpha <= 0.0 || alpha > alpha_cap {
+            // Emit a structured reject marker so the bench runner can
+            // count tangent-line rejections alongside IFT ones.
+            // Tangent-line only fires when IFT returned None for
+            // non-cache reasons (large Δρ, factor failed, etc.), so
+            // this represents the "linear predictor stack failed
+            // entirely → fall back to flat warm-start" case. Counting
+            // the rate at biobank scale tells us how often the warm-
+            // start is degenerating to flat after IFT rejects.
+            let reason = if alpha <= 0.0 {
+                "alpha_negative"
+            } else {
+                "alpha_above_cap"
+            };
+            log::info!(
+                "[TANGENT-REJECTED] reason={} alpha={:.3e} cap={:.3e}",
+                reason, alpha, alpha_cap,
+            );
             return Some(cur_beta);
         }
         let mut predicted = cur_beta.0.clone();
@@ -2506,11 +2523,18 @@ impl<'a> RemlState<'a> {
             *p = c + alpha * (c - pp);
         }
         if !predicted.iter().all(|v: &f64| v.is_finite()) {
+            log::info!(
+                "[TANGENT-REJECTED] reason=non_finite_predicted alpha={:.3e} cap={:.3e}",
+                alpha, alpha_cap,
+            );
             return Some(cur_beta);
         }
-        log::debug!(
-            "[warm-start] tangent prediction: α={:.3} (‖dρ_step‖²={:.3e}, ‖dρ_prev‖²={:.3e})",
-            alpha, step_dot_d.abs(), d_rho_norm_sq,
+        log::info!(
+            "[TANGENT-PREDICT] alpha={:.3e} cap={:.3e} drho_step_norm_sq={:.3e} drho_prev_norm_sq={:.3e}",
+            alpha,
+            alpha_cap,
+            step_dot_d.abs(),
+            d_rho_norm_sq,
         );
         Some(Coefficients::new(predicted))
     }
