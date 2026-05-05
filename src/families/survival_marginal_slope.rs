@@ -27,8 +27,8 @@ use crate::families::marginal_slope_shared::{
     build_denested_partition_cells as shared_denested_partition_cells, eval_coeff4_at,
     is_sigma_aux_index as shared_is_sigma_aux_index,
     observed_denested_cell_partials as shared_observed_denested_cell_partials,
-    probit_frailty_scale, probit_frailty_scale_multi_dir_jet, psi_derivative_location,
-    scale_coeff4,
+    outer_row_indices, outer_score_scale, probit_frailty_scale, probit_frailty_scale_multi_dir_jet,
+    psi_derivative_location, scale_coeff4,
 };
 use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
@@ -2520,6 +2520,70 @@ impl SurvivalMarginalSlopeFamily {
     #[inline]
     fn probit_frailty_scale(&self) -> f64 {
         probit_frailty_scale(self.gaussian_frailty_sd)
+    }
+
+    /// Outer-aware variant of `log_likelihood_only`. When
+    /// `options.outer_score_subsample` is `None` this iterates over all rows
+    /// and matches the legacy full-data implementation. When it is `Some`,
+    /// only the masked rows contribute and the row-summed total is rescaled
+    /// by `weight_scale = n_full / |mask|` (Horvitz-Thompson). Lets outer-only
+    /// score/gradient passes scale to biobank `n` without distorting the
+    /// full-data inner-PIRLS or covariance code paths.
+    pub(crate) fn log_likelihood_only_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        options: &BlockwiseFitOptions,
+    ) -> Result<f64, String> {
+        let flex_active = self.effective_flex_active(block_states)?;
+        let row_iter = outer_row_indices(options, self.n).to_vec();
+        let scale = outer_score_scale(options, self.n);
+        if flex_active {
+            self.validate_exact_monotonicity(block_states)?;
+            let total: Result<f64, String> = row_iter
+                .into_par_iter()
+                .try_fold(
+                    || 0.0,
+                    |mut ll, i| -> Result<_, String> {
+                        ll -= self.row_neglog_flex_value(i, block_states)?;
+                        Ok(ll)
+                    },
+                )
+                .try_reduce(
+                    || 0.0,
+                    |left, right| -> Result<_, String> { Ok(left + right) },
+                );
+            return total.map(|v| v * scale);
+        }
+        // True fast path: closed-form scalar NLL, no jets, no Vecs, no gradients.
+        let guard = self.derivative_guard;
+        let probit_scale = self.probit_frailty_scale();
+        let total: Result<f64, String> = row_iter
+            .into_par_iter()
+            .try_fold(
+                || 0.0,
+                |mut ll, i| -> Result<_, String> {
+                    let q_geom = self.row_dynamic_q_geometry(i, block_states)?;
+                    let g = block_states[2].eta[i];
+                    let (nll, _, _) = row_primary_closed_form(
+                        q_geom.q0,
+                        q_geom.q1,
+                        q_geom.qd1,
+                        g,
+                        self.z[i],
+                        self.weights[i],
+                        self.event[i],
+                        guard,
+                        probit_scale,
+                    )?;
+                    ll -= nll;
+                    Ok(ll)
+                },
+            )
+            .try_reduce(
+                || 0.0,
+                |left, right| -> Result<_, String> { Ok(left + right) },
+            );
+        total.map(|v| v * scale)
     }
 
     fn is_sigma_aux_index(
@@ -12118,52 +12182,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
-        let flex_active = self.effective_flex_active(block_states)?;
-        if flex_active {
-            self.validate_exact_monotonicity(block_states)?;
-            return (0..self.n)
-                .into_par_iter()
-                .try_fold(
-                    || 0.0,
-                    |mut ll, i| -> Result<_, String> {
-                        ll -= self.row_neglog_flex_value(i, block_states)?;
-                        Ok(ll)
-                    },
-                )
-                .try_reduce(
-                    || 0.0,
-                    |left, right| -> Result<_, String> { Ok(left + right) },
-                );
-        }
-        // True fast path: closed-form scalar NLL, no jets, no Vecs, no gradients.
-        let guard = self.derivative_guard;
-        let probit_scale = self.probit_frailty_scale();
-        (0..self.n)
-            .into_par_iter()
-            .try_fold(
-                || 0.0,
-                |mut ll, i| -> Result<_, String> {
-                    let q_geom = self.row_dynamic_q_geometry(i, block_states)?;
-                    let g = block_states[2].eta[i];
-                    let (nll, _, _) = row_primary_closed_form(
-                        q_geom.q0,
-                        q_geom.q1,
-                        q_geom.qd1,
-                        g,
-                        self.z[i],
-                        self.weights[i],
-                        self.event[i],
-                        guard,
-                        probit_scale,
-                    )?;
-                    ll -= nll;
-                    Ok(ll)
-                },
-            )
-            .try_reduce(
-                || 0.0,
-                |left, right| -> Result<_, String> { Ok(left + right) },
-            )
+        self.log_likelihood_only_with_options(block_states, &BlockwiseFitOptions::default())
     }
 
     fn exact_newton_joint_hessian(
@@ -13565,6 +13584,168 @@ mod tests {
         let sparse = SparseColMat::try_new_from_triplets(dense.nrows(), dense.ncols(), &triplets)
             .expect("assemble sparse design");
         DesignMatrix::Sparse(crate::matrix::SparseDesignMatrix::new(sparse))
+    }
+
+    /// Build an n-row closed-form survival family with empty time/marginal/
+    /// logslope blocks (so q0/q1/qd1 come from offsets only). No flex
+    /// deviations are configured, so `log_likelihood_only` takes the
+    /// closed-form fast path.
+    fn make_closed_form_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
+        // Pseudo-random rows uncorrelated with row parity, so an even-only
+        // subsample is representative for the Horvitz-Thompson rescaling
+        // check.
+        let event: Array1<f64> =
+            Array1::from_iter((0..n).map(|i| if (i * 31 + 7) % 5 >= 3 { 1.0 } else { 0.0 }));
+        let weights: Array1<f64> =
+            Array1::from_iter((0..n).map(|i| 0.5 + ((i * 13 + 4) % 5) as f64 * 0.1));
+        let z: Array1<f64> = Array1::from_iter(
+            (0..n).map(|i| -1.0 + 2.0 * (((i * 17 + 5) % n) as f64 + 0.5) / (n as f64)),
+        );
+        let offset_entry: Array1<f64> = Array1::from_iter(
+            (0..n).map(|i| -0.4 + 0.7 * (((i * 11 + 3) % n) as f64 + 0.5) / (n as f64)),
+        );
+        let offset_exit: Array1<f64> = Array1::from_iter(
+            (0..n).map(|i| 0.1 + 0.6 * (((i * 19 + 7) % n) as f64 + 0.5) / (n as f64)),
+        );
+        // qd1 must remain strictly above the derivative guard.
+        let derivative_offset_exit: Array1<f64> = Array1::from_iter(
+            (0..n).map(|i| 0.5 + 0.05 * ((i * 23 + 1) % 3) as f64),
+        );
+        SurvivalMarginalSlopeFamily {
+            n,
+            event: Arc::new(event),
+            weights: Arc::new(weights),
+            z: Arc::new(z),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            // Empty time/marginal/logslope designs: `n_rows × 0` so the
+            // closed-form q geometry is driven entirely by offsets.
+            design_entry: DesignMatrix::from(Array2::zeros((n, 0))),
+            design_exit: DesignMatrix::from(Array2::zeros((n, 0))),
+            design_derivative_exit: DesignMatrix::from(Array2::zeros((n, 0))),
+            offset_entry: Arc::new(offset_entry),
+            offset_exit: Arc::new(offset_exit),
+            derivative_offset_exit: Arc::new(derivative_offset_exit),
+            marginal_design: DesignMatrix::from(Array2::zeros((n, 0))),
+            logslope_design: DesignMatrix::from(Array2::zeros((n, 0))),
+            score_warp: None,
+            link_dev: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+        }
+    }
+
+    fn closed_form_block_states(family: &SurvivalMarginalSlopeFamily, g: f64)
+    -> Vec<ParameterBlockState> {
+        let n = family.n;
+        vec![
+            // Time block: empty beta; per-row eta entries unused (designs
+            // are zero-column).
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: Array1::zeros(n),
+            },
+            // Marginal block: empty beta.
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: Array1::zeros(n),
+            },
+            // Log-slope block: empty beta with per-row eta = g (constant
+            // log-slope across rows).
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: Array1::from_elem(n, g),
+            },
+        ]
+    }
+
+    #[test]
+    fn survival_log_likelihood_subsample_full_equals_unsampled() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_closed_form_test_family(n);
+        let states = closed_form_block_states(&family, 0.25);
+
+        let baseline = family
+            .log_likelihood_only(&states)
+            .expect("baseline ll (no subsample)");
+
+        let mut opts_full = BlockwiseFitOptions::default();
+        opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            (0..n).collect(),
+            n,
+            0xDEADBEEF,
+        )));
+        let with_full_mask = family
+            .log_likelihood_only_with_options(&states, &opts_full)
+            .expect("ll with mask=full");
+
+        let rel = ((with_full_mask - baseline) / baseline.abs().max(1.0)).abs();
+        assert!(
+            rel < 1e-12,
+            "subsample(mask=full) {} differs from baseline {} by rel {}",
+            with_full_mask,
+            baseline,
+            rel
+        );
+    }
+
+    #[test]
+    fn survival_log_likelihood_subsample_half_scales_correctly() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_closed_form_test_family(n);
+        let states = closed_form_block_states(&family, 0.25);
+
+        let even_mask: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
+        let m = even_mask.len();
+
+        let mut opts_half = BlockwiseFitOptions::default();
+        opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            even_mask.clone(),
+            n,
+            0xCAFE,
+        )));
+        let scaled = family
+            .log_likelihood_only_with_options(&states, &opts_half)
+            .expect("ll with mask=even");
+
+        // Raw even-row sum: same mask but weight_scale = 1.0.
+        let mut opts_even_unscaled = BlockwiseFitOptions::default();
+        opts_even_unscaled.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
+            mask: Arc::new(even_mask),
+            n_full: m,
+            weight_scale: 1.0,
+            seed: 0,
+        }));
+        let raw_even_sum = family
+            .log_likelihood_only_with_options(&states, &opts_even_unscaled)
+            .expect("raw even-row ll sum");
+
+        let expected_scaled = (n as f64 / m as f64) * raw_even_sum;
+        let rel = ((scaled - expected_scaled) / expected_scaled.abs().max(1.0)).abs();
+        assert!(
+            rel < 1e-12,
+            "scaled {} != 2*even_sum {} (rel {})",
+            scaled,
+            expected_scaled,
+            rel
+        );
+
+        // Horvitz-Thompson check: 2 * Σ_even ≈ full-data sum.
+        let baseline = family
+            .log_likelihood_only(&states)
+            .expect("baseline ll");
+        let ht_rel = ((scaled - baseline) / baseline.abs().max(1.0)).abs();
+        assert!(
+            ht_rel < 0.05,
+            "Horvitz-Thompson scaled {} not near baseline {} (rel {})",
+            scaled,
+            baseline,
+            ht_rel
+        );
     }
 
     #[test]
