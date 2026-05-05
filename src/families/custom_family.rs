@@ -11276,11 +11276,20 @@ fn apply_joint_block_penalty(
     vector: &Array1<f64>,
     diagonal_ridge: f64,
 ) -> Array1<f64> {
+    // Per-block matvec via faer's parallel gemv (`fast_av`) instead of
+    // ndarray's serial scalar `dot`. The faer wrapper auto-falls-back to
+    // ndarray dot for sub-threshold dims, so small blocks pay no
+    // overhead. At biobank scale (large per-block dims) this swaps a
+    // serial loop for a SIMD-parallel matmul kernel — meaningful because
+    // this function is invoked inside the PCG matvec closure (called
+    // once per CG iter, hundreds-to-thousands of times per outer iter
+    // per the perf-scout report at memory/perf_scout_pcg_penalty_matvec.md).
     let mut out = Array1::<f64>::zeros(vector.len());
     for (b, s_lambda) in s_lambdas.iter().enumerate() {
         let (start, end) = ranges[b];
         let block = vector.slice(s![start..end]);
-        out.slice_mut(s![start..end]).assign(&s_lambda.dot(&block));
+        let prod = crate::linalg::faer_ndarray::fast_av(s_lambda, &block);
+        out.slice_mut(s![start..end]).assign(&prod);
     }
     if diagonal_ridge > 0.0 {
         out.scaled_add(diagonal_ridge, vector);
