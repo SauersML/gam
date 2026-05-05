@@ -808,6 +808,98 @@ pub fn assert_outer_only(
     // intentionally empty in Phase 1
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4: biobank-scale outer-score subsample auto-injection.
+//
+// At biobank scale (n > BIOBANK_OUTER_SUBSAMPLE_THRESHOLD) the
+// marginal-slope outer optimization burns most of its time in O(n) per-row
+// score / Hessian sweeps. `inject_biobank_outer_subsample` constructs a
+// stratified subsample (100 z-deciles × distinct secondary classes) and
+// installs it on the supplied `BlockwiseFitOptions` so outer-only sweeps
+// downscale to ~K rows. Inner-PIRLS and final-covariance passes still run
+// on the full data because they don't consult `outer_score_subsample`.
+//
+// The auto-enable gate fires only when `outer_score_subsample.is_none()`
+// so any caller that already supplied a subsample (for example a test or
+// a future CLI flag) is preserved verbatim.
+// ---------------------------------------------------------------------------
+
+/// Auto-enable threshold for the biobank-scale outer-score subsample.
+pub const BIOBANK_OUTER_SUBSAMPLE_THRESHOLD: usize = 50_000;
+/// Default subsample size targeted at biobank scale; mgcv::bam(discrete=TRUE)
+/// regime, ample for stable score / Hessian sums.
+pub const BIOBANK_OUTER_SUBSAMPLE_K: usize = 20_000;
+/// Deterministic seed for the auto-enabled subsample. Tests rely on this
+/// being stable across runs.
+pub const BIOBANK_OUTER_SUBSAMPLE_SEED: u64 = 0xC0FFEE_5EED;
+
+/// Install a stratified outer-score subsample on `opts` when `n` exceeds the
+/// biobank-scale threshold and no subsample is already configured. Returns
+/// `true` when a subsample was installed, `false` otherwise.
+///
+/// `z` is the linearized PGS axis the marginal-slope family stratifies on.
+/// `secondary` is the distinct-class indicator (binary y for bernoulli,
+/// event indicator for survival) used as the secondary stratification key.
+///
+/// This is a thin, separately-testable wrapper around
+/// [`build_outer_score_subsample`] so the wiring layer (workflow.rs) can be
+/// exercised without spinning up a full fit.
+pub fn inject_biobank_outer_subsample(
+    opts: &mut crate::custom_family::BlockwiseFitOptions,
+    z: &[f64],
+    secondary: &[u8],
+) -> bool {
+    let n = z.len();
+    if n <= BIOBANK_OUTER_SUBSAMPLE_THRESHOLD {
+        return false;
+    }
+    if opts.outer_score_subsample.is_some() {
+        return false;
+    }
+    if z.len() != secondary.len() {
+        // Defensive: mismatched lengths would panic inside the builder; bail
+        // out instead so the legacy full-data path keeps running.
+        return false;
+    }
+    let subsample = build_outer_score_subsample(
+        z,
+        secondary,
+        BIOBANK_OUTER_SUBSAMPLE_K,
+        BIOBANK_OUTER_SUBSAMPLE_SEED,
+    );
+    log::info!(
+        "[biobank-scale] constructed outer-score subsample: n={} k={} weight_scale={:.3} seed={:#x}",
+        n,
+        subsample.len(),
+        subsample.weight_scale,
+        BIOBANK_OUTER_SUBSAMPLE_SEED,
+    );
+    opts.outer_score_subsample = Some(Arc::new(subsample));
+    true
+}
+
+/// Convenience wrapper that converts an `Array1<f64>` event/y indicator
+/// (the canonical marginal-slope storage) into the `&[u8]` form the
+/// stratifier expects, then delegates to [`inject_biobank_outer_subsample`].
+///
+/// Non-zero entries map to `1u8`, exact zeros to `0u8`. NaNs are bucketed
+/// with non-zero (treated as a third class only if any are present, but
+/// `build_outer_score_subsample` handles arbitrary u8 alphabets transparently).
+pub fn inject_biobank_outer_subsample_from_arrays(
+    opts: &mut crate::custom_family::BlockwiseFitOptions,
+    z: &[f64],
+    secondary_f64: &[f64],
+) -> bool {
+    if z.len() != secondary_f64.len() {
+        return false;
+    }
+    let secondary: Vec<u8> = secondary_f64
+        .iter()
+        .map(|&v| if v != 0.0 { 1u8 } else { 0u8 })
+        .collect();
+    inject_biobank_outer_subsample(opts, z, &secondary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -908,5 +1000,105 @@ mod tests {
             "weight_scale {} not near 5.0",
             scale
         );
+    }
+
+    // ── Phase 4 wiring: biobank-scale auto-injection ───────────────────────
+
+    #[test]
+    fn inject_biobank_outer_subsample_fires_at_biobank_scale() {
+        // n=100k > 50k threshold → subsample should be installed and the
+        // mask length should be roughly K (within stratification overshoot).
+        let n: usize = 100_000;
+        let z: Vec<f64> = (0..n).map(|i| (i as f64) * 1e-3).collect();
+        let secondary: Vec<u8> = (0..n).map(|i| (i % 2) as u8).collect();
+        let mut opts = crate::custom_family::BlockwiseFitOptions::default();
+        assert!(opts.outer_score_subsample.is_none());
+        let installed = inject_biobank_outer_subsample(&mut opts, &z, &secondary);
+        assert!(installed, "subsample should be installed at n={}", n);
+        let s = opts
+            .outer_score_subsample
+            .as_ref()
+            .expect("subsample present");
+        // K with 200-stratum overshoot bound.
+        assert!(
+            s.len() >= BIOBANK_OUTER_SUBSAMPLE_K,
+            "mask len {} below K {}",
+            s.len(),
+            BIOBANK_OUTER_SUBSAMPLE_K
+        );
+        assert!(
+            s.len() <= BIOBANK_OUTER_SUBSAMPLE_K + 200,
+            "mask len {} much larger than K {} + 200",
+            s.len(),
+            BIOBANK_OUTER_SUBSAMPLE_K
+        );
+        assert_eq!(s.n_full, n);
+        // weight_scale ≈ n / mask.len() ≈ 5.
+        assert!((s.weight_scale - 5.0).abs() < 0.5);
+        assert_eq!(s.seed, BIOBANK_OUTER_SUBSAMPLE_SEED);
+    }
+
+    #[test]
+    fn inject_biobank_outer_subsample_skips_below_threshold() {
+        // n=10k ≤ 50k threshold → subsample stays None.
+        let n: usize = 10_000;
+        let z: Vec<f64> = (0..n).map(|i| (i as f64) * 1e-3).collect();
+        let secondary: Vec<u8> = (0..n).map(|i| (i % 2) as u8).collect();
+        let mut opts = crate::custom_family::BlockwiseFitOptions::default();
+        let installed = inject_biobank_outer_subsample(&mut opts, &z, &secondary);
+        assert!(!installed, "subsample must not fire below threshold");
+        assert!(opts.outer_score_subsample.is_none());
+    }
+
+    #[test]
+    fn inject_biobank_outer_subsample_preserves_existing() {
+        // Pre-existing subsample must not be overwritten.
+        let n: usize = 100_000;
+        let z: Vec<f64> = (0..n).map(|i| (i as f64) * 1e-3).collect();
+        let secondary: Vec<u8> = (0..n).map(|i| (i % 2) as u8).collect();
+        let preset = build_outer_score_subsample(&z, &secondary, 1_000, 0xABCDEF);
+        let preset_seed = preset.seed;
+        let preset_len = preset.len();
+        let mut opts = crate::custom_family::BlockwiseFitOptions::default();
+        opts.outer_score_subsample = Some(Arc::new(preset));
+        let installed = inject_biobank_outer_subsample(&mut opts, &z, &secondary);
+        assert!(!installed, "existing subsample must be preserved");
+        let s = opts
+            .outer_score_subsample
+            .as_ref()
+            .expect("subsample present");
+        assert_eq!(s.seed, preset_seed);
+        assert_eq!(s.len(), preset_len);
+    }
+
+    #[test]
+    fn inject_biobank_outer_subsample_from_arrays_maps_nonzero_to_one() {
+        // f64-secondary convenience: any non-zero entry should map to 1u8.
+        let n: usize = 100_000;
+        let z: Vec<f64> = (0..n).map(|i| (i as f64) * 1e-3).collect();
+        // Mix of 0.0 and 1.0 — exercises the standard binary case.
+        let secondary_f64: Vec<f64> = (0..n).map(|i| (i % 2) as f64).collect();
+        let mut opts = crate::custom_family::BlockwiseFitOptions::default();
+        let installed = inject_biobank_outer_subsample_from_arrays(
+            &mut opts,
+            &z,
+            &secondary_f64,
+        );
+        assert!(installed);
+        let s = opts
+            .outer_score_subsample
+            .as_ref()
+            .expect("subsample present");
+        assert!(s.len() >= BIOBANK_OUTER_SUBSAMPLE_K);
+    }
+
+    #[test]
+    fn inject_biobank_outer_subsample_rejects_mismatched_lengths() {
+        let z: Vec<f64> = (0..100_000).map(|i| i as f64).collect();
+        let secondary: Vec<u8> = (0..50_000).map(|i| (i % 2) as u8).collect();
+        let mut opts = crate::custom_family::BlockwiseFitOptions::default();
+        let installed = inject_biobank_outer_subsample(&mut opts, &z, &secondary);
+        assert!(!installed);
+        assert!(opts.outer_score_subsample.is_none());
     }
 }
