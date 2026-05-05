@@ -3062,11 +3062,50 @@ impl<'a> RemlState<'a> {
                             } else {
                                 f64::NAN
                             };
+                            // Δρ-step magnitude the predictor handled
+                            // here. Pulled from the OLD IFT cache (the
+                            // one the prediction was made against) BEFORE
+                            // updatewarm_start_from replaces it. Lets the
+                            // bench runner correlate residual quality
+                            // with step size — a small step that still
+                            // produced a large residual is a stronger
+                            // indictment of the linearization than a
+                            // large step at the same residual.
+                            let drho_norm = match self.ift_warm_start_cache.read() {
+                                Ok(guard) => match guard.as_ref() {
+                                    Some(c) if c.rho.len() == rho.len() => {
+                                        let mut sq = 0.0_f64;
+                                        for (n, o) in rho.iter().zip(c.rho.iter()) {
+                                            let d = n - o;
+                                            sq += d * d;
+                                        }
+                                        sq.sqrt()
+                                    }
+                                    _ => f64::NAN,
+                                },
+                                Err(_) => f64::NAN,
+                            };
+                            // Hessian conditioning indicator. log|H_pen|
+                            // tracks how the penalized curvature matrix
+                            // shifts across solves; sudden jumps signal
+                            // a flat direction opening up or a near-
+                            // singular geometry (the kind that often
+                            // precedes a PIRLS failure or a large IFT
+                            // residual). Read from the cached factor
+                            // when present (commit ec18559d), or NaN
+                            // when it hasn't been populated yet (first
+                            // solve at this surface).
+                            let h_pen_logdet = match self.ift_cached_factor.read() {
+                                Ok(guard) => guard.as_ref().map(|f| f.logdet()).unwrap_or(f64::NAN),
+                                Err(_) => f64::NAN,
+                            };
                             log::info!(
-                                "[IFT-QUALITY] residual={:.3e} converged_norm={:.3e} predicted_norm={:.3e} iters={}",
+                                "[IFT-QUALITY] residual={:.3e} converged_norm={:.3e} predicted_norm={:.3e} drho_norm={:.3e} h_pen_logdet={:.3e} iters={}",
                                 residual,
                                 conv_norm,
                                 pred_norm,
+                                drho_norm,
+                                h_pen_logdet,
                                 pirls_result.iteration,
                             );
                             // Feed the residual back into the adaptive
