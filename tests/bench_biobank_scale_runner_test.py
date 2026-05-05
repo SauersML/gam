@@ -739,6 +739,61 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         self.assertIn("n_tangent_accepts=2", d)
         self.assertNotIn("tangent_p50=", d)
 
+    def test_combine_fit_verdicts_worst_wins(self) -> None:
+        # DEGRADED > MARGINAL > HEALTHY > NO-DATA total ordering.
+        # The combined verdict reflects the WORST tier across the
+        # two axes — a fit that's HEALTHY on one axis but DEGRADED
+        # on the other is overall DEGRADED.
+        combine = _RUNNER._combine_fit_verdicts
+        # Both HEALTHY → HEALTHY.
+        self.assertEqual(combine("HEALTHY", "HEALTHY"), "HEALTHY")
+        # One MARGINAL trumps the other HEALTHY.
+        self.assertEqual(combine("HEALTHY", "MARGINAL"), "MARGINAL")
+        self.assertEqual(combine("MARGINAL", "HEALTHY"), "MARGINAL")
+        # One DEGRADED trumps everything else.
+        self.assertEqual(combine("HEALTHY", "DEGRADED"), "DEGRADED")
+        self.assertEqual(combine("DEGRADED", "HEALTHY"), "DEGRADED")
+        self.assertEqual(combine("MARGINAL", "DEGRADED"), "DEGRADED")
+        self.assertEqual(combine("DEGRADED", "DEGRADED"), "DEGRADED")
+        # NO-DATA is the bottom of the order — any other tier wins.
+        self.assertEqual(combine("HEALTHY", "NO-DATA"), "HEALTHY")
+        self.assertEqual(combine("NO-DATA", "MARGINAL"), "MARGINAL")
+        self.assertEqual(combine("NO-DATA", "DEGRADED"), "DEGRADED")
+        # None is treated as NO-DATA (sub-verdict not emitted because
+        # its source markers were absent).
+        self.assertEqual(combine(None, "HEALTHY"), "HEALTHY")
+        self.assertEqual(combine("MARGINAL", None), "MARGINAL")
+        self.assertEqual(combine(None, None), "NO-DATA")
+
+    def test_phase_summary_emits_fit_health_combining_warm_start_and_pirls(self) -> None:
+        # End-to-end: when both [WARM-START health] and [PIRLS health]
+        # fire, the [FIT health] line combines them and shows the
+        # individual sub-verdicts in its detail.
+        stderr = "\n".join([
+            # Healthy IFT data
+            "[IFT-QUALITY] residual=1.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=3",
+            "[IFT-QUALITY] residual=2.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=3",
+            # Degraded PIRLS rates (median 0.6 → DEGRADED tier)
+            "[PIRLS solve-end] iters=8 elapsed=0.001s g_norm_initial=1.0e+01 g_norm_final=1.0e-02 convergence_rate=5.500e-01 status=Converged",
+            "[PIRLS solve-end] iters=10 elapsed=0.001s g_norm_initial=1.0e+01 g_norm_final=1.0e-02 convergence_rate=6.500e-01 status=Converged",
+            "[PIRLS solve-end] iters=12 elapsed=0.001s g_norm_initial=1.0e+01 g_norm_final=1.0e-02 convergence_rate=7.000e-01 status=Converged",
+            "[PHASE] my-fit fit end elapsed=10.0s",
+        ])
+        out = self._run_summary(stderr)
+        # All three health lines emit
+        self.assertIn("[WARM-START health]", out)
+        self.assertIn("[PIRLS health]", out)
+        self.assertIn("[FIT health]", out)
+        # Combined verdict is DEGRADED (PIRLS axis wins) and the
+        # detail shows BOTH sub-verdicts.
+        fit_lines = [
+            line for line in out.splitlines() if line.startswith("[FIT health]")
+        ]
+        self.assertEqual(len(fit_lines), 1)
+        self.assertIn("verdict=DEGRADED", fit_lines[0])
+        self.assertIn("warm_start=", fit_lines[0])
+        self.assertIn("pirls=DEGRADED", fit_lines[0])
+
     def test_pirls_health_verdict_classifies_tiers(self) -> None:
         # HEALTHY: 95% of solves at rate < 0.5 (each Newton iter at
         # least halved the gradient on average for the bulk of the

@@ -2090,6 +2090,8 @@ def _emit_phase_summary(
     # we have IFT-QUALITY data; absent otherwise so a fit that
     # legitimately doesn't exercise the warm-start path doesn't get
     # tagged.
+    warm_start_verdict: str | None = None
+    pirls_verdict: str | None = None
     if ift_quality_matches or outer_nonfinite or tangent_quality_matches:
         residuals_for_verdict = [
             float(m[0]) for m in ift_quality_matches if float(m[0]) == float(m[0])
@@ -2117,6 +2119,7 @@ def _emit_phase_summary(
             n_tangent_accepts=len(tangent_resids),
             tangent_p50=tangent_p50,
         )
+        warm_start_verdict = verdict
         print(
             f"[WARM-START health] cmd='{cmd_preview}' verdict={verdict} {detail}",
             file=sys.stderr,
@@ -2138,12 +2141,55 @@ def _emit_phase_summary(
             if r == r:
                 pirls_rates.append(r)
         if pirls_rates:
-            pirls_verdict, pirls_detail = _pirls_health_verdict(rates=pirls_rates)
+            verdict, pirls_detail = _pirls_health_verdict(rates=pirls_rates)
+            pirls_verdict = verdict
             print(
-                f"[PIRLS health] cmd='{cmd_preview}' verdict={pirls_verdict} {pirls_detail}",
+                f"[PIRLS health] cmd='{cmd_preview}' verdict={verdict} {pirls_detail}",
                 file=sys.stderr,
                 flush=True,
             )
+    # Top-level [FIT health] verdict combines the warm-start and PIRLS
+    # verdicts into a single glance-readable tier so reviewers don't
+    # have to mentally combine the two. Combination is "worst tier
+    # wins" with a documented total ordering — DEGRADED >
+    # MARGINAL > HEALTHY > NO-DATA. Emitted only when at least one
+    # sub-verdict was determined.
+    if warm_start_verdict is not None or pirls_verdict is not None:
+        combined = _combine_fit_verdicts(warm_start_verdict, pirls_verdict)
+        ws_label = warm_start_verdict if warm_start_verdict else "ABSENT"
+        pirls_label = pirls_verdict if pirls_verdict else "ABSENT"
+        print(
+            f"[FIT health] cmd='{cmd_preview}' verdict={combined} "
+            f"warm_start={ws_label} pirls={pirls_label}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _combine_fit_verdicts(
+    warm_start: str | None,
+    pirls: str | None,
+) -> str:
+    """Combine the warm-start and PIRLS health verdicts into a single
+    top-level fit verdict via a worst-wins total ordering:
+
+      DEGRADED  > MARGINAL > HEALTHY > NO-DATA
+
+    Either input may be `None` (sub-verdict was not emitted because
+    its source markers were absent); a `None` is treated as if the
+    sub-verdict were NO-DATA. The combined verdict reflects the
+    WORST tier seen across the two axes — a fit that's HEALTHY on
+    one axis but DEGRADED on the other is overall DEGRADED, not
+    "averaged" to MARGINAL. The independent sub-verdicts remain
+    visible in the [FIT health] line's `warm_start=` and `pirls=`
+    fields so reviewers can see which axis tripped the combined
+    verdict.
+    """
+    rank = {"DEGRADED": 3, "MARGINAL": 2, "HEALTHY": 1, "NO-DATA": 0}
+    inv_rank = {v: k for k, v in rank.items()}
+    ws_rank = rank.get(warm_start or "NO-DATA", 0)
+    p_rank = rank.get(pirls or "NO-DATA", 0)
+    return inv_rank[max(ws_rank, p_rank)]
 
 
 def _pirls_health_verdict(*, rates: list[float]) -> tuple[str, str]:
