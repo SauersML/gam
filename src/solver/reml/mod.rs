@@ -30,19 +30,9 @@ const FIRTH_MAX_QUADRATIC_WORK: usize = 100_000_000;
 
 /// Cached state from the most recent successful PIRLS solve, populated by
 /// `updatewarm_start_from` and consumed by the IFT-based warm-start
-/// predictor. See the field doc on
-/// `RemlObjectiveState::ift_warm_start_cache` for the math.
-///
-/// Fields are `#[allow(dead_code)]` because the predictor lives in a
-/// follow-up commit; this struct fixes the cache layout / lifecycle so
-/// the predictor implementation has a stable surface to plug into. All
-/// fields are intentionally unused for now — the writer/clear paths
-/// in `runtime.rs` are real (populate after each PIRLS converge,
-/// invalidate on reset_surface / invalidate_link_dependent_state /
-/// failed solve), so the lifecycle is exercised even before the
-/// reader exists.
+/// predictor (`predict_warm_start_beta_ift_from_cache`). See the field
+/// doc on `RemlState::ift_warm_start_cache` for the math.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub(crate) struct IftWarmStartCache {
     /// β at the converged solve, in ORIGINAL basis. Mirror of
     /// `warm_start_beta` stashed alongside the H factor for atomic

@@ -2256,6 +2256,39 @@ impl<'a> RemlState<'a> {
         }
     }
 
+    /// Predict β at `new_rho` via the implicit-function-theorem first-order
+    /// expansion `β_predict = β_cur − Σ_k Δρ_k · H_pen^{-1} · (e^{ρ_cur_k} S_k β_cur)`.
+    ///
+    /// Returns `None` (caller falls back to tangent-line / flat warm-start) when:
+    /// * the IFT cache is empty (no prior converged solve, or one was invalidated),
+    /// * ρ has been stamped yet (length 0 — see `record_warm_start_rho`),
+    /// * Δρ is too aggressive for the linearized predictor to trust
+    ///   (max |Δρ_k| > 2.0 — i.e. a single penalty has moved by more than e²
+    ///   in λ-space, well outside the regime where the local linear Jacobian
+    ///   is descriptive),
+    /// * factorization or back-solve fails / produces non-finite output.
+    ///
+    /// The factorization is recomputed every call (one Cholesky per outer
+    /// iter, O(p³)). At p≈100–200 this is sub-millisecond and is dwarfed by
+    /// the inner Newton's per-iter cost, so caching the factor is not worth
+    /// the extra interior-mutability plumbing.
+    pub(crate) fn predict_warm_start_beta_ift(
+        &self,
+        new_rho: &Array1<f64>,
+    ) -> Option<Coefficients> {
+        if !self.warm_start_enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let cache_guard = self.ift_warm_start_cache.read().unwrap();
+        let cache = cache_guard.as_ref()?;
+        predict_warm_start_beta_ift_from_cache(
+            cache,
+            self.canonical_penalties.as_ref(),
+            new_rho,
+            self.p,
+        )
+    }
+
     /// Predict β at `new_rho` via tangent-line extrapolation across the
     /// last two (ρ, β) pairs. Returns `None` if either pair is missing,
     /// the ρ-step direction is degenerate, or the extrapolation step
@@ -2273,6 +2306,14 @@ impl<'a> RemlState<'a> {
     ) -> Option<Coefficients> {
         if !self.warm_start_enabled.load(Ordering::Relaxed) {
             return None;
+        }
+        // Try the IFT-based predictor first. It uses the exact first-order
+        // Jacobian of β(ρ) at the cached solve and beats the tangent-line
+        // predictor whenever a converged H_pen is available — which is
+        // every call after the first successful PIRLS solve.
+        if let Some(predicted) = self.predict_warm_start_beta_ift(new_rho) {
+            log::debug!("[warm-start] IFT prediction accepted");
+            return Some(predicted);
         }
         let cur_beta = self.warm_start_beta.read().unwrap().clone()?;
         let cur_rho = self.warm_start_rho.read().unwrap().clone();
@@ -2925,6 +2966,163 @@ impl<'a> RemlState<'a> {
             }
         }
     }
+}
+
+/// Maximum |Δρ_k| beyond which the IFT linear predictor is rejected.
+/// Δρ = log(λ_new / λ_old); 2.0 corresponds to a 7.4× change in λ along
+/// any single penalty direction — well outside the regime where the local
+/// first-order Jacobian dβ/dρ is faithful. At larger steps the inner
+/// PIRLS Newton handles the move better starting from the cached β
+/// directly than from a wildly extrapolated point.
+const IFT_WARM_START_MAX_DRHO: f64 = 2.0;
+
+/// Below this magnitude in any Δρ_k, the per-component IFT contribution is
+/// numerically negligible and skipped (saves one back-solve per inactive
+/// component).
+const IFT_WARM_START_DRHO_EPS: f64 = 1e-12;
+
+/// Free-function form of the IFT warm-start predictor. Operates purely on
+/// the cache + canonical penalties + new ρ, so it is testable without
+/// instantiating a full `RemlState`.
+///
+/// Math (see field doc on `RemlState::ift_warm_start_cache`):
+/// `β_predict(ρ_new) = β_cur − Σ_k Δρ_k · H_pen^{-1} · (e^{ρ_cur_k} S_k β_cur)`
+/// where Δρ = ρ_new − ρ_cur and H_pen, β are taken at the cached solve.
+///
+/// Basis handling: S_k and β_cur live in the ORIGINAL basis (the cache
+/// stashes β_original). H_pen, however, is cached in the TRANSFORMED basis
+/// (it comes from `PirlsResult.penalized_hessian_transformed`). When the
+/// PIRLS solve was run in original-sparse-native mode (`frame_was_original`),
+/// `qs = I` and we solve directly. Otherwise we round-trip through qs:
+/// `qs · H_tfd · qs^T · u = v` ⟹ `u = qs · (H_tfd \ (qs^T · v))`. qs is
+/// orthogonal by construction (`stable_reparameterizationwith_invariant`
+/// builds it from orthogonal eigenvector matrices), so qs^{-1} = qs^T.
+pub(crate) fn predict_warm_start_beta_ift_from_cache(
+    cache: &super::IftWarmStartCache,
+    canonical_penalties: &[crate::construction::CanonicalPenalty],
+    new_rho: &Array1<f64>,
+    p: usize,
+) -> Option<Coefficients> {
+    // Cache populated but ρ not yet stamped (happens between
+    // updatewarm_start_from and record_warm_start_rho on the first solve).
+    if cache.rho.is_empty() {
+        return None;
+    }
+    let k = cache.rho.len();
+    if new_rho.len() != k
+        || canonical_penalties.len() != k
+        || cache.beta_original.len() != p
+    {
+        return None;
+    }
+
+    // Δρ guard: reject in toto if any single component exceeds the cap.
+    // We do not partially clip: the directions we drop matter just as much
+    // as the directions we keep, and a clipped predictor is harder to
+    // reason about than a clean fallback.
+    let mut max_abs_drho = 0.0_f64;
+    let drho: Array1<f64> = (0..k)
+        .map(|i| {
+            let d = new_rho[i] - cache.rho[i];
+            if !d.is_finite() {
+                return f64::INFINITY;
+            }
+            if d.abs() > max_abs_drho {
+                max_abs_drho = d.abs();
+            }
+            d
+        })
+        .collect();
+    if !max_abs_drho.is_finite() || max_abs_drho > IFT_WARM_START_MAX_DRHO {
+        return None;
+    }
+
+    // Build Σ_k Δρ_k · e^{ρ_cur_k} · S_k · β_cur in the ORIGINAL basis.
+    // Aggregating into a single rhs lets us factor H once and back-solve
+    // exactly once, instead of k times. Mathematically:
+    //   Σ_k Δρ_k H^{-1} v_k = H^{-1} (Σ_k Δρ_k v_k)
+    // since H^{-1} is linear in its rhs.
+    let beta_cur = &cache.beta_original;
+    let mut rhs_original = Array1::<f64>::zeros(p);
+    let mut any_active = false;
+    for (idx, cp) in canonical_penalties.iter().enumerate() {
+        let dr = drho[idx];
+        if dr.abs() <= IFT_WARM_START_DRHO_EPS {
+            continue;
+        }
+        any_active = true;
+        let r = &cp.col_range;
+        // S_k · β_cur is block-local: only β_cur[r] contributes, and the
+        // result lives in r as well.
+        let beta_block = beta_cur.slice(s![r.start..r.end]);
+        let sb_block = cp.local.dot(&beta_block);
+        let scale = dr * cache.rho[idx].exp();
+        let mut rhs_slice = rhs_original.slice_mut(s![r.start..r.end]);
+        for (target, src) in rhs_slice.iter_mut().zip(sb_block.iter()) {
+            *target += scale * *src;
+        }
+    }
+
+    if !any_active {
+        // All Δρ are below the eps floor — predictor reduces to identity.
+        // Returning the cached β here is equivalent to the flat warm-start
+        // and slightly better than the tangent-line predictor (which the
+        // caller would otherwise try), since the IFT cache reflects a
+        // genuinely converged solve.
+        return Some(Coefficients::new(beta_cur.clone()));
+    }
+
+    if !rhs_original.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+
+    // Convert rhs to the basis H_pen lives in, solve, convert back.
+    let solve_in_original = cache.frame_was_original;
+    let rhs_in_h_basis = if solve_in_original {
+        rhs_original
+    } else {
+        // rhs_tfd = qs^T · rhs_original. Dimension check: qs is p×p.
+        if cache.qs.nrows() != p || cache.qs.ncols() != p {
+            return None;
+        }
+        cache.qs.t().dot(&rhs_original)
+    };
+
+    let factor = match cache.penalized_hessian_transformed.factorize() {
+        Ok(f) => f,
+        Err(_) => return None,
+    };
+    let solution_in_h_basis = match factor.solve(&rhs_in_h_basis) {
+        Ok(u) => u,
+        Err(_) => return None,
+    };
+    let solution_original = if solve_in_original {
+        solution_in_h_basis
+    } else {
+        cache.qs.dot(&solution_in_h_basis)
+    };
+
+    if !solution_original.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+
+    // β_predict = β_cur − H^{-1} · (Σ_k Δρ_k e^{ρ_k} S_k β_cur).
+    // (The sign convention: dβ/dρ_k = −H^{-1} (e^{ρ_k} S_k β), so
+    //  Δβ = −Σ_k Δρ_k H^{-1} (e^{ρ_k} S_k β) = −solution_original.)
+    let mut predicted = beta_cur.clone();
+    for (target, &correction) in predicted.iter_mut().zip(solution_original.iter()) {
+        *target -= correction;
+    }
+    if !predicted.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    log::debug!(
+        "[warm-start] IFT prediction: max|Δρ|={:.3e}, ‖rhs‖={:.3e}, ‖Δβ‖={:.3e}",
+        max_abs_drho,
+        rhs_in_h_basis.dot(&rhs_in_h_basis).sqrt(),
+        solution_original.dot(&solution_original).sqrt(),
+    );
+    Some(Coefficients::new(predicted))
 }
 
 impl<'a> RemlState<'a> {
@@ -5497,5 +5695,313 @@ mod tk_math_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ift_warm_start_tests {
+    use super::*;
+    use crate::construction::CanonicalPenalty;
+    use crate::linalg::matrix::SymmetricMatrix;
+    use ndarray::Array2;
+
+    /// Build a CanonicalPenalty from a dense p×p SPD-ish penalty matrix by
+    /// taking its eigendecomposition and packing the positive-eigenvalue
+    /// components into the `rank × p` root.
+    fn dense_canonical_from_local(local: Array2<f64>, p: usize) -> CanonicalPenalty {
+        use crate::faer_ndarray::FaerEigh;
+        use faer::Side;
+        let (evals, evecs) = local.eigh(Side::Lower).expect("eigh penalty");
+        let mut rows: Vec<Array1<f64>> = Vec::new();
+        let mut positive_eigenvalues: Vec<f64> = Vec::new();
+        for (idx, &lam) in evals.iter().enumerate() {
+            if lam > 1e-12 {
+                let scale = lam.sqrt();
+                let v = evecs.column(idx).to_owned();
+                rows.push(v.mapv(|x| x * scale));
+                positive_eigenvalues.push(lam);
+            }
+        }
+        let rank = rows.len();
+        let mut root = Array2::<f64>::zeros((rank, p));
+        for (i, row) in rows.iter().enumerate() {
+            for j in 0..p {
+                root[[i, j]] = row[j];
+            }
+        }
+        let nullity = p - rank;
+        CanonicalPenalty {
+            root,
+            col_range: 0..p,
+            total_dim: p,
+            nullity,
+            local,
+            positive_eigenvalues,
+            op: None,
+        }
+    }
+
+    /// Verify the IFT predictor satisfies the linearized FOC:
+    /// `H_pen · (β_predict − β_cur) ≈ −Σ_k Δρ_k · e^{ρ_k} · S_k · β_cur`.
+    /// Tested in the original-basis path (`frame_was_original = true`).
+    #[test]
+    fn ift_predictor_satisfies_linearized_foc_original_basis() {
+        let p = 5usize;
+        // Hand-built S_1, S_2 — diagonal-dominant SPD blocks so the
+        // local matrices have full rank and the FOC is non-trivial.
+        let s1 = Array2::from_shape_vec(
+            (p, p),
+            vec![
+                2.0, 0.3, 0.0, 0.0, 0.0,
+                0.3, 2.5, 0.4, 0.0, 0.0,
+                0.0, 0.4, 1.8, 0.2, 0.0,
+                0.0, 0.0, 0.2, 1.2, 0.1,
+                0.0, 0.0, 0.0, 0.1, 1.5,
+            ],
+        )
+        .unwrap();
+        let s2 = Array2::from_shape_vec(
+            (p, p),
+            vec![
+                1.1, 0.0, 0.2, 0.0, 0.1,
+                0.0, 0.9, 0.0, 0.3, 0.0,
+                0.2, 0.0, 1.4, 0.0, 0.2,
+                0.0, 0.3, 0.0, 1.7, 0.0,
+                0.1, 0.0, 0.2, 0.0, 2.1,
+            ],
+        )
+        .unwrap();
+        let cp1 = dense_canonical_from_local(s1.clone(), p);
+        let cp2 = dense_canonical_from_local(s2.clone(), p);
+        let canonical = vec![cp1, cp2];
+
+        // Cached β at converged solve.
+        let beta_cur = ndarray::array![0.4, -0.7, 0.2, 0.9, -0.3];
+        // Cached ρ.
+        let rho_cur = ndarray::array![0.2_f64, -0.1];
+        // H_pen at the cached solve. Doesn't have to literally equal
+        // ∇²D + Σ e^ρ_k S_k for the linear-FOC check; it just has to
+        // be SPD and consistent with what the predictor uses. Keep it
+        // simple: use ∇²D = identity and add the penalties.
+        let mut h_pen = Array2::<f64>::eye(p);
+        for (k_idx, cp) in canonical.iter().enumerate() {
+            let lam = rho_cur[k_idx].exp();
+            for i in 0..p {
+                for j in 0..p {
+                    h_pen[[i, j]] += lam * cp.local[[i, j]];
+                }
+            }
+        }
+
+        let cache = super::super::IftWarmStartCache {
+            beta_original: beta_cur.clone(),
+            rho: rho_cur.clone(),
+            penalized_hessian_transformed: SymmetricMatrix::Dense(h_pen.clone()),
+            qs: Array2::eye(p),
+            frame_was_original: true,
+        };
+
+        // Small Δρ — well within the 2.0 cap.
+        let new_rho = ndarray::array![0.25_f64, -0.05];
+        let predicted = predict_warm_start_beta_ift_from_cache(
+            &cache,
+            &canonical,
+            &new_rho,
+            p,
+        )
+        .expect("IFT predictor should accept small Δρ");
+
+        // Check the linearized FOC residual:
+        //   H_pen · (β_pred − β_cur) + Σ_k Δρ_k · e^{ρ_k} · S_k · β_cur ≈ 0
+        let dbeta = &predicted.0 - &beta_cur;
+        let lhs = h_pen.dot(&dbeta);
+        let mut rhs = Array1::<f64>::zeros(p);
+        for (k_idx, cp) in canonical.iter().enumerate() {
+            let drho = new_rho[k_idx] - rho_cur[k_idx];
+            let scale = drho * rho_cur[k_idx].exp();
+            let sb = cp.local.dot(&beta_cur);
+            for i in 0..p {
+                rhs[i] += scale * sb[i];
+            }
+        }
+        // residual should be tiny (linear-FOC is exactly satisfied by the IFT
+        // predictor up to factorization round-off).
+        let residual: f64 = lhs
+            .iter()
+            .zip(rhs.iter())
+            .map(|(&a, &b)| (a + b) * (a + b))
+            .sum::<f64>()
+            .sqrt();
+        let scale: f64 = rhs.iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-12);
+        assert!(
+            residual / scale < 1e-9,
+            "IFT predictor violates linearized FOC: residual {residual:.3e}, scale {scale:.3e}"
+        );
+
+        // β_predict should be different from β_cur (otherwise the predictor
+        // is a no-op and the test is meaningless).
+        let dbeta_norm: f64 = dbeta.iter().map(|x| x * x).sum::<f64>().sqrt();
+        assert!(
+            dbeta_norm > 1e-6,
+            "IFT predictor produced zero β-update; check that Δρ propagated"
+        );
+    }
+
+    /// Verify the basis-conversion path: when frame_was_original=false,
+    /// solving with H in transformed basis and round-tripping through qs
+    /// (which is orthogonal) must produce the SAME prediction as solving
+    /// in original basis with H_orig = qs · H_tfd · qs^T.
+    #[test]
+    fn ift_predictor_basis_conversion_matches_original() {
+        let p = 4usize;
+        let s1 = Array2::from_shape_vec(
+            (p, p),
+            vec![
+                1.5, 0.2, 0.0, 0.0,
+                0.2, 1.8, 0.1, 0.0,
+                0.0, 0.1, 1.2, 0.05,
+                0.0, 0.0, 0.05, 1.4,
+            ],
+        )
+        .unwrap();
+        let cp1 = dense_canonical_from_local(s1.clone(), p);
+        let canonical = vec![cp1];
+
+        let beta_cur = ndarray::array![0.5, -0.3, 0.8, 0.2];
+        let rho_cur = ndarray::array![0.1_f64];
+
+        // H_orig = I + e^ρ · S
+        let mut h_orig = Array2::<f64>::eye(p);
+        let lam = rho_cur[0].exp();
+        for i in 0..p {
+            for j in 0..p {
+                h_orig[[i, j]] += lam * canonical[0].local[[i, j]];
+            }
+        }
+
+        // Build a non-trivial orthogonal qs (Gram-Schmidt of a random-ish basis).
+        let raw = Array2::from_shape_vec(
+            (p, p),
+            vec![
+                1.0, 0.5, 0.0, 0.1,
+                0.0, 1.0, 0.3, 0.0,
+                0.2, 0.0, 1.0, 0.4,
+                0.0, 0.1, 0.0, 1.0,
+            ],
+        )
+        .unwrap();
+        let (q, _r) = {
+            use crate::faer_ndarray::FaerQr;
+            raw.qr().expect("QR")
+        };
+        let qs: Array2<f64> = q;
+        // Sanity: qs is orthogonal.
+        let qq = qs.t().dot(&qs);
+        for i in 0..p {
+            for j in 0..p {
+                let target = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (qq[[i, j]] - target).abs() < 1e-10,
+                    "qs not orthogonal at [{},{}]: {}",
+                    i,
+                    j,
+                    qq[[i, j]]
+                );
+            }
+        }
+
+        let h_tfd = qs.t().dot(&h_orig).dot(&qs);
+
+        let cache_tfd = super::super::IftWarmStartCache {
+            beta_original: beta_cur.clone(),
+            rho: rho_cur.clone(),
+            penalized_hessian_transformed: SymmetricMatrix::Dense(h_tfd),
+            qs: qs.clone(),
+            frame_was_original: false,
+        };
+        let cache_orig = super::super::IftWarmStartCache {
+            beta_original: beta_cur.clone(),
+            rho: rho_cur.clone(),
+            penalized_hessian_transformed: SymmetricMatrix::Dense(h_orig.clone()),
+            qs: Array2::eye(p),
+            frame_was_original: true,
+        };
+
+        let new_rho = ndarray::array![0.3_f64];
+        let predicted_tfd = predict_warm_start_beta_ift_from_cache(
+            &cache_tfd,
+            &canonical,
+            &new_rho,
+            p,
+        )
+        .expect("tfd predict");
+        let predicted_orig = predict_warm_start_beta_ift_from_cache(
+            &cache_orig,
+            &canonical,
+            &new_rho,
+            p,
+        )
+        .expect("orig predict");
+
+        for i in 0..p {
+            assert!(
+                (predicted_tfd.0[i] - predicted_orig.0[i]).abs() < 1e-10,
+                "basis-conversion path mismatch at index {i}: tfd={}, orig={}",
+                predicted_tfd.0[i],
+                predicted_orig.0[i],
+            );
+        }
+    }
+
+    /// Δρ above the safety cap must reject (return None), so the caller
+    /// falls through to the tangent-line / flat warm-start.
+    #[test]
+    fn ift_predictor_rejects_large_drho() {
+        let p = 3usize;
+        let s1 = Array2::from_shape_vec(
+            (p, p),
+            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        )
+        .unwrap();
+        let cp1 = dense_canonical_from_local(s1, p);
+        let canonical = vec![cp1];
+        let beta_cur = ndarray::array![1.0, 1.0, 1.0];
+        let rho_cur = ndarray::array![0.0_f64];
+        let h_pen = Array2::<f64>::eye(p) * 2.0;
+        let cache = super::super::IftWarmStartCache {
+            beta_original: beta_cur,
+            rho: rho_cur,
+            penalized_hessian_transformed: SymmetricMatrix::Dense(h_pen),
+            qs: Array2::eye(p),
+            frame_was_original: true,
+        };
+        // |Δρ| = 3 > IFT_WARM_START_MAX_DRHO = 2.0 → reject.
+        let new_rho = ndarray::array![3.0_f64];
+        let predicted =
+            predict_warm_start_beta_ift_from_cache(&cache, &canonical, &new_rho, p);
+        assert!(
+            predicted.is_none(),
+            "predictor should reject Δρ above cap, got {:?}",
+            predicted
+        );
+    }
+
+    /// Empty ρ in the cache (the in-between state where
+    /// updatewarm_start_from has populated β/H but record_warm_start_rho
+    /// has not stamped ρ yet) must return None.
+    #[test]
+    fn ift_predictor_rejects_unstamped_cache() {
+        let p = 2usize;
+        let cache = super::super::IftWarmStartCache {
+            beta_original: ndarray::array![1.0, 2.0],
+            rho: Array1::zeros(0),
+            penalized_hessian_transformed: SymmetricMatrix::Dense(Array2::eye(p)),
+            qs: Array2::eye(p),
+            frame_was_original: true,
+        };
+        let new_rho = ndarray::array![0.1_f64];
+        let predicted =
+            predict_warm_start_beta_ift_from_cache(&cache, &[], &new_rho, p);
+        assert!(predicted.is_none());
     }
 }
