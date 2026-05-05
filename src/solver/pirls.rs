@@ -3989,6 +3989,28 @@ where
         // In standard LM, we solve (H + λI)δ = -g
         let mut loop_lambda = lambda;
         let mut attempts = 0;
+        // Snapshot the LM trajectory's starting λ for the
+        // `[PIRLS lm-trajectory]` log emitted at iter-end. This is what
+        // the runtime-layer adaptive clamp (commit 43be42be) selected for
+        // this iter, and the iter-end final λ (after Madsen accept-side
+        // shrink/expand) reveals how the LM trajectory moved this iter.
+        // Aggregating start→final ratios across a fit tells us whether
+        // the textbook LM updates (commits 58ae42d1, d37626e6) are
+        // actually moving λ in useful directions at biobank scale.
+        let lm_start_lambda = lambda;
+        // Track the gain ratio of the accepted step. None on the
+        // rejection-exhausted path (no step was ever accepted this iter).
+        // Aggregating ρ accepted across iters tells us whether the LM
+        // model is well-calibrated: ρ ≈ 1 throughout = healthy Newton;
+        // ρ << 1 = model over-states predicted reduction. The
+        // `unused_assignments` allow is justified: the trajectory log
+        // is emitted only on iter-end fall-through (via `break;` from
+        // the LM loop), which always passes through the accept-step
+        // assignment. The initial `None` is the safety value if a
+        // future code path adds a different fall-through; defending
+        // that case is cheap.
+        #[allow(unused_assignments)]
+        let mut lm_accept_rho: Option<f64> = None;
         // Madsen-Nielsen-Tingleff stateful rejection factor (eq 3.16 in
         // "Methods for non-linear least squares problems", IMM Tech Univ
         // Denmark, 2nd ed 2004): v starts at 2 and doubles on every
@@ -4247,7 +4269,10 @@ where
                                 consecutive_fisher_fallbacks = 0;
                             }
                         }
-                        // Accept Step
+                        // Accept Step.
+                        // Stash the accepted gain ratio for the
+                        // [PIRLS lm-trajectory] log emitted at iter-end.
+                        lm_accept_rho = Some(rho);
                         // Update Trust Region (Lambda) — Madsen-Nielsen-Tingleff
                         // smooth Marquardt update. See `madsen_lm_accept_factor`
                         // for the textbook derivation and canonical values.
@@ -4599,6 +4624,39 @@ where
             lm_predred_total.as_secs_f64(),
             lm_candidate_total.as_secs_f64(),
             other_total.as_secs_f64(),
+        );
+        // Per-iter LM trajectory: validates that the textbook Madsen
+        // accept (commit 58ae42d1) and reject (d37626e6) updates plus
+        // the runtime adaptive λ clamp (43be42be) are moving the trust
+        // region in useful directions.
+        //   start_lambda  : λ at iter start (after runtime adaptive
+        //                   clamp; matches PIRLS's own safety clamp)
+        //   final_lambda  : λ written for the next iter (after Madsen
+        //                   accept-side shrink/expand, OR last
+        //                   loop_lambda if rejection-exhausted)
+        //   ratio         : final/start, log10 — distribution tells
+        //                   us the per-iter trust-region trajectory.
+        //                   Healthy Newton: ratio < 0 (shrink). Hard:
+        //                   ratio > 0 (expand). Mostly stationary:
+        //                   ratio ≈ 0.
+        //   accept_rho    : gain ratio of the accepted step. ≈1 means
+        //                   the quadratic model was faithful; <0.5
+        //                   means it overstated the predicted
+        //                   reduction. NaN on rejection-exhausted.
+        let lambda_ratio_log10 = if lm_start_lambda > 0.0 && lambda > 0.0 {
+            (lambda / lm_start_lambda).log10()
+        } else {
+            f64::NAN
+        };
+        log::info!(
+            "[PIRLS lm-trajectory] iter={:>3} start_lambda={:.3e} final_lambda={:.3e} \
+             log10_ratio={:.3} accept_rho={:.3} attempts={}",
+            iter,
+            lm_start_lambda,
+            lambda,
+            lambda_ratio_log10,
+            lm_accept_rho.unwrap_or(f64::NAN),
+            lm_attempts_done,
         );
     }
 
