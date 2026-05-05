@@ -1586,9 +1586,17 @@ struct OuterFirstOrderBridge<'a> {
     outer_inner_cap: Option<Arc<AtomicUsize>>,
     /// Counts accepted gradient evaluations (one per BFGS outer iter).
     iter_count: usize,
-    /// First observed `‖g‖` from `eval_grad`. Reserved for a follow-up
-    /// gradient-ratio gate; not yet consumed by the schedule.
+    /// First observed `‖g‖` from `eval_grad`. Used by the schedule to
+    /// compute the gradient-ratio (`last / initial`) — when the ratio
+    /// drops, the optimizer is approaching convergence and the inner
+    /// cap should lift to full so the cached β is at full tolerance.
     g_norm_initial: Option<f64>,
+    /// `‖g‖` from the most recent eval. Stale by one outer iter relative
+    /// to the cap that consumes it (the cap is set BEFORE the new eval),
+    /// but for monotone-decreasing g_norm this is safe — it makes the
+    /// cap conservatively LARGER than the truly-needed value, never
+    /// smaller.
+    last_g_norm: Option<f64>,
 }
 
 impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
@@ -1613,12 +1621,21 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         // source"; the inner solver still honors `pirls_max_iterations`
         // and the screening cap (combined via min).
         if let Some(cap_arc) = self.outer_inner_cap.as_ref() {
-            let cap = first_order_inner_cap_schedule(self.iter_count);
+            let g_ratio = match (self.last_g_norm, self.g_norm_initial) {
+                (Some(g), Some(g0)) if g0 > 0.0 => Some(g / g0),
+                _ => None,
+            };
+            let cap = first_order_inner_cap_schedule(self.iter_count, g_ratio);
             let prev = cap_arc.swap(cap, Ordering::Relaxed);
             if prev != cap {
+                let ratio_str = match g_ratio {
+                    Some(r) => format!("{:.3e}", r),
+                    None => "n/a".to_string(),
+                };
                 log::info!(
-                    "[OUTER schedule] inner-PIRLS cap transition iter={} prev={} new={} ({})",
+                    "[OUTER schedule] inner-PIRLS cap transition iter={} g_ratio={} prev={} new={} ({})",
                     self.iter_count,
+                    ratio_str,
                     prev,
                     cap,
                     if cap == 0 { "uncapped" } else { "capped" }
@@ -1640,6 +1657,9 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         if self.g_norm_initial.is_none() && g_norm.is_finite() && g_norm > 0.0 {
             self.g_norm_initial = Some(g_norm);
         }
+        if g_norm.is_finite() {
+            self.last_g_norm = Some(g_norm);
+        }
         log::info!(
             "[STAGE] outer eval end order=ValueAndGradient elapsed={:.3}s cost={:.6e} |g|={:.3e} (first-order bridge, iter={})",
             stage_start.elapsed().as_secs_f64(),
@@ -1656,33 +1676,64 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
 }
 
 /// Coarsen-then-tighten inner-PIRLS cap schedule for the outer first-order
-/// (BFGS) path.
+/// (BFGS) path. Combines a fallback iter-count tier with a gradient-ratio
+/// gate so the cap responds to ACTUAL convergence progress rather than
+/// just iter count.
 ///
 /// At biobank scale (n ≈ 320k) the inner Newton solve dominates wall-clock
 /// — a full 30-iter solve costs ~20 minutes per outer iter. The schedule
 /// keeps the inner cap shallow during the first few outer iters when ρ
 /// is far from converged (the outer descent direction depends on a coarse
 /// cost/gradient that 5–10 inner iters reproduce within Wolfe tolerance),
-/// then lifts back to full as the optimizer approaches convergence. A
-/// cap of 0 means "no cap from this source"; the inner solver still
+/// then lifts back to full as the optimizer approaches convergence.
+///
+/// `g_ratio = ‖g_now‖ / ‖g_initial‖` is the gradient-norm decay since the
+/// seed. When this ratio drops below ~5%, the optimizer is essentially
+/// converged and the inner cap MUST lift to full so the cached β is at
+/// full tolerance (the convergence guard re-evaluates with full inner
+/// cap on completion, so this is belt-and-suspenders, but it avoids
+/// burning a final outer iter at low cap).
+///
+/// A cap of 0 means "no cap from this source"; the inner solver still
 /// honors the user's `pirls_max_iterations` and the screening cap.
 ///
-/// Monotone non-decreasing in `iter_count` so the inner noise floor only
-/// loosens. The cap stays fixed within a single outer iter (line-search
-/// probes go through `eval_cost`, which does NOT touch the cap atomic).
-fn first_order_inner_cap_schedule(iter_count: usize) -> usize {
-    // First outer iter starts from the seed (cold warm-start, ill-conditioned),
-    // so its inner solve is the slowest. Cap aggressively at 3 — matches
-    // mgcv's "screening" inner budget — so a first-iter inner solve at
-    // biobank n=320k (≈30s/iter) takes ~90s rather than ~150s. Subsequent
-    // iters relax as the warm-start improves and the cubic model
-    // stabilizes.
-    match iter_count {
+/// The schedule is monotone non-decreasing in `iter_count` (the
+/// fallback path) so the inner noise floor only loosens; the
+/// gradient-ratio path can lift earlier than the iter-count would
+/// suggest, but never tightens. The cap stays fixed within a single
+/// outer iter (line-search probes go through `eval_cost`, which does
+/// NOT touch the cap atomic).
+fn first_order_inner_cap_schedule(iter_count: usize, g_ratio: Option<f64>) -> usize {
+    // Iter-count fallback. Used as the lower-bound cap when no g_ratio
+    // is available (first iter), or when g_ratio hasn't decayed yet.
+    let iter_cap = match iter_count {
         0 => 3,
         1 => 5,
         2 | 3 => 10,
         4 | 5 => 20,
         _ => 0,
+    };
+    // Gradient-ratio override: lift cap earlier than the iter schedule
+    // would suggest when convergence is nearing. Threshold values are
+    // chosen so the lift happens 1-2 outer iters before the iter-count
+    // schedule would otherwise lift, capturing the typical
+    // "converging fast" regime without prematurely burning inner cost
+    // on still-coarse iterates.
+    let ratio_cap = match g_ratio {
+        Some(r) if r < 0.01 => 0,        // ~converged → full
+        Some(r) if r < 0.05 => 20,
+        Some(r) if r < 0.20 => 10,
+        Some(r) if r < 0.50 => 5,
+        _ => 3,                           // still far from converged → coarsest
+    };
+    // Take the LARGER of the two (looser cap = more inner work). Both
+    // signals can independently say "loosen up" — we never tighten
+    // beyond what either signal would allow. Cap=0 (full) is the loosest;
+    // when either signal returns 0, the result is 0.
+    if iter_cap == 0 || ratio_cap == 0 {
+        0
+    } else {
+        iter_cap.max(ratio_cap)
     }
 }
 
@@ -1692,22 +1743,51 @@ mod outer_inner_cap_schedule_tests {
 
     #[test]
     fn schedule_is_shallow_at_start() {
-        assert_eq!(first_order_inner_cap_schedule(0), 3);
-        assert_eq!(first_order_inner_cap_schedule(1), 5);
+        // No g_ratio yet (first iter) → iter-count tier governs.
+        assert_eq!(first_order_inner_cap_schedule(0, None), 3);
+        assert_eq!(first_order_inner_cap_schedule(1, None), 5);
     }
 
     #[test]
     fn schedule_loosens_in_middle() {
-        assert_eq!(first_order_inner_cap_schedule(2), 10);
-        assert_eq!(first_order_inner_cap_schedule(3), 10);
-        assert_eq!(first_order_inner_cap_schedule(4), 20);
-        assert_eq!(first_order_inner_cap_schedule(5), 20);
+        assert_eq!(first_order_inner_cap_schedule(2, None), 10);
+        assert_eq!(first_order_inner_cap_schedule(3, None), 10);
+        assert_eq!(first_order_inner_cap_schedule(4, None), 20);
+        assert_eq!(first_order_inner_cap_schedule(5, None), 20);
     }
 
     #[test]
     fn schedule_lifts_to_full_after_iter_5() {
-        assert_eq!(first_order_inner_cap_schedule(6), 0);
-        assert_eq!(first_order_inner_cap_schedule(20), 0);
+        assert_eq!(first_order_inner_cap_schedule(6, None), 0);
+        assert_eq!(first_order_inner_cap_schedule(20, None), 0);
+    }
+
+    #[test]
+    fn schedule_lifts_early_when_gradient_ratio_small() {
+        // Even at iter 0 (where iter-tier would give cap=3), if the
+        // gradient has decayed to <1% of initial, lift to full.
+        assert_eq!(first_order_inner_cap_schedule(0, Some(0.005)), 0);
+        // At iter 1 with ratio 4% → ratio_cap=20, iter_cap=5 → max=20
+        assert_eq!(first_order_inner_cap_schedule(1, Some(0.04)), 20);
+        // At iter 2 with ratio 30% → ratio_cap=10, iter_cap=10 → 10
+        assert_eq!(first_order_inner_cap_schedule(2, Some(0.30)), 10);
+    }
+
+    #[test]
+    fn schedule_takes_max_of_both_caps() {
+        // iter_cap=20 (iter 4), ratio_cap=3 (ratio 60% → no tier hit, default 3)
+        // → max=20 (looser).
+        assert_eq!(first_order_inner_cap_schedule(4, Some(0.60)), 20);
+        // iter_cap=3 (iter 0), ratio_cap=5 (ratio 30% → r<0.50 tier) → max=5.
+        assert_eq!(first_order_inner_cap_schedule(0, Some(0.30)), 5);
+        // iter_cap=10 (iter 2), ratio_cap=10 (ratio 15% → r<0.20 tier) → 10.
+        assert_eq!(first_order_inner_cap_schedule(2, Some(0.15)), 10);
+    }
+
+    #[test]
+    fn schedule_full_overrides_finite_cap() {
+        // ratio < 1% → ratio_cap=0 (full); even with iter_cap=3, result is 0.
+        assert_eq!(first_order_inner_cap_schedule(0, Some(0.0001)), 0);
     }
 }
 
@@ -1759,7 +1839,9 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
             // divisor the schedule would lift to full inner-cap at ARC iter
             // 3 instead of iter 6.
             let arc_iter = self.eval_count / 2;
-            let cap = first_order_inner_cap_schedule(arc_iter);
+            // ARC bridge currently doesn't track g_norm_initial; pass None
+            // so the schedule falls back to its iter-count tier path.
+            let cap = first_order_inner_cap_schedule(arc_iter, None);
             let prev = cap_arc.swap(cap, Ordering::Relaxed);
             if prev != cap {
                 log::info!(
@@ -1812,7 +1894,9 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
             // divisor the schedule would lift to full inner-cap at ARC iter
             // 3 instead of iter 6.
             let arc_iter = self.eval_count / 2;
-            let cap = first_order_inner_cap_schedule(arc_iter);
+            // ARC bridge currently doesn't track g_norm_initial; pass None
+            // so the schedule falls back to its iter-count tier path.
+            let cap = first_order_inner_cap_schedule(arc_iter, None);
             let prev = cap_arc.swap(cap, Ordering::Relaxed);
             if prev != cap {
                 log::info!(
@@ -4332,6 +4416,7 @@ fn run_outer_with_plan(
                     outer_inner_cap: config.outer_inner_cap.clone(),
                     iter_count: 0,
                     g_norm_initial: None,
+                    last_g_norm: None,
                 };
                 let mut optimizer = Bfgs::new(seed.clone(), objective)
                     .with_bounds(bounds)
