@@ -3807,6 +3807,13 @@ where
     // changes the approximation itself --- it becomes a PQL-type surrogate.
     'pirls_loop: for iter in 1..=options.max_iterations {
         iterations = iter;
+        // Per-iter wall-clock anchor: lets the [PIRLS iter-end] log below
+        // report exactly how long this iteration took. Useful for the
+        // adaptive-convergence work (replacing the path #3 schedule
+        // bandaid) — we need to see what fraction of inner cost is
+        // curvature update vs LM solve vs deviance check, plus per-iter
+        // timing distribution at biobank scale.
+        let iter_start = std::time::Instant::now();
         // Start-of-iteration beacon: emits one line BEFORE the curvature-sensitive
         // inner work begins, so CI logs show *which* PIRLS iteration is in flight
         // if the process is killed during `update_with_curvature` or the LM solve.
@@ -4406,6 +4413,22 @@ where
         } // end loop (lambda search)
         // Recycle the regularized hessian buffer for the next iteration.
         regularized_buf = Some(regularized);
+        // Per-iter wall-clock log: lets us see in CI logs how each
+        // inner-Newton iter spent its time. Includes the final LM
+        // damping (lambda) so we can see when the LM step search has
+        // re-stabilized vs is still struggling. Foundation for the
+        // adaptive-convergence work (task #3) — the path #3 schedule
+        // is currently hardcoded; once we have per-iter timing we can
+        // exit early when the iteration is cheap (small change) AND
+        // the residual is small.
+        log::info!(
+            "[PIRLS iter-end] iter={:>3} elapsed={:.4}s lm_lambda={:.2e} last_dev_change={:.3e} last_halving={}",
+            iter,
+            iter_start.elapsed().as_secs_f64(),
+            lambda,
+            last_deviance_change,
+            last_step_halving,
+        );
     }
 
     let state = final_state.ok_or(EstimationError::PirlsDidNotConverge {
