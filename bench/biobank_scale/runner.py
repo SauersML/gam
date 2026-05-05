@@ -1436,9 +1436,21 @@ def fmt_kib(kib: Any) -> str:
 
 def heartbeat_loop(proc: subprocess.Popen[bytes], cmd_preview: str, stop_event: threading.Event) -> None:
     start = time.monotonic()
+    timeout = float(_CMD_TIMEOUT_SEC) if _CMD_TIMEOUT_SEC is not None else None
+    warned_80pct = False
     while True:
         elapsed = time.monotonic() - start
         snap = ps_snapshot(proc.pid)
+        # Highlight when we're approaching the cmd timeout — a one-shot
+        # warning at 80% so CI logs grep on `[HEARTBEAT-WARN]` to find
+        # near-timeout cases without needing to compute timing manually.
+        if timeout is not None and not warned_80pct and elapsed >= 0.8 * timeout:
+            print(
+                f"[HEARTBEAT-WARN] elapsed={elapsed:.1f}s exceeded 80% of cmd_timeout={timeout:.0f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            warned_80pct = True
         print(
             f"[HEARTBEAT] elapsed={elapsed:8.1f}s cmd='{cmd_preview}' pid={proc.pid} "
             f"cpu={snap.get('cpu_pct', 'n/a')}% mem={snap.get('mem_pct', 'n/a')}% "
