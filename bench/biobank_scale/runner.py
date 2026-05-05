@@ -1694,7 +1694,7 @@ _OUTER_HESSIAN_ELAPSED_PATTERN = re.compile(
 # Healthy Newton: rate < 0.5. Stuck near a near-singular geometry or
 # starting from a poor warm-start: rate ≥ 0.7.
 _PIRLS_SOLVE_END_PATTERN = re.compile(
-    r"\[PIRLS solve-end\]\s+iters=(\d+)\s+elapsed=([\d.]+)s\s+g_norm_initial=\S+\s+g_norm_final=\S+\s+convergence_rate=([\deE.+\-nNaA]+)\s+status="
+    r"\[PIRLS solve-end\]\s+iters=(\d+)\s+elapsed=([\d.]+)s\s+g_norm_initial=\S+\s+g_norm_final=\S+\s+convergence_rate=([\deE.+\-nNaA]+)\s+status=(\w+)"
 )
 
 # κ-optimization scaling instrumentation from commit cd89625f. The
@@ -2203,7 +2203,26 @@ def _emit_phase_summary(
     pirls_solve_matches = _PIRLS_SOLVE_END_PATTERN.findall(captured_stderr)
     if pirls_solve_matches:
         rates: list[float] = []
-        for _iters, _elapsed, rate_str in pirls_solve_matches:
+        # Per-status counts: distinguishes the 5 PirlsStatus variants
+        # (Converged, MaxIterationsReached, StalledAtValidMinimum,
+        # LmStepSearchExhausted, Unstable). At biobank scale we
+        # expect mostly Converged + StalledAtValidMinimum (legitimate
+        # outcomes). MaxIterationsReached or LmStepSearchExhausted in
+        # large quantities indicates the inner cap is too tight or the
+        # geometry is genuinely hard.
+        status_counts: dict[str, int] = {}
+        # Per-solve iter count distribution. Different from
+        # `pirls_iters` (which counts iter-end markers — i.e., total
+        # iters across all solves). p50 / p95 of per-solve iters
+        # tells us "how long does a typical solve take" vs the total
+        # iter budget.
+        per_solve_iters: list[int] = []
+        for iters_str, _elapsed, rate_str, status in pirls_solve_matches:
+            status_counts[status] = status_counts.get(status, 0) + 1
+            try:
+                per_solve_iters.append(int(iters_str))
+            except ValueError:
+                pass
             try:
                 r = float(rate_str)
             except (ValueError, TypeError):
@@ -2216,9 +2235,24 @@ def _emit_phase_summary(
             p50 = sorted_r[n // 2]
             p95 = sorted_r[min(n - 1, int(0.95 * n))]
             rmax = sorted_r[-1]
+            # Stable status breakdown (sorted alphabetically).
+            status_pieces = " ".join(
+                f"pirls_status_{status}={count}"
+                for status, count in sorted(status_counts.items())
+            )
+            iter_pieces = ""
+            if per_solve_iters:
+                sorted_iters = sorted(per_solve_iters)
+                ni = len(sorted_iters)
+                iter_pieces = (
+                    f" pirls_solve_iters_p50={sorted_iters[ni // 2]}"
+                    f" pirls_solve_iters_p95={sorted_iters[min(ni - 1, int(0.95 * ni))]}"
+                    f" pirls_solve_iters_max={sorted_iters[-1]}"
+                )
             parts.append(
                 f"pirls_solves={n} pirls_conv_p50={p50:.3f} "
-                f"pirls_conv_p95={p95:.3f} pirls_conv_max={rmax:.3f}"
+                f"pirls_conv_p95={p95:.3f} pirls_conv_max={rmax:.3f} "
+                f"{status_pieces}{iter_pieces}"
             )
     # κ-optimization driver wall-time. Per-call markers feed the
     # distribution; summary lines feed the totals. Multiple κ
