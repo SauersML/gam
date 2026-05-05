@@ -2270,9 +2270,20 @@ impl<'a> RemlState<'a> {
                 // predictor's per-call work is now dominated by the
                 // back-solve plus the `O(p)` rhs accumulation.
                 let lambda_s_beta_blocks: Option<Vec<ndarray::Array1<f64>>> = {
+                    // Parallelize across penalties: each `S_k · β_cur`
+                    // mat-vec is independent of the others. At biobank-
+                    // scale CTN with p ≈ several thousand and ~10
+                    // penalties, the serial precompute is ~250M flops
+                    // per cache write — repeated 5-10× per fit as the
+                    // outer optimizer accepts new ρ. Parallelizing
+                    // across rayon's thread pool brings this down to
+                    // (~250M / cores) flops per write, eliminating
+                    // the precompute as a meaningful biobank-scale
+                    // serial cost.
+                    use rayon::prelude::*;
                     let blocks: Vec<ndarray::Array1<f64>> = self
                         .canonical_penalties
-                        .iter()
+                        .par_iter()
                         .map(|cp| {
                             let r = &cp.col_range;
                             let beta_block = beta_original.slice(s![r.start..r.end]);
@@ -7048,6 +7059,67 @@ mod ift_warm_start_tests {
                 w[0] >= w[1],
                 "adaptive cap is not monotone non-increasing in residual: {caps:?}"
             );
+        }
+    }
+
+    /// Parallel `S_k · β` mat-vec across penalties (the rayon par_iter
+    /// pattern used at IFT cache-write time in updatewarm_start_from)
+    /// must produce bit-equivalent output to the serial version. The
+    /// parallelization is across penalties (each penalty's mat-vec is
+    /// independent and writes to its own Vec slot — no shared state),
+    /// so reordering doesn't change the floating-point result. This
+    /// test pins that invariant down: 8 penalties × 50-coefficient
+    /// blocks, par_iter vs serial iter, must agree to bit-equality
+    /// (not just within-tolerance).
+    #[test]
+    fn parallel_lambda_s_beta_blocks_matches_serial() {
+        use rayon::prelude::*;
+        let p = 50usize;
+        let n_penalties = 8usize;
+        let mut canonical = Vec::with_capacity(n_penalties);
+        for k in 0..n_penalties {
+            let scale = (k as f64 + 1.0) * 0.5;
+            let mut s = Array2::<f64>::zeros((p, p));
+            for i in 0..p {
+                s[[i, i]] = scale;
+                if i + 1 < p {
+                    s[[i, i + 1]] = scale * 0.1;
+                    s[[i + 1, i]] = scale * 0.1;
+                }
+            }
+            canonical.push(dense_canonical_from_local(s, p));
+        }
+        let beta_cur = ndarray::Array1::from_shape_fn(p, |i| {
+            (i as f64 * 0.1).sin() + (i as f64 * 0.05).cos()
+        });
+        // Serial reference.
+        let serial: Vec<ndarray::Array1<f64>> = canonical
+            .iter()
+            .map(|cp| {
+                let r = &cp.col_range;
+                let beta_block = beta_cur.slice(s![r.start..r.end]);
+                cp.local.dot(&beta_block)
+            })
+            .collect();
+        // Parallel (matches the writer at line ~2272).
+        let parallel: Vec<ndarray::Array1<f64>> = canonical
+            .par_iter()
+            .map(|cp| {
+                let r = &cp.col_range;
+                let beta_block = beta_cur.slice(s![r.start..r.end]);
+                cp.local.dot(&beta_block)
+            })
+            .collect();
+        assert_eq!(serial.len(), parallel.len());
+        for (s_block, p_block) in serial.iter().zip(parallel.iter()) {
+            assert_eq!(s_block.len(), p_block.len());
+            for (a, b) in s_block.iter().zip(p_block.iter()) {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "parallel mat-vec diverged from serial: {a} vs {b}",
+                );
+            }
         }
     }
 
