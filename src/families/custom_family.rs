@@ -11276,25 +11276,37 @@ fn apply_joint_block_penalty(
     vector: &Array1<f64>,
     diagonal_ridge: f64,
 ) -> Array1<f64> {
-    // Per-block matvec via faer's parallel gemv (`fast_av`) instead of
-    // ndarray's serial scalar `dot`. The faer wrapper auto-falls-back to
-    // ndarray dot for sub-threshold dims, so small blocks pay no
-    // overhead. At biobank scale (large per-block dims) this swaps a
-    // serial loop for a SIMD-parallel matmul kernel — meaningful because
-    // this function is invoked inside the PCG matvec closure (called
-    // once per CG iter, hundreds-to-thousands of times per outer iter
-    // per the perf-scout report at memory/perf_scout_pcg_penalty_matvec.md).
     let mut out = Array1::<f64>::zeros(vector.len());
+    apply_joint_block_penalty_into(ranges, s_lambdas, vector, diagonal_ridge, &mut out);
+    out
+}
+
+/// In-place variant of [`apply_joint_block_penalty`]. Caller supplies the
+/// output buffer to eliminate per-call allocation.
+///
+/// Uses `fast_av_view_into` to write directly into the per-block slice of
+/// `out`, avoiding the per-block intermediate `Array1` from `fast_av`. At
+/// biobank scale this is invoked inside the PCG matvec closure (called
+/// once per CG iter, hundreds-to-thousands of times per outer iter per
+/// the perf-scout report).
+fn apply_joint_block_penalty_into(
+    ranges: &[(usize, usize)],
+    s_lambdas: &[Array2<f64>],
+    vector: &Array1<f64>,
+    diagonal_ridge: f64,
+    out: &mut Array1<f64>,
+) {
+    debug_assert_eq!(out.len(), vector.len());
+    out.fill(0.0);
     for (b, s_lambda) in s_lambdas.iter().enumerate() {
         let (start, end) = ranges[b];
         let block = vector.slice(s![start..end]);
-        let prod = crate::linalg::faer_ndarray::fast_av(s_lambda, &block);
-        out.slice_mut(s![start..end]).assign(&prod);
+        let out_slice = out.slice_mut(s![start..end]);
+        crate::linalg::faer_ndarray::fast_av_view_into(s_lambda, &block, out_slice);
     }
     if diagonal_ridge > 0.0 {
         out.scaled_add(diagonal_ridge, vector);
     }
-    out
 }
 
 /// Penalty-aware Jacobi preconditioner used by every matrix-free PCG path
