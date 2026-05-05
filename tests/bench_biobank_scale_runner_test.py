@@ -1265,6 +1265,89 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         self.assertIn("pirls=DEGRADED", fit_lines[0])
         self.assertIn("curvature=ABSENT", fit_lines[0])
 
+    def test_phase_summary_curvature_healthy_when_fisher_frac_low(self) -> None:
+        # End-to-end: curvature HEALTHY when fisher_frac < 0.05 AND
+        # no force_fisher engagement. With all three axes HEALTHY,
+        # the [FIT health] verdict should also be HEALTHY.
+        # 1 Fisher / 25 Observed → fisher_frac ≈ 0.04 (HEALTHY band).
+        stderr_lines = [
+            "[IFT-QUALITY] residual=1.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=3",
+            "[PIRLS solve-end] iters=4 elapsed=0.001s g_norm_initial=1.0e+01 g_norm_final=1.0e-02 convergence_rate=2.000e-01 status=Converged",
+            "[PIRLS solve-end] iters=4 elapsed=0.001s g_norm_initial=1.0e+01 g_norm_final=1.0e-02 convergence_rate=2.300e-01 status=Converged",
+        ]
+        # 25 Observed + 1 Fisher → fisher_frac = 1/26 ≈ 0.038 < 0.05.
+        for i in range(1, 26):
+            stderr_lines.append(
+                f"[STAGE] PIRLS update_with_curvature iter={i} curvature=Observed elapsed=0.01s"
+            )
+        stderr_lines.append(
+            "[STAGE] PIRLS update_with_curvature iter=26 curvature=Fisher elapsed=0.01s"
+        )
+        stderr_lines.append("[PHASE] my-fit fit end elapsed=10.0s")
+        stderr = "\n".join(stderr_lines)
+        out = self._run_summary(stderr)
+        curv_lines = [
+            line for line in out.splitlines() if line.startswith("[CURVATURE health]")
+        ]
+        self.assertEqual(len(curv_lines), 1)
+        self.assertIn("verdict=HEALTHY", curv_lines[0])
+        # All three axes HEALTHY → combined verdict HEALTHY,
+        # dominant_axis=pirls (tie-break order pirls > warm_start >
+        # curvature). The dominant axis being pirls in the all-HEALTHY
+        # case is a documented contract — not a "winner" since
+        # nothing's wrong, just the tie-break preference.
+        fit_lines = [
+            line for line in out.splitlines() if line.startswith("[FIT health]")
+        ]
+        self.assertEqual(len(fit_lines), 1)
+        self.assertIn("verdict=HEALTHY", fit_lines[0])
+        self.assertIn("dominant_axis=pirls", fit_lines[0])
+
+    def test_phase_summary_curvature_marginal_when_fisher_frac_in_band(self) -> None:
+        # End-to-end: curvature verdict at MARGINAL tier (fisher_frac
+        # in [0.05, 0.20) AND no force_fisher engagement). Verifies
+        # the MIDDLE tier fires correctly when both other axes are
+        # HEALTHY, locking the verdict combination semantics for
+        # `[FIT health] verdict=MARGINAL`.
+        #
+        # 1 Fisher / 9 Observed → fisher_frac = 0.10 (in MARGINAL band).
+        # No force_fisher_for_rest markers → no engagement.
+        stderr_lines = [
+            # Healthy IFT (warm_start = HEALTHY).
+            "[IFT-QUALITY] residual=1.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=3",
+            # Healthy PIRLS rates.
+            "[PIRLS solve-end] iters=4 elapsed=0.001s g_norm_initial=1.0e+01 g_norm_final=1.0e-02 convergence_rate=2.000e-01 status=Converged",
+            "[PIRLS solve-end] iters=4 elapsed=0.001s g_norm_initial=1.0e+01 g_norm_final=1.0e-02 convergence_rate=2.300e-01 status=Converged",
+        ]
+        # 9 Observed iters
+        for i in range(1, 10):
+            stderr_lines.append(
+                f"[STAGE] PIRLS update_with_curvature iter={i} curvature=Observed elapsed=0.01s"
+            )
+        # 1 Fisher iter → fisher_frac = 1/10 = 0.10
+        stderr_lines.append(
+            "[STAGE] PIRLS update_with_curvature iter=10 curvature=Fisher elapsed=0.01s"
+        )
+        stderr_lines.append("[PHASE] my-fit fit end elapsed=10.0s")
+        stderr = "\n".join(stderr_lines)
+        out = self._run_summary(stderr)
+        # Curvature verdict is MARGINAL (fisher_frac=0.10, in band).
+        curv_lines = [
+            line for line in out.splitlines() if line.startswith("[CURVATURE health]")
+        ]
+        self.assertEqual(len(curv_lines), 1)
+        self.assertIn("verdict=MARGINAL", curv_lines[0])
+        self.assertIn("fisher_frac=0.10", curv_lines[0])
+        self.assertIn("force_fisher_n=0", curv_lines[0])
+        # FIT verdict picks up MARGINAL via worst-of-three (others HEALTHY).
+        fit_lines = [
+            line for line in out.splitlines() if line.startswith("[FIT health]")
+        ]
+        self.assertEqual(len(fit_lines), 1)
+        self.assertIn("verdict=MARGINAL", fit_lines[0])
+        self.assertIn("dominant_axis=curvature", fit_lines[0])
+        self.assertIn("curvature=MARGINAL", fit_lines[0])
+
     def test_phase_summary_curvature_degraded_drives_fit_health(self) -> None:
         # End-to-end: when curvature markers fire and indicate
         # DEGRADED reliability (Fisher-fallback engagement), the
