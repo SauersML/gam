@@ -1975,9 +1975,20 @@ def _warm_start_health_verdict(
                 AND no outer-non-finite signals
       MARGINAL  coverage ≥ 0.30 OR p50_resid < 0.30
                 AND no outer-non-finite signals
-      DEGRADED  otherwise, OR any outer-non-finite signals
-                (the geometry itself is broken — predictor
-                faithfulness is moot)
+      DEGRADED  any of:
+                  - any outer-non-finite signals (broken geometry)
+                  - predictor was tried (n_rejects + n_noops > 0)
+                    AND no residuals captured (the predictor
+                    was firing but never delivered a real
+                    prediction — e.g. all calls fell through
+                    on large Δρ, or all noop)
+                  - residuals present but neither HEALTHY nor
+                    MARGINAL thresholds met
+      NO-DATA   the predictor was never tried (n_accepts +
+                n_rejects + n_noops == 0) AND no outer-non-finite
+                — the fit didn't exercise the warm-start path
+                (e.g. a non-REML code path), so there's nothing
+                to assess
 
     `n_outer_nonfinite` is the count of [OUTER non-finite] warnings
     captured during the fit. A non-zero count means at least one
@@ -2010,9 +2021,18 @@ def _warm_start_health_verdict(
     if n_outer_nonfinite > 0:
         return ("DEGRADED", detail)
     if not residuals:
-        # No accepted predictions to assess faithfulness against. Even
-        # if rejects/noops dominate, we can only judge coverage.
-        return ("NO-DATA", detail)
+        # No residuals captured — distinguish "predictor never tried"
+        # (truly NO-DATA) from "predictor tried but always fell
+        # through" (DEGRADED — the warm-start machinery is collapsing
+        # to flat at this surface).
+        n_total = n_accepts + n_rejects + n_noops
+        if n_total == 0:
+            return ("NO-DATA", detail)
+        # Predictor was tried but produced no real predictions (either
+        # all rejects, all noops, or both). That's a degradation
+        # signal — the warm-start machinery is not delivering at
+        # this surface even though the path is being exercised.
+        return ("DEGRADED", detail)
     if coverage >= 0.70 and p50_resid < 0.05:
         return ("HEALTHY", detail)
     if coverage >= 0.30 or p50_resid < 0.30:

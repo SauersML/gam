@@ -753,9 +753,29 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
             residuals=[0.6],
         )
         self.assertEqual(v, "DEGRADED", f"detail={d}")
-        # NO-DATA: rejects-only run (predictor never accepted)
+        # NEW SEMANTICS: rejects-only run (predictor was tried but
+        # ALWAYS fell through) is DEGRADED, not NO-DATA. The
+        # warm-start machinery is firing but never delivering — a
+        # real degradation signal at this surface.
         v, d = _RUNNER._warm_start_health_verdict(
             n_accepts=0, n_rejects=5, n_noops=0,
+            residuals=[],
+        )
+        self.assertEqual(v, "DEGRADED", f"detail={d}")
+        # NEW SEMANTICS: noops-only run is also DEGRADED — the
+        # predictor was tried but only produced identity returns
+        # (Δρ below floor every time), so the warm-start path
+        # exercised but contributed nothing.
+        v, d = _RUNNER._warm_start_health_verdict(
+            n_accepts=0, n_rejects=0, n_noops=4,
+            residuals=[],
+        )
+        self.assertEqual(v, "DEGRADED", f"detail={d}")
+        # NO-DATA only when the predictor was never tried at all
+        # (n_accepts + n_rejects + n_noops == 0) AND no
+        # outer-non-finite signals.
+        v, d = _RUNNER._warm_start_health_verdict(
+            n_accepts=0, n_rejects=0, n_noops=0,
             residuals=[],
         )
         self.assertEqual(v, "NO-DATA", f"detail={d}")
