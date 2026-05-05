@@ -427,6 +427,143 @@ where
         .map(|(solution, _)| solution)
 }
 
+/// Write-into variant of `solve_spd_pcg_with_info` that takes an apply closure
+/// of the form `Fn(&Array1<f64>, &mut Array1<f64>)` so the matvec can write into
+/// a caller-owned buffer. This eliminates the per-iteration `Array1::<f64>`
+/// allocation for the matvec result that the legacy closure-returning variant
+/// forces. See commit 83369abb for the analogous penalty-vector elimination.
+pub fn solve_spd_pcg_with_info_into<F>(
+    apply: F,
+    rhs: &Array1<f64>,
+    preconditioner_diag: &Array1<f64>,
+    rel_tol: f64,
+    max_iter: usize,
+) -> Option<(Array1<f64>, PcgSolveInfo)>
+where
+    F: Fn(&Array1<f64>, &mut Array1<f64>),
+{
+    let p = rhs.len();
+    if p == 0 || preconditioner_diag.len() != p || max_iter == 0 {
+        return None;
+    }
+    let rhs_norm = rhs.dot(rhs).sqrt();
+    if !rhs_norm.is_finite() {
+        return None;
+    }
+    if rhs_norm == 0.0 {
+        return Some((
+            Array1::<f64>::zeros(p),
+            PcgSolveInfo {
+                iterations: 0,
+                converged: true,
+                relative_residual_norm: 0.0,
+            },
+        ));
+    }
+
+    let tol = rel_tol.max(1e-12) * rhs_norm.max(1.0);
+    let mut x = Array1::<f64>::zeros(p);
+    let mut r = rhs.clone();
+
+    let mut inv_m = Array1::<f64>::zeros(p);
+    Zip::from(&mut inv_m)
+        .and(preconditioner_diag)
+        .par_for_each(|inv, &m| {
+            *inv = 1.0 / m.abs().max(1e-12);
+        });
+
+    let mut z = Array1::<f64>::zeros(p);
+    Zip::from(&mut z)
+        .and(&r)
+        .and(&inv_m)
+        .par_for_each(|zi, &ri, &im| {
+            *zi = ri * im;
+        });
+    let mut p_dir = z.clone();
+    let mut rz_old = r.dot(&z);
+    if !rz_old.is_finite() || rz_old <= 0.0 {
+        return None;
+    }
+
+    // Reusable matvec scratch (filled by `apply`).
+    let mut ap = Array1::<f64>::zeros(p);
+
+    for iter in 0..max_iter {
+        apply(&p_dir, &mut ap);
+        if ap.len() != p {
+            return None;
+        }
+        let denom = p_dir.dot(&ap);
+        if !denom.is_finite() || denom <= 0.0 {
+            return None;
+        }
+        let alpha = rz_old / denom;
+        if !alpha.is_finite() {
+            return None;
+        }
+        x.scaled_add(alpha, &p_dir);
+        r.scaled_add(-alpha, &ap);
+        if (iter + 1) % 32 == 0 {
+            // Periodic residual refresh: r <- rhs - A x. Reuse `ap` as scratch
+            // for A x to avoid an extra allocation.
+            apply(&x, &mut ap);
+            if ap.len() != p {
+                return None;
+            }
+            r.assign(rhs);
+            r.scaled_add(-1.0, &ap);
+        }
+        let r_norm = r.dot(&r).sqrt();
+        if r_norm.is_finite() && r_norm <= tol {
+            return x.iter().all(|v| v.is_finite()).then_some((
+                x,
+                PcgSolveInfo {
+                    iterations: iter + 1,
+                    converged: true,
+                    relative_residual_norm: r_norm / rhs_norm.max(1.0),
+                },
+            ));
+        }
+        Zip::from(&mut z)
+            .and(&r)
+            .and(&inv_m)
+            .par_for_each(|zi, &ri, &im| {
+                *zi = ri * im;
+            });
+        let rz_new = r.dot(&z);
+        if !rz_new.is_finite() || rz_new <= 0.0 {
+            return None;
+        }
+        let beta = rz_new / rz_old;
+        if !beta.is_finite() {
+            return None;
+        }
+        Zip::from(&mut p_dir).and(&z).par_for_each(|pi, &zi| {
+            *pi = zi + beta * *pi;
+        });
+        rz_old = rz_new;
+    }
+    None
+}
+
+/// Write-into variant of `solve_spd_pcg`. Matches `solve_spd_pcg`'s return
+/// shape but takes an `apply` closure that writes its result into a caller
+/// buffer, enabling the inner-Newton PCG hot path to avoid per-iter
+/// `Array1::<f64>` allocations for the matvec output (biobank-scale critical).
+pub fn solve_spd_pcg_into<F>(
+    apply: F,
+    rhs: &Array1<f64>,
+    preconditioner_diag: &Array1<f64>,
+    rel_tol: f64,
+    max_iter: usize,
+) -> Option<Array1<f64>>
+where
+    F: Fn(&Array1<f64>, &mut Array1<f64>),
+{
+    solve_spd_pcg_with_info_into(apply, rhs, preconditioner_diag, rel_tol, max_iter)
+        .map(|(solution, _)| solution)
+}
+
 #[derive(Clone)]
 pub(crate) struct RidgePlanner {
     cond_estimate: Option<f64>,
@@ -518,7 +655,10 @@ impl RidgePlanner {
 
 #[cfg(test)]
 mod tests {
-    use super::{boundary_hit_step_fraction, solve_spd_pcg, solve_spd_pcg_with_info};
+    use super::{
+        boundary_hit_step_fraction, solve_spd_pcg, solve_spd_pcg_into, solve_spd_pcg_with_info,
+        solve_spd_pcg_with_info_into,
+    };
     use ndarray::{Array1, array};
 
     #[test]
@@ -556,5 +696,65 @@ mod tests {
         let m = Array1::from_vec(vec![4.0, 3.0]);
         assert!(solve_spd_pcg_with_info(|v| h.dot(v), &b, &m, 1e-10, 0).is_none());
         assert!(solve_spd_pcg(|v| h.dot(v), &b, &m, 1e-10, 0).is_none());
+    }
+
+    #[test]
+    fn solve_spd_pcg_into_matches_legacy_owned_variant() {
+        let h = array![
+            [4.0, 1.0, 0.5],
+            [1.0, 3.0, 0.25],
+            [0.5, 0.25, 2.0]
+        ];
+        let b = array![1.0, 2.0, -0.5];
+        let m = Array1::from_vec(vec![4.0, 3.0, 2.0]);
+        let owned = solve_spd_pcg(|v| h.dot(v), &b, &m, 1e-12, 50).expect("legacy pcg");
+        let writeinto = solve_spd_pcg_into(
+            |v, out| {
+                let prod = h.dot(v);
+                out.assign(&prod);
+            },
+            &b,
+            &m,
+            1e-12,
+            50,
+        )
+        .expect("write-into pcg");
+        assert_eq!(owned.len(), writeinto.len());
+        for (a, b) in owned.iter().zip(writeinto.iter()) {
+            assert!((a - b).abs() < 1e-10, "owned={a} writeinto={b}");
+        }
+    }
+
+    #[test]
+    fn solve_spd_pcg_into_rejects_zero_iteration_budget() {
+        let h = array![[4.0, 1.0], [1.0, 3.0]];
+        let b = array![1.0, 2.0];
+        let m = Array1::from_vec(vec![4.0, 3.0]);
+        assert!(
+            solve_spd_pcg_with_info_into(
+                |v, out| {
+                    let prod = h.dot(v);
+                    out.assign(&prod);
+                },
+                &b,
+                &m,
+                1e-10,
+                0,
+            )
+            .is_none()
+        );
+        assert!(
+            solve_spd_pcg_into(
+                |v, out| {
+                    let prod = h.dot(v);
+                    out.assign(&prod);
+                },
+                &b,
+                &m,
+                1e-10,
+                0,
+            )
+            .is_none()
+        );
     }
 }
