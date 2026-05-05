@@ -3662,6 +3662,20 @@ pub(crate) struct RemlState<'a> {
     /// on failed solves.
     pub(crate) last_pirls_lm_lambda: Arc<AtomicU64>,
 
+    /// Last observed IFT-prediction residual (`‖β_converged − β_predicted‖
+    /// / ‖β_converged‖`) from the most recent non-screening solve where
+    /// the predictor was actually consumed. Bit-packed `f64` (low 64
+    /// bits via `f64::to_bits`); `0` means "no signal yet".
+    ///
+    /// Read by `predict_warm_start_beta_ift` to drive the adaptive
+    /// |Δρ| cap (`adaptive_ift_max_drho`): a small residual loosens
+    /// the cap, a large one tightens it. Replaces the previous
+    /// hardcoded `IFT_WARM_START_MAX_DRHO = 2.0` constant with a
+    /// data-driven policy, so the predictor adapts to the empirical
+    /// faithfulness of the linearization at this surface's scale.
+    /// Reset on `reset_surface` and on failed solves.
+    pub(crate) last_ift_prediction_residual: Arc<AtomicU64>,
+
     /// When set, the penalties have Kronecker (tensor-product) structure and
     /// the REML evaluator can use O(∏q_j) logdet instead of O(p³) eigendecomposition.
     /// Populated via `set_kronecker_penalty_system` after construction.
