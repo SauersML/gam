@@ -1982,6 +1982,19 @@ where
         );
 
         let strategy_result = problem.run(&mut obj, "standard REML")?;
+        // Convergence guard for the outer-aware inner-PIRLS schedule
+        // (path #3): the BFGS bridge stores a coarsen-then-tighten cap
+        // into `reml_state.outer_inner_cap` on every accepted gradient
+        // eval. After the outer optimizer returns, the cached warm-start
+        // β was computed at whatever cap the schedule last set — which
+        // for fast-converging fits (≤5 BFGS iters) is a coarse cap of
+        // 5/10/20 rather than the full inner budget. Reset the cap to 0
+        // and run one final cost eval at the converged ρ so the cached
+        // β is at full inner tolerance.
+        reml_state
+            .outer_inner_cap
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let _ = reml_state.compute_cost(&strategy_result.rho);
         (
             strategy_result.rho.clone(),
             cfg.link_kind.mixture_state().cloned(),
@@ -2229,6 +2242,16 @@ where
             ),
         );
         let outer_result = problem.run(&mut obj, "mixture/SAS flexible link")?;
+        // Convergence guard for the outer-aware inner-PIRLS schedule
+        // (path #3) — see the matching comment in the standard REML arm
+        // above. Reset the cap and run one final compute_cost at the
+        // converged ρ so the cached warm-start β is at full inner
+        // tolerance regardless of where the BFGS schedule was when the
+        // optimizer terminated.
+        reml_state
+            .outer_inner_cap
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let _ = reml_state.compute_cost(&outer_result.rho.slice(s![..k]).to_owned());
         let final_rho = outer_result.rho.slice(s![..k]).to_owned();
         let final_mix_state = if use_mixture {
             let final_mix_rho = outer_result.rho.slice(s![k..(k + mixture_dim)]).to_owned();
