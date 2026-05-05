@@ -5676,6 +5676,29 @@ impl BernoulliMarginalSlopeFamily {
         psi_index: usize,
         cache: &BernoulliMarginalSlopeExactEvalCache,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        self.exact_newton_joint_psi_terms_from_cache_with_options(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            cache,
+            &BlockwiseFitOptions::default(),
+        )
+    }
+
+    /// Outer-aware variant of `exact_newton_joint_psi_terms_from_cache`. When
+    /// `options.outer_score_subsample` is `None`, iterates all rows and is
+    /// bit-for-bit equivalent to the legacy implementation. When `Some`, only
+    /// the masked rows contribute and every row-summed component (objective
+    /// scalar, score vector, Hessian operator blocks) is rescaled by
+    /// `weight_scale = n_full / |mask|` (Horvitz-Thompson).
+    pub(crate) fn exact_newton_joint_psi_terms_from_cache_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         let slices = &cache.slices;
         let primary = &cache.primary;
         let Some((block_idx, local_idx)) = psi_derivative_location(derivative_blocks, psi_index)
@@ -5712,8 +5735,9 @@ impl BernoulliMarginalSlopeFamily {
         )?;
 
         // Block-local accumulator path: avoids O(n p^2) dense Hessian
-        let (objective_psi, score_psi, block_acc) = (0..((n + ROW_CHUNK_SIZE - 1)
-            / ROW_CHUNK_SIZE))
+        let row_iter = outer_row_indices(options, n).to_vec();
+        let outer_scale = outer_score_scale(options, n);
+        let (mut objective_psi, mut score_psi, mut block_acc) = row_iter
             .into_par_iter()
             .try_fold(
                 || {
@@ -5723,58 +5747,54 @@ impl BernoulliMarginalSlopeFamily {
                         BernoulliBlockHessianAccumulator::new(slices),
                     )
                 },
-                |mut acc, chunk_idx| -> Result<_, String> {
-                    let start = chunk_idx * ROW_CHUNK_SIZE;
-                    let end = (start + ROW_CHUNK_SIZE).min(n);
-                    for row in start..end {
-                        let dir = self.row_primary_psi_direction_from_map(
-                            row,
-                            block_idx,
-                            &psi_map,
-                            block_states,
-                            primary,
-                        )?;
-                        let row_ctx = Self::row_ctx(cache, row);
-                        let (_, f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
-                            row,
-                            block_states,
-                            primary,
-                            row_ctx,
-                        )?;
-                        let third = self.row_primary_third_contracted_recompute(
-                            row,
-                            block_states,
-                            cache,
-                            row_ctx,
-                            &dir,
-                        )?;
-                        let psi_row =
-                            self.block_psi_row_from_map(row, block_idx, &psi_map, slices)?;
-                        acc.0 += f_pi.dot(&dir);
-                        acc.1
-                            .slice_mut(s![psi_row.range.clone()])
-                            .scaled_add(f_pi[idx_primary], &psi_row.local_vec);
-                        acc.1 += &self.pullback_primary_vector(
-                            row,
-                            slices,
-                            primary,
-                            &f_pipi.dot(&dir),
-                        )?;
+                |mut acc, row| -> Result<_, String> {
+                    let dir = self.row_primary_psi_direction_from_map(
+                        row,
+                        block_idx,
+                        &psi_map,
+                        block_states,
+                        primary,
+                    )?;
+                    let row_ctx = Self::row_ctx(cache, row);
+                    let (_, f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
+                        row,
+                        block_states,
+                        primary,
+                        row_ctx,
+                    )?;
+                    let third = self.row_primary_third_contracted_recompute(
+                        row,
+                        block_states,
+                        cache,
+                        row_ctx,
+                        &dir,
+                    )?;
+                    let psi_row =
+                        self.block_psi_row_from_map(row, block_idx, &psi_map, slices)?;
+                    acc.0 += f_pi.dot(&dir);
+                    acc.1
+                        .slice_mut(s![psi_row.range.clone()])
+                        .scaled_add(f_pi[idx_primary], &psi_row.local_vec);
+                    acc.1 += &self.pullback_primary_vector(
+                        row,
+                        slices,
+                        primary,
+                        &f_pipi.dot(&dir),
+                    )?;
 
-                        // psi_row outer pullback(f_pipi[idx_primary,:]) + transpose
-                        let right_primary = f_pipi.row(idx_primary).to_owned();
-                        acc.2.add_rank1_psi_cross(
-                            self,
-                            row,
-                            slices,
-                            primary,
-                            block_idx,
-                            &psi_row.local_vec,
-                            &right_primary,
-                        );
-                        // third tensor pullback
-                        acc.2.add_pullback(self, row, slices, primary, &third);
-                    }
+                    // psi_row outer pullback(f_pipi[idx_primary,:]) + transpose
+                    let right_primary = f_pipi.row(idx_primary).to_owned();
+                    acc.2.add_rank1_psi_cross(
+                        self,
+                        row,
+                        slices,
+                        primary,
+                        block_idx,
+                        &psi_row.local_vec,
+                        &right_primary,
+                    );
+                    // third tensor pullback
+                    acc.2.add_pullback(self, row, slices, primary, &third);
                     Ok(acc)
                 },
             )
@@ -5793,6 +5813,11 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(left)
                 },
             )?;
+        if outer_scale != 1.0 {
+            objective_psi *= outer_scale;
+            score_psi.mapv_inplace(|v| v * outer_scale);
+            block_acc.scale_assign(outer_scale);
+        }
         Ok(Some(ExactNewtonJointPsiTerms {
             objective_psi,
             score_psi,
@@ -5808,6 +5833,28 @@ impl BernoulliMarginalSlopeFamily {
         psi_i: usize,
         psi_j: usize,
         cache: &BernoulliMarginalSlopeExactEvalCache,
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        self.exact_newton_joint_psisecond_order_terms_from_cache_with_options(
+            block_states,
+            derivative_blocks,
+            psi_i,
+            psi_j,
+            cache,
+            &BlockwiseFitOptions::default(),
+        )
+    }
+
+    /// Outer-aware variant of `exact_newton_joint_psisecond_order_terms_from_cache`.
+    /// See `exact_newton_joint_psi_terms_from_cache_with_options` for the
+    /// row-iter / rescaling contract.
+    pub(crate) fn exact_newton_joint_psisecond_order_terms_from_cache_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_i: usize,
+        psi_j: usize,
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        options: &BlockwiseFitOptions,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
         let slices = &cache.slices;
         let primary = &cache.primary;
@@ -5888,8 +5935,9 @@ impl BernoulliMarginalSlopeFamily {
         };
 
         // Block-local accumulator path for second-order psi terms
-        let (objective_psi_psi, score_psi_psi, block_acc) = (0..((n + ROW_CHUNK_SIZE - 1)
-            / ROW_CHUNK_SIZE))
+        let row_iter = outer_row_indices(options, n).to_vec();
+        let outer_scale = outer_score_scale(options, n);
+        let (mut objective_psi_psi, mut score_psi_psi, mut block_acc) = row_iter
             .into_par_iter()
             .try_fold(
                 || {
@@ -5899,10 +5947,8 @@ impl BernoulliMarginalSlopeFamily {
                         BernoulliBlockHessianAccumulator::new(slices),
                     )
                 },
-                |mut acc, chunk_idx| -> Result<_, String> {
-                    let start = chunk_idx * ROW_CHUNK_SIZE;
-                    let end = (start + ROW_CHUNK_SIZE).min(n);
-                    for row in start..end {
+                |mut acc, row| -> Result<_, String> {
+                    {
                         let dir_i = self.row_primary_psi_direction_from_map(
                             row,
                             block_i,
@@ -6071,6 +6117,11 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(left)
                 },
             )?;
+        if outer_scale != 1.0 {
+            objective_psi_psi *= outer_scale;
+            score_psi_psi.mapv_inplace(|v| v * outer_scale);
+            block_acc.scale_assign(outer_scale);
+        }
         Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
             objective_psi_psi,
             score_psi_psi,
@@ -7813,11 +7864,12 @@ impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiW
                 &self.options,
             );
         }
-        self.family.exact_newton_joint_psi_terms_from_cache(
+        self.family.exact_newton_joint_psi_terms_from_cache_with_options(
             &self.block_states,
             &self.derivative_blocks,
             psi_index,
             &self.cache,
+            &self.options,
         )
     }
 
@@ -7853,12 +7905,13 @@ impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiW
             );
         }
         self.family
-            .exact_newton_joint_psisecond_order_terms_from_cache(
+            .exact_newton_joint_psisecond_order_terms_from_cache_with_options(
                 &self.block_states,
                 &self.derivative_blocks,
                 psi_i,
                 psi_j,
                 &self.cache,
+                &self.options,
             )
     }
 
@@ -14867,5 +14920,321 @@ mod tests {
             .expect("ll minus sigma");
         let objective_fd = -(ll_plus - ll_minus) / (2.0 * eps);
         assert!((terms.objective_psi - objective_fd).abs() < 1e-5);
+    }
+
+    /// Multi-row rigid-probit family with non-trivial marginal/logslope
+    /// designs (per-row eta varies), so half-mask Horvitz-Thompson rescaling
+    /// over even rows is a representative subsample for the block-path
+    /// `exact_newton_joint_psi_terms_from_cache` and its second-order sibling.
+    fn make_block_psi_test_family(n: usize) -> BernoulliMarginalSlopeFamily {
+        let y: Array1<f64> =
+            Array1::from_iter((0..n).map(|i| if (i * 31 + 7) % 5 >= 3 { 1.0 } else { 0.0 }));
+        let weights: Array1<f64> =
+            Array1::from_iter((0..n).map(|i| 0.5 + ((i * 13 + 4) % 7) as f64 * 0.1));
+        let z: Array1<f64> = Array1::from_iter(
+            (0..n).map(|i| -1.5 + 3.0 * (((i * 17 + 5) % n) as f64 + 0.5) / (n as f64)),
+        );
+        let marginal_design = Array2::from_shape_fn((n, 1), |(i, _)| {
+            0.3 + 0.4 * (((i * 29 + 11) % n) as f64) / (n as f64)
+        });
+        let logslope_design = Array2::from_shape_fn((n, 1), |(i, _)| {
+            0.2 + 0.5 * (((i * 37 + 9) % n) as f64) / (n as f64)
+        });
+        BernoulliMarginalSlopeFamily {
+            y: Arc::new(y),
+            weights: Arc::new(weights),
+            z: Arc::new(z),
+            gaussian_frailty_sd: None,
+            base_link: bernoulli_marginal_slope_probit_link(),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                marginal_design,
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                logslope_design,
+            )),
+            score_warp: None,
+            link_dev: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
+        }
+    }
+
+    fn block_psi_test_block_states(
+        family: &BernoulliMarginalSlopeFamily,
+        m_beta: f64,
+        g_beta: f64,
+    ) -> Vec<ParameterBlockState> {
+        let m_design = family.marginal_design.to_dense().to_owned();
+        let g_design = family.logslope_design.to_dense().to_owned();
+        let m_eta = m_design.dot(&array![m_beta]);
+        let g_eta = g_design.dot(&array![g_beta]);
+        vec![
+            ParameterBlockState {
+                beta: array![m_beta],
+                eta: m_eta,
+            },
+            ParameterBlockState {
+                beta: array![g_beta],
+                eta: g_eta,
+            },
+        ]
+    }
+
+    fn block_psi_test_marginal_derivative_blocks(
+        n: usize,
+    ) -> Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>> {
+        let x_psi = Array2::from_shape_fn((n, 1), |(i, _)| {
+            0.4 + 0.3 * (((i * 41 + 13) % n) as f64) / (n as f64)
+        });
+        vec![
+            vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                None,
+                x_psi,
+                Array2::zeros((1, 1)),
+                None,
+                None,
+                None,
+                None,
+            )],
+            Vec::new(),
+        ]
+    }
+
+    fn block_psi_test_dual_derivative_blocks(
+        n: usize,
+    ) -> Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>> {
+        let x_psi_m = Array2::from_shape_fn((n, 1), |(i, _)| {
+            0.4 + 0.3 * (((i * 41 + 13) % n) as f64) / (n as f64)
+        });
+        let x_psi_g = Array2::from_shape_fn((n, 1), |(i, _)| {
+            0.2 + 0.5 * (((i * 43 + 17) % n) as f64) / (n as f64)
+        });
+        vec![
+            vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                None,
+                x_psi_m,
+                Array2::zeros((1, 1)),
+                None,
+                None,
+                None,
+                None,
+            )],
+            vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                None,
+                x_psi_g,
+                Array2::zeros((1, 1)),
+                None,
+                None,
+                None,
+                None,
+            )],
+        ]
+    }
+
+    #[test]
+    fn bernoulli_psi_terms_from_cache_subsample_full_equals_unsampled() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_block_psi_test_family(n);
+        let states = block_psi_test_block_states(&family, 0.15, 0.25);
+        let derivative_blocks = block_psi_test_marginal_derivative_blocks(n);
+        let cache = family
+            .build_exact_eval_cache(&states)
+            .expect("exact eval cache");
+
+        let baseline = family
+            .exact_newton_joint_psi_terms_from_cache(&states, &derivative_blocks, 0, &cache)
+            .expect("baseline psi terms")
+            .expect("some");
+
+        let mut opts_full = BlockwiseFitOptions::default();
+        opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            (0..n).collect(),
+            n,
+            0xDEADBEEF,
+        )));
+        let with_full = family
+            .exact_newton_joint_psi_terms_from_cache_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                &cache,
+                &opts_full,
+            )
+            .expect("with full")
+            .expect("some");
+
+        let obj_rel = ((with_full.objective_psi - baseline.objective_psi)
+            / baseline.objective_psi.abs().max(1.0))
+        .abs();
+        assert!(obj_rel < 1e-12, "objective_psi rel {}", obj_rel);
+        let score_rel = rel_diff_array1(&with_full.score_psi, &baseline.score_psi);
+        assert!(score_rel < 1e-12, "score_psi rel {}", score_rel);
+    }
+
+    #[test]
+    fn bernoulli_psi_terms_from_cache_subsample_half_scales_correctly() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_block_psi_test_family(n);
+        let states = block_psi_test_block_states(&family, 0.15, 0.25);
+        let derivative_blocks = block_psi_test_marginal_derivative_blocks(n);
+        let cache = family
+            .build_exact_eval_cache(&states)
+            .expect("exact eval cache");
+
+        let even_mask: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
+        let m = even_mask.len();
+
+        let mut opts_half = BlockwiseFitOptions::default();
+        opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            even_mask.clone(),
+            n,
+            0xCAFE,
+        )));
+        let scaled = family
+            .exact_newton_joint_psi_terms_from_cache_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                &cache,
+                &opts_half,
+            )
+            .expect("scaled")
+            .expect("some");
+
+        let mut opts_raw = BlockwiseFitOptions::default();
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
+            mask: Arc::new(even_mask),
+            n_full: m,
+            weight_scale: 1.0,
+            seed: 0,
+        }));
+        let raw = family
+            .exact_newton_joint_psi_terms_from_cache_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                &cache,
+                &opts_raw,
+            )
+            .expect("raw")
+            .expect("some");
+
+        let factor = n as f64 / m as f64;
+        let exp_obj = factor * raw.objective_psi;
+        let obj_rel = ((scaled.objective_psi - exp_obj) / exp_obj.abs().max(1.0)).abs();
+        assert!(obj_rel < 1e-12, "objective_psi rel {}", obj_rel);
+        let exp_score = &raw.score_psi * factor;
+        let score_rel = rel_diff_array1(&scaled.score_psi, &exp_score);
+        assert!(score_rel < 1e-12, "score_psi rel {}", score_rel);
+    }
+
+    #[test]
+    fn bernoulli_psi_second_order_terms_from_cache_subsample_full_equals_unsampled() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_block_psi_test_family(n);
+        let states = block_psi_test_block_states(&family, 0.15, 0.25);
+        let derivative_blocks = block_psi_test_dual_derivative_blocks(n);
+        let cache = family
+            .build_exact_eval_cache(&states)
+            .expect("exact eval cache");
+
+        let baseline = family
+            .exact_newton_joint_psisecond_order_terms_from_cache(
+                &states,
+                &derivative_blocks,
+                0,
+                1,
+                &cache,
+            )
+            .expect("baseline psi second-order")
+            .expect("some");
+
+        let mut opts_full = BlockwiseFitOptions::default();
+        opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            (0..n).collect(),
+            n,
+            0xDEADBEEF,
+        )));
+        let with_full = family
+            .exact_newton_joint_psisecond_order_terms_from_cache_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                1,
+                &cache,
+                &opts_full,
+            )
+            .expect("with full")
+            .expect("some");
+
+        let obj_rel = ((with_full.objective_psi_psi - baseline.objective_psi_psi)
+            / baseline.objective_psi_psi.abs().max(1.0))
+        .abs();
+        assert!(obj_rel < 1e-12, "objective rel {}", obj_rel);
+        let score_rel = rel_diff_array1(&with_full.score_psi_psi, &baseline.score_psi_psi);
+        assert!(score_rel < 1e-12, "score rel {}", score_rel);
+    }
+
+    #[test]
+    fn bernoulli_psi_second_order_terms_from_cache_subsample_half_scales_correctly() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_block_psi_test_family(n);
+        let states = block_psi_test_block_states(&family, 0.15, 0.25);
+        let derivative_blocks = block_psi_test_dual_derivative_blocks(n);
+        let cache = family
+            .build_exact_eval_cache(&states)
+            .expect("exact eval cache");
+
+        let even_mask: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
+        let m = even_mask.len();
+
+        let mut opts_half = BlockwiseFitOptions::default();
+        opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            even_mask.clone(),
+            n,
+            0xCAFE,
+        )));
+        let scaled = family
+            .exact_newton_joint_psisecond_order_terms_from_cache_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                1,
+                &cache,
+                &opts_half,
+            )
+            .expect("scaled")
+            .expect("some");
+
+        let mut opts_raw = BlockwiseFitOptions::default();
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
+            mask: Arc::new(even_mask),
+            n_full: m,
+            weight_scale: 1.0,
+            seed: 0,
+        }));
+        let raw = family
+            .exact_newton_joint_psisecond_order_terms_from_cache_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                1,
+                &cache,
+                &opts_raw,
+            )
+            .expect("raw")
+            .expect("some");
+
+        let factor = n as f64 / m as f64;
+        let exp_obj = factor * raw.objective_psi_psi;
+        let obj_rel = ((scaled.objective_psi_psi - exp_obj) / exp_obj.abs().max(1.0)).abs();
+        assert!(obj_rel < 1e-12, "objective rel {}", obj_rel);
+        let exp_score = &raw.score_psi_psi * factor;
+        let score_rel = rel_diff_array1(&scaled.score_psi_psi, &exp_score);
+        assert!(score_rel < 1e-12, "score rel {}", score_rel);
     }
 }
