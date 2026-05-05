@@ -1771,6 +1771,28 @@ _OUTER_EVAL_END_PATTERN = re.compile(
     r"\[STAGE\] outer eval end order=(\w+) elapsed=([\d.]+)s"
 )
 
+# Seed-screening cascade summary log. Emitted once per outer-fit
+# call by `rank_seeds_with_screening` after iterating the cap-tier
+# cascade (commit 40c20d5b). Captures the final cascade state:
+#   elapsed       : wall-clock for the whole cascade across all stages
+#   stages_used   : how many cap tiers had to be tried (1 = first-tier
+#                   pass, ≥2 = some seeds rejected at lower caps and
+#                   the cascade had to escalate)
+#   final_cap     : the cap used at the last successful stage
+#                   (`uncapped` literal or numeric)
+#   ranked / seeds: surviving seeds / total seeds presented
+#
+# Aggregating tells us whether seed-screening is paying off (high
+# stages_used = the cap-tier cascade is doing real work) or whether
+# the heuristic seeds are usually fine (stages_used=1). At biobank
+# scale this can dominate startup cost if the seeds are routinely
+# rejected at the tightest caps.
+_SEED_CASCADE_PATTERN = re.compile(
+    r"\[OUTER\][^\n]*seed screening cascade complete\s+"
+    r"elapsed=([\d.]+)s\s+stages_used=(\d+)\s+"
+    r"final_cap=(\w+)\s+ranked=(\d+)/(\d+)"
+)
+
 # IFT predictor identity / no-op counter. Emitted when all Δρ_k are
 # below the numerical-noise floor — the outer made an effectively-zero
 # ρ-step and the predictor returned the cached β unchanged. The
@@ -1988,6 +2010,31 @@ def _emit_phase_summary(
     # `outer_h_total`) is the OTHER work (score computation, IFT
     # predict, gradient assembly, etc.); when significant, that gap
     # itself is a hint about where to optimize next.
+    # Seed-screening cascade summary aggregation. Emit a verdict line
+    # capturing total cascade wall-clock, total stages exercised, and
+    # the cumulative ranked/seeds ratio. Useful for diagnosing whether
+    # the seed-screening cap-tier cascade is doing real work at
+    # biobank scale or sitting at the first tier.
+    seed_cascades = _SEED_CASCADE_PATTERN.findall(captured_stderr)
+    if seed_cascades:
+        n_cascades = len(seed_cascades)
+        cascade_elapsed_total = sum(float(m[0]) for m in seed_cascades)
+        stages_total = sum(int(m[1]) for m in seed_cascades)
+        ranked_total = sum(int(m[3]) for m in seed_cascades)
+        seeds_total = sum(int(m[4]) for m in seed_cascades)
+        # Count how many cascades had to escalate beyond the first tier
+        # (`stages_used >= 2`). A high count indicates the heuristic
+        # seeds are routinely rejected at the tightest caps and the
+        # cascade has to escalate — extra startup cost at biobank scale.
+        cascades_escalated = sum(1 for m in seed_cascades if int(m[1]) >= 2)
+        rank_rate = ranked_total / max(seeds_total, 1)
+        parts.append(
+            f"seed_cascade_n={n_cascades} "
+            f"seed_cascade_elapsed={cascade_elapsed_total:.1f}s "
+            f"seed_cascade_escalated={cascades_escalated} "
+            f"seed_cascade_stages_total={stages_total} "
+            f"seed_cascade_rank_rate={rank_rate:.2f}"
+        )
     outer_eval_ends = _OUTER_EVAL_END_PATTERN.findall(captured_stderr)
     if outer_eval_ends:
         per_order_counts: dict[str, int] = {}
