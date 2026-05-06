@@ -7074,19 +7074,17 @@ impl HyperOperator for TransformationNormalPsiHessianOperator {
 
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
         debug_assert_eq!(factor.nrows(), self.dim());
-        let n = self.family.response_val_basis.nrows();
         let p = factor.nrows();
         let k = factor.ncols();
         let cov = self
             .family
-            .covariate_design
-            .try_row_chunk(0..n)
-            .expect("validated CTN psi Hessian operator covariate chunk should not fail");
+            .covariate_dense_arc()
+            .expect("validated CTN psi Hessian operator covariate cache should not fail");
         let cov_psi = self
             .tensor_op()
             .materialize_cov_first_axis(self.axis)
             .expect("validated CTN psi Hessian operator covariate derivative should not fail");
-        let out = self.apply_columns_with_shared_cov(factor, &cov, &cov_psi);
+        let out = self.apply_columns_with_shared_cov(factor, cov.as_ref(), &cov_psi);
         debug_assert_eq!(out.nrows(), p);
         debug_assert_eq!(out.ncols(), k);
         out
@@ -7094,11 +7092,10 @@ impl HyperOperator for TransformationNormalPsiHessianOperator {
 
     fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
         debug_assert_eq!(factor.nrows(), self.dim());
-        let n = self.family.response_val_basis.nrows();
-        let cov =
-            self.family.covariate_design.try_row_chunk(0..n).expect(
-                "validated CTN psi Hessian projected trace covariate chunk should not fail",
-            );
+        let cov = self
+            .family
+            .covariate_dense_arc()
+            .expect("validated CTN psi Hessian projected trace covariate cache should not fail");
         let cov_psi = self
             .tensor_op()
             .materialize_cov_first_axis(self.axis)
@@ -7110,7 +7107,7 @@ impl HyperOperator for TransformationNormalPsiHessianOperator {
                 &self.beta,
                 &self.row_quantities,
                 self.axis,
-                &cov,
+                cov.as_ref(),
                 &cov_psi,
                 factor.view(),
             )
