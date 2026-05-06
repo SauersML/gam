@@ -30,8 +30,8 @@ const FIRTH_MAX_QUADRATIC_WORK: usize = 100_000_000;
 
 /// Cached state from the most recent successful PIRLS solve, populated by
 /// `updatewarm_start_from` and consumed by the IFT-based warm-start
-/// predictor (`predict_warm_start_beta_ift_from_cache`). See the field
-/// doc on `RemlState::ift_warm_start_cache` for the math.
+/// predictor (`RemlState::predict_warm_start_beta_ift_with_outcome`).
+/// See the field doc on `RemlState::ift_warm_start_cache` for the math.
 #[derive(Clone)]
 pub(crate) struct IftWarmStartCache {
     /// β at the converged solve, in ORIGINAL basis. Mirror of

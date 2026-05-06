@@ -3827,25 +3827,6 @@ pub(crate) fn adaptive_lm_lambda_hint(
     Some(cached_lambda.clamp(floor, ceiling))
 }
 
-/// `ift_warm_start_tests` module without penalty.
-#[allow(dead_code)]
-pub(crate) fn predict_warm_start_beta_ift_from_cache(
-    cache: &super::IftWarmStartCache,
-    canonical_penalties: &[crate::construction::CanonicalPenalty],
-    new_rho: &Array1<f64>,
-    p: usize,
-    last_ift_residual: Option<f64>,
-) -> Option<Coefficients> {
-    predict_warm_start_beta_ift_inner(
-        cache,
-        canonical_penalties,
-        new_rho,
-        p,
-        last_ift_residual,
-        None,
-    )
-}
-
 /// Variant taking a pre-built `&dyn FactorizedSystem` so the caller can
 /// reuse a cached Cholesky factor across successive predict calls. See
 /// `RemlState::predict_warm_start_beta_ift_with_outcome` for the cache
@@ -3862,31 +3843,13 @@ pub(crate) fn predict_warm_start_beta_ift_with_factor(
     last_ift_residual: Option<f64>,
     factor_override: &dyn crate::linalg::matrix::FactorizedSystem,
 ) -> Option<Coefficients> {
-    predict_warm_start_beta_ift_inner(
-        cache,
-        canonical_penalties,
-        new_rho,
-        p,
-        last_ift_residual,
-        Some(factor_override),
-    )
-}
-
-fn predict_warm_start_beta_ift_inner(
-    cache: &super::IftWarmStartCache,
-    canonical_penalties: &[crate::construction::CanonicalPenalty],
-    new_rho: &Array1<f64>,
-    p: usize,
-    last_ift_residual: Option<f64>,
-    factor_override: Option<&dyn crate::linalg::matrix::FactorizedSystem>,
-) -> Option<Coefficients> {
     predict_warm_start_beta_ift_inner_with_outcome(
         cache,
         canonical_penalties,
         new_rho,
         p,
         last_ift_residual,
-        factor_override,
+        Some(factor_override),
     )
     .map(|(coef, _outcome)| coef)
 }
@@ -6824,6 +6787,29 @@ mod ift_warm_start_tests {
     use crate::linalg::matrix::SymmetricMatrix;
     use ndarray::Array2;
 
+    /// Test-only entry into `predict_warm_start_beta_ift_inner_with_outcome`
+    /// that drops the outcome — the production
+    /// `RemlState::predict_warm_start_beta_ift_with_outcome` path uses the
+    /// outcome to bookkeep the IFT cache, but the regression tests below
+    /// only assert on `Coefficients`.
+    fn predict_warm_start_beta_ift_inner(
+        cache: &super::IftWarmStartCache,
+        canonical_penalties: &[CanonicalPenalty],
+        new_rho: &Array1<f64>,
+        p: usize,
+        last_ift_residual: Option<f64>,
+    ) -> Option<Coefficients> {
+        super::predict_warm_start_beta_ift_inner_with_outcome(
+            cache,
+            canonical_penalties,
+            new_rho,
+            p,
+            last_ift_residual,
+            None,
+        )
+        .map(|(coef, _outcome)| coef)
+    }
+
     /// Build a CanonicalPenalty from a dense p×p SPD-ish penalty matrix by
     /// taking its eigendecomposition and packing the positive-eigenvalue
     /// components into the `rank × p` root.
@@ -6917,9 +6903,8 @@ mod ift_warm_start_tests {
 
         // Small Δρ — well within the 2.0 cap.
         let new_rho = ndarray::array![0.25_f64, -0.05];
-        let predicted =
-            predict_warm_start_beta_ift_from_cache(&cache, &canonical, &new_rho, p, None)
-                .expect("IFT predictor should accept small Δρ");
+        let predicted = predict_warm_start_beta_ift_inner(&cache, &canonical, &new_rho, p, None)
+            .expect("IFT predictor should accept small Δρ");
 
         // Check the linearized FOC residual:
         //   H_pen · (β_pred − β_cur) + Σ_k Δρ_k · e^{ρ_k} · S_k · β_cur ≈ 0
@@ -7030,16 +7015,11 @@ mod ift_warm_start_tests {
 
         let new_rho = ndarray::array![0.25_f64, -0.05];
         let predicted_inline =
-            predict_warm_start_beta_ift_from_cache(&cache_inline, &canonical, &new_rho, p, None)
+            predict_warm_start_beta_ift_inner(&cache_inline, &canonical, &new_rho, p, None)
                 .expect("inline-path predict");
-        let predicted_precompute = predict_warm_start_beta_ift_from_cache(
-            &cache_precompute,
-            &canonical,
-            &new_rho,
-            p,
-            None,
-        )
-        .expect("precompute-path predict");
+        let predicted_precompute =
+            predict_warm_start_beta_ift_inner(&cache_precompute, &canonical, &new_rho, p, None)
+                .expect("precompute-path predict");
 
         // Bit-equivalent: the precompute path multiplies and accumulates
         // in the same order as the inline path, so the two should agree
@@ -7068,7 +7048,7 @@ mod ift_warm_start_tests {
             lambda_s_beta_blocks: Some(vec![ndarray::Array1::zeros(0)]), // length 1, expected 2
         };
         let predicted_fallback =
-            predict_warm_start_beta_ift_from_cache(&cache_wrong_len, &canonical, &new_rho, p, None)
+            predict_warm_start_beta_ift_inner(&cache_wrong_len, &canonical, &new_rho, p, None)
                 .expect("wrong-length precompute should still predict via inline fallback");
         for i in 0..p {
             let diff = (predicted_inline.0[i] - predicted_fallback.0[i]).abs();
@@ -7223,10 +7203,10 @@ mod ift_warm_start_tests {
 
         let new_rho = ndarray::array![0.3_f64];
         let predicted_tfd =
-            predict_warm_start_beta_ift_from_cache(&cache_tfd, &canonical, &new_rho, p, None)
+            predict_warm_start_beta_ift_inner(&cache_tfd, &canonical, &new_rho, p, None)
                 .expect("tfd predict");
         let predicted_orig =
-            predict_warm_start_beta_ift_from_cache(&cache_orig, &canonical, &new_rho, p, None)
+            predict_warm_start_beta_ift_inner(&cache_orig, &canonical, &new_rho, p, None)
                 .expect("orig predict");
 
         for i in 0..p {
@@ -7262,8 +7242,7 @@ mod ift_warm_start_tests {
         // |Δρ| = 3 > IFT_WARM_START_DEFAULT_MAX_DRHO = 2.0 → reject under
         // default cap (no quality history).
         let new_rho = ndarray::array![3.0_f64];
-        let predicted =
-            predict_warm_start_beta_ift_from_cache(&cache, &canonical, &new_rho, p, None);
+        let predicted = predict_warm_start_beta_ift_inner(&cache, &canonical, &new_rho, p, None);
         assert!(
             predicted.is_none(),
             "predictor should reject Δρ above default cap, got {:?}",
@@ -7272,7 +7251,7 @@ mod ift_warm_start_tests {
         // With excellent prior quality (residual=0.005) the adaptive cap
         // expands to 4.0, so |Δρ|=3 is now ACCEPTED.
         let predicted_good_history =
-            predict_warm_start_beta_ift_from_cache(&cache, &canonical, &new_rho, p, Some(0.005));
+            predict_warm_start_beta_ift_inner(&cache, &canonical, &new_rho, p, Some(0.005));
         assert!(
             predicted_good_history.is_some(),
             "predictor should accept Δρ=3 under expanded cap (good prior quality)",
@@ -7281,7 +7260,7 @@ mod ift_warm_start_tests {
         // tightens to 0.5, so even modest |Δρ|=1 is REJECTED.
         let modest_rho = ndarray::array![1.0_f64];
         let predicted_bad_history =
-            predict_warm_start_beta_ift_from_cache(&cache, &canonical, &modest_rho, p, Some(0.6));
+            predict_warm_start_beta_ift_inner(&cache, &canonical, &modest_rho, p, Some(0.6));
         assert!(
             predicted_bad_history.is_none(),
             "predictor should reject Δρ=1 under tightened cap (poor prior quality)",
@@ -7290,11 +7269,12 @@ mod ift_warm_start_tests {
 
     /// All Δρ below the eps floor (effectively-zero outer step) must
     /// return Some(β_cur, Noop) — preserving the cached β unchanged.
-    /// Regression-locks the wrapper-side early-noop short-circuit
-    /// (commit shipping with this test) which avoids paying a fresh
-    /// O(p³)/3 Cholesky for an identity prediction. The inner function
-    /// also has its own noop check, so this test exercises the noop
-    /// CONTRACT regardless of which path detects it first.
+    /// The inner predictor short-circuits identity predictions before
+    /// paying a fresh O(p³)/3 Cholesky; this test exercises that
+    /// contract directly. The production
+    /// `RemlState::predict_warm_start_beta_ift_with_outcome` wraps the
+    /// same check in front of the H_pen factor lookup so the cache miss
+    /// is also avoided.
     #[test]
     fn ift_predictor_returns_noop_when_all_drho_below_eps() {
         use crate::estimate::reml::IftWarmStartCache;
@@ -7318,9 +7298,8 @@ mod ift_warm_start_tests {
         // Δρ = 1e-15 is well below IFT_WARM_START_DRHO_EPS (1e-12);
         // every component of the new ρ is essentially the cached ρ.
         let new_rho = ndarray::array![1e-15_f64];
-        let predicted =
-            super::predict_warm_start_beta_ift_from_cache(&cache, &canonical, &new_rho, p, None)
-                .expect("noop must return Some(β_cur)");
+        let predicted = predict_warm_start_beta_ift_inner(&cache, &canonical, &new_rho, p, None)
+            .expect("noop must return Some(β_cur)");
         for i in 0..p {
             assert_eq!(
                 predicted.0[i], beta_cur[i],
@@ -7345,7 +7324,7 @@ mod ift_warm_start_tests {
             lambda_s_beta_blocks: None,
         };
         let new_rho = ndarray::array![0.1_f64];
-        let predicted = predict_warm_start_beta_ift_from_cache(&cache, &[], &new_rho, p, None);
+        let predicted = predict_warm_start_beta_ift_inner(&cache, &[], &new_rho, p, None);
         assert!(predicted.is_none());
     }
 
@@ -7512,19 +7491,18 @@ mod ift_warm_start_tests {
         // new_rho dim mismatch: cache has 1 ρ, caller passes 2.
         let bad_new_rho = ndarray::array![0.1_f64, 0.2];
         assert!(
-            predict_warm_start_beta_ift_from_cache(&cache, &canonical, &bad_new_rho, p, None)
-                .is_none(),
+            predict_warm_start_beta_ift_inner(&cache, &canonical, &bad_new_rho, p, None).is_none(),
             "new_rho dim mismatch must reject",
         );
         // penalty_penalties dim mismatch: cache has 1 ρ, caller passes 0 penalties.
         let new_rho = ndarray::array![0.1_f64];
         assert!(
-            predict_warm_start_beta_ift_from_cache(&cache, &[], &new_rho, p, None).is_none(),
+            predict_warm_start_beta_ift_inner(&cache, &[], &new_rho, p, None).is_none(),
             "penalty dim mismatch must reject",
         );
         // beta dim mismatch: cache has p=3 β, caller passes p=4.
         assert!(
-            predict_warm_start_beta_ift_from_cache(&cache, &canonical, &new_rho, 4, None).is_none(),
+            predict_warm_start_beta_ift_inner(&cache, &canonical, &new_rho, 4, None).is_none(),
             "beta dim mismatch must reject",
         );
     }
