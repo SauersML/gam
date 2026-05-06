@@ -5453,7 +5453,7 @@ impl BernoulliMarginalSlopeFamily {
     /// reduction into the caller-owned `out` buffer, avoiding the per-call
     /// allocation that the legacy owned-return form forces. Used by the
     /// inner-Newton PCG hot path (biobank scale).
-    #[allow(dead_code)]  // wired by a follow-up commit; method exists so the API surface is committed
+    #[allow(dead_code)] // wired by a follow-up commit; method exists so the API surface is committed
     fn exact_newton_joint_hessian_matvec_into_from_cache(
         &self,
         direction: &Array1<f64>,
@@ -5461,11 +5461,8 @@ impl BernoulliMarginalSlopeFamily {
         cache: &BernoulliMarginalSlopeExactEvalCache,
         out: &mut Array1<f64>,
     ) -> Result<(), String> {
-        let result = self.exact_newton_joint_hessian_matvec_from_cache(
-            direction,
-            block_states,
-            cache,
-        )?;
+        let result =
+            self.exact_newton_joint_hessian_matvec_from_cache(direction, block_states, cache)?;
         if result.len() != out.len() {
             return Err(format!(
                 "exact_newton_joint_hessian_matvec_into_from_cache: result len {} != out len {}",
@@ -15712,9 +15709,7 @@ mod tests {
     #[test]
     #[ignore]
     fn margslope_sigma_psi_scaling_law() {
-        use crate::families::marginal_slope_shared::{
-            OuterScoreSubsample, auto_outer_subsample_k,
-        };
+        use crate::families::marginal_slope_shared::{OuterScoreSubsample, auto_outer_subsample_k};
         use std::time::Instant;
 
         let ns: Vec<usize> = vec![5_000, 10_000, 25_000, 50_000, 100_000, 200_000, 320_000];
@@ -15760,7 +15755,11 @@ mod tests {
             sub_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let t_sub = sub_samples[sub_samples.len() / 2];
 
-            let speedup = if t_sub > 0.0 { t_full / t_sub } else { f64::NAN };
+            let speedup = if t_sub > 0.0 {
+                t_full / t_sub
+            } else {
+                f64::NAN
+            };
             eprintln!(
                 "[MS-SCALING] row n={n} full_s={t_full:.5} subsample_s={t_sub:.5} K={k} speedup={speedup:.2}x"
             );
@@ -15813,7 +15812,11 @@ mod tests {
                 (y - pred).powi(2)
             })
             .sum();
-        let r2 = if ss_tot > 0.0 { 1.0 - ss_res / ss_tot } else { 0.0 };
+        let r2 = if ss_tot > 0.0 {
+            1.0 - ss_res / ss_tot
+        } else {
+            0.0
+        };
         let max_abs_log_resid: f64 = logs
             .iter()
             .map(|(x, y)| (y - (log_a + alpha * x)).abs())

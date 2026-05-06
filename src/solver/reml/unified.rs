@@ -4912,7 +4912,8 @@ pub fn reml_laml_evaluate(
         let large_linear_work =
             n_obs.saturating_mul(p_dim) >= MATRIX_FREE_OUTER_HESSIAN_NP_THRESHOLD;
         let large_k = k_outer >= MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD;
-        let scale_prefers_operator = large_p || large_n_and_moderate_p || large_linear_work || large_k;
+        let scale_prefers_operator =
+            large_p || large_n_and_moderate_p || large_linear_work || large_k;
         let subspace_forces_dense = solution.penalty_subspace_trace.is_some();
         let use_operator = hessian_kernel.is_some()
             && (callback_operator_kernel || scale_prefers_operator)
@@ -12765,12 +12766,7 @@ mod tests {
         use ndarray::array;
 
         // U_S: 4×2 with two orthonormal columns (a 2D subspace of R^4).
-        let u_s = array![
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [0.0, 0.0],
-            [0.0, 0.0],
-        ];
+        let u_s = array![[1.0, 0.0], [0.0, 1.0], [0.0, 0.0], [0.0, 0.0],];
         // H_proj⁻¹: 2×2 SPD with off-diagonal coupling.
         let h_proj_inverse = array![[2.0, 0.5], [0.5, 3.0]];
         let trace = PenaltySubspaceTrace {

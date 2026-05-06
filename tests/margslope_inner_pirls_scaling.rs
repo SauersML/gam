@@ -50,9 +50,7 @@ use gam::terms::smooth::{
     TermCollectionSpec,
 };
 use gam::types::{InverseLink, LinkFunction};
-use gam::{
-    BernoulliMarginalSlopeFitRequest, FitRequest, FitResult, fit_model,
-};
+use gam::{BernoulliMarginalSlopeFitRequest, FitRequest, FitResult, fit_model};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -242,7 +240,13 @@ fn margslope_inner_pirls_scaling_law() {
         let per_inner = row.total_s / (row.inner_cycles.max(1) as f64);
         eprintln!(
             "[MS-INNER-SCALING] row n={} total_s={:.3} outer_iters={} inner_cycles={} per_outer_s={:.4} per_inner_s={:.4} converged={}",
-            row.n, row.total_s, row.outer_iters, row.inner_cycles, per_outer, per_inner, row.converged
+            row.n,
+            row.total_s,
+            row.outer_iters,
+            row.inner_cycles,
+            per_outer,
+            per_inner,
+            row.converged
         );
         rows.push(row);
     }
@@ -316,12 +320,14 @@ fn margslope_inner_pirls_scaling_law() {
         if pred_320k <= 2400.0 {
             eprintln!(
                 "[MS-INNER-SCALING-VERDICT] rigid path NOT the biobank bottleneck (pred {:.0}s ≤ 2400s by {:.0}× headroom)",
-                pred_320k, 2400.0 / pred_320k
+                pred_320k,
+                2400.0 / pred_320k
             );
         } else {
             eprintln!(
                 "[MS-INNER-SCALING-VERDICT] rigid path WOULD over-budget at biobank: pred={:.0}s > 2400s by {:.1}×",
-                pred_320k, pred_320k / 2400.0
+                pred_320k,
+                pred_320k / 2400.0
             );
         }
     }
@@ -357,7 +363,13 @@ fn margslope_inner_pirls_flex_scaling_law() {
         let per_inner = row.total_s / (row.inner_cycles.max(1) as f64);
         eprintln!(
             "[MS-INNER-FLEX-SCALING] row n={} total_s={:.3} outer_iters={} inner_cycles={} per_outer_s={:.4} per_inner_s={:.4} converged={}",
-            row.n, row.total_s, row.outer_iters, row.inner_cycles, per_outer, per_inner, row.converged
+            row.n,
+            row.total_s,
+            row.outer_iters,
+            row.inner_cycles,
+            per_outer,
+            per_inner,
+            row.converged
         );
         rows.push(row);
     }
