@@ -56,6 +56,34 @@ const MIN_DERIV: f64 = 1e-8;
 const MIN_WEIGHT: f64 = 1e-12;
 const EXACT_DENSE_BLOCK_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 const EXACT_DENSE_TOTAL_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const GAMLSS_ROWWISE_PAR_MIN_N: usize = 4096;
+
+fn gamlss_rowwise_map<F>(n: usize, f: F) -> Array1<f64>
+where
+    F: Fn(usize) -> f64 + Sync,
+{
+    if n >= GAMLSS_ROWWISE_PAR_MIN_N {
+        Array1::from((0..n).into_par_iter().map(&f).collect::<Vec<f64>>())
+    } else {
+        Array1::from_iter((0..n).map(f))
+    }
+}
+
+fn gamlss_rowwise_map_result<F>(n: usize, f: F) -> Result<Array1<f64>, String>
+where
+    F: Fn(usize) -> Result<f64, String> + Sync,
+{
+    if n >= GAMLSS_ROWWISE_PAR_MIN_N {
+        let values: Result<Vec<f64>, String> = (0..n).into_par_iter().map(&f).collect();
+        Ok(Array1::from(values?))
+    } else {
+        let mut out = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            out[i] = f(i)?;
+        }
+        Ok(out)
+    }
+}
 
 enum DenseOrOperator<'a> {
     Borrowed(&'a Array2<f64>),
@@ -6831,9 +6859,10 @@ impl CustomFamilyGenerative for GaussianLocationScaleFamily {
             ));
         }
         let mu = block_states[Self::BLOCK_MU].eta.clone();
-        let sigma = block_states[Self::BLOCK_LOG_SIGMA]
-            .eta
-            .mapv(logb_sigma_from_eta_scalar);
+        let eta_log_sigma = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        let sigma = gamlss_rowwise_map(eta_log_sigma.len(), |i| {
+            logb_sigma_from_eta_scalar(eta_log_sigma[i])
+        });
         Ok(GenerativeSpec {
             mean: mu,
             noise: NoiseModel::Gaussian { sigma },
@@ -10427,10 +10456,12 @@ impl CustomFamilyGenerative for GaussianLocationScaleWiggleFamily {
                 block_states.len()
             ));
         }
-        let mean = &block_states[Self::BLOCK_MU].eta + &block_states[Self::BLOCK_WIGGLE].eta;
-        let sigma = block_states[Self::BLOCK_LOG_SIGMA]
-            .eta
-            .mapv(logb_sigma_from_eta_scalar);
+        let eta_mu = &block_states[Self::BLOCK_MU].eta;
+        let eta_wiggle = &block_states[Self::BLOCK_WIGGLE].eta;
+        let eta_log_sigma = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        let n = eta_mu.len();
+        let mean = gamlss_rowwise_map(n, |i| eta_mu[i] + eta_wiggle[i]);
+        let sigma = gamlss_rowwise_map(n, |i| logb_sigma_from_eta_scalar(eta_log_sigma[i]));
         Ok(GenerativeSpec {
             mean,
             noise: NoiseModel::Gaussian { sigma },
@@ -11595,12 +11626,11 @@ impl CustomFamilyGenerative for BinomialMeanWiggleFamily {
         if eta.len() != self.y.len() || etaw.len() != self.y.len() {
             return Err("BinomialMeanWiggleFamily generative size mismatch".to_string());
         }
-        let mut mean = Array1::<f64>::zeros(self.y.len());
-        for i in 0..mean.len() {
+        let mean = gamlss_rowwise_map_result(self.y.len(), |i| {
             let jet = inverse_link_jet_for_inverse_link(&self.link_kind, eta[i] + etaw[i])
                 .map_err(|e| format!("fixed-link wiggle inverse-link evaluation failed: {e}"))?;
-            mean[i] = jet.mu;
-        }
+            Ok(jet.mu)
+        })?;
         Ok(GenerativeSpec {
             mean,
             noise: NoiseModel::Bernoulli,
@@ -11689,9 +11719,8 @@ impl CustomFamilyGenerative for PoissonLogFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<GenerativeSpec, String> {
-        let mean = expect_single_block(block_states, "PoissonLogFamily")?
-            .eta
-            .mapv(|e| e.clamp(-30.0, 30.0).exp().max(1e-12));
+        let eta = &expect_single_block(block_states, "PoissonLogFamily")?.eta;
+        let mean = gamlss_rowwise_map(eta.len(), |i| eta[i].clamp(-30.0, 30.0).exp().max(1e-12));
         Ok(GenerativeSpec {
             mean,
             noise: NoiseModel::Poisson,
@@ -11947,9 +11976,8 @@ impl CustomFamilyGenerative for GammaLogFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<GenerativeSpec, String> {
-        let mean = expect_single_block(block_states, "GammaLogFamily")?
-            .eta
-            .mapv(|e| e.clamp(-30.0, 30.0).exp().max(1e-12));
+        let eta = &expect_single_block(block_states, "GammaLogFamily")?.eta;
+        let mean = gamlss_rowwise_map(eta.len(), |i| eta[i].clamp(-30.0, 30.0).exp().max(1e-12));
         Ok(GenerativeSpec {
             mean,
             noise: NoiseModel::Gamma { shape: self.shape },
@@ -14958,14 +14986,13 @@ impl CustomFamilyGenerative for BinomialLocationScaleFamily {
         if eta_t.len() != self.y.len() || eta_ls.len() != self.y.len() {
             return Err("BinomialLocationScaleFamily generative size mismatch".to_string());
         }
-        let mut mean = Array1::<f64>::zeros(self.y.len());
-        for i in 0..mean.len() {
+        let mean = gamlss_rowwise_map_result(self.y.len(), |i| {
             let sigma = exp_sigma_from_eta_scalar(eta_ls[i]);
             let q = binomial_location_scale_q0(eta_t[i], sigma);
             let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q)
                 .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
-            mean[i] = jet.mu;
-        }
+            Ok(jet.mu)
+        })?;
         Ok(GenerativeSpec {
             mean,
             noise: NoiseModel::Bernoulli,
@@ -19689,14 +19716,13 @@ impl CustomFamilyGenerative for BinomialLocationScaleWiggleFamily {
         {
             return Err("BinomialLocationScaleWiggleFamily generative size mismatch".to_string());
         }
-        let mut mean = Array1::<f64>::zeros(self.y.len());
-        for i in 0..mean.len() {
+        let mean = gamlss_rowwise_map_result(self.y.len(), |i| {
             let sigma = exp_sigma_from_eta_scalar(eta_ls[i]);
             let q0 = binomial_location_scale_q0(eta_t[i], sigma);
             let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q0 + etaw[i])
                 .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
-            mean[i] = jet.mu;
-        }
+            Ok(jet.mu)
+        })?;
         Ok(GenerativeSpec {
             mean,
             noise: NoiseModel::Bernoulli,
