@@ -7326,6 +7326,27 @@ impl GaussianLocationScaleHessianWorkspace {
 }
 
 impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace {
+    fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+        // Same Hv structure as `hessian_matvec`, but built once via 3 GEMMs
+        // (`Xᵀ diag(W) X` per block) instead of letting
+        // `MatrixFreeSpdOperator::materialize_dense_operator` reconstruct the
+        // dense Hessian via `total` canonical-basis HVPs. At biobank scale
+        // (n≈320k, p_total≈82) the canonical-basis path takes ~568s per κ-iter
+        // while the dense build via fast_xt_diag_x/y is ~1s.
+        let pmu = self.xmu.ncols();
+        let p_ls = self.x_ls.ncols();
+        let total = pmu + p_ls;
+        let h_mm = xt_diag_x_dense(self.xmu.as_ref(), &self.coeff_mm)?;
+        let h_ml = xt_diag_y_dense(self.xmu.as_ref(), &self.coeff_ml, self.x_ls.as_ref())?;
+        let h_ll = xt_diag_x_dense(self.x_ls.as_ref(), &self.coeff_ll)?;
+        let mut h = Array2::<f64>::zeros((total, total));
+        h.slice_mut(s![0..pmu, 0..pmu]).assign(&h_mm);
+        h.slice_mut(s![0..pmu, pmu..total]).assign(&h_ml);
+        h.slice_mut(s![pmu..total, pmu..total]).assign(&h_ll);
+        mirror_upper_to_lower(&mut h);
+        Ok(Some(h))
+    }
+
     fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         let pmu = self.xmu.ncols();
         let p_ls = self.x_ls.ncols();
@@ -10231,6 +10252,19 @@ impl GaussianLocationScaleWiggleHessianWorkspace {
 }
 
 impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWorkspace {
+    fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+        // Same Hv structure as `hessian_matvec`, but routed through the
+        // already-existing `assemble_dense` row-pieces helper (six GEMMs:
+        // h_mm, h_ml, h_mw_b, h_mw_d, h_lw, h_ww). Avoids `total` canonical-
+        // basis HVPs in `MatrixFreeSpdOperator::materialize_dense_operator`,
+        // which at biobank scale (n≈320k, p_total≈82) costs ~568s per κ-iter
+        // versus ~1s for the dense build.
+        let dense = self
+            .pieces
+            .assemble_dense(self.xmu.as_ref(), self.x_ls.as_ref())?;
+        Ok(Some(dense))
+    }
+
     fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         let pmu = self.xmu.ncols();
         let p_ls = self.x_ls.ncols();
@@ -15143,6 +15177,40 @@ impl BinomialLocationScaleHessianWorkspace {
 }
 
 impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace {
+    fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+        // Same Hv structure as `hessian_matvec`, built once via 3 GEMMs:
+        //   H_tt = X_tᵀ diag(coeff_tt) X_t,
+        //   H_tl = X_tᵀ diag(coeff_tl) X_ls,
+        //   H_ll = X_lsᵀ diag(coeff_ll) X_ls,
+        // versus letting `MatrixFreeSpdOperator::materialize_dense_operator`
+        // reconstruct the dense Hessian via `total` canonical-basis HVPs. At
+        // biobank scale (n≈320k, p_total≈82) the canonical-basis path takes
+        // ~568s per κ-iter while the dense build via fast_xt_diag_x/y is ~1s.
+        //
+        // If either design is operator-backed and the active resource policy
+        // refuses dense materialization (biobank-mode budget guard), we
+        // surface the error to the dispatch site, which falls through to
+        // diagonal+matvec scaffolding rather than the dense path.
+        let pt = self.x_t.ncols();
+        let pls = self.x_ls.ncols();
+        let total = pt + pls;
+        let x_t_dense = self
+            .x_t
+            .try_to_dense_arc("BinomialLocationScaleHessianWorkspace::hessian_dense x_t")?;
+        let x_ls_dense = self
+            .x_ls
+            .try_to_dense_arc("BinomialLocationScaleHessianWorkspace::hessian_dense x_ls")?;
+        let h_tt = xt_diag_x_dense(x_t_dense.as_ref(), &self.coeff_tt)?;
+        let h_tl = xt_diag_y_dense(x_t_dense.as_ref(), &self.coeff_tl, x_ls_dense.as_ref())?;
+        let h_ll = xt_diag_x_dense(x_ls_dense.as_ref(), &self.coeff_ll)?;
+        let mut h = Array2::<f64>::zeros((total, total));
+        h.slice_mut(s![0..pt, 0..pt]).assign(&h_tt);
+        h.slice_mut(s![0..pt, pt..total]).assign(&h_tl);
+        h.slice_mut(s![pt..total, pt..total]).assign(&h_ll);
+        mirror_upper_to_lower(&mut h);
+        Ok(Some(h))
+    }
+
     fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         let pt = self.x_t.ncols();
         let pls = self.x_ls.ncols();
@@ -19444,6 +19512,20 @@ impl BinomialLocationScaleWiggleHessianWorkspace {
 }
 
 impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWorkspace {
+    fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+        // Same Hv structure as `hessian_matvec`, but routed through the
+        // already-existing `assemble_dense` row-pieces helper (eight GEMMs
+        // covering h_tt, h_tl, h_ll, h_tw_b, h_tw_d, h_lw_b, h_lw_d, h_ww).
+        // Avoids `total` canonical-basis HVPs in
+        // `MatrixFreeSpdOperator::materialize_dense_operator`, which at
+        // biobank scale (n≈320k, p_total≈82) costs ~568s per κ-iter versus
+        // ~1s for the dense build.
+        let dense = self
+            .pieces
+            .assemble_dense(self.x_t.as_ref(), self.x_ls.as_ref())?;
+        Ok(Some(dense))
+    }
+
     fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         let pt = self.x_t.ncols();
         let pls = self.x_ls.ncols();
