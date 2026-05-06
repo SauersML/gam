@@ -3302,42 +3302,6 @@ impl PenaltySubspaceTrace {
         self.trace_projected_logdet_reduced(&self.reduce_operator(a))
     }
 
-    /// Apply the projected kernel `K = U_S · H_proj⁻¹ · U_Sᵀ` to a vector
-    /// without materializing `K`.  Three steps:
-    ///
-    ///   1. Project `v_proj = U_Sᵀ · v` onto the identified subspace
-    ///      (`O(p·r)`),
-    ///   2. solve `y_proj = H_proj⁻¹ · v_proj` on the `r × r` reduced
-    ///      Hessian (`O(r²)`),
-    ///   3. lift `y = U_S · y_proj` back to the full space (`O(p·r)`).
-    ///
-    /// Total cost: `O(p·r + r²)`.  Materializing `K` first would cost
-    /// `O(p²·r)` for the assembly plus `O(p²)` per matvec, so for
-    /// `r << p` this is strictly the win.
-    ///
-    /// Mathematically equivalent to `H⁻¹` on the identified subspace and
-    /// zero on `null(S)` — the projection consistent with the projected
-    /// logdet `log|U_Sᵀ H U_S|_+` used by the rank-deficient LAML fix.
-    /// This is the primitive that priority item (c) — the matrix-free
-    /// outer Hessian — needs to extend `build_outer_hessian_operator`'s
-    /// matvec to apply the projected kernel for problems where
-    /// `solution.penalty_subspace_trace.is_some()` (currently forced to
-    /// the dense `compute_outer_hessian` path; see the
-    /// `subspace_forced_dense` reason in `[OUTER hessian-route]`).
-    ///
-    /// Wired into `build_outer_hessian_operator`'s `dispatch_solve`
-    /// closure as of this commit; the `#[allow(dead_code)]` previously
-    /// guarded against the lib-only build flagging it dead has been
-    /// removed since the helper is now reachable from production
-    /// code (although the routing gate still blocks subspace cases
-    /// from reaching this code in production today, the call site
-    /// is real lib code, satisfying the dead_code lint).
-    #[allow(dead_code)]
-    pub fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
-        let v_proj: Array1<f64> = self.u_s.t().dot(v);
-        let y_proj: Array1<f64> = self.h_proj_inverse.dot(&v_proj);
-        self.u_s.dot(&y_proj)
-    }
 }
 
 /// Specifies whether the model uses profiled scale (Gaussian REML) or
@@ -13603,63 +13567,6 @@ mod tests {
             fd_second,
             abs_err_without,
         );
-    }
-
-    #[test]
-    fn penalty_subspace_trace_apply_matches_dense_kernel() {
-        // Construct a small `PenaltySubspaceTrace` with a known `U_S` and
-        // `H_proj_inverse`, then verify `apply(v)` agrees with the
-        // dense formula `K · v` where `K = U_S · H_proj_inverse · U_Sᵀ`.
-        // This is the math contract that the matrix-free outer-Hessian
-        // path (priority c) will rely on; locking it down here means
-        // future commits can't silently change the kernel definition
-        // without breaking this test.
-        use super::PenaltySubspaceTrace;
-        use ndarray::array;
-
-        // U_S: 4×2 with two orthonormal columns (a 2D subspace of R^4).
-        let u_s = array![[1.0, 0.0], [0.0, 1.0], [0.0, 0.0], [0.0, 0.0],];
-        // H_proj⁻¹: 2×2 SPD with off-diagonal coupling.
-        let h_proj_inverse = array![[2.0, 0.5], [0.5, 3.0]];
-        let trace = PenaltySubspaceTrace {
-            u_s: u_s.clone(),
-            h_proj_inverse: h_proj_inverse.clone(),
-        };
-
-        // Materialize K = U_S · H_proj⁻¹ · U_Sᵀ for the reference.
-        let temp = u_s.dot(&h_proj_inverse); // 4×2
-        let k_dense = temp.dot(&u_s.t()); // 4×4
-
-        // Test on three independent vectors.
-        for v in [
-            array![1.0, 0.0, 0.0, 0.0],
-            array![0.0, 1.0, 1.0, 0.0],
-            array![0.5, -0.3, 1.7, -2.1],
-        ] {
-            let lhs = trace.apply(&v);
-            let rhs = k_dense.dot(&v);
-            for i in 0..4 {
-                assert!(
-                    (lhs[i] - rhs[i]).abs() < 1e-12,
-                    "apply mismatch at idx {i}: got {} vs dense {}",
-                    lhs[i],
-                    rhs[i]
-                );
-            }
-            // Components in null(U_S) (rows 2,3) MUST be zero — the
-            // projected kernel acts trivially outside the identified
-            // subspace.
-            assert!(
-                lhs[2].abs() < 1e-12,
-                "apply must zero null(U_S) component at idx 2; got {}",
-                lhs[2]
-            );
-            assert!(
-                lhs[3].abs() < 1e-12,
-                "apply must zero null(U_S) component at idx 3; got {}",
-                lhs[3]
-            );
-        }
     }
 
     #[test]
