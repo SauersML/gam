@@ -18437,250 +18437,263 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         let g4 = d4q;
         let (sigma, ds, d2s, d3s, d4s) = exp_sigma_derivs_up_to_fourth_array(eta_ls.view());
 
-        let mut d2_h = Array2::<f64>::zeros((total, total));
-        for i in 0..n {
-            // Per-row scalar objective derivatives for F_i(q).
-            let q_i = core0.q0[i] + etaw[i];
-            let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
-                self.y[i],
-                self.weights[i],
-                q_i,
-                core0.mu[i],
-                core0.dmu_dq[i],
-                core0.d2mu_dq2[i],
-                core0.d3mu_dq3[i],
-                &self.link_kind,
-            );
-            let m4 = binomial_neglog_q_fourth_derivative_dispatch(
-                self.y[i],
-                self.weights[i],
-                q_i,
-                core0.mu[i],
-                core0.dmu_dq[i],
-                core0.d2mu_dq2[i],
-                core0.d3mu_dq3[i],
-                &self.link_kind,
-            )?;
-
-            // Non-wiggle q0(eta_t, eta_ls) derivatives and sigma-ratio helpers.
-            let q0 = nonwiggle_q_derivs(eta_t[i], sigma[i]);
-            let s_safe = sigma[i];
-            let s2 = s_safe * s_safe;
-            let s3 = s2 * s_safe;
-            let s4 = s3 * s_safe;
-            let s5 = s4 * s_safe;
-            let q0_tl_ls_ls =
-                d3s[i] / s2 - 6.0 * ds[i] * d2s[i] / s3 + 6.0 * ds[i] * ds[i] * ds[i] / s4;
-            let q0_tl_ls_ls_ls =
-                d4s[i] / s2 - 8.0 * ds[i] * d3s[i] / s3 - 6.0 * d2s[i] * d2s[i] / s3
-                    + 36.0 * ds[i] * ds[i] * d2s[i] / s4
-                    - 24.0 * ds[i] * ds[i] * ds[i] * ds[i] / s5;
-            let q0_ll_ls_ls = eta_t[i] * q0_tl_ls_ls_ls;
-
-            let u_t_i = d_eta_t_u[i];
-            let u_ls_i = d_eta_ls_u[i];
-            let v_t_i = d_eta_tv[i];
-            let v_ls_i = d_eta_lsv[i];
-
-            // Directional z=q0 primitives for u and v.
-            let dq0_u = q0.q_t * u_t_i + q0.q_ls * u_ls_i;
-            let dq0v = q0.q_t * v_t_i + q0.q_ls * v_ls_i;
-            let d2q0_uv = q0.q_tl * (u_t_i * v_ls_i + v_t_i * u_ls_i) + q0.q_ll * u_ls_i * v_ls_i;
-
-            let dq0_t_u = q0.q_tl * u_ls_i;
-            let dq0_tv = q0.q_tl * v_ls_i;
-            let dq0_ls_u = q0.q_tl * u_t_i + q0.q_ll * u_ls_i;
-            let dq0_lsv = q0.q_tl * v_t_i + q0.q_ll * v_ls_i;
-            let dq0_tl_u = q0.q_tl_ls * u_ls_i;
-            let dq0_tlv = q0.q_tl_ls * v_ls_i;
-            let dq0_ll_u = q0.q_tl_ls * u_t_i + q0.q_ll_ls * u_ls_i;
-            let dq0_llv = q0.q_tl_ls * v_t_i + q0.q_ll_ls * v_ls_i;
-
-            let d2q0_t_uv = q0.q_tl_ls * u_ls_i * v_ls_i;
-            let d2q0_ls_uv =
-                q0.q_tl_ls * (u_ls_i * v_t_i + v_ls_i * u_t_i) + q0.q_ll_ls * u_ls_i * v_ls_i;
-            let d2q0_tl_uv = q0_tl_ls_ls * u_ls_i * v_ls_i;
-            let d2q0_ll_uv =
-                q0_tl_ls_ls * (u_t_i * v_ls_i + v_t_i * u_ls_i) + q0_ll_ls_ls * u_ls_i * v_ls_i;
-
-            let br = b0.row(i);
-            let dr = d0.row(i);
-            let ddr = dd0.row(i);
-            let d3r = d3_basis.row(i);
-            let b_u = br.dot(&uw);
-            let bv = br.dot(&vw);
-            let b1_u = dr.dot(&uw);
-            let b1v = dr.dot(&vw);
-            let b2_u = ddr.dot(&uw);
-            let b2v = ddr.dot(&vw);
-            let b3_u = d3r.dot(&uw);
-            let b3v = d3r.dot(&vw);
-
-            // Wiggle scalar chain terms:
-            //   m = 1 + g1,     g2 = betaw^T B''(q0),
-            //   dm[u]   = B'·uw + g2*dq0[u],
-            //   d2m[u,v]= g3*dq0[u]dq0[v] + g2*d2q0[u,v] + (B''·vw)dq0[u] + (B''·uw)dq0[v],
-            //   dg2[u]  = B''·uw + g3*dq0[u],
-            //   d2g2[u,v]=g4*dq0[u]dq0[v] + g3*d2q0[u,v] + (B'''·vw)dq0[u] + (B'''·uw)dq0[v].
-            let dm_u = b1_u + g2[i] * dq0_u;
-            let dmv = b1v + g2[i] * dq0v;
-            let d2m_uv = g3[i] * dq0_u * dq0v + g2[i] * d2q0_uv + b2v * dq0_u + b2_u * dq0v;
-            let dg2_u = b2_u + g3[i] * dq0_u;
-            let dg2v = b2v + g3[i] * dq0v;
-            let d2g2_uv = g4[i] * dq0_u * dq0v + g3[i] * d2q0_uv + b3v * dq0_u + b3_u * dq0v;
-
-            // First/second directional terms for total q.
-            let dq_u = m[i] * dq0_u + b_u;
-            let dqv = m[i] * dq0v + bv;
-            // Simplify exact formula for q = q0 + betaw^T B(q0):
-            //   D²q[u,v] = m*d²q0 + g2*dq0[u]dq0[v] + (B'·uw)dq0[v] + (B'·vw)dq0[u].
-            let d2q_uv = m[i] * d2q0_uv + g2[i] * dq0_u * dq0v + b1_u * dq0v + b1v * dq0_u;
-
-            // q partials by block and their first/second directional derivatives.
-            let q_t = m[i] * q0.q_t;
-            let q_ls = m[i] * q0.q_ls;
-            let q_tt = g2[i] * q0.q_t * q0.q_t;
-            let q_tl = g2[i] * q0.q_t * q0.q_ls + m[i] * q0.q_tl;
-            let q_ll = g2[i] * q0.q_ls * q0.q_ls + m[i] * q0.q_ll;
-
-            let dq_t_u = dm_u * q0.q_t + m[i] * dq0_t_u;
-            let dq_tv = dmv * q0.q_t + m[i] * dq0_tv;
-            let dq_ls_u = dm_u * q0.q_ls + m[i] * dq0_ls_u;
-            let dq_lsv = dmv * q0.q_ls + m[i] * dq0_lsv;
-
-            let d2q_t_uv = d2m_uv * q0.q_t + dm_u * dq0_tv + dmv * dq0_t_u + m[i] * d2q0_t_uv;
-            let d2q_ls_uv = d2m_uv * q0.q_ls + dm_u * dq0_lsv + dmv * dq0_ls_u + m[i] * d2q0_ls_uv;
-
-            let dq_tt_u = dg2_u * q0.q_t * q0.q_t + g2[i] * (2.0 * q0.q_t * dq0_t_u);
-            let dq_ttv = dg2v * q0.q_t * q0.q_t + g2[i] * (2.0 * q0.q_t * dq0_tv);
-            let d2q_tt_uv = d2g2_uv * q0.q_t * q0.q_t
-                + dg2_u * (2.0 * q0.q_t * dq0_tv)
-                + dg2v * (2.0 * q0.q_t * dq0_t_u)
-                + g2[i] * (2.0 * dq0_t_u * dq0_tv + 2.0 * q0.q_t * d2q0_t_uv);
-
-            let dq_tl_u = dg2_u * q0.q_t * q0.q_ls
-                + g2[i] * (dq0_t_u * q0.q_ls + q0.q_t * dq0_ls_u)
-                + dm_u * q0.q_tl
-                + m[i] * dq0_tl_u;
-            let dq_tlv = dg2v * q0.q_t * q0.q_ls
-                + g2[i] * (dq0_tv * q0.q_ls + q0.q_t * dq0_lsv)
-                + dmv * q0.q_tl
-                + m[i] * dq0_tlv;
-            let d2q_tl_uv = d2g2_uv * q0.q_t * q0.q_ls
-                + dg2_u * (dq0_tv * q0.q_ls + q0.q_t * dq0_lsv)
-                + dg2v * (dq0_t_u * q0.q_ls + q0.q_t * dq0_ls_u)
-                + g2[i]
-                    * (d2q0_t_uv * q0.q_ls
-                        + dq0_t_u * dq0_lsv
-                        + dq0_tv * dq0_ls_u
-                        + q0.q_t * d2q0_ls_uv)
-                + d2m_uv * q0.q_tl
-                + dm_u * dq0_tlv
-                + dmv * dq0_tl_u
-                + m[i] * d2q0_tl_uv;
-
-            let dq_ll_u = dg2_u * q0.q_ls * q0.q_ls
-                + g2[i] * (2.0 * q0.q_ls * dq0_ls_u)
-                + dm_u * q0.q_ll
-                + m[i] * dq0_ll_u;
-            let dq_llv = dg2v * q0.q_ls * q0.q_ls
-                + g2[i] * (2.0 * q0.q_ls * dq0_lsv)
-                + dmv * q0.q_ll
-                + m[i] * dq0_llv;
-            let d2q_ll_uv = d2g2_uv * q0.q_ls * q0.q_ls
-                + dg2_u * (2.0 * q0.q_ls * dq0_lsv)
-                + dg2v * (2.0 * q0.q_ls * dq0_ls_u)
-                + g2[i] * (2.0 * dq0_ls_u * dq0_lsv + 2.0 * q0.q_ls * d2q0_ls_uv)
-                + d2m_uv * q0.q_ll
-                + dm_u * dq0_llv
-                + dmv * dq0_ll_u
-                + m[i] * d2q0_ll_uv;
-
-            // Exact second directional coefficients for the scalar block weights.
-            let coeff_tt = second_directionalhessian_coeff_fromobjective_q_terms(
-                m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_t, q_t, q_tt, dq_t_u, dq_tv, dq_t_u, dq_tv,
-                d2q_t_uv, d2q_t_uv, dq_tt_u, dq_ttv, d2q_tt_uv,
-            );
-            let coeff_tl = second_directionalhessian_coeff_fromobjective_q_terms(
-                m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_t, q_ls, q_tl, dq_t_u, dq_tv, dq_ls_u, dq_lsv,
-                d2q_t_uv, d2q_ls_uv, dq_tl_u, dq_tlv, d2q_tl_uv,
-            );
-            let coeff_ll = second_directionalhessian_coeff_fromobjective_q_terms(
-                m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_ls, q_ls, q_ll, dq_ls_u, dq_lsv, dq_ls_u,
-                dq_lsv, d2q_ls_uv, d2q_ls_uv, dq_ll_u, dq_llv, d2q_ll_uv,
-            );
-
-            let xtr = x_t.row(i);
-            let xlsr = x_ls.row(i);
-            for a_idx in 0..pt {
-                for b_idx in a_idx..pt {
-                    d2_h[[a_idx, b_idx]] += coeff_tt * xtr[a_idx] * xtr[b_idx];
-                }
-            }
-            for a_idx in 0..pt {
-                for b_idx in 0..pls {
-                    d2_h[[a_idx, pt + b_idx]] += coeff_tl * xtr[a_idx] * xlsr[b_idx];
-                }
-            }
-            for a_idx in 0..pls {
-                for b_idx in a_idx..pls {
-                    d2_h[[pt + a_idx, pt + b_idx]] += coeff_ll * xlsr[a_idx] * xlsr[b_idx];
-                }
-            }
-
-            for j in 0..pw {
-                let qw = br[j];
-                let dqw_u = dr[j] * dq0_u;
-                let dqwv = dr[j] * dq0v;
-                let d2qw_uv = ddr[j] * dq0_u * dq0v + dr[j] * d2q0_uv;
-                let q_tw = dr[j] * q0.q_t;
-                let q_lw = dr[j] * q0.q_ls;
-                let dq_tw_u = ddr[j] * dq0_u * q0.q_t + dr[j] * dq0_t_u;
-                let dq_twv = ddr[j] * dq0v * q0.q_t + dr[j] * dq0_tv;
-                let d2q_tw_uv = d3r[j] * dq0_u * dq0v * q0.q_t
-                    + ddr[j] * (d2q0_uv * q0.q_t + dq0_u * dq0_tv + dq0v * dq0_t_u)
-                    + dr[j] * d2q0_t_uv;
-                let dq_lw_u = ddr[j] * dq0_u * q0.q_ls + dr[j] * dq0_ls_u;
-                let dq_lwv = ddr[j] * dq0v * q0.q_ls + dr[j] * dq0_lsv;
-                let d2q_lw_uv = d3r[j] * dq0_u * dq0v * q0.q_ls
-                    + ddr[j] * (d2q0_uv * q0.q_ls + dq0_u * dq0_lsv + dq0v * dq0_ls_u)
-                    + dr[j] * d2q0_ls_uv;
-
-                let coeff_tw = second_directionalhessian_coeff_fromobjective_q_terms(
-                    m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_t, qw, q_tw, dq_t_u, dq_tv, dqw_u, dqwv,
-                    d2q_t_uv, d2qw_uv, dq_tw_u, dq_twv, d2q_tw_uv,
+        let mut d2_h: Array2<f64> = (0..n)
+            .into_par_iter()
+            .map(|i| -> Result<Array2<f64>, String> {
+                let mut row_h = Array2::<f64>::zeros((total, total));
+                // Per-row scalar objective derivatives for F_i(q).
+                let q_i = core0.q0[i] + etaw[i];
+                let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
+                    self.y[i],
+                    self.weights[i],
+                    q_i,
+                    core0.mu[i],
+                    core0.dmu_dq[i],
+                    core0.d2mu_dq2[i],
+                    core0.d3mu_dq3[i],
+                    &self.link_kind,
                 );
-                let coeff_lw = second_directionalhessian_coeff_fromobjective_q_terms(
-                    m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_ls, qw, q_lw, dq_ls_u, dq_lsv, dqw_u,
-                    dqwv, d2q_ls_uv, d2qw_uv, dq_lw_u, dq_lwv, d2q_lw_uv,
+                let m4 = binomial_neglog_q_fourth_derivative_dispatch(
+                    self.y[i],
+                    self.weights[i],
+                    q_i,
+                    core0.mu[i],
+                    core0.dmu_dq[i],
+                    core0.d2mu_dq2[i],
+                    core0.d3mu_dq3[i],
+                    &self.link_kind,
+                )?;
+
+                // Non-wiggle q0(eta_t, eta_ls) derivatives and sigma-ratio helpers.
+                let q0 = nonwiggle_q_derivs(eta_t[i], sigma[i]);
+                let s_safe = sigma[i];
+                let s2 = s_safe * s_safe;
+                let s3 = s2 * s_safe;
+                let s4 = s3 * s_safe;
+                let s5 = s4 * s_safe;
+                let q0_tl_ls_ls =
+                    d3s[i] / s2 - 6.0 * ds[i] * d2s[i] / s3 + 6.0 * ds[i] * ds[i] * ds[i] / s4;
+                let q0_tl_ls_ls_ls =
+                    d4s[i] / s2 - 8.0 * ds[i] * d3s[i] / s3 - 6.0 * d2s[i] * d2s[i] / s3
+                        + 36.0 * ds[i] * ds[i] * d2s[i] / s4
+                        - 24.0 * ds[i] * ds[i] * ds[i] * ds[i] / s5;
+                let q0_ll_ls_ls = eta_t[i] * q0_tl_ls_ls_ls;
+
+                let u_t_i = d_eta_t_u[i];
+                let u_ls_i = d_eta_ls_u[i];
+                let v_t_i = d_eta_tv[i];
+                let v_ls_i = d_eta_lsv[i];
+
+                // Directional z=q0 primitives for u and v.
+                let dq0_u = q0.q_t * u_t_i + q0.q_ls * u_ls_i;
+                let dq0v = q0.q_t * v_t_i + q0.q_ls * v_ls_i;
+                let d2q0_uv =
+                    q0.q_tl * (u_t_i * v_ls_i + v_t_i * u_ls_i) + q0.q_ll * u_ls_i * v_ls_i;
+
+                let dq0_t_u = q0.q_tl * u_ls_i;
+                let dq0_tv = q0.q_tl * v_ls_i;
+                let dq0_ls_u = q0.q_tl * u_t_i + q0.q_ll * u_ls_i;
+                let dq0_lsv = q0.q_tl * v_t_i + q0.q_ll * v_ls_i;
+                let dq0_tl_u = q0.q_tl_ls * u_ls_i;
+                let dq0_tlv = q0.q_tl_ls * v_ls_i;
+                let dq0_ll_u = q0.q_tl_ls * u_t_i + q0.q_ll_ls * u_ls_i;
+                let dq0_llv = q0.q_tl_ls * v_t_i + q0.q_ll_ls * v_ls_i;
+
+                let d2q0_t_uv = q0.q_tl_ls * u_ls_i * v_ls_i;
+                let d2q0_ls_uv =
+                    q0.q_tl_ls * (u_ls_i * v_t_i + v_ls_i * u_t_i) + q0.q_ll_ls * u_ls_i * v_ls_i;
+                let d2q0_tl_uv = q0_tl_ls_ls * u_ls_i * v_ls_i;
+                let d2q0_ll_uv =
+                    q0_tl_ls_ls * (u_t_i * v_ls_i + v_t_i * u_ls_i) + q0_ll_ls_ls * u_ls_i * v_ls_i;
+
+                let br = b0.row(i);
+                let dr = d0.row(i);
+                let ddr = dd0.row(i);
+                let d3r = d3_basis.row(i);
+                let b_u = br.dot(&uw);
+                let bv = br.dot(&vw);
+                let b1_u = dr.dot(&uw);
+                let b1v = dr.dot(&vw);
+                let b2_u = ddr.dot(&uw);
+                let b2v = ddr.dot(&vw);
+                let b3_u = d3r.dot(&uw);
+                let b3v = d3r.dot(&vw);
+
+                // Wiggle scalar chain terms:
+                //   m = 1 + g1,     g2 = betaw^T B''(q0),
+                //   dm[u]   = B'·uw + g2*dq0[u],
+                //   d2m[u,v]= g3*dq0[u]dq0[v] + g2*d2q0[u,v] + (B''·vw)dq0[u] + (B''·uw)dq0[v],
+                //   dg2[u]  = B''·uw + g3*dq0[u],
+                //   d2g2[u,v]=g4*dq0[u]dq0[v] + g3*d2q0[u,v] + (B'''·vw)dq0[u] + (B'''·uw)dq0[v].
+                let dm_u = b1_u + g2[i] * dq0_u;
+                let dmv = b1v + g2[i] * dq0v;
+                let d2m_uv = g3[i] * dq0_u * dq0v + g2[i] * d2q0_uv + b2v * dq0_u + b2_u * dq0v;
+                let dg2_u = b2_u + g3[i] * dq0_u;
+                let dg2v = b2v + g3[i] * dq0v;
+                let d2g2_uv = g4[i] * dq0_u * dq0v + g3[i] * d2q0_uv + b3v * dq0_u + b3_u * dq0v;
+
+                // First/second directional terms for total q.
+                let dq_u = m[i] * dq0_u + b_u;
+                let dqv = m[i] * dq0v + bv;
+                // Simplify exact formula for q = q0 + betaw^T B(q0):
+                //   D²q[u,v] = m*d²q0 + g2*dq0[u]dq0[v] + (B'·uw)dq0[v] + (B'·vw)dq0[u].
+                let d2q_uv = m[i] * d2q0_uv + g2[i] * dq0_u * dq0v + b1_u * dq0v + b1v * dq0_u;
+
+                // q partials by block and their first/second directional derivatives.
+                let q_t = m[i] * q0.q_t;
+                let q_ls = m[i] * q0.q_ls;
+                let q_tt = g2[i] * q0.q_t * q0.q_t;
+                let q_tl = g2[i] * q0.q_t * q0.q_ls + m[i] * q0.q_tl;
+                let q_ll = g2[i] * q0.q_ls * q0.q_ls + m[i] * q0.q_ll;
+
+                let dq_t_u = dm_u * q0.q_t + m[i] * dq0_t_u;
+                let dq_tv = dmv * q0.q_t + m[i] * dq0_tv;
+                let dq_ls_u = dm_u * q0.q_ls + m[i] * dq0_ls_u;
+                let dq_lsv = dmv * q0.q_ls + m[i] * dq0_lsv;
+
+                let d2q_t_uv = d2m_uv * q0.q_t + dm_u * dq0_tv + dmv * dq0_t_u + m[i] * d2q0_t_uv;
+                let d2q_ls_uv =
+                    d2m_uv * q0.q_ls + dm_u * dq0_lsv + dmv * dq0_ls_u + m[i] * d2q0_ls_uv;
+
+                let dq_tt_u = dg2_u * q0.q_t * q0.q_t + g2[i] * (2.0 * q0.q_t * dq0_t_u);
+                let dq_ttv = dg2v * q0.q_t * q0.q_t + g2[i] * (2.0 * q0.q_t * dq0_tv);
+                let d2q_tt_uv = d2g2_uv * q0.q_t * q0.q_t
+                    + dg2_u * (2.0 * q0.q_t * dq0_tv)
+                    + dg2v * (2.0 * q0.q_t * dq0_t_u)
+                    + g2[i] * (2.0 * dq0_t_u * dq0_tv + 2.0 * q0.q_t * d2q0_t_uv);
+
+                let dq_tl_u = dg2_u * q0.q_t * q0.q_ls
+                    + g2[i] * (dq0_t_u * q0.q_ls + q0.q_t * dq0_ls_u)
+                    + dm_u * q0.q_tl
+                    + m[i] * dq0_tl_u;
+                let dq_tlv = dg2v * q0.q_t * q0.q_ls
+                    + g2[i] * (dq0_tv * q0.q_ls + q0.q_t * dq0_lsv)
+                    + dmv * q0.q_tl
+                    + m[i] * dq0_tlv;
+                let d2q_tl_uv = d2g2_uv * q0.q_t * q0.q_ls
+                    + dg2_u * (dq0_tv * q0.q_ls + q0.q_t * dq0_lsv)
+                    + dg2v * (dq0_t_u * q0.q_ls + q0.q_t * dq0_ls_u)
+                    + g2[i]
+                        * (d2q0_t_uv * q0.q_ls
+                            + dq0_t_u * dq0_lsv
+                            + dq0_tv * dq0_ls_u
+                            + q0.q_t * d2q0_ls_uv)
+                    + d2m_uv * q0.q_tl
+                    + dm_u * dq0_tlv
+                    + dmv * dq0_tl_u
+                    + m[i] * d2q0_tl_uv;
+
+                let dq_ll_u = dg2_u * q0.q_ls * q0.q_ls
+                    + g2[i] * (2.0 * q0.q_ls * dq0_ls_u)
+                    + dm_u * q0.q_ll
+                    + m[i] * dq0_ll_u;
+                let dq_llv = dg2v * q0.q_ls * q0.q_ls
+                    + g2[i] * (2.0 * q0.q_ls * dq0_lsv)
+                    + dmv * q0.q_ll
+                    + m[i] * dq0_llv;
+                let d2q_ll_uv = d2g2_uv * q0.q_ls * q0.q_ls
+                    + dg2_u * (2.0 * q0.q_ls * dq0_lsv)
+                    + dg2v * (2.0 * q0.q_ls * dq0_ls_u)
+                    + g2[i] * (2.0 * dq0_ls_u * dq0_lsv + 2.0 * q0.q_ls * d2q0_ls_uv)
+                    + d2m_uv * q0.q_ll
+                    + dm_u * dq0_llv
+                    + dmv * dq0_ll_u
+                    + m[i] * d2q0_ll_uv;
+
+                // Exact second directional coefficients for the scalar block weights.
+                let coeff_tt = second_directionalhessian_coeff_fromobjective_q_terms(
+                    m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_t, q_t, q_tt, dq_t_u, dq_tv, dq_t_u,
+                    dq_tv, d2q_t_uv, d2q_t_uv, dq_tt_u, dq_ttv, d2q_tt_uv,
+                );
+                let coeff_tl = second_directionalhessian_coeff_fromobjective_q_terms(
+                    m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_t, q_ls, q_tl, dq_t_u, dq_tv, dq_ls_u,
+                    dq_lsv, d2q_t_uv, d2q_ls_uv, dq_tl_u, dq_tlv, d2q_tl_uv,
+                );
+                let coeff_ll = second_directionalhessian_coeff_fromobjective_q_terms(
+                    m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_ls, q_ls, q_ll, dq_ls_u, dq_lsv, dq_ls_u,
+                    dq_lsv, d2q_ls_uv, d2q_ls_uv, dq_ll_u, dq_llv, d2q_ll_uv,
                 );
 
+                let xtr = x_t.row(i);
+                let xlsr = x_ls.row(i);
                 for a_idx in 0..pt {
-                    d2_h[[a_idx, pt + pls + j]] += coeff_tw * xtr[a_idx];
+                    for b_idx in a_idx..pt {
+                        row_h[[a_idx, b_idx]] += coeff_tt * xtr[a_idx] * xtr[b_idx];
+                    }
+                }
+                for a_idx in 0..pt {
+                    for b_idx in 0..pls {
+                        row_h[[a_idx, pt + b_idx]] += coeff_tl * xtr[a_idx] * xlsr[b_idx];
+                    }
                 }
                 for a_idx in 0..pls {
-                    d2_h[[pt + a_idx, pt + pls + j]] += coeff_lw * xlsr[a_idx];
+                    for b_idx in a_idx..pls {
+                        row_h[[pt + a_idx, pt + b_idx]] += coeff_ll * xlsr[a_idx] * xlsr[b_idx];
+                    }
                 }
-            }
 
-            for j in 0..pw {
-                let qwj = br[j];
-                let dqwj_u = dr[j] * dq0_u;
-                let dqwjv = dr[j] * dq0v;
-                let d2qwj_uv = ddr[j] * dq0_u * dq0v + dr[j] * d2q0_uv;
-                for k in j..pw {
-                    let qwk = br[k];
-                    let dqwk_u = dr[k] * dq0_u;
-                    let dqwkv = dr[k] * dq0v;
-                    let d2qwk_uv = ddr[k] * dq0_u * dq0v + dr[k] * d2q0_uv;
-                    let coeffww = second_directionalhessian_coeff_fromobjective_q_terms(
-                        m1, m2, m3, m4, dq_u, dqv, d2q_uv, qwj, qwk, 0.0, dqwj_u, dqwjv, dqwk_u,
-                        dqwkv, d2qwj_uv, d2qwk_uv, 0.0, 0.0, 0.0,
+                for j in 0..pw {
+                    let qw = br[j];
+                    let dqw_u = dr[j] * dq0_u;
+                    let dqwv = dr[j] * dq0v;
+                    let d2qw_uv = ddr[j] * dq0_u * dq0v + dr[j] * d2q0_uv;
+                    let q_tw = dr[j] * q0.q_t;
+                    let q_lw = dr[j] * q0.q_ls;
+                    let dq_tw_u = ddr[j] * dq0_u * q0.q_t + dr[j] * dq0_t_u;
+                    let dq_twv = ddr[j] * dq0v * q0.q_t + dr[j] * dq0_tv;
+                    let d2q_tw_uv = d3r[j] * dq0_u * dq0v * q0.q_t
+                        + ddr[j] * (d2q0_uv * q0.q_t + dq0_u * dq0_tv + dq0v * dq0_t_u)
+                        + dr[j] * d2q0_t_uv;
+                    let dq_lw_u = ddr[j] * dq0_u * q0.q_ls + dr[j] * dq0_ls_u;
+                    let dq_lwv = ddr[j] * dq0v * q0.q_ls + dr[j] * dq0_lsv;
+                    let d2q_lw_uv = d3r[j] * dq0_u * dq0v * q0.q_ls
+                        + ddr[j] * (d2q0_uv * q0.q_ls + dq0_u * dq0_lsv + dq0v * dq0_ls_u)
+                        + dr[j] * d2q0_ls_uv;
+
+                    let coeff_tw = second_directionalhessian_coeff_fromobjective_q_terms(
+                        m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_t, qw, q_tw, dq_t_u, dq_tv, dqw_u,
+                        dqwv, d2q_t_uv, d2qw_uv, dq_tw_u, dq_twv, d2q_tw_uv,
                     );
-                    d2_h[[pt + pls + j, pt + pls + k]] += coeffww;
+                    let coeff_lw = second_directionalhessian_coeff_fromobjective_q_terms(
+                        m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_ls, qw, q_lw, dq_ls_u, dq_lsv, dqw_u,
+                        dqwv, d2q_ls_uv, d2qw_uv, dq_lw_u, dq_lwv, d2q_lw_uv,
+                    );
+
+                    for a_idx in 0..pt {
+                        row_h[[a_idx, pt + pls + j]] += coeff_tw * xtr[a_idx];
+                    }
+                    for a_idx in 0..pls {
+                        row_h[[pt + a_idx, pt + pls + j]] += coeff_lw * xlsr[a_idx];
+                    }
                 }
-            }
-        }
+
+                for j in 0..pw {
+                    let qwj = br[j];
+                    let dqwj_u = dr[j] * dq0_u;
+                    let dqwjv = dr[j] * dq0v;
+                    let d2qwj_uv = ddr[j] * dq0_u * dq0v + dr[j] * d2q0_uv;
+                    for k in j..pw {
+                        let qwk = br[k];
+                        let dqwk_u = dr[k] * dq0_u;
+                        let dqwkv = dr[k] * dq0v;
+                        let d2qwk_uv = ddr[k] * dq0_u * dq0v + dr[k] * d2q0_uv;
+                        let coeffww = second_directionalhessian_coeff_fromobjective_q_terms(
+                            m1, m2, m3, m4, dq_u, dqv, d2q_uv, qwj, qwk, 0.0, dqwj_u, dqwjv,
+                            dqwk_u, dqwkv, d2qwj_uv, d2qwk_uv, 0.0, 0.0, 0.0,
+                        );
+                        row_h[[pt + pls + j, pt + pls + k]] += coeffww;
+                    }
+                }
+
+                Ok(row_h)
+            })
+            .try_reduce(
+                || Array2::<f64>::zeros((total, total)),
+                |mut acc, row_h| {
+                    acc += &row_h;
+                    Ok(acc)
+                },
+            )?;
 
         mirror_upper_to_lower(&mut d2_h);
         Ok(Some(d2_h))
