@@ -887,9 +887,9 @@ pub trait CustomFamily {
     /// the observed-information correction W_obs = W_Fisher - (y-mu)*B.
     fn exact_newton_joint_hessian(
         &self,
-        _: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        Ok(None)
+        exact_newton_joint_hessian_from_exact_blocks(self, block_states)
     }
 
     /// Optional exact joint log-likelihood / score evaluation in flattened
@@ -909,10 +909,14 @@ pub trait CustomFamily {
     /// coefficient-space direction `d_beta_flat`.
     fn exact_newton_joint_hessian_directional_derivative(
         &self,
-        _: &[ParameterBlockState],
-        _: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        Ok(None)
+        exact_newton_joint_hessian_directional_derivative_from_blocks(
+            self,
+            block_states,
+            d_beta_flat,
+        )
     }
 
     /// Optional exact second directional derivative of the joint Hessian.
@@ -923,10 +927,19 @@ pub trait CustomFamily {
     /// `v = d_betav_flat`.
     fn exact_newton_joint_hessiansecond_directional_derivative(
         &self,
-        _: &[ParameterBlockState],
-        _: &Array1<f64>,
-        _: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        d_beta_u_flat: &Array1<f64>,
+        d_betav_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        if !self.exact_newton_joint_hessian_beta_dependent() {
+            let total = block_states
+                .iter()
+                .map(|state| state.beta.len())
+                .sum::<usize>();
+            validate_flat_direction_length(d_beta_u_flat, total, "joint exact-newton d2H u")?;
+            validate_flat_direction_length(d_betav_flat, total, "joint exact-newton d2H v")?;
+            return Ok(Some(Array2::zeros((total, total))));
+        }
         Ok(None)
     }
 
@@ -1135,9 +1148,12 @@ pub trait CustomFamily {
     fn exact_newton_joint_hessian_with_specs(
         &self,
         block_states: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
     ) -> Result<Option<Array2<f64>>, String> {
-        self.exact_newton_joint_hessian(block_states)
+        match self.exact_newton_joint_hessian(block_states)? {
+            Some(hessian) => Ok(Some(hessian)),
+            None => exact_newton_joint_hessian_from_working_sets(self, block_states, specs),
+        }
     }
 
     /// Optional scale-aware exact joint curvature for the outer REML calculus.
@@ -1238,10 +1254,18 @@ pub trait CustomFamily {
     fn exact_newton_joint_hessian_directional_derivative_with_specs(
         &self,
         block_states: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        self.exact_newton_joint_hessian_directional_derivative(block_states, d_beta_flat)
+        match self.exact_newton_joint_hessian_directional_derivative(block_states, d_beta_flat)? {
+            Some(hessian) => Ok(Some(hessian)),
+            None => exact_newton_joint_hessian_directional_derivative_from_working_sets(
+                self,
+                block_states,
+                specs,
+                d_beta_flat,
+            ),
+        }
     }
 
     /// Optional spec-aware exact second directional derivative of the joint Hessian.
@@ -5865,6 +5889,297 @@ pub(crate) fn symmetrize_dense_in_place(matrix: &mut Array2<f64>) {
             matrix[[j, i]] = v;
         }
     }
+}
+
+fn validate_flat_direction_length(
+    direction: &Array1<f64>,
+    expected: usize,
+    context: &str,
+) -> Result<(), String> {
+    if direction.len() != expected {
+        return Err(format!(
+            "{context}: direction length mismatch: got {}, expected {expected}",
+            direction.len()
+        ));
+    }
+    Ok(())
+}
+
+fn exact_newton_joint_hessian_from_exact_blocks<F: CustomFamily + ?Sized>(
+    family: &F,
+    block_states: &[ParameterBlockState],
+) -> Result<Option<Array2<f64>>, String> {
+    let evaluation = family.evaluate(block_states)?;
+    if evaluation.blockworking_sets.len() != block_states.len() {
+        return Err(format!(
+            "exact_newton_joint_hessian default: working-set count {} != block count {}",
+            evaluation.blockworking_sets.len(),
+            block_states.len()
+        ));
+    }
+    if evaluation
+        .blockworking_sets
+        .iter()
+        .any(|working_set| !matches!(working_set, BlockWorkingSet::ExactNewton { .. }))
+    {
+        return Ok(None);
+    }
+
+    let total = block_states
+        .iter()
+        .map(|state| state.beta.len())
+        .sum::<usize>();
+    let mut joint = Array2::<f64>::zeros((total, total));
+    let mut start = 0usize;
+    for (block_idx, (state, working_set)) in block_states
+        .iter()
+        .zip(evaluation.blockworking_sets.iter())
+        .enumerate()
+    {
+        let p_block = state.beta.len();
+        let end = start + p_block;
+        let BlockWorkingSet::ExactNewton { hessian, .. } = working_set else {
+            unreachable!("non-ExactNewton working sets were filtered above");
+        };
+        let dense = hessian.to_dense();
+        if dense.nrows() != p_block || dense.ncols() != p_block {
+            return Err(format!(
+                "exact_newton_joint_hessian default: block {block_idx} Hessian shape {}x{} != expected {p_block}x{p_block}",
+                dense.nrows(),
+                dense.ncols()
+            ));
+        }
+        joint.slice_mut(s![start..end, start..end]).assign(&dense);
+        start = end;
+    }
+    Ok(Some(joint))
+}
+
+fn exact_newton_joint_hessian_from_working_sets<F: CustomFamily + ?Sized>(
+    family: &F,
+    block_states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+) -> Result<Option<Array2<f64>>, String> {
+    if block_states.len() != specs.len() {
+        return Err(format!(
+            "exact_newton_joint_hessian_with_specs default: block state count {} != spec count {}",
+            block_states.len(),
+            specs.len()
+        ));
+    }
+    let evaluation = family.evaluate(block_states)?;
+    if evaluation.blockworking_sets.len() != block_states.len() {
+        return Err(format!(
+            "exact_newton_joint_hessian_with_specs default: working-set count {} != block count {}",
+            evaluation.blockworking_sets.len(),
+            block_states.len()
+        ));
+    }
+
+    let total = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+    let mut joint = Array2::<f64>::zeros((total, total));
+    let mut start = 0usize;
+    for (block_idx, ((state, spec), working_set)) in block_states
+        .iter()
+        .zip(specs.iter())
+        .zip(evaluation.blockworking_sets.iter())
+        .enumerate()
+    {
+        let p_block = spec.design.ncols();
+        if state.beta.len() != p_block {
+            return Err(format!(
+                "exact_newton_joint_hessian_with_specs default: block {block_idx} beta length {} != design cols {p_block}",
+                state.beta.len()
+            ));
+        }
+        let end = start + p_block;
+        let dense = match working_set {
+            BlockWorkingSet::ExactNewton { hessian, .. } => hessian.to_dense(),
+            BlockWorkingSet::Diagonal {
+                working_weights, ..
+            } => spec.design.diag_xtw_x(working_weights)?,
+        };
+        if dense.nrows() != p_block || dense.ncols() != p_block {
+            return Err(format!(
+                "exact_newton_joint_hessian_with_specs default: block {block_idx} Hessian shape {}x{} != expected {p_block}x{p_block}",
+                dense.nrows(),
+                dense.ncols()
+            ));
+        }
+        joint.slice_mut(s![start..end, start..end]).assign(&dense);
+        start = end;
+    }
+    Ok(Some(joint))
+}
+
+fn exact_newton_joint_hessian_directional_derivative_from_blocks<F: CustomFamily + ?Sized>(
+    family: &F,
+    block_states: &[ParameterBlockState],
+    d_beta_flat: &Array1<f64>,
+) -> Result<Option<Array2<f64>>, String> {
+    let total = block_states
+        .iter()
+        .map(|state| state.beta.len())
+        .sum::<usize>();
+    validate_flat_direction_length(
+        d_beta_flat,
+        total,
+        "exact_newton_joint_hessian_directional_derivative default",
+    )?;
+    if !family.exact_newton_joint_hessian_beta_dependent() {
+        return Ok(Some(Array2::zeros((total, total))));
+    }
+
+    let mut joint = Array2::<f64>::zeros((total, total));
+    let mut start = 0usize;
+    for (block_idx, state) in block_states.iter().enumerate() {
+        let p_block = state.beta.len();
+        let end = start + p_block;
+        let d_beta_block = d_beta_flat.slice(s![start..end]).to_owned();
+        let Some(local) = family.exact_newton_hessian_directional_derivative(
+            block_states,
+            block_idx,
+            &d_beta_block,
+        )?
+        else {
+            return Ok(None);
+        };
+        if local.nrows() != p_block || local.ncols() != p_block {
+            return Err(format!(
+                "exact_newton_joint_hessian_directional_derivative default: block {block_idx} dH shape {}x{} != expected {p_block}x{p_block}",
+                local.nrows(),
+                local.ncols()
+            ));
+        }
+        joint.slice_mut(s![start..end, start..end]).assign(&local);
+        start = end;
+    }
+    Ok(Some(joint))
+}
+
+fn exact_newton_joint_hessian_directional_derivative_from_working_sets<F: CustomFamily + ?Sized>(
+    family: &F,
+    block_states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    d_beta_flat: &Array1<f64>,
+) -> Result<Option<Array2<f64>>, String> {
+    if block_states.len() != specs.len() {
+        return Err(format!(
+            "exact_newton_joint_hessian_directional_derivative_with_specs default: block state count {} != spec count {}",
+            block_states.len(),
+            specs.len()
+        ));
+    }
+    let total = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+    validate_flat_direction_length(
+        d_beta_flat,
+        total,
+        "exact_newton_joint_hessian_directional_derivative_with_specs default",
+    )?;
+    if !family.exact_newton_joint_hessian_beta_dependent() {
+        return Ok(Some(Array2::zeros((total, total))));
+    }
+
+    let evaluation = family.evaluate(block_states)?;
+    if evaluation.blockworking_sets.len() != block_states.len() {
+        return Err(format!(
+            "exact_newton_joint_hessian_directional_derivative_with_specs default: working-set count {} != block count {}",
+            evaluation.blockworking_sets.len(),
+            block_states.len()
+        ));
+    }
+
+    let mut joint = Array2::<f64>::zeros((total, total));
+    let mut start = 0usize;
+    for (block_idx, ((state, spec), working_set)) in block_states
+        .iter()
+        .zip(specs.iter())
+        .zip(evaluation.blockworking_sets.iter())
+        .enumerate()
+    {
+        let p_block = spec.design.ncols();
+        let end = start + p_block;
+        let d_beta_block = d_beta_flat.slice(s![start..end]).to_owned();
+        let local = match working_set {
+            BlockWorkingSet::ExactNewton { .. } => family
+                .exact_newton_hessian_directional_derivative(
+                    block_states,
+                    block_idx,
+                    &d_beta_block,
+                )?,
+            BlockWorkingSet::Diagonal {
+                working_weights, ..
+            } => {
+                let mut d_eta = spec.design.apply(&d_beta_block);
+                let mut geometry_correction = Array2::<f64>::zeros((p_block, p_block));
+                if let Some(geometry) = family.block_geometry_directional_derivative(
+                    block_states,
+                    block_idx,
+                    spec,
+                    &d_beta_block,
+                )? {
+                    if geometry.d_offset.len() != d_eta.len() {
+                        return Err(format!(
+                            "exact_newton_joint_hessian_directional_derivative_with_specs default: block {block_idx} geometry offset derivative length {} != eta length {}",
+                            geometry.d_offset.len(),
+                            d_eta.len()
+                        ));
+                    }
+                    d_eta += &geometry.d_offset;
+                    if let Some(d_design) = geometry.d_design {
+                        if d_design.nrows() != spec.design.nrows() || d_design.ncols() != p_block {
+                            return Err(format!(
+                                "exact_newton_joint_hessian_directional_derivative_with_specs default: block {block_idx} d_design shape {}x{} != expected {}x{}",
+                                d_design.nrows(),
+                                d_design.ncols(),
+                                spec.design.nrows(),
+                                p_block
+                            ));
+                        }
+                        d_eta += &d_design.dot(&state.beta);
+
+                        let x_dense = spec.design.to_dense();
+                        let mut weighted_x = x_dense.clone();
+                        let mut weighted_dx = d_design.clone();
+                        ndarray::Zip::from(weighted_x.rows_mut())
+                            .and(weighted_dx.rows_mut())
+                            .and(working_weights.view())
+                            .for_each(|mut wx_row, mut wdx_row, &wi| {
+                                wx_row.mapv_inplace(|value| value * wi);
+                                wdx_row.mapv_inplace(|value| value * wi);
+                            });
+                        geometry_correction += &fast_atb(&d_design, &weighted_x);
+                        geometry_correction += &fast_atb(&x_dense, &weighted_dx);
+                    }
+                }
+                family
+                    .diagonalworking_weights_directional_derivative(
+                        block_states,
+                        block_idx,
+                        &d_eta,
+                    )?
+                    .map(|dw| {
+                        let mut local = spec.design.diag_xtw_x(&dw)?;
+                        local += &geometry_correction;
+                        Ok::<Array2<f64>, String>(local)
+                    })
+                    .transpose()?
+            }
+        };
+        let Some(local) = local else {
+            return Ok(None);
+        };
+        if local.nrows() != p_block || local.ncols() != p_block {
+            return Err(format!(
+                "exact_newton_joint_hessian_directional_derivative_with_specs default: block {block_idx} dH shape {}x{} != expected {p_block}x{p_block}",
+                local.nrows(),
+                local.ncols()
+            ));
+        }
+        joint.slice_mut(s![start..end, start..end]).assign(&local);
+        start = end;
+    }
+    Ok(Some(joint))
 }
 
 fn exact_newton_joint_hessian_symmetrized<F: CustomFamily + Clone + Send + Sync + 'static>(
@@ -13355,6 +13670,144 @@ mod tests {
             hessian,
             crate::solver::outer_strategy::Derivative::Unavailable
         );
+    }
+
+    #[derive(Clone)]
+    struct DefaultDiagonalExactHookFamily;
+
+    impl CustomFamily for DefaultDiagonalExactHookFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let eta = block_states[0].eta.clone();
+            let weights = eta.mapv(|value| 2.0 + value * value);
+            Ok(FamilyEvaluation {
+                log_likelihood: -0.5 * eta.dot(&eta),
+                blockworking_sets: vec![BlockWorkingSet::Diagonal {
+                    working_response: Array1::zeros(eta.len()),
+                    working_weights: weights,
+                }],
+            })
+        }
+
+        fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+            true
+        }
+
+        fn diagonalworking_weights_directional_derivative(
+            &self,
+            block_states: &[ParameterBlockState],
+            _: usize,
+            d_eta: &Array1<f64>,
+        ) -> Result<Option<Array1<f64>>, String> {
+            Ok(Some((&block_states[0].eta * d_eta) * 2.0))
+        }
+
+        fn exact_newton_joint_hessiansecond_directional_derivative(
+            &self,
+            block_states: &[ParameterBlockState],
+            u: &Array1<f64>,
+            v: &Array1<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            let spec = default_diagonal_exact_hook_spec();
+            let u_eta = spec.design.apply(u);
+            let v_eta = spec.design.apply(v);
+            assert_eq!(block_states[0].eta.len(), u_eta.len());
+            spec.design.diag_xtw_x(&((&u_eta * &v_eta) * 2.0)).map(Some)
+        }
+    }
+
+    fn default_diagonal_exact_hook_spec() -> ParameterBlockSpec {
+        ParameterBlockSpec {
+            name: "default_exact".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+                [1.0, 0.5],
+                [0.0, 1.0],
+                [2.0, -1.0]
+            ])),
+            offset: Array1::zeros(3),
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(2))],
+            nullspace_dims: vec![],
+            initial_log_lambdas: array![0.0],
+            initial_beta: Some(array![0.2, -0.1]),
+        }
+    }
+
+    #[test]
+    fn default_custom_family_exact_hessian_hooks_assemble_diagonal_working_sets() {
+        let family = DefaultDiagonalExactHookFamily;
+        let spec = default_diagonal_exact_hook_spec();
+        let beta = array![0.2, -0.1];
+        let eta = spec.design.apply(&beta);
+        let states = vec![ParameterBlockState {
+            beta: beta.clone(),
+            eta: eta.clone(),
+        }];
+
+        let h = family
+            .exact_newton_joint_hessian_with_specs(&states, &[spec.clone()])
+            .expect("default joint Hessian hook should succeed")
+            .expect("diagonal working sets should assemble an exact joint Hessian");
+        let expected_h = spec
+            .design
+            .diag_xtw_x(&eta.mapv(|value| 2.0 + value * value))
+            .unwrap();
+        assert_eq!(h, expected_h);
+
+        let direction = array![0.3, -0.4];
+        let dh = family
+            .exact_newton_joint_hessian_directional_derivative_with_specs(
+                &states,
+                &[spec.clone()],
+                &direction,
+            )
+            .expect("default joint dH hook should succeed")
+            .expect("diagonal weight derivative should assemble an exact joint dH");
+        let d_eta = spec.design.apply(&direction);
+        let expected_dh = spec.design.diag_xtw_x(&((&eta * &d_eta) * 2.0)).unwrap();
+        assert_eq!(dh, expected_dh);
+
+        let d2h = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&states, &direction, &beta)
+            .expect("family second directional hook should succeed")
+            .expect("second directional hook should be exact");
+        let beta_eta = spec.design.apply(&beta);
+        let expected_d2h = spec
+            .design
+            .diag_xtw_x(&((&d_eta * &beta_eta) * 2.0))
+            .unwrap();
+        assert_eq!(d2h, expected_d2h);
+    }
+
+    #[test]
+    fn default_custom_family_exact_hessian_hooks_drive_profiled_outer_hessian() {
+        let spec = default_diagonal_exact_hook_spec();
+        let result = evaluate_custom_family_joint_hyper(
+            &DefaultDiagonalExactHookFamily,
+            &[spec],
+            &BlockwiseFitOptions {
+                use_remlobjective: true,
+                use_outer_hessian: true,
+                compute_covariance: false,
+                inner_max_cycles: 1,
+                ..BlockwiseFitOptions::default()
+            },
+            &array![0.0],
+            &[vec![]],
+            None,
+            EvalMode::ValueGradientHessian,
+        )
+        .expect("profiled outer Hessian should use default exact Hessian hooks");
+
+        assert_eq!(result.gradient.len(), 1);
+        match result.outer_hessian {
+            crate::solver::outer_strategy::HessianResult::Analytic(hessian) => {
+                assert_eq!(hessian.dim(), (1, 1));
+                assert!(hessian[[0, 0]].is_finite());
+            }
+            _ => panic!("outer Hessian should be analytic"),
+        }
     }
 
     #[test]
