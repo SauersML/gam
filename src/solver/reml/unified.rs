@@ -572,6 +572,11 @@ pub struct ScalarGlmIngredients<'a> {
 
 #[derive(Clone)]
 pub enum OuterHessianDerivativeKernel {
+    /// Gaussian/constant-curvature families have no likelihood drift corrections.
+    /// This marker still enables the unified exact outer-HVP operator, whose
+    /// penalty/logdet/profiled-dispersion terms are fully analytic and avoid
+    /// dense pairwise assembly at large n.
+    Gaussian,
     ScalarGlm {
         c_array: Array1<f64>,
         d_array: Option<Array1<f64>>,
@@ -601,6 +606,10 @@ impl OuterHessianDerivativeKernel {
 pub struct GaussianDerivatives;
 
 impl HessianDerivativeProvider for GaussianDerivatives {
+    fn outer_hessian_derivative_kernel(&self) -> Option<OuterHessianDerivativeKernel> {
+        Some(OuterHessianDerivativeKernel::Gaussian)
+    }
+
     fn hessian_derivative_correction(
         &self,
         _: &Array1<f64>,
@@ -6610,6 +6619,7 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
 
             let correction = if self.incl_logdet_h {
                 match &self.kernel {
+                    OuterHessianDerivativeKernel::Gaussian => 0.0,
                     OuterHessianDerivativeKernel::ScalarGlm { .. } => {
                         self.scalar_correction_trace(idx, alpha, &coord.v, &correction_m_alpha)?
                     }
@@ -6803,9 +6813,17 @@ fn build_outer_hessian_operator(
         }
     }
 
+    for ii in 0..k {
+        for jj in ii..k {
+            pair_ld_s[[ii, jj]] = det2[[ii, jj]];
+            if ii != jj {
+                pair_ld_s[[jj, ii]] = det2[[ii, jj]];
+            }
+        }
+    }
+
     for idx in 0..k {
         pair_a[[idx, idx]] = coords[idx].a;
-        pair_ld_s[[idx, idx]] = det2[[idx, idx]];
         pair_g[idx][idx] = Some(coords[idx].g.clone());
         let base = if solution.penalty_coords[idx].is_block_local() {
             let (block, start, end) = solution.penalty_coords[idx].scaled_block_local(1.0);
@@ -7080,6 +7098,7 @@ fn build_outer_hessian_operator(
 
     let leverage = if incl_logdet_h {
         match &kernel {
+            OuterHessianDerivativeKernel::Gaussian => None,
             OuterHessianDerivativeKernel::ScalarGlm { x, .. } => {
                 Some(hop.xt_logdet_kernel_x_diagonal(x))
             }
@@ -11582,6 +11601,100 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn gaussian_derivatives_advertise_exact_outer_hvp_kernel() {
+        let g = GaussianDerivatives;
+        assert!(matches!(
+            g.outer_hessian_derivative_kernel(),
+            Some(OuterHessianDerivativeKernel::Gaussian)
+        ));
+    }
+
+    #[test]
+    fn standard_gam_large_n_gaussian_prefers_operator_when_dense_work_is_large() {
+        assert!(prefer_outer_hessian_operator(320_000, 42, 6));
+        assert!(matches!(
+            GaussianDerivatives.outer_hessian_derivative_kernel(),
+            Some(OuterHessianDerivativeKernel::Gaussian)
+        ));
+    }
+
+    #[test]
+    fn gaussian_outer_hessian_operator_matches_dense_assembly() {
+        let h = array![[2.4, 0.2], [0.2, 1.7]];
+        let hop = Arc::new(DenseSpectralOperator::from_symmetric(&h).unwrap());
+        let beta = array![0.35, -0.55];
+        let penalty_root_0 = array![[1.0, 0.2], [0.0, 0.4]];
+        let penalty_root_1 = array![[0.3, -0.1], [0.0, 0.9]];
+        let solution = InnerSolution {
+            log_likelihood: -8.0,
+            penalty_quadratic: 0.9,
+            hessian_op: hop.clone(),
+            beta,
+            penalty_coords: vec![
+                PenaltyCoordinate::from_dense_root(penalty_root_0),
+                PenaltyCoordinate::from_dense_root(penalty_root_1),
+            ],
+            penalty_logdet: PenaltyLogdetDerivs {
+                value: 0.0,
+                first: array![0.8, 0.6],
+                second: Some(array![[0.11, 0.03], [0.03, 0.17]]),
+            },
+            deriv_provider: Box::new(GaussianDerivatives),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: None,
+            hessian_logdet_correction: 0.0,
+            penalty_subspace_trace: None,
+            rho_curvature_scale: 1.0,
+            n_observations: 320_000,
+            nullspace_dim: 1.0,
+            dispersion: DispersionHandling::ProfiledGaussian,
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+            barrier_config: None,
+        };
+        let rho: Vec<f64> = vec![0.2_f64, -0.4_f64];
+        let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
+
+        let dense = compute_outer_hessian(
+            &solution,
+            &rho,
+            &lambdas,
+            solution.hessian_op.as_ref(),
+            solution.deriv_provider.as_ref(),
+        )
+        .unwrap();
+        let kernel = solution
+            .deriv_provider
+            .outer_hessian_derivative_kernel()
+            .unwrap();
+        let operator = build_outer_hessian_operator(
+            &solution,
+            &lambdas,
+            solution.deriv_provider.as_ref(),
+            kernel,
+        )
+        .unwrap();
+        let materialized =
+            crate::solver::outer_strategy::OuterHessianOperator::materialize_dense(&operator)
+                .unwrap();
+
+        for row in 0..dense.nrows() {
+            for col in 0..dense.ncols() {
+                let expected = dense[[row, col]];
+                let actual = materialized[[row, col]];
+                let tolerance = 1e-10_f64.max(1e-10 * expected.abs());
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "Gaussian outer Hessian operator mismatch at ({row}, {col}): materialized={actual}, dense={expected}"
+                );
+            }
+        }
     }
 
     /// Scalar EFS counterexample: at z=2, λ=1/3 in a one-coefficient
