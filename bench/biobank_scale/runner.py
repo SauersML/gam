@@ -4214,6 +4214,29 @@ def do_run_method(args: argparse.Namespace) -> int:
             "status": "ok",
             **result,
         }
+    except TimeoutError as exc:
+        # Per-command wall-clock budget exhausted. This is an EXPECTED
+        # failure mode at biobank scale (the [HEARTBEAT] line and
+        # [PHASE summary] above already explain WHICH phase was running
+        # when the budget ran out, so a Python stack trace adds no
+        # information and just clutters the log). Emit a one-line
+        # `[ERROR]` so the failure is visibly distinct from a random
+        # crash and parsers can grep for `status=timeout`.
+        print(
+            f"[ERROR] method={spec.name} status=timeout "
+            f"timeout_sec={_CMD_TIMEOUT_SEC} reason={exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        payload = {
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "status": "timeout",
+            "method": spec.name,
+            "dataset": spec.dataset,
+            "family": spec.family,
+            "timeout_sec": _CMD_TIMEOUT_SEC,
+            "error": str(exc),
+        }
     except Exception as exc:
         traceback.print_exc(file=sys.stderr)
         sys.stderr.flush()
