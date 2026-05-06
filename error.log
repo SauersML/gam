@@ -12329,3 +12329,2014 @@ index 3f93c29430becb5e5f288a4902893a85d01371bd..f427b5b06c345eaf30a79391a5aec21a
 
 ----- PATCH END -----
 
+[2026-05-06T20:58:48.282379+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:58:48.285178+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:58:48.285228+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:59:03.615720+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:59:03.618360+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:59:03.618435+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:59:06.285051+00:00] apply_result: mode=apply id=task_e_69fb939cb9408324b24c471ed3ae9baa status=Partial applied=0 skipped=0 conflicts=1 cmd=(cd /Users/user/gam && git apply --3way /var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/.tmpzRgRUG/patch.diff)
+stdout_tail=
+
+stderr_tail=
+Applied patch to 'src/linalg/matrix.rs' with conflicts.
+U src/linalg/matrix.rs
+
+patch_summary: kind=git-diff lines=1103 chars=42817 cwd=/Users/user/gam ; head=
+diff --git a/src/linalg/matrix.rs b/src/linalg/matrix.rs
+index e10566d7764e9d51a36ab46304f0f04471f335df..01fda8946c0d5b158fcd11f97656064436cabeef 100644
+--- a/src/linalg/matrix.rs
++++ b/src/linalg/matrix.rs
+@@ -10,110 +10,152 @@ use faer::linalg::matmul::matmul;
+ use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
+ use ndarray::{
+     Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, ShapeBuilder, s,
+ };
+ use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+ use rayon::slice::ParallelSliceMut;
+ use std::borrow::Cow;
+ use std::collections::BTreeMap;
+ use std::ops::Deref;
+ use std::ops::Range;
+ use std::sync::{Arc, OnceLock};
+ 
+ const MATRIX_FREE_PCG_MIN_P: usize = 2048;
+ const MATRIX_FREE_PCG_REL_TOL: f64 = 1e-8;
+ const MATRIX_FREE_PCG…
+----- PATCH BEGIN -----
+diff --git a/src/linalg/matrix.rs b/src/linalg/matrix.rs
+index e10566d7764e9d51a36ab46304f0f04471f335df..01fda8946c0d5b158fcd11f97656064436cabeef 100644
+--- a/src/linalg/matrix.rs
++++ b/src/linalg/matrix.rs
+@@ -10,110 +10,152 @@ use faer::linalg::matmul::matmul;
+ use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
+ use ndarray::{
+     Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, ShapeBuilder, s,
+ };
+ use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+ use rayon::slice::ParallelSliceMut;
+ use std::borrow::Cow;
+ use std::collections::BTreeMap;
+ use std::ops::Deref;
+ use std::ops::Range;
+ use std::sync::{Arc, OnceLock};
+ 
+ const MATRIX_FREE_PCG_MIN_P: usize = 2048;
+ const MATRIX_FREE_PCG_REL_TOL: f64 = 1e-8;
+ const MATRIX_FREE_PCG_MAX_ITER: usize = 2000;
+ const MAX_SINGLE_DENSE_MATERIALIZATION_BYTES: usize = 256 * 1024 * 1024;
+ const MAX_PERSISTENT_SPARSE_DENSE_CACHE_BYTES: usize = 256 * 1024 * 1024;
+ const MAX_SPARSE_TO_DENSE_BYTES: usize = MAX_SINGLE_DENSE_MATERIALIZATION_BYTES;
+ const CHUNKED_DENSE_MATERIALIZATION_BYTES: usize = 8 * 1024 * 1024;
+ const OPERATOR_ROW_CHUNK_SIZE: usize = 256;
+ const KERNEL_OPERATOR_ROW_CHUNK_SIZE: usize = 2048;
+ /// Minimum n*p product for the dense-row parallel fold/reduce paths
+ /// (`diag_gram`, `apply_weighted_normal`, `dense_transpose_matvec_view`).
+ /// Below this, the sequential row loop wins on overhead.
+ const DENSE_ROW_PARALLEL_MIN_NP: u64 = 200_000;
++const WEIGHTED_CROSSPROD_PARALLEL_MIN_FLOPS: u64 = 500_000;
++const SPARSE_ROW_PARALLEL_MIN_FLOPS: u64 = 100_000;
+ /// Maximum bytes for the (n, tail_total) intermediate in GEMM-batched tensor
+ /// product matvecs.  Beyond this threshold, fall back to per-column GEMV.
+ const TENSOR_GEMM_MAX_INTERMEDIATE_BYTES: usize = 128 * 1024 * 1024; // 128 MB
+ 
+ pub use crate::linalg::utils::PcgSolveInfo;
+ 
+ fn checked_dense_nbytes(nrows: usize, ncols: usize, context: &str) -> Result<usize, String> {
+     nrows
+         .checked_mul(ncols)
+         .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()))
+         .ok_or_else(|| format!("{context}: dense size overflow for {nrows}x{ncols}"))
+ }
+ 
+ pub fn panic_or_error_if_biobank_mode_and_to_dense_called_with_policy(
+     context: &str,
+     n: usize,
+     p: usize,
+     policy: &ResourcePolicy,
+ ) -> Result<(), String> {
+     let dense_bytes = checked_dense_nbytes(n, p, context)?;
+     let limit = policy.max_single_materialization_bytes;
+     if dense_bytes > limit {
+         let gib = dense_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+         return Err(format!(
+             "{context}: refusing to densify operator-backed design {n}x{p} (~{gib:.2} GiB); use matrix-free or chunked code"
+         ));
+     }
+     Ok(())
+ }
+ 
+ fn weighted_crossprod_dense(
+     left: &Array2<f64>,
+     weights: &Array1<f64>,
+     right: &Array2<f64>,
+ ) -> Result<Array2<f64>, String> {
+     if left.nrows() != weights.len() || right.nrows() != weights.len() {
+         return Err(format!(
+             "weighted_crossprod_dense row mismatch: left={}, weights={}, right={}",
+             left.nrows(),
+             weights.len(),
+             right.nrows()
+         ));
+     }
++    Ok(weighted_crossprod_dense_view(left, weights.view(), right))
++}
++
++fn weighted_crossprod_dense_view(
++    left: &Array2<f64>,
++    weights: ArrayView1<'_, f64>,
++    right: &Array2<f64>,
++) -> Array2<f64> {
++    let n = weights.len();
++    let p_left = left.ncols();
++    let p_right = right.ncols();
++    let work = (n as u64)
++        .saturating_mul(p_left as u64)
++        .saturating_mul(p_right as u64);
++    if rayon::current_num_threads() <= 1 || work < WEIGHTED_CROSSPROD_PARALLEL_MIN_FLOPS {
++        return weighted_crossprod_dense_rows(left, weights, right, 0..n);
++    }
++
++    let n_threads = rayon::current_num_threads();
++    let chunk_rows = n.div_ceil(n_threads * 4).max(1);
++    let starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
++    let partials: Vec<Array2<f64>> = starts
++        .into_par_iter()
++        .map(|start| {
++            weighted_crossprod_dense_rows(left, weights, right, start..(start + chunk_rows).min(n))
++        })
++        .collect();
++    let mut out = Array2::<f64>::zeros((p_left, p_right));
++    for partial in &partials {
++        out += partial;
++    }
++    out
++}
++
++fn weighted_crossprod_dense_rows(
++    left: &Array2<f64>,
++    weights: ArrayView1<'_, f64>,
++    right: &Array2<f64>,
++    rows: Range<usize>,
++) -> Array2<f64> {
+     let mut out = Array2::<f64>::zeros((left.ncols(), right.ncols()));
+-    for i in 0..weights.len() {
++    for i in rows {
+         let wi = weights[i].max(0.0);
+         if wi == 0.0 {
+             continue;
+         }
+         for a in 0..left.ncols() {
+             let scaled = wi * left[[i, a]];
+             if scaled == 0.0 {
+                 continue;
+             }
+             for b in 0..right.ncols() {
+                 out[[a, b]] += scaled * right[[i, b]];
+             }
+         }
+     }
+-    Ok(out)
++    out
+ }
+ 
+ pub struct DenseRightProductView<'a> {
+     base: &'a Array2<f64>,
+     first: Option<&'a Array2<f64>>,
+     second: Option<&'a Array2<f64>>,
+ }
+ 
+ impl<'a> DenseRightProductView<'a> {
+     pub fn new(base: &'a Array2<f64>) -> Self {
+         Self {
+             base,
+             first: None,
+             second: None,
+         }
+     }
+ 
+     pub fn with_factor(mut self, factor: &'a Array2<f64>) -> Self {
+         if self.first.is_none() {
+             self.first = Some(factor);
+         } else if self.second.is_none() {
+             self.second = Some(factor);
+         } else {
+             panic!("DenseRightProductView supports at most two right factors");
+         }
+@@ -284,82 +326,193 @@ fn dense_transpose_matvec_view(matrix: &Array2<f64>, vector: ArrayView1<'_, f64>
+     (0..n)
+         .into_par_iter()
+         .fold(
+             || Array1::<f64>::zeros(p),
+             |mut acc, i| {
+                 let vi = vector[i];
+                 if vi != 0.0 {
+                     for j in 0..p {
+                         acc[j] += matrix[[i, j]] * vi;
+                     }
+                 }
+                 acc
+             },
+         )
+         .reduce(
+             || Array1::<f64>::zeros(p),
+             |mut a, b| {
+                 a += &b;
+                 a
+             },
+         )
+ }
+ 
+ #[inline]
+ fn dense_xtwx_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> Array2<f64> {
++    weighted_crossprod_dense_view(matrix, weights, matrix)
++}
++
++#[inline]
++fn dense_diag_gram_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> Array1<f64> {
+     let p = matrix.ncols();
+-    let mut xtwx = Array2::<f64>::zeros((p, p));
++    let mut diag = Array1::<f64>::zeros(p);
+     for i in 0..matrix.nrows() {
+         let wi = weights[i].max(0.0);
+         if wi == 0.0 {
+             continue;
+         }
+-        for a in 0..p {
+-            let xa = matrix[[i, a]];
+-            for b in a..p {
+-                let v = wi * xa * matrix[[i, b]];
++        for j in 0..p {
++            let xij = matrix[[i, j]];
++            diag[j] += wi * xij * xij;
++        }
++    }
++    diag
++}
++
++fn sparse_csr_weighted_xtwx(
++    row_ptr: &[usize],
++    col_idx: &[usize],
++    vals: &[f64],
++    n: usize,
++    p: usize,
++    weights: ArrayView1<'_, f64>,
++) -> Array2<f64> {
++    let nnz = vals.len() as u64;
++    let avg = nnz.checked_div(n.max(1) as u64).unwrap_or(0);
++    let work = (n as u64).saturating_mul(avg.saturating_mul(avg));
++    if rayon::current_num_threads() <= 1 || work < SPARSE_ROW_PARALLEL_MIN_FLOPS {
++        return sparse_csr_weighted_xtwx_rows(row_ptr, col_idx, vals, p, weights, 0..n);
++    }
++
++    let n_threads = rayon::current_num_threads();
++    let target_chunks = (n_threads * 8).max(1);
++    let chunk_rows = n.div_ceil(target_chunks).max(1);
++    let starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
++    let partials: Vec<Array2<f64>> = starts
++        .into_par_iter()
++        .map(|start| {
++            sparse_csr_weighted_xtwx_rows(
++                row_ptr,
++                col_idx,
++                vals,
++                p,
++                weights,
++                start..(start + chunk_rows).min(n),
++            )
++        })
++        .collect();
++    let mut xtwx = Array2::<f64>::zeros((p, p));
++    for partial in &partials {
++        xtwx += partial;
++    }
++    xtwx
++}
++
++fn sparse_csr_weighted_xtwx_rows(
++    row_ptr: &[usize],
++    col_idx: &[usize],
++    vals: &[f64],
++    p: usize,
++    weights: ArrayView1<'_, f64>,
++    rows: Range<usize>,
++) -> Array2<f64> {
++    let mut xtwx = Array2::<f64>::zeros((p, p));
++    for i in rows {
++        let wi = weights[i].max(0.0);
++        if wi == 0.0 {
++            continue;
++        }
++        let start = row_ptr[i];
++        let end = row_ptr[i + 1];
++        for a_ptr in start..end {
++            let a = col_idx[a_ptr];
++            let wxa = wi * vals[a_ptr];
++            for b_ptr in a_ptr..end {
++                let b = col_idx[b_ptr];
++                let v = wxa * vals[b_ptr];
+                 xtwx[[a, b]] += v;
+                 if a != b {
+                     xtwx[[b, a]] += v;
+                 }
+             }
+         }
+     }
+     xtwx
+ }
+ 
+-#[inline]
+-fn dense_diag_gram_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> Array1<f64> {
+-    let p = matrix.ncols();
++fn sparse_csr_diag_gram(
++    row_ptr: &[usize],
++    col_idx: &[usize],
++    vals: &[f64],
++    n: usize,
++    p: usize,
++    weights: ArrayView1<'_, f64>,
++) -> Array1<f64> {
++    let work = vals.len() as u64;
++    if rayon::current_num_threads() <= 1 || work < SPARSE_ROW_PARALLEL_MIN_FLOPS {
++        return sparse_csr_diag_gram_rows(row_ptr, col_idx, vals, p, weights, 0..n);
++    }
++    let n_threads = rayon::current_num_threads();
++    let chunk_rows = n.div_ceil(n_threads * 8).max(1);
++    let starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
++    let partials: Vec<Array1<f64>> = starts
++        .into_par_iter()
++        .map(|start| {
++            sparse_csr_diag_gram_rows(
++                row_ptr,
++                col_idx,
++                vals,
++                p,
++                weights,
++                start..(start + chunk_rows).min(n),
++            )
++        })
++        .collect();
+     let mut diag = Array1::<f64>::zeros(p);
+-    for i in 0..matrix.nrows() {
++    for partial in &partials {
++        diag += partial;
++    }
++    diag
++}
++
++fn sparse_csr_diag_gram_rows(
++    row_ptr: &[usize],
++    col_idx: &[usize],
++    vals: &[f64],
++    p: usize,
++    weights: ArrayView1<'_, f64>,
++    rows: Range<usize>,
++) -> Array1<f64> {
++    let mut diag = Array1::<f64>::zeros(p);
++    for i in rows {
+         let wi = weights[i].max(0.0);
+         if wi == 0.0 {
+             continue;
+         }
+-        for j in 0..p {
+-            let xij = matrix[[i, j]];
++        for idx in row_ptr[i]..row_ptr[i + 1] {
++            let j = col_idx[idx];
++            let xij = vals[idx];
+             diag[j] += wi * xij * xij;
+         }
+     }
+     diag
+ }
+ 
+ #[inline]
+ fn dense_transpose_weighted_response(
+     matrix: &Array2<f64>,
+     weights: &Array1<f64>,
+     y: &Array1<f64>,
+     row_scale: Option<&Array1<f64>>,
+ ) -> Array1<f64> {
+     let mut out = Array1::<f64>::zeros(matrix.ncols());
+     for i in 0..matrix.nrows() {
+         let mut scaled = y[i] * weights[i].max(0.0);
+         if let Some(scale) = row_scale {
+             scaled *= scale[i];
+         }
+         if scaled == 0.0 {
+             continue;
+         }
+         for j in 0..matrix.ncols() {
+             out[j] += matrix[[i, j]] * scaled;
+         }
+@@ -2564,97 +2717,99 @@ impl LinearOperator for TensorProductDesignOperator {
+         let q0 = self.marginals[0].ncols();
+ 
+         // ── Factored Gram computation ──────────────────────────────────
+         //
+         // Generalizes RowwiseKroneckerOperator's gamma approach to k factors.
+         //
+         // X'WX[multi_a, multi_b] =
+         //   Σ_i w[i] · B₁[i,a₁]·B₂[i,a₂]·…·Bₖ[i,aₖ] · B₁[i,b₁]·B₂[i,b₂]·…·Bₖ[i,bₖ]
+         //
+         // Factor out B₁:
+         //   = Σ_i (w[i] · B₂[i,a₂]·B₂[i,b₂] · … · Bₖ[i,aₖ]·Bₖ[i,bₖ]) · B₁[i,a₁]·B₁[i,b₁]
+         //
+         // For each tuple (a₂,b₂,…,aₖ,bₖ), form γ[i] = w[i]·∏_{d>1} Bd[i,ad]·Bd[i,bd],
+         // then the (a₁,b₁) block = B₁'·diag(γ)·B₁  which is a q₁×q₁ gram.
+         //
+         // This avoids per-row allocation and computes many small BLAS grams
+         // instead of one huge (∏qⱼ)×(∏qⱼ) outer product.
+ 
+         let mut xtwx = Array2::<f64>::zeros((self.total_cols, self.total_cols));
+         let b0 = &self.marginals[0];
+ 
+         // Collect tail marginal dimensions.
+         let tail_dims: Vec<usize> = self.marginals[1..].iter().map(|m| m.ncols()).collect();
+         let tail_total: usize = tail_dims.iter().product();
+ 
+-        // Iterate over all (a_tail, b_tail) index pairs in the tail dimensions.
+-        // For symmetry, only iterate a_flat <= b_flat and mirror.
+-        let mut gamma = Array1::<f64>::zeros(n);
+-        let mut block = Array2::<f64>::zeros((q0, q0));
++        // Iterate over all (a_tail, b_tail) index pairs in a deterministic
++        // task order. Each rayon task owns its gamma vector and q0×q0 block,
++        // and the collected blocks are scattered sequentially in pair order so
++        // reductions do not depend on worker scheduling.
+         let tail_d = tail_dims.len();
+-        let mut a_indices = vec![0usize; tail_d];
+-        let mut b_indices = vec![0usize; tail_d];
+-
+-        for a_flat in 0..tail_total {
+-            decode_multi_index(a_flat, &tail_dims, &mut a_indices);
+-
+-            for b_flat in a_flat..tail_total {
++        let pairs: Vec<(usize, usize)> = (0..tail_total)
++            .flat_map(|a_flat| (a_flat..tail_total).map(move |b_flat| (a_flat, b_flat)))
++            .collect();
++        let blocks: Vec<(usize, usize, Array2<f64>)> = pairs
++            .into_par_iter()
++            .map(|(a_flat, b_flat)| {
++                let mut a_indices = vec![0usize; tail_d];
++                let mut b_indices = vec![0usize; tail_d];
++                decode_multi_index(a_flat, &tail_dims, &mut a_indices);
+                 decode_multi_index(b_flat, &tail_dims, &mut b_indices);
+ 
+-                // Form γ[i] = w[i] · ∏_{d=1..k-1} B_{d+1}[i, a_d] · B_{d+1}[i, b_d]
++                let mut gamma = Array1::<f64>::zeros(n);
+                 for i in 0..n {
+                     let mut prod = weights[i].max(0.0);
+-                    if prod == 0.0 {
+-                        gamma[i] = 0.0;
+-                        continue;
+-                    }
+-                    for dim_idx in 0..tail_d {
+-                        let m = &self.marginals[dim_idx + 1];
+-                        prod *= m[[i, a_indices[dim_idx]]] * m[[i, b_indices[dim_idx]]];
+-                        if prod == 0.0 {
+-                            break;
++                    if prod != 0.0 {
++                        for dim_idx in 0..tail_d {
++                            let m = &self.marginals[dim_idx + 1];
++                            prod *= m[[i, a_indices[dim_idx]]] * m[[i, b_indices[dim_idx]]];
++                            if prod == 0.0 {
++                                break;
++                            }
+                         }
+                     }
+                     gamma[i] = prod;
+                 }
+ 
+-                // Compute B₁' · diag(γ) · B₁ → (q₀ × q₀) block via BLAS.
+-                block.fill(0.0);
++                let mut block = Array2::<f64>::zeros((q0, q0));
+                 streaming_blas_xt_diag_x(b0.as_ref(), &gamma, &mut block);
++                (a_flat, b_flat, block)
++            })
++            .collect();
+ 
+-                // Scatter block into the full xtwx.
+-                // Global column for (j₁, tail_flat) = j₁ * tail_total + tail_flat.
+-                for a1 in 0..q0 {
+-                    let ga = a1 * tail_total + a_flat;
+-                    for b1 in 0..q0 {
+-                        let gb = b1 * tail_total + b_flat;
+-                        xtwx[[ga, gb]] += block[[a1, b1]];
+-                        if a_flat != b_flat {
+-                            let ga_mirror = a1 * tail_total + b_flat;
+-                            let gb_mirror = b1 * tail_total + a_flat;
+-                            xtwx[[ga_mirror, gb_mirror]] += block[[a1, b1]];
+-                        }
++        for (a_flat, b_flat, block) in blocks {
++            // Scatter block into the full xtwx.
++            // Global column for (j₁, tail_flat) = j₁ * tail_total + tail_flat.
++            for a1 in 0..q0 {
++                let ga = a1 * tail_total + a_flat;
++                for b1 in 0..q0 {
++                    let gb = b1 * tail_total + b_flat;
++                    xtwx[[ga, gb]] += block[[a1, b1]];
++                    if a_flat != b_flat {
++                        let ga_mirror = a1 * tail_total + b_flat;
++                        let gb_mirror = b1 * tail_total + a_flat;
++                        xtwx[[ga_mirror, gb_mirror]] += block[[a1, b1]];
+                     }
+                 }
+             }
+         }
+         Ok(xtwx)
+     }
+ 
+     fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+         if weights.len() != self.n {
+             return Err(format!(
+                 "TensorProductDesignOperator::diag_gram: weights length {} != n {}",
+                 weights.len(),
+                 self.n
+             ));
+         }
+         // diag(X'WX)[j] = Σ_i w[i] · x_{ij}²
+         // For tensor product: x_{i, j₁·tail+j_tail} = B₁[i,j₁] · ∏_{d>1} Bᵈ[i,jᵈ]
+         // So: diag[j] = Σ_i w[i] · B₁[i,j₁]² · ∏_{d>1} Bᵈ[i,jᵈ]²
+         //
+         // O(n · ∏qⱼ) instead of O(n · (∏qⱼ)²) from the full gram.
+         let d = self.marginals.len();
+         if d == 0 {
+             return Ok(Array1::zeros(0));
+         }
+         let mut diag = vec![0.0_f64; self.total_cols];
+@@ -3250,70 +3405,77 @@ impl LinearOperator for RowwiseKroneckerOperator {
+     ///   = Σᵢ w[i] * cov[i,j1] * time[i,t1] * cov[i,j2] * time[i,t2]
+     ///   = Σᵢ (w[i] * cov[i,j1] * cov[i,j2]) * (time[i,t1] * time[i,t2])
+     ///
+     /// For each (t1, t2) pair, we form the n-vector
+     ///   γ_{t1,t2}[i] = w[i] * time[i,t1] * time[i,t2]
+     /// and then the (p_cov, p_cov) block is cov' diag(γ_{t1,t2}) cov.
+     ///
+     /// Cost: O(n * p_time² * p_cov²) vs O(n * (p_cov*p_time)²) for the naive path.
+     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+         let n = self.n;
+         let p_cov = self.p_cov;
+         let p_time = self.p_time;
+         let p_total = p_cov * p_time;
+         if weights.len() != n {
+             return Err(format!(
+                 "RowwiseKroneckerOperator::diag_xtw_x: weights length {} != n {}",
+                 weights.len(),
+                 n
+             ));
+         }
+         let mut xtwx = Array2::<f64>::zeros((p_total, p_total));
+         let time = self.time_basis.as_ref();
+ 
+         // For each time-basis pair (t1, t2), the (p_cov, p_cov) block is
+         //   cov' diag(γ_{t1,t2}) cov
+-        // where γ[i] = w[i] * time[i,t1] * time[i,t2].
+-        // We delegate to cov.compute_xtwx(γ) which stays sparse-native.
+-        let mut gamma = Array1::<f64>::zeros(n);
+-        for t1 in 0..p_time {
+-            for t2 in 0..=t1 {
++        // where γ[i] = w[i] * time[i,t1] * time[i,t2].  Blocks are computed
++        // in rayon tasks with task-local gamma arrays, then scattered in
++        // lexicographic pair order for deterministic reductions.
++        let pairs: Vec<(usize, usize)> = (0..p_time)
++            .flat_map(|t1| (0..=t1).map(move |t2| (t1, t2)))
++            .collect();
++        let blocks: Result<Vec<(usize, usize, Array2<f64>)>, String> = pairs
++            .into_par_iter()
++            .map(|(t1, t2)| {
+                 let time_t1 = time.column(t1);
+                 let time_t2 = time.column(t2);
++                let mut gamma = Array1::<f64>::zeros(n);
+                 ndarray::Zip::from(&mut gamma)
+                     .and(weights)
+                     .and(&time_t1)
+                     .and(&time_t2)
+-                    .par_for_each(|g, &w, &a, &b| *g = w.max(0.0) * a * b);
+-                let block = self.cov.compute_xtwx(&gamma)?;
+-                // Scatter block into xtwx for both (t1, t2) and (t2, t1).
+-                for j1 in 0..p_cov {
+-                    for j2 in 0..p_cov {
+-                        xtwx[[j1 * p_time + t1, j2 * p_time + t2]] = block[[j1, j2]];
+-                        if t1 != t2 {
+-                            xtwx[[j1 * p_time + t2, j2 * p_time + t1]] = block[[j1, j2]];
+-                        }
++                    .for_each(|g, &w, &a, &b| *g = w.max(0.0) * a * b);
++                self.cov.compute_xtwx(&gamma).map(|block| (t1, t2, block))
++            })
++            .collect();
++        for (t1, t2, block) in blocks? {
++            // Scatter block into xtwx for both (t1, t2) and (t2, t1).
++            for j1 in 0..p_cov {
++                for j2 in 0..p_cov {
++                    xtwx[[j1 * p_time + t1, j2 * p_time + t2]] = block[[j1, j2]];
++                    if t1 != t2 {
++                        xtwx[[j1 * p_time + t2, j2 * p_time + t1]] = block[[j1, j2]];
+                     }
+                 }
+             }
+         }
+         Ok(xtwx)
+     }
+ 
+     fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+         let n = self.n;
+         let p_cov = self.p_cov;
+         let p_time = self.p_time;
+         if weights.len() != n {
+             return Err(format!(
+                 "RowwiseKroneckerOperator::diag_gram: weights {} != n {}",
+                 weights.len(),
+                 n
+             ));
+         }
+         let time = self.time_basis.as_ref();
+         // diag(X'WX)[j*pt+t] = Σᵢ w[i] * cov[i,j]² * time[i,t]²
+         // Use cov.diag_gram(w ⊙ time[:,t]²) which stays sparse-native.
+         let mut out = Array1::<f64>::zeros(p_cov * p_time);
+         let mut gamma = Array1::<f64>::zeros(n);
+         for t in 0..p_time {
+             let time_col = time.column(t);
+@@ -4598,133 +4760,90 @@ impl LinearOperator for DesignMatrix {
+                 //       parallel + SIMD over the densified design and beats
+                 //       any scalar rayon sparse loop by an order of magnitude.
+                 //
+                 //   (B) Genuinely sparse — B-spline / banded bases keep
+                 //       nnz_row at a small constant (4–6), so the per-row
+                 //       O(nnz_row²) work is ~25× fewer FLOPs than the dense
+                 //       matmul and densification is a regression.  Run a
+                 //       row-parallel scalar accumulation in that regime.
+                 //
+                 // Heuristic: average nnz_per_row >= p/4 picks (A).  In practice
+                 // the upstream `should_use_sparse_native_pirls` already routes
+                 // banded sparse XᵀWX designs to a separate sparse-native PIRLS
+                 // path that does NOT call this function, so the (A) branch
+                 // covers every actual call site we have today; the (B) branch
+                 // is a correctness-preserving safety net for future callers.
+                 let n = self.nrows();
+                 let nnz_x = xs.as_ref().val().len();
+                 let avg_nnz_row = if n > 0 { nnz_x / n } else { p };
+                 let dense_regime = 4 * avg_nnz_row >= p;
+                 if dense_regime {
+                     let xd = xs.to_dense_arc();
+                     let mut xtwx = Array2::<f64>::zeros((p, p));
+                     streaming_blas_xt_diag_x(xd.as_ref(), weights, &mut xtwx);
+                     return Ok(xtwx);
+                 }
+-                use rayon::iter::{IntoParallelIterator, ParallelIterator};
+                 let csr = xs
+-                    .as_ref()
+-                    .to_row_major()
+-                    .map_err(|_| "failed to obtain CSR view in compute_xtwx".to_string())?;
+-                let n_threads = rayon::current_num_threads().max(1);
+-                let target_chunks = (n_threads * 16).max(n_threads);
+-                let chunk_rows = (n / target_chunks).max(256).min(n.max(1));
+-                let chunk_starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
+-                let partials: Vec<Array2<f64>> = chunk_starts
+-                    .into_par_iter()
+-                    .map(|start| {
+-                        let end = (start + chunk_rows).min(n);
+-                        let mut local = Array2::<f64>::zeros((p, p));
+-                        let sym = csr.symbolic();
+-                        let row_ptr = sym.row_ptr();
+-                        let col_idx = sym.col_idx();
+-                        let vals = csr.val();
+-                        for i in start..end {
+-                            let wi = weights[i].max(0.0);
+-                            if wi == 0.0 {
+-                                continue;
+-                            }
+-                            let r_start = row_ptr[i];
+-                            let r_end = row_ptr[i + 1];
+-                            for a_ptr in r_start..r_end {
+-                                let a = col_idx[a_ptr];
+-                                let wxa = wi * vals[a_ptr];
+-                                for b_ptr in a_ptr..r_end {
+-                                    let b = col_idx[b_ptr];
+-                                    let v = wxa * vals[b_ptr];
+-                                    local[[a, b]] += v;
+-                                    if a != b {
+-                                        local[[b, a]] += v;
+-                                    }
+-                                }
+-                            }
+-                        }
+-                        local
+-                    })
+-                    .collect();
+-                let mut xtwx = Array2::<f64>::zeros((p, p));
+-                for partial in partials.iter() {
+-                    xtwx += partial;
+-                }
+-                Ok(xtwx)
++                    .to_csr_arc()
++                    .ok_or_else(|| "failed to obtain CSR view in compute_xtwx".to_string())?;
++                let sym = csr.symbolic();
++                Ok(sparse_csr_weighted_xtwx(
++                    sym.row_ptr(),
++                    sym.col_idx(),
++                    csr.val(),
++                    n,
++                    p,
++                    weights.view(),
++                ))
+             }
+         }
+     }
+ 
+     fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+         if weights.len() != self.nrows() {
+             return Err(format!(
+                 "diag_gram dimension mismatch: weights length {} != nrows {}",
+                 weights.len(),
+                 self.nrows()
+             ));
+         }
+         let p = self.ncols();
+-        let mut diag = Array1::<f64>::zeros(p);
+         match self {
+             Self::Dense(x) => x.diag_gram(weights),
+             Self::Sparse(xs) => {
+                 let csr = xs
+-                    .as_ref()
+-                    .to_row_major()
+-                    .map_err(|_| "failed to obtain CSR view in diag_gram".to_string())?;
++                    .to_csr_arc()
++                    .ok_or_else(|| "failed to obtain CSR view in diag_gram".to_string())?;
+                 let sym = csr.symbolic();
+-                let row_ptr = sym.row_ptr();
+-                let col_idx = sym.col_idx();
+-                let vals = csr.val();
+-                for i in 0..self.nrows() {
+-                    let wi = weights[i].max(0.0);
+-                    if wi == 0.0 {
+-                        continue;
+-                    }
+-                    for idx in row_ptr[i]..row_ptr[i + 1] {
+-                        let j = col_idx[idx];
+-                        let xij = vals[idx];
+-                        diag[j] += wi * xij * xij;
+-                    }
+-                }
+-                Ok(diag)
++                Ok(sparse_csr_diag_gram(
++                    sym.row_ptr(),
++                    sym.col_idx(),
++                    csr.val(),
++                    self.nrows(),
++                    p,
++                    weights.view(),
++                ))
+             }
+         }
+     }
+ 
+     fn factorize_system(
+         &self,
+         weights: &Array1<f64>,
+         penalty: Option<&Array2<f64>>,
+     ) -> Result<Box<dyn FactorizedSystem>, String> {
+         if weights.len() != self.nrows() {
+             return Err(format!(
+                 "factorize_system dimension mismatch: weights length {} != nrows {}",
+                 weights.len(),
+                 self.nrows()
+             ));
+         }
+         match self {
+             Self::Dense(_) => self.factorize_system_dense(weights, penalty),
+             Self::Sparse(matrix) => {
+                 let system = assemble_sparseweighted_gram_system(matrix, weights, penalty)?;
+                 let factor = crate::linalg::sparse_exact::factorize_sparse_spd(&system)
+                     .map_err(|e| format!("factorize_system failed: {e:?}"))?;
+                 Ok(Box::new(factor))
+             }
+         }
+@@ -5972,121 +6091,93 @@ impl DesignMatrix {
+                     for idx in start..end {
+                         acc += values[idx] * vector[row_idx[idx]];
+                     }
+                     output[col] = acc;
+                 }
+                 output
+             }
+         }
+     }
+ 
+     fn compute_xtwx_view(&self, weights: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
+         if weights.len() != self.nrows() {
+             return Err(format!(
+                 "compute_xtwx dimension mismatch: weights length {} != nrows {}",
+                 weights.len(),
+                 self.nrows()
+             ));
+         }
+         match self {
+             Self::Dense(DenseDesignMatrix::Materialized(matrix)) => {
+                 Ok(dense_xtwx_view(matrix, weights))
+             }
+             Self::Dense(DenseDesignMatrix::Lazy(op)) => op.diag_xtw_x(&weights.to_owned()),
+             Self::Sparse(xs) => {
+                 let p = xs.ncols();
+-                let mut xtwx = Array2::<f64>::zeros((p, p));
+                 let csr = xs
+-                    .as_ref()
+-                    .to_row_major()
+-                    .map_err(|_| "failed to obtain CSR view in compute_xtwx".to_string())?;
++                    .to_csr_arc()
++                    .ok_or_else(|| "failed to obtain CSR view in compute_xtwx".to_string())?;
+                 let sym = csr.symbolic();
+-                let row_ptr = sym.row_ptr();
+-                let col_idx = sym.col_idx();
+-                let vals = csr.val();
+-                for i in 0..xs.nrows() {
+-                    let wi = weights[i].max(0.0);
+-                    if wi == 0.0 {
+-                        continue;
+-                    }
+-                    let start = row_ptr[i];
+-                    let end = row_ptr[i + 1];
+-                    for a_ptr in start..end {
+-                        let a = col_idx[a_ptr];
+-                        let xa = vals[a_ptr];
+-                        for b_ptr in a_ptr..end {
+-                            let b = col_idx[b_ptr];
+-                            let xb = vals[b_ptr];
+-                            let v = wi * xa * xb;
+-                            xtwx[[a, b]] += v;
+-                            if a != b {
+-                                xtwx[[b, a]] += v;
+-                            }
+-                        }
+-                    }
+-                }
+-                Ok(xtwx)
++                Ok(sparse_csr_weighted_xtwx(
++                    sym.row_ptr(),
++                    sym.col_idx(),
++                    csr.val(),
++                    xs.nrows(),
++                    p,
++                    weights,
++                ))
+             }
+         }
+     }
+ 
+     fn diag_gram_view(&self, weights: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
+         if weights.len() != self.nrows() {
+             return Err(format!(
+                 "diag_gram dimension mismatch: weights length {} != nrows {}",
+                 weights.len(),
+                 self.nrows()
+             ));
+         }
+         match self {
+             Self::Dense(DenseDesignMatrix::Materialized(matrix)) => {
+                 Ok(dense_diag_gram_view(matrix, weights))
+             }
+             Self::Dense(DenseDesignMatrix::Lazy(op)) => op.diag_gram(&weights.to_owned()),
+             Self::Sparse(xs) => {
+                 let p = xs.ncols();
+-                let mut diag = Array1::<f64>::zeros(p);
+                 let csr = xs
+-                    .as_ref()
+-                    .to_row_major()
+-                    .map_err(|_| "failed to obtain CSR view in diag_gram".to_string())?;
++                    .to_csr_arc()
++                    .ok_or_else(|| "failed to obtain CSR view in diag_gram".to_string())?;
+                 let sym = csr.symbolic();
+-                let row_ptr = sym.row_ptr();
+-                let col_idx = sym.col_idx();
+-                let vals = csr.val();
+-                for i in 0..xs.nrows() {
+-                    let wi = weights[i].max(0.0);
+-                    if wi == 0.0 {
+-                        continue;
+-                    }
+-                    for idx in row_ptr[i]..row_ptr[i + 1] {
+-                        let j = col_idx[idx];
+-                        let xij = vals[idx];
+-                        diag[j] += wi * xij * xij;
+-                    }
+-                }
+-                Ok(diag)
++                Ok(sparse_csr_diag_gram(
++                    sym.row_ptr(),
++                    sym.col_idx(),
++                    csr.val(),
++                    xs.nrows(),
++                    p,
++                    weights,
++                ))
+             }
+         }
+     }
+ 
+     fn compute_xtwy_view(
+         &self,
+         weights: ArrayView1<'_, f64>,
+         y: ArrayView1<'_, f64>,
+     ) -> Result<Array1<f64>, String> {
+         if weights.len() != self.nrows() || y.len() != self.nrows() {
+             return Err(format!(
+                 "compute_xtwy dimension mismatch: weights={}, y={}, nrows={}",
+                 weights.len(),
+                 y.len(),
+                 self.nrows()
+             ));
+         }
+         match self {
+             Self::Dense(DenseDesignMatrix::Materialized(matrix)) => {
+                 Ok(dense_transpose_weighted_response_view(matrix, weights, y))
+             }
+             Self::Dense(DenseDesignMatrix::Lazy(op)) => {
+                 op.compute_xtwy(&weights.to_owned(), &y.to_owned())
+             }
+             Self::Sparse(xs) => {
+@@ -6276,52 +6367,52 @@ impl From<&DesignMatrix> for DesignMatrix {
+     }
+ }
+ 
+ impl From<DesignMatrix> for DesignBlock {
+     fn from(value: DesignMatrix) -> Self {
+         match value {
+             DesignMatrix::Dense(matrix) => Self::Dense(matrix),
+             DesignMatrix::Sparse(matrix) => Self::Sparse(matrix),
+         }
+     }
+ }
+ 
+ impl From<&DesignMatrix> for DesignBlock {
+     fn from(value: &DesignMatrix) -> Self {
+         match value {
+             DesignMatrix::Dense(matrix) => Self::Dense(matrix.clone()),
+             DesignMatrix::Sparse(matrix) => Self::Sparse(matrix.clone()),
+         }
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::{
+         ChunkedKernelDesignOperator, DenseDesignMatrix, DenseDesignOperator, DesignMatrix,
+-        EmbeddedColumnBlock, MultiChannelOperator, ReparamOperator, SparseDesignMatrix,
+-        SparseHessianAccumulator, dense_matvec, dense_transpose_matvec,
++        EmbeddedColumnBlock, MultiChannelOperator, ReparamOperator, RowwiseKroneckerOperator,
++        SparseDesignMatrix, SparseHessianAccumulator, dense_matvec, dense_transpose_matvec,
+         dense_transpose_weighted_response,
+     };
+     use crate::linalg::matrix::LinearOperator;
+     use crate::linalg::utils::{PcgSolveInfo, StableSolver};
+     use crate::testing::no_densify_design;
+     use crate::types::RidgePolicy;
+     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
+     use ndarray::{Array1, Array2, Axis, array, s};
+     use std::sync::Arc;
+ 
+     fn exact_weighted_penalized_solve(
+         design: &Array2<f64>,
+         weights: &Array1<f64>,
+         rhs: &Array1<f64>,
+         penalty: &Array2<f64>,
+         ridge: f64,
+     ) -> Array1<f64> {
+         let mut h = design
+             .t()
+             .dot(&(design * &weights.view().insert_axis(Axis(1))));
+         h += penalty;
+         if ridge > 0.0 {
+             for i in 0..h.nrows() {
+                 h[[i, i]] += ridge;
+             }
+@@ -6915,32 +7006,159 @@ mod tests {
+             }
+         }
+ 
+         let op_dense = op.to_dense();
+         let max_diff = (&op_dense - &dense)
+             .iter()
+             .map(|v: &f64| v.abs())
+             .fold(0.0f64, f64::max);
+         assert!(
+             max_diff < 1e-14,
+             "3D to_dense mismatch: max_diff={max_diff}"
+         );
+ 
+         // Test round-trip: apply then apply_transpose.
+         let beta = Array1::from_vec((0..p).map(|j| (j as f64).sin()).collect());
+         let xb = op.apply(&beta);
+         let xtxb = op.apply_transpose(&xb);
+         let ref_xtxb = dense.t().dot(&dense.dot(&beta));
+         let max_diff = (&xtxb - &ref_xtxb)
+             .iter()
+             .map(|v: &f64| v.abs())
+             .fold(0.0f64, f64::max);
+         assert!(max_diff < 1e-10, "3D X'Xβ mismatch: max_diff={max_diff}");
+     }
+ 
++    #[test]
++    fn sparse_weighted_crossprod_parallel_path_matches_dense_reference() {
++        use faer::sparse::Triplet;
++
++        let n = 4096;
++        let p = 192;
++        let mut triplets = Vec::with_capacity(n * 4);
++        let mut dense = Array2::<f64>::zeros((n, p));
++        for i in 0..n {
++            let base = (i * 37) % p;
++            for k in 0..4 {
++                let col = (base + k * 11) % p;
++                let val = ((i + 3 * k + 1) as f64).sin() * 0.25 + 0.5;
++                triplets.push(Triplet::new(i, col, val));
++                dense[[i, col]] = val;
++            }
++        }
++        let sparse = faer::sparse::SparseColMat::try_new_from_triplets(n, p, &triplets).unwrap();
++        let design = DesignMatrix::Sparse(SparseDesignMatrix::new(sparse));
++        let weights = Array1::from_iter((0..n).map(|i| match i % 7 {
++            0 => 0.0,
++            r => 0.5 + r as f64 * 0.125,
++        }));
++
++        let got = design.compute_xtwx(&weights).unwrap();
++        let mut reference = Array2::<f64>::zeros((p, p));
++        for i in 0..n {
++            let wi = weights[i].max(0.0);
++            if wi == 0.0 {
++                continue;
++            }
++            for a in 0..p {
++                let xa = dense[[i, a]];
++                if xa == 0.0 {
++                    continue;
++                }
++                for b in 0..p {
++                    reference[[a, b]] += wi * xa * dense[[i, b]];
++                }
++            }
++        }
++        let max_diff = (&got - &reference)
++            .iter()
++            .map(|v: &f64| v.abs())
++            .fold(0.0_f64, f64::max);
++        assert!(
++            max_diff < 1e-10,
++            "sparse xtwx mismatch: max_diff={max_diff}"
++        );
++
++        let got_diag = design.diag_gram(&weights).unwrap();
++        let ref_diag = reference.diag().to_owned();
++        let max_diag_diff = (&got_diag - &ref_diag)
++            .iter()
++            .map(|v: &f64| v.abs())
++            .fold(0.0_f64, f64::max);
++        assert!(
++            max_diag_diff < 1e-10,
++            "sparse diag gram mismatch: max_diff={max_diag_diff}"
++        );
++    }
++
++    #[test]
++    fn rowwise_kronecker_sparse_structured_xtwx_matches_dense_reference() {
++        use faer::sparse::Triplet;
++
++        let n = 2048;
++        let p_cov = 64;
++        let p_time = 6;
++        let mut triplets = Vec::with_capacity(n * 3);
++        let mut cov_dense = Array2::<f64>::zeros((n, p_cov));
++        for i in 0..n {
++            let base = (i * 17) % p_cov;
++            for k in 0..3 {
++                let col = (base + k * 7) % p_cov;
++                let val = 0.2 + (((i + k) % 13) as f64) / 17.0;
++                triplets.push(Triplet::new(i, col, val));
++                cov_dense[[i, col]] = val;
++            }
++        }
++        let cov_sparse =
++            faer::sparse::SparseColMat::try_new_from_triplets(n, p_cov, &triplets).unwrap();
++        let cov = DesignMatrix::Sparse(SparseDesignMatrix::new(cov_sparse));
++        let mut time = Array2::<f64>::zeros((n, p_time));
++        for i in 0..n {
++            for t in 0..p_time {
++                time[[i, t]] = (((i + 1) * (t + 3)) as f64).cos() * 0.1 + 0.4;
++            }
++        }
++        let op = RowwiseKroneckerOperator::new(cov, Arc::new(time.clone())).unwrap();
++        let weights = Array1::from_iter((0..n).map(|i| 0.25 + ((i % 11) as f64) * 0.05));
++        let got = op.diag_xtw_x(&weights).unwrap();
++
++        let p_total = p_cov * p_time;
++        let mut reference = Array2::<f64>::zeros((p_total, p_total));
++        for i in 0..n {
++            for c1 in 0..p_cov {
++                let x1 = cov_dense[[i, c1]];
++                if x1 == 0.0 {
++                    continue;
++                }
++                for t1 in 0..p_time {
++                    let a = c1 * p_time + t1;
++                    let xa = x1 * time[[i, t1]];
++                    for c2 in 0..p_cov {
++                        let x2 = cov_dense[[i, c2]];
++                        if x2 == 0.0 {
++                            continue;
++                        }
++                        for t2 in 0..p_time {
++                            let b = c2 * p_time + t2;
++                            reference[[a, b]] += weights[i] * xa * x2 * time[[i, t2]];
++                        }
++                    }
++                }
++            }
++        }
++        let max_diff = (&got - &reference)
++            .iter()
++            .map(|v: &f64| v.abs())
++            .fold(0.0_f64, f64::max);
++        assert!(
++            max_diff < 1e-9,
++            "rowwise kronecker sparse xtwx mismatch: max_diff={max_diff}"
++        );
++    }
++
+     #[test]
+     fn embedded_column_block_zero_row_local_materializes_empty_global_width() {
+         let local = Array2::<f64>::zeros((0, 0));
+         let out = EmbeddedColumnBlock::new(&local, 2..5, 7).materialize();
+         assert_eq!(out.dim(), (0, 7));
+     }
+ }
+
+----- PATCH END -----
+
+[2026-05-06T20:59:56.334008+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:59:56.363986+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:59:56.364070+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:59:58.869292+00:00] apply_result: mode=apply id=task_e_69fb93bb24bc8324a8b227661933a4ed status=Partial applied=0 skipped=0 conflicts=1 cmd=(cd /Users/user/gam && git apply --3way /var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/.tmpmlh3Ly/patch.diff)
+stdout_tail=
+
+stderr_tail=
+Applied patch to 'src/solver/outer_strategy.rs' with conflicts.
+U src/solver/outer_strategy.rs
+
+patch_summary: kind=git-diff lines=835 chars=34701 cwd=/Users/user/gam ; head=
+diff --git a/src/solver/outer_strategy.rs b/src/solver/outer_strategy.rs
+index d30a37928ca299908a3f020cabfbe01152a16217..6b66d044ce004acbea97733a619b57276fd125d5 100644
+--- a/src/solver/outer_strategy.rs
++++ b/src/solver/outer_strategy.rs
+@@ -110,84 +110,132 @@ impl InnerProgressFeedback {
+                 last_converged: self.last_converged.load(Ordering::Relaxed),
+                 last_ift_residual,
+                 last_accept_rho,
+             })
+         }
+     }
+ }
+ 
+ #[derive(Clone, Copy, Debug)]
+ struct InnerProgressSnapshot {
+     last_iters: usize,
+     last_converged: bool,
+     /// Most-recent IFT predictor residual (see field doc on
+     /// `InnerProgressFeedback`). `None` when the predictor has not
+     /// reported yet, when the cache was reset, or when the previous
+----- PATCH BEGIN -----
+diff --git a/src/solver/outer_strategy.rs b/src/solver/outer_strategy.rs
+index d30a37928ca299908a3f020cabfbe01152a16217..6b66d044ce004acbea97733a619b57276fd125d5 100644
+--- a/src/solver/outer_strategy.rs
++++ b/src/solver/outer_strategy.rs
+@@ -110,84 +110,132 @@ impl InnerProgressFeedback {
+                 last_converged: self.last_converged.load(Ordering::Relaxed),
+                 last_ift_residual,
+                 last_accept_rho,
+             })
+         }
+     }
+ }
+ 
+ #[derive(Clone, Copy, Debug)]
+ struct InnerProgressSnapshot {
+     last_iters: usize,
+     last_converged: bool,
+     /// Most-recent IFT predictor residual (see field doc on
+     /// `InnerProgressFeedback`). `None` when the predictor has not
+     /// reported yet, when the cache was reset, or when the previous
+     /// solve fell back to flat warm-start (no IFT prediction
+     /// consumed).
+     last_ift_residual: Option<f64>,
+     /// Most-recent accepted LM gain ratio (see field doc on
+     /// `InnerProgressFeedback::accept_rho`). `None` when no step was
+     /// accepted in the previous solve (rejection-exhausted) or when
+     /// the cache was reset.
+     last_accept_rho: Option<f64>,
+ }
+ 
++/// Exact dense-materialization route exposed by an outer Hessian operator.
++///
++/// The optimizer uses this as a work-model contract before turning a
++/// matrix-free analytic Hessian into a dense ARC model. `Unavailable` means
++/// callers must stay matrix-free; the remaining variants are all analytic
++/// (never numerical finite-difference Hessians) but differ in how much
++/// per-column HVP overhead they imply.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum OuterHessianMaterialization {
++    /// Dense materialization is not part of this operator's contract.
++    Unavailable,
++    /// Materialization is exact but implemented by cheap repeated HVP probes.
++    RepeatedHvp,
++    /// Materialization is exact and can apply many HVP directions together.
++    BatchedHvp,
++    /// Materialization is exact and can be assembled without basis probing.
++    Explicit,
++}
++
++impl OuterHessianMaterialization {
++    fn is_available(self) -> bool {
++        !matches!(self, Self::Unavailable)
++    }
++}
++
+ /// Matrix-free outer Hessian operator.
+ ///
+ /// This is the exact outer Hessian action `H_outer * v` evaluated at the
+ /// current outer point, without requiring dense materialization.
+ ///
+-/// The trait provides three increasingly batched primitives:
++/// The trait provides four increasingly materialized primitives:
+ ///
+ /// - [`matvec`](Self::matvec) — single column, the only one implementors must
+ ///   provide.
+ /// - [`mul_mat`](Self::mul_mat) — multi-column; the default falls back to
+ ///   column-by-column `matvec`. Implementors override this when they can
+ ///   amortize per-Hv-apply overhead (cached factorizations, parallel matvecs)
+ ///   across many right-hand-sides.
+-/// - [`is_cheap_to_materialize`](Self::is_cheap_to_materialize) — an explicit
+-///   work-model hint for callers deciding whether probing every column is
+-///   affordable.
++/// - [`materialization_capability`](Self::materialization_capability) — an
++///   explicit work-model contract that tells ARC whether dense exact
++///   materialization is unavailable, cheap repeated-HVP, batched-HVP, or
++///   explicit.
+ /// - [`materialize_dense`](Self::materialize_dense) — the special case
+ ///   `mul_mat(I_dim)` followed by a symmetric average of the off-diagonals to
+-///   absorb round-off asymmetry. Callers should only use this for planning
+-///   when [`is_cheap_to_materialize`](Self::is_cheap_to_materialize) is true,
+-///   or for post-fit code paths that explicitly need a concrete matrix.
++///   absorb round-off asymmetry. ARC callers only use this when
++///   [`materialization_capability`](Self::materialization_capability) advertises
++///   an exact dense route, preserving the no-numerical-Hessian policy.
+ pub trait OuterHessianOperator: Send + Sync {
+     fn dim(&self) -> usize;
+     fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String>;
+ 
+     /// Whether probing all basis columns is cheap enough for dense ARC.
+     ///
+     /// The default is deliberately conservative. For operator-backed Duchon,
+     /// CTN, survival, or other row-streaming kernels, `dim <= 64` does not
+     /// imply cheap materialization: each column may trigger a full data pass.
++    ///
++    /// New implementations should prefer overriding
++    /// [`materialization_capability`](Self::materialization_capability) so the
++    /// caller can distinguish cheap repeated probes from true batched/explicit
++    /// Hessian materialization.
+     fn is_cheap_to_materialize(&self) -> bool {
+         false
+     }
+ 
++    /// Exact dense-materialization capability for this operator.
++    ///
++    /// The default preserves the historical work-model hook: operators that
++    /// already opted into cheap probing via
++    /// [`is_cheap_to_materialize`](Self::is_cheap_to_materialize) are treated
++    /// as exact repeated-HVP materializers. Backends that can amortize or avoid
++    /// basis probes should override this to return
++    /// [`OuterHessianMaterialization::BatchedHvp`] or
++    /// [`OuterHessianMaterialization::Explicit`].
++    fn materialization_capability(&self) -> OuterHessianMaterialization {
++        if self.is_cheap_to_materialize() {
++            OuterHessianMaterialization::RepeatedHvp
++        } else {
++            OuterHessianMaterialization::Unavailable
++        }
++    }
++
+     /// Apply the operator to all `m` columns of `factor`, returning a
+     /// `dim × m` matrix whose `j`th column is `H · factor[:, j]`.
+     ///
+     /// The default implementation runs the per-column matvecs in parallel
+     /// over rayon — each matvec is independent and the K×K basis-probe used
+     /// by [`materialize_dense`](Self::materialize_dense) issues exactly `dim`
+     /// such calls.  Implementors override when batching is cheaper (cached
+     /// factorizations, BLAS-3 kernels). All
+     /// [`materialize_dense`](Self::materialize_dense) callers route through
+     /// this method, so an override automatically accelerates any
+     /// work-model-approved materialization path used by the planner.
+     fn mul_mat(&self, factor: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+         use rayon::iter::{IntoParallelIterator, ParallelIterator};
+         let dim = self.dim();
+         if factor.nrows() != dim {
+             return Err(format!(
+                 "outer Hessian operator factor row count mismatch: got {}, expected {}",
+                 factor.nrows(),
+                 dim
+             ));
+         }
+         let m = factor.ncols();
+         let cols: Result<Vec<Array1<f64>>, String> = (0..m)
+             .into_par_iter()
+             .map(|j| {
+@@ -213,50 +261,55 @@ pub trait OuterHessianOperator: Send + Sync {
+ 
+     /// Materialize the outer Hessian into a dense `dim × dim` matrix by
+     /// applying the operator to the identity in a single
+     /// [`mul_mat`](Self::mul_mat) call, then averaging the off-diagonals to
+     /// stabilize against round-off asymmetry.
+     fn materialize_dense(&self) -> Result<Array2<f64>, String> {
+         let dim = self.dim();
+         let identity = Array2::<f64>::eye(dim);
+         let mut dense = self.mul_mat(identity.view())?;
+         if dense.nrows() != dim || dense.ncols() != dim {
+             return Err(format!(
+                 "outer Hessian operator mul_mat returned {}x{}, expected {}x{}",
+                 dense.nrows(),
+                 dense.ncols(),
+                 dim,
+                 dim
+             ));
+         }
+         for row in 0..dim {
+             for col in (row + 1)..dim {
+                 let sym = 0.5 * (dense[[row, col]] + dense[[col, row]]);
+                 dense[[row, col]] = sym;
+                 dense[[col, row]] = sym;
+             }
+         }
++        if !dense.iter().all(|value| value.is_finite()) {
++            return Err(
++                "outer Hessian dense materialization produced non-finite entries".to_string(),
++            );
++        }
+         Ok(dense)
+     }
+ }
+ 
+ struct RhoBlockAdditiveOuterHessian {
+     base: Arc<dyn OuterHessianOperator>,
+     rho_block: Array2<f64>,
+     dim: usize,
+ }
+ 
+ impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {
+     fn dim(&self) -> usize {
+         self.dim
+     }
+ 
+     fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+         if v.len() != self.dim {
+             return Err(format!(
+                 "outer Hessian operator input length mismatch: got {}, expected {}",
+                 v.len(),
+                 self.dim
+             ));
+         }
+         let mut out = self.base.matvec(v)?;
+         let k = self.rho_block.nrows();
+@@ -276,93 +329,107 @@ impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {
+     fn mul_mat(&self, factor: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+         let mut out = self.base.mul_mat(factor)?;
+         let k = self.rho_block.nrows();
+         if k > 0 {
+             if k > out.nrows() {
+                 return Err(format!(
+                     "rho-block Hessian update shape mismatch: rho_block is {}x{}, mul_mat output has {} rows",
+                     self.rho_block.nrows(),
+                     self.rho_block.ncols(),
+                     out.nrows()
+                 ));
+             }
+             // Update the leading-k rows of `out` by the rho_block contribution
+             // to the first k rows of v: out[..k, :] += rho_block · factor[..k, :].
+             let factor_top = factor.slice(ndarray::s![..k, ..]);
+             let rho_contrib = self.rho_block.dot(&factor_top);
+             out.slice_mut(ndarray::s![..k, ..])
+                 .scaled_add(1.0, &rho_contrib);
+         }
+         Ok(out)
+     }
+ 
+     fn is_cheap_to_materialize(&self) -> bool {
+         self.base.is_cheap_to_materialize()
+     }
++
++    fn materialization_capability(&self) -> OuterHessianMaterialization {
++        self.base.materialization_capability()
++    }
+ }
+ 
+ /// Upper safety bound for operator materialization after the operator has
+ /// explicitly declared that dense probing is cheap. Dimension alone is never
+ /// sufficient: a 50-column operator can still mean 50 full row-streaming CTN,
+ /// Duchon, or survival passes.
+ pub(crate) const OUTER_HVP_MATERIALIZE_MAX_DIM: usize = 64;
+ 
+ /// Hv-apply counter wrapping an `OuterHessianOperator`.
+ ///
+ /// Used by `run_operator_trust_region` so the per-iteration log line can
+ /// report exactly how many matrix-free Hv applications were spent inside
+ /// the Steihaug-Toint CG inner solve. A high count at biobank scale is the
+ /// quantitative signal that the matrix-free Hv kernel — not ARC's outer
+ /// loop — is the bottleneck.
+ struct HvApplyCounter<'a> {
+     inner: &'a dyn OuterHessianOperator,
+     count: std::sync::atomic::AtomicU64,
+ }
+ 
+ impl<'a> HvApplyCounter<'a> {
+     fn new(inner: &'a dyn OuterHessianOperator) -> Self {
+         Self {
+             inner,
+             count: std::sync::atomic::AtomicU64::new(0),
+         }
+     }
+ 
+     fn count(&self) -> u64 {
+         self.count.load(std::sync::atomic::Ordering::Relaxed)
+     }
+ }
+ 
+ impl<'a> OuterHessianOperator for HvApplyCounter<'a> {
+     fn dim(&self) -> usize {
+         self.inner.dim()
+     }
+ 
+     fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+         self.count
+             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+         self.inner.matvec(v)
+     }
++
++    fn mul_mat(&self, factor: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
++        self.count
++            .fetch_add(factor.ncols() as u64, std::sync::atomic::Ordering::Relaxed);
++        self.inner.mul_mat(factor)
++    }
++
++    fn materialization_capability(&self) -> OuterHessianMaterialization {
++        self.inner.materialization_capability()
++    }
+ }
+ 
+ /// Whether an analytic derivative is available for a given order.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum Derivative {
+     /// Exact analytic derivative implemented and available.
+     Analytic,
+     /// No analytic derivative; must be approximated or skipped.
+     Unavailable,
+ }
+ 
+ /// Declares what a specific model path can provide to the outer optimizer.
+ ///
+ /// Each call site that optimizes smoothing parameters constructs one of these
+ /// to describe its analytic derivative coverage. The [`plan`] function then
+ /// selects the optimizer and Hessian strategy.
+ const SMALL_OUTER_BFGS_MAX_PARAMS: usize = 8;
+ const SECOND_ORDER_GEOMETRY_PROBE_MAX_PARAMS: usize = 64;
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub struct OuterThetaLayout {
+     pub n_params: usize,
+     pub psi_dim: usize,
+ }
+ 
+@@ -1612,51 +1679,54 @@ fn finite_outer_first_order_eval_or_error(
+     layout: OuterThetaLayout,
+     eval: OuterEval,
+ ) -> Result<OuterEval, ObjectiveEvalError> {
+     layout.validate_gradient_len(&eval.gradient, context)?;
+     if !eval.cost.is_finite() {
+         return Err(ObjectiveEvalError::recoverable(format!(
+             "{context}: objective returned a non-finite cost"
+         )));
+     }
+     if !eval.gradient.iter().all(|v| v.is_finite()) {
+         return Err(ObjectiveEvalError::recoverable(format!(
+             "{context}: objective returned a non-finite gradient"
+         )));
+     }
+     Ok(eval)
+ }
+ 
+ fn validate_second_order_seed_hessian(
+     context: &str,
+     layout: OuterThetaLayout,
+     eval: &OuterEval,
+ ) -> Result<(), ObjectiveEvalError> {
+     if layout.n_params > SECOND_ORDER_GEOMETRY_PROBE_MAX_PARAMS || !eval.hessian.is_analytic() {
+         return Ok(());
+     }
+-    if matches!(&eval.hessian, HessianResult::Operator(op) if !op.is_cheap_to_materialize()) {
++    if matches!(
++        &eval.hessian,
++        HessianResult::Operator(op) if !op.materialization_capability().is_available()
++    ) {
+         return Ok(());
+     }
+ 
+     let Some(hessian) = eval.hessian.materialize_dense().map_err(|message| {
+         ObjectiveEvalError::recoverable(format!(
+             "{context}: analytic outer Hessian materialization failed during second-order seed validation: {message}"
+         ))
+     })?
+     else {
+         return Ok(());
+     };
+ 
+     layout.validate_hessian_shape(&hessian, context)?;
+     if !hessian.iter().all(|value| value.is_finite()) {
+         return Err(ObjectiveEvalError::recoverable(format!(
+             "{context}: analytic outer Hessian probe encountered non-finite entries"
+         )));
+     }
+ 
+     Ok(())
+ }
+ 
+ fn finite_efs_eval_or_error(
+     context: &str,
+     layout: OuterThetaLayout,
+@@ -2246,51 +2316,51 @@ mod outer_inner_cap_schedule_tests {
+         let snap = Some(InnerProgressSnapshot {
+             last_iters: 4,
+             last_converged: true,
+             last_ift_residual: Some(0.30),
+             last_accept_rho: Some(0.20),
+         });
+         assert_eq!(first_order_inner_cap_schedule(2, None, snap), 10);
+         // When only LM accept_rho is poor (IFT residual is excellent),
+         // the bumps still compose: IFT base = 1 (excellent), accept_rho
+         // bump = +2 → margin = 3, cap = 4 + 3 = 7.
+         let snap = Some(InnerProgressSnapshot {
+             last_iters: 4,
+             last_converged: true,
+             last_ift_residual: Some(0.005),
+             last_accept_rho: Some(0.30),
+         });
+         assert_eq!(first_order_inner_cap_schedule(2, None, snap), 7);
+     }
+ }
+ 
+ struct OuterSecondOrderBridge<'a> {
+     obj: &'a mut dyn OuterObjective,
+     layout: OuterThetaLayout,
+     hessian_source: HessianSource,
+     /// When the evaluator returns `HessianResult::Operator(op)` and the
+-    /// operator declares dense probing cheap, the bridge may basis-probe the
++    /// operator advertises an exact dense route, the bridge may materialize the
+     /// operator into a dense K×K matrix so the dense ARC path can run an exact
+     /// factorization instead of operator-CG.
+     materialize_operator_max_dim: usize,
+     /// Counts gradient/Hessian evaluations so that progress is visible even
+     /// when the upstream `opt` solver does not emit per-iteration logs of its
+     /// own. Emitted at INFO from `eval_grad` and `eval_hessian` (the calls
+     /// that gate one optimizer step); skipped on `eval_cost` so linesearch
+     /// trial points do not flood the log. Also drives the outer-aware
+     /// inner-PIRLS cap schedule (see `first_order_inner_cap_schedule`).
+     eval_count: usize,
+     /// Outer-aware inner-PIRLS cap atomic. When `Some`, the bridge stores
+     /// a coarsen-then-tighten cap into it on every accepted eval_grad /
+     /// eval_hessian call. Mirrors the BFGS-side wiring in
+     /// `OuterFirstOrderBridge`. Cap is NEVER touched in `eval_cost` so
+     /// line-search probes within an outer iter see a stable inner
+     /// tolerance (Wolfe / trust-region acceptance both assume constant
+     /// cost noise within a bracket).
+     outer_inner_cap: Option<InnerProgressFeedback>,
+     /// First observed `‖g‖` from `eval_grad`/`eval_hessian`. Used by the
+     /// schedule's gradient-ratio gate so the cap lifts when the optimizer
+     /// is approaching convergence, not just when iter count says so.
+     g_norm_initial: Option<f64>,
+     /// `‖g‖` from the most recent eval. See `OuterFirstOrderBridge` for
+     /// the staleness rationale: monotone-decreasing g_norm means the cap
+     /// is conservatively LARGER than truly needed, never smaller.
+@@ -2451,56 +2521,57 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
+         let eval = finite_outer_eval_or_error("outer eval failed", self.layout, eval)?;
+         self.eval_count += 1;
+         let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+         if self.g_norm_initial.is_none() && g_norm.is_finite() && g_norm > 0.0 {
+             self.g_norm_initial = Some(g_norm);
+         }
+         if g_norm.is_finite() {
+             self.last_g_norm = Some(g_norm);
+         }
+         log::info!(
+             "[STAGE] outer eval end order=ValueGradientHessian elapsed={:.3}s cost={:.6e} |g|={:.3e}",
+             stage_start.elapsed().as_secs_f64(),
+             eval.cost,
+             g_norm,
+         );
+         log::info!(
+             "[OUTER] eval#{n} (hess) cost={cost:.6e} |g|={gnorm:.3e}",
+             n = self.eval_count,
+             cost = eval.cost,
+             gnorm = g_norm,
+         );
+         let hessian = match self.hessian_source {
+             HessianSource::Analytic => match eval.hessian {
+                 HessianResult::Analytic(h) => Some(h),
+                 HessianResult::Operator(ref op)
+-                    if op.is_cheap_to_materialize()
++                    if op.materialization_capability().is_available()
+                         && op.dim() <= self.materialize_operator_max_dim =>
+                 {
+-                    // Work-model-approved operator: basis-probe the Hv
+-                    // operator into a dense K×K matrix so the dense ARC path
+-                    // can run an exact factorization.
++                    // Work-model-approved exact operator materialization:
++                    // batched/explicit backends can avoid one full pass per
++                    // basis column while still feeding dense ARC an analytic
++                    // K×K matrix.
+                     Some(
+                         op.materialize_dense()
+                             .map_err(|message| ObjectiveEvalError::Fatal {
+                                 message: format!(
+                                     "outer Hessian operator materialization failed: {message}"
+                                 ),
+                             })?,
+                     )
+                 }
+                 HessianResult::Operator(_) | HessianResult::Unavailable => None,
+             },
+             HessianSource::BfgsApprox
+             | HessianSource::EfsFixedPoint
+             | HessianSource::HybridEfsFixedPoint => None,
+         };
+         Ok(SecondOrderSample {
+             value: eval.cost,
+             gradient: eval.gradient,
+             hessian,
+         })
+     }
+ }
+ 
+ struct OuterFixedPointBridge<'a> {
+     obj: &'a mut dyn OuterObjective,
+@@ -3377,83 +3448,50 @@ pub enum OperatorTrustRegionStopReason {
+     /// (e.g. BFGS gradient-only) instead of trusting the partial result.
+     RoutingMismatch,
+ }
+ 
+ struct BorrowedDenseOuterHessian<'a> {
+     matrix: &'a Array2<f64>,
+ }
+ 
+ impl OuterHessianOperator for BorrowedDenseOuterHessian<'_> {
+     fn dim(&self) -> usize {
+         self.matrix.nrows()
+     }
+ 
+     fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+         if v.len() != self.matrix.ncols() {
+             return Err(format!(
+                 "dense outer Hessian matvec length mismatch: got {}, expected {}",
+                 v.len(),
+                 self.matrix.ncols()
+             ));
+         }
+         Ok(self.matrix.dot(v))
+     }
+ }
+ 
+-fn materialize_outer_hessian_dense_sequential(
+-    op: &dyn OuterHessianOperator,
+-) -> Result<Array2<f64>, String> {
+-    let dim = op.dim();
+-    let mut dense = Array2::<f64>::zeros((dim, dim));
+-    for col in 0..dim {
+-        let mut basis = Array1::<f64>::zeros(dim);
+-        basis[col] = 1.0;
+-        let hv = op.matvec(&basis)?;
+-        if hv.len() != dim {
+-            return Err(format!(
+-                "outer Hessian operator column {col} length mismatch: got {}, expected {dim}",
+-                hv.len()
+-            ));
+-        }
+-        dense.column_mut(col).assign(&hv);
+-    }
+-    for row in 0..dim {
+-        for col in (row + 1)..dim {
+-            let sym = 0.5 * (dense[[row, col]] + dense[[col, row]]);
+-            dense[[row, col]] = sym;
+-            dense[[col, row]] = sym;
+-        }
+-    }
+-    if !dense.iter().all(|value| value.is_finite()) {
+-        return Err(
+-            "outer Hessian sequential dense materialization produced non-finite entries"
+-                .to_string(),
+-        );
+-    }
+-    Ok(dense)
+-}
+-
+ /// Pick the post-rejection trust radius. If the cubic model just
+ /// predicted a decrease >1e6 × |cost| (i.e. the local function is wildly
+ /// non-quadratic at the proposed step), and a Newton-step-scale derived
+ /// radius is materially smaller than the post-halving default, snap to
+ /// the derived radius — this avoids 20+ wasted halvings when an accepted
+ /// step lands in a steep-gradient basin mid-loop. Otherwise return the
+ /// caller's `default_radius` (standard ARC geometric backoff).
+ ///
+ /// `pred_dec` is the cubic model's predicted decrease at the rejected step,
+ /// `default_radius` is what plain halving would set (typically
+ /// `trust_radius * 0.5`), and `derived_radius` is the
+ /// `|cost|/‖g‖`-derived target.
+ #[inline]
+ fn snap_recovery_radius_on_rejection(
+     cost: f64,
+     pred_dec: f64,
+     derived_radius: f64,
+     default_radius: f64,
+ ) -> f64 {
+     let cost_scale = cost.abs().max(1.0);
+     let mismatch_ratio = if pred_dec.is_finite() && pred_dec > 0.0 {
+         pred_dec / cost_scale
+     } else {
+         0.0
+     };
+@@ -3962,53 +4000,54 @@ fn run_operator_trust_region(
+             log::warn!(
+                 "[ARC] iter={iter}: family returned non-operator Hessian mid-flight \
+                  (planner expected Operator throughout, got {observed_shape}); \
+                  returning best-effort x_k cost={:.6e} grad_norm={:.3e}. \
+                  Routing decision was made on seed_eval.hessian shape; family \
+                  should declare a consistent shape via its capability surface.",
+                 eval_k.cost,
+                 g_norm
+             );
+             return Ok(OuterResult {
+                 rho: x_k,
+                 final_value: eval_k.cost,
+                 iterations: iter,
+                 final_grad_norm: g_norm,
+                 final_gradient: Some(eval_k.gradient),
+                 final_hessian: None,
+                 converged: false,
+                 plan_used: plan,
+                 operator_trust_radius: Some(trust_radius),
+                 operator_stop_reason: Some(OperatorTrustRegionStopReason::RoutingMismatch),
+             });
+         };
+         if materialize_dense_after_rejection
+             && dense_model.is_none()
+             && op_arc.dim() <= OPERATOR_DENSE_REUSE_MAX_DIM
++            && op_arc.materialization_capability().is_available()
+         {
+             let materialize_start = std::time::Instant::now();
+-            match materialize_outer_hessian_dense_sequential(op_arc.as_ref()) {
++            match op_arc.materialize_dense() {
+                 Ok(dense) => {
+                     log::info!(
+                         "[ARC-timing] iter={iter} status=dense_model_ready dim={} bytes={} \
+                          elapsed={:.3}s",
+                         dense.nrows(),
+                         dense.len() * std::mem::size_of::<f64>(),
+                         materialize_start.elapsed().as_secs_f64(),
+                     );
+                     dense_model = Some(dense);
+                 }
+                 Err(message) => {
+                     log::debug!(
+                         "[ARC-timing] iter={iter} dense outer Hessian reuse skipped: {message}"
+                     );
+                 }
+             }
+             materialize_dense_after_rejection = false;
+         }
+         let counter = HvApplyCounter::new(op_arc.as_ref());
+         let dense_borrowed;
+         let step_op: &dyn OuterHessianOperator = if let Some(dense) = dense_model.as_ref() {
+             dense_borrowed = BorrowedDenseOuterHessian { matrix: dense };
+             &dense_borrowed
+         } else {
+             &counter
+@@ -4792,51 +4831,51 @@ fn run_outer_with_plan(
+                     });
+                 let mut seed_eval = match seed_eval {
+                     Ok(seed_eval) => seed_eval,
+                     Err(err) => {
+                         log::warn!(
+                             "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
+                         );
+                         rejection_reasons.push((seed_idx, "validation", err.to_string()));
+                         continue 'seed_attempts;
+                     }
+                 };
+                 validate_second_order_seed_hessian(context, layout, &seed_eval).map_err(|err| {
+                     match err {
+                         ObjectiveEvalError::Recoverable { message }
+                         | ObjectiveEvalError::Fatal { message } => {
+                             EstimationError::RemlOptimizationFailed(message)
+                         }
+                     }
+                 })?;
+                 started_seeds += 1;
+                 seed_slot = started_seeds;
+ 
+                 let cheap_materializable_operator = matches!(
+                     seed_eval.hessian,
+                     HessianResult::Operator(ref op)
+-                        if op.is_cheap_to_materialize()
++                        if op.materialization_capability().is_available()
+                             && op.dim() <= OUTER_HVP_MATERIALIZE_MAX_DIM
+                 );
+                 if cheap_materializable_operator {
+                     // The operator's own work model says probing every column
+                     // is cheap; convert the seed Hessian to dense in-place.
+                     // Subsequent bridge evaluations apply the same predicate.
+                     if let HessianResult::Operator(op) = &seed_eval.hessian {
+                         match op.materialize_dense() {
+                             Ok(dense) => {
+                                 seed_eval.hessian = HessianResult::Analytic(dense);
+                             }
+                             Err(message) => {
+                                 let err = EstimationError::RemlOptimizationFailed(format!(
+                                     "outer Hessian operator materialization failed: {message}"
+                                 ));
+                                 log::warn!(
+                                     "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
+                                 );
+                                 rejection_reasons.push((seed_idx, "validation", err.to_string()));
+                                 continue 'seed_attempts;
+                             }
+                         }
+                     }
+                 }
+                 if matches!(seed_eval.hessian, HessianResult::Operator(_)) {
+@@ -7268,138 +7307,159 @@ mod tests {
+                 hessian_source: HessianSource::Analytic,
+             },
+             None,
+         )
+         .expect("operator ARC attempt");
+         assert!(
+             !result.converged,
+             "single-iteration fixture should reject and exhaust its budget"
+         );
+         assert_eq!(
+             cost_calls.load(std::sync::atomic::Ordering::Relaxed),
+             1,
+             "one rejected trial should require exactly one cost-only evaluation"
+         );
+         assert_eq!(
+             full_calls.load(std::sync::atomic::Ordering::Relaxed),
+             1,
+             "rejected trial must not request gradient/Hessian; only initial eval should be full"
+         );
+     }
+ 
+     #[test]
+     fn operator_arc_reuses_dense_model_after_rejection() {
+         struct CountingIdentityOuterHessianOperator {
+             matvec_calls: Arc<std::sync::atomic::AtomicUsize>,
++            batched_mul_mat_calls: Arc<std::sync::atomic::AtomicUsize>,
+         }
+ 
+         impl OuterHessianOperator for CountingIdentityOuterHessianOperator {
+             fn dim(&self) -> usize {
+                 1
+             }
+ 
+             fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+                 self.matvec_calls
+                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                 Ok(v.clone())
+             }
++
++            fn mul_mat(&self, factor: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
++                self.batched_mul_mat_calls
++                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                Ok(factor.to_owned())
++            }
++
++            fn materialization_capability(&self) -> OuterHessianMaterialization {
++                OuterHessianMaterialization::BatchedHvp
++            }
+         }
+ 
+         struct RejectingObjective {
+             matvec_calls: Arc<std::sync::atomic::AtomicUsize>,
++            batched_mul_mat_calls: Arc<std::sync::atomic::AtomicUsize>,
+         }
+ 
+         impl OuterObjective for RejectingObjective {
+             fn capability(&self) -> OuterCapability {
+                 OuterCapability {
+                     gradient: Derivative::Analytic,
+                     hessian: Derivative::Analytic,
+                     n_params: 1,
+                     psi_dim: 0,
+                     fixed_point_available: false,
+                     barrier_config: None,
+                     prefer_gradient_only: false,
+                     disable_fixed_point: false,
+                 }
+             }
+ 
+             fn eval_cost(&mut self, theta: &Array1<f64>) -> Result<f64, EstimationError> {
+                 Ok(theta[0].abs())
+             }
+ 
+             fn eval(&mut self, theta: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+                 self.eval_with_order(theta, OuterEvalOrder::ValueGradientHessian)
+             }
+ 
+             fn eval_with_order(
+                 &mut self,
+                 theta: &Array1<f64>,
+                 _: OuterEvalOrder,
+             ) -> Result<OuterEval, EstimationError> {
+                 Ok(OuterEval {
+                     cost: theta[0].abs(),
+                     gradient: array![1.0],
+                     hessian: HessianResult::Operator(Arc::new(
+                         CountingIdentityOuterHessianOperator {
+                             matvec_calls: Arc::clone(&self.matvec_calls),
++                            batched_mul_mat_calls: Arc::clone(&self.batched_mul_mat_calls),
+                         },
+                     )),
+                 })
+             }
+ 
+             fn reset(&mut self) {}
+         }
+ 
+         let matvec_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
++        let batched_mul_mat_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+         let mut obj = RejectingObjective {
+             matvec_calls: Arc::clone(&matvec_calls),
++            batched_mul_mat_calls: Arc::clone(&batched_mul_mat_calls),
+         };
+         let seed = array![0.0];
+         let initial_eval = obj
+             .eval_with_order(&seed, OuterEvalOrder::ValueGradientHessian)
+             .expect("initial eval");
+         let result = run_operator_trust_region(
+             &mut obj,
+             &seed,
+             OuterThetaLayout::new(1, 0),
+             None,
+             1e-12,
+             3,
+             initial_eval,
+             OuterPlan {
+                 solver: Solver::Arc,
+                 hessian_source: HessianSource::Analytic,
+             },
+             None,
+         )
+         .expect("operator ARC attempt");
+         assert!(!result.converged);
+         assert_eq!(
+             matvec_calls.load(std::sync::atomic::Ordering::Relaxed),
+-            3,
+-            "first rejected step uses two HVPs; dense materialization uses one \
+-             sequential HVP; later rejected steps must reuse the dense model"
++            2,
++            "first rejected step uses two HVPs; batched dense materialization must not \
++             fall back to an extra per-column matvec"
++        );
++        assert_eq!(
++            batched_mul_mat_calls.load(std::sync::atomic::Ordering::Relaxed),
++            1,
++            "post-rejection dense ARC reuse must materialize through the operator's \
++             batched mul_mat path exactly once"
+         );
+     }
+ 
+     #[test]
+     fn candidate_selection_prefers_lower_cost_within_same_convergence_class() {
+         let nonconverged_hi = OuterResult {
+             rho: array![0.0],
+             final_value: 9.0,
+             iterations: 1,
+             final_grad_norm: 1.0,
+             final_gradient: None,
+             final_hessian: None,
+             converged: false,
+             plan_used: OuterPlan {
+                 solver: Solver::Bfgs,
+                 hessian_source: HessianSource::BfgsApprox,
+             },
+             operator_trust_radius: None,
+             operator_stop_reason: None,
+         };
+         let nonconverged_lo = OuterResult {
+             rho: array![1.0],
+             final_value: 1.0,
+             iterations: 1,
+             final_grad_norm: 1.0,
+
+----- PATCH END -----
+
