@@ -7621,16 +7621,38 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     let inner_tol = options.inner_tol;
     let inner_max_cycles = options.inner_max_cycles;
     let inner_max_cycles = capped_inner_max_cycles(options, inner_max_cycles);
-    let mut s_lambdas = Vec::with_capacity(specs.len());
-    for (b, spec) in specs.iter().enumerate() {
-        let p = spec.design.ncols();
-        let lambdas = block_log_lambdas[b].mapv(f64::exp);
-        let mut s_lambda = Array2::<f64>::zeros((p, p));
-        for (k, s) in spec.penalties.iter().enumerate() {
-            s.add_scaled_to(lambdas[k], &mut s_lambda);
-        }
-        s_lambdas.push(s_lambda);
-    }
+    // Each block's assembled penalty matrix depends only on that block's
+    // penalties and smoothing parameters. Build these setup matrices in
+    // parallel, but keep the coordinate-descent and line-search loops below
+    // strictly serial because each accepted block update changes the state seen
+    // by later blocks.
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    let s_lambdas = (0..specs.len())
+        .into_par_iter()
+        .map(|b| {
+            let spec = &specs[b];
+            let Some(block_log_lambda) = block_log_lambdas.get(b) else {
+                return Err(format!(
+                    "missing log-smoothing parameter vector for block {b}"
+                ));
+            };
+            if block_log_lambda.len() != spec.penalties.len() {
+                return Err(format!(
+                    "block {b} log-smoothing parameter length {} does not match penalties {}",
+                    block_log_lambda.len(),
+                    spec.penalties.len()
+                ));
+            }
+
+            let p = spec.design.ncols();
+            let lambdas = block_log_lambda.mapv(f64::exp);
+            let mut s_lambda = Array2::<f64>::zeros((p, p));
+            for (k, s) in spec.penalties.iter().enumerate() {
+                s.add_scaled_to(lambdas[k], &mut s_lambda);
+            }
+            Ok(s_lambda)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let ridge = effective_solverridge(options.ridge_floor);
     let mut cached_active_sets: Vec<Option<Vec<usize>>> = vec![None; specs.len()];
     if let Some(seed) = warm_start
