@@ -2,7 +2,9 @@ use crate::faer_ndarray::{
     FaerArrayView, array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_atv_into, fast_av,
     fast_av_into, fast_xt_diag_x,
 };
-use crate::resource::{MaterializationPolicy, MatrixMaterializationError, ResourcePolicy};
+use crate::resource::{
+    MaterializationPolicy, MatrixMaterializationError, ResourcePolicy, rows_for_target_bytes,
+};
 use crate::types::RidgePolicy;
 use faer::Accum;
 use faer::Par;
@@ -37,6 +39,28 @@ const DENSE_ROW_PARALLEL_MIN_NP: u64 = 200_000;
 const TENSOR_GEMM_MAX_INTERMEDIATE_BYTES: usize = 128 * 1024 * 1024; // 128 MB
 
 pub use crate::linalg::utils::PcgSolveInfo;
+
+#[inline]
+fn dense_materialization_chunk_rows(nrows: usize, ncols: usize) -> usize {
+    rows_for_target_bytes(CHUNKED_DENSE_MATERIALIZATION_BYTES, ncols)
+        .max(1)
+        .min(nrows.max(1))
+}
+
+fn dense_operator_to_dense_by_chunks<O: DenseDesignOperator + ?Sized>(
+    op: &O,
+) -> Result<Array2<f64>, MatrixMaterializationError> {
+    let n = op.nrows();
+    let p = op.ncols();
+    let chunk_rows = dense_materialization_chunk_rows(n, p);
+    let mut out = Array2::<f64>::zeros((n, p));
+    for start in (0..n).step_by(chunk_rows) {
+        let end = (start + chunk_rows).min(n);
+        let slice = out.slice_mut(s![start..end, ..]);
+        op.row_chunk_into(start..end, slice)?;
+    }
+    Ok(out)
+}
 
 fn checked_dense_nbytes(nrows: usize, ncols: usize, context: &str) -> Result<usize, String> {
     nrows
@@ -593,13 +617,20 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
                 limit_bytes: policy.max_single_dense_bytes,
             });
         }
-        Ok(self.to_dense_arc())
+        dense_operator_to_dense_by_chunks(self).map(Arc::new)
     }
 
-    /// Shared dense materialization. Implementations that already own an
+    /// Shared dense materialization via the required row-chunk API.
+    ///
+    /// This deliberately does not fall back through `to_dense()`: operator-backed
+    /// designs can be biobank-scale, and their chunked row path is the bounded
+    /// memory materialization contract. Implementations that already own an
     /// `Arc<Array2<_>>` should override this to return it directly.
     fn to_dense_arc(&self) -> Arc<Array2<f64>> {
-        Arc::new(self.to_dense())
+        Arc::new(
+            dense_operator_to_dense_by_chunks(self)
+                .expect("DenseDesignOperator::to_dense_arc: row-chunk materialization failed"),
+        )
     }
 }
 
@@ -707,7 +738,11 @@ impl DenseDesignMatrix {
                     op.ncols(),
                     &policy,
                 )?;
-                Ok(op.to_dense_arc())
+                dense_operator_to_dense_by_chunks(op.as_ref())
+                    .map(Arc::new)
+                    .map_err(|err| {
+                        format!("{context}: failed to materialize dense row chunks: {err}")
+                    })
             }
         }
     }
@@ -4846,9 +4881,28 @@ impl DenseDesignOperator for DesignMatrix {
                 context: "DesignMatrix::row_chunk_into shape mismatch",
             });
         }
-        let chunk = DesignMatrix::try_row_chunk(self, rows)?;
-        out.assign(&chunk);
-        Ok(())
+        match self {
+            Self::Dense(matrix) => matrix.row_chunk_into(rows, out),
+            Self::Sparse(matrix) => {
+                out.fill(0.0);
+                let csr =
+                    matrix
+                        .to_csr_arc()
+                        .ok_or(MatrixMaterializationError::MissingRowChunk {
+                            context: "DesignMatrix::row_chunk_into: failed to obtain CSR view",
+                        })?;
+                let sym = csr.symbolic();
+                let row_ptr = sym.row_ptr();
+                let col_idx = sym.col_idx();
+                let vals = csr.val();
+                for (local_row, row) in rows.enumerate() {
+                    for ptr in row_ptr[row]..row_ptr[row + 1] {
+                        out[[local_row, col_idx[ptr]]] = vals[ptr];
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 
     fn to_dense(&self) -> Array2<f64> {
@@ -5327,17 +5381,13 @@ impl DesignMatrix {
     pub fn try_to_dense_by_chunks(&self, context: &str) -> Result<Array2<f64>, String> {
         let n = self.nrows();
         let p = self.ncols();
-        let chunk_rows = (CHUNKED_DENSE_MATERIALIZATION_BYTES
-            / (p.max(1) * std::mem::size_of::<f64>()))
-        .max(1)
-        .min(n.max(1));
+        let chunk_rows = dense_materialization_chunk_rows(n, p);
         let mut out = Array2::<f64>::zeros((n, p));
         for start in (0..n).step_by(chunk_rows) {
             let end = (start + chunk_rows).min(n);
-            let chunk = self
-                .try_row_chunk(start..end)
+            let slice = out.slice_mut(s![start..end, ..]);
+            self.row_chunk_into(start..end, slice)
                 .map_err(|err| format!("{context}: failed to materialize row chunk: {err}"))?;
-            out.slice_mut(s![start..end, ..]).assign(&chunk);
         }
         Ok(out)
     }
@@ -6326,16 +6376,93 @@ mod tests {
     use super::{
         ChunkedKernelDesignOperator, DenseDesignMatrix, DenseDesignOperator, DesignMatrix,
         EmbeddedColumnBlock, MultiChannelOperator, ReparamOperator, SparseDesignMatrix,
-        SparseHessianAccumulator, dense_matvec, dense_transpose_matvec,
-        dense_transpose_weighted_response,
+        SparseHessianAccumulator, dense_matvec, dense_operator_to_dense_by_chunks,
+        dense_transpose_matvec, dense_transpose_weighted_response, dense_xtwx_view,
     };
     use crate::linalg::matrix::LinearOperator;
     use crate::linalg::utils::{PcgSolveInfo, StableSolver};
+    use crate::resource::MatrixMaterializationError;
     use crate::testing::no_densify_design;
     use crate::types::RidgePolicy;
     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
-    use ndarray::{Array1, Array2, Axis, array, s};
+    use ndarray::{Array1, Array2, ArrayViewMut2, Axis, array, s};
+    use std::ops::Range;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ChunkOnlyOperator {
+        n: usize,
+        p: usize,
+        row_chunk_calls: AtomicUsize,
+    }
+
+    impl ChunkOnlyOperator {
+        fn value(&self, i: usize, j: usize) -> f64 {
+            ((i % 251) as f64) * 0.25 - ((j % 127) as f64) * 0.5 + ((i + j) % 7) as f64
+        }
+    }
+
+    impl LinearOperator for ChunkOnlyOperator {
+        fn nrows(&self) -> usize {
+            self.n
+        }
+
+        fn ncols(&self) -> usize {
+            self.p
+        }
+
+        fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+            let mut out = Array1::<f64>::zeros(self.n);
+            for i in 0..self.n {
+                let mut acc = 0.0;
+                for j in 0..self.p {
+                    acc += self.value(i, j) * vector[j];
+                }
+                out[i] = acc;
+            }
+            out
+        }
+
+        fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+            let mut out = Array1::<f64>::zeros(self.p);
+            for i in 0..self.n {
+                for j in 0..self.p {
+                    out[j] += self.value(i, j) * vector[i];
+                }
+            }
+            out
+        }
+
+        fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+            let dense = dense_operator_to_dense_by_chunks(self).map_err(|err| err.to_string())?;
+            Ok(dense_xtwx_view(&dense, weights.view()))
+        }
+    }
+
+    impl DenseDesignOperator for ChunkOnlyOperator {
+        fn row_chunk_into(
+            &self,
+            rows: Range<usize>,
+            mut out: ArrayViewMut2<'_, f64>,
+        ) -> Result<(), MatrixMaterializationError> {
+            self.row_chunk_calls.fetch_add(1, Ordering::SeqCst);
+            if out.nrows() != rows.end - rows.start || out.ncols() != self.p {
+                return Err(MatrixMaterializationError::MissingRowChunk {
+                    context: "ChunkOnlyOperator::row_chunk_into shape mismatch",
+                });
+            }
+            for (local, row) in rows.enumerate() {
+                for col in 0..self.p {
+                    out[[local, col]] = self.value(row, col);
+                }
+            }
+            Ok(())
+        }
+
+        fn to_dense(&self) -> Array2<f64> {
+            panic!("ChunkOnlyOperator::to_dense fallback must not be used")
+        }
+    }
 
     fn exact_weighted_penalized_solve(
         design: &Array2<f64>,
@@ -6809,6 +6936,54 @@ mod tests {
                 reference[j],
                 fused[j]
             );
+        }
+    }
+
+    #[test]
+    fn large_lazy_dense_materialization_streams_chunks_without_to_dense_fallback() {
+        let n = 11_000usize;
+        let p = 128usize;
+        let op = Arc::new(ChunkOnlyOperator {
+            n,
+            p,
+            row_chunk_calls: AtomicUsize::new(0),
+        });
+        let design = DenseDesignMatrix::from(Arc::clone(&op));
+
+        let dense = design.to_dense_arc();
+
+        assert_eq!(dense.dim(), (n, p));
+        assert!(
+            op.row_chunk_calls.load(Ordering::SeqCst) > 1,
+            "expected dense materialization to stream more than one row chunk"
+        );
+        for &(i, j) in &[(0, 0), (8_191, 127), (8_192, 0), (10_999, 64)] {
+            assert_eq!(dense[[i, j]], op.value(i, j));
+        }
+    }
+
+    #[test]
+    fn try_to_dense_by_chunks_writes_directly_into_output_slices() {
+        let n = 11_000usize;
+        let p = 128usize;
+        let op = Arc::new(ChunkOnlyOperator {
+            n,
+            p,
+            row_chunk_calls: AtomicUsize::new(0),
+        });
+        let design = DesignMatrix::Dense(DenseDesignMatrix::from(Arc::clone(&op)));
+
+        let dense = design
+            .try_to_dense_by_chunks("large chunked regression")
+            .expect("chunked materialization");
+
+        assert_eq!(dense.dim(), (n, p));
+        assert!(
+            op.row_chunk_calls.load(Ordering::SeqCst) > 1,
+            "expected direct chunked conversion to use bounded row chunks"
+        );
+        for &(i, j) in &[(1, 7), (4_096, 12), (8_193, 63), (10_998, 127)] {
+            assert_eq!(dense[[i, j]], op.value(i, j));
         }
     }
 

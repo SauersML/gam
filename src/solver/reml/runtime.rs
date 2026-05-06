@@ -346,6 +346,25 @@ impl<'a> RemlState<'a> {
         ndarray::linalg::general_mat_mul(1.0, &x_block, &z_block, 0.0, &mut target);
     }
 
+    fn tk_fill_gram_block_entries_scalar(
+        x_dense: &Array2<f64>,
+        z: &Array2<f64>,
+        i_block: &TkActiveBlock,
+        j_block: &TkActiveBlock,
+        gram: &mut Array2<f64>,
+    ) {
+        let p = x_dense.ncols();
+        for &(bi, _) in &i_block.entries {
+            let ii = i_block.start + bi;
+            for &(bj, _) in &j_block.entries {
+                let jj = j_block.start + bj;
+                gram[[bi, bj]] = (0..p)
+                    .map(|col| x_dense[[ii, col]] * z[[col, jj]])
+                    .sum::<f64>();
+            }
+        }
+    }
+
     fn tk_gradient_from_shared(
         x_dense: &Array2<f64>,
         z: &Array2<f64>,
@@ -390,24 +409,41 @@ impl<'a> RemlState<'a> {
             .and(c_array)
             .and(&x_y)
             .par_for_each(|o, &d, &h, &c, &xy| *o = d * h - c * xy);
-        let mut p_total = Array2::<f64>::zeros((p, p));
-        for i in 0..n {
-            let wi = diag_combined[i];
-            if wi == 0.0 {
-                continue;
-            }
-            let z_i = z.column(i);
-            for a in 0..p {
-                let wa = wi * z_i[a];
-                for b in a..p {
-                    let val = wa * z_i[b];
-                    p_total[[a, b]] += val;
-                    if a != b {
-                        p_total[[b, a]] += val;
+        let chunk_len = (n / (rayon::current_num_threads().saturating_mul(4).max(1)))
+            .clamp(TK_BLOCK_SIZE, 2048);
+        let diag_chunks: Vec<usize> = (0..n).step_by(chunk_len).collect();
+        let mut p_total = diag_chunks
+            .par_iter()
+            .fold(
+                || Array2::<f64>::zeros((p, p)),
+                |mut local, &i0| {
+                    let i1 = (i0 + chunk_len).min(n);
+                    for i in i0..i1 {
+                        let wi = diag_combined[i];
+                        if wi == 0.0 {
+                            continue;
+                        }
+                        for a in 0..p {
+                            let wa = wi * z[[a, i]];
+                            for b in a..p {
+                                let val = wa * z[[b, i]];
+                                local[[a, b]] += val;
+                                if a != b {
+                                    local[[b, a]] += val;
+                                }
+                            }
+                        }
                     }
-                }
-            }
-        }
+                    local
+                },
+            )
+            .reduce(
+                || Array2::<f64>::zeros((p, p)),
+                |mut left, right| {
+                    left += &right;
+                    left
+                },
+            );
         p_total.mapv_inplace(|v| 0.25 * v);
         for a in 0..p {
             for b in 0..p {
@@ -415,47 +451,63 @@ impl<'a> RemlState<'a> {
             }
         }
 
-        for (j_block_idx, j_block) in shared.active_blocks.iter().enumerate() {
-            let j0 = j_block.start;
-            let j1 = j_block.end;
-            for i_block in &shared.active_blocks[..=j_block_idx] {
-                let i0 = i_block.start;
-                let i1 = i_block.end;
-                Self::tk_fill_gram_block(x_dense, z, i0, i1, j0, j1, gram);
-                for &(bi, ci) in &i_block.entries {
-                    for &(bj, cj) in &j_block.entries {
-                        let gij = gram[[bi, bj]];
-                        let weight = ci * cj * gij * gij;
-                        let ii = i0 + bi;
-                        let jj = j0 + bj;
-                        let sym_factor = if i0 == j0 { 1.0 } else { 2.0 };
-                        let scale = -0.25 * weight * sym_factor;
-                        if ii == jj {
-                            let z_i = z.column(ii);
-                            for a in 0..p {
-                                for b in a..p {
-                                    let val = scale * z_i[a] * z_i[b];
-                                    p_total[[a, b]] += val;
-                                    if a != b {
-                                        p_total[[b, a]] += val;
+        let active_pairs: Vec<(usize, usize)> = (0..shared.active_blocks.len())
+            .flat_map(|j_block_idx| {
+                (0..=j_block_idx).map(move |i_block_idx| (i_block_idx, j_block_idx))
+            })
+            .collect();
+        let active_total = active_pairs
+            .par_iter()
+            .fold(
+                || Array2::<f64>::zeros((p, p)),
+                |mut local, &(i_block_idx, j_block_idx)| {
+                    let i_block = &shared.active_blocks[i_block_idx];
+                    let j_block = &shared.active_blocks[j_block_idx];
+                    let sym_factor = if i_block_idx == j_block_idx { 1.0 } else { 2.0 };
+                    for &(bi, ci) in &i_block.entries {
+                        let ii = i_block.start + bi;
+                        for &(bj, cj) in &j_block.entries {
+                            let jj = j_block.start + bj;
+                            let gij = (0..p)
+                                .map(|col| x_dense[[ii, col]] * z[[col, jj]])
+                                .sum::<f64>();
+                            let weight = ci * cj * gij * gij;
+                            let scale = -0.25 * weight * sym_factor;
+                            if ii == jj {
+                                for a in 0..p {
+                                    let za = z[[a, ii]];
+                                    for b in a..p {
+                                        let val = scale * za * z[[b, ii]];
+                                        local[[a, b]] += val;
+                                        if a != b {
+                                            local[[b, a]] += val;
+                                        }
                                     }
                                 }
-                            }
-                        } else {
-                            let z_ii = z.column(ii);
-                            let z_jj = z.column(jj);
-                            let half_scale = 0.5 * scale;
-                            for a in 0..p {
-                                for b in 0..p {
-                                    p_total[[a, b]] +=
-                                        half_scale * (z_ii[a] * z_jj[b] + z_jj[a] * z_ii[b]);
+                            } else {
+                                let half_scale = 0.5 * scale;
+                                for a in 0..p {
+                                    let z_ii_a = z[[a, ii]];
+                                    let z_jj_a = z[[a, jj]];
+                                    for b in 0..p {
+                                        local[[a, b]] += half_scale
+                                            * (z_ii_a * z[[b, jj]] + z_jj_a * z[[b, ii]]);
+                                    }
                                 }
                             }
                         }
                     }
-                }
-            }
-        }
+                    local
+                },
+            )
+            .reduce(
+                || Array2::<f64>::zeros((p, p)),
+                |mut left, right| {
+                    left += &right;
+                    left
+                },
+            );
+        p_total += &active_total;
 
         let xp = x_dense.dot(&p_total);
         let mut lev_p = Array1::<f64>::zeros(n);
@@ -480,61 +532,78 @@ impl<'a> RemlState<'a> {
                 Self::tk_firth_beta_hessian_trace(firth_op, &beta_dirs[idx], &p_total)?;
             let eta_total = x_vks[idx].mapv(|value| -value);
             let direct = Self::tk_direct_gradient_from_cd_and_design(
-                x_dense, z, c_array, d_array, e_array, &eta_total, None, shared, gram,
+                x_dense, z, c_array, d_array, e_array, &eta_total, None, shared, gram, true,
             )?;
             gradient[idx] = trace_ak_p - correction_trace + firth_trace + direct;
         }
-        for (extra_idx, drift) in ext_drifts.iter().enumerate() {
-            if drift.raw_dim() != p_total.raw_dim() {
-                return Err(EstimationError::InvalidInput(format!(
-                    "Tierney-Kadane ext penalty drift shape mismatch: expected {}x{}, got {}x{}",
-                    p,
-                    p,
-                    drift.nrows(),
-                    drift.ncols()
-                )));
-            }
-            let mut trace_ak_p = 0.0;
-            for row in 0..p {
-                for col in 0..p {
-                    trace_ak_p += drift[[row, col]] * p_total[[col, row]];
-                }
-            }
-            let x_vk_idx = k + extra_idx;
-            let correction_trace =
-                Self::tk_active_weighted_trace(&shared.active_blocks, &x_vks[x_vk_idx], &lev_p);
-            let firth_trace =
-                Self::tk_firth_beta_hessian_trace(firth_op, &beta_dirs[x_vk_idx], &p_total)?;
-            let mut eta_total = x_vks[x_vk_idx].mapv(|value| -value);
-            if let Some(eta_fixed) = ext_eta_fixed
-                .get(extra_idx)
-                .and_then(|value| value.as_ref())
-            {
-                if eta_fixed.len() != n {
+        let ext_values = (0..ext_drifts.len())
+            .into_par_iter()
+            .map(|extra_idx| -> Result<(usize, f64), EstimationError> {
+                let drift = &ext_drifts[extra_idx];
+                if drift.raw_dim() != p_total.raw_dim() {
                     return Err(EstimationError::InvalidInput(format!(
-                        "Tierney-Kadane ext fixed eta length mismatch: expected {}, got {}",
-                        n,
-                        eta_fixed.len()
+                        "Tierney-Kadane ext penalty drift shape mismatch: expected {}x{}, got {}x{}",
+                        p,
+                        p,
+                        drift.nrows(),
+                        drift.ncols()
                     )));
                 }
-                eta_total += eta_fixed;
-            }
-            let x_fixed = ext_x_fixed.get(extra_idx).and_then(|value| value.as_ref());
-            if let Some(x_fixed) = x_fixed {
-                if x_fixed.raw_dim() != x_dense.raw_dim() {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "Tierney-Kadane ext fixed design shape mismatch: expected {}x{}, got {}x{}",
-                        x_dense.nrows(),
-                        x_dense.ncols(),
-                        x_fixed.nrows(),
-                        x_fixed.ncols()
-                    )));
+                let mut trace_ak_p = 0.0;
+                for row in 0..p {
+                    for col in 0..p {
+                        trace_ak_p += drift[[row, col]] * p_total[[col, row]];
+                    }
                 }
-            }
-            let direct = Self::tk_direct_gradient_from_cd_and_design(
-                x_dense, z, c_array, d_array, e_array, &eta_total, x_fixed, shared, gram,
-            )?;
-            gradient[x_vk_idx] = trace_ak_p - correction_trace + firth_trace + direct;
+                let x_vk_idx = k + extra_idx;
+                let correction_trace =
+                    Self::tk_active_weighted_trace(&shared.active_blocks, &x_vks[x_vk_idx], &lev_p);
+                let firth_trace =
+                    Self::tk_firth_beta_hessian_trace(firth_op, &beta_dirs[x_vk_idx], &p_total)?;
+                let mut eta_total = x_vks[x_vk_idx].mapv(|value| -value);
+                if let Some(eta_fixed) = ext_eta_fixed
+                    .get(extra_idx)
+                    .and_then(|value| value.as_ref())
+                {
+                    if eta_fixed.len() != n {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "Tierney-Kadane ext fixed eta length mismatch: expected {}, got {}",
+                            n,
+                            eta_fixed.len()
+                        )));
+                    }
+                    eta_total += eta_fixed;
+                }
+                let x_fixed = ext_x_fixed.get(extra_idx).and_then(|value| value.as_ref());
+                if let Some(x_fixed) = x_fixed {
+                    if x_fixed.raw_dim() != x_dense.raw_dim() {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "Tierney-Kadane ext fixed design shape mismatch: expected {}x{}, got {}x{}",
+                            x_dense.nrows(),
+                            x_dense.ncols(),
+                            x_fixed.nrows(),
+                            x_fixed.ncols()
+                        )));
+                    }
+                }
+                let mut local_gram = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
+                let direct = Self::tk_direct_gradient_from_cd_and_design(
+                    x_dense,
+                    z,
+                    c_array,
+                    d_array,
+                    e_array,
+                    &eta_total,
+                    x_fixed,
+                    shared,
+                    &mut local_gram,
+                    false,
+                )?;
+                Ok((x_vk_idx, trace_ak_p - correction_trace + firth_trace + direct))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (idx, value) in ext_values {
+            gradient[idx] = value;
         }
 
         for g in gradient.iter_mut() {
@@ -607,6 +676,7 @@ impl<'a> RemlState<'a> {
         x_fixed: Option<&Array2<f64>>,
         shared: &TkSharedIntermediates,
         gram: &mut Array2<f64>,
+        use_dense_kernels: bool,
     ) -> Result<f64, EstimationError> {
         let n = x_dense.nrows();
         if eta_total.len() != n || e_array.len() != n {
@@ -667,9 +737,13 @@ impl<'a> RemlState<'a> {
             for i_block in &direct_blocks[..=j_block_idx] {
                 let i0 = i_block.start;
                 let i1 = i_block.end;
-                Self::tk_fill_gram_block(x_dense, z, i0, i1, j0, j1, gram);
+                if use_dense_kernels {
+                    Self::tk_fill_gram_block(x_dense, z, i0, i1, j0, j1, gram);
+                } else {
+                    Self::tk_fill_gram_block_entries_scalar(x_dense, z, i_block, j_block, gram);
+                }
 
-                let design_gram = if has_design_deriv {
+                let design_gram = if has_design_deriv && use_dense_kernels {
                     let x_theta = x_fixed.expect("design derivative checked above");
                     let rows = i1 - i0;
                     let cols = j1 - j0;
@@ -699,6 +773,14 @@ impl<'a> RemlState<'a> {
                         let c_direct = (cpi * cj + ci * cpj) * gij * gij * gij / 12.0;
                         let k_direct = if let Some((forward, reverse)) = design_gram.as_ref() {
                             let kp = forward[[bi, bj]] + reverse[[bj, bi]];
+                            0.25 * ci * cj * gij * gij * kp
+                        } else if let Some(x_theta) = x_fixed {
+                            let kp = (0..x_dense.ncols())
+                                .map(|col| {
+                                    x_theta[[ii, col]] * z[[col, jj]]
+                                        + x_theta[[jj, col]] * z[[col, ii]]
+                                })
+                                .sum::<f64>();
                             0.25 * ci * cj * gij * gij * kp
                         } else {
                             0.0
