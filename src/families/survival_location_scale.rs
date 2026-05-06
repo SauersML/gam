@@ -47,6 +47,7 @@ use crate::solver::estimate::{
 use crate::terms::construction::kronecker_product;
 use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, s};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use statrs::function::erf::erfc;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1760,16 +1761,23 @@ impl SurvivalLocationScaleFamily {
         let mut d2_h_h0 = Array1::<f64>::zeros(n);
         let mut d2_h_h1 = Array1::<f64>::zeros(n);
 
-        for i in 0..n {
-            let state = self.row_predictor_state(
-                dynamic.h_entry[i],
-                dynamic.h_exit[i],
-                dynamic.hdot_exit[i],
-                dynamic.q_entry[i],
-                dynamic.q_exit[i],
-                dynamic.qdot_exit[i],
-            );
-            let Some(row) = self.row_derivatives_rescaled(i, state, deriv_log_scale)? else {
+        let row_derivatives = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let state = self.row_predictor_state(
+                    dynamic.h_entry[i],
+                    dynamic.h_exit[i],
+                    dynamic.hdot_exit[i],
+                    dynamic.q_entry[i],
+                    dynamic.q_exit[i],
+                    dynamic.qdot_exit[i],
+                );
+                self.row_derivatives_rescaled(i, state, deriv_log_scale)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (i, row) in row_derivatives.into_iter().enumerate() {
+            let Some(row) = row else {
                 continue;
             };
             d1_q[i] = row.d1_q;
