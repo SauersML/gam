@@ -9130,10 +9130,13 @@ fn build_custom_family_inner_assembly<'dp>(
     };
 
     // Collect dense penalty matrices so references stay valid for the assembler.
-    let per_block_penalties_dense: Vec<Vec<Array2<f64>>> = specs
-        .iter()
-        .map(|s| s.penalties.iter().map(|p| p.to_dense()).collect())
-        .collect();
+    let per_block_penalties_dense: Vec<Vec<Array2<f64>>> = {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        (0..specs.len())
+            .into_par_iter()
+            .map(|b| specs[b].penalties.iter().map(|p| p.to_dense()).collect())
+            .collect()
+    };
     let block_descs: Vec<PenaltyBlockDesc> = (0..specs.len())
         .flat_map(|b| {
             let (start, end) = ranges[b];
@@ -11109,40 +11112,42 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         // the value, ψ gradient, ψψ Hessian, and ρψ mixed block all
         // differentiate the same log|S|_+ objective.
         let s_logdet_blocks = if include_logdet_s {
-            let mut blocks = Vec::with_capacity(specs.len());
-            for (b, spec) in specs.iter().enumerate() {
-                let p = spec.design.ncols();
-                let lambdas = per_block[b].mapv(f64::exp);
-                let mut s_lambda = Array2::<f64>::zeros((p, p));
-                for (k, s) in spec.penalties.iter().enumerate() {
-                    s.add_scaled_to(lambdas[k], &mut s_lambda);
-                }
-                if options.ridge_policy.include_penalty_logdet {
-                    for d in 0..p {
-                        s_lambda[[d, d]] += ridge;
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let block_results: Vec<Result<PenaltyPseudologdet, String>> = (0..specs.len())
+                .into_par_iter()
+                .map(|b| {
+                    let spec = &specs[b];
+                    let p = spec.design.ncols();
+                    let lambdas = per_block[b].mapv(f64::exp);
+                    let mut s_lambda = Array2::<f64>::zeros((p, p));
+                    for (k, s) in spec.penalties.iter().enumerate() {
+                        s.add_scaled_to(lambdas[k], &mut s_lambda);
                     }
-                }
-                let structural_nullity = if !spec.nullspace_dims.is_empty()
-                    && spec.nullspace_dims.len() == spec.penalties.len()
-                {
-                    let penalties_dense: Vec<Array2<f64>> = spec
-                        .penalties
-                        .iter()
-                        .map(|penalty| penalty.to_dense())
-                        .collect();
-                    Some(exact_intersection_nullity(
-                        &penalties_dense,
-                        &spec.nullspace_dims,
-                    ))
-                } else {
-                    None
-                };
-                blocks.push(PenaltyPseudologdet::from_assembled_with_nullity(
-                    s_lambda,
-                    structural_nullity,
-                )?);
-            }
-            Some(blocks)
+                    if options.ridge_policy.include_penalty_logdet {
+                        for d in 0..p {
+                            s_lambda[[d, d]] += ridge;
+                        }
+                    }
+                    let structural_nullity = if !spec.nullspace_dims.is_empty()
+                        && spec.nullspace_dims.len() == spec.penalties.len()
+                    {
+                        let penalties_dense: Vec<Array2<f64>> = spec
+                            .penalties
+                            .iter()
+                            .map(|penalty| penalty.to_dense())
+                            .collect();
+                        Some(exact_intersection_nullity(
+                            &penalties_dense,
+                            &spec.nullspace_dims,
+                        ))
+                    } else {
+                        None
+                    };
+                    PenaltyPseudologdet::from_assembled_with_nullity(s_lambda, structural_nullity)
+                })
+                .collect();
+            let blocks: Result<Vec<_>, _> = block_results.into_iter().collect();
+            Some(blocks?)
         } else {
             None
         };
@@ -11988,40 +11993,42 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
     };
 
     let s_logdet_blocks = if include_logdet_s {
-        let mut blocks = Vec::with_capacity(specs.len());
-        for (b, spec) in specs.iter().enumerate() {
-            let p = spec.design.ncols();
-            let lambdas = per_block[b].mapv(f64::exp);
-            let mut s_lambda = Array2::<f64>::zeros((p, p));
-            for (k, s) in spec.penalties.iter().enumerate() {
-                s.add_scaled_to(lambdas[k], &mut s_lambda);
-            }
-            if options.ridge_policy.include_penalty_logdet {
-                for d in 0..p {
-                    s_lambda[[d, d]] += ridge;
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let block_results: Vec<Result<PenaltyPseudologdet, String>> = (0..specs.len())
+            .into_par_iter()
+            .map(|b| {
+                let spec = &specs[b];
+                let p = spec.design.ncols();
+                let lambdas = per_block[b].mapv(f64::exp);
+                let mut s_lambda = Array2::<f64>::zeros((p, p));
+                for (k, s) in spec.penalties.iter().enumerate() {
+                    s.add_scaled_to(lambdas[k], &mut s_lambda);
                 }
-            }
-            let structural_nullity = if !spec.nullspace_dims.is_empty()
-                && spec.nullspace_dims.len() == spec.penalties.len()
-            {
-                let penalties_dense: Vec<Array2<f64>> = spec
-                    .penalties
-                    .iter()
-                    .map(|penalty| penalty.to_dense())
-                    .collect();
-                Some(exact_intersection_nullity(
-                    &penalties_dense,
-                    &spec.nullspace_dims,
-                ))
-            } else {
-                None
-            };
-            blocks.push(PenaltyPseudologdet::from_assembled_with_nullity(
-                s_lambda,
-                structural_nullity,
-            )?);
-        }
-        Some(blocks)
+                if options.ridge_policy.include_penalty_logdet {
+                    for d in 0..p {
+                        s_lambda[[d, d]] += ridge;
+                    }
+                }
+                let structural_nullity = if !spec.nullspace_dims.is_empty()
+                    && spec.nullspace_dims.len() == spec.penalties.len()
+                {
+                    let penalties_dense: Vec<Array2<f64>> = spec
+                        .penalties
+                        .iter()
+                        .map(|penalty| penalty.to_dense())
+                        .collect();
+                    Some(exact_intersection_nullity(
+                        &penalties_dense,
+                        &spec.nullspace_dims,
+                    ))
+                } else {
+                    None
+                };
+                PenaltyPseudologdet::from_assembled_with_nullity(s_lambda, structural_nullity)
+            })
+            .collect();
+        let blocks: Result<Vec<_>, _> = block_results.into_iter().collect();
+        Some(blocks?)
     } else {
         None
     };
