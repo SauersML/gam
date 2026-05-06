@@ -3052,8 +3052,7 @@ impl TransformationNormalFamily {
                         let basis = endpoint_basis[e];
                         endpoint_psi[e] = basis[0] * acc.gamma_psi[0];
                         for k in 1..p_resp {
-                            endpoint_psi[e] +=
-                                2.0 * basis[k] * acc.gamma[k] * acc.gamma_psi[k];
+                            endpoint_psi[e] += 2.0 * basis[k] * acc.gamma[k] * acc.gamma_psi[k];
                         }
                     }
 
@@ -3148,20 +3147,16 @@ impl TransformationNormalFamily {
                             let hppsi_a = hppsi_cov_factor * c + hppsi_psi_factor * psi;
                             let endpoint_a = [endpoint_factor[0] * c, endpoint_factor[1] * c];
                             let endpoint_psi_a = [
-                                endpoint_psi_cov_factor[0] * c
-                                    + endpoint_psi_psi_factor[0] * psi,
-                                endpoint_psi_cov_factor[1] * c
-                                    + endpoint_psi_psi_factor[1] * psi,
+                                endpoint_psi_cov_factor[0] * c + endpoint_psi_psi_factor[0] * psi,
+                                endpoint_psi_cov_factor[1] * c + endpoint_psi_psi_factor[1] * psi,
                             ];
                             let out_idx = offset + cidx;
                             for col in 0..rank {
                                 let projected_idx = k * rank + col;
                                 let g_dir = acc.gamma_dir[projected_idx];
                                 let g_psi_dir = acc.gamma_psi_dir[projected_idx];
-                                let h_factor_dir =
-                                    if k == 0 { 0.0 } else { 2.0 * rvk * g_dir };
-                                let hp_factor_dir =
-                                    if k == 0 { 0.0 } else { 2.0 * rdk * g_dir };
+                                let h_factor_dir = if k == 0 { 0.0 } else { 2.0 * rvk * g_dir };
+                                let hp_factor_dir = if k == 0 { 0.0 } else { 2.0 * rdk * g_dir };
                                 let hpsi_cov_factor_dir =
                                     if k == 0 { 0.0 } else { 2.0 * rvk * g_psi_dir };
                                 let hppsi_cov_factor_dir =
@@ -5676,128 +5671,6 @@ impl TransformationNormalFamily {
             }
         }
         Ok(out)
-    }
-
-    fn axis_snapshots(&self) -> Result<Vec<TransformationNormalPsiWorkspaceAxisSnapshot>, String> {
-        let mut guard = self
-            .cache
-            .lock()
-            .map_err(|_| "TransformationNormalPsiWorkspace cache poisoned".to_string())?;
-        if guard.is_none() {
-            let computed = self.compute_all_axes()?;
-            *guard = Some(computed);
-        }
-        let cached = guard.as_ref().expect("populated above");
-        Ok(cached
-            .iter()
-            .map(|entry| TransformationNormalPsiWorkspaceAxisSnapshot {
-                op_arc: Arc::clone(&entry.op_arc),
-                axis: entry.axis,
-                row_gamma: Arc::clone(&entry.row_gamma),
-                row_h: Arc::clone(&entry.row_h),
-                row_h_prime: Arc::clone(&entry.row_h_prime),
-                endpoint_q: Arc::clone(&entry.endpoint_q),
-                beta: Arc::clone(&entry.beta),
-            })
-            .collect())
-    }
-
-    fn compute_pair_cache(
-        &self,
-    ) -> Result<Vec<Vec<Option<Arc<TransformationNormalPsiWorkspacePairCacheEntry>>>>, String> {
-        let axes = self.axis_snapshots()?;
-        let n_psi = axes.len();
-        if n_psi == 0 {
-            return Ok(Vec::new());
-        }
-
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let pairs: Vec<(usize, usize)> = (0..n_psi)
-            .flat_map(|i| (i..n_psi).map(move |j| (i, j)))
-            .collect();
-        let computed: Vec<
-            Result<
-                (
-                    usize,
-                    usize,
-                    Arc<TransformationNormalPsiWorkspacePairCacheEntry>,
-                ),
-                String,
-            >,
-        > = pairs
-            .into_par_iter()
-            .map(|(psi_i, psi_j)| {
-                let entry_i = &axes[psi_i];
-                let entry_j = &axes[psi_j];
-                let op = entry_i
-                    .op_arc
-                    .as_any()
-                    .downcast_ref::<TensorKroneckerPsiOperator>()
-                    .ok_or_else(|| {
-                        "TransformationNormalPsiWorkspace ψ-ψ pair cache requires tensor-backed operator"
-                            .to_string()
-                    })?;
-                if entry_j
-                    .op_arc
-                    .as_any()
-                    .downcast_ref::<TensorKroneckerPsiOperator>()
-                    .is_none()
-                {
-                    return Err(
-                        "TransformationNormalPsiWorkspace ψ-ψ pair cache requires tensor-backed operator on both axes"
-                            .to_string(),
-                    );
-                }
-
-                let (objective_psi_psi, score_psi_psi, _) = self
-                    .family
-                    .scop_psi_psi_value_score_hvp_from_operator(
-                        entry_i.beta.as_ref(),
-                        op,
-                        entry_i.axis,
-                        entry_j.axis,
-                        entry_i.row_gamma.view(),
-                        entry_i.row_h.view(),
-                        entry_i.row_h_prime.view(),
-                        entry_i.endpoint_q.as_slice(),
-                        None,
-                    )?;
-                if !objective_psi_psi.is_finite() || !score_psi_psi.iter().all(|v| v.is_finite())
-                {
-                    return Err(format!(
-                        "TransformationNormalPsiWorkspace ψ-ψ pair cache produced non-finite values at \
-                         psi_i={psi_i}, psi_j={psi_j}: obj_finite={}, score_all_finite={}",
-                        objective_psi_psi.is_finite(),
-                        score_psi_psi.iter().all(|v| v.is_finite()),
-                    ));
-                }
-
-                Ok((
-                    psi_i,
-                    psi_j,
-                    Arc::new(TransformationNormalPsiWorkspacePairCacheEntry {
-                        objective_psi_psi,
-                        score_psi_psi,
-                        op_arc: Arc::clone(&entry_i.op_arc),
-                        axis_i: entry_i.axis,
-                        axis_j: entry_j.axis,
-                        row_gamma: Arc::clone(&entry_i.row_gamma),
-                        row_h: Arc::clone(&entry_i.row_h),
-                        row_h_prime: Arc::clone(&entry_i.row_h_prime),
-                        endpoint_q: Arc::clone(&entry_i.endpoint_q),
-                        beta: Arc::clone(&entry_i.beta),
-                    }),
-                ))
-            })
-            .collect();
-
-        let mut table = vec![vec![None; n_psi]; n_psi];
-        for result in computed {
-            let (i, j, entry) = result?;
-            table[i][j] = Some(Arc::clone(&entry));
-            table[j][i] = Some(entry);
-        }
-        Ok(table)
     }
 }
 
@@ -10873,6 +10746,26 @@ mod tests {
                 score_fd[idx]
             );
         }
+
+        let mut factor = Array2::<f64>::zeros((beta.len(), 4));
+        for (col, seed) in [408_u64, 409, 410, 411].into_iter().enumerate() {
+            factor
+                .column_mut(col)
+                .assign(&toy_probe_vector(beta.len(), seed));
+        }
+        let got_mat = op.mul_mat(&factor);
+        for col in 0..factor.ncols() {
+            let want_col = op.mul_vec(&factor.column(col).to_owned());
+            for row in 0..beta.len() {
+                let tol = 1.0e-11 * want_col[row].abs().max(1.0) + 1.0e-11;
+                assert!(
+                    (got_mat[[row, col]] - want_col[row]).abs() <= tol,
+                    "first-order psi Hessian batched mul_mat mismatch at ({row}, {col}): got={:.6e}, want={:.6e}",
+                    got_mat[[row, col]],
+                    want_col[row],
+                );
+            }
+        }
     }
 
     #[test]
@@ -12765,6 +12658,128 @@ impl TransformationNormalPsiWorkspace {
             });
         }
         Ok(out)
+    }
+
+    fn axis_snapshots(&self) -> Result<Vec<TransformationNormalPsiWorkspaceAxisSnapshot>, String> {
+        let mut guard = self
+            .cache
+            .lock()
+            .map_err(|_| "TransformationNormalPsiWorkspace cache poisoned".to_string())?;
+        if guard.is_none() {
+            let computed = self.compute_all_axes()?;
+            *guard = Some(computed);
+        }
+        let cached = guard.as_ref().expect("populated above");
+        Ok(cached
+            .iter()
+            .map(|entry| TransformationNormalPsiWorkspaceAxisSnapshot {
+                op_arc: Arc::clone(&entry.op_arc),
+                axis: entry.axis,
+                row_gamma: Arc::clone(&entry.row_gamma),
+                row_h: Arc::clone(&entry.row_h),
+                row_h_prime: Arc::clone(&entry.row_h_prime),
+                endpoint_q: Arc::clone(&entry.endpoint_q),
+                beta: Arc::clone(&entry.beta),
+            })
+            .collect())
+    }
+
+    fn compute_pair_cache(
+        &self,
+    ) -> Result<Vec<Vec<Option<Arc<TransformationNormalPsiWorkspacePairCacheEntry>>>>, String> {
+        let axes = self.axis_snapshots()?;
+        let n_psi = axes.len();
+        if n_psi == 0 {
+            return Ok(Vec::new());
+        }
+
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let pairs: Vec<(usize, usize)> = (0..n_psi)
+            .flat_map(|i| (i..n_psi).map(move |j| (i, j)))
+            .collect();
+        let computed: Vec<
+            Result<
+                (
+                    usize,
+                    usize,
+                    Arc<TransformationNormalPsiWorkspacePairCacheEntry>,
+                ),
+                String,
+            >,
+        > = pairs
+            .into_par_iter()
+            .map(|(psi_i, psi_j)| {
+                let entry_i = &axes[psi_i];
+                let entry_j = &axes[psi_j];
+                let op = entry_i
+                    .op_arc
+                    .as_any()
+                    .downcast_ref::<TensorKroneckerPsiOperator>()
+                    .ok_or_else(|| {
+                        "TransformationNormalPsiWorkspace psi-psi pair cache requires tensor-backed operator"
+                            .to_string()
+                    })?;
+                if entry_j
+                    .op_arc
+                    .as_any()
+                    .downcast_ref::<TensorKroneckerPsiOperator>()
+                    .is_none()
+                {
+                    return Err(
+                        "TransformationNormalPsiWorkspace psi-psi pair cache requires tensor-backed operator on both axes"
+                            .to_string(),
+                    );
+                }
+
+                let (objective_psi_psi, score_psi_psi, _) =
+                    self.family.scop_psi_psi_value_score_hvp_from_operator(
+                        entry_i.beta.as_ref(),
+                        op,
+                        entry_i.axis,
+                        entry_j.axis,
+                        entry_i.row_gamma.view(),
+                        entry_i.row_h.view(),
+                        entry_i.row_h_prime.view(),
+                        entry_i.endpoint_q.as_slice(),
+                        None,
+                    )?;
+                if !objective_psi_psi.is_finite()
+                    || !score_psi_psi.iter().all(|v: &f64| v.is_finite())
+                {
+                    return Err(format!(
+                        "TransformationNormalPsiWorkspace psi-psi pair cache produced non-finite values at \
+                         psi_i={psi_i}, psi_j={psi_j}: obj_finite={}, score_all_finite={}",
+                        objective_psi_psi.is_finite(),
+                        score_psi_psi.iter().all(|v: &f64| v.is_finite()),
+                    ));
+                }
+
+                Ok((
+                    psi_i,
+                    psi_j,
+                    Arc::new(TransformationNormalPsiWorkspacePairCacheEntry {
+                        objective_psi_psi,
+                        score_psi_psi,
+                        op_arc: Arc::clone(&entry_i.op_arc),
+                        axis_i: entry_i.axis,
+                        axis_j: entry_j.axis,
+                        row_gamma: Arc::clone(&entry_i.row_gamma),
+                        row_h: Arc::clone(&entry_i.row_h),
+                        row_h_prime: Arc::clone(&entry_i.row_h_prime),
+                        endpoint_q: Arc::clone(&entry_i.endpoint_q),
+                        beta: Arc::clone(&entry_i.beta),
+                    }),
+                ))
+            })
+            .collect();
+
+        let mut table = vec![vec![None; n_psi]; n_psi];
+        for result in computed {
+            let (i, j, entry) = result?;
+            table[i][j] = Some(Arc::clone(&entry));
+            table[j][i] = Some(entry);
+        }
+        Ok(table)
     }
 }
 
