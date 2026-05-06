@@ -5508,17 +5508,59 @@ fn block_quadratic_penalty(
     value
 }
 
+const TOTAL_QUADRATIC_PENALTY_PAR_MIN_BLOCKS: usize = 4;
+// Avoid Rayon overhead for a few tiny blocks; this approximates the dense
+// mat-vec work in βᵀSβ before splitting independent block penalties.
+const TOTAL_QUADRATIC_PENALTY_PAR_MIN_DENSE_WORK: usize = 16_384;
+
+fn total_quadratic_penalty_parallel_worthwhile(
+    states: &[ParameterBlockState],
+    s_lambdas: &[Array2<f64>],
+) -> bool {
+    let n_blocks = states.len().min(s_lambdas.len());
+    if n_blocks < TOTAL_QUADRATIC_PENALTY_PAR_MIN_BLOCKS || rayon::current_num_threads() <= 1 {
+        return false;
+    }
+
+    states
+        .iter()
+        .zip(s_lambdas.iter())
+        .map(|(state, s_lambda)| {
+            let p = state.beta.len().min(s_lambda.ncols());
+            p.saturating_mul(s_lambda.nrows())
+        })
+        .try_fold(0usize, |acc, work| {
+            let next = acc.saturating_add(work);
+            (next < TOTAL_QUADRATIC_PENALTY_PAR_MIN_DENSE_WORK).then_some(next)
+        })
+        .is_none()
+}
+
 fn total_quadratic_penalty(
     states: &[ParameterBlockState],
     s_lambdas: &[Array2<f64>],
     ridge: f64,
     ridge_policy: RidgePolicy,
 ) -> f64 {
-    let mut total = 0.0;
-    for (state, s_lambda) in states.iter().zip(s_lambdas.iter()) {
-        total += block_quadratic_penalty(&state.beta, s_lambda, ridge, ridge_policy);
+    if total_quadratic_penalty_parallel_worthwhile(states, s_lambdas) {
+        use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+
+        states
+            .par_iter()
+            .zip(s_lambdas.par_iter())
+            .map(|(state, s_lambda)| {
+                block_quadratic_penalty(&state.beta, s_lambda, ridge, ridge_policy)
+            })
+            .reduce(|| 0.0, |left, right| left + right)
+    } else {
+        states
+            .iter()
+            .zip(s_lambdas.iter())
+            .map(|(state, s_lambda)| {
+                block_quadratic_penalty(&state.beta, s_lambda, ridge, ridge_policy)
+            })
+            .sum()
     }
-    total
 }
 
 fn stable_logdet_with_ridge_policy(
