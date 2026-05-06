@@ -1402,6 +1402,17 @@ pub trait HyperOperator: Send + Sync {
         self.trace_projected_factor(factor)
     }
 
+    /// Compute the exact projected matrix `F^T B F`.
+    ///
+    /// The default uses the batched `B F` path. Structured operators can
+    /// override this when the projection itself has a cheaper analytic form
+    /// than materialising every column of `B F`. This is the quantity required
+    /// by dense spectral logdet-Hessian contractions.
+    fn projected_matrix(&self, factor: &Array2<f64>) -> Array2<f64> {
+        let op_factor = self.mul_mat(factor);
+        factor.t().dot(&op_factor)
+    }
+
     /// Fill columns `[start, start + out.ncols())` of `B` into `out`.
     ///
     /// Sparse exact traces build `B E` in column batches. Operators with
@@ -8415,13 +8426,7 @@ impl DenseSpectralOperator {
 
     #[inline]
     fn projected_operator(&self, factor: &Array2<f64>, op: &dyn HyperOperator) -> Array2<f64> {
-        // Batched form: ask the operator to apply itself to all `rank` columns
-        // at once. Matrix-free Khatri–Rao operators (CTN dH / d²H) override
-        // `mul_mat` to fuse the K applies into two BLAS3 matmuls, replacing
-        // the per-column matvec loop that dominated the macOS profile of
-        // margslope-duchon16d.
-        let op_factor = op.mul_mat(factor);
-        factor.t().dot(&op_factor)
+        op.projected_matrix(factor)
     }
 
     #[inline]
