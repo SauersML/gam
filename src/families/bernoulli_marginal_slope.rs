@@ -3791,6 +3791,11 @@ impl BernoulliMarginalSlopeFamily {
     ///   out[k,l] = sum_m f_{klm} dir[m]
     /// Rigid path uses the closed-form kernel. The flexible de-nested
     /// transport path contracts the cell-moment kernel analytically.
+    ///
+    /// Keep this kernel row-local and single-threaded. Its production callers
+    /// already parallelize the outer row reductions with Rayon (`row_iter` /
+    /// chunk `into_par_iter()` folds), which avoids nested Rayon overhead for
+    /// the small per-row matrices assembled here.
     fn row_primary_third_contracted_recompute(
         &self,
         row: usize,
