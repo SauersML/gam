@@ -11903,12 +11903,24 @@ impl MaterializablePsiDerivativeOperator for TensorKroneckerPsiOperator {
 /// here; they delegate back to the existing `CustomFamily` direct hooks. Those
 /// paths are already operator-backed and fire only at full-Hessian outer
 /// evaluations (the dominant cost we are addressing here is gradient-mode).
+struct TransformationNormalPsiWorkspaceCacheEntry {
+    objective_psi: f64,
+    score_psi: Array1<f64>,
+    op_arc: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+    axis: usize,
+    row_gamma: Arc<Array2<f64>>,
+    row_h: Arc<Array1<f64>>,
+    row_h_prime: Arc<Array1<f64>>,
+    endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
+    beta: Arc<Array1<f64>>,
+}
+
 struct TransformationNormalPsiWorkspace {
     family: TransformationNormalFamily,
     block_states: Vec<ParameterBlockState>,
     specs: Vec<ParameterBlockSpec>,
     derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
-    cache: Mutex<Option<Vec<Option<ExactNewtonJointPsiTerms>>>>,
+    cache: Mutex<Option<Vec<TransformationNormalPsiWorkspaceCacheEntry>>>,
 }
 
 impl TransformationNormalPsiWorkspace {
@@ -11934,7 +11946,9 @@ impl TransformationNormalPsiWorkspace {
     /// per-axis [`scop_psi_terms`] path that reloads it once per axis. Op
     /// counts are identical to the per-axis path; only the loop nesting and
     /// reduction shape change.
-    fn compute_all_axes(&self) -> Result<Vec<Option<ExactNewtonJointPsiTerms>>, String> {
+    fn compute_all_axes(
+        &self,
+    ) -> Result<Vec<TransformationNormalPsiWorkspaceCacheEntry>, String> {
         if self.block_states.len() != 1 {
             return Err(format!(
                 "TransformationNormalFamily expects 1 block, got {}",
@@ -11969,8 +11983,7 @@ impl TransformationNormalPsiWorkspace {
 
         // Resolve and validate the shared tensor-Kronecker ψ operator across
         // every axis. CTN is single-block so all entries point at the same
-        // operator instance.
-        let mut tensor_op: Option<&TensorKroneckerPsiOperator> = None;
+        // operator instance; we still loop to validate the contract.
         let mut op_arcs: Vec<Arc<dyn CustomFamilyPsiDerivativeOperator>> = Vec::with_capacity(n_psi);
         let mut axes: Vec<usize> = Vec::with_capacity(n_psi);
         for deriv in block_derivs.iter() {
@@ -11982,28 +11995,29 @@ impl TransformationNormalPsiWorkspace {
                         .to_string()
                 })?
                 .clone();
-            let op = op_arc
+            // Validate tensor-Kronecker backing without holding a reference
+            // across the move into `op_arcs`.
+            if op_arc
                 .as_any()
                 .downcast_ref::<TensorKroneckerPsiOperator>()
-                .ok_or_else(|| {
+                .is_none()
+            {
+                return Err(
                     "TransformationNormalFamily ψ workspace requires tensor-backed operator"
-                        .to_string()
-                })?;
-            if let Some(existing) = tensor_op {
-                if !std::ptr::eq(existing, op) {
-                    return Err(
-                        "TransformationNormalFamily ψ workspace requires a shared tensor operator \
-                         across all axes"
-                            .to_string(),
-                    );
-                }
-            } else {
-                tensor_op = Some(op);
+                        .to_string(),
+                );
             }
             axes.push(deriv.implicit_axis);
             op_arcs.push(op_arc);
         }
-        let op = tensor_op.expect("at least one axis ensured above");
+        // The shared instance is whichever axis we resolve first; downcast it
+        // again for materialization. CTN's `build_tensor_psi_derivatives`
+        // guarantees this is the same instance across every axis.
+        let shared_op_arc = Arc::clone(&op_arcs[0]);
+        let op = shared_op_arc
+            .as_any()
+            .downcast_ref::<TensorKroneckerPsiOperator>()
+            .expect("validated tensor-backed above");
 
         // Materialize the per-axis covariate ψ-derivative blocks once. Each
         // call hits the operator-level cache; subsequent calls within this
@@ -12209,36 +12223,33 @@ impl TransformationNormalPsiWorkspace {
                 PsiAllAxesAccum::merge,
             );
 
-        // Re-attach the per-axis matrix-free first-order Hessian operators.
-        // Each operator is constructed against the shared row_quantities cache
-        // we already built — identical to the per-axis path.
+        // Stash the cached numeric data plus per-axis operator handles. The
+        // matrix-free `TransformationNormalPsiHessianOperator` is reconstructed
+        // on each `first_order_terms()` call from the cached Arc-shared row
+        // state — Arc clones are O(1) and the cached operator instance carries
+        // no per-evaluation mutable state.
         let PsiAllAxesAccum {
             objective_psi,
             mut score_psi,
         } = accum;
-        let mut out: Vec<Option<ExactNewtonJointPsiTerms>> = Vec::with_capacity(n_psi);
+        let beta_arc = Arc::new(beta.clone());
+        let mut out: Vec<TransformationNormalPsiWorkspaceCacheEntry> = Vec::with_capacity(n_psi);
         for (axis_idx, &axis) in axes.iter().enumerate() {
-            let hessian_psi_operator: Arc<dyn HyperOperator> =
-                Arc::new(TransformationNormalPsiHessianOperator::new(
-                    Arc::new(self.family.clone()),
-                    beta.clone(),
-                    Arc::clone(&op_arcs[axis_idx]),
-                    axis,
-                    Arc::clone(&row.gamma),
-                    Arc::clone(&row.h),
-                    Arc::clone(&row.h_prime),
-                    Arc::clone(&row.endpoint_q),
-                ));
             // Take the per-axis score buffer out of the accumulator without
             // cloning. The order matches the construction order so each axis
             // is consumed exactly once.
             let score_axis = std::mem::replace(&mut score_psi[axis_idx], Array1::<f64>::zeros(0));
-            out.push(Some(ExactNewtonJointPsiTerms {
+            out.push(TransformationNormalPsiWorkspaceCacheEntry {
                 objective_psi: objective_psi[axis_idx],
                 score_psi: score_axis,
-                hessian_psi: Array2::zeros((0, 0)),
-                hessian_psi_operator: Some(hessian_psi_operator),
-            }));
+                op_arc: Arc::clone(&op_arcs[axis_idx]),
+                axis,
+                row_gamma: Arc::clone(&row.gamma),
+                row_h: Arc::clone(&row.h),
+                row_h_prime: Arc::clone(&row.h_prime),
+                endpoint_q: Arc::clone(&row.endpoint_q),
+                beta: Arc::clone(&beta_arc),
+            });
         }
         Ok(out)
     }
@@ -12261,7 +12272,29 @@ impl ExactNewtonJointPsiWorkspace for TransformationNormalPsiWorkspace {
         if psi_index >= cached.len() {
             return Ok(None);
         }
-        Ok(cached[psi_index].clone())
+        let entry = &cached[psi_index];
+        // Reconstruct the matrix-free first-order Hessian operator on each
+        // call. Arc-cloning shared row state and `op_arc` is O(1); the
+        // operator carries no mutable per-evaluation state. The cached
+        // numeric `score_psi` buffer is cloned because `ExactNewtonJointPsiTerms`
+        // is not `Clone`-derivable through the `dyn HyperOperator` field.
+        let hessian_psi_operator: Arc<dyn HyperOperator> =
+            Arc::new(TransformationNormalPsiHessianOperator::new(
+                Arc::new(self.family.clone()),
+                (*entry.beta).clone(),
+                Arc::clone(&entry.op_arc),
+                entry.axis,
+                Arc::clone(&entry.row_gamma),
+                Arc::clone(&entry.row_h),
+                Arc::clone(&entry.row_h_prime),
+                Arc::clone(&entry.endpoint_q),
+            ));
+        Ok(Some(ExactNewtonJointPsiTerms {
+            objective_psi: entry.objective_psi,
+            score_psi: entry.score_psi.clone(),
+            hessian_psi: Array2::zeros((0, 0)),
+            hessian_psi_operator: Some(hessian_psi_operator),
+        }))
     }
 
     fn second_order_terms(
