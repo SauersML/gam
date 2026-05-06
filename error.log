@@ -16404,3 +16404,1925 @@ index 3f93c29430becb5e5f288a4902893a85d01371bd..1d6831e613f4d4e814226ec9f569cefd
 [2026-05-06T21:08:12.566853+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
 [2026-05-06T21:08:12.569645+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
 [2026-05-06T21:08:12.569775+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:08:37.798279+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T21:08:37.803544+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:08:37.803661+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:08:50.152455+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T21:08:50.155044+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:08:50.155144+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:08:52.561334+00:00] apply_result: mode=apply id=task_e_69fb93e2fd448324a7720b970b2fc135 status=Partial applied=1 skipped=0 conflicts=1 cmd=(cd /Users/user/gam && git apply --3way /var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/.tmp7GMidF/patch.diff)
+stdout_tail=
+
+stderr_tail=
+Applied patch to 'src/solver/reml/mod.rs' cleanly.
+Applied patch to 'src/solver/reml/runtime.rs' with conflicts.
+U src/solver/reml/runtime.rs
+
+patch_summary: kind=git-diff lines=1060 chars=42042 cwd=/Users/user/gam ; head=
+diff --git a/src/solver/reml/mod.rs b/src/solver/reml/mod.rs
+index 073576bbf88026b6339f9c5bb4c5d7fe814c76cc..6b2e98ace39cd1ef4a2268135f4624a474ea7ac9 100644
+--- a/src/solver/reml/mod.rs
++++ b/src/solver/reml/mod.rs
+@@ -819,51 +819,51 @@ mod tests {
+         assert!(
+             dh_rel < 3e-2,
+             "H_tau mismatch vs FD: rel={dh_rel:.3e}, num={dh_num:.3e}, den={dh_den:.3e}"
+         );
+ 
+         let v_abs = (v_tau_analytic - v_taufd).abs();
+         let v_rel = v_abs / v_taufd.abs().max(1e-10);
+         assert_eq!(
+             v_tau_analytic.signum(),
+             v_taufd.signum(),
+             "V_tau sign mismatch: analytic={v_tau_analytic:.6e}, fd={v_taufd:.6e}"
+         );
+         assert!(
+             v_rel < 2e-2,
+             "V_tau mismatch vs FD: rel={v_rel:.3e}, abs={v_…
+----- PATCH BEGIN -----
+diff --git a/src/solver/reml/mod.rs b/src/solver/reml/mod.rs
+index 073576bbf88026b6339f9c5bb4c5d7fe814c76cc..6b2e98ace39cd1ef4a2268135f4624a474ea7ac9 100644
+--- a/src/solver/reml/mod.rs
++++ b/src/solver/reml/mod.rs
+@@ -819,51 +819,51 @@ mod tests {
+         assert!(
+             dh_rel < 3e-2,
+             "H_tau mismatch vs FD: rel={dh_rel:.3e}, num={dh_num:.3e}, den={dh_den:.3e}"
+         );
+ 
+         let v_abs = (v_tau_analytic - v_taufd).abs();
+         let v_rel = v_abs / v_taufd.abs().max(1e-10);
+         assert_eq!(
+             v_tau_analytic.signum(),
+             v_taufd.signum(),
+             "V_tau sign mismatch: analytic={v_tau_analytic:.6e}, fd={v_taufd:.6e}"
+         );
+         assert!(
+             v_rel < 2e-2,
+             "V_tau mismatch vs FD: rel={v_rel:.3e}, abs={v_abs:.3e}, analytic={v_tau_analytic:.6e}, fd={v_taufd:.6e}"
+         );
+ 
+         assert!(
+             cancellation.abs() < 1e-10,
+             "stationarity cancellation failed: | -ell_beta^T B + beta^T S B | = {:.3e}",
+             cancellation.abs()
+         );
+     }
+ 
+     #[test]
+-    fn firth_exacthessian_rejects_without_tk_second_derivatives() {
++    fn firth_exacthessian_includes_analytic_tk_second_derivatives() {
+         // Rank-deficient X: the 4th column is 2x the 2nd column.
+         let y = array![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
+         let w = Array1::<f64>::ones(y.len());
+         let x = array![
+             [1.0, -1.2, 0.4, -2.4],
+             [1.0, -0.9, -0.1, -1.8],
+             [1.0, -0.6, 0.3, -1.2],
+             [1.0, -0.2, -0.4, -0.4],
+             [1.0, 0.1, 0.5, 0.2],
+             [1.0, 0.4, -0.6, 0.8],
+             [1.0, 0.8, 0.2, 1.6],
+             [1.0, 1.1, -0.3, 2.2],
+             [1.0, 1.4, 0.7, 2.8],
+             [1.0, 1.7, -0.2, 3.4],
+         ];
+         let s0 = array![
+             [0.0, 0.0, 0.0, 0.0],
+             [0.0, 1.5, 0.2, 0.0],
+             [0.0, 0.2, 1.0, 0.0],
+             [0.0, 0.0, 0.0, 0.5],
+         ];
+         let s1 = array![
+             [0.0, 0.0, 0.0, 0.0],
+             [0.0, 0.8, -0.1, 0.0],
+             [0.0, -0.1, 0.6, 0.0],
+@@ -876,61 +876,158 @@ mod tests {
+             GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+             1e-9,
+             true,
+         )
+         .with_max_iterations(500);
+         let p = x.ncols();
+         use crate::estimate::PenaltySpec;
+         let specs = vec![PenaltySpec::Dense(s0), PenaltySpec::Dense(s1)];
+         let canonical = crate::construction::canonicalize_penalty_specs(&specs, &[1, 1], p, "test")
+             .map(|(canonical, _)| canonical)
+             .expect("canonicalize");
+         let state = RemlState::newwith_offset(
+             y.view(),
+             x.clone(),
+             w.view(),
+             offset.view(),
+             canonical,
+             p,
+             &cfg,
+             Some(vec![1, 1]),
+             None,
+             None,
+         )
+         .expect("state");
+         let rho = array![0.1, -0.2];
++        assert!(
++            state.analytic_outer_hessian_enabled(),
++            "Firth logit should no longer disable analytic outer Hessian planning"
++        );
++        let outer = state
++            .compute_outer_eval_with_order(
++                &rho,
++                crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian,
++            )
++            .expect("outer Hessian eval should succeed");
++        assert!(
++            outer.hessian.is_analytic(),
++            "outer planner should request and return an analytic Hessian"
++        );
+         let bundle = state.obtain_eval_bundle(&rho).expect("exact firth bundle");
+-        let err = state
++        let h_dense = state
+             .compute_lamlhessian_exact_from_bundle(&rho, &bundle)
+-            .expect_err("Firth exact Hessian should require analytic TK second derivatives");
+-        let msg = err.to_string();
++            .expect("Firth exact Hessian should include analytic TK second derivatives");
++        assert_eq!(h_dense.raw_dim(), ndarray::Ix2(2, 2));
+         assert!(
+-            msg.contains("Tierney-Kadane outer Hessian requires analytic second derivatives"),
+-            "unexpected error: {msg}"
++            h_dense.iter().all(|value| value.is_finite()),
++            "Hessian should be finite: {h_dense:?}"
+         );
+     }
+ 
++    #[test]
++    fn firth_outer_hessian_matches_gradient_finite_difference_with_tk_terms() {
++        let y = array![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0];
++        let w = Array1::<f64>::ones(y.len());
++        let x = array![
++            [1.0, -1.0, 0.3],
++            [1.0, -0.7, -0.2],
++            [1.0, -0.3, 0.4],
++            [1.0, 0.0, -0.5],
++            [1.0, 0.2, 0.6],
++            [1.0, 0.6, -0.4],
++            [1.0, 0.9, 0.2],
++            [1.0, 1.3, -0.1],
++        ];
++        let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.1], [0.0, 0.1, 0.7],];
++        let s1 = array![[0.0, 0.0, 0.0], [0.0, 0.4, -0.05], [0.0, -0.05, 0.9],];
++        let cfg = RemlConfig::external(
++            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
++            1e-9,
++            true,
++        )
++        .with_max_iterations(500);
++        let p_dim = x.ncols();
++        use crate::estimate::PenaltySpec;
++        let specs = vec![PenaltySpec::Dense(s0), PenaltySpec::Dense(s1)];
++        let canonical =
++            crate::construction::canonicalize_penalty_specs(&specs, &[1, 1], p_dim, "test")
++                .map(|(canonical, _)| canonical)
++                .expect("canonicalize");
++        let offset = Array1::<f64>::zeros(y.len());
++        let state = RemlState::newwith_offset(
++            y.view(),
++            x.clone(),
++            w.view(),
++            offset.view(),
++            canonical,
++            p_dim,
++            &cfg,
++            Some(vec![1, 1]),
++            None,
++            None,
++        )
++        .expect("state");
++        let rho = array![0.15, -0.25];
++        let eval = state
++            .compute_outer_eval_with_order(
++                &rho,
++                crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian,
++            )
++            .expect("analytic Hessian eval");
++        let h = eval.hessian.unwrap_analytic();
++        let delta = 2.0e-5;
++        for col in 0..rho.len() {
++            let mut rp = rho.clone();
++            let mut rm = rho.clone();
++            rp[col] += delta;
++            rm[col] -= delta;
++            let gp = state
++                .compute_outer_eval_with_order(
++                    &rp,
++                    crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
++                )
++                .expect("plus grad")
++                .gradient;
++            let gm = state
++                .compute_outer_eval_with_order(
++                    &rm,
++                    crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
++                )
++                .expect("minus grad")
++                .gradient;
++            for row in 0..rho.len() {
++                let fd = (gp[row] - gm[row]) / (2.0 * delta);
++                let an = h[[row, col]];
++                let rel = (fd - an).abs() / fd.abs().max(an.abs()).max(1e-6);
++                assert!(
++                    rel < 2.0e-3,
++                    "Hessian mismatch ({row},{col}): analytic={an:.9e}, fd={fd:.9e}, rel={rel:.3e}"
++                );
++            }
++        }
++    }
++
+     #[test]
+     fn firthgradient_lives_in_design_column_space_under_rank_deficiency() {
+         // Rank-deficient design: col4 = 2*col2.
+         let x = array![
+             [1.0, -1.2, 0.4, -2.4],
+             [1.0, -0.9, -0.1, -1.8],
+             [1.0, -0.6, 0.3, -1.2],
+             [1.0, -0.2, -0.4, -0.4],
+             [1.0, 0.1, 0.5, 0.2],
+             [1.0, 0.4, -0.6, 0.8],
+             [1.0, 0.8, 0.2, 1.6],
+             [1.0, 1.1, -0.3, 2.2],
+         ];
+         let beta = array![0.1, -0.2, 0.3, 0.05];
+         let eta = x.dot(&beta);
+         let op = FirthDenseOperator::build(&x, &eta).expect("firth operator");
+ 
+         // Exact reduced-space Firth gradient:
+         //   gradPhi = 0.5 Xᵀ (w' ⊙ h), with h = diag(X_r K_r X_rᵀ).
+         let gradphi = 0.5 * x.t().dot(&(&op.w1 * &op.h_diag));
+ 
+         // Check (I - QQᵀ) gradPhi ≈ 0.
+         let q = &op.q_basis;
+         let proj = q.dot(&q.t().dot(&gradphi));
+         let resid = &gradphi - &proj;
+diff --git a/src/solver/reml/runtime.rs b/src/solver/reml/runtime.rs
+index dcd73d6a801f0e196fcb96017a3103cb197c3851..51db27bba38157b5b14f51714b35c7e2ace8c61a 100644
+--- a/src/solver/reml/runtime.rs
++++ b/src/solver/reml/runtime.rs
+@@ -44,100 +44,81 @@ fn compute_gradient_for_tk(mode: super::unified::EvalMode) -> bool {
+ /// the penalty stays comparable to the cost differences that actually
+ /// distinguish good seeds from bad. The penalty vanishes at the true inner
+ /// mode (r_g → 0), so converged screening fits incur no penalty.
+ ///
+ /// Outside of screening, partial fits never reach this helper:
+ /// `execute_pirls_if_needed` surfaces `MaxIterationsReached` and
+ /// `LmStepSearchExhausted` as `EstimationError::PirlsDidNotConverge`, so
+ /// production REML evaluations always operate on certified inner modes
+ /// and this helper is a strict no-op for them.
+ #[inline]
+ fn screening_residual_penalty(cost: f64, pr: &PirlsResult) -> f64 {
+     if !cost.is_finite() || !pr.status.is_failed_max_iterations() {
+         return cost;
+     }
+     let r_g = pr.relative_gradient_norm();
+     if r_g.is_finite() {
+         cost + 0.5 * r_g * r_g
+     } else {
+         f64::INFINITY
+     }
+ }
+ 
+ struct TkCorrectionTerms {
+     value: f64,
+     gradient: Option<Array1<f64>>,
++    hessian: Option<Array2<f64>>,
+ }
+ 
+ struct TkSharedIntermediates {
+     h_diag: Array1<f64>,
+     x_m: Array1<f64>,
+     y: Array1<f64>,
+     active_blocks: Vec<TkActiveBlock>,
+ }
+ 
+ struct TkActiveBlock {
+     start: usize,
+     end: usize,
+     entries: Vec<(usize, f64)>,
+ }
+ 
+ /// Family-dependent derivative context shared by all assembly builders.
+ ///
+ /// Both `build_dense_derivative_context` and `build_sparse_derivative_context`
+ /// return this, eliminating the tuple-order mismatch that previously existed
+ /// between the two paths.
+ struct DerivativeContext {
+     deriv_provider: Box<dyn super::unified::HessianDerivativeProvider>,
+     dispersion: super::unified::DispersionHandling,
+     log_likelihood: f64,
+     firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
+     barrier_config: Option<super::unified::BarrierConfig>,
+ }
+ 
+ impl<'a> RemlState<'a> {
+     pub(crate) fn analytic_outer_hessian_enabled(&self) -> bool {
+-        // The Tierney-Kadane skewness correction has analytic value and
+-        // first ρ-derivative paths (`tierney_kadane_analytic_core`), but
+-        // its analytic outer-Hessian is not implemented. Production requires
+-        // analytic second derivatives for Hessian mode.
+-        // `tierney_kadane_terms` therefore returns an `InvalidInput` error
+-        // for `ValueGradientHessian` mode whenever TK is active (Firth +
+-        // non-identity link). Without gating the outer evaluator that
+-        // failure cascades through seed validation and aborts the entire
+-        // REML fit (e.g. the `cli_firth_fit_*` integration test). Treat
+-        // analytic outer Hessian as disabled in those configurations so
+-        // the optimizer falls back to its gradient-only descent path
+-        // (BFGS / quasi-Newton); the spectral exact Hessian path is then
+-        // not requested and TK never sees `ValueGradientHessian`. The
+-        // explicit safety guard in `tierney_kadane_terms` still rejects
+-        // any caller that constructs Hessian mode directly (covered by
+-        // `firth_exacthessian_rejects_without_tk_second_derivatives`).
+-        if self.config.firth_bias_reduction && self.config.link_function() != LinkFunction::Identity
+-        {
+-            return false;
+-        }
+         // Biobank-scale fallback: the analytic outer Hessian is only safe
+         // at biobank scale when the unified evaluator can express it as a
+         // matrix-free Hv operator (`build_outer_hessian_operator` /
+         // `HessianResult::Operator`) instead of materializing the full
+         // `O(K · n · p²)` dense pairwise LAML Hessian. The operator
+         // representation is selected by `prefer_outer_hessian_operator`
+         // when `(n, p, K)` cross the assembly-cost crossover.
+         //
+         // This formalizes the previous unconditional `n > 50_000` bandaid
+         // (CI run 25354126629, 2026-05-04: standard-GAM probit at n=320k,
+         // p=42 hit the 40-min cmd timeout) as: "decline analytic Hessian
+         // when the dense `compute_outer_hessian` path would run AND `n` is
+         // biobank-scale." Whenever the operator path is available the
+         // optimizer keeps analytic curvature; whenever the operator path
+         // is unavailable (small `n·p`, narrow basis, or
+         // `penalty_subspace_trace.is_some()` forcing the projected dense
+         // kernel) at biobank scale, we fall back to BFGS instead of
+         // running the `O(K² · n · p²)` dense assembly.
+         //
+         // Mirrors the gates in survival_marginal_slope.rs / bernoulli_
+         // marginal_slope.rs / latent_survival.rs etc. for the custom-
+         // family path; this gate covers the standard-GAM path that goes
+         // through `fit_gam` rather than `fit_custom_family`.
+         let n_obs = self.x.nrows();
+         let p_dim = self.x.ncols();
+@@ -761,81 +742,365 @@ impl<'a> RemlState<'a> {
+         c_array: &Array1<f64>,
+         c_prime: &Array1<f64>,
+     ) -> Vec<TkActiveBlock> {
+         let n = c_array.len();
+         let mut blocks = Vec::with_capacity(n.div_ceil(TK_BLOCK_SIZE));
+         for start in (0..n).step_by(TK_BLOCK_SIZE) {
+             let end = (start + TK_BLOCK_SIZE).min(n);
+             let mut entries = Vec::new();
+             for offset in 0..(end - start) {
+                 let idx = start + offset;
+                 if c_array[idx] != 0.0 || c_prime[idx] != 0.0 {
+                     entries.push((offset, 0.0));
+                 }
+             }
+             if !entries.is_empty() {
+                 blocks.push(TkActiveBlock {
+                     start,
+                     end,
+                     entries,
+                 });
+             }
+         }
+         blocks
+     }
+ 
++    fn tk_penalty_dense(
++        cp: &crate::construction::CanonicalPenalty,
++        lambda: f64,
++        p: usize,
++    ) -> Array2<f64> {
++        let mut out = Array2::<f64>::zeros((p, p));
++        let r = &cp.col_range;
++        for a in 0..cp.block_dim() {
++            for b in 0..cp.block_dim() {
++                let mut val = 0.0;
++                for row in 0..cp.rank() {
++                    val += cp.root[[row, a]] * cp.root[[row, b]];
++                }
++                out[[r.start + a, r.start + b]] = lambda * val;
++            }
++        }
++        out
++    }
++
++    fn tk_xt_diag_x(x_dense: &Array2<f64>, diag: &Array1<f64>) -> Array2<f64> {
++        let mut weighted = Array2::<f64>::zeros(x_dense.raw_dim());
++        Self::xt_diag_x_dense_into(x_dense, diag, &mut weighted)
++    }
++
++    fn tk_hessian_rho_canonical_logit(
++        x_dense: &Array2<f64>,
++        c_array: &Array1<f64>,
++        d_array: &Array1<f64>,
++        e_array: &Array1<f64>,
++        f_array: &Array1<f64>,
++        tk_penalties: &[crate::construction::CanonicalPenalty],
++        lambdas: &[f64],
++        beta: &Array1<f64>,
++        firth_op: Option<&super::FirthDenseOperator>,
++        h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
++    ) -> Result<Array2<f64>, EstimationError> {
++        let n = x_dense.nrows();
++        let p = x_dense.ncols();
++        let k = tk_penalties.len();
++        if k == 0 {
++            return Ok(Array2::zeros((0, 0)));
++        }
++        if c_array.len() != n || d_array.len() != n || e_array.len() != n || f_array.len() != n {
++            return Err(EstimationError::InvalidInput(
++                "Tierney-Kadane Hessian derivative arrays have inconsistent lengths".to_string(),
++            ));
++        }
++
++        let mut k_mat = Array2::<f64>::zeros((p, p));
++        for col in 0..p {
++            let mut rhs = Array1::<f64>::zeros(p);
++            rhs[col] = 1.0;
++            let sol = h_inv_solve(&rhs)?;
++            k_mat.column_mut(col).assign(&sol);
++        }
++        enforce_symmetry(&mut k_mat);
++
++        let mut a_mats = Vec::with_capacity(k);
++        let mut v = Vec::with_capacity(k);
++        let mut eta_i = Vec::with_capacity(k);
++        for idx in 0..k {
++            let a = Self::tk_penalty_dense(&tk_penalties[idx], lambdas[idx], p);
++            let rhs = a.dot(beta);
++            let vi = h_inv_solve(&rhs)?;
++            let bi = vi.mapv(|value| -value);
++            let ei = x_dense.dot(&bi);
++            a_mats.push(a);
++            v.push(vi);
++            eta_i.push(ei);
++        }
++
++        let mut h_i = Vec::with_capacity(k);
++        for idx in 0..k {
++            let diag = c_array * &eta_i[idx];
++            let mut h = &a_mats[idx] + &Self::tk_xt_diag_x(x_dense, &diag);
++            if let Some(op) = firth_op {
++                let dir = op.direction_from_deta(eta_i[idx].clone());
++                h -= &op.hphi_direction(&dir);
++            }
++            enforce_symmetry(&mut h);
++            h_i.push(h);
++        }
++
++        let mut beta_ij: Vec<Vec<Array1<f64>>> = (0..k)
++            .map(|_| (0..k).map(|_| Array1::<f64>::zeros(p)).collect())
++            .collect();
++        let mut h_ij: Vec<Vec<Array2<f64>>> = (0..k)
++            .map(|_| (0..k).map(|_| Array2::<f64>::zeros((p, p))).collect())
++            .collect();
++        for i in 0..k {
++            for j in 0..=i {
++                let mut rhs = h_i[j].dot(&v[i]);
++                rhs += &a_mats[i].dot(&v[j]);
++                if i == j {
++                    rhs -= &a_mats[i].dot(beta);
++                }
++                let bij = h_inv_solve(&rhs)?;
++                beta_ij[i][j] = bij.clone();
++                beta_ij[j][i] = bij;
++            }
++        }
++        for i in 0..k {
++            for j in 0..=i {
++                let eta_ij = x_dense.dot(&beta_ij[i][j]);
++                let diag = c_array * &eta_ij + &(d_array * &(&eta_i[i] * &eta_i[j]));
++                let mut h = Self::tk_xt_diag_x(x_dense, &diag);
++                if i == j {
++                    h += &a_mats[i];
++                }
++                if let Some(op) = firth_op {
++                    let dir_ij = op.direction_from_deta(eta_ij);
++                    h -= &op.hphi_direction(&dir_ij);
++                    let dir_i = op.direction_from_deta(eta_i[i].clone());
++                    let dir_j = op.direction_from_deta(eta_i[j].clone());
++                    let eye = Array2::<f64>::eye(p);
++                    h -= &op.hphisecond_direction_apply(&dir_i, &dir_j, &eye);
++                }
++                enforce_symmetry(&mut h);
++                h_ij[i][j] = h.clone();
++                h_ij[j][i] = h;
++            }
++        }
++
++        let mut k_i = Vec::with_capacity(k);
++        for i in 0..k {
++            k_i.push(-k_mat.dot(&h_i[i]).dot(&k_mat));
++        }
++        let mut k_ij: Vec<Vec<Array2<f64>>> = (0..k)
++            .map(|_| (0..k).map(|_| Array2::<f64>::zeros((p, p))).collect())
++            .collect();
++        for i in 0..k {
++            for j in 0..=i {
++                let kij = k_mat.dot(&h_i[j]).dot(&k_mat).dot(&h_i[i]).dot(&k_mat)
++                    + k_mat.dot(&h_i[i]).dot(&k_mat).dot(&h_i[j]).dot(&k_mat)
++                    - k_mat.dot(&h_ij[i][j]).dot(&k_mat);
++                k_ij[i][j] = kij.clone();
++                k_ij[j][i] = kij;
++            }
++        }
++
++        #[derive(Clone)]
++        struct Jet {
++            v: f64,
++            g: Array1<f64>,
++            h: Array2<f64>,
++        }
++        impl Jet {
++            fn constant(v: f64, k: usize) -> Self {
++                Self {
++                    v,
++                    g: Array1::zeros(k),
++                    h: Array2::zeros((k, k)),
++                }
++            }
++            fn add(&self, other: &Self) -> Self {
++                Self {
++                    v: self.v + other.v,
++                    g: &self.g + &other.g,
++                    h: &self.h + &other.h,
++                }
++            }
++            fn scale(&self, a: f64) -> Self {
++                Self {
++                    v: self.v * a,
++                    g: self.g.mapv(|x| x * a),
++                    h: self.h.mapv(|x| x * a),
++                }
++            }
++            fn mul(&self, other: &Self) -> Self {
++                let k = self.g.len();
++                let mut h = &self.h * other.v + &other.h * self.v;
++                for i in 0..k {
++                    for j in 0..k {
++                        h[[i, j]] += self.g[i] * other.g[j] + other.g[i] * self.g[j];
++                    }
++                }
++                Self {
++                    v: self.v * other.v,
++                    g: &self.g * other.v + &other.g * self.v,
++                    h,
++                }
++            }
++            fn square(&self) -> Self {
++                self.mul(self)
++            }
++            fn cube(&self) -> Self {
++                self.mul(self).mul(self)
++            }
++        }
++
++        let mut hdiag = Vec::with_capacity(n);
++        for row in 0..n {
++            let x = x_dense.row(row);
++            let mut jet = Jet::constant(x.dot(&k_mat.dot(&x.to_owned())), k);
++            for a in 0..k {
++                jet.g[a] = x.dot(&k_i[a].dot(&x.to_owned()));
++            }
++            for a in 0..k {
++                for b in 0..k {
++                    jet.h[[a, b]] = x.dot(&k_ij[a][b].dot(&x.to_owned()));
++                }
++            }
++            hdiag.push(jet);
++        }
++        let mut cjet = Vec::with_capacity(n);
++        let mut djet = Vec::with_capacity(n);
++        for row in 0..n {
++            let mut eta = Jet::constant(0.0, k);
++            for a in 0..k {
++                eta.g[a] = eta_i[a][row];
++                for b in 0..k {
++                    eta.h[[a, b]] = x_dense.row(row).dot(&beta_ij[a][b]);
++                }
++            }
++            let mut c = Jet::constant(c_array[row], k);
++            let mut d = Jet::constant(d_array[row], k);
++            for a in 0..k {
++                c.g[a] = d_array[row] * eta.g[a];
++                d.g[a] = e_array[row] * eta.g[a];
++                for b in 0..k {
++                    c.h[[a, b]] = d_array[row] * eta.h[[a, b]] + e_array[row] * eta.g[a] * eta.g[b];
++                    d.h[[a, b]] = e_array[row] * eta.h[[a, b]] + f_array[row] * eta.g[a] * eta.g[b];
++                }
++            }
++            cjet.push(c);
++            djet.push(d);
++        }
++
++        let mut total = Jet::constant(0.0, k);
++        for row in 0..n {
++            total = total.add(&djet[row].mul(&hdiag[row].square()).scale(-0.125));
++        }
++        for irow in 0..n {
++            let xi = x_dense.row(irow).to_owned();
++            for jrow in 0..n {
++                let xj = x_dense.row(jrow).to_owned();
++                let mut kg = Jet::constant(xi.dot(&k_mat.dot(&xj)), k);
++                for a in 0..k {
++                    kg.g[a] = xi.dot(&k_i[a].dot(&xj));
++                }
++                for a in 0..k {
++                    for b in 0..k {
++                        kg.h[[a, b]] = xi.dot(&k_ij[a][b].dot(&xj));
++                    }
++                }
++                let term = cjet[irow]
++                    .mul(&cjet[jrow])
++                    .mul(&kg.cube())
++                    .scale(1.0 / 12.0);
++                total = total.add(&term);
++            }
++        }
++        let mut qjets: Vec<Jet> = (0..p).map(|_| Jet::constant(0.0, k)).collect();
++        for row in 0..n {
++            let wh = cjet[row].mul(&hdiag[row]);
++            for col in 0..p {
++                qjets[col] = qjets[col].add(&wh.scale(x_dense[[row, col]]));
++            }
++        }
++        for a in 0..p {
++            for b in 0..p {
++                let mut kj = Jet::constant(k_mat[[a, b]], k);
++                for i in 0..k {
++                    kj.g[i] = k_i[i][[a, b]];
++                }
++                for i in 0..k {
++                    for j in 0..k {
++                        kj.h[[i, j]] = k_ij[i][j][[a, b]];
++                    }
++                }
++                total = total.add(&qjets[a].mul(&kj).mul(&qjets[b]).scale(0.125));
++            }
++        }
++        if total.h.iter().any(|v| !v.is_finite()) {
++            return Err(EstimationError::InvalidInput(
++                "Tierney-Kadane analytic Hessian produced a non-finite entry".to_string(),
++            ));
++        }
++        Ok(total.h)
++    }
++
+     fn tierney_kadane_analytic_core(
+         &self,
+         x_dense: &Array2<f64>,
+         z: &Array2<f64>,
+         c_array: &Array1<f64>,
+         d_array: &Array1<f64>,
+         e_array: &Array1<f64>,
++        f_array: &Array1<f64>,
+         tk_penalties: &[crate::construction::CanonicalPenalty],
+         lambdas: &[f64],
+         ext_coords: &[super::unified::HyperCoord],
+         beta: &Array1<f64>,
+         firth_op: Option<&super::FirthDenseOperator>,
+         compute_gradient: bool,
++        compute_hessian: bool,
+         h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
+     ) -> Result<TkCorrectionTerms, EstimationError> {
+         let p = x_dense.ncols();
+         let k = tk_penalties.len();
+ 
+         let shared = Self::tk_shared_intermediates(
+             x_dense,
+             z,
+             c_array,
+             "Tierney-Kadane correction",
+             h_inv_solve,
+         )?;
+         let mut gram = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
+         let value = Self::tk_scalar_from_shared(x_dense, z, d_array, &shared, &mut gram)?;
+         if !compute_gradient {
+             return Ok(TkCorrectionTerms {
+                 value,
+                 gradient: None,
++                hessian: None,
+             });
+         }
+ 
+         let mut x_vks: Vec<Array1<f64>> = Vec::with_capacity(k + ext_coords.len());
+         let mut beta_dirs: Vec<Array1<f64>> = Vec::with_capacity(k + ext_coords.len());
+         for idx in 0..k {
+             let cp = &tk_penalties[idx];
+             let r = &cp.col_range;
+             let beta_block = beta.slice(s![r.start..r.end]);
+             let r_beta = cp.root.dot(&beta_block);
+             let mut s_k_beta = Array1::<f64>::zeros(p);
+             for a in 0..cp.block_dim() {
+                 s_k_beta[r.start + a] = (0..cp.rank())
+                     .map(|row| cp.root[[row, a]] * r_beta[row])
+                     .sum::<f64>();
+             }
+             let a_k_beta = &s_k_beta * lambdas[idx];
+             let v_k = h_inv_solve(&a_k_beta)?;
+             x_vks.push(x_dense.dot(&v_k));
+             beta_dirs.push(v_k.mapv(|value| -value));
+         }
+         let mut ext_drifts = Vec::with_capacity(ext_coords.len());
+         let mut ext_eta_fixed = Vec::with_capacity(ext_coords.len());
+         let mut ext_x_fixed = Vec::with_capacity(ext_coords.len());
+         for coord in ext_coords {
+@@ -859,158 +1124,182 @@ impl<'a> RemlState<'a> {
+             let beta_theta = h_inv_solve(&coord.g)?;
+             x_vks.push(x_dense.dot(&beta_theta));
+             beta_dirs.push(beta_theta.mapv(|value| -value));
+             ext_drifts.push(drift);
+             ext_eta_fixed.push(coord.tk_eta_fixed.clone());
+             ext_x_fixed.push(coord.tk_x_fixed.clone());
+         }
+ 
+         let gradient = Self::tk_gradient_from_shared(
+             x_dense,
+             z,
+             c_array,
+             d_array,
+             e_array,
+             tk_penalties,
+             lambdas,
+             &ext_drifts,
+             &ext_eta_fixed,
+             &ext_x_fixed,
+             &x_vks,
+             &beta_dirs,
+             firth_op,
+             &shared,
+             &mut gram,
+         )?;
++        let hessian = if compute_hessian {
++            Some(Self::tk_hessian_rho_canonical_logit(
++                x_dense,
++                c_array,
++                d_array,
++                e_array,
++                f_array,
++                tk_penalties,
++                lambdas,
++                beta,
++                firth_op,
++                h_inv_solve,
++            )?)
++        } else {
++            None
++        };
+         Ok(TkCorrectionTerms {
+             value,
+             gradient: Some(gradient),
++            hessian,
+         })
+     }
+ 
+     fn tierney_kadane_terms(
+         &self,
+         rho: &Array1<f64>,
+         bundle: &EvalShared,
+         mode: super::unified::EvalMode,
+         ext_coords: &[super::unified::HyperCoord],
+     ) -> Result<TkCorrectionTerms, EstimationError> {
+         if self.config.link_function() == LinkFunction::Identity {
+             return Ok(TkCorrectionTerms {
+                 value: 0.0,
+                 gradient: None,
++                hessian: None,
+             });
+         }
+         if !self.config.firth_bias_reduction {
+             return Ok(TkCorrectionTerms {
+                 value: 0.0,
+                 gradient: None,
++                hessian: None,
+             });
+         }
+ 
+         let pirls_result = bundle.pirls_result.as_ref();
+-        let (c_array, d_array, e_array) = self.hessian_cde_arrays(pirls_result)?;
++        let (c_array, d_array, e_array, f_array) = self.hessian_cdef_arrays(pirls_result)?;
+         if let Some(idx) = c_array.iter().position(|v| !v.is_finite()) {
+             return Err(EstimationError::InvalidInput(format!(
+                 "Tierney-Kadane correction received non-finite c derivative at row {idx}: {}",
+                 c_array[idx]
+             )));
+         }
+         if let Some(idx) = d_array.iter().position(|v| !v.is_finite()) {
+             return Err(EstimationError::InvalidInput(format!(
+                 "Tierney-Kadane correction received non-finite d derivative at row {idx}: {}",
+                 d_array[idx]
+             )));
+         }
+         let compute_gradient = compute_gradient_for_tk(mode);
+-        if mode == super::unified::EvalMode::ValueGradientHessian {
+-            return Err(EstimationError::InvalidInput(
+-                "Tierney-Kadane outer Hessian requires analytic second derivatives".to_string(),
+-            ));
+-        }
+         if c_array.is_empty() || d_array.is_empty() {
+             return Ok(TkCorrectionTerms {
+                 value: 0.0,
+                 gradient: if compute_gradient {
+                     Some(Array1::zeros(rho.len() + ext_coords.len()))
+                 } else {
+                     None
+                 },
++                hessian: if mode == super::unified::EvalMode::ValueGradientHessian {
++                    Some(Array2::zeros((
++                        rho.len() + ext_coords.len(),
++                        rho.len() + ext_coords.len(),
++                    )))
++                } else {
++                    None
++                },
+             });
+         }
+ 
+         let n_x = self.x().nrows();
+         let p_x = self.x().ncols();
+         let dense_work = n_x.saturating_mul(p_x);
+         if n_x > TK_MAX_OBSERVATIONS || p_x > TK_MAX_COEFFICIENTS || dense_work > TK_MAX_DENSE_WORK
+         {
+             return Err(EstimationError::InvalidInput(format!(
+                 "Tierney-Kadane correction requires dense small-model calculus; refusing to silently disable it for n={n_x}, p={p_x}, n*p={dense_work}"
+             )));
+         }
+ 
+         if let Some(sparse) = bundle.sparse_exact.as_ref() {
+             let x_dense = self
+                 .x()
+                 .try_to_dense_arc("frozen-curvature TK correction requires dense design access")
+                 .map_err(EstimationError::InvalidInput)?;
+             let xt = x_dense.t().to_owned();
+             let z_mat =
+                 crate::linalg::sparse_exact::solve_sparse_spdmulti(sparse.factor.as_ref(), &xt)?;
+             let factor_ref = sparse.factor.clone();
+             let h_inv_solve = |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
+                 crate::linalg::sparse_exact::solve_sparse_spd(&factor_ref, rhs)
+             };
+             let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
+             let beta = self.sparse_exact_beta_original(pirls_result);
+             let firth_op = if self.config.firth_bias_reduction
+                 && matches!(self.config.link_function(), LinkFunction::Logit)
+             {
+                 if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
+                     Some(cached.clone())
+                 } else {
+                     Some(std::sync::Arc::new(Self::build_firth_dense_operator(
+                         x_dense.as_ref(),
+                         &pirls_result.final_eta,
+                         self.weights,
+                     )?))
+                 }
+             } else {
+                 None
+             };
+             return self.tierney_kadane_analytic_core(
+                 x_dense.as_ref(),
+                 &z_mat,
+                 &c_array,
+                 &d_array,
+                 &e_array,
++                &f_array,
+                 &self.canonical_penalties,
+                 &lambdas,
+                 ext_coords,
+                 &beta,
+                 firth_op.as_deref(),
+                 compute_gradient,
++                mode == super::unified::EvalMode::ValueGradientHessian,
+                 &h_inv_solve,
+             );
+         }
+ 
+         let free_basis_opt = self.active_constraint_free_basis(pirls_result);
+         let use_original_basis = matches!(
+             pirls_result.coordinate_frame,
+             pirls::PirlsCoordinateFrame::TransformedQs
+         ) && free_basis_opt.is_none();
+         // `firth_bias_reduction == true` here: the early return above bails
+         // out otherwise, so h_total is the only TK-relevant operator.
+         let h_tk_source = bundle.h_total.as_ref();
+         let h_tk_eval = if use_original_basis {
+             self.bundle_matrix_in_original_basis(pirls_result, h_tk_source)
+         } else if let Some(z) = free_basis_opt.as_ref() {
+             Self::projectwith_basis(h_tk_source, z)
+         } else {
+             h_tk_source.clone()
+         };
+         let x_eff_dense = if use_original_basis {
+             self.x()
+                 .try_to_dense_arc("Tierney-Kadane correction requires dense original design access")
+                 .map_err(EstimationError::InvalidInput)?
+                 .as_ref()
+                 .clone()
+@@ -1105,87 +1394,95 @@ impl<'a> RemlState<'a> {
+             self.sparse_exact_beta_original(pirls_result)
+         } else if let Some(z) = free_basis_opt.as_ref() {
+             z.t()
+                 .dot(&pirls_result.beta_transformed.as_ref().to_owned())
+         } else {
+             pirls_result.beta_transformed.as_ref().clone()
+         };
+         let firth_op = if self.config.firth_bias_reduction
+             && matches!(self.config.link_function(), LinkFunction::Logit)
+         {
+             Some(std::sync::Arc::new(Self::build_firth_dense_operator(
+                 &x_eff_dense,
+                 &pirls_result.final_eta,
+                 self.weights,
+             )?))
+         } else {
+             None
+         };
+ 
+         self.tierney_kadane_analytic_core(
+             &x_eff_dense,
+             &z_mat,
+             &c_array,
+             &d_array,
+             &e_array,
++            &f_array,
+             &tk_penalties,
+             &lambdas,
+             ext_coords,
+             &beta,
+             firth_op.as_deref(),
+             compute_gradient,
++            mode == super::unified::EvalMode::ValueGradientHessian,
+             &h_inv_solve,
+         )
+     }
+ 
+     fn validate_tk_ext_coords(
+         &self,
+         mode: super::unified::EvalMode,
+         ext_coords: &[super::unified::HyperCoord],
+     ) -> Result<(), EstimationError> {
+         if self.config.link_function() == LinkFunction::Identity
+             || !self.config.firth_bias_reduction
+             || !compute_gradient_for_tk(mode)
+         {
+             return Ok(());
+         }
+         for (idx, coord) in ext_coords.iter().enumerate() {
+             if coord.tk_eta_fixed.is_none() || coord.tk_x_fixed.is_none() {
+                 return Err(EstimationError::InvalidInput(format!(
+                     "Tierney-Kadane external gradient coordinate {idx} is missing analytic fixed-beta design/eta derivative carriers"
+                 )));
+             }
+         }
+         Ok(())
+     }
+ 
+     fn apply_tk_to_result(
+         &self,
+         mut result: super::unified::RemlLamlResult,
+         tk_terms: TkCorrectionTerms,
+     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+         result.cost += tk_terms.value;
++        if let Some(tk_hess) = tk_terms.hessian.as_ref() {
++            result
++                .hessian
++                .add_rho_block_dense(tk_hess)
++                .map_err(EstimationError::InvalidInput)?;
++        }
+         if let (Some(ref mut grad), Some(tk_grad)) = (result.gradient.as_mut(), tk_terms.gradient) {
+             if tk_grad.len() == grad.len() {
+                 **grad += &tk_grad;
+             } else {
+                 // The unified evaluator returns one gradient entry per
+                 // (ρ, ext_coord) coordinate; the analytic Tierney–Kadane
+                 // propagation in `tk_gradient_from_shared` produces exactly
+                 // the same per-coordinate layout (`tk_penalties.len() +
+                 // ext_drifts.len()`).  An arity mismatch means the two
+                 // sides were assembled against different coordinate sets,
+                 // which would yield a structurally inconsistent total
+                 // gradient and is therefore rejected outright instead of
+                 // silently zero-padding or truncating.
+                 return Err(EstimationError::InvalidInput(format!(
+                     "Tierney-Kadane gradient coordinate count mismatch: evaluator produced {} entries, analytic c/d propagation produced {}; this indicates the TK term and the unified evaluator were assembled against different coordinate sets",
+                     grad.len(),
+                     tk_grad.len()
+                 )));
+             }
+         }
+         Ok(result)
+     }
+ 
+     pub(super) fn should_compute_hot_diagnostics(&self, eval_idx: u64) -> bool {
+         // Keep expensive diagnostics out of the hot path unless they can
+@@ -1449,50 +1746,81 @@ impl<'a> RemlState<'a> {
+                 if !h1.is_finite()
+                     || !h2.is_finite()
+                     || !h3.is_finite()
+                     || !h4.is_finite()
+                     || !h5.is_finite()
+                 {
+                     *e_o = 0.0;
+                     return Ok(());
+                 }
+                 let mu_i = mu[i];
+                 let vj = pirls::variance_jet_for_weight_family(weight_family, mu_i);
+                 if !(vj.v.is_finite() && vj.v > 0.0) {
+                     *e_o = 0.0;
+                     return Ok(());
+                 }
+                 let pw = weights[i].max(0.0);
+                 let y_i = y_view[i];
+                 let e_i = pirls::e_obs_from_jets(y_i, mu_i, h1, h2, h3, h4, h5, vj, phi, pw);
+                 *e_o = if e_i.is_finite() { e_i } else { 0.0 };
+                 Ok(())
+             })?;
+ 
+         Ok((c_array, d_array, e_array))
+     }
+ 
++    fn hessian_cdef_arrays(
++        &self,
++        pirls_result: &PirlsResult,
++    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
++        let (c_array, d_array, e_array) = self.hessian_cde_arrays(pirls_result)?;
++        let link_function = self.config.link_function();
++        let canonical_logit = matches!(link_function, LinkFunction::Logit)
++            && self.runtime_mixture_link_state.is_none();
++        if !canonical_logit {
++            return Err(EstimationError::InvalidInput(
++                "Tierney-Kadane outer Hessian is implemented for canonical Binomial Logit Firth fits only".to_string(),
++            ));
++        }
++        let mut f_array = Array1::<f64>::zeros(e_array.len());
++        use rayon::prelude::*;
++        let final_eta = &pirls_result.final_eta;
++        let weights = &self.weights;
++        let f_s = f_array.as_slice_mut().expect("f_array must be contiguous");
++        f_s.par_iter_mut().enumerate().for_each(|(i, f_o)| {
++            let eta_raw = final_eta[i];
++            let eta_used = eta_raw.clamp(-700.0_f64, 700.0_f64);
++            if eta_raw != eta_used {
++                *f_o = 0.0;
++            } else {
++                let jet = crate::mixture_link::logit_inverse_link_jet5(eta_used);
++                *f_o = weights[i].max(0.0) * jet.d5;
++            }
++        });
++        Ok((c_array, d_array, e_array, f_array))
++    }
++
+     /// Compute soft prior cost without needing workspace
+     pub(super) fn compute_soft_priorcost(&self, rho: &Array1<f64>) -> f64 {
+         let len = rho.len();
+         if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
+             return 0.0;
+         }
+ 
+         let inv_bound = 1.0 / RHO_BOUND;
+         let sharp = RHO_SOFT_PRIOR_SHARPNESS;
+         let mut cost = 0.0;
+         for &ri in rho.iter() {
+             let scaled = sharp * ri * inv_bound;
+             cost += scaled.cosh().ln();
+         }
+ 
+         cost * RHO_SOFT_PRIOR_WEIGHT
+     }
+ 
+     /// Compute soft prior gradient without workspace mutation.
+     pub(super) fn compute_soft_priorgrad(&self, rho: &Array1<f64>) -> Array1<f64> {
+         let len = rho.len();
+         let mut grad = Array1::<f64>::zeros(len);
+         if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
+             return grad;
+         }
+
+----- PATCH END -----
+
+[2026-05-06T21:10:02.165741+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T21:10:02.198859+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:10:02.198933+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:10:17.842008+00:00] apply_result: mode=apply id=task_e_69fb93f729b48324837dd5ef2eafc83a status=Partial applied=1 skipped=0 conflicts=1 cmd=(cd /Users/user/gam && git apply --3way /var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/.tmpL6cXOy/patch.diff)
+stdout_tail=
+
+stderr_tail=
+Applied patch to 'src/families/custom_family.rs' with conflicts.
+Applied patch to 'src/families/survival_location_scale.rs' cleanly.
+U src/families/custom_family.rs
+
+patch_summary: kind=git-diff lines=791 chars=31302 cwd=/Users/user/gam ; head=
+diff --git a/src/families/custom_family.rs b/src/families/custom_family.rs
+index e901472ee99b0e33b9e194ac2d36bef076665274..7773f5f223eeb69ca16b6f4a2a9682a70fa45b1f 100644
+--- a/src/families/custom_family.rs
++++ b/src/families/custom_family.rs
+@@ -5740,50 +5740,57 @@ fn exact_joint_hessian_dense_bytes(total: usize) -> Result<usize, String> {
+     total
+         .checked_mul(total)
+         .and_then(|n| n.checked_mul(std::mem::size_of::<f64>()))
+         .ok_or_else(|| format!("joint Hessian dense byte count overflow for dim={total}"))
+ }
+ 
+ fn ensure_exact_joint_hessian_dense_budget(total: usize, context: &str) -> Result<(), String> {
+     let bytes = exact_joint_hessian_dense_bytes(total)?;
+     if bytes > EXACT_JOINT_HESSIAN_DENSE_MAX_BYTES {
+         return Err(format!(
+             "{c…
+----- PATCH BEGIN -----
+diff --git a/src/families/custom_family.rs b/src/families/custom_family.rs
+index e901472ee99b0e33b9e194ac2d36bef076665274..7773f5f223eeb69ca16b6f4a2a9682a70fa45b1f 100644
+--- a/src/families/custom_family.rs
++++ b/src/families/custom_family.rs
+@@ -5740,50 +5740,57 @@ fn exact_joint_hessian_dense_bytes(total: usize) -> Result<usize, String> {
+     total
+         .checked_mul(total)
+         .and_then(|n| n.checked_mul(std::mem::size_of::<f64>()))
+         .ok_or_else(|| format!("joint Hessian dense byte count overflow for dim={total}"))
+ }
+ 
+ fn ensure_exact_joint_hessian_dense_budget(total: usize, context: &str) -> Result<(), String> {
+     let bytes = exact_joint_hessian_dense_bytes(total)?;
+     if bytes > EXACT_JOINT_HESSIAN_DENSE_MAX_BYTES {
+         return Err(format!(
+             "{context}: exact dense joint Hessian requires {:.2} GiB for dim={total}, \
+              exceeding the {:.2} GiB cap; refusing approximate determinant algebra",
+             bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+             EXACT_JOINT_HESSIAN_DENSE_MAX_BYTES as f64 / (1024.0 * 1024.0 * 1024.0),
+         ));
+     }
+     Ok(())
+ }
+ 
+ struct JointHessianBundle<'a> {
+     source: JointHessianSource,
+     beta_flat: Array1<f64>,
+     compute_dh: Box<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + 'a>,
+     compute_d2h:
+         Box<dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String> + 'a>,
++    owned_compute_dh:
++        Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
++    owned_compute_d2h: Arc<
++        dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>
++            + Send
++            + Sync,
++    >,
+     rho_curvature_scale: f64,
+     hessian_logdet_correction: f64,
+ }
+ 
+ fn materialize_joint_hessian_source(
+     source: &JointHessianSource,
+     total: usize,
+     context: &str,
+ ) -> Result<Array2<f64>, String> {
+     match source {
+         JointHessianSource::Dense(matrix) => Ok(matrix.clone()),
+         JointHessianSource::Operator { apply, .. } => {
+             ensure_exact_joint_hessian_dense_budget(total, context)?;
+             let mut matrix = Array2::<f64>::zeros((total, total));
+             let mut basis = Array1::<f64>::zeros(total);
+             for col in 0..total {
+                 basis[col] = 1.0;
+                 let applied = apply(&basis)?;
+                 basis[col] = 0.0;
+                 if applied.len() != total {
+                     return Err(format!(
+                         "{context}: operator matvec length mismatch: got {}, expected {}",
+                         applied.len(),
+                         total
+                     ));
+@@ -5923,112 +5930,152 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
+         specs,
+         options,
+     )?;
+     if let Some(curvature) = family.exact_newton_outer_curvature(block_states)? {
+         let h_joint_unpen = JointHessianSource::Dense(symmetrized_square_matrix(
+             curvature.hessian,
+             total,
+             "joint exact-newton Hessian shape mismatch in outer gradient (rescaled)",
+         )?);
+         let compute_dh = Box::new(exact_newton_dh_closure(
+             family,
+             Arc::clone(&synced),
+             specs,
+             total,
+             true,
+             1.0,
+             hessian_workspace.clone(),
+         ));
+         let compute_d2h = Box::new(exact_newton_d2h_closure(
+             family,
+             Arc::clone(&synced),
+             specs,
+             total,
+             true,
+             1.0,
+-            hessian_workspace,
++            hessian_workspace.clone(),
+         ));
++        let owned_compute_dh = exact_newton_dh_closure_owned(
++            family.clone(),
++            Arc::clone(&synced),
++            specs.to_vec(),
++            total,
++            true,
++            1.0,
++            hessian_workspace.clone(),
++        );
++        let owned_compute_d2h = exact_newton_d2h_closure_owned(
++            family.clone(),
++            Arc::clone(&synced),
++            specs.to_vec(),
++            total,
++            true,
++            1.0,
++            hessian_workspace,
++        );
+         return Ok(Some(JointHessianBundle {
+             source: h_joint_unpen,
+             beta_flat,
+             compute_dh,
+             compute_d2h,
++            owned_compute_dh,
++            owned_compute_d2h,
+             rho_curvature_scale: curvature.rho_curvature_scale,
+             hessian_logdet_correction: curvature.hessian_logdet_correction,
+         }));
+     }
+     let exact_joint_source =
+         if use_joint_matrix_free_path(total, joint_observation_count(block_states)) {
+             hessian_workspace
+                 .as_ref()
+                 .map(|workspace| {
+                     exact_newton_joint_hessian_source_from_workspace(
+                         workspace,
+                         total,
+                         "joint exact-newton operator mismatch in outer gradient",
+                     )
+                 })
+                 .transpose()?
+                 .flatten()
+         } else {
+             None
+         };
+     let exact_joint_source = match exact_joint_source {
+         Some(source) => Some(source),
+         None => exact_newton_joint_hessian_symmetrized(
+             family,
+             block_states,
+             specs,
+             total,
+             "joint exact-newton Hessian shape mismatch in outer gradient",
+         )
+         .map(|source| source.map(JointHessianSource::Dense))?,
+     };
+     if let Some(h_joint_unpen) = exact_joint_source {
+         let compute_dh = Box::new(exact_newton_dh_closure(
+             family,
+             Arc::clone(&synced),
+             specs,
+             total,
+             false,
+             1.0,
+             hessian_workspace.clone(),
+         ));
+         let compute_d2h = Box::new(exact_newton_d2h_closure(
+             family,
+             Arc::clone(&synced),
+             specs,
+             total,
+             false,
+             1.0,
+-            hessian_workspace,
++            hessian_workspace.clone(),
+         ));
++        let owned_compute_dh = exact_newton_dh_closure_owned(
++            family.clone(),
++            Arc::clone(&synced),
++            specs.to_vec(),
++            total,
++            false,
++            1.0,
++            hessian_workspace.clone(),
++        );
++        let owned_compute_d2h = exact_newton_d2h_closure_owned(
++            family.clone(),
++            Arc::clone(&synced),
++            specs.to_vec(),
++            total,
++            false,
++            1.0,
++            hessian_workspace,
++        );
+         return Ok(Some(JointHessianBundle {
+             source: h_joint_unpen,
+             beta_flat,
+             compute_dh,
+             compute_d2h,
++            owned_compute_dh,
++            owned_compute_d2h,
+             rho_curvature_scale: 1.0,
+             hessian_logdet_correction: 0.0,
+         }));
+     }
+ 
+     // Path 2: surrogate joint Hessian (fallback).
+     if let Some(h_joint_unpen) = family
+         .joint_outer_hyper_surrogate_hessian_with_specs(block_states, specs)?
+         .map(|h| {
+             symmetrized_square_matrix(
+                 h,
+                 total,
+                 "joint outer-hyper surrogate Hessian shape mismatch",
+             )
+         })
+         .transpose()?
+     {
+         let beta_flat = flatten_state_betas(block_states, specs);
+ 
+         let compute_dh =
+             Box::new(
+                 move |v_k: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
+                     let h_rho = family
+                         .joint_outer_hyper_surrogate_hessian_directional_derivative_with_specs(
+                             block_states,
+@@ -6042,55 +6089,100 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
+                             "joint surrogate dH shape mismatch",
+                         )?))),
+                         None => Err("joint surrogate dH unavailable for analytic outer gradient"
+                             .to_string()),
+                     }
+                 },
+             );
+         let compute_d2h = Box::new(
+             move |u: &Array1<f64>, v: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
+                 match family
+                     .joint_outer_hyper_surrogate_hessian_second_directional_derivative_with_specs(
+                         block_states,
+                         specs,
+                         u,
+                         v,
+                     )? {
+                     Some(m) => Ok(Some(DriftDerivResult::Dense(symmetrized_square_matrix(
+                         m,
+                         total,
+                         "joint surrogate d2H shape mismatch",
+                     )?))),
+                     None => Ok(None),
+                 }
+             },
+         );
++        let family_owned = family.clone();
++        let states_owned = block_states.to_vec();
++        let specs_owned = specs.to_vec();
++        let owned_compute_dh =
++            Arc::new(
++                move |v_k: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
++                    match family_owned
++                        .joint_outer_hyper_surrogate_hessian_directional_derivative_with_specs(
++                            &states_owned,
++                            &specs_owned,
++                            v_k,
++                        )? {
++                        Some(h) => Ok(Some(DriftDerivResult::Dense(symmetrized_square_matrix(
++                            h,
++                            total,
++                            "joint surrogate dH shape mismatch",
++                        )?))),
++                        None => Err("joint surrogate dH unavailable for analytic outer gradient"
++                            .to_string()),
++                    }
++                },
++            );
++        let family_owned = family.clone();
++        let states_owned = block_states.to_vec();
++        let specs_owned = specs.to_vec();
++        let owned_compute_d2h = Arc::new(
++            move |u: &Array1<f64>, v: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
++                match family_owned
++                    .joint_outer_hyper_surrogate_hessian_second_directional_derivative_with_specs(
++                        &states_owned,
++                        &specs_owned,
++                        u,
++                        v,
++                    )? {
++                    Some(m) => Ok(Some(DriftDerivResult::Dense(symmetrized_square_matrix(
++                        m,
++                        total,
++                        "joint surrogate d2H shape mismatch",
++                    )?))),
++                    None => Ok(None),
++                }
++            },
++        );
+         return Ok(Some(JointHessianBundle {
+             source: JointHessianSource::Dense(h_joint_unpen),
+             beta_flat,
+             compute_dh,
+             compute_d2h,
++            owned_compute_dh,
++            owned_compute_d2h,
+             rho_curvature_scale: 1.0,
+             hessian_logdet_correction: 0.0,
+         }));
+     }
+ 
+     Ok(None)
+ }
+ 
+ /// Build a closure computing dH[v] using exact Newton derivatives on synced states.
+ /// Non-finite derivative output is treated as a hard error.
+ fn exact_newton_dh_closure<'a, F: CustomFamily>(
+     family: &'a F,
+     synced_states: Arc<Vec<ParameterBlockState>>,
+     specs: &'a [ParameterBlockSpec],
+     total: usize,
+     use_outer_curvature_derivatives: bool,
+     scale: f64,
+     workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+ ) -> impl Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + 'a {
+     move |v_k: &Array1<f64>| {
+         if use_outer_curvature_derivatives {
+             let h_rho = family.exact_newton_outer_curvature_directional_derivative_with_specs(
+                 synced_states.as_ref(),
+                 specs,
+                 v_k,
+@@ -9294,76 +9386,78 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
+         ridge
+     } else {
+         0.0
+     };
+     let extra_logdet_ridge = if options.ridge_policy.include_penalty_logdet
+         && !options.ridge_policy.include_quadratic_penalty
+     {
+         ridge
+     } else {
+         0.0
+     };
+ 
+     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
+     let ranges = block_param_ranges(specs);
+     let total = ranges.last().map(|(_, end)| *end).unwrap_or(0);
+ 
+     let efs_eval = {
+         if let Some(joint_bundle) =
+             build_joint_hessian_closures(family, &inner.block_states, specs, total, options)?
+         {
+             let JointHessianBundle {
+                 source: h_joint_unpen,
+                 beta_flat,
+                 compute_dh,
+                 compute_d2h,
++                owned_compute_dh,
++                owned_compute_d2h,
+                 rho_curvature_scale,
+                 hessian_logdet_correction,
+             } = joint_bundle;
+             joint_outer_evaluate_efs(
+                 &inner,
+                 specs,
+                 &per_block,
+                 rho,
+                 &beta_flat,
+                 h_joint_unpen,
+                 &ranges,
+                 total,
+                 ridge,
+                 moderidge,
+                 extra_logdet_ridge,
+                 rho_curvature_scale,
+                 hessian_logdet_correction,
+                 include_logdet_h,
+                 include_logdet_s,
+                 strict_spd,
+                 options,
+                 family.pseudo_logdet_mode(),
+                 compute_dh.as_ref(),
+                 compute_d2h.as_ref(),
+-                None,
+-                None,
++                Some(owned_compute_dh),
++                Some(owned_compute_d2h),
+                 None,
+             )
+         } else {
+             if family.requires_joint_outer_hyper_path() {
+                 return Err(
+                         "outer hyper fixed-point evaluation requires a joint exact path for this family"
+                             .to_string(),
+                     );
+             }
+             if specs.len() != 1 {
+                 return Err(
+                         "generic fixed-point outer fallback is only valid for single-block families; multi-block families must provide a joint outer path"
+                             .to_string(),
+                     );
+             }
+ 
+             let eval = family.evaluate(&inner.block_states)?;
+             let block_idx = 0;
+             let spec = &specs[block_idx];
+             let work = &eval.blockworking_sets[block_idx];
+             let p = spec.design.ncols();
+             let mut diagonal_design = None::<DesignMatrix>;
+             let h_joint_unpen = match work {
+                 BlockWorkingSet::Diagonal {
+                     working_response: _,
+@@ -10665,50 +10759,51 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
+             specs,
+             &derivative_blocks_for_batch,
+             rho_current,
+             workspace_for_batch.clone(),
+         ) {
+             // Sanity check: batched output must match (rho_dim + psi_dim).
+             let expected = rho_dim + psi_dim;
+             if batch.objective_theta.len() == expected
+                 && batch.trace_h_inv_hdot.len() == expected
+                 && batch.trace_s_pinv_sdot.len() == expected
+             {
+                 if let Some(joint_bundle_value_only) = build_joint_hessian_closures(
+                     family,
+                     &inner.block_states,
+                     specs,
+                     total,
+                     options,
+                 )? {
+                     let JointHessianBundle {
+                         source: h_joint_unpen,
+                         beta_flat,
+                         compute_dh,
+                         compute_d2h,
+                         rho_curvature_scale,
+                         hessian_logdet_correction,
++                        ..
+                     } = joint_bundle_value_only;
+                     let value_only = joint_outer_evaluate(
+                         &inner,
+                         specs,
+                         &per_block,
+                         rho_current,
+                         &beta_flat,
+                         h_joint_unpen,
+                         &ranges,
+                         total,
+                         ridge,
+                         moderidge,
+                         extra_logdet_ridge,
+                         rho_curvature_scale,
+                         hessian_logdet_correction,
+                         include_logdet_h,
+                         include_logdet_s,
+                         strict_spd,
+                         EvalMode::ValueOnly,
+                         options,
+                         family.pseudo_logdet_mode(),
+                         compute_dh.as_ref(),
+                         compute_d2h.as_ref(),
+                         None,
+                         None,
+@@ -10735,77 +10830,79 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
+                         };
+                         gradient[j] = batch.objective_theta[j] + trace_term - det_term;
+                     }
+                     return Ok(OuterObjectiveEvalResult {
+                         objective: value_only.objective,
+                         gradient,
+                         outer_hessian: crate::solver::outer_strategy::HessianResult::Unavailable,
+                         warm_start: value_only.warm_start,
+                     });
+                 }
+             }
+         }
+     }
+ 
+     // Try build_joint_hessian_closures which handles both exact Newton and
+     // surrogate Hessian sources, then call joint_outer_evaluate with no
+     // extended coordinates.
+     if let Some(joint_bundle) =
+         build_joint_hessian_closures(family, &inner.block_states, specs, total, options)?
+     {
+         let JointHessianBundle {
+             source: h_joint_unpen,
+             beta_flat,
+             compute_dh,
+             compute_d2h,
++            owned_compute_dh,
++            owned_compute_d2h,
+             rho_curvature_scale,
+             hessian_logdet_correction,
+         } = joint_bundle;
+         let eval_result = joint_outer_evaluate(
+             &inner,
+             specs,
+             &per_block,
+             rho_current,
+             &beta_flat,
+             h_joint_unpen,
+             &ranges,
+             total,
+             ridge,
+             moderidge,
+             extra_logdet_ridge,
+             rho_curvature_scale,
+             hessian_logdet_correction,
+             include_logdet_h,
+             include_logdet_s,
+             strict_spd,
+             eval_mode,
+             options,
+             family.pseudo_logdet_mode(),
+             compute_dh.as_ref(),
+             compute_d2h.as_ref(),
+-            None,
+-            None,
++            Some(owned_compute_dh),
++            Some(owned_compute_d2h),
+             None, // no ext_coords when psi_dim == 0
+         )?;
+ 
+         return Ok(eval_result);
+     }
+ 
+     // Joint Hessian unavailable via either exact Newton or surrogate.
+     // The generic fallback is only mathematically defensible for single-block
+     // families — multi-block families with coupled likelihood curvature require
+     // the joint path.
+     if family.requires_joint_outer_hyper_path() {
+         return Err(
+             "outer hyper-derivative evaluation requires a joint exact path for this family"
+                 .to_string()
+                 .into(),
+         );
+     }
+ 
+     // Generic fallback: single-block only. Extract the per-block Hessian and
+     // route through joint_outer_evaluate with the single block as the "joint"
+     // system.
+     if specs.len() != 1 {
+         return Err(
+             "generic outer fallback is only valid for single-block families; multi-block families must provide a joint outer path"
+                 .to_string()
+diff --git a/src/families/survival_location_scale.rs b/src/families/survival_location_scale.rs
+index d3ef6aa260341fce526e0c4f2023d89bea0b2867..28cfc66c70c28d9c3ea16654ee2a13a71cf9939d 100644
+--- a/src/families/survival_location_scale.rs
++++ b/src/families/survival_location_scale.rs
+@@ -7787,53 +7787,73 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
+                 self.family
+                     .exact_newton_joint_psihessian_directional_derivative_from_parts(
+                         &self.joint_quantities,
+                         dir.as_ref(),
+                         d_beta_flat,
+                     )?,
+             ),
+         ))
+     }
+ }
+ 
+ /// Observed vs expected information: The survival location-scale family uses
+ /// `BlockWorkingSet::ExactNewton` which provides the actual gradient and Hessian
+ /// (-nabla^2 log L) from the survival likelihood. This is the **observed** Hessian
+ /// by construction, which is the correct quantity for the outer REML Laplace
+ /// approximation (see response.md Section 3). No Fisher surrogate is used here.
+ impl CustomFamily for SurvivalLocationScaleFamily {
+     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+         true
+     }
+ 
+     fn coefficient_hessian_cost(&self, specs: &[crate::custom_family::ParameterBlockSpec]) -> u64 {
+         // Survival location-scale couples its blocks (threshold/time/log-σ
+         // and any link/time wiggles) through the survival likelihood: every
+         // row contributes a dense outer-product over (Σ p_b) coefficients.
++        // At biobank scale the joint outer evaluator routes the coefficient
++        // Hessian through its matrix-free HVP path; the cost remains an honest
++        // dense-assembly diagnostic, while exact outer derivative order is now
++        // driven by the explicit outer-HVP capability below rather than by a
++        // first-order downgrade gate.
+         crate::custom_family::joint_coupled_coefficient_hessian_cost(self.n as u64, specs)
+     }
+ 
++    fn outer_hyper_hessian_hvp_available(
++        &self,
++        _specs: &[crate::custom_family::ParameterBlockSpec],
++    ) -> bool {
++        true
++    }
++
++    fn outer_hyper_hessian_dense_available(
++        &self,
++        specs: &[crate::custom_family::ParameterBlockSpec],
++    ) -> bool {
++        let p_total: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
++        !crate::custom_family::use_joint_matrix_free_path(p_total, self.n)
++    }
++
+     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+         let n = self.n;
+         let dynamic = self.build_dynamic_geometry(block_states)?;
+         let mut ll = 0.0;
+ 
+         // Per-row derivative collection — used for gradient only.
+         let mut grad_time_eta_h0 = Array1::<f64>::zeros(n);
+         let mut grad_time_eta_h1 = Array1::<f64>::zeros(n);
+         let mut grad_time_eta_d = Array1::<f64>::zeros(n);
+         let mut d1_q0 = Array1::<f64>::zeros(n);
+         let mut d1_q1 = Array1::<f64>::zeros(n);
+         let mut d1_qdot = Array1::<f64>::zeros(n);
+ 
+         for i in 0..n {
+             let state = self.row_predictor_state(
+                 dynamic.h_entry[i],
+                 dynamic.h_exit[i],
+                 dynamic.hdot_exit[i],
+                 dynamic.q_entry[i],
+                 dynamic.q_exit[i],
+                 dynamic.qdot_exit[i],
+             );
+             let Some(row) = self.row_derivatives(i, state)? else {
+                 continue;
+             };
+@@ -9389,62 +9409,51 @@ impl CustomFamily for SurvivalLocationScaleFamily {
+                 ));
+             }
+             for j in 0..beta.len() {
+                 let lb = lower_bounds[j];
+                 if lb.is_finite() && beta[j] < lb {
+                     beta[j] = lb;
+                 }
+             }
+         } else if block_idx == Self::BLOCK_LINK_WIGGLE && self.x_link_wiggle.is_some() {
+             // Link-wiggle coefficients are structurally non-negative (see
+             // max_feasible_link_wiggle_step, which checks beta[j] >= 0).
+             for j in 0..beta.len() {
+                 if beta[j] < 0.0 {
+                     beta[j] = 0.0;
+                 }
+             }
+         }
+         Ok(beta)
+     }
+ }
+ 
+ fn fit_survival_location_scale(
+     spec: SurvivalLocationScaleSpec,
+ ) -> Result<UnifiedFitResult, String> {
+     let prepared = prepare_survival_location_scale_model(&spec)?;
+-    // Same biobank-scale outer-Hessian gate as the marginal-slope and
+-    // gamlss families. At biobank n the analytic outer Hessian dominates
+-    // wall-clock; route to BFGS on the analytic gradient instead.
+-    let n_obs = spec.age_entry.len();
+-    let biobank_scale = n_obs > 50_000;
+-    let mut options = survival_blockwise_fit_options(&spec);
+-    if biobank_scale && options.use_outer_hessian {
+-        options.use_outer_hessian = false;
+-        log::info!(
+-            "[survival-location-scale] declining analytic outer Hessian for n={n_obs}; routing to BFGS"
+-        );
+-    }
++    let options = survival_blockwise_fit_options(&spec);
+     let fit = fit_custom_family(&prepared.family, &prepared.blockspecs, &options)?;
+     finalize_survival_location_scale_fit(&prepared, &fit)
+ }
+ 
+ pub(crate) fn select_survival_link_wiggle_basis_from_pilot(
+     pilot: &SurvivalLocationScaleTermFitResult,
+     wiggle_cfg: &WiggleBlockConfig,
+     wiggle_penalty_orders: &[usize],
+ ) -> Result<SelectedWiggleBasis, String> {
+     let eta_threshold = pilot
+         .threshold_design
+         .design
+         .dot(&pilot.fit.beta_threshold());
+     let eta_log_sigma = pilot
+         .log_sigma_design
+         .design
+         .dot(&pilot.fit.beta_log_sigma());
+     let q_seed = Array1::from_iter(
+         eta_threshold
+             .iter()
+             .zip(eta_log_sigma.iter())
+             .map(|(&threshold, &ls)| survival_q0_from_eta(threshold, ls)),
+     );
+     select_wiggle_basis_from_seed(q_seed.view(), wiggle_cfg, wiggle_penalty_orders)
+ }
+@@ -10096,50 +10105,115 @@ mod tests {
+             name: name.to_string(),
+             design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((
+                 family.n, p,
+             )))),
+             offset: Array1::zeros(family.n),
+             penalties: Vec::new(),
+             nullspace_dims: Vec::new(),
+             initial_log_lambdas: Array1::zeros(0),
+             initial_beta: None,
+         };
+         let specs = vec![
+             mk_spec("time", p_time),
+             mk_spec("threshold", p_threshold),
+             mk_spec("log_sigma", p_log_sigma),
+         ];
+         let p_total = (p_time + p_threshold + p_log_sigma) as u64;
+         let expected = crate::custom_family::joint_coupled_coefficient_hessian_cost(n, &specs);
+         assert_eq!(family.coefficient_hessian_cost(&specs), expected);
+         assert_eq!(expected, n * p_total * p_total);
+         assert!(
+             expected > crate::custom_family::default_coefficient_hessian_cost(&specs),
+             "joint-coupled cost must exceed block-diagonal default by the cross-block fill"
+         );
+     }
+ 
++    #[test]
++    fn survival_location_scale_advertises_outer_hvp_at_biobank_dimensions() {
++        let family = survival_exact_newton_test_family();
++        let mk_spec = |name: &str, p: usize| ParameterBlockSpec {
++            name: name.to_string(),
++            design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((
++                family.n, p,
++            )))),
++            offset: Array1::zeros(family.n),
++            penalties: Vec::new(),
++            nullspace_dims: Vec::new(),
++            initial_log_lambdas: Array1::zeros(0),
++            initial_beta: None,
++        };
++        let specs = vec![
++            mk_spec("time", 200),
++            mk_spec("threshold", 200),
++            mk_spec("log_sigma", 200),
++        ];
++
++        assert!(family.outer_hyper_hessian_hvp_available(&specs));
++        assert!(crate::custom_family::use_joint_matrix_free_path(
++            specs.iter().map(|spec| spec.design.ncols()).sum(),
++            family.n,
++        ));
++        assert!(
++            !family.outer_hyper_hessian_dense_available(&specs),
++            "biobank-scale survival location-scale should expose the outer Hessian through HVPs, not dense pairwise assembly"
++        );
++    }
++
++    #[test]
++    fn survival_location_scale_planner_keeps_analytic_hessian_at_biobank_dimensions() {
++        let family = survival_exact_newton_test_family();
++        let mk_spec = |name: &str, p: usize| ParameterBlockSpec {
++            name: name.to_string(),
++            design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((
++                family.n, p,
++            )))),
++            offset: Array1::zeros(family.n),
++            penalties: Vec::new(),
++            nullspace_dims: Vec::new(),
++            initial_log_lambdas: Array1::zeros(0),
++            initial_beta: None,
++        };
++        let specs = vec![
++            mk_spec("time", 200),
++            mk_spec("threshold", 200),
++            mk_spec("log_sigma", 200),
++        ];
++        let options = crate::custom_family::BlockwiseFitOptions::default();
++
++        let (gradient, hessian) =
++            crate::custom_family::custom_family_outer_derivatives(&family, &specs, &options);
++        assert_eq!(
++            gradient,
++            crate::solver::outer_strategy::Derivative::Analytic
++        );
++        assert_eq!(
++            hessian,
++            crate::solver::outer_strategy::Derivative::Analytic,
++            "large survival location-scale fits must not be demoted to BFGS when the explicit HVP operator covers the dimensions"
++        );
++    }
++
+     #[test]
+     fn time_block_post_update_leaves_beta_unchanged() {
+         // The time block carries structural lower bounds (see
+         // `structural_time_coefficient_lower_bounds`).  `post_update_block_beta`
+         // projects the accepted line-search β onto the feasible box so the
+         // *next* `max_feasible_time_step` call never sees an ulp-level
+         // infeasibility.  The projection must satisfy two invariants:
+         //   (i)  feasible β is returned unchanged (idempotence on the feasible
+         //        set),
+         //   (ii) β projected from outside the feasible set lies on the feasible
+         //        set (every coefficient is ≥ its lower bound).
+         // The test family has `time_coefficient_lower_bounds = [0.0]`, matching
+         // the single structural time column in `x_time_exit`.
+         let family = survival_exact_newton_test_family();
+         let spec = ParameterBlockSpec {
+             name: "time_transform".to_string(),
+             design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((1, 1)))),
+             offset: Array1::zeros(1),
+             penalties: Vec::new(),
+             nullspace_dims: Vec::new(),
+             initial_log_lambdas: Array1::zeros(0),
+             initial_beta: None,
+         };
+ 
+         // Feasible β: already ≥ the 0.0 bound, so the projection is a no-op.
+
+----- PATCH END -----
+
