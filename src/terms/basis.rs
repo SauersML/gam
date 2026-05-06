@@ -2841,6 +2841,10 @@ const IMPLICIT_MATVEC_CHUNK_SIZE: usize = 1000;
 /// Minimum data size to activate parallel iteration for implicit matvecs.
 const IMPLICIT_MATVEC_PAR_THRESHOLD: usize = 10_000;
 
+/// Number of lower-triangular center rows per tile when assembling dense
+/// ThinPlate penalty ψ-derivative kernel blocks.
+const THIN_PLATE_PENALTY_PSI_TILE_ROWS: usize = 32;
+
 impl ImplicitDesignPsiDerivative {
     /// Construct from pre-computed radial jet scalars.
     ///
@@ -16242,21 +16246,63 @@ fn build_thin_plate_penalty_psi_derivativeswithworkspace(
     let mut omega = Array2::<f64>::zeros((k, k));
     let mut omega_psi = Array2::<f64>::zeros((k, k));
     let mut omega_psi_psi = Array2::<f64>::zeros((k, k));
-    for i in 0..k {
-        for j in i..k {
-            let mut dist2 = 0.0;
-            for axis in 0..d {
-                let delta = centers[[i, axis]] - centers[[j, axis]];
-                dist2 += delta * delta;
+
+    // Evaluate the dense symmetric center-pair kernel blocks in independent
+    // lower-triangular row tiles. Each rayon worker owns its tile-local entry
+    // buffer (scratch workspace) and returns immutable results; the serial
+    // assembly below is the only place that writes to the dense output arrays,
+    // so no mutable ndarray storage is shared across workers.
+    struct ThinPlatePsiTileEntry {
+        i: usize,
+        j: usize,
+        phi: f64,
+        phi_psi: f64,
+        phi_psi_psi: f64,
+    }
+
+    let n_tiles = k.div_ceil(THIN_PLATE_PENALTY_PSI_TILE_ROWS);
+    let omega_tiles: Result<Vec<Vec<ThinPlatePsiTileEntry>>, BasisError> = (0..n_tiles)
+        .into_par_iter()
+        .map(|tile_idx| {
+            let row_start = tile_idx * THIN_PLATE_PENALTY_PSI_TILE_ROWS;
+            let row_end = (row_start + THIN_PLATE_PENALTY_PSI_TILE_ROWS).min(k);
+            let tile_pairs = (row_start..row_end).map(|i| i + 1).sum::<usize>();
+            let mut entries = Vec::with_capacity(tile_pairs);
+            for i in row_start..row_end {
+                for j in 0..=i {
+                    let mut dist2 = 0.0;
+                    for axis in 0..d {
+                        let delta = centers[[i, axis]] - centers[[j, axis]];
+                        dist2 += delta * delta;
+                    }
+                    let (phi, phi_psi, phi_psi_psi) = thin_plate_kernel_psi_triplet_from_distance(
+                        dist2.sqrt(),
+                        spec.length_scale,
+                        d,
+                    )?;
+                    entries.push(ThinPlatePsiTileEntry {
+                        i,
+                        j,
+                        phi,
+                        phi_psi,
+                        phi_psi_psi,
+                    });
+                }
             }
-            let (phi, phi_psi, phi_psi_psi) =
-                thin_plate_kernel_psi_triplet_from_distance(dist2.sqrt(), spec.length_scale, d)?;
-            omega[[i, j]] = phi;
-            omega[[j, i]] = phi;
-            omega_psi[[i, j]] = phi_psi;
-            omega_psi[[j, i]] = phi_psi;
-            omega_psi_psi[[i, j]] = phi_psi_psi;
-            omega_psi_psi[[j, i]] = phi_psi_psi;
+            Ok(entries)
+        })
+        .collect();
+
+    for tile in omega_tiles? {
+        for entry in tile {
+            omega[[entry.i, entry.j]] = entry.phi;
+            omega_psi[[entry.i, entry.j]] = entry.phi_psi;
+            omega_psi_psi[[entry.i, entry.j]] = entry.phi_psi_psi;
+            if entry.i != entry.j {
+                omega[[entry.j, entry.i]] = entry.phi;
+                omega_psi[[entry.j, entry.i]] = entry.phi_psi;
+                omega_psi_psi[[entry.j, entry.i]] = entry.phi_psi_psi;
+            }
         }
     }
 
