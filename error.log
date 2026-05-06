@@ -19427,3 +19427,2626 @@ index f40232dea758c6a89e4fb396fe0b91401ddc63dc..8c22678d12d0b3593acd1bf613807b1a
 
 ----- PATCH END -----
 
+[2026-05-06T21:17:27.553839+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T21:17:27.557091+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:17:27.557147+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:17:31.146466+00:00] apply_result: mode=apply id=task_e_69fb94094ac08324bc1438b32bcc8f07 status=Partial applied=0 skipped=0 conflicts=1 cmd=(cd /Users/user/gam && git apply --3way /var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/.tmppTcKXm/patch.diff)
+stdout_tail=
+
+stderr_tail=
+Applied patch to 'src/terms/smooth.rs' with conflicts.
+U src/terms/smooth.rs
+
+patch_summary: kind=git-diff lines=308 chars=13532 cwd=/Users/user/gam ; head=
+diff --git a/src/terms/smooth.rs b/src/terms/smooth.rs
+index f40232dea758c6a89e4fb396fe0b91401ddc63dc..7ca8553fe651842620a508993931be03c2e75841 100644
+--- a/src/terms/smooth.rs
++++ b/src/terms/smooth.rs
+@@ -10846,74 +10846,64 @@ fn try_exact_joint_spatial_length_scale_optimization(
+ /// κ = exp(ψ̄). No sum-to-zero constraint is enforced during optimization.
+ fn try_exact_joint_spatial_aniso_optimization(
+     data: ArrayView2<'_, f64>,
+     y: ArrayView1<'_, f64>,
+     weights: ArrayView1<'_, f64>,
+     offset: ArrayView1<'_, f64>,
+     resolvedspec: &TermCollectionSpec,
+     baseline_design: &TermCollectionDesign,
+     family: LikelihoodFamily,
+     options: &FitOptions,
+     spatial_terms: &[usize],
+     dims_per_term: &[usize],
+     theta0: &Array1<f64>,
+     lower: &Array1<f64>,
+   …
+----- PATCH BEGIN -----
+diff --git a/src/terms/smooth.rs b/src/terms/smooth.rs
+index f40232dea758c6a89e4fb396fe0b91401ddc63dc..7ca8553fe651842620a508993931be03c2e75841 100644
+--- a/src/terms/smooth.rs
++++ b/src/terms/smooth.rs
+@@ -10846,74 +10846,64 @@ fn try_exact_joint_spatial_length_scale_optimization(
+ /// κ = exp(ψ̄). No sum-to-zero constraint is enforced during optimization.
+ fn try_exact_joint_spatial_aniso_optimization(
+     data: ArrayView2<'_, f64>,
+     y: ArrayView1<'_, f64>,
+     weights: ArrayView1<'_, f64>,
+     offset: ArrayView1<'_, f64>,
+     resolvedspec: &TermCollectionSpec,
+     baseline_design: &TermCollectionDesign,
+     family: LikelihoodFamily,
+     options: &FitOptions,
+     spatial_terms: &[usize],
+     dims_per_term: &[usize],
+     theta0: &Array1<f64>,
+     lower: &Array1<f64>,
+     upper: &Array1<f64>,
+     rho_dim: usize,
+     kappa_options: &SpatialLengthScaleOptimizationOptions,
+ ) -> Result<Array1<f64>, EstimationError> {
+     // Use bounds and design metadata for validation.
+     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
+     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
+     use crate::solver::outer_strategy::{Derivative, OuterEval, OuterEvalOrder};
+ 
+     let theta_dim = theta0.len();
+     let psi_dim = theta_dim - rho_dim;
+-    // Capability is always available for these families (every variant routes
+-    // through the unified outer-Hessian path — see
+-    // `exact_joint_spatial_outer_hessian_available`). Gate the *use* of the
+-    // analytic outer Hessian on problem size. The exact analytic Hessian
+-    // requires per-row third/fourth-derivative work in
+-    // `cubic_cell_kernel`/`bernoulli_marginal_slope`, with cost
+-    // O(n · ψ-axes · per-row cell moments). At biobank scale (n ≈ 320k,
+-    // ψ-axes ≈ 16 + linkwiggle/timewiggle/scale-dim knots) this dominates
+-    // wall-clock for every outer eval and prevents convergence inside the
+-    // 50-min CI budget. When we cross the threshold, declare hessian as
+-    // `Unavailable`; the planner then routes to `Solver::HybridEfs`
+-    // (multiplicative fixed-point on ρ + preconditioned ψ gradient via the
+-    // EFS trace Gram), which costs O(1) H⁻¹ solves per outer iteration and
+-    // does not need the third/fourth-derivative tensors. Small fixtures
+-    // (`n ≤ 50k` AND `ψ_dim ≤ 30`) keep the analytic path so existing
+-    // convergence-regression tests are unaffected.
+-    let n_obs = data.nrows();
++    // Capability is declared solely from derivative coverage, not from
++    // problem size.  The unified REML evaluator now exposes exact matrix-free
++    // outer Hessian operators for the costly third/fourth-derivative
++    // contractions used by anisotropic spatial ψ coordinates; its internal
++    // `(n, p, K)` work model chooses `HessianResult::Operator` at biobank
++    // scale and the dense analytic matrix only below that crossover.  Keeping
++    // `Derivative::Analytic` here preserves ARC / trust-region-CG second-order
++    // optimization for `n > 50_000` and `ψ_dim > 30` instead of forcing the
++    // obsolete HybridEFS compatibility path.
+     let analytic_outer_hessian_available =
+-        exact_joint_spatial_outer_hessian_available(family, baseline_design)
+-            && n_obs <= 50_000
+-            && psi_dim <= 30;
++        exact_joint_spatial_outer_hessian_available(family, baseline_design);
+     if !analytic_outer_hessian_available {
+         log::info!(
+-            "[spatial-aniso-joint] declining analytic outer Hessian for n={n_obs}, psi_dim={psi_dim}; routing to HybridEFS"
++            "[spatial-aniso-joint] analytic outer Hessian unavailable for family/design; routing without second-order geometry (psi_dim={psi_dim})"
+         );
+     }
+     let prefer_gradient_only = false;
+ 
+     log::trace!(
+         "[spatial-aniso-joint] starting analytic optimization: rho_dim={}, psi_dim={}, dims_per_term={:?}",
+         rho_dim,
+         psi_dim,
+         dims_per_term,
+     );
+ 
+     // Shared context for the optimization closures. Holds immutable references
+     // to data/spec/options and the realized-design cache.
+     struct AnisoJointContext<'d> {
+         data: ArrayView2<'d, f64>,
+         rho_dim: usize,
+         cache: SingleBlockExactJointDesignCache<'d>,
+         evaluator: crate::estimate::ExternalJointHyperEvaluator<'d>,
+     }
+ 
+     impl<'d> AnisoJointContext<'d> {
+         /// Full evaluation on the current realized design + hyper_dirs.
+         fn eval_full(
+             &mut self,
+             theta: &Array1<f64>,
+@@ -15853,50 +15843,217 @@ mod tests {
+                     double_penalty: false,
+                     coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                     coefficient_min: None,
+                     coefficient_max: None,
+                 })
+                 .collect(),
+             random_effect_terms: vec![],
+             smooth_terms: vec![],
+         };
+         let design = build_term_collection_design(data.view(), &spec).expect("design");
+ 
+         // Both Gaussian and BinomialLogit on a dense design now report
+         // analytic Hessian available; the unified evaluator routes
+         // non-Gaussian dense-lazy designs through `build_outer_hessian_operator`
+         // at biobank scale and through `compute_outer_hessian` otherwise.
+         assert!(exact_joint_spatial_outer_hessian_available(
+             LikelihoodFamily::BinomialLogit,
+             &design,
+         ));
+         assert!(exact_joint_spatial_outer_hessian_available(
+             LikelihoodFamily::GaussianIdentity,
+             &design,
+         ));
+     }
+ 
++    #[test]
++    fn spatial_aniso_joint_exact_hessian_materializes_small_case() {
++        let n = 18usize;
++        let mut data = Array2::<f64>::zeros((n, 2));
++        for i in 0..n {
++            let t = i as f64 / (n as f64 - 1.0);
++            data[[i, 0]] = t;
++            data[[i, 1]] = (0.41 * i as f64).sin();
++        }
++        let y = Array1::from_iter((0..n).map(|i| {
++            let t = i as f64 / (n as f64 - 1.0);
++            0.4 + (2.0 * std::f64::consts::PI * t).sin()
++        }));
++        let weights = Array1::ones(n);
++        let offset = Array1::zeros(n);
++        let spec = TermCollectionSpec {
++            linear_terms: vec![],
++            random_effect_terms: vec![],
++            smooth_terms: vec![SmoothTermSpec {
++                name: "matern_aniso".to_string(),
++                basis: SmoothBasisSpec::Matern {
++                    feature_cols: vec![0, 1],
++                    spec: MaternBasisSpec {
++                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
++                        length_scale: 0.85,
++                        nu: MaternNu::FiveHalves,
++                        include_intercept: false,
++                        double_penalty: true,
++                        identifiability: MaternIdentifiability::CenterSumToZero,
++                        aniso_log_scales: Some(vec![0.2, -0.2]),
++                    },
++                    input_scales: None,
++                },
++                shape: ShapeConstraint::None,
++            }],
++        };
++        let fit_opts = FitOptions {
++            latent_cloglog: None,
++            mixture_link: None,
++            optimize_mixture: false,
++            sas_link: None,
++            optimize_sas: false,
++            compute_inference: false,
++            max_iter: 120,
++            tol: 1e-10,
++            nullspace_dims: vec![],
++            linear_constraints: None,
++            firth_bias_reduction: false,
++            adaptive_regularization: None,
++            penalty_shrinkage_floor: None,
++            rho_prior: Default::default(),
++            kronecker_penalty_system: None,
++            kronecker_factored: None,
++        };
++
++        let design = build_term_collection_design(data.view(), &spec).expect("design");
++        let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
++        let spatial_terms = spatial_length_scale_term_indices(&frozen);
++        let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
++        assert_eq!(dims_per_term, vec![2]);
++        let rho_dim = design.penalties.len();
++        let log_kappa0 = SpatialLogKappaCoords::from_length_scales_aniso(
++            &frozen,
++            &spatial_terms,
++            &SpatialLengthScaleOptimizationOptions::default(),
++        );
++        let mut theta = Array1::<f64>::zeros(rho_dim + log_kappa0.as_array().len());
++        for j in 0..rho_dim {
++            theta[j] = -0.15 + 0.07 * j as f64;
++        }
++        theta.slice_mut(s![rho_dim..]).assign(log_kappa0.as_array());
++
++        let external_opts =
++            external_opts_for_design(LikelihoodFamily::GaussianIdentity, &design, &fit_opts);
++        let mut cache = SingleBlockExactJointDesignCache::new(
++            data.view(),
++            frozen,
++            design.clone(),
++            spatial_terms,
++            rho_dim,
++            dims_per_term,
++        )
++        .expect("single-block cache");
++        let mut evaluator = crate::estimate::ExternalJointHyperEvaluator::new(
++            y.view(),
++            weights.view(),
++            &design.design,
++            offset.view(),
++            &design.penalties,
++            &external_opts,
++            "small aniso Hessian finite-difference evaluator",
++        )
++        .expect("evaluator");
++
++        let eval_at = |theta: &Array1<f64>,
++                       cache: &mut SingleBlockExactJointDesignCache<'_>,
++                       evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
++                       order: crate::solver::outer_strategy::OuterEvalOrder| {
++            cache.ensure_theta(theta).expect("theta applied");
++            let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
++                data.view(),
++                cache.spec(),
++                cache.design(),
++                &cache.spatial_terms,
++            )
++            .expect("hyper dirs build")
++            .expect("hyper dirs present");
++            evaluate_joint_reml_outer_eval_at_theta(
++                evaluator,
++                cache.design(),
++                theta,
++                rho_dim,
++                hyper_dirs,
++                None,
++                order,
++            )
++            .expect("outer eval")
++        };
++
++        let (_, gradient, hessian_result) = eval_at(
++            &theta,
++            &mut cache,
++            &mut evaluator,
++            crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian,
++        );
++        let hessian = hessian_result
++            .materialize_dense()
++            .expect("hessian materializes")
++            .expect("hessian present");
++        assert_eq!(hessian.nrows(), theta.len());
++        assert_eq!(hessian.ncols(), theta.len());
++        assert!(hessian.iter().all(|value| value.is_finite()));
++        assert!(gradient.iter().all(|value| value.is_finite()));
++
++        let symmetry_diff = max_abs_diff_matrix(&hessian, &hessian.t().to_owned());
++        assert!(
++            symmetry_diff <= 1e-10,
++            "small aniso exact Hessian should be symmetric, max diff={symmetry_diff}"
++        );
++        let psi_block = hessian.slice(s![rho_dim.., rho_dim..]).to_owned();
++        assert!(
++            psi_block.iter().any(|value| value.abs() > 1e-10),
++            "small aniso exact Hessian should carry non-zero ψ curvature"
++        );
++    }
++
++    #[test]
++    fn spatial_aniso_joint_large_psi_dim_keeps_second_order_route() {
++        let cap = crate::solver::outer_strategy::OuterCapability {
++            gradient: crate::solver::outer_strategy::Derivative::Analytic,
++            hessian: crate::solver::outer_strategy::Derivative::Analytic,
++            n_params: 40,
++            psi_dim: 31,
++            fixed_point_available: true,
++            barrier_config: None,
++            prefer_gradient_only: false,
++            disable_fixed_point: false,
++        };
++        let route = crate::solver::outer_strategy::plan(&cap);
++        assert_eq!(route.solver, crate::solver::outer_strategy::Solver::Arc);
++        assert_eq!(
++            route.hessian_source,
++            crate::solver::outer_strategy::HessianSource::Analytic
++        );
++        assert!(route.routing_log_line().contains("matrix-free=true"));
++    }
++
+     #[test]
+     fn exact_joint_spatial_outer_hessian_available_for_sparse_designs() {
+         let n = 96usize;
+         let x = Array1::linspace(0.0, 1.0, n);
+         let mut data = Array2::<f64>::zeros((n, 1));
+         data.column_mut(0).assign(&x);
+         let spec = TermCollectionSpec {
+             linear_terms: vec![],
+             random_effect_terms: vec![],
+             smooth_terms: vec![SmoothTermSpec {
+                 name: "s_x".to_string(),
+                 basis: SmoothBasisSpec::BSpline1D {
+                     feature_col: 0,
+                     spec: BSplineBasisSpec {
+                         degree: 3,
+                         penalty_order: 2,
+                         knotspec: BSplineKnotSpec::Generate {
+                             data_range: (0.0, 1.0),
+                             num_internal_knots: 32,
+                         },
+                         double_penalty: false,
+                         identifiability: BSplineIdentifiability::default(),
+                     },
+                 },
+                 shape: ShapeConstraint::None,
+
+----- PATCH END -----
+
+[2026-05-06T21:18:15.418561+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T21:18:15.449892+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:18:15.449978+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:18:18.459340+00:00] apply_result: mode=apply id=task_e_69fb93ed54188324825fbf1741fd03b1 status=Partial applied=0 skipped=0 conflicts=1 cmd=(cd /Users/user/gam && git apply --3way /var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/.tmprQEZP4/patch.diff)
+stdout_tail=
+
+stderr_tail=
+Applied patch to 'src/families/gamlss.rs' with conflicts.
+U src/families/gamlss.rs
+
+patch_summary: kind=git-diff lines=816 chars=32875 cwd=/Users/user/gam ; head=
+diff --git a/src/families/gamlss.rs b/src/families/gamlss.rs
+index 2a8d4a6eda5b3057bc8b1ef07017c5cb164aff2d..e35f1eb79c5a478122a2616d03438bb0895edddb 100644
+--- a/src/families/gamlss.rs
++++ b/src/families/gamlss.rs
+@@ -2954,65 +2954,50 @@ pub(crate) fn select_binomial_mean_link_wiggle_basis_from_pilot(
+     select_wiggle_basis_from_seed(q_seed.view(), wiggle_cfg, wiggle_penalty_orders)
+ }
+ 
+ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
+     data: ndarray::ArrayView2<'_, f64>,
+     pilot_spec: &TermCollectionSpec,
+     pilot_design: &TermCollectionDesign,
+     pilot_fit: &UnifiedFitResult,
+     y: &Array1<f64>,
+     weights: &Array1<f64>,
+     link_kind: InverseLink,
+     selected_wiggle_basis: SelectedWiggleBasis,
+     options: &BlockwiseFitOptions,
+     kappa_options:…
+----- PATCH BEGIN -----
+diff --git a/src/families/gamlss.rs b/src/families/gamlss.rs
+index 2a8d4a6eda5b3057bc8b1ef07017c5cb164aff2d..e35f1eb79c5a478122a2616d03438bb0895edddb 100644
+--- a/src/families/gamlss.rs
++++ b/src/families/gamlss.rs
+@@ -2954,65 +2954,50 @@ pub(crate) fn select_binomial_mean_link_wiggle_basis_from_pilot(
+     select_wiggle_basis_from_seed(q_seed.view(), wiggle_cfg, wiggle_penalty_orders)
+ }
+ 
+ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
+     data: ndarray::ArrayView2<'_, f64>,
+     pilot_spec: &TermCollectionSpec,
+     pilot_design: &TermCollectionDesign,
+     pilot_fit: &UnifiedFitResult,
+     y: &Array1<f64>,
+     weights: &Array1<f64>,
+     link_kind: InverseLink,
+     selected_wiggle_basis: SelectedWiggleBasis,
+     options: &BlockwiseFitOptions,
+     kappa_options: &SpatialLengthScaleOptimizationOptions,
+ ) -> Result<BinomialMeanWiggleTermFitResult, String> {
+     const RHO_BOUND: f64 = 12.0;
+ 
+     validate_term_weights(
+         data,
+         y.len(),
+         weights,
+         "fit_binomial_mean_wiggle_terms_with_selected_basis",
+     )?;
+     validate_binomial_response(y, "fit_binomial_mean_wiggle_terms_with_selected_basis")?;
+ 
+-    // Same biobank-scale outer-Hessian gate as the marginal-slope families
+-    // (see survival_marginal_slope.rs:13286). At biobank n the analytic
+-    // outer Hessian dominates wall-clock; route to BFGS on the analytic
+-    // gradient instead.
+-    let n_obs = data.nrows();
+-    let biobank_scale = n_obs > 50_000;
+-    let mut options_override = options.clone();
+-    if biobank_scale && options_override.use_outer_hessian {
+-        options_override.use_outer_hessian = false;
+-        log::info!(
+-            "[gamlss-binomial-mean-wiggle] declining analytic outer Hessian for n={n_obs}; routing to BFGS"
+-        );
+-    }
+-    let options: &BlockwiseFitOptions = &options_override;
+-
+     let SelectedWiggleBasis {
+         knots: wiggle_knots,
+         degree: wiggle_degree,
+         block: wiggle_block,
+         ..
+     } = selected_wiggle_basis;
+ 
+     let spatial_terms = spatial_length_scale_term_indices(pilot_spec);
+     if spatial_terms.is_empty() {
+         let fit = fit_binomial_mean_wiggle(
+             BinomialMeanWiggleSpec {
+                 y: y.clone(),
+                 weights: weights.clone(),
+                 link_kind,
+                 wiggle_knots: wiggle_knots.clone(),
+                 wiggle_degree,
+                 eta_block: ParameterBlockInput {
+                     design: pilot_design.design.clone(),
+                     offset: Array1::zeros(y.len()),
+                     penalties: pilot_design
+                         .penalties
+                         .iter()
+                         .map(|bp| crate::solver::estimate::PenaltySpec::from_blockwise_ref(bp))
+                         .collect(),
+                     nullspace_dims: vec![],
+@@ -10722,63 +10707,331 @@ impl BinomialMeanWiggleFamily {
+         let mut global = 0usize;
+         for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
+             for deriv in block_derivs {
+                 if global == psi_index {
+                     if block_idx != Self::BLOCK_ETA {
+                         return Ok(None);
+                     }
+                     let action = match CustomFamilyPsiDesignAction::from_first_derivative(
+                         deriv,
+                         n,
+                         p_eta,
+                         0..n,
+                         "BinomialMeanWiggleFamily eta",
+                     ) {
+                         Ok(action) => action,
+                         Err(_) => return Ok(None),
+                     };
+                     let z_eta_psi = action.forward_mul(beta_eta.view());
+                     return Ok(Some((action, z_eta_psi)));
+                 }
+                 global += 1;
+             }
+         }
+         Ok(None)
+     }
++
++    fn bmw_static_hessian_operator(
++        &self,
++        block_states: &[ParameterBlockState],
++        x_eta_arc: Arc<Array2<f64>>,
++    ) -> Result<Arc<RowCoeffOperator>, String> {
++        if block_states.len() != 2 {
++            return Err(format!(
++                "BinomialMeanWiggleFamily expects 2 blocks, got {}",
++                block_states.len()
++            ));
++        }
++        let eta = &block_states[Self::BLOCK_ETA].eta;
++        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
++        let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
++        let n = self.y.len();
++        if eta.len() != n || etaw.len() != n || self.weights.len() != n {
++            return Err("BinomialMeanWiggleFamily input size mismatch".to_string());
++        }
++        let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
++        let p_eta = x_eta_arc.ncols();
++        let pw = geom.basis.ncols();
++        let mut coeff_eta = Array1::<f64>::zeros(n);
++        let mut coeff_etaw_b = Array1::<f64>::zeros(n);
++        let mut coeff_etaw_d1 = Array1::<f64>::zeros(n);
++        let mut coeff_ww = Array1::<f64>::zeros(n);
++        for row in 0..n {
++            let q = eta[row] + etaw[row];
++            let (m1, m2, _) = self.neglog_q_derivatives(self.y[row], self.weights[row], q)?;
++            let a = geom.dq_dq0[row];
++            let b = geom.d2q_dq02[row];
++            coeff_eta[row] = hessian_coeff_fromobjective_q_terms(m1, m2, a, a, b);
++            coeff_etaw_b[row] = m2 * a;
++            coeff_etaw_d1[row] = m1;
++            coeff_ww[row] = m2;
++        }
++        Ok(Arc::new(RowCoeffOperator::from_directions(
++            vec![p_eta, pw],
++            vec![
++                (0, x_eta_arc),
++                (1, Arc::new(geom.basis)),
++                (1, Arc::new(geom.basis_d1)),
++            ],
++            vec![
++                (0, 0, coeff_eta),
++                (0, 1, coeff_etaw_b),
++                (0, 2, coeff_etaw_d1),
++                (1, 1, coeff_ww),
++            ],
++            n,
++        )))
++    }
++
++    fn bmw_directional_operator(
++        &self,
++        block_states: &[ParameterBlockState],
++        x_eta_arc: Arc<Array2<f64>>,
++        d_beta_flat: &Array1<f64>,
++    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
++    {
++        if block_states.len() != 2 {
++            return Err(format!(
++                "BinomialMeanWiggleFamily expects 2 blocks, got {}",
++                block_states.len()
++            ));
++        }
++        let eta = &block_states[Self::BLOCK_ETA].eta;
++        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
++        let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
++        let n = self.y.len();
++        if eta.len() != n || etaw.len() != n || self.weights.len() != n {
++            return Err("BinomialMeanWiggleFamily input size mismatch".to_string());
++        }
++        let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
++        let p_eta = x_eta_arc.ncols();
++        let pw = geom.basis.ncols();
++        let total = p_eta + pw;
++        if d_beta_flat.len() != total {
++            return Err(format!(
++                "BinomialMeanWiggleFamily joint d_beta length mismatch: got {}, expected {}",
++                d_beta_flat.len(),
++                total
++            ));
++        }
++        let u_eta = d_beta_flat.slice(s![0..p_eta]).to_owned();
++        let uw = d_beta_flat.slice(s![p_eta..total]).to_owned();
++        let xi = fast_av(x_eta_arc.as_ref(), &u_eta);
++        let phi = fast_av(&geom.basis, &uw);
++        let basis1_u = fast_av(&geom.basis_d1, &uw);
++        let basis2_u = fast_av(&geom.basis_d2, &uw);
++
++        let mut coeff_eta = Array1::<f64>::zeros(n);
++        let mut coeff_etaw_b = Array1::<f64>::zeros(n);
++        let mut coeff_etaw_d1 = Array1::<f64>::zeros(n);
++        let mut coeff_etaw_d2 = Array1::<f64>::zeros(n);
++        let mut coeff_ww_bb = Array1::<f64>::zeros(n);
++        let mut coeff_ww_db = Array1::<f64>::zeros(n);
++        for row in 0..n {
++            let q = eta[row] + etaw[row];
++            let (m1, m2, m3) = self.neglog_q_derivatives(self.y[row], self.weights[row], q)?;
++            let a = geom.dq_dq0[row];
++            let b = geom.d2q_dq02[row];
++            let c = geom.d3q_dq03[row];
++            let q_u = a * xi[row] + phi[row];
++            let a_u = b * xi[row] + basis1_u[row];
++            let b_u = c * xi[row] + basis2_u[row];
++            coeff_eta[row] = directionalhessian_coeff_fromobjective_q_terms(
++                m1, m2, m3, q_u, a, a, b, a_u, a_u, b_u,
++            );
++            coeff_etaw_b[row] = m3 * q_u * a + m2 * a_u;
++            coeff_etaw_d1[row] = m2 * (a * xi[row] + q_u);
++            coeff_etaw_d2[row] = m1 * xi[row];
++            coeff_ww_bb[row] = m3 * q_u;
++            coeff_ww_db[row] = m2 * xi[row];
++        }
++        Ok(Some(Arc::new(RowCoeffOperator::from_directions(
++            vec![p_eta, pw],
++            vec![
++                (0, x_eta_arc),
++                (1, Arc::new(geom.basis)),
++                (1, Arc::new(geom.basis_d1)),
++                (1, Arc::new(geom.basis_d2)),
++            ],
++            vec![
++                (0, 0, coeff_eta),
++                (0, 1, coeff_etaw_b),
++                (0, 2, coeff_etaw_d1),
++                (0, 3, coeff_etaw_d2),
++                (1, 1, coeff_ww_bb),
++                (1, 2, coeff_ww_db),
++            ],
++            n,
++        ))))
++    }
++
++    fn bmw_second_directional_operator(
++        &self,
++        block_states: &[ParameterBlockState],
++        x_eta_arc: Arc<Array2<f64>>,
++        d_beta_u_flat: &Array1<f64>,
++        d_beta_v_flat: &Array1<f64>,
++    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
++    {
++        if block_states.len() != 2 {
++            return Err(format!(
++                "BinomialMeanWiggleFamily expects 2 blocks, got {}",
++                block_states.len()
++            ));
++        }
++        let eta = &block_states[Self::BLOCK_ETA].eta;
++        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
++        let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
++        let n = self.y.len();
++        if eta.len() != n || etaw.len() != n || self.weights.len() != n {
++            return Err("BinomialMeanWiggleFamily input size mismatch".to_string());
++        }
++        let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
++        let p_eta = x_eta_arc.ncols();
++        let pw = geom.basis.ncols();
++        let total = p_eta + pw;
++        if d_beta_u_flat.len() != total || d_beta_v_flat.len() != total {
++            return Err(format!(
++                "BinomialMeanWiggleFamily joint second d_beta length mismatch: got {} and {}, expected {}",
++                d_beta_u_flat.len(),
++                d_beta_v_flat.len(),
++                total
++            ));
++        }
++        let u_eta = d_beta_u_flat.slice(s![0..p_eta]).to_owned();
++        let v_eta = d_beta_v_flat.slice(s![0..p_eta]).to_owned();
++        let uw = d_beta_u_flat.slice(s![p_eta..total]).to_owned();
++        let vw = d_beta_v_flat.slice(s![p_eta..total]).to_owned();
++
++        let xi_u = fast_av(x_eta_arc.as_ref(), &u_eta);
++        let xi_v = fast_av(x_eta_arc.as_ref(), &v_eta);
++        let phi_u = fast_av(&geom.basis, &uw);
++        let phi_v = fast_av(&geom.basis, &vw);
++        let b1u = fast_av(&geom.basis_d1, &uw);
++        let b1v = fast_av(&geom.basis_d1, &vw);
++        let b2u = fast_av(&geom.basis_d2, &uw);
++        let b2v = fast_av(&geom.basis_d2, &vw);
++        let b3u = fast_av(&geom.basis_d3, &uw);
++        let b3v = fast_av(&geom.basis_d3, &vw);
++
++        let mut coeff_eta = Array1::<f64>::zeros(n);
++        let mut coeff_etaw_b = Array1::<f64>::zeros(n);
++        let mut coeff_etaw_d1 = Array1::<f64>::zeros(n);
++        let mut coeff_etaw_d2 = Array1::<f64>::zeros(n);
++        let mut coeff_etaw_d3 = Array1::<f64>::zeros(n);
++        let mut coeff_ww_bb = Array1::<f64>::zeros(n);
++        let mut coeff_ww_db = Array1::<f64>::zeros(n);
++        let mut coeff_ww_ddb = Array1::<f64>::zeros(n);
++        let mut coeff_ww_dd = Array1::<f64>::zeros(n);
++
++        for row in 0..n {
++            let q = eta[row] + etaw[row];
++            let (m1, m2, m3) = self.neglog_q_derivatives(self.y[row], self.weights[row], q)?;
++            let m4 = self.neglog_q_fourth_derivative(self.y[row], self.weights[row], q)?;
++            let a = geom.dq_dq0[row];
++            let b = geom.d2q_dq02[row];
++            let c = geom.d3q_dq03[row];
++            let d = geom.d4q_dq04[row];
++
++            let q_u = a * xi_u[row] + phi_u[row];
++            let a_u = b * xi_u[row] + b1u[row];
++            let b_u = c * xi_u[row] + b2u[row];
++            let q_v = a * xi_v[row] + phi_v[row];
++            let a_v = b * xi_v[row] + b1v[row];
++            let b_v = c * xi_v[row] + b2v[row];
++            let q_uv = b * xi_u[row] * xi_v[row] + b1u[row] * xi_v[row] + b1v[row] * xi_u[row];
++            let a_uv = c * xi_u[row] * xi_v[row] + b2u[row] * xi_v[row] + b2v[row] * xi_u[row];
++            let b_uv = d * xi_u[row] * xi_v[row] + b3u[row] * xi_v[row] + b3v[row] * xi_u[row];
++
++            coeff_eta[row] = second_directionalhessian_coeff_fromobjective_q_terms(
++                m1, m2, m3, m4, q_u, q_v, q_uv, a, a, b, a_u, a_v, a_u, a_v, a_uv, a_uv, b_u, b_v,
++                b_uv,
++            );
++            let d2_c_b = m4 * q_u * q_v * a + m3 * (q_uv * a + q_u * a_v + q_v * a_u) + m2 * a_uv;
++            let dc_b_u = m3 * q_u * a + m2 * a_u;
++            let dc_b_v = m3 * q_v * a + m2 * a_v;
++            let c_b_static = m2 * a;
++            let d2_c_b1 = m3 * q_u * q_v + m2 * q_uv;
++            let dc_b1_u = m2 * q_u;
++            let dc_b1_v = m2 * q_v;
++
++            coeff_etaw_b[row] = d2_c_b;
++            coeff_etaw_d1[row] = dc_b_u * xi_v[row] + dc_b_v * xi_u[row] + d2_c_b1;
++            coeff_etaw_d2[row] =
++                c_b_static * xi_u[row] * xi_v[row] + dc_b1_u * xi_v[row] + dc_b1_v * xi_u[row];
++            coeff_etaw_d3[row] = m1 * xi_u[row] * xi_v[row];
++
++            let dw = m2;
++            let dw_u = m3 * q_u;
++            let dw_v = m3 * q_v;
++            let dw_uv = m4 * q_u * q_v + m3 * q_uv;
++            let xixj = xi_u[row] * xi_v[row];
++            coeff_ww_bb[row] = dw_uv;
++            coeff_ww_db[row] = dw_v * xi_u[row] + dw_u * xi_v[row];
++            coeff_ww_ddb[row] = dw * xixj;
++            coeff_ww_dd[row] = 2.0 * dw * xixj;
++        }
++
++        Ok(Some(Arc::new(RowCoeffOperator::from_directions(
++            vec![p_eta, pw],
++            vec![
++                (0, x_eta_arc),
++                (1, Arc::new(geom.basis)),
++                (1, Arc::new(geom.basis_d1)),
++                (1, Arc::new(geom.basis_d2)),
++                (1, Arc::new(geom.basis_d3)),
++            ],
++            vec![
++                (0, 0, coeff_eta),
++                (0, 1, coeff_etaw_b),
++                (0, 2, coeff_etaw_d1),
++                (0, 3, coeff_etaw_d2),
++                (0, 4, coeff_etaw_d3),
++                (1, 1, coeff_ww_bb),
++                (1, 2, coeff_ww_db),
++                (1, 3, coeff_ww_ddb),
++                (2, 2, coeff_ww_dd),
++            ],
++            n,
++        ))))
++    }
+ }
+ 
+ impl CustomFamily for BinomialMeanWiggleFamily {
+     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+         true
+     }
+ 
+     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
+-        // Mean and link-wiggle blocks couple through the binomial weight,
+-        // giving a dense joint Hessian of size (p_μ + p_w)² per row. This
+-        // family does not yet expose a matrix-free joint workspace, so the
+-        // honest per-evaluation cost remains the dense build.
+-        crate::custom_family::joint_coupled_coefficient_hessian_cost(self.y.len() as u64, specs)
++        // The mean-wiggle Hessian is exposed as a row-coefficient operator,
++        // so the hot representation cost is one Θ(n · (p_eta + p_w)) HVP
++        // rather than dense Θ(n · (p_eta + p_w)^2) assembly.
++        let p_total = specs
++            .iter()
++            .map(|s| s.design.ncols() as u64)
++            .fold(0u64, |acc, p| acc.saturating_add(p));
++        (self.y.len() as u64).saturating_mul(p_total.max(1))
+     }
+ 
+     fn block_linear_constraints(
+         &self,
+         _: &[ParameterBlockState],
+         block_idx: usize,
+         spec: &ParameterBlockSpec,
+     ) -> Result<Option<LinearInequalityConstraints>, String> {
+         if block_idx != Self::BLOCK_WIGGLE {
+             return Ok(None);
+         }
+         Ok(monotone_wiggle_nonnegative_constraints(spec.design.ncols()))
+     }
+ 
+     fn post_update_block_beta(
+         &self,
+         _: &[ParameterBlockState],
+         block_idx: usize,
+         _: &ParameterBlockSpec,
+         beta: Array1<f64>,
+     ) -> Result<Array1<f64>, String> {
+         if block_idx != Self::BLOCK_WIGGLE {
+             return Ok(beta);
+         }
+         Ok(project_monotone_wiggle_beta(beta))
+@@ -10872,50 +11125,65 @@ impl CustomFamily for BinomialMeanWiggleFamily {
+             return Err("wiggle geometry requires eta block".to_string());
+         }
+         let eta = &block_states[Self::BLOCK_ETA].eta;
+         if eta.len() != self.y.len() {
+             return Err("BinomialMeanWiggleFamily eta size mismatch".to_string());
+         }
+         let x = self.wiggle_design(eta.view())?;
+         if x.ncols() != spec.design.ncols() {
+             return Err(format!(
+                 "dynamic wiggle design col mismatch: got {}, expected {}",
+                 x.ncols(),
+                 spec.design.ncols()
+             ));
+         }
+         let nrows = x.nrows();
+         Ok((
+             DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x)),
+             Array1::zeros(nrows),
+         ))
+     }
+ 
+     fn block_geometry_is_dynamic(&self) -> bool {
+         true
+     }
+ 
++    fn exact_newton_joint_hessian_workspace(
++        &self,
++        block_states: &[ParameterBlockState],
++        specs: &[ParameterBlockSpec],
++    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
++        let x_eta = self.dense_eta_design_fromspecs(specs)?.into_owned();
++        let workspace =
++            BinomialMeanWiggleHessianWorkspace::new(self.clone(), block_states.to_vec(), x_eta)?;
++        Ok(Some(Arc::new(workspace)))
++    }
++
++    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
++        true
++    }
++
+     fn exact_newton_joint_hessian_with_specs(
+         &self,
+         block_states: &[ParameterBlockState],
+         specs: &[ParameterBlockSpec],
+     ) -> Result<Option<Array2<f64>>, String> {
+         if block_states.len() != 2 {
+             return Err(format!(
+                 "BinomialMeanWiggleFamily expects 2 blocks, got {}",
+                 block_states.len()
+             ));
+         }
+         let x_eta = self.dense_eta_design_fromspecs(specs)?;
+         let eta = &block_states[Self::BLOCK_ETA].eta;
+         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
+         let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
+         let n = self.y.len();
+         if eta.len() != n || etaw.len() != n || self.weights.len() != n {
+             return Err("BinomialMeanWiggleFamily input size mismatch".to_string());
+         }
+         let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
+         let p_eta = x_eta.ncols();
+         let pw = geom.basis.ncols();
+         let mut coeff_eta = Array1::<f64>::zeros(n);
+         let mut coeff_etaw_b = Array1::<f64>::zeros(n);
+         let mut coeff_etaw_d1 = Array1::<f64>::zeros(n);
+@@ -11523,50 +11791,127 @@ impl CustomFamily for BinomialMeanWiggleFamily {
+         let score_psi = binomial_pack_mean_wiggle_joint_score(
+             &(x_eta_psi.t().dot(&score_eta_xa) + x_eta.t().dot(&score_eta_x)),
+             &score_w,
+         );
+         let a_eta_eta = xt_diag_y_dense(x_eta_psi, &coeff_eta_eta_xa_x, &x_eta)?;
+         let h_eta_eta = &a_eta_eta + &a_eta_eta.t() + &xt_diag_x_dense(&x_eta, &coeff_eta_eta_xx)?;
+         let h_eta_w = xt_diag_y_dense(x_eta_psi, &coeff_eta_w_xa_b, &geom.basis)?
+             + &xt_diag_y_dense(&x_eta, &coeff_eta_w_x_b, &geom.basis)?
+             + &xt_diag_y_dense(&x_eta, &coeff_eta_w_x_d1, &geom.basis_d1)?
+             + &xt_diag_y_dense(x_eta_psi, &coeff_eta_w_xa_d1, &geom.basis_d1)?
+             + &xt_diag_y_dense(&x_eta, &coeff_eta_w_x_d2, &geom.basis_d2)?;
+         let a_ww = xt_diag_y_dense(&geom.basis_d1, &coeff_ww_db, &geom.basis)?;
+         let h_ww = xt_diag_x_dense(&geom.basis, &coeff_ww_bb)? + &a_ww + &a_ww.t();
+ 
+         Ok(Some(crate::custom_family::ExactNewtonJointPsiTerms {
+             objective_psi,
+             score_psi,
+             hessian_psi: binomial_pack_mean_wiggle_joint_symmetrichessian(
+                 &h_eta_eta, &h_eta_w, &h_ww,
+             ),
+             hessian_psi_operator: None,
+         }))
+     }
+ }
+ 
++struct BinomialMeanWiggleHessianWorkspace {
++    family: BinomialMeanWiggleFamily,
++    block_states: Vec<ParameterBlockState>,
++    x_eta: Arc<Array2<f64>>,
++    hessian_operator: Arc<RowCoeffOperator>,
++}
++
++impl BinomialMeanWiggleHessianWorkspace {
++    fn new(
++        family: BinomialMeanWiggleFamily,
++        block_states: Vec<ParameterBlockState>,
++        x_eta: Array2<f64>,
++    ) -> Result<Self, String> {
++        let x_eta = Arc::new(x_eta);
++        let hessian_operator = family.bmw_static_hessian_operator(&block_states, x_eta.clone())?;
++        Ok(Self {
++            family,
++            block_states,
++            x_eta,
++            hessian_operator,
++        })
++    }
++}
++
++impl ExactNewtonJointHessianWorkspace for BinomialMeanWiggleHessianWorkspace {
++    fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
++        Ok(Some(
++            crate::solver::estimate::reml::unified::HyperOperator::mul_vec(
++                self.hessian_operator.as_ref(),
++                v,
++            ),
++        ))
++    }
++
++    fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
++        Ok(None)
++    }
++
++    fn directional_derivative(
++        &self,
++        _d_beta_flat: &Array1<f64>,
++    ) -> Result<Option<Array2<f64>>, String> {
++        Ok(None)
++    }
++
++    fn directional_derivative_operator(
++        &self,
++        d_beta_flat: &Array1<f64>,
++    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
++    {
++        self.family
++            .bmw_directional_operator(&self.block_states, self.x_eta.clone(), d_beta_flat)
++    }
++
++    fn second_directional_derivative(
++        &self,
++        _d_beta_u_flat: &Array1<f64>,
++        _d_beta_v_flat: &Array1<f64>,
++    ) -> Result<Option<Array2<f64>>, String> {
++        Ok(None)
++    }
++
++    fn second_directional_derivative_operator(
++        &self,
++        d_beta_u: &Array1<f64>,
++        d_beta_v: &Array1<f64>,
++    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
++    {
++        self.family.bmw_second_directional_operator(
++            &self.block_states,
++            self.x_eta.clone(),
++            d_beta_u,
++            d_beta_v,
++        )
++    }
++}
++
+ impl CustomFamilyGenerative for BinomialMeanWiggleFamily {
+     fn generativespec(
+         &self,
+         block_states: &[ParameterBlockState],
+     ) -> Result<GenerativeSpec, String> {
+         if block_states.len() != 2 {
+             return Err(format!(
+                 "BinomialMeanWiggleFamily expects 2 blocks, got {}",
+                 block_states.len()
+             ));
+         }
+         let eta = &block_states[Self::BLOCK_ETA].eta;
+         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
+         if eta.len() != self.y.len() || etaw.len() != self.y.len() {
+             return Err("BinomialMeanWiggleFamily generative size mismatch".to_string());
+         }
+         let mut mean = Array1::<f64>::zeros(self.y.len());
+         for i in 0..mean.len() {
+             let jet = inverse_link_jet_for_inverse_link(&self.link_kind, eta[i] + etaw[i])
+                 .map_err(|e| format!("fixed-link wiggle inverse-link evaluation failed: {e}"))?;
+             mean[i] = jet.mu;
+         }
+         Ok(GenerativeSpec {
+             mean,
+             noise: NoiseModel::Bernoulli,
+@@ -25791,26 +26136,214 @@ mod tests {
+             let (fm, _) = crate::families::custom_family::test_outerobjective_andgradient(
+                 &family,
+                 &specs,
+                 &options,
+                 &penalty_counts,
+                 &rho_m,
+             )
+             .expect("objective at rho-h");
+             let gfd = (fp - fm) / (2.0 * h);
+             let both_in_noise = g0[k].abs() < noise_floor && gfd.abs() < noise_floor;
+             if !both_in_noise {
+                 let abs_err = (g0[k] - gfd).abs();
+                 let rel_err = abs_err / gfd.abs().max(g0[k].abs()).max(1e-12);
+                 assert!(
+                     rel_err < 1e-3 || abs_err < 1e-6,
+                     "batched gradient mismatch at coord {k}: \
+                      batched={:.6e}, fd={:.6e}, abs_err={:.3e}, rel_err={:.3e}",
+                     g0[k],
+                     gfd,
+                     abs_err,
+                     rel_err,
+                 );
+             }
+         }
+     }
++
++    fn binomial_mean_wiggle_operator_fixture() -> (
++        BinomialMeanWiggleFamily,
++        Vec<ParameterBlockState>,
++        Vec<ParameterBlockSpec>,
++        Array2<f64>,
++    ) {
++        let x_eta = array![
++            [1.0, -0.9],
++            [1.0, -0.45],
++            [1.0, -0.1],
++            [1.0, 0.2],
++            [1.0, 0.55],
++            [1.0, 0.9],
++        ];
++        let beta_eta = array![-0.15, 0.7];
++        let eta = x_eta.dot(&beta_eta);
++        let degree = 3usize;
++        let knots = initialize_monotone_wiggle_knots_from_seed(eta.view(), degree, 4)
++            .expect("mean-wiggle knots");
++        let family = BinomialMeanWiggleFamily {
++            y: array![0.0, 1.0, 0.0, 1.0, 1.0, 0.0],
++            weights: array![1.0, 0.8, 1.2, 1.0, 0.7, 1.1],
++            link_kind: InverseLink::Standard(LinkFunction::Logit),
++            wiggle_knots: knots,
++            wiggle_degree: degree,
++            policy: crate::resource::ResourcePolicy::default_library(),
++        };
++        let basis = family.wiggle_design(eta.view()).expect("wiggle basis");
++        let beta_w = Array1::from_iter((0..basis.ncols()).map(|j| 0.015 * (j as f64 + 1.0)));
++        let etaw = basis.dot(&beta_w);
++        let states = vec![
++            ParameterBlockState {
++                beta: beta_eta,
++                eta: eta.clone(),
++            },
++            ParameterBlockState {
++                beta: beta_w,
++                eta: etaw,
++            },
++        ];
++        let specs = vec![
++            ParameterBlockSpec {
++                name: "eta".to_string(),
++                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x_eta.clone())),
++                offset: Array1::zeros(eta.len()),
++                penalties: vec![],
++                nullspace_dims: vec![],
++                initial_log_lambdas: Array1::zeros(0),
++                initial_beta: None,
++            },
++            ParameterBlockSpec {
++                name: "wiggle".to_string(),
++                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(basis)),
++                offset: Array1::zeros(eta.len()),
++                penalties: vec![],
++                nullspace_dims: vec![],
++                initial_log_lambdas: Array1::zeros(0),
++                initial_beta: None,
++            },
++        ];
++        (family, states, specs, x_eta)
++    }
++
++    fn assert_close_matrix(a: &Array2<f64>, b: &Array2<f64>, tol: f64, label: &str) {
++        assert_eq!(a.dim(), b.dim(), "{label} shape mismatch");
++        let max_err = a
++            .iter()
++            .zip(b.iter())
++            .map(|(&x, &y)| (x - y).abs())
++            .fold(0.0_f64, f64::max);
++        assert!(
++            max_err < tol,
++            "{label} max error {max_err:.3e} >= {tol:.3e}"
++        );
++    }
++
++    #[test]
++    fn binomial_mean_wiggle_hessian_operators_match_dense_derivatives() {
++        let (family, states, specs, x_eta) = binomial_mean_wiggle_operator_fixture();
++        let p_eta = x_eta.ncols();
++        let pw = states[BinomialMeanWiggleFamily::BLOCK_WIGGLE].beta.len();
++        let total = p_eta + pw;
++        let dir_u = Array1::from_iter((0..total).map(|j| 0.03 * (j as f64 + 1.0).sin()));
++        let dir_v = Array1::from_iter((0..total).map(|j| -0.02 * (j as f64 + 0.5).cos()));
++
++        let dense_h = family
++            .exact_newton_joint_hessian_with_specs(&states, &specs)
++            .expect("dense H")
++            .expect("dense H available");
++        let workspace = family
++            .exact_newton_joint_hessian_workspace(&states, &specs)
++            .expect("workspace")
++            .expect("workspace available");
++        let h_columns =
++            Array2::from_shape_fn((total, total), |(i, j)| if i == j { 1.0 } else { 0.0 });
++        let op_h = crate::solver::estimate::reml::unified::HyperOperator::mul_mat(
++            family
++                .bmw_static_hessian_operator(&states, Arc::new(x_eta.clone()))
++                .expect("static op")
++                .as_ref(),
++            &h_columns,
++        );
++        assert_close_matrix(&op_h, &dense_h, 1e-10, "static H operator");
++        let hv = workspace
++            .hessian_matvec(&dir_u)
++            .expect("workspace HVP")
++            .expect("workspace HVP available");
++        let hv_dense = dense_h.dot(&dir_u);
++        let hv_err = (&hv - &hv_dense).mapv(f64::abs).sum();
++        assert!(hv_err < 1e-10, "workspace HVP mismatch {hv_err:.3e}");
++
++        let dense_dh = family
++            .exact_newton_joint_hessian_directional_derivative_with_specs(&states, &specs, &dir_u)
++            .expect("dense dH")
++            .expect("dense dH available");
++        let op_dh = workspace
++            .directional_derivative_operator(&dir_u)
++            .expect("dH operator")
++            .expect("dH operator available")
++            .to_dense();
++        assert_close_matrix(&op_dh, &dense_dh, 1e-10, "directional dH operator");
++
++        let dense_d2h = family
++            .exact_newton_joint_hessian_second_directional_derivative_with_specs(
++                &states, &specs, &dir_u, &dir_v,
++            )
++            .expect("dense d2H")
++            .expect("dense d2H available");
++        let op_d2h = workspace
++            .second_directional_derivative_operator(&dir_u, &dir_v)
++            .expect("d2H operator")
++            .expect("d2H operator available")
++            .to_dense();
++        assert_close_matrix(
++            &op_d2h,
++            &dense_d2h,
++            1e-10,
++            "second directional d2H operator",
++        );
++    }
++
++    #[test]
++    fn binomial_mean_wiggle_planner_keeps_second_order_at_large_n() {
++        let n = 50_001usize;
++        let family = BinomialMeanWiggleFamily {
++            y: Array1::zeros(n),
++            weights: Array1::ones(n),
++            link_kind: InverseLink::Standard(LinkFunction::Logit),
++            wiggle_knots: initialize_monotone_wiggle_knots_from_seed(
++                Array1::linspace(-1.0, 1.0, 9).view(),
++                3,
++                4,
++            )
++            .expect("large-n knots"),
++            wiggle_degree: 3,
++            policy: crate::resource::ResourcePolicy::default_library(),
++        };
++        let specs = vec![
++            ParameterBlockSpec {
++                name: "eta".to_string(),
++                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros(
++                    (n, 2),
++                ))),
++                offset: Array1::zeros(n),
++                penalties: vec![],
++                nullspace_dims: vec![],
++                initial_log_lambdas: Array1::zeros(0),
++                initial_beta: None,
++            },
++            ParameterBlockSpec {
++                name: "wiggle".to_string(),
++                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros(
++                    (n, 34),
++                ))),
++                offset: Array1::zeros(n),
++                penalties: vec![],
++                nullspace_dims: vec![],
++                initial_log_lambdas: Array1::zeros(0),
++                initial_beta: None,
++            },
++        ];
++        assert!(family.inner_coefficient_hessian_hvp_available(&specs));
++        assert_eq!(
++            family.exact_outer_derivative_order(&specs, &BlockwiseFitOptions::default()),
++            crate::custom_family::ExactOuterDerivativeOrder::Second
++        );
++    }
+ }
+
+----- PATCH END -----
+
+[2026-05-06T21:19:08.414119+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T21:19:08.441594+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:19:08.441699+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:19:12.078434+00:00] apply_result: mode=apply id=task_e_69fb938423f08324829c6c7a0c34c82d status=Partial applied=0 skipped=0 conflicts=1 cmd=(cd /Users/user/gam && git apply --3way /var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/.tmpfvzIop/patch.diff)
+stdout_tail=
+
+stderr_tail=
+Applied patch to 'src/solver/reml/unified.rs' with conflicts.
+U src/solver/reml/unified.rs
+
+patch_summary: kind=git-diff lines=596 chars=24284 cwd=/Users/user/gam ; head=
+diff --git a/src/solver/reml/unified.rs b/src/solver/reml/unified.rs
+index 3f93c29430becb5e5f288a4902893a85d01371bd..d3e15e2445435726afc7aaff9ab355c62b21b2e2 100644
+--- a/src/solver/reml/unified.rs
++++ b/src/solver/reml/unified.rs
+@@ -10027,218 +10027,253 @@ impl StochasticTraceTargets<'_> {
+                 implicit_ops,
+             } => dense_matrices.len() + implicit_ops.len(),
+         }
+     }
+ }
+ 
+ impl StochasticTraceEstimator {
+     /// Create a new estimator with the given configuration.
+     pub fn new(config: StochasticTraceConfig) -> Self {
+         Self { config }
+     }
+ 
+     /// Create with default configuration.
+     pub fn with_defaults() -> Self {
+         Self::new(StochasticTraceConfig::default())
+----- PATCH BEGIN -----
+diff --git a/src/solver/reml/unified.rs b/src/solver/reml/unified.rs
+index 3f93c29430becb5e5f288a4902893a85d01371bd..d3e15e2445435726afc7aaff9ab355c62b21b2e2 100644
+--- a/src/solver/reml/unified.rs
++++ b/src/solver/reml/unified.rs
+@@ -10027,218 +10027,253 @@ impl StochasticTraceTargets<'_> {
+                 implicit_ops,
+             } => dense_matrices.len() + implicit_ops.len(),
+         }
+     }
+ }
+ 
+ impl StochasticTraceEstimator {
+     /// Create a new estimator with the given configuration.
+     pub fn new(config: StochasticTraceConfig) -> Self {
+         Self { config }
+     }
+ 
+     /// Create with default configuration.
+     pub fn with_defaults() -> Self {
+         Self::new(StochasticTraceConfig::default())
+     }
+ 
+     fn for_outer_hessian(dim: usize, n_coords: usize) -> Self {
+         Self::new(StochasticTraceConfig::outer_hessian(dim, n_coords))
+     }
+ 
+     fn estimate_from_probe_batch<F>(
+         &self,
+         hop: &dyn HessianOperator,
+         n_coords: usize,
+-        mut evaluate_probe: F,
++        evaluate_probe: F,
+     ) -> Vec<f64>
+     where
+-        F: FnMut(&Array1<f64>, &Array1<f64>, &mut [f64]),
++        F: Fn(&Array1<f64>, &Array1<f64>, &mut [f64]) + Sync,
+     {
++        use rayon::iter::{IntoParallelIterator, ParallelIterator};
++
+         if n_coords == 0 {
+             return Vec::new();
+         }
+ 
+         let p = hop.dim();
+         if p == 0 {
+             return vec![0.0; n_coords];
+         }
+ 
+         let mut means = vec![0.0_f64; n_coords];
+         let mut m2s = vec![0.0_f64; n_coords];
+-        let mut probe_values = vec![0.0_f64; n_coords];
+         let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
+         let check_interval = 4;
++        let solve_rel_tol = self.config.solve_rel_tol;
++        let mut n_done = 0usize;
++
++        while n_done < self.config.n_probes_max {
++            let batch_len = check_interval.min(self.config.n_probes_max - n_done);
++            let probes: Vec<Array1<f64>> = (0..batch_len)
++                .map(|_| {
++                    let mut z = Array1::<f64>::zeros(p);
++                    rademacher_probe_into(z.view_mut(), &mut rng_state);
++                    z
++                })
++                .collect();
+ 
+-        let mut z = Array1::<f64>::zeros(p);
+-        for m in 0..self.config.n_probes_max {
+-            rademacher_probe_into(z.view_mut(), &mut rng_state);
+-            let w = hop.stochastic_trace_solve(&z, self.config.solve_rel_tol);
+-            evaluate_probe(&z, &w, &mut probe_values);
++            let batch_values: Vec<Vec<f64>> = probes
++                .into_par_iter()
++                .map(|z| {
++                    let w = hop.stochastic_trace_solve(&z, solve_rel_tol);
++                    let mut values = vec![0.0_f64; n_coords];
++                    evaluate_probe(&z, &w, &mut values);
++                    values
++                })
++                .collect();
+ 
+-            for k in 0..n_coords {
+-                let q_k = probe_values[k];
+-                let count = (m + 1) as f64;
+-                let delta = q_k - means[k];
+-                means[k] += delta / count;
+-                let delta2 = q_k - means[k];
+-                m2s[k] += delta * delta2;
++            for probe_values in batch_values {
++                n_done += 1;
++                let count = n_done as f64;
++                for k in 0..n_coords {
++                    let q_k = probe_values[k];
++                    let delta = q_k - means[k];
++                    means[k] += delta / count;
++                    let delta2 = q_k - means[k];
++                    m2s[k] += delta * delta2;
++                }
+             }
+ 
+-            let n_done = m + 1;
+-            if n_done >= self.config.n_probes_min && n_done % check_interval == 0 {
+-                if self.check_convergence(n_done, &means, &m2s) {
+-                    break;
+-                }
++            if n_done >= self.config.n_probes_min
++                && n_done % check_interval == 0
++                && self.check_convergence(n_done, &means, &m2s)
++            {
++                break;
+             }
+         }
+ 
+         means
+     }
+ 
+     fn estimate_matrix_from_probe_batch<F>(
+         &self,
+         hop: &dyn HessianOperator,
+         n_coords: usize,
+-        mut evaluate_probe: F,
++        evaluate_probe: F,
+     ) -> Array2<f64>
+     where
+-        F: FnMut(&Array1<f64>, &mut Array2<f64>),
++        F: Fn(&Array1<f64>, &mut Array2<f64>) + Sync,
+     {
++        use rayon::iter::{IntoParallelIterator, ParallelIterator};
++
+         if n_coords == 0 {
+             return Array2::zeros((0, 0));
+         }
+         let p = hop.dim();
+         if p == 0 {
+             return Array2::zeros((n_coords, n_coords));
+         }
+ 
+         let mut means = Array2::<f64>::zeros((n_coords, n_coords));
+         let mut m2s = Array2::<f64>::zeros((n_coords, n_coords));
+-        let mut probe_values = Array2::<f64>::zeros((n_coords, n_coords));
+         let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
+         let check_interval = 4;
+-        let mut z = Array1::<f64>::zeros(p);
+-
+-        for m in 0..self.config.n_probes_max {
+-            rademacher_probe_into(z.view_mut(), &mut rng_state);
+-            probe_values.fill(0.0);
+-            evaluate_probe(&z, &mut probe_values);
+-
+-            let count = (m + 1) as f64;
+-            for d in 0..n_coords {
+-                for e in 0..n_coords {
+-                    let q = probe_values[[d, e]];
+-                    let delta = q - means[[d, e]];
+-                    means[[d, e]] += delta / count;
+-                    let delta2 = q - means[[d, e]];
+-                    m2s[[d, e]] += delta * delta2;
++        let mut n_done = 0usize;
++
++        while n_done < self.config.n_probes_max {
++            let batch_len = check_interval.min(self.config.n_probes_max - n_done);
++            let probes: Vec<Array1<f64>> = (0..batch_len)
++                .map(|_| {
++                    let mut z = Array1::<f64>::zeros(p);
++                    rademacher_probe_into(z.view_mut(), &mut rng_state);
++                    z
++                })
++                .collect();
++
++            let batch_values: Vec<Array2<f64>> = probes
++                .into_par_iter()
++                .map(|z| {
++                    let mut values = Array2::<f64>::zeros((n_coords, n_coords));
++                    evaluate_probe(&z, &mut values);
++                    values
++                })
++                .collect();
++
++            for probe_values in batch_values {
++                n_done += 1;
++                let count = n_done as f64;
++                for d in 0..n_coords {
++                    for e in 0..n_coords {
++                        let q = probe_values[[d, e]];
++                        let delta = q - means[[d, e]];
++                        means[[d, e]] += delta / count;
++                        let delta2 = q - means[[d, e]];
++                        m2s[[d, e]] += delta * delta2;
++                    }
+                 }
+             }
+ 
+-            let n_done = m + 1;
+             if n_done >= self.config.n_probes_min
+                 && n_done % check_interval == 0
+                 && self.check_matrix_convergence(n_done, &means, &m2s)
+             {
+                 break;
+             }
+         }
+ 
+         for d in 0..n_coords {
+             for e in (d + 1)..n_coords {
+                 let avg = 0.5 * (means[[d, e]] + means[[e, d]]);
+                 means[[d, e]] = avg;
+                 means[[e, d]] = avg;
+             }
+         }
+         means
+     }
+ 
+     fn estimate_hinv_traces(
+         &self,
+         hop: &dyn HessianOperator,
+         targets: StochasticTraceTargets<'_>,
+     ) -> Vec<f64> {
+         let n_coords = targets.len();
+         if n_coords == 0 {
+             return Vec::new();
+         }
+ 
+         match targets {
+             StochasticTraceTargets::Dense(matrices) => {
+-                let mut a_w = Array1::<f64>::zeros(hop.dim());
+                 self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
++                    let mut a_w = Array1::<f64>::zeros(w.len());
+                     for k in 0..matrices.len() {
+                         dense_matvec_into(matrices[k], w.view(), a_w.view_mut());
+                         probe_values[k] = z.dot(&a_w);
+                     }
+                 })
+             }
+             StochasticTraceTargets::Mixed {
+                 dense_matrices,
+                 operators,
+-            } => {
+-                let mut a_w = Array1::<f64>::zeros(hop.dim());
+-                self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
+-                    for k in 0..dense_matrices.len() {
+-                        dense_matvec_into(dense_matrices[k], w.view(), a_w.view_mut());
+-                        probe_values[k] = z.dot(&a_w);
+-                    }
++            } => self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
++                let mut a_w = Array1::<f64>::zeros(w.len());
++                for k in 0..dense_matrices.len() {
++                    dense_matvec_into(dense_matrices[k], w.view(), a_w.view_mut());
++                    probe_values[k] = z.dot(&a_w);
++                }
+ 
+-                    let dense_count = dense_matrices.len();
+-                    for (oi, op) in operators.iter().enumerate() {
+-                        let k = dense_count + oi;
+-                        if op.has_fast_bilinear_view() {
+-                            probe_values[k] = op.bilinear_view(w.view(), z.view());
+-                        } else {
+-                            op.mul_vec_into(w.view(), a_w.view_mut());
+-                            probe_values[k] = z.dot(&a_w);
+-                        }
++                let dense_count = dense_matrices.len();
++                for (oi, op) in operators.iter().enumerate() {
++                    let k = dense_count + oi;
++                    if op.has_fast_bilinear_view() {
++                        probe_values[k] = op.bilinear_view(w.view(), z.view());
++                    } else {
++                        op.mul_vec_into(w.view(), a_w.view_mut());
++                        probe_values[k] = z.dot(&a_w);
+                     }
+-                })
+-            }
++                }
++            }),
+             StochasticTraceTargets::Structural {
+                 dense_matrices,
+                 implicit_ops,
+             } => {
+                 if implicit_ops.is_empty() {
+                     let no_ops: [&dyn HyperOperator; 0] = [];
+                     return self.estimate_hinv_traces(
+                         hop,
+                         StochasticTraceTargets::Mixed {
+                             dense_matrices,
+                             operators: &no_ops,
+                         },
+                     );
+                 }
+ 
+                 let x_design = implicit_ops[0].x_design.clone();
+-                let mut x_vec = Array1::<f64>::zeros(x_design.nrows());
+-                let mut y_vec = Array1::<f64>::zeros(x_design.nrows());
+-                let mut a_w = Array1::<f64>::zeros(hop.dim());
+                 self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
++                    let mut x_vec = Array1::<f64>::zeros(x_design.nrows());
++                    let mut y_vec = Array1::<f64>::zeros(x_design.nrows());
++                    let mut a_w = Array1::<f64>::zeros(w.len());
+                     design_matrix_apply_view_into(x_design.as_ref(), z.view(), x_vec.view_mut());
+                     design_matrix_apply_view_into(x_design.as_ref(), w.view(), y_vec.view_mut());
+ 
+                     for k in 0..dense_matrices.len() {
+                         dense_matvec_into(dense_matrices[k], w.view(), a_w.view_mut());
+                         probe_values[k] = z.dot(&a_w);
+                     }
+ 
+                     let dense_count = dense_matrices.len();
+                     for (oi, op) in implicit_ops.iter().enumerate() {
+                         let k = dense_count + oi;
+                         probe_values[k] = op.bilinear_with_shared_x(&x_vec, &y_vec, z, w);
+                     }
+                 })
+             }
+         }
+     }
+ 
+     /// Estimate a single trace `tr(H⁻¹ A)` using the same batched Hutchinson
+     /// core as the multi-coordinate path.
+     pub fn estimate_single_trace(&self, hop: &dyn HessianOperator, matrix: &Array2<f64>) -> f64 {
+         let matrices = [matrix];
+         self.estimate_hinv_traces(hop, StochasticTraceTargets::Dense(&matrices))[0]
+     }
+ 
+@@ -10358,69 +10393,73 @@ impl StochasticTraceEstimator {
+         if total == 0 {
+             return Array2::zeros((0, 0));
+         }
+ 
+         let p = hop.dim();
+         if p == 0 {
+             return Array2::zeros((total, total));
+         }
+ 
+         if total == 1 {
+             let value = if n_dense == 1 {
+                 self.estimate_second_order_single_dense(hop, dense_matrices[0])
+             } else {
+                 self.estimate_second_order_single_implicit(hop, implicit_ops[0])
+             };
+             return Array2::from_elem((1, 1), value);
+         }
+ 
+         // Get the shared X reference from the first implicit operator.
+         let x_design = if n_ops > 0 {
+             Some(implicit_ops[0].x_design.clone())
+         } else {
+             None
+         };
+ 
+-        let mut q_columns = Array2::zeros((p, total));
+-        let mut dense_a_u: Vec<Array1<f64>> = (0..n_dense).map(|_| Array1::zeros(p)).collect();
+         let n_obs = implicit_ops.first().map(|op| op.w_diag.len()).unwrap_or(0);
+-        let mut x_vec = Array1::<f64>::zeros(n_obs);
+-        let mut y_vec = Array1::<f64>::zeros(n_obs);
+-        let mut x_r: Vec<Array1<f64>> = (0..total).map(|_| Array1::zeros(n_obs)).collect();
+-        let mut implicit_dx_u: Vec<Array1<f64>> =
+-            (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
+-        let mut implicit_w_dx_u: Vec<Array1<f64>> =
+-            (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
+-        let mut implicit_w_y: Vec<Array1<f64>> = (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
+-        let mut implicit_dx_r: Vec<Vec<Array1<f64>>> = (0..n_ops)
+-            .map(|_| (0..total).map(|_| Array1::zeros(n_obs)).collect())
+-            .collect();
+-        let mut implicit_u_s: Vec<Array1<f64>> = (0..n_ops).map(|_| Array1::zeros(p)).collect();
+-        let mut implicit_n_work = Array1::<f64>::zeros(n_obs);
+-        let mut implicit_p_work = Array1::<f64>::zeros(p);
+ 
+         self.estimate_matrix_from_probe_batch(hop, total, |z, probe_values| {
++            let mut q_columns = Array2::zeros((p, total));
++            let mut dense_a_u: Vec<Array1<f64>> =
++                (0..n_dense).map(|_| Array1::zeros(p)).collect();
++            let mut x_vec = Array1::<f64>::zeros(n_obs);
++            let mut y_vec = Array1::<f64>::zeros(n_obs);
++            let mut x_r: Vec<Array1<f64>> = (0..total).map(|_| Array1::zeros(n_obs)).collect();
++            let mut implicit_dx_u: Vec<Array1<f64>> =
++                (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
++            let mut implicit_w_dx_u: Vec<Array1<f64>> =
++                (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
++            let mut implicit_w_y: Vec<Array1<f64>> =
++                (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
++            let mut implicit_dx_r: Vec<Vec<Array1<f64>>> = (0..n_ops)
++                .map(|_| (0..total).map(|_| Array1::zeros(n_obs)).collect())
++                .collect();
++            let mut implicit_u_s: Vec<Array1<f64>> =
++                (0..n_ops).map(|_| Array1::zeros(p)).collect();
++            let mut implicit_n_work = Array1::<f64>::zeros(n_obs);
++            let mut implicit_p_work = Array1::<f64>::zeros(p);
++
+             // Step 1: u = H⁻¹ z (shared solve)
+             let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
+ 
+             if let Some(ref x) = x_design {
+                 design_matrix_apply_view_into(x.as_ref(), z.view(), x_vec.view_mut());
+             }
+ 
+             // Step 2: Form q_e = A_e z for all axes e.
+             // For dense: q_e = dense_matrix * z
+             // For implicit: q_e = op.matvec_with_shared_xz(&x_vec, &z)
+             for e in 0..n_dense {
+                 dense_matvec_into(dense_matrices[e], z.view(), q_columns.column_mut(e));
+             }
+             for (oi, op) in implicit_ops.iter().enumerate() {
+                 let e = n_dense + oi;
+                 op.matvec_with_shared_xz_into(
+                     &x_vec,
+                     z.view(),
+                     q_columns.column_mut(e),
+                     implicit_n_work.view_mut(),
+                     implicit_p_work.view_mut(),
+                 );
+             }
+ 
+             // Step 3: R = H⁻¹ [q_1, ..., q_D] (block solve, total RHS)
+@@ -10562,121 +10601,120 @@ impl StochasticTraceEstimator {
+         hop: &dyn HessianOperator,
+         dense_matrices: &[&Array2<f64>],
+         operators: &[&dyn HyperOperator],
+     ) -> Array2<f64> {
+         let n_dense = dense_matrices.len();
+         let n_ops = operators.len();
+         let total = n_dense + n_ops;
+         if total == 0 {
+             return Array2::zeros((0, 0));
+         }
+ 
+         let p = hop.dim();
+         if p == 0 {
+             return Array2::zeros((total, total));
+         }
+ 
+         if total == 1 {
+             let value = if n_dense == 1 {
+                 self.estimate_second_order_single_dense(hop, dense_matrices[0])
+             } else {
+                 self.estimate_second_order_single_operator(hop, operators[0])
+             };
+             return Array2::from_elem((1, 1), value);
+         }
+ 
+-        let mut q_columns = Array2::zeros((p, total));
+-        let mut a_u_columns = Array2::zeros((p, total));
+-
+         self.estimate_matrix_from_probe_batch(hop, total, |z, probe_values| {
++            let mut q_columns = Array2::zeros((p, total));
++            let mut a_u_columns = Array2::zeros((p, total));
+             let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
+ 
+             for e in 0..n_dense {
+                 dense_matvec_into(dense_matrices[e], z.view(), q_columns.column_mut(e));
+                 dense_matvec_into(dense_matrices[e], u.view(), a_u_columns.column_mut(e));
+             }
+             for (oi, op) in operators.iter().enumerate() {
+                 let e = n_dense + oi;
+                 op.mul_vec_into(z.view(), q_columns.column_mut(e));
+                 op.mul_vec_into(u.view(), a_u_columns.column_mut(e));
+             }
+ 
+             let r = hop.stochastic_trace_solve_multi(&q_columns, self.config.solve_rel_tol);
+ 
+             for d in 0..total {
+                 let a_d_u = a_u_columns.column(d);
+                 for e in d..total {
+                     let r_e = r.column(e);
+                     let val = a_d_u.dot(&r_e);
+                     probe_values[[d, e]] = val;
+                     if d != e {
+                         let r_d = r.column(d);
+                         let val_sym = a_u_columns.column(e).dot(&r_d);
+                         probe_values[[e, d]] = val_sym;
+                     }
+                 }
+             }
+         })
+     }
+ 
+     fn estimate_second_order_single_dense(
+         &self,
+         hop: &dyn HessianOperator,
+         matrix: &Array2<f64>,
+     ) -> f64 {
+         let p = hop.dim();
+         if p == 0 {
+             return 0.0;
+         }
+ 
+-        let mut q = Array1::<f64>::zeros(p);
+         self.estimate_matrix_from_probe_batch(hop, 1, |z, probe_values| {
++            let mut q = Array1::<f64>::zeros(p);
+             let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
+             dense_matvec_into(matrix, z.view(), q.view_mut());
+             let r = hop.stochastic_trace_solve(&q, self.config.solve_rel_tol);
+             probe_values[[0, 0]] = dense_bilinear(matrix, u.view(), r.view());
+         })[[0, 0]]
+     }
+ 
+     fn estimate_second_order_single_implicit(
+         &self,
+         hop: &dyn HessianOperator,
+         op: &ImplicitHyperOperator,
+     ) -> f64 {
+         let p = hop.dim();
+         if p == 0 {
+             return 0.0;
+         }
+ 
+         let n_obs = op.w_diag.len();
+-        let mut x_z = Array1::<f64>::zeros(n_obs);
+-        let mut x_u = Array1::<f64>::zeros(n_obs);
+-        let mut x_r = Array1::<f64>::zeros(n_obs);
+-        let mut n_work = Array1::<f64>::zeros(n_obs);
+-        let mut p_work = Array1::<f64>::zeros(p);
+-        let mut q = Array1::<f64>::zeros(p);
+         self.estimate_matrix_from_probe_batch(hop, 1, |z, probe_values| {
++            let mut x_z = Array1::<f64>::zeros(n_obs);
++            let mut x_u = Array1::<f64>::zeros(n_obs);
++            let mut x_r = Array1::<f64>::zeros(n_obs);
++            let mut n_work = Array1::<f64>::zeros(n_obs);
++            let mut p_work = Array1::<f64>::zeros(p);
++            let mut q = Array1::<f64>::zeros(p);
+             let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
+             design_matrix_apply_view_into(&op.x_design, z.view(), x_z.view_mut());
+             op.matvec_with_shared_xz_into(
+                 &x_z,
+                 z.view(),
+                 q.view_mut(),
+                 n_work.view_mut(),
+                 p_work.view_mut(),
+             );
+             let r = hop.stochastic_trace_solve(&q, self.config.solve_rel_tol);
+ 
+             design_matrix_apply_view_into(&op.x_design, u.view(), x_u.view_mut());
+             design_matrix_apply_view_into(&op.x_design, r.view(), x_r.view_mut());
+             let dx_u = op
+                 .implicit_deriv
+                 .forward_mul(op.axis, &u.view())
+                 .expect("radial scalar evaluation failed during implicit derivative forward_mul");
+             let dx_r = op
+                 .implicit_deriv
+                 .forward_mul(op.axis, &r.view())
+                 .expect("radial scalar evaluation failed during implicit derivative forward_mul");
+ 
+             let w = &*op.w_diag;
+             let mut value = 0.0;
+             for i in 0..w.len() {
+@@ -10686,53 +10724,53 @@ impl StochasticTraceEstimator {
+             }
+             // Non-Gaussian fixed-β third-derivative correction:
+             //   uᵀ Xᵀ diag(c ⊙ X_{ψ_d} β̂) X r = Σ_i (X u)_i · c_x_psi_beta_i · (X r)_i
+             if let Some(c_x_psi_beta) = op.c_x_psi_beta.as_ref() {
+                 let c = c_x_psi_beta.as_ref();
+                 for i in 0..w.len() {
+                     value += x_u[i] * c[i] * x_r[i];
+                 }
+             }
+             value += dense_bilinear(&op.s_psi, r.view(), u.view());
+ 
+             probe_values[[0, 0]] = value;
+         })[[0, 0]]
+     }
+ 
+     fn estimate_second_order_single_operator(
+         &self,
+         hop: &dyn HessianOperator,
+         op: &dyn HyperOperator,
+     ) -> f64 {
+         let p = hop.dim();
+         if p == 0 {
+             return 0.0;
+         }
+ 
+-        let mut q = Array1::<f64>::zeros(p);
+-        let mut a_u = Array1::<f64>::zeros(p);
+         self.estimate_matrix_from_probe_batch(hop, 1, |z, probe_values| {
++            let mut q = Array1::<f64>::zeros(p);
++            let mut a_u = Array1::<f64>::zeros(p);
+             let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
+             op.mul_vec_into(z.view(), q.view_mut());
+             op.mul_vec_into(u.view(), a_u.view_mut());
+             let r = hop.stochastic_trace_solve(&q, self.config.solve_rel_tol);
+             probe_values[[0, 0]] = a_u.dot(&r);
+         })[[0, 0]]
+     }
+ 
+     /// Check the adaptive stopping criterion.
+     ///
+     /// Returns `true` if all coordinates have converged:
+     /// ```text
+     /// max_k  s_{M,k} / (√M · max(|q̄_{M,k}|, τ_rel))  ≤  ε
+     /// ```
+     fn check_convergence(&self, n: usize, means: &[f64], m2s: &[f64]) -> bool {
+         if n < 2 {
+             return false;
+         }
+         let sqrt_n = (n as f64).sqrt();
+         let n_f = n as f64;
+ 
+         for k in 0..means.len() {
+             let variance = m2s[k] / (n_f - 1.0);
+             let std_dev = variance.max(0.0).sqrt();
+             let denom = sqrt_n * means[k].abs().max(self.config.tau_rel);
+
+----- PATCH END -----
+
+[2026-05-06T21:20:41.623679+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T21:20:41.648368+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:20:41.648428+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:20:44.073541+00:00] apply_result: mode=apply id=task_e_69fb93404bb883248861e9e584e7177c status=Partial applied=0 skipped=0 conflicts=1 cmd=(cd /Users/user/gam && git apply --3way /var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/.tmp0v6Y5f/patch.diff)
+stdout_tail=
+
+stderr_tail=
+Applied patch to 'src/families/transformation_normal.rs' with conflicts.
+U src/families/transformation_normal.rs
+
+patch_summary: kind=git-diff lines=767 chars=34314 cwd=/Users/user/gam ; head=
+diff --git a/src/families/transformation_normal.rs b/src/families/transformation_normal.rs
+index 88eacd9401e41f65a0bf49f5df5e2b8b8a1b0d84..212a2c926e4080227682ccca7ccf91d959d2a52f 100644
+--- a/src/families/transformation_normal.rs
++++ b/src/families/transformation_normal.rs
+@@ -91,50 +91,60 @@ impl Default for TransformationNormalConfig {
+             response_extra_penalty_orders: vec![1],
+             double_penalty: true,
+         }
+     }
+ }
+ 
+ /// Baseline cap for the tensor-product width used by the transformation-normal
+ /// response basis. Small datasets should stay compact because the fit
+ /// repeatedly factorizes dense penalized Hessians.
+ const BASE_TRANSFORMATION_TENSOR_WIDTH: usize = 160;
+ /// Large samples can support a richer response basis without the aggressive
+ /// under…
+----- PATCH BEGIN -----
+diff --git a/src/families/transformation_normal.rs b/src/families/transformation_normal.rs
+index 88eacd9401e41f65a0bf49f5df5e2b8b8a1b0d84..212a2c926e4080227682ccca7ccf91d959d2a52f 100644
+--- a/src/families/transformation_normal.rs
++++ b/src/families/transformation_normal.rs
+@@ -91,50 +91,60 @@ impl Default for TransformationNormalConfig {
+             response_extra_penalty_orders: vec![1],
+             double_penalty: true,
+         }
+     }
+ }
+ 
+ /// Baseline cap for the tensor-product width used by the transformation-normal
+ /// response basis. Small datasets should stay compact because the fit
+ /// repeatedly factorizes dense penalized Hessians.
+ const BASE_TRANSFORMATION_TENSOR_WIDTH: usize = 160;
+ /// Large samples can support a richer response basis without the aggressive
+ /// underfitting forced by the small-sample cap above. This upper cap keeps the
+ /// tensor width bounded even when the covariate side is narrow.
+ const LARGE_SAMPLE_TRANSFORMATION_TENSOR_WIDTH: usize = 320;
+ /// E[log |Z|] for Z ~ N(0, 1), used to put local log-absolute residual
+ /// projections on the standard-normal scale.
+ const STANDARD_NORMAL_MEAN_LOG_ABS: f64 = -0.635_181_422_730_739_1;
+ /// Relative tolerance for response-grid deduplication and zero-width-gap
+ /// skipping. Used by both the fit-time grid builder
+ /// (`transformation_monotonicity_response_grid`) and the predict-time
+ /// derivative-grid builder. Kept in sync so the two grids generate the
+ /// same point set on identical inputs (otherwise predict could hit a
+ /// distinct grid point that the fit-time barrier never bounded).
+ pub const TRANSFORMATION_GRID_RELATIVE_TOL: f64 = 1.0e-12;
+ 
++/// Minimum row-by-output work estimate before SCOP row-contribution reductions
++/// switch to Rayon. Below this threshold the sequential path avoids parallel
++/// scheduling overhead and preserves the original accumulation order.
++const SCOP_ROW_REDUCTION_PARALLEL_MIN_WORK: usize = 65_536;
++
++#[inline]
++fn scop_use_parallel_row_reduction(n_rows: usize, output_len: usize) -> bool {
++    n_rows > 1 && n_rows.saturating_mul(output_len) >= SCOP_ROW_REDUCTION_PARALLEL_MIN_WORK
++}
++
+ /// Strict-feasibility margin for `h' > 0` on the monotonicity grid. Used
+ /// both by the fit-time fraction-to-boundary line search (so accepted β
+ /// keeps `h'(grid) ≥ EPS`) and by the predict-time monotonicity check
+ /// in `inference::predict_input` (which rejects predictions whose minimum
+ /// `h'` on the response grid drops below this threshold). Keeping these
+ /// in sync prevents the predict path from rejecting fits that the
+ /// optimizer accepted as feasible — and vice versa.
+ pub const TRANSFORMATION_MONOTONICITY_EPS: f64 = 1.0e-8;
+ /// Absolute bound for feasible transformation scores on the standard-normal
+ /// scale. The CTN likelihood targets `h(Y|x) ~ N(0,1)`; accepting exact-Newton
+ /// iterates with finite positive `h'` but astronomical `|h|` lets curvature
+ /// diagnostics overflow into meaningless values. This is a numerical runaway
+ /// guard, not a statistical plausibility filter: startup seeds can temporarily
+ /// land outside practically observable normal quantiles before the line search
+ /// moves them back into the likelihood's high-density region.
+ pub const TRANSFORMATION_NORMAL_H_ABS_MAX: f64 = 1.0e6;
+ /// Maximum number of response quantiles drawn into the monotonicity grid.
+ /// Shared between fit and predict so the grid construction is identical.
+ pub const TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES: usize = 129;
+ /// Number of equal subdivisions inserted between consecutive grid points
+ /// (knots + quantiles). Shared between fit and predict.
+ pub const TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS: usize = 4;
+ /// Number of dense-spectral factor columns processed per exact ψψ HVP row pass.
+ /// At biobank CTN dimensions p≈800, this keeps the per-worker accumulator well
+ /// under 1 MiB while reducing repeated SCOP row-invariant work by 32× relative
+@@ -1909,53 +1919,51 @@ impl TransformationNormalFamily {
+         if beta.len() != p_total || direction.len() != p_total || probe.len() != p_total {
+             return Err(format!(
+                 "SCOP dH matvec length mismatch: beta={}, direction={}, probe={}, expected={p_total}",
+                 beta.len(),
+                 direction.len(),
+                 probe.len()
+             ));
+         }
+         let beta_mat = beta
+             .view()
+             .into_shape_with_order((p_resp, p_cov))
+             .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
+         let dir_mat = direction
+             .view()
+             .into_shape_with_order((p_resp, p_cov))
+             .map_err(|e| format!("SCOP direction reshape failed: {e}"))?;
+         let probe_mat = probe
+             .view()
+             .into_shape_with_order((p_resp, p_cov))
+             .map_err(|e| format!("SCOP probe reshape failed: {e}"))?;
+         let cov = self
+             .covariate_dense_arc()
+             .map_err(|e| format!("SCOP dH matvec requires cached covariate design: {e}"))?;
+         let weights = self.weights.as_ref();
+         let h_prime = row_quantities.h_prime.as_ref();
+-        let mut out = Array1::<f64>::zeros(p_total);
+-
+-        for i in 0..n {
++        let add_row = |out: &mut Array1<f64>, i: usize| {
+             let cov_row = cov.row(i);
+             let rv = self.response_val_basis.row(i);
+             let rd = self.response_deriv_basis.row(i);
+             let wi = weights[i];
+             let hp = h_prime[i];
+             let inv_hp = 1.0 / hp;
+             let inv_hp_sq = inv_hp * inv_hp;
+             let inv_hp_cu = inv_hp_sq * inv_hp;
+ 
+             let mut gamma = vec![0.0; p_resp];
+             let mut gamma_dir = vec![0.0; p_resp];
+             let mut gamma_probe = vec![0.0; p_resp];
+             for k in 0..p_resp {
+                 gamma[k] = beta_mat.row(k).dot(&cov_row);
+                 gamma_dir[k] = dir_mat.row(k).dot(&cov_row);
+                 gamma_probe[k] = probe_mat.row(k).dot(&cov_row);
+             }
+ 
+             let mut h_dir = rv[0] * gamma_dir[0];
+             let mut hp_dir = rd[0] * gamma_dir[0];
+             let mut h_probe = rv[0] * gamma_probe[0];
+             let mut hp_probe = rd[0] * gamma_probe[0];
+             let mut h_dir_probe = 0.0;
+             let mut hp_dir_probe = 0.0;
+             let mut endpoint_dir = [
+@@ -2058,104 +2066,128 @@ impl TransformationNormalFamily {
+                         normalizer_scalar +=
+                             q.second[a][b] * endpoint_dir[b] * endpoint_factor_probe[a];
+                         normalizer_scalar += q.second[a][b]
+                             * (endpoint_factor_dir[a] * endpoint_probe[b]
+                                 + endpoint_factor[a] * endpoint_dir_probe[b]);
+                         for c_ep in 0..2 {
+                             normalizer_scalar += q.third[a][b][c_ep]
+                                 * endpoint_dir[c_ep]
+                                 * endpoint_factor[a]
+                                 * endpoint_probe[b];
+                         }
+                     }
+                 }
+                 let scalar = wi
+                     * (h_factor_dir * h_probe
+                         + h_factor * h_dir_probe
+                         + h_dir * h_second_probe
+                         + (hp_factor_dir * hp_probe + hp_factor * hp_dir_probe) * inv_hp_sq
+                         - 2.0 * hp_factor * hp_probe * hp_dir * inv_hp_cu
+                         + hp_second_probe * hp_dir * inv_hp_sq
+                         + normalizer_scalar);
+                 for c in 0..p_cov {
+                     out[k * p_cov + c] += scalar * cov_row[c];
+                 }
+             }
+-        }
++        };
++
++        let out = if scop_use_parallel_row_reduction(n, p_total) {
++            use rayon::iter::{IntoParallelIterator, ParallelIterator};
++            (0..n)
++                .into_par_iter()
++                .fold(
++                    || Array1::<f64>::zeros(p_total),
++                    |mut acc, i| {
++                        add_row(&mut acc, i);
++                        acc
++                    },
++                )
++                .reduce(
++                    || Array1::<f64>::zeros(p_total),
++                    |mut lhs, rhs| {
++                        lhs += &rhs;
++                        lhs
++                    },
++                )
++        } else {
++            let mut out = Array1::<f64>::zeros(p_total);
++            for i in 0..n {
++                add_row(&mut out, i);
++            }
++            out
++        };
+ 
+         Ok(out)
+     }
+ 
+     fn scop_hessian_second_directional_matvec(
+         &self,
+         beta: &Array1<f64>,
+         direction_u: &Array1<f64>,
+         direction_v: &Array1<f64>,
+         row_quantities: &TransformationNormalRowQuantityCache,
+         probe: &Array1<f64>,
+     ) -> Result<Array1<f64>, String> {
+         let n = self.response_val_basis.nrows();
+         let p_resp = self.response_val_basis.ncols();
+         let p_cov = self.covariate_design.ncols();
+         let p_total = p_resp * p_cov;
+         if beta.len() != p_total
+             || direction_u.len() != p_total
+             || direction_v.len() != p_total
+             || probe.len() != p_total
+         {
+             return Err(format!(
+                 "SCOP d2H matvec length mismatch: beta={}, u={}, v={}, probe={}, expected={p_total}",
+                 beta.len(),
+                 direction_u.len(),
+                 direction_v.len(),
+                 probe.len()
+             ));
+         }
+         let beta_mat = beta
+             .view()
+             .into_shape_with_order((p_resp, p_cov))
+             .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
+         let dir_u_mat = direction_u
+             .view()
+             .into_shape_with_order((p_resp, p_cov))
+             .map_err(|e| format!("SCOP u direction reshape failed: {e}"))?;
+         let dir_v_mat = direction_v
+             .view()
+             .into_shape_with_order((p_resp, p_cov))
+             .map_err(|e| format!("SCOP v direction reshape failed: {e}"))?;
+         let probe_mat = probe
+             .view()
+             .into_shape_with_order((p_resp, p_cov))
+             .map_err(|e| format!("SCOP probe reshape failed: {e}"))?;
+         let cov = self
+             .covariate_dense_arc()
+             .map_err(|e| format!("SCOP d2H matvec requires cached covariate design: {e}"))?;
+         let weights = self.weights.as_ref();
+         let h_prime = row_quantities.h_prime.as_ref();
+-        let mut out = Array1::<f64>::zeros(p_total);
+-
+-        for i in 0..n {
++        let add_row = |out: &mut Array1<f64>, i: usize| {
+             let cov_row = cov.row(i);
+             let rv = self.response_val_basis.row(i);
+             let rd = self.response_deriv_basis.row(i);
+             let wi = weights[i];
+             let hp = h_prime[i];
+             let inv_hp = 1.0 / hp;
+             let inv_hp_sq = inv_hp * inv_hp;
+             let inv_hp_cu = inv_hp_sq * inv_hp;
+             let inv_hp_qu = inv_hp_sq * inv_hp_sq;
+ 
+             let mut gamma = vec![0.0; p_resp];
+             let mut gamma_u = vec![0.0; p_resp];
+             let mut gamma_v = vec![0.0; p_resp];
+             let mut gamma_probe = vec![0.0; p_resp];
+             for k in 0..p_resp {
+                 gamma[k] = beta_mat.row(k).dot(&cov_row);
+                 gamma_u[k] = dir_u_mat.row(k).dot(&cov_row);
+                 gamma_v[k] = dir_v_mat.row(k).dot(&cov_row);
+                 gamma_probe[k] = probe_mat.row(k).dot(&cov_row);
+             }
+ 
+             let mut hp_u = rd[0] * gamma_u[0];
+             let mut hp_v = rd[0] * gamma_v[0];
+             let mut hp_probe = rd[0] * gamma_probe[0];
+             let mut h_uv = 0.0;
+@@ -2331,51 +2363,77 @@ impl TransformationNormalFamily {
+                                 + endpoint_factor_v[a] * endpoint_u_probe[b]);
+                     }
+                 }
+                 let scalar = wi
+                     * (h_factor_u * h_v_probe
+                         + h_factor_v * h_u_probe
+                         + h_uv * h_second_probe
+                         + (hp_factor_u * hp_v_probe + hp_factor_v * hp_u_probe) * inv_hp_sq
+                         - 2.0
+                             * (hp_factor_u * hp_probe + hp_factor * hp_u_probe)
+                             * hp_v
+                             * inv_hp_cu
+                         - 2.0
+                             * (hp_factor_v * hp_probe + hp_factor * hp_v_probe)
+                             * hp_u
+                             * inv_hp_cu
+                         - 2.0 * hp_factor * hp_probe * hp_uv * inv_hp_cu
+                         + 6.0 * hp_factor * hp_probe * hp_u * hp_v * inv_hp_qu
+                         + hp_second_probe * hp_uv * inv_hp_sq
+                         - 2.0 * hp_second_probe * hp_u * hp_v * inv_hp_cu
+                         + normalizer_scalar);
+                 for c in 0..p_cov {
+                     out[k * p_cov + c] += scalar * cov_row[c];
+                 }
+             }
+-        }
++        };
++
++        let out = if scop_use_parallel_row_reduction(n, p_total) {
++            use rayon::iter::{IntoParallelIterator, ParallelIterator};
++            (0..n)
++                .into_par_iter()
++                .fold(
++                    || Array1::<f64>::zeros(p_total),
++                    |mut acc, i| {
++                        add_row(&mut acc, i);
++                        acc
++                    },
++                )
++                .reduce(
++                    || Array1::<f64>::zeros(p_total),
++                    |mut lhs, rhs| {
++                        lhs += &rhs;
++                        lhs
++                    },
++                )
++        } else {
++            let mut out = Array1::<f64>::zeros(p_total);
++            for i in 0..n {
++                add_row(&mut out, i);
++            }
++            out
++        };
+ 
+         Ok(out)
+     }
+ 
+     fn scop_hessian_diagonal(
+         &self,
+         beta: &Array1<f64>,
+         row_quantities: &TransformationNormalRowQuantityCache,
+     ) -> Result<Array1<f64>, String> {
+         let n = self.response_val_basis.nrows();
+         let p_resp = self.response_val_basis.ncols();
+         let p_cov = self.covariate_design.ncols();
+         let p_total = p_resp * p_cov;
+         if beta.len() != p_total {
+             return Err(format!(
+                 "SCOP Hessian diagonal beta length {} != expected {p_total}",
+                 beta.len()
+             ));
+         }
+         let beta_mat = beta
+             .view()
+             .into_shape_with_order((p_resp, p_cov))
+             .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
+         let cov = self
+             .covariate_dense_arc()
+@@ -2485,152 +2543,174 @@ impl TransformationNormalFamily {
+             ));
+         }
+         let beta_mat = beta
+             .view()
+             .into_shape_with_order((p_resp, p_cov))
+             .map_err(|e| format!("SCOP psi beta reshape failed: {e}"))?;
+         let cov = self
+             .covariate_dense_arc()
+             .map_err(|e| format!("SCOP psi terms require cached covariate design: {e}"))?;
+         let cov_psi = op
+             .materialize_cov_first_axis(axis)
+             .map_err(|e| format!("SCOP psi materialize_cov_first failed: {e}"))?;
+         if cov_psi.nrows() != n || cov_psi.ncols() != p_cov {
+             return Err(format!(
+                 "SCOP psi covariate derivative shape {}x{} != expected {}x{}",
+                 cov_psi.nrows(),
+                 cov_psi.ncols(),
+                 n,
+                 p_cov
+             ));
+         }
+ 
+         let weights = self.weights.as_ref();
+         let h = row_quantities.h.as_ref();
+         let h_prime = row_quantities.h_prime.as_ref();
+-        let mut objective_psi = 0.0;
+-        let mut score_psi = Array1::<f64>::zeros(p_total);
+-
+-        for i in 0..n {
++        let endpoint_basis = [
++            self.response_upper_basis
++                .as_slice()
++                .ok_or_else(|| "SCOP endpoint upper basis is not contiguous".to_string())?,
++            self.response_lower_basis
++                .as_slice()
++                .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
++        ];
++        let add_row = |score_psi: &mut Array1<f64>, i: usize| -> f64 {
+             let cov_row = cov.row(i);
+             let psi_row = cov_psi.row(i);
+             let rv = self.response_val_basis.row(i);
+             let rd = self.response_deriv_basis.row(i);
+             let wi = weights[i];
+             let hi = h[i];
+             let hp = h_prime[i];
+             let inv_hp = 1.0 / hp;
+             let inv_hp_sq = inv_hp * inv_hp;
+             let q = row_quantities.endpoint_q[i];
+             let gamma_row = row_quantities.gamma.row(i);
+ 
+             let mut gamma = vec![0.0; p_resp];
+             let mut gamma_psi = vec![0.0; p_resp];
+             for k in 0..p_resp {
+                 gamma[k] = gamma_row[k];
+                 gamma_psi[k] = beta_mat.row(k).dot(&psi_row);
+             }
+ 
+             let mut h_psi = rv[0] * gamma_psi[0];
+             let mut hp_psi = rd[0] * gamma_psi[0];
+             for k in 1..p_resp {
+                 h_psi += 2.0 * rv[k] * gamma[k] * gamma_psi[k];
+                 hp_psi += 2.0 * rd[k] * gamma[k] * gamma_psi[k];
+             }
+ 
+-            let endpoint_basis = [
+-                self.response_upper_basis
+-                    .as_slice()
+-                    .ok_or_else(|| "SCOP endpoint upper basis is not contiguous".to_string())?,
+-                self.response_lower_basis
+-                    .as_slice()
+-                    .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
+-            ];
+             let mut endpoint_psi = [0.0; 2];
+             let mut endpoint_factor = vec![[0.0; 2]; p_resp];
+             let mut endpoint_psi_cov_factor = vec![[0.0; 2]; p_resp];
+             let mut endpoint_psi_psi_factor = vec![[0.0; 2]; p_resp];
+             for e in 0..2 {
+                 let basis = endpoint_basis[e];
+                 endpoint_psi[e] = basis[0] * gamma_psi[0];
+                 endpoint_factor[0][e] = basis[0];
+                 endpoint_psi_psi_factor[0][e] = basis[0];
+                 for k in 1..p_resp {
+                     endpoint_psi[e] += 2.0 * basis[k] * gamma[k] * gamma_psi[k];
+                     endpoint_factor[k][e] = 2.0 * basis[k] * gamma[k];
+                     endpoint_psi_cov_factor[k][e] = 2.0 * basis[k] * gamma_psi[k];
+                     endpoint_psi_psi_factor[k][e] = 2.0 * basis[k] * gamma[k];
+                 }
+             }
+ 
+-            objective_psi +=
+-                wi * (hi * h_psi - hp_psi * inv_hp + endpoint_chain_first(&q, endpoint_psi));
+-
+             let mut h_factor = vec![0.0; p_resp];
+             let mut hp_factor = vec![0.0; p_resp];
+             let mut hpsi_cov_factor = vec![0.0; p_resp];
+             let mut hppsi_cov_factor = vec![0.0; p_resp];
+             let mut hpsi_psi_factor = vec![0.0; p_resp];
+             let mut hppsi_psi_factor = vec![0.0; p_resp];
+             h_factor[0] = rv[0];
+             hp_factor[0] = rd[0];
+             hpsi_psi_factor[0] = rv[0];
+             hppsi_psi_factor[0] = rd[0];
+             for k in 1..p_resp {
+                 h_factor[k] = 2.0 * rv[k] * gamma[k];
+                 hp_factor[k] = 2.0 * rd[k] * gamma[k];
+                 hpsi_cov_factor[k] = 2.0 * rv[k] * gamma_psi[k];
+                 hppsi_cov_factor[k] = 2.0 * rd[k] * gamma_psi[k];
+                 hpsi_psi_factor[k] = 2.0 * rv[k] * gamma[k];
+                 hppsi_psi_factor[k] = 2.0 * rd[k] * gamma[k];
+             }
+ 
+             for k in 0..p_resp {
+                 for c in 0..p_cov {
+                     let idx = k * p_cov + c;
+                     let h_a = h_factor[k] * cov_row[c];
+                     let hp_a = hp_factor[k] * cov_row[c];
+                     let hpsi_a = hpsi_cov_factor[k] * cov_row[c] + hpsi_psi_factor[k] * psi_row[c];
+                     let hppsi_a =
+                         hppsi_cov_factor[k] * cov_row[c] + hppsi_psi_factor[k] * psi_row[c];
+                     let endpoint_a = [
+                         endpoint_factor[k][0] * cov_row[c],
+                         endpoint_factor[k][1] * cov_row[c],
+                     ];
+                     let endpoint_psi_a = [
+                         endpoint_psi_cov_factor[k][0] * cov_row[c]
+                             + endpoint_psi_psi_factor[k][0] * psi_row[c],
+                         endpoint_psi_cov_factor[k][1] * cov_row[c]
+                             + endpoint_psi_psi_factor[k][1] * psi_row[c],
+                     ];
+                     score_psi[idx] += wi
+                         * (h_a * h_psi + hi * hpsi_a - hppsi_a * inv_hp
+                             + hp_psi * hp_a * inv_hp_sq
+                             + endpoint_chain_second(&q, endpoint_psi, endpoint_a, endpoint_psi_a));
+                 }
+             }
+-        }
++            wi * (hi * h_psi - hp_psi * inv_hp + endpoint_chain_first(&q, endpoint_psi))
++        };
++
++        let (objective_psi, score_psi) = if scop_use_parallel_row_reduction(n, p_total) {
++            use rayon::iter::{IntoParallelIterator, ParallelIterator};
++            (0..n)
++                .into_par_iter()
++                .fold(
++                    || (0.0, Array1::<f64>::zeros(p_total)),
++                    |(mut objective_acc, mut score_acc), i| {
++                        objective_acc += add_row(&mut score_acc, i);
++                        (objective_acc, score_acc)
++                    },
++                )
++                .reduce(
++                    || (0.0, Array1::<f64>::zeros(p_total)),
++                    |(objective_lhs, mut score_lhs), (objective_rhs, score_rhs)| {
++                        score_lhs += &score_rhs;
++                        (objective_lhs + objective_rhs, score_lhs)
++                    },
++                )
++        } else {
++            let mut objective_psi = 0.0;
++            let mut score_psi = Array1::<f64>::zeros(p_total);
++            for i in 0..n {
++                objective_psi += add_row(&mut score_psi, i);
++            }
++            (objective_psi, score_psi)
++        };
+ 
+         let hessian_psi_operator: Arc<dyn HyperOperator> =
+             Arc::new(TransformationNormalPsiHessianOperator::new(
+                 Arc::new(self.clone()),
+                 beta.clone(),
+                 Arc::clone(&op_arc),
+                 axis,
+                 Arc::clone(&row_quantities.gamma),
+                 Arc::clone(&row_quantities.h),
+                 Arc::clone(&row_quantities.h_prime),
+                 Arc::clone(&row_quantities.endpoint_q),
+             ));
+ 
+         Ok(ExactNewtonJointPsiTerms {
+             objective_psi,
+             score_psi,
+             hessian_psi: Array2::zeros((0, 0)),
+             hessian_psi_operator: Some(hessian_psi_operator),
+         })
+     }
+ 
+     fn scop_psi_hessian_apply_from_operator(
+         &self,
+         beta: &Array1<f64>,
+         row_quantities: &TransformationNormalRowQuantityCache,
+@@ -2690,75 +2770,128 @@ impl TransformationNormalFamily {
+         let dir_mat = direction
+             .view()
+             .into_shape_with_order((p_resp, p_cov))
+             .map_err(|e| format!("SCOP psi Hessian apply direction reshape failed: {e}"))?;
+         if cov_psi.nrows() != n || cov_psi.ncols() != p_cov {
+             return Err(format!(
+                 "SCOP psi Hessian apply covariate derivative shape {}x{} for axis {axis} != expected {}x{}",
+                 cov_psi.nrows(),
+                 cov_psi.ncols(),
+                 n,
+                 p_cov
+             ));
+         }
+ 
+         let weights = self.weights.as_ref();
+         let h = row_quantities.h.as_ref();
+         let h_prime = row_quantities.h_prime.as_ref();
+         let endpoint_basis = [
+             self.response_upper_basis
+                 .as_slice()
+                 .ok_or_else(|| "SCOP endpoint upper basis is not contiguous".to_string())?,
+             self.response_lower_basis
+                 .as_slice()
+                 .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
+         ];
+-        let mut out = Array1::<f64>::zeros(p_total);
+-        let mut gamma = vec![0.0; p_resp];
+-        let mut gamma_dir = vec![0.0; p_resp];
+-        let mut gamma_psi = vec![0.0; p_resp];
+-        let mut gamma_psi_dir = vec![0.0; p_resp];
+-        let mut endpoint_factor = vec![[0.0; 2]; p_resp];
+-        let mut endpoint_factor_dir = vec![[0.0; 2]; p_resp];
+-        let mut endpoint_psi_cov_factor = vec![[0.0; 2]; p_resp];
+-        let mut endpoint_psi_psi_factor = vec![[0.0; 2]; p_resp];
+-        let mut endpoint_psi_cov_factor_dir = vec![[0.0; 2]; p_resp];
+-        let mut endpoint_psi_psi_factor_dir = vec![[0.0; 2]; p_resp];
+-        let mut h_factor = vec![0.0; p_resp];
+-        let mut hp_factor = vec![0.0; p_resp];
+-        let mut h_factor_dir = vec![0.0; p_resp];
+-        let mut hp_factor_dir = vec![0.0; p_resp];
+-        let mut hpsi_cov_factor = vec![0.0; p_resp];
+-        let mut hppsi_cov_factor = vec![0.0; p_resp];
+-        let mut hpsi_psi_factor = vec![0.0; p_resp];
+-        let mut hppsi_psi_factor = vec![0.0; p_resp];
+-        let mut hpsi_cov_factor_dir = vec![0.0; p_resp];
+-        let mut hppsi_cov_factor_dir = vec![0.0; p_resp];
+-        let mut hpsi_psi_factor_dir = vec![0.0; p_resp];
+-        let mut hppsi_psi_factor_dir = vec![0.0; p_resp];
++        struct PsiHessianApplyScratch {
++            gamma: Vec<f64>,
++            gamma_dir: Vec<f64>,
++            gamma_psi: Vec<f64>,
++            gamma_psi_dir: Vec<f64>,
++            endpoint_factor: Vec<[f64; 2]>,
++            endpoint_factor_dir: Vec<[f64; 2]>,
++            endpoint_psi_cov_factor: Vec<[f64; 2]>,
++            endpoint_psi_psi_factor: Vec<[f64; 2]>,
++            endpoint_psi_cov_factor_dir: Vec<[f64; 2]>,
++            endpoint_psi_psi_factor_dir: Vec<[f64; 2]>,
++            h_factor: Vec<f64>,
++            hp_factor: Vec<f64>,
++            h_factor_dir: Vec<f64>,
++            hp_factor_dir: Vec<f64>,
++            hpsi_cov_factor: Vec<f64>,
++            hppsi_cov_factor: Vec<f64>,
++            hpsi_psi_factor: Vec<f64>,
++            hppsi_psi_factor: Vec<f64>,
++            hpsi_cov_factor_dir: Vec<f64>,
++            hppsi_cov_factor_dir: Vec<f64>,
++            hpsi_psi_factor_dir: Vec<f64>,
++            hppsi_psi_factor_dir: Vec<f64>,
++        }
++
++        impl PsiHessianApplyScratch {
++            fn new(p_resp: usize) -> Self {
++                Self {
++                    gamma: vec![0.0; p_resp],
++                    gamma_dir: vec![0.0; p_resp],
++                    gamma_psi: vec![0.0; p_resp],
++                    gamma_psi_dir: vec![0.0; p_resp],
++                    endpoint_factor: vec![[0.0; 2]; p_resp],
++                    endpoint_factor_dir: vec![[0.0; 2]; p_resp],
++                    endpoint_psi_cov_factor: vec![[0.0; 2]; p_resp],
++                    endpoint_psi_psi_factor: vec![[0.0; 2]; p_resp],
++                    endpoint_psi_cov_factor_dir: vec![[0.0; 2]; p_resp],
++                    endpoint_psi_psi_factor_dir: vec![[0.0; 2]; p_resp],
++                    h_factor: vec![0.0; p_resp],
++                    hp_factor: vec![0.0; p_resp],
++                    h_factor_dir: vec![0.0; p_resp],
++                    hp_factor_dir: vec![0.0; p_resp],
++                    hpsi_cov_factor: vec![0.0; p_resp],
++                    hppsi_cov_factor: vec![0.0; p_resp],
++                    hpsi_psi_factor: vec![0.0; p_resp],
++                    hppsi_psi_factor: vec![0.0; p_resp],
++                    hpsi_cov_factor_dir: vec![0.0; p_resp],
++                    hppsi_cov_factor_dir: vec![0.0; p_resp],
++                    hpsi_psi_factor_dir: vec![0.0; p_resp],
++                    hppsi_psi_factor_dir: vec![0.0; p_resp],
++                }
++            }
++        }
++
++        let add_row = |out: &mut Array1<f64>, scratch: &mut PsiHessianApplyScratch, i: usize| {
++            let gamma = &mut scratch.gamma;
++            let gamma_dir = &mut scratch.gamma_dir;
++            let gamma_psi = &mut scratch.gamma_psi;
++            let gamma_psi_dir = &mut scratch.gamma_psi_dir;
++            let endpoint_factor = &mut scratch.endpoint_factor;
++            let endpoint_factor_dir = &mut scratch.endpoint_factor_dir;
++            let endpoint_psi_cov_factor = &mut scratch.endpoint_psi_cov_factor;
++            let endpoint_psi_psi_factor = &mut scratch.endpoint_psi_psi_factor;
++            let endpoint_psi_cov_factor_dir = &mut scratch.endpoint_psi_cov_factor_dir;
++            let endpoint_psi_psi_factor_dir = &mut scratch.endpoint_psi_psi_factor_dir;
++            let h_factor = &mut scratch.h_factor;
++            let hp_factor = &mut scratch.hp_factor;
++            let h_factor_dir = &mut scratch.h_factor_dir;
++            let hp_factor_dir = &mut scratch.hp_factor_dir;
++            let hpsi_cov_factor = &mut scratch.hpsi_cov_factor;
++            let hppsi_cov_factor = &mut scratch.hppsi_cov_factor;
++            let hpsi_psi_factor = &mut scratch.hpsi_psi_factor;
++            let hppsi_psi_factor = &mut scratch.hppsi_psi_factor;
++            let hpsi_cov_factor_dir = &mut scratch.hpsi_cov_factor_dir;
++            let hppsi_cov_factor_dir = &mut scratch.hppsi_cov_factor_dir;
++            let hpsi_psi_factor_dir = &mut scratch.hpsi_psi_factor_dir;
++            let hppsi_psi_factor_dir = &mut scratch.hppsi_psi_factor_dir;
+ 
+-        for i in 0..n {
+             let cov_row = cov.row(i);
+             let psi_row = cov_psi.row(i);
+             let rv = self.response_val_basis.row(i);
+             let rd = self.response_deriv_basis.row(i);
+             let wi = weights[i];
+             let hi = h[i];
+             let hp = h_prime[i];
+             let inv_hp = 1.0 / hp;
+             let inv_hp_sq = inv_hp * inv_hp;
+             let inv_hp_cu = inv_hp_sq * inv_hp;
+             let q = row_quantities.endpoint_q[i];
+             let gamma_row = row_quantities.gamma.row(i);
+ 
+             for k in 0..p_resp {
+                 gamma[k] = gamma_row[k];
+                 gamma_dir[k] = dir_mat.row(k).dot(&cov_row);
+                 gamma_psi[k] = beta_mat.row(k).dot(&psi_row);
+                 gamma_psi_dir[k] = dir_mat.row(k).dot(&psi_row);
+             }
+ 
+             let mut h_dir = rv[0] * gamma_dir[0];
+             let mut hp_dir = rd[0] * gamma_dir[0];
+             let mut h_psi = rv[0] * gamma_psi[0];
+             let mut hp_psi = rd[0] * gamma_psi[0];
+             let mut h_psi_dir = rv[0] * gamma_psi_dir[0];
+@@ -2870,51 +3003,89 @@ impl TransformationNormalFamily {
+                         endpoint_psi_cov_factor_dir[k][0] * cov_row[c]
+                             + endpoint_psi_psi_factor_dir[k][0] * psi_row[c],
+                         endpoint_psi_cov_factor_dir[k][1] * cov_row[c]
+                             + endpoint_psi_psi_factor_dir[k][1] * psi_row[c],
+                     ];
+                     let value =
+                         h_a_dir * h_psi + h_a * h_psi_dir + h_dir * hpsi_a + hi * hpsi_a_dir
+                             - hppsi_a_dir * inv_hp
+                             - hppsi_a * d_inv_hp
+                             + hp_psi_dir * hp_a * inv_hp_sq
+                             + hp_psi * hp_a_dir * inv_hp_sq
+                             + hp_psi * hp_a * d_inv_hp_sq
+                             + endpoint_chain_third(
+                                 &q,
+                                 endpoint_psi,
+                                 endpoint_a,
+                                 endpoint_dir,
+                                 endpoint_psi_a,
+                                 endpoint_psi_dir,
+                                 endpoint_a_dir,
+                                 endpoint_psi_a_dir,
+                             );
+                     out[idx] += wi * value;
+                 }
+             }
+-        }
++        };
++
++        let out = if scop_use_parallel_row_reduction(n, p_total) {
++            use rayon::iter::{IntoParallelIterator, ParallelIterator};
++            (0..n)
++                .into_par_iter()
++                .fold(
++                    || {
++                        (
++                            Array1::<f64>::zeros(p_total),
++                            PsiHessianApplyScratch::new(p_resp),
++                        )
++                    },
++                    |(mut acc, mut scratch), i| {
++                        add_row(&mut acc, &mut scratch, i);
++                        (acc, scratch)
++                    },
++                )
++                .reduce(
++                    || {
++                        (
++                            Array1::<f64>::zeros(p_total),
++                            PsiHessianApplyScratch::new(p_resp),
++                        )
++                    },
++                    |(mut lhs, scratch), (rhs, _)| {
++                        lhs += &rhs;
++                        (lhs, scratch)
++                    },
++                )
++                .0
++        } else {
++            let mut out = Array1::<f64>::zeros(p_total);
++            let mut scratch = PsiHessianApplyScratch::new(p_resp);
++            for i in 0..n {
++                add_row(&mut out, &mut scratch, i);
++            }
++            out
++        };
+ 
+         Ok(out)
+     }
+ 
+     fn scop_psi_hessian_hvp_mat_from_cov(
+         &self,
+         beta: &Array1<f64>,
+         row_quantities: &TransformationNormalRowQuantityCache,
+         axis: usize,
+         cov: &Array2<f64>,
+         cov_psi: &Array2<f64>,
+         factor: ArrayView2<'_, f64>,
+     ) -> Result<Array2<f64>, String> {
+         let n = self.response_val_basis.nrows();
+         let p_resp = self.response_val_basis.ncols();
+         let p_cov = self.covariate_design.ncols();
+         let p_total = p_resp * p_cov;
+         let rank = factor.ncols();
+         if cov.nrows() != n || cov.ncols() != p_cov {
+             return Err(format!(
+                 "SCOP psi Hessian batched apply covariate shape {}x{} != expected {}x{}",
+                 cov.nrows(),
+                 cov.ncols(),
+                 n,
+                 p_cov
+
+----- PATCH END -----
+
