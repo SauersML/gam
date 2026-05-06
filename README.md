@@ -116,10 +116,6 @@ gam generate model.json data.csv --n-draws 5 --out synthetic.csv
 
 Run `gam <command> --help` for full options.
 
-## Design notes
-
-- [Python API v1 contract](docs/rfcs/0001-python-api-v1.md): freezes the intended formula-first Python surface before any PyO3 binding work.
-
 ## Formula language
 
 ```

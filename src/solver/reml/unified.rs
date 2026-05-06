@@ -4886,7 +4886,6 @@ pub fn reml_laml_evaluate(
                 p_dim,
                 k_outer,
                 callback_operator_kernel,
-                has_subspace_trace,
             );
         // Reason mnemonic: which clause carried the routing.  Ordered so
         // the most specific reason wins; "kernel_absent" wins over
@@ -5027,16 +5026,18 @@ pub(crate) fn prefer_outer_hessian_operator(n: usize, p: usize, k: usize) -> boo
 ///
 /// Callback kernels are explicit family-supplied directional operators, so they
 /// select the operator path independently of the generic `(n, p, K)` crossover.
-/// A projected penalty-subspace trace still requires the dense path because the
-/// current operator kernel is full-space.
+/// A penalty-subspace trace, when present, is handled inside
+/// `build_outer_hessian_operator` / `UnifiedOuterHessianOperator::matvec`
+/// through the projected `trace_operator` / `trace_projected_logdet` paths,
+/// so it no longer forces the dense fallback — the matvec is bit-equivalent
+/// to `compute_outer_hessian` under subspace.
 pub(crate) fn use_outer_hessian_operator_path(
     n: usize,
     p: usize,
     k: usize,
     callback_operator_kernel: bool,
-    subspace_trace_present: bool,
 ) -> bool {
-    (callback_operator_kernel || prefer_outer_hessian_operator(n, p, k)) && !subspace_trace_present
+    callback_operator_kernel || prefer_outer_hessian_operator(n, p, k)
 }
 
 fn is_hessian_unavailable(error: &str) -> bool {
