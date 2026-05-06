@@ -10971,14 +10971,22 @@ fn try_exact_joint_spatial_aniso_optimization(
 
     let theta_dim = theta0.len();
     let psi_dim = theta_dim - rho_dim;
-    // Capability is always available for these families (every variant routes
-    // through the unified outer-Hessian path — see
-    // `exact_joint_spatial_outer_hessian_available`). Large problems are a
-    // representation choice, not a capability gap: the unified evaluator can
-    // return `HessianResult::Operator` and ARC consumes exact HVPs without
-    // materializing the dense outer Hessian.
+    // Capability is declared solely from derivative coverage, not from
+    // problem size. The unified REML evaluator now exposes exact matrix-free
+    // outer Hessian operators for the costly third/fourth-derivative
+    // contractions used by anisotropic spatial ψ coordinates; its internal
+    // `(n, p, K)` work model chooses `HessianResult::Operator` at biobank
+    // scale and the dense analytic matrix only below that crossover. Keeping
+    // `Derivative::Analytic` here preserves ARC / trust-region-CG second-order
+    // optimization for `n > 50_000` and `ψ_dim > 30` instead of forcing the
+    // obsolete HybridEFS compatibility path.
     let analytic_outer_hessian_available =
         exact_joint_spatial_outer_hessian_available(family, baseline_design);
+    if !analytic_outer_hessian_available {
+        log::info!(
+            "[spatial-aniso-joint] analytic outer Hessian unavailable for family/design; routing without second-order geometry (psi_dim={psi_dim})"
+        );
+    }
     let prefer_gradient_only = false;
 
     log::trace!(
@@ -15953,6 +15961,173 @@ mod tests {
             LikelihoodFamily::GaussianIdentity,
             &design,
         ));
+    }
+
+    #[test]
+    fn spatial_aniso_joint_exact_hessian_materializes_small_case() {
+        let n = 18usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            data[[i, 1]] = (0.41 * i as f64).sin();
+        }
+        let y = Array1::from_iter((0..n).map(|i| {
+            let t = i as f64 / (n as f64 - 1.0);
+            0.4 + (2.0 * std::f64::consts::PI * t).sin()
+        }));
+        let weights = Array1::ones(n);
+        let offset = Array1::zeros(n);
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "matern_aniso".to_string(),
+                basis: SmoothBasisSpec::Matern {
+                    feature_cols: vec![0, 1],
+                    spec: MaternBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
+                        length_scale: 0.85,
+                        nu: MaternNu::FiveHalves,
+                        include_intercept: false,
+                        double_penalty: true,
+                        identifiability: MaternIdentifiability::CenterSumToZero,
+                        aniso_log_scales: Some(vec![0.2, -0.2]),
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let fit_opts = FitOptions {
+            latent_cloglog: None,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: false,
+            max_iter: 120,
+            tol: 1e-10,
+            nullspace_dims: vec![],
+            linear_constraints: None,
+            firth_bias_reduction: false,
+            adaptive_regularization: None,
+            penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
+        };
+
+        let design = build_term_collection_design(data.view(), &spec).expect("design");
+        let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
+        let spatial_terms = spatial_length_scale_term_indices(&frozen);
+        let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
+        assert_eq!(dims_per_term, vec![2]);
+        let rho_dim = design.penalties.len();
+        let log_kappa0 = SpatialLogKappaCoords::from_length_scales_aniso(
+            &frozen,
+            &spatial_terms,
+            &SpatialLengthScaleOptimizationOptions::default(),
+        );
+        let mut theta = Array1::<f64>::zeros(rho_dim + log_kappa0.as_array().len());
+        for j in 0..rho_dim {
+            theta[j] = -0.15 + 0.07 * j as f64;
+        }
+        theta.slice_mut(s![rho_dim..]).assign(log_kappa0.as_array());
+
+        let external_opts =
+            external_opts_for_design(LikelihoodFamily::GaussianIdentity, &design, &fit_opts);
+        let mut cache = SingleBlockExactJointDesignCache::new(
+            data.view(),
+            frozen,
+            design.clone(),
+            spatial_terms,
+            rho_dim,
+            dims_per_term,
+        )
+        .expect("single-block cache");
+        let mut evaluator = crate::estimate::ExternalJointHyperEvaluator::new(
+            y.view(),
+            weights.view(),
+            &design.design,
+            offset.view(),
+            &design.penalties,
+            &external_opts,
+            "small aniso Hessian finite-difference evaluator",
+        )
+        .expect("evaluator");
+
+        let eval_at = |theta: &Array1<f64>,
+                       cache: &mut SingleBlockExactJointDesignCache<'_>,
+                       evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
+                       order: crate::solver::outer_strategy::OuterEvalOrder| {
+            cache.ensure_theta(theta).expect("theta applied");
+            let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
+                data.view(),
+                cache.spec(),
+                cache.design(),
+                &cache.spatial_terms,
+            )
+            .expect("hyper dirs build")
+            .expect("hyper dirs present");
+            evaluate_joint_reml_outer_eval_at_theta(
+                evaluator,
+                cache.design(),
+                theta,
+                rho_dim,
+                hyper_dirs,
+                None,
+                order,
+            )
+            .expect("outer eval")
+        };
+
+        let (_, gradient, hessian_result) = eval_at(
+            &theta,
+            &mut cache,
+            &mut evaluator,
+            crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian,
+        );
+        let hessian = hessian_result
+            .materialize_dense()
+            .expect("hessian materializes")
+            .expect("hessian present");
+        assert_eq!(hessian.nrows(), theta.len());
+        assert_eq!(hessian.ncols(), theta.len());
+        assert!(hessian.iter().all(|value| value.is_finite()));
+        assert!(gradient.iter().all(|value| value.is_finite()));
+
+        let symmetry_diff = max_abs_diff_matrix(&hessian, &hessian.t().to_owned());
+        assert!(
+            symmetry_diff <= 1e-10,
+            "small aniso exact Hessian should be symmetric, max diff={symmetry_diff}"
+        );
+        let psi_block = hessian.slice(s![rho_dim.., rho_dim..]).to_owned();
+        assert!(
+            psi_block.iter().any(|value| value.abs() > 1e-10),
+            "small aniso exact Hessian should carry non-zero ψ curvature"
+        );
+    }
+
+    #[test]
+    fn spatial_aniso_joint_large_psi_dim_keeps_second_order_route() {
+        let cap = crate::solver::outer_strategy::OuterCapability {
+            gradient: crate::solver::outer_strategy::Derivative::Analytic,
+            hessian: crate::solver::outer_strategy::Derivative::Analytic,
+            n_params: 40,
+            psi_dim: 31,
+            fixed_point_available: true,
+            barrier_config: None,
+            prefer_gradient_only: false,
+            disable_fixed_point: false,
+        };
+        let route = crate::solver::outer_strategy::plan(&cap);
+        assert_eq!(route.solver, crate::solver::outer_strategy::Solver::Arc);
+        assert_eq!(
+            route.hessian_source,
+            crate::solver::outer_strategy::HessianSource::Analytic
+        );
+        assert!(route.routing_log_line().contains("matrix-free=true"));
     }
 
     #[test]
