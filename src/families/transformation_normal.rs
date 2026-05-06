@@ -57,7 +57,7 @@ use crate::smooth::{
 };
 use crate::solver::estimate::UnifiedFitResult;
 use crate::solver::estimate::reml::unified::{
-    DriftDerivResult, HyperOperator, ProjectedFactorCache,
+    DriftDerivResult, HyperOperator, ProjectedFactorCache, ProjectedFactorKey,
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use std::cell::RefCell;
@@ -1206,9 +1206,8 @@ impl TransformationNormalFamily {
             .into_shape_with_order((p_resp, p_cov))
             .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
         let cov = self
-            .covariate_design
-            .try_row_chunk(0..n)
-            .map_err(|e| format!("SCOP gradient requires row chunk: {e}"))?;
+            .covariate_dense_arc()
+            .map_err(|e| format!("SCOP gradient requires cached covariate design: {e}"))?;
         let weights = self.weights.as_ref();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
@@ -1323,9 +1322,8 @@ impl TransformationNormalFamily {
             .into_shape_with_order((p_resp, p_cov))
             .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
         let cov = self
-            .covariate_design
-            .try_row_chunk(0..n)
-            .map_err(|e| format!("SCOP gradient requires row chunk: {e}"))?;
+            .covariate_dense_arc()
+            .map_err(|e| format!("SCOP gradient requires cached covariate design: {e}"))?;
         let weights = self.weights.as_ref();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
@@ -1427,10 +1425,9 @@ impl TransformationNormalFamily {
             .view()
             .into_shape_with_order((p_resp, p_cov))
             .map_err(|e| format!("SCOP direction reshape failed: {e}"))?;
-        let cov = self
-            .covariate_design
-            .try_row_chunk(0..n)
-            .map_err(|e| format!("SCOP Hessian directional derivative requires row chunk: {e}"))?;
+        let cov = self.covariate_dense_arc().map_err(|e| {
+            format!("SCOP Hessian directional derivative requires cached covariate design: {e}")
+        })?;
         let weights = self.weights.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
         let mut out = Array2::<f64>::zeros((p_total, p_total));
@@ -1607,8 +1604,10 @@ impl TransformationNormalFamily {
             .view()
             .into_shape_with_order((p_resp, p_cov))
             .map_err(|e| format!("SCOP v direction reshape failed: {e}"))?;
-        let cov = self.covariate_design.try_row_chunk(0..n).map_err(|e| {
-            format!("SCOP Hessian second directional derivative requires row chunk: {e}")
+        let cov = self.covariate_dense_arc().map_err(|e| {
+            format!(
+                "SCOP Hessian second directional derivative requires cached covariate design: {e}"
+            )
         })?;
         let weights = self.weights.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
@@ -1806,9 +1805,8 @@ impl TransformationNormalFamily {
             .into_shape_with_order((p_resp, p_cov))
             .map_err(|e| format!("SCOP probe reshape failed: {e}"))?;
         let cov = self
-            .covariate_design
-            .try_row_chunk(0..n)
-            .map_err(|e| format!("SCOP Hessian matvec requires row chunk: {e}"))?;
+            .covariate_dense_arc()
+            .map_err(|e| format!("SCOP Hessian matvec requires cached covariate design: {e}"))?;
         let weights = self.weights.as_ref();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
@@ -1929,9 +1927,8 @@ impl TransformationNormalFamily {
             .into_shape_with_order((p_resp, p_cov))
             .map_err(|e| format!("SCOP probe reshape failed: {e}"))?;
         let cov = self
-            .covariate_design
-            .try_row_chunk(0..n)
-            .map_err(|e| format!("SCOP dH matvec requires row chunk: {e}"))?;
+            .covariate_dense_arc()
+            .map_err(|e| format!("SCOP dH matvec requires cached covariate design: {e}"))?;
         let weights = self.weights.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
         let mut out = Array1::<f64>::zeros(p_total);
@@ -2130,9 +2127,8 @@ impl TransformationNormalFamily {
             .into_shape_with_order((p_resp, p_cov))
             .map_err(|e| format!("SCOP probe reshape failed: {e}"))?;
         let cov = self
-            .covariate_design
-            .try_row_chunk(0..n)
-            .map_err(|e| format!("SCOP d2H matvec requires row chunk: {e}"))?;
+            .covariate_dense_arc()
+            .map_err(|e| format!("SCOP d2H matvec requires cached covariate design: {e}"))?;
         let weights = self.weights.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
         let mut out = Array1::<f64>::zeros(p_total);
@@ -2382,9 +2378,8 @@ impl TransformationNormalFamily {
             .into_shape_with_order((p_resp, p_cov))
             .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
         let cov = self
-            .covariate_design
-            .try_row_chunk(0..n)
-            .map_err(|e| format!("SCOP Hessian diagonal requires row chunk: {e}"))?;
+            .covariate_dense_arc()
+            .map_err(|e| format!("SCOP Hessian diagonal requires cached covariate design: {e}"))?;
         let weights = self.weights.as_ref();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
@@ -2494,9 +2489,8 @@ impl TransformationNormalFamily {
             .into_shape_with_order((p_resp, p_cov))
             .map_err(|e| format!("SCOP psi beta reshape failed: {e}"))?;
         let cov = self
-            .covariate_design
-            .try_row_chunk(0..n)
-            .map_err(|e| format!("SCOP psi terms require covariate row chunk: {e}"))?;
+            .covariate_dense_arc()
+            .map_err(|e| format!("SCOP psi terms require cached covariate design: {e}"))?;
         let cov_psi = op
             .materialize_cov_first_axis(axis)
             .map_err(|e| format!("SCOP psi materialize_cov_first failed: {e}"))?;
@@ -2644,11 +2638,9 @@ impl TransformationNormalFamily {
         axis: usize,
         direction: &Array1<f64>,
     ) -> Result<Array1<f64>, String> {
-        let n = self.response_val_basis.nrows();
         let cov = self
-            .covariate_design
-            .try_row_chunk(0..n)
-            .map_err(|e| format!("SCOP psi Hessian apply requires covariate row chunk: {e}"))?;
+            .covariate_dense_arc()
+            .map_err(|e| format!("SCOP psi Hessian apply requires cached covariate design: {e}"))?;
         let cov_psi = op
             .materialize_cov_first_axis(axis)
             .map_err(|e| format!("SCOP psi Hessian apply materialize_cov_first failed: {e}"))?;
@@ -5524,10 +5516,9 @@ impl TransformationNormalFamily {
             .view()
             .into_shape_with_order((p_resp, p_cov))
             .map_err(|e| format!("SCOP psi hessian direction reshape failed: {e}"))?;
-        let cov = self
-            .covariate_design
-            .try_row_chunk(0..n)
-            .map_err(|e| format!("SCOP psi hessian direction requires covariate row chunk: {e}"))?;
+        let cov = self.covariate_dense_arc().map_err(|e| {
+            format!("SCOP psi hessian direction requires cached covariate design: {e}")
+        })?;
         let cov_psi_arc = op
             .materialize_cov_first_axis_arc(axis)
             .map_err(|e| format!("SCOP psi hessian materialize_cov_first failed: {e}"))?;
