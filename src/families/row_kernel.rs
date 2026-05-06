@@ -478,8 +478,8 @@ impl<const K: usize, T: RowKernel<K> + 'static> ExactNewtonJointHessianWorkspace
         // `row_kernel_hessian_dense`. Without this override the trace path
         // calls `MatrixFreeSpdOperator::materialize_dense_operator`, which
         // rebuilds the same dense matrix by applying the Hv operator to
-        // every canonical basis vector — a `p × O(n*K^2)` redundant
-        // re-stream of the row data. At biobank scale (n≈320k, p≈200) that
+        // every canonical basis vector: a `p * O(n*K^2)` redundant
+        // re-stream of the row data. At biobank scale (n~320k, p~200) that
         // is hundreds of seconds of pure waste per outer-Hessian build.
         Ok(Some(row_kernel_hessian_dense(&*self.kern, &self.cache)))
     }

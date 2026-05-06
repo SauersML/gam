@@ -1785,32 +1785,48 @@ impl TransformationNormalFamily {
         row_quantities: &TransformationNormalRowQuantityCache,
         probe: &Array1<f64>,
     ) -> Result<Array1<f64>, String> {
+        let mut probes = Array2::<f64>::zeros((probe.len(), 1));
+        probes.column_mut(0).assign(probe);
+        let out = self.scop_hessian_matmat(beta, row_quantities, &probes)?;
+        Ok(out.column(0).to_owned())
+    }
+
+    fn scop_hessian_matmat(
+        &self,
+        beta: &Array1<f64>,
+        row_quantities: &TransformationNormalRowQuantityCache,
+        probes: &Array2<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let stage_start = std::time::Instant::now();
         let n = self.response_val_basis.nrows();
         let p_resp = self.response_val_basis.ncols();
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
-        if beta.len() != p_total || probe.len() != p_total {
+        let n_probe = probes.ncols();
+        if beta.len() != p_total || probes.nrows() != p_total {
             return Err(format!(
-                "SCOP Hessian matvec length mismatch: beta={}, probe={}, expected={p_total}",
+                "SCOP Hessian matmat length mismatch: beta={}, probes rows={}, expected={p_total}",
                 beta.len(),
-                probe.len()
+                probes.nrows()
             ));
         }
         let beta_mat = beta
             .view()
             .into_shape_with_order((p_resp, p_cov))
             .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
-        let probe_mat = probe
-            .view()
-            .into_shape_with_order((p_resp, p_cov))
-            .map_err(|e| format!("SCOP probe reshape failed: {e}"))?;
         let cov = self
             .covariate_dense_arc()
-            .map_err(|e| format!("SCOP Hessian matvec requires cached covariate design: {e}"))?;
+            .map_err(|e| format!("SCOP Hessian matmat requires cached covariate design: {e}"))?;
         let weights = self.weights.as_ref();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
-        let mut out = Array1::<f64>::zeros(p_total);
+        let mut out = Array2::<f64>::zeros((p_total, n_probe));
+        let mut gamma = vec![0.0; p_resp];
+        let mut probe_gamma = vec![0.0; p_resp * n_probe];
+        let mut h_probe = vec![0.0; n_probe];
+        let mut hp_probe = vec![0.0; n_probe];
+        let mut lower_probe = vec![0.0; n_probe];
+        let mut upper_probe = vec![0.0; n_probe];
 
         for i in 0..n {
             let cov_row = cov.row(i);
@@ -1822,26 +1838,40 @@ impl TransformationNormalFamily {
             let inv_hp = 1.0 / hp;
             let inv_hp_sq = inv_hp * inv_hp;
 
-            let mut gamma = vec![0.0; p_resp];
-            let mut probe_gamma = vec![0.0; p_resp];
             for k in 0..p_resp {
                 gamma[k] = beta_mat.row(k).dot(&cov_row);
-                probe_gamma[k] = probe_mat.row(k).dot(&cov_row);
+                let row_offset = k * p_cov;
+                let probe_offset = k * n_probe;
+                for j in 0..n_probe {
+                    let mut value = 0.0;
+                    for c in 0..p_cov {
+                        value += probes[[row_offset + c, j]] * cov_row[c];
+                    }
+                    probe_gamma[probe_offset + j] = value;
+                }
             }
 
-            let mut h_probe = rv[0] * probe_gamma[0];
-            let mut hp_probe = rd[0] * probe_gamma[0];
-            let mut lower_probe = self.response_lower_basis[0] * probe_gamma[0];
-            let mut upper_probe = self.response_upper_basis[0] * probe_gamma[0];
+            for j in 0..n_probe {
+                h_probe[j] = rv[0] * probe_gamma[j];
+                hp_probe[j] = rd[0] * probe_gamma[j];
+                lower_probe[j] = self.response_lower_basis[0] * probe_gamma[j];
+                upper_probe[j] = self.response_upper_basis[0] * probe_gamma[j];
+            }
             for k in 1..p_resp {
-                h_probe += 2.0 * rv[k] * gamma[k] * probe_gamma[k];
-                hp_probe += 2.0 * rd[k] * gamma[k] * probe_gamma[k];
-                lower_probe += 2.0 * self.response_lower_basis[k] * gamma[k] * probe_gamma[k];
-                upper_probe += 2.0 * self.response_upper_basis[k] * gamma[k] * probe_gamma[k];
+                let probe_offset = k * n_probe;
+                let gamma_k = gamma[k];
+                for j in 0..n_probe {
+                    let pg = probe_gamma[probe_offset + j];
+                    h_probe[j] += 2.0 * rv[k] * gamma_k * pg;
+                    hp_probe[j] += 2.0 * rd[k] * gamma_k * pg;
+                    lower_probe[j] += 2.0 * self.response_lower_basis[k] * gamma_k * pg;
+                    upper_probe[j] += 2.0 * self.response_upper_basis[k] * gamma_k * pg;
+                }
             }
             let q = row_quantities.endpoint_q[i];
 
             for k in 0..p_resp {
+                let probe_offset = k * n_probe;
                 let h_factor = if k == 0 {
                     rv[0]
                 } else {
@@ -1851,11 +1881,6 @@ impl TransformationNormalFamily {
                     rd[0]
                 } else {
                     2.0 * rd[k] * gamma[k]
-                };
-                let second_probe = if k == 0 {
-                    0.0
-                } else {
-                    2.0 * (hi * rv[k] - rd[k] * inv_hp) * probe_gamma[k]
                 };
                 let lower_factor = if k == 0 {
                     self.response_lower_basis[0]
@@ -1867,31 +1892,48 @@ impl TransformationNormalFamily {
                 } else {
                     2.0 * self.response_upper_basis[k] * gamma[k]
                 };
-                let lower_factor_probe = if k == 0 {
-                    0.0
-                } else {
-                    2.0 * self.response_lower_basis[k] * probe_gamma[k]
-                };
-                let upper_factor_probe = if k == 0 {
-                    0.0
-                } else {
-                    2.0 * self.response_upper_basis[k] * probe_gamma[k]
-                };
-                let normalizer_probe = q.first[0] * upper_factor_probe
-                    + q.first[1] * lower_factor_probe
-                    + (q.second[0][0] * upper_factor + q.second[1][0] * lower_factor) * upper_probe
-                    + (q.second[0][1] * upper_factor + q.second[1][1] * lower_factor) * lower_probe;
-                let scalar = wi
-                    * (h_factor * h_probe
-                        + hp_factor * hp_probe * inv_hp_sq
-                        + second_probe
-                        + normalizer_probe);
-                for c in 0..p_cov {
-                    out[k * p_cov + c] += scalar * cov_row[c];
+                for j in 0..n_probe {
+                    let pg = probe_gamma[probe_offset + j];
+                    let second_probe = if k == 0 {
+                        0.0
+                    } else {
+                        2.0 * (hi * rv[k] - rd[k] * inv_hp) * pg
+                    };
+                    let lower_factor_probe = if k == 0 {
+                        0.0
+                    } else {
+                        2.0 * self.response_lower_basis[k] * pg
+                    };
+                    let upper_factor_probe = if k == 0 {
+                        0.0
+                    } else {
+                        2.0 * self.response_upper_basis[k] * pg
+                    };
+                    let normalizer_probe = q.first[0] * upper_factor_probe
+                        + q.first[1] * lower_factor_probe
+                        + (q.second[0][0] * upper_factor + q.second[1][0] * lower_factor)
+                            * upper_probe[j]
+                        + (q.second[0][1] * upper_factor + q.second[1][1] * lower_factor)
+                            * lower_probe[j];
+                    let scalar = wi
+                        * (h_factor * h_probe[j]
+                            + hp_factor * hp_probe[j] * inv_hp_sq
+                            + second_probe
+                            + normalizer_probe);
+                    for c in 0..p_cov {
+                        out[[k * p_cov + c, j]] += scalar * cov_row[c];
+                    }
                 }
             }
         }
 
+        log::info!(
+            "[STAGE] CTN scop_hessian_matmat n={} p={} k={} elapsed={:.3}s",
+            n,
+            p_total,
+            n_probe,
+            stage_start.elapsed().as_secs_f64(),
+        );
         Ok(out)
     }
 
