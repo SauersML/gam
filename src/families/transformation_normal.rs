@@ -7387,6 +7387,13 @@ impl TransformationNormalJointHessianWorkspace {
 }
 
 impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorkspace {
+    fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+        let (_, hessian) = self
+            .family
+            .scop_gradient_and_negative_hessian(&self.beta, &self.row_quantities)?;
+        Ok(Some(hessian))
+    }
+
     fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         Ok(Some(self.apply_hessian(v)?))
     }

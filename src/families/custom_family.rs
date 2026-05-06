@@ -4218,6 +4218,10 @@ pub struct ExactNewtonJointPsiSecondOrderTerms {
 }
 
 pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
+    fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+        Ok(None)
+    }
+
     fn hessian_matvec(&self, _: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         Ok(None)
     }
@@ -5802,6 +5806,23 @@ fn exact_newton_joint_hessian_source_from_workspace(
     total: usize,
     context: &str,
 ) -> Result<Option<JointHessianSource>, String> {
+    if let Some(mut hessian) = workspace.hessian_dense()? {
+        if hessian.nrows() != total || hessian.ncols() != total {
+            return Err(format!(
+                "{context}: dense Hessian shape mismatch: got {}x{}, expected {total}x{total}",
+                hessian.nrows(),
+                hessian.ncols()
+            ));
+        }
+        if hessian.iter().any(|value| !value.is_finite()) {
+            return Err(format!(
+                "{context}: dense Hessian contains non-finite values"
+            ));
+        }
+        symmetrize_dense_in_place(&mut hessian);
+        return Ok(Some(JointHessianSource::Dense(hessian)));
+    }
+
     let Some(diagonal) = workspace.hessian_diagonal()? else {
         return Ok(None);
     };
