@@ -855,6 +855,9 @@ struct BlockHessianAccumulator {
     h_hw: Array2<f64>,
 }
 
+const PULLBACK_PARALLEL_MIN_CELLS: usize = 16_384;
+const PULLBACK_PARALLEL_TARGET_CELLS: usize = 65_536;
+
 impl BlockHessianAccumulator {
     fn new(p_t: usize, p_m: usize, p_g: usize, p_h: usize, p_w: usize) -> Self {
         Self {
@@ -876,6 +879,42 @@ impl BlockHessianAccumulator {
         }
     }
 
+    fn block_dims(&self) -> (usize, usize, usize, usize, usize) {
+        (
+            self.h_tt.nrows(),
+            self.h_mm.nrows(),
+            self.h_gg.nrows(),
+            self.h_hh.nrows(),
+            self.h_ww.nrows(),
+        )
+    }
+
+    fn deterministic_lhs_chunks(lhs_len: usize, rhs_len: usize) -> Vec<std::ops::Range<usize>> {
+        let cells = lhs_len.saturating_mul(rhs_len);
+        if cells < PULLBACK_PARALLEL_MIN_CELLS || lhs_len <= 1 || rayon::current_num_threads() <= 1
+        {
+            return std::iter::once(0..lhs_len).collect();
+        }
+        let chunk_len = (PULLBACK_PARALLEL_TARGET_CELLS / rhs_len.max(1))
+            .max(1)
+            .min(lhs_len);
+        (0..lhs_len)
+            .step_by(chunk_len)
+            .map(|start| start..(start + chunk_len).min(lhs_len))
+            .collect()
+    }
+
+    fn add_ordered_lhs_partials(
+        target: &mut Array2<f64>,
+        partials: Vec<Result<(std::ops::Range<usize>, Array2<f64>), String>>,
+    ) -> Result<(), String> {
+        for partial in partials {
+            let (range, block) = partial?;
+            target.slice_mut(s![range, ..]).scaled_add(1.0, &block);
+        }
+        Ok(())
+    }
+
     /// Accumulate a primary-space Hessian into block-local matrices.
     /// Equivalent to `add_pullback_primary_hessian` but avoids the p×p target.
     fn add_pullback(
@@ -890,17 +929,53 @@ impl BlockHessianAccumulator {
             &family.design_exit,
             &family.design_derivative_exit,
         ];
-        for a in 0..3 {
-            for b in 0..3 {
-                time_designs[a]
-                    .row_outer_into(
-                        row,
-                        time_designs[b],
-                        primary_hessian[[a, b]],
-                        &mut self.h_tt,
-                    )
-                    .map_err(|e| format!("add_pullback time row_outer_into: {e}"))?;
+        let (p_t, _, _, _, _) = self.block_dims();
+        let tt_chunks = Self::deterministic_lhs_chunks(p_t, p_t);
+        if tt_chunks.len() == 1 {
+            for a in 0..3 {
+                for b in 0..3 {
+                    time_designs[a]
+                        .row_outer_into(
+                            row,
+                            time_designs[b],
+                            primary_hessian[[a, b]],
+                            &mut self.h_tt,
+                        )
+                        .map_err(|e| format!("add_pullback time row_outer_into: {e}"))?;
+                }
             }
+        } else {
+            let time_rows: Vec<Array1<f64>> = time_designs
+                .iter()
+                .map(|des| {
+                    let chunk = des
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("add_pullback time design try_row_chunk: {e}"))?;
+                    Ok(chunk.row(0).to_owned())
+                })
+                .collect::<Result<_, String>>()?;
+            let time_partials: Vec<Result<(std::ops::Range<usize>, Array2<f64>), String>> =
+                tt_chunks
+                    .into_par_iter()
+                    .map(|chunk| {
+                        let mut local = Array2::zeros((chunk.len(), p_t));
+                        for (local_a, coeff_a) in chunk.clone().enumerate() {
+                            for coeff_b in 0..p_t {
+                                let mut value = 0.0;
+                                for a in 0..3 {
+                                    for b in 0..3 {
+                                        value += primary_hessian[[a, b]]
+                                            * time_rows[a][coeff_a]
+                                            * time_rows[b][coeff_b];
+                                    }
+                                }
+                                local[[local_a, coeff_b]] = value;
+                            }
+                        }
+                        Ok((chunk, local))
+                    })
+                    .collect();
+            Self::add_ordered_lhs_partials(&mut self.h_tt, time_partials)?;
         }
 
         // Marginal×marginal: single rank-1 with combined weight
@@ -1508,52 +1583,80 @@ impl BlockHessianAccumulator {
         ];
         let pt = jt[0].len();
         let pm = jm[0].len();
-        for a in 0..pt {
-            for b in 0..pt {
-                let mut v = 0.0;
-                for u in 0..3 {
-                    for w in 0..3 {
-                        v += ph[[u, w]] * jt[u][a] * jt[w][b];
+        let tt_chunks = Self::deterministic_lhs_chunks(pt, pt);
+        let tt_partials: Vec<Result<(std::ops::Range<usize>, Array2<f64>), String>> = tt_chunks
+            .into_par_iter()
+            .map(|chunk| {
+                let mut local = Array2::zeros((chunk.len(), pt));
+                for (local_a, a) in chunk.clone().enumerate() {
+                    for b in 0..pt {
+                        let mut v = 0.0;
+                        for u in 0..3 {
+                            for w in 0..3 {
+                                v += ph[[u, w]] * jt[u][a] * jt[w][b];
+                            }
+                        }
+                        for u in 0..3 {
+                            v += fg[u] * ktt[u][[a, b]];
+                        }
+                        local[[local_a, b]] = v;
                     }
                 }
-                for u in 0..3 {
-                    v += fg[u] * ktt[u][[a, b]];
-                }
-                self.h_tt[[a, b]] += v;
-            }
-        }
-        for a in 0..pm {
-            for b in 0..pm {
-                let mut v = 0.0;
-                for u in 0..3 {
-                    for w in 0..3 {
-                        v += ph[[u, w]] * jm[u][a] * jm[w][b];
+                Ok((chunk, local))
+            })
+            .collect();
+        Self::add_ordered_lhs_partials(&mut self.h_tt, tt_partials)?;
+
+        let mm_chunks = Self::deterministic_lhs_chunks(pm, pm);
+        let mm_partials: Vec<Result<(std::ops::Range<usize>, Array2<f64>), String>> = mm_chunks
+            .into_par_iter()
+            .map(|chunk| {
+                let mut local = Array2::zeros((chunk.len(), pm));
+                for (local_a, a) in chunk.clone().enumerate() {
+                    for b in 0..pm {
+                        let mut v = 0.0;
+                        for u in 0..3 {
+                            for w in 0..3 {
+                                v += ph[[u, w]] * jm[u][a] * jm[w][b];
+                            }
+                        }
+                        for u in 0..3 {
+                            v += fg[u] * kmm[u][[a, b]];
+                        }
+                        local[[local_a, b]] = v;
                     }
                 }
-                for u in 0..3 {
-                    v += fg[u] * kmm[u][[a, b]];
-                }
-                self.h_mm[[a, b]] += v;
-            }
-        }
+                Ok((chunk, local))
+            })
+            .collect();
+        Self::add_ordered_lhs_partials(&mut self.h_mm, mm_partials)?;
         family
             .logslope_design
             .syr_row_into(row, ph[[3, 3]], &mut self.h_gg)
             .map_err(|e| format!("add_pullback_with_q_geometry gg syr: {e}"))?;
-        for a in 0..pt {
-            for b in 0..pm {
-                let mut v = 0.0;
-                for u in 0..3 {
-                    for w in 0..3 {
-                        v += ph[[u, w]] * jt[u][a] * jm[w][b];
+        let tm_chunks = Self::deterministic_lhs_chunks(pt, pm);
+        let tm_partials: Vec<Result<(std::ops::Range<usize>, Array2<f64>), String>> = tm_chunks
+            .into_par_iter()
+            .map(|chunk| {
+                let mut local = Array2::zeros((chunk.len(), pm));
+                for (local_a, a) in chunk.clone().enumerate() {
+                    for b in 0..pm {
+                        let mut v = 0.0;
+                        for u in 0..3 {
+                            for w in 0..3 {
+                                v += ph[[u, w]] * jt[u][a] * jm[w][b];
+                            }
+                        }
+                        for u in 0..3 {
+                            v += fg[u] * ktm[u][[a, b]];
+                        }
+                        local[[local_a, b]] = v;
                     }
                 }
-                for u in 0..3 {
-                    v += fg[u] * ktm[u][[a, b]];
-                }
-                self.h_tm[[a, b]] += v;
-            }
-        }
+                Ok((chunk, local))
+            })
+            .collect();
+        Self::add_ordered_lhs_partials(&mut self.h_tm, tm_partials)?;
         let gc = family
             .logslope_design
             .try_row_chunk(row..row + 1)
