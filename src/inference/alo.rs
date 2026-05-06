@@ -97,6 +97,7 @@ fn multiblock_col_offsets(block_designs: &[Array2<f64>]) -> Vec<usize> {
     offsets
 }
 
+#[allow(dead_code)]
 #[inline]
 fn multiblock_alo_chunk_size(p_tot: usize, n_blocks: usize, n_obs: usize) -> usize {
     if p_tot == 0 || n_blocks == 0 || n_obs == 0 {
