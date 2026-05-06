@@ -11656,6 +11656,20 @@ mod tests {
                 );
             }
         }
+
+        let alpha = array![0.37, -0.58];
+        let hvp = crate::solver::outer_strategy::OuterHessianOperator::matvec(&operator, &alpha)
+            .expect("operator HVP");
+        let dense_hvp = dense.dot(&alpha);
+        for i in 0..hvp.len() {
+            let tolerance = 1e-10_f64.max(1e-10 * dense_hvp[i].abs());
+            assert!(
+                (hvp[i] - dense_hvp[i]).abs() <= tolerance,
+                "outer Hessian HVP mismatch at {i}: operator={}, dense={}",
+                hvp[i],
+                dense_hvp[i]
+            );
+        }
     }
 
     #[test]

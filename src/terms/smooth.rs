@@ -10930,30 +10930,12 @@ fn try_exact_joint_spatial_aniso_optimization(
     let psi_dim = theta_dim - rho_dim;
     // Capability is always available for these families (every variant routes
     // through the unified outer-Hessian path — see
-    // `exact_joint_spatial_outer_hessian_available`). Gate the *use* of the
-    // analytic outer Hessian on problem size. The exact analytic Hessian
-    // requires per-row third/fourth-derivative work in
-    // `cubic_cell_kernel`/`bernoulli_marginal_slope`, with cost
-    // O(n · ψ-axes · per-row cell moments). At biobank scale (n ≈ 320k,
-    // ψ-axes ≈ 16 + linkwiggle/timewiggle/scale-dim knots) this dominates
-    // wall-clock for every outer eval and prevents convergence inside the
-    // 50-min CI budget. When we cross the threshold, declare hessian as
-    // `Unavailable`; the planner then routes to `Solver::HybridEfs`
-    // (multiplicative fixed-point on ρ + preconditioned ψ gradient via the
-    // EFS trace Gram), which costs O(1) H⁻¹ solves per outer iteration and
-    // does not need the third/fourth-derivative tensors. Small fixtures
-    // (`n ≤ 50k` AND `ψ_dim ≤ 30`) keep the analytic path so existing
-    // convergence-regression tests are unaffected.
-    let n_obs = data.nrows();
+    // `exact_joint_spatial_outer_hessian_available`). Large problems are a
+    // representation choice, not a capability gap: the unified evaluator can
+    // return `HessianResult::Operator` and ARC consumes exact HVPs without
+    // materializing the dense outer Hessian.
     let analytic_outer_hessian_available =
-        exact_joint_spatial_outer_hessian_available(family, baseline_design)
-            && n_obs <= 50_000
-            && psi_dim <= 30;
-    if !analytic_outer_hessian_available {
-        log::info!(
-            "[spatial-aniso-joint] declining analytic outer Hessian for n={n_obs}, psi_dim={psi_dim}; routing to HybridEFS"
-        );
-    }
+        exact_joint_spatial_outer_hessian_available(family, baseline_design);
     let prefer_gradient_only = false;
 
     log::trace!(
@@ -11234,18 +11216,13 @@ fn try_exact_joint_spatial_isotropic_optimization(
 
     let theta_dim = theta0.len();
     let kappa_dim = theta_dim - rho_dim;
-    // Same biobank-scale gate as the aniso path — see comment block on the
-    // sibling helper for the rationale.
-    let n_obs = data.nrows();
+    // The unified REML evaluator now exposes exact dense or matrix-free
+    // outer-Hessian geometry for spatial κ coordinates.  Capability is
+    // independent of `(n, kappa_dim)`: large problems are represented by
+    // `HessianResult::Operator` and routed through ARC's HVP trust-region
+    // path instead of being downgraded to HybridEFS.
     let analytic_outer_hessian_available =
-        exact_joint_spatial_outer_hessian_available(family, baseline_design)
-            && n_obs <= 50_000
-            && kappa_dim <= 30;
-    if !analytic_outer_hessian_available {
-        log::info!(
-            "[spatial-iso-joint] declining analytic outer Hessian for n={n_obs}, kappa_dim={kappa_dim}; routing to HybridEFS"
-        );
-    }
+        exact_joint_spatial_outer_hessian_available(family, baseline_design);
     let prefer_gradient_only = false;
 
     log::trace!(
