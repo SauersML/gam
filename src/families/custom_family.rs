@@ -4177,6 +4177,7 @@ pub(crate) fn resolve_custom_family_x_psi_psi_map(
     })
 }
 
+#[derive(Clone)]
 pub struct ExactNewtonJointPsiTerms {
     pub objective_psi: f64,
     pub score_psi: Array1<f64>,
