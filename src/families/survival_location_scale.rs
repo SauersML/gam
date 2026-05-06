@@ -12,7 +12,10 @@ use crate::custom_family::{
     resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi_map, second_psi_linear_map,
     shared_dense_arc, weighted_crossprod_psi_maps, wrap_spatial_implicit_psi_operator,
 };
-use crate::faer_ndarray::{FaerEigh, fast_atb, fast_atv, fast_av, fast_xt_diag_x};
+use crate::faer_ndarray::{
+    FaerEigh, fast_atb_with_parallelism, fast_atv, fast_av, fast_xt_diag_x,
+    fast_xt_diag_x_with_parallelism,
+};
 use crate::families::gamlss::{
     SelectedWiggleBasis, WiggleBlockConfig, monotone_wiggle_basis_with_derivative_order,
     monotone_wiggle_nonnegative_constraints, select_wiggle_basis_from_seed,
@@ -246,6 +249,15 @@ fn sanitize_survival_weight_vector(weights: &Array1<f64>) -> Array1<f64> {
 fn safe_fast_xt_diag_x(x: &Array2<f64>, weights: &Array1<f64>) -> Array2<f64> {
     let sanitized = sanitize_survival_weight_vector(weights);
     fast_xt_diag_x(x, &sanitized)
+}
+
+fn safe_fast_xt_diag_x_with_parallelism(
+    x: &Array2<f64>,
+    weights: &Array1<f64>,
+    par: faer::Par,
+) -> Array2<f64> {
+    let sanitized = sanitize_survival_weight_vector(weights);
+    fast_xt_diag_x_with_parallelism(x, &sanitized, par)
 }
 
 /// Layer 2 defense: compute q0 = -eta_t * exp(-eta_ls) with log-space
@@ -4412,6 +4424,15 @@ fn weighted_crossprod_dense(
     weights: &Array1<f64>,
     right: &Array2<f64>,
 ) -> Result<Array2<f64>, String> {
+    weighted_crossprod_dense_with_parallelism(left, weights, right, faer::get_global_parallelism())
+}
+
+fn weighted_crossprod_dense_with_parallelism(
+    left: &Array2<f64>,
+    weights: &Array1<f64>,
+    right: &Array2<f64>,
+    par: faer::Par,
+) -> Result<Array2<f64>, String> {
     if left.nrows() != weights.len() || right.nrows() != weights.len() {
         return Err(format!(
             "weighted_crossprod_dense row mismatch: left is {}x{}, weights has {}, right is {}x{}",
@@ -4448,7 +4469,7 @@ fn weighted_crossprod_dense(
         }
     }
     if fast_path_ok {
-        let out = fast_atb(left, &weighted_right);
+        let out = fast_atb_with_parallelism(left, &weighted_right, par);
         if out.iter().all(|value| value.is_finite()) {
             return Ok(out);
         }
@@ -5887,77 +5908,186 @@ impl SurvivalLocationScaleFamily {
             .map(DesignMatrix::to_dense_cow);
         let x_log_sigma_deriv = x_log_sigma_deriv_cow.as_ref().map(|c| &**c);
 
-        // Time-time block (mirrors line 5846-5849 in the joint assembly).
-        let h_time = safe_fast_xt_diag_x(&dynamic.time_jac_entry, &(-&q.h_time_h0))
-            + safe_fast_xt_diag_x(&dynamic.time_jac_exit, &(-&q.h_time_h1))
-            + safe_fast_xt_diag_x(&dynamic.time_jac_deriv, &q.h_time_d);
-
-        // Threshold-threshold block.
-        let h_tt = if let Some(x_t_deriv) = x_threshold_deriv {
-            let h_exit = -(&q.d2_q1 * &q.dq_t.mapv(|v| safe_product(v, v))
-                + &q.d2_qdot1 * &q.dqdot_t.mapv(|v| safe_product(v, v))
-                + &q.d1_qdot1 * &q.d2qdot_tt);
-            let h_entry =
-                -(&q.d2_q0 * &q.dq_t_entry.as_ref().unwrap().mapv(|v| safe_product(v, v)));
-            let h_deriv = -(&q.d2_qdot1 * &q.dqdot_td.mapv(|v| safe_product(v, v)));
-            let h_exit_deriv =
-                -(&q.d2_qdot1 * &(&q.dqdot_t * &q.dqdot_td) + &q.d1_qdot1 * &q.d2qdot_ttd);
-            let mut h_tt = weighted_crossprod_dense(x_threshold_exit, &h_exit, x_threshold_exit)?
-                + weighted_crossprod_dense(x_threshold_entry, &h_entry, x_threshold_entry)?
-                + weighted_crossprod_dense(x_t_deriv, &h_deriv, x_t_deriv)?;
-            let cross = weighted_crossprod_dense(x_threshold_exit, &h_exit_deriv, x_t_deriv)?;
-            h_tt += &cross;
-            h_tt += &cross.t().to_owned();
-            h_tt
+        let use_outer_parallel = rayon::current_num_threads() > 1;
+        // When multiple independent Hessian blocks are assembled by Rayon tasks,
+        // keep each faer GEMM/GEMV sequential.  This trades inner parallelism for
+        // coarse block-level parallelism and avoids nested Rayon/faer
+        // oversubscription on the same worker pool.
+        let product_parallelism = if use_outer_parallel {
+            faer::Par::Seq
         } else {
-            let h_t = -(&q.d2_q1 * &q.dq_t.mapv(|v| safe_product(v, v))
-                + &q.d2_q0 * &q.dq_t_entry.as_ref().unwrap().mapv(|v| safe_product(v, v))
-                + &q.d2_qdot1 * &q.dqdot_t.mapv(|v| safe_product(v, v))
-                + &q.d1_qdot1 * &q.d2qdot_tt);
-            weighted_crossprod_dense(&x_threshold_exit, &h_t, &x_threshold_exit)?
+            faer::get_global_parallelism()
         };
 
-        // Log-sigma–log-sigma block.
-        let h_ll = if let Some(x_ls_deriv) = x_log_sigma_deriv {
-            let dq_ls_entry = q.dq_ls_entry.as_ref().unwrap();
-            let d2q_ls_entry = q.d2q_ls_entry.as_ref().unwrap();
-            let h_exit = -(&q.d2_q1 * &q.dq_ls.mapv(|v| safe_product(v, v))
-                + &(&q.d1_q1 * &q.d2q_ls)
-                + &q.d2_qdot1 * &q.dqdot_ls.mapv(|v| safe_product(v, v))
-                + &(&q.d1_qdot1 * &q.d2qdot_ls));
-            let h_entry = -(&q.d2_q0 * &dq_ls_entry.mapv(|v| safe_product(v, v))
-                + &(&q.d1_q0 * d2q_ls_entry));
-            let h_deriv = -(&q.d2_qdot1 * &q.dqdot_lsd.mapv(|v| safe_product(v, v)));
-            let h_exit_deriv =
-                -(&q.d2_qdot1 * &(&q.dqdot_ls * &q.dqdot_lsd) + &q.d1_qdot1 * &q.d2qdot_lslsd);
-            let mut h_ll = weighted_crossprod_dense(x_log_sigma_exit, &h_exit, x_log_sigma_exit)?
-                + weighted_crossprod_dense(x_log_sigma_entry, &h_entry, x_log_sigma_entry)?
-                + weighted_crossprod_dense(x_ls_deriv, &h_deriv, x_ls_deriv)?;
-            let cross = weighted_crossprod_dense(x_log_sigma_exit, &h_exit_deriv, x_ls_deriv)?;
-            h_ll += &cross;
-            h_ll += &cross.t().to_owned();
-            h_ll
+        let assemble_h_time = || -> Result<Array2<f64>, String> {
+            // Time-time block (mirrors line 5846-5849 in the joint assembly).
+            Ok(safe_fast_xt_diag_x_with_parallelism(
+                &dynamic.time_jac_entry,
+                &(-&q.h_time_h0),
+                product_parallelism,
+            ) + safe_fast_xt_diag_x_with_parallelism(
+                &dynamic.time_jac_exit,
+                &(-&q.h_time_h1),
+                product_parallelism,
+            ) + safe_fast_xt_diag_x_with_parallelism(
+                &dynamic.time_jac_deriv,
+                &q.h_time_d,
+                product_parallelism,
+            ))
+        };
+
+        let assemble_h_tt = || -> Result<Array2<f64>, String> {
+            // Threshold-threshold block.
+            if let Some(x_t_deriv) = x_threshold_deriv {
+                let h_exit = -(&q.d2_q1 * &q.dq_t.mapv(|v| safe_product(v, v))
+                    + &q.d2_qdot1 * &q.dqdot_t.mapv(|v| safe_product(v, v))
+                    + &q.d1_qdot1 * &q.d2qdot_tt);
+                let h_entry =
+                    -(&q.d2_q0 * &q.dq_t_entry.as_ref().unwrap().mapv(|v| safe_product(v, v)));
+                let h_deriv = -(&q.d2_qdot1 * &q.dqdot_td.mapv(|v| safe_product(v, v)));
+                let h_exit_deriv =
+                    -(&q.d2_qdot1 * &(&q.dqdot_t * &q.dqdot_td) + &q.d1_qdot1 * &q.d2qdot_ttd);
+                let mut h_tt = weighted_crossprod_dense_with_parallelism(
+                    x_threshold_exit,
+                    &h_exit,
+                    x_threshold_exit,
+                    product_parallelism,
+                )? + weighted_crossprod_dense_with_parallelism(
+                    x_threshold_entry,
+                    &h_entry,
+                    x_threshold_entry,
+                    product_parallelism,
+                )? + weighted_crossprod_dense_with_parallelism(
+                    x_t_deriv,
+                    &h_deriv,
+                    x_t_deriv,
+                    product_parallelism,
+                )?;
+                let cross = weighted_crossprod_dense_with_parallelism(
+                    x_threshold_exit,
+                    &h_exit_deriv,
+                    x_t_deriv,
+                    product_parallelism,
+                )?;
+                h_tt += &cross;
+                h_tt += &cross.t().to_owned();
+                Ok(h_tt)
+            } else {
+                let h_t = -(&q.d2_q1 * &q.dq_t.mapv(|v| safe_product(v, v))
+                    + &q.d2_q0 * &q.dq_t_entry.as_ref().unwrap().mapv(|v| safe_product(v, v))
+                    + &q.d2_qdot1 * &q.dqdot_t.mapv(|v| safe_product(v, v))
+                    + &q.d1_qdot1 * &q.d2qdot_tt);
+                weighted_crossprod_dense_with_parallelism(
+                    x_threshold_exit,
+                    &h_t,
+                    x_threshold_exit,
+                    product_parallelism,
+                )
+            }
+        };
+
+        let assemble_h_ll = || -> Result<Array2<f64>, String> {
+            // Log-sigma–log-sigma block.
+            if let Some(x_ls_deriv) = x_log_sigma_deriv {
+                let dq_ls_entry = q.dq_ls_entry.as_ref().unwrap();
+                let d2q_ls_entry = q.d2q_ls_entry.as_ref().unwrap();
+                let h_exit = -(&q.d2_q1 * &q.dq_ls.mapv(|v| safe_product(v, v))
+                    + &(&q.d1_q1 * &q.d2q_ls)
+                    + &q.d2_qdot1 * &q.dqdot_ls.mapv(|v| safe_product(v, v))
+                    + &(&q.d1_qdot1 * &q.d2qdot_ls));
+                let h_entry = -(&q.d2_q0 * &dq_ls_entry.mapv(|v| safe_product(v, v))
+                    + &(&q.d1_q0 * d2q_ls_entry));
+                let h_deriv = -(&q.d2_qdot1 * &q.dqdot_lsd.mapv(|v| safe_product(v, v)));
+                let h_exit_deriv =
+                    -(&q.d2_qdot1 * &(&q.dqdot_ls * &q.dqdot_lsd) + &q.d1_qdot1 * &q.d2qdot_lslsd);
+                let mut h_ll = weighted_crossprod_dense_with_parallelism(
+                    x_log_sigma_exit,
+                    &h_exit,
+                    x_log_sigma_exit,
+                    product_parallelism,
+                )? + weighted_crossprod_dense_with_parallelism(
+                    x_log_sigma_entry,
+                    &h_entry,
+                    x_log_sigma_entry,
+                    product_parallelism,
+                )? + weighted_crossprod_dense_with_parallelism(
+                    x_ls_deriv,
+                    &h_deriv,
+                    x_ls_deriv,
+                    product_parallelism,
+                )?;
+                let cross = weighted_crossprod_dense_with_parallelism(
+                    x_log_sigma_exit,
+                    &h_exit_deriv,
+                    x_ls_deriv,
+                    product_parallelism,
+                )?;
+                h_ll += &cross;
+                h_ll += &cross.t().to_owned();
+                Ok(h_ll)
+            } else {
+                let h_ls = -(&q.d2_q1 * &q.dq_ls.mapv(|v| safe_product(v, v))
+                    + &(&q.d1_q1 * &q.d2q_ls)
+                    + &q.d2_q0 * &q.dq_ls_entry.as_ref().unwrap().mapv(|v| safe_product(v, v))
+                    + &(&q.d1_q0 * q.d2q_ls_entry.as_ref().unwrap())
+                    + &q.d2_qdot1 * &q.dqdot_ls.mapv(|v| safe_product(v, v))
+                    + &(&q.d1_qdot1 * &q.d2qdot_ls));
+                weighted_crossprod_dense_with_parallelism(
+                    x_log_sigma_exit,
+                    &h_ls,
+                    x_log_sigma_exit,
+                    product_parallelism,
+                )
+            }
+        };
+
+        let assemble_h_wiggle = || -> Result<Option<Array2<f64>>, String> {
+            // Optional link-wiggle block.
+            if let (Some(xw_exit), Some(xw_entry), Some(xw_qdot)) = (
+                dynamic.wiggle_basis_exit.as_ref(),
+                dynamic.wiggle_basis_entry.as_ref(),
+                dynamic.wiggle_qdot_basis_exit.as_ref(),
+            ) {
+                Ok(Some(
+                    weighted_crossprod_dense_with_parallelism(
+                        xw_exit,
+                        &(-&q.d2_q1),
+                        xw_exit,
+                        product_parallelism,
+                    )? + weighted_crossprod_dense_with_parallelism(
+                        xw_entry,
+                        &(-&q.d2_q0),
+                        xw_entry,
+                        product_parallelism,
+                    )? + weighted_crossprod_dense_with_parallelism(
+                        xw_qdot,
+                        &(-&q.d2_qdot1),
+                        xw_qdot,
+                        product_parallelism,
+                    )?,
+                ))
+            } else {
+                Ok(None)
+            }
+        };
+
+        let (h_time, h_tt, h_ll, h_wiggle) = if use_outer_parallel {
+            let ((h_time, h_tt), (h_ll, h_wiggle)) = rayon::join(
+                || rayon::join(assemble_h_time, assemble_h_tt),
+                || rayon::join(assemble_h_ll, assemble_h_wiggle),
+            );
+            (h_time?, h_tt?, h_ll?, h_wiggle?)
         } else {
-            let h_ls = -(&q.d2_q1 * &q.dq_ls.mapv(|v| safe_product(v, v))
-                + &(&q.d1_q1 * &q.d2q_ls)
-                + &q.d2_q0 * &q.dq_ls_entry.as_ref().unwrap().mapv(|v| safe_product(v, v))
-                + &(&q.d1_q0 * q.d2q_ls_entry.as_ref().unwrap())
-                + &q.d2_qdot1 * &q.dqdot_ls.mapv(|v| safe_product(v, v))
-                + &(&q.d1_qdot1 * &q.d2qdot_ls));
-            weighted_crossprod_dense(&x_log_sigma_exit, &h_ls, &x_log_sigma_exit)?
+            (
+                assemble_h_time()?,
+                assemble_h_tt()?,
+                assemble_h_ll()?,
+                assemble_h_wiggle()?,
+            )
         };
 
         let mut blocks = vec![h_time, h_tt, h_ll];
-
-        // Optional link-wiggle block.
-        if let (Some(xw_exit), Some(xw_entry), Some(xw_qdot)) = (
-            dynamic.wiggle_basis_exit.as_ref(),
-            dynamic.wiggle_basis_entry.as_ref(),
-            dynamic.wiggle_qdot_basis_exit.as_ref(),
-        ) {
-            let hww = weighted_crossprod_dense(xw_exit, &(-&q.d2_q1), xw_exit)?
-                + weighted_crossprod_dense(xw_entry, &(-&q.d2_q0), xw_entry)?
-                + weighted_crossprod_dense(xw_qdot, &(-&q.d2_qdot1), xw_qdot)?;
+        if let Some(hww) = h_wiggle {
             blocks.push(hww);
         }
 
