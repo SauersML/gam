@@ -8423,6 +8423,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 struct BorrowedJointDerivProvider<'a> {
     compute_dh: &'a dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
     compute_d2h: &'a dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+    family_outer_hessian_operator:
+        Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
 }
 
 // SAFETY: Only used synchronously within the same stack frame that creates it.
@@ -9054,6 +9056,7 @@ fn joint_outer_evaluate(
             Box::new(BorrowedJointDerivProvider {
                 compute_dh,
                 compute_d2h,
+                family_outer_hessian_operator: batched_outer_hessian_operator.clone(),
             })
         };
 
@@ -9279,6 +9282,7 @@ fn joint_outer_evaluate_efs(
             Box::new(BorrowedJointDerivProvider {
                 compute_dh,
                 compute_d2h,
+                family_outer_hessian_operator: None,
             })
         };
 
