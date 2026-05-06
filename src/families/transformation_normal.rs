@@ -12030,10 +12030,15 @@ impl TransformationNormalPsiWorkspace {
         // again for row-chunk streaming. CTN's `build_tensor_psi_derivatives`
         // guarantees this is the same instance across every axis.
         let shared_op_arc = Arc::clone(&op_arcs[0]);
-        let op = shared_op_arc
+        let Some(op) = shared_op_arc
             .as_any()
             .downcast_ref::<TensorKroneckerPsiOperator>()
-            .expect("validated tensor-backed above");
+        else {
+            return Err(
+                "TransformationNormalFamily ψ workspace lost tensor-backed operator after validation"
+                    .to_string(),
+            );
+        };
 
         let weights = self.family.weights.as_ref();
         let h = row.h.as_ref();
