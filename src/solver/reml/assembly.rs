@@ -14,8 +14,202 @@ use super::unified::{
     PenaltyCoordinate, PenaltyLogdetDerivs, PenaltySubspaceTrace, RemlLamlResult,
     penalty_matrix_root, reml_laml_evaluate,
 };
+use crate::faer_ndarray::fast_xt_diag_y;
 use ndarray::{Array1, Array2};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::sync::Arc;
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Streaming weighted dense-design products
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Dense weighted-product work below this approximate flop count stays on the
+/// caller thread and uses the existing faer GEMM path. Above the threshold we
+/// stream rows through rayon-local accumulation buffers to avoid materializing
+/// weighted n×p design copies at biobank scale.
+const DENSE_WEIGHTED_PRODUCT_PAR_FLOPS: usize = 8_000_000;
+
+#[inline]
+fn dense_weighted_chunk_rows(cols: usize) -> usize {
+    const TARGET_BYTES: usize = 2 * 1024 * 1024;
+    const MIN_ROWS: usize = 256;
+    const MAX_ROWS: usize = 4096;
+    let bytes_per_row = cols.max(1) * std::mem::size_of::<f64>();
+    (TARGET_BYTES / bytes_per_row).clamp(MIN_ROWS, MAX_ROWS)
+}
+
+/// Write `diag(scale) · x` into `out`, preserving `out`'s allocation when its
+/// shape already matches `x`.
+///
+/// This replaces the former clone-and-row-scale pattern used by REML assembly
+/// tests and Firth kernels. It is intentionally simple and deterministic for a
+/// fixed row order.
+pub(crate) fn row_scale_dense_into(x: &Array2<f64>, scale: &Array1<f64>, out: &mut Array2<f64>) {
+    debug_assert_eq!(x.nrows(), scale.len(), "scale length must match row count");
+    if out.raw_dim() != x.raw_dim() {
+        *out = Array2::<f64>::zeros(x.raw_dim());
+    }
+    ndarray::Zip::from(out.rows_mut())
+        .and(x.rows())
+        .and(scale.view())
+        .for_each(|mut dst, src, &w| {
+            dst.assign(&src);
+            dst *= w;
+        });
+}
+
+/// Return `diag(scale) · x` without exposing the reusable-buffer API.
+pub(crate) fn row_scale_dense(x: &Array2<f64>, scale: &Array1<f64>) -> Array2<f64> {
+    let mut out = Array2::<f64>::zeros(x.raw_dim());
+    row_scale_dense_into(x, scale, &mut out);
+    out
+}
+
+fn accumulate_weighted_cross_rows(
+    out: &mut Array2<f64>,
+    left: &Array2<f64>,
+    right: &Array2<f64>,
+    weights: &Array1<f64>,
+    row_start: usize,
+    row_end: usize,
+) {
+    let p = left.ncols();
+    let q = right.ncols();
+    for i in row_start..row_end {
+        let wi = weights[i];
+        if wi == 0.0 {
+            continue;
+        }
+        for a in 0..p {
+            let scaled = wi * left[[i, a]];
+            if scaled == 0.0 {
+                continue;
+            }
+            for b in 0..q {
+                out[[a, b]] += scaled * right[[i, b]];
+            }
+        }
+    }
+}
+
+fn accumulate_xt_diag_x_upper_rows(
+    out: &mut Array2<f64>,
+    x: &Array2<f64>,
+    diag: &Array1<f64>,
+    row_start: usize,
+    row_end: usize,
+) {
+    let p = x.ncols();
+    for i in row_start..row_end {
+        let wi = diag[i];
+        if wi == 0.0 {
+            continue;
+        }
+        for a in 0..p {
+            let scaled = wi * x[[i, a]];
+            if scaled == 0.0 {
+                continue;
+            }
+            for b in a..p {
+                out[[a, b]] += scaled * x[[i, b]];
+            }
+        }
+    }
+}
+
+/// Compute `leftᵀ diag(weights) right` using streamed row-block
+/// accumulation for large products. The parallel path allocates one dense
+/// p×q accumulator per rayon worker/task instead of allocating an n×q weighted
+/// design matrix.
+pub(crate) fn weighted_cross_dense(
+    left: &Array2<f64>,
+    right: &Array2<f64>,
+    weights: &Array1<f64>,
+) -> Array2<f64> {
+    debug_assert_eq!(left.nrows(), right.nrows());
+    debug_assert_eq!(left.nrows(), weights.len());
+    let n = weights.len();
+    let p = left.ncols();
+    let q = right.ncols();
+    if n == 0 || p == 0 || q == 0 {
+        return Array2::<f64>::zeros((p, q));
+    }
+
+    let work = n.saturating_mul(p).saturating_mul(q);
+    if rayon::current_num_threads() <= 1 || work < DENSE_WEIGHTED_PRODUCT_PAR_FLOPS {
+        return fast_xt_diag_y(left, weights, right);
+    }
+
+    let chunk_rows = dense_weighted_chunk_rows(p + q).min(n);
+    let chunks = n.div_ceil(chunk_rows);
+    (0..chunks)
+        .into_par_iter()
+        .fold(
+            || Array2::<f64>::zeros((p, q)),
+            |mut local, chunk| {
+                let start = chunk * chunk_rows;
+                let end = (start + chunk_rows).min(n);
+                accumulate_weighted_cross_rows(&mut local, left, right, weights, start, end);
+                local
+            },
+        )
+        .reduce(
+            || Array2::<f64>::zeros((p, q)),
+            |mut a, b| {
+                a += &b;
+                a
+            },
+        )
+}
+
+/// Compute `xᵀ diag(diag) x`. For small products this reuses `weighted` as an
+/// n×p row-scaled scratch and dispatches to faer GEMM. For large products it
+/// streams rows into rayon-local p×p buffers and mirrors the accumulated upper
+/// triangle, avoiding weighted design materialization.
+pub(crate) fn xt_diag_x_dense_into(
+    x: &Array2<f64>,
+    diag: &Array1<f64>,
+    weighted: &mut Array2<f64>,
+) -> Array2<f64> {
+    let (n, p) = x.dim();
+    debug_assert_eq!(diag.len(), n, "diag length must match row count");
+    if n == 0 || p == 0 {
+        return Array2::<f64>::zeros((p, p));
+    }
+
+    let work = n.saturating_mul(p).saturating_mul(p);
+    if rayon::current_num_threads() <= 1 || work < DENSE_WEIGHTED_PRODUCT_PAR_FLOPS {
+        row_scale_dense_into(x, diag, weighted);
+        return crate::faer_ndarray::fast_atb(x, weighted);
+    }
+
+    let chunk_rows = dense_weighted_chunk_rows(p).min(n);
+    let chunks = n.div_ceil(chunk_rows);
+    let mut out = (0..chunks)
+        .into_par_iter()
+        .fold(
+            || Array2::<f64>::zeros((p, p)),
+            |mut local, chunk| {
+                let start = chunk * chunk_rows;
+                let end = (start + chunk_rows).min(n);
+                accumulate_xt_diag_x_upper_rows(&mut local, x, diag, start, end);
+                local
+            },
+        )
+        .reduce(
+            || Array2::<f64>::zeros((p, p)),
+            |mut a, b| {
+                a += &b;
+                a
+            },
+        );
+    for a in 0..p {
+        for b in 0..a {
+            out[[a, b]] = out[[b, a]];
+        }
+    }
+    out
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  InnerAssembly — the single entry point for InnerSolution construction
@@ -197,6 +391,105 @@ where
             Some((pc, pg, ph))
         } else {
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use approx::assert_relative_eq;
+    use ndarray::Array2;
+
+    fn assert_matrix_close(
+        got: &Array2<f64>,
+        expected: &Array2<f64>,
+        epsilon: f64,
+        max_relative: f64,
+    ) {
+        assert_eq!(got.dim(), expected.dim());
+        for ((i, j), &value) in got.indexed_iter() {
+            assert_relative_eq!(
+                value,
+                expected[[i, j]],
+                epsilon = epsilon,
+                max_relative = max_relative
+            );
+        }
+    }
+
+    fn deterministic_matrix(n: usize, p: usize, phase: f64) -> Array2<f64> {
+        Array2::from_shape_fn((n, p), |(i, j)| {
+            let a = ((i as f64 + 1.0) * (j as f64 + 3.0) + phase).sin();
+            let b = ((i as f64 + 5.0) / (j as f64 + 2.0) + phase).cos();
+            0.25 * a + 0.75 * b
+        })
+    }
+
+    fn deterministic_weights(n: usize) -> Array1<f64> {
+        Array1::from_shape_fn(n, |i| {
+            if i % 17 == 0 {
+                0.0
+            } else {
+                0.2 + ((i as f64 + 1.0) * 0.013).sin().abs()
+            }
+        })
+    }
+
+    fn weighted_cross_reference(
+        left: &Array2<f64>,
+        right: &Array2<f64>,
+        weights: &Array1<f64>,
+    ) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((left.ncols(), right.ncols()));
+        for i in 0..weights.len() {
+            for a in 0..left.ncols() {
+                let scaled = weights[i] * left[[i, a]];
+                for b in 0..right.ncols() {
+                    out[[a, b]] += scaled * right[[i, b]];
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn row_scale_dense_into_reuses_buffer_and_matches_reference() {
+        let x = deterministic_matrix(37, 11, 0.3);
+        let weights = deterministic_weights(x.nrows());
+        let mut out = Array2::<f64>::zeros(x.raw_dim());
+        let ptr = out.as_ptr();
+        row_scale_dense_into(&x, &weights, &mut out);
+        assert_eq!(out.as_ptr(), ptr);
+        for i in 0..x.nrows() {
+            for j in 0..x.ncols() {
+                assert_relative_eq!(out[[i, j]], x[[i, j]] * weights[i], epsilon = 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn weighted_cross_dense_matches_rowwise_reference_at_biobank_block_size() {
+        let left = deterministic_matrix(2048, 96, 0.1);
+        let right = deterministic_matrix(2048, 64, 0.7);
+        let weights = deterministic_weights(left.nrows());
+        let got = weighted_cross_dense(&left, &right, &weights);
+        let expected = weighted_cross_reference(&left, &right, &weights);
+        assert_matrix_close(&got, &expected, 5e-10, 5e-12);
+    }
+
+    #[test]
+    fn xt_diag_x_dense_into_matches_symmetric_reference_at_biobank_block_size() {
+        let x = deterministic_matrix(1024, 96, 1.1);
+        let weights = deterministic_weights(x.nrows());
+        let mut scratch = Array2::<f64>::zeros((0, 0));
+        let got = xt_diag_x_dense_into(&x, &weights, &mut scratch);
+        let expected = weighted_cross_reference(&x, &x, &weights);
+        assert_matrix_close(&got, &expected, 3e-10, 5e-12);
+        for i in 0..got.nrows() {
+            for j in 0..got.ncols() {
+                assert_relative_eq!(got[[i, j]], got[[j, i]], epsilon = 0.0);
+            }
         }
     }
 }
