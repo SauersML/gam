@@ -27,6 +27,7 @@ use super::polya_gamma::PolyaGamma;
 use crate::construction::CanonicalPenalty;
 use crate::estimate::reml::FirthDenseOperator;
 use crate::estimate::reml::penalty_logdet::PenaltyPseudologdet;
+use crate::estimate::{UnifiedFitResult, validate_explicit_dense_hessian_for_whitening};
 use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_ata_into, fast_atv};
 use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
 use crate::matrix::DesignMatrix;
@@ -1031,12 +1032,181 @@ mod tests {
         run_logit_polya_gamma_gibbs, run_nuts_sampling_flattened_family,
     };
     use crate::construction::CanonicalPenalty;
+    use crate::estimate::{
+        BlockRole, FitGeometry, FitInference, FittedBlock, FittedLinkState, UnifiedFitResult,
+        UnifiedFitResultParts,
+    };
     use crate::matrix::DesignMatrix;
     use crate::survival::{MonotonicityPenalty, PenaltyBlocks, SurvivalSpec};
-    use crate::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior};
+    use crate::types::{
+        InverseLink, LikelihoodFamily, LikelihoodScaleMetadata, LinkFunction,
+        LogLikelihoodNormalization, RhoPrior,
+    };
     use general_mcmc::generic_hmc::HamiltonianTarget;
     use ndarray::{Array1, Array2, array};
     use std::sync::Arc;
+
+    fn hmc_test_fit(
+        blocks: Vec<FittedBlock>,
+        inference: Option<FitInference>,
+        geometry: Option<FitGeometry>,
+    ) -> UnifiedFitResult {
+        let lambdas = Array1::zeros(0);
+        UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
+            blocks,
+            log_lambdas: lambdas.clone(),
+            lambdas,
+            likelihood_family: Some(LikelihoodFamily::GaussianIdentity),
+            likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: LogLikelihoodNormalization::Full,
+            log_likelihood: -1.0,
+            deviance: 2.0,
+            reml_score: 0.0,
+            stable_penalty_term: 0.0,
+            penalized_objective: 0.0,
+            outer_iterations: 1,
+            outer_converged: true,
+            outer_gradient_norm: 0.0,
+            standard_deviation: 1.0,
+            covariance_conditional: None,
+            covariance_corrected: None,
+            inference,
+            fitted_link: FittedLinkState::Standard(None),
+            geometry,
+            block_states: Vec::new(),
+            pirls_status: crate::pirls::PirlsStatus::Converged,
+            max_abs_eta: 0.0,
+            constraint_kkt: None,
+            artifacts: Default::default(),
+            inner_cycles: 0,
+        })
+        .expect("valid HMC handoff test fit")
+    }
+
+    #[test]
+    fn hmc_whitening_consumes_standard_fit_inference_hessian() {
+        let hessian = array![[2.0, 0.1], [0.1, 1.6]];
+        let fit = hmc_test_fit(
+            vec![FittedBlock {
+                beta: array![0.05, -0.1],
+                role: BlockRole::Mean,
+                edf: 2.0,
+                lambdas: Array1::zeros(0),
+            }],
+            Some(FitInference {
+                edf_by_block: vec![],
+                edf_total: 2.0,
+                smoothing_correction: None,
+                penalized_hessian: hessian.clone(),
+                working_weights: array![1.0, 1.0, 1.0],
+                working_response: array![0.0, 0.1, -0.2],
+                reparam_qs: None,
+                beta_covariance: None,
+                beta_standard_errors: None,
+                beta_covariance_corrected: None,
+                beta_standard_errors_corrected: None,
+                bias_correction_beta: None,
+            }),
+            None,
+        );
+
+        let explicit = super::explicit_fit_hessian_for_whitening(&fit, 2, "standard fit")
+            .expect("standard fit exports explicit Hessian");
+        assert_eq!(explicit, &hessian);
+
+        let x = array![[1.0, 0.0], [1.0, 0.5], [1.0, -0.5]];
+        let y = array![0.0, 0.2, -0.1];
+        let weights = Array1::ones(3);
+        let penalty = Array2::eye(2);
+        NutsPosterior::new(
+            x.view(),
+            y.view(),
+            weights.view(),
+            penalty.view(),
+            fit.beta.view(),
+            explicit.view(),
+            NutsFamily::Gaussian,
+            1.0,
+            false,
+        )
+        .expect("HMC target whitens with upstream Hessian");
+    }
+
+    #[test]
+    fn hmc_whitening_consumes_blockwise_geometry_hessian() {
+        let hessian = array![[3.0, 0.2], [0.2, 2.0]];
+        let fit = hmc_test_fit(
+            vec![
+                FittedBlock {
+                    beta: array![0.1],
+                    role: BlockRole::Location,
+                    edf: 1.0,
+                    lambdas: Array1::zeros(0),
+                },
+                FittedBlock {
+                    beta: array![-0.2],
+                    role: BlockRole::Scale,
+                    edf: 1.0,
+                    lambdas: Array1::zeros(0),
+                },
+            ],
+            None,
+            Some(FitGeometry {
+                penalized_hessian: hessian.clone(),
+                working_weights: array![1.0, 0.8],
+                working_response: array![0.0, 0.1],
+            }),
+        );
+
+        let explicit = super::explicit_fit_hessian_for_whitening(&fit, 2, "blockwise fit")
+            .expect("blockwise fit exports materialized Hessian");
+        assert_eq!(explicit, &hessian);
+    }
+
+    #[test]
+    fn hmc_whitening_rejects_covariance_only_fit_without_synthesizing_hessian() {
+        let fit = UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
+            blocks: vec![FittedBlock {
+                beta: array![0.0],
+                role: BlockRole::Mean,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            }],
+            log_lambdas: Array1::zeros(0),
+            lambdas: Array1::zeros(0),
+            likelihood_family: Some(LikelihoodFamily::GaussianIdentity),
+            likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: LogLikelihoodNormalization::Full,
+            log_likelihood: -1.0,
+            deviance: 2.0,
+            reml_score: 0.0,
+            stable_penalty_term: 0.0,
+            penalized_objective: 0.0,
+            outer_iterations: 1,
+            outer_converged: true,
+            outer_gradient_norm: 0.0,
+            standard_deviation: 1.0,
+            covariance_conditional: Some(array![[0.5]]),
+            covariance_corrected: None,
+            inference: None,
+            fitted_link: FittedLinkState::Standard(None),
+            geometry: None,
+            block_states: Vec::new(),
+            pirls_status: crate::pirls::PirlsStatus::Converged,
+            max_abs_eta: 0.0,
+            constraint_kkt: None,
+            artifacts: Default::default(),
+            inner_cycles: 0,
+        })
+        .expect("covariance-only fit can exist for prediction");
+
+        let err = super::explicit_fit_hessian_for_whitening(&fit, 1, "covariance-only fit")
+            .expect_err("HMC must not invert covariance as a Hessian fallback");
+        assert!(
+            err.contains("missing an explicit penalized Hessian"),
+            "unexpected error: {err}"
+        );
+    }
 
     #[test]
     fn log1pexp_is_finite_for_extreme_eta() {
@@ -2902,6 +3072,33 @@ pub struct SurvivalNutsInputs<'a> {
 pub enum FamilyNutsInputs<'a> {
     Glm(GlmFlatInputs<'a>),
     Survival(Box<SurvivalNutsInputs<'a>>),
+}
+
+/// Return the explicit fitted penalized Hessian used for HMC/NUTS whitening.
+///
+/// This is the only supported upstream-to-HMC curvature handoff: callers must
+/// pass a dense Hessian (or an already materialized exact operator stored as a
+/// dense Hessian) exported by the fitter. We deliberately do not synthesize a
+/// numerical Hessian and do not invert `beta_covariance` as a compatibility
+/// fallback, because either path can silently whiten against curvature that the
+/// upstream fit never certified.
+pub fn explicit_fit_hessian_for_whitening<'a>(
+    fit: &'a UnifiedFitResult,
+    expected_dim: usize,
+    label: &str,
+) -> Result<&'a Array2<f64>, String> {
+    let hessian = fit.penalized_hessian().ok_or_else(|| {
+        format!(
+            "{label}: fit result is missing an explicit penalized Hessian for HMC/NUTS whitening"
+        )
+    })?;
+    validate_explicit_dense_hessian_for_whitening(
+        &format!("{label} penalized Hessian"),
+        hessian,
+        expected_dim,
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(hessian)
 }
 
 /// Family-agnostic flattened NUTS entrypoint across all supported likelihood families.

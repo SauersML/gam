@@ -6007,13 +6007,12 @@ fn run_sample_standard(
             weights: weights.view(),
             penalty_matrix: penalty.view(),
             mode: fit.beta.view(),
-            hessian: fit
-                .penalized_hessian()
-                .ok_or_else(|| {
-                    "fit result is missing inference Hessian; refit with inference enabled"
-                        .to_string()
-                })?
-                .view(),
+            hessian: gam::inference::hmc::explicit_fit_hessian_for_whitening(
+                &fit,
+                p,
+                "sample refit",
+            )?
+            .view(),
             gamma_shape: fit.likelihood_scale.gamma_shape(),
             firth_bias_reduction: false,
         }),
@@ -7260,7 +7259,6 @@ fn core_saved_fit_result(
     beta_covariance_corrected: Option<Array2<f64>>,
     summary: SavedFitSummary,
 ) -> UnifiedFitResult {
-    let p = beta.len();
     // Saved models are part of the stable inference contract. Reject non-finite
     // values at construction time so JSON cannot silently encode them as null.
     let summary = summary
@@ -7286,22 +7284,12 @@ fn core_saved_fit_result(
     }
     {
         let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
-        let inf = gam::estimate::FitInference {
-            edf_by_block: Vec::new(),
-            edf_total: 0.0,
-            smoothing_correction: None,
-            penalized_hessian: Array2::<f64>::zeros((p, p)),
-            working_weights: Array1::<f64>::zeros(0),
-            working_response: Array1::<f64>::zeros(0),
-            reparam_qs: None,
-            beta_covariance,
-            beta_standard_errors: None,
-            beta_covariance_corrected,
-            beta_standard_errors_corrected: None,
-            bias_correction_beta: None,
-        };
-        let covariance_conditional = inf.beta_covariance.clone();
-        let covariance_corrected = inf.beta_covariance_corrected.clone();
+        // Do not export a synthetic/placeholder Hessian here. Saved fits built
+        // from externally supplied summary/covariance data may provide covariance
+        // for prediction, but HMC/NUTS whitening requires an explicit upstream
+        // penalized Hessian from the fitter itself.
+        let covariance_conditional = beta_covariance;
+        let covariance_corrected = beta_covariance_corrected;
         let penalized_objective = summary.reml_score;
         UnifiedFitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
             blocks: vec![gam::estimate::FittedBlock {
@@ -7326,7 +7314,7 @@ fn core_saved_fit_result(
             standard_deviation,
             covariance_conditional,
             covariance_corrected,
-            inference: Some(inf),
+            inference: None,
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
             block_states: Vec::new(),

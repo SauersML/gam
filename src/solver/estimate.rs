@@ -3266,6 +3266,61 @@ impl FitInference {
     }
 }
 
+/// Validate that a saved penalized Hessian is an explicit dense precision
+/// matrix suitable for HMC/NUTS whitening.
+///
+/// The HMC path whitens with a Cholesky factor of this matrix, so upstream fits
+/// must not export placeholders, missing curvature hidden behind a covariance,
+/// or nonsymmetric/non-SPD matrices. This check intentionally validates only
+/// already-materialized dense Hessians; it does not synthesize curvature from
+/// numerical differences or invert a covariance fallback.
+pub fn validate_explicit_dense_hessian_for_whitening(
+    label: &str,
+    hessian: &Array2<f64>,
+    expected_dim: usize,
+) -> Result<(), EstimationError> {
+    if hessian.nrows() != expected_dim || hessian.ncols() != expected_dim {
+        return Err(EstimationError::InvalidInput(format!(
+            "{label} shape mismatch: got {}x{}, expected {}x{}",
+            hessian.nrows(),
+            hessian.ncols(),
+            expected_dim,
+            expected_dim
+        )));
+    }
+    if expected_dim == 0 {
+        return Ok(());
+    }
+    validate_all_finite_estimation(label, hessian.iter().copied())?;
+    if !hessian.iter().any(|value| value.abs() > 0.0) {
+        return Err(EstimationError::InvalidInput(format!(
+            "{label} must be an explicit dense Hessian; zero placeholders are not usable for HMC/NUTS whitening"
+        )));
+    }
+    let symmetry_tol = 1e-10;
+    for i in 0..expected_dim {
+        for j in 0..i {
+            let a = hessian[[i, j]];
+            let b = hessian[[j, i]];
+            let scale = 1.0_f64.max(a.abs()).max(b.abs());
+            if (a - b).abs() > symmetry_tol * scale {
+                return Err(EstimationError::InvalidInput(format!(
+                    "{label} must be symmetric for HMC/NUTS whitening; entries ({i},{j})={a} and ({j},{i})={b} differ"
+                )));
+            }
+        }
+    }
+    hessian
+        .to_owned()
+        .cholesky(Side::Lower)
+        .map(|_| ())
+        .map_err(|err| {
+            EstimationError::InvalidInput(format!(
+                "{label} must be positive definite for HMC/NUTS whitening; Cholesky failed: {err:?}"
+            ))
+        })
+}
+
 fn array1_values_equal(lhs: &Array1<f64>, rhs: &Array1<f64>) -> bool {
     lhs.len() == rhs.len() && lhs.iter().zip(rhs.iter()).all(|(a, b)| a == b)
 }
@@ -3465,6 +3520,11 @@ impl UnifiedFitResult {
                     p
                 )));
             }
+            validate_explicit_dense_hessian_for_whitening(
+                "UnifiedFitResult inference penalized Hessian",
+                &inf.penalized_hessian,
+                p,
+            )?;
             if let Some(cov) = inf.beta_covariance.as_ref() {
                 if cov.nrows() != p || cov.ncols() != p {
                     return Err(EstimationError::InvalidInput(format!(
@@ -3568,6 +3628,11 @@ impl UnifiedFitResult {
                     p
                 )));
             }
+            validate_explicit_dense_hessian_for_whitening(
+                "UnifiedFitResult geometry penalized Hessian",
+                &geom.penalized_hessian,
+                p,
+            )?;
             if geom.working_weights.len() != geom.working_response.len() {
                 return Err(EstimationError::InvalidInput(format!(
                     "UnifiedFitResult geometry working vector length mismatch: working_weights={}, working_response={}",
