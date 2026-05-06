@@ -11745,6 +11745,149 @@ mod tests {
     }
 
     #[test]
+    fn outer_hessian_operator_matvec_matches_dense_subspace_with_null_alpha() {
+        // p=4, K=2, r=2 fixture — exercises the full projection K = U_S H_proj⁻¹ U_Sᵀ
+        // (the existing r=1 case at projected_operator_hessian_matches_dense_subspace_trace
+        // only verifies a trivial 1-D subspace).  Includes a small symmetric off-diagonal
+        // so H_proj is non-diagonal.
+        let h = array![
+            [3.0, 0.1, 0.0, 0.0],
+            [0.1, 5.0, 0.05, 0.0],
+            [0.0, 0.05, 7.0, 0.15],
+            [0.0, 0.0, 0.15, 11.0]
+        ];
+        let hop = Arc::new(DenseSpectralOperator::from_symmetric(&h).unwrap());
+
+        // U_S spans the first two coordinates.  Null directions are dims 2,3.
+        let u_s = array![[1.0, 0.0], [0.0, 1.0], [0.0, 0.0], [0.0, 0.0]];
+
+        // H_proj = U_Sᵀ H U_S = top-left 2×2 of H = [[3.0, 0.1], [0.1, 5.0]].
+        // Closed-form 2×2 inverse for the test fixture: 1/(3·5 − 0.1²) · [[5, −0.1], [−0.1, 3]].
+        let det = 3.0_f64 * 5.0 - 0.1 * 0.1;
+        let h_proj_inverse = array![[5.0 / det, -0.1 / det], [-0.1 / det, 3.0 / det]];
+
+        // Penalty roots mix identified (rows 0,1) and null (rows 2,3) directions, so
+        // the projection is non-trivial — `compute_outer_hessian` must collapse the
+        // null components and the matvec must match.
+        let penalty_root_0 = array![[0.7, 0.3, 0.6, 0.0]];
+        let penalty_root_1 = array![[0.2, 0.5, 0.0, 0.4]];
+
+        let x = array![[1.0, 0.2, 0.5, 0.3], [1.0, 1.1, -0.2, 0.4], [1.0, -0.8, 0.7, -0.1], [1.0, 0.5, 0.3, 0.6]];
+        let c_array = array![0.31, -0.27, 0.19, -0.11];
+        let d_array = array![0.17, -0.11, 0.23, 0.07];
+        let deriv_provider = SinglePredictorGlmDerivatives {
+            c_array,
+            d_array: Some(d_array),
+            x_transformed: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x)),
+        };
+
+        // Pre-compute log|H_proj|_+ = ln(det(H_proj)) for the correction term.
+        let logdet_h_proj = det.ln();
+
+        let beta = array![0.4, -0.7, 0.2, 0.1];
+        let solution = InnerSolution {
+            log_likelihood: -2.3,
+            penalty_quadratic: 0.6,
+            hessian_op: hop.clone(),
+            beta,
+            penalty_coords: vec![
+                PenaltyCoordinate::from_dense_root(penalty_root_0),
+                PenaltyCoordinate::from_dense_root(penalty_root_1),
+            ],
+            penalty_logdet: PenaltyLogdetDerivs {
+                value: 0.0,
+                first: array![0.4, -0.2],
+                second: Some(array![[0.13, 0.02], [0.02, 0.09]]),
+            },
+            deriv_provider: Box::new(deriv_provider),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: None,
+            hessian_logdet_correction: logdet_h_proj - hop.logdet(),
+            penalty_subspace_trace: Some(Arc::new(PenaltySubspaceTrace {
+                u_s,
+                h_proj_inverse,
+            })),
+            rho_curvature_scale: 1.0,
+            n_observations: 4,
+            nullspace_dim: 2.0,
+            dispersion: DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: true,
+            },
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+            barrier_config: None,
+        };
+        let rho: Vec<f64> = vec![0.2_f64, -0.1];
+        let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
+
+        let dense = compute_outer_hessian(
+            &solution,
+            &rho,
+            &lambdas,
+            solution.hessian_op.as_ref(),
+            solution.deriv_provider.as_ref(),
+        )
+        .unwrap();
+        let kernel = solution
+            .deriv_provider
+            .outer_hessian_derivative_kernel()
+            .unwrap();
+        let operator = build_outer_hessian_operator(
+            &solution,
+            &lambdas,
+            solution.deriv_provider.as_ref(),
+            kernel,
+        )
+        .unwrap();
+
+        // (6) Materialised dense extension to r=2: every entry must match.
+        let materialized =
+            crate::solver::outer_strategy::OuterHessianOperator::materialize_dense(&operator)
+                .unwrap();
+        for row in 0..dense.nrows() {
+            for col in 0..dense.ncols() {
+                assert_relative_eq!(
+                    materialized[[row, col]],
+                    dense[[row, col]],
+                    epsilon = 1e-12,
+                    max_relative = 1e-12
+                );
+            }
+        }
+
+        // (3) HVP equivalence across a basis-and-mix set of α probes.
+        // (4) The [1, -1] and [0.7, -0.3] probes lift through penalty roots whose
+        //     columns 2,3 carry non-zero null components, so they exercise the
+        //     projection rather than just the identified subspace.
+        let alphas = [
+            array![1.0, 0.0],
+            array![0.0, 1.0],
+            array![1.0, 1.0],
+            array![1.0, -1.0],
+            array![0.7, -0.3],
+        ];
+        for alpha in alphas.iter() {
+            let hvp =
+                crate::solver::outer_strategy::OuterHessianOperator::matvec(&operator, alpha)
+                    .expect("operator HVP");
+            let dense_hvp = dense.dot(alpha);
+            for i in 0..hvp.len() {
+                assert_relative_eq!(
+                    hvp[i],
+                    dense_hvp[i],
+                    epsilon = 1e-12,
+                    max_relative = 1e-12
+                );
+            }
+        }
+    }
+
+    #[test]
     fn projected_operator_hessian_matches_dense_subspace_trace() {
         let h = array![[3.0, 0.2], [0.2, 5.0]];
         let hop = Arc::new(DenseSpectralOperator::from_symmetric(&h).unwrap());

@@ -12982,7 +12982,6 @@ mod tests {
                 crate::solver::estimate::reml::unified::MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N,
                 k_outer,
                 true,
-                false,
             )
         );
         assert!(
@@ -12991,7 +12990,6 @@ mod tests {
                 spec.design.ncols(),
                 k_outer,
                 true,
-                false,
             )
         );
 
