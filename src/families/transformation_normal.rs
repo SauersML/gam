@@ -8598,15 +8598,15 @@ impl TensorKroneckerPsiOperator {
         if deriv.x_psi.nrows() == self.n_data() && deriv.x_psi.ncols() == self.p_cov() {
             return Ok(deriv.x_psi.slice(s![rows, ..]).to_owned());
         }
-        if self.cov_first_axis_cache_fits_budget() {
-            let cached = self.materialize_cov_first_axis_arc(axis)?;
-            return Ok(cached.slice(s![rows, ..]).to_owned());
-        }
         let Some(op) = deriv.implicit_operator.as_ref() else {
             return Err(crate::terms::basis::BasisError::InvalidInput(format!(
                 "missing covariate psi row chunk operator for axis {axis}"
             )));
         };
+        if self.cov_first_axis_cache_fits_budget() && op.as_materializable().is_some() {
+            let cached = self.materialize_cov_first_axis_arc(axis)?;
+            return Ok(cached.slice(s![rows, ..]).to_owned());
+        }
         op.row_chunk_first(deriv.implicit_axis, rows)
     }
 
