@@ -8381,9 +8381,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let n = self.n;
         let dynamic = self.build_dynamic_geometry(block_states)?;
 
-        let mut ll = 0.0;
-
-        for i in 0..n {
+        let row_log_likelihood = |i: usize| -> Result<f64, String> {
             let state = self.row_predictor_state(
                 dynamic.h_entry[i],
                 dynamic.h_exit[i],
@@ -8392,12 +8390,39 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 dynamic.q_exit[i],
                 dynamic.qdot_exit[i],
             );
-            let Some(kernel) = self.exact_row_kernel(i, state)? else {
-                continue;
-            };
-            ll += kernel.log_likelihood();
+            Ok(self
+                .exact_row_kernel(i, state)?
+                .map_or(0.0, SurvivalExactRowKernel::log_likelihood))
+        };
+
+        const PARALLEL_LOG_LIKELIHOOD_ROW_THRESHOLD: usize = 1024;
+        const LOG_LIKELIHOOD_CHUNK_ROWS: usize = 1024;
+        if n < PARALLEL_LOG_LIKELIHOOD_ROW_THRESHOLD {
+            let mut ll = 0.0;
+            for i in 0..n {
+                ll += row_log_likelihood(i)?;
+            }
+            return Ok(ll);
         }
 
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let chunk_sums: Vec<Result<f64, String>> = (0..n.div_ceil(LOG_LIKELIHOOD_CHUNK_ROWS))
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * LOG_LIKELIHOOD_CHUNK_ROWS;
+                let end = (start + LOG_LIKELIHOOD_CHUNK_ROWS).min(n);
+                let mut ll = 0.0;
+                for i in start..end {
+                    ll += row_log_likelihood(i)?;
+                }
+                Ok(ll)
+            })
+            .collect();
+
+        let mut ll = 0.0;
+        for chunk_sum in chunk_sums {
+            ll += chunk_sum?;
+        }
         Ok(ll)
     }
 
