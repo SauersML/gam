@@ -13,8 +13,8 @@ use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
     CoeffSupport, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView, add_optional_matrix,
     add_optional_vector, add_two_surface_psi_outer,
-    build_denested_partition_cells as shared_denested_partition_cells, eval_coeff4_at,
-    is_sigma_aux_index as shared_is_sigma_aux_index,
+    build_denested_partition_cells as shared_denested_partition_cells, chunked_row_reduction,
+    eval_coeff4_at, is_sigma_aux_index as shared_is_sigma_aux_index,
     observed_denested_cell_partials as shared_observed_denested_cell_partials, outer_row_indices,
     outer_score_scale, probit_frailty_scale, probit_frailty_scale_multi_dir_jet,
     psi_derivative_location, scale_coeff4,
@@ -2459,41 +2459,30 @@ impl BernoulliMarginalSlopeFamily {
         let n = self.y.len();
         let row_iter = outer_row_indices(options, n).to_vec();
         let scale = outer_score_scale(options, n);
-        let (mut objective_psi, mut score_psi, mut acc) = row_iter
-            .into_par_iter()
-            .try_fold(
-                || {
-                    (
-                        0.0,
-                        Array1::<f64>::zeros(slices.total),
-                        BernoulliBlockHessianAccumulator::new(&slices),
-                    )
-                },
-                |mut acc, row| -> Result<_, String> {
-                    let (obj, grad, hess) =
-                        self.row_sigma_primary_terms(row, block_states, false)?;
-                    acc.0 += obj;
-                    self.accumulate_rigid_sigma_pullback(
-                        row, &slices, &grad, &hess, &mut acc.1, &mut acc.2,
-                    )?;
-                    Ok(acc)
-                },
-            )
-            .try_reduce(
-                || {
-                    (
-                        0.0,
-                        Array1::<f64>::zeros(slices.total),
-                        BernoulliBlockHessianAccumulator::new(&slices),
-                    )
-                },
-                |mut left, right| -> Result<_, String> {
-                    left.0 += right.0;
-                    left.1 += &right.1;
-                    left.2.add(&right.2);
-                    Ok(left)
-                },
-            )?;
+        // Bit-deterministic reduction: see `chunked_row_reduction`.
+        let (mut objective_psi, mut score_psi, mut acc) = chunked_row_reduction(
+            row_iter.as_slice(),
+            || {
+                (
+                    0.0,
+                    Array1::<f64>::zeros(slices.total),
+                    BernoulliBlockHessianAccumulator::new(&slices),
+                )
+            },
+            |row, acc| -> Result<(), String> {
+                let (obj, grad, hess) = self.row_sigma_primary_terms(row, block_states, false)?;
+                acc.0 += obj;
+                self.accumulate_rigid_sigma_pullback(
+                    row, &slices, &grad, &hess, &mut acc.1, &mut acc.2,
+                )?;
+                Ok(())
+            },
+            |total, chunk| {
+                total.0 += chunk.0;
+                total.1 += &chunk.1;
+                total.2.add(&chunk.2);
+            },
+        )?;
         if scale != 1.0 {
             objective_psi *= scale;
             score_psi.mapv_inplace(|v| v * scale);
@@ -2538,41 +2527,30 @@ impl BernoulliMarginalSlopeFamily {
         let n = self.y.len();
         let row_iter = outer_row_indices(options, n).to_vec();
         let scale = outer_score_scale(options, n);
-        let (mut objective_psi_psi, mut score_psi_psi, mut acc) = row_iter
-            .into_par_iter()
-            .try_fold(
-                || {
-                    (
-                        0.0,
-                        Array1::<f64>::zeros(slices.total),
-                        BernoulliBlockHessianAccumulator::new(&slices),
-                    )
-                },
-                |mut acc, row| -> Result<_, String> {
-                    let (obj, grad, hess) =
-                        self.row_sigma_primary_terms(row, block_states, true)?;
-                    acc.0 += obj;
-                    self.accumulate_rigid_sigma_pullback(
-                        row, &slices, &grad, &hess, &mut acc.1, &mut acc.2,
-                    )?;
-                    Ok(acc)
-                },
-            )
-            .try_reduce(
-                || {
-                    (
-                        0.0,
-                        Array1::<f64>::zeros(slices.total),
-                        BernoulliBlockHessianAccumulator::new(&slices),
-                    )
-                },
-                |mut left, right| -> Result<_, String> {
-                    left.0 += right.0;
-                    left.1 += &right.1;
-                    left.2.add(&right.2);
-                    Ok(left)
-                },
-            )?;
+        // Bit-deterministic reduction: see `chunked_row_reduction`.
+        let (mut objective_psi_psi, mut score_psi_psi, mut acc) = chunked_row_reduction(
+            row_iter.as_slice(),
+            || {
+                (
+                    0.0,
+                    Array1::<f64>::zeros(slices.total),
+                    BernoulliBlockHessianAccumulator::new(&slices),
+                )
+            },
+            |row, acc| -> Result<(), String> {
+                let (obj, grad, hess) = self.row_sigma_primary_terms(row, block_states, true)?;
+                acc.0 += obj;
+                self.accumulate_rigid_sigma_pullback(
+                    row, &slices, &grad, &hess, &mut acc.1, &mut acc.2,
+                )?;
+                Ok(())
+            },
+            |total, chunk| {
+                total.0 += chunk.0;
+                total.1 += &chunk.1;
+                total.2.add(&chunk.2);
+            },
+        )?;
         if scale != 1.0 {
             objective_psi_psi *= scale;
             score_psi_psi.mapv_inplace(|v| v * scale);
@@ -2629,55 +2607,51 @@ impl BernoulliMarginalSlopeFamily {
         let primary = primary_slices(&slices);
         let row_iter = outer_row_indices(options, n).to_vec();
         let outer_scale = outer_score_scale(options, n);
-        let mut acc = row_iter
-            .into_par_iter()
-            .try_fold(
-                || BernoulliBlockHessianAccumulator::new(&slices),
-                |mut acc, row| -> Result<_, String> {
-                    let row_dir =
-                        self.row_primary_direction_from_flat(row, &slices, &primary, d_beta_flat)?;
-                    let zero = Array1::<f64>::zeros(primary.total);
-                    let mut grad = Array1::<f64>::zeros(primary.total);
-                    for a in 0..primary.total {
-                        let mut da = Array1::<f64>::zeros(primary.total);
-                        da[a] = 1.0;
-                        let scale = self.sigma_scale_jet(3, &[1], &[])?;
-                        grad[a] = self.row_neglog_directional_with_scale_jet(
+        // Bit-deterministic reduction: see `chunked_row_reduction`.
+        let mut acc = chunked_row_reduction(
+            row_iter.as_slice(),
+            || BernoulliBlockHessianAccumulator::new(&slices),
+            |row, acc| -> Result<(), String> {
+                let row_dir =
+                    self.row_primary_direction_from_flat(row, &slices, &primary, d_beta_flat)?;
+                let zero = Array1::<f64>::zeros(primary.total);
+                let mut grad = Array1::<f64>::zeros(primary.total);
+                for a in 0..primary.total {
+                    let mut da = Array1::<f64>::zeros(primary.total);
+                    da[a] = 1.0;
+                    let scale = self.sigma_scale_jet(3, &[1], &[])?;
+                    grad[a] = self.row_neglog_directional_with_scale_jet(
+                        row,
+                        block_states,
+                        &[zero.clone(), row_dir.clone(), da],
+                        &scale,
+                    )?;
+                }
+                let mut hess = Array2::<f64>::zeros((primary.total, primary.total));
+                for a in 0..primary.total {
+                    let mut da = Array1::<f64>::zeros(primary.total);
+                    da[a] = 1.0;
+                    for b in a..primary.total {
+                        let mut db = Array1::<f64>::zeros(primary.total);
+                        db[b] = 1.0;
+                        let scale = self.sigma_scale_jet(4, &[1], &[])?;
+                        let value = self.row_neglog_directional_with_scale_jet(
                             row,
                             block_states,
-                            &[zero.clone(), row_dir.clone(), da],
+                            &[zero.clone(), row_dir.clone(), da.clone(), db],
                             &scale,
                         )?;
+                        hess[[a, b]] = value;
+                        hess[[b, a]] = value;
                     }
-                    let mut hess = Array2::<f64>::zeros((primary.total, primary.total));
-                    for a in 0..primary.total {
-                        let mut da = Array1::<f64>::zeros(primary.total);
-                        da[a] = 1.0;
-                        for b in a..primary.total {
-                            let mut db = Array1::<f64>::zeros(primary.total);
-                            db[b] = 1.0;
-                            let scale = self.sigma_scale_jet(4, &[1], &[])?;
-                            let value = self.row_neglog_directional_with_scale_jet(
-                                row,
-                                block_states,
-                                &[zero.clone(), row_dir.clone(), da.clone(), db],
-                                &scale,
-                            )?;
-                            hess[[a, b]] = value;
-                            hess[[b, a]] = value;
-                        }
-                    }
-                    acc.add_pullback(self, row, &slices, &primary, &hess);
-                    Ok(acc)
-                },
-            )
-            .try_reduce(
-                || BernoulliBlockHessianAccumulator::new(&slices),
-                |mut left, right| -> Result<_, String> {
-                    left.add(&right);
-                    Ok(left)
-                },
-            )?;
+                }
+                acc.add_pullback(self, row, &slices, &primary, &hess);
+                Ok(())
+            },
+            |total, chunk| {
+                total.add(&chunk);
+            },
+        )?;
         if outer_scale != 1.0 {
             acc.scale_assign(outer_scale);
         }
