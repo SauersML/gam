@@ -6,7 +6,9 @@ use crate::smooth::PenaltyStructureHint;
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatRef, Par, Side};
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut2, Axis, s};
-use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+use rayon::iter::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+};
 use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 
@@ -1771,10 +1773,12 @@ pub fn stable_reparameterizationwith_invariant(
     let q_pen = array_to_faer(&invariant.split.q_pen);
     let q_null = array_to_faer(&invariant.split.q_null);
     let qs_base = array_to_faer(&invariant.qs_base);
-    // Compute transformed roots on-the-fly: R_k_block @ Q[start..end, :].
-    // This avoids storing k full-width (rank × p) matrices in the invariant.
-    let rs_transformed: Vec<Mat<f64>> = penalties
-        .iter()
+    // Each penalty root transform is independent: R_k_block @ Q[start..end, :].
+    // Run those per-penalty products (and their S_k = R_k'R_k caches) in
+    // parallel, then collect in slice order so all downstream accumulation stays
+    // deterministic and bit-for-bit stable with respect to penalty ordering.
+    let penalty_transforms: Vec<(Mat<f64>, Mat<f64>)> = penalties
+        .par_iter()
         .map(|cp| {
             let r = &cp.col_range;
             let root_faer = array_to_faer(&cp.root);
@@ -1788,9 +1792,12 @@ pub fn stable_reparameterizationwith_invariant(
                 1.0,
                 Par::Seq,
             );
-            product
+            let s_k = penalty_from_root_faer(&product);
+            (product, s_k)
         })
         .collect();
+    let (rs_transformed, s_k_penalized_cache): (Vec<Mat<f64>>, Vec<Mat<f64>>) =
+        penalty_transforms.into_iter().unzip();
 
     let penalized_rank = invariant.split.rank();
 
@@ -1798,8 +1805,10 @@ pub fn stable_reparameterizationwith_invariant(
     let mut range_rotation = Mat::<f64>::zeros(penalized_rank, penalized_rank);
     if penalized_rank > 0 {
         let mut range_block = Mat::<f64>::zeros(penalized_rank, penalized_rank);
-        for (lambda, rs_k) in lambdas.iter().zip(rs_transformed.iter()) {
-            let s_k = penalty_from_root_faer(rs_k);
+        // Deterministic assembly: the independent S_k transforms were computed in
+        // parallel above, but the lambda-weighted sum is accumulated serially in
+        // canonical penalty order to avoid order-dependent floating-point drift.
+        for (lambda, s_k) in lambdas.iter().zip(s_k_penalized_cache.iter()) {
             for i in 0..penalized_rank {
                 for j in 0..penalized_rank {
                     range_block[(i, j)] += *lambda * s_k[(i, j)];
@@ -1835,11 +1844,6 @@ pub fn stable_reparameterizationwith_invariant(
         // q_pen and rs_transformed stay in the lambda-independent
         // invariant basis.  E and S⁺ below are expressed in this same
         // basis using U from the eigendecomposition.
-    }
-
-    let mut s_k_penalized_cache: Vec<Mat<f64>> = Vec::with_capacity(m);
-    for rs_k in rs_transformed.iter() {
-        s_k_penalized_cache.push(penalty_from_root_faer(rs_k));
     }
 
     // Subspace-invariant penalty spectral calculus:
@@ -1957,22 +1961,25 @@ pub fn stable_reparameterizationwith_invariant(
     let log_det = log_det_sum.sum();
     let delta = 0.0;
 
-    let mut det1vec = vec![0.0; lambdas.len()];
-
-    for (k, lambda) in lambdas.iter().enumerate() {
-        let s_k = &s_k_penalized_cache[k];
-        // Compute tr((S+δI)⁻¹ S_k) in the range eigenbasis without ever
-        // materializing (S+δI)⁻¹. Using faer's matmul keeps this contraction
-        // aligned with the orthogonal-similarity debug reference path.
-        let trace = trace_penalty_in_orthogonal_basis(
-            s_k,
-            penalized_rank,
-            &range_rotation,
-            &floored_eigs,
-            delta,
-        );
-        det1vec[k] = *lambda * trace;
-    }
+    // The det1 contractions are independent once the eigensystem is fixed.  Use
+    // indexed parallel collection so the output vector preserves lambda order.
+    let det1vec: Vec<f64> = (0..lambdas.len())
+        .into_par_iter()
+        .map(|k| {
+            let s_k = &s_k_penalized_cache[k];
+            // Compute tr((S+δI)⁻¹ S_k) in the range eigenbasis without ever
+            // materializing (S+δI)⁻¹. Using faer's matmul keeps this contraction
+            // aligned with the orthogonal-similarity debug reference path.
+            let trace = trace_penalty_in_orthogonal_basis(
+                s_k,
+                penalized_rank,
+                &range_rotation,
+                &floored_eigs,
+                delta,
+            );
+            lambdas[k] * trace
+        })
+        .collect();
 
     #[cfg(debug_assertions)]
     {
@@ -2042,10 +2049,9 @@ pub fn stable_reparameterizationwith_invariant(
         );
     }
 
-    let rs_transformed_arr: Vec<Array2<f64>> = rs_transformed.iter().map(mat_to_array).collect();
-    let canonical_transformed: Vec<CanonicalPenalty> = rs_transformed_arr
-        .iter()
-        .map(|r| CanonicalPenalty::from_dense_root(r.clone(), p))
+    let canonical_transformed: Vec<CanonicalPenalty> = rs_transformed
+        .par_iter()
+        .map(|r| CanonicalPenalty::from_dense_root(mat_to_array(r), p))
         .collect();
     Ok(ReparamResult {
         s_transformed: mat_to_array(&s_truncated),
