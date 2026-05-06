@@ -4869,12 +4869,16 @@ pub fn reml_laml_evaluate(
         let large_linear_work =
             n_obs.saturating_mul(p_dim) >= MATRIX_FREE_OUTER_HESSIAN_NP_THRESHOLD;
         let large_k = k_outer >= MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD;
-        let scale_prefers_operator =
-            large_p || large_n_and_moderate_p || large_linear_work || large_k;
+        let scale_prefers_operator = prefer_outer_hessian_operator(n_obs, p_dim, k_outer);
         let subspace_forces_dense = solution.penalty_subspace_trace.is_some();
         let use_operator = hessian_kernel.is_some()
-            && (callback_operator_kernel || scale_prefers_operator)
-            && !subspace_forces_dense;
+            && use_outer_hessian_operator_path(
+                n_obs,
+                p_dim,
+                k_outer,
+                callback_operator_kernel,
+                subspace_forces_dense,
+            );
         // Reason mnemonic: which clause carried the routing.  Ordered so
         // the most specific reason wins; "kernel_absent" wins over
         // everything else because that disables the operator path
@@ -5007,6 +5011,23 @@ pub(crate) fn prefer_outer_hessian_operator(n: usize, p: usize, k: usize) -> boo
     // `K` itself can drive the crossover regardless of `(n, p)`.
     let large_k = k >= MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD;
     large_p || large_n_and_moderate_p || large_linear_work || large_k
+}
+
+/// Selects the matrix-free outer-Hessian representation once a Hessian HVP
+/// kernel is available.
+///
+/// Callback kernels are explicit family-supplied directional operators, so they
+/// select the operator path independently of the generic `(n, p, K)` crossover.
+/// A projected penalty-subspace trace still requires the dense path because the
+/// current operator kernel is full-space.
+pub(crate) fn use_outer_hessian_operator_path(
+    n: usize,
+    p: usize,
+    k: usize,
+    callback_operator_kernel: bool,
+    subspace_trace_present: bool,
+) -> bool {
+    (callback_operator_kernel || prefer_outer_hessian_operator(n, p, k)) && !subspace_trace_present
 }
 
 fn is_hessian_unavailable(error: &str) -> bool {
