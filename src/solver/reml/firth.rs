@@ -1,7 +1,10 @@
 use super::*;
 use crate::linalg::utils::enforce_symmetry;
 use crate::mixture_link::logit_inverse_link_jet5;
-use ndarray::ShapeBuilder;
+use ndarray::{ShapeBuilder, Zip};
+
+const FIRTH_DERIVATIVE_PARALLEL_MIN_N: usize = 16_384;
+const FIRTH_ROW_SCALE_PARALLEL_MIN_CELLS: usize = 200_000;
 
 impl<'a> RemlState<'a> {
     pub(crate) fn xt_diag_x_dense_into(
@@ -76,11 +79,30 @@ impl<'a> RemlState<'a> {
         out
     }
 
+    #[inline]
+    fn parallelize_firth_derivative_rows(n: usize) -> bool {
+        n >= FIRTH_DERIVATIVE_PARALLEL_MIN_N && rayon::current_num_threads() > 1
+    }
+
+    #[inline]
+    fn parallelize_firth_row_scale(n: usize, p: usize) -> bool {
+        n.saturating_mul(p) >= FIRTH_ROW_SCALE_PARALLEL_MIN_CELLS
+            && rayon::current_num_threads() > 1
+    }
+
     pub(crate) fn row_scale(x: &Array2<f64>, scale: &Array1<f64>) -> Array2<f64> {
+        let (n, p) = x.dim();
         let mut out = x.clone();
-        ndarray::Zip::from(out.rows_mut())
-            .and(scale.view())
-            .for_each(|mut row, w| row *= *w);
+        let rows = out.rows_mut();
+        if Self::parallelize_firth_row_scale(n, p) {
+            Zip::from(rows)
+                .and(scale.view())
+                .par_for_each(|mut row, w| row *= *w);
+        } else {
+            Zip::from(rows)
+                .and(scale.view())
+                .for_each(|mut row, w| row *= *w);
+        }
         out
     }
 
@@ -88,6 +110,55 @@ impl<'a> RemlState<'a> {
     fn logit_fisher_weight_derivatives(eta: f64) -> (f64, f64, f64, f64, f64) {
         let jet = logit_inverse_link_jet5(eta);
         (jet.d1, jet.d2, jet.d3, jet.d4, jet.d5)
+    }
+
+    fn fill_logit_fisher_weight_derivative_arrays(
+        eta: &Array1<f64>,
+        w: &mut Array1<f64>,
+        w1: &mut Array1<f64>,
+        w2: &mut Array1<f64>,
+        w3: &mut Array1<f64>,
+        w4: &mut Array1<f64>,
+    ) {
+        debug_assert_eq!(eta.len(), w.len());
+        debug_assert_eq!(eta.len(), w1.len());
+        debug_assert_eq!(eta.len(), w2.len());
+        debug_assert_eq!(eta.len(), w3.len());
+        debug_assert_eq!(eta.len(), w4.len());
+
+        if Self::parallelize_firth_derivative_rows(eta.len()) {
+            Zip::from(w)
+                .and(w1)
+                .and(w2)
+                .and(w3)
+                .and(w4)
+                .and(eta.view())
+                .par_for_each(|wi, wi1, wi2, wi3, wi4, &ei| {
+                    let (value, first, second, third, fourth) =
+                        Self::logit_fisher_weight_derivatives(ei);
+                    *wi = value;
+                    *wi1 = first;
+                    *wi2 = second;
+                    *wi3 = third;
+                    *wi4 = fourth;
+                });
+        } else {
+            Zip::from(w)
+                .and(w1)
+                .and(w2)
+                .and(w3)
+                .and(w4)
+                .and(eta.view())
+                .for_each(|wi, wi1, wi2, wi3, wi4, &ei| {
+                    let (value, first, second, third, fourth) =
+                        Self::logit_fisher_weight_derivatives(ei);
+                    *wi = value;
+                    *wi1 = first;
+                    *wi2 = second;
+                    *wi3 = third;
+                    *wi4 = fourth;
+                });
+        }
     }
 
     pub(crate) fn weighted_cross(
@@ -402,15 +473,9 @@ impl FirthDenseOperator {
         let mut w2 = Array1::<f64>::zeros(n);
         let mut w3 = Array1::<f64>::zeros(n);
         let mut w4 = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let ei = eta[i];
-            let (wi, wi1, wi2, wi3, wi4) = RemlState::logit_fisher_weight_derivatives(ei);
-            w[i] = wi;
-            w1[i] = wi1;
-            w2[i] = wi2;
-            w3[i] = wi3;
-            w4[i] = wi4;
-        }
+        RemlState::fill_logit_fisher_weight_derivative_arrays(
+            eta, &mut w, &mut w1, &mut w2, &mut w3, &mut w4,
+        );
         let basis_design = if let Some(scale) = observation_weight_sqrt.as_ref() {
             RemlState::row_scale(x_dense, scale)
         } else {
