@@ -6220,6 +6220,325 @@ impl TransformationNormalFamily {
         }
         Ok(out)
     }
+
+    fn scop_psi_hessian_directional_trace_factor_chunk_from_cov(
+        &self,
+        beta: &Array1<f64>,
+        direction: &Array1<f64>,
+        row_quantities: &TransformationNormalRowQuantityCache,
+        row_start: usize,
+        cov: ArrayView2<'_, f64>,
+        cov_psi: ArrayView2<'_, f64>,
+        factor: ArrayView2<'_, f64>,
+    ) -> Result<f64, String> {
+        let total_n = self.response_val_basis.nrows();
+        let n = cov.nrows();
+        let p_resp = self.response_val_basis.ncols();
+        let p_cov = self.covariate_design.ncols();
+        let p_total = p_resp * p_cov;
+        let rank = factor.ncols();
+        if row_start > total_n || row_start + n > total_n {
+            return Err(format!(
+                "SCOP psi Hessian directional projected trace row window [{row_start}, {}) exceeds n={total_n}",
+                row_start + n
+            ));
+        }
+        if cov.ncols() != p_cov || cov_psi.nrows() != n || cov_psi.ncols() != p_cov {
+            return Err(format!(
+                "SCOP psi Hessian directional projected trace chunk shape mismatch: cov={}x{}, cov_psi={}x{}, expected n={} p_cov={}",
+                cov.nrows(),
+                cov.ncols(),
+                cov_psi.nrows(),
+                cov_psi.ncols(),
+                n,
+                p_cov
+            ));
+        }
+        if beta.len() != p_total || direction.len() != p_total || factor.nrows() != p_total {
+            return Err(format!(
+                "SCOP psi Hessian directional projected trace length mismatch: beta={}, direction={}, factor_rows={}, expected={p_total}",
+                beta.len(),
+                direction.len(),
+                factor.nrows()
+            ));
+        }
+        let beta_mat = beta
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP psi directional trace beta reshape failed: {e}"))?;
+        let dir_mat = direction
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP psi directional trace direction reshape failed: {e}"))?;
+        let endpoint_basis = [
+            self.response_upper_basis.as_slice().ok_or_else(|| {
+                "SCOP psi directional trace endpoint upper basis is not contiguous".to_string()
+            })?,
+            self.response_lower_basis.as_slice().ok_or_else(|| {
+                "SCOP psi directional trace endpoint lower basis is not contiguous".to_string()
+            })?,
+        ];
+
+        struct PsiDhTraceAccum {
+            value: f64,
+            gamma: Vec<f64>,
+            gamma_dir: Vec<f64>,
+            gamma_psi: Vec<f64>,
+            gamma_psi_dir: Vec<f64>,
+            gamma_f: Vec<f64>,
+            gamma_psi_f: Vec<f64>,
+            h_f: Vec<f64>,
+            hp_f: Vec<f64>,
+            h_f_dir: Vec<f64>,
+            hp_f_dir: Vec<f64>,
+            h_ff: Vec<f64>,
+            hp_ff: Vec<f64>,
+            hpsi_f: Vec<f64>,
+            hppsi_f: Vec<f64>,
+            hpsi_f_dir: Vec<f64>,
+            hppsi_f_dir: Vec<f64>,
+            hpsi_ff: Vec<f64>,
+            hppsi_ff: Vec<f64>,
+            endpoint_f: Vec<[f64; 2]>,
+            endpoint_f_dir: Vec<[f64; 2]>,
+            endpoint_ff: Vec<[f64; 2]>,
+            endpoint_psi_f: Vec<[f64; 2]>,
+            endpoint_psi_f_dir: Vec<[f64; 2]>,
+            endpoint_psi_ff: Vec<[f64; 2]>,
+        }
+
+        impl PsiDhTraceAccum {
+            fn new(p_resp: usize, rank: usize) -> Self {
+                let projected_len = p_resp * rank;
+                Self {
+                    value: 0.0,
+                    gamma: vec![0.0; p_resp],
+                    gamma_dir: vec![0.0; p_resp],
+                    gamma_psi: vec![0.0; p_resp],
+                    gamma_psi_dir: vec![0.0; p_resp],
+                    gamma_f: vec![0.0; projected_len],
+                    gamma_psi_f: vec![0.0; projected_len],
+                    h_f: vec![0.0; rank],
+                    hp_f: vec![0.0; rank],
+                    h_f_dir: vec![0.0; rank],
+                    hp_f_dir: vec![0.0; rank],
+                    h_ff: vec![0.0; rank],
+                    hp_ff: vec![0.0; rank],
+                    hpsi_f: vec![0.0; rank],
+                    hppsi_f: vec![0.0; rank],
+                    hpsi_f_dir: vec![0.0; rank],
+                    hppsi_f_dir: vec![0.0; rank],
+                    hpsi_ff: vec![0.0; rank],
+                    hppsi_ff: vec![0.0; rank],
+                    endpoint_f: vec![[0.0; 2]; rank],
+                    endpoint_f_dir: vec![[0.0; 2]; rank],
+                    endpoint_ff: vec![[0.0; 2]; rank],
+                    endpoint_psi_f: vec![[0.0; 2]; rank],
+                    endpoint_psi_f_dir: vec![[0.0; 2]; rank],
+                    endpoint_psi_ff: vec![[0.0; 2]; rank],
+                }
+            }
+
+            fn merge(mut self, rhs: Self) -> Self {
+                self.value += rhs.value;
+                self
+            }
+        }
+
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let weights = self.weights.as_ref();
+        let h_prime = row_quantities.h_prime.as_ref();
+        let accum = (0..n)
+            .into_par_iter()
+            .fold(
+                || PsiDhTraceAccum::new(p_resp, rank),
+                |mut acc, local_i| {
+                    let i = row_start + local_i;
+                    let cov_row = cov.row(local_i);
+                    let psi_row = cov_psi.row(local_i);
+                    let rv = self.response_val_basis.row(i);
+                    let rd = self.response_deriv_basis.row(i);
+                    let wi = weights[i];
+                    let hp = h_prime[i];
+                    let inv_hp = 1.0 / hp;
+                    let inv_hp_sq = inv_hp * inv_hp;
+                    let inv_hp_cu = inv_hp_sq * inv_hp;
+                    let inv_hp_qu = inv_hp_sq * inv_hp_sq;
+                    let q = row_quantities.endpoint_q[i];
+
+                    for k in 0..p_resp {
+                        acc.gamma[k] = beta_mat.row(k).dot(&cov_row);
+                        acc.gamma_dir[k] = dir_mat.row(k).dot(&cov_row);
+                        acc.gamma_psi[k] = beta_mat.row(k).dot(&psi_row);
+                        acc.gamma_psi_dir[k] = dir_mat.row(k).dot(&psi_row);
+                    }
+
+                    acc.gamma_f.fill(0.0);
+                    acc.gamma_psi_f.fill(0.0);
+                    for k in 0..p_resp {
+                        let factor_row_base = k * p_cov;
+                        let projected_base = k * rank;
+                        for cidx in 0..p_cov {
+                            let factor_row = factor_row_base + cidx;
+                            let cov_v = cov_row[cidx];
+                            let psi_v = psi_row[cidx];
+                            for col in 0..rank {
+                                let coeff = factor[[factor_row, col]];
+                                let idx = projected_base + col;
+                                acc.gamma_f[idx] += coeff * cov_v;
+                                acc.gamma_psi_f[idx] += coeff * psi_v;
+                            }
+                        }
+                    }
+
+                    let mut hp_psi = rd[0] * acc.gamma_psi[0];
+                    let mut h_dir = rv[0] * acc.gamma_dir[0];
+                    let mut hp_dir = rd[0] * acc.gamma_dir[0];
+                    let mut h_psi_dir = rv[0] * acc.gamma_psi_dir[0];
+                    let mut hp_psi_dir = rd[0] * acc.gamma_psi_dir[0];
+                    for k in 1..p_resp {
+                        hp_psi += 2.0 * rd[k] * acc.gamma[k] * acc.gamma_psi[k];
+                        h_dir += 2.0 * rv[k] * acc.gamma[k] * acc.gamma_dir[k];
+                        hp_dir += 2.0 * rd[k] * acc.gamma[k] * acc.gamma_dir[k];
+                        h_psi_dir += 2.0
+                            * rv[k]
+                            * (acc.gamma_dir[k] * acc.gamma_psi[k]
+                                + acc.gamma[k] * acc.gamma_psi_dir[k]);
+                        hp_psi_dir += 2.0
+                            * rd[k]
+                            * (acc.gamma_dir[k] * acc.gamma_psi[k]
+                                + acc.gamma[k] * acc.gamma_psi_dir[k]);
+                    }
+                    let d_inv_hp = -hp_dir * inv_hp_sq;
+                    let d_inv_hp_sq = -2.0 * hp_dir * inv_hp_cu;
+                    let d_inv_hp_cu = -3.0 * hp_dir * inv_hp_qu;
+
+                    let mut endpoint_psi = [0.0_f64; 2];
+                    let mut endpoint_dir = [0.0_f64; 2];
+                    let mut endpoint_psi_dir = [0.0_f64; 2];
+                    for e in 0..2 {
+                        let basis = endpoint_basis[e];
+                        endpoint_psi[e] = basis[0] * acc.gamma_psi[0];
+                        endpoint_dir[e] = basis[0] * acc.gamma_dir[0];
+                        endpoint_psi_dir[e] = basis[0] * acc.gamma_psi_dir[0];
+                        for k in 1..p_resp {
+                            endpoint_psi[e] += 2.0 * basis[k] * acc.gamma[k] * acc.gamma_psi[k];
+                            endpoint_dir[e] += 2.0 * basis[k] * acc.gamma[k] * acc.gamma_dir[k];
+                            endpoint_psi_dir[e] += 2.0
+                                * basis[k]
+                                * (acc.gamma_dir[k] * acc.gamma_psi[k]
+                                    + acc.gamma[k] * acc.gamma_psi_dir[k]);
+                        }
+                    }
+
+                    for col in 0..rank {
+                        acc.h_f[col] = rv[0] * acc.gamma_f[col];
+                        acc.hp_f[col] = rd[0] * acc.gamma_f[col];
+                        acc.h_f_dir[col] = 0.0;
+                        acc.hp_f_dir[col] = 0.0;
+                        acc.h_ff[col] = 0.0;
+                        acc.hp_ff[col] = 0.0;
+                        acc.hpsi_f[col] = rv[0] * acc.gamma_psi_f[col];
+                        acc.hppsi_f[col] = rd[0] * acc.gamma_psi_f[col];
+                        acc.hpsi_f_dir[col] = 0.0;
+                        acc.hppsi_f_dir[col] = 0.0;
+                        acc.hpsi_ff[col] = 0.0;
+                        acc.hppsi_ff[col] = 0.0;
+                        acc.endpoint_f[col] = [
+                            endpoint_basis[0][0] * acc.gamma_f[col],
+                            endpoint_basis[1][0] * acc.gamma_f[col],
+                        ];
+                        acc.endpoint_f_dir[col] = [0.0; 2];
+                        acc.endpoint_ff[col] = [0.0; 2];
+                        acc.endpoint_psi_f[col] = [
+                            endpoint_basis[0][0] * acc.gamma_psi_f[col],
+                            endpoint_basis[1][0] * acc.gamma_psi_f[col],
+                        ];
+                        acc.endpoint_psi_f_dir[col] = [0.0; 2];
+                        acc.endpoint_psi_ff[col] = [0.0; 2];
+                    }
+                    for k in 1..p_resp {
+                        let g = acc.gamma[k];
+                        let gd = acc.gamma_dir[k];
+                        let gp = acc.gamma_psi[k];
+                        let gpd = acc.gamma_psi_dir[k];
+                        for col in 0..rank {
+                            let idx = k * rank + col;
+                            let gf = acc.gamma_f[idx];
+                            let gpf = acc.gamma_psi_f[idx];
+                            acc.h_f[col] += 2.0 * rv[k] * g * gf;
+                            acc.hp_f[col] += 2.0 * rd[k] * g * gf;
+                            acc.h_f_dir[col] += 2.0 * rv[k] * gd * gf;
+                            acc.hp_f_dir[col] += 2.0 * rd[k] * gd * gf;
+                            acc.h_ff[col] += 2.0 * rv[k] * gf * gf;
+                            acc.hp_ff[col] += 2.0 * rd[k] * gf * gf;
+                            acc.hpsi_f[col] += 2.0 * rv[k] * (gf * gp + g * gpf);
+                            acc.hppsi_f[col] += 2.0 * rd[k] * (gf * gp + g * gpf);
+                            acc.hpsi_f_dir[col] += 2.0 * rv[k] * (gf * gpd + gd * gpf);
+                            acc.hppsi_f_dir[col] += 2.0 * rd[k] * (gf * gpd + gd * gpf);
+                            acc.hpsi_ff[col] += 4.0 * rv[k] * gf * gpf;
+                            acc.hppsi_ff[col] += 4.0 * rd[k] * gf * gpf;
+                            for e in 0..2 {
+                                let basis = endpoint_basis[e];
+                                acc.endpoint_f[col][e] += 2.0 * basis[k] * g * gf;
+                                acc.endpoint_f_dir[col][e] += 2.0 * basis[k] * gd * gf;
+                                acc.endpoint_ff[col][e] += 2.0 * basis[k] * gf * gf;
+                                acc.endpoint_psi_f[col][e] += 2.0 * basis[k] * (gf * gp + g * gpf);
+                                acc.endpoint_psi_f_dir[col][e] +=
+                                    2.0 * basis[k] * (gf * gpd + gd * gpf);
+                                acc.endpoint_psi_ff[col][e] += 4.0 * basis[k] * gf * gpf;
+                            }
+                        }
+                    }
+
+                    for col in 0..rank {
+                        let numerator = 2.0 * acc.hppsi_f[col] * acc.hp_f[col];
+                        let numerator_dir = 2.0
+                            * (acc.hppsi_f_dir[col] * acc.hp_f[col]
+                                + acc.hppsi_f[col] * acc.hp_f_dir[col]);
+                        let barrier_product = acc.hp_f[col] * acc.hp_f[col] * hp_psi;
+                        let barrier_product_dir = 2.0 * acc.hp_f_dir[col] * acc.hp_f[col] * hp_psi
+                            + acc.hp_f[col] * acc.hp_f[col] * hp_psi_dir;
+                        let value = 2.0 * acc.hpsi_f_dir[col] * acc.h_f[col]
+                            + 2.0 * acc.hpsi_f[col] * acc.h_f_dir[col]
+                            + h_psi_dir * acc.h_ff[col]
+                            + h_dir * acc.hpsi_ff[col]
+                            + numerator_dir * inv_hp_sq
+                            + numerator * d_inv_hp_sq
+                            - 2.0
+                                * (barrier_product_dir * inv_hp_cu + barrier_product * d_inv_hp_cu)
+                            - acc.hppsi_ff[col] * d_inv_hp
+                            + acc.hp_ff[col] * hp_psi_dir * inv_hp_sq
+                            + acc.hp_ff[col] * hp_psi * d_inv_hp_sq
+                            + endpoint_chain_fourth(
+                                &q,
+                                endpoint_psi,
+                                acc.endpoint_f[col],
+                                acc.endpoint_f[col],
+                                endpoint_dir,
+                                acc.endpoint_psi_f[col],
+                                acc.endpoint_psi_f[col],
+                                endpoint_psi_dir,
+                                acc.endpoint_ff[col],
+                                acc.endpoint_f_dir[col],
+                                acc.endpoint_f_dir[col],
+                                acc.endpoint_psi_ff[col],
+                                acc.endpoint_psi_f_dir[col],
+                                acc.endpoint_psi_f_dir[col],
+                                [0.0; 2],
+                                [0.0; 2],
+                            );
+                        acc.value += wi * value;
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || PsiDhTraceAccum::new(p_resp, rank),
+                |left, right| left.merge(right),
+            );
+        Ok(accum.value)
+    }
 }
 
 fn ctn_penalty_scale_log_lambdas(
@@ -7531,6 +7850,109 @@ impl HyperOperator for TransformationNormalPsiHessianOperator {
         let p = self.dim();
         let dense = self.mul_mat(&Array2::<f64>::eye(p));
         0.5 * (&dense + &dense.t())
+    }
+
+    fn is_implicit(&self) -> bool {
+        true
+    }
+}
+
+struct TransformationNormalPsiDhMatrixFreeOperator {
+    family: Arc<TransformationNormalFamily>,
+    beta: Array1<f64>,
+    direction: Array1<f64>,
+    op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+    axis: usize,
+    row_quantities: TransformationNormalRowQuantityCache,
+}
+
+impl TransformationNormalPsiDhMatrixFreeOperator {
+    fn new(
+        family: Arc<TransformationNormalFamily>,
+        beta: Array1<f64>,
+        direction: Array1<f64>,
+        op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+        axis: usize,
+        row_quantities: TransformationNormalRowQuantityCache,
+    ) -> Self {
+        Self {
+            family,
+            beta,
+            direction,
+            op,
+            axis,
+            row_quantities,
+        }
+    }
+
+    fn p_total(&self) -> usize {
+        self.beta.len()
+    }
+
+    fn tensor_op(&self) -> &TensorKroneckerPsiOperator {
+        self.op
+            .as_any()
+            .downcast_ref::<TensorKroneckerPsiOperator>()
+            .expect("validated CTN psi dH operator must remain tensor-backed")
+    }
+}
+
+impl HyperOperator for TransformationNormalPsiDhMatrixFreeOperator {
+    fn dim(&self) -> usize {
+        self.p_total()
+    }
+
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        self.to_dense().dot(v)
+    }
+
+    fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
+        debug_assert_eq!(factor.nrows(), self.p_total());
+        let n = self.family.response_val_basis.nrows();
+        let p_cov = self.family.covariate_design.ncols();
+        let rows_per_chunk = self
+            .family
+            .scop_psi_pair_rows_per_chunk(p_cov)
+            .min(n.max(1));
+        let op = self.tensor_op();
+        let mut total = 0.0;
+        for start in (0..n).step_by(rows_per_chunk) {
+            let end = (start + rows_per_chunk).min(n);
+            let rows = start..end;
+            let cov = self
+                .family
+                .covariate_design
+                .try_row_chunk(rows.clone())
+                .expect("validated CTN psi dH projected trace covariate chunk should not fail");
+            let cov_psi = op
+                .cov_first_axis_row_chunk_streaming(self.axis, rows.clone())
+                .expect("validated CTN psi dH projected trace covariate derivative chunk should not fail");
+            total += self
+                .family
+                .scop_psi_hessian_directional_trace_factor_chunk_from_cov(
+                    &self.beta,
+                    &self.direction,
+                    &self.row_quantities,
+                    start,
+                    cov.view(),
+                    cov_psi.view(),
+                    factor.view(),
+                )
+                .expect("validated CTN psi dH projected trace inputs should not fail");
+        }
+        total
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        self.family
+            .scop_psi_hessian_directional_derivative(
+                &self.beta,
+                &self.direction,
+                &self.row_quantities,
+                self.tensor_op(),
+                self.axis,
+            )
+            .expect("validated CTN psi dH dense materialization inputs should not fail")
     }
 
     fn is_implicit(&self) -> bool {
@@ -11874,6 +12296,35 @@ mod tests {
             2e-4,
             "transformation normal psi hessian directional derivative",
         );
+
+        let workspace = family
+            .exact_newton_joint_psi_workspace(&[state.clone()], &specs, &derivative_blocks)
+            .expect("CTN psi workspace constructor")
+            .expect("CTN psi workspace must be present");
+        let drift_op = workspace
+            .hessian_directional_derivative(0, &direction)
+            .expect("workspace psi dH operator")
+            .expect("workspace psi dH operator must be present");
+        let DriftDerivResult::Operator(drift_op) = drift_op else {
+            panic!("CTN workspace psi dH must be operator-backed");
+        };
+        let mut factor = Array2::<f64>::zeros((state.beta.len(), 3));
+        for (col, seed) in [91_001_u64, 92_001_u64, 93_001_u64].into_iter().enumerate() {
+            factor
+                .column_mut(col)
+                .assign(&toy_probe_vector(state.beta.len(), seed));
+        }
+        let got_trace = drift_op.trace_projected_factor(&factor);
+        let want_trace = factor
+            .iter()
+            .zip(analytic.dot(&factor).iter())
+            .map(|(&f, &bf)| f * bf)
+            .sum::<f64>();
+        let trace_tol = 1.0e-10 * want_trace.abs().max(1.0) + 1.0e-10;
+        assert!(
+            (got_trace - want_trace).abs() <= trace_tol,
+            "workspace psi dH projected trace mismatch: got={got_trace:.6e}, want={want_trace:.6e}",
+        );
     }
 
     #[test]
@@ -13870,18 +14321,43 @@ impl ExactNewtonJointPsiWorkspace for TransformationNormalPsiWorkspace {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<DriftDerivResult>, String> {
-        // Defer to the existing direct hook and wrap the dense result. The
-        // CTN drift `D_β H_ψ[u]` is dense-only at present.
-        Ok(self
-            .family
-            .exact_newton_joint_psihessian_directional_derivative(
-                &self.block_states,
-                &self.specs,
-                &self.derivative_blocks,
-                psi_index,
-                d_beta_flat,
-            )?
-            .map(DriftDerivResult::Dense))
+        let mut guard = self
+            .cache
+            .lock()
+            .map_err(|_| "TransformationNormalPsiWorkspace cache poisoned".to_string())?;
+        if guard.is_none() {
+            let computed = self.compute_all_axes()?;
+            *guard = Some(computed);
+        }
+        let cached = guard.as_ref().expect("populated above");
+        if psi_index >= cached.len() {
+            return Ok(None);
+        }
+        let entry = &cached[psi_index];
+        if d_beta_flat.len() != entry.beta.len() {
+            return Err(format!(
+                "TransformationNormalPsiWorkspace psi dH direction length {} != expected {}",
+                d_beta_flat.len(),
+                entry.beta.len()
+            ));
+        }
+        let row_quantities = TransformationNormalRowQuantityCache {
+            beta: Arc::clone(&entry.beta),
+            gamma: Arc::clone(&entry.row_gamma),
+            h: Arc::clone(&entry.row_h),
+            h_prime: Arc::clone(&entry.row_h_prime),
+            endpoint_q: Arc::clone(&entry.endpoint_q),
+            log_likelihood: 0.0,
+        };
+        let op = TransformationNormalPsiDhMatrixFreeOperator::new(
+            Arc::new(self.family.clone()),
+            entry.beta.as_ref().clone(),
+            d_beta_flat.clone(),
+            Arc::clone(&entry.op_arc),
+            entry.axis,
+            row_quantities,
+        );
+        Ok(Some(DriftDerivResult::Operator(Arc::new(op))))
     }
 }
 
