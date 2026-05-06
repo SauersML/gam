@@ -56,6 +56,34 @@ const MIN_DERIV: f64 = 1e-8;
 const MIN_WEIGHT: f64 = 1e-12;
 const EXACT_DENSE_BLOCK_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 const EXACT_DENSE_TOTAL_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const GAMLSS_ROWWISE_PAR_MIN_N: usize = 4096;
+
+fn gamlss_rowwise_map<F>(n: usize, f: F) -> Array1<f64>
+where
+    F: Fn(usize) -> f64 + Sync,
+{
+    if n >= GAMLSS_ROWWISE_PAR_MIN_N {
+        Array1::from((0..n).into_par_iter().map(&f).collect::<Vec<f64>>())
+    } else {
+        Array1::from_iter((0..n).map(f))
+    }
+}
+
+fn gamlss_rowwise_map_result<F>(n: usize, f: F) -> Result<Array1<f64>, String>
+where
+    F: Fn(usize) -> Result<f64, String> + Sync,
+{
+    if n >= GAMLSS_ROWWISE_PAR_MIN_N {
+        let values: Result<Vec<f64>, String> = (0..n).into_par_iter().map(&f).collect();
+        Ok(Array1::from(values?))
+    } else {
+        let mut out = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            out[i] = f(i)?;
+        }
+        Ok(out)
+    }
+}
 
 enum DenseOrOperator<'a> {
     Borrowed(&'a Array2<f64>),
@@ -6831,9 +6859,10 @@ impl CustomFamilyGenerative for GaussianLocationScaleFamily {
             ));
         }
         let mu = block_states[Self::BLOCK_MU].eta.clone();
-        let sigma = block_states[Self::BLOCK_LOG_SIGMA]
-            .eta
-            .mapv(logb_sigma_from_eta_scalar);
+        let eta_log_sigma = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        let sigma = gamlss_rowwise_map(eta_log_sigma.len(), |i| {
+            logb_sigma_from_eta_scalar(eta_log_sigma[i])
+        });
         Ok(GenerativeSpec {
             mean: mu,
             noise: NoiseModel::Gaussian { sigma },
@@ -10427,10 +10456,12 @@ impl CustomFamilyGenerative for GaussianLocationScaleWiggleFamily {
                 block_states.len()
             ));
         }
-        let mean = &block_states[Self::BLOCK_MU].eta + &block_states[Self::BLOCK_WIGGLE].eta;
-        let sigma = block_states[Self::BLOCK_LOG_SIGMA]
-            .eta
-            .mapv(logb_sigma_from_eta_scalar);
+        let eta_mu = &block_states[Self::BLOCK_MU].eta;
+        let eta_wiggle = &block_states[Self::BLOCK_WIGGLE].eta;
+        let eta_log_sigma = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        let n = eta_mu.len();
+        let mean = gamlss_rowwise_map(n, |i| eta_mu[i] + eta_wiggle[i]);
+        let sigma = gamlss_rowwise_map(n, |i| logb_sigma_from_eta_scalar(eta_log_sigma[i]));
         Ok(GenerativeSpec {
             mean,
             noise: NoiseModel::Gaussian { sigma },
@@ -11595,12 +11626,11 @@ impl CustomFamilyGenerative for BinomialMeanWiggleFamily {
         if eta.len() != self.y.len() || etaw.len() != self.y.len() {
             return Err("BinomialMeanWiggleFamily generative size mismatch".to_string());
         }
-        let mut mean = Array1::<f64>::zeros(self.y.len());
-        for i in 0..mean.len() {
+        let mean = gamlss_rowwise_map_result(self.y.len(), |i| {
             let jet = inverse_link_jet_for_inverse_link(&self.link_kind, eta[i] + etaw[i])
                 .map_err(|e| format!("fixed-link wiggle inverse-link evaluation failed: {e}"))?;
-            mean[i] = jet.mu;
-        }
+            Ok(jet.mu)
+        })?;
         Ok(GenerativeSpec {
             mean,
             noise: NoiseModel::Bernoulli,
@@ -11689,9 +11719,8 @@ impl CustomFamilyGenerative for PoissonLogFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<GenerativeSpec, String> {
-        let mean = expect_single_block(block_states, "PoissonLogFamily")?
-            .eta
-            .mapv(|e| e.clamp(-30.0, 30.0).exp().max(1e-12));
+        let eta = &expect_single_block(block_states, "PoissonLogFamily")?.eta;
+        let mean = gamlss_rowwise_map(eta.len(), |i| eta[i].clamp(-30.0, 30.0).exp().max(1e-12));
         Ok(GenerativeSpec {
             mean,
             noise: NoiseModel::Poisson,
@@ -11729,11 +11758,6 @@ impl GammaLogFamily {
 
 impl CustomFamily for GammaLogFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        use crate::mixture_link::InverseLinkJet as MixtureInverseLinkJet;
-        use crate::pirls::{
-            WeightFamily, WeightLink, fisher_weight_dispatch, observed_weight_dispatch,
-        };
-
         let eta = &expect_single_block(block_states, "GammaLogFamily")?.eta;
         let n = self.y.len();
         if eta.len() != n || self.weights.len() != n {
@@ -11743,7 +11767,6 @@ impl CustomFamily for GammaLogFamily {
             return Err("GammaLogFamily shape must be finite and > 0".to_string());
         }
 
-        let mut mu = Array1::<f64>::zeros(n);
         let mut ll = 0.0;
         let mut z = Array1::<f64>::zeros(n);
         let mut w = Array1::<f64>::zeros(n);
@@ -11760,176 +11783,25 @@ impl CustomFamily for GammaLogFamily {
             let e = e_raw.clamp(-ETA_HARD_CLAMP, ETA_HARD_CLAMP);
             let active_clamp = e != e_raw;
             let m = safe_exp(e).max(1e-12);
-            mu[i] = m;
             // Gamma(shape=k, scale=mu/k), dropping constants independent of eta.
             ll += self.weights[i] * (-self.shape * (yi / m + m.ln()));
-            let dmu = m.max(MIN_DERIV);
-            let var = (m * m / self.shape).max(MIN_PROB);
             if self.weights[i] == 0.0 || active_clamp {
                 w[i] = 0.0;
                 z[i] = eta[i];
             } else {
-                w[i] = floor_positiveweight(self.weights[i] * (dmu * dmu / var), MIN_WEIGHT);
-                z[i] = e + (yi - m) / signedwith_floor(dmu, MIN_DERIV);
-
-                // Compute observed-information weight via the generic
-                // noncanonical dispatch for Gamma-log. The dispatch falls
-                // through to the generic `observed_weight_noncanonical` path,
-                // which validates the full variance-function jet machinery.
-                // For log link: h(η)=exp(η), h'=μ, h''=μ, h'''=μ, h''''=μ.
-                let jet = MixtureInverseLinkJet {
-                    mu: m,
-                    d1: m,
-                    d2: m,
-                    d3: m,
-                };
-                let phi_gamma = 1.0 / self.shape;
-                let (w_obs, c_obs, d_obs) = observed_weight_dispatch(
-                    WeightFamily::Gamma,
-                    WeightLink::Log,
-                    e,
-                    yi,
-                    m,
-                    phi_gamma,
-                    self.weights[i],
-                    jet,
-                    m, // h4 = exp(eta) = mu for log link
-                );
-                // Also compute the Fisher weight via the unified dispatch.
-                // For Gamma-log this exercises the generic noncanonical path
-                // with VarianceJet::gamma.
-                let (w_fisher, c_fisher, d_fisher) = fisher_weight_dispatch(
-                    WeightFamily::Gamma,
-                    WeightLink::Log,
-                    e,
-                    m,
-                    phi_gamma,
-                    self.weights[i],
-                    jet,
-                );
-                // Cross-check Gaussian-log and Gaussian-inverse specializations
-                // using the current observation's coordinates. These exercise the
-                // closed-form weight functions for those family-link combos.
-                let (w_gl, _, _) = fisher_weight_dispatch(
-                    WeightFamily::Gaussian,
-                    WeightLink::Log,
-                    e,
-                    m,
-                    phi_gamma,
-                    self.weights[i],
-                    jet,
-                );
-                let (w_gi, _, _) = fisher_weight_dispatch(
-                    WeightFamily::Gaussian,
-                    WeightLink::Inverse,
-                    e.max(1e-6),
-                    m,
-                    phi_gamma,
-                    self.weights[i],
-                    jet,
-                );
-                let (w_obs_gl, _, _) = observed_weight_dispatch(
-                    WeightFamily::Gaussian,
-                    WeightLink::Log,
-                    e,
-                    yi,
-                    m,
-                    phi_gamma,
-                    self.weights[i],
-                    jet,
-                    m,
-                );
-                let (w_obs_gi, _, _) = observed_weight_dispatch(
-                    WeightFamily::Gaussian,
-                    WeightLink::Inverse,
-                    e.max(1e-6),
-                    yi,
-                    m,
-                    phi_gamma,
-                    self.weights[i],
-                    jet,
-                    m,
-                );
-                // Log observed-vs-Fisher weight deviations for all family-link
-                // combinations exercised in this iteration.
-                let w_dev = (w_obs - w_fisher).abs();
-                if w_dev > 0.1 * w_fisher.abs().max(1e-10) {
-                    log::trace!(
-                        "[gamma-log] obs-weight deviation at i={i}: fisher={:.4e}, obs={:.4e}, \
-                         c_obs={:.4e}, d_obs={:.4e}, c_fisher={:.4e}, d_fisher={:.4e}, \
-                         w_gl={:.4e}, w_gi={:.4e}, w_obs_gl={:.4e}, w_obs_gi={:.4e}",
-                        w_fisher,
-                        w_obs,
-                        c_obs,
-                        d_obs,
-                        c_fisher,
-                        d_fisher,
-                        w_gl,
-                        w_gi,
-                        w_obs_gl,
-                        w_obs_gi,
-                    );
-                }
+                // Gamma with log mean is non-canonical.  The exact observed
+                // eta-space curvature is
+                //
+                //   -d²ℓ/dη² = prior_weight * shape * y / μ,
+                //
+                // not the Fisher weight `prior_weight * shape`.  Store the
+                // observed weight directly so diagonal REML/LAML Hessians use
+                // the true Laplace curvature instead of a PQL/Fisher surrogate.
+                let observed_weight = self.weights[i] * self.shape * yi / m;
+                w[i] = floor_positiveweight(observed_weight, MIN_WEIGHT);
+                let score = self.weights[i] * self.shape * (yi / m - 1.0);
+                z[i] = e + score / w[i];
             }
-        }
-
-        // Validate vectorised observed-weight dispatch for the Gamma-log
-        // combination. This exercises the `compute_observed_weights_dispatched`
-        // → `compute_noncanonical_observed_weights` path and the
-        // `VarianceJet::binomial_n` constructor (via a Binomial-logit dispatch
-        // on a single element).
-        if n > 0 {
-            use crate::pirls::compute_observed_weights_dispatched;
-
-            // Build jets for log link: h(η)=exp(η), all derivatives = μ.
-            let jets: Vec<MixtureInverseLinkJet> = mu
-                .iter()
-                .map(|&m| MixtureInverseLinkJet {
-                    mu: m,
-                    d1: m,
-                    d2: m,
-                    d3: m,
-                })
-                .collect();
-            let h4: Vec<f64> = mu.iter().copied().collect();
-            let phi_gamma = 1.0 / self.shape;
-            let (w_vec, c_vec, d_vec) = compute_observed_weights_dispatched(
-                WeightFamily::Gamma,
-                WeightLink::Log,
-                eta,
-                self.y.view(),
-                &jets,
-                &h4,
-                phi_gamma,
-                self.weights.view(),
-            );
-            log::trace!(
-                "[gamma-log] vectorised observed weights: w_sum={:.4e}, c_sum={:.4e}, d_sum={:.4e}",
-                w_vec.sum(),
-                c_vec.sum(),
-                d_vec.sum(),
-            );
-
-            // Single-element Binomial-logit dispatch to exercise binomial_n.
-            let p_test = 0.5_f64.min(mu[0].max(1e-6));
-            let binom_jet = MixtureInverseLinkJet {
-                mu: p_test,
-                d1: p_test * (1.0 - p_test),
-                d2: 0.0,
-                d3: 0.0,
-            };
-            let (w_bl, _, _) = observed_weight_dispatch(
-                WeightFamily::Binomial,
-                WeightLink::Logit,
-                0.0,
-                0.0,
-                p_test,
-                1.0,
-                1.0,
-                binom_jet,
-                0.0,
-            );
-            log::trace!("[binom-logit] single dispatch: w={:.4e}", w_bl);
         }
 
         Ok(FamilyEvaluation {
@@ -11940,6 +11812,52 @@ impl CustomFamily for GammaLogFamily {
             }],
         })
     }
+
+    fn diagonalworking_weights_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        d_eta: &Array1<f64>,
+    ) -> Result<Option<Array1<f64>>, String> {
+        if block_idx != Self::BLOCK_ETA {
+            return Ok(None);
+        }
+        let eta = &expect_single_block(block_states, "GammaLogFamily")?.eta;
+        let n = self.y.len();
+        if eta.len() != n || self.weights.len() != n || d_eta.len() != n {
+            return Err("GammaLogFamily input size mismatch".to_string());
+        }
+        if !self.shape.is_finite() || self.shape <= 0.0 {
+            return Err("GammaLogFamily shape must be finite and > 0".to_string());
+        }
+
+        const ETA_HARD_CLAMP: f64 = 30.0;
+        let mut dw = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let yi = self.y[i];
+            if !yi.is_finite() || yi <= 0.0 {
+                return Err(format!(
+                    "GammaLogFamily requires positive finite y; found y[{i}]={yi}"
+                ));
+            }
+            let e_raw = eta[i];
+            let e = e_raw.clamp(-ETA_HARD_CLAMP, ETA_HARD_CLAMP);
+            if self.weights[i] == 0.0 || e != e_raw {
+                dw[i] = 0.0;
+                continue;
+            }
+            let m = safe_exp(e).max(1e-12);
+            let observed_weight = self.weights[i] * self.shape * yi / m;
+            // d/dη [prior_weight * shape * y / exp(η)] = -W_obs.
+            // If the positive floor is active, match the evaluated local piece.
+            if observed_weight <= MIN_WEIGHT {
+                dw[i] = 0.0;
+            } else {
+                dw[i] = -observed_weight * d_eta[i];
+            }
+        }
+        Ok(Some(dw))
+    }
 }
 
 impl CustomFamilyGenerative for GammaLogFamily {
@@ -11947,9 +11865,8 @@ impl CustomFamilyGenerative for GammaLogFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<GenerativeSpec, String> {
-        let mean = expect_single_block(block_states, "GammaLogFamily")?
-            .eta
-            .mapv(|e| e.clamp(-30.0, 30.0).exp().max(1e-12));
+        let eta = &expect_single_block(block_states, "GammaLogFamily")?.eta;
+        let mean = gamlss_rowwise_map(eta.len(), |i| eta[i].clamp(-30.0, 30.0).exp().max(1e-12));
         Ok(GenerativeSpec {
             mean,
             noise: NoiseModel::Gamma { shape: self.shape },
@@ -14958,14 +14875,13 @@ impl CustomFamilyGenerative for BinomialLocationScaleFamily {
         if eta_t.len() != self.y.len() || eta_ls.len() != self.y.len() {
             return Err("BinomialLocationScaleFamily generative size mismatch".to_string());
         }
-        let mut mean = Array1::<f64>::zeros(self.y.len());
-        for i in 0..mean.len() {
+        let mean = gamlss_rowwise_map_result(self.y.len(), |i| {
             let sigma = exp_sigma_from_eta_scalar(eta_ls[i]);
             let q = binomial_location_scale_q0(eta_t[i], sigma);
             let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q)
                 .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
-            mean[i] = jet.mu;
-        }
+            Ok(jet.mu)
+        })?;
         Ok(GenerativeSpec {
             mean,
             noise: NoiseModel::Bernoulli,
@@ -19689,14 +19605,13 @@ impl CustomFamilyGenerative for BinomialLocationScaleWiggleFamily {
         {
             return Err("BinomialLocationScaleWiggleFamily generative size mismatch".to_string());
         }
-        let mut mean = Array1::<f64>::zeros(self.y.len());
-        for i in 0..mean.len() {
+        let mean = gamlss_rowwise_map_result(self.y.len(), |i| {
             let sigma = exp_sigma_from_eta_scalar(eta_ls[i]);
             let q0 = binomial_location_scale_q0(eta_t[i], sigma);
             let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q0 + etaw[i])
                 .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
-            mean[i] = jet.mu;
-        }
+            Ok(jet.mu)
+        })?;
         Ok(GenerativeSpec {
             mean,
             noise: NoiseModel::Bernoulli,
@@ -22176,6 +22091,109 @@ mod tests {
                 assert_eq!(working_response[2], gamma_eta[2]);
             }
             BlockWorkingSet::ExactNewton { .. } => panic!("expected diagonal Gamma block"),
+        }
+    }
+
+    #[test]
+    fn poisson_log_canonical_diagonal_weight_is_fisher_and_observed() {
+        let family = PoissonLogFamily {
+            y: array![0.0, 3.0],
+            weights: array![1.5, 0.5],
+        };
+        let eta = array![-0.4_f64, 0.7_f64];
+        let eval = family
+            .evaluate(&[ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: eta.clone(),
+            }])
+            .expect("poisson evaluate");
+
+        match &eval.blockworking_sets[PoissonLogFamily::BLOCK_ETA] {
+            BlockWorkingSet::Diagonal {
+                working_response: _,
+                working_weights,
+            } => {
+                for i in 0..eta.len() {
+                    let fisher_weight = family.weights[i] * eta[i].exp();
+                    assert!(
+                        (working_weights[i] - fisher_weight).abs() < 1e-12,
+                        "canonical Poisson-log observed and Fisher weights should coincide at row {i}: got {}, expected {}",
+                        working_weights[i],
+                        fisher_weight
+                    );
+                }
+            }
+            BlockWorkingSet::ExactNewton { .. } => panic!("expected diagonal Poisson block"),
+        }
+    }
+
+    #[test]
+    fn gamma_log_noncanonical_diagonal_uses_observed_not_fisher_weight_and_dw() {
+        let family = GammaLogFamily {
+            y: array![2.0, 0.25],
+            weights: array![1.25, 0.75],
+            shape: 3.0,
+        };
+        let eta = array![0.0_f64, -0.5_f64];
+        let states = vec![ParameterBlockState {
+            beta: Array1::zeros(0),
+            eta: eta.clone(),
+        }];
+        let eval = family.evaluate(&states).expect("gamma evaluate");
+
+        match &eval.blockworking_sets[GammaLogFamily::BLOCK_ETA] {
+            BlockWorkingSet::Diagonal {
+                working_response,
+                working_weights,
+            } => {
+                for i in 0..eta.len() {
+                    let mu = eta[i].exp();
+                    let fisher_weight = family.weights[i] * family.shape;
+                    let observed_weight = fisher_weight * family.y[i] / mu;
+                    assert!(
+                        (working_weights[i] - observed_weight).abs() < 1e-12,
+                        "Gamma-log row {i} should use observed weight: got {}, expected {}",
+                        working_weights[i],
+                        observed_weight
+                    );
+                    assert!(
+                        (working_weights[i] - fisher_weight).abs() > 1e-6,
+                        "fixture should distinguish observed from Fisher at row {i}: observed {}, fisher {}",
+                        working_weights[i],
+                        fisher_weight
+                    );
+
+                    let score = fisher_weight * (family.y[i] / mu - 1.0);
+                    let expected_response = eta[i] + score / observed_weight;
+                    assert!(
+                        (working_response[i] - expected_response).abs() < 1e-12,
+                        "Gamma-log row {i} working response should be consistent with observed Newton weight: got {}, expected {}",
+                        working_response[i],
+                        expected_response
+                    );
+                }
+            }
+            BlockWorkingSet::ExactNewton { .. } => panic!("expected diagonal Gamma block"),
+        }
+
+        let d_eta = array![0.5_f64, -2.0_f64];
+        let dw = family
+            .diagonalworking_weights_directional_derivative(
+                &states,
+                GammaLogFamily::BLOCK_ETA,
+                &d_eta,
+            )
+            .expect("gamma dW")
+            .expect("gamma dW present");
+        for i in 0..eta.len() {
+            let observed_weight = family.weights[i] * family.shape * family.y[i] / eta[i].exp();
+            let expected_dw = -observed_weight * d_eta[i];
+            assert!(
+                (dw[i] - expected_dw).abs() < 1e-12,
+                "Gamma-log row {i} dW should differentiate observed weights: got {}, expected {}",
+                dw[i],
+                expected_dw
+            );
         }
     }
 

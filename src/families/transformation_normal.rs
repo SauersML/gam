@@ -1211,92 +1211,147 @@ impl TransformationNormalFamily {
         let weights = self.weights.as_ref();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
-        let mut gradient = Array1::<f64>::zeros(p_total);
-        let mut hessian = Array2::<f64>::zeros((p_total, p_total));
-        let mut gamma = vec![0.0; p_resp];
-        let mut dh_factor = vec![0.0; p_resp];
-        let mut dhp_factor = vec![0.0; p_resp];
-        let mut second_diag = vec![0.0; p_resp];
-        let mut lower_factor = vec![0.0; p_resp];
-        let mut upper_factor = vec![0.0; p_resp];
+        let endpoint_q = row_quantities.endpoint_q.as_ref();
+        let response_val_basis = &self.response_val_basis;
+        let response_deriv_basis = &self.response_deriv_basis;
+        let response_lower_basis = &self.response_lower_basis;
+        let response_upper_basis = &self.response_upper_basis;
 
-        for i in 0..n {
-            let cov_row = cov.row(i);
-            let rv = self.response_val_basis.row(i);
-            let rd = self.response_deriv_basis.row(i);
-            let wi = weights[i];
-            let hi = h[i];
-            let hp = h_prime[i];
-            let inv_hp = 1.0 / hp;
-            let inv_hp_sq = inv_hp * inv_hp;
+        struct ScopAccum {
+            gradient: Array1<f64>,
+            hessian: Array2<f64>,
+        }
 
-            for k in 0..p_resp {
-                gamma[k] = beta_mat.row(k).dot(&cov_row);
-            }
-
-            let q = row_quantities.endpoint_q[i];
-            lower_factor[0] = self.response_lower_basis[0];
-            upper_factor[0] = self.response_upper_basis[0];
-            for k in 1..p_resp {
-                lower_factor[k] = 2.0 * self.response_lower_basis[k] * gamma[k];
-                upper_factor[k] = 2.0 * self.response_upper_basis[k] * gamma[k];
-            }
-
-            second_diag.fill(0.0);
-            dh_factor[0] = rv[0];
-            dhp_factor[0] = rd[0];
-            for k in 1..p_resp {
-                dh_factor[k] = 2.0 * rv[k] * gamma[k];
-                dhp_factor[k] = 2.0 * rd[k] * gamma[k];
-                second_diag[k] = 2.0 * (hi * rv[k] - rd[k] * inv_hp);
-            }
-
-            for k in 0..p_resp {
-                let normalizer_score_factor =
-                    q.first[0] * upper_factor[k] + q.first[1] * lower_factor[k];
-                let score_factor =
-                    wi * (-hi * dh_factor[k] + dhp_factor[k] * inv_hp - normalizer_score_factor);
-                for c in 0..p_cov {
-                    gradient[k * p_cov + c] += score_factor * cov_row[c];
+        impl ScopAccum {
+            fn new(p_total: usize) -> Self {
+                Self {
+                    gradient: Array1::<f64>::zeros(p_total),
+                    hessian: Array2::<f64>::zeros((p_total, p_total)),
                 }
             }
+        }
 
-            for k in 0..p_resp {
-                for l in 0..p_resp {
-                    let mut block_factor =
-                        dh_factor[k] * dh_factor[l] + dhp_factor[k] * dhp_factor[l] * inv_hp_sq;
-                    if k == l {
-                        block_factor += second_diag[k];
+        let policy = ResourcePolicy::default_library();
+        let accum_bytes = p_total
+            .saturating_mul(p_total.saturating_add(1))
+            .saturating_mul(std::mem::size_of::<f64>())
+            .max(1);
+        let memory_bound_chunks = (policy.max_single_materialization_bytes / accum_bytes).max(1);
+        let target_chunks = rayon::current_num_threads()
+            .saturating_mul(4)
+            .max(1)
+            .min(memory_bound_chunks)
+            .min(n.max(1));
+        let chunk_rows = n.max(1).div_ceil(target_chunks);
+        let row_chunks: Vec<(usize, usize)> = (0..n)
+            .step_by(chunk_rows)
+            .map(|start| (start, (start + chunk_rows).min(n)))
+            .collect();
+
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        // Rayon collects this indexed iterator into `Vec` in row-chunk order;
+        // the final serial fold below preserves that order so results do not
+        // depend on worker scheduling.
+        let partials: Vec<ScopAccum> = row_chunks
+            .into_par_iter()
+            .map(|(start, end)| {
+                let mut acc = ScopAccum::new(p_total);
+                let mut gamma = vec![0.0; p_resp];
+                let mut dh_factor = vec![0.0; p_resp];
+                let mut dhp_factor = vec![0.0; p_resp];
+                let mut second_diag = vec![0.0; p_resp];
+                let mut lower_factor = vec![0.0; p_resp];
+                let mut upper_factor = vec![0.0; p_resp];
+
+                for i in start..end {
+                    let cov_row = cov.row(i);
+                    let rv = response_val_basis.row(i);
+                    let rd = response_deriv_basis.row(i);
+                    let wi = weights[i];
+                    let hi = h[i];
+                    let hp = h_prime[i];
+                    let inv_hp = 1.0 / hp;
+                    let inv_hp_sq = inv_hp * inv_hp;
+
+                    for k in 0..p_resp {
+                        gamma[k] = beta_mat.row(k).dot(&cov_row);
                     }
-                    let upper_ab = if k == l && k > 0 {
-                        2.0 * self.response_upper_basis[k]
-                    } else {
-                        0.0
-                    };
-                    let lower_ab = if k == l && k > 0 {
-                        2.0 * self.response_lower_basis[k]
-                    } else {
-                        0.0
-                    };
-                    block_factor += q.first[0] * upper_ab
-                        + q.first[1] * lower_ab
-                        + q.second[0][0] * upper_factor[k] * upper_factor[l]
-                        + q.second[0][1] * upper_factor[k] * lower_factor[l]
-                        + q.second[1][0] * lower_factor[k] * upper_factor[l]
-                        + q.second[1][1] * lower_factor[k] * lower_factor[l];
-                    block_factor *= wi;
-                    if block_factor == 0.0 {
-                        continue;
+
+                    let q = endpoint_q[i];
+                    lower_factor[0] = response_lower_basis[0];
+                    upper_factor[0] = response_upper_basis[0];
+                    for k in 1..p_resp {
+                        lower_factor[k] = 2.0 * response_lower_basis[k] * gamma[k];
+                        upper_factor[k] = 2.0 * response_upper_basis[k] * gamma[k];
                     }
-                    for c in 0..p_cov {
-                        let row_idx = k * p_cov + c;
-                        let left = block_factor * cov_row[c];
-                        for d in 0..p_cov {
-                            hessian[[row_idx, l * p_cov + d]] += left * cov_row[d];
+
+                    second_diag.fill(0.0);
+                    dh_factor[0] = rv[0];
+                    dhp_factor[0] = rd[0];
+                    for k in 1..p_resp {
+                        dh_factor[k] = 2.0 * rv[k] * gamma[k];
+                        dhp_factor[k] = 2.0 * rd[k] * gamma[k];
+                        second_diag[k] = 2.0 * (hi * rv[k] - rd[k] * inv_hp);
+                    }
+
+                    for k in 0..p_resp {
+                        let normalizer_score_factor =
+                            q.first[0] * upper_factor[k] + q.first[1] * lower_factor[k];
+                        let score_factor = wi
+                            * (-hi * dh_factor[k] + dhp_factor[k] * inv_hp
+                                - normalizer_score_factor);
+                        for c in 0..p_cov {
+                            acc.gradient[k * p_cov + c] += score_factor * cov_row[c];
+                        }
+                    }
+
+                    for k in 0..p_resp {
+                        for l in 0..p_resp {
+                            let mut block_factor = dh_factor[k] * dh_factor[l]
+                                + dhp_factor[k] * dhp_factor[l] * inv_hp_sq;
+                            if k == l {
+                                block_factor += second_diag[k];
+                            }
+                            let upper_ab = if k == l && k > 0 {
+                                2.0 * response_upper_basis[k]
+                            } else {
+                                0.0
+                            };
+                            let lower_ab = if k == l && k > 0 {
+                                2.0 * response_lower_basis[k]
+                            } else {
+                                0.0
+                            };
+                            block_factor += q.first[0] * upper_ab
+                                + q.first[1] * lower_ab
+                                + q.second[0][0] * upper_factor[k] * upper_factor[l]
+                                + q.second[0][1] * upper_factor[k] * lower_factor[l]
+                                + q.second[1][0] * lower_factor[k] * upper_factor[l]
+                                + q.second[1][1] * lower_factor[k] * lower_factor[l];
+                            block_factor *= wi;
+                            if block_factor == 0.0 {
+                                continue;
+                            }
+                            for c in 0..p_cov {
+                                let row_idx = k * p_cov + c;
+                                let left = block_factor * cov_row[c];
+                                for d in 0..p_cov {
+                                    acc.hessian[[row_idx, l * p_cov + d]] += left * cov_row[d];
+                                }
+                            }
                         }
                     }
                 }
-            }
+
+                acc
+            })
+            .collect();
+
+        let mut gradient = Array1::<f64>::zeros(p_total);
+        let mut hessian = Array2::<f64>::zeros((p_total, p_total));
+        for partial in partials {
+            gradient.scaled_add(1.0, &partial.gradient);
+            hessian.scaled_add(1.0, &partial.hessian);
         }
 
         Ok((gradient, hessian))
@@ -1430,119 +1485,144 @@ impl TransformationNormalFamily {
         })?;
         let weights = self.weights.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
-        let mut out = Array2::<f64>::zeros((p_total, p_total));
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        const TARGET_CHUNK_COUNT: usize = 32;
+        let chunk_size = n.div_ceil(TARGET_CHUNK_COUNT).max(1);
+        let n_chunks = n.div_ceil(chunk_size);
 
-        for i in 0..n {
-            let cov_row = cov.row(i);
-            let rv = self.response_val_basis.row(i);
-            let rd = self.response_deriv_basis.row(i);
-            let wi = weights[i];
-            let hp = h_prime[i];
-            let inv_hp = 1.0 / hp;
-            let inv_hp_sq = inv_hp * inv_hp;
-            let inv_hp_cu = inv_hp_sq * inv_hp;
+        // Fixed row chunks give each rayon worker a private matrix accumulator while
+        // preserving chunk-index order for deterministic floating-point reduction.
+        let chunk_outputs: Vec<Array2<f64>> = (0..n_chunks)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * chunk_size;
+                let end = (start + chunk_size).min(n);
+                let mut chunk_out = Array2::<f64>::zeros((p_total, p_total));
 
-            let mut gamma = vec![0.0; p_resp];
-            let mut gamma_dir = vec![0.0; p_resp];
-            for k in 0..p_resp {
-                gamma[k] = beta_mat.row(k).dot(&cov_row);
-                gamma_dir[k] = dir_mat.row(k).dot(&cov_row);
-            }
+                for i in start..end {
+                    let cov_row = cov.row(i);
+                    let rv = self.response_val_basis.row(i);
+                    let rd = self.response_deriv_basis.row(i);
+                    let wi = weights[i];
+                    let hp = h_prime[i];
+                    let inv_hp = 1.0 / hp;
+                    let inv_hp_sq = inv_hp * inv_hp;
+                    let inv_hp_cu = inv_hp_sq * inv_hp;
 
-            let mut h_dir = rv[0] * gamma_dir[0];
-            let mut hp_dir = rd[0] * gamma_dir[0];
-            let mut endpoint_dir = [
-                self.response_upper_basis[0] * gamma_dir[0],
-                self.response_lower_basis[0] * gamma_dir[0],
-            ];
-            for k in 1..p_resp {
-                h_dir += 2.0 * rv[k] * gamma[k] * gamma_dir[k];
-                hp_dir += 2.0 * rd[k] * gamma[k] * gamma_dir[k];
-                endpoint_dir[0] += 2.0 * self.response_upper_basis[k] * gamma[k] * gamma_dir[k];
-                endpoint_dir[1] += 2.0 * self.response_lower_basis[k] * gamma[k] * gamma_dir[k];
-            }
-            let q = row_quantities.endpoint_q[i];
-
-            let mut h_factor = vec![0.0; p_resp];
-            let mut hp_factor = vec![0.0; p_resp];
-            let mut h_factor_dir = vec![0.0; p_resp];
-            let mut hp_factor_dir = vec![0.0; p_resp];
-            let mut endpoint_factor = [vec![0.0; p_resp], vec![0.0; p_resp]];
-            let mut endpoint_factor_dir = [vec![0.0; p_resp], vec![0.0; p_resp]];
-            h_factor[0] = rv[0];
-            hp_factor[0] = rd[0];
-            endpoint_factor[0][0] = self.response_upper_basis[0];
-            endpoint_factor[1][0] = self.response_lower_basis[0];
-            for k in 1..p_resp {
-                h_factor[k] = 2.0 * rv[k] * gamma[k];
-                hp_factor[k] = 2.0 * rd[k] * gamma[k];
-                h_factor_dir[k] = 2.0 * rv[k] * gamma_dir[k];
-                hp_factor_dir[k] = 2.0 * rd[k] * gamma_dir[k];
-                endpoint_factor[0][k] = 2.0 * self.response_upper_basis[k] * gamma[k];
-                endpoint_factor[1][k] = 2.0 * self.response_lower_basis[k] * gamma[k];
-                endpoint_factor_dir[0][k] = 2.0 * self.response_upper_basis[k] * gamma_dir[k];
-                endpoint_factor_dir[1][k] = 2.0 * self.response_lower_basis[k] * gamma_dir[k];
-            }
-
-            for k in 0..p_resp {
-                for l in 0..p_resp {
-                    let same_shape = k == l && k > 0;
-                    let mut normalizer_block = 0.0;
-                    for a in 0..2 {
-                        let h_a_ab = if same_shape {
-                            2.0 * if a == 0 {
-                                self.response_upper_basis[k]
-                            } else {
-                                self.response_lower_basis[k]
-                            }
-                        } else {
-                            0.0
-                        };
-                        for b in 0..2 {
-                            normalizer_block += q.second[a][b] * endpoint_dir[b] * h_a_ab;
-                            normalizer_block += q.second[a][b]
-                                * (endpoint_factor_dir[a][k] * endpoint_factor[b][l]
-                                    + endpoint_factor[a][k] * endpoint_factor_dir[b][l]);
-                            for c_ep in 0..2 {
-                                normalizer_block += q.third[a][b][c_ep]
-                                    * endpoint_dir[c_ep]
-                                    * endpoint_factor[a][k]
-                                    * endpoint_factor[b][l];
-                            }
-                        }
+                    let mut gamma = vec![0.0; p_resp];
+                    let mut gamma_dir = vec![0.0; p_resp];
+                    for k in 0..p_resp {
+                        gamma[k] = beta_mat.row(k).dot(&cov_row);
+                        gamma_dir[k] = dir_mat.row(k).dot(&cov_row);
                     }
-                    for c in 0..p_cov {
-                        let row_idx = k * p_cov + c;
-                        let h_a = h_factor[k] * cov_row[c];
-                        let hp_a = hp_factor[k] * cov_row[c];
-                        let dh_a = h_factor_dir[k] * cov_row[c];
-                        let dhp_a = hp_factor_dir[k] * cov_row[c];
-                        for d in 0..p_cov {
-                            let col_idx = l * p_cov + d;
-                            let h_b = h_factor[l] * cov_row[d];
-                            let hp_b = hp_factor[l] * cov_row[d];
-                            let dh_b = h_factor_dir[l] * cov_row[d];
-                            let dhp_b = hp_factor_dir[l] * cov_row[d];
-                            let (h_ab, hp_ab) = if same_shape {
-                                (
-                                    2.0 * rv[k] * cov_row[c] * cov_row[d],
-                                    2.0 * rd[k] * cov_row[c] * cov_row[d],
-                                )
-                            } else {
-                                (0.0, 0.0)
-                            };
-                            let value = dh_a * h_b
-                                + h_a * dh_b
-                                + h_dir * h_ab
-                                + (dhp_a * hp_b + hp_a * dhp_b) * inv_hp_sq
-                                - 2.0 * hp_a * hp_b * hp_dir * inv_hp_cu
-                                + hp_ab * hp_dir * inv_hp_sq
-                                + normalizer_block * cov_row[c] * cov_row[d];
-                            out[[row_idx, col_idx]] += wi * value;
+
+                    let mut h_dir = rv[0] * gamma_dir[0];
+                    let mut hp_dir = rd[0] * gamma_dir[0];
+                    let mut endpoint_dir = [
+                        self.response_upper_basis[0] * gamma_dir[0],
+                        self.response_lower_basis[0] * gamma_dir[0],
+                    ];
+                    for k in 1..p_resp {
+                        h_dir += 2.0 * rv[k] * gamma[k] * gamma_dir[k];
+                        hp_dir += 2.0 * rd[k] * gamma[k] * gamma_dir[k];
+                        endpoint_dir[0] +=
+                            2.0 * self.response_upper_basis[k] * gamma[k] * gamma_dir[k];
+                        endpoint_dir[1] +=
+                            2.0 * self.response_lower_basis[k] * gamma[k] * gamma_dir[k];
+                    }
+                    let q = row_quantities.endpoint_q[i];
+
+                    let mut h_factor = vec![0.0; p_resp];
+                    let mut hp_factor = vec![0.0; p_resp];
+                    let mut h_factor_dir = vec![0.0; p_resp];
+                    let mut hp_factor_dir = vec![0.0; p_resp];
+                    let mut endpoint_factor = [vec![0.0; p_resp], vec![0.0; p_resp]];
+                    let mut endpoint_factor_dir = [vec![0.0; p_resp], vec![0.0; p_resp]];
+                    h_factor[0] = rv[0];
+                    hp_factor[0] = rd[0];
+                    endpoint_factor[0][0] = self.response_upper_basis[0];
+                    endpoint_factor[1][0] = self.response_lower_basis[0];
+                    for k in 1..p_resp {
+                        h_factor[k] = 2.0 * rv[k] * gamma[k];
+                        hp_factor[k] = 2.0 * rd[k] * gamma[k];
+                        h_factor_dir[k] = 2.0 * rv[k] * gamma_dir[k];
+                        hp_factor_dir[k] = 2.0 * rd[k] * gamma_dir[k];
+                        endpoint_factor[0][k] = 2.0 * self.response_upper_basis[k] * gamma[k];
+                        endpoint_factor[1][k] = 2.0 * self.response_lower_basis[k] * gamma[k];
+                        endpoint_factor_dir[0][k] =
+                            2.0 * self.response_upper_basis[k] * gamma_dir[k];
+                        endpoint_factor_dir[1][k] =
+                            2.0 * self.response_lower_basis[k] * gamma_dir[k];
+                    }
+
+                    for k in 0..p_resp {
+                        for l in 0..p_resp {
+                            let same_shape = k == l && k > 0;
+                            let mut normalizer_block = 0.0;
+                            for a in 0..2 {
+                                let h_a_ab = if same_shape {
+                                    2.0 * if a == 0 {
+                                        self.response_upper_basis[k]
+                                    } else {
+                                        self.response_lower_basis[k]
+                                    }
+                                } else {
+                                    0.0
+                                };
+                                for b in 0..2 {
+                                    normalizer_block += q.second[a][b] * endpoint_dir[b] * h_a_ab;
+                                    normalizer_block += q.second[a][b]
+                                        * (endpoint_factor_dir[a][k] * endpoint_factor[b][l]
+                                            + endpoint_factor[a][k] * endpoint_factor_dir[b][l]);
+                                    for c_ep in 0..2 {
+                                        normalizer_block += q.third[a][b][c_ep]
+                                            * endpoint_dir[c_ep]
+                                            * endpoint_factor[a][k]
+                                            * endpoint_factor[b][l];
+                                    }
+                                }
+                            }
+                            for c in 0..p_cov {
+                                let row_idx = k * p_cov + c;
+                                let h_a = h_factor[k] * cov_row[c];
+                                let hp_a = hp_factor[k] * cov_row[c];
+                                let dh_a = h_factor_dir[k] * cov_row[c];
+                                let dhp_a = hp_factor_dir[k] * cov_row[c];
+                                for d in 0..p_cov {
+                                    let col_idx = l * p_cov + d;
+                                    let h_b = h_factor[l] * cov_row[d];
+                                    let hp_b = hp_factor[l] * cov_row[d];
+                                    let dh_b = h_factor_dir[l] * cov_row[d];
+                                    let dhp_b = hp_factor_dir[l] * cov_row[d];
+                                    let (h_ab, hp_ab) = if same_shape {
+                                        (
+                                            2.0 * rv[k] * cov_row[c] * cov_row[d],
+                                            2.0 * rd[k] * cov_row[c] * cov_row[d],
+                                        )
+                                    } else {
+                                        (0.0, 0.0)
+                                    };
+                                    let value = dh_a * h_b
+                                        + h_a * dh_b
+                                        + h_dir * h_ab
+                                        + (dhp_a * hp_b + hp_a * dhp_b) * inv_hp_sq
+                                        - 2.0 * hp_a * hp_b * hp_dir * inv_hp_cu
+                                        + hp_ab * hp_dir * inv_hp_sq
+                                        + normalizer_block * cov_row[c] * cov_row[d];
+                                    chunk_out[[row_idx, col_idx]] += wi * value;
+                                }
+                            }
                         }
                     }
                 }
-            }
+
+                chunk_out
+            })
+            .collect();
+
+        let mut out = Array2::<f64>::zeros((p_total, p_total));
+        for chunk in chunk_outputs {
+            out += &chunk;
         }
 
         Ok(0.5 * (&out + &out.t()))
@@ -1611,169 +1691,200 @@ impl TransformationNormalFamily {
         })?;
         let weights = self.weights.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
-        let mut out = Array2::<f64>::zeros((p_total, p_total));
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        const TARGET_CHUNK_COUNT: usize = 32;
+        let chunk_size = n.div_ceil(TARGET_CHUNK_COUNT).max(1);
+        let n_chunks = n.div_ceil(chunk_size);
 
-        for i in 0..n {
-            let cov_row = cov.row(i);
-            let rv = self.response_val_basis.row(i);
-            let rd = self.response_deriv_basis.row(i);
-            let wi = weights[i];
-            let hp = h_prime[i];
-            let inv_hp = 1.0 / hp;
-            let inv_hp_sq = inv_hp * inv_hp;
-            let inv_hp_cu = inv_hp_sq * inv_hp;
-            let inv_hp_qu = inv_hp_sq * inv_hp_sq;
+        // Fixed row chunks give each rayon worker a private matrix accumulator while
+        // preserving chunk-index order for deterministic floating-point reduction.
+        let chunk_outputs: Vec<Array2<f64>> = (0..n_chunks)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * chunk_size;
+                let end = (start + chunk_size).min(n);
+                let mut chunk_out = Array2::<f64>::zeros((p_total, p_total));
 
-            let mut gamma = vec![0.0; p_resp];
-            let mut gamma_u = vec![0.0; p_resp];
-            let mut gamma_v = vec![0.0; p_resp];
-            for k in 0..p_resp {
-                gamma[k] = beta_mat.row(k).dot(&cov_row);
-                gamma_u[k] = dir_u_mat.row(k).dot(&cov_row);
-                gamma_v[k] = dir_v_mat.row(k).dot(&cov_row);
-            }
+                for i in start..end {
+                    let cov_row = cov.row(i);
+                    let rv = self.response_val_basis.row(i);
+                    let rd = self.response_deriv_basis.row(i);
+                    let wi = weights[i];
+                    let hp = h_prime[i];
+                    let inv_hp = 1.0 / hp;
+                    let inv_hp_sq = inv_hp * inv_hp;
+                    let inv_hp_cu = inv_hp_sq * inv_hp;
+                    let inv_hp_qu = inv_hp_sq * inv_hp_sq;
 
-            let mut hp_u = rd[0] * gamma_u[0];
-            let mut hp_v = rd[0] * gamma_v[0];
-            let mut h_uv = 0.0;
-            let mut hp_uv = 0.0;
-            let mut endpoint_u = [
-                self.response_upper_basis[0] * gamma_u[0],
-                self.response_lower_basis[0] * gamma_u[0],
-            ];
-            let mut endpoint_v = [
-                self.response_upper_basis[0] * gamma_v[0],
-                self.response_lower_basis[0] * gamma_v[0],
-            ];
-            let mut endpoint_uv = [0.0, 0.0];
-            for k in 1..p_resp {
-                hp_u += 2.0 * rd[k] * gamma[k] * gamma_u[k];
-                hp_v += 2.0 * rd[k] * gamma[k] * gamma_v[k];
-                h_uv += 2.0 * rv[k] * gamma_u[k] * gamma_v[k];
-                hp_uv += 2.0 * rd[k] * gamma_u[k] * gamma_v[k];
-                endpoint_u[0] += 2.0 * self.response_upper_basis[k] * gamma[k] * gamma_u[k];
-                endpoint_u[1] += 2.0 * self.response_lower_basis[k] * gamma[k] * gamma_u[k];
-                endpoint_v[0] += 2.0 * self.response_upper_basis[k] * gamma[k] * gamma_v[k];
-                endpoint_v[1] += 2.0 * self.response_lower_basis[k] * gamma[k] * gamma_v[k];
-                endpoint_uv[0] += 2.0 * self.response_upper_basis[k] * gamma_u[k] * gamma_v[k];
-                endpoint_uv[1] += 2.0 * self.response_lower_basis[k] * gamma_u[k] * gamma_v[k];
-            }
-            let q = row_quantities.endpoint_q[i];
+                    let mut gamma = vec![0.0; p_resp];
+                    let mut gamma_u = vec![0.0; p_resp];
+                    let mut gamma_v = vec![0.0; p_resp];
+                    for k in 0..p_resp {
+                        gamma[k] = beta_mat.row(k).dot(&cov_row);
+                        gamma_u[k] = dir_u_mat.row(k).dot(&cov_row);
+                        gamma_v[k] = dir_v_mat.row(k).dot(&cov_row);
+                    }
 
-            let mut h_factor = vec![0.0; p_resp];
-            let mut hp_factor = vec![0.0; p_resp];
-            let mut h_factor_u = vec![0.0; p_resp];
-            let mut hp_factor_u = vec![0.0; p_resp];
-            let mut h_factor_v = vec![0.0; p_resp];
-            let mut hp_factor_v = vec![0.0; p_resp];
-            let mut endpoint_factor = [vec![0.0; p_resp], vec![0.0; p_resp]];
-            let mut endpoint_factor_u = [vec![0.0; p_resp], vec![0.0; p_resp]];
-            let mut endpoint_factor_v = [vec![0.0; p_resp], vec![0.0; p_resp]];
-            h_factor[0] = rv[0];
-            hp_factor[0] = rd[0];
-            endpoint_factor[0][0] = self.response_upper_basis[0];
-            endpoint_factor[1][0] = self.response_lower_basis[0];
-            for k in 1..p_resp {
-                h_factor[k] = 2.0 * rv[k] * gamma[k];
-                hp_factor[k] = 2.0 * rd[k] * gamma[k];
-                h_factor_u[k] = 2.0 * rv[k] * gamma_u[k];
-                hp_factor_u[k] = 2.0 * rd[k] * gamma_u[k];
-                h_factor_v[k] = 2.0 * rv[k] * gamma_v[k];
-                hp_factor_v[k] = 2.0 * rd[k] * gamma_v[k];
-                endpoint_factor[0][k] = 2.0 * self.response_upper_basis[k] * gamma[k];
-                endpoint_factor[1][k] = 2.0 * self.response_lower_basis[k] * gamma[k];
-                endpoint_factor_u[0][k] = 2.0 * self.response_upper_basis[k] * gamma_u[k];
-                endpoint_factor_u[1][k] = 2.0 * self.response_lower_basis[k] * gamma_u[k];
-                endpoint_factor_v[0][k] = 2.0 * self.response_upper_basis[k] * gamma_v[k];
-                endpoint_factor_v[1][k] = 2.0 * self.response_lower_basis[k] * gamma_v[k];
-            }
+                    let mut hp_u = rd[0] * gamma_u[0];
+                    let mut hp_v = rd[0] * gamma_v[0];
+                    let mut h_uv = 0.0;
+                    let mut hp_uv = 0.0;
+                    let mut endpoint_u = [
+                        self.response_upper_basis[0] * gamma_u[0],
+                        self.response_lower_basis[0] * gamma_u[0],
+                    ];
+                    let mut endpoint_v = [
+                        self.response_upper_basis[0] * gamma_v[0],
+                        self.response_lower_basis[0] * gamma_v[0],
+                    ];
+                    let mut endpoint_uv = [0.0, 0.0];
+                    for k in 1..p_resp {
+                        hp_u += 2.0 * rd[k] * gamma[k] * gamma_u[k];
+                        hp_v += 2.0 * rd[k] * gamma[k] * gamma_v[k];
+                        h_uv += 2.0 * rv[k] * gamma_u[k] * gamma_v[k];
+                        hp_uv += 2.0 * rd[k] * gamma_u[k] * gamma_v[k];
+                        endpoint_u[0] += 2.0 * self.response_upper_basis[k] * gamma[k] * gamma_u[k];
+                        endpoint_u[1] += 2.0 * self.response_lower_basis[k] * gamma[k] * gamma_u[k];
+                        endpoint_v[0] += 2.0 * self.response_upper_basis[k] * gamma[k] * gamma_v[k];
+                        endpoint_v[1] += 2.0 * self.response_lower_basis[k] * gamma[k] * gamma_v[k];
+                        endpoint_uv[0] +=
+                            2.0 * self.response_upper_basis[k] * gamma_u[k] * gamma_v[k];
+                        endpoint_uv[1] +=
+                            2.0 * self.response_lower_basis[k] * gamma_u[k] * gamma_v[k];
+                    }
+                    let q = row_quantities.endpoint_q[i];
 
-            for k in 0..p_resp {
-                for l in 0..p_resp {
-                    let same_shape = k == l && k > 0;
-                    let mut normalizer_block = 0.0;
-                    for a in 0..2 {
-                        let h_a_ab = if same_shape {
-                            2.0 * if a == 0 {
-                                self.response_upper_basis[k]
-                            } else {
-                                self.response_lower_basis[k]
-                            }
-                        } else {
-                            0.0
-                        };
-                        for b in 0..2 {
-                            normalizer_block += q.second[a][b] * endpoint_uv[b] * h_a_ab;
-                            for c_ep in 0..2 {
-                                normalizer_block +=
-                                    q.third[a][b][c_ep] * endpoint_v[c_ep] * endpoint_u[b] * h_a_ab;
-                                normalizer_block += q.third[a][b][c_ep]
-                                    * endpoint_uv[c_ep]
-                                    * endpoint_factor[a][k]
-                                    * endpoint_factor[b][l];
-                                normalizer_block += q.third[a][b][c_ep]
-                                    * endpoint_u[c_ep]
-                                    * (endpoint_factor_v[a][k] * endpoint_factor[b][l]
-                                        + endpoint_factor[a][k] * endpoint_factor_v[b][l]);
-                                normalizer_block += q.third[a][b][c_ep]
-                                    * endpoint_v[c_ep]
-                                    * endpoint_factor_u[a][k]
-                                    * endpoint_factor[b][l];
-                                normalizer_block += q.third[a][b][c_ep]
-                                    * endpoint_v[c_ep]
-                                    * endpoint_factor[a][k]
-                                    * endpoint_factor_u[b][l];
-                                for d_ep in 0..2 {
-                                    normalizer_block += q.fourth[a][b][c_ep][d_ep]
-                                        * endpoint_v[d_ep]
-                                        * endpoint_u[c_ep]
-                                        * endpoint_factor[a][k]
-                                        * endpoint_factor[b][l];
+                    let mut h_factor = vec![0.0; p_resp];
+                    let mut hp_factor = vec![0.0; p_resp];
+                    let mut h_factor_u = vec![0.0; p_resp];
+                    let mut hp_factor_u = vec![0.0; p_resp];
+                    let mut h_factor_v = vec![0.0; p_resp];
+                    let mut hp_factor_v = vec![0.0; p_resp];
+                    let mut endpoint_factor = [vec![0.0; p_resp], vec![0.0; p_resp]];
+                    let mut endpoint_factor_u = [vec![0.0; p_resp], vec![0.0; p_resp]];
+                    let mut endpoint_factor_v = [vec![0.0; p_resp], vec![0.0; p_resp]];
+                    h_factor[0] = rv[0];
+                    hp_factor[0] = rd[0];
+                    endpoint_factor[0][0] = self.response_upper_basis[0];
+                    endpoint_factor[1][0] = self.response_lower_basis[0];
+                    for k in 1..p_resp {
+                        h_factor[k] = 2.0 * rv[k] * gamma[k];
+                        hp_factor[k] = 2.0 * rd[k] * gamma[k];
+                        h_factor_u[k] = 2.0 * rv[k] * gamma_u[k];
+                        hp_factor_u[k] = 2.0 * rd[k] * gamma_u[k];
+                        h_factor_v[k] = 2.0 * rv[k] * gamma_v[k];
+                        hp_factor_v[k] = 2.0 * rd[k] * gamma_v[k];
+                        endpoint_factor[0][k] = 2.0 * self.response_upper_basis[k] * gamma[k];
+                        endpoint_factor[1][k] = 2.0 * self.response_lower_basis[k] * gamma[k];
+                        endpoint_factor_u[0][k] = 2.0 * self.response_upper_basis[k] * gamma_u[k];
+                        endpoint_factor_u[1][k] = 2.0 * self.response_lower_basis[k] * gamma_u[k];
+                        endpoint_factor_v[0][k] = 2.0 * self.response_upper_basis[k] * gamma_v[k];
+                        endpoint_factor_v[1][k] = 2.0 * self.response_lower_basis[k] * gamma_v[k];
+                    }
+
+                    for k in 0..p_resp {
+                        for l in 0..p_resp {
+                            let same_shape = k == l && k > 0;
+                            let mut normalizer_block = 0.0;
+                            for a in 0..2 {
+                                let h_a_ab = if same_shape {
+                                    2.0 * if a == 0 {
+                                        self.response_upper_basis[k]
+                                    } else {
+                                        self.response_lower_basis[k]
+                                    }
+                                } else {
+                                    0.0
+                                };
+                                for b in 0..2 {
+                                    normalizer_block += q.second[a][b] * endpoint_uv[b] * h_a_ab;
+                                    for c_ep in 0..2 {
+                                        normalizer_block += q.third[a][b][c_ep]
+                                            * endpoint_v[c_ep]
+                                            * endpoint_u[b]
+                                            * h_a_ab;
+                                        normalizer_block += q.third[a][b][c_ep]
+                                            * endpoint_uv[c_ep]
+                                            * endpoint_factor[a][k]
+                                            * endpoint_factor[b][l];
+                                        normalizer_block += q.third[a][b][c_ep]
+                                            * endpoint_u[c_ep]
+                                            * (endpoint_factor_v[a][k] * endpoint_factor[b][l]
+                                                + endpoint_factor[a][k] * endpoint_factor_v[b][l]);
+                                        normalizer_block += q.third[a][b][c_ep]
+                                            * endpoint_v[c_ep]
+                                            * endpoint_factor_u[a][k]
+                                            * endpoint_factor[b][l];
+                                        normalizer_block += q.third[a][b][c_ep]
+                                            * endpoint_v[c_ep]
+                                            * endpoint_factor[a][k]
+                                            * endpoint_factor_u[b][l];
+                                        for d_ep in 0..2 {
+                                            normalizer_block += q.fourth[a][b][c_ep][d_ep]
+                                                * endpoint_v[d_ep]
+                                                * endpoint_u[c_ep]
+                                                * endpoint_factor[a][k]
+                                                * endpoint_factor[b][l];
+                                        }
+                                    }
+                                    normalizer_block += q.second[a][b]
+                                        * (endpoint_factor_u[a][k] * endpoint_factor_v[b][l]
+                                            + endpoint_factor_v[a][k] * endpoint_factor_u[b][l]);
                                 }
                             }
-                            normalizer_block += q.second[a][b]
-                                * (endpoint_factor_u[a][k] * endpoint_factor_v[b][l]
-                                    + endpoint_factor_v[a][k] * endpoint_factor_u[b][l]);
-                        }
-                    }
-                    for c in 0..p_cov {
-                        let row_idx = k * p_cov + c;
-                        let hp_a = hp_factor[k] * cov_row[c];
-                        let dh_a_u = h_factor_u[k] * cov_row[c];
-                        let dhp_a_u = hp_factor_u[k] * cov_row[c];
-                        let dh_a_v = h_factor_v[k] * cov_row[c];
-                        let dhp_a_v = hp_factor_v[k] * cov_row[c];
-                        for d in 0..p_cov {
-                            let col_idx = l * p_cov + d;
-                            let hp_b = hp_factor[l] * cov_row[d];
-                            let dh_b_u = h_factor_u[l] * cov_row[d];
-                            let dhp_b_u = hp_factor_u[l] * cov_row[d];
-                            let dh_b_v = h_factor_v[l] * cov_row[d];
-                            let dhp_b_v = hp_factor_v[l] * cov_row[d];
-                            let (h_ab, hp_ab) = if same_shape {
-                                (
-                                    2.0 * rv[k] * cov_row[c] * cov_row[d],
-                                    2.0 * rd[k] * cov_row[c] * cov_row[d],
-                                )
-                            } else {
-                                (0.0, 0.0)
-                            };
-                            let value = dh_a_u * dh_b_v
-                                + dh_a_v * dh_b_u
-                                + h_uv * h_ab
-                                + (dhp_a_u * dhp_b_v + dhp_a_v * dhp_b_u) * inv_hp_sq
-                                - 2.0 * (dhp_a_u * hp_b + hp_a * dhp_b_u) * hp_v * inv_hp_cu
-                                - 2.0 * (dhp_a_v * hp_b + hp_a * dhp_b_v) * hp_u * inv_hp_cu
-                                - 2.0 * hp_a * hp_b * hp_uv * inv_hp_cu
-                                + 6.0 * hp_a * hp_b * hp_u * hp_v * inv_hp_qu
-                                + hp_ab * hp_uv * inv_hp_sq
-                                - 2.0 * hp_ab * hp_u * hp_v * inv_hp_cu
-                                + normalizer_block * cov_row[c] * cov_row[d];
-                            out[[row_idx, col_idx]] += wi * value;
+                            for c in 0..p_cov {
+                                let row_idx = k * p_cov + c;
+                                let hp_a = hp_factor[k] * cov_row[c];
+                                let dh_a_u = h_factor_u[k] * cov_row[c];
+                                let dhp_a_u = hp_factor_u[k] * cov_row[c];
+                                let dh_a_v = h_factor_v[k] * cov_row[c];
+                                let dhp_a_v = hp_factor_v[k] * cov_row[c];
+                                for d in 0..p_cov {
+                                    let col_idx = l * p_cov + d;
+                                    let hp_b = hp_factor[l] * cov_row[d];
+                                    let dh_b_u = h_factor_u[l] * cov_row[d];
+                                    let dhp_b_u = hp_factor_u[l] * cov_row[d];
+                                    let dh_b_v = h_factor_v[l] * cov_row[d];
+                                    let dhp_b_v = hp_factor_v[l] * cov_row[d];
+                                    let (h_ab, hp_ab) = if same_shape {
+                                        (
+                                            2.0 * rv[k] * cov_row[c] * cov_row[d],
+                                            2.0 * rd[k] * cov_row[c] * cov_row[d],
+                                        )
+                                    } else {
+                                        (0.0, 0.0)
+                                    };
+                                    let value = dh_a_u * dh_b_v
+                                        + dh_a_v * dh_b_u
+                                        + h_uv * h_ab
+                                        + (dhp_a_u * dhp_b_v + dhp_a_v * dhp_b_u) * inv_hp_sq
+                                        - 2.0
+                                            * (dhp_a_u * hp_b + hp_a * dhp_b_u)
+                                            * hp_v
+                                            * inv_hp_cu
+                                        - 2.0
+                                            * (dhp_a_v * hp_b + hp_a * dhp_b_v)
+                                            * hp_u
+                                            * inv_hp_cu
+                                        - 2.0 * hp_a * hp_b * hp_uv * inv_hp_cu
+                                        + 6.0 * hp_a * hp_b * hp_u * hp_v * inv_hp_qu
+                                        + hp_ab * hp_uv * inv_hp_sq
+                                        - 2.0 * hp_ab * hp_u * hp_v * inv_hp_cu
+                                        + normalizer_block * cov_row[c] * cov_row[d];
+                                    chunk_out[[row_idx, col_idx]] += wi * value;
+                                }
+                            }
                         }
                     }
                 }
-            }
+
+                chunk_out
+            })
+            .collect();
+
+        let mut out = Array2::<f64>::zeros((p_total, p_total));
+        for chunk in chunk_outputs {
+            out += &chunk;
         }
 
         Ok(0.5 * (&out + &out.t()))
@@ -12856,6 +12967,48 @@ mod tests {
     }
 
     #[test]
+    fn ctn_large_n_outer_hvp_capability_selects_operator_path() {
+        let psi = array![0.15, -0.10];
+        let (family, derivative_blocks, _, spec) = toy_family_and_derivatives(&psi);
+        let specs = std::slice::from_ref(&spec);
+        assert!(family.outer_hyper_hessian_hvp_available(specs));
+
+        let rho_dim = spec.initial_log_lambdas.len();
+        let psi_dim = derivative_blocks[0].len();
+        let k_outer = rho_dim + psi_dim;
+        assert!(
+            crate::solver::estimate::reml::unified::use_outer_hessian_operator_path(
+                crate::solver::estimate::reml::unified::MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD,
+                crate::solver::estimate::reml::unified::MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N,
+                k_outer,
+                true,
+                false,
+            )
+        );
+        assert!(
+            crate::solver::estimate::reml::unified::use_outer_hessian_operator_path(
+                crate::solver::estimate::reml::unified::MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD,
+                spec.design.ncols(),
+                k_outer,
+                true,
+                false,
+            )
+        );
+
+        let options = BlockwiseFitOptions {
+            use_remlobjective: true,
+            use_outer_hessian: true,
+            ..BlockwiseFitOptions::default()
+        };
+        let (gradient, hessian) = custom_family_outer_derivatives(&family, specs, &options);
+        assert_eq!(
+            gradient,
+            crate::solver::outer_strategy::Derivative::Analytic
+        );
+        assert_eq!(hessian, crate::solver::outer_strategy::Derivative::Analytic);
+    }
+
+    #[test]
     fn ctn_joint_hessian_workspace_dh_operator_matches_dense() {
         let psi = array![0.15, -0.10];
         let (family, _, state, spec) = toy_family_and_derivatives(&psi);
@@ -14955,76 +15108,11 @@ pub fn fit_transformation_normal(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
     warm_start: Option<&TransformationWarmStart>,
 ) -> Result<TransformationNormalFitResult, String> {
-    let mut options = options.clone();
-    // Biobank-scale fallback for CTN: the analytic outer Hessian is only
-    // safe at biobank scale when the unified evaluator can express it as a
-    // matrix-free Hv operator (`build_outer_hessian_operator` →
-    // `HessianResult::Operator` → `run_operator_trust_region`'s
-    // Steihaug-Toint CG) instead of materializing the full
-    // `O(K · n · p²)` dense pairwise LAML Hessian.
-    //
-    // CTN's `CustomFamilyDerivProvider` returns
-    // `OuterHessianDerivativeKernel::Callback { compute_dh, compute_d2h }`
-    // unconditionally, so the unified evaluator's `use_operator` predicate
-    // (`reml_laml_evaluate`, src/solver/reml/unified.rs:4827) selects the
-    // operator path whenever a Hessian is requested and
-    // `solution.penalty_subspace_trace.is_none()` — and custom-family never
-    // installs a `penalty_subspace_trace`. The operator path then absorbs
-    // the per-outer-eval `O(K · n · p²)` cost via `O(n · p)` HVPs, which is
-    // the regime CTN actually needs at the n=20k stratified-subsample shape
-    // used by the biobank-scale margslope jobs.
-    //
-    // This formalizes the previous unconditional `n > 10_000 ⇒ decline
-    // analytic outer Hessian` bandaid (CI run 25351074828, 2026-05-04:
-    // 7-min ARC iters with the dense pairwise assembly) as: "decline
-    // analytic Hessian when the dense `compute_outer_hessian` path would
-    // run AND `n` is biobank-scale." Whenever the operator path is
-    // available the optimizer keeps analytic curvature; whenever it is
-    // unavailable at biobank scale, we fall back to BFGS instead of
-    // running the `O(K² · n · p²)` dense assembly.
-    //
-    // Mirrors the operator-availability gate at
-    // `src/solver/reml/runtime.rs:115` for the standard-GAM path; this
-    // gate covers the CTN custom-family path that goes through
-    // `fit_custom_family` and `joint_outer_evaluate → reml_laml_evaluate`.
-    let n_obs = covariate_data.nrows();
-    let ctn_biobank_threshold = 10_000usize;
-    // CTN's outer-Hv kernel is always
-    // `OuterHessianDerivativeKernel::Callback` (built from the
-    // family-supplied `compute_dh` / `compute_d2h` closures by
-    // `CustomFamilyDerivProvider::outer_hessian_derivative_kernel`,
-    // src/families/custom_family.rs:8290). The unified evaluator's
-    // `callback_operator_kernel` arm of `use_operator`
-    // (src/solver/reml/unified.rs:4823) therefore fires unconditionally
-    // for CTN — the operator representation is selected regardless of the
-    // `(n, p, K)` crossover that `prefer_outer_hessian_operator` tests.
-    //
-    // We additionally consult the `(n, p, K)` predicate for symmetry with
-    // the standard-GAM gate (`runtime.rs:115`) and as a defensive lower
-    // bound: any future refactor that loses the callback short-circuit
-    // still has the same scale-based safety net the standard-GAM path
-    // uses. We pass conservative lower bounds for `(p, K)` because the
-    // exact dimensions are only known after the response/covariate bases
-    // are built later in this function.
-    let ctn_kernel_is_callback = true;
-    let n_obs_for_predicate = n_obs;
-    let p_dim_lower_bound = covariate_data.ncols();
-    let k_lower_bound: usize = 0;
-    let operator_path_available = ctn_kernel_is_callback
-        || crate::solver::estimate::reml::unified::prefer_outer_hessian_operator(
-            n_obs_for_predicate,
-            p_dim_lower_bound,
-            k_lower_bound,
-        );
-    if n_obs > ctn_biobank_threshold && options.use_outer_hessian && !operator_path_available {
-        options.use_outer_hessian = false;
-        log::info!(
-            "[transformation-normal] declining analytic outer Hessian for \
-             n={n_obs} (matrix-free operator path unavailable, dense LAML \
-             pairwise assembly is O(K²·n·p²)); routing to BFGS"
-        );
-    }
-    let options = options;
+    let options = options.clone();
+    // CTN advertises profiled outer-Hessian HVP support and supplies the
+    // callback derivative kernel consumed by the unified REML/LAML evaluator.
+    // Keep analytic curvature enabled here: the evaluator routes CTN Hessians
+    // through the matrix-free operator path instead of dense pairwise assembly.
     let covariate_spec = covariate_spec.clone();
 
     // 1. Build a bootstrap covariate design first so the response basis can

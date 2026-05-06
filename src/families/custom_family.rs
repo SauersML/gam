@@ -333,12 +333,11 @@ pub struct BlockGeometryDirectionalDerivative {
 ///
 /// - `Diagonal`: provides IRLS working weights W such that the per-block Hessian
 ///   is X'WX. For canonical links (logit-Binomial, log-Poisson), W_obs = W_Fisher.
-///   For non-canonical links, W should ideally be the observed weight
-///   W_obs = W_Fisher - (y-mu)*B to ensure the outer REML uses the exact Laplace
-///   Hessian. Currently, GAMLSS families using Diagonal blocks with non-canonical
-///   links may provide Fisher weights; this is acceptable when the link is close to
-///   canonical (small residual correction) but introduces a PQL-type approximation
-///   for strongly non-canonical links.
+///   For supported non-canonical diagonal links, W must be the observed weight
+///   W_obs = W_Fisher - (y-mu)*B so the outer REML uses the exact Laplace
+///   Hessian. The matching [`CustomFamily::diagonalworking_weights_directional_derivative`]
+///   callback must differentiate the same observed W surface; silently using Fisher
+///   weights or zero `dW` would change the criterion into a PQL-type surrogate.
 #[derive(Clone, Debug)]
 pub enum BlockWorkingSet {
     /// Standard IRLS/GLM-style diagonal working set for eta-space updates.
@@ -846,6 +845,26 @@ pub trait CustomFamily {
         Ok(None)
     }
 
+    /// Optional exact second directional derivative of a block's ExactNewton Hessian.
+    ///
+    /// Returns `Some(d2H)` where:
+    /// - `d2H` is `D²_beta H_L[u, v]` for the provided block-local
+    ///   coefficient-space directions.
+    /// - shape is `(p_block, p_block)`.
+    ///
+    /// Generic single-block REML/LAML Hessian evaluation requires this term for
+    /// `BlockWorkingSet::ExactNewton` blocks; `None` means the exact second
+    /// Hessian drift is unavailable.
+    fn exact_newton_hessian_second_directional_derivative(
+        &self,
+        _: &[ParameterBlockState],
+        _: usize,
+        _: &Array1<f64>,
+        _: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        Ok(None)
+    }
+
     /// Optional exact joint coefficient-space Hessian across all blocks.
     ///
     /// Returns the unpenalized matrix `H_L = -nabla^2 log L` in the flattened block order.
@@ -1311,6 +1330,27 @@ pub trait CustomFamily {
         &self,
         _: &[ParameterBlockState],
         _: usize,
+        _: &Array1<f64>,
+    ) -> Result<Option<Array1<f64>>, String> {
+        Ok(None)
+    }
+
+    /// Optional exact second directional derivative of diagonal working weights.
+    ///
+    /// This callback supplies the `d²w` term for static-design single-block
+    /// generic fallback Hessian drift:
+    ///
+    ///   D²_beta H_L[u, v] = X^T diag(D²w[D eta_u, D eta_v]) X.
+    ///
+    /// Families with coefficient-dependent block geometry must use an exact
+    /// Newton Hessian path or a joint outer path until second-order geometry
+    /// hooks are available; the generic diagonal fallback will reject nonzero
+    /// first-order geometry while building `d²H`.
+    fn diagonalworking_weights_second_directional_derivative(
+        &self,
+        _: &[ParameterBlockState],
+        _: usize,
+        _: &Array1<f64>,
         _: &Array1<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
         Ok(None)
@@ -8301,8 +8341,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 /// expects the actual perturbation direction `δβ`, so we negate `v_k` before calling it.
 struct BorrowedJointDerivProvider<'a> {
     compute_dh: &'a dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
-    compute_d2h:
-        Option<&'a dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>>,
+    compute_d2h: &'a dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
 }
 
 // SAFETY: Only used synchronously within the same stack frame that creates it.
@@ -8347,15 +8386,12 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
         v_l: &Array1<f64>,
         u_kl: &Array1<f64>,
     ) -> Result<Option<DriftDerivResult>, String> {
-        let Some(d2h) = self.compute_d2h.as_ref() else {
-            return Ok(None);
-        };
         let Some(term1) = (self.compute_dh)(u_kl)? else {
             return Ok(None);
         };
         let neg_v_k = -v_k;
         let neg_v_l = -v_l;
-        let Some(term2) = d2h(&neg_v_l, &neg_v_k)? else {
+        let Some(term2) = (self.compute_d2h)(&neg_v_l, &neg_v_k)? else {
             return Ok(None);
         };
         let op = crate::solver::estimate::reml::unified::CompositeHyperOperator {
@@ -8916,12 +8952,9 @@ fn joint_outer_evaluate(
                 compute_d2h: owned_d2h,
             })
         } else {
-            let compute_d2h_ref: Option<
-                &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
-            > = Some(compute_d2h);
             Box::new(BorrowedJointDerivProvider {
                 compute_dh,
-                compute_d2h: compute_d2h_ref,
+                compute_d2h,
             })
         };
 
@@ -9143,12 +9176,9 @@ fn joint_outer_evaluate_efs(
                 compute_d2h: owned_d2h,
             })
         } else {
-            let compute_d2h_ref: Option<
-                &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
-            > = Some(compute_d2h);
             Box::new(BorrowedJointDerivProvider {
                 compute_dh,
-                compute_d2h: compute_d2h_ref,
+                compute_d2h,
             })
         };
 
@@ -9549,9 +9579,104 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                     }
                 }
             };
-            let compute_d2h = |_: &Array1<f64>,
-                               _: &Array1<f64>|
-             -> Result<Option<DriftDerivResult>, String> { Ok(None) };
+            let compute_d2h = |u: &Array1<f64>,
+                               v: &Array1<f64>|
+             -> Result<Option<DriftDerivResult>, String> {
+                if !include_logdet_h {
+                    return Ok(None);
+                }
+                match work {
+                    BlockWorkingSet::ExactNewton { .. } => {
+                        match family.exact_newton_hessian_second_directional_derivative(
+                            &inner.block_states,
+                            block_idx,
+                            u,
+                            v,
+                        )? {
+                            Some(h_exact) => {
+                                Ok(Some(DriftDerivResult::Dense(symmetrized_square_matrix(
+                                    h_exact,
+                                    p,
+                                    &format!(
+                                        "block {block_idx} exact-newton d2H shape mismatch in fixed-point outer evaluation"
+                                    ),
+                                )?)))
+                            }
+                            None => Err(format!(
+                                "missing exact-newton d2H callback for block {block_idx} while fixed-point evaluation requires H_beta_beta term"
+                            )),
+                        }
+                    }
+                    BlockWorkingSet::Diagonal { .. } => {
+                        let x_dyn = diagonal_design.as_ref().ok_or_else(|| {
+                            format!(
+                                "missing dynamic design for block {block_idx} diagonal fixed-point second correction"
+                            )
+                        })?;
+                        let x_dense = x_dyn.to_dense();
+                        let n = x_dense.nrows();
+                        let reject_second_order_geometry =
+                            |label: &str,
+                             geom: Option<BlockGeometryDirectionalDerivative>|
+                             -> Result<(), String> {
+                                if let Some(geom_dir) = geom {
+                                    let has_offset =
+                                        geom_dir.d_offset.iter().any(|value| *value != 0.0);
+                                    if geom_dir.d_design.is_some() || has_offset {
+                                        return Err(format!(
+                                            "block {block_idx} diagonal d2H requires second-order block-geometry derivatives for {label}; use an exact-newton or joint outer path"
+                                        ));
+                                    }
+                                }
+                                Ok(())
+                            };
+                        reject_second_order_geometry(
+                            "first direction",
+                            family.block_geometry_directional_derivative(
+                                &inner.block_states,
+                                block_idx,
+                                spec,
+                                u,
+                            )?,
+                        )?;
+                        reject_second_order_geometry(
+                            "second direction",
+                            family.block_geometry_directional_derivative(
+                                &inner.block_states,
+                                block_idx,
+                                spec,
+                                v,
+                            )?,
+                        )?;
+                        let d_eta_u = x_dyn.matrixvectormultiply(u);
+                        let d_eta_v = x_dyn.matrixvectormultiply(v);
+                        let d2w = family
+                            .diagonalworking_weights_second_directional_derivative(
+                                &inner.block_states,
+                                block_idx,
+                                &d_eta_u,
+                                &d_eta_v,
+                            )?
+                            .ok_or_else(|| {
+                                format!(
+                                    "missing diagonal d2W callback for block {block_idx} while fixed-point evaluation requires H_beta_beta term"
+                                )
+                            })?;
+                        if d2w.len() != n {
+                            return Err(format!(
+                                "block {block_idx} diagonal d2W length mismatch in fixed-point outer evaluation: got {}, expected {}",
+                                d2w.len(),
+                                n
+                            ));
+                        }
+                        let mut scaled_x = x_dense.clone();
+                        ndarray::Zip::from(scaled_x.rows_mut())
+                            .and(&d2w)
+                            .par_for_each(|mut sr, &d2wi| sr.mapv_inplace(|value| value * d2wi));
+                        Ok(Some(DriftDerivResult::Dense(fast_atb(&x_dense, &scaled_x))))
+                    }
+                }
+            };
             joint_outer_evaluate_efs(
                 &inner,
                 specs,
@@ -10999,9 +11124,104 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         }
     };
 
-    // No d²H provider for the generic single-block fallback.
-    let compute_d2h =
-        |_: &Array1<f64>, _: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> { Ok(None) };
+    // Build a derivative provider that computes D²_β H_L[u, v] on demand.
+    let compute_d2h = |u: &Array1<f64>,
+                       v: &Array1<f64>|
+     -> Result<Option<DriftDerivResult>, String> {
+        if !include_logdet_h {
+            return Ok(None);
+        }
+        match work {
+            BlockWorkingSet::ExactNewton { .. } => {
+                match family.exact_newton_hessian_second_directional_derivative(
+                    &inner.block_states,
+                    b,
+                    u,
+                    v,
+                )? {
+                    Some(h_exact) => Ok(Some(DriftDerivResult::Dense(symmetrized_square_matrix(
+                        h_exact,
+                        p,
+                        &format!("block {b} exact-newton d2H shape mismatch"),
+                    )?))),
+                    None => Err(format!(
+                        "missing exact-newton d2H callback for block {b} while REML Hessian requires H_beta_beta term"
+                    )),
+                }
+            }
+            BlockWorkingSet::Diagonal {
+                working_response: _,
+                working_weights: _,
+            } => {
+                let x_dyn = diagonal_design.as_ref().ok_or_else(|| {
+                    format!("missing dynamic design for block {b} diagonal second correction")
+                })?;
+                let x_dense = x_dyn.to_dense();
+                let n = x_dense.nrows();
+
+                let reject_second_order_geometry = |label: &str,
+                                                    geom: Option<
+                    BlockGeometryDirectionalDerivative,
+                >|
+                 -> Result<(), String> {
+                    if let Some(geom_dir) = geom {
+                        let has_offset = geom_dir.d_offset.iter().any(|value| *value != 0.0);
+                        if geom_dir.d_design.is_some() || has_offset {
+                            return Err(format!(
+                                "block {b} diagonal d2H requires second-order block-geometry derivatives for {label}; use an exact-newton or joint outer path"
+                            ));
+                        }
+                    }
+                    Ok(())
+                };
+                reject_second_order_geometry(
+                    "first direction",
+                    family.block_geometry_directional_derivative(
+                        &inner.block_states,
+                        b,
+                        spec,
+                        u,
+                    )?,
+                )?;
+                reject_second_order_geometry(
+                    "second direction",
+                    family.block_geometry_directional_derivative(
+                        &inner.block_states,
+                        b,
+                        spec,
+                        v,
+                    )?,
+                )?;
+
+                let d_eta_u = x_dyn.matrixvectormultiply(u);
+                let d_eta_v = x_dyn.matrixvectormultiply(v);
+                let d2w = family
+                    .diagonalworking_weights_second_directional_derivative(
+                        &inner.block_states,
+                        b,
+                        &d_eta_u,
+                        &d_eta_v,
+                    )?
+                    .ok_or_else(|| {
+                        format!(
+                            "missing diagonal d2W callback for block {b} while REML Hessian requires H_beta_beta term"
+                        )
+                    })?;
+                if d2w.len() != n {
+                    return Err(format!(
+                        "block {b} diagonal d2W length mismatch: got {}, expected {}",
+                        d2w.len(),
+                        n
+                    ));
+                }
+                let mut scaled_x = x_dense.clone();
+                ndarray::Zip::from(scaled_x.rows_mut())
+                    .and(&d2w)
+                    .par_for_each(|mut sr, &d2wi| sr.mapv_inplace(|value| value * d2wi));
+                Ok(Some(DriftDerivResult::Dense(fast_atb(&x_dense, &scaled_x))))
+            }
+        }
+    };
 
     let eval_result = joint_outer_evaluate(
         &inner,
@@ -11565,15 +11785,78 @@ fn apply_joint_block_penalty_into(
     out: &mut Array1<f64>,
 ) {
     debug_assert_eq!(out.len(), vector.len());
+    debug_assert!(s_lambdas.len() <= ranges.len());
     out.fill(0.0);
-    for (b, s_lambda) in s_lambdas.iter().enumerate() {
-        let (start, end) = ranges[b];
-        let block = vector.slice(s![start..end]);
-        let out_slice = out.slice_mut(s![start..end]);
-        crate::linalg::faer_ndarray::fast_av_view_into(s_lambda, &block, out_slice);
+
+    if s_lambdas.len() <= 1 {
+        for (b, s_lambda) in s_lambdas.iter().enumerate() {
+            let (start, end) = ranges[b];
+            let block = vector.slice(s![start..end]);
+            let mut out_slice = out.slice_mut(s![start..end]);
+            crate::linalg::faer_ndarray::fast_av_view_into(s_lambda, &block, out_slice.view_mut());
+        }
+        if diagonal_ridge > 0.0 {
+            out.scaled_add(diagonal_ridge, vector);
+        }
+        return;
     }
+
+    if out.as_slice_mut().is_none() {
+        for (b, s_lambda) in s_lambdas.iter().enumerate() {
+            let (start, end) = ranges[b];
+            let block = vector.slice(s![start..end]);
+            let mut out_slice = out.slice_mut(s![start..end]);
+            crate::linalg::faer_ndarray::fast_av_view_into(s_lambda, &block, out_slice.view_mut());
+        }
+        if diagonal_ridge > 0.0 {
+            out.scaled_add(diagonal_ridge, vector);
+        }
+        return;
+    }
+
+    {
+        let out_values = out
+            .as_slice_mut()
+            .expect("joint penalty output should be contiguous");
+        let mut out_blocks = Vec::with_capacity(s_lambdas.len());
+        let mut remaining = out_values;
+        let mut cursor = 0usize;
+        for &(start, end) in ranges.iter().take(s_lambdas.len()) {
+            debug_assert!(start >= cursor);
+            debug_assert!(end >= start);
+            let (_, after_gap) = remaining.split_at_mut(start - cursor);
+            let (out_block, after_block) = after_gap.split_at_mut(end - start);
+            out_blocks.push(out_block);
+            remaining = after_block;
+            cursor = end;
+        }
+
+        use rayon::prelude::*;
+
+        out_blocks
+            .into_par_iter()
+            .enumerate()
+            .for_each(|(b, out_block)| {
+                let (start, end) = ranges[b];
+                let block = vector.slice(s![start..end]);
+                let out_view = ArrayViewMut1::from(out_block.as_mut());
+                crate::linalg::faer_ndarray::fast_av_view_into(&s_lambdas[b], &block, out_view);
+            });
+    }
+
     if diagonal_ridge > 0.0 {
-        out.scaled_add(diagonal_ridge, vector);
+        if let (Some(out_values), Some(vector_values)) = (out.as_slice_mut(), vector.as_slice()) {
+            use rayon::prelude::*;
+
+            out_values
+                .par_iter_mut()
+                .zip(vector_values.par_iter())
+                .for_each(|(out_value, vector_value)| {
+                    *out_value += diagonal_ridge * *vector_value;
+                });
+        } else {
+            out.scaled_add(diagonal_ridge, vector);
+        }
     }
 }
 
@@ -12936,6 +13219,122 @@ mod tests {
         assert_eq!(hessian, crate::solver::outer_strategy::Derivative::Analytic);
     }
 
+    #[derive(Clone)]
+    struct OneBlockQuarticExactFamily {
+        linear: f64,
+        curvature: f64,
+        second_scale: f64,
+    }
+
+    impl CustomFamily for OneBlockQuarticExactFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let beta = block_states[0].beta[0];
+            let log_likelihood =
+                self.linear * beta - 0.5 * beta * beta - self.curvature * beta.powi(4) / 12.0;
+            let gradient = self.linear - beta - self.curvature * beta.powi(3) / 3.0;
+            let hessian = 1.0 + self.curvature * beta * beta;
+            Ok(FamilyEvaluation {
+                log_likelihood,
+                blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                    gradient: array![gradient],
+                    hessian: SymmetricMatrix::Dense(array![[hessian]]),
+                }],
+            })
+        }
+
+        fn exact_newton_hessian_directional_derivative(
+            &self,
+            block_states: &[ParameterBlockState],
+            block_idx: usize,
+            direction: &Array1<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            assert_eq!(block_idx, 0);
+            let beta = block_states[0].beta[0];
+            Ok(Some(array![[2.0 * self.curvature * beta * direction[0]]]))
+        }
+
+        fn exact_newton_hessian_second_directional_derivative(
+            &self,
+            _: &[ParameterBlockState],
+            block_idx: usize,
+            u: &Array1<f64>,
+            v: &Array1<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            assert_eq!(block_idx, 0);
+            Ok(Some(array![[2.0
+                * self.curvature
+                * self.second_scale
+                * u[0]
+                * v[0]]]))
+        }
+    }
+
+    #[test]
+    fn generic_single_block_fallback_includes_nonzero_d2h_drift() {
+        let spec = ParameterBlockSpec {
+            name: "quartic".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+            offset: array![0.0],
+            penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
+            nullspace_dims: vec![],
+            initial_log_lambdas: array![0.0],
+            initial_beta: Some(array![0.75]),
+        };
+        let options = BlockwiseFitOptions {
+            inner_tol: 1e-11,
+            use_remlobjective: true,
+            use_outer_hessian: true,
+            compute_covariance: false,
+            ..BlockwiseFitOptions::default()
+        };
+        let penalty_counts = vec![1];
+        let rho = array![0.0];
+
+        let with_d2 = evaluate_custom_family_hyper_internal(
+            &OneBlockQuarticExactFamily {
+                linear: 3.0,
+                curvature: 0.5,
+                second_scale: 1.0,
+            },
+            std::slice::from_ref(&spec),
+            &options,
+            &penalty_counts,
+            &rho,
+            &[vec![]],
+            None,
+            EvalMode::ValueGradientHessian,
+        )
+        .expect("single-block fallback with exact d2H should evaluate");
+        let without_d2_contribution = evaluate_custom_family_hyper_internal(
+            &OneBlockQuarticExactFamily {
+                linear: 3.0,
+                curvature: 0.5,
+                second_scale: 0.0,
+            },
+            &[spec],
+            &options,
+            &penalty_counts,
+            &rho,
+            &[vec![]],
+            None,
+            EvalMode::ValueGradientHessian,
+        )
+        .expect("single-block fallback with zero d2H should evaluate");
+
+        let h_with = with_d2.outer_hessian.unwrap_analytic();
+        let h_without = without_d2_contribution.outer_hessian.unwrap_analytic();
+        let d2h_delta = h_with[[0, 0]] - h_without[[0, 0]];
+        assert!(
+            d2h_delta.abs() > 1e-8,
+            "expected nonzero outer Hessian contribution from d2H; with={:?}, without={:?}",
+            h_with,
+            h_without
+        );
+    }
+
     #[test]
     fn custom_family_outer_derivatives_keeps_second_order_for_large_inner_problem() {
         // Inner (n, p) scale does not block the analytic outer Hessian: the
@@ -13302,6 +13701,16 @@ mod tests {
             d_eta: &Array1<f64>,
         ) -> Result<Option<Array1<f64>>, String> {
             Ok(Some(Array1::zeros(d_eta.len())))
+        }
+
+        fn diagonalworking_weights_second_directional_derivative(
+            &self,
+            _: &[ParameterBlockState],
+            _: usize,
+            d_eta_u: &Array1<f64>,
+            _: &Array1<f64>,
+        ) -> Result<Option<Array1<f64>>, String> {
+            Ok(Some(Array1::zeros(d_eta_u.len())))
         }
     }
 

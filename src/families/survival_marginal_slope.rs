@@ -303,6 +303,16 @@ struct DynamicQBlockwiseAccumulator {
     hess_link_dev: Option<Array2<f64>>,
 }
 
+#[derive(Clone)]
+struct DynamicQCoreHessianBlocks {
+    hess_time: Array2<f64>,
+    hess_marginal: Array2<f64>,
+    hess_logslope: Array2<f64>,
+    hess_time_marginal: Array2<f64>,
+    hess_time_logslope: Array2<f64>,
+    hess_marginal_logslope: Array2<f64>,
+}
+
 impl DynamicQBlockwiseAccumulator {
     fn new(slices: &BlockSlices) -> Self {
         Self {
@@ -4103,58 +4113,90 @@ impl SurvivalMarginalSlopeFamily {
         let p = primary.total;
         let cached = self.build_cached_partition(primary, a, b, beta_h, beta_w)?;
 
+        struct ExactTimepointCellAccum {
+            f_aa: f64,
+            f_u: Vec<f64>,
+            f_au: Vec<f64>,
+            f_uv: Vec<f64>,
+        }
+
+        let cell_accums = cached
+            .cells
+            .par_iter()
+            .map(|entry| -> Result<ExactTimepointCellAccum, String> {
+                let neg_cell = entry.neg_cell;
+                let state = &entry.state;
+                let fixed = &entry.fixed;
+                let neg_dc_da = fixed.dc_da.map(|value| -value);
+                let neg_dc_daa = fixed.dc_daa.map(|value| -value);
+                let mut f_u = vec![0.0; p];
+                let mut f_au = vec![0.0; p];
+                let mut f_uv = vec![0.0; p * p];
+                let f_aa = exact_kernel::cell_second_derivative_from_moments(
+                    neg_cell,
+                    &neg_dc_da,
+                    &neg_dc_da,
+                    &neg_dc_daa,
+                    &state.moments,
+                )?;
+                for u in 0..p {
+                    let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
+                    let neg_coeff_au = fixed.coeff_au[u].map(|value| -value);
+                    f_u[u] = exact_kernel::cell_first_derivative_from_moments(
+                        &neg_coeff_u,
+                        &state.moments,
+                    )?;
+                    f_au[u] = exact_kernel::cell_second_derivative_from_moments(
+                        neg_cell,
+                        &neg_dc_da,
+                        &neg_coeff_u,
+                        &neg_coeff_au,
+                        &state.moments,
+                    )?;
+                }
+                for u in 0..p {
+                    let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
+                    for v in u..p {
+                        let second_coeff = if u == primary.g {
+                            fixed.coeff_bu[v]
+                        } else if v == primary.g {
+                            fixed.coeff_bu[u]
+                        } else {
+                            [0.0; 4]
+                        };
+                        let neg_coeff_v = fixed.coeff_u[v].map(|value| -value);
+                        let neg_second_coeff = second_coeff.map(|value| -value);
+                        let value = exact_kernel::cell_second_derivative_from_moments(
+                            neg_cell,
+                            &neg_coeff_u,
+                            &neg_coeff_v,
+                            &neg_second_coeff,
+                            &state.moments,
+                        )?;
+                        f_uv[u * p + v] = value;
+                        f_uv[v * p + u] = value;
+                    }
+                }
+                Ok(ExactTimepointCellAccum {
+                    f_aa,
+                    f_u,
+                    f_au,
+                    f_uv,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
         let mut f_u = Array1::<f64>::zeros(p);
         let mut f_au = Array1::<f64>::zeros(p);
         let mut f_uv = Array2::<f64>::zeros((p, p));
         let mut f_aa = 0.0;
-
-        for entry in &cached.cells {
-            let neg_cell = entry.neg_cell;
-            let state = &entry.state;
-            let fixed = &entry.fixed;
-            let neg_dc_da = fixed.dc_da.map(|value| -value);
-            let neg_dc_daa = fixed.dc_daa.map(|value| -value);
-            f_aa += exact_kernel::cell_second_derivative_from_moments(
-                neg_cell,
-                &neg_dc_da,
-                &neg_dc_da,
-                &neg_dc_daa,
-                &state.moments,
-            )?;
+        for acc in cell_accums {
+            f_aa += acc.f_aa;
             for u in 0..p {
-                let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
-                let neg_coeff_au = fixed.coeff_au[u].map(|value| -value);
-                f_u[u] +=
-                    exact_kernel::cell_first_derivative_from_moments(&neg_coeff_u, &state.moments)?;
-                f_au[u] += exact_kernel::cell_second_derivative_from_moments(
-                    neg_cell,
-                    &neg_dc_da,
-                    &neg_coeff_u,
-                    &neg_coeff_au,
-                    &state.moments,
-                )?;
-            }
-            for u in 0..p {
-                let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
-                for v in u..p {
-                    let second_coeff = if u == primary.g {
-                        fixed.coeff_bu[v]
-                    } else if v == primary.g {
-                        fixed.coeff_bu[u]
-                    } else {
-                        [0.0; 4]
-                    };
-                    let neg_coeff_v = fixed.coeff_u[v].map(|value| -value);
-                    let neg_second_coeff = second_coeff.map(|value| -value);
-                    let value = exact_kernel::cell_second_derivative_from_moments(
-                        neg_cell,
-                        &neg_coeff_u,
-                        &neg_coeff_v,
-                        &neg_second_coeff,
-                        &state.moments,
-                    )?;
-                    f_uv[[u, v]] += value;
-                    f_uv[[v, u]] = f_uv[[u, v]];
+                f_u[u] += acc.f_u[u];
+                f_au[u] += acc.f_au[u];
+                for v in 0..p {
+                    f_uv[[u, v]] += acc.f_uv[u * p + v];
                 }
             }
         }
@@ -4181,25 +4223,37 @@ impl SurvivalMarginalSlopeFamily {
             a_u[u] = f_u[u] / d_check;
         }
 
+        let d_u_cell_accums = cached
+            .cells
+            .par_iter()
+            .map(|entry| -> Result<Vec<f64>, String> {
+                let cell = entry.partition_cell.cell;
+                let state = &entry.state;
+                let fixed = &entry.fixed;
+                let eta_poly = vec![cell.c0, cell.c1, cell.c2, cell.c3];
+                let chi_poly = fixed.dc_da.to_vec();
+                let mut d_u = vec![0.0; p];
+                for u in 0..p {
+                    let eta_u_poly = poly_add(&poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u]);
+                    let chi_u_poly =
+                        poly_add(&poly_scale(&fixed.dc_daa, a_u[u]), &fixed.coeff_au[u]);
+                    let integrand = poly_sub(
+                        &chi_u_poly,
+                        &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_poly),
+                    );
+                    d_u[u] = exact_kernel::cell_polynomial_integral_from_moments(
+                        &integrand,
+                        &state.moments,
+                        "survival D_t first derivative",
+                    )?;
+                }
+                Ok(d_u)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let mut d_u = Array1::<f64>::zeros(p);
-        for entry in &cached.cells {
-            let cell = entry.partition_cell.cell;
-            let state = &entry.state;
-            let fixed = &entry.fixed;
-            let eta_poly = vec![cell.c0, cell.c1, cell.c2, cell.c3];
-            let chi_poly = fixed.dc_da.to_vec();
+        for cell_d_u in d_u_cell_accums {
             for u in 0..p {
-                let eta_u_poly = poly_add(&poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u]);
-                let chi_u_poly = poly_add(&poly_scale(&fixed.dc_daa, a_u[u]), &fixed.coeff_au[u]);
-                let integrand = poly_sub(
-                    &chi_u_poly,
-                    &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_poly),
-                );
-                d_u[u] += exact_kernel::cell_polynomial_integral_from_moments(
-                    &integrand,
-                    &state.moments,
-                    "survival D_t first derivative",
-                )?;
+                d_u[u] += cell_d_u[u];
             }
         }
 
@@ -4299,92 +4353,106 @@ impl SurvivalMarginalSlopeFamily {
 
         let mut d_uv = Array2::<f64>::zeros((p, p));
         if need_d_uv {
-            for entry in &cached.cells {
-                let cell = entry.partition_cell.cell;
-                let state = &entry.state;
-                let fixed = &entry.fixed;
-                let eta_poly = vec![cell.c0, cell.c1, cell.c2, cell.c3];
-                let chi_poly = fixed.dc_da.to_vec();
-                let eta_aa_poly = fixed.dc_daa.to_vec();
-                let eta_aaa_poly = fixed.dc_daaa.to_vec();
-                let mut eta_u_poly = vec![PolyVec::new(); p];
-                let mut chi_u_poly = vec![PolyVec::new(); p];
-                for u in 0..p {
-                    eta_u_poly[u] = poly_add(&poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u]);
-                    chi_u_poly[u] = poly_add(&poly_scale(&eta_aa_poly, a_u[u]), &fixed.coeff_au[u]);
-                }
-                for u in 0..p {
-                    for v in u..p {
-                        let r_uv_fixed = if u == primary.g {
-                            fixed.coeff_bu[v].to_vec()
-                        } else if v == primary.g {
-                            fixed.coeff_bu[u].to_vec()
-                        } else {
-                            vec![0.0; 4]
-                        };
-                        let chi_uv_fixed = if u == primary.g {
-                            fixed.coeff_abu[v].to_vec()
-                        } else if v == primary.g {
-                            fixed.coeff_abu[u].to_vec()
-                        } else {
-                            vec![0.0; 4]
-                        };
-                        let eta_uv_poly = poly_add(
-                            &poly_add(
+            let d_uv_cell_accums = cached
+                .cells
+                .par_iter()
+                .map(|entry| -> Result<Vec<f64>, String> {
+                    let cell = entry.partition_cell.cell;
+                    let state = &entry.state;
+                    let fixed = &entry.fixed;
+                    let eta_poly = vec![cell.c0, cell.c1, cell.c2, cell.c3];
+                    let chi_poly = fixed.dc_da.to_vec();
+                    let eta_aa_poly = fixed.dc_daa.to_vec();
+                    let eta_aaa_poly = fixed.dc_daaa.to_vec();
+                    let mut eta_u_poly = vec![PolyVec::new(); p];
+                    let mut chi_u_poly = vec![PolyVec::new(); p];
+                    let mut d_uv = vec![0.0; p * p];
+                    for u in 0..p {
+                        eta_u_poly[u] = poly_add(&poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u]);
+                        chi_u_poly[u] =
+                            poly_add(&poly_scale(&eta_aa_poly, a_u[u]), &fixed.coeff_au[u]);
+                    }
+                    for u in 0..p {
+                        for v in u..p {
+                            let r_uv_fixed = if u == primary.g {
+                                fixed.coeff_bu[v].to_vec()
+                            } else if v == primary.g {
+                                fixed.coeff_bu[u].to_vec()
+                            } else {
+                                vec![0.0; 4]
+                            };
+                            let chi_uv_fixed = if u == primary.g {
+                                fixed.coeff_abu[v].to_vec()
+                            } else if v == primary.g {
+                                fixed.coeff_abu[u].to_vec()
+                            } else {
+                                vec![0.0; 4]
+                            };
+                            let eta_uv_poly = poly_add(
                                 &poly_add(
-                                    &poly_scale(&chi_poly, a_uv[[u, v]]),
-                                    &poly_scale(&eta_aa_poly, a_u[u] * a_u[v]),
+                                    &poly_add(
+                                        &poly_scale(&chi_poly, a_uv[[u, v]]),
+                                        &poly_scale(&eta_aa_poly, a_u[u] * a_u[v]),
+                                    ),
+                                    &poly_scale(&fixed.coeff_au[u], a_u[v]),
                                 ),
-                                &poly_scale(&fixed.coeff_au[u], a_u[v]),
-                            ),
-                            &poly_add(&poly_scale(&fixed.coeff_au[v], a_u[u]), &r_uv_fixed),
-                        );
-                        let chi_uv_poly = poly_add(
-                            &poly_add(
+                                &poly_add(&poly_scale(&fixed.coeff_au[v], a_u[u]), &r_uv_fixed),
+                            );
+                            let chi_uv_poly = poly_add(
                                 &poly_add(
-                                    &poly_scale(&eta_aa_poly, a_uv[[u, v]]),
-                                    &poly_scale(&eta_aaa_poly, a_u[u] * a_u[v]),
+                                    &poly_add(
+                                        &poly_scale(&eta_aa_poly, a_uv[[u, v]]),
+                                        &poly_scale(&eta_aaa_poly, a_u[u] * a_u[v]),
+                                    ),
+                                    &poly_scale(&fixed.coeff_aau[u], a_u[v]),
                                 ),
-                                &poly_scale(&fixed.coeff_aau[u], a_u[v]),
-                            ),
-                            &poly_add(&poly_scale(&fixed.coeff_aau[v], a_u[u]), &chi_uv_fixed),
-                        );
-                        let term2 = poly_scale(
-                            &poly_mul(&poly_mul(&chi_u_poly[v], &eta_poly), &eta_u_poly[u]),
-                            -1.0,
-                        );
-                        let term3 = poly_scale(
-                            &poly_mul(&poly_mul(&chi_u_poly[u], &eta_poly), &eta_u_poly[v]),
-                            -1.0,
-                        );
-                        let term4 = poly_scale(
-                            &poly_mul(
+                                &poly_add(&poly_scale(&fixed.coeff_aau[v], a_u[u]), &chi_uv_fixed),
+                            );
+                            let term2 = poly_scale(
+                                &poly_mul(&poly_mul(&chi_u_poly[v], &eta_poly), &eta_u_poly[u]),
+                                -1.0,
+                            );
+                            let term3 = poly_scale(
+                                &poly_mul(&poly_mul(&chi_u_poly[u], &eta_poly), &eta_u_poly[v]),
+                                -1.0,
+                            );
+                            let term4 = poly_scale(
+                                &poly_mul(
+                                    &chi_poly,
+                                    &poly_add(
+                                        &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
+                                        &poly_mul(&eta_poly, &eta_uv_poly),
+                                    ),
+                                ),
+                                -1.0,
+                            );
+                            let term5 = poly_mul(
                                 &chi_poly,
-                                &poly_add(
+                                &poly_mul(
+                                    &poly_mul(&eta_poly, &eta_poly),
                                     &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
-                                    &poly_mul(&eta_poly, &eta_uv_poly),
                                 ),
-                            ),
-                            -1.0,
-                        );
-                        let term5 = poly_mul(
-                            &chi_poly,
-                            &poly_mul(
-                                &poly_mul(&eta_poly, &eta_poly),
-                                &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
-                            ),
-                        );
-                        let integrand = poly_add(
-                            &poly_add(&poly_add(&chi_uv_poly, &term2), &term3),
-                            &poly_add(&term4, &term5),
-                        );
-                        let value = exact_kernel::cell_polynomial_integral_from_moments(
-                            &integrand,
-                            &state.moments,
-                            "survival D_t second derivative",
-                        )?;
-                        d_uv[[u, v]] += value;
-                        d_uv[[v, u]] = d_uv[[u, v]];
+                            );
+                            let integrand = poly_add(
+                                &poly_add(&poly_add(&chi_uv_poly, &term2), &term3),
+                                &poly_add(&term4, &term5),
+                            );
+                            let value = exact_kernel::cell_polynomial_integral_from_moments(
+                                &integrand,
+                                &state.moments,
+                                "survival D_t second derivative",
+                            )?;
+                            d_uv[u * p + v] = value;
+                            d_uv[v * p + u] = value;
+                        }
+                    }
+                    Ok(d_uv)
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            for cell_d_uv in d_uv_cell_accums {
+                for u in 0..p {
+                    for v in 0..p {
+                        d_uv[[u, v]] += cell_d_uv[u * p + v];
                     }
                 }
             }
@@ -4791,18 +4859,16 @@ impl SurvivalMarginalSlopeFamily {
         Ok(())
     }
 
-    fn accumulate_dynamic_q_core_hessian(
+    fn dynamic_q_core_hessian_blocks(
         &self,
         row: usize,
-        slices: &BlockSlices,
+        p_t: usize,
+        p_m: usize,
+        p_g: usize,
         q_geom: &SurvivalMarginalSlopeDynamicRow,
         primary_gradient: ndarray::ArrayView1<'_, f64>,
         primary_hessian: ArrayView2<'_, f64>,
-        joint_hessian: &mut Array2<f64>,
-    ) -> Result<(), String> {
-        let p_t = slices.time.len();
-        let p_m = slices.marginal.len();
-        let p_g = slices.logslope.len();
+    ) -> Result<DynamicQCoreHessianBlocks, String> {
         let dq_time = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
         let dq_marginal = [
             &q_geom.dq0_marginal,
@@ -4824,83 +4890,295 @@ impl SurvivalMarginalSlopeFamily {
             &q_geom.d2q1_time_marginal,
             &q_geom.d2qd1_time_marginal,
         ];
+        let logslope_chunk = self
+            .logslope_design
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("dynamic_q_core_hessian_blocks logslope try_row_chunk: {e}"))?;
+        let logslope_row = logslope_chunk.row(0).to_owned();
 
-        for a in 0..p_t {
-            for b in 0..p_t {
-                let mut value = 0.0;
-                for q_u in 0..3 {
-                    for q_v in 0..3 {
-                        value += primary_hessian[[q_u, q_v]] * dq_time[q_u][a] * dq_time[q_v][b];
-                    }
-                    value += primary_gradient[q_u] * d2q_time_time[q_u][[a, b]];
-                }
-                joint_hessian[[slices.time.start + a, slices.time.start + b]] += value;
-            }
-        }
+        // Build independent, thread-local Hessian blocks in parallel.  The
+        // caller performs the only mutation of the destination Hessian after
+        // these blocks have been reduced, so no worker writes to shared output.
+        let (
+            (hess_time, hess_marginal),
+            (hess_logslope, (hess_time_marginal, (hess_time_logslope, hess_marginal_logslope))),
+        ) = rayon::join(
+            || {
+                rayon::join(
+                    || {
+                        let mut block = Array2::<f64>::zeros((p_t, p_t));
+                        for a in 0..p_t {
+                            for b in 0..p_t {
+                                let mut value = 0.0;
+                                for q_u in 0..3 {
+                                    for q_v in 0..3 {
+                                        value += primary_hessian[[q_u, q_v]]
+                                            * dq_time[q_u][a]
+                                            * dq_time[q_v][b];
+                                    }
+                                    value += primary_gradient[q_u] * d2q_time_time[q_u][[a, b]];
+                                }
+                                block[[a, b]] = value;
+                            }
+                        }
+                        block
+                    },
+                    || {
+                        let mut block = Array2::<f64>::zeros((p_m, p_m));
+                        for a in 0..p_m {
+                            for b in 0..p_m {
+                                let mut value = 0.0;
+                                for q_u in 0..3 {
+                                    for q_v in 0..3 {
+                                        value += primary_hessian[[q_u, q_v]]
+                                            * dq_marginal[q_u][a]
+                                            * dq_marginal[q_v][b];
+                                    }
+                                    value +=
+                                        primary_gradient[q_u] * d2q_marginal_marginal[q_u][[a, b]];
+                                }
+                                block[[a, b]] = value;
+                            }
+                        }
+                        block
+                    },
+                )
+            },
+            || {
+                rayon::join(
+                    || {
+                        let mut block = Array2::<f64>::zeros((p_g, p_g));
+                        for a in 0..p_g {
+                            let xa = logslope_row[a];
+                            if xa == 0.0 {
+                                continue;
+                            }
+                            for b in 0..p_g {
+                                block[[a, b]] = primary_hessian[[3, 3]] * xa * logslope_row[b];
+                            }
+                        }
+                        block
+                    },
+                    || {
+                        rayon::join(
+                            || {
+                                let mut block = Array2::<f64>::zeros((p_t, p_m));
+                                for a in 0..p_t {
+                                    for b in 0..p_m {
+                                        let mut value = 0.0;
+                                        for q_u in 0..3 {
+                                            for q_v in 0..3 {
+                                                value += primary_hessian[[q_u, q_v]]
+                                                    * dq_time[q_u][a]
+                                                    * dq_marginal[q_v][b];
+                                            }
+                                            value += primary_gradient[q_u]
+                                                * d2q_time_marginal[q_u][[a, b]];
+                                        }
+                                        block[[a, b]] = value;
+                                    }
+                                }
+                                block
+                            },
+                            || {
+                                rayon::join(
+                                    || {
+                                        let mut block = Array2::<f64>::zeros((p_t, p_g));
+                                        for a in 0..p_t {
+                                            let mut weight = 0.0;
+                                            for q_u in 0..3 {
+                                                weight +=
+                                                    primary_hessian[[q_u, 3]] * dq_time[q_u][a];
+                                            }
+                                            for b in 0..p_g {
+                                                block[[a, b]] = weight * logslope_row[b];
+                                            }
+                                        }
+                                        block
+                                    },
+                                    || {
+                                        let mut block = Array2::<f64>::zeros((p_m, p_g));
+                                        for a in 0..p_m {
+                                            let mut weight = 0.0;
+                                            for q_u in 0..3 {
+                                                weight +=
+                                                    primary_hessian[[q_u, 3]] * dq_marginal[q_u][a];
+                                            }
+                                            for b in 0..p_g {
+                                                block[[a, b]] = weight * logslope_row[b];
+                                            }
+                                        }
+                                        block
+                                    },
+                                )
+                            },
+                        )
+                    },
+                )
+            },
+        );
 
-        for a in 0..p_m {
-            for b in 0..p_m {
-                let mut value = 0.0;
-                for q_u in 0..3 {
-                    for q_v in 0..3 {
-                        value +=
-                            primary_hessian[[q_u, q_v]] * dq_marginal[q_u][a] * dq_marginal[q_v][b];
-                    }
-                    value += primary_gradient[q_u] * d2q_marginal_marginal[q_u][[a, b]];
-                }
-                joint_hessian[[slices.marginal.start + a, slices.marginal.start + b]] += value;
-            }
-        }
+        Ok(DynamicQCoreHessianBlocks {
+            hess_time,
+            hess_marginal,
+            hess_logslope,
+            hess_time_marginal,
+            hess_time_logslope,
+            hess_marginal_logslope,
+        })
+    }
 
-        self.logslope_design
-            .syr_row_into_view(
-                row,
-                primary_hessian[[3, 3]],
-                joint_hessian.slice_mut(s![slices.logslope.clone(), slices.logslope.clone()]),
-            )
-            .map_err(|e| format!("accumulate_dynamic_q_core_hessian logslope syr: {e}"))?;
-
-        for a in 0..p_t {
-            for b in 0..p_m {
-                let mut value = 0.0;
-                for q_u in 0..3 {
-                    for q_v in 0..3 {
-                        value +=
-                            primary_hessian[[q_u, q_v]] * dq_time[q_u][a] * dq_marginal[q_v][b];
-                    }
-                    value += primary_gradient[q_u] * d2q_time_marginal[q_u][[a, b]];
-                }
-                joint_hessian[[slices.time.start + a, slices.marginal.start + b]] += value;
-                joint_hessian[[slices.marginal.start + b, slices.time.start + a]] += value;
-            }
-        }
-
+    fn dynamic_q_core_diagonal_hessian_blocks(
+        &self,
+        row: usize,
+        p_t: usize,
+        p_m: usize,
+        p_g: usize,
+        q_geom: &SurvivalMarginalSlopeDynamicRow,
+        primary_gradient: ndarray::ArrayView1<'_, f64>,
+        primary_hessian: ArrayView2<'_, f64>,
+    ) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), String> {
+        let dq_time = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
+        let dq_marginal = [
+            &q_geom.dq0_marginal,
+            &q_geom.dq1_marginal,
+            &q_geom.dqd1_marginal,
+        ];
+        let d2q_time_time = [
+            &q_geom.d2q0_time_time,
+            &q_geom.d2q1_time_time,
+            &q_geom.d2qd1_time_time,
+        ];
+        let d2q_marginal_marginal = [
+            &q_geom.d2q0_marginal_marginal,
+            &q_geom.d2q1_marginal_marginal,
+            &q_geom.d2qd1_marginal_marginal,
+        ];
         let logslope_chunk = self
             .logslope_design
             .try_row_chunk(row..row + 1)
             .map_err(|e| {
-                format!("accumulate_dynamic_q_core_hessian logslope try_row_chunk: {e}")
+                format!("dynamic_q_core_diagonal_hessian_blocks logslope try_row_chunk: {e}")
             })?;
-        let logslope_row = logslope_chunk.row(0);
+        let logslope_row = logslope_chunk.row(0).to_owned();
+
+        let ((hess_time, hess_marginal), hess_logslope) = rayon::join(
+            || {
+                let (hess_time, hess_marginal) = rayon::join(
+                    || {
+                        let mut block = Array2::<f64>::zeros((p_t, p_t));
+                        for a in 0..p_t {
+                            for b in 0..p_t {
+                                let mut value = 0.0;
+                                for q_u in 0..3 {
+                                    for q_v in 0..3 {
+                                        value += primary_hessian[[q_u, q_v]]
+                                            * dq_time[q_u][a]
+                                            * dq_time[q_v][b];
+                                    }
+                                    value += primary_gradient[q_u] * d2q_time_time[q_u][[a, b]];
+                                }
+                                block[[a, b]] = value;
+                            }
+                        }
+                        block
+                    },
+                    || {
+                        let mut block = Array2::<f64>::zeros((p_m, p_m));
+                        for a in 0..p_m {
+                            for b in 0..p_m {
+                                let mut value = 0.0;
+                                for q_u in 0..3 {
+                                    for q_v in 0..3 {
+                                        value += primary_hessian[[q_u, q_v]]
+                                            * dq_marginal[q_u][a]
+                                            * dq_marginal[q_v][b];
+                                    }
+                                    value +=
+                                        primary_gradient[q_u] * d2q_marginal_marginal[q_u][[a, b]];
+                                }
+                                block[[a, b]] = value;
+                            }
+                        }
+                        block
+                    },
+                );
+                (hess_time, hess_marginal)
+            },
+            || {
+                let mut block = Array2::<f64>::zeros((p_g, p_g));
+                for a in 0..p_g {
+                    let xa = logslope_row[a];
+                    if xa == 0.0 {
+                        continue;
+                    }
+                    for b in 0..p_g {
+                        block[[a, b]] = primary_hessian[[3, 3]] * xa * logslope_row[b];
+                    }
+                }
+                block
+            },
+        );
+        Ok((hess_time, hess_marginal, hess_logslope))
+    }
+
+    fn accumulate_dynamic_q_core_hessian(
+        &self,
+        row: usize,
+        slices: &BlockSlices,
+        q_geom: &SurvivalMarginalSlopeDynamicRow,
+        primary_gradient: ndarray::ArrayView1<'_, f64>,
+        primary_hessian: ArrayView2<'_, f64>,
+        joint_hessian: &mut Array2<f64>,
+    ) -> Result<(), String> {
+        let p_t = slices.time.len();
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+        let blocks = self.dynamic_q_core_hessian_blocks(
+            row,
+            p_t,
+            p_m,
+            p_g,
+            q_geom,
+            primary_gradient,
+            primary_hessian,
+        )?;
+
         for a in 0..p_t {
-            let mut weight = 0.0;
-            for q_u in 0..3 {
-                weight += primary_hessian[[q_u, 3]] * dq_time[q_u][a];
+            for b in 0..p_t {
+                joint_hessian[[slices.time.start + a, slices.time.start + b]] +=
+                    blocks.hess_time[[a, b]];
             }
+        }
+        for a in 0..p_m {
+            for b in 0..p_m {
+                joint_hessian[[slices.marginal.start + a, slices.marginal.start + b]] +=
+                    blocks.hess_marginal[[a, b]];
+            }
+        }
+        for a in 0..p_g {
             for b in 0..p_g {
-                let value = weight * logslope_row[b];
+                joint_hessian[[slices.logslope.start + a, slices.logslope.start + b]] +=
+                    blocks.hess_logslope[[a, b]];
+            }
+        }
+        for a in 0..p_t {
+            for b in 0..p_m {
+                let value = blocks.hess_time_marginal[[a, b]];
+                joint_hessian[[slices.time.start + a, slices.marginal.start + b]] += value;
+                joint_hessian[[slices.marginal.start + b, slices.time.start + a]] += value;
+            }
+        }
+        for a in 0..p_t {
+            for b in 0..p_g {
+                let value = blocks.hess_time_logslope[[a, b]];
                 joint_hessian[[slices.time.start + a, slices.logslope.start + b]] += value;
                 joint_hessian[[slices.logslope.start + b, slices.time.start + a]] += value;
             }
         }
-
         for a in 0..p_m {
-            let mut weight = 0.0;
-            for q_u in 0..3 {
-                weight += primary_hessian[[q_u, 3]] * dq_marginal[q_u][a];
-            }
             for b in 0..p_g {
-                let value = weight * logslope_row[b];
+                let value = blocks.hess_marginal_logslope[[a, b]];
                 joint_hessian[[slices.marginal.start + a, slices.logslope.start + b]] += value;
                 joint_hessian[[slices.logslope.start + b, slices.marginal.start + a]] += value;
             }
@@ -4950,54 +5228,22 @@ impl SurvivalMarginalSlopeFamily {
         hess_time: &mut Array2<f64>,
         hess_marginal: &mut Array2<f64>,
         hess_logslope: &mut Array2<f64>,
-    ) {
-        let d2q_time_time = [
-            &q_geom.d2q0_time_time,
-            &q_geom.d2q1_time_time,
-            &q_geom.d2qd1_time_time,
-        ];
-        let d2q_marginal_marginal = [
-            &q_geom.d2q0_marginal_marginal,
-            &q_geom.d2q1_marginal_marginal,
-            &q_geom.d2qd1_marginal_marginal,
-        ];
-        let dq_time = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
-        let dq_marginal = [
-            &q_geom.dq0_marginal,
-            &q_geom.dq1_marginal,
-            &q_geom.dqd1_marginal,
-        ];
+    ) -> Result<(), String> {
+        let (local_time, local_marginal, local_logslope) = self
+            .dynamic_q_core_diagonal_hessian_blocks(
+                row,
+                hess_time.nrows(),
+                hess_marginal.nrows(),
+                hess_logslope.nrows(),
+                q_geom,
+                primary_gradient,
+                primary_hessian,
+            )?;
 
-        for a in 0..hess_time.nrows() {
-            for b in 0..hess_time.ncols() {
-                let mut value = 0.0;
-                for q_u in 0..3 {
-                    for q_v in 0..3 {
-                        value += primary_hessian[[q_u, q_v]] * dq_time[q_u][a] * dq_time[q_v][b];
-                    }
-                    value += primary_gradient[q_u] * d2q_time_time[q_u][[a, b]];
-                }
-                hess_time[[a, b]] += value;
-            }
-        }
-
-        for a in 0..hess_marginal.nrows() {
-            for b in 0..hess_marginal.ncols() {
-                let mut value = 0.0;
-                for q_u in 0..3 {
-                    for q_v in 0..3 {
-                        value +=
-                            primary_hessian[[q_u, q_v]] * dq_marginal[q_u][a] * dq_marginal[q_v][b];
-                    }
-                    value += primary_gradient[q_u] * d2q_marginal_marginal[q_u][[a, b]];
-                }
-                hess_marginal[[a, b]] += value;
-            }
-        }
-
-        self.logslope_design
-            .syr_row_into(row, primary_hessian[[3, 3]], hess_logslope)
-            .expect("survival logslope block syr");
+        *hess_time += &local_time;
+        *hess_marginal += &local_marginal;
+        *hess_logslope += &local_logslope;
+        Ok(())
     }
 
     fn accumulate_dynamic_q_blockwise_row(
@@ -5025,7 +5271,7 @@ impl SurvivalMarginalSlopeFamily {
             &mut acc.hess_time,
             &mut acc.hess_marginal,
             &mut acc.hess_logslope,
-        );
+        )?;
         if let (Some(primary_range), Some(gradient), Some(hessian)) = (
             primary.h.as_ref(),
             acc.grad_score_warp.as_mut(),
@@ -5561,6 +5807,186 @@ impl SurvivalMarginalSlopeFamily {
         let p = primary.total;
         let cached = self.build_cached_partition(primary, a, b, beta_h, beta_w)?;
 
+        struct DirectionalTimepointCellAccum {
+            f_a: f64,
+            f_aa: f64,
+            f_u: Vec<f64>,
+            f_au: Vec<f64>,
+            f_uv: Vec<f64>,
+            f_a_dir: f64,
+            f_aa_dir: f64,
+            f_au_dir: Vec<f64>,
+            f_uv_dir: Vec<f64>,
+        }
+
+        let cell_accums = cached
+            .cells
+            .par_iter()
+            .map(
+                |cell_entry| -> Result<DirectionalTimepointCellAccum, String> {
+                    let neg_cell = cell_entry.neg_cell;
+                    let state = &cell_entry.state;
+                    let fixed = &cell_entry.fixed;
+                    let neg_dc_da: [f64; 4] = fixed.dc_da.map(|v| -v);
+                    let neg_dc_daa: [f64; 4] = fixed.dc_daa.map(|v| -v);
+
+                    let f_a = exact_kernel::cell_first_derivative_from_moments(
+                        &neg_dc_da,
+                        &state.moments,
+                    )?;
+                    let f_aa = exact_kernel::cell_second_derivative_from_moments(
+                        neg_cell,
+                        &neg_dc_da,
+                        &neg_dc_da,
+                        &neg_dc_daa,
+                        &state.moments,
+                    )?;
+
+                    let mut neg_coeff_dir = [0.0; 4];
+                    let mut neg_coeff_a_dir = [0.0; 4];
+                    let mut neg_coeff_aa_dir = [0.0; 4];
+                    for c in 0..p {
+                        if dir[c] == 0.0 {
+                            continue;
+                        }
+                        for k in 0..4 {
+                            neg_coeff_dir[k] -= fixed.coeff_u[c][k] * dir[c];
+                            neg_coeff_a_dir[k] -= fixed.coeff_au[c][k] * dir[c];
+                            neg_coeff_aa_dir[k] -= fixed.coeff_aau[c][k] * dir[c];
+                        }
+                    }
+
+                    let f_a_dir = exact_kernel::cell_second_derivative_from_moments(
+                        neg_cell,
+                        &neg_dc_da,
+                        &neg_coeff_dir,
+                        &neg_coeff_a_dir,
+                        &state.moments,
+                    )?;
+                    let f_aa_dir = exact_kernel::cell_third_derivative_from_moments(
+                        neg_cell,
+                        &neg_dc_da,
+                        &neg_dc_da,
+                        &neg_coeff_dir,
+                        &neg_dc_daa,
+                        &neg_coeff_a_dir,
+                        &neg_coeff_a_dir,
+                        &neg_coeff_aa_dir,
+                        &state.moments,
+                    )?;
+
+                    let mut f_u = vec![0.0; p];
+                    let mut f_au = vec![0.0; p];
+                    let mut f_uv = vec![0.0; p * p];
+                    let mut f_au_dir = vec![0.0; p];
+                    let mut f_uv_dir = vec![0.0; p * p];
+                    for u in 0..p {
+                        let neg_coeff_u = fixed.coeff_u[u].map(|v| -v);
+                        let neg_coeff_au = fixed.coeff_au[u].map(|v| -v);
+
+                        f_u[u] = exact_kernel::cell_first_derivative_from_moments(
+                            &neg_coeff_u,
+                            &state.moments,
+                        )?;
+                        f_au[u] = exact_kernel::cell_second_derivative_from_moments(
+                            neg_cell,
+                            &neg_dc_da,
+                            &neg_coeff_u,
+                            &neg_coeff_au,
+                            &state.moments,
+                        )?;
+
+                        let mut neg_coeff_u_dir = [0.0; 4];
+                        let mut neg_coeff_au_dir = [0.0; 4];
+                        for c in 0..p {
+                            if dir[c] == 0.0 {
+                                continue;
+                            }
+                            let sc = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, u, c);
+                            let sca = self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, u, c);
+                            for k in 0..4 {
+                                neg_coeff_u_dir[k] -= sc[k] * dir[c];
+                                neg_coeff_au_dir[k] -= sca[k] * dir[c];
+                            }
+                        }
+
+                        f_au_dir[u] = exact_kernel::cell_third_derivative_from_moments(
+                            neg_cell,
+                            &neg_dc_da,
+                            &neg_coeff_u,
+                            &neg_coeff_dir,
+                            &neg_coeff_au,
+                            &neg_coeff_a_dir,
+                            &neg_coeff_u_dir,
+                            &neg_coeff_au_dir,
+                            &state.moments,
+                        )?;
+                    }
+
+                    for u in 0..p {
+                        for v in u..p {
+                            let neg_coeff_u = fixed.coeff_u[u].map(|val| -val);
+                            let neg_coeff_v = fixed.coeff_u[v].map(|val| -val);
+                            let sc_uv = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, u, v);
+                            let neg_sc_uv = sc_uv.map(|val| -val);
+
+                            let base_val = exact_kernel::cell_second_derivative_from_moments(
+                                neg_cell,
+                                &neg_coeff_u,
+                                &neg_coeff_v,
+                                &neg_sc_uv,
+                                &state.moments,
+                            )?;
+                            f_uv[u * p + v] = base_val;
+                            f_uv[v * p + u] = base_val;
+
+                            let mut neg_coeff_u_dir = [0.0; 4];
+                            let mut neg_coeff_v_dir = [0.0; 4];
+                            for c in 0..p {
+                                if dir[c] == 0.0 {
+                                    continue;
+                                }
+                                let sc_uc =
+                                    self.cell_pair_second_coeff(primary, &fixed.coeff_bu, u, c);
+                                let sc_vc =
+                                    self.cell_pair_second_coeff(primary, &fixed.coeff_bu, v, c);
+                                for k in 0..4 {
+                                    neg_coeff_u_dir[k] -= sc_uc[k] * dir[c];
+                                    neg_coeff_v_dir[k] -= sc_vc[k] * dir[c];
+                                }
+                            }
+
+                            let dir_val = exact_kernel::cell_third_derivative_from_moments(
+                                neg_cell,
+                                &neg_coeff_u,
+                                &neg_coeff_v,
+                                &neg_coeff_dir,
+                                &neg_sc_uv,
+                                &neg_coeff_u_dir,
+                                &neg_coeff_v_dir,
+                                &[0.0; 4], // third cross vanishes for cubic cells
+                                &state.moments,
+                            )?;
+                            f_uv_dir[u * p + v] = dir_val;
+                            f_uv_dir[v * p + u] = dir_val;
+                        }
+                    }
+
+                    Ok(DirectionalTimepointCellAccum {
+                        f_a,
+                        f_aa,
+                        f_u,
+                        f_au,
+                        f_uv,
+                        f_a_dir,
+                        f_aa_dir,
+                        f_au_dir,
+                        f_uv_dir,
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>, String>>()?;
+
         let mut f_a = 0.0;
         let mut f_aa = 0.0;
         let mut f_u = Array1::<f64>::zeros(p);
@@ -5570,145 +5996,18 @@ impl SurvivalMarginalSlopeFamily {
         let mut f_aa_dir = 0.0;
         let mut f_au_dir = Array1::<f64>::zeros(p);
         let mut f_uv_dir = Array2::<f64>::zeros((p, p));
-
-        for cell_entry in &cached.cells {
-            let neg_cell = cell_entry.neg_cell;
-            let state = &cell_entry.state;
-            let fixed = &cell_entry.fixed;
-            let neg_dc_da: [f64; 4] = fixed.dc_da.map(|v| -v);
-            let neg_dc_daa: [f64; 4] = fixed.dc_daa.map(|v| -v);
-
-            f_a += exact_kernel::cell_first_derivative_from_moments(&neg_dc_da, &state.moments)?;
-            f_aa += exact_kernel::cell_second_derivative_from_moments(
-                neg_cell,
-                &neg_dc_da,
-                &neg_dc_da,
-                &neg_dc_daa,
-                &state.moments,
-            )?;
-
-            let mut neg_coeff_dir = [0.0; 4];
-            let mut neg_coeff_a_dir = [0.0; 4];
-            let mut neg_coeff_aa_dir = [0.0; 4];
-            for c in 0..p {
-                if dir[c] == 0.0 {
-                    continue;
-                }
-                for k in 0..4 {
-                    neg_coeff_dir[k] -= fixed.coeff_u[c][k] * dir[c];
-                    neg_coeff_a_dir[k] -= fixed.coeff_au[c][k] * dir[c];
-                    neg_coeff_aa_dir[k] -= fixed.coeff_aau[c][k] * dir[c];
-                }
-            }
-
-            f_a_dir += exact_kernel::cell_second_derivative_from_moments(
-                neg_cell,
-                &neg_dc_da,
-                &neg_coeff_dir,
-                &neg_coeff_a_dir,
-                &state.moments,
-            )?;
-            f_aa_dir += exact_kernel::cell_third_derivative_from_moments(
-                neg_cell,
-                &neg_dc_da,
-                &neg_dc_da,
-                &neg_coeff_dir,
-                &neg_dc_daa,
-                &neg_coeff_a_dir,
-                &neg_coeff_a_dir,
-                &neg_coeff_aa_dir,
-                &state.moments,
-            )?;
-
+        for acc in cell_accums {
+            f_a += acc.f_a;
+            f_aa += acc.f_aa;
+            f_a_dir += acc.f_a_dir;
+            f_aa_dir += acc.f_aa_dir;
             for u in 0..p {
-                let neg_coeff_u = fixed.coeff_u[u].map(|v| -v);
-                let neg_coeff_au = fixed.coeff_au[u].map(|v| -v);
-
-                f_u[u] +=
-                    exact_kernel::cell_first_derivative_from_moments(&neg_coeff_u, &state.moments)?;
-                f_au[u] += exact_kernel::cell_second_derivative_from_moments(
-                    neg_cell,
-                    &neg_dc_da,
-                    &neg_coeff_u,
-                    &neg_coeff_au,
-                    &state.moments,
-                )?;
-
-                let mut neg_coeff_u_dir = [0.0; 4];
-                let mut neg_coeff_au_dir = [0.0; 4];
-                for c in 0..p {
-                    if dir[c] == 0.0 {
-                        continue;
-                    }
-                    let sc = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, u, c);
-                    let sca = self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, u, c);
-                    for k in 0..4 {
-                        neg_coeff_u_dir[k] -= sc[k] * dir[c];
-                        neg_coeff_au_dir[k] -= sca[k] * dir[c];
-                    }
-                }
-
-                f_au_dir[u] += exact_kernel::cell_third_derivative_from_moments(
-                    neg_cell,
-                    &neg_dc_da,
-                    &neg_coeff_u,
-                    &neg_coeff_dir,
-                    &neg_coeff_au,
-                    &neg_coeff_a_dir,
-                    &neg_coeff_u_dir,
-                    &neg_coeff_au_dir,
-                    &state.moments,
-                )?;
-            }
-
-            for u in 0..p {
-                for v in u..p {
-                    let neg_coeff_u = fixed.coeff_u[u].map(|val| -val);
-                    let neg_coeff_v = fixed.coeff_u[v].map(|val| -val);
-                    let sc_uv = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, u, v);
-                    let neg_sc_uv = sc_uv.map(|val| -val);
-
-                    let base_val = exact_kernel::cell_second_derivative_from_moments(
-                        neg_cell,
-                        &neg_coeff_u,
-                        &neg_coeff_v,
-                        &neg_sc_uv,
-                        &state.moments,
-                    )?;
-                    f_uv[[u, v]] += base_val;
-                    if u != v {
-                        f_uv[[v, u]] += base_val;
-                    }
-
-                    let mut neg_coeff_u_dir = [0.0; 4];
-                    let mut neg_coeff_v_dir = [0.0; 4];
-                    for c in 0..p {
-                        if dir[c] == 0.0 {
-                            continue;
-                        }
-                        let sc_uc = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, u, c);
-                        let sc_vc = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, v, c);
-                        for k in 0..4 {
-                            neg_coeff_u_dir[k] -= sc_uc[k] * dir[c];
-                            neg_coeff_v_dir[k] -= sc_vc[k] * dir[c];
-                        }
-                    }
-
-                    let dir_val = exact_kernel::cell_third_derivative_from_moments(
-                        neg_cell,
-                        &neg_coeff_u,
-                        &neg_coeff_v,
-                        &neg_coeff_dir,
-                        &neg_sc_uv,
-                        &neg_coeff_u_dir,
-                        &neg_coeff_v_dir,
-                        &[0.0; 4], // third cross vanishes for cubic cells
-                        &state.moments,
-                    )?;
-                    f_uv_dir[[u, v]] += dir_val;
-                    if u != v {
-                        f_uv_dir[[v, u]] += dir_val;
-                    }
+                f_u[u] += acc.f_u[u];
+                f_au[u] += acc.f_au[u];
+                f_au_dir[u] += acc.f_au_dir[u];
+                for v in 0..p {
+                    f_uv[[u, v]] += acc.f_uv[u * p + v];
+                    f_uv_dir[[u, v]] += acc.f_uv_dir[u * p + v];
                 }
             }
         }
@@ -5909,111 +6208,18 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
 
-        // D_u_dir: directional derivative of the density normalization first derivative
-        let mut d_u_dir = Array1::<f64>::zeros(p);
-        for cell_entry in &cached.cells {
-            let cell = cell_entry.partition_cell.cell;
-            let state_ref = &cell_entry.state;
-            let fixed = &cell_entry.fixed;
-            let eta_poly = vec![cell.c0, cell.c1, cell.c2, cell.c3];
-            let chi_poly = fixed.dc_da.to_vec();
-            let eta_aa_poly = fixed.dc_daa.to_vec();
-
-            let mut eta_u_poly = vec![PolyVec::new(); p];
-            let mut chi_u_poly = vec![PolyVec::new(); p];
-            for u in 0..p {
-                eta_u_poly[u] =
-                    poly_add(&poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u].to_vec());
-                chi_u_poly[u] = poly_add(
-                    &poly_scale(&eta_aa_poly, a_u[u]),
-                    &fixed.coeff_au[u].to_vec(),
-                );
-            }
-
-            let mut coeff_dir_poly = vec![0.0; 4];
-            let mut coeff_a_dir_poly = vec![0.0; 4];
-            for c in 0..p {
-                if dir[c] == 0.0 {
-                    continue;
-                }
-                for k in 0..4 {
-                    coeff_dir_poly[k] += fixed.coeff_u[c][k] * dir[c];
-                    coeff_a_dir_poly[k] += fixed.coeff_au[c][k] * dir[c];
-                }
-            }
-            let eta_dir_poly = poly_add(&poly_scale(&chi_poly, a_dir), &coeff_dir_poly);
-
-            for u in 0..p {
-                let mut eta_u_dir_fixed = vec![0.0; 4];
-                let mut chi_u_dir_fixed = vec![0.0; 4];
-                for c in 0..p {
-                    if dir[c] == 0.0 {
-                        continue;
-                    }
-                    let sc = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, u, c);
-                    let sca = self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, u, c);
-                    for k in 0..4 {
-                        eta_u_dir_fixed[k] += sc[k] * dir[c];
-                        chi_u_dir_fixed[k] += sca[k] * dir[c];
-                    }
-                }
-                let eta_u_dir_poly = poly_add(
-                    &poly_add(
-                        &poly_scale(&chi_poly, a_u_dir[u]),
-                        &poly_scale(&eta_aa_poly, a_u[u] * a_dir),
-                    ),
-                    &eta_u_dir_fixed,
-                );
-                let eta_aaa_poly = fixed.dc_daaa.to_vec();
-                let chi_u_dir_poly = poly_add(
-                    &poly_add(
-                        &poly_scale(&eta_aa_poly, a_u_dir[u]),
-                        &poly_scale(&eta_aaa_poly, a_u[u] * a_dir),
-                    ),
-                    &chi_u_dir_fixed,
-                );
-
-                // D_u integrand: chi_u - chi * eta * eta_u
-                let integrand_base = poly_sub(
-                    &chi_u_poly[u],
-                    &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_poly[u]),
-                );
-                // Polynomial derivative of integrand w.r.t. dir
-                let integrand_dir = poly_sub(
-                    &poly_sub(
-                        &poly_sub(
-                            &chi_u_dir_poly,
-                            &poly_mul(&poly_mul(&coeff_a_dir_poly, &eta_poly), &eta_u_poly[u]),
-                        ),
-                        &poly_mul(&poly_mul(&chi_poly, &eta_dir_poly), &eta_u_poly[u]),
-                    ),
-                    &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_dir_poly),
-                );
-                // Moment-weighting correction: -eta*eta_dir * integrand_base
-                let full_integrand = poly_sub(
-                    &integrand_dir,
-                    &poly_mul(&poly_mul(&eta_poly, &eta_dir_poly), &integrand_base),
-                );
-
-                d_u_dir[u] += exact_kernel::cell_polynomial_integral_from_moments(
-                    &full_integrand,
-                    &state_ref.moments,
-                    "survival D_t first derivative directional",
-                )?;
-            }
-        }
-
-        // D_uv_dir
-        let mut d_uv_dir = Array2::<f64>::zeros((p, p));
-        if need_d_uv_dir {
-            for cell_entry in &cached.cells {
+        // D_u_dir: directional derivative of the density normalization first derivative.
+        let d_u_dir_cell_accums = cached
+            .cells
+            .par_iter()
+            .map(|cell_entry| -> Result<Array1<f64>, String> {
+                let mut d_u_dir = Array1::<f64>::zeros(p);
                 let cell = cell_entry.partition_cell.cell;
                 let state_ref = &cell_entry.state;
                 let fixed = &cell_entry.fixed;
                 let eta_poly = vec![cell.c0, cell.c1, cell.c2, cell.c3];
                 let chi_poly = fixed.dc_da.to_vec();
                 let eta_aa_poly = fixed.dc_daa.to_vec();
-                let eta_aaa_poly = fixed.dc_daaa.to_vec();
 
                 let mut eta_u_poly = vec![PolyVec::new(); p];
                 let mut chi_u_poly = vec![PolyVec::new(); p];
@@ -6025,6 +6231,7 @@ impl SurvivalMarginalSlopeFamily {
                         &fixed.coeff_au[u].to_vec(),
                     );
                 }
+
                 let mut coeff_dir_poly = vec![0.0; 4];
                 let mut coeff_a_dir_poly = vec![0.0; 4];
                 for c in 0..p {
@@ -6037,288 +6244,413 @@ impl SurvivalMarginalSlopeFamily {
                     }
                 }
                 let eta_dir_poly = poly_add(&poly_scale(&chi_poly, a_dir), &coeff_dir_poly);
-                let chi_dir_poly = poly_add(&poly_scale(&eta_aa_poly, a_dir), &coeff_a_dir_poly);
 
                 for u in 0..p {
-                    for v in u..p {
-                        let r_uv_fixed = if u == primary.g {
-                            fixed.coeff_bu[v].to_vec()
-                        } else if v == primary.g {
-                            fixed.coeff_bu[u].to_vec()
-                        } else {
-                            vec![0.0; 4]
-                        };
-
-                        let eta_uv_poly = poly_add(
-                            &poly_add(
-                                &poly_add(
-                                    &poly_scale(&chi_poly, a_uv[[u, v]]),
-                                    &poly_scale(&eta_aa_poly, a_u[u] * a_u[v]),
-                                ),
-                                &poly_scale(&fixed.coeff_au[u].to_vec(), a_u[v]),
-                            ),
-                            &poly_add(
-                                &poly_scale(&fixed.coeff_au[v].to_vec(), a_u[u]),
-                                &r_uv_fixed,
-                            ),
-                        );
-
-                        // D_uv integrand: 5 terms
-                        let t1 = poly_add(
-                            &poly_add(
-                                &poly_scale(&eta_aa_poly, a_uv[[u, v]]),
-                                &poly_scale(&eta_aaa_poly, a_u[u] * a_u[v]),
-                            ),
-                            &poly_add(
-                                &poly_scale(&fixed.coeff_aau[u].to_vec(), a_u[v]),
-                                &poly_add(
-                                    &poly_scale(&fixed.coeff_aau[v].to_vec(), a_u[u]),
-                                    &if u == primary.g {
-                                        fixed.coeff_abu[v].to_vec()
-                                    } else if v == primary.g {
-                                        fixed.coeff_abu[u].to_vec()
-                                    } else {
-                                        vec![0.0; 4]
-                                    },
-                                ),
-                            ),
-                        );
-                        let t2 = poly_scale(
-                            &poly_mul(&poly_mul(&chi_u_poly[v], &eta_poly), &eta_u_poly[u]),
-                            -1.0,
-                        );
-                        let t3 = poly_scale(
-                            &poly_mul(&poly_mul(&chi_u_poly[u], &eta_poly), &eta_u_poly[v]),
-                            -1.0,
-                        );
-                        let t4 = poly_scale(
-                            &poly_mul(
-                                &chi_poly,
-                                &poly_add(
-                                    &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
-                                    &poly_mul(&eta_poly, &eta_uv_poly),
-                                ),
-                            ),
-                            -1.0,
-                        );
-                        let t5 = poly_mul(
-                            &chi_poly,
-                            &poly_mul(
-                                &poly_mul(&eta_poly, &eta_poly),
-                                &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
-                            ),
-                        );
-                        let i_base =
-                            poly_add(&poly_add(&poly_add(&t1, &t2), &t3), &poly_add(&t4, &t5));
-
-                        // Polynomial dir-derivatives of per-u quantities
-                        let mut eu_dir_fixed_u = vec![0.0; 4];
-                        let mut eu_dir_fixed_v = vec![0.0; 4];
-                        let mut cu_dir_fixed_u = vec![0.0; 4];
-                        let mut cu_dir_fixed_v = vec![0.0; 4];
-                        for c in 0..p {
-                            if dir[c] == 0.0 {
-                                continue;
-                            }
-                            let sc_u = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, u, c);
-                            let sc_v = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, v, c);
-                            let sca_u =
-                                self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, u, c);
-                            let sca_v =
-                                self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, v, c);
-                            for k in 0..4 {
-                                eu_dir_fixed_u[k] += sc_u[k] * dir[c];
-                                eu_dir_fixed_v[k] += sc_v[k] * dir[c];
-                                cu_dir_fixed_u[k] += sca_u[k] * dir[c];
-                                cu_dir_fixed_v[k] += sca_v[k] * dir[c];
-                            }
+                    let mut eta_u_dir_fixed = vec![0.0; 4];
+                    let mut chi_u_dir_fixed = vec![0.0; 4];
+                    for c in 0..p {
+                        if dir[c] == 0.0 {
+                            continue;
                         }
-                        let eta_u_dir_poly_u = poly_add(
-                            &poly_add(
-                                &poly_scale(&chi_poly, a_u_dir[u]),
-                                &poly_scale(&eta_aa_poly, a_u[u] * a_dir),
-                            ),
-                            &eu_dir_fixed_u,
-                        );
-                        let eta_u_dir_poly_v = poly_add(
-                            &poly_add(
-                                &poly_scale(&chi_poly, a_u_dir[v]),
-                                &poly_scale(&eta_aa_poly, a_u[v] * a_dir),
-                            ),
-                            &eu_dir_fixed_v,
-                        );
-                        let chi_u_dir_poly_u = poly_add(
-                            &poly_add(
-                                &poly_scale(&eta_aa_poly, a_u_dir[u]),
-                                &poly_scale(&eta_aaa_poly, a_u[u] * a_dir),
-                            ),
-                            &cu_dir_fixed_u,
-                        );
-                        let chi_u_dir_poly_v = poly_add(
-                            &poly_add(
-                                &poly_scale(&eta_aa_poly, a_u_dir[v]),
-                                &poly_scale(&eta_aaa_poly, a_u[v] * a_dir),
-                            ),
-                            &cu_dir_fixed_v,
-                        );
-                        let eta_uv_dir_poly = poly_add(
-                            &poly_add(
-                                &poly_scale(&chi_poly, a_uv_dir[[u, v]]),
-                                &poly_scale(
-                                    &eta_aa_poly,
-                                    a_u_dir[u] * a_u[v]
-                                        + a_u[u] * a_u_dir[v]
-                                        + a_uv[[u, v]] * a_dir,
-                                ),
-                            ),
-                            &poly_add(
-                                &poly_add(
-                                    &poly_scale(&fixed.coeff_au[u].to_vec(), a_u_dir[v]),
-                                    &poly_scale(&fixed.coeff_au[v].to_vec(), a_u_dir[u]),
-                                ),
-                                &{
-                                    let mut fp = vec![0.0; 4];
-                                    for c in 0..p {
-                                        if dir[c] == 0.0 {
-                                            continue;
-                                        }
-                                        let sca_u = self.cell_pair_third_coeff_a(
-                                            primary,
-                                            &fixed.coeff_abu,
-                                            u,
-                                            c,
-                                        );
-                                        let sca_v = self.cell_pair_third_coeff_a(
-                                            primary,
-                                            &fixed.coeff_abu,
-                                            v,
-                                            c,
-                                        );
-                                        for k in 0..4 {
-                                            fp[k] += sca_u[k] * dir[c] * a_u[v]
-                                                + sca_v[k] * dir[c] * a_u[u];
-                                        }
-                                    }
-                                    fp
-                                },
-                            ),
-                        );
+                        let sc = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, u, c);
+                        let sca = self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, u, c);
+                        for k in 0..4 {
+                            eta_u_dir_fixed[k] += sc[k] * dir[c];
+                            chi_u_dir_fixed[k] += sca[k] * dir[c];
+                        }
+                    }
+                    let eta_u_dir_poly = poly_add(
+                        &poly_add(
+                            &poly_scale(&chi_poly, a_u_dir[u]),
+                            &poly_scale(&eta_aa_poly, a_u[u] * a_dir),
+                        ),
+                        &eta_u_dir_fixed,
+                    );
+                    let eta_aaa_poly = fixed.dc_daaa.to_vec();
+                    let chi_u_dir_poly = poly_add(
+                        &poly_add(
+                            &poly_scale(&eta_aa_poly, a_u_dir[u]),
+                            &poly_scale(&eta_aaa_poly, a_u[u] * a_dir),
+                        ),
+                        &chi_u_dir_fixed,
+                    );
 
-                        // Differentiate each of the 5 integrand terms
-                        let t1_dir = poly_add(
-                            &poly_add(
-                                &poly_scale(&eta_aa_poly, a_uv_dir[[u, v]]),
-                                &poly_scale(
-                                    &eta_aaa_poly,
-                                    a_u_dir[u] * a_u[v]
-                                        + a_u[u] * a_u_dir[v]
-                                        + a_uv[[u, v]] * a_dir,
-                                ),
+                    // D_u integrand: chi_u - chi * eta * eta_u
+                    let integrand_base = poly_sub(
+                        &chi_u_poly[u],
+                        &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_poly[u]),
+                    );
+                    // Polynomial derivative of integrand w.r.t. dir
+                    let integrand_dir = poly_sub(
+                        &poly_sub(
+                            &poly_sub(
+                                &chi_u_dir_poly,
+                                &poly_mul(&poly_mul(&coeff_a_dir_poly, &eta_poly), &eta_u_poly[u]),
                             ),
-                            &poly_add(
-                                &poly_scale(&fixed.coeff_aau[u].to_vec(), a_u_dir[v]),
-                                &poly_scale(&fixed.coeff_aau[v].to_vec(), a_u_dir[u]),
-                            ),
+                            &poly_mul(&poly_mul(&chi_poly, &eta_dir_poly), &eta_u_poly[u]),
+                        ),
+                        &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_dir_poly),
+                    );
+                    // Moment-weighting correction: -eta*eta_dir * integrand_base
+                    let full_integrand = poly_sub(
+                        &integrand_dir,
+                        &poly_mul(&poly_mul(&eta_poly, &eta_dir_poly), &integrand_base),
+                    );
+
+                    d_u_dir[u] += exact_kernel::cell_polynomial_integral_from_moments(
+                        &full_integrand,
+                        &state_ref.moments,
+                        "survival D_t first derivative directional",
+                    )?;
+                }
+                Ok(d_u_dir)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut d_u_dir = Array1::<f64>::zeros(p);
+        for cell_d_u_dir in d_u_dir_cell_accums {
+            for u in 0..p {
+                d_u_dir[u] += cell_d_u_dir[u];
+            }
+        }
+
+        // D_uv_dir
+        let mut d_uv_dir = Array2::<f64>::zeros((p, p));
+        if need_d_uv_dir {
+            let d_uv_dir_cell_accums = cached
+                .cells
+                .par_iter()
+                .map(|cell_entry| -> Result<Array2<f64>, String> {
+                    let mut d_uv_dir = Array2::<f64>::zeros((p, p));
+                    let cell = cell_entry.partition_cell.cell;
+                    let state_ref = &cell_entry.state;
+                    let fixed = &cell_entry.fixed;
+                    let eta_poly = vec![cell.c0, cell.c1, cell.c2, cell.c3];
+                    let chi_poly = fixed.dc_da.to_vec();
+                    let eta_aa_poly = fixed.dc_daa.to_vec();
+                    let eta_aaa_poly = fixed.dc_daaa.to_vec();
+
+                    let mut eta_u_poly = vec![PolyVec::new(); p];
+                    let mut chi_u_poly = vec![PolyVec::new(); p];
+                    for u in 0..p {
+                        eta_u_poly[u] =
+                            poly_add(&poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u].to_vec());
+                        chi_u_poly[u] = poly_add(
+                            &poly_scale(&eta_aa_poly, a_u[u]),
+                            &fixed.coeff_au[u].to_vec(),
                         );
-                        let t2_dir = poly_scale(
-                            &poly_add(
+                    }
+                    let mut coeff_dir_poly = vec![0.0; 4];
+                    let mut coeff_a_dir_poly = vec![0.0; 4];
+                    for c in 0..p {
+                        if dir[c] == 0.0 {
+                            continue;
+                        }
+                        for k in 0..4 {
+                            coeff_dir_poly[k] += fixed.coeff_u[c][k] * dir[c];
+                            coeff_a_dir_poly[k] += fixed.coeff_au[c][k] * dir[c];
+                        }
+                    }
+                    let eta_dir_poly = poly_add(&poly_scale(&chi_poly, a_dir), &coeff_dir_poly);
+                    let chi_dir_poly =
+                        poly_add(&poly_scale(&eta_aa_poly, a_dir), &coeff_a_dir_poly);
+
+                    for u in 0..p {
+                        for v in u..p {
+                            let r_uv_fixed = if u == primary.g {
+                                fixed.coeff_bu[v].to_vec()
+                            } else if v == primary.g {
+                                fixed.coeff_bu[u].to_vec()
+                            } else {
+                                vec![0.0; 4]
+                            };
+
+                            let eta_uv_poly = poly_add(
                                 &poly_add(
-                                    &poly_mul(
-                                        &poly_mul(&chi_u_dir_poly_v, &eta_poly),
-                                        &eta_u_poly[u],
+                                    &poly_add(
+                                        &poly_scale(&chi_poly, a_uv[[u, v]]),
+                                        &poly_scale(&eta_aa_poly, a_u[u] * a_u[v]),
                                     ),
-                                    &poly_mul(
-                                        &poly_mul(&chi_u_poly[v], &eta_dir_poly),
-                                        &eta_u_poly[u],
-                                    ),
+                                    &poly_scale(&fixed.coeff_au[u].to_vec(), a_u[v]),
                                 ),
-                                &poly_mul(&poly_mul(&chi_u_poly[v], &eta_poly), &eta_u_dir_poly_u),
-                            ),
-                            -1.0,
-                        );
-                        let t3_dir = poly_scale(
-                            &poly_add(
                                 &poly_add(
-                                    &poly_mul(
-                                        &poly_mul(&chi_u_dir_poly_u, &eta_poly),
-                                        &eta_u_poly[v],
-                                    ),
-                                    &poly_mul(
-                                        &poly_mul(&chi_u_poly[u], &eta_dir_poly),
-                                        &eta_u_poly[v],
+                                    &poly_scale(&fixed.coeff_au[v].to_vec(), a_u[u]),
+                                    &r_uv_fixed,
+                                ),
+                            );
+
+                            // D_uv integrand: 5 terms
+                            let t1 = poly_add(
+                                &poly_add(
+                                    &poly_scale(&eta_aa_poly, a_uv[[u, v]]),
+                                    &poly_scale(&eta_aaa_poly, a_u[u] * a_u[v]),
+                                ),
+                                &poly_add(
+                                    &poly_scale(&fixed.coeff_aau[u].to_vec(), a_u[v]),
+                                    &poly_add(
+                                        &poly_scale(&fixed.coeff_aau[v].to_vec(), a_u[u]),
+                                        &if u == primary.g {
+                                            fixed.coeff_abu[v].to_vec()
+                                        } else if v == primary.g {
+                                            fixed.coeff_abu[u].to_vec()
+                                        } else {
+                                            vec![0.0; 4]
+                                        },
                                     ),
                                 ),
-                                &poly_mul(&poly_mul(&chi_u_poly[u], &eta_poly), &eta_u_dir_poly_v),
-                            ),
-                            -1.0,
-                        );
-                        let t4_dir = poly_scale(
-                            &poly_add(
+                            );
+                            let t2 = poly_scale(
+                                &poly_mul(&poly_mul(&chi_u_poly[v], &eta_poly), &eta_u_poly[u]),
+                                -1.0,
+                            );
+                            let t3 = poly_scale(
+                                &poly_mul(&poly_mul(&chi_u_poly[u], &eta_poly), &eta_u_poly[v]),
+                                -1.0,
+                            );
+                            let t4 = poly_scale(
                                 &poly_mul(
-                                    &chi_dir_poly,
+                                    &chi_poly,
                                     &poly_add(
                                         &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
                                         &poly_mul(&eta_poly, &eta_uv_poly),
                                     ),
                                 ),
-                                &poly_mul(
-                                    &chi_poly,
-                                    &poly_add(
-                                        &poly_add(
-                                            &poly_mul(&eta_u_dir_poly_u, &eta_u_poly[v]),
-                                            &poly_mul(&eta_u_poly[u], &eta_u_dir_poly_v),
-                                        ),
-                                        &poly_add(
-                                            &poly_mul(&eta_dir_poly, &eta_uv_poly),
-                                            &poly_mul(&eta_poly, &eta_uv_dir_poly),
-                                        ),
-                                    ),
-                                ),
-                            ),
-                            -1.0,
-                        );
-                        let t5_dir = poly_add(
-                            &poly_mul(
-                                &chi_dir_poly,
+                                -1.0,
+                            );
+                            let t5 = poly_mul(
+                                &chi_poly,
                                 &poly_mul(
                                     &poly_mul(&eta_poly, &eta_poly),
                                     &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
                                 ),
-                            ),
-                            &poly_mul(
-                                &chi_poly,
+                            );
+                            let i_base =
+                                poly_add(&poly_add(&poly_add(&t1, &t2), &t3), &poly_add(&t4, &t5));
+
+                            // Polynomial dir-derivatives of per-u quantities
+                            let mut eu_dir_fixed_u = vec![0.0; 4];
+                            let mut eu_dir_fixed_v = vec![0.0; 4];
+                            let mut cu_dir_fixed_u = vec![0.0; 4];
+                            let mut cu_dir_fixed_v = vec![0.0; 4];
+                            for c in 0..p {
+                                if dir[c] == 0.0 {
+                                    continue;
+                                }
+                                let sc_u =
+                                    self.cell_pair_second_coeff(primary, &fixed.coeff_bu, u, c);
+                                let sc_v =
+                                    self.cell_pair_second_coeff(primary, &fixed.coeff_bu, v, c);
+                                let sca_u =
+                                    self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, u, c);
+                                let sca_v =
+                                    self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, v, c);
+                                for k in 0..4 {
+                                    eu_dir_fixed_u[k] += sc_u[k] * dir[c];
+                                    eu_dir_fixed_v[k] += sc_v[k] * dir[c];
+                                    cu_dir_fixed_u[k] += sca_u[k] * dir[c];
+                                    cu_dir_fixed_v[k] += sca_v[k] * dir[c];
+                                }
+                            }
+                            let eta_u_dir_poly_u = poly_add(
                                 &poly_add(
-                                    &poly_mul(
-                                        &poly_scale(&poly_mul(&eta_dir_poly, &eta_poly), 2.0),
-                                        &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
+                                    &poly_scale(&chi_poly, a_u_dir[u]),
+                                    &poly_scale(&eta_aa_poly, a_u[u] * a_dir),
+                                ),
+                                &eu_dir_fixed_u,
+                            );
+                            let eta_u_dir_poly_v = poly_add(
+                                &poly_add(
+                                    &poly_scale(&chi_poly, a_u_dir[v]),
+                                    &poly_scale(&eta_aa_poly, a_u[v] * a_dir),
+                                ),
+                                &eu_dir_fixed_v,
+                            );
+                            let chi_u_dir_poly_u = poly_add(
+                                &poly_add(
+                                    &poly_scale(&eta_aa_poly, a_u_dir[u]),
+                                    &poly_scale(&eta_aaa_poly, a_u[u] * a_dir),
+                                ),
+                                &cu_dir_fixed_u,
+                            );
+                            let chi_u_dir_poly_v = poly_add(
+                                &poly_add(
+                                    &poly_scale(&eta_aa_poly, a_u_dir[v]),
+                                    &poly_scale(&eta_aaa_poly, a_u[v] * a_dir),
+                                ),
+                                &cu_dir_fixed_v,
+                            );
+                            let eta_uv_dir_poly = poly_add(
+                                &poly_add(
+                                    &poly_scale(&chi_poly, a_uv_dir[[u, v]]),
+                                    &poly_scale(
+                                        &eta_aa_poly,
+                                        a_u_dir[u] * a_u[v]
+                                            + a_u[u] * a_u_dir[v]
+                                            + a_uv[[u, v]] * a_dir,
+                                    ),
+                                ),
+                                &poly_add(
+                                    &poly_add(
+                                        &poly_scale(&fixed.coeff_au[u].to_vec(), a_u_dir[v]),
+                                        &poly_scale(&fixed.coeff_au[v].to_vec(), a_u_dir[u]),
+                                    ),
+                                    &{
+                                        let mut fp = vec![0.0; 4];
+                                        for c in 0..p {
+                                            if dir[c] == 0.0 {
+                                                continue;
+                                            }
+                                            let sca_u = self.cell_pair_third_coeff_a(
+                                                primary,
+                                                &fixed.coeff_abu,
+                                                u,
+                                                c,
+                                            );
+                                            let sca_v = self.cell_pair_third_coeff_a(
+                                                primary,
+                                                &fixed.coeff_abu,
+                                                v,
+                                                c,
+                                            );
+                                            for k in 0..4 {
+                                                fp[k] += sca_u[k] * dir[c] * a_u[v]
+                                                    + sca_v[k] * dir[c] * a_u[u];
+                                            }
+                                        }
+                                        fp
+                                    },
+                                ),
+                            );
+
+                            // Differentiate each of the 5 integrand terms
+                            let t1_dir = poly_add(
+                                &poly_add(
+                                    &poly_scale(&eta_aa_poly, a_uv_dir[[u, v]]),
+                                    &poly_scale(
+                                        &eta_aaa_poly,
+                                        a_u_dir[u] * a_u[v]
+                                            + a_u[u] * a_u_dir[v]
+                                            + a_uv[[u, v]] * a_dir,
+                                    ),
+                                ),
+                                &poly_add(
+                                    &poly_scale(&fixed.coeff_aau[u].to_vec(), a_u_dir[v]),
+                                    &poly_scale(&fixed.coeff_aau[v].to_vec(), a_u_dir[u]),
+                                ),
+                            );
+                            let t2_dir = poly_scale(
+                                &poly_add(
+                                    &poly_add(
+                                        &poly_mul(
+                                            &poly_mul(&chi_u_dir_poly_v, &eta_poly),
+                                            &eta_u_poly[u],
+                                        ),
+                                        &poly_mul(
+                                            &poly_mul(&chi_u_poly[v], &eta_dir_poly),
+                                            &eta_u_poly[u],
+                                        ),
                                     ),
                                     &poly_mul(
-                                        &poly_mul(&eta_poly, &eta_poly),
+                                        &poly_mul(&chi_u_poly[v], &eta_poly),
+                                        &eta_u_dir_poly_u,
+                                    ),
+                                ),
+                                -1.0,
+                            );
+                            let t3_dir = poly_scale(
+                                &poly_add(
+                                    &poly_add(
+                                        &poly_mul(
+                                            &poly_mul(&chi_u_dir_poly_u, &eta_poly),
+                                            &eta_u_poly[v],
+                                        ),
+                                        &poly_mul(
+                                            &poly_mul(&chi_u_poly[u], &eta_dir_poly),
+                                            &eta_u_poly[v],
+                                        ),
+                                    ),
+                                    &poly_mul(
+                                        &poly_mul(&chi_u_poly[u], &eta_poly),
+                                        &eta_u_dir_poly_v,
+                                    ),
+                                ),
+                                -1.0,
+                            );
+                            let t4_dir = poly_scale(
+                                &poly_add(
+                                    &poly_mul(
+                                        &chi_dir_poly,
                                         &poly_add(
-                                            &poly_mul(&eta_u_dir_poly_u, &eta_u_poly[v]),
-                                            &poly_mul(&eta_u_poly[u], &eta_u_dir_poly_v),
+                                            &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
+                                            &poly_mul(&eta_poly, &eta_uv_poly),
+                                        ),
+                                    ),
+                                    &poly_mul(
+                                        &chi_poly,
+                                        &poly_add(
+                                            &poly_add(
+                                                &poly_mul(&eta_u_dir_poly_u, &eta_u_poly[v]),
+                                                &poly_mul(&eta_u_poly[u], &eta_u_dir_poly_v),
+                                            ),
+                                            &poly_add(
+                                                &poly_mul(&eta_dir_poly, &eta_uv_poly),
+                                                &poly_mul(&eta_poly, &eta_uv_dir_poly),
+                                            ),
                                         ),
                                     ),
                                 ),
-                            ),
-                        );
+                                -1.0,
+                            );
+                            let t5_dir = poly_add(
+                                &poly_mul(
+                                    &chi_dir_poly,
+                                    &poly_mul(
+                                        &poly_mul(&eta_poly, &eta_poly),
+                                        &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
+                                    ),
+                                ),
+                                &poly_mul(
+                                    &chi_poly,
+                                    &poly_add(
+                                        &poly_mul(
+                                            &poly_scale(&poly_mul(&eta_dir_poly, &eta_poly), 2.0),
+                                            &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
+                                        ),
+                                        &poly_mul(
+                                            &poly_mul(&eta_poly, &eta_poly),
+                                            &poly_add(
+                                                &poly_mul(&eta_u_dir_poly_u, &eta_u_poly[v]),
+                                                &poly_mul(&eta_u_poly[u], &eta_u_dir_poly_v),
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                            );
 
-                        let i_base_dir = poly_add(
-                            &poly_add(&poly_add(&t1_dir, &t2_dir), &t3_dir),
-                            &poly_add(&t4_dir, &t5_dir),
-                        );
-                        let full_integrand = poly_sub(
-                            &i_base_dir,
-                            &poly_mul(&poly_mul(&eta_poly, &eta_dir_poly), &i_base),
-                        );
+                            let i_base_dir = poly_add(
+                                &poly_add(&poly_add(&t1_dir, &t2_dir), &t3_dir),
+                                &poly_add(&t4_dir, &t5_dir),
+                            );
+                            let full_integrand = poly_sub(
+                                &i_base_dir,
+                                &poly_mul(&poly_mul(&eta_poly, &eta_dir_poly), &i_base),
+                            );
 
-                        let value = exact_kernel::cell_polynomial_integral_from_moments(
-                            &full_integrand,
-                            &state_ref.moments,
-                            "survival D_t second derivative directional",
-                        )?;
-                        d_uv_dir[[u, v]] += value;
-                        d_uv_dir[[v, u]] = d_uv_dir[[u, v]];
+                            let value = exact_kernel::cell_polynomial_integral_from_moments(
+                                &full_integrand,
+                                &state_ref.moments,
+                                "survival D_t second derivative directional",
+                            )?;
+                            d_uv_dir[[u, v]] += value;
+                            d_uv_dir[[v, u]] = d_uv_dir[[u, v]];
+                        }
+                    }
+                    Ok(d_uv_dir)
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            for cell_d_uv_dir in d_uv_dir_cell_accums {
+                for u in 0..p {
+                    for v in 0..p {
+                        d_uv_dir[[u, v]] += cell_d_uv_dir[[u, v]];
                     }
                 }
             }
@@ -6370,6 +6702,353 @@ impl SurvivalMarginalSlopeFamily {
         let zero4 = [0.0; 4];
         let cached = self.build_cached_partition(primary, a, b, beta_h, beta_w)?;
 
+        struct BiDirectionalTimepointCellAccum {
+            f_a: f64,
+            f_aa: f64,
+            f_u: Array1<f64>,
+            f_au: Array1<f64>,
+            f_uv: Array2<f64>,
+            f_a_d1: f64,
+            f_aa_d1: f64,
+            f_au_d1: Array1<f64>,
+            f_uv_d1: Array2<f64>,
+            f_a_d2: f64,
+            f_aa_d2: f64,
+            f_au_d2: Array1<f64>,
+            f_uv_d2: Array2<f64>,
+            f_a_d12: f64,
+            f_aa_d12: f64,
+            f_au_d12: Array1<f64>,
+            f_uv_d12: Array2<f64>,
+        }
+
+        let cell_accums = cached
+            .cells
+            .par_iter()
+            .map(|ce| -> Result<BiDirectionalTimepointCellAccum, String> {
+                let mut f_a = 0.0f64;
+                let mut f_aa = 0.0f64;
+                let mut f_u = Array1::<f64>::zeros(p);
+                let mut f_au = Array1::<f64>::zeros(p);
+                let mut f_uv = Array2::<f64>::zeros((p, p));
+                let mut f_a_d1 = 0.0f64;
+                let mut f_aa_d1 = 0.0f64;
+                let mut f_au_d1 = Array1::<f64>::zeros(p);
+                let mut f_uv_d1 = Array2::<f64>::zeros((p, p));
+                let mut f_a_d2 = 0.0f64;
+                let mut f_aa_d2 = 0.0f64;
+                let mut f_au_d2 = Array1::<f64>::zeros(p);
+                let mut f_uv_d2 = Array2::<f64>::zeros((p, p));
+                let mut f_a_d12 = 0.0f64;
+                let mut f_aa_d12 = 0.0f64;
+                let mut f_au_d12 = Array1::<f64>::zeros(p);
+                let mut f_uv_d12 = Array2::<f64>::zeros((p, p));
+                let nc = ce.neg_cell;
+                let st = &ce.state;
+                let fx = &ce.fixed;
+                let da = fx.dc_da.map(|v| -v);
+                let daa = fx.dc_daa.map(|v| -v);
+
+                f_a += exact_kernel::cell_first_derivative_from_moments(&da, &st.moments)?;
+                f_aa += exact_kernel::cell_second_derivative_from_moments(
+                    nc,
+                    &da,
+                    &da,
+                    &daa,
+                    &st.moments,
+                )?;
+
+                let mut cd1 = [0.0; 4];
+                let mut ca1 = [0.0; 4];
+                let mut caa1 = [0.0; 4];
+                let mut cd2 = [0.0; 4];
+                let mut ca2 = [0.0; 4];
+                let mut caa2 = [0.0; 4];
+                let mut cd12 = [0.0; 4];
+                let mut ca12 = [0.0; 4];
+                for c in 0..p {
+                    for k in 0..4 {
+                        if dir1[c] != 0.0 {
+                            cd1[k] -= fx.coeff_u[c][k] * dir1[c];
+                            ca1[k] -= fx.coeff_au[c][k] * dir1[c];
+                            caa1[k] -= fx.coeff_aau[c][k] * dir1[c];
+                        }
+                        if dir2[c] != 0.0 {
+                            cd2[k] -= fx.coeff_u[c][k] * dir2[c];
+                            ca2[k] -= fx.coeff_au[c][k] * dir2[c];
+                            caa2[k] -= fx.coeff_aau[c][k] * dir2[c];
+                        }
+                    }
+                }
+                for c1 in 0..p {
+                    if dir1[c1] == 0.0 {
+                        continue;
+                    }
+                    for c2 in 0..p {
+                        if dir2[c2] == 0.0 {
+                            continue;
+                        }
+                        let sc = self.cell_pair_second_coeff(primary, &fx.coeff_bu, c1, c2);
+                        let sca = self.cell_pair_third_coeff_a(primary, &fx.coeff_abu, c1, c2);
+                        for k in 0..4 {
+                            cd12[k] -= sc[k] * dir1[c1] * dir2[c2];
+                            ca12[k] -= sca[k] * dir1[c1] * dir2[c2];
+                        }
+                    }
+                }
+
+                f_a_d1 += exact_kernel::cell_second_derivative_from_moments(
+                    nc,
+                    &da,
+                    &cd1,
+                    &ca1,
+                    &st.moments,
+                )?;
+                f_a_d2 += exact_kernel::cell_second_derivative_from_moments(
+                    nc,
+                    &da,
+                    &cd2,
+                    &ca2,
+                    &st.moments,
+                )?;
+                f_a_d12 += exact_kernel::cell_third_derivative_from_moments(
+                    nc,
+                    &da,
+                    &cd1,
+                    &cd2,
+                    &ca1,
+                    &ca2,
+                    &cd12,
+                    &ca12,
+                    &st.moments,
+                )?;
+                f_aa_d1 += exact_kernel::cell_third_derivative_from_moments(
+                    nc,
+                    &da,
+                    &da,
+                    &cd1,
+                    &daa,
+                    &ca1,
+                    &ca1,
+                    &caa1,
+                    &st.moments,
+                )?;
+                f_aa_d2 += exact_kernel::cell_third_derivative_from_moments(
+                    nc,
+                    &da,
+                    &da,
+                    &cd2,
+                    &daa,
+                    &ca2,
+                    &ca2,
+                    &caa2,
+                    &st.moments,
+                )?;
+                f_aa_d12 += exact_kernel::cell_fourth_derivative_from_moments(
+                    nc,
+                    &da,
+                    &da,
+                    &cd1,
+                    &cd2,
+                    &daa,
+                    &ca1,
+                    &ca2,
+                    &ca1,
+                    &ca2,
+                    &cd12,
+                    &caa1,
+                    &caa2,
+                    &[0.0; 4],
+                    &[0.0; 4],
+                    &[0.0; 4],
+                    &st.moments,
+                )?;
+
+                for u in 0..p {
+                    let cu = fx.coeff_u[u].map(|v| -v);
+                    let cau = fx.coeff_au[u].map(|v| -v);
+                    f_u[u] += exact_kernel::cell_first_derivative_from_moments(&cu, &st.moments)?;
+                    f_au[u] += exact_kernel::cell_second_derivative_from_moments(
+                        nc,
+                        &da,
+                        &cu,
+                        &cau,
+                        &st.moments,
+                    )?;
+                    let mut cu1 = [0.0; 4];
+                    let mut cau1 = [0.0; 4];
+                    let mut cu2 = [0.0; 4];
+                    let mut cau2 = [0.0; 4];
+                    for c in 0..p {
+                        let sc = self.cell_pair_second_coeff(primary, &fx.coeff_bu, u, c);
+                        let sca = self.cell_pair_third_coeff_a(primary, &fx.coeff_abu, u, c);
+                        for k in 0..4 {
+                            if dir1[c] != 0.0 {
+                                cu1[k] -= sc[k] * dir1[c];
+                                cau1[k] -= sca[k] * dir1[c];
+                            }
+                            if dir2[c] != 0.0 {
+                                cu2[k] -= sc[k] * dir2[c];
+                                cau2[k] -= sca[k] * dir2[c];
+                            }
+                        }
+                    }
+                    f_au_d1[u] += exact_kernel::cell_third_derivative_from_moments(
+                        nc,
+                        &da,
+                        &cu,
+                        &cd1,
+                        &cau,
+                        &ca1,
+                        &cu1,
+                        &cau1,
+                        &st.moments,
+                    )?;
+                    f_au_d2[u] += exact_kernel::cell_third_derivative_from_moments(
+                        nc,
+                        &da,
+                        &cu,
+                        &cd2,
+                        &cau,
+                        &ca2,
+                        &cu2,
+                        &cau2,
+                        &st.moments,
+                    )?;
+                    f_au_d12[u] += exact_kernel::cell_fourth_derivative_from_moments(
+                        nc,
+                        &da,
+                        &cu,
+                        &cd1,
+                        &cd2,
+                        &cau,
+                        &ca1,
+                        &ca2,
+                        &cu1,
+                        &cu2,
+                        &cd12,
+                        &[0.0; 4],
+                        &[0.0; 4],
+                        &[0.0; 4],
+                        &[0.0; 4],
+                        &[0.0; 4],
+                        &st.moments,
+                    )?;
+                }
+                for u in 0..p {
+                    for v in u..p {
+                        let cu = fx.coeff_u[u].map(|x| -x);
+                        let cv = fx.coeff_u[v].map(|x| -x);
+                        let sc = self
+                            .cell_pair_second_coeff(primary, &fx.coeff_bu, u, v)
+                            .map(|x| -x);
+                        let bv = exact_kernel::cell_second_derivative_from_moments(
+                            nc,
+                            &cu,
+                            &cv,
+                            &sc,
+                            &st.moments,
+                        )?;
+                        f_uv[[u, v]] += bv;
+                        if u != v {
+                            f_uv[[v, u]] += bv;
+                        }
+                        let mut cu1 = [0.0; 4];
+                        let mut cv1 = [0.0; 4];
+                        let mut cu2 = [0.0; 4];
+                        let mut cv2 = [0.0; 4];
+                        for c in 0..p {
+                            let suc = self.cell_pair_second_coeff(primary, &fx.coeff_bu, u, c);
+                            let svc = self.cell_pair_second_coeff(primary, &fx.coeff_bu, v, c);
+                            for k in 0..4 {
+                                if dir1[c] != 0.0 {
+                                    cu1[k] -= suc[k] * dir1[c];
+                                    cv1[k] -= svc[k] * dir1[c];
+                                }
+                                if dir2[c] != 0.0 {
+                                    cu2[k] -= suc[k] * dir2[c];
+                                    cv2[k] -= svc[k] * dir2[c];
+                                }
+                            }
+                        }
+                        let d1v = exact_kernel::cell_third_derivative_from_moments(
+                            nc,
+                            &cu,
+                            &cv,
+                            &cd1,
+                            &sc,
+                            &cu1,
+                            &cv1,
+                            &[0.0; 4],
+                            &st.moments,
+                        )?;
+                        f_uv_d1[[u, v]] += d1v;
+                        if u != v {
+                            f_uv_d1[[v, u]] += d1v;
+                        }
+                        let d2v = exact_kernel::cell_third_derivative_from_moments(
+                            nc,
+                            &cu,
+                            &cv,
+                            &cd2,
+                            &sc,
+                            &cu2,
+                            &cv2,
+                            &[0.0; 4],
+                            &st.moments,
+                        )?;
+                        f_uv_d2[[u, v]] += d2v;
+                        if u != v {
+                            f_uv_d2[[v, u]] += d2v;
+                        }
+                        let d12v = exact_kernel::cell_fourth_derivative_from_moments(
+                            nc,
+                            &cu,
+                            &cv,
+                            &cd1,
+                            &cd2,
+                            &sc,
+                            &cu1,
+                            &cu2,
+                            &cv1,
+                            &cv2,
+                            &cd12,
+                            &[0.0; 4],
+                            &[0.0; 4],
+                            &[0.0; 4],
+                            &[0.0; 4],
+                            &[0.0; 4],
+                            &st.moments,
+                        )?;
+                        f_uv_d12[[u, v]] += d12v;
+                        if u != v {
+                            f_uv_d12[[v, u]] += d12v;
+                        }
+                    }
+                }
+
+                Ok(BiDirectionalTimepointCellAccum {
+                    f_a,
+                    f_aa,
+                    f_u,
+                    f_au,
+                    f_uv,
+                    f_a_d1,
+                    f_aa_d1,
+                    f_au_d1,
+                    f_uv_d1,
+                    f_a_d2,
+                    f_aa_d2,
+                    f_au_d2,
+                    f_uv_d2,
+                    f_a_d12,
+                    f_aa_d12,
+                    f_au_d12,
+                    f_uv_d12,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
         let mut f_a = 0.0f64;
         let mut f_aa = 0.0f64;
         let mut f_u = Array1::<f64>::zeros(p);
@@ -6388,283 +7067,26 @@ impl SurvivalMarginalSlopeFamily {
         let mut f_au_d12 = Array1::<f64>::zeros(p);
         let mut f_uv_d12 = Array2::<f64>::zeros((p, p));
 
-        for ce in &cached.cells {
-            let nc = ce.neg_cell;
-            let st = &ce.state;
-            let fx = &ce.fixed;
-            let da = fx.dc_da.map(|v| -v);
-            let daa = fx.dc_daa.map(|v| -v);
-
-            f_a += exact_kernel::cell_first_derivative_from_moments(&da, &st.moments)?;
-            f_aa +=
-                exact_kernel::cell_second_derivative_from_moments(nc, &da, &da, &daa, &st.moments)?;
-
-            let mut cd1 = [0.0; 4];
-            let mut ca1 = [0.0; 4];
-            let mut caa1 = [0.0; 4];
-            let mut cd2 = [0.0; 4];
-            let mut ca2 = [0.0; 4];
-            let mut caa2 = [0.0; 4];
-            let mut cd12 = [0.0; 4];
-            let mut ca12 = [0.0; 4];
-            for c in 0..p {
-                for k in 0..4 {
-                    if dir1[c] != 0.0 {
-                        cd1[k] -= fx.coeff_u[c][k] * dir1[c];
-                        ca1[k] -= fx.coeff_au[c][k] * dir1[c];
-                        caa1[k] -= fx.coeff_aau[c][k] * dir1[c];
-                    }
-                    if dir2[c] != 0.0 {
-                        cd2[k] -= fx.coeff_u[c][k] * dir2[c];
-                        ca2[k] -= fx.coeff_au[c][k] * dir2[c];
-                        caa2[k] -= fx.coeff_aau[c][k] * dir2[c];
-                    }
-                }
-            }
-            for c1 in 0..p {
-                if dir1[c1] == 0.0 {
-                    continue;
-                }
-                for c2 in 0..p {
-                    if dir2[c2] == 0.0 {
-                        continue;
-                    }
-                    let sc = self.cell_pair_second_coeff(primary, &fx.coeff_bu, c1, c2);
-                    let sca = self.cell_pair_third_coeff_a(primary, &fx.coeff_abu, c1, c2);
-                    for k in 0..4 {
-                        cd12[k] -= sc[k] * dir1[c1] * dir2[c2];
-                        ca12[k] -= sca[k] * dir1[c1] * dir2[c2];
-                    }
-                }
-            }
-
-            f_a_d1 += exact_kernel::cell_second_derivative_from_moments(
-                nc,
-                &da,
-                &cd1,
-                &ca1,
-                &st.moments,
-            )?;
-            f_a_d2 += exact_kernel::cell_second_derivative_from_moments(
-                nc,
-                &da,
-                &cd2,
-                &ca2,
-                &st.moments,
-            )?;
-            f_a_d12 += exact_kernel::cell_third_derivative_from_moments(
-                nc,
-                &da,
-                &cd1,
-                &cd2,
-                &ca1,
-                &ca2,
-                &cd12,
-                &ca12,
-                &st.moments,
-            )?;
-            f_aa_d1 += exact_kernel::cell_third_derivative_from_moments(
-                nc,
-                &da,
-                &da,
-                &cd1,
-                &daa,
-                &ca1,
-                &ca1,
-                &caa1,
-                &st.moments,
-            )?;
-            f_aa_d2 += exact_kernel::cell_third_derivative_from_moments(
-                nc,
-                &da,
-                &da,
-                &cd2,
-                &daa,
-                &ca2,
-                &ca2,
-                &caa2,
-                &st.moments,
-            )?;
-            f_aa_d12 += exact_kernel::cell_fourth_derivative_from_moments(
-                nc,
-                &da,
-                &da,
-                &cd1,
-                &cd2,
-                &daa,
-                &ca1,
-                &ca2,
-                &ca1,
-                &ca2,
-                &cd12,
-                &caa1,
-                &caa2,
-                &[0.0; 4],
-                &[0.0; 4],
-                &[0.0; 4],
-                &st.moments,
-            )?;
-
+        for acc in cell_accums {
+            f_a += acc.f_a;
+            f_aa += acc.f_aa;
+            f_a_d1 += acc.f_a_d1;
+            f_aa_d1 += acc.f_aa_d1;
+            f_a_d2 += acc.f_a_d2;
+            f_aa_d2 += acc.f_aa_d2;
+            f_a_d12 += acc.f_a_d12;
+            f_aa_d12 += acc.f_aa_d12;
             for u in 0..p {
-                let cu = fx.coeff_u[u].map(|v| -v);
-                let cau = fx.coeff_au[u].map(|v| -v);
-                f_u[u] += exact_kernel::cell_first_derivative_from_moments(&cu, &st.moments)?;
-                f_au[u] += exact_kernel::cell_second_derivative_from_moments(
-                    nc,
-                    &da,
-                    &cu,
-                    &cau,
-                    &st.moments,
-                )?;
-                let mut cu1 = [0.0; 4];
-                let mut cau1 = [0.0; 4];
-                let mut cu2 = [0.0; 4];
-                let mut cau2 = [0.0; 4];
-                for c in 0..p {
-                    let sc = self.cell_pair_second_coeff(primary, &fx.coeff_bu, u, c);
-                    let sca = self.cell_pair_third_coeff_a(primary, &fx.coeff_abu, u, c);
-                    for k in 0..4 {
-                        if dir1[c] != 0.0 {
-                            cu1[k] -= sc[k] * dir1[c];
-                            cau1[k] -= sca[k] * dir1[c];
-                        }
-                        if dir2[c] != 0.0 {
-                            cu2[k] -= sc[k] * dir2[c];
-                            cau2[k] -= sca[k] * dir2[c];
-                        }
-                    }
-                }
-                f_au_d1[u] += exact_kernel::cell_third_derivative_from_moments(
-                    nc,
-                    &da,
-                    &cu,
-                    &cd1,
-                    &cau,
-                    &ca1,
-                    &cu1,
-                    &cau1,
-                    &st.moments,
-                )?;
-                f_au_d2[u] += exact_kernel::cell_third_derivative_from_moments(
-                    nc,
-                    &da,
-                    &cu,
-                    &cd2,
-                    &cau,
-                    &ca2,
-                    &cu2,
-                    &cau2,
-                    &st.moments,
-                )?;
-                f_au_d12[u] += exact_kernel::cell_fourth_derivative_from_moments(
-                    nc,
-                    &da,
-                    &cu,
-                    &cd1,
-                    &cd2,
-                    &cau,
-                    &ca1,
-                    &ca2,
-                    &cu1,
-                    &cu2,
-                    &cd12,
-                    &[0.0; 4],
-                    &[0.0; 4],
-                    &[0.0; 4],
-                    &[0.0; 4],
-                    &[0.0; 4],
-                    &st.moments,
-                )?;
-            }
-            for u in 0..p {
-                for v in u..p {
-                    let cu = fx.coeff_u[u].map(|x| -x);
-                    let cv = fx.coeff_u[v].map(|x| -x);
-                    let sc = self
-                        .cell_pair_second_coeff(primary, &fx.coeff_bu, u, v)
-                        .map(|x| -x);
-                    let bv = exact_kernel::cell_second_derivative_from_moments(
-                        nc,
-                        &cu,
-                        &cv,
-                        &sc,
-                        &st.moments,
-                    )?;
-                    f_uv[[u, v]] += bv;
-                    if u != v {
-                        f_uv[[v, u]] += bv;
-                    }
-                    let mut cu1 = [0.0; 4];
-                    let mut cv1 = [0.0; 4];
-                    let mut cu2 = [0.0; 4];
-                    let mut cv2 = [0.0; 4];
-                    for c in 0..p {
-                        let suc = self.cell_pair_second_coeff(primary, &fx.coeff_bu, u, c);
-                        let svc = self.cell_pair_second_coeff(primary, &fx.coeff_bu, v, c);
-                        for k in 0..4 {
-                            if dir1[c] != 0.0 {
-                                cu1[k] -= suc[k] * dir1[c];
-                                cv1[k] -= svc[k] * dir1[c];
-                            }
-                            if dir2[c] != 0.0 {
-                                cu2[k] -= suc[k] * dir2[c];
-                                cv2[k] -= svc[k] * dir2[c];
-                            }
-                        }
-                    }
-                    let d1v = exact_kernel::cell_third_derivative_from_moments(
-                        nc,
-                        &cu,
-                        &cv,
-                        &cd1,
-                        &sc,
-                        &cu1,
-                        &cv1,
-                        &[0.0; 4],
-                        &st.moments,
-                    )?;
-                    f_uv_d1[[u, v]] += d1v;
-                    if u != v {
-                        f_uv_d1[[v, u]] += d1v;
-                    }
-                    let d2v = exact_kernel::cell_third_derivative_from_moments(
-                        nc,
-                        &cu,
-                        &cv,
-                        &cd2,
-                        &sc,
-                        &cu2,
-                        &cv2,
-                        &[0.0; 4],
-                        &st.moments,
-                    )?;
-                    f_uv_d2[[u, v]] += d2v;
-                    if u != v {
-                        f_uv_d2[[v, u]] += d2v;
-                    }
-                    let d12v = exact_kernel::cell_fourth_derivative_from_moments(
-                        nc,
-                        &cu,
-                        &cv,
-                        &cd1,
-                        &cd2,
-                        &sc,
-                        &cu1,
-                        &cu2,
-                        &cv1,
-                        &cv2,
-                        &cd12,
-                        &[0.0; 4],
-                        &[0.0; 4],
-                        &[0.0; 4],
-                        &[0.0; 4],
-                        &[0.0; 4],
-                        &st.moments,
-                    )?;
-                    f_uv_d12[[u, v]] += d12v;
-                    if u != v {
-                        f_uv_d12[[v, u]] += d12v;
-                    }
+                f_u[u] += acc.f_u[u];
+                f_au[u] += acc.f_au[u];
+                f_au_d1[u] += acc.f_au_d1[u];
+                f_au_d2[u] += acc.f_au_d2[u];
+                f_au_d12[u] += acc.f_au_d12[u];
+                for v in 0..p {
+                    f_uv[[u, v]] += acc.f_uv[[u, v]];
+                    f_uv_d1[[u, v]] += acc.f_uv_d1[[u, v]];
+                    f_uv_d2[[u, v]] += acc.f_uv_d2[[u, v]];
+                    f_uv_d12[[u, v]] += acc.f_uv_d12[[u, v]];
                 }
             }
         }
@@ -7174,280 +7596,307 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
 
-        for ce in &cached.cells {
-            let cell = ce.partition_cell.cell;
-            let st = &ce.state;
-            let fx = &ce.fixed;
-            let eta_base = [cell.c0, cell.c1, cell.c2, cell.c3];
+        let d_uv_uv_cell_accums = cached
+            .cells
+            .par_iter()
+            .map(|ce| -> Result<Array2<f64>, String> {
+                let mut d_uv_uv = Array2::<f64>::zeros((p, p));
+                let cell = ce.partition_cell.cell;
+                let st = &ce.state;
+                let fx = &ce.fixed;
+                let eta_base = [cell.c0, cell.c1, cell.c2, cell.c3];
 
-            let coeff_dir1 = self.cell_directional_coeff_family(primary, &fx.coeff_u, dir1);
-            let coeff_dir2 = self.cell_directional_coeff_family(primary, &fx.coeff_u, dir2);
-            let coeff_dir12 =
-                self.cell_mixed_directional_from_b_family(primary, &fx.coeff_bu, dir1, dir2);
-            let coeff_a_dir1 = self.cell_directional_coeff_family(primary, &fx.coeff_au, dir1);
-            let coeff_a_dir2 = self.cell_directional_coeff_family(primary, &fx.coeff_au, dir2);
-            let coeff_a_dir12 =
-                self.cell_mixed_directional_from_b_family(primary, &fx.coeff_abu, dir1, dir2);
-            let coeff_aa_dir1 = self.cell_directional_coeff_family(primary, &fx.coeff_aau, dir1);
-            let coeff_aa_dir2 = self.cell_directional_coeff_family(primary, &fx.coeff_aau, dir2);
-            let coeff_aa_dir12 =
-                self.cell_mixed_directional_from_b_family(primary, &fx.coeff_aabu, dir1, dir2);
-            let coeff_aaa_dir1 = self.cell_directional_coeff_family(primary, &fx.coeff_aaau, dir1);
-            let coeff_aaa_dir2 = self.cell_directional_coeff_family(primary, &fx.coeff_aaau, dir2);
-            let coeff_aaa_dir12 =
-                self.cell_mixed_directional_from_b_family(primary, &fx.coeff_aabu, dir1, dir2);
+                let coeff_dir1 = self.cell_directional_coeff_family(primary, &fx.coeff_u, dir1);
+                let coeff_dir2 = self.cell_directional_coeff_family(primary, &fx.coeff_u, dir2);
+                let coeff_dir12 =
+                    self.cell_mixed_directional_from_b_family(primary, &fx.coeff_bu, dir1, dir2);
+                let coeff_a_dir1 = self.cell_directional_coeff_family(primary, &fx.coeff_au, dir1);
+                let coeff_a_dir2 = self.cell_directional_coeff_family(primary, &fx.coeff_au, dir2);
+                let coeff_a_dir12 =
+                    self.cell_mixed_directional_from_b_family(primary, &fx.coeff_abu, dir1, dir2);
+                let coeff_aa_dir1 =
+                    self.cell_directional_coeff_family(primary, &fx.coeff_aau, dir1);
+                let coeff_aa_dir2 =
+                    self.cell_directional_coeff_family(primary, &fx.coeff_aau, dir2);
+                let coeff_aa_dir12 =
+                    self.cell_mixed_directional_from_b_family(primary, &fx.coeff_aabu, dir1, dir2);
+                let coeff_aaa_dir1 =
+                    self.cell_directional_coeff_family(primary, &fx.coeff_aaau, dir1);
+                let coeff_aaa_dir2 =
+                    self.cell_directional_coeff_family(primary, &fx.coeff_aaau, dir2);
+                let coeff_aaa_dir12 =
+                    self.cell_mixed_directional_from_b_family(primary, &fx.coeff_aabu, dir1, dir2);
 
-            let eta_poly_jet = coeff4_composite_bilinear(
-                &eta_base,
-                &fx.dc_da,
-                &fx.dc_daa,
-                &coeff_dir1,
-                &coeff_dir2,
-                &coeff_dir12,
-                &coeff_a_dir1,
-                &coeff_a_dir2,
-                ad1,
-                ad2,
-                ad12,
-            );
-            let chi_poly_jet = coeff4_composite_bilinear(
-                &fx.dc_da,
-                &fx.dc_daa,
-                &fx.dc_daaa,
-                &coeff_a_dir1,
-                &coeff_a_dir2,
-                &coeff_a_dir12,
-                &coeff_aa_dir1,
-                &coeff_aa_dir2,
-                ad1,
-                ad2,
-                ad12,
-            );
-            let eta_aa_poly_jet = coeff4_composite_bilinear(
-                &fx.dc_daa,
-                &fx.dc_daaa,
-                &zero4,
-                &coeff_aa_dir1,
-                &coeff_aa_dir2,
-                &coeff_aa_dir12,
-                &coeff_aaa_dir1,
-                &coeff_aaa_dir2,
-                ad1,
-                ad2,
-                ad12,
-            );
-            let eta_aaa_poly_jet = coeff4_fixed_bilinear(
-                &fx.dc_daaa,
-                &coeff_aaa_dir1,
-                &coeff_aaa_dir2,
-                &coeff_aaa_dir12,
-            );
-
-            let mut eta_u_poly_jets = Vec::with_capacity(p);
-            let mut chi_u_poly_jets = Vec::with_capacity(p);
-            let mut coeff_au_fixed_jets = Vec::with_capacity(p);
-            let mut coeff_aau_fixed_jets = Vec::with_capacity(p);
-            for u in 0..p {
-                let coeff_u_dir1 =
-                    self.cell_param_directional_from_b_family(primary, &fx.coeff_bu, u, dir1);
-                let coeff_u_dir2 =
-                    self.cell_param_directional_from_b_family(primary, &fx.coeff_bu, u, dir2);
-                let coeff_u_dir12 =
-                    self.cell_param_mixed_from_bb_family(primary, &fx.coeff_bbu, u, dir1, dir2);
-                let coeff_au_dir1 =
-                    self.cell_param_directional_from_b_family(primary, &fx.coeff_abu, u, dir1);
-                let coeff_au_dir2 =
-                    self.cell_param_directional_from_b_family(primary, &fx.coeff_abu, u, dir2);
-                let coeff_au_dir12 =
-                    self.cell_param_mixed_from_bb_family(primary, &fx.coeff_abbu, u, dir1, dir2);
-                let coeff_aau_dir1 =
-                    self.cell_param_directional_from_b_family(primary, &fx.coeff_aabu, u, dir1);
-                let coeff_aau_dir2 =
-                    self.cell_param_directional_from_b_family(primary, &fx.coeff_aabu, u, dir2);
-                let coeff_aau_dir12 =
-                    self.cell_param_mixed_from_bb_family(primary, &fx.coeff_abbu, u, dir1, dir2);
-
-                let coeff_u_fixed_jet = coeff4_fixed_bilinear(
-                    &fx.coeff_u[u],
-                    &coeff_u_dir1,
-                    &coeff_u_dir2,
-                    &coeff_u_dir12,
+                let eta_poly_jet = coeff4_composite_bilinear(
+                    &eta_base,
+                    &fx.dc_da,
+                    &fx.dc_daa,
+                    &coeff_dir1,
+                    &coeff_dir2,
+                    &coeff_dir12,
+                    &coeff_a_dir1,
+                    &coeff_a_dir2,
+                    ad1,
+                    ad2,
+                    ad12,
                 );
-                let coeff_au_fixed_jet = coeff4_fixed_bilinear(
-                    &fx.coeff_au[u],
-                    &coeff_au_dir1,
-                    &coeff_au_dir2,
-                    &coeff_au_dir12,
+                let chi_poly_jet = coeff4_composite_bilinear(
+                    &fx.dc_da,
+                    &fx.dc_daa,
+                    &fx.dc_daaa,
+                    &coeff_a_dir1,
+                    &coeff_a_dir2,
+                    &coeff_a_dir12,
+                    &coeff_aa_dir1,
+                    &coeff_aa_dir2,
+                    ad1,
+                    ad2,
+                    ad12,
                 );
-                let coeff_aau_fixed_jet = coeff4_fixed_bilinear(
-                    &fx.coeff_aau[u],
-                    &coeff_aau_dir1,
-                    &coeff_aau_dir2,
-                    &coeff_aau_dir12,
+                let eta_aa_poly_jet = coeff4_composite_bilinear(
+                    &fx.dc_daa,
+                    &fx.dc_daaa,
+                    &zero4,
+                    &coeff_aa_dir1,
+                    &coeff_aa_dir2,
+                    &coeff_aa_dir12,
+                    &coeff_aaa_dir1,
+                    &coeff_aaa_dir2,
+                    ad1,
+                    ad2,
+                    ad12,
+                );
+                let eta_aaa_poly_jet = coeff4_fixed_bilinear(
+                    &fx.dc_daaa,
+                    &coeff_aaa_dir1,
+                    &coeff_aaa_dir2,
+                    &coeff_aaa_dir12,
                 );
 
-                eta_u_poly_jets.push(poly_add_jets(
-                    &poly_scale_jets(&chi_poly_jet, &a_u_jets[u]),
-                    &coeff_u_fixed_jet,
-                ));
-                chi_u_poly_jets.push(poly_add_jets(
-                    &poly_scale_jets(&eta_aa_poly_jet, &a_u_jets[u]),
-                    &coeff_au_fixed_jet,
-                ));
-                coeff_au_fixed_jets.push(coeff_au_fixed_jet);
-                coeff_aau_fixed_jets.push(coeff_aau_fixed_jet);
-            }
-
-            for u in 0..p {
-                for v in u..p {
-                    let a_uv_jet = MultiDirJet::bilinear(
-                        auv[[u, v]],
-                        auvd1[[u, v]],
-                        auvd2[[u, v]],
-                        auvd12[[u, v]],
+                let mut eta_u_poly_jets = Vec::with_capacity(p);
+                let mut chi_u_poly_jets = Vec::with_capacity(p);
+                let mut coeff_au_fixed_jets = Vec::with_capacity(p);
+                let mut coeff_aau_fixed_jets = Vec::with_capacity(p);
+                for u in 0..p {
+                    let coeff_u_dir1 =
+                        self.cell_param_directional_from_b_family(primary, &fx.coeff_bu, u, dir1);
+                    let coeff_u_dir2 =
+                        self.cell_param_directional_from_b_family(primary, &fx.coeff_bu, u, dir2);
+                    let coeff_u_dir12 =
+                        self.cell_param_mixed_from_bb_family(primary, &fx.coeff_bbu, u, dir1, dir2);
+                    let coeff_au_dir1 =
+                        self.cell_param_directional_from_b_family(primary, &fx.coeff_abu, u, dir1);
+                    let coeff_au_dir2 =
+                        self.cell_param_directional_from_b_family(primary, &fx.coeff_abu, u, dir2);
+                    let coeff_au_dir12 = self.cell_param_mixed_from_bb_family(
+                        primary,
+                        &fx.coeff_abbu,
+                        u,
+                        dir1,
+                        dir2,
                     );
-                    let a_u_prod = a_u_jets[u].mul(&a_u_jets[v]);
-                    let r_uv_fixed_jet = coeff4_fixed_bilinear(
-                        &self.cell_pair_second_coeff(primary, &fx.coeff_bu, u, v),
-                        &self.cell_pair_directional_from_bb_family(
-                            primary,
-                            &fx.coeff_bbu,
-                            u,
-                            v,
-                            dir1,
-                        ),
-                        &self.cell_pair_directional_from_bb_family(
-                            primary,
-                            &fx.coeff_bbu,
-                            u,
-                            v,
-                            dir2,
-                        ),
-                        &self.cell_pair_mixed_from_bbb_family(
-                            primary,
-                            &fx.coeff_bbbu,
-                            u,
-                            v,
-                            dir1,
-                            dir2,
-                        ),
-                    );
-                    let chi_uv_fixed_jet = coeff4_fixed_bilinear(
-                        &self.cell_pair_third_coeff_a(primary, &fx.coeff_abu, u, v),
-                        &self.cell_pair_directional_from_bb_family(
-                            primary,
-                            &fx.coeff_abbu,
-                            u,
-                            v,
-                            dir1,
-                        ),
-                        &self.cell_pair_directional_from_bb_family(
-                            primary,
-                            &fx.coeff_abbu,
-                            u,
-                            v,
-                            dir2,
-                        ),
-                        &self.cell_pair_mixed_from_bbb_family(
-                            primary,
-                            &fx.coeff_bbbu,
-                            u,
-                            v,
-                            dir1,
-                            dir2,
-                        ),
+                    let coeff_aau_dir1 =
+                        self.cell_param_directional_from_b_family(primary, &fx.coeff_aabu, u, dir1);
+                    let coeff_aau_dir2 =
+                        self.cell_param_directional_from_b_family(primary, &fx.coeff_aabu, u, dir2);
+                    let coeff_aau_dir12 = self.cell_param_mixed_from_bb_family(
+                        primary,
+                        &fx.coeff_abbu,
+                        u,
+                        dir1,
+                        dir2,
                     );
 
-                    let eta_uv_poly_jet = poly_add_jets(
-                        &poly_add_jets(
-                            &poly_scale_jets(&chi_poly_jet, &a_uv_jet),
-                            &poly_scale_jets(&eta_aa_poly_jet, &a_u_prod),
-                        ),
-                        &poly_add_jets(
-                            &poly_scale_jets(&coeff_au_fixed_jets[u], &a_u_jets[v]),
-                            &poly_add_jets(
-                                &poly_scale_jets(&coeff_au_fixed_jets[v], &a_u_jets[u]),
-                                &r_uv_fixed_jet,
+                    let coeff_u_fixed_jet = coeff4_fixed_bilinear(
+                        &fx.coeff_u[u],
+                        &coeff_u_dir1,
+                        &coeff_u_dir2,
+                        &coeff_u_dir12,
+                    );
+                    let coeff_au_fixed_jet = coeff4_fixed_bilinear(
+                        &fx.coeff_au[u],
+                        &coeff_au_dir1,
+                        &coeff_au_dir2,
+                        &coeff_au_dir12,
+                    );
+                    let coeff_aau_fixed_jet = coeff4_fixed_bilinear(
+                        &fx.coeff_aau[u],
+                        &coeff_aau_dir1,
+                        &coeff_aau_dir2,
+                        &coeff_aau_dir12,
+                    );
+
+                    eta_u_poly_jets.push(poly_add_jets(
+                        &poly_scale_jets(&chi_poly_jet, &a_u_jets[u]),
+                        &coeff_u_fixed_jet,
+                    ));
+                    chi_u_poly_jets.push(poly_add_jets(
+                        &poly_scale_jets(&eta_aa_poly_jet, &a_u_jets[u]),
+                        &coeff_au_fixed_jet,
+                    ));
+                    coeff_au_fixed_jets.push(coeff_au_fixed_jet);
+                    coeff_aau_fixed_jets.push(coeff_aau_fixed_jet);
+                }
+
+                for u in 0..p {
+                    for v in u..p {
+                        let a_uv_jet = MultiDirJet::bilinear(
+                            auv[[u, v]],
+                            auvd1[[u, v]],
+                            auvd2[[u, v]],
+                            auvd12[[u, v]],
+                        );
+                        let a_u_prod = a_u_jets[u].mul(&a_u_jets[v]);
+                        let r_uv_fixed_jet = coeff4_fixed_bilinear(
+                            &self.cell_pair_second_coeff(primary, &fx.coeff_bu, u, v),
+                            &self.cell_pair_directional_from_bb_family(
+                                primary,
+                                &fx.coeff_bbu,
+                                u,
+                                v,
+                                dir1,
                             ),
-                        ),
-                    );
-                    let chi_uv_poly_jet = poly_add_jets(
-                        &poly_add_jets(
-                            &poly_scale_jets(&eta_aa_poly_jet, &a_uv_jet),
-                            &poly_scale_jets(&eta_aaa_poly_jet, &a_u_prod),
-                        ),
-                        &poly_add_jets(
-                            &poly_scale_jets(&coeff_aau_fixed_jets[u], &a_u_jets[v]),
-                            &poly_add_jets(
-                                &poly_scale_jets(&coeff_aau_fixed_jets[v], &a_u_jets[u]),
-                                &chi_uv_fixed_jet,
+                            &self.cell_pair_directional_from_bb_family(
+                                primary,
+                                &fx.coeff_bbu,
+                                u,
+                                v,
+                                dir2,
                             ),
-                        ),
-                    );
+                            &self.cell_pair_mixed_from_bbb_family(
+                                primary,
+                                &fx.coeff_bbbu,
+                                u,
+                                v,
+                                dir1,
+                                dir2,
+                            ),
+                        );
+                        let chi_uv_fixed_jet = coeff4_fixed_bilinear(
+                            &self.cell_pair_third_coeff_a(primary, &fx.coeff_abu, u, v),
+                            &self.cell_pair_directional_from_bb_family(
+                                primary,
+                                &fx.coeff_abbu,
+                                u,
+                                v,
+                                dir1,
+                            ),
+                            &self.cell_pair_directional_from_bb_family(
+                                primary,
+                                &fx.coeff_abbu,
+                                u,
+                                v,
+                                dir2,
+                            ),
+                            &self.cell_pair_mixed_from_bbb_family(
+                                primary,
+                                &fx.coeff_bbbu,
+                                u,
+                                v,
+                                dir1,
+                                dir2,
+                            ),
+                        );
 
-                    let t1 = chi_uv_poly_jet.clone();
-                    let t2 = poly_scale_jets(
-                        &poly_mul_jets(
-                            &poly_mul_jets(&chi_u_poly_jets[v], &eta_poly_jet),
-                            &eta_u_poly_jets[u],
-                        ),
-                        &MultiDirJet::constant(2, -1.0),
-                    );
-                    let t3 = poly_scale_jets(
-                        &poly_mul_jets(
-                            &poly_mul_jets(&chi_u_poly_jets[u], &eta_poly_jet),
-                            &eta_u_poly_jets[v],
-                        ),
-                        &MultiDirJet::constant(2, -1.0),
-                    );
-                    let t4 = poly_scale_jets(
-                        &poly_mul_jets(
+                        let eta_uv_poly_jet = poly_add_jets(
+                            &poly_add_jets(
+                                &poly_scale_jets(&chi_poly_jet, &a_uv_jet),
+                                &poly_scale_jets(&eta_aa_poly_jet, &a_u_prod),
+                            ),
+                            &poly_add_jets(
+                                &poly_scale_jets(&coeff_au_fixed_jets[u], &a_u_jets[v]),
+                                &poly_add_jets(
+                                    &poly_scale_jets(&coeff_au_fixed_jets[v], &a_u_jets[u]),
+                                    &r_uv_fixed_jet,
+                                ),
+                            ),
+                        );
+                        let chi_uv_poly_jet = poly_add_jets(
+                            &poly_add_jets(
+                                &poly_scale_jets(&eta_aa_poly_jet, &a_uv_jet),
+                                &poly_scale_jets(&eta_aaa_poly_jet, &a_u_prod),
+                            ),
+                            &poly_add_jets(
+                                &poly_scale_jets(&coeff_aau_fixed_jets[u], &a_u_jets[v]),
+                                &poly_add_jets(
+                                    &poly_scale_jets(&coeff_aau_fixed_jets[v], &a_u_jets[u]),
+                                    &chi_uv_fixed_jet,
+                                ),
+                            ),
+                        );
+
+                        let t1 = chi_uv_poly_jet.clone();
+                        let t2 = poly_scale_jets(
+                            &poly_mul_jets(
+                                &poly_mul_jets(&chi_u_poly_jets[v], &eta_poly_jet),
+                                &eta_u_poly_jets[u],
+                            ),
+                            &MultiDirJet::constant(2, -1.0),
+                        );
+                        let t3 = poly_scale_jets(
+                            &poly_mul_jets(
+                                &poly_mul_jets(&chi_u_poly_jets[u], &eta_poly_jet),
+                                &eta_u_poly_jets[v],
+                            ),
+                            &MultiDirJet::constant(2, -1.0),
+                        );
+                        let t4 = poly_scale_jets(
+                            &poly_mul_jets(
+                                &chi_poly_jet,
+                                &poly_add_jets(
+                                    &poly_mul_jets(&eta_u_poly_jets[u], &eta_u_poly_jets[v]),
+                                    &poly_mul_jets(&eta_poly_jet, &eta_uv_poly_jet),
+                                ),
+                            ),
+                            &MultiDirJet::constant(2, -1.0),
+                        );
+                        let t5 = poly_mul_jets(
                             &chi_poly_jet,
-                            &poly_add_jets(
+                            &poly_mul_jets(
+                                &poly_mul_jets(&eta_poly_jet, &eta_poly_jet),
                                 &poly_mul_jets(&eta_u_poly_jets[u], &eta_u_poly_jets[v]),
-                                &poly_mul_jets(&eta_poly_jet, &eta_uv_poly_jet),
                             ),
-                        ),
-                        &MultiDirJet::constant(2, -1.0),
-                    );
-                    let t5 = poly_mul_jets(
-                        &chi_poly_jet,
-                        &poly_mul_jets(
-                            &poly_mul_jets(&eta_poly_jet, &eta_poly_jet),
-                            &poly_mul_jets(&eta_u_poly_jets[u], &eta_u_poly_jets[v]),
-                        ),
-                    );
-                    let i_base_jet = poly_add_jets(
-                        &poly_add_jets(&poly_add_jets(&t1, &t2), &t3),
-                        &poly_add_jets(&t4, &t5),
-                    );
+                        );
+                        let i_base_jet = poly_add_jets(
+                            &poly_add_jets(&poly_add_jets(&t1, &t2), &t3),
+                            &poly_add_jets(&t4, &t5),
+                        );
 
-                    let i_base = poly_coeff_mask(&i_base_jet, 0);
-                    let i_base_d2 = poly_coeff_mask(&i_base_jet, 2);
-                    let i_base_d12 = poly_coeff_mask(&i_base_jet, 3);
-                    let eta_poly = poly_coeff_mask(&eta_poly_jet, 0);
-                    let eta_d1_poly = poly_coeff_mask(&eta_poly_jet, 1);
-                    let eta_d2_poly = poly_coeff_mask(&eta_poly_jet, 2);
-                    let eta_d12_poly = poly_coeff_mask(&eta_poly_jet, 3);
+                        let i_base = poly_coeff_mask(&i_base_jet, 0);
+                        let i_base_d2 = poly_coeff_mask(&i_base_jet, 2);
+                        let i_base_d12 = poly_coeff_mask(&i_base_jet, 3);
+                        let eta_poly = poly_coeff_mask(&eta_poly_jet, 0);
+                        let eta_d1_poly = poly_coeff_mask(&eta_poly_jet, 1);
+                        let eta_d2_poly = poly_coeff_mask(&eta_poly_jet, 2);
+                        let eta_d12_poly = poly_coeff_mask(&eta_poly_jet, 3);
 
-                    let correction = poly_add(
-                        &poly_mul(
-                            &poly_add(
-                                &poly_mul(&eta_d2_poly, &eta_d1_poly),
-                                &poly_mul(&eta_poly, &eta_d12_poly),
+                        let correction = poly_add(
+                            &poly_mul(
+                                &poly_add(
+                                    &poly_mul(&eta_d2_poly, &eta_d1_poly),
+                                    &poly_mul(&eta_poly, &eta_d12_poly),
+                                ),
+                                &i_base,
                             ),
-                            &i_base,
-                        ),
-                        &poly_mul(&poly_mul(&eta_poly, &eta_d1_poly), &i_base_d2),
-                    );
-                    let full_integrand = poly_sub(&i_base_d12, &correction);
-                    let value = exact_kernel::cell_polynomial_integral_from_moments(
-                        &full_integrand,
-                        &st.moments,
-                        "survival D_t second derivative bidirectional",
-                    )?;
-                    d_uv_uv[[u, v]] += value;
-                    d_uv_uv[[v, u]] = d_uv_uv[[u, v]];
+                            &poly_mul(&poly_mul(&eta_poly, &eta_d1_poly), &i_base_d2),
+                        );
+                        let full_integrand = poly_sub(&i_base_d12, &correction);
+                        let value = exact_kernel::cell_polynomial_integral_from_moments(
+                            &full_integrand,
+                            &st.moments,
+                            "survival D_t second derivative bidirectional",
+                        )?;
+                        d_uv_uv[[u, v]] += value;
+                        d_uv_uv[[v, u]] = d_uv_uv[[u, v]];
+                    }
+                }
+                Ok(d_uv_uv)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        for cell_d_uv_uv in d_uv_uv_cell_accums {
+            for u in 0..p {
+                for v in 0..p {
+                    d_uv_uv[[u, v]] += cell_d_uv_uv[[u, v]];
                 }
             }
         }

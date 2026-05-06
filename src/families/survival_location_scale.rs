@@ -1357,6 +1357,7 @@ impl SurvivalLocationScaleFamily {
     const BLOCK_THRESHOLD: usize = 1;
     const BLOCK_LOG_SIGMA: usize = 2;
     const BLOCK_LINK_WIGGLE: usize = 3;
+    const EVALUATE_PARALLEL_ROW_THRESHOLD: usize = 1024;
 
     #[inline]
     fn time_wiggle_range(&self) -> std::ops::Range<usize> {
@@ -8204,25 +8205,94 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let mut d1_q1 = Array1::<f64>::zeros(n);
         let mut d1_qdot = Array1::<f64>::zeros(n);
 
-        for i in 0..n {
-            let state = self.row_predictor_state(
-                dynamic.h_entry[i],
-                dynamic.h_exit[i],
-                dynamic.hdot_exit[i],
-                dynamic.q_entry[i],
-                dynamic.q_exit[i],
-                dynamic.qdot_exit[i],
-            );
-            let Some(row) = self.row_derivatives(i, state)? else {
-                continue;
+        let assign_row_derivatives =
+            |i: usize,
+             row: SurvivalRowDerivatives,
+             d1_q0: &mut Array1<f64>,
+             d1_q1: &mut Array1<f64>,
+             d1_qdot: &mut Array1<f64>,
+             grad_time_eta_h0: &mut Array1<f64>,
+             grad_time_eta_h1: &mut Array1<f64>,
+             grad_time_eta_d: &mut Array1<f64>| {
+                d1_q0[i] = row.d1_q0;
+                d1_q1[i] = row.d1_q1;
+                d1_qdot[i] = row.d1_qdot1;
+                grad_time_eta_h0[i] = row.grad_time_eta_h0;
+                grad_time_eta_h1[i] = row.grad_time_eta_h1;
+                grad_time_eta_d[i] = row.grad_time_eta_d;
             };
-            ll += row.ll;
-            d1_q0[i] = row.d1_q0;
-            d1_q1[i] = row.d1_q1;
-            d1_qdot[i] = row.d1_qdot1;
-            grad_time_eta_h0[i] = row.grad_time_eta_h0;
-            grad_time_eta_h1[i] = row.grad_time_eta_h1;
-            grad_time_eta_d[i] = row.grad_time_eta_d;
+
+        if n >= Self::EVALUATE_PARALLEL_ROW_THRESHOLD && rayon::current_num_threads() > 1 {
+            struct RowDerivativeAccumulator {
+                ll: f64,
+                rows: Vec<(usize, SurvivalRowDerivatives)>,
+            }
+
+            let make_acc = || RowDerivativeAccumulator {
+                ll: 0.0,
+                rows: Vec::new(),
+            };
+            let acc = (0..n)
+                .into_par_iter()
+                .try_fold(make_acc, |mut acc, i| -> Result<_, String> {
+                    let state = self.row_predictor_state(
+                        dynamic.h_entry[i],
+                        dynamic.h_exit[i],
+                        dynamic.hdot_exit[i],
+                        dynamic.q_entry[i],
+                        dynamic.q_exit[i],
+                        dynamic.qdot_exit[i],
+                    );
+                    if let Some(row) = self.row_derivatives(i, state)? {
+                        acc.ll += row.ll;
+                        acc.rows.push((i, row));
+                    }
+                    Ok(acc)
+                })
+                .try_reduce(make_acc, |mut a, mut b| {
+                    a.ll += b.ll;
+                    a.rows.append(&mut b.rows);
+                    Ok::<_, String>(a)
+                })?;
+
+            ll = acc.ll;
+            for (i, row) in acc.rows {
+                assign_row_derivatives(
+                    i,
+                    row,
+                    &mut d1_q0,
+                    &mut d1_q1,
+                    &mut d1_qdot,
+                    &mut grad_time_eta_h0,
+                    &mut grad_time_eta_h1,
+                    &mut grad_time_eta_d,
+                );
+            }
+        } else {
+            for i in 0..n {
+                let state = self.row_predictor_state(
+                    dynamic.h_entry[i],
+                    dynamic.h_exit[i],
+                    dynamic.hdot_exit[i],
+                    dynamic.q_entry[i],
+                    dynamic.q_exit[i],
+                    dynamic.qdot_exit[i],
+                );
+                let Some(row) = self.row_derivatives(i, state)? else {
+                    continue;
+                };
+                ll += row.ll;
+                assign_row_derivatives(
+                    i,
+                    row,
+                    &mut d1_q0,
+                    &mut d1_q1,
+                    &mut d1_qdot,
+                    &mut grad_time_eta_h0,
+                    &mut grad_time_eta_h1,
+                    &mut grad_time_eta_d,
+                );
+            }
         }
 
         // Per-block gradients (O(n·p_k) each, no Hessian algebra).
@@ -8311,9 +8381,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let n = self.n;
         let dynamic = self.build_dynamic_geometry(block_states)?;
 
-        let mut ll = 0.0;
-
-        for i in 0..n {
+        let row_log_likelihood = |i: usize| -> Result<f64, String> {
             let state = self.row_predictor_state(
                 dynamic.h_entry[i],
                 dynamic.h_exit[i],
@@ -8322,12 +8390,39 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 dynamic.q_exit[i],
                 dynamic.qdot_exit[i],
             );
-            let Some(kernel) = self.exact_row_kernel(i, state)? else {
-                continue;
-            };
-            ll += kernel.log_likelihood();
+            Ok(self
+                .exact_row_kernel(i, state)?
+                .map_or(0.0, SurvivalExactRowKernel::log_likelihood))
+        };
+
+        const PARALLEL_LOG_LIKELIHOOD_ROW_THRESHOLD: usize = 1024;
+        const LOG_LIKELIHOOD_CHUNK_ROWS: usize = 1024;
+        if n < PARALLEL_LOG_LIKELIHOOD_ROW_THRESHOLD {
+            let mut ll = 0.0;
+            for i in 0..n {
+                ll += row_log_likelihood(i)?;
+            }
+            return Ok(ll);
         }
 
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let chunk_sums: Vec<Result<f64, String>> = (0..n.div_ceil(LOG_LIKELIHOOD_CHUNK_ROWS))
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * LOG_LIKELIHOOD_CHUNK_ROWS;
+                let end = (start + LOG_LIKELIHOOD_CHUNK_ROWS).min(n);
+                let mut ll = 0.0;
+                for i in start..end {
+                    ll += row_log_likelihood(i)?;
+                }
+                Ok(ll)
+            })
+            .collect();
+
+        let mut ll = 0.0;
+        for chunk_sum in chunk_sums {
+            ll += chunk_sum?;
+        }
         Ok(ll)
     }
 
