@@ -146,7 +146,10 @@ fn biobank_convergence_regression() {
         }
     }
 
-    let weights = Array1::ones(n);
+    // Deterministic non-uniform row weights exercise the fused weighted-residual
+    // and weighted-design assembly paths while preserving an exact integer-row
+    // weighting interpretation.
+    let weights = Array1::from_iter((0..n).map(|i| if i % 5 == 0 { 2.0 } else { 1.0 }));
     let offset = Array1::<f64>::zeros(n);
 
     // Single smooth block — k_smoothing = 1.
@@ -277,7 +280,7 @@ fn biobank_convergence_regression() {
 
     eprintln!(
         "[biobank_convergence_regression] n={n}, p={p}, k_smoothing=1 \
-         | wall_clock={:.3}s, outer_iter={}, pirls_iter={}, corr_eta={:.4}, mad_eta={:.4}, status={:?}",
+         | wall_clock={:.3}s, outer_iter={}, pirls_iter={}, corr_eta={:.4}, mad_eta={:.4}, status={:?}, weighted_rows=true",
         elapsed.as_secs_f64(),
         fit.outer_iterations,
         pirls_iter,
