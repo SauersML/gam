@@ -547,7 +547,7 @@ pub fn optimize_survival_baseline_config_with_gradient<F>(
     objective: F,
 ) -> Result<SurvivalBaselineConfig, String>
 where
-    F: FnMut(&SurvivalBaselineConfig) -> Result<(f64, Array1<f64>), String>,
+    F: FnMut(&SurvivalBaselineConfig) -> Result<(f64, Array1<f64>, Array2<f64>), String>,
 {
     use crate::solver::outer_strategy::{
         Derivative, HessianResult, OuterEval, OuterProblem, SolverClass,
@@ -561,8 +561,7 @@ where
     let upper = seed.mapv(|v| v + 6.0);
     let problem = OuterProblem::new(dim)
         .with_gradient(Derivative::Analytic)
-        .with_hessian(Derivative::Unavailable)
-        .with_prefer_gradient_only(true)
+        .with_hessian(Derivative::Analytic)
         .with_solver_class(SolverClass::Primary)
         .with_tolerance(1e-4)
         .with_max_iter(240)
@@ -573,12 +572,19 @@ where
     let cost_fn = move |_: &mut (), theta: &ndarray::Array1<f64>| {
         let cfg = survival_baseline_config_from_theta(target, theta)
             .map_err(crate::estimate::EstimationError::InvalidInput)?;
-        let (cost, gradient) = cost_objective.borrow_mut()(&cfg)
+        let (cost, gradient, hessian) = cost_objective.borrow_mut()(&cfg)
             .map_err(crate::estimate::EstimationError::InvalidInput)?;
         if gradient.len() != dim {
             return Err(crate::estimate::EstimationError::InvalidInput(format!(
                 "{context}: baseline gradient dimension mismatch: got {}, expected {dim}",
                 gradient.len()
+            )));
+        }
+        if hessian.nrows() != dim || hessian.ncols() != dim {
+            return Err(crate::estimate::EstimationError::InvalidInput(format!(
+                "{context}: baseline Hessian dimension mismatch: got {}x{}, expected {dim}x{dim}",
+                hessian.nrows(),
+                hessian.ncols()
             )));
         }
         Ok(cost)
@@ -587,7 +593,7 @@ where
     let eval_fn = move |_: &mut (), theta: &ndarray::Array1<f64>| {
         let cfg = survival_baseline_config_from_theta(target, theta)
             .map_err(crate::estimate::EstimationError::InvalidInput)?;
-        let (cost, gradient) = eval_objective.borrow_mut()(&cfg)
+        let (cost, gradient, hessian) = eval_objective.borrow_mut()(&cfg)
             .map_err(crate::estimate::EstimationError::InvalidInput)?;
         if gradient.len() != dim {
             return Err(crate::estimate::EstimationError::InvalidInput(format!(
@@ -595,10 +601,17 @@ where
                 gradient.len()
             )));
         }
+        if hessian.nrows() != dim || hessian.ncols() != dim {
+            return Err(crate::estimate::EstimationError::InvalidInput(format!(
+                "{context}: baseline Hessian dimension mismatch: got {}x{}, expected {dim}x{dim}",
+                hessian.nrows(),
+                hessian.ncols()
+            )));
+        }
         Ok(OuterEval {
             cost,
             gradient,
-            hessian: HessianResult::Unavailable,
+            hessian: HessianResult::Analytic(hessian),
         })
     };
     let mut obj = problem.build_objective(
@@ -2108,6 +2121,223 @@ pub fn marginal_slope_baseline_offset_theta_partials(
     ))
 }
 
+/// Contract marginal-slope offset residuals and channel curvatures into the
+/// exact Hessian with respect to baseline θ-parameters.
+pub fn marginal_slope_baseline_chain_rule_hessian(
+    age_entry: ndarray::ArrayView1<'_, f64>,
+    age_exit: ndarray::ArrayView1<'_, f64>,
+    cfg: &SurvivalBaselineConfig,
+    residuals: &crate::families::survival::OffsetChannelResiduals,
+    curvatures: &crate::families::survival::OffsetChannelCurvatures,
+) -> Result<Option<Array2<f64>>, String> {
+    let n = age_exit.len();
+    if age_entry.len() != n
+        || residuals.exit.len() != n
+        || residuals.entry.len() != n
+        || residuals.derivative.len() != n
+        || curvatures.rows.len() != n
+    {
+        return Err(format!(
+            "marginal_slope_baseline_chain_rule_hessian: length mismatch (age_entry={}, age_exit={}, r_exit={}, r_entry={}, r_deriv={}, h_rows={})",
+            age_entry.len(),
+            n,
+            residuals.exit.len(),
+            residuals.entry.len(),
+            residuals.derivative.len(),
+            curvatures.rows.len(),
+        ));
+    }
+    let probe_age = age_exit.iter().copied().find(|v| v.is_finite() && *v > 0.0);
+    let dim = match probe_age {
+        Some(t) => match marginal_slope_baseline_offset_theta_second_partials(t, cfg)? {
+            None => return Ok(None),
+            Some(parts) => parts.first.len(),
+        },
+        None => {
+            return Err(
+                "marginal_slope_baseline_chain_rule_hessian: no valid positive age for dim probe"
+                    .to_string(),
+            );
+        }
+    };
+    let mut hessian = Array2::<f64>::zeros((dim, dim));
+    for i in 0..n {
+        let exit_parts = marginal_slope_baseline_offset_theta_second_partials(age_exit[i], cfg)?
+            .ok_or_else(|| {
+                "unexpected None from marginal-slope second partials at exit".to_string()
+            })?;
+        if exit_parts.first.len() != dim {
+            return Err(
+                "marginal_slope_baseline_chain_rule_hessian: theta_dim drifted".to_string(),
+            );
+        }
+        let mut entry_parts = None;
+        if residuals.entry[i] != 0.0 {
+            entry_parts = Some(
+                marginal_slope_baseline_offset_theta_second_partials(age_entry[i], cfg)?
+                    .ok_or_else(|| {
+                        "unexpected None from marginal-slope second partials at entry".to_string()
+                    })?,
+            );
+        }
+        for a in 0..dim {
+            for b in 0..dim {
+                let j_exit_a = exit_parts.first[a].0;
+                let j_exit_b = exit_parts.first[b].0;
+                let j_deriv_a = exit_parts.first[a].1;
+                let j_deriv_b = exit_parts.first[b].1;
+                let mut value = residuals.exit[i] * exit_parts.second[a][b].0
+                    + residuals.derivative[i] * exit_parts.second[a][b].1;
+                if let Some(parts) = entry_parts.as_ref() {
+                    value += residuals.entry[i] * parts.second[a][b].0;
+                }
+                let curv = curvatures.rows[i];
+                let j_entry_a = entry_parts.as_ref().map_or(0.0, |parts| parts.first[a].0);
+                let j_entry_b = entry_parts.as_ref().map_or(0.0, |parts| parts.first[b].0);
+                let ja = [j_entry_a, j_exit_a, j_deriv_a];
+                let jb = [j_entry_b, j_exit_b, j_deriv_b];
+                for u in 0..3 {
+                    for v in 0..3 {
+                        value += ja[u] * curv[u][v] * jb[v];
+                    }
+                }
+                hessian[[a, b]] += value;
+            }
+        }
+    }
+    Ok(Some(hessian))
+}
+
+struct MarginalSlopeThetaSecondPartials {
+    first: Vec<(f64, f64)>,
+    second: Vec<Vec<(f64, f64)>>,
+}
+
+fn marginal_slope_baseline_offset_theta_second_partials(
+    age: f64,
+    cfg: &SurvivalBaselineConfig,
+) -> Result<Option<MarginalSlopeThetaSecondPartials>, String> {
+    let Some(point) = evaluate_marginal_slope_baseline_point(age, cfg)? else {
+        return Ok(None);
+    };
+    let Some((hazard, first, second)) = survival_hazard_theta_first_second(age, cfg)? else {
+        return Ok(None);
+    };
+    let (cum_hazard, instant_hazard) = hazard;
+    let survival = (-cum_hazard).exp();
+    let a = survival / normal_pdf(point.q);
+    let b = point.q * a - 1.0;
+    let b_factor = a + point.q * b;
+    let dim = first.len();
+    let mut first_out = Vec::with_capacity(dim);
+    let mut second_out = vec![vec![(0.0, 0.0); dim]; dim];
+    for i in 0..dim {
+        let (h_i, inst_i) = first[i];
+        first_out.push((a * h_i, a * (inst_i + instant_hazard * b * h_i)));
+    }
+    for i in 0..dim {
+        for j in 0..dim {
+            let (h_i, inst_i) = first[i];
+            let (h_j, inst_j) = first[j];
+            let (h_ij, inst_ij) = second[i][j];
+            let a_j = a * b * h_j;
+            let b_j = a * h_j * b_factor;
+            let q_ij = a * h_ij + a * b * h_i * h_j;
+            let qt_inner_i = inst_i + instant_hazard * b * h_i;
+            let qt_ij = a_j * qt_inner_i
+                + a * (inst_ij + inst_j * b * h_i + instant_hazard * (b_j * h_i + b * h_ij));
+            second_out[i][j] = (q_ij, qt_ij);
+        }
+    }
+    Ok(Some(MarginalSlopeThetaSecondPartials {
+        first: first_out,
+        second: second_out,
+    }))
+}
+
+type HazardFirstSecond = ((f64, f64), Vec<(f64, f64)>, Vec<Vec<(f64, f64)>>);
+
+fn survival_hazard_theta_first_second(
+    age: f64,
+    cfg: &SurvivalBaselineConfig,
+) -> Result<Option<HazardFirstSecond>, String> {
+    let Some(hazard) = survival_cumulative_and_instant_hazard(age, cfg)? else {
+        return Ok(None);
+    };
+    let first = survival_hazard_theta_partials(age, cfg)?
+        .ok_or_else(|| "unexpected missing hazard partials".to_string())?;
+    let dim = first.len();
+    let mut second = vec![vec![(0.0, 0.0); dim]; dim];
+    match cfg.target {
+        SurvivalBaselineTarget::Linear => return Ok(None),
+        SurvivalBaselineTarget::Weibull => {
+            let scale = cfg
+                .scale
+                .ok_or_else(|| "weibull missing scale".to_string())?;
+            let shape = cfg
+                .shape
+                .ok_or_else(|| "weibull missing shape".to_string())?;
+            let log_time_ratio = age.ln() - scale.ln();
+            let cumulative_hazard = hazard.0;
+            let instant_hazard = hazard.1;
+            let eta = shape * log_time_ratio;
+            second[0][0] = (
+                shape * shape * cumulative_hazard,
+                shape * shape * instant_hazard,
+            );
+            second[0][1] = (
+                -shape * cumulative_hazard * (1.0 + eta),
+                -shape * instant_hazard * (2.0 + eta),
+            );
+            second[1][0] = second[0][1];
+            second[1][1] = (
+                eta * cumulative_hazard * (1.0 + eta),
+                (eta + (1.0 + eta) * (1.0 + eta)) * instant_hazard,
+            );
+        }
+        SurvivalBaselineTarget::Gompertz => {
+            let shape = cfg
+                .shape
+                .ok_or_else(|| "gompertz missing shape".to_string())?;
+            second[0][0] = first[0];
+            second[0][1] = first[1];
+            second[1][0] = first[1];
+            second[1][1] =
+                gompertz_cumulative_shape_second_derivative(age, cfg.rate.unwrap(), shape);
+        }
+        SurvivalBaselineTarget::GompertzMakeham => {
+            let shape = cfg.shape.ok_or_else(|| "gm missing shape".to_string())?;
+            second[0][0] = first[0];
+            second[0][1] = first[1];
+            second[1][0] = first[1];
+            second[1][1] =
+                gompertz_cumulative_shape_second_derivative(age, cfg.rate.unwrap(), shape);
+            second[2][2] = first[2];
+        }
+    }
+    Ok(Some((hazard, first, second)))
+}
+
+#[inline]
+fn gompertz_cumulative_shape_second_derivative(age: f64, rate: f64, shape: f64) -> (f64, f64) {
+    let x = shape * age;
+    if shape.abs() < 1e-10 {
+        let t = age;
+        (
+            rate * t * t * t * (1.0 / 3.0 + x / 4.0 + x * x / 10.0),
+            rate * t * t * (1.0 + x + 0.5 * x * x),
+        )
+    } else {
+        let e = x.exp();
+        let em1 = x.exp_m1();
+        let n = shape * age * e - em1;
+        (
+            rate * (age * age * e / shape - 2.0 * n / (shape * shape * shape)),
+            rate * age * age * e,
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Baseline offsets
 // ---------------------------------------------------------------------------
@@ -2548,10 +2778,10 @@ mod tests {
         baseline_offset_theta_partials, build_survival_marginal_slope_baseline_offsets,
         build_survival_timewiggle_from_baseline, evaluate_survival_baseline,
         evaluate_survival_marginal_slope_baseline, marginal_slope_baseline_chain_rule_gradient,
-        marginal_slope_baseline_offset_theta_partials, survival_baseline_config_from_theta,
-        survival_baseline_theta_from_config,
+        marginal_slope_baseline_chain_rule_hessian, marginal_slope_baseline_offset_theta_partials,
+        survival_baseline_config_from_theta, survival_baseline_theta_from_config,
     };
-    use crate::families::survival::OffsetChannelResiduals;
+    use crate::families::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
     use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
     use crate::probability::normal_cdf;
     use ndarray::{Array1, array};
@@ -2714,6 +2944,137 @@ mod tests {
                 1e-5,
                 &format!("near-zero gm-probit q' theta[{k}]"),
             );
+        }
+    }
+
+    fn shifted_quadratic_offset_residuals(
+        age_entry: ndarray::ArrayView1<'_, f64>,
+        age_exit: ndarray::ArrayView1<'_, f64>,
+        base_cfg: &SurvivalBaselineConfig,
+        candidate_cfg: &SurvivalBaselineConfig,
+        base: &OffsetChannelResiduals,
+        curvatures: &OffsetChannelCurvatures,
+    ) -> OffsetChannelResiduals {
+        let n = age_exit.len();
+        let mut entry = base.entry.clone();
+        let mut exit = base.exit.clone();
+        let mut derivative = base.derivative.clone();
+        for row in 0..n {
+            let (_, base_exit, base_deriv) =
+                baseline_marginal_slope_channels(age_exit[row], base_cfg);
+            let (_, cand_exit, cand_deriv) =
+                baseline_marginal_slope_channels(age_exit[row], candidate_cfg);
+            let base_entry = if base.entry[row] == 0.0 {
+                0.0
+            } else {
+                baseline_marginal_slope_channels(age_entry[row], base_cfg).1
+            };
+            let cand_entry = if base.entry[row] == 0.0 {
+                0.0
+            } else {
+                baseline_marginal_slope_channels(age_entry[row], candidate_cfg).1
+            };
+            let delta = [
+                cand_entry - base_entry,
+                cand_exit - base_exit,
+                cand_deriv - base_deriv,
+            ];
+            let mut shift = [0.0; 3];
+            for i in 0..3 {
+                for j in 0..3 {
+                    shift[i] += curvatures.rows[row][i][j] * delta[j];
+                }
+            }
+            if base.entry[row] != 0.0 {
+                entry[row] += shift[0];
+            }
+            exit[row] += shift[1];
+            derivative[row] += shift[2];
+        }
+        OffsetChannelResiduals {
+            entry,
+            exit,
+            derivative,
+        }
+    }
+
+    fn baseline_marginal_slope_channels(age: f64, cfg: &SurvivalBaselineConfig) -> (f64, f64, f64) {
+        let (q, q_t) = evaluate_survival_marginal_slope_baseline(age, cfg).expect("baseline");
+        (q, q, q_t)
+    }
+
+    #[test]
+    fn marginal_slope_baseline_chain_rule_hessian_matches_fd_gradient() {
+        let cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::GompertzMakeham,
+            scale: None,
+            shape: Some(0.025),
+            rate: Some(0.012),
+            makeham: Some(0.003),
+        };
+        let theta = survival_baseline_theta_from_config(&cfg)
+            .expect("theta")
+            .expect("nonlinear");
+        let age_entry = array![2.5, 0.0, 5.0];
+        let age_exit = array![7.5, 11.0, 15.0];
+        let base_residuals = OffsetChannelResiduals {
+            entry: array![0.2, 0.0, -0.1],
+            exit: array![0.6, -0.3, 0.4],
+            derivative: array![-0.5, 0.25, 0.15],
+        };
+        let curvatures = OffsetChannelCurvatures {
+            rows: vec![
+                [[1.4, 0.2, -0.1], [0.2, 1.1, 0.05], [-0.1, 0.05, 0.7]],
+                [[0.9, -0.15, 0.0], [-0.15, 1.3, 0.12], [0.0, 0.12, 0.8]],
+                [[1.2, 0.05, 0.09], [0.05, 0.95, -0.04], [0.09, -0.04, 0.6]],
+            ],
+        };
+        let analytic = marginal_slope_baseline_chain_rule_hessian(
+            age_entry.view(),
+            age_exit.view(),
+            &cfg,
+            &base_residuals,
+            &curvatures,
+        )
+        .expect("hessian")
+        .expect("nonlinear");
+
+        let gradient_at = |theta_candidate: &Array1<f64>| -> Array1<f64> {
+            let candidate = survival_baseline_config_from_theta(cfg.target, theta_candidate)
+                .expect("candidate cfg");
+            let residuals = shifted_quadratic_offset_residuals(
+                age_entry.view(),
+                age_exit.view(),
+                &cfg,
+                &candidate,
+                &base_residuals,
+                &curvatures,
+            );
+            marginal_slope_baseline_chain_rule_gradient(
+                age_entry.view(),
+                age_exit.view(),
+                &candidate,
+                &residuals,
+            )
+            .expect("gradient")
+            .expect("nonlinear")
+        };
+
+        for j in 0..theta.len() {
+            let step = if j == 1 { 2e-5 } else { 1e-5 };
+            let mut plus = theta.clone();
+            plus[j] += step;
+            let mut minus = theta.clone();
+            minus[j] -= step;
+            let fd_col = (&gradient_at(&plus) - &gradient_at(&minus)) / (2.0 * step);
+            for i in 0..theta.len() {
+                assert_close(
+                    analytic[[i, j]],
+                    fd_col[i],
+                    2e-5,
+                    &format!("baseline Hessian ({i},{j})"),
+                );
+            }
         }
     }
 

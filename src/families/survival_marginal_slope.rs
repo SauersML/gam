@@ -34,7 +34,7 @@ use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
     row_kernel_hessian_dense, row_kernel_log_likelihood,
 };
-use crate::families::survival::OffsetChannelResiduals;
+use crate::families::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
 use crate::families::survival_location_scale::{
     TimeBlockInput, TimeWiggleBlockInput, project_onto_linear_constraints,
     structural_time_coefficient_constraints,
@@ -124,6 +124,7 @@ pub struct SurvivalMarginalSlopeFitResult {
     pub logslope_design: TermCollectionDesign,
     pub baseline_slope: f64,
     pub baseline_offset_residuals: OffsetChannelResiduals,
+    pub baseline_offset_curvatures: OffsetChannelCurvatures,
     pub z_normalization: LatentZNormalization,
     pub time_block_penalties_len: usize,
     pub score_warp_runtime: Option<DeviationRuntime>,
@@ -4781,47 +4782,63 @@ impl SurvivalMarginalSlopeFamily {
         (&base.gradient, &base.hessian)
     }
 
-    fn offset_channel_residuals(
+    fn offset_channel_geometry(
         &self,
         block_states: &[ParameterBlockState],
-    ) -> Result<OffsetChannelResiduals, String> {
+    ) -> Result<(OffsetChannelResiduals, OffsetChannelCurvatures), String> {
         let flex_active = self.effective_flex_active(block_states)?;
         let primary = flex_active.then(|| flex_primary_slices(self));
         let rows = (0..self.n)
             .into_par_iter()
-            .map(|row| -> Result<(usize, f64, f64, f64), String> {
-                if self.weights[row] <= 0.0 {
-                    return Ok((row, 0.0, 0.0, 0.0));
-                }
-                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-                let gradient = if let Some(primary) = primary.as_ref() {
-                    self.compute_row_flex_primary_gradient_hessian_exact(
-                        row,
-                        block_states,
-                        &q_geom,
-                        primary,
-                    )?
-                    .1
-                } else {
-                    self.compute_row_primary_gradient_hessian_uncached(row, block_states)?
-                        .1
-                };
-                Ok((row, gradient[1], gradient[0], gradient[2]))
-            })
+            .map(
+                |row| -> Result<(usize, f64, f64, f64, [[f64; 3]; 3]), String> {
+                    if self.weights[row] <= 0.0 {
+                        return Ok((row, 0.0, 0.0, 0.0, [[0.0; 3]; 3]));
+                    }
+                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    let (gradient, hessian) = if let Some(primary) = primary.as_ref() {
+                        let (_, gradient, hessian) = self
+                            .compute_row_flex_primary_gradient_hessian_exact(
+                                row,
+                                block_states,
+                                &q_geom,
+                                primary,
+                            )?;
+                        (gradient, hessian)
+                    } else {
+                        let (_, gradient, hessian) =
+                            self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+                        (gradient, hessian)
+                    };
+                    let channel = [0usize, 1usize, 2usize];
+                    let mut curvature = [[0.0; 3]; 3];
+                    for a in 0..3 {
+                        for b in 0..3 {
+                            curvature[a][b] = hessian[[channel[a], channel[b]]];
+                        }
+                    }
+                    Ok((row, gradient[1], gradient[0], gradient[2], curvature))
+                },
+            )
             .collect::<Result<Vec<_>, String>>()?;
         let mut exit = Array1::<f64>::zeros(self.n);
         let mut entry = Array1::<f64>::zeros(self.n);
         let mut derivative = Array1::<f64>::zeros(self.n);
-        for (row, r_exit, r_entry, r_derivative) in rows {
+        let mut curvatures = vec![[[0.0; 3]; 3]; self.n];
+        for (row, r_exit, r_entry, r_derivative, curvature) in rows {
             exit[row] = r_exit;
             entry[row] = r_entry;
             derivative[row] = r_derivative;
+            curvatures[row] = curvature;
         }
-        Ok(OffsetChannelResiduals {
-            exit,
-            entry,
-            derivative,
-        })
+        Ok((
+            OffsetChannelResiduals {
+                exit,
+                entry,
+                derivative,
+            },
+            OffsetChannelCurvatures { rows: curvatures },
+        ))
     }
 
     fn accumulate_dynamic_q_core_gradient(
@@ -14267,10 +14284,10 @@ pub fn fit_survival_marginal_slope_terms(
         },
     )?;
 
-    let baseline_offset_residuals = {
+    let (baseline_offset_residuals, baseline_offset_curvatures) = {
         let final_family =
             make_family(&solved.designs[0], &solved.designs[1], *sigma_hint.borrow());
-        final_family.offset_channel_residuals(&solved.fit.block_states)?
+        final_family.offset_channel_geometry(&solved.fit.block_states)?
     };
     let mut resolved_specs = solved.resolved_specs;
     let designs = solved.designs;
@@ -14283,6 +14300,7 @@ pub fn fit_survival_marginal_slope_terms(
         gaussian_frailty_sd: *sigma_hint.borrow(),
         baseline_slope,
         baseline_offset_residuals,
+        baseline_offset_curvatures,
         z_normalization,
         time_block_penalties_len: time_penalties_len,
         score_warp_runtime,
