@@ -869,16 +869,135 @@ struct ColMeta {
 // Parquet — columnar, zero StringRecord, schema from metadata
 // ---------------------------------------------------------------------------
 
+enum ParquetBatchColumn {
+    Numeric(Vec<f64>),
+    Strings(Vec<String>),
+}
+
+fn decode_parquet_batch_column(
+    col: &dyn arrow::array::Array,
+    n_rows: usize,
+    base_row: usize,
+    header: &str,
+    is_string_col: bool,
+) -> Result<ParquetBatchColumn, String> {
+    use arrow::array::{
+        Array as ArrowArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
+        Int32Array, Int64Array, LargeStringArray, StringArray, UInt8Array, UInt16Array,
+        UInt32Array, UInt64Array,
+    };
+    use arrow::datatypes::DataType;
+
+    if col.null_count() > 0 {
+        for i in 0..n_rows {
+            if col.is_null(i) {
+                return Err(format!(
+                    "null value at row {}, column '{}'",
+                    base_row + i + 1,
+                    header
+                ));
+            }
+        }
+    }
+
+    if is_string_col {
+        if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+            return Ok(ParquetBatchColumn::Strings(
+                (0..n_rows).map(|i| arr.value(i).to_string()).collect(),
+            ));
+        }
+        if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
+            return Ok(ParquetBatchColumn::Strings(
+                (0..n_rows).map(|i| arr.value(i).to_string()).collect(),
+            ));
+        }
+
+        // Dictionary-encoded strings are not directly a StringArray. Cast only
+        // those remaining string-like arrays rather than falling back for every
+        // Utf8/LargeUtf8 column.
+        let casted = arrow::compute::cast(col, &DataType::Utf8)
+            .map_err(|e| format!("failed to cast column '{}' to string: {e}", header))?;
+        let arr = casted
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| format!("column '{}' could not be read as string after cast", header))?;
+        return Ok(ParquetBatchColumn::Strings(
+            (0..n_rows).map(|i| arr.value(i).to_string()).collect(),
+        ));
+    }
+
+    let mut values = Vec::with_capacity(n_rows);
+    match col.data_type() {
+        DataType::Float64 => {
+            let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
+            values.extend(arr.values().iter().copied());
+        }
+        DataType::Float32 => {
+            let arr = col.as_any().downcast_ref::<Float32Array>().unwrap();
+            values.extend(arr.values().iter().map(|&v| v as f64));
+        }
+        DataType::Int64 => {
+            let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+            values.extend(arr.values().iter().map(|&v| v as f64));
+        }
+        DataType::Int32 => {
+            let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
+            values.extend(arr.values().iter().map(|&v| v as f64));
+        }
+        DataType::Int16 => {
+            let arr = col.as_any().downcast_ref::<Int16Array>().unwrap();
+            values.extend(arr.values().iter().map(|&v| v as f64));
+        }
+        DataType::Int8 => {
+            let arr = col.as_any().downcast_ref::<Int8Array>().unwrap();
+            values.extend(arr.values().iter().map(|&v| v as f64));
+        }
+        DataType::UInt64 => {
+            let arr = col.as_any().downcast_ref::<UInt64Array>().unwrap();
+            values.extend(arr.values().iter().map(|&v| v as f64));
+        }
+        DataType::UInt32 => {
+            let arr = col.as_any().downcast_ref::<UInt32Array>().unwrap();
+            values.extend(arr.values().iter().map(|&v| v as f64));
+        }
+        DataType::UInt16 => {
+            let arr = col.as_any().downcast_ref::<UInt16Array>().unwrap();
+            values.extend(arr.values().iter().map(|&v| v as f64));
+        }
+        DataType::UInt8 => {
+            let arr = col.as_any().downcast_ref::<UInt8Array>().unwrap();
+            values.extend(arr.values().iter().map(|&v| v as f64));
+        }
+        DataType::Boolean => {
+            let arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
+            values.extend((0..n_rows).map(|i| if arr.value(i) { 1.0 } else { 0.0 }));
+        }
+        other => {
+            return Err(format!(
+                "unsupported parquet column type {:?} for column '{}'",
+                other, header
+            ));
+        }
+    }
+
+    if let Some(i) = values.iter().position(|v| !v.is_finite()) {
+        return Err(format!(
+            "non-finite value at row {}, column '{}'",
+            base_row + i + 1,
+            header
+        ));
+    }
+
+    Ok(ParquetBatchColumn::Numeric(values))
+}
+
 fn load_parquet_inferred(
     path: &Path,
     requested_columns: &[String],
 ) -> Result<EncodedDataset, String> {
-    use arrow::array::{
-        Array as ArrowArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
-        Int32Array, Int64Array, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-    };
     use arrow::datatypes::DataType;
     use parquet::arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
+    use rayon::prelude::*;
     use std::fs::File;
 
     let t_open = std::time::Instant::now();
@@ -933,139 +1052,40 @@ fn load_parquet_inferred(
         }
     }
 
+    let mut rows_seen = 0usize;
     for batch_result in reader {
         let batch =
             batch_result.map_err(|e| format!("failed to read parquet record batch: {e}"))?;
         let n_rows = batch.num_rows();
 
-        for j in 0..p {
-            let col = batch.column(j);
-            if is_string_col[j] {
-                // String/dictionary column → accumulate raw strings.
-                let strings = string_cols[j].as_mut().unwrap();
-                // Try to get as StringArray (handles Utf8, LargeUtf8, Dictionary).
-                let str_arr = col.as_any().downcast_ref::<StringArray>();
-                if let Some(arr) = str_arr {
-                    for i in 0..n_rows {
-                        if ArrowArray::is_null(arr, i) {
-                            return Err(format!(
-                                "null value at row {}, column '{}'",
-                                col_vecs[j].len() + i + 1,
-                                &headers[j]
-                            ));
-                        }
-                        strings.push(arr.value(i).to_string());
-                    }
-                } else {
-                    // Dictionary-encoded or LargeUtf8: cast to StringArray via arrow cast.
-                    let casted = arrow::compute::cast(col, &DataType::Utf8).map_err(|e| {
-                        format!("failed to cast column '{}' to string: {e}", &headers[j])
-                    })?;
-                    let arr = casted
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .ok_or_else(|| {
-                            format!(
-                                "column '{}' could not be read as string after cast",
-                                &headers[j]
-                            )
-                        })?;
-                    for i in 0..n_rows {
-                        if ArrowArray::is_null(arr, i) {
-                            return Err(format!(
-                                "null value at row {}, column '{}'",
-                                col_vecs[j].len() + i + 1,
-                                &headers[j]
-                            ));
-                        }
-                        strings.push(arr.value(i).to_string());
-                    }
+        let decoded_columns: Vec<Result<ParquetBatchColumn, String>> = (0..p)
+            .into_par_iter()
+            .map(|j| {
+                decode_parquet_batch_column(
+                    batch.column(j).as_ref(),
+                    n_rows,
+                    rows_seen,
+                    &headers[j],
+                    is_string_col[j],
+                )
+            })
+            .collect();
+
+        for (j, decoded) in decoded_columns.into_iter().enumerate() {
+            match decoded? {
+                ParquetBatchColumn::Strings(mut strings) => {
+                    debug_assert!(is_string_col[j]);
+                    string_cols[j].as_mut().unwrap().append(&mut strings);
+                    let new_len = col_vecs[j].len() + n_rows;
+                    col_vecs[j].resize(new_len, f64::NAN);
                 }
-                // Push NaN placeholders into col_vecs; will be replaced.
-                for _ in 0..n_rows {
-                    col_vecs[j].push(f64::NAN);
-                }
-            } else {
-                // Numeric / boolean column → parse to f64.
-                let base_row = col_vecs[j].len();
-                // Check for nulls.
-                if col.null_count() > 0 {
-                    for i in 0..n_rows {
-                        if col.is_null(i) {
-                            return Err(format!(
-                                "null value at row {}, column '{}'",
-                                base_row + i + 1,
-                                &headers[j]
-                            ));
-                        }
-                    }
-                }
-                match col.data_type() {
-                    DataType::Float64 => {
-                        let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
-                        col_vecs[j].extend(arr.values().iter().copied());
-                    }
-                    DataType::Float32 => {
-                        let arr = col.as_any().downcast_ref::<Float32Array>().unwrap();
-                        col_vecs[j].extend(arr.values().iter().map(|&v| v as f64));
-                    }
-                    DataType::Int64 => {
-                        let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-                        col_vecs[j].extend(arr.values().iter().map(|&v| v as f64));
-                    }
-                    DataType::Int32 => {
-                        let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
-                        col_vecs[j].extend(arr.values().iter().map(|&v| v as f64));
-                    }
-                    DataType::Int16 => {
-                        let arr = col.as_any().downcast_ref::<Int16Array>().unwrap();
-                        col_vecs[j].extend(arr.values().iter().map(|&v| v as f64));
-                    }
-                    DataType::Int8 => {
-                        let arr = col.as_any().downcast_ref::<Int8Array>().unwrap();
-                        col_vecs[j].extend(arr.values().iter().map(|&v| v as f64));
-                    }
-                    DataType::UInt64 => {
-                        let arr = col.as_any().downcast_ref::<UInt64Array>().unwrap();
-                        col_vecs[j].extend(arr.values().iter().map(|&v| v as f64));
-                    }
-                    DataType::UInt32 => {
-                        let arr = col.as_any().downcast_ref::<UInt32Array>().unwrap();
-                        col_vecs[j].extend(arr.values().iter().map(|&v| v as f64));
-                    }
-                    DataType::UInt16 => {
-                        let arr = col.as_any().downcast_ref::<UInt16Array>().unwrap();
-                        col_vecs[j].extend(arr.values().iter().map(|&v| v as f64));
-                    }
-                    DataType::UInt8 => {
-                        let arr = col.as_any().downcast_ref::<UInt8Array>().unwrap();
-                        col_vecs[j].extend(arr.values().iter().map(|&v| v as f64));
-                    }
-                    DataType::Boolean => {
-                        let arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
-                        for i in 0..n_rows {
-                            col_vecs[j].push(if arr.value(i) { 1.0 } else { 0.0 });
-                        }
-                    }
-                    other => {
-                        return Err(format!(
-                            "unsupported parquet column type {:?} for column '{}'",
-                            other, &headers[j]
-                        ));
-                    }
-                }
-                // Validate finiteness for this batch.
-                for i in base_row..col_vecs[j].len() {
-                    if !col_vecs[j][i].is_finite() {
-                        return Err(format!(
-                            "non-finite value at row {}, column '{}'",
-                            i + 1,
-                            &headers[j]
-                        ));
-                    }
+                ParquetBatchColumn::Numeric(mut values) => {
+                    debug_assert!(!is_string_col[j]);
+                    col_vecs[j].append(&mut values);
                 }
             }
         }
+        rows_seen += n_rows;
     }
 
     let total_rows = col_vecs[0].len();
@@ -1087,45 +1107,65 @@ fn load_parquet_inferred(
     let mut schema_cols = Vec::<SchemaColumn>::with_capacity(p);
     let mut column_kinds = Vec::<ColumnKindTag>::with_capacity(p);
 
-    for j in 0..p {
-        if is_string_col[j] {
-            // Categorical.
-            let strings = string_cols[j].as_ref().unwrap();
-            let mut level_index: HashMap<String, usize> = HashMap::new();
-            let mut levels_vec: Vec<String> = Vec::new();
-            for s in strings {
-                if !level_index.contains_key(s.as_str()) {
-                    level_index.insert(s.clone(), levels_vec.len());
-                    levels_vec.push(s.clone());
+    let finalized_columns: Vec<(Vec<f64>, ColumnKindTag, SchemaColumn)> = col_vecs
+        .into_par_iter()
+        .zip(string_cols.into_par_iter())
+        .zip(is_string_col.into_par_iter())
+        .zip(headers.par_iter())
+        .map(|(((mut col_values, strings), is_string), header)| {
+            if is_string {
+                // Categorical. Preserve level order by scanning each column in
+                // row order; columns are independent and can be finalized in
+                // parallel without changing schema order after collection.
+                let strings = strings.expect("string column storage missing");
+                let mut level_index: HashMap<String, usize> = HashMap::new();
+                let mut levels_vec: Vec<String> = Vec::new();
+                for s in &strings {
+                    if !level_index.contains_key(s.as_str()) {
+                        level_index.insert(s.clone(), levels_vec.len());
+                        levels_vec.push(s.clone());
+                    }
                 }
-            }
-            // Encode into col_vecs.
-            for (i, s) in strings.iter().enumerate() {
-                col_vecs[j][i] = *level_index.get(s.as_str()).unwrap() as f64;
-            }
-            column_kinds.push(ColumnKindTag::Categorical);
-            schema_cols.push(SchemaColumn {
-                name: headers[j].clone(),
-                kind: ColumnKindTag::Categorical,
-                levels: levels_vec,
-            });
-        } else {
-            // Numeric: check if binary.
-            let all_binary = col_vecs[j]
-                .iter()
-                .all(|&v| (v - 0.0).abs() < 1e-12 || (v - 1.0).abs() < 1e-12);
-            let kind = if all_binary {
-                ColumnKindTag::Binary
+                for (i, s) in strings.iter().enumerate() {
+                    col_values[i] = *level_index.get(s.as_str()).unwrap() as f64;
+                }
+                (
+                    col_values,
+                    ColumnKindTag::Categorical,
+                    SchemaColumn {
+                        name: header.clone(),
+                        kind: ColumnKindTag::Categorical,
+                        levels: levels_vec,
+                    },
+                )
             } else {
-                ColumnKindTag::Continuous
-            };
-            column_kinds.push(kind);
-            schema_cols.push(SchemaColumn {
-                name: headers[j].clone(),
-                kind,
-                levels: Vec::new(),
-            });
-        }
+                // Numeric: check if binary.
+                let all_binary = col_values
+                    .iter()
+                    .all(|&v| (v - 0.0).abs() < 1e-12 || (v - 1.0).abs() < 1e-12);
+                let kind = if all_binary {
+                    ColumnKindTag::Binary
+                } else {
+                    ColumnKindTag::Continuous
+                };
+                (
+                    col_values,
+                    kind,
+                    SchemaColumn {
+                        name: header.clone(),
+                        kind,
+                        levels: Vec::new(),
+                    },
+                )
+            }
+        })
+        .collect();
+
+    let mut col_vecs = Vec::with_capacity(p);
+    for (col_values, kind, schema_col) in finalized_columns {
+        col_vecs.push(col_values);
+        column_kinds.push(kind);
+        schema_cols.push(schema_col);
     }
     let schema_ms = t_schema.elapsed().as_secs_f64() * 1000.0;
     if schema_ms > 100.0 {
@@ -1142,13 +1182,17 @@ fn load_parquet_inferred(
     }
 
     let t_assemble = std::time::Instant::now();
-    // Assemble Array2.
+    // Assemble Array2. Rows are independent; keep column order from col_vecs.
     let mut values = Array2::<f64>::zeros((total_rows, p));
-    for j in 0..p {
-        for (i, &v) in col_vecs[j].iter().enumerate() {
-            values[[i, j]] = v;
-        }
-    }
+    values
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(i, mut row)| {
+            for j in 0..p {
+                row[j] = col_vecs[j][i];
+            }
+        });
     let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1000.0;
     if assemble_ms > 100.0 {
         log::info!(
