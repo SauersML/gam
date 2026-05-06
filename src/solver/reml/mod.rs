@@ -841,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn firth_exacthessian_rejects_without_tk_second_derivatives() {
+    fn firth_exacthessian_includes_analytic_tk_second_derivatives() {
         // Rank-deficient X: the 4th column is 2x the 2nd column.
         let y = array![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
         let w = Array1::<f64>::ones(y.len());
@@ -898,15 +898,112 @@ mod tests {
         )
         .expect("state");
         let rho = array![0.1, -0.2];
-        let bundle = state.obtain_eval_bundle(&rho).expect("exact firth bundle");
-        let err = state
-            .compute_lamlhessian_exact_from_bundle(&rho, &bundle)
-            .expect_err("Firth exact Hessian should require analytic TK second derivatives");
-        let msg = err.to_string();
         assert!(
-            msg.contains("Tierney-Kadane outer Hessian requires analytic second derivatives"),
-            "unexpected error: {msg}"
+            state.analytic_outer_hessian_enabled(),
+            "Firth logit should no longer disable analytic outer Hessian planning"
         );
+        let outer = state
+            .compute_outer_eval_with_order(
+                &rho,
+                crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian,
+            )
+            .expect("outer Hessian eval should succeed");
+        assert!(
+            outer.hessian.is_analytic(),
+            "outer planner should request and return an analytic Hessian"
+        );
+        let bundle = state.obtain_eval_bundle(&rho).expect("exact firth bundle");
+        let h_dense = state
+            .compute_lamlhessian_exact_from_bundle(&rho, &bundle)
+            .expect("Firth exact Hessian should include analytic TK second derivatives");
+        assert_eq!(h_dense.raw_dim(), ndarray::Ix2(2, 2));
+        assert!(
+            h_dense.iter().all(|value| value.is_finite()),
+            "Hessian should be finite: {h_dense:?}"
+        );
+    }
+
+    #[test]
+    fn firth_outer_hessian_matches_gradient_finite_difference_with_tk_terms() {
+        let y = array![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0];
+        let w = Array1::<f64>::ones(y.len());
+        let x = array![
+            [1.0, -1.0, 0.3],
+            [1.0, -0.7, -0.2],
+            [1.0, -0.3, 0.4],
+            [1.0, 0.0, -0.5],
+            [1.0, 0.2, 0.6],
+            [1.0, 0.6, -0.4],
+            [1.0, 0.9, 0.2],
+            [1.0, 1.3, -0.1],
+        ];
+        let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.1], [0.0, 0.1, 0.7],];
+        let s1 = array![[0.0, 0.0, 0.0], [0.0, 0.4, -0.05], [0.0, -0.05, 0.9],];
+        let cfg = RemlConfig::external(
+            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+            1e-9,
+            true,
+        )
+        .with_max_iterations(500);
+        let p_dim = x.ncols();
+        use crate::estimate::PenaltySpec;
+        let specs = vec![PenaltySpec::Dense(s0), PenaltySpec::Dense(s1)];
+        let canonical =
+            crate::construction::canonicalize_penalty_specs(&specs, &[1, 1], p_dim, "test")
+                .map(|(canonical, _)| canonical)
+                .expect("canonicalize");
+        let offset = Array1::<f64>::zeros(y.len());
+        let state = RemlState::newwith_offset(
+            y.view(),
+            x.clone(),
+            w.view(),
+            offset.view(),
+            canonical,
+            p_dim,
+            &cfg,
+            Some(vec![1, 1]),
+            None,
+            None,
+        )
+        .expect("state");
+        let rho = array![0.15, -0.25];
+        let eval = state
+            .compute_outer_eval_with_order(
+                &rho,
+                crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian,
+            )
+            .expect("analytic Hessian eval");
+        let h = eval.hessian.unwrap_analytic();
+        let delta = 2.0e-5;
+        for col in 0..rho.len() {
+            let mut rp = rho.clone();
+            let mut rm = rho.clone();
+            rp[col] += delta;
+            rm[col] -= delta;
+            let gp = state
+                .compute_outer_eval_with_order(
+                    &rp,
+                    crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+                )
+                .expect("plus grad")
+                .gradient;
+            let gm = state
+                .compute_outer_eval_with_order(
+                    &rm,
+                    crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+                )
+                .expect("minus grad")
+                .gradient;
+            for row in 0..rho.len() {
+                let fd = (gp[row] - gm[row]) / (2.0 * delta);
+                let an = h[[row, col]];
+                let rel = (fd - an).abs() / fd.abs().max(an.abs()).max(1e-6);
+                assert!(
+                    rel < 2.0e-3,
+                    "Hessian mismatch ({row},{col}): analytic={an:.9e}, fd={fd:.9e}, rel={rel:.3e}"
+                );
+            }
+        }
     }
 
     #[test]
