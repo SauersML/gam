@@ -4871,27 +4871,40 @@ fn select_equal_mass_centers(
     let mut leaves = vec![Leaf { start: 0, end: n }];
 
     let choose_split_dim = |slice: &[usize]| -> usize {
-        let mut best_dim = 0usize;
-        let mut best_span = f64::NEG_INFINITY;
-        for j in 0..d {
-            let mut minv = f64::INFINITY;
-            let mut maxv = f64::NEG_INFINITY;
-            for &idx in slice {
-                let v = data[[idx, j]];
-                if v < minv {
-                    minv = v;
+        // Score candidate split dimensions in parallel, but keep each dimension's
+        // row scan in serial row order and use the same strict-`>` update rule
+        // (with lowest-dimension tie breaking) as the original greedy splitter.
+        (0..d)
+            .into_par_iter()
+            .map(|j| {
+                let mut minv = f64::INFINITY;
+                let mut maxv = f64::NEG_INFINITY;
+                for &idx in slice {
+                    let v = data[[idx, j]];
+                    if v < minv {
+                        minv = v;
+                    }
+                    if v > maxv {
+                        maxv = v;
+                    }
                 }
-                if v > maxv {
-                    maxv = v;
+                let span = maxv - minv;
+                let span = if span.is_nan() {
+                    f64::NEG_INFINITY
+                } else {
+                    span
+                };
+                (j, span)
+            })
+            .reduce_with(|a, b| {
+                if b.1 > a.1 || (b.1 == a.1 && b.0 < a.0) {
+                    b
+                } else {
+                    a
                 }
-            }
-            let span = maxv - minv;
-            if span > best_span {
-                best_span = span;
-                best_dim = j;
-            }
-        }
-        best_dim
+            })
+            .map(|(j, _)| j)
+            .unwrap_or(0)
     };
 
     while leaves.len() < num_centers {
@@ -4952,19 +4965,29 @@ fn select_equal_mass_centers(
             *v /= m.max(1.0);
         }
 
-        let mut best_idx = slice[0];
-        let mut best_d2 = f64::INFINITY;
-        for &idx in slice {
-            let mut d2 = 0.0;
-            for j in 0..d {
-                let delta = data[[idx, j]] - centroid[j];
-                d2 += delta * delta;
-            }
-            if d2 < best_d2 || (d2 == best_d2 && idx < best_idx) {
-                best_d2 = d2;
-                best_idx = idx;
-            }
-        }
+        let best_idx = slice
+            .par_iter()
+            .filter_map(|&idx| {
+                let mut d2 = 0.0;
+                for j in 0..d {
+                    let delta = data[[idx, j]] - centroid[j];
+                    d2 += delta * delta;
+                }
+                if d2.is_finite() {
+                    Some((idx, d2))
+                } else {
+                    None
+                }
+            })
+            .reduce_with(|a, b| {
+                if b.1 < a.1 || (b.1 == a.1 && b.0 < a.0) {
+                    b
+                } else {
+                    a
+                }
+            })
+            .map(|(idx, _)| idx)
+            .unwrap_or(slice[0]);
         centers.row_mut(c).assign(&data.row(best_idx));
     }
     Ok(centers)
