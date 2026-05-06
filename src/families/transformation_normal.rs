@@ -8598,6 +8598,10 @@ impl TensorKroneckerPsiOperator {
         if deriv.x_psi.nrows() == self.n_data() && deriv.x_psi.ncols() == self.p_cov() {
             return Ok(deriv.x_psi.slice(s![rows, ..]).to_owned());
         }
+        if self.cov_first_axis_cache_fits_budget() {
+            let cached = self.materialize_cov_first_axis_arc(axis)?;
+            return Ok(cached.slice(s![rows, ..]).to_owned());
+        }
         let Some(op) = deriv.implicit_operator.as_ref() else {
             return Err(crate::terms::basis::BasisError::InvalidInput(format!(
                 "missing covariate psi row chunk operator for axis {axis}"
@@ -8671,6 +8675,17 @@ impl TensorKroneckerPsiOperator {
             ))
         })?;
         mat_op.materialize_first(deriv.implicit_axis)
+    }
+
+    fn cov_first_axis_cache_fits_budget(&self) -> bool {
+        let policy = ResourcePolicy::default_library();
+        let per_axis_bytes = self
+            .n_data()
+            .saturating_mul(self.p_cov())
+            .saturating_mul(std::mem::size_of::<f64>());
+        let all_axes_bytes = per_axis_bytes.saturating_mul(self.covariate_derivs.len());
+        per_axis_bytes <= policy.max_single_materialization_bytes
+            && all_axes_bytes <= policy.max_operator_cache_bytes
     }
 
     fn materialize_cov_first_axis_arc(
