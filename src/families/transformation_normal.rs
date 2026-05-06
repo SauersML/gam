@@ -2905,6 +2905,357 @@ impl TransformationNormalFamily {
         Ok(out)
     }
 
+    fn scop_psi_hessian_hvp_mat_from_cov(
+        &self,
+        beta: &Array1<f64>,
+        row_quantities: &TransformationNormalRowQuantityCache,
+        axis: usize,
+        cov: &Array2<f64>,
+        cov_psi: &Array2<f64>,
+        factor: ArrayView2<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        let n = self.response_val_basis.nrows();
+        let p_resp = self.response_val_basis.ncols();
+        let p_cov = self.covariate_design.ncols();
+        let p_total = p_resp * p_cov;
+        let rank = factor.ncols();
+        if cov.nrows() != n || cov.ncols() != p_cov {
+            return Err(format!(
+                "SCOP psi Hessian batched apply covariate shape {}x{} != expected {}x{}",
+                cov.nrows(),
+                cov.ncols(),
+                n,
+                p_cov
+            ));
+        }
+        if cov_psi.nrows() != n || cov_psi.ncols() != p_cov {
+            return Err(format!(
+                "SCOP psi Hessian batched apply covariate derivative shape {}x{} for axis {axis} != expected {}x{}",
+                cov_psi.nrows(),
+                cov_psi.ncols(),
+                n,
+                p_cov
+            ));
+        }
+        if beta.len() != p_total || factor.nrows() != p_total {
+            return Err(format!(
+                "SCOP psi Hessian batched apply length mismatch: beta={}, factor_rows={}, expected={p_total}",
+                beta.len(),
+                factor.nrows()
+            ));
+        }
+        let beta_mat = beta
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP psi Hessian batched apply beta reshape failed: {e}"))?;
+        let endpoint_basis = [
+            self.response_upper_basis
+                .as_slice()
+                .ok_or_else(|| "SCOP endpoint upper basis is not contiguous".to_string())?,
+            self.response_lower_basis
+                .as_slice()
+                .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
+        ];
+
+        struct PsiBatchedAccum {
+            hvp: Array2<f64>,
+            gamma: Vec<f64>,
+            gamma_psi: Vec<f64>,
+            gamma_dir: Vec<f64>,
+            gamma_psi_dir: Vec<f64>,
+            h_dir: Vec<f64>,
+            hp_dir: Vec<f64>,
+            h_psi_dir: Vec<f64>,
+            hp_psi_dir: Vec<f64>,
+            endpoint_dir: Vec<[f64; 2]>,
+            endpoint_psi_dir: Vec<[f64; 2]>,
+        }
+
+        impl PsiBatchedAccum {
+            fn new(p_total: usize, p_resp: usize, rank: usize) -> Self {
+                let projected_len = p_resp * rank;
+                Self {
+                    hvp: Array2::<f64>::zeros((p_total, rank)),
+                    gamma: vec![0.0; p_resp],
+                    gamma_psi: vec![0.0; p_resp],
+                    gamma_dir: vec![0.0; projected_len],
+                    gamma_psi_dir: vec![0.0; projected_len],
+                    h_dir: vec![0.0; rank],
+                    hp_dir: vec![0.0; rank],
+                    h_psi_dir: vec![0.0; rank],
+                    hp_psi_dir: vec![0.0; rank],
+                    endpoint_dir: vec![[0.0; 2]; rank],
+                    endpoint_psi_dir: vec![[0.0; 2]; rank],
+                }
+            }
+
+            fn merge(mut self, rhs: Self) -> Self {
+                self.hvp += &rhs.hvp;
+                self
+            }
+        }
+
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let weights = self.weights.as_ref();
+        let h = row_quantities.h.as_ref();
+        let h_prime = row_quantities.h_prime.as_ref();
+        let accum = (0..n)
+            .into_par_iter()
+            .fold(
+                || PsiBatchedAccum::new(p_total, p_resp, rank),
+                |mut acc, i| {
+                    let cov_row = cov.row(i);
+                    let psi_row = cov_psi.row(i);
+                    let rv = self.response_val_basis.row(i);
+                    let rd = self.response_deriv_basis.row(i);
+                    let wi = weights[i];
+                    let hi = h[i];
+                    let hp = h_prime[i];
+                    let inv_hp = 1.0 / hp;
+                    let inv_hp_sq = inv_hp * inv_hp;
+                    let inv_hp_cu = inv_hp_sq * inv_hp;
+                    let q = row_quantities.endpoint_q[i];
+                    let gamma_row = row_quantities.gamma.row(i);
+
+                    for k in 0..p_resp {
+                        acc.gamma[k] = gamma_row[k];
+                        acc.gamma_psi[k] = beta_mat.row(k).dot(&psi_row);
+                    }
+
+                    acc.gamma_dir.fill(0.0);
+                    acc.gamma_psi_dir.fill(0.0);
+                    for k in 0..p_resp {
+                        let factor_row_base = k * p_cov;
+                        let projected_base = k * rank;
+                        for cidx in 0..p_cov {
+                            let factor_row = factor_row_base + cidx;
+                            let cov_v = cov_row[cidx];
+                            let psi_v = psi_row[cidx];
+                            for col in 0..rank {
+                                let coeff = factor[[factor_row, col]];
+                                let idx = projected_base + col;
+                                acc.gamma_dir[idx] += coeff * cov_v;
+                                acc.gamma_psi_dir[idx] += coeff * psi_v;
+                            }
+                        }
+                    }
+
+                    let mut h_psi = rv[0] * acc.gamma_psi[0];
+                    let mut hp_psi = rd[0] * acc.gamma_psi[0];
+                    for k in 1..p_resp {
+                        h_psi += 2.0 * rv[k] * acc.gamma[k] * acc.gamma_psi[k];
+                        hp_psi += 2.0 * rd[k] * acc.gamma[k] * acc.gamma_psi[k];
+                    }
+
+                    let mut endpoint_psi = [0.0; 2];
+                    for e in 0..2 {
+                        let basis = endpoint_basis[e];
+                        endpoint_psi[e] = basis[0] * acc.gamma_psi[0];
+                        for k in 1..p_resp {
+                            endpoint_psi[e] +=
+                                2.0 * basis[k] * acc.gamma[k] * acc.gamma_psi[k];
+                        }
+                    }
+
+                    for col in 0..rank {
+                        acc.h_dir[col] = rv[0] * acc.gamma_dir[col];
+                        acc.hp_dir[col] = rd[0] * acc.gamma_dir[col];
+                        acc.h_psi_dir[col] = rv[0] * acc.gamma_psi_dir[col];
+                        acc.hp_psi_dir[col] = rd[0] * acc.gamma_psi_dir[col];
+                        acc.endpoint_dir[col] = [
+                            endpoint_basis[0][0] * acc.gamma_dir[col],
+                            endpoint_basis[1][0] * acc.gamma_dir[col],
+                        ];
+                        acc.endpoint_psi_dir[col] = [
+                            endpoint_basis[0][0] * acc.gamma_psi_dir[col],
+                            endpoint_basis[1][0] * acc.gamma_psi_dir[col],
+                        ];
+                    }
+                    for k in 1..p_resp {
+                        let g = acc.gamma[k];
+                        let g_psi = acc.gamma_psi[k];
+                        for col in 0..rank {
+                            let idx = k * rank + col;
+                            let g_dir = acc.gamma_dir[idx];
+                            let g_psi_dir = acc.gamma_psi_dir[idx];
+                            acc.h_dir[col] += 2.0 * rv[k] * g * g_dir;
+                            acc.hp_dir[col] += 2.0 * rd[k] * g * g_dir;
+                            acc.h_psi_dir[col] += 2.0 * rv[k] * (g_dir * g_psi + g * g_psi_dir);
+                            acc.hp_psi_dir[col] += 2.0 * rd[k] * (g_dir * g_psi + g * g_psi_dir);
+                            for e in 0..2 {
+                                let basis = endpoint_basis[e];
+                                acc.endpoint_dir[col][e] += 2.0 * basis[k] * g * g_dir;
+                                acc.endpoint_psi_dir[col][e] +=
+                                    2.0 * basis[k] * (g_dir * g_psi + g * g_psi_dir);
+                            }
+                        }
+                    }
+
+                    for k in 0..p_resp {
+                        let offset = k * p_cov;
+                        let rvk = rv[k];
+                        let rdk = rd[k];
+                        let g = acc.gamma[k];
+                        let g_psi = acc.gamma_psi[k];
+                        let h_factor = if k == 0 { rvk } else { 2.0 * rvk * g };
+                        let hp_factor = if k == 0 { rdk } else { 2.0 * rdk * g };
+                        let hpsi_cov_factor = if k == 0 { 0.0 } else { 2.0 * rvk * g_psi };
+                        let hppsi_cov_factor = if k == 0 { 0.0 } else { 2.0 * rdk * g_psi };
+                        let hpsi_psi_factor = if k == 0 { rvk } else { 2.0 * rvk * g };
+                        let hppsi_psi_factor = if k == 0 { rdk } else { 2.0 * rdk * g };
+                        let endpoint_factor = [
+                            if k == 0 {
+                                endpoint_basis[0][k]
+                            } else {
+                                2.0 * endpoint_basis[0][k] * g
+                            },
+                            if k == 0 {
+                                endpoint_basis[1][k]
+                            } else {
+                                2.0 * endpoint_basis[1][k] * g
+                            },
+                        ];
+                        let endpoint_psi_cov_factor = [
+                            if k == 0 {
+                                0.0
+                            } else {
+                                2.0 * endpoint_basis[0][k] * g_psi
+                            },
+                            if k == 0 {
+                                0.0
+                            } else {
+                                2.0 * endpoint_basis[1][k] * g_psi
+                            },
+                        ];
+                        let endpoint_psi_psi_factor = [
+                            if k == 0 {
+                                endpoint_basis[0][k]
+                            } else {
+                                2.0 * endpoint_basis[0][k] * g
+                            },
+                            if k == 0 {
+                                endpoint_basis[1][k]
+                            } else {
+                                2.0 * endpoint_basis[1][k] * g
+                            },
+                        ];
+                        for cidx in 0..p_cov {
+                            let c = cov_row[cidx];
+                            let psi = psi_row[cidx];
+                            let h_a = h_factor * c;
+                            let hp_a = hp_factor * c;
+                            let hpsi_a = hpsi_cov_factor * c + hpsi_psi_factor * psi;
+                            let hppsi_a = hppsi_cov_factor * c + hppsi_psi_factor * psi;
+                            let endpoint_a = [endpoint_factor[0] * c, endpoint_factor[1] * c];
+                            let endpoint_psi_a = [
+                                endpoint_psi_cov_factor[0] * c
+                                    + endpoint_psi_psi_factor[0] * psi,
+                                endpoint_psi_cov_factor[1] * c
+                                    + endpoint_psi_psi_factor[1] * psi,
+                            ];
+                            let out_idx = offset + cidx;
+                            for col in 0..rank {
+                                let projected_idx = k * rank + col;
+                                let g_dir = acc.gamma_dir[projected_idx];
+                                let g_psi_dir = acc.gamma_psi_dir[projected_idx];
+                                let h_factor_dir =
+                                    if k == 0 { 0.0 } else { 2.0 * rvk * g_dir };
+                                let hp_factor_dir =
+                                    if k == 0 { 0.0 } else { 2.0 * rdk * g_dir };
+                                let hpsi_cov_factor_dir =
+                                    if k == 0 { 0.0 } else { 2.0 * rvk * g_psi_dir };
+                                let hppsi_cov_factor_dir =
+                                    if k == 0 { 0.0 } else { 2.0 * rdk * g_psi_dir };
+                                let hpsi_psi_factor_dir =
+                                    if k == 0 { 0.0 } else { 2.0 * rvk * g_dir };
+                                let hppsi_psi_factor_dir =
+                                    if k == 0 { 0.0 } else { 2.0 * rdk * g_dir };
+                                let h_a_dir = h_factor_dir * c;
+                                let hp_a_dir = hp_factor_dir * c;
+                                let hpsi_a_dir =
+                                    hpsi_cov_factor_dir * c + hpsi_psi_factor_dir * psi;
+                                let hppsi_a_dir =
+                                    hppsi_cov_factor_dir * c + hppsi_psi_factor_dir * psi;
+                                let endpoint_factor_dir = [
+                                    if k == 0 {
+                                        0.0
+                                    } else {
+                                        2.0 * endpoint_basis[0][k] * g_dir
+                                    },
+                                    if k == 0 {
+                                        0.0
+                                    } else {
+                                        2.0 * endpoint_basis[1][k] * g_dir
+                                    },
+                                ];
+                                let endpoint_psi_cov_factor_dir = [
+                                    if k == 0 {
+                                        0.0
+                                    } else {
+                                        2.0 * endpoint_basis[0][k] * g_psi_dir
+                                    },
+                                    if k == 0 {
+                                        0.0
+                                    } else {
+                                        2.0 * endpoint_basis[1][k] * g_psi_dir
+                                    },
+                                ];
+                                let endpoint_psi_psi_factor_dir = [
+                                    if k == 0 {
+                                        0.0
+                                    } else {
+                                        2.0 * endpoint_basis[0][k] * g_dir
+                                    },
+                                    if k == 0 {
+                                        0.0
+                                    } else {
+                                        2.0 * endpoint_basis[1][k] * g_dir
+                                    },
+                                ];
+                                let endpoint_a_dir =
+                                    [endpoint_factor_dir[0] * c, endpoint_factor_dir[1] * c];
+                                let endpoint_psi_a_dir = [
+                                    endpoint_psi_cov_factor_dir[0] * c
+                                        + endpoint_psi_psi_factor_dir[0] * psi,
+                                    endpoint_psi_cov_factor_dir[1] * c
+                                        + endpoint_psi_psi_factor_dir[1] * psi,
+                                ];
+                                let d_inv_hp = -acc.hp_dir[col] * inv_hp_sq;
+                                let d_inv_hp_sq = -2.0 * acc.hp_dir[col] * inv_hp_cu;
+                                let value = h_a_dir * h_psi
+                                    + h_a * acc.h_psi_dir[col]
+                                    + acc.h_dir[col] * hpsi_a
+                                    + hi * hpsi_a_dir
+                                    - hppsi_a_dir * inv_hp
+                                    - hppsi_a * d_inv_hp
+                                    + acc.hp_psi_dir[col] * hp_a * inv_hp_sq
+                                    + hp_psi * hp_a_dir * inv_hp_sq
+                                    + hp_psi * hp_a * d_inv_hp_sq
+                                    + endpoint_chain_third(
+                                        &q,
+                                        endpoint_psi,
+                                        endpoint_a,
+                                        acc.endpoint_dir[col],
+                                        endpoint_psi_a,
+                                        acc.endpoint_psi_dir[col],
+                                        endpoint_a_dir,
+                                        endpoint_psi_a_dir,
+                                    );
+                                acc.hvp[[out_idx, col]] += wi * value;
+                            }
+                        }
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || PsiBatchedAccum::new(p_total, p_resp, rank),
+                |left, right| left.merge(right),
+            );
+
+        Ok(accum.hvp)
+    }
+
     fn scop_psi_psi_value_score_hvp_from_cov(
         &self,
         beta: &Array1<f64>,
@@ -5326,6 +5677,128 @@ impl TransformationNormalFamily {
         }
         Ok(out)
     }
+
+    fn axis_snapshots(&self) -> Result<Vec<TransformationNormalPsiWorkspaceAxisSnapshot>, String> {
+        let mut guard = self
+            .cache
+            .lock()
+            .map_err(|_| "TransformationNormalPsiWorkspace cache poisoned".to_string())?;
+        if guard.is_none() {
+            let computed = self.compute_all_axes()?;
+            *guard = Some(computed);
+        }
+        let cached = guard.as_ref().expect("populated above");
+        Ok(cached
+            .iter()
+            .map(|entry| TransformationNormalPsiWorkspaceAxisSnapshot {
+                op_arc: Arc::clone(&entry.op_arc),
+                axis: entry.axis,
+                row_gamma: Arc::clone(&entry.row_gamma),
+                row_h: Arc::clone(&entry.row_h),
+                row_h_prime: Arc::clone(&entry.row_h_prime),
+                endpoint_q: Arc::clone(&entry.endpoint_q),
+                beta: Arc::clone(&entry.beta),
+            })
+            .collect())
+    }
+
+    fn compute_pair_cache(
+        &self,
+    ) -> Result<Vec<Vec<Option<Arc<TransformationNormalPsiWorkspacePairCacheEntry>>>>, String> {
+        let axes = self.axis_snapshots()?;
+        let n_psi = axes.len();
+        if n_psi == 0 {
+            return Ok(Vec::new());
+        }
+
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let pairs: Vec<(usize, usize)> = (0..n_psi)
+            .flat_map(|i| (i..n_psi).map(move |j| (i, j)))
+            .collect();
+        let computed: Vec<
+            Result<
+                (
+                    usize,
+                    usize,
+                    Arc<TransformationNormalPsiWorkspacePairCacheEntry>,
+                ),
+                String,
+            >,
+        > = pairs
+            .into_par_iter()
+            .map(|(psi_i, psi_j)| {
+                let entry_i = &axes[psi_i];
+                let entry_j = &axes[psi_j];
+                let op = entry_i
+                    .op_arc
+                    .as_any()
+                    .downcast_ref::<TensorKroneckerPsiOperator>()
+                    .ok_or_else(|| {
+                        "TransformationNormalPsiWorkspace ψ-ψ pair cache requires tensor-backed operator"
+                            .to_string()
+                    })?;
+                if entry_j
+                    .op_arc
+                    .as_any()
+                    .downcast_ref::<TensorKroneckerPsiOperator>()
+                    .is_none()
+                {
+                    return Err(
+                        "TransformationNormalPsiWorkspace ψ-ψ pair cache requires tensor-backed operator on both axes"
+                            .to_string(),
+                    );
+                }
+
+                let (objective_psi_psi, score_psi_psi, _) = self
+                    .family
+                    .scop_psi_psi_value_score_hvp_from_operator(
+                        entry_i.beta.as_ref(),
+                        op,
+                        entry_i.axis,
+                        entry_j.axis,
+                        entry_i.row_gamma.view(),
+                        entry_i.row_h.view(),
+                        entry_i.row_h_prime.view(),
+                        entry_i.endpoint_q.as_slice(),
+                        None,
+                    )?;
+                if !objective_psi_psi.is_finite() || !score_psi_psi.iter().all(|v| v.is_finite())
+                {
+                    return Err(format!(
+                        "TransformationNormalPsiWorkspace ψ-ψ pair cache produced non-finite values at \
+                         psi_i={psi_i}, psi_j={psi_j}: obj_finite={}, score_all_finite={}",
+                        objective_psi_psi.is_finite(),
+                        score_psi_psi.iter().all(|v| v.is_finite()),
+                    ));
+                }
+
+                Ok((
+                    psi_i,
+                    psi_j,
+                    Arc::new(TransformationNormalPsiWorkspacePairCacheEntry {
+                        objective_psi_psi,
+                        score_psi_psi,
+                        op_arc: Arc::clone(&entry_i.op_arc),
+                        axis_i: entry_i.axis,
+                        axis_j: entry_j.axis,
+                        row_gamma: Arc::clone(&entry_i.row_gamma),
+                        row_h: Arc::clone(&entry_i.row_h),
+                        row_h_prime: Arc::clone(&entry_i.row_h_prime),
+                        endpoint_q: Arc::clone(&entry_i.endpoint_q),
+                        beta: Arc::clone(&entry_i.beta),
+                    }),
+                ))
+            })
+            .collect();
+
+        let mut table = vec![vec![None; n_psi]; n_psi];
+        for result in computed {
+            let (i, j, entry) = result?;
+            table[i][j] = Some(Arc::clone(&entry));
+            table[j][i] = Some(entry);
+        }
+        Ok(table)
+    }
 }
 
 fn ctn_penalty_scale_log_lambdas(
@@ -6455,27 +6928,17 @@ impl TransformationNormalPsiHessianOperator {
         factor: &Array2<f64>,
         cov: &Array2<f64>,
         cov_psi: &Array2<f64>,
-    ) -> Vec<Array1<f64>> {
-        let apply_col = |col: usize| {
-            self.family
-                .scop_psi_hessian_apply_from_operator_with_cov(
-                    &self.beta,
-                    &self.row_quantities,
-                    self.axis,
-                    cov,
-                    cov_psi,
-                    &factor.column(col).to_owned(),
-                )
-                .expect("validated CTN psi Hessian operator batched input should not fail")
-        };
-
-        let k = factor.ncols();
-        if rayon::current_thread_index().is_some() {
-            (0..k).map(apply_col).collect()
-        } else {
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            (0..k).into_par_iter().map(apply_col).collect()
-        }
+    ) -> Array2<f64> {
+        self.family
+            .scop_psi_hessian_hvp_mat_from_cov(
+                &self.beta,
+                &self.row_quantities,
+                self.axis,
+                cov,
+                cov_psi,
+                factor.view(),
+            )
+            .expect("validated CTN psi Hessian operator batched input should not fail")
     }
 }
 
@@ -6510,11 +6973,9 @@ impl HyperOperator for TransformationNormalPsiHessianOperator {
             .tensor_op()
             .materialize_cov_first_axis(self.axis)
             .expect("validated CTN psi Hessian operator covariate derivative should not fail");
-        let cols = self.apply_columns_with_shared_cov(factor, &cov, &cov_psi);
-        let mut out = Array2::<f64>::zeros((p, k));
-        for (col, applied) in cols.into_iter().enumerate() {
-            out.column_mut(col).assign(&applied);
-        }
+        let out = self.apply_columns_with_shared_cov(factor, &cov, &cov_psi);
+        debug_assert_eq!(out.nrows(), p);
+        debug_assert_eq!(out.ncols(), k);
         out
     }
 
@@ -11916,15 +12377,38 @@ impl MaterializablePsiDerivativeOperator for TensorKroneckerPsiOperator {
 ///    `first_order_terms(idx)` lookups are O(p_total) clones rather than full
 ///    row walks.
 ///
-/// `second_order_terms` and `hessian_directional_derivative` are not cached
-/// here; they delegate back to the existing `CustomFamily` direct hooks. Those
-/// paths are already operator-backed and fire only at full-Hessian outer
-/// evaluations (the dominant cost we are addressing here is gradient-mode).
+/// `second_order_terms` are cached as a full symmetric ψ-pair table after the
+/// first request so full-Hessian outer evaluations do not repeatedly traverse
+/// the same CTN rows for each `(ψ_i, ψ_j)` callback. The mixed
+/// `hessian_directional_derivative` hook still delegates to the direct path.
 struct TransformationNormalPsiWorkspaceCacheEntry {
     objective_psi: f64,
     score_psi: Array1<f64>,
     op_arc: Arc<dyn CustomFamilyPsiDerivativeOperator>,
     axis: usize,
+    row_gamma: Arc<Array2<f64>>,
+    row_h: Arc<Array1<f64>>,
+    row_h_prime: Arc<Array1<f64>>,
+    endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
+    beta: Arc<Array1<f64>>,
+}
+
+struct TransformationNormalPsiWorkspaceAxisSnapshot {
+    op_arc: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+    axis: usize,
+    row_gamma: Arc<Array2<f64>>,
+    row_h: Arc<Array1<f64>>,
+    row_h_prime: Arc<Array1<f64>>,
+    endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
+    beta: Arc<Array1<f64>>,
+}
+
+struct TransformationNormalPsiWorkspacePairCacheEntry {
+    objective_psi_psi: f64,
+    score_psi_psi: Array1<f64>,
+    op_arc: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+    axis_i: usize,
+    axis_j: usize,
     row_gamma: Arc<Array2<f64>>,
     row_h: Arc<Array1<f64>>,
     row_h_prime: Arc<Array1<f64>>,
@@ -11938,6 +12422,8 @@ struct TransformationNormalPsiWorkspace {
     specs: Vec<ParameterBlockSpec>,
     derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
     cache: Mutex<Option<Vec<TransformationNormalPsiWorkspaceCacheEntry>>>,
+    pair_cache:
+        Mutex<Option<Vec<Vec<Option<Arc<TransformationNormalPsiWorkspacePairCacheEntry>>>>>>,
 }
 
 impl TransformationNormalPsiWorkspace {
@@ -11953,6 +12439,7 @@ impl TransformationNormalPsiWorkspace {
             specs,
             derivative_blocks,
             cache: Mutex::new(None),
+            pair_cache: Mutex::new(None),
         }
     }
 
@@ -12328,97 +12815,49 @@ impl ExactNewtonJointPsiWorkspace for TransformationNormalPsiWorkspace {
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        let (axis_i, axis_j, op_i, op_j, row_gamma, row_h, row_h_prime, endpoint_q, beta) = {
+        let start = std::time::Instant::now();
+        let entry = {
             let mut guard = self
-                .cache
+                .pair_cache
                 .lock()
-                .map_err(|_| "TransformationNormalPsiWorkspace cache poisoned".to_string())?;
+                .map_err(|_| "TransformationNormalPsiWorkspace pair cache poisoned".to_string())?;
             if guard.is_none() {
-                let computed = self.compute_all_axes()?;
+                let computed = self.compute_pair_cache()?;
                 *guard = Some(computed);
             }
             let cached = guard.as_ref().expect("populated above");
             if psi_i >= cached.len() || psi_j >= cached.len() {
                 return Ok(None);
             }
-            let entry_i = &cached[psi_i];
-            let entry_j = &cached[psi_j];
-            (
-                entry_i.axis,
-                entry_j.axis,
-                Arc::clone(&entry_i.op_arc),
-                Arc::clone(&entry_j.op_arc),
-                Arc::clone(&entry_i.row_gamma),
-                Arc::clone(&entry_i.row_h),
-                Arc::clone(&entry_i.row_h_prime),
-                Arc::clone(&entry_i.endpoint_q),
-                Arc::clone(&entry_i.beta),
-            )
+            cached[psi_i][psi_j].as_ref().map(Arc::clone)
         };
-
-        let start = std::time::Instant::now();
-        let op = op_i
-            .as_any()
-            .downcast_ref::<TensorKroneckerPsiOperator>()
-            .ok_or_else(|| {
-                "TransformationNormalPsiWorkspace ψ-ψ terms require tensor-backed operator"
-                    .to_string()
-            })?;
-        if op_j
-            .as_any()
-            .downcast_ref::<TensorKroneckerPsiOperator>()
-            .is_none()
-        {
-            return Err(
-                "TransformationNormalPsiWorkspace ψ-ψ terms require tensor-backed operator on both axes"
-                    .to_string(),
-            );
-        }
-
-        let (objective_psi_psi, score_psi_psi, _) =
-            self.family.scop_psi_psi_value_score_hvp_from_operator(
-                beta.as_ref(),
-                op,
-                axis_i,
-                axis_j,
-                row_gamma.view(),
-                row_h.view(),
-                row_h_prime.view(),
-                endpoint_q.as_slice(),
-                None,
-            )?;
-        if !objective_psi_psi.is_finite() || !score_psi_psi.iter().all(|v| v.is_finite()) {
-            return Err(format!(
-                "TransformationNormalPsiWorkspace ψ-ψ terms produced non-finite values at \
-                 psi_i={psi_i}, psi_j={psi_j}: obj_finite={}, score_all_finite={}",
-                objective_psi_psi.is_finite(),
-                score_psi_psi.iter().all(|v| v.is_finite()),
-            ));
-        }
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
 
         let hessian_psi_psi_operator: Box<dyn HyperOperator> =
             Box::new(TransformationNormalPsiPsiHessianOperator::new(
                 Arc::new(self.family.clone()),
-                beta.as_ref().clone(),
-                Arc::clone(&op_i),
-                axis_i,
-                axis_j,
-                Arc::clone(&row_gamma),
-                Arc::clone(&row_h),
-                Arc::clone(&row_h_prime),
-                Arc::clone(&endpoint_q),
+                entry.beta.as_ref().clone(),
+                Arc::clone(&entry.op_arc),
+                entry.axis_i,
+                entry.axis_j,
+                Arc::clone(&entry.row_gamma),
+                Arc::clone(&entry.row_h),
+                Arc::clone(&entry.row_h_prime),
+                Arc::clone(&entry.endpoint_q),
             ));
         log::info!(
             "[STAGE] CTN psi-psi workspace pair (psi_i={}, psi_j={}, axes={},{}) elapsed={:.3}s",
             psi_i,
             psi_j,
-            axis_i,
-            axis_j,
+            entry.axis_i,
+            entry.axis_j,
             start.elapsed().as_secs_f64(),
         );
         Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
-            objective_psi_psi,
-            score_psi_psi,
+            objective_psi_psi: entry.objective_psi_psi,
+            score_psi_psi: entry.score_psi_psi.clone(),
             hessian_psi_psi: Array2::zeros((0, 0)),
             hessian_psi_psi_operator: Some(hessian_psi_psi_operator),
         }))
