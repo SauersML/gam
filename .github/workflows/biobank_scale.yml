@@ -3,7 +3,10 @@ name: Biobank Scale
 on:
   workflow_dispatch:
   schedule:
+    # Hourly short run.
     - cron: "0 * * * *"
+    # Daily extended run at 02:00 America/Chicago (CDT) — runs without the 50-min job cap.
+    - cron: "0 7 * * *"
 
 concurrency:
   group: biobank-scale-${{ github.ref }}
@@ -16,7 +19,7 @@ permissions:
 jobs:
   prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: ${{ github.event.schedule == '0 7 * * *' && 4320 || 50 }}
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       cache_key: ${{ steps.cache_key.outputs.cache_key }}
@@ -94,7 +97,7 @@ jobs:
   bootstrap-runtime:
     needs: prepare
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: ${{ github.event.schedule == '0 7 * * *' && 4320 || 50 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -124,12 +127,13 @@ jobs:
       - prepare
       - bootstrap-runtime
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: ${{ github.event.schedule == '0 7 * * *' && 4320 || 50 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     env:
-      BENCH_CMD_TIMEOUT_SEC: "2400"
+      # Daily run leaves this empty so runner.py disables the per-command timeout entirely.
+      BENCH_CMD_TIMEOUT_SEC: ${{ github.event.schedule == '0 7 * * *' && '' || '2400' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -205,7 +209,7 @@ jobs:
   aggregate:
     needs: benchmark
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: ${{ github.event.schedule == '0 7 * * *' && 4320 || 50 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
