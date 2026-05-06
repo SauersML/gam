@@ -3332,6 +3332,7 @@ impl PenaltySubspaceTrace {
     /// code (although the routing gate still blocks subspace cases
     /// from reaching this code in production today, the call site
     /// is real lib code, satisfying the dead_code lint).
+    #[allow(dead_code)]
     pub fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
         let v_proj: Array1<f64> = self.u_s.t().dot(v);
         let y_proj: Array1<f64> = self.h_proj_inverse.dot(&v_proj);

@@ -1,7 +1,7 @@
 use super::*;
 use crate::linalg::utils::enforce_symmetry;
 use crate::mixture_link::logit_inverse_link_jet5;
-use ndarray::{ShapeBuilder, Zip};
+use ndarray::Zip;
 use rayon::slice::ParallelSliceMut;
 
 const FIRTH_DERIVATIVE_PARALLEL_MIN_N: usize = 16_384;
