@@ -77,13 +77,13 @@ use gam::survival_construction::{
     build_survival_time_offsets_for_likelihood, build_survival_timewiggle_from_baseline,
     build_time_varying_survival_covariate_template, center_survival_time_designs_at_anchor,
     evaluate_survival_time_basis_row, initial_survival_baseline_config_for_fit,
-    marginal_slope_baseline_chain_rule_gradient, normalize_survival_time_pair,
-    optimize_survival_baseline_config, optimize_survival_baseline_config_with_gradient,
-    parse_survival_distribution, parse_survival_likelihood_mode, parse_survival_time_basis_config,
-    positive_survival_time_seed, require_structural_survival_time_basis,
-    resolve_survival_time_anchor_value, resolved_survival_time_basis_config_from_build,
-    survival_baseline_targetname, survival_derivative_guard_for_likelihood,
-    survival_likelihood_modename,
+    marginal_slope_baseline_chain_rule_gradient, marginal_slope_baseline_chain_rule_hessian,
+    normalize_survival_time_pair, optimize_survival_baseline_config,
+    optimize_survival_baseline_config_with_gradient, parse_survival_distribution,
+    parse_survival_likelihood_mode, parse_survival_time_basis_config, positive_survival_time_seed,
+    require_structural_survival_time_basis, resolve_survival_time_anchor_value,
+    resolved_survival_time_basis_config_from_build, survival_baseline_targetname,
+    survival_derivative_guard_for_likelihood, survival_likelihood_modename,
 };
 use gam::survival_location_scale::{
     SurvivalCovariateTermBlockTemplate, SurvivalLocationScalePredictInput,
@@ -4574,7 +4574,18 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         "survival marginal-slope baseline unexpectedly has no theta gradient"
                             .to_string()
                     })?;
-                    Ok((fit.fit.reml_score, gradient))
+                    let hessian = marginal_slope_baseline_chain_rule_hessian(
+                        age_entry.view(),
+                        age_exit.view(),
+                        candidate,
+                        &fit.baseline_offset_residuals,
+                        &fit.baseline_offset_curvatures,
+                    )?
+                    .ok_or_else(|| {
+                        "survival marginal-slope baseline unexpectedly has no theta Hessian"
+                            .to_string()
+                    })?;
+                    Ok((fit.fit.reml_score, gradient, hessian))
                 },
             )?;
         }
