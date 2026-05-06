@@ -34,6 +34,8 @@ const KERNEL_OPERATOR_ROW_CHUNK_SIZE: usize = 2048;
 /// (`diag_gram`, `apply_weighted_normal`, `dense_transpose_matvec_view`).
 /// Below this, the sequential row loop wins on overhead.
 const DENSE_ROW_PARALLEL_MIN_NP: u64 = 200_000;
+const WEIGHTED_CROSSPROD_PARALLEL_MIN_FLOPS: u64 = 500_000;
+const SPARSE_ROW_PARALLEL_MIN_FLOPS: u64 = 100_000;
 /// Maximum bytes for the (n, tail_total) intermediate in GEMM-batched tensor
 /// product matvecs.  Beyond this threshold, fall back to per-column GEMV.
 const TENSOR_GEMM_MAX_INTERMEDIATE_BYTES: usize = 128 * 1024 * 1024; // 128 MB
@@ -99,8 +101,48 @@ fn weighted_crossprod_dense(
             right.nrows()
         ));
     }
+    Ok(weighted_crossprod_dense_view(left, weights.view(), right))
+}
+
+fn weighted_crossprod_dense_view(
+    left: &Array2<f64>,
+    weights: ArrayView1<'_, f64>,
+    right: &Array2<f64>,
+) -> Array2<f64> {
+    let n = weights.len();
+    let p_left = left.ncols();
+    let p_right = right.ncols();
+    let work = (n as u64)
+        .saturating_mul(p_left as u64)
+        .saturating_mul(p_right as u64);
+    if rayon::current_num_threads() <= 1 || work < WEIGHTED_CROSSPROD_PARALLEL_MIN_FLOPS {
+        return weighted_crossprod_dense_rows(left, weights, right, 0..n);
+    }
+
+    let n_threads = rayon::current_num_threads();
+    let chunk_rows = n.div_ceil(n_threads * 4).max(1);
+    let starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
+    let partials: Vec<Array2<f64>> = starts
+        .into_par_iter()
+        .map(|start| {
+            weighted_crossprod_dense_rows(left, weights, right, start..(start + chunk_rows).min(n))
+        })
+        .collect();
+    let mut out = Array2::<f64>::zeros((p_left, p_right));
+    for partial in &partials {
+        out += partial;
+    }
+    out
+}
+
+fn weighted_crossprod_dense_rows(
+    left: &Array2<f64>,
+    weights: ArrayView1<'_, f64>,
+    right: &Array2<f64>,
+    rows: Range<usize>,
+) -> Array2<f64> {
     let mut out = Array2::<f64>::zeros((left.ncols(), right.ncols()));
-    for i in 0..weights.len() {
+    for i in rows {
         let wi = weights[i].max(0.0);
         if wi == 0.0 {
             continue;
@@ -115,7 +157,7 @@ fn weighted_crossprod_dense(
             }
         }
     }
-    Ok(out)
+    out
 }
 
 pub struct DenseRightProductView<'a> {
@@ -330,25 +372,7 @@ fn dense_transpose_matvec_view(matrix: &Array2<f64>, vector: ArrayView1<'_, f64>
 
 #[inline]
 fn dense_xtwx_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> Array2<f64> {
-    let p = matrix.ncols();
-    let mut xtwx = Array2::<f64>::zeros((p, p));
-    for i in 0..matrix.nrows() {
-        let wi = weights[i].max(0.0);
-        if wi == 0.0 {
-            continue;
-        }
-        for a in 0..p {
-            let xa = matrix[[i, a]];
-            for b in a..p {
-                let v = wi * xa * matrix[[i, b]];
-                xtwx[[a, b]] += v;
-                if a != b {
-                    xtwx[[b, a]] += v;
-                }
-            }
-        }
-    }
-    xtwx
+    weighted_crossprod_dense_view(matrix, weights, matrix)
 }
 
 #[inline]
@@ -362,6 +386,135 @@ fn dense_diag_gram_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> A
         }
         for j in 0..p {
             let xij = matrix[[i, j]];
+            diag[j] += wi * xij * xij;
+        }
+    }
+    diag
+}
+
+fn sparse_csr_weighted_xtwx(
+    row_ptr: &[usize],
+    col_idx: &[usize],
+    vals: &[f64],
+    n: usize,
+    p: usize,
+    weights: ArrayView1<'_, f64>,
+) -> Array2<f64> {
+    let nnz = vals.len() as u64;
+    let avg = nnz.checked_div(n.max(1) as u64).unwrap_or(0);
+    let work = (n as u64).saturating_mul(avg.saturating_mul(avg));
+    if rayon::current_num_threads() <= 1 || work < SPARSE_ROW_PARALLEL_MIN_FLOPS {
+        return sparse_csr_weighted_xtwx_rows(row_ptr, col_idx, vals, p, weights, 0..n);
+    }
+
+    let n_threads = rayon::current_num_threads();
+    let target_chunks = (n_threads * 8).max(1);
+    let chunk_rows = n.div_ceil(target_chunks).max(1);
+    let starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
+    let partials: Vec<Array2<f64>> = starts
+        .into_par_iter()
+        .map(|start| {
+            sparse_csr_weighted_xtwx_rows(
+                row_ptr,
+                col_idx,
+                vals,
+                p,
+                weights,
+                start..(start + chunk_rows).min(n),
+            )
+        })
+        .collect();
+    let mut xtwx = Array2::<f64>::zeros((p, p));
+    for partial in &partials {
+        xtwx += partial;
+    }
+    xtwx
+}
+
+fn sparse_csr_weighted_xtwx_rows(
+    row_ptr: &[usize],
+    col_idx: &[usize],
+    vals: &[f64],
+    p: usize,
+    weights: ArrayView1<'_, f64>,
+    rows: Range<usize>,
+) -> Array2<f64> {
+    let mut xtwx = Array2::<f64>::zeros((p, p));
+    for i in rows {
+        let wi = weights[i].max(0.0);
+        if wi == 0.0 {
+            continue;
+        }
+        let start = row_ptr[i];
+        let end = row_ptr[i + 1];
+        for a_ptr in start..end {
+            let a = col_idx[a_ptr];
+            let wxa = wi * vals[a_ptr];
+            for b_ptr in a_ptr..end {
+                let b = col_idx[b_ptr];
+                let v = wxa * vals[b_ptr];
+                xtwx[[a, b]] += v;
+                if a != b {
+                    xtwx[[b, a]] += v;
+                }
+            }
+        }
+    }
+    xtwx
+}
+
+fn sparse_csr_diag_gram(
+    row_ptr: &[usize],
+    col_idx: &[usize],
+    vals: &[f64],
+    n: usize,
+    p: usize,
+    weights: ArrayView1<'_, f64>,
+) -> Array1<f64> {
+    let work = vals.len() as u64;
+    if rayon::current_num_threads() <= 1 || work < SPARSE_ROW_PARALLEL_MIN_FLOPS {
+        return sparse_csr_diag_gram_rows(row_ptr, col_idx, vals, p, weights, 0..n);
+    }
+    let n_threads = rayon::current_num_threads();
+    let chunk_rows = n.div_ceil(n_threads * 8).max(1);
+    let starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
+    let partials: Vec<Array1<f64>> = starts
+        .into_par_iter()
+        .map(|start| {
+            sparse_csr_diag_gram_rows(
+                row_ptr,
+                col_idx,
+                vals,
+                p,
+                weights,
+                start..(start + chunk_rows).min(n),
+            )
+        })
+        .collect();
+    let mut diag = Array1::<f64>::zeros(p);
+    for partial in &partials {
+        diag += partial;
+    }
+    diag
+}
+
+fn sparse_csr_diag_gram_rows(
+    row_ptr: &[usize],
+    col_idx: &[usize],
+    vals: &[f64],
+    p: usize,
+    weights: ArrayView1<'_, f64>,
+    rows: Range<usize>,
+) -> Array1<f64> {
+    let mut diag = Array1::<f64>::zeros(p);
+    for i in rows {
+        let wi = weights[i].max(0.0);
+        if wi == 0.0 {
+            continue;
+        }
+        for idx in row_ptr[i]..row_ptr[i + 1] {
+            let j = col_idx[idx];
+            let xij = vals[idx];
             diag[j] += wi * xij * xij;
         }
     }
@@ -2621,53 +2774,55 @@ impl LinearOperator for TensorProductDesignOperator {
         let tail_dims: Vec<usize> = self.marginals[1..].iter().map(|m| m.ncols()).collect();
         let tail_total: usize = tail_dims.iter().product();
 
-        // Iterate over all (a_tail, b_tail) index pairs in the tail dimensions.
-        // For symmetry, only iterate a_flat <= b_flat and mirror.
-        let mut gamma = Array1::<f64>::zeros(n);
-        let mut block = Array2::<f64>::zeros((q0, q0));
+        // Iterate over all (a_tail, b_tail) index pairs in a deterministic
+        // task order. Each rayon task owns its gamma vector and q0×q0 block,
+        // and the collected blocks are scattered sequentially in pair order so
+        // reductions do not depend on worker scheduling.
         let tail_d = tail_dims.len();
-        let mut a_indices = vec![0usize; tail_d];
-        let mut b_indices = vec![0usize; tail_d];
-
-        for a_flat in 0..tail_total {
-            decode_multi_index(a_flat, &tail_dims, &mut a_indices);
-
-            for b_flat in a_flat..tail_total {
+        let pairs: Vec<(usize, usize)> = (0..tail_total)
+            .flat_map(|a_flat| (a_flat..tail_total).map(move |b_flat| (a_flat, b_flat)))
+            .collect();
+        let blocks: Vec<(usize, usize, Array2<f64>)> = pairs
+            .into_par_iter()
+            .map(|(a_flat, b_flat)| {
+                let mut a_indices = vec![0usize; tail_d];
+                let mut b_indices = vec![0usize; tail_d];
+                decode_multi_index(a_flat, &tail_dims, &mut a_indices);
                 decode_multi_index(b_flat, &tail_dims, &mut b_indices);
 
-                // Form γ[i] = w[i] · ∏_{d=1..k-1} B_{d+1}[i, a_d] · B_{d+1}[i, b_d]
+                let mut gamma = Array1::<f64>::zeros(n);
                 for i in 0..n {
                     let mut prod = weights[i].max(0.0);
-                    if prod == 0.0 {
-                        gamma[i] = 0.0;
-                        continue;
-                    }
-                    for dim_idx in 0..tail_d {
-                        let m = &self.marginals[dim_idx + 1];
-                        prod *= m[[i, a_indices[dim_idx]]] * m[[i, b_indices[dim_idx]]];
-                        if prod == 0.0 {
-                            break;
+                    if prod != 0.0 {
+                        for dim_idx in 0..tail_d {
+                            let m = &self.marginals[dim_idx + 1];
+                            prod *= m[[i, a_indices[dim_idx]]] * m[[i, b_indices[dim_idx]]];
+                            if prod == 0.0 {
+                                break;
+                            }
                         }
                     }
                     gamma[i] = prod;
                 }
 
-                // Compute B₁' · diag(γ) · B₁ → (q₀ × q₀) block via BLAS.
-                block.fill(0.0);
+                let mut block = Array2::<f64>::zeros((q0, q0));
                 streaming_blas_xt_diag_x(b0.as_ref(), &gamma, &mut block);
+                (a_flat, b_flat, block)
+            })
+            .collect();
 
-                // Scatter block into the full xtwx.
-                // Global column for (j₁, tail_flat) = j₁ * tail_total + tail_flat.
-                for a1 in 0..q0 {
-                    let ga = a1 * tail_total + a_flat;
-                    for b1 in 0..q0 {
-                        let gb = b1 * tail_total + b_flat;
-                        xtwx[[ga, gb]] += block[[a1, b1]];
-                        if a_flat != b_flat {
-                            let ga_mirror = a1 * tail_total + b_flat;
-                            let gb_mirror = b1 * tail_total + a_flat;
-                            xtwx[[ga_mirror, gb_mirror]] += block[[a1, b1]];
-                        }
+        for (a_flat, b_flat, block) in blocks {
+            // Scatter block into the full xtwx.
+            // Global column for (j₁, tail_flat) = j₁ * tail_total + tail_flat.
+            for a1 in 0..q0 {
+                let ga = a1 * tail_total + a_flat;
+                for b1 in 0..q0 {
+                    let gb = b1 * tail_total + b_flat;
+                    xtwx[[ga, gb]] += block[[a1, b1]];
+                    if a_flat != b_flat {
+                        let ga_mirror = a1 * tail_total + b_flat;
+                        let gb_mirror = b1 * tail_total + a_flat;
+                        xtwx[[ga_mirror, gb_mirror]] += block[[a1, b1]];
                     }
                 }
             }
@@ -3307,26 +3462,33 @@ impl LinearOperator for RowwiseKroneckerOperator {
 
         // For each time-basis pair (t1, t2), the (p_cov, p_cov) block is
         //   cov' diag(γ_{t1,t2}) cov
-        // where γ[i] = w[i] * time[i,t1] * time[i,t2].
-        // We delegate to cov.compute_xtwx(γ) which stays sparse-native.
-        let mut gamma = Array1::<f64>::zeros(n);
-        for t1 in 0..p_time {
-            for t2 in 0..=t1 {
+        // where γ[i] = w[i] * time[i,t1] * time[i,t2].  Blocks are computed
+        // in rayon tasks with task-local gamma arrays, then scattered in
+        // lexicographic pair order for deterministic reductions.
+        let pairs: Vec<(usize, usize)> = (0..p_time)
+            .flat_map(|t1| (0..=t1).map(move |t2| (t1, t2)))
+            .collect();
+        let blocks: Result<Vec<(usize, usize, Array2<f64>)>, String> = pairs
+            .into_par_iter()
+            .map(|(t1, t2)| {
                 let time_t1 = time.column(t1);
                 let time_t2 = time.column(t2);
+                let mut gamma = Array1::<f64>::zeros(n);
                 ndarray::Zip::from(&mut gamma)
                     .and(weights)
                     .and(&time_t1)
                     .and(&time_t2)
-                    .par_for_each(|g, &w, &a, &b| *g = w.max(0.0) * a * b);
-                let block = self.cov.compute_xtwx(&gamma)?;
-                // Scatter block into xtwx for both (t1, t2) and (t2, t1).
-                for j1 in 0..p_cov {
-                    for j2 in 0..p_cov {
-                        xtwx[[j1 * p_time + t1, j2 * p_time + t2]] = block[[j1, j2]];
-                        if t1 != t2 {
-                            xtwx[[j1 * p_time + t2, j2 * p_time + t1]] = block[[j1, j2]];
-                        }
+                    .for_each(|g, &w, &a, &b| *g = w.max(0.0) * a * b);
+                self.cov.compute_xtwx(&gamma).map(|block| (t1, t2, block))
+            })
+            .collect();
+        for (t1, t2, block) in blocks? {
+            // Scatter block into xtwx for both (t1, t2) and (t2, t1).
+            for j1 in 0..p_cov {
+                for j2 in 0..p_cov {
+                    xtwx[[j1 * p_time + t1, j2 * p_time + t2]] = block[[j1, j2]];
+                    if t1 != t2 {
+                        xtwx[[j1 * p_time + t2, j2 * p_time + t1]] = block[[j1, j2]];
                     }
                 }
             }
@@ -4682,52 +4844,18 @@ impl LinearOperator for DesignMatrix {
                     streaming_blas_xt_diag_x(xd.as_ref(), weights, &mut xtwx);
                     return Ok(xtwx);
                 }
-                use rayon::iter::{IntoParallelIterator, ParallelIterator};
                 let csr = xs
-                    .as_ref()
-                    .to_row_major()
-                    .map_err(|_| "failed to obtain CSR view in compute_xtwx".to_string())?;
-                let n_threads = rayon::current_num_threads().max(1);
-                let target_chunks = (n_threads * 16).max(n_threads);
-                let chunk_rows = (n / target_chunks).max(256).min(n.max(1));
-                let chunk_starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
-                let partials: Vec<Array2<f64>> = chunk_starts
-                    .into_par_iter()
-                    .map(|start| {
-                        let end = (start + chunk_rows).min(n);
-                        let mut local = Array2::<f64>::zeros((p, p));
-                        let sym = csr.symbolic();
-                        let row_ptr = sym.row_ptr();
-                        let col_idx = sym.col_idx();
-                        let vals = csr.val();
-                        for i in start..end {
-                            let wi = weights[i].max(0.0);
-                            if wi == 0.0 {
-                                continue;
-                            }
-                            let r_start = row_ptr[i];
-                            let r_end = row_ptr[i + 1];
-                            for a_ptr in r_start..r_end {
-                                let a = col_idx[a_ptr];
-                                let wxa = wi * vals[a_ptr];
-                                for b_ptr in a_ptr..r_end {
-                                    let b = col_idx[b_ptr];
-                                    let v = wxa * vals[b_ptr];
-                                    local[[a, b]] += v;
-                                    if a != b {
-                                        local[[b, a]] += v;
-                                    }
-                                }
-                            }
-                        }
-                        local
-                    })
-                    .collect();
-                let mut xtwx = Array2::<f64>::zeros((p, p));
-                for partial in partials.iter() {
-                    xtwx += partial;
-                }
-                Ok(xtwx)
+                    .to_csr_arc()
+                    .ok_or_else(|| "failed to obtain CSR view in compute_xtwx".to_string())?;
+                let sym = csr.symbolic();
+                Ok(sparse_csr_weighted_xtwx(
+                    sym.row_ptr(),
+                    sym.col_idx(),
+                    csr.val(),
+                    n,
+                    p,
+                    weights.view(),
+                ))
             }
         }
     }
@@ -4741,30 +4869,21 @@ impl LinearOperator for DesignMatrix {
             ));
         }
         let p = self.ncols();
-        let mut diag = Array1::<f64>::zeros(p);
         match self {
             Self::Dense(x) => x.diag_gram(weights),
             Self::Sparse(xs) => {
                 let csr = xs
-                    .as_ref()
-                    .to_row_major()
-                    .map_err(|_| "failed to obtain CSR view in diag_gram".to_string())?;
+                    .to_csr_arc()
+                    .ok_or_else(|| "failed to obtain CSR view in diag_gram".to_string())?;
                 let sym = csr.symbolic();
-                let row_ptr = sym.row_ptr();
-                let col_idx = sym.col_idx();
-                let vals = csr.val();
-                for i in 0..self.nrows() {
-                    let wi = weights[i].max(0.0);
-                    if wi == 0.0 {
-                        continue;
-                    }
-                    for idx in row_ptr[i]..row_ptr[i + 1] {
-                        let j = col_idx[idx];
-                        let xij = vals[idx];
-                        diag[j] += wi * xij * xij;
-                    }
-                }
-                Ok(diag)
+                Ok(sparse_csr_diag_gram(
+                    sym.row_ptr(),
+                    sym.col_idx(),
+                    csr.val(),
+                    self.nrows(),
+                    p,
+                    weights.view(),
+                ))
             }
         }
     }
@@ -6071,37 +6190,18 @@ impl DesignMatrix {
             Self::Dense(DenseDesignMatrix::Lazy(op)) => op.diag_xtw_x(&weights.to_owned()),
             Self::Sparse(xs) => {
                 let p = xs.ncols();
-                let mut xtwx = Array2::<f64>::zeros((p, p));
                 let csr = xs
-                    .as_ref()
-                    .to_row_major()
-                    .map_err(|_| "failed to obtain CSR view in compute_xtwx".to_string())?;
+                    .to_csr_arc()
+                    .ok_or_else(|| "failed to obtain CSR view in compute_xtwx".to_string())?;
                 let sym = csr.symbolic();
-                let row_ptr = sym.row_ptr();
-                let col_idx = sym.col_idx();
-                let vals = csr.val();
-                for i in 0..xs.nrows() {
-                    let wi = weights[i].max(0.0);
-                    if wi == 0.0 {
-                        continue;
-                    }
-                    let start = row_ptr[i];
-                    let end = row_ptr[i + 1];
-                    for a_ptr in start..end {
-                        let a = col_idx[a_ptr];
-                        let xa = vals[a_ptr];
-                        for b_ptr in a_ptr..end {
-                            let b = col_idx[b_ptr];
-                            let xb = vals[b_ptr];
-                            let v = wi * xa * xb;
-                            xtwx[[a, b]] += v;
-                            if a != b {
-                                xtwx[[b, a]] += v;
-                            }
-                        }
-                    }
-                }
-                Ok(xtwx)
+                Ok(sparse_csr_weighted_xtwx(
+                    sym.row_ptr(),
+                    sym.col_idx(),
+                    csr.val(),
+                    xs.nrows(),
+                    p,
+                    weights,
+                ))
             }
         }
     }
@@ -6121,27 +6221,18 @@ impl DesignMatrix {
             Self::Dense(DenseDesignMatrix::Lazy(op)) => op.diag_gram(&weights.to_owned()),
             Self::Sparse(xs) => {
                 let p = xs.ncols();
-                let mut diag = Array1::<f64>::zeros(p);
                 let csr = xs
-                    .as_ref()
-                    .to_row_major()
-                    .map_err(|_| "failed to obtain CSR view in diag_gram".to_string())?;
+                    .to_csr_arc()
+                    .ok_or_else(|| "failed to obtain CSR view in diag_gram".to_string())?;
                 let sym = csr.symbolic();
-                let row_ptr = sym.row_ptr();
-                let col_idx = sym.col_idx();
-                let vals = csr.val();
-                for i in 0..xs.nrows() {
-                    let wi = weights[i].max(0.0);
-                    if wi == 0.0 {
-                        continue;
-                    }
-                    for idx in row_ptr[i]..row_ptr[i + 1] {
-                        let j = col_idx[idx];
-                        let xij = vals[idx];
-                        diag[j] += wi * xij * xij;
-                    }
-                }
-                Ok(diag)
+                Ok(sparse_csr_diag_gram(
+                    sym.row_ptr(),
+                    sym.col_idx(),
+                    csr.val(),
+                    xs.nrows(),
+                    p,
+                    weights,
+                ))
             }
         }
     }
@@ -6375,9 +6466,10 @@ impl From<&DesignMatrix> for DesignBlock {
 mod tests {
     use super::{
         ChunkedKernelDesignOperator, DenseDesignMatrix, DenseDesignOperator, DesignMatrix,
-        EmbeddedColumnBlock, MultiChannelOperator, ReparamOperator, SparseDesignMatrix,
-        SparseHessianAccumulator, dense_matvec, dense_operator_to_dense_by_chunks,
-        dense_transpose_matvec, dense_transpose_weighted_response, dense_xtwx_view,
+        EmbeddedColumnBlock, MultiChannelOperator, ReparamOperator, RowwiseKroneckerOperator,
+        SparseDesignMatrix, SparseHessianAccumulator, dense_matvec,
+        dense_operator_to_dense_by_chunks, dense_transpose_matvec,
+        dense_transpose_weighted_response, dense_xtwx_view,
     };
     use crate::linalg::matrix::LinearOperator;
     use crate::linalg::utils::{PcgSolveInfo, StableSolver};
@@ -7137,6 +7229,133 @@ mod tests {
             .map(|v: &f64| v.abs())
             .fold(0.0f64, f64::max);
         assert!(max_diff < 1e-10, "3D X'Xβ mismatch: max_diff={max_diff}");
+    }
+
+    #[test]
+    fn sparse_weighted_crossprod_parallel_path_matches_dense_reference() {
+        use faer::sparse::Triplet;
+
+        let n = 4096;
+        let p = 192;
+        let mut triplets = Vec::with_capacity(n * 4);
+        let mut dense = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let base = (i * 37) % p;
+            for k in 0..4 {
+                let col = (base + k * 11) % p;
+                let val = ((i + 3 * k + 1) as f64).sin() * 0.25 + 0.5;
+                triplets.push(Triplet::new(i, col, val));
+                dense[[i, col]] = val;
+            }
+        }
+        let sparse = faer::sparse::SparseColMat::try_new_from_triplets(n, p, &triplets).unwrap();
+        let design = DesignMatrix::Sparse(SparseDesignMatrix::new(sparse));
+        let weights = Array1::from_iter((0..n).map(|i| match i % 7 {
+            0 => 0.0,
+            r => 0.5 + r as f64 * 0.125,
+        }));
+
+        let got = design.compute_xtwx(&weights).unwrap();
+        let mut reference = Array2::<f64>::zeros((p, p));
+        for i in 0..n {
+            let wi = weights[i].max(0.0);
+            if wi == 0.0 {
+                continue;
+            }
+            for a in 0..p {
+                let xa = dense[[i, a]];
+                if xa == 0.0 {
+                    continue;
+                }
+                for b in 0..p {
+                    reference[[a, b]] += wi * xa * dense[[i, b]];
+                }
+            }
+        }
+        let max_diff = (&got - &reference)
+            .iter()
+            .map(|v: &f64| v.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_diff < 1e-10,
+            "sparse xtwx mismatch: max_diff={max_diff}"
+        );
+
+        let got_diag = design.diag_gram(&weights).unwrap();
+        let ref_diag = reference.diag().to_owned();
+        let max_diag_diff = (&got_diag - &ref_diag)
+            .iter()
+            .map(|v: &f64| v.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_diag_diff < 1e-10,
+            "sparse diag gram mismatch: max_diff={max_diag_diff}"
+        );
+    }
+
+    #[test]
+    fn rowwise_kronecker_sparse_structured_xtwx_matches_dense_reference() {
+        use faer::sparse::Triplet;
+
+        let n = 2048;
+        let p_cov = 64;
+        let p_time = 6;
+        let mut triplets = Vec::with_capacity(n * 3);
+        let mut cov_dense = Array2::<f64>::zeros((n, p_cov));
+        for i in 0..n {
+            let base = (i * 17) % p_cov;
+            for k in 0..3 {
+                let col = (base + k * 7) % p_cov;
+                let val = 0.2 + (((i + k) % 13) as f64) / 17.0;
+                triplets.push(Triplet::new(i, col, val));
+                cov_dense[[i, col]] = val;
+            }
+        }
+        let cov_sparse =
+            faer::sparse::SparseColMat::try_new_from_triplets(n, p_cov, &triplets).unwrap();
+        let cov = DesignMatrix::Sparse(SparseDesignMatrix::new(cov_sparse));
+        let mut time = Array2::<f64>::zeros((n, p_time));
+        for i in 0..n {
+            for t in 0..p_time {
+                time[[i, t]] = (((i + 1) * (t + 3)) as f64).cos() * 0.1 + 0.4;
+            }
+        }
+        let op = RowwiseKroneckerOperator::new(cov, Arc::new(time.clone())).unwrap();
+        let weights = Array1::from_iter((0..n).map(|i| 0.25 + ((i % 11) as f64) * 0.05));
+        let got = op.diag_xtw_x(&weights).unwrap();
+
+        let p_total = p_cov * p_time;
+        let mut reference = Array2::<f64>::zeros((p_total, p_total));
+        for i in 0..n {
+            for c1 in 0..p_cov {
+                let x1 = cov_dense[[i, c1]];
+                if x1 == 0.0 {
+                    continue;
+                }
+                for t1 in 0..p_time {
+                    let a = c1 * p_time + t1;
+                    let xa = x1 * time[[i, t1]];
+                    for c2 in 0..p_cov {
+                        let x2 = cov_dense[[i, c2]];
+                        if x2 == 0.0 {
+                            continue;
+                        }
+                        for t2 in 0..p_time {
+                            let b = c2 * p_time + t2;
+                            reference[[a, b]] += weights[i] * xa * x2 * time[[i, t2]];
+                        }
+                    }
+                }
+            }
+        }
+        let max_diff = (&got - &reference)
+            .iter()
+            .map(|v: &f64| v.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_diff < 1e-9,
+            "rowwise kronecker sparse xtwx mismatch: max_diff={max_diff}"
+        );
     }
 
     #[test]
