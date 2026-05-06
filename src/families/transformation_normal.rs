@@ -1944,16 +1944,31 @@ impl TransformationNormalFamily {
         row_quantities: &TransformationNormalRowQuantityCache,
         probe: &Array1<f64>,
     ) -> Result<Array1<f64>, String> {
+        let mut probes = Array2::<f64>::zeros((probe.len(), 1));
+        probes.column_mut(0).assign(probe);
+        let out = self.scop_hessian_directional_matmat(beta, direction, row_quantities, &probes)?;
+        Ok(out.column(0).to_owned())
+    }
+
+    fn scop_hessian_directional_matmat(
+        &self,
+        beta: &Array1<f64>,
+        direction: &Array1<f64>,
+        row_quantities: &TransformationNormalRowQuantityCache,
+        probes: &Array2<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let stage_start = std::time::Instant::now();
         let n = self.response_val_basis.nrows();
         let p_resp = self.response_val_basis.ncols();
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
-        if beta.len() != p_total || direction.len() != p_total || probe.len() != p_total {
+        let n_probe = probes.ncols();
+        if beta.len() != p_total || direction.len() != p_total || probes.nrows() != p_total {
             return Err(format!(
-                "SCOP dH matvec length mismatch: beta={}, direction={}, probe={}, expected={p_total}",
+                "SCOP dH matmat length mismatch: beta={}, direction={}, probes rows={}, expected={p_total}",
                 beta.len(),
                 direction.len(),
-                probe.len()
+                probes.nrows()
             ));
         }
         let beta_mat = beta
@@ -1964,16 +1979,21 @@ impl TransformationNormalFamily {
             .view()
             .into_shape_with_order((p_resp, p_cov))
             .map_err(|e| format!("SCOP direction reshape failed: {e}"))?;
-        let probe_mat = probe
-            .view()
-            .into_shape_with_order((p_resp, p_cov))
-            .map_err(|e| format!("SCOP probe reshape failed: {e}"))?;
         let cov = self
             .covariate_dense_arc()
-            .map_err(|e| format!("SCOP dH matvec requires cached covariate design: {e}"))?;
+            .map_err(|e| format!("SCOP dH matmat requires cached covariate design: {e}"))?;
         let weights = self.weights.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
-        let mut out = Array1::<f64>::zeros(p_total);
+        let mut out = Array2::<f64>::zeros((p_total, n_probe));
+        let mut gamma = vec![0.0; p_resp];
+        let mut gamma_dir = vec![0.0; p_resp];
+        let mut gamma_probe = vec![0.0; p_resp * n_probe];
+        let mut h_probe = vec![0.0; n_probe];
+        let mut hp_probe = vec![0.0; n_probe];
+        let mut h_dir_probe = vec![0.0; n_probe];
+        let mut hp_dir_probe = vec![0.0; n_probe];
+        let mut endpoint_probe = [vec![0.0; n_probe], vec![0.0; n_probe]];
+        let mut endpoint_dir_probe = [vec![0.0; n_probe], vec![0.0; n_probe]];
 
         for i in 0..n {
             let cov_row = cov.row(i);
@@ -1985,49 +2005,62 @@ impl TransformationNormalFamily {
             let inv_hp_sq = inv_hp * inv_hp;
             let inv_hp_cu = inv_hp_sq * inv_hp;
 
-            let mut gamma = vec![0.0; p_resp];
-            let mut gamma_dir = vec![0.0; p_resp];
-            let mut gamma_probe = vec![0.0; p_resp];
             for k in 0..p_resp {
                 gamma[k] = beta_mat.row(k).dot(&cov_row);
                 gamma_dir[k] = dir_mat.row(k).dot(&cov_row);
-                gamma_probe[k] = probe_mat.row(k).dot(&cov_row);
+                let row_offset = k * p_cov;
+                let probe_offset = k * n_probe;
+                for j in 0..n_probe {
+                    let mut value = 0.0;
+                    for c in 0..p_cov {
+                        value += probes[[row_offset + c, j]] * cov_row[c];
+                    }
+                    gamma_probe[probe_offset + j] = value;
+                }
             }
 
             let mut h_dir = rv[0] * gamma_dir[0];
             let mut hp_dir = rd[0] * gamma_dir[0];
-            let mut h_probe = rv[0] * gamma_probe[0];
-            let mut hp_probe = rd[0] * gamma_probe[0];
-            let mut h_dir_probe = 0.0;
-            let mut hp_dir_probe = 0.0;
             let mut endpoint_dir = [
                 self.response_upper_basis[0] * gamma_dir[0],
                 self.response_lower_basis[0] * gamma_dir[0],
             ];
-            let mut endpoint_probe = [
-                self.response_upper_basis[0] * gamma_probe[0],
-                self.response_lower_basis[0] * gamma_probe[0],
-            ];
-            let mut endpoint_dir_probe = [0.0, 0.0];
+            for j in 0..n_probe {
+                h_probe[j] = rv[0] * gamma_probe[j];
+                hp_probe[j] = rd[0] * gamma_probe[j];
+                h_dir_probe[j] = 0.0;
+                hp_dir_probe[j] = 0.0;
+                endpoint_probe[0][j] = self.response_upper_basis[0] * gamma_probe[j];
+                endpoint_probe[1][j] = self.response_lower_basis[0] * gamma_probe[j];
+                endpoint_dir_probe[0][j] = 0.0;
+                endpoint_dir_probe[1][j] = 0.0;
+            }
             for k in 1..p_resp {
+                let probe_offset = k * n_probe;
+                let gamma_k = gamma[k];
+                let gamma_dir_k = gamma_dir[k];
                 h_dir += 2.0 * rv[k] * gamma[k] * gamma_dir[k];
                 hp_dir += 2.0 * rd[k] * gamma[k] * gamma_dir[k];
-                h_probe += 2.0 * rv[k] * gamma[k] * gamma_probe[k];
-                hp_probe += 2.0 * rd[k] * gamma[k] * gamma_probe[k];
-                h_dir_probe += 2.0 * rv[k] * gamma_dir[k] * gamma_probe[k];
-                hp_dir_probe += 2.0 * rd[k] * gamma_dir[k] * gamma_probe[k];
                 endpoint_dir[0] += 2.0 * self.response_upper_basis[k] * gamma[k] * gamma_dir[k];
                 endpoint_dir[1] += 2.0 * self.response_lower_basis[k] * gamma[k] * gamma_dir[k];
-                endpoint_probe[0] += 2.0 * self.response_upper_basis[k] * gamma[k] * gamma_probe[k];
-                endpoint_probe[1] += 2.0 * self.response_lower_basis[k] * gamma[k] * gamma_probe[k];
-                endpoint_dir_probe[0] +=
-                    2.0 * self.response_upper_basis[k] * gamma_dir[k] * gamma_probe[k];
-                endpoint_dir_probe[1] +=
-                    2.0 * self.response_lower_basis[k] * gamma_dir[k] * gamma_probe[k];
+                for j in 0..n_probe {
+                    let pg = gamma_probe[probe_offset + j];
+                    h_probe[j] += 2.0 * rv[k] * gamma_k * pg;
+                    hp_probe[j] += 2.0 * rd[k] * gamma_k * pg;
+                    h_dir_probe[j] += 2.0 * rv[k] * gamma_dir_k * pg;
+                    hp_dir_probe[j] += 2.0 * rd[k] * gamma_dir_k * pg;
+                    endpoint_probe[0][j] += 2.0 * self.response_upper_basis[k] * gamma_k * pg;
+                    endpoint_probe[1][j] += 2.0 * self.response_lower_basis[k] * gamma_k * pg;
+                    endpoint_dir_probe[0][j] +=
+                        2.0 * self.response_upper_basis[k] * gamma_dir_k * pg;
+                    endpoint_dir_probe[1][j] +=
+                        2.0 * self.response_lower_basis[k] * gamma_dir_k * pg;
+                }
             }
             let q = row_quantities.endpoint_q[i];
 
             for k in 0..p_resp {
+                let probe_offset = k * n_probe;
                 let h_factor = if k == 0 {
                     rv[0]
                 } else {
@@ -2047,16 +2080,6 @@ impl TransformationNormalFamily {
                     0.0
                 } else {
                     2.0 * rd[k] * gamma_dir[k]
-                };
-                let h_second_probe = if k == 0 {
-                    0.0
-                } else {
-                    2.0 * rv[k] * gamma_probe[k]
-                };
-                let hp_second_probe = if k == 0 {
-                    0.0
-                } else {
-                    2.0 * rd[k] * gamma_probe[k]
                 };
                 let endpoint_factor = [
                     if k == 0 {
@@ -2082,48 +2105,61 @@ impl TransformationNormalFamily {
                         2.0 * self.response_lower_basis[k] * gamma_dir[k]
                     },
                 ];
-                let endpoint_factor_probe = [
-                    if k == 0 {
-                        0.0
-                    } else {
-                        2.0 * self.response_upper_basis[k] * gamma_probe[k]
-                    },
-                    if k == 0 {
-                        0.0
-                    } else {
-                        2.0 * self.response_lower_basis[k] * gamma_probe[k]
-                    },
-                ];
-                let mut normalizer_scalar = 0.0;
-                for a in 0..2 {
-                    for b in 0..2 {
-                        normalizer_scalar +=
-                            q.second[a][b] * endpoint_dir[b] * endpoint_factor_probe[a];
-                        normalizer_scalar += q.second[a][b]
-                            * (endpoint_factor_dir[a] * endpoint_probe[b]
-                                + endpoint_factor[a] * endpoint_dir_probe[b]);
-                        for c_ep in 0..2 {
-                            normalizer_scalar += q.third[a][b][c_ep]
-                                * endpoint_dir[c_ep]
-                                * endpoint_factor[a]
-                                * endpoint_probe[b];
+                for j in 0..n_probe {
+                    let pg = gamma_probe[probe_offset + j];
+                    let h_second_probe = if k == 0 { 0.0 } else { 2.0 * rv[k] * pg };
+                    let hp_second_probe = if k == 0 { 0.0 } else { 2.0 * rd[k] * pg };
+                    let endpoint_factor_probe = [
+                        if k == 0 {
+                            0.0
+                        } else {
+                            2.0 * self.response_upper_basis[k] * pg
+                        },
+                        if k == 0 {
+                            0.0
+                        } else {
+                            2.0 * self.response_lower_basis[k] * pg
+                        },
+                    ];
+                    let mut normalizer_scalar = 0.0;
+                    for a in 0..2 {
+                        for b in 0..2 {
+                            normalizer_scalar +=
+                                q.second[a][b] * endpoint_dir[b] * endpoint_factor_probe[a];
+                            normalizer_scalar += q.second[a][b]
+                                * (endpoint_factor_dir[a] * endpoint_probe[b][j]
+                                    + endpoint_factor[a] * endpoint_dir_probe[b][j]);
+                            for c_ep in 0..2 {
+                                normalizer_scalar += q.third[a][b][c_ep]
+                                    * endpoint_dir[c_ep]
+                                    * endpoint_factor[a]
+                                    * endpoint_probe[b][j];
+                            }
                         }
                     }
-                }
-                let scalar = wi
-                    * (h_factor_dir * h_probe
-                        + h_factor * h_dir_probe
-                        + h_dir * h_second_probe
-                        + (hp_factor_dir * hp_probe + hp_factor * hp_dir_probe) * inv_hp_sq
-                        - 2.0 * hp_factor * hp_probe * hp_dir * inv_hp_cu
-                        + hp_second_probe * hp_dir * inv_hp_sq
-                        + normalizer_scalar);
-                for c in 0..p_cov {
-                    out[k * p_cov + c] += scalar * cov_row[c];
+                    let scalar = wi
+                        * (h_factor_dir * h_probe[j]
+                            + h_factor * h_dir_probe[j]
+                            + h_dir * h_second_probe
+                            + (hp_factor_dir * hp_probe[j] + hp_factor * hp_dir_probe[j])
+                                * inv_hp_sq
+                            - 2.0 * hp_factor * hp_probe[j] * hp_dir * inv_hp_cu
+                            + hp_second_probe * hp_dir * inv_hp_sq
+                            + normalizer_scalar);
+                    for c in 0..p_cov {
+                        out[[k * p_cov + c, j]] += scalar * cov_row[c];
+                    }
                 }
             }
         }
 
+        log::info!(
+            "[STAGE] CTN scop_hessian_directional_matmat n={} p={} k={} elapsed={:.3}s",
+            n,
+            p_total,
+            n_probe,
+            stage_start.elapsed().as_secs_f64(),
+        );
         Ok(out)
     }
 
@@ -2135,21 +2171,43 @@ impl TransformationNormalFamily {
         row_quantities: &TransformationNormalRowQuantityCache,
         probe: &Array1<f64>,
     ) -> Result<Array1<f64>, String> {
+        let mut probes = Array2::<f64>::zeros((probe.len(), 1));
+        probes.column_mut(0).assign(probe);
+        let out = self.scop_hessian_second_directional_matmat(
+            beta,
+            direction_u,
+            direction_v,
+            row_quantities,
+            &probes,
+        )?;
+        Ok(out.column(0).to_owned())
+    }
+
+    fn scop_hessian_second_directional_matmat(
+        &self,
+        beta: &Array1<f64>,
+        direction_u: &Array1<f64>,
+        direction_v: &Array1<f64>,
+        row_quantities: &TransformationNormalRowQuantityCache,
+        probes: &Array2<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let stage_start = std::time::Instant::now();
         let n = self.response_val_basis.nrows();
         let p_resp = self.response_val_basis.ncols();
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
+        let n_probe = probes.ncols();
         if beta.len() != p_total
             || direction_u.len() != p_total
             || direction_v.len() != p_total
-            || probe.len() != p_total
+            || probes.nrows() != p_total
         {
             return Err(format!(
-                "SCOP d2H matvec length mismatch: beta={}, u={}, v={}, probe={}, expected={p_total}",
+                "SCOP d2H matmat length mismatch: beta={}, u={}, v={}, probes rows={}, expected={p_total}",
                 beta.len(),
                 direction_u.len(),
                 direction_v.len(),
-                probe.len()
+                probes.nrows()
             ));
         }
         let beta_mat = beta
@@ -2164,16 +2222,24 @@ impl TransformationNormalFamily {
             .view()
             .into_shape_with_order((p_resp, p_cov))
             .map_err(|e| format!("SCOP v direction reshape failed: {e}"))?;
-        let probe_mat = probe
-            .view()
-            .into_shape_with_order((p_resp, p_cov))
-            .map_err(|e| format!("SCOP probe reshape failed: {e}"))?;
         let cov = self
             .covariate_dense_arc()
-            .map_err(|e| format!("SCOP d2H matvec requires cached covariate design: {e}"))?;
+            .map_err(|e| format!("SCOP d2H matmat requires cached covariate design: {e}"))?;
         let weights = self.weights.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
-        let mut out = Array1::<f64>::zeros(p_total);
+        let mut out = Array2::<f64>::zeros((p_total, n_probe));
+        let mut gamma = vec![0.0; p_resp];
+        let mut gamma_u = vec![0.0; p_resp];
+        let mut gamma_v = vec![0.0; p_resp];
+        let mut gamma_probe = vec![0.0; p_resp * n_probe];
+        let mut hp_probe = vec![0.0; n_probe];
+        let mut h_u_probe = vec![0.0; n_probe];
+        let mut hp_u_probe = vec![0.0; n_probe];
+        let mut h_v_probe = vec![0.0; n_probe];
+        let mut hp_v_probe = vec![0.0; n_probe];
+        let mut endpoint_probe = [vec![0.0; n_probe], vec![0.0; n_probe]];
+        let mut endpoint_u_probe = [vec![0.0; n_probe], vec![0.0; n_probe]];
+        let mut endpoint_v_probe = [vec![0.0; n_probe], vec![0.0; n_probe]];
 
         for i in 0..n {
             let cov_row = cov.row(i);
@@ -2186,26 +2252,25 @@ impl TransformationNormalFamily {
             let inv_hp_cu = inv_hp_sq * inv_hp;
             let inv_hp_qu = inv_hp_sq * inv_hp_sq;
 
-            let mut gamma = vec![0.0; p_resp];
-            let mut gamma_u = vec![0.0; p_resp];
-            let mut gamma_v = vec![0.0; p_resp];
-            let mut gamma_probe = vec![0.0; p_resp];
             for k in 0..p_resp {
                 gamma[k] = beta_mat.row(k).dot(&cov_row);
                 gamma_u[k] = dir_u_mat.row(k).dot(&cov_row);
                 gamma_v[k] = dir_v_mat.row(k).dot(&cov_row);
-                gamma_probe[k] = probe_mat.row(k).dot(&cov_row);
+                let row_offset = k * p_cov;
+                let probe_offset = k * n_probe;
+                for j in 0..n_probe {
+                    let mut value = 0.0;
+                    for c in 0..p_cov {
+                        value += probes[[row_offset + c, j]] * cov_row[c];
+                    }
+                    gamma_probe[probe_offset + j] = value;
+                }
             }
 
             let mut hp_u = rd[0] * gamma_u[0];
             let mut hp_v = rd[0] * gamma_v[0];
-            let mut hp_probe = rd[0] * gamma_probe[0];
             let mut h_uv = 0.0;
             let mut hp_uv = 0.0;
-            let mut h_u_probe = 0.0;
-            let mut hp_u_probe = 0.0;
-            let mut h_v_probe = 0.0;
-            let mut hp_v_probe = 0.0;
             let mut endpoint_u = [
                 self.response_upper_basis[0] * gamma_u[0],
                 self.response_lower_basis[0] * gamma_u[0],
@@ -2214,43 +2279,58 @@ impl TransformationNormalFamily {
                 self.response_upper_basis[0] * gamma_v[0],
                 self.response_lower_basis[0] * gamma_v[0],
             ];
-            let mut endpoint_probe = [
-                self.response_upper_basis[0] * gamma_probe[0],
-                self.response_lower_basis[0] * gamma_probe[0],
-            ];
             let mut endpoint_uv = [0.0, 0.0];
-            let mut endpoint_u_probe = [0.0, 0.0];
-            let mut endpoint_v_probe = [0.0, 0.0];
+            for j in 0..n_probe {
+                hp_probe[j] = rd[0] * gamma_probe[j];
+                h_u_probe[j] = 0.0;
+                hp_u_probe[j] = 0.0;
+                h_v_probe[j] = 0.0;
+                hp_v_probe[j] = 0.0;
+                endpoint_probe[0][j] = self.response_upper_basis[0] * gamma_probe[j];
+                endpoint_probe[1][j] = self.response_lower_basis[0] * gamma_probe[j];
+                endpoint_u_probe[0][j] = 0.0;
+                endpoint_u_probe[1][j] = 0.0;
+                endpoint_v_probe[0][j] = 0.0;
+                endpoint_v_probe[1][j] = 0.0;
+            }
             for k in 1..p_resp {
+                let probe_offset = k * n_probe;
+                let gamma_k = gamma[k];
+                let gamma_u_k = gamma_u[k];
+                let gamma_v_k = gamma_v[k];
                 hp_u += 2.0 * rd[k] * gamma[k] * gamma_u[k];
                 hp_v += 2.0 * rd[k] * gamma[k] * gamma_v[k];
-                hp_probe += 2.0 * rd[k] * gamma[k] * gamma_probe[k];
                 h_uv += 2.0 * rv[k] * gamma_u[k] * gamma_v[k];
                 hp_uv += 2.0 * rd[k] * gamma_u[k] * gamma_v[k];
-                h_u_probe += 2.0 * rv[k] * gamma_u[k] * gamma_probe[k];
-                hp_u_probe += 2.0 * rd[k] * gamma_u[k] * gamma_probe[k];
-                h_v_probe += 2.0 * rv[k] * gamma_v[k] * gamma_probe[k];
-                hp_v_probe += 2.0 * rd[k] * gamma_v[k] * gamma_probe[k];
                 endpoint_u[0] += 2.0 * self.response_upper_basis[k] * gamma[k] * gamma_u[k];
                 endpoint_u[1] += 2.0 * self.response_lower_basis[k] * gamma[k] * gamma_u[k];
                 endpoint_v[0] += 2.0 * self.response_upper_basis[k] * gamma[k] * gamma_v[k];
                 endpoint_v[1] += 2.0 * self.response_lower_basis[k] * gamma[k] * gamma_v[k];
-                endpoint_probe[0] += 2.0 * self.response_upper_basis[k] * gamma[k] * gamma_probe[k];
-                endpoint_probe[1] += 2.0 * self.response_lower_basis[k] * gamma[k] * gamma_probe[k];
                 endpoint_uv[0] += 2.0 * self.response_upper_basis[k] * gamma_u[k] * gamma_v[k];
                 endpoint_uv[1] += 2.0 * self.response_lower_basis[k] * gamma_u[k] * gamma_v[k];
-                endpoint_u_probe[0] +=
-                    2.0 * self.response_upper_basis[k] * gamma_u[k] * gamma_probe[k];
-                endpoint_u_probe[1] +=
-                    2.0 * self.response_lower_basis[k] * gamma_u[k] * gamma_probe[k];
-                endpoint_v_probe[0] +=
-                    2.0 * self.response_upper_basis[k] * gamma_v[k] * gamma_probe[k];
-                endpoint_v_probe[1] +=
-                    2.0 * self.response_lower_basis[k] * gamma_v[k] * gamma_probe[k];
+                for j in 0..n_probe {
+                    let pg = gamma_probe[probe_offset + j];
+                    hp_probe[j] += 2.0 * rd[k] * gamma_k * pg;
+                    h_u_probe[j] += 2.0 * rv[k] * gamma_u_k * pg;
+                    hp_u_probe[j] += 2.0 * rd[k] * gamma_u_k * pg;
+                    h_v_probe[j] += 2.0 * rv[k] * gamma_v_k * pg;
+                    hp_v_probe[j] += 2.0 * rd[k] * gamma_v_k * pg;
+                    endpoint_probe[0][j] += 2.0 * self.response_upper_basis[k] * gamma_k * pg;
+                    endpoint_probe[1][j] += 2.0 * self.response_lower_basis[k] * gamma_k * pg;
+                    endpoint_u_probe[0][j] +=
+                        2.0 * self.response_upper_basis[k] * gamma_u_k * pg;
+                    endpoint_u_probe[1][j] +=
+                        2.0 * self.response_lower_basis[k] * gamma_u_k * pg;
+                    endpoint_v_probe[0][j] +=
+                        2.0 * self.response_upper_basis[k] * gamma_v_k * pg;
+                    endpoint_v_probe[1][j] +=
+                        2.0 * self.response_lower_basis[k] * gamma_v_k * pg;
+                }
             }
             let q = row_quantities.endpoint_q[i];
 
             for k in 0..p_resp {
+                let probe_offset = k * n_probe;
                 let hp_factor = if k == 0 {
                     rd[0]
                 } else {
@@ -2322,81 +2402,94 @@ impl TransformationNormalFamily {
                         2.0 * self.response_lower_basis[k] * gamma_v[k]
                     },
                 ];
-                let endpoint_factor_probe = [
-                    if k == 0 {
-                        0.0
-                    } else {
-                        2.0 * self.response_upper_basis[k] * gamma_probe[k]
-                    },
-                    if k == 0 {
-                        0.0
-                    } else {
-                        2.0 * self.response_lower_basis[k] * gamma_probe[k]
-                    },
-                ];
-                let mut normalizer_scalar = 0.0;
-                for a in 0..2 {
-                    for b in 0..2 {
-                        normalizer_scalar +=
-                            q.second[a][b] * endpoint_uv[b] * endpoint_factor_probe[a];
-                        for c_ep in 0..2 {
-                            normalizer_scalar += q.third[a][b][c_ep]
-                                * endpoint_v[c_ep]
-                                * endpoint_u[b]
-                                * endpoint_factor_probe[a];
-                            normalizer_scalar += q.third[a][b][c_ep]
-                                * endpoint_uv[c_ep]
-                                * endpoint_factor[a]
-                                * endpoint_probe[b];
-                            normalizer_scalar += q.third[a][b][c_ep]
-                                * endpoint_u[c_ep]
-                                * (endpoint_factor_v[a] * endpoint_probe[b]
-                                    + endpoint_factor[a] * endpoint_v_probe[b]);
-                            normalizer_scalar += q.third[a][b][c_ep]
-                                * endpoint_v[c_ep]
-                                * endpoint_factor_u[a]
-                                * endpoint_probe[b];
-                            normalizer_scalar += q.third[a][b][c_ep]
-                                * endpoint_v[c_ep]
-                                * endpoint_factor[a]
-                                * endpoint_u_probe[b];
-                            for d_ep in 0..2 {
-                                normalizer_scalar += q.fourth[a][b][c_ep][d_ep]
-                                    * endpoint_v[d_ep]
-                                    * endpoint_u[c_ep]
+                for j in 0..n_probe {
+                    let pg = gamma_probe[probe_offset + j];
+                    let h_second_probe = if k == 0 { 0.0 } else { 2.0 * rv[k] * pg };
+                    let hp_second_probe = if k == 0 { 0.0 } else { 2.0 * rd[k] * pg };
+                    let endpoint_factor_probe = [
+                        if k == 0 {
+                            0.0
+                        } else {
+                            2.0 * self.response_upper_basis[k] * pg
+                        },
+                        if k == 0 {
+                            0.0
+                        } else {
+                            2.0 * self.response_lower_basis[k] * pg
+                        },
+                    ];
+                    let mut normalizer_scalar = 0.0;
+                    for a in 0..2 {
+                        for b in 0..2 {
+                            normalizer_scalar +=
+                                q.second[a][b] * endpoint_uv[b] * endpoint_factor_probe[a];
+                            for c_ep in 0..2 {
+                                normalizer_scalar += q.third[a][b][c_ep]
+                                    * endpoint_v[c_ep]
+                                    * endpoint_u[b]
+                                    * endpoint_factor_probe[a];
+                                normalizer_scalar += q.third[a][b][c_ep]
+                                    * endpoint_uv[c_ep]
                                     * endpoint_factor[a]
-                                    * endpoint_probe[b];
+                                    * endpoint_probe[b][j];
+                                normalizer_scalar += q.third[a][b][c_ep]
+                                    * endpoint_u[c_ep]
+                                    * (endpoint_factor_v[a] * endpoint_probe[b][j]
+                                        + endpoint_factor[a] * endpoint_v_probe[b][j]);
+                                normalizer_scalar += q.third[a][b][c_ep]
+                                    * endpoint_v[c_ep]
+                                    * endpoint_factor_u[a]
+                                    * endpoint_probe[b][j];
+                                normalizer_scalar += q.third[a][b][c_ep]
+                                    * endpoint_v[c_ep]
+                                    * endpoint_factor[a]
+                                    * endpoint_u_probe[b][j];
+                                for d_ep in 0..2 {
+                                    normalizer_scalar += q.fourth[a][b][c_ep][d_ep]
+                                        * endpoint_v[d_ep]
+                                        * endpoint_u[c_ep]
+                                        * endpoint_factor[a]
+                                        * endpoint_probe[b][j];
+                                }
                             }
+                            normalizer_scalar += q.second[a][b]
+                                * (endpoint_factor_u[a] * endpoint_v_probe[b][j]
+                                    + endpoint_factor_v[a] * endpoint_u_probe[b][j]);
                         }
-                        normalizer_scalar += q.second[a][b]
-                            * (endpoint_factor_u[a] * endpoint_v_probe[b]
-                                + endpoint_factor_v[a] * endpoint_u_probe[b]);
                     }
-                }
-                let scalar = wi
-                    * (h_factor_u * h_v_probe
-                        + h_factor_v * h_u_probe
-                        + h_uv * h_second_probe
-                        + (hp_factor_u * hp_v_probe + hp_factor_v * hp_u_probe) * inv_hp_sq
-                        - 2.0
-                            * (hp_factor_u * hp_probe + hp_factor * hp_u_probe)
-                            * hp_v
-                            * inv_hp_cu
-                        - 2.0
-                            * (hp_factor_v * hp_probe + hp_factor * hp_v_probe)
-                            * hp_u
-                            * inv_hp_cu
-                        - 2.0 * hp_factor * hp_probe * hp_uv * inv_hp_cu
-                        + 6.0 * hp_factor * hp_probe * hp_u * hp_v * inv_hp_qu
-                        + hp_second_probe * hp_uv * inv_hp_sq
-                        - 2.0 * hp_second_probe * hp_u * hp_v * inv_hp_cu
-                        + normalizer_scalar);
-                for c in 0..p_cov {
-                    out[k * p_cov + c] += scalar * cov_row[c];
+                    let scalar = wi
+                        * (h_factor_u * h_v_probe[j]
+                            + h_factor_v * h_u_probe[j]
+                            + h_uv * h_second_probe
+                            + (hp_factor_u * hp_v_probe[j] + hp_factor_v * hp_u_probe[j])
+                                * inv_hp_sq
+                            - 2.0
+                                * (hp_factor_u * hp_probe[j] + hp_factor * hp_u_probe[j])
+                                * hp_v
+                                * inv_hp_cu
+                            - 2.0
+                                * (hp_factor_v * hp_probe[j] + hp_factor * hp_v_probe[j])
+                                * hp_u
+                                * inv_hp_cu
+                            - 2.0 * hp_factor * hp_probe[j] * hp_uv * inv_hp_cu
+                            + 6.0 * hp_factor * hp_probe[j] * hp_u * hp_v * inv_hp_qu
+                            + hp_second_probe * hp_uv * inv_hp_sq
+                            - 2.0 * hp_second_probe * hp_u * hp_v * inv_hp_cu
+                            + normalizer_scalar);
+                    for c in 0..p_cov {
+                        out[[k * p_cov + c, j]] += scalar * cov_row[c];
+                    }
                 }
             }
         }
 
+        log::info!(
+            "[STAGE] CTN scop_hessian_second_directional_matmat n={} p={} k={} elapsed={:.3}s",
+            n,
+            p_total,
+            n_probe,
+            stage_start.elapsed().as_secs_f64(),
+        );
         Ok(out)
     }
 
