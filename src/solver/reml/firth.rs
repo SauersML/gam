@@ -1,13 +1,10 @@
 use super::*;
 use crate::linalg::utils::enforce_symmetry;
 use crate::mixture_link::logit_inverse_link_jet5;
-<<<<<<< ours
 use ndarray::{ShapeBuilder, Zip};
 
 const FIRTH_DERIVATIVE_PARALLEL_MIN_N: usize = 16_384;
 const FIRTH_ROW_SCALE_PARALLEL_MIN_CELLS: usize = 200_000;
-=======
->>>>>>> theirs
 
 impl<'a> RemlState<'a> {
     pub(crate) fn xt_diag_x_dense_into(
@@ -30,7 +27,6 @@ impl<'a> RemlState<'a> {
     }
 
     pub(crate) fn row_scale(x: &Array2<f64>, scale: &Array1<f64>) -> Array2<f64> {
-<<<<<<< ours
         let (n, p) = x.dim();
         let mut out = x.clone();
         let rows = out.rows_mut();
@@ -44,9 +40,6 @@ impl<'a> RemlState<'a> {
                 .for_each(|mut row, w| row *= *w);
         }
         out
-=======
-        super::assembly::row_scale_dense(x, scale)
->>>>>>> theirs
     }
 
     #[inline]
