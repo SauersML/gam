@@ -333,12 +333,11 @@ pub struct BlockGeometryDirectionalDerivative {
 ///
 /// - `Diagonal`: provides IRLS working weights W such that the per-block Hessian
 ///   is X'WX. For canonical links (logit-Binomial, log-Poisson), W_obs = W_Fisher.
-///   For non-canonical links, W should ideally be the observed weight
-///   W_obs = W_Fisher - (y-mu)*B to ensure the outer REML uses the exact Laplace
-///   Hessian. Currently, GAMLSS families using Diagonal blocks with non-canonical
-///   links may provide Fisher weights; this is acceptable when the link is close to
-///   canonical (small residual correction) but introduces a PQL-type approximation
-///   for strongly non-canonical links.
+///   For supported non-canonical diagonal links, W must be the observed weight
+///   W_obs = W_Fisher - (y-mu)*B so the outer REML uses the exact Laplace
+///   Hessian. The matching [`CustomFamily::diagonalworking_weights_directional_derivative`]
+///   callback must differentiate the same observed W surface; silently using Fisher
+///   weights or zero `dW` would change the criterion into a PQL-type surrogate.
 #[derive(Clone, Debug)]
 pub enum BlockWorkingSet {
     /// Standard IRLS/GLM-style diagonal working set for eta-space updates.
