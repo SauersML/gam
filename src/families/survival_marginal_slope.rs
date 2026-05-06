@@ -8512,6 +8512,8 @@ impl SurvivalMarginalSlopeFamily {
 
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let outer_scale = outer_score_scale(options, self.n);
+        // Process fixed row chunks in parallel and merge local cross-block
+        // accumulators in row-chunk order for deterministic timewiggle assembly.
         let (
             mut objective_psi,
             mut score_t,
@@ -8520,9 +8522,10 @@ impl SurvivalMarginalSlopeFamily {
             mut score_h,
             mut score_w,
             mut acc,
-        ) = row_iter
-            .into_par_iter()
-            .try_fold(make_acc, |mut a, row| -> Result<Acc, String> {
+        ) = chunked_row_reduction(
+            row_iter.as_slice(),
+            make_acc,
+            |row, a| -> Result<(), String> {
                 let psi_row = psi_map
                     .row_vector(row)
                     .map_err(|e| format!("survival rowwise psi map: {e}"))?;
@@ -8633,18 +8636,18 @@ impl SurvivalMarginalSlopeFamily {
                     a.6.add_timewiggle_psi_kappa_alpha(self, lift, &f_pi);
                 }
 
-                Ok(a)
-            })
-            .try_reduce(make_acc, |mut a, b| {
-                a.0 += b.0;
-                a.1 += &b.1;
-                a.2 += &b.2;
-                a.3 += &b.3;
-                a.4 += &b.4;
-                a.5 += &b.5;
-                a.6.add(&b.6);
-                Ok(a)
-            })?;
+                Ok(())
+            },
+            |total, chunk| {
+                total.0 += chunk.0;
+                total.1 += &chunk.1;
+                total.2 += &chunk.2;
+                total.3 += &chunk.3;
+                total.4 += &chunk.4;
+                total.5 += &chunk.5;
+                total.6.add(&chunk.6);
+            },
+        )?;
 
         if outer_scale != 1.0 {
             objective_psi *= outer_scale;
@@ -8824,6 +8827,8 @@ impl SurvivalMarginalSlopeFamily {
 
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let outer_scale = outer_score_scale(options, self.n);
+        // Process fixed row chunks in parallel and merge local cross-block
+        // accumulators in row-chunk order for deterministic timewiggle assembly.
         let (
             mut objective_psi_psi,
             mut score_t,
@@ -8832,9 +8837,10 @@ impl SurvivalMarginalSlopeFamily {
             mut score_h,
             mut score_w,
             mut acc,
-        ) = row_iter
-            .into_par_iter()
-            .try_fold(make_acc, |mut a, row| -> Result<Acc, String> {
+        ) = chunked_row_reduction(
+            row_iter.as_slice(),
+            make_acc,
+            |row, a| -> Result<(), String> {
                 // Compute psi design rows once; derive directions from them.
                 let psi_row_i = psi_map_i
                     .row_vector(row)
@@ -9083,18 +9089,18 @@ impl SurvivalMarginalSlopeFamily {
                     }
                 }
 
-                Ok(a)
-            })
-            .try_reduce(make_acc, |mut a, b| {
-                a.0 += b.0;
-                a.1 += &b.1;
-                a.2 += &b.2;
-                a.3 += &b.3;
-                a.4 += &b.4;
-                a.5 += &b.5;
-                a.6.add(&b.6);
-                Ok(a)
-            })?;
+                Ok(())
+            },
+            |total, chunk| {
+                total.0 += chunk.0;
+                total.1 += &chunk.1;
+                total.2 += &chunk.2;
+                total.3 += &chunk.3;
+                total.4 += &chunk.4;
+                total.5 += &chunk.5;
+                total.6.add(&chunk.6);
+            },
+        )?;
 
         if outer_scale != 1.0 {
             objective_psi_psi *= outer_scale;
@@ -9215,143 +9221,134 @@ impl SurvivalMarginalSlopeFamily {
 
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let outer_scale = outer_score_scale(options, self.n);
-        let mut acc = row_iter
-            .into_par_iter()
-            .try_fold(
-                || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-                |mut acc, row| -> Result<BlockHessianAccumulator, String> {
-                    let psi_row = psi_map
-                        .row_vector(row)
-                        .map_err(|e| format!("survival rowwise psi map: {e}"))?;
+        // Process fixed row chunks in parallel and merge local cross-block
+        // accumulators in row-chunk order for deterministic timewiggle assembly.
+        let mut acc = chunked_row_reduction(
+            row_iter.as_slice(),
+            || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+            |row, acc| -> Result<(), String> {
+                let psi_row = psi_map
+                    .row_vector(row)
+                    .map_err(|e| format!("survival rowwise psi map: {e}"))?;
 
-                    let q_geom = if timewiggle_active {
-                        Some(self.row_dynamic_q_geometry(row, block_states)?)
-                    } else {
-                        None
-                    };
+                let q_geom = if timewiggle_active {
+                    Some(self.row_dynamic_q_geometry(row, block_states)?)
+                } else {
+                    None
+                };
 
-                    let psi_lift = if timewiggle_psi {
-                        Some(self.timewiggle_marginal_psi_row_lift(
-                            row,
-                            block_states,
-                            flex_primary.as_ref(),
-                            &psi_row,
-                            beta_psi,
-                        )?)
-                    } else {
-                        None
-                    };
+                let psi_lift = if timewiggle_psi {
+                    Some(self.timewiggle_marginal_psi_row_lift(
+                        row,
+                        block_states,
+                        flex_primary.as_ref(),
+                        &psi_row,
+                        beta_psi,
+                    )?)
+                } else {
+                    None
+                };
 
-                    let psi_dir = if let Some(lift) = psi_lift.as_ref() {
-                        lift.dir.clone()
-                    } else if let Some(primary) = flex_primary.as_ref() {
-                        primary_direction_from_psi_row_flex(primary, block_idx, &psi_row, beta_psi)
-                    } else {
-                        primary_direction_from_psi_row(block_idx, &psi_row, beta_psi)
-                    };
-                    let psi_action = if psi_lift.is_some() {
-                        self.timewiggle_psi_action(
-                            row,
-                            block_states,
-                            &slices,
-                            flex_primary.as_ref(),
-                            &psi_row,
-                            beta_psi,
-                            d_beta_flat,
-                        )?
-                    } else if let Some(primary) = flex_primary.as_ref() {
-                        primary_psi_action_from_psi_row_flex(
-                            primary,
-                            block_idx,
-                            &psi_row,
-                            d_beta_block,
-                        )
-                    } else {
-                        primary_psi_action_from_psi_row(block_idx, &psi_row, d_beta_block)
-                    };
-                    let row_dir = self.row_primary_direction_from_flat_dynamic(
+                let psi_dir = if let Some(lift) = psi_lift.as_ref() {
+                    lift.dir.clone()
+                } else if let Some(primary) = flex_primary.as_ref() {
+                    primary_direction_from_psi_row_flex(primary, block_idx, &psi_row, beta_psi)
+                } else {
+                    primary_direction_from_psi_row(block_idx, &psi_row, beta_psi)
+                };
+                let psi_action = if psi_lift.is_some() {
+                    self.timewiggle_psi_action(
                         row,
                         block_states,
                         &slices,
+                        flex_primary.as_ref(),
+                        &psi_row,
+                        beta_psi,
                         d_beta_flat,
-                    )?;
-                    let q_geom_lazy;
-                    let h_pi = if let Some(primary) = flex_primary.as_ref() {
-                        let q_ref = match q_geom.as_ref() {
-                            Some(q) => q,
-                            None => {
-                                q_geom_lazy = self.row_dynamic_q_geometry(row, block_states)?;
-                                &q_geom_lazy
-                            }
-                        };
-                        self.compute_row_flex_primary_gradient_hessian_exact(
-                            row,
-                            block_states,
-                            q_ref,
-                            primary,
-                        )?
-                        .2
-                    } else {
-                        self.compute_row_primary_gradient_hessian_uncached(row, block_states)?
-                            .2
+                    )?
+                } else if let Some(primary) = flex_primary.as_ref() {
+                    primary_psi_action_from_psi_row_flex(primary, block_idx, &psi_row, d_beta_block)
+                } else {
+                    primary_psi_action_from_psi_row(block_idx, &psi_row, d_beta_block)
+                };
+                let row_dir = self.row_primary_direction_from_flat_dynamic(
+                    row,
+                    block_states,
+                    &slices,
+                    d_beta_flat,
+                )?;
+                let q_geom_lazy;
+                let h_pi = if let Some(primary) = flex_primary.as_ref() {
+                    let q_ref = match q_geom.as_ref() {
+                        Some(q) => q,
+                        None => {
+                            q_geom_lazy = self.row_dynamic_q_geometry(row, block_states)?;
+                            &q_geom_lazy
+                        }
                     };
-                    let third_beta =
-                        self.row_primary_third_contracted_general(row, block_states, &row_dir)?;
-                    let fourth = self.row_primary_fourth_contracted_general(
+                    self.compute_row_flex_primary_gradient_hessian_exact(
                         row,
                         block_states,
-                        &row_dir,
-                        &psi_dir,
-                    )?;
+                        q_ref,
+                        primary,
+                    )?
+                    .2
+                } else {
+                    self.compute_row_primary_gradient_hessian_uncached(row, block_states)?
+                        .2
+                };
+                let third_beta =
+                    self.row_primary_third_contracted_general(row, block_states, &row_dir)?;
+                let fourth = self.row_primary_fourth_contracted_general(
+                    row,
+                    block_states,
+                    &row_dir,
+                    &psi_dir,
+                )?;
 
-                    let right_primary = third_beta.t().dot(&loading);
-                    if let Some(q) = q_geom.as_ref() {
-                        acc.add_rank1_psi_cross_with_q_geometry(
-                            self,
-                            row,
-                            q,
-                            block_idx,
-                            &psi_row,
-                            &right_primary,
-                        )?;
-                    } else {
-                        acc.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary)?;
-                    }
-                    if let Some(q) = q_geom.as_ref() {
-                        let zero_grad = Array1::zeros(fourth.nrows());
-                        acc.add_pullback_with_q_geometry(self, row, q, &zero_grad, &fourth)?;
-                    } else {
-                        acc.add_pullback(self, row, &fourth)?;
-                    }
-                    let third_action =
-                        self.row_primary_third_contracted_general(row, block_states, &psi_action)?;
-                    if let Some(q) = q_geom.as_ref() {
-                        let zero_grad = Array1::zeros(third_action.nrows());
-                        acc.add_pullback_with_q_geometry(self, row, q, &zero_grad, &third_action)?;
-                    } else {
-                        acc.add_pullback(self, row, &third_action)?;
-                    }
-                    // Timewiggle psi corrections
-                    if let Some(lift) = psi_lift.as_ref() {
-                        let q = q_geom.as_ref().unwrap();
-                        // U^α cross with third_beta (D_β H term)
-                        acc.add_timewiggle_psi_u_cross(self, row, q, lift, &third_beta)?;
-                        let second_pullback_weight =
-                            third_beta.dot(&psi_dir) + h_pi.dot(&psi_action);
-                        acc.add_second_pullback_weighted(q, &second_pullback_weight);
-                        let kappa_weight = h_pi.dot(&row_dir);
-                        acc.add_timewiggle_psi_kappa_alpha(self, lift, &kappa_weight);
-                    }
-                    Ok(acc)
-                },
-            )
-            .try_reduce(
-                || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-                |mut a, b| {
-                    a.add(&b);
-                    Ok(a)
-                },
-            )?;
+                let right_primary = third_beta.t().dot(&loading);
+                if let Some(q) = q_geom.as_ref() {
+                    acc.add_rank1_psi_cross_with_q_geometry(
+                        self,
+                        row,
+                        q,
+                        block_idx,
+                        &psi_row,
+                        &right_primary,
+                    )?;
+                } else {
+                    acc.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary)?;
+                }
+                if let Some(q) = q_geom.as_ref() {
+                    let zero_grad = Array1::zeros(fourth.nrows());
+                    acc.add_pullback_with_q_geometry(self, row, q, &zero_grad, &fourth)?;
+                } else {
+                    acc.add_pullback(self, row, &fourth)?;
+                }
+                let third_action =
+                    self.row_primary_third_contracted_general(row, block_states, &psi_action)?;
+                if let Some(q) = q_geom.as_ref() {
+                    let zero_grad = Array1::zeros(third_action.nrows());
+                    acc.add_pullback_with_q_geometry(self, row, q, &zero_grad, &third_action)?;
+                } else {
+                    acc.add_pullback(self, row, &third_action)?;
+                }
+                // Timewiggle psi corrections
+                if let Some(lift) = psi_lift.as_ref() {
+                    let q = q_geom.as_ref().unwrap();
+                    // U^α cross with third_beta (D_β H term)
+                    acc.add_timewiggle_psi_u_cross(self, row, q, lift, &third_beta)?;
+                    let second_pullback_weight = third_beta.dot(&psi_dir) + h_pi.dot(&psi_action);
+                    acc.add_second_pullback_weighted(q, &second_pullback_weight);
+                    let kappa_weight = h_pi.dot(&row_dir);
+                    acc.add_timewiggle_psi_kappa_alpha(self, lift, &kappa_weight);
+                }
+                Ok(())
+            },
+            |total, chunk| {
+                total.add(&chunk);
+            },
+        )?;
 
         if outer_scale != 1.0 {
             acc.scale_assign(outer_scale);
@@ -9418,141 +9415,132 @@ impl SurvivalMarginalSlopeFamily {
 
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let outer_scale = outer_score_scale(options, self.n);
-        let mut acc = row_iter
-            .into_par_iter()
-            .try_fold(
-                || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-                |mut acc, row| -> Result<BlockHessianAccumulator, String> {
-                    let psi_row = psi_map
-                        .row_vector(row)
-                        .map_err(|e| format!("survival rowwise psi map: {e}"))?;
+        // Process fixed row chunks in parallel and merge local cross-block
+        // accumulators in row-chunk order for deterministic timewiggle assembly.
+        let mut acc = chunked_row_reduction(
+            row_iter.as_slice(),
+            || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+            |row, acc| -> Result<(), String> {
+                let psi_row = psi_map
+                    .row_vector(row)
+                    .map_err(|e| format!("survival rowwise psi map: {e}"))?;
 
-                    let q_geom = if timewiggle_active {
-                        Some(self.row_dynamic_q_geometry(row, block_states)?)
-                    } else {
-                        None
-                    };
+                let q_geom = if timewiggle_active {
+                    Some(self.row_dynamic_q_geometry(row, block_states)?)
+                } else {
+                    None
+                };
 
-                    let psi_lift = if timewiggle_psi {
-                        Some(self.timewiggle_marginal_psi_row_lift(
-                            row,
-                            block_states,
-                            flex_primary.as_ref(),
-                            &psi_row,
-                            beta_psi,
-                        )?)
-                    } else {
-                        None
-                    };
+                let psi_lift = if timewiggle_psi {
+                    Some(self.timewiggle_marginal_psi_row_lift(
+                        row,
+                        block_states,
+                        flex_primary.as_ref(),
+                        &psi_row,
+                        beta_psi,
+                    )?)
+                } else {
+                    None
+                };
 
-                    let psi_dir = if let Some(lift) = psi_lift.as_ref() {
-                        lift.dir.clone()
-                    } else if let Some(primary) = flex_primary.as_ref() {
-                        primary_direction_from_psi_row_flex(primary, block_idx, &psi_row, beta_psi)
-                    } else {
-                        primary_direction_from_psi_row(block_idx, &psi_row, beta_psi)
-                    };
-                    let psi_action = if psi_lift.is_some() {
-                        self.timewiggle_psi_action(
-                            row,
-                            block_states,
-                            &slices,
-                            flex_primary.as_ref(),
-                            &psi_row,
-                            beta_psi,
-                            d_beta_flat,
-                        )?
-                    } else if let Some(primary) = flex_primary.as_ref() {
-                        primary_psi_action_from_psi_row_flex(
-                            primary,
-                            block_idx,
-                            &psi_row,
-                            d_beta_block,
-                        )
-                    } else {
-                        primary_psi_action_from_psi_row(block_idx, &psi_row, d_beta_block)
-                    };
-                    let row_dir = self.row_primary_direction_from_flat_dynamic(
+                let psi_dir = if let Some(lift) = psi_lift.as_ref() {
+                    lift.dir.clone()
+                } else if let Some(primary) = flex_primary.as_ref() {
+                    primary_direction_from_psi_row_flex(primary, block_idx, &psi_row, beta_psi)
+                } else {
+                    primary_direction_from_psi_row(block_idx, &psi_row, beta_psi)
+                };
+                let psi_action = if psi_lift.is_some() {
+                    self.timewiggle_psi_action(
                         row,
                         block_states,
                         &slices,
+                        flex_primary.as_ref(),
+                        &psi_row,
+                        beta_psi,
                         d_beta_flat,
-                    )?;
-                    let q_geom_lazy;
-                    let h_pi = if let Some(primary) = flex_primary.as_ref() {
-                        let q_ref = match q_geom.as_ref() {
-                            Some(q) => q,
-                            None => {
-                                q_geom_lazy = self.row_dynamic_q_geometry(row, block_states)?;
-                                &q_geom_lazy
-                            }
-                        };
-                        self.compute_row_flex_primary_gradient_hessian_exact(
-                            row,
-                            block_states,
-                            q_ref,
-                            primary,
-                        )?
-                        .2
-                    } else {
-                        self.compute_row_primary_gradient_hessian_uncached(row, block_states)?
-                            .2
+                    )?
+                } else if let Some(primary) = flex_primary.as_ref() {
+                    primary_psi_action_from_psi_row_flex(primary, block_idx, &psi_row, d_beta_block)
+                } else {
+                    primary_psi_action_from_psi_row(block_idx, &psi_row, d_beta_block)
+                };
+                let row_dir = self.row_primary_direction_from_flat_dynamic(
+                    row,
+                    block_states,
+                    &slices,
+                    d_beta_flat,
+                )?;
+                let q_geom_lazy;
+                let h_pi = if let Some(primary) = flex_primary.as_ref() {
+                    let q_ref = match q_geom.as_ref() {
+                        Some(q) => q,
+                        None => {
+                            q_geom_lazy = self.row_dynamic_q_geometry(row, block_states)?;
+                            &q_geom_lazy
+                        }
                     };
-                    let third_beta =
-                        self.row_primary_third_contracted_general(row, block_states, &row_dir)?;
-                    let fourth = self.row_primary_fourth_contracted_general(
+                    self.compute_row_flex_primary_gradient_hessian_exact(
                         row,
                         block_states,
-                        &row_dir,
-                        &psi_dir,
-                    )?;
+                        q_ref,
+                        primary,
+                    )?
+                    .2
+                } else {
+                    self.compute_row_primary_gradient_hessian_uncached(row, block_states)?
+                        .2
+                };
+                let third_beta =
+                    self.row_primary_third_contracted_general(row, block_states, &row_dir)?;
+                let fourth = self.row_primary_fourth_contracted_general(
+                    row,
+                    block_states,
+                    &row_dir,
+                    &psi_dir,
+                )?;
 
-                    let right_primary = third_beta.t().dot(&loading);
-                    if let Some(q) = q_geom.as_ref() {
-                        acc.add_rank1_psi_cross_with_q_geometry(
-                            self,
-                            row,
-                            q,
-                            block_idx,
-                            &psi_row,
-                            &right_primary,
-                        )?;
-                    } else {
-                        acc.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary)?;
-                    }
-                    if let Some(q) = q_geom.as_ref() {
-                        let zero_grad = Array1::zeros(fourth.nrows());
-                        acc.add_pullback_with_q_geometry(self, row, q, &zero_grad, &fourth)?;
-                    } else {
-                        acc.add_pullback(self, row, &fourth)?;
-                    }
-                    let third_action =
-                        self.row_primary_third_contracted_general(row, block_states, &psi_action)?;
-                    if let Some(q) = q_geom.as_ref() {
-                        let zero_grad = Array1::zeros(third_action.nrows());
-                        acc.add_pullback_with_q_geometry(self, row, q, &zero_grad, &third_action)?;
-                    } else {
-                        acc.add_pullback(self, row, &third_action)?;
-                    }
-                    if let Some(lift) = psi_lift.as_ref() {
-                        let q = q_geom.as_ref().unwrap();
-                        acc.add_timewiggle_psi_u_cross(self, row, q, lift, &third_beta)?;
-                        let second_pullback_weight =
-                            third_beta.dot(&psi_dir) + h_pi.dot(&psi_action);
-                        acc.add_second_pullback_weighted(q, &second_pullback_weight);
-                        let kappa_weight = h_pi.dot(&row_dir);
-                        acc.add_timewiggle_psi_kappa_alpha(self, lift, &kappa_weight);
-                    }
-                    Ok(acc)
-                },
-            )
-            .try_reduce(
-                || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-                |mut a, b| {
-                    a.add(&b);
-                    Ok(a)
-                },
-            )?;
+                let right_primary = third_beta.t().dot(&loading);
+                if let Some(q) = q_geom.as_ref() {
+                    acc.add_rank1_psi_cross_with_q_geometry(
+                        self,
+                        row,
+                        q,
+                        block_idx,
+                        &psi_row,
+                        &right_primary,
+                    )?;
+                } else {
+                    acc.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary)?;
+                }
+                if let Some(q) = q_geom.as_ref() {
+                    let zero_grad = Array1::zeros(fourth.nrows());
+                    acc.add_pullback_with_q_geometry(self, row, q, &zero_grad, &fourth)?;
+                } else {
+                    acc.add_pullback(self, row, &fourth)?;
+                }
+                let third_action =
+                    self.row_primary_third_contracted_general(row, block_states, &psi_action)?;
+                if let Some(q) = q_geom.as_ref() {
+                    let zero_grad = Array1::zeros(third_action.nrows());
+                    acc.add_pullback_with_q_geometry(self, row, q, &zero_grad, &third_action)?;
+                } else {
+                    acc.add_pullback(self, row, &third_action)?;
+                }
+                if let Some(lift) = psi_lift.as_ref() {
+                    let q = q_geom.as_ref().unwrap();
+                    acc.add_timewiggle_psi_u_cross(self, row, q, lift, &third_beta)?;
+                    let second_pullback_weight = third_beta.dot(&psi_dir) + h_pi.dot(&psi_action);
+                    acc.add_second_pullback_weighted(q, &second_pullback_weight);
+                    let kappa_weight = h_pi.dot(&row_dir);
+                    acc.add_timewiggle_psi_kappa_alpha(self, lift, &kappa_weight);
+                }
+                Ok(())
+            },
+            |total, chunk| {
+                total.add(&chunk);
+            },
+        )?;
 
         if outer_scale != 1.0 {
             acc.scale_assign(outer_scale);
