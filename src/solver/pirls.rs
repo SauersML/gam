@@ -5041,6 +5041,22 @@ pub struct PirlsResult {
 }
 
 impl PirlsResult {
+    /// Export the stabilized transformed Hessian as an exact dense matrix for
+    /// downstream solve paths that require explicit Hessians.
+    ///
+    /// The returned matrix is the convergence Hessian already used by PIRLS and
+    /// REML (`X'W_HX + S_λ`, plus the explicit stabilization ridge when active).
+    /// Sparse-native fits are materialized from their assembled sparse Hessian;
+    /// no numerical Hessian approximation or compatibility fallback is used.
+    pub fn dense_stabilizedhessian_transformed(
+        &self,
+        context: &str,
+    ) -> Result<Array2<f64>, EstimationError> {
+        self.stabilizedhessian_transformed
+            .try_to_dense_exact(context)
+            .map_err(EstimationError::InvalidInput)
+    }
+
     #[inline]
     pub fn jeffreys_logdet(&self) -> Option<f64> {
         self.firth.jeffreys_logdet()

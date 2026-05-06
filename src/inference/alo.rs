@@ -171,8 +171,12 @@ fn compute_alo_diagnostics_from_pirls_impl(
     let e = &base.reparam_result.e_transformed;
     let ridge = base.ridge_passport.laplacehessianridge().max(0.0);
 
-    // ALO needs dense Hessian for chunked column solves via StableSolver.
-    let h_dense_for_alo = base.stabilizedhessian_transformed.to_dense();
+    // ALO needs the exact penalized Hessian materialized densely for chunked
+    // column solves via StableSolver.  The PIRLS export path validates the
+    // matrix instead of falling back to a numerical Hessian approximation.
+    let h_dense_for_alo = base.dense_stabilizedhessian_transformed(
+        "ALO diagnostics require exact dense stabilized penalized Hessian",
+    )?;
 
     // Build model-agnostic AloInput from PIRLS geometry, then delegate.
     let input = AloInput {
@@ -371,6 +375,8 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
     let w_h = input.hessian_weights;
     let w_s = input.score_weights;
 
+    validate_alo_solve_setup(input, n, p)?;
+
     let factor = StableSolver::new("alo penalized hessian")
         .factorize(input.penalized_hessian)
         .map_err(|_| EstimationError::ModelIsIllConditioned {
@@ -542,6 +548,97 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
         leverage: aii,
         fisherweights: w_h.clone(),
     })
+}
+
+fn validate_alo_solve_setup(input: &AloInput, n: usize, p: usize) -> Result<(), EstimationError> {
+    let h = input.penalized_hessian;
+    if h.nrows() != p || h.ncols() != p {
+        return Err(EstimationError::InvalidInput(format!(
+            "ALO diagnostics require a dense exact penalized Hessian with shape {p}x{p}; got {}x{}",
+            h.nrows(),
+            h.ncols()
+        )));
+    }
+    if h.iter().any(|v| !v.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "ALO diagnostics require a finite dense exact penalized Hessian".to_string(),
+        ));
+    }
+    let sym_tol = 1e-8;
+    for i in 0..p {
+        for j in 0..i {
+            let a = h[[i, j]];
+            let b = h[[j, i]];
+            let scale = a.abs().max(b.abs()).max(1.0);
+            if (a - b).abs() > sym_tol * scale {
+                return Err(EstimationError::InvalidInput(format!(
+                    "ALO diagnostics require a symmetric dense exact penalized Hessian; entries ({i},{j}) and ({j},{i}) differ by {:.3e}",
+                    (a - b).abs()
+                )));
+            }
+        }
+    }
+
+    let vector_lengths = [
+        ("hessian_weights", input.hessian_weights.len()),
+        ("score_weights", input.score_weights.len()),
+        ("working_response", input.working_response.len()),
+        ("eta", input.eta.len()),
+        ("offset", input.offset.len()),
+    ];
+    for (name, len) in vector_lengths {
+        if len != n {
+            return Err(EstimationError::InvalidInput(format!(
+                "ALO diagnostics require {name} length {n}; got {len}"
+            )));
+        }
+    }
+    if input.hessian_weights.iter().any(|v| !v.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "ALO diagnostics require finite Hessian-side weights".to_string(),
+        ));
+    }
+    if input.score_weights.iter().any(|v| !v.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "ALO diagnostics require finite score-side weights".to_string(),
+        ));
+    }
+    if input.working_response.iter().any(|v| !v.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "ALO diagnostics require finite working responses".to_string(),
+        ));
+    }
+    if input.eta.iter().any(|v| !v.is_finite()) || input.offset.iter().any(|v| !v.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "ALO diagnostics require finite linear predictors and offsets".to_string(),
+        ));
+    }
+    if !input.phi.is_finite() || input.phi <= 0.0 {
+        return Err(EstimationError::InvalidInput(format!(
+            "ALO diagnostics require positive finite dispersion phi; got {}",
+            input.phi
+        )));
+    }
+    if !input.ridge.is_finite() || input.ridge < 0.0 {
+        return Err(EstimationError::InvalidInput(format!(
+            "ALO diagnostics require a finite non-negative Hessian ridge; got {}",
+            input.ridge
+        )));
+    }
+    if let Some(e) = input.penalty_root {
+        if e.ncols() != p {
+            return Err(EstimationError::InvalidInput(format!(
+                "ALO diagnostics require penalty root to have {p} columns; got {}",
+                e.ncols()
+            )));
+        }
+        if e.iter().any(|v| !v.is_finite()) {
+            return Err(EstimationError::InvalidInput(
+                "ALO diagnostics require finite penalty-root entries".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Compute ALO diagnostics (eta_tilde, SE, leverage) from a fitted GAM result.

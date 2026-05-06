@@ -3671,6 +3671,33 @@ impl SymmetricMatrix {
         }
     }
 
+    /// Materialize this exact symmetric matrix as a dense `Array2` and validate
+    /// that it is suitable for dense linear solves.
+    ///
+    /// This does not approximate or synthesize missing entries: sparse matrices
+    /// are expanded from their stored exact upper-triangular representation, and
+    /// dense matrices are cloned as-is. Callers that require explicit Hessians
+    /// (for example ALO solve setup) should use this instead of a blind
+    /// `to_dense()` so shape and derivative-validity failures are reported at
+    /// the export boundary.
+    pub fn try_to_dense_exact(&self, context: &str) -> Result<Array2<f64>, String> {
+        if self.nrows() != self.ncols() {
+            return Err(format!(
+                "{context}: exact symmetric matrix must be square, got {}x{}",
+                self.nrows(),
+                self.ncols()
+            ));
+        }
+
+        let dense = self.to_dense();
+        if dense.iter().any(|v| !v.is_finite()) {
+            return Err(format!(
+                "{context}: exact dense materialization contains non-finite entries"
+            ));
+        }
+        Ok(dense)
+    }
+
     pub fn factorize(&self) -> Result<Box<dyn FactorizedSystem>, String> {
         match self {
             Self::Dense(mat) => {
