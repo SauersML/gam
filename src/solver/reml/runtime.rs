@@ -6130,7 +6130,32 @@ impl<'a> RemlState<'a> {
         self.rotate_link_ext_coords_to_original(&bundle, &mut ext_coords)?;
 
         let mut assembly = self.build_auto_assembly(rho, &bundle, mode, true)?;
+        let ext_dim = ext_coords.len();
+        let p_dim = ext_coords.first().map(|coord| coord.g.len()).unwrap_or(0);
         assembly.ext_coords = ext_coords;
+        if mode == super::unified::EvalMode::ValueGradientHessian {
+            // Link-shape parameters do not directly differentiate the penalty
+            // matrices, so their explicit rho-link second partials are zero.
+            // Installing this callback is still required: the unified Hessian
+            // builder then evaluates the nonzero profiled cross terms from the
+            // first-order link drifts and IFT mode responses.
+            assembly.rho_ext_pair_fn = Some(Box::new(move |_, _| super::unified::HyperCoordPair {
+                a: 0.0,
+                g: Array1::zeros(p_dim),
+                b_mat: Array2::zeros((p_dim, p_dim)),
+                b_operator: None,
+                ld_s: 0.0,
+            }));
+            assembly.ext_coord_pair_fn =
+                Some(Box::new(move |_, _| super::unified::HyperCoordPair {
+                    a: 0.0,
+                    g: Array1::zeros(p_dim),
+                    b_mat: Array2::zeros((p_dim, p_dim)),
+                    b_operator: None,
+                    ld_s: 0.0,
+                }));
+            debug_assert!(ext_dim > 0);
+        }
         self.assemble_and_evaluate(rho, &bundle, mode, assembly)
     }
 
