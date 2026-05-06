@@ -7850,8 +7850,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
         // Returning `None` falls back to the operator path (e.g. when the
         // family chooses not to materialize for very large p), preserving
         // the current behavior at large scale.
-        self.family
-            .exact_newton_joint_hessian(&self.block_states)
+        self.family.exact_newton_joint_hessian(&self.block_states)
     }
 
     fn hessian_matvec(&self, beta_flat: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {

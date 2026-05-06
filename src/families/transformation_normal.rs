@@ -12498,6 +12498,23 @@ mod tests {
             .expect("workspace build")
             .expect("workspace present");
 
+        let dense_from_workspace = workspace
+            .hessian_dense()
+            .expect("workspace dense Hessian call")
+            .expect("workspace dense Hessian present");
+        assert_eq!(dense_from_workspace.nrows(), p);
+        assert_eq!(dense_from_workspace.ncols(), p);
+        for i in 0..p {
+            for j in 0..p {
+                let want = dense[[i, j]];
+                let got = dense_from_workspace[[i, j]];
+                assert!(
+                    (want - got).abs() <= 1e-12 * want.abs().max(1.0) + 1e-12,
+                    "workspace dense mismatch at ({i}, {j}): dense={want:.6e}, workspace={got:.6e}"
+                );
+            }
+        }
+
         // Diagonal must agree element-wise (matrix-free pre-square path vs. dense gram).
         let diag_op = workspace
             .hessian_diagonal()
