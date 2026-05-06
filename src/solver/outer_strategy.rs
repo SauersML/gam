@@ -6481,6 +6481,27 @@ mod tests {
     }
 
     #[test]
+    fn routing_matern_iso_large_kappa_dim_stays_on_arc_with_analytic_hessian() {
+        // Spatial isotropic κ no longer declares Hessian unavailable when
+        // kappa_dim > 30.  Large κ blocks are represented by exact HVP
+        // operators at evaluation time, so the planner must keep second-order
+        // ARC instead of selecting HybridEFS.
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Analytic,
+            n_params: 37,
+            psi_dim: 31,
+            fixed_point_available: true,
+            barrier_config: None,
+            prefer_gradient_only: false,
+            disable_fixed_point: false,
+        };
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Arc);
+        assert_eq!(p.hessian_source, HessianSource::Analytic);
+    }
+
+    #[test]
     fn routing_marginal_slope_stays_on_arc_when_both_derivs_analytic() {
         // Bernoulli/survival marginal-slope: the planner contract is the
         // same — (Analytic, Analytic) → ARC + Analytic. Runtime selects
