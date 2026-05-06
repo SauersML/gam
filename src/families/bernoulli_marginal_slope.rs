@@ -7836,6 +7836,24 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
 }
 
 impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
+    fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+        // At biobank scale (n≈320k, p_total≤221) the exact REML/LAML algebra
+        // currently demands a dense spectral factorization of the coefficient
+        // Hessian. Building that dense Hessian once via the family's
+        // single-pass row kernel (one row visit accumulating every (a, b)
+        // pullback simultaneously) is orders of magnitude cheaper than
+        // letting `MatrixFreeSpdOperator::materialize_dense_operator`
+        // reconstruct it via p_total canonical-basis HVPs (each of which
+        // re-runs the full row stream). Both paths produce the same Hessian;
+        // exposing it here lets the trace code pick the cheap one.
+        //
+        // Returning `None` falls back to the operator path (e.g. when the
+        // family chooses not to materialize for very large p), preserving
+        // the current behavior at large scale.
+        self.family
+            .exact_newton_joint_hessian(&self.block_states)
+    }
+
     fn hessian_matvec(&self, beta_flat: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         // Hv-action against the full coefficient Hessian is consumed by inner
         // PCG / inner-Newton paths (not outer-only score), so the row mask

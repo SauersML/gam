@@ -9800,6 +9800,18 @@ impl SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
 }
 
 impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
+    fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+        // Same rationale as the Bernoulli marginal-slope override: when the
+        // family is willing to materialize the dense joint Hessian directly
+        // (p_total below the family's internal threshold), exposing it here
+        // lets `MatrixFreeSpdOperator::materialize_dense_operator` skip the
+        // p canonical-basis HVP loop and just wrap the dense matvec. At
+        // biobank scale (p_total≈200) this trims hundreds of seconds per
+        // outer-Hessian build.
+        self.family
+            .exact_newton_joint_hessian(&self.block_states)
+    }
+
     fn hessian_matvec(&self, beta_flat: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         Ok(Some(self.joint_hessian_operator.mul_vec(beta_flat)))
     }
