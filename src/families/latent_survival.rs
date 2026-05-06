@@ -16,7 +16,8 @@
 use crate::estimate::UnifiedFitResult;
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, ExactNewtonJointGradientEvaluation,
-    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, fit_custom_family,
+    ExactNewtonJointHessianWorkspace, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    PenaltyMatrix, fit_custom_family,
 };
 use crate::families::gamlss::{FamilyMetadata, ParameterLink};
 use crate::families::lognormal_kernel::{
@@ -328,20 +329,6 @@ pub fn fit_latent_survival_terms(
     if latent_sd.is_none() {
         blocks.push(build_log_sigma_blockspec(0.5));
     }
-    // Same biobank-scale outer-Hessian gate as the marginal-slope families
-    // (see survival_marginal_slope.rs:13286). At biobank n the analytic
-    // outer Hessian dominates wall-clock; route to BFGS on the analytic
-    // gradient instead.
-    let n_obs = data.nrows();
-    let biobank_scale = n_obs > 50_000;
-    let mut options_override = options.clone();
-    if biobank_scale && options_override.use_outer_hessian {
-        options_override.use_outer_hessian = false;
-        log::info!(
-            "[latent-survival] declining analytic outer Hessian for n={n_obs}; routing to BFGS"
-        );
-    }
-    let options: &BlockwiseFitOptions = &options_override;
     let fit = fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())?;
     let latent_sd = family.latent_sd(&fit.block_states)?;
     Ok(LatentSurvivalTermFitResult {
@@ -384,17 +371,6 @@ pub fn fit_latent_binary_terms(
         build_time_blockspec(&time_prepared, &spec.time_block),
         build_mean_blockspec(&mean_design, spec.mean_offset.clone()),
     ];
-    // Same biobank-scale outer-Hessian gate as latent-survival above.
-    let n_obs = data.nrows();
-    let biobank_scale = n_obs > 50_000;
-    let mut options_override = options.clone();
-    if biobank_scale && options_override.use_outer_hessian {
-        options_override.use_outer_hessian = false;
-        log::info!(
-            "[latent-binary] declining analytic outer Hessian for n={n_obs}; routing to BFGS"
-        );
-    }
-    let options: &BlockwiseFitOptions = &options_override;
     let fit = fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())?;
     Ok(LatentBinaryTermFitResult {
         fit,
@@ -2438,6 +2414,10 @@ struct BinaryFromLogSurvival {
     grad_scale: f64,
     neg_hess_scale: f64,
     outer_scale: f64,
+    grad_scale_prime: f64,
+    grad_scale_second: f64,
+    outer_scale_prime: f64,
+    outer_scale_second: f64,
 }
 
 fn binary_from_log_survival(log_survival: f64, event: u8) -> Result<BinaryFromLogSurvival, String> {
@@ -2447,6 +2427,10 @@ fn binary_from_log_survival(log_survival: f64, event: u8) -> Result<BinaryFromLo
             grad_scale: 1.0,
             neg_hess_scale: 1.0,
             outer_scale: 0.0,
+            grad_scale_prime: 0.0,
+            grad_scale_second: 0.0,
+            outer_scale_prime: 0.0,
+            outer_scale_second: 0.0,
         });
     }
     if event != 1 {
@@ -2462,12 +2446,659 @@ fn binary_from_log_survival(log_survival: f64, event: u8) -> Result<BinaryFromLo
             "latent-binary encountered non-positive event probability from log survival {log_survival}"
         ));
     }
+    let event_prob2 = event_prob * event_prob;
+    let event_prob3 = event_prob2 * event_prob;
+    let event_prob4 = event_prob3 * event_prob;
+    let survival2 = survival * survival;
+    let survival3 = survival2 * survival;
+    let outer_scale = survival / event_prob2;
     Ok(BinaryFromLogSurvival {
         log_lik: event_prob.ln(),
         grad_scale: -survival / event_prob,
         neg_hess_scale: survival / event_prob,
-        outer_scale: survival / (event_prob * event_prob),
+        outer_scale,
+        grad_scale_prime: -outer_scale,
+        grad_scale_second: -(outer_scale * (1.0 + 2.0 * survival / event_prob)),
+        outer_scale_prime: outer_scale * (1.0 + 2.0 * survival / event_prob),
+        outer_scale_second: survival / event_prob2
+            + 6.0 * survival2 / event_prob3
+            + 6.0 * survival3 / event_prob4,
     })
+}
+
+#[derive(Clone)]
+struct LatentBinaryJointSlices {
+    time: std::ops::Range<usize>,
+    mean: std::ops::Range<usize>,
+    total: usize,
+}
+
+impl LatentBinaryFamily {
+    fn joint_slices(&self) -> LatentBinaryJointSlices {
+        let p_time = self.x_time_exit.ncols();
+        let p_mean = self.x_mean.ncols();
+        LatentBinaryJointSlices {
+            time: 0..p_time,
+            mean: p_time..p_time + p_mean,
+            total: p_time + p_mean,
+        }
+    }
+
+    fn row_primary_direction_from_flat(
+        &self,
+        row: usize,
+        slices: &LatentBinaryJointSlices,
+        d_beta_flat: &Array1<f64>,
+    ) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(LATENT_SURVIVAL_PRIMARY_DIM);
+        let d_time = d_beta_flat.slice(s![slices.time.clone()]);
+        out[LATENT_SURVIVAL_PRIMARY_Q_ENTRY] = self.x_time_entry.row(row).dot(&d_time);
+        out[LATENT_SURVIVAL_PRIMARY_Q_EXIT] = self.x_time_exit.row(row).dot(&d_time);
+        out[LATENT_SURVIVAL_PRIMARY_MU] = self
+            .x_mean
+            .dot_row_view(row, d_beta_flat.slice(s![slices.mean.clone()]));
+        out
+    }
+
+    fn add_pullback_primary_gradient(
+        &self,
+        target: &mut Array1<f64>,
+        row: usize,
+        slices: &LatentBinaryJointSlices,
+        primary_gradient: &Array1<f64>,
+        weight: f64,
+    ) {
+        for (primary_idx, time_vec) in [
+            (LATENT_SURVIVAL_PRIMARY_Q_ENTRY, self.x_time_entry.row(row)),
+            (LATENT_SURVIVAL_PRIMARY_Q_EXIT, self.x_time_exit.row(row)),
+        ] {
+            let scale = weight * primary_gradient[primary_idx];
+            if scale == 0.0 {
+                continue;
+            }
+            for i in 0..time_vec.len() {
+                let xi = time_vec[i];
+                if xi != 0.0 {
+                    target[slices.time.start + i] += scale * xi;
+                }
+            }
+        }
+
+        let mean_scale = weight * primary_gradient[LATENT_SURVIVAL_PRIMARY_MU];
+        if mean_scale != 0.0 {
+            self.x_mean
+                .axpy_row_into(
+                    row,
+                    mean_scale,
+                    &mut target.slice_mut(s![slices.mean.clone()]),
+                )
+                .expect("latent binary mean gradient pullback dimension mismatch");
+        }
+    }
+
+    fn add_pullback_primary_hessian(
+        &self,
+        target: &mut Array2<f64>,
+        row: usize,
+        slices: &LatentBinaryJointSlices,
+        primary_hessian: &Array2<f64>,
+    ) {
+        {
+            let time_target = &mut target.slice_mut(s![slices.time.clone(), slices.time.clone()]);
+            dense_outer_accumulate(
+                time_target,
+                primary_hessian[[
+                    LATENT_SURVIVAL_PRIMARY_Q_ENTRY,
+                    LATENT_SURVIVAL_PRIMARY_Q_ENTRY,
+                ]],
+                self.x_time_entry.row(row),
+            );
+            dense_outer_accumulate(
+                time_target,
+                primary_hessian[[
+                    LATENT_SURVIVAL_PRIMARY_Q_EXIT,
+                    LATENT_SURVIVAL_PRIMARY_Q_EXIT,
+                ]],
+                self.x_time_exit.row(row),
+            );
+            dense_symmetric_cross_accumulate(
+                time_target,
+                primary_hessian[[
+                    LATENT_SURVIVAL_PRIMARY_Q_ENTRY,
+                    LATENT_SURVIVAL_PRIMARY_Q_EXIT,
+                ]],
+                self.x_time_entry.row(row),
+                self.x_time_exit.row(row),
+            );
+        }
+
+        let mean_weight = primary_hessian[[LATENT_SURVIVAL_PRIMARY_MU, LATENT_SURVIVAL_PRIMARY_MU]];
+        self.x_mean
+            .syr_row_into_view(
+                row,
+                mean_weight,
+                target.slice_mut(s![slices.mean.clone(), slices.mean.clone()]),
+            )
+            .expect("latent binary mean pullback dimension mismatch");
+
+        let mean_row = self
+            .x_mean
+            .try_row_chunk(row..row + 1)
+            .expect("latent binary mean pullback row_chunk must succeed");
+        let mean_vec = mean_row.row(0);
+        for (primary_idx, time_vec) in [
+            (LATENT_SURVIVAL_PRIMARY_Q_ENTRY, self.x_time_entry.row(row)),
+            (LATENT_SURVIVAL_PRIMARY_Q_EXIT, self.x_time_exit.row(row)),
+        ] {
+            let weight = primary_hessian[[primary_idx, LATENT_SURVIVAL_PRIMARY_MU]];
+            if weight == 0.0 {
+                continue;
+            }
+            for i in 0..time_vec.len() {
+                let xi = time_vec[i];
+                if xi == 0.0 {
+                    continue;
+                }
+                for j in 0..mean_vec.len() {
+                    let xj = mean_vec[j];
+                    if xj == 0.0 {
+                        continue;
+                    }
+                    target[[slices.time.start + i, slices.mean.start + j]] += weight * xi * xj;
+                    target[[slices.mean.start + j, slices.time.start + i]] += weight * xj * xi;
+                }
+            }
+        }
+    }
+
+    fn evaluate_exact_newton_joint_dense(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        let (q_entry, q_exit, mu) = self.split_time_eta(block_states)?;
+        let slices = self.joint_slices();
+        let mut ll = 0.0;
+        let mut gradient = Array1::<f64>::zeros(slices.total);
+        let mut hessian = Array2::<f64>::zeros((slices.total, slices.total));
+        for row_idx in 0..self.event_target.len() {
+            let wi = self.weights[row_idx];
+            if wi <= MIN_WEIGHT {
+                continue;
+            }
+            let row = build_latent_survival_row(
+                row_idx,
+                self.hazard_loading,
+                LatentSurvivalEventType::RightCensored,
+                q_entry[row_idx],
+                q_exit[row_idx],
+                1.0,
+                self.unloaded_mass_entry[row_idx],
+                self.unloaded_mass_exit[row_idx],
+                0.0,
+            )?;
+            let (row_log_survival, survival_gradient, survival_hessian) =
+                latent_survival_row_primary_gradient_hessian(
+                    &self.quadctx,
+                    &row,
+                    q_entry[row_idx],
+                    q_exit[row_idx],
+                    1.0,
+                    mu[row_idx],
+                    self.latent_sd,
+                    false,
+                )?;
+            let binary = binary_from_log_survival(row_log_survival, self.event_target[row_idx])?;
+            ll += wi * binary.log_lik;
+            let primary_gradient = binary.grad_scale * &survival_gradient;
+            let mut primary_hessian = binary.grad_scale * survival_hessian;
+            for a in 0..LATENT_SURVIVAL_PRIMARY_DIM {
+                for b in 0..LATENT_SURVIVAL_PRIMARY_DIM {
+                    primary_hessian[[a, b]] +=
+                        binary.outer_scale * survival_gradient[a] * survival_gradient[b];
+                }
+            }
+            self.add_pullback_primary_gradient(
+                &mut gradient,
+                row_idx,
+                &slices,
+                &primary_gradient,
+                wi,
+            );
+            self.add_pullback_primary_hessian(
+                &mut hessian,
+                row_idx,
+                &slices,
+                &(wi * primary_hessian),
+            );
+        }
+        Ok((ll, gradient, hessian))
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative_dense(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let (q_entry, q_exit, mu) = self.split_time_eta(block_states)?;
+        let slices = self.joint_slices();
+        if d_beta_flat.len() != slices.total {
+            return Err(format!(
+                "latent binary joint dH direction length mismatch: got {}, expected {}",
+                d_beta_flat.len(),
+                slices.total
+            ));
+        }
+        let mut out = Array2::<f64>::zeros((slices.total, slices.total));
+        for row_idx in 0..self.event_target.len() {
+            let wi = self.weights[row_idx];
+            if wi <= MIN_WEIGHT {
+                continue;
+            }
+            let row = build_latent_survival_row(
+                row_idx,
+                self.hazard_loading,
+                LatentSurvivalEventType::RightCensored,
+                q_entry[row_idx],
+                q_exit[row_idx],
+                1.0,
+                self.unloaded_mass_entry[row_idx],
+                self.unloaded_mass_exit[row_idx],
+                0.0,
+            )?;
+            let (row_log_survival, survival_gradient, survival_hessian) =
+                latent_survival_row_primary_gradient_hessian(
+                    &self.quadctx,
+                    &row,
+                    q_entry[row_idx],
+                    q_exit[row_idx],
+                    1.0,
+                    mu[row_idx],
+                    self.latent_sd,
+                    false,
+                )?;
+            let binary = binary_from_log_survival(row_log_survival, self.event_target[row_idx])?;
+            let direction = self.row_primary_direction_from_flat(row_idx, &slices, d_beta_flat);
+            let third = latent_survival_row_primary_third_contracted(
+                &self.quadctx,
+                &row,
+                q_entry[row_idx],
+                q_exit[row_idx],
+                1.0,
+                mu[row_idx],
+                self.latent_sd,
+                &direction,
+                false,
+            )?;
+            let g_u = -survival_hessian.dot(&direction);
+            let t_u = survival_gradient.dot(&direction);
+            let mut primary = binary.grad_scale * third;
+            primary.scaled_add(binary.grad_scale_prime * t_u, &survival_hessian);
+            for a in 0..LATENT_SURVIVAL_PRIMARY_DIM {
+                for b in 0..LATENT_SURVIVAL_PRIMARY_DIM {
+                    primary[[a, b]] += binary.outer_scale_prime
+                        * t_u
+                        * survival_gradient[a]
+                        * survival_gradient[b]
+                        + binary.outer_scale
+                            * (g_u[a] * survival_gradient[b] + survival_gradient[a] * g_u[b]);
+                }
+            }
+            self.add_pullback_primary_hessian(&mut out, row_idx, &slices, &(wi * primary));
+        }
+        Ok(out)
+    }
+
+    fn exact_newton_joint_hessian_second_directional_derivative_dense(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let (q_entry, q_exit, mu) = self.split_time_eta(block_states)?;
+        let slices = self.joint_slices();
+        if d_beta_u_flat.len() != slices.total || d_beta_v_flat.len() != slices.total {
+            return Err(format!(
+                "latent binary joint d2H direction length mismatch: got {} and {}, expected {}",
+                d_beta_u_flat.len(),
+                d_beta_v_flat.len(),
+                slices.total
+            ));
+        }
+        let mut out = Array2::<f64>::zeros((slices.total, slices.total));
+        for row_idx in 0..self.event_target.len() {
+            let wi = self.weights[row_idx];
+            if wi <= MIN_WEIGHT {
+                continue;
+            }
+            let row = build_latent_survival_row(
+                row_idx,
+                self.hazard_loading,
+                LatentSurvivalEventType::RightCensored,
+                q_entry[row_idx],
+                q_exit[row_idx],
+                1.0,
+                self.unloaded_mass_entry[row_idx],
+                self.unloaded_mass_exit[row_idx],
+                0.0,
+            )?;
+            let (row_log_survival, survival_gradient, survival_hessian) =
+                latent_survival_row_primary_gradient_hessian(
+                    &self.quadctx,
+                    &row,
+                    q_entry[row_idx],
+                    q_exit[row_idx],
+                    1.0,
+                    mu[row_idx],
+                    self.latent_sd,
+                    false,
+                )?;
+            let binary = binary_from_log_survival(row_log_survival, self.event_target[row_idx])?;
+            let direction_u = self.row_primary_direction_from_flat(row_idx, &slices, d_beta_u_flat);
+            let direction_v = self.row_primary_direction_from_flat(row_idx, &slices, d_beta_v_flat);
+            let third_u = latent_survival_row_primary_third_contracted(
+                &self.quadctx,
+                &row,
+                q_entry[row_idx],
+                q_exit[row_idx],
+                1.0,
+                mu[row_idx],
+                self.latent_sd,
+                &direction_u,
+                false,
+            )?;
+            let third_v = latent_survival_row_primary_third_contracted(
+                &self.quadctx,
+                &row,
+                q_entry[row_idx],
+                q_exit[row_idx],
+                1.0,
+                mu[row_idx],
+                self.latent_sd,
+                &direction_v,
+                false,
+            )?;
+            let fourth = latent_survival_row_primary_fourth_contracted(
+                &self.quadctx,
+                &row,
+                q_entry[row_idx],
+                q_exit[row_idx],
+                1.0,
+                mu[row_idx],
+                self.latent_sd,
+                &direction_u,
+                &direction_v,
+                false,
+            )?;
+            let g_u = -survival_hessian.dot(&direction_u);
+            let g_v = -survival_hessian.dot(&direction_v);
+            let g_uv = -third_v.dot(&direction_u);
+            let t_u = survival_gradient.dot(&direction_u);
+            let t_v = survival_gradient.dot(&direction_v);
+            let l_uv = -direction_u.dot(&survival_hessian.dot(&direction_v));
+            let c_u = binary.grad_scale_prime * t_u;
+            let c_v = binary.grad_scale_prime * t_v;
+            let c_uv = binary.grad_scale_second * t_u * t_v + binary.grad_scale_prime * l_uv;
+            let o_u = binary.outer_scale_prime * t_u;
+            let o_v = binary.outer_scale_prime * t_v;
+            let o_uv = binary.outer_scale_second * t_u * t_v + binary.outer_scale_prime * l_uv;
+            let mut primary = binary.grad_scale * fourth;
+            primary.scaled_add(c_u, &third_v);
+            primary.scaled_add(c_v, &third_u);
+            primary.scaled_add(c_uv, &survival_hessian);
+            for a in 0..LATENT_SURVIVAL_PRIMARY_DIM {
+                for b in 0..LATENT_SURVIVAL_PRIMARY_DIM {
+                    primary[[a, b]] += o_uv * survival_gradient[a] * survival_gradient[b]
+                        + o_v * (g_u[a] * survival_gradient[b] + survival_gradient[a] * g_u[b])
+                        + o_u * (g_v[a] * survival_gradient[b] + survival_gradient[a] * g_v[b])
+                        + binary.outer_scale
+                            * (g_uv[a] * survival_gradient[b]
+                                + g_u[a] * g_v[b]
+                                + g_v[a] * g_u[b]
+                                + survival_gradient[a] * g_uv[b]);
+                }
+            }
+            self.add_pullback_primary_hessian(&mut out, row_idx, &slices, &(wi * primary));
+        }
+        Ok(out)
+    }
+}
+
+struct LatentSurvivalHessianWorkspace {
+    family: LatentSurvivalFamily,
+    block_states: Vec<ParameterBlockState>,
+    slices: LatentSurvivalJointSlices,
+}
+
+impl LatentSurvivalHessianWorkspace {
+    fn new(family: LatentSurvivalFamily, block_states: Vec<ParameterBlockState>) -> Self {
+        let slices = family.joint_slices();
+        Self {
+            family,
+            block_states,
+            slices,
+        }
+    }
+}
+
+impl ExactNewtonJointHessianWorkspace for LatentSurvivalHessianWorkspace {
+    fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+        self.family
+            .evaluate_exact_newton_joint_dense(&self.block_states)
+            .map(|(_, _, hessian)| Some(hessian))
+    }
+
+    fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
+        let mut out = Array1::<f64>::zeros(self.slices.total);
+        self.hessian_matvec_into(v, &mut out)?;
+        Ok(Some(out))
+    }
+
+    fn hessian_matvec_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<bool, String> {
+        if v.len() != self.slices.total || out.len() != self.slices.total {
+            return Err(format!(
+                "latent survival Hessian matvec dimension mismatch: v={} out={} expected={}",
+                v.len(),
+                out.len(),
+                self.slices.total
+            ));
+        }
+        out.fill(0.0);
+        let (q_entry, q_exit, qdot_exit, mu) = self.family.split_time_eta(&self.block_states)?;
+        let sigma = self.family.latent_sd(&self.block_states)?;
+        let include_log_sigma = self.slices.log_sigma.is_some();
+        for row_idx in 0..self.family.event_target.len() {
+            let wi = self.family.weights[row_idx];
+            if wi <= MIN_WEIGHT {
+                continue;
+            }
+            let event_type = if self.family.event_target[row_idx] >= 1 {
+                LatentSurvivalEventType::ExactEvent
+            } else {
+                LatentSurvivalEventType::RightCensored
+            };
+            let row = build_latent_survival_row(
+                row_idx,
+                self.family.hazard_loading,
+                event_type,
+                q_entry[row_idx],
+                q_exit[row_idx],
+                qdot_exit[row_idx],
+                self.family.unloaded_mass_entry[row_idx],
+                self.family.unloaded_mass_exit[row_idx],
+                self.family.unloaded_hazard_exit[row_idx],
+            )?;
+            let (_, _, primary_hessian) = latent_survival_row_primary_gradient_hessian(
+                &self.family.quadctx,
+                &row,
+                q_entry[row_idx],
+                q_exit[row_idx],
+                qdot_exit[row_idx],
+                mu[row_idx],
+                sigma,
+                include_log_sigma,
+            )?;
+            let primary_dir = self
+                .family
+                .row_primary_direction_from_flat(row_idx, &self.slices, v);
+            let primary_hv = primary_hessian.dot(&primary_dir);
+            self.family
+                .add_pullback_primary_gradient(out, row_idx, &self.slices, &primary_hv, wi);
+        }
+        Ok(true)
+    }
+
+    fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
+        let dense = self
+            .family
+            .evaluate_exact_newton_joint_dense(&self.block_states)?
+            .2;
+        Ok(Some(dense.diag().to_owned()))
+    }
+
+    fn directional_derivative(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.family
+            .exact_newton_joint_hessian_directional_derivative_dense(
+                &self.block_states,
+                d_beta_flat,
+            )
+            .map(Some)
+    }
+
+    fn second_directional_derivative(
+        &self,
+        d_beta_u: &Array1<f64>,
+        d_beta_v: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.family
+            .exact_newton_joint_hessian_second_directional_derivative_dense(
+                &self.block_states,
+                d_beta_u,
+                d_beta_v,
+            )
+            .map(Some)
+    }
+}
+
+struct LatentBinaryHessianWorkspace {
+    family: LatentBinaryFamily,
+    block_states: Vec<ParameterBlockState>,
+    slices: LatentBinaryJointSlices,
+}
+
+impl LatentBinaryHessianWorkspace {
+    fn new(family: LatentBinaryFamily, block_states: Vec<ParameterBlockState>) -> Self {
+        let slices = family.joint_slices();
+        Self {
+            family,
+            block_states,
+            slices,
+        }
+    }
+}
+
+impl ExactNewtonJointHessianWorkspace for LatentBinaryHessianWorkspace {
+    fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+        self.family
+            .evaluate_exact_newton_joint_dense(&self.block_states)
+            .map(|(_, _, hessian)| Some(hessian))
+    }
+
+    fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
+        let mut out = Array1::<f64>::zeros(self.slices.total);
+        self.hessian_matvec_into(v, &mut out)?;
+        Ok(Some(out))
+    }
+
+    fn hessian_matvec_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<bool, String> {
+        if v.len() != self.slices.total || out.len() != self.slices.total {
+            return Err(format!(
+                "latent binary Hessian matvec dimension mismatch: v={} out={} expected={}",
+                v.len(),
+                out.len(),
+                self.slices.total
+            ));
+        }
+        out.fill(0.0);
+        let (q_entry, q_exit, mu) = self.family.split_time_eta(&self.block_states)?;
+        for row_idx in 0..self.family.event_target.len() {
+            let wi = self.family.weights[row_idx];
+            if wi <= MIN_WEIGHT {
+                continue;
+            }
+            let row = build_latent_survival_row(
+                row_idx,
+                self.family.hazard_loading,
+                LatentSurvivalEventType::RightCensored,
+                q_entry[row_idx],
+                q_exit[row_idx],
+                1.0,
+                self.family.unloaded_mass_entry[row_idx],
+                self.family.unloaded_mass_exit[row_idx],
+                0.0,
+            )?;
+            let (row_log_survival, survival_gradient, survival_hessian) =
+                latent_survival_row_primary_gradient_hessian(
+                    &self.family.quadctx,
+                    &row,
+                    q_entry[row_idx],
+                    q_exit[row_idx],
+                    1.0,
+                    mu[row_idx],
+                    self.family.latent_sd,
+                    false,
+                )?;
+            let binary =
+                binary_from_log_survival(row_log_survival, self.family.event_target[row_idx])?;
+            let primary_dir = self
+                .family
+                .row_primary_direction_from_flat(row_idx, &self.slices, v);
+            let mut primary_hv = binary.grad_scale * survival_hessian.dot(&primary_dir);
+            let outer_dot = survival_gradient.dot(&primary_dir);
+            for a in 0..LATENT_SURVIVAL_PRIMARY_DIM {
+                primary_hv[a] += binary.outer_scale * survival_gradient[a] * outer_dot;
+            }
+            self.family
+                .add_pullback_primary_gradient(out, row_idx, &self.slices, &primary_hv, wi);
+        }
+        Ok(true)
+    }
+
+    fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
+        let dense = self
+            .family
+            .evaluate_exact_newton_joint_dense(&self.block_states)?
+            .2;
+        Ok(Some(dense.diag().to_owned()))
+    }
+
+    fn directional_derivative(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.family
+            .exact_newton_joint_hessian_directional_derivative_dense(
+                &self.block_states,
+                d_beta_flat,
+            )
+            .map(Some)
+    }
+
+    fn second_directional_derivative(
+        &self,
+        d_beta_u: &Array1<f64>,
+        d_beta_v: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.family
+            .exact_newton_joint_hessian_second_directional_derivative_dense(
+                &self.block_states,
+                d_beta_u,
+                d_beta_v,
+            )
+            .map(Some)
+    }
 }
 
 impl CustomFamily for LatentSurvivalFamily {
@@ -2571,6 +3202,17 @@ impl CustomFamily for LatentSurvivalFamily {
             .map(|(_, _, hessian)| Some(hessian))
     }
 
+    fn exact_newton_joint_hessian_workspace(
+        &self,
+        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        Ok(Some(Arc::new(LatentSurvivalHessianWorkspace::new(
+            self.clone(),
+            block_states.to_vec(),
+        ))))
+    }
+
     fn exact_newton_joint_gradient_evaluation(
         &self,
         block_states: &[ParameterBlockState],
@@ -2614,6 +3256,17 @@ impl CustomFamily for LatentSurvivalFamily {
 }
 
 impl CustomFamily for LatentBinaryFamily {
+    fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+        true
+    }
+
+    fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
+        crate::custom_family::joint_coupled_coefficient_hessian_cost(
+            self.event_target.len() as u64,
+            specs,
+        )
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         let (q_entry, q_exit, mu) = self.split_time_eta(block_states)?;
         let n = self.event_target.len();
@@ -2761,6 +3414,62 @@ impl CustomFamily for LatentBinaryFamily {
         } else {
             Ok(None)
         }
+    }
+
+    fn exact_newton_joint_hessian(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.evaluate_exact_newton_joint_dense(block_states)
+            .map(|(_, _, hessian)| Some(hessian))
+    }
+
+    fn exact_newton_joint_hessian_workspace(
+        &self,
+        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        Ok(Some(Arc::new(LatentBinaryHessianWorkspace::new(
+            self.clone(),
+            block_states.to_vec(),
+        ))))
+    }
+
+    fn exact_newton_joint_gradient_evaluation(
+        &self,
+        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        self.evaluate_exact_newton_joint_dense(block_states)
+            .map(|(log_likelihood, gradient, _)| {
+                Some(ExactNewtonJointGradientEvaluation {
+                    log_likelihood,
+                    gradient,
+                })
+            })
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.exact_newton_joint_hessian_directional_derivative_dense(block_states, d_beta_flat)
+            .map(Some)
+    }
+
+    fn exact_newton_joint_hessiansecond_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.exact_newton_joint_hessian_second_directional_derivative_dense(
+            block_states,
+            d_beta_u_flat,
+            d_beta_v_flat,
+        )
+        .map(Some)
     }
 
     fn requires_joint_outer_hyper_path(&self) -> bool {
@@ -2918,6 +3627,66 @@ mod tests {
         .0
     }
 
+    fn latent_test_specs(n: usize, block_dims: &[(&str, usize)]) -> Vec<ParameterBlockSpec> {
+        block_dims
+            .iter()
+            .map(|(name, p)| ParameterBlockSpec {
+                name: (*name).to_string(),
+                design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::zeros((n, *p)))),
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            })
+            .collect()
+    }
+
+    fn fixed_sigma_binary_test_family() -> LatentBinaryFamily {
+        LatentBinaryFamily {
+            event_target: array![1u8, 0u8],
+            weights: array![1.0, 0.7],
+            latent_sd: 0.35,
+            hazard_loading: HazardLoading::LoadedVsUnloaded,
+            unloaded_mass_entry: array![0.02, 0.03],
+            unloaded_mass_exit: array![0.05, 0.08],
+            x_time_entry: array![[1.0, -0.2], [0.4, 0.7]],
+            x_time_exit: array![[1.3, 0.1], [0.9, 1.0]],
+            x_mean: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0, -0.3], [0.2, 0.9]])),
+            time_linear_constraints: None,
+            quadctx: Arc::new(QuadratureContext::new()),
+        }
+    }
+
+    fn latent_binary_states_from_joint_beta(
+        family: &LatentBinaryFamily,
+        joint_beta: &Array1<f64>,
+    ) -> Vec<ParameterBlockState> {
+        let slices = family.joint_slices();
+        let n = family.event_target.len();
+        let beta_time = joint_beta.slice(s![slices.time.clone()]).to_owned();
+        let beta_mean = joint_beta.slice(s![slices.mean.clone()]).to_owned();
+
+        let mut eta_time = Array1::<f64>::zeros(3 * n);
+        eta_time
+            .slice_mut(s![0..n])
+            .assign(&family.x_time_entry.dot(&beta_time));
+        eta_time
+            .slice_mut(s![n..2 * n])
+            .assign(&family.x_time_exit.dot(&beta_time));
+
+        vec![
+            ParameterBlockState {
+                beta: beta_time,
+                eta: eta_time,
+            },
+            ParameterBlockState {
+                beta: beta_mean.clone(),
+                eta: family.x_mean.dot(&beta_mean),
+            },
+        ]
+    }
+
     #[test]
     fn latent_survival_coefficient_cost_uses_joint_coupled_formula() {
         // `evaluate_exact_newton_joint_dense` builds a fully dense joint
@@ -2976,6 +3745,115 @@ mod tests {
         // Cross-block fill (time–mean, time–log_sigma, mean–log_sigma) makes
         // the joint cost strictly larger than the block-diagonal default.
         assert!(expected_joint > expected_block_diag);
+    }
+
+    #[test]
+    fn latent_family_planner_keeps_outer_hessian_at_large_n() {
+        use crate::families::custom_family::custom_family_outer_derivatives;
+        use crate::solver::outer_strategy::Derivative;
+
+        let options = BlockwiseFitOptions::default();
+        let large_n = 50_001;
+
+        let survival = learnable_sigma_test_family();
+        let survival_specs =
+            latent_test_specs(large_n, &[("time", 2), ("mean", 2), ("log_sigma", 1)]);
+        let (surv_grad, surv_hess) =
+            custom_family_outer_derivatives(&survival, &survival_specs, &options);
+        assert_eq!(surv_grad, Derivative::Analytic);
+        assert_eq!(surv_hess, Derivative::Analytic);
+
+        let binary = fixed_sigma_binary_test_family();
+        let binary_specs = latent_test_specs(large_n, &[("time", 2), ("mean", 2)]);
+        let (bin_grad, bin_hess) =
+            custom_family_outer_derivatives(&binary, &binary_specs, &options);
+        assert_eq!(bin_grad, Derivative::Analytic);
+        assert_eq!(bin_hess, Derivative::Analytic);
+    }
+
+    #[test]
+    fn latent_binary_exact_joint_hessian_and_workspace_matvec_match_fd() {
+        let family = fixed_sigma_binary_test_family();
+        let beta = array![0.15, 0.25, 0.1, -0.15];
+        let states = latent_binary_states_from_joint_beta(&family, &beta);
+        let h = 1e-6;
+
+        let analytic_hessian = family
+            .exact_newton_joint_hessian(&states)
+            .expect("analytic latent binary joint hessian evaluation")
+            .expect("latent binary should expose exact joint hessian");
+
+        for j in 0..beta.len() {
+            let mut beta_plus = beta.clone();
+            beta_plus[j] += h;
+            let gradient_plus = family
+                .exact_newton_joint_gradient_evaluation(
+                    &latent_binary_states_from_joint_beta(&family, &beta_plus),
+                    &[],
+                )
+                .expect("joint gradient plus")
+                .expect("joint gradient should exist")
+                .gradient;
+
+            let mut beta_minus = beta.clone();
+            beta_minus[j] -= h;
+            let gradient_minus = family
+                .exact_newton_joint_gradient_evaluation(
+                    &latent_binary_states_from_joint_beta(&family, &beta_minus),
+                    &[],
+                )
+                .expect("joint gradient minus")
+                .expect("joint gradient should exist")
+                .gradient;
+
+            let fd_column = -((&gradient_plus - &gradient_minus) / (2.0 * h));
+            let analytic_column = analytic_hessian.column(j).to_owned();
+            let rel = max_relative_array1(&analytic_column, &fd_column);
+            assert!(
+                rel < 5e-4,
+                "latent binary joint Hessian column {j} mismatch: rel={rel}, analytic={analytic_column:?}, fd={fd_column:?}"
+            );
+        }
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &[])
+            .expect("latent binary hessian workspace")
+            .expect("workspace should exist");
+        let direction = array![0.4, -0.2, 0.3, 0.1];
+        let hv = workspace
+            .hessian_matvec(&direction)
+            .expect("workspace matvec")
+            .expect("workspace should support matvec");
+        let dense_hv = analytic_hessian.dot(&direction);
+        assert!(
+            max_relative_array1(&hv, &dense_hv) < 1e-12,
+            "latent binary workspace HVP mismatch: hv={hv:?}, dense={dense_hv:?}"
+        );
+
+        let dh = workspace
+            .directional_derivative(&direction)
+            .expect("workspace dH")
+            .expect("workspace should support dH");
+        let fd_step = 1e-5;
+        let h_plus = family
+            .exact_newton_joint_hessian(&latent_binary_states_from_joint_beta(
+                &family,
+                &(beta.clone() + &(fd_step * &direction)),
+            ))
+            .expect("hessian plus")
+            .expect("hessian plus should exist");
+        let h_minus = family
+            .exact_newton_joint_hessian(&latent_binary_states_from_joint_beta(
+                &family,
+                &(beta - &(fd_step * &direction)),
+            ))
+            .expect("hessian minus")
+            .expect("hessian minus should exist");
+        let fd_dh = (&h_plus - &h_minus) / (2.0 * fd_step);
+        assert!(
+            max_relative_array2(&dh, &fd_dh) < 2e-4,
+            "latent binary workspace dH mismatch: dh={dh:?}, fd={fd_dh:?}"
+        );
     }
 
     #[test]
