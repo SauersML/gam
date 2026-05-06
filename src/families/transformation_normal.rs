@@ -33,10 +33,11 @@ use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyPsiDerivativeOperator, ExactNewtonJointGradientEvaluation,
     ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
-    ExactNewtonJointPsiTerms, FamilyEvaluation, MaterializablePsiDerivativeOperator,
-    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, build_block_spatial_psi_derivatives,
-    custom_family_outer_derivatives, evaluate_custom_family_joint_hyper,
-    evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
+    ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, FamilyEvaluation,
+    MaterializablePsiDerivativeOperator, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
+    build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
+    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, fit_custom_family,
+    fit_custom_family_fixed_log_lambdas,
 };
 use crate::families::gamlss::{
     initializewiggle_knots_from_seed, solve_penalizedweighted_projection,
@@ -55,7 +56,9 @@ use crate::smooth::{
     spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::UnifiedFitResult;
-use crate::solver::estimate::reml::unified::{HyperOperator, ProjectedFactorCache};
+use crate::solver::estimate::reml::unified::{
+    DriftDerivResult, HyperOperator, ProjectedFactorCache,
+};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
@@ -132,6 +135,11 @@ pub const TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES: usize = 129;
 /// Number of equal subdivisions inserted between consecutive grid points
 /// (knots + quantiles). Shared between fit and predict.
 pub const TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS: usize = 4;
+/// Number of dense-spectral factor columns processed per exact ψψ HVP row pass.
+/// At biobank CTN dimensions p≈800, this keeps the per-worker accumulator well
+/// under 1 MiB while reducing repeated SCOP row-invariant work by 32× relative
+/// to one-column HVP dispatch.
+const SCOP_PSI_PSI_HVP_TILE_COLS: usize = 32;
 
 fn beta_bits_match(cached: &Array1<f64>, candidate: &Array1<f64>) -> bool {
     cached.len() == candidate.len()
@@ -6540,7 +6548,7 @@ impl TransformationNormalPsiPsiHessianOperator {
         let p = factor.nrows();
         let k = factor.ncols();
         let mut out = Array2::<f64>::zeros((p, k));
-        let tile_cols = 8usize.min(k.max(1));
+        let tile_cols = SCOP_PSI_PSI_HVP_TILE_COLS.min(k.max(1));
         for start_col in (0..k).step_by(tile_cols) {
             let end_col = (start_col + tile_cols).min(k);
             let tile = factor.slice(s![.., start_col..end_col]);
