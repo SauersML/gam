@@ -3307,10 +3307,16 @@ impl PenaltySubspaceTrace {
     /// `U_S · (H_proj⁻¹ · (U_Sᵀ · v))` so cost is `O(p · r + r²)` and the
     /// result is identically zero on `null(U_S)`.
     ///
-    /// Production caller: the projected leverage / `adjoint_z_c` shortcut
-    /// in `build_outer_hessian_operator`.  Per-row leverage
-    /// `h^{G,proj}_i = Xᵢᵀ · K · Xᵢ` is computed by applying this to each
-    /// row of `X`; `z_c = K · Xᵀ(c ⊙ h^{G,proj})` is a single application.
+    /// Test-only: documents the projected-kernel action that
+    /// [`Self::xt_projected_kernel_x_diagonal`] inlines for production
+    /// (the prod path streams `Z = X · U_S` row-chunked rather than
+    /// invoking `apply` per row).  The companion test
+    /// `subspace_apply_adjoint_shortcut_matches_dense_projected_trace`
+    /// verifies the identity `tr(K · C[u]) = uᵀ · Xᵀ(c ⊙ h^{G,proj})` that
+    /// the production leverage shortcut depends on.  Note the corresponding
+    /// `z_c` stays gated by `H⁻¹` (not `K`) so the IFT mode-response
+    /// semantics line up with `compute_outer_hessian`.
+    #[cfg(test)]
     pub fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
         let v_proj = self.u_s.t().dot(v);
         let y_proj = self.h_proj_inverse.dot(&v_proj);
