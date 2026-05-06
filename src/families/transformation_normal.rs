@@ -7130,6 +7130,10 @@ struct TransformationNormalPsiPsiHessianOperator {
     op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
     axis_i: usize,
     axis_j: usize,
+    trace_axes: Arc<Vec<usize>>,
+    trace_axis_i_pos: usize,
+    trace_axis_j_pos: usize,
+    trace_cache_id: usize,
     row_gamma: Arc<Array2<f64>>,
     row_h: Arc<Array1<f64>>,
     row_h_prime: Arc<Array1<f64>>,
@@ -7148,12 +7152,57 @@ impl TransformationNormalPsiPsiHessianOperator {
         row_h_prime: Arc<Array1<f64>>,
         endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
     ) -> Self {
+        let trace_axes = if axis_i == axis_j {
+            Arc::new(vec![axis_i])
+        } else {
+            Arc::new(vec![axis_i, axis_j])
+        };
+        let trace_axis_i_pos = 0;
+        let trace_axis_j_pos = if axis_i == axis_j { 0 } else { 1 };
+        Self::new_with_trace_axes(
+            family,
+            beta,
+            op,
+            axis_i,
+            axis_j,
+            trace_axes,
+            trace_axis_i_pos,
+            trace_axis_j_pos,
+            row_gamma,
+            row_h,
+            row_h_prime,
+            endpoint_q,
+        )
+    }
+
+    fn new_with_trace_axes(
+        family: Arc<TransformationNormalFamily>,
+        beta: Array1<f64>,
+        op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+        axis_i: usize,
+        axis_j: usize,
+        trace_axes: Arc<Vec<usize>>,
+        trace_axis_i_pos: usize,
+        trace_axis_j_pos: usize,
+        row_gamma: Arc<Array2<f64>>,
+        row_h: Arc<Array1<f64>>,
+        row_h_prime: Arc<Array1<f64>>,
+        endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
+    ) -> Self {
+        let op_ptr = Arc::as_ptr(&op) as *const () as usize;
+        let row_ptr = Arc::as_ptr(&row_gamma) as usize;
+        let axes_ptr = Arc::as_ptr(&trace_axes) as usize;
+        let trace_cache_id = op_ptr ^ row_ptr.rotate_left(17) ^ axes_ptr.rotate_left(31);
         Self {
             family,
             beta,
             op,
             axis_i,
             axis_j,
+            trace_axes,
+            trace_axis_i_pos,
+            trace_axis_j_pos,
+            trace_cache_id,
             row_gamma,
             row_h,
             row_h_prime,
@@ -7255,6 +7304,61 @@ impl TransformationNormalPsiPsiHessianOperator {
             )
             .expect("validated CTN psi-psi projected trace inputs should not fail")
     }
+
+    fn projected_trace_table(&self, factor: &Array2<f64>) -> Array2<f64> {
+        debug_assert_eq!(factor.nrows(), self.p_total());
+        let n_axes = self.trace_axes.len();
+        let n = self.family.response_val_basis.nrows();
+        let p_cov = self.family.covariate_design.ncols();
+        let policy = ResourcePolicy::default_library();
+        let rows_per_chunk = crate::resource::rows_for_target_bytes(
+            policy.row_chunk_target_bytes,
+            p_cov.saturating_mul(n_axes + 2).max(1),
+        )
+        .max(1)
+        .min(n.max(1));
+
+        let op = self.tensor_op();
+        let mut out = Array2::<f64>::zeros((n_axes, n_axes));
+        for start in (0..n).step_by(rows_per_chunk) {
+            let end = (start + rows_per_chunk).min(n);
+            let rows = start..end;
+            let cov = self
+                .family
+                .covariate_design
+                .try_row_chunk(rows.clone())
+                .expect("validated CTN psi-psi projected trace covariate chunk should not fail");
+            let mut cov_psi_chunks: Vec<Array2<f64>> = Vec::with_capacity(n_axes);
+            for &axis in self.trace_axes.iter() {
+                cov_psi_chunks.push(
+                    op.cov_first_axis_row_chunk_streaming(axis, rows.clone())
+                        .expect("validated CTN psi-psi projected trace first-axis chunk should not fail"),
+                );
+            }
+
+            for i in 0..n_axes {
+                for j in i..n_axes {
+                    let cov_ij = op
+                        .cov_second_axis_row_chunk(self.trace_axes[i], self.trace_axes[j], rows.clone())
+                        .expect("validated CTN psi-psi projected trace second-axis chunk should not fail");
+                    let value = self.trace_columns_with_shared_cov(
+                        factor,
+                        &cov,
+                        &cov_psi_chunks[i],
+                        &cov_psi_chunks[j],
+                        &cov_ij,
+                        start,
+                        end,
+                    );
+                    out[[i, j]] += value;
+                    if i != j {
+                        out[[j, i]] += value;
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 impl HyperOperator for TransformationNormalPsiPsiHessianOperator {
@@ -7315,9 +7419,11 @@ impl HyperOperator for TransformationNormalPsiPsiHessianOperator {
     fn trace_projected_factor_cached(
         &self,
         factor: &Array2<f64>,
-        _cache: &ProjectedFactorCache,
+        cache: &ProjectedFactorCache,
     ) -> f64 {
-        self.trace_projected_factor(factor)
+        let key = ProjectedFactorKey::from_factor_view(self.trace_cache_id, factor.view());
+        let table = cache.get_or_insert_with(key, || self.projected_trace_table(factor));
+        table[[self.trace_axis_i_pos, self.trace_axis_j_pos]]
     }
 
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
@@ -12645,6 +12751,9 @@ struct TransformationNormalPsiWorkspacePairCacheEntry {
     op_arc: Arc<dyn CustomFamilyPsiDerivativeOperator>,
     axis_i: usize,
     axis_j: usize,
+    trace_axes: Arc<Vec<usize>>,
+    trace_axis_i_pos: usize,
+    trace_axis_j_pos: usize,
     row_gamma: Arc<Array2<f64>>,
     row_h: Arc<Array1<f64>>,
     row_h_prime: Arc<Array1<f64>>,
@@ -13039,6 +13148,7 @@ impl TransformationNormalPsiWorkspace {
         let pairs: Vec<(usize, usize)> = (0..n_psi)
             .flat_map(|i| (i..n_psi).map(move |j| (i, j)))
             .collect();
+        let trace_axes = Arc::new(axes.iter().map(|entry| entry.axis).collect::<Vec<_>>());
 
         let op = axes[0]
             .op_arc
@@ -13188,6 +13298,9 @@ impl TransformationNormalPsiWorkspace {
                 op_arc: Arc::clone(&entry_i.op_arc),
                 axis_i: entry_i.axis,
                 axis_j: entry_j.axis,
+                trace_axes: Arc::clone(&trace_axes),
+                trace_axis_i_pos: i,
+                trace_axis_j_pos: j,
                 row_gamma: Arc::clone(&entry_i.row_gamma),
                 row_h: Arc::clone(&entry_i.row_h),
                 row_h_prime: Arc::clone(&entry_i.row_h_prime),
@@ -13268,18 +13381,22 @@ impl ExactNewtonJointPsiWorkspace for TransformationNormalPsiWorkspace {
             return Ok(None);
         };
 
-        let hessian_psi_psi_operator: Box<dyn HyperOperator> =
-            Box::new(TransformationNormalPsiPsiHessianOperator::new(
+        let hessian_psi_psi_operator: Box<dyn HyperOperator> = Box::new(
+            TransformationNormalPsiPsiHessianOperator::new_with_trace_axes(
                 Arc::new(self.family.clone()),
                 entry.beta.as_ref().clone(),
                 Arc::clone(&entry.op_arc),
                 entry.axis_i,
                 entry.axis_j,
+                Arc::clone(&entry.trace_axes),
+                entry.trace_axis_i_pos,
+                entry.trace_axis_j_pos,
                 Arc::clone(&entry.row_gamma),
                 Arc::clone(&entry.row_h),
                 Arc::clone(&entry.row_h_prime),
                 Arc::clone(&entry.endpoint_q),
-            ));
+            ),
+        );
         log::info!(
             "[STAGE] CTN psi-psi workspace pair (psi_i={}, psi_j={}, axes={},{}) elapsed={:.3}s",
             psi_i,
