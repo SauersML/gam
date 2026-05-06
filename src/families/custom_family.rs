@@ -9963,8 +9963,8 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                 beta_flat,
                 compute_dh,
                 compute_d2h,
-                owned_compute_dh: _,
-                owned_compute_d2h: _,
+                owned_compute_dh,
+                owned_compute_d2h,
                 rho_curvature_scale,
                 hessian_logdet_correction,
             } = joint_bundle;
@@ -9989,8 +9989,8 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                 family.pseudo_logdet_mode(),
                 compute_dh.as_ref(),
                 compute_d2h.as_ref(),
-                Some(owned_compute_dh),
-                Some(owned_compute_d2h),
+                owned_compute_dh,
+                owned_compute_d2h,
                 None,
             )
         } else {
