@@ -11297,6 +11297,29 @@ mod tests {
                     .expect("direct ψ-ψ Hessian operator must be present");
                 assert_eq!(cached_op.dim(), direct_op.dim());
                 assert_eq!(cached_op.dim(), state.beta.len());
+
+                let mut factor = Array2::<f64>::zeros((state.beta.len(), 3));
+                for (col, seed) in [
+                    10_001_u64 + psi_i as u64,
+                    20_001_u64 + psi_j as u64,
+                    30_001_u64 + (psi_i + psi_j) as u64,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    factor
+                        .column_mut(col)
+                        .assign(&toy_probe_vector(state.beta.len(), seed));
+                }
+                let projected_cache = ProjectedFactorCache::default();
+                let cached_trace =
+                    cached_op.trace_projected_factor_cached(&factor, &projected_cache);
+                let direct_trace = cached_op.trace_projected_factor(&factor);
+                let trace_tol = 1.0e-10 * direct_trace.abs().max(1.0) + 1.0e-10;
+                assert!(
+                    (cached_trace - direct_trace).abs() <= trace_tol,
+                    "workspace ψ-ψ cached projected trace mismatch at pair ({psi_i},{psi_j}): cached={cached_trace:.6e}, direct={direct_trace:.6e}",
+                );
             }
         }
     }
