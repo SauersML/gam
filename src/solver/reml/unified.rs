@@ -1540,7 +1540,6 @@ fn projected_factor_value_fingerprint(factor: ArrayView2<'_, f64>) -> (u64, u64)
 #[derive(Default)]
 pub struct ProjectedFactorCache {
     entries: Mutex<HashMap<ProjectedFactorKey, Arc<Array2<f64>>>>,
-    row_traces: Mutex<HashMap<ProjectedTraceRowsKey, Arc<ProjectedTraceRows>>>,
 }
 
 impl ProjectedFactorCache {
@@ -1553,43 +1552,6 @@ impl ProjectedFactorCache {
             .entries
             .lock()
             .expect("projected factor cache lock poisoned");
-        if let Some(value) = entries.get(&key).cloned() {
-            return value;
-        }
-        let computed = Arc::new(compute());
-        entries.insert(key, computed.clone());
-        computed
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ProjectedTraceRowsKey {
-    left: ProjectedFactorKey,
-    right: ProjectedFactorKey,
-}
-
-impl ProjectedTraceRowsKey {
-    pub fn new(left: ProjectedFactorKey, right: ProjectedFactorKey) -> Self {
-        Self { left, right }
-    }
-}
-
-pub struct ProjectedTraceRows {
-    pub aa: Array1<f64>,
-    pub ab: Array1<f64>,
-    pub bb: Array1<f64>,
-}
-
-impl ProjectedFactorCache {
-    pub fn get_or_insert_trace_rows_with(
-        &self,
-        key: ProjectedTraceRowsKey,
-        compute: impl FnOnce() -> ProjectedTraceRows,
-    ) -> Arc<ProjectedTraceRows> {
-        let mut entries = self
-            .row_traces
-            .lock()
-            .expect("projected trace row cache lock poisoned");
         if let Some(value) = entries.get(&key).cloned() {
             return value;
         }
