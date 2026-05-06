@@ -14630,67 +14630,120 @@ impl CustomFamily for BinomialLocationScaleFamily {
         // logical rows, but each row is (x_t_i, 0) for the threshold direction
         // and (0, x_ls_i) for the log-σ direction. We materialize Q_t and Q_l
         // as two (total × n) panels, one per channel.
-        const CHUNK_ROWS: usize = 1024;
+        const LEVERAGE_CHUNK_ROWS: usize = 1024;
+        const MIN_PARALLEL_LEVERAGE_ROWS: usize = 2 * LEVERAGE_CHUNK_ROWS;
+        let leverage_chunk_rows = if n >= MIN_PARALLEL_LEVERAGE_ROWS {
+            LEVERAGE_CHUNK_ROWS
+        } else {
+            n.max(1)
+        };
+        let leverage_chunks = n.div_ceil(leverage_chunk_rows);
+
+        struct LeverageScratch {
+            rhs_t: ndarray::Array2<f64>,
+            rhs_l: ndarray::Array2<f64>,
+        }
+
+        impl LeverageScratch {
+            fn new(total: usize, chunk_rows: usize) -> Self {
+                Self {
+                    rhs_t: ndarray::Array2::<f64>::zeros((total, chunk_rows)),
+                    rhs_l: ndarray::Array2::<f64>::zeros((total, chunk_rows)),
+                }
+            }
+        }
+
+        let leverage_parts: Vec<(
+            usize,
+            ndarray::Array1<f64>,
+            ndarray::Array1<f64>,
+            ndarray::Array1<f64>,
+        )> = (0..leverage_chunks)
+            .into_par_iter()
+            .map_init(
+                || LeverageScratch::new(total, leverage_chunk_rows),
+                |scratch, chunk_idx| {
+                    let row_start = chunk_idx * leverage_chunk_rows;
+                    let row_end = (row_start + leverage_chunk_rows).min(n);
+                    let m = row_end - row_start;
+                    let mut rhs_t = scratch.rhs_t.slice_mut(s![.., 0..m]);
+                    let mut rhs_l = scratch.rhs_l.slice_mut(s![.., 0..m]);
+                    rhs_t.fill(0.0);
+                    rhs_l.fill(0.0);
+                    for j in 0..m {
+                        let i = row_start + j;
+                        for c in 0..pt {
+                            rhs_t[[c, j]] = x_t[[i, c]];
+                        }
+                        for c in 0..pls {
+                            rhs_l[[pt + c, j]] = x_ls[[i, c]];
+                        }
+                    }
+                    let q_t = factor.solve_mat(&rhs_t.to_owned());
+                    let q_l = factor.solve_mat(&rhs_l.to_owned());
+                    let mut chunk_00 = ndarray::Array1::<f64>::zeros(m);
+                    let mut chunk_01 = ndarray::Array1::<f64>::zeros(m);
+                    let mut chunk_11 = ndarray::Array1::<f64>::zeros(m);
+                    for j in 0..m {
+                        let i = row_start + j;
+                        let mut l00 = 0.0;
+                        let mut l11 = 0.0;
+                        let mut l01 = 0.0;
+                        for c in 0..pt {
+                            l00 += x_t[[i, c]] * q_t[[c, j]];
+                            l01 += x_t[[i, c]] * q_l[[c, j]];
+                        }
+                        for c in 0..pls {
+                            l11 += x_ls[[i, c]] * q_l[[pt + c, j]];
+                        }
+                        chunk_00[j] = l00;
+                        chunk_01[j] = l01;
+                        chunk_11[j] = l11;
+                    }
+                    (row_start, chunk_00, chunk_01, chunk_11)
+                },
+            )
+            .collect();
+
         // L00, L01, L11: per-row leverage entries.
         let mut leverage_00 = ndarray::Array1::<f64>::zeros(n);
         let mut leverage_01 = ndarray::Array1::<f64>::zeros(n);
         let mut leverage_11 = ndarray::Array1::<f64>::zeros(n);
-        let mut row_start = 0usize;
-        while row_start < n {
-            let row_end = (row_start + CHUNK_ROWS).min(n);
-            let m = row_end - row_start;
-            let mut rhs_t = ndarray::Array2::<f64>::zeros((total, m));
-            let mut rhs_l = ndarray::Array2::<f64>::zeros((total, m));
-            for j in 0..m {
-                let i = row_start + j;
-                for c in 0..pt {
-                    rhs_t[[c, j]] = x_t[[i, c]];
-                }
-                for c in 0..pls {
-                    rhs_l[[pt + c, j]] = x_ls[[i, c]];
-                }
-            }
-            let q_t = factor.solve_mat(&rhs_t);
-            let q_l = factor.solve_mat(&rhs_l);
-            for j in 0..m {
-                let i = row_start + j;
-                let mut l00 = 0.0;
-                let mut l11 = 0.0;
-                let mut l01 = 0.0;
-                for c in 0..pt {
-                    l00 += x_t[[i, c]] * q_t[[c, j]];
-                    l01 += x_t[[i, c]] * q_l[[c, j]];
-                }
-                for c in 0..pls {
-                    l11 += x_ls[[i, c]] * q_l[[pt + c, j]];
-                }
-                leverage_00[i] = l00;
-                leverage_01[i] = l01;
-                leverage_11[i] = l11;
-            }
-            row_start = row_end;
+        for (row_start, chunk_00, chunk_01, chunk_11) in leverage_parts {
+            let row_end = row_start + chunk_00.len();
+            leverage_00
+                .slice_mut(s![row_start..row_end])
+                .assign(&chunk_00);
+            leverage_01
+                .slice_mut(s![row_start..row_end])
+                .assign(&chunk_01);
+            leverage_11
+                .slice_mut(s![row_start..row_end])
+                .assign(&chunk_11);
         }
 
         // ── Step 5: per-coordinate accumulation.
         // Build (H^{-1})_{b,b} once per block; this amortizes
         // tr(H^{-1} A_k) across all penalties supported in block b.
-        let mut h_inv_block_diag: Vec<ndarray::Array2<f64>> = Vec::with_capacity(specs.len());
-        for b in 0..specs.len() {
-            let (start, end) = ranges[b];
-            let p_b = end - start;
-            let mut rhs = ndarray::Array2::<f64>::zeros((total, p_b));
-            for c in 0..p_b {
-                rhs[[start + c, c]] = 1.0;
-            }
-            let m_full = factor.solve_mat(&rhs);
-            let mut block = ndarray::Array2::<f64>::zeros((p_b, p_b));
-            for r in 0..p_b {
+        let h_inv_block_diag: Vec<ndarray::Array2<f64>> = (0..specs.len())
+            .into_par_iter()
+            .map(|b| {
+                let (start, end) = ranges[b];
+                let p_b = end - start;
+                let mut rhs = ndarray::Array2::<f64>::zeros((total, p_b));
                 for c in 0..p_b {
-                    block[[r, c]] = m_full[[start + r, c]];
+                    rhs[[start + c, c]] = 1.0;
                 }
-            }
-            h_inv_block_diag.push(block);
-        }
+                let m_full = factor.solve_mat(&rhs);
+                let mut block = ndarray::Array2::<f64>::zeros((p_b, p_b));
+                for r in 0..p_b {
+                    for c in 0..p_b {
+                        block[[r, c]] = m_full[[start + r, c]];
+                    }
+                }
+                block
+            })
+            .collect();
 
         // Pseudologdet helper for the penalty pseudo-inverse trace.
         let mut s_pseudologdet_blocks: Vec<
@@ -14741,20 +14794,26 @@ impl CustomFamily for BinomialLocationScaleFamily {
         let mut row_r = ndarray::Array1::<f64>::zeros(n);
         let mut row_s = ndarray::Array1::<f64>::zeros(n);
         let mut row_q = ndarray::Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let q = core.q0[i];
-            let r = 1.0 / core.sigma[i];
-            let s_factor = core.dsigma_deta[i] / core.sigma[i];
-            let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
-                self.y[i],
-                self.weights[i],
-                q,
-                core.mu[i],
-                core.dmu_dq[i],
-                core.d2mu_dq2[i],
-                core.d3mu_dq3[i],
-                &self.link_kind,
-            );
+        let row_scalars: Vec<(f64, f64, f64, f64, f64, f64)> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let q = core.q0[i];
+                let r = 1.0 / core.sigma[i];
+                let s_factor = core.dsigma_deta[i] / core.sigma[i];
+                let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
+                    self.y[i],
+                    self.weights[i],
+                    q,
+                    core.mu[i],
+                    core.dmu_dq[i],
+                    core.d2mu_dq2[i],
+                    core.d3mu_dq3[i],
+                    &self.link_kind,
+                );
+                (m1, m2, m3, r, s_factor, q)
+            })
+            .collect();
+        for (i, (m1, m2, m3, r, s_factor, q)) in row_scalars.into_iter().enumerate() {
             row_m1[i] = m1;
             row_m2[i] = m2;
             row_m3[i] = m3;
@@ -14767,67 +14826,106 @@ impl CustomFamily for BinomialLocationScaleFamily {
         let mut trace_h_inv_hdot = ndarray::Array1::<f64>::zeros(total_pen);
         let mut trace_s_pinv_sdot = ndarray::Array1::<f64>::zeros(total_pen);
 
+        const MIN_PARALLEL_PENALTY_COORDS: usize = 2;
+        let mut penalty_coords = Vec::with_capacity(total_pen);
         let mut flat_idx = 0usize;
         for b in 0..specs.len() {
-            let (start, end) = ranges[b];
-            let p_b = end - start;
-            let beta_b = beta_flat.slice(s![start..end]).to_owned();
-            for (k_local, pen) in specs[b].penalties.iter().enumerate() {
-                let lambda_k = per_block_rho[b][k_local].exp();
-                let mut s_k_local = ndarray::Array2::<f64>::zeros((p_b, p_b));
-                pen.add_scaled_to(lambda_k, &mut s_k_local);
-                let s_k_beta_local = s_k_local.dot(&beta_b);
-                objective_theta[flat_idx] = 0.5 * beta_b.dot(&s_k_beta_local);
-
-                // u_k = -H^{-1} (A_k β).
-                let mut a_k_beta_full = ndarray::Array1::<f64>::zeros(total);
-                a_k_beta_full
-                    .slice_mut(s![start..end])
-                    .assign(&s_k_beta_local);
-                let mut u_k = factor.solvevec(&a_k_beta_full);
-                u_k.mapv_inplace(|v| -v);
-
-                // tr(H^{-1} A_k) = tr( (H^{-1})_{b,b} · (λ_k S_k) ).
-                let m_block = &h_inv_block_diag[b];
-                let mut tr_pen = 0.0;
-                for r in 0..p_b {
-                    for c in 0..p_b {
-                        tr_pen += m_block[[r, c]] * s_k_local[[c, r]];
-                    }
-                }
-
-                // Drift trace: Σ_i tr(C_i(u_k) · L_i).
-                let u_k_t = u_k.slice(s![0..pt]).to_owned();
-                let u_k_ls = u_k.slice(s![pt..total]).to_owned();
-                let d_eta_t = fast_av(&x_t, &u_k_t);
-                let d_eta_ls = fast_av(&x_ls, &u_k_ls);
-                let mut drift_trace = 0.0;
-                for i in 0..n {
-                    let q = row_q[i];
-                    let r_val = row_r[i];
-                    let s_factor = row_s[i];
-                    let m1 = row_m1[i];
-                    let m2 = row_m2[i];
-                    let m3 = row_m3[i];
-                    let a_eta = d_eta_t[i];
-                    let b_eta = d_eta_ls[i];
-                    let sb = s_factor * b_eta;
-                    let du = -r_val * a_eta - q * sb;
-                    let c_tt = r_val * r_val * (m3 * du - 2.0 * m2 * sb);
-                    let c_tl =
-                        s_factor * r_val * (q * m3 * du + m2 * (2.0 * du - q * sb) - m1 * sb);
-                    let c_ll = s_factor * s_factor * (m1 + 3.0 * q * m2 + q * q * m3) * du;
-                    drift_trace +=
-                        c_tt * leverage_00[i] + 2.0 * c_tl * leverage_01[i] + c_ll * leverage_11[i];
-                }
-
-                trace_h_inv_hdot[flat_idx] = tr_pen + drift_trace;
-
-                // Penalty pseudo-logdet derivative: tr(S^+ · λ_k S_k) (block-local).
-                trace_s_pinv_sdot[flat_idx] =
-                    s_pseudologdet_blocks[b].tau_gradient_component(&s_k_local);
-
+            for k_local in 0..specs[b].penalties.len() {
+                penalty_coords.push((flat_idx, b, k_local));
                 flat_idx += 1;
+            }
+        }
+        let penalty_coord_chunk_size = if penalty_coords.len() >= MIN_PARALLEL_PENALTY_COORDS {
+            1
+        } else {
+            penalty_coords.len().max(1)
+        };
+
+        struct PenaltyGradientPart {
+            flat_idx: usize,
+            objective_theta: f64,
+            trace_h_inv_hdot: f64,
+            trace_s_pinv_sdot: f64,
+        }
+
+        let penalty_parts: Vec<Result<Vec<PenaltyGradientPart>, String>> = penalty_coords
+            .par_chunks(penalty_coord_chunk_size)
+            .map(|chunk| {
+                let mut chunk_parts = Vec::with_capacity(chunk.len());
+                for &(flat_idx, b, k_local) in chunk {
+                    let (start, end) = ranges[b];
+                    let p_b = end - start;
+                    let beta_b = beta_flat.slice(s![start..end]).to_owned();
+                    let pen = &specs[b].penalties[k_local];
+                    let lambda_k = per_block_rho[b][k_local].exp();
+                    let mut s_k_local = ndarray::Array2::<f64>::zeros((p_b, p_b));
+                    pen.add_scaled_to(lambda_k, &mut s_k_local);
+                    let s_k_beta_local = s_k_local.dot(&beta_b);
+                    let objective_theta = 0.5 * beta_b.dot(&s_k_beta_local);
+
+                    // u_k = -H^{-1} (A_k β).
+                    let mut a_k_beta_full = ndarray::Array1::<f64>::zeros(total);
+                    a_k_beta_full
+                        .slice_mut(s![start..end])
+                        .assign(&s_k_beta_local);
+                    let mut u_k = factor.solvevec(&a_k_beta_full);
+                    u_k.mapv_inplace(|v| -v);
+
+                    // tr(H^{-1} A_k) = tr( (H^{-1})_{b,b} · (λ_k S_k) ).
+                    let m_block = &h_inv_block_diag[b];
+                    let mut tr_pen = 0.0;
+                    for r in 0..p_b {
+                        for c in 0..p_b {
+                            tr_pen += m_block[[r, c]] * s_k_local[[c, r]];
+                        }
+                    }
+
+                    // Drift trace: Σ_i tr(C_i(u_k) · L_i).
+                    let u_k_t = u_k.slice(s![0..pt]).to_owned();
+                    let u_k_ls = u_k.slice(s![pt..total]).to_owned();
+                    let d_eta_t = fast_av(&x_t, &u_k_t);
+                    let d_eta_ls = fast_av(&x_ls, &u_k_ls);
+                    let mut drift_trace = 0.0;
+                    for i in 0..n {
+                        let q = row_q[i];
+                        let r_val = row_r[i];
+                        let s_factor = row_s[i];
+                        let m1 = row_m1[i];
+                        let m2 = row_m2[i];
+                        let m3 = row_m3[i];
+                        let a_eta = d_eta_t[i];
+                        let b_eta = d_eta_ls[i];
+                        let sb = s_factor * b_eta;
+                        let du = -r_val * a_eta - q * sb;
+                        let c_tt = r_val * r_val * (m3 * du - 2.0 * m2 * sb);
+                        let c_tl =
+                            s_factor * r_val * (q * m3 * du + m2 * (2.0 * du - q * sb) - m1 * sb);
+                        let c_ll = s_factor * s_factor * (m1 + 3.0 * q * m2 + q * q * m3) * du;
+                        drift_trace += c_tt * leverage_00[i]
+                            + 2.0 * c_tl * leverage_01[i]
+                            + c_ll * leverage_11[i];
+                    }
+
+                    // Penalty pseudo-logdet derivative: tr(S^+ · λ_k S_k) (block-local).
+                    let trace_s_pinv_sdot =
+                        s_pseudologdet_blocks[b].tau_gradient_component(&s_k_local);
+
+                    chunk_parts.push(PenaltyGradientPart {
+                        flat_idx,
+                        objective_theta,
+                        trace_h_inv_hdot: tr_pen + drift_trace,
+                        trace_s_pinv_sdot,
+                    });
+                }
+                Ok(chunk_parts)
+            })
+            .collect();
+
+        for chunk in penalty_parts {
+            for part in chunk? {
+                objective_theta[part.flat_idx] = part.objective_theta;
+                trace_h_inv_hdot[part.flat_idx] = part.trace_h_inv_hdot;
+                trace_s_pinv_sdot[part.flat_idx] = part.trace_s_pinv_sdot;
             }
         }
 
