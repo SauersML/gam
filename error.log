@@ -11607,3 +11607,725 @@ index e901472ee99b0e33b9e194ac2d36bef076665274..06f37d01ecea65a388f7b4476899c211
 [2026-05-06T20:52:37.857394+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
 [2026-05-06T20:52:37.860168+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
 [2026-05-06T20:52:37.860244+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:52:51.753290+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:52:51.755417+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:52:51.755469+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:53:15.982900+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:53:16.017189+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:53:16.017289+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:53:39.870250+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:53:39.904457+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:53:39.904529+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:53:59.286882+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:53:59.289510+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:53:59.289567+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:54:14.004951+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:54:14.007581+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:54:14.007648+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:54:15.910868+00:00] apply_result: mode=apply id=task_e_69fb93c369448324a17ea62ca8158e7b status=Partial applied=1 skipped=0 conflicts=1 cmd=(cd /Users/user/gam && git apply --3way /var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/.tmprJ38AD/patch.diff)
+stdout_tail=
+
+stderr_tail=
+Applied patch to 'src/families/custom_family.rs' with conflicts.
+Applied patch to 'src/solver/reml/unified.rs' cleanly.
+U src/families/custom_family.rs
+
+patch_summary: kind=git-diff lines=674 chars=25657 cwd=/Users/user/gam ; head=
+diff --git a/src/families/custom_family.rs b/src/families/custom_family.rs
+index e901472ee99b0e33b9e194ac2d36bef076665274..cf58190e13f32f5d4d3267078c5092e4099cddb1 100644
+--- a/src/families/custom_family.rs
++++ b/src/families/custom_family.rs
+@@ -8225,50 +8225,51 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
+         penalty_value,
+         cycles: cycles_done,
+         converged,
+         block_logdet_h,
+         block_logdet_s,
+         s_lambdas,
+     })
+ }
+ 
+ /// Borrowed derivative provider for joint models that wraps closures with
+ /// non-`'static` lifetimes.
+ ///
+ /// The closures borrow data from the calling stack frame (family, synced states,
+ /// specs), so we use borrowed closures with a non-`'static` lifetime.
+ /// Instead we borrow the closures a…
+----- PATCH BEGIN -----
+diff --git a/src/families/custom_family.rs b/src/families/custom_family.rs
+index e901472ee99b0e33b9e194ac2d36bef076665274..cf58190e13f32f5d4d3267078c5092e4099cddb1 100644
+--- a/src/families/custom_family.rs
++++ b/src/families/custom_family.rs
+@@ -8225,50 +8225,51 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
+         penalty_value,
+         cycles: cycles_done,
+         converged,
+         block_logdet_h,
+         block_logdet_s,
+         s_lambdas,
+     })
+ }
+ 
+ /// Borrowed derivative provider for joint models that wraps closures with
+ /// non-`'static` lifetimes.
+ ///
+ /// The closures borrow data from the calling stack frame (family, synced states,
+ /// specs), so we use borrowed closures with a non-`'static` lifetime.
+ /// Instead we borrow the closures and implement `HessianDerivativeProvider` directly.
+ ///
+ /// # Sign convention
+ ///
+ /// The unified evaluator passes `v_k = H⁻¹(A_k β̂)` to `hessian_derivative_correction`.
+ /// By the implicit function theorem, `dβ̂/dρ_k = −v_k`. The stored `compute_dh`
+ /// expects the actual perturbation direction `δβ`, so we negate `v_k` before calling it.
+ struct BorrowedJointDerivProvider<'a> {
+     compute_dh: &'a dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+     compute_d2h:
+         Option<&'a dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>>,
++    outer_hessian_operator: Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
+ }
+ 
+ // SAFETY: Only used synchronously within the same stack frame that creates it.
+ // The provider is constructed, boxed, passed to `unified_joint_cost_gradient`,
+ // consumed by the unified evaluator, and dropped — all within a single call to
+ // `joint_outer_evaluate`. No cross-thread sharing occurs.
+ unsafe impl Send for BorrowedJointDerivProvider<'_> {}
+ unsafe impl Sync for BorrowedJointDerivProvider<'_> {}
+ 
+ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
+     fn hessian_derivative_correction(
+         &self,
+         v_k: &Array1<f64>,
+     ) -> Result<Option<Array2<f64>>, String> {
+         Ok(self
+             .hessian_derivative_correction_result(v_k)?
+             .map(|result| result.into_operator().to_dense()))
+     }
+ 
+     fn hessian_derivative_correction_result(
+         &self,
+         v_k: &Array1<f64>,
+     ) -> Result<Option<DriftDerivResult>, String> {
+         let neg_v = -v_k;
+         (self.compute_dh)(&neg_v)
+@@ -8291,59 +8292,66 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
+         v_l: &Array1<f64>,
+         u_kl: &Array1<f64>,
+     ) -> Result<Option<DriftDerivResult>, String> {
+         let Some(d2h) = self.compute_d2h.as_ref() else {
+             return Ok(None);
+         };
+         let Some(term1) = (self.compute_dh)(u_kl)? else {
+             return Ok(None);
+         };
+         let neg_v_k = -v_k;
+         let neg_v_l = -v_l;
+         let Some(term2) = d2h(&neg_v_l, &neg_v_k)? else {
+             return Ok(None);
+         };
+         let op = crate::solver::estimate::reml::unified::CompositeHyperOperator {
+             dense: None,
+             operators: vec![term1.into_operator(), term2.into_operator()],
+             dim_hint: u_kl.len(),
+         };
+         Ok(Some(DriftDerivResult::Operator(Arc::new(op))))
+     }
+ 
+     fn has_corrections(&self) -> bool {
+         true
+     }
++
++    fn family_outer_hessian_operator(
++        &self,
++    ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
++        self.outer_hessian_operator.clone()
++    }
+ }
+ 
+ struct OwnedJointDerivProvider {
+     compute_dh: Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
+     compute_d2h: Arc<
+         dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>
+             + Send
+             + Sync,
+     >,
++    outer_hessian_operator: Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
+ }
+ 
+ impl HessianDerivativeProvider for OwnedJointDerivProvider {
+     fn hessian_derivative_correction(
+         &self,
+         v_k: &Array1<f64>,
+     ) -> Result<Option<Array2<f64>>, String> {
+         Ok(self
+             .hessian_derivative_correction_result(v_k)?
+             .map(|result| result.into_operator().to_dense()))
+     }
+ 
+     fn hessian_derivative_correction_result(
+         &self,
+         v_k: &Array1<f64>,
+     ) -> Result<Option<DriftDerivResult>, String> {
+         let neg_v = -v_k;
+         (self.compute_dh)(&neg_v)
+     }
+ 
+     fn hessian_second_derivative_correction(
+         &self,
+         v_k: &Array1<f64>,
+         v_l: &Array1<f64>,
+         u_kl: &Array1<f64>,
+@@ -8367,50 +8375,56 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
+         let Some(term2) = (self.compute_d2h)(&neg_v_l, &neg_v_k)? else {
+             return Ok(None);
+         };
+         let op = crate::solver::estimate::reml::unified::CompositeHyperOperator {
+             dense: None,
+             operators: vec![term1.into_operator(), term2.into_operator()],
+             dim_hint: u_kl.len(),
+         };
+         Ok(Some(DriftDerivResult::Operator(Arc::new(op))))
+     }
+ 
+     fn has_corrections(&self) -> bool {
+         true
+     }
+ 
+     fn outer_hessian_derivative_kernel(
+         &self,
+     ) -> Option<crate::solver::estimate::reml::unified::OuterHessianDerivativeKernel> {
+         Some(
+             crate::solver::estimate::reml::unified::OuterHessianDerivativeKernel::Callback {
+                 first: Arc::clone(&self.compute_dh),
+                 second: Arc::clone(&self.compute_d2h),
+             },
+         )
+     }
++
++    fn family_outer_hessian_operator(
++        &self,
++    ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
++        self.outer_hessian_operator.clone()
++    }
+ }
+ 
+ /// Optional bundle of extended (ψ) hyperparameter coordinate data to attach
+ /// to an `InnerSolution` before calling the unified evaluator.
+ struct ExtCoordBundle {
+     coords: Vec<HyperCoord>,
+     ext_ext_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
+     rho_ext_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
+     drift_fn: Option<FixedDriftDerivFn>,
+ }
+ 
+ struct ScaledHyperOperator {
+     inner: Arc<dyn HyperOperator>,
+     scale: f64,
+ }
+ 
+ impl HyperOperator for ScaledHyperOperator {
+     fn dim(&self) -> usize {
+         self.inner.dim()
+     }
+ 
+     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+         self.inner.mul_vec(v).mapv(|value| self.scale * value)
+     }
+ 
+@@ -8825,69 +8839,72 @@ fn joint_outer_evaluate(
+     ranges: &[(usize, usize)],
+     total: usize,
+     ridge: f64,
+     moderidge: f64,
+     extra_logdet_ridge: f64,
+     rho_curvature_scale: f64,
+     hessian_logdet_correction: f64,
+     include_logdet_h: bool,
+     include_logdet_s: bool,
+     strict_spd: bool,
+     eval_mode: EvalMode,
+     options: &BlockwiseFitOptions,
+     pseudo_logdet_mode: PseudoLogdetMode,
+     compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+     compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+     owned_compute_dh: Option<
+         Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
+     >,
+     owned_compute_d2h: Option<
+         Arc<
+             dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>
+                 + Send
+                 + Sync,
+         >,
+     >,
++    outer_hessian_operator: Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
+     ext_bundle: Option<ExtCoordBundle>,
+ ) -> Result<OuterObjectiveEvalResult, String> {
+     let joint_trace_diagonal_ridge = moderidge + if !strict_spd { extra_logdet_ridge } else { 0.0 };
+     let scaled_joint_trace_diagonal_ridge = rho_curvature_scale * joint_trace_diagonal_ridge;
+ 
+     // Build derivative provider from the caller-supplied closures.
+     let provider_box: Box<dyn HessianDerivativeProvider + '_> =
+         if let (Some(owned_dh), Some(owned_d2h)) = (owned_compute_dh, owned_compute_d2h) {
+             Box::new(OwnedJointDerivProvider {
+                 compute_dh: owned_dh,
+                 compute_d2h: owned_d2h,
++                outer_hessian_operator: outer_hessian_operator.clone(),
+             })
+         } else {
+             let compute_d2h_ref: Option<
+                 &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+             > = Some(compute_d2h);
+             Box::new(BorrowedJointDerivProvider {
+                 compute_dh,
+                 compute_d2h: compute_d2h_ref,
++                outer_hessian_operator: outer_hessian_operator.clone(),
+             })
+         };
+ 
+     let scaled_s_lambdas: Vec<Array2<f64>> = inner
+         .s_lambdas
+         .iter()
+         .map(|matrix| {
+             if rho_curvature_scale == 1.0 {
+                 matrix.clone()
+             } else {
+                 matrix.mapv(|value| rho_curvature_scale * value)
+             }
+         })
+         .collect();
+ 
+     let hessian_op: Arc<dyn crate::solver::estimate::reml::unified::HessianOperator> =
+         if use_joint_matrix_free_path(total, joint_observation_count(&inner.block_states)) {
+             let ranges_vec = ranges.to_vec();
+             let s_lambdas = Arc::new(scaled_s_lambdas.clone());
+             let trace_diagonal_ridge = scaled_joint_trace_diagonal_ridge
+                 + rho_curvature_scale * JOINT_TRACE_STABILITY_RIDGE;
+             match h_joint_unpen {
+                 JointHessianSource::Dense(h_joint) => {
+                     let h_joint = Arc::new(h_joint);
+                     let apply_h = Arc::clone(&h_joint);
+@@ -9063,58 +9080,60 @@ fn joint_outer_evaluate_efs(
+     strict_spd: bool,
+     options: &BlockwiseFitOptions,
+     pseudo_logdet_mode: PseudoLogdetMode,
+     compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+     compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+     owned_compute_dh: Option<
+         Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
+     >,
+     owned_compute_d2h: Option<
+         Arc<
+             dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>
+                 + Send
+                 + Sync,
+         >,
+     >,
+     ext_bundle: Option<ExtCoordBundle>,
+ ) -> Result<crate::solver::outer_strategy::EfsEval, String> {
+     let joint_trace_diagonal_ridge = moderidge + if !strict_spd { extra_logdet_ridge } else { 0.0 };
+     let scaled_joint_trace_diagonal_ridge = rho_curvature_scale * joint_trace_diagonal_ridge;
+ 
+     let provider_box: Box<dyn HessianDerivativeProvider + '_> =
+         if let (Some(owned_dh), Some(owned_d2h)) = (owned_compute_dh, owned_compute_d2h) {
+             Box::new(OwnedJointDerivProvider {
+                 compute_dh: owned_dh,
+                 compute_d2h: owned_d2h,
++                outer_hessian_operator: None,
+             })
+         } else {
+             let compute_d2h_ref: Option<
+                 &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+             > = Some(compute_d2h);
+             Box::new(BorrowedJointDerivProvider {
+                 compute_dh,
+                 compute_d2h: compute_d2h_ref,
++                outer_hessian_operator: None,
+             })
+         };
+ 
+     let scaled_s_lambdas: Vec<Array2<f64>> = inner
+         .s_lambdas
+         .iter()
+         .map(|matrix| {
+             if rho_curvature_scale == 1.0 {
+                 matrix.clone()
+             } else {
+                 matrix.mapv(|value| rho_curvature_scale * value)
+             }
+         })
+         .collect();
+ 
+     let hessian_op: Arc<dyn crate::solver::estimate::reml::unified::HessianOperator> =
+         if use_joint_matrix_free_path(total, joint_observation_count(&inner.block_states)) {
+             let ranges_vec = ranges.to_vec();
+             let s_lambdas = Arc::new(scaled_s_lambdas.clone());
+             let trace_diagonal_ridge = scaled_joint_trace_diagonal_ridge
+                 + rho_curvature_scale * JOINT_TRACE_STABILITY_RIDGE;
+             match h_joint_unpen {
+                 JointHessianSource::Dense(h_joint) => {
+                     let h_joint = Arc::new(h_joint);
+                     let apply_h = Arc::clone(&h_joint);
+@@ -10598,50 +10617,51 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
+         // Route through the unified path (joint_outer_evaluate → reml_laml_evaluate).
+         let eval_result = joint_outer_evaluate(
+             &inner,
+             specs,
+             &per_block,
+             rho_current,
+             &beta_flat,
+             h_joint_unpen,
+             &ranges,
+             total,
+             ridge,
+             moderidge,
+             extra_logdet_ridge,
+             rho_curvature_scale,
+             hessian_logdet_correction,
+             include_logdet_h,
+             include_logdet_s,
+             strict_spd,
+             eval_mode,
+             options,
+             family.pseudo_logdet_mode(),
+             &compute_dh,
+             &compute_d2h,
+             Some(owned_compute_dh),
+             Some(owned_compute_d2h),
++            family.outer_hyper_hessian_operator(specs),
+             ext_bundle,
+         )?;
+ 
+         // The unified evaluator produces gradient/Hessian of size (rho_dim + psi_dim),
+         // with ρ coordinates first and ψ coordinates appended — matching the expected
+         // output order of CustomFamilyJointHyperResult.
+         log::info!(
+             "[STAGE] cthf_internal psi_dim={} eval_mode={:?} post_unified elapsed={:.3}s",
+             psi_dim,
+             eval_mode,
+             cthf_internal_psi_branch_start.elapsed().as_secs_f64(),
+         );
+         return Ok(eval_result);
+     }
+ 
+     // ── ρ-only path (psi_dim == 0): route through unified evaluator ──
+     //
+     // Batched fast-path: if the family overrides `batched_outer_gradient_terms`
+     // and we are in `ValueAndGradient` mode, factor H once at the family level
+     // and amortize all K trace computations in a single streaming pass.
+     // The cost is still computed via the unified `ValueOnly` path; only the
+     // gradient assembly is replaced. See `BatchedOuterGradientTerms`.
+     if eval_mode == EvalMode::ValueAndGradient {
+         let beta_flat_for_batch = flatten_state_betas(&inner.block_states, specs);
+         let synced_states_for_batch = synchronized_states_from_flat_beta(
+@@ -10691,50 +10711,51 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
+                     let value_only = joint_outer_evaluate(
+                         &inner,
+                         specs,
+                         &per_block,
+                         rho_current,
+                         &beta_flat,
+                         h_joint_unpen,
+                         &ranges,
+                         total,
+                         ridge,
+                         moderidge,
+                         extra_logdet_ridge,
+                         rho_curvature_scale,
+                         hessian_logdet_correction,
+                         include_logdet_h,
+                         include_logdet_s,
+                         strict_spd,
+                         EvalMode::ValueOnly,
+                         options,
+                         family.pseudo_logdet_mode(),
+                         compute_dh.as_ref(),
+                         compute_d2h.as_ref(),
+                         None,
+                         None,
+                         None,
++                        None,
+                     )?;
+                     // Assemble the gradient via the universal three-term formula:
+                     //   grad[k] = obj_θ[k] + 0.5 * tr(H⁻¹ Ḣ_k) - 0.5 * tr(S⁺ Ṡ_k).
+                     // This matches `outer_gradient_entry` for fixed-dispersion
+                     // families. Profiled-Gaussian families (which scale the
+                     // penalty term by dp_cgrad / profiled_scale) currently fall
+                     // back to the generic path because they should not opt in
+                     // to this hook.
+                     let mut gradient = Array1::<f64>::zeros(expected);
+                     for j in 0..expected {
+                         let trace_term = if include_logdet_h {
+                             0.5 * batch.trace_h_inv_hdot[j]
+                         } else {
+                             0.0
+                         };
+                         let det_term = if include_logdet_s {
+                             0.5 * batch.trace_s_pinv_sdot[j]
+                         } else {
+                             0.0
+                         };
+                         gradient[j] = batch.objective_theta[j] + trace_term - det_term;
+                     }
+                     return Ok(OuterObjectiveEvalResult {
+                         objective: value_only.objective,
+                         gradient,
+@@ -10762,50 +10783,51 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
+         } = joint_bundle;
+         let eval_result = joint_outer_evaluate(
+             &inner,
+             specs,
+             &per_block,
+             rho_current,
+             &beta_flat,
+             h_joint_unpen,
+             &ranges,
+             total,
+             ridge,
+             moderidge,
+             extra_logdet_ridge,
+             rho_curvature_scale,
+             hessian_logdet_correction,
+             include_logdet_h,
+             include_logdet_s,
+             strict_spd,
+             eval_mode,
+             options,
+             family.pseudo_logdet_mode(),
+             compute_dh.as_ref(),
+             compute_d2h.as_ref(),
+             None,
+             None,
++            family.outer_hyper_hessian_operator(specs),
+             None, // no ext_coords when psi_dim == 0
+         )?;
+ 
+         return Ok(eval_result);
+     }
+ 
+     // Joint Hessian unavailable via either exact Newton or surrogate.
+     // The generic fallback is only mathematically defensible for single-block
+     // families — multi-block families with coupled likelihood curvature require
+     // the joint path.
+     if family.requires_joint_outer_hyper_path() {
+         return Err(
+             "outer hyper-derivative evaluation requires a joint exact path for this family"
+                 .to_string()
+                 .into(),
+         );
+     }
+ 
+     // Generic fallback: single-block only. Extract the per-block Hessian and
+     // route through joint_outer_evaluate with the single block as the "joint"
+     // system.
+     if specs.len() != 1 {
+         return Err(
+             "generic outer fallback is only valid for single-block families; multi-block families must provide a joint outer path"
+                 .to_string()
+@@ -10949,50 +10971,51 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
+ 
+     let eval_result = joint_outer_evaluate(
+         &inner,
+         specs,
+         &per_block,
+         rho_current,
+         &beta_flat,
+         JointHessianSource::Dense(h_joint_unpen),
+         &ranges,
+         total,
+         ridge,
+         moderidge,
+         extra_logdet_ridge,
+         1.0,
+         0.0,
+         include_logdet_h,
+         include_logdet_s,
+         strict_spd,
+         eval_mode,
+         options,
+         family.pseudo_logdet_mode(),
+         &compute_dh,
+         &compute_d2h,
+         None,
+         None,
++        family.outer_hyper_hessian_operator(specs),
+         None, // no ext_coords for generic single-block fallback
+     )?;
+ 
+     Ok(eval_result)
+ }
+ 
+ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync + 'static>(
+     family: &F,
+     specs: &[ParameterBlockSpec],
+     options: &BlockwiseFitOptions,
+     rho_current: &Array1<f64>,
+     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+     warm_start: Option<&CustomFamilyWarmStart>,
+     eval_mode: EvalMode,
+ ) -> Result<CustomFamilyJointHyperResult, CustomFamilyError> {
+     let penalty_counts = validate_blockspecs(specs)?;
+     let eval_result = evaluate_custom_family_hyper_internal(
+         family,
+         specs,
+         options,
+         &penalty_counts,
+         rho_current,
+         derivative_blocks,
+         warm_start.map(|w| &w.inner),
+         eval_mode,
+diff --git a/src/solver/reml/unified.rs b/src/solver/reml/unified.rs
+index 3f93c29430becb5e5f288a4902893a85d01371bd..f427b5b06c345eaf30a79391a5aec21adf088b42 100644
+--- a/src/solver/reml/unified.rs
++++ b/src/solver/reml/unified.rs
+@@ -10892,50 +10892,147 @@ fn splitmix64(state: &mut u64) -> u64 {
+     z ^ (z >> 31)
+ }
+ 
+ fn rademacher_probe_into(mut z: ArrayViewMut1<'_, f64>, rng: &mut Xoshiro256SS) {
+     let mut bits: u64 = 0;
+     let mut remaining_bits = 0u32;
+ 
+     for i in 0..z.len() {
+         if remaining_bits == 0 {
+             bits = rng.next_u64();
+             remaining_bits = 64;
+         }
+         z[i] = if bits & 1 == 0 { 1.0 } else { -1.0 };
+         bits >>= 1;
+         remaining_bits -= 1;
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+     use crate::solver::estimate::DP_FLOOR;
+     use approx::assert_relative_eq;
+     use ndarray::array;
+ 
++    struct SentinelOuterHessianOperator {
++        matrix: Array2<f64>,
++    }
++
++    impl crate::solver::outer_strategy::OuterHessianOperator for SentinelOuterHessianOperator {
++        fn dim(&self) -> usize {
++            self.matrix.nrows()
++        }
++
++        fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
++            Ok(self.matrix.dot(v))
++        }
++
++        fn is_cheap_to_materialize(&self) -> bool {
++            true
++        }
++    }
++
++    struct FamilyOperatorOnlyDerivatives {
++        op: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
++    }
++
++    impl HessianDerivativeProvider for FamilyOperatorOnlyDerivatives {
++        fn hessian_derivative_correction(
++            &self,
++            _: &Array1<f64>,
++        ) -> Result<Option<Array2<f64>>, String> {
++            Ok(None)
++        }
++
++        fn has_corrections(&self) -> bool {
++            false
++        }
++
++        fn outer_hessian_derivative_kernel(&self) -> Option<OuterHessianDerivativeKernel> {
++            None
++        }
++
++        fn family_outer_hessian_operator(
++            &self,
++        ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
++            Some(Arc::clone(&self.op))
++        }
++    }
++
++    #[test]
++    fn value_gradient_hessian_prefers_family_supplied_outer_operator() {
++        let hop = Arc::new(DenseSpectralOperator::from_symmetric(&Array2::eye(2)).unwrap());
++        let family_matrix = array![[42.0]];
++        let family_operator = Arc::new(SentinelOuterHessianOperator {
++            matrix: family_matrix.clone(),
++        });
++        let deriv_provider = FamilyOperatorOnlyDerivatives {
++            op: family_operator,
++        };
++
++        let solution = InnerSolution {
++            log_likelihood: -1.25,
++            penalty_quadratic: 0.4,
++            hessian_op: hop,
++            beta: array![0.5, -0.25],
++            penalty_coords: vec![PenaltyCoordinate::from_dense_root(Array2::eye(2))],
++            penalty_logdet: PenaltyLogdetDerivs {
++                value: 0.0,
++                first: array![0.0],
++                second: Some(array![[0.0]]),
++            },
++            deriv_provider: Box::new(deriv_provider),
++            tk_correction: 0.0,
++            tk_gradient: None,
++            firth: None,
++            hessian_logdet_correction: 0.0,
++            penalty_subspace_trace: None,
++            rho_curvature_scale: 1.0,
++            n_observations: 2,
++            nullspace_dim: 0.0,
++            dispersion: DispersionHandling::Fixed {
++                phi: 1.0,
++                include_logdet_h: true,
++                include_logdet_s: true,
++            },
++            ext_coords: Vec::new(),
++            ext_coord_pair_fn: None,
++            rho_ext_pair_fn: None,
++            fixed_drift_deriv: None,
++            barrier_config: None,
++        };
++
++        let result = reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
++            .expect("family outer operator evaluation");
++        let crate::solver::outer_strategy::HessianResult::Operator(op) = result.hessian else {
++            panic!("expected family-supplied operator Hessian route");
++        };
++        let dense = op.materialize_dense().expect("sentinel materialization");
++        assert_eq!(dense, family_matrix);
++    }
++
+     #[test]
+     fn test_dense_spectral_operator_simple() {
+         // 2×2 diagonal matrix: H = diag(2, 5)
+         let h = Array2::from_diag(&array![2.0, 5.0]);
+         let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
+ 
+         // logdet = ln(2) + ln(5)
+         let expected_logdet = 2.0_f64.ln() + 5.0_f64.ln();
+         assert!((op.logdet() - expected_logdet).abs() < 1e-12);
+ 
+         // tr(H⁻¹ I) = 1/2 + 1/5 = 0.7
+         let id = Array2::eye(2);
+         let trace = op.trace_hinv_product(&id);
+         assert!((trace - 0.7).abs() < 1e-12);
+ 
+         // solve: H⁻¹ [1, 1] = [0.5, 0.2]
+         let rhs = array![1.0, 1.0];
+         let sol = op.solve(&rhs);
+         assert!((sol[0] - 0.5).abs() < 1e-12);
+         assert!((sol[1] - 0.2).abs() < 1e-12);
+ 
+         assert_eq!(sol.len(), 2);
+     }
+ 
+     #[test]
+
+----- PATCH END -----
+
