@@ -3244,11 +3244,12 @@ impl TransformationNormalFamily {
                     let global_row = row_start + row_idx;
                     let rv = self.response_val_basis.row(global_row);
                     let rd = self.response_deriv_basis.row(global_row);
+                    let gamma_row = cached_gamma.row(row_idx);
 
                     for k in 0..p_resp {
                         let beta_k = beta_mat.row(k);
                         let dir_k = direction_mat.row(k);
-                        acc.gamma[k] = beta_k.dot(&cov_row);
+                        acc.gamma[k] = gamma_row[k];
                         acc.gamma_i[k] = beta_k.dot(&cov_i_row);
                         acc.gamma_j[k] = beta_k.dot(&cov_j_row);
                         acc.gamma_ij[k] = beta_k.dot(&cov_ij_row);
