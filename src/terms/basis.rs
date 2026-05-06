@@ -2352,7 +2352,7 @@ pub fn assert_no_dense_derivative_materialization(n: usize, p: usize, d_pc: usiz
 }
 
 pub fn assert_spatial_centers_below_biobank_cap(
-    n: usize,
+    _n: usize,
     d_pc: usize,
     centers: ArrayView2<'_, f64>,
 ) {
@@ -2365,7 +2365,6 @@ pub fn assert_spatial_centers_below_biobank_cap(
     let k = centers.nrows();
     let centers_bytes = dense_design_bytes(k, d_pc);
     let center_center_bytes = dense_design_bytes(k, k);
-    let data_center_bytes = dense_design_bytes(n, k);
     assert!(
         centers_bytes <= SPATIAL_CENTER_CENTER_MAX_BYTES,
         "spatial PC centers exceed center storage cap: K={k}, d_pc={d_pc}, centers={:.1} MiB, cap={:.1} MiB",
@@ -2377,13 +2376,6 @@ pub fn assert_spatial_centers_below_biobank_cap(
         "spatial PC centers exceed center-center biobank cap: K={k}, d_pc={d_pc}, KxK={:.1} MiB, cap={:.1} MiB",
         center_center_bytes as f64 / (1024.0 * 1024.0),
         SPATIAL_CENTER_CENTER_MAX_BYTES as f64 / (1024.0 * 1024.0),
-    );
-    assert!(
-        data_center_bytes <= crate::resource::SPATIAL_DISTANCE_CACHE_SINGLE_ENTRY_MAX_BYTES
-            || !spatial_distance_cacheable_entry(n, k),
-        "spatial PC n*K distance cache cap mismatch: n={n}, K={k}, d_pc={d_pc}, optional n*K cache={:.1} MiB, cap={:.1} MiB",
-        data_center_bytes as f64 / (1024.0 * 1024.0),
-        crate::resource::SPATIAL_DISTANCE_CACHE_SINGLE_ENTRY_MAX_BYTES as f64 / (1024.0 * 1024.0),
     );
 }
 
@@ -9576,18 +9568,15 @@ fn build_thin_plate_penalty_matrices(
     let poly_cols = thin_plate_polynomial_basis_dimension(d);
     let total_cols = kernel_cols + poly_cols;
     let mut omega = Array2::<f64>::zeros((k, k));
-    for i in 0..k {
-        for j in i..k {
-            let mut dist2 = 0.0;
-            for c in 0..d {
-                let delta = centers[[i, c]] - centers[[j, c]];
-                dist2 += delta * delta;
-            }
-            let kij = thin_plate_kernel_from_dist2(dist2 / (length_scale * length_scale), d)?;
-            omega[[i, j]] = kij;
-            omega[[j, i]] = kij;
+    let length_scale_sq = length_scale * length_scale;
+    fill_symmetric_from_row_kernel(&mut omega, |i, j| {
+        let mut dist2 = 0.0;
+        for c in 0..d {
+            let delta = centers[[i, c]] - centers[[j, c]];
+            dist2 += delta * delta;
         }
-    }
+        thin_plate_kernel_from_dist2(dist2 / length_scale_sq, d)
+    })?;
     let omega_constrained = {
         let zt_o = fast_atb(kernel_transform, &omega);
         // `kernel_transform` spans the side-constraint nullspace, so the
@@ -9618,27 +9607,15 @@ fn build_matern_kernel_penalty(
     let k = centers.nrows();
     let total_cols = k + usize::from(include_intercept);
     let mut center_kernel = Array2::<f64>::zeros((k, k));
-    for i in 0..k {
-        for j in i..k {
-            let r = if let Some(eta) = aniso_log_scales {
-                aniso_distance(
-                    centers.row(i).as_slice().unwrap(),
-                    centers.row(j).as_slice().unwrap(),
-                    eta,
-                )
-            } else {
-                let mut dist2 = 0.0;
-                for axis in 0..centers.ncols() {
-                    let delta = centers[[i, axis]] - centers[[j, axis]];
-                    dist2 += delta * delta;
-                }
-                dist2.sqrt()
-            };
-            let kij = matern_kernel_from_distance(r, length_scale, nu)?;
-            center_kernel[[i, j]] = kij;
-            center_kernel[[j, i]] = kij;
-        }
-    }
+    let axis_scales = aniso_log_scales.map(aniso_axis_scales);
+    fill_symmetric_from_row_kernel(&mut center_kernel, |i, j| {
+        let r = if let Some(scales) = axis_scales.as_deref() {
+            aniso_distance_rows_with_scales(centers, i, centers, j, scales)
+        } else {
+            euclidean_distance_rows(centers, i, centers, j)
+        };
+        matern_kernel_from_distance(r, length_scale, nu)
+    })?;
     let mut penalty_kernel = Array2::<f64>::zeros((total_cols, total_cols));
     penalty_kernel
         .slice_mut(s![0..k, 0..k])
@@ -11317,6 +11294,58 @@ fn aniso_distance(data_row: &[f64], center: &[f64], eta: &[f64]) -> f64 {
     )
 }
 
+#[inline(always)]
+fn euclidean_distance_rows(
+    lhs: ArrayView2<'_, f64>,
+    lhs_row: usize,
+    rhs: ArrayView2<'_, f64>,
+    rhs_row: usize,
+) -> f64 {
+    debug_assert_eq!(lhs.ncols(), rhs.ncols());
+    stable_euclidean_norm((0..lhs.ncols()).map(|axis| lhs[[lhs_row, axis]] - rhs[[rhs_row, axis]]))
+}
+
+#[inline(always)]
+fn aniso_axis_scales(eta: &[f64]) -> Vec<f64> {
+    let eta_mean = centered_aniso_log_scale_mean(eta);
+    eta.iter()
+        .map(|&value| aniso_axis_scale(value, eta_mean))
+        .collect()
+}
+
+#[inline(always)]
+fn aniso_distance_rows_with_scales(
+    lhs: ArrayView2<'_, f64>,
+    lhs_row: usize,
+    rhs: ArrayView2<'_, f64>,
+    rhs_row: usize,
+    axis_scales: &[f64],
+) -> f64 {
+    debug_assert_eq!(lhs.ncols(), rhs.ncols());
+    debug_assert_eq!(lhs.ncols(), axis_scales.len());
+    stable_euclidean_norm(
+        (0..lhs.ncols())
+            .map(|axis| axis_scales[axis] * (lhs[[lhs_row, axis]] - rhs[[rhs_row, axis]])),
+    )
+}
+
+fn fill_symmetric_from_row_kernel<F>(matrix: &mut Array2<f64>, kernel: F) -> Result<(), BasisError>
+where
+    F: Fn(usize, usize) -> Result<f64, BasisError> + Sync,
+{
+    debug_assert_eq!(matrix.nrows(), matrix.ncols());
+    matrix
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .try_for_each(|(i, mut row)| {
+            for j in 0..row.len() {
+                row[j] = kernel(i, j)?;
+            }
+            Ok(())
+        })
+}
+
 /// Return y-space points `y_{i,a} = exp(ψ_a) x_{i,a}` with
 /// `ψ_a = η_a - mean(η)` so Euclidean pairwise
 /// distances in y equal anisotropic kernel distances in x:
@@ -11504,39 +11533,6 @@ pub(crate) fn pairwise_distance_bounds_sampled(points: ArrayView2<'_, f64>) -> O
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct SpatialDistanceCacheKey {
-    datarows: usize,
-    data_cols: usize,
-    data_ptr: usize,
-    data_stride0: isize,
-    data_stride1: isize,
-    centersrows: usize,
-    centers_cols: usize,
-    centers_hash: u64,
-}
-
-#[derive(Debug, Clone)]
-struct SpatialDistanceCacheEntry {
-    data_center_r: Arc<Array2<f64>>,
-    center_center_r: Arc<Array2<f64>>,
-}
-
-impl crate::resource::ResidentBytes for SpatialDistanceCacheEntry {
-    fn resident_bytes(&self) -> usize {
-        std::mem::size_of::<f64>()
-            .saturating_mul(self.data_center_r.nrows())
-            .saturating_mul(self.data_center_r.ncols())
-            .saturating_add(
-                std::mem::size_of::<f64>()
-                    .saturating_mul(self.center_center_r.nrows())
-                    .saturating_mul(self.center_center_r.ncols()),
-            )
-    }
-}
-
-const SPATIAL_DISTANCE_CACHE_MIN_PAIRS: usize = 2048;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ConstraintNullspaceCacheKey {
     centersrows: usize,
     centers_cols: usize,
@@ -11563,8 +11559,6 @@ struct OwnedDataCacheKey {
 
 #[derive(Debug)]
 struct BasisCacheContext {
-    spatial_distance:
-        crate::resource::ByteLruCache<SpatialDistanceCacheKey, SpatialDistanceCacheEntry>,
     constraint_nullspace: ConstraintNullspaceCache,
     owned_data: crate::resource::ByteLruCache<OwnedDataCacheKey, Arc<Array2<f64>>>,
 }
@@ -11572,9 +11566,6 @@ struct BasisCacheContext {
 impl BasisCacheContext {
     fn with_policy(policy: &crate::resource::ResourcePolicy) -> Self {
         Self {
-            spatial_distance: crate::resource::ByteLruCache::new(
-                policy.max_spatial_distance_cache_bytes,
-            ),
             constraint_nullspace: ConstraintNullspaceCache::default(),
             owned_data: crate::resource::ByteLruCache::with_max_entries(
                 policy.max_owned_data_cache_bytes,
@@ -11590,12 +11581,12 @@ impl Default for BasisCacheContext {
     }
 }
 
-/// Explicit per-run workspace for basis/spatial cache reuse.
+/// Explicit per-run workspace for reusable basis-construction caches.
 ///
 /// Pass one workspace through repeated basis builds to avoid global mutable state
 /// and to keep caching scoped to a caller-controlled lifecycle.
 ///
-/// The spatial-distance and owned-data caches are byte-limited via the
+/// Owned-data cache entries are byte-limited via the
 /// [`crate::resource::ResourcePolicy`] provided at construction; use
 /// [`BasisWorkspace::with_policy`] for biobank-scale workloads where a single
 /// entry can be multiple gigabytes.
@@ -11641,100 +11632,6 @@ fn hash_arrayview2(values: ArrayView2<'_, f64>) -> u64 {
         v.to_bits().hash(&mut hasher);
     }
     hasher.finish()
-}
-
-fn compute_data_center_distances(
-    data: ArrayView2<'_, f64>,
-    centers: ArrayView2<'_, f64>,
-) -> Result<Array2<f64>, BasisError> {
-    let n = data.nrows();
-    let d = data.ncols();
-    let k = centers.nrows();
-    let mut distances = Array2::<f64>::zeros((n, k));
-    let result: Result<(), BasisError> = distances
-        .axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .enumerate()
-        .try_for_each(|(i, mut row)| {
-            for j in 0..k {
-                row[j] = stable_euclidean_norm((0..d).map(|c| data[[i, c]] - centers[[j, c]]));
-            }
-            Ok(())
-        });
-    result?;
-    Ok(distances)
-}
-
-fn compute_center_center_distances(centers: ArrayView2<'_, f64>) -> Array2<f64> {
-    let d = centers.ncols();
-    let k = centers.nrows();
-    let mut distances = Array2::<f64>::zeros((k, k));
-    for i in 0..k {
-        for j in i..k {
-            let r = stable_euclidean_norm((0..d).map(|c| centers[[i, c]] - centers[[j, c]]));
-            distances[[i, j]] = r;
-            distances[[j, i]] = r;
-        }
-    }
-    distances
-}
-
-#[inline(always)]
-fn spatial_distance_data_center_bytes(n: usize, k: usize) -> usize {
-    n.saturating_mul(k)
-        .saturating_mul(std::mem::size_of::<f64>())
-}
-
-#[inline(always)]
-fn spatial_distance_cacheable_entry(n: usize, k: usize) -> bool {
-    spatial_distance_data_center_bytes(n, k)
-        <= crate::resource::SPATIAL_DISTANCE_CACHE_SINGLE_ENTRY_MAX_BYTES
-}
-
-fn spatial_distance_matrices(
-    data: ArrayView2<'_, f64>,
-    centers: ArrayView2<'_, f64>,
-    cache: &BasisCacheContext,
-) -> Result<(Arc<Array2<f64>>, Arc<Array2<f64>>), BasisError> {
-    let n = data.nrows();
-    let k = centers.nrows();
-    if n.saturating_mul(k) < SPATIAL_DISTANCE_CACHE_MIN_PAIRS
-        || !spatial_distance_cacheable_entry(n, k)
-    {
-        let dc = Arc::new(compute_data_center_distances(data, centers)?);
-        let cc = Arc::new(compute_center_center_distances(centers));
-        return Ok((dc, cc));
-    }
-
-    let key = SpatialDistanceCacheKey {
-        datarows: data.nrows(),
-        data_cols: data.ncols(),
-        data_ptr: data.as_ptr() as usize,
-        data_stride0: data.strides()[0],
-        data_stride1: data.strides()[1],
-        centersrows: centers.nrows(),
-        centers_cols: centers.ncols(),
-        centers_hash: hash_arrayview2(centers),
-    };
-
-    if let Some(hit) = cache.spatial_distance.get(&key) {
-        return Ok((hit.data_center_r.clone(), hit.center_center_r.clone()));
-    }
-
-    let computed_dc = Arc::new(compute_data_center_distances(data, centers)?);
-    let computed_cc = Arc::new(compute_center_center_distances(centers));
-
-    if let Some(hit) = cache.spatial_distance.get(&key) {
-        return Ok((hit.data_center_r.clone(), hit.center_center_r.clone()));
-    }
-    cache.spatial_distance.insert(
-        key,
-        SpatialDistanceCacheEntry {
-            data_center_r: computed_dc.clone(),
-            center_center_r: computed_cc.clone(),
-        },
-    );
-    Ok((computed_dc, computed_cc))
 }
 
 fn constraint_nullspace_order_code(order: DuchonNullspaceOrder) -> u8 {
@@ -11996,7 +11893,7 @@ pub fn create_matern_spline_basiswithworkspace(
     nu: MaternNu,
     include_intercept: bool,
     aniso_log_scales: Option<&[f64]>,
-    workspace: &mut BasisWorkspace,
+    _workspace: &mut BasisWorkspace,
 ) -> Result<MaternSplineBasis, BasisError> {
     let n = data.nrows();
     let d = data.ncols();
@@ -12076,62 +11973,33 @@ pub fn create_matern_spline_basiswithworkspace(
     // Under anisotropy we work in y-space (y = Ax), so r = |Ah| replaces |h|.
     let mut kernel_block = Array2::<f64>::zeros((n, k));
     let mut center_kernel = Array2::<f64>::zeros((k, k));
-    if let Some(eta) = aniso_log_scales {
-        // Anisotropic path: compute distances via aniso_distance.
-        let kernel_result: Result<(), BasisError> = kernel_block
-            .axis_iter_mut(Axis(0))
-            .into_par_iter()
-            .enumerate()
-            .try_for_each(|(i, mut row)| {
-                let xi = data.row(i);
-                for j in 0..k {
-                    let r = aniso_distance(
-                        xi.as_slice().unwrap(),
-                        centers.row(j).as_slice().unwrap(),
-                        eta,
-                    );
-                    row[j] = matern_kernel_from_distance(r, length_scale, nu)?;
-                }
-                Ok(())
-            });
-        kernel_result?;
-        for i in 0..k {
-            for j in i..k {
-                let r = aniso_distance(
-                    centers.row(i).as_slice().unwrap(),
-                    centers.row(j).as_slice().unwrap(),
-                    eta,
-                );
-                let kij = matern_kernel_from_distance(r, length_scale, nu)?;
-                center_kernel[[i, j]] = kij;
-                center_kernel[[j, i]] = kij;
+    let axis_scales = aniso_log_scales.map(aniso_axis_scales);
+    let kernel_result: Result<(), BasisError> = kernel_block
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .try_for_each(|(i, mut row)| {
+            for j in 0..k {
+                let r = if let Some(scales) = axis_scales.as_deref() {
+                    aniso_distance_rows_with_scales(data, i, centers, j, scales)
+                } else {
+                    euclidean_distance_rows(data, i, centers, j)
+                };
+                row[j] = matern_kernel_from_distance(r, length_scale, nu)?;
             }
-        }
-    } else {
-        // Isotropic path: use cached spatial distance matrices.
-        let (data_center_r, center_center_r) =
-            spatial_distance_matrices(data, centers, &mut workspace.cache)?;
-        let kernel_result: Result<(), BasisError> = kernel_block
-            .axis_iter_mut(Axis(0))
-            .into_par_iter()
-            .enumerate()
-            .try_for_each(|(i, mut row)| {
-                for j in 0..k {
-                    row[j] = matern_kernel_from_distance(data_center_r[[i, j]], length_scale, nu)?;
-                }
-                Ok(())
-            });
-        kernel_result?;
-        // Center-center Gram matrix K_CC. In RKHS form, the kernel penalty on
-        // radial coefficients is alpha^T K_CC alpha.
-        for i in 0..k {
-            for j in i..k {
-                let kij = matern_kernel_from_distance(center_center_r[[i, j]], length_scale, nu)?;
-                center_kernel[[i, j]] = kij;
-                center_kernel[[j, i]] = kij;
-            }
-        }
-    }
+            Ok(())
+        });
+    kernel_result?;
+    // Center-center Gram matrix K_CC. In RKHS form, the kernel penalty on
+    // radial coefficients is alpha^T K_CC alpha.
+    fill_symmetric_from_row_kernel(&mut center_kernel, |i, j| {
+        let r = if let Some(scales) = axis_scales.as_deref() {
+            aniso_distance_rows_with_scales(centers, i, centers, j, scales)
+        } else {
+            euclidean_distance_rows(centers, i, centers, j)
+        };
+        matern_kernel_from_distance(r, length_scale, nu)
+    })?;
 
     let mut basis = Array2::<f64>::zeros((n, total_cols));
     basis.slice_mut(s![.., 0..k]).assign(&kernel_block);
@@ -15484,23 +15352,31 @@ pub fn create_duchon_spline_basiswithworkspace(
     } else {
         None
     };
-    let center_center_r = compute_center_center_distances(centers);
     let z = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
+    let pure_poly_coeff = if length_scale.is_none() {
+        Some(PolyharmonicBlockCoeff::new(
+            pure_duchon_block_order(p_order, s_order),
+            d,
+        ))
+    } else {
+        None
+    };
     let mut center_kernel = Array2::<f64>::zeros((k, k));
-    for i in 0..k {
-        for j in i..k {
-            let kij = duchon_matern_kernel_general_from_distance(
-                center_center_r[[i, j]],
+    fill_symmetric_from_row_kernel(&mut center_kernel, |i, j| {
+        let r = euclidean_distance_rows(centers, i, centers, j);
+        if let Some(ref ppc) = pure_poly_coeff {
+            Ok(ppc.eval(r))
+        } else {
+            duchon_matern_kernel_general_from_distance(
+                r,
                 length_scale,
                 p_order,
                 s_order,
                 d,
                 coeffs.as_ref(),
-            )?;
-            center_kernel[[i, j]] = kij;
-            center_kernel[[j, i]] = kij;
+            )
         }
-    }
+    })?;
     let omega_constrained = {
         let zt_k = fast_atb(&z, &center_kernel);
         fast_ab(&zt_k, &z)
@@ -15626,6 +15502,7 @@ fn build_duchon_basis_designwithworkspace(
         None
     };
 
+    let axis_scales = aniso_log_scales.map(aniso_axis_scales);
     let mut basis = Array2::<f64>::zeros((n, total_cols));
     // Process rows in chunks to amortize thread-local allocation across many rows.
     // Use larger chunks (1024) for better cache utilization at biobank scale.
@@ -15636,29 +15513,14 @@ fn build_duchon_basis_designwithworkspace(
         .enumerate()
         .try_for_each(|(ci, mut chunk)| {
             let mut kernel_row = vec![0.0; k];
-            // Pre-allocate row/center buffers once per thread to avoid 200M+
-            // heap allocations in the anisotropic distance path.
-            let mut data_row_buf = vec![0.0; d];
-            let mut center_buf = vec![0.0; d];
             let chunk_start = ci * chunk_size;
             for local_i in 0..chunk.nrows() {
                 let i = chunk_start + local_i;
-                // Copy data row once; reuse across all k centers.
-                if aniso_log_scales.is_some() {
-                    for a in 0..d {
-                        data_row_buf[a] = data[[i, a]];
-                    }
-                }
                 for j in 0..k {
-                    let r = if let Some(eta) = aniso_log_scales {
-                        for a in 0..d {
-                            center_buf[a] = centers[[j, a]];
-                        }
-                        aniso_distance(&data_row_buf, &center_buf, eta)
+                    let r = if let Some(scales) = axis_scales.as_deref() {
+                        aniso_distance_rows_with_scales(data, i, centers, j, scales)
                     } else {
-                        stable_euclidean_norm(
-                            (0..d).map(|axis| data[[i, axis]] - centers[[j, axis]]),
-                        )
+                        euclidean_distance_rows(data, i, centers, j)
                     };
                     kernel_row[j] = if let Some(ref ppc) = pure_poly_coeff {
                         // Pure Duchon: use precomputed coefficient, skip gamma calls.
@@ -16429,18 +16291,15 @@ fn create_thin_plate_spline_basis_scaledwithworkspace(
 
     // Omega block on knots
     let mut omega = Array2::<f64>::zeros((k, k));
-    for i in 0..k {
-        for j in i..k {
-            let mut dist2 = 0.0;
-            for c in 0..d {
-                let delta = knots[[i, c]] - knots[[j, c]];
-                dist2 += delta * delta;
-            }
-            let kij = thin_plate_kernel_from_dist2(dist2 / (length_scale * length_scale), d)?;
-            omega[[i, j]] = kij;
-            omega[[j, i]] = kij;
+    let length_scale_sq = length_scale * length_scale;
+    fill_symmetric_from_row_kernel(&mut omega, |i, j| {
+        let mut dist2 = 0.0;
+        for c in 0..d {
+            let delta = knots[[i, c]] - knots[[j, c]];
+            dist2 += delta * delta;
         }
-    }
+        thin_plate_kernel_from_dist2(dist2 / length_scale_sq, d)
+    })?;
 
     // Enforce TPS side-constraint P(knots)^T α = 0 by projecting onto
     // the nullspace of P(knots)^T.
@@ -21591,66 +21450,6 @@ mod tests {
     }
 
     #[test]
-    fn spatial_distance_cacheability_is_byte_capped() {
-        let n = 400_000;
-
-        assert_eq!(spatial_distance_data_center_bytes(n, 24), 76_800_000);
-        assert_eq!(spatial_distance_data_center_bytes(n, 32), 102_400_000);
-        assert_eq!(spatial_distance_data_center_bytes(n, 64), 204_800_000);
-        assert_eq!(spatial_distance_data_center_bytes(n, 128), 409_600_000);
-        assert_eq!(spatial_distance_data_center_bytes(n, 1400), 4_480_000_000);
-
-        assert!(spatial_distance_cacheable_entry(n, 24));
-        assert!(spatial_distance_cacheable_entry(n, 32));
-        assert!(spatial_distance_cacheable_entry(n, 64));
-        assert!(!spatial_distance_cacheable_entry(n, 128));
-        assert!(!spatial_distance_cacheable_entry(n, 1400));
-    }
-
-    #[test]
-    fn spatial_distance_cache_evicts_by_total_bytes() {
-        fn key(id: usize) -> SpatialDistanceCacheKey {
-            SpatialDistanceCacheKey {
-                datarows: id,
-                data_cols: 1,
-                data_ptr: id,
-                data_stride0: 1,
-                data_stride1: 1,
-                centersrows: 1,
-                centers_cols: 1,
-                centers_hash: id as u64,
-            }
-        }
-
-        // Each entry reports 200 MiB via its dense arrays.
-        fn entry() -> SpatialDistanceCacheEntry {
-            // 25 * 1024 * 1024 f64 = 200 MiB per field; we only need one field
-            // to hit the target, but keep both populated to match production.
-            let pair_bytes: usize = 200 * 1024 * 1024 / std::mem::size_of::<f64>();
-            SpatialDistanceCacheEntry {
-                data_center_r: Arc::new(Array2::zeros((pair_bytes, 1))),
-                center_center_r: Arc::new(Array2::zeros((1, 1))),
-            }
-        }
-
-        let cache: crate::resource::ByteLruCache<
-            SpatialDistanceCacheKey,
-            SpatialDistanceCacheEntry,
-        > = crate::resource::ByteLruCache::new(crate::resource::SPATIAL_DISTANCE_CACHE_MAX_BYTES);
-
-        cache.insert(key(1), entry());
-        cache.insert(key(2), entry());
-        cache.insert(key(3), entry());
-
-        // Total resident bytes must stay at or below the 512 MiB cap, and the
-        // oldest entry must have been evicted.
-        assert!(cache.resident_bytes() <= crate::resource::SPATIAL_DISTANCE_CACHE_MAX_BYTES);
-        assert!(cache.get(&key(1)).is_none());
-        assert!(cache.get(&key(2)).is_some());
-        assert!(cache.get(&key(3)).is_some());
-    }
-
-    #[test]
     fn test_knot_generation_uniform() {
         let knots = internal::generate_full_knot_vector((0.0, 10.0), 3, 2).unwrap();
         // 3 internal + 2 * (2+1) boundary = 9 knots
@@ -25036,19 +24835,6 @@ mod tests {
             sampled.0,
             exact.0
         );
-    }
-
-    #[test]
-    fn test_compute_data_center_distances_preserves_tiny_nonzero_separations() {
-        let data = array![[0.0, 0.0, 0.0]];
-        let centers = array![[1.0e-200, 0.0, 0.0]];
-        let distances = compute_data_center_distances(data.view(), centers.view())
-            .expect("distance matrix should build");
-        assert!(
-            distances[[0, 0]] > 0.0,
-            "tiny finite separations should not collapse to an exact collision"
-        );
-        assert!((distances[[0, 0]] - 1.0e-200).abs() / 1.0e-200 < 1e-12);
     }
 
     #[test]

@@ -73,6 +73,10 @@ harness = false
 name = "closed_form_criterion"
 harness = false
 
+[[bench]]
+name = "spatial_basis_construction"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
