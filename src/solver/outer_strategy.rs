@@ -341,6 +341,12 @@ impl<'a> OuterHessianOperator for HvApplyCounter<'a> {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.matvec(v)
     }
+
+    fn mul_mat(&self, factor: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+        self.count
+            .fetch_add(factor.ncols() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.inner.mul_mat(factor)
+    }
 }
 
 /// Whether an analytic derivative is available for a given order.
@@ -3397,39 +3403,21 @@ impl OuterHessianOperator for BorrowedDenseOuterHessian<'_> {
         }
         Ok(self.matrix.dot(v))
     }
-}
 
-fn materialize_outer_hessian_dense_sequential(
-    op: &dyn OuterHessianOperator,
-) -> Result<Array2<f64>, String> {
-    let dim = op.dim();
-    let mut dense = Array2::<f64>::zeros((dim, dim));
-    for col in 0..dim {
-        let mut basis = Array1::<f64>::zeros(dim);
-        basis[col] = 1.0;
-        let hv = op.matvec(&basis)?;
-        if hv.len() != dim {
+    fn mul_mat(&self, factor: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+        if factor.nrows() != self.matrix.ncols() {
             return Err(format!(
-                "outer Hessian operator column {col} length mismatch: got {}, expected {dim}",
-                hv.len()
+                "dense outer Hessian factor row count mismatch: got {}, expected {}",
+                factor.nrows(),
+                self.matrix.ncols()
             ));
         }
-        dense.column_mut(col).assign(&hv);
+        Ok(self.matrix.dot(&factor))
     }
-    for row in 0..dim {
-        for col in (row + 1)..dim {
-            let sym = 0.5 * (dense[[row, col]] + dense[[col, row]]);
-            dense[[row, col]] = sym;
-            dense[[col, row]] = sym;
-        }
+
+    fn is_cheap_to_materialize(&self) -> bool {
+        true
     }
-    if !dense.iter().all(|value| value.is_finite()) {
-        return Err(
-            "outer Hessian sequential dense materialization produced non-finite entries"
-                .to_string(),
-        );
-    }
-    Ok(dense)
 }
 
 /// Pick the post-rejection trust radius. If the cubic model just
@@ -3986,16 +3974,23 @@ fn run_operator_trust_region(
             && op_arc.dim() <= OPERATOR_DENSE_REUSE_MAX_DIM
         {
             let materialize_start = std::time::Instant::now();
-            match materialize_outer_hessian_dense_sequential(op_arc.as_ref()) {
+            match op_arc.materialize_dense() {
                 Ok(dense) => {
-                    log::info!(
-                        "[ARC-timing] iter={iter} status=dense_model_ready dim={} bytes={} \
-                         elapsed={:.3}s",
-                        dense.nrows(),
-                        dense.len() * std::mem::size_of::<f64>(),
-                        materialize_start.elapsed().as_secs_f64(),
-                    );
-                    dense_model = Some(dense);
+                    if !dense.iter().all(|value| value.is_finite()) {
+                        log::debug!(
+                            "[ARC-timing] iter={iter} dense outer Hessian reuse skipped: \
+                             materialization produced non-finite entries"
+                        );
+                    } else {
+                        log::info!(
+                            "[ARC-timing] iter={iter} status=dense_model_ready dim={} bytes={} \
+                             elapsed={:.3}s",
+                            dense.nrows(),
+                            dense.len() * std::mem::size_of::<f64>(),
+                            materialize_start.elapsed().as_secs_f64(),
+                        );
+                        dense_model = Some(dense);
+                    }
                 }
                 Err(message) => {
                     log::debug!(
@@ -5734,6 +5729,65 @@ mod tests {
         fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
             Ok(v.clone())
         }
+    }
+
+    #[test]
+    fn materialize_dense_uses_single_batched_mul_mat() {
+        struct BatchedOnlyHessian {
+            matrix: Array2<f64>,
+            matvec_calls: Arc<AtomicUsize>,
+            mul_mat_calls: Arc<AtomicUsize>,
+            rhs_columns: Arc<AtomicUsize>,
+        }
+
+        impl OuterHessianOperator for BatchedOnlyHessian {
+            fn dim(&self) -> usize {
+                self.matrix.nrows()
+            }
+
+            fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+                self.matvec_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(self.matrix.dot(v))
+            }
+
+            fn mul_mat(&self, factor: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+                self.mul_mat_calls.fetch_add(1, Ordering::Relaxed);
+                self.rhs_columns
+                    .fetch_add(factor.ncols(), Ordering::Relaxed);
+                Ok(self.matrix.dot(&factor))
+            }
+        }
+
+        let matvec_calls = Arc::new(AtomicUsize::new(0));
+        let mul_mat_calls = Arc::new(AtomicUsize::new(0));
+        let rhs_columns = Arc::new(AtomicUsize::new(0));
+        let op = BatchedOnlyHessian {
+            matrix: array![[2.0, 0.25, -0.5], [0.5, 3.0, 1.0], [-0.25, 2.0, 4.0]],
+            matvec_calls: Arc::clone(&matvec_calls),
+            mul_mat_calls: Arc::clone(&mul_mat_calls),
+            rhs_columns: Arc::clone(&rhs_columns),
+        };
+
+        let dense = op
+            .materialize_dense()
+            .expect("batched dense materialization");
+        let expected = array![[2.0, 0.375, -0.375], [0.375, 3.0, 1.5], [-0.375, 1.5, 4.0]];
+        assert_eq!(dense, expected);
+        assert_eq!(
+            mul_mat_calls.load(Ordering::Relaxed),
+            1,
+            "dense materialization must batch all identity columns into one mul_mat call"
+        );
+        assert_eq!(
+            rhs_columns.load(Ordering::Relaxed),
+            3,
+            "the single batched materialization call must include every identity RHS"
+        );
+        assert_eq!(
+            matvec_calls.load(Ordering::Relaxed),
+            0,
+            "operators with batched mul_mat must not be probed column-by-column"
+        );
     }
 
     #[test]
