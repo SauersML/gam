@@ -7735,144 +7735,247 @@ fn build_duchon_operator_penalty_aniso_derivatives(
 
     let metric_weights = centered_aniso_metric_weights(aniso_log_scales);
 
-    for k in 0..p {
-        for j in 0..p {
-            let ci: Vec<f64> = (0..d).map(|a| centers[[k, a]]).collect();
-            let cj: Vec<f64> = (0..d).map(|a| centers[[j, a]]).collect();
-            let (r, s_vec) = aniso_distance_and_components(&ci, &cj, aniso_log_scales);
+    struct DuchonAnisoRawChunk {
+        k_start: usize,
+        k_end: usize,
+        d0_raw: Array2<f64>,
+        d1_raw: Array2<f64>,
+        d2_raw: Array2<f64>,
+        d0_raw_eta: Vec<Array2<f64>>,
+        d1_raw_eta: Vec<Array2<f64>>,
+        d2_raw_eta: Vec<Array2<f64>>,
+        d0_raw_eta2: Vec<Array2<f64>>,
+        d1_raw_eta2: Vec<Array2<f64>>,
+        d2_raw_eta2: Vec<Array2<f64>>,
+    }
 
-            // Get the Duchon radial jets, including the exact off-origin
-            // derivatives of t = R²φ needed for D₁/D₂ anisotropic penalties.
-            let (phi, q, t, dt_dr, d2t_dr2) = if let Some(length_scale) = length_scale {
-                let jets = duchon_radial_jets(
-                    r,
-                    length_scale,
-                    p_order,
-                    s_order,
-                    d,
-                    coeffs
-                        .as_ref()
-                        .expect("hybrid Duchon partial-fraction coefficients"),
-                )?;
-                (jets.phi, jets.q, jets.t, jets.t_r, jets.t_rr)
-            } else {
-                let phi = polyharmonic_kernel(r, pure_block_order, d);
-                let (q, t, dt_dr, d2t_dr2) =
-                    duchon_polyharmonic_operator_block_jets(r, pure_block_order, d)?;
-                (phi, q, t, dt_dr, d2t_dr2)
-            };
+    let n_workers = rayon::current_num_threads().max(1);
+    let n_chunks = p.min(n_workers * 4).max(1);
+    let rows_per_chunk = p.div_ceil(n_chunks).max(1);
+    let row_chunks: Vec<(usize, usize)> = (0..p)
+        .step_by(rows_per_chunk)
+        .map(|k_start| (k_start, (k_start + rows_per_chunk).min(p)))
+        .collect();
 
-            // Fill raw operator matrices (projected through Z_kernel).
-            for col in 0..z_cols {
-                let z_jc = z_kernel[[j, col]];
-                d0_raw[[k, col]] += phi * z_jc;
+    let mut raw_chunks: Vec<DuchonAnisoRawChunk> = row_chunks
+        .into_par_iter()
+        .map(
+            |(k_start, k_end)| -> Result<DuchonAnisoRawChunk, BasisError> {
+                let chunk_p = k_end - k_start;
+                let mut chunk = DuchonAnisoRawChunk {
+                    k_start,
+                    k_end,
+                    d0_raw: Array2::<f64>::zeros((chunk_p, z_cols)),
+                    d1_raw: Array2::<f64>::zeros((chunk_p * d, z_cols)),
+                    d2_raw: Array2::<f64>::zeros((chunk_p * d * d, z_cols)),
+                    d0_raw_eta: (0..dim).map(|_| Array2::zeros((chunk_p, z_cols))).collect(),
+                    d1_raw_eta: (0..dim)
+                        .map(|_| Array2::zeros((chunk_p * d, z_cols)))
+                        .collect(),
+                    d2_raw_eta: (0..dim)
+                        .map(|_| Array2::zeros((chunk_p * d * d, z_cols)))
+                        .collect(),
+                    d0_raw_eta2: (0..dim).map(|_| Array2::zeros((chunk_p, z_cols))).collect(),
+                    d1_raw_eta2: (0..dim)
+                        .map(|_| Array2::zeros((chunk_p * d, z_cols)))
+                        .collect(),
+                    d2_raw_eta2: (0..dim)
+                        .map(|_| Array2::zeros((chunk_p * d * d, z_cols)))
+                        .collect(),
+                };
 
-                // D₁: anisotropic gradient components.
-                //   ∂φ/∂x_b = φ_r · ∂r/∂x_b = (φ_r/r) · w_b · h_b = q · w_b · h_b
-                // where w_b = exp(2ψ_b) is the metric weight for axis b.
-                for b in 0..d {
-                    let h_b = ci[b] - cj[b];
-                    let w_b = metric_weights[b];
-                    d1_raw[[k * d + b, col]] += q * w_b * h_b * z_jc;
-                }
+                for k in k_start..k_end {
+                    let k_local = k - k_start;
+                    let ci: Vec<f64> = (0..d).map(|a| centers[[k, a]]).collect();
+                    for j in 0..p {
+                        let cj: Vec<f64> = (0..d).map(|a| centers[[j, a]]).collect();
+                        let (r, s_vec) = aniso_distance_and_components(&ci, &cj, aniso_log_scales);
 
-                for b in 0..d {
-                    let h_b = ci[b] - cj[b];
-                    let w_b = metric_weights[b];
-                    for c in 0..d {
-                        let h_c = ci[c] - cj[c];
-                        let w_c = metric_weights[c];
-                        let row = (k * d + b) * d + c;
-                        // At center collisions (r=0) the kernel gradient
-                        // h vanishes but `t` may be a (signed) infinity for
-                        // pure polyharmonic kernels (e.g. r³ in dim 3 has
-                        // t = 3c/r → ±∞ at r=0). Multiplying yields NaN
-                        // even though the limit `(w_b h_b)(w_c h_c)·t` is
-                        // 0. Skip the mixed Hessian term when r is at
-                        // center collision so D2_raw stays finite; only the
-                        // diagonal δ_{bc}·w_b·q survives in the limit.
-                        let entry = if r <= 1e-14 {
-                            if b == c { w_b * q } else { 0.0 }
+                        // Get the Duchon radial jets, including the exact off-origin
+                        // derivatives of t = R²φ needed for D₁/D₂ anisotropic penalties.
+                        let (phi, q, t, dt_dr, d2t_dr2) = if let Some(length_scale) = length_scale {
+                            let jets = duchon_radial_jets(
+                                r,
+                                length_scale,
+                                p_order,
+                                s_order,
+                                d,
+                                coeffs
+                                    .as_ref()
+                                    .expect("hybrid Duchon partial-fraction coefficients"),
+                            )?;
+                            (jets.phi, jets.q, jets.t, jets.t_r, jets.t_rr)
                         } else {
-                            hessian_operator_entry(q, t, h_b, h_c, w_b, w_c, b, c)
+                            let phi = polyharmonic_kernel(r, pure_block_order, d);
+                            let (q, t, dt_dr, d2t_dr2) =
+                                duchon_polyharmonic_operator_block_jets(r, pure_block_order, d)?;
+                            (phi, q, t, dt_dr, d2t_dr2)
                         };
-                        d2_raw[[row, col]] += entry * z_jc;
-                    }
-                }
 
-                // Per-axis η_a derivatives.
-                for a in 0..dim {
-                    let s_a = s_vec[a];
-                    let w_a = metric_weights[a];
+                        // Fill raw operator matrices (projected through Z_kernel).
+                        for col in 0..z_cols {
+                            let z_jc = z_kernel[[j, col]];
+                            chunk.d0_raw[[k_local, col]] += phi * z_jc;
 
-                    if r <= 1e-14 {
-                        for b in 0..d {
-                            for c in 0..d {
-                                let row = (k * d + b) * d + c;
-                                if b == c && a == b {
-                                    d2_raw_eta[a][[row, col]] += 2.0 * q * w_a * z_jc;
-                                    d2_raw_eta2[a][[row, col]] += 4.0 * q * w_a * z_jc;
+                            // D₁: anisotropic gradient components.
+                            //   ∂φ/∂x_b = φ_r · ∂r/∂x_b = (φ_r/r) · w_b · h_b = q · w_b · h_b
+                            // where w_b = exp(2ψ_b) is the metric weight for axis b.
+                            for b in 0..d {
+                                let h_b = ci[b] - cj[b];
+                                let w_b = metric_weights[b];
+                                chunk.d1_raw[[k_local * d + b, col]] += q * w_b * h_b * z_jc;
+                            }
+
+                            for b in 0..d {
+                                let h_b = ci[b] - cj[b];
+                                let w_b = metric_weights[b];
+                                for c in 0..d {
+                                    let h_c = ci[c] - cj[c];
+                                    let w_c = metric_weights[c];
+                                    let row = (k_local * d + b) * d + c;
+                                    // At center collisions (r=0) the kernel gradient
+                                    // h vanishes but `t` may be a (signed) infinity for
+                                    // pure polyharmonic kernels (e.g. r³ in dim 3 has
+                                    // t = 3c/r → ±∞ at r=0). Multiplying yields NaN
+                                    // even though the limit `(w_b h_b)(w_c h_c)·t` is
+                                    // 0. Skip the mixed Hessian term when r is at
+                                    // center collision so D2_raw stays finite; only the
+                                    // diagonal δ_{bc}·w_b·q survives in the limit.
+                                    let entry = if r <= 1e-14 {
+                                        if b == c { w_b * q } else { 0.0 }
+                                    } else {
+                                        hessian_operator_entry(q, t, h_b, h_c, w_b, w_c, b, c)
+                                    };
+                                    chunk.d2_raw[[row, col]] += entry * z_jc;
+                                }
+                            }
+
+                            // Per-axis η_a derivatives.
+                            for a in 0..dim {
+                                let s_a = s_vec[a];
+                                let w_a = metric_weights[a];
+
+                                if r <= 1e-14 {
+                                    for b in 0..d {
+                                        for c in 0..d {
+                                            let row = (k_local * d + b) * d + c;
+                                            if b == c && a == b {
+                                                chunk.d2_raw_eta[a][[row, col]] +=
+                                                    2.0 * q * w_a * z_jc;
+                                                chunk.d2_raw_eta2[a][[row, col]] +=
+                                                    4.0 * q * w_a * z_jc;
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+
+                                // D₀ derivatives (unchanged — chain rule through r only).
+                                chunk.d0_raw_eta[a][[k_local, col]] += q * s_a * z_jc;
+                                chunk.d0_raw_eta2[a][[k_local, col]] +=
+                                    (t * s_a * s_a + 2.0 * q * s_a) * z_jc;
+
+                                // D₁ derivatives.
+                                // Base D₁_b = q · w_b · h_b.
+                                //
+                                // First derivative:
+                                //   ∂D₁_b/∂ψ_a = (∂q/∂ψ_a) · w_b · h_b + q · (∂w_b/∂ψ_a) · h_b
+                                //   ∂q/∂ψ_a = q_r · (s_a/r) = t · s_a  (since t = q_r/r)
+                                //   ∂w_b/∂ψ_a = 2 · δ_{ab} · w_b
+                                //
+                                //   = w_b · h_b · (t · s_a + 2 · δ_{ab} · q)
+                                //
+                                // Second derivative (diagonal):
+                                //   ∂²D₁_b/∂ψ_a² = ∂/∂ψ_a [w_b · h_b · (t·s_a + 2·δ_{ab}·q)]
+                                //   For a != b: w_b · h_b · (dt_dr·s_a²/r + 2·t·s_a)
+                                //   For a == b: w_a · h_a · (dt_dr·s_a²/r + 6·t·s_a + 4·q)
+                                for b in 0..d {
+                                    let h_b = ci[b] - cj[b];
+                                    let w_b = metric_weights[b];
+                                    let row = k_local * d + b;
+
+                                    let d1_first = if a == b {
+                                        w_b * h_b * (t * s_a + 2.0 * q)
+                                    } else {
+                                        w_b * h_b * t * s_a
+                                    };
+                                    chunk.d1_raw_eta[a][[row, col]] += d1_first * z_jc;
+
+                                    let d1_eta2_val = if a == b {
+                                        w_b * h_b
+                                            * (dt_dr * s_a * s_a / r + 6.0 * t * s_a + 4.0 * q)
+                                    } else {
+                                        w_b * h_b * (dt_dr * s_a * s_a / r + 2.0 * t * s_a)
+                                    };
+                                    chunk.d1_raw_eta2[a][[row, col]] += d1_eta2_val * z_jc;
+                                }
+
+                                for b in 0..d {
+                                    let h_b = ci[b] - cj[b];
+                                    let w_b = metric_weights[b];
+                                    for c in 0..d {
+                                        let h_c = ci[c] - cj[c];
+                                        let w_c = metric_weights[c];
+                                        let row = (k_local * d + b) * d + c;
+                                        chunk.d2_raw_eta[a][[row, col]] +=
+                                            hessian_operator_eta_entry(
+                                                q, t, dt_dr, r, s_a, h_b, h_c, w_b, w_c, a, b, c,
+                                            ) * z_jc;
+                                        chunk.d2_raw_eta2[a][[row, col]] +=
+                                            hessian_operator_eta2_entry(
+                                                q, t, dt_dr, d2t_dr2, r, s_a, h_b, h_c, w_b, w_c,
+                                                a, b, c,
+                                            ) * z_jc;
+                                    }
                                 }
                             }
                         }
-                        continue;
-                    }
-
-                    // D₀ derivatives (unchanged — chain rule through r only).
-                    d0_raw_eta[a][[k, col]] += q * s_a * z_jc;
-                    d0_raw_eta2[a][[k, col]] += (t * s_a * s_a + 2.0 * q * s_a) * z_jc;
-
-                    // D₁ derivatives.
-                    // Base D₁_b = q · w_b · h_b.
-                    //
-                    // First derivative:
-                    //   ∂D₁_b/∂ψ_a = (∂q/∂ψ_a) · w_b · h_b + q · (∂w_b/∂ψ_a) · h_b
-                    //   ∂q/∂ψ_a = q_r · (s_a/r) = t · s_a  (since t = q_r/r)
-                    //   ∂w_b/∂ψ_a = 2 · δ_{ab} · w_b
-                    //
-                    //   = w_b · h_b · (t · s_a + 2 · δ_{ab} · q)
-                    //
-                    // Second derivative (diagonal):
-                    //   ∂²D₁_b/∂ψ_a² = ∂/∂ψ_a [w_b · h_b · (t·s_a + 2·δ_{ab}·q)]
-                    //   For a != b: w_b · h_b · (dt_dr·s_a²/r + 2·t·s_a)
-                    //   For a == b: w_a · h_a · (dt_dr·s_a²/r + 6·t·s_a + 4·q)
-                    for b in 0..d {
-                        let h_b = ci[b] - cj[b];
-                        let w_b = metric_weights[b];
-                        let row = k * d + b;
-
-                        let d1_first = if a == b {
-                            w_b * h_b * (t * s_a + 2.0 * q)
-                        } else {
-                            w_b * h_b * t * s_a
-                        };
-                        d1_raw_eta[a][[row, col]] += d1_first * z_jc;
-
-                        let d1_eta2_val = if a == b {
-                            w_b * h_b * (dt_dr * s_a * s_a / r + 6.0 * t * s_a + 4.0 * q)
-                        } else {
-                            w_b * h_b * (dt_dr * s_a * s_a / r + 2.0 * t * s_a)
-                        };
-                        d1_raw_eta2[a][[row, col]] += d1_eta2_val * z_jc;
-                    }
-
-                    for b in 0..d {
-                        let h_b = ci[b] - cj[b];
-                        let w_b = metric_weights[b];
-                        for c in 0..d {
-                            let h_c = ci[c] - cj[c];
-                            let w_c = metric_weights[c];
-                            let row = (k * d + b) * d + c;
-                            d2_raw_eta[a][[row, col]] += hessian_operator_eta_entry(
-                                q, t, dt_dr, r, s_a, h_b, h_c, w_b, w_c, a, b, c,
-                            ) * z_jc;
-                            d2_raw_eta2[a][[row, col]] += hessian_operator_eta2_entry(
-                                q, t, dt_dr, d2t_dr2, r, s_a, h_b, h_c, w_b, w_c, a, b, c,
-                            ) * z_jc;
-                        }
                     }
                 }
-            }
+
+                Ok(chunk)
+            },
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+    raw_chunks.sort_by_key(|chunk| chunk.k_start);
+
+    // Deterministically reduce row chunks in increasing row order. Each chunk
+    // owns a disjoint band of output rows, so reduction is assignment rather
+    // than floating-point addition across worker-local buffers.
+    for chunk in raw_chunks {
+        let k_range = chunk.k_start..chunk.k_end;
+        let d1_range = (chunk.k_start * d)..(chunk.k_end * d);
+        let d2_range = (chunk.k_start * d * d)..(chunk.k_end * d * d);
+
+        d0_raw
+            .slice_mut(s![k_range.clone(), ..])
+            .assign(&chunk.d0_raw);
+        d1_raw
+            .slice_mut(s![d1_range.clone(), ..])
+            .assign(&chunk.d1_raw);
+        d2_raw
+            .slice_mut(s![d2_range.clone(), ..])
+            .assign(&chunk.d2_raw);
+
+        for a in 0..dim {
+            d0_raw_eta[a]
+                .slice_mut(s![k_range.clone(), ..])
+                .assign(&chunk.d0_raw_eta[a]);
+            d1_raw_eta[a]
+                .slice_mut(s![d1_range.clone(), ..])
+                .assign(&chunk.d1_raw_eta[a]);
+            d2_raw_eta[a]
+                .slice_mut(s![d2_range.clone(), ..])
+                .assign(&chunk.d2_raw_eta[a]);
+            d0_raw_eta2[a]
+                .slice_mut(s![k_range.clone(), ..])
+                .assign(&chunk.d0_raw_eta2[a]);
+            d1_raw_eta2[a]
+                .slice_mut(s![d1_range.clone(), ..])
+                .assign(&chunk.d1_raw_eta2[a]);
+            d2_raw_eta2[a]
+                .slice_mut(s![d2_range.clone(), ..])
+                .assign(&chunk.d2_raw_eta2[a]);
         }
     }
 
