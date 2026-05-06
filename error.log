@@ -7664,3 +7664,566 @@ index 2107bc758ca02294f440ea6f0c749925cb3e8838..ceab9a73bec094d46be0681475226611
 
 ----- PATCH END -----
 
+[2026-05-06T20:34:39.407885+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:34:39.410099+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:34:39.410198+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:34:54.585005+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:34:54.586686+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:34:54.586744+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:35:08.464003+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:35:08.465668+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:35:08.465718+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:35:24.387387+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:35:24.389021+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:35:24.389083+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:35:27.365735+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:35:27.368965+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:35:27.369068+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:35:40.694540+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:35:40.696194+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:35:40.696258+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:35:42.451485+00:00] apply_result: mode=apply id=task_e_69fb93b7224c8324a69210c4f7903a3f status=Partial applied=0 skipped=0 conflicts=1 cmd=(cd /Users/user/gam && git apply --3way /var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/.tmpToq3MD/patch.diff)
+stdout_tail=
+
+stderr_tail=
+Applied patch to 'src/solver/reml/firth.rs' with conflicts.
+U src/solver/reml/firth.rs
+
+patch_summary: kind=git-diff lines=507 chars=25284 cwd=/Users/user/gam ; head=
+diff --git a/src/solver/reml/firth.rs b/src/solver/reml/firth.rs
+index 2107bc758ca02294f440ea6f0c749925cb3e8838..f3085f46ff2162048ab28ea88dafee6b273061e3 100644
+--- a/src/solver/reml/firth.rs
++++ b/src/solver/reml/firth.rs
+@@ -1,29 +1,30 @@
+ use super::*;
+ use crate::linalg::utils::enforce_symmetry;
+ use crate::mixture_link::logit_inverse_link_jet5;
+ use ndarray::ShapeBuilder;
++use rayon::slice::ParallelSliceMut;
+ 
+ impl<'a> RemlState<'a> {
+     pub(crate) fn xt_diag_x_dense_into(
+         x: &Array2<f64>,
+         diag: &Array1<f64>,
+         weighted: &mut Array2<f64>,
+     ) -> Array2<f64> {
+         let (n, p) = x.dim();
+         if n == 0 || p == 0 {
+             return Array2::<f64>::zeros((p, p));
+----- PATCH BEGIN -----
+diff --git a/src/solver/reml/firth.rs b/src/solver/reml/firth.rs
+index 2107bc758ca02294f440ea6f0c749925cb3e8838..f3085f46ff2162048ab28ea88dafee6b273061e3 100644
+--- a/src/solver/reml/firth.rs
++++ b/src/solver/reml/firth.rs
+@@ -1,29 +1,30 @@
+ use super::*;
+ use crate::linalg::utils::enforce_symmetry;
+ use crate::mixture_link::logit_inverse_link_jet5;
+ use ndarray::ShapeBuilder;
++use rayon::slice::ParallelSliceMut;
+ 
+ impl<'a> RemlState<'a> {
+     pub(crate) fn xt_diag_x_dense_into(
+         x: &Array2<f64>,
+         diag: &Array1<f64>,
+         weighted: &mut Array2<f64>,
+     ) -> Array2<f64> {
+         let (n, p) = x.dim();
+         if n == 0 || p == 0 {
+             return Array2::<f64>::zeros((p, p));
+         }
+         const STREAMING_BYTES_THRESHOLD: usize = 8 * 1024 * 1024;
+         let dense_work_bytes = n
+             .checked_mul(p)
+             .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()))
+             .unwrap_or(usize::MAX);
+         if dense_work_bytes > STREAMING_BYTES_THRESHOLD {
+             return Self::xt_diag_x_dense_chunked_into(x, diag, weighted);
+         }
+         if weighted.raw_dim() != x.raw_dim() {
+             *weighted = Array2::<f64>::zeros(x.raw_dim());
+         }
+         weighted.assign(x);
+         ndarray::Zip::from(weighted.rows_mut())
+             .and(diag.view())
+@@ -62,50 +63,131 @@ impl<'a> RemlState<'a> {
+             {
+                 let mut chunk = weighted_chunk.slice_mut(s![0..rows, ..]);
+                 for local_row in 0..rows {
+                     let src_row = row_start + local_row;
+                     let scale = diag[src_row];
+                     for col in 0..p {
+                         chunk[[local_row, col]] = x[[src_row, col]] * scale;
+                     }
+                 }
+             }
+             let x_chunk = x.slice(s![row_start..row_start + rows, ..]);
+             let weighted_view = weighted_chunk.slice(s![0..rows, ..]);
+             out += &fast_atb(&x_chunk, &weighted_view);
+         }
+         out
+     }
+ 
+     pub(crate) fn row_scale(x: &Array2<f64>, scale: &Array1<f64>) -> Array2<f64> {
+         let mut out = x.clone();
+         ndarray::Zip::from(out.rows_mut())
+             .and(scale.view())
+             .for_each(|mut row, w| row *= *w);
+         out
+     }
+ 
++    #[inline]
++    fn dense_product_likely_uses_inner_parallelism(m: usize, n: usize, k: usize) -> bool {
++        // Keep this in sync with faer_ndarray::matmul_parallelism.  When a
++        // dense product is large enough for faer/BLAS-style internal
++        // parallelism, do not also wrap sibling products in rayon::join: that
++        // can oversubscribe CPU threads and slow down the REML hot path.
++        const PAR_MIN_FLOP_SCALE: usize = 2_000_000;
++        const PAR_MIN_LONG_DIM: usize = 256;
++        let flop_scale = m.saturating_mul(n).saturating_mul(k);
++        let long_dim = m.max(n).max(k);
++        flop_scale >= PAR_MIN_FLOP_SCALE && long_dim >= PAR_MIN_LONG_DIM
++    }
++
++    #[inline]
++    fn should_join_independent_dense_products(products: &[(usize, usize, usize)]) -> bool {
++        const JOIN_MIN_TOTAL_FLOP_SCALE: usize = 128 * 1024;
++        if rayon::current_num_threads() <= 1 {
++            return false;
++        }
++        let mut total_flop_scale = 0usize;
++        for &(m, n, k) in products {
++            if Self::dense_product_likely_uses_inner_parallelism(m, n, k) {
++                return false;
++            }
++            total_flop_scale =
++                total_flop_scale.saturating_add(m.saturating_mul(n).saturating_mul(k));
++        }
++        total_flop_scale >= JOIN_MIN_TOTAL_FLOP_SCALE
++    }
++
++    #[inline]
++    fn scale_rows_by_inverse_observation_weight_sqrt(
++        out: &mut Array2<f64>,
++        observation_weight_sqrt: Option<&Array1<f64>>,
++    ) {
++        let Some(scale) = observation_weight_sqrt else {
++            return;
++        };
++        debug_assert_eq!(out.nrows(), scale.len());
++        let ncols = out.ncols();
++        if ncols == 0 {
++            return;
++        }
++        const PAR_MIN_CELLS: usize = 64 * 1024;
++        let cells = out.nrows().saturating_mul(ncols);
++        if cells >= PAR_MIN_CELLS && rayon::current_num_threads() > 1 && out.is_standard_layout() {
++            if let Some(slice) = out.as_slice_memory_order_mut() {
++                slice
++                    .par_chunks_mut(ncols)
++                    .enumerate()
++                    .for_each(|(row, row_values)| {
++                        let s = scale[row];
++                        if s > 0.0 {
++                            let inv = s.recip();
++                            for value in row_values {
++                                *value *= inv;
++                            }
++                        } else {
++                            for value in row_values {
++                                *value = 0.0;
++                            }
++                        }
++                    });
++                return;
++            }
++        }
++        for row in 0..out.nrows() {
++            let s = scale[row];
++            if s > 0.0 {
++                let inv = s.recip();
++                for col in 0..ncols {
++                    out[[row, col]] *= inv;
++                }
++            } else {
++                for col in 0..ncols {
++                    out[[row, col]] = 0.0;
++                }
++            }
++        }
++    }
++
+     #[inline]
+     fn logit_fisher_weight_derivatives(eta: f64) -> (f64, f64, f64, f64, f64) {
+         let jet = logit_inverse_link_jet5(eta);
+         (jet.d1, jet.d2, jet.d3, jet.d4, jet.d5)
+     }
+ 
+     pub(crate) fn weighted_cross(
+         left: &Array2<f64>,
+         right: &Array2<f64>,
+         weights: &Array1<f64>,
+     ) -> Array2<f64> {
+         debug_assert_eq!(left.nrows(), right.nrows());
+         debug_assert_eq!(left.nrows(), weights.len());
+         crate::faer_ndarray::fast_xt_diag_y(left, weights, right)
+     }
+ 
+     pub(crate) fn trace_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+         debug_assert_eq!(a.nrows(), b.ncols());
+         debug_assert_eq!(a.ncols(), b.nrows());
+         let elems = a.nrows().saturating_mul(a.ncols());
+         if elems >= 32 * 32 {
+             let aview = FaerArrayView::new(a);
+             let bview = FaerArrayView::new(b);
+             return faer_frob_inner(aview.as_ref(), bview.as_ref().transpose());
+         }
+@@ -1507,74 +1589,77 @@ impl FirthDenseOperator {
+         let z = &self.z_reduced;
+         let x_r = &self.x_reduced;
+         let k = &self.k_reduced;
+         let x_ri = &kernel.x_tau_i_reduced;
+         let x_rj = &kernel.x_tau_j_reduced;
+         let deta_i = &kernel.deta_i_partial;
+         let deta_j = &kernel.deta_j_partial;
+         let dh_i = &kernel.dot_h_i_partial;
+         let dh_j = &kernel.dot_h_j_partial;
+         let dot_k_i = &kernel.dot_k_i_reduced;
+         let dot_k_j = &kernel.dot_k_j_reduced;
+         let dot_i_i = &kernel.dot_i_i_partial;
+         let dot_i_j = &kernel.dot_i_j_partial;
+ 
+         // Optional second-design pieces: default to zero when the design is
+         // τ-linear (η̈_{ij} = 0, X_{ij} = 0).
+         let x_tau_tau_is_some = kernel.x_tau_tau_reduced.is_some();
+         let x_rij_zero = Array2::<f64>::zeros(x_r.raw_dim());
+         let x_rij: &Array2<f64> = kernel.x_tau_tau_reduced.as_ref().unwrap_or(&x_rij_zero);
+         let zeros_n = Array1::<f64>::zeros(n);
+         let deta_ij = kernel.deta_ij_partial.as_ref().unwrap_or(&zeros_n);
+ 
+         // ─────────────────────────────────────────────────────────────────
+         //  η̇ vectors in β-rhs space (η_V := X V, η_{i,V} := X_i V, etc.)
+         // ─────────────────────────────────────────────────────────────────
+-        let eta_v = fast_ab(&self.x_dense, rhs); // n×m
+-        let eta_i_v = fast_ab(x_tau_i, rhs); // n×m
+-        let eta_j_v = fast_ab(x_tau_j, rhs); // n×m
++        let (eta_v, eta_i_v, eta_j_v) = if RemlState::should_join_independent_dense_products(&[
++            (n, m, p),
++            (n, m, p),
++            (n, m, p),
++        ]) {
++            let (eta_v, (eta_i_v, eta_j_v)) = rayon::join(
++                || fast_ab(&self.x_dense, rhs),
++                || rayon::join(|| fast_ab(x_tau_i, rhs), || fast_ab(x_tau_j, rhs)),
++            );
++            (eta_v, eta_i_v, eta_j_v)
++        } else {
++            (
++                fast_ab(&self.x_dense, rhs),
++                fast_ab(x_tau_i, rhs),
++                fast_ab(x_tau_j, rhs),
++            )
++        }; // n×m blocks
+         // X_{ij} V from the reduced second-derivative design:
+         //   reduce_explicit_design: X_{r,τ} = diag(√a) X_τ Q,
+         //   invert:  X_{ij} = diag(1/√a) X_{r,ij} Qᵀ.
+         let eta_ij_v: Array2<f64> = if x_tau_tau_is_some {
+             let qt_v = fast_atb(&self.q_basis, rhs); // r×m
+             let mut out = fast_ab(x_rij, &qt_v); // n×m in sqrt(a)-scaled space
+-            if let Some(scale) = self.observation_weight_sqrt.as_ref() {
+-                for row in 0..out.nrows() {
+-                    let s = scale[row];
+-                    if s > 0.0 {
+-                        let inv = s.recip();
+-                        for col in 0..out.ncols() {
+-                            out[[row, col]] *= inv;
+-                        }
+-                    } else {
+-                        for col in 0..out.ncols() {
+-                            out[[row, col]] = 0.0;
+-                        }
+-                    }
+-                }
+-            }
++            RemlState::scale_rows_by_inverse_observation_weight_sqrt(
++                &mut out,
++                self.observation_weight_sqrt.as_ref(),
++            );
+             out
+         } else {
+             Array2::<f64>::zeros((n, m))
+         };
+ 
+         // ─────────────────────────────────────────────────────────────────
+         //  Shared per-direction reduced operators
+         //    A_τ = K İ K   (reduced analog of T_τ = K I_τ K)
+         //    K̇_τ = -A_τ  (already cached)
+         // ─────────────────────────────────────────────────────────────────
+         let a_i_reduced = -dot_k_i; // K İ_i K = -K̇_i
+         let a_j_reduced = -dot_k_j;
+ 
+         // ─────────────────────────────────────────────────────────────────
+         //  Ï_{ij}  — second cross derivative of reduced Fisher
+         // ─────────────────────────────────────────────────────────────────
+         //   Ï_{ij} = X_{r,ij}ᵀ W X_r + X_rᵀ W X_{r,ij}
+         //          + X_{r,i}ᵀ W X_{r,j} + X_{r,j}ᵀ W X_{r,i}
+         //          + X_{r,i}ᵀ Ẇ_j X_r + X_rᵀ Ẇ_j X_{r,i}
+         //          + X_{r,j}ᵀ Ẇ_i X_r + X_rᵀ Ẇ_i X_{r,j}
+         //          + X_rᵀ Ẅ_{ij} X_r.
+         //   Ẇ_α   = diag(w' ⊙ η̇_α),  Ẅ_{ij} = diag(w'' ⊙ η̇_i ⊙ η̇_j + w' ⊙ η̈_ij).
+         let dw_i = &self.w1 * deta_i;
+         let dw_j = &self.w1 * deta_j;
+         let ddw_ij = &(&self.w2 * &(deta_i * deta_j)) + &(&self.w1 * deta_ij);
+@@ -1587,63 +1672,80 @@ impl FirthDenseOperator {
+         i_ddot = i_ddot + RemlState::weighted_cross(x_rj, x_ri, &self.w);
+         i_ddot = i_ddot + RemlState::weighted_cross(x_ri, x_r, &dw_j);
+         i_ddot = i_ddot + RemlState::weighted_cross(x_r, x_ri, &dw_j);
+         i_ddot = i_ddot + RemlState::weighted_cross(x_rj, x_r, &dw_i);
+         i_ddot = i_ddot + RemlState::weighted_cross(x_r, x_rj, &dw_i);
+         i_ddot = i_ddot + crate::faer_ndarray::fast_xt_diag_x(x_r, &ddw_ij);
+ 
+         // K̈_{ij} = −K Ï K + K İ_i K İ_j K + K İ_j K İ_i K.
+         //   Using K İ_α K = −K̇_α = a_α_reduced, the two product terms collapse to
+         //   K İ_i K İ_j K = a_i_reduced · İ_j · K,
+         //   K İ_j K İ_i K = a_j_reduced · İ_i · K.
+         let k_ddot: Array2<f64> = -k.dot(&i_ddot).dot(k)
+             + a_i_reduced.dot(dot_i_j).dot(k)
+             + a_j_reduced.dot(dot_i_i).dot(k);
+ 
+         // ─────────────────────────────────────────────────────────────────
+         //  ḧ_{ij}
+         // ─────────────────────────────────────────────────────────────────
+         //   ḧ_ij = 2 diag(X_{r,ij} K X_rᵀ)
+         //        + diag(X_r K̈_ij X_rᵀ)
+         //        + 2 diag(X_{r,i} K̇_j X_rᵀ)
+         //        + 2 diag(X_{r,j} K̇_i X_rᵀ)
+         //        + 2 diag(X_{r,i} K X_{r,j}ᵀ).
+         // Using diag(A Bᵀ) = rowwise_dot(A, B):
+         let dh_ij: Array1<f64> = {
+-            let mut acc = Array1::<f64>::zeros(n);
++            let r = k.ncols();
++            let can_join = RemlState::should_join_independent_dense_products(&[
++                (n, r, r),
++                (n, r, r),
++                (n, r, r),
++                (n, r, r),
++            ]);
++            let (xr_kddot, ri_kdot_j, rj_kdot_i, ri_k) = if can_join {
++                let ((xr_kddot, ri_kdot_j), (rj_kdot_i, ri_k)) = rayon::join(
++                    || rayon::join(|| fast_ab(x_r, &k_ddot), || fast_ab(x_ri, dot_k_j)),
++                    || rayon::join(|| fast_ab(x_rj, dot_k_i), || fast_ab(x_ri, k)),
++                );
++                (xr_kddot, ri_kdot_j, rj_kdot_i, ri_k)
++            } else {
++                (
++                    fast_ab(x_r, &k_ddot),
++                    fast_ab(x_ri, dot_k_j),
++                    fast_ab(x_rj, dot_k_i),
++                    fast_ab(x_ri, k),
++                )
++            };
++
++            let mut acc = Self::rowwise_dot(&xr_kddot, x_r);
++            acc = acc + 2.0 * Self::rowwise_dot(&ri_kdot_j, x_r);
++            acc = acc + 2.0 * Self::rowwise_dot(&rj_kdot_i, x_r);
++            acc = acc + 2.0 * Self::rowwise_dot(&ri_k, x_rj);
+             if x_tau_tau_is_some {
+                 let rij_k = fast_ab(x_rij, k);
+                 acc = acc + 2.0 * Self::rowwise_dot(&rij_k, x_r);
+             }
+-            let xr_kddot = fast_ab(x_r, &k_ddot);
+-            acc = acc + Self::rowwise_dot(&xr_kddot, x_r);
+-            let ri_kdot_j = fast_ab(x_ri, dot_k_j);
+-            acc = acc + 2.0 * Self::rowwise_dot(&ri_kdot_j, x_r);
+-            let rj_kdot_i = fast_ab(x_rj, dot_k_i);
+-            acc = acc + 2.0 * Self::rowwise_dot(&rj_kdot_i, x_r);
+-            let ri_k = fast_ab(x_ri, k);
+-            acc = acc + 2.0 * Self::rowwise_dot(&ri_k, x_rj);
+             acc
+         };
+ 
+         // ─────────────────────────────────────────────────────────────────
+         //  Γ, Γ̇_i, Γ̇_j, Γ̈_ij  (diagonal row-weight n-vectors)
+         // ─────────────────────────────────────────────────────────────────
+         //   γ        = w'' ⊙ h
+         //   γ̇_i     = w''' ⊙ η̇_i ⊙ h + w'' ⊙ ḣ_i
+         //   γ̈_ij   = w'''' ⊙ η̇_i ⊙ η̇_j ⊙ h
+         //            + w''' ⊙ η̈_ij ⊙ h
+         //            + w''' ⊙ η̇_i ⊙ ḣ_j
+         //            + w''' ⊙ η̇_j ⊙ ḣ_i
+         //            + w'' ⊙ ḧ_ij
+         let gamma = &self.w2 * &self.h_diag;
+         let gamma_dot_i = &(&(&self.w3 * deta_i) * &self.h_diag) + &(&self.w2 * dh_i);
+         let gamma_dot_j = &(&(&self.w3 * deta_j) * &self.h_diag) + &(&self.w2 * dh_j);
+         let gamma_ddot = &(&(&(&self.w4 * deta_i) * deta_j) * &self.h_diag)
+             + &(&(&(&self.w3 * deta_ij) * &self.h_diag)
+                 + &(&(&self.w3 * deta_i) * dh_j)
+                 + &(&(&self.w3 * deta_j) * dh_i)
+                 + &(&self.w2 * &dh_ij));
+ 
+         // ─────────────────────────────────────────────────────────────────
+         //  Diagonal-term β-rhs contributions:
+         //    ∂²(XᵀΓX)/∂τ_i∂τ_j · V
+@@ -1655,66 +1757,57 @@ impl FirthDenseOperator {
+         // ─────────────────────────────────────────────────────────────────
+         let mut diag_term = Array2::<f64>::zeros((p, m));
+         let gamma_col = gamma.view().insert_axis(Axis(1));
+         let gamma_i_col = gamma_dot_i.view().insert_axis(Axis(1));
+         let gamma_j_col = gamma_dot_j.view().insert_axis(Axis(1));
+         let gamma_ij_col = gamma_ddot.view().insert_axis(Axis(1));
+ 
+         // X_iᵀ (γ ⊙ η_{j,V}) + X_jᵀ (γ ⊙ η_{i,V})
+         diag_term = diag_term + fast_atb(x_tau_i, &(&eta_j_v * &gamma_col));
+         diag_term = diag_term + fast_atb(x_tau_j, &(&eta_i_v * &gamma_col));
+         // X_iᵀ (γ̇_j ⊙ η_V) + X_jᵀ (γ̇_i ⊙ η_V)
+         diag_term = diag_term + fast_atb(x_tau_i, &(&eta_v * &gamma_j_col));
+         diag_term = diag_term + fast_atb(x_tau_j, &(&eta_v * &gamma_i_col));
+         // Xᵀ (γ̇_j ⊙ η_{i,V}) + Xᵀ (γ̇_i ⊙ η_{j,V})
+         diag_term = diag_term + fast_ab(&self.x_dense_t, &(&eta_i_v * &gamma_j_col));
+         diag_term = diag_term + fast_ab(&self.x_dense_t, &(&eta_j_v * &gamma_i_col));
+         // Xᵀ (γ̈_ij ⊙ η_V)
+         diag_term = diag_term + fast_ab(&self.x_dense_t, &(&eta_v * &gamma_ij_col));
+         // X_{ij}ᵀ (γ ⊙ η_V) + Xᵀ (γ ⊙ η_{ij,V})
+         if x_tau_tau_is_some {
+             // X_{ij}ᵀ = Q X_{r,ij}ᵀ · diag(1/√a)  (inverse of the reduce shim),
+             // but caller supplies the reduced second-derivative design.  We
+             // form X_{ij}ᵀ Y as q_basis · (X_{r,ij}ᵀ · diag(1/√a)·Y) = Q · X_{r,ij}ᵀ (Y unscaled).
+             // When no observation weights, X_{r,ij} = X_{ij} Q and
+             //   X_{ij}ᵀ Y = Q X_{r,ij}ᵀ Y.
+-            let y = &eta_v * &gamma_col;
+-            let xt_ij_y: Array2<f64> = if let Some(scale) = self.observation_weight_sqrt.as_ref() {
++            let y: Array2<f64> = &eta_v * &gamma_col;
++            let xt_ij_y: Array2<f64> = if self.observation_weight_sqrt.is_some() {
+                 let mut y_scaled = y.clone();
+-                for row in 0..y_scaled.nrows() {
+-                    let s = scale[row];
+-                    if s > 0.0 {
+-                        let inv = s.recip();
+-                        for col in 0..y_scaled.ncols() {
+-                            y_scaled[[row, col]] *= inv;
+-                        }
+-                    } else {
+-                        for col in 0..y_scaled.ncols() {
+-                            y_scaled[[row, col]] = 0.0;
+-                        }
+-                    }
+-                }
++                RemlState::scale_rows_by_inverse_observation_weight_sqrt(
++                    &mut y_scaled,
++                    self.observation_weight_sqrt.as_ref(),
++                );
+                 self.q_basis.dot(&x_rij.t().dot(&y_scaled))
+             } else {
+                 self.q_basis.dot(&x_rij.t().dot(&y))
+             };
+             diag_term = diag_term + xt_ij_y;
+             diag_term = diag_term + self.x_dense_t.dot(&(&eta_ij_v * &gamma_col));
+         }
+ 
+         // ─────────────────────────────────────────────────────────────────
+         //  BᵀPB branch — 9-term expansion.
+         //
+         //  Represent each B-like operator as an "n-row scaling vector for the
+         //  X part plus tails along X_τ and X_{ij}".  For rhs V, define the
+         //  row-scaled η-space blocks R(B) = diag(scale) X V + tails.  Then
+         //  Bᵀ (P action) R is assembled by row-scaling and left-multiplying
+         //  the appropriate full designs.
+         // ─────────────────────────────────────────────────────────────────
+ 
+         // B V row-block (eta-space):  B V = diag(w') X V.
+         let w1_col = self.w1.view().insert_axis(Axis(1));
+         let b_v = &eta_v * &w1_col;
+ 
+         // Ḃ_i V = diag(w'' ⊙ η̇_i) X V + diag(w') X_i V.
+         let w2_deta_i = &self.w2 * deta_i;
+         let w2_deta_j = &self.w2 * deta_j;
+@@ -1775,70 +1868,60 @@ impl FirthDenseOperator {
+         //   term2 = Ḃ_iᵀ P Ḃ_j V + Ḃ_jᵀ P Ḃ_i V
+         //   term3 = Ḃ_iᵀ Ṗ_j B V + Bᵀ Ṗ_j Ḃ_i V
+         //   term4 = Ḃ_jᵀ Ṗ_i B V + Bᵀ Ṗ_i Ḃ_j V
+         //   term5 = Bᵀ P̈_ij B V
+         //
+         // "Bᵀ Q V" with B = diag(w') X equals left_scaled_xt(w1, Q V).
+         // "Ḃ_iᵀ Q V" = diag(w'' ⊙ η̇_i) X acting on the left, plus
+         //              diag(w') X_i on the left.  In transpose:
+         //   Ḃ_iᵀ Q V = Xᵀ (diag(w'' ⊙ η̇_i) Q V) + X_iᵀ (diag(w') Q V).
+         // "B̈_ijᵀ Q V" mirrors B̈_ij above in transpose.
+ 
+         let apply_bdot_tau_t =
+             |scale_deta: &Array1<f64>, x_tau_mat: &Array2<f64>, q_v: &Array2<f64>| {
+                 let scale_col = scale_deta.view().insert_axis(Axis(1));
+                 self.x_dense_t.dot(&(q_v * &scale_col)) + x_tau_mat.t().dot(&(q_v * &w1_col))
+             };
+ 
+         let apply_bddot_ij_t = |q_v: &Array2<f64>| -> Array2<f64> {
+             let scale_col_full = bddot_scale.view().insert_axis(Axis(1));
+             let mut out = self.x_dense_t.dot(&(q_v * &scale_col_full));
+             out = out + x_tau_j.t().dot(&(q_v * &w2_deta_i_col));
+             out = out + x_tau_i.t().dot(&(q_v * &w2_deta_j_col));
+             if x_tau_tau_is_some {
+                 // X_{ij}ᵀ (w1 ⊙ Q V)
+                 let y = q_v * &w1_col;
+-                let contrib: Array2<f64> =
+-                    if let Some(scale) = self.observation_weight_sqrt.as_ref() {
+-                        let mut y_scaled = y.clone();
+-                        for row in 0..y_scaled.nrows() {
+-                            let s = scale[row];
+-                            if s > 0.0 {
+-                                let inv = s.recip();
+-                                for col in 0..y_scaled.ncols() {
+-                                    y_scaled[[row, col]] *= inv;
+-                                }
+-                            } else {
+-                                for col in 0..y_scaled.ncols() {
+-                                    y_scaled[[row, col]] = 0.0;
+-                                }
+-                            }
+-                        }
+-                        self.q_basis.dot(&x_rij.t().dot(&y_scaled))
+-                    } else {
+-                        self.q_basis.dot(&x_rij.t().dot(&y))
+-                    };
++                let contrib: Array2<f64> = if self.observation_weight_sqrt.is_some() {
++                    let mut y_scaled = y.clone();
++                    RemlState::scale_rows_by_inverse_observation_weight_sqrt(
++                        &mut y_scaled,
++                        self.observation_weight_sqrt.as_ref(),
++                    );
++                    self.q_basis.dot(&x_rij.t().dot(&y_scaled))
++                } else {
++                    self.q_basis.dot(&x_rij.t().dot(&y))
++                };
+                 out = out + contrib;
+             }
+             out
+         };
+ 
+         // term1
+         let t1a = apply_bddot_ij_t(&p_bv);
+         let t1b = self.left_scaled_xt(&self.w1, &p_bddot_ij_v);
+         // term2
+         let t2a = apply_bdot_tau_t(&w2_deta_i, x_tau_i, &p_bdot_j_v);
+         let t2b = apply_bdot_tau_t(&w2_deta_j, x_tau_j, &p_bdot_i_v);
+         // term3: Ḃ_iᵀ Ṗ_j B V + Bᵀ Ṗ_j Ḃ_i V
+         let t3a = apply_bdot_tau_t(&w2_deta_i, x_tau_i, &pdot_j_bv);
+         let t3b = self.left_scaled_xt(&self.w1, &pdot_j_bdot_i_v);
+         // term4: Ḃ_jᵀ Ṗ_i B V + Bᵀ Ṗ_i Ḃ_j V
+         let t4a = apply_bdot_tau_t(&w2_deta_j, x_tau_j, &pdot_i_bv);
+         let t4b = self.left_scaled_xt(&self.w1, &pdot_i_bdot_j_v);
+         // term5
+         let t5 = self.left_scaled_xt(&self.w1, &p_ddot_b_v);
+ 
+         let d2_bpb = t1a + t1b + t2a + t2b + t3a + t3b + t4a + t4b + t5;
+ 
+         0.5 * (diag_term - d2_bpb)
+     }
+ 
+
+----- PATCH END -----
+
+[2026-05-06T20:36:13.584405+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:36:13.586324+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:36:13.586379+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:36:30.957398+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:36:30.959094+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:36:30.959147+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
