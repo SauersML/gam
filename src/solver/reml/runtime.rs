@@ -66,6 +66,7 @@ fn screening_residual_penalty(cost: f64, pr: &PirlsResult) -> f64 {
 struct TkCorrectionTerms {
     value: f64,
     gradient: Option<Array1<f64>>,
+    hessian: Option<Array2<f64>>,
 }
 
 struct TkSharedIntermediates {
@@ -96,24 +97,32 @@ struct DerivativeContext {
 
 impl<'a> RemlState<'a> {
     pub(crate) fn analytic_outer_hessian_enabled(&self) -> bool {
-        // The Tierney-Kadane skewness correction has analytic value and
-        // first ρ-derivative paths (`tierney_kadane_analytic_core`), but
-        // its analytic outer-Hessian is not implemented. Production requires
-        // analytic second derivatives for Hessian mode.
-        // `tierney_kadane_terms` therefore returns an `InvalidInput` error
-        // for `ValueGradientHessian` mode whenever TK is active (Firth +
-        // non-identity link). Without gating the outer evaluator that
-        // failure cascades through seed validation and aborts the entire
-        // REML fit (e.g. the `cli_firth_fit_*` integration test). Treat
-        // analytic outer Hessian as disabled in those configurations so
-        // the optimizer falls back to its gradient-only descent path
-        // (BFGS / quasi-Newton); the spectral exact Hessian path is then
-        // not requested and TK never sees `ValueGradientHessian`. The
-        // explicit safety guard in `tierney_kadane_terms` still rejects
-        // any caller that constructs Hessian mode directly (covered by
-        // `firth_exacthessian_rejects_without_tk_second_derivatives`).
+        // (1) Tierney-Kadane gate: TK has analytic value and first
+        // ρ-derivative paths but no analytic outer Hessian; running
+        // ValueGradientHessian against TK aborts the fit. Disable analytic
+        // Hessian when TK is active (Firth + non-identity link) so the
+        // optimizer falls back to BFGS/quasi-Newton.
         if self.config.firth_bias_reduction && self.config.link_function() != LinkFunction::Identity
         {
+            return false;
+        }
+        // (2) Biobank-scale fallback: analytic outer Hessian is only safe
+        // when the unified evaluator can express it as a matrix-free Hv
+        // operator (`prefer_outer_hessian_operator`). Whenever that path
+        // is unavailable at biobank scale, the dense `O(K²·n·p²)` LAML
+        // pairwise assembly would run instead — route to BFGS.
+        let n_obs = self.x.nrows();
+        let p_dim = self.x.ncols();
+        let k_outer = self.canonical_penalties.len();
+        let operator_path_available =
+            super::unified::prefer_outer_hessian_operator(n_obs, p_dim, k_outer);
+        if n_obs > 50_000 && !operator_path_available {
+            log::info!(
+                "[standard-GAM] declining analytic outer Hessian for \
+                 n={n_obs} p={p_dim} k={k_outer} (matrix-free operator \
+                 path unavailable, dense LAML pairwise assembly is \
+                 O(k²·n·p²)); routing to BFGS"
+            );
             return false;
         }
         true
@@ -828,6 +837,287 @@ impl<'a> RemlState<'a> {
         blocks
     }
 
+    fn tk_penalty_dense(
+        cp: &crate::construction::CanonicalPenalty,
+        lambda: f64,
+        p: usize,
+    ) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((p, p));
+        let r = &cp.col_range;
+        for a in 0..cp.block_dim() {
+            for b in 0..cp.block_dim() {
+                let mut val = 0.0;
+                for row in 0..cp.rank() {
+                    val += cp.root[[row, a]] * cp.root[[row, b]];
+                }
+                out[[r.start + a, r.start + b]] = lambda * val;
+            }
+        }
+        out
+    }
+
+    fn tk_xt_diag_x(x_dense: &Array2<f64>, diag: &Array1<f64>) -> Array2<f64> {
+        let mut weighted = Array2::<f64>::zeros(x_dense.raw_dim());
+        Self::xt_diag_x_dense_into(x_dense, diag, &mut weighted)
+    }
+
+    fn tk_hessian_rho_canonical_logit(
+        x_dense: &Array2<f64>,
+        c_array: &Array1<f64>,
+        d_array: &Array1<f64>,
+        e_array: &Array1<f64>,
+        f_array: &Array1<f64>,
+        tk_penalties: &[crate::construction::CanonicalPenalty],
+        lambdas: &[f64],
+        beta: &Array1<f64>,
+        firth_op: Option<&super::FirthDenseOperator>,
+        h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        let n = x_dense.nrows();
+        let p = x_dense.ncols();
+        let k = tk_penalties.len();
+        if k == 0 {
+            return Ok(Array2::zeros((0, 0)));
+        }
+        if c_array.len() != n || d_array.len() != n || e_array.len() != n || f_array.len() != n {
+            return Err(EstimationError::InvalidInput(
+                "Tierney-Kadane Hessian derivative arrays have inconsistent lengths".to_string(),
+            ));
+        }
+
+        let mut k_mat = Array2::<f64>::zeros((p, p));
+        for col in 0..p {
+            let mut rhs = Array1::<f64>::zeros(p);
+            rhs[col] = 1.0;
+            let sol = h_inv_solve(&rhs)?;
+            k_mat.column_mut(col).assign(&sol);
+        }
+        enforce_symmetry(&mut k_mat);
+
+        let mut a_mats = Vec::with_capacity(k);
+        let mut v = Vec::with_capacity(k);
+        let mut eta_i = Vec::with_capacity(k);
+        for idx in 0..k {
+            let a = Self::tk_penalty_dense(&tk_penalties[idx], lambdas[idx], p);
+            let rhs = a.dot(beta);
+            let vi = h_inv_solve(&rhs)?;
+            let bi = vi.mapv(|value| -value);
+            let ei = x_dense.dot(&bi);
+            a_mats.push(a);
+            v.push(vi);
+            eta_i.push(ei);
+        }
+
+        let mut h_i = Vec::with_capacity(k);
+        for idx in 0..k {
+            let diag = c_array * &eta_i[idx];
+            let mut h = &a_mats[idx] + &Self::tk_xt_diag_x(x_dense, &diag);
+            if let Some(op) = firth_op {
+                let dir = op.direction_from_deta(eta_i[idx].clone());
+                h -= &op.hphi_direction(&dir);
+            }
+            enforce_symmetry(&mut h);
+            h_i.push(h);
+        }
+
+        let mut beta_ij: Vec<Vec<Array1<f64>>> = (0..k)
+            .map(|_| (0..k).map(|_| Array1::<f64>::zeros(p)).collect())
+            .collect();
+        let mut h_ij: Vec<Vec<Array2<f64>>> = (0..k)
+            .map(|_| (0..k).map(|_| Array2::<f64>::zeros((p, p))).collect())
+            .collect();
+        for i in 0..k {
+            for j in 0..=i {
+                let mut rhs = h_i[j].dot(&v[i]);
+                rhs += &a_mats[i].dot(&v[j]);
+                if i == j {
+                    rhs -= &a_mats[i].dot(beta);
+                }
+                let bij = h_inv_solve(&rhs)?;
+                beta_ij[i][j] = bij.clone();
+                beta_ij[j][i] = bij;
+            }
+        }
+        for i in 0..k {
+            for j in 0..=i {
+                let eta_ij = x_dense.dot(&beta_ij[i][j]);
+                let diag = c_array * &eta_ij + &(d_array * &(&eta_i[i] * &eta_i[j]));
+                let mut h = Self::tk_xt_diag_x(x_dense, &diag);
+                if i == j {
+                    h += &a_mats[i];
+                }
+                if let Some(op) = firth_op {
+                    let dir_ij = op.direction_from_deta(eta_ij);
+                    h -= &op.hphi_direction(&dir_ij);
+                    let dir_i = op.direction_from_deta(eta_i[i].clone());
+                    let dir_j = op.direction_from_deta(eta_i[j].clone());
+                    let eye = Array2::<f64>::eye(p);
+                    h -= &op.hphisecond_direction_apply(&dir_i, &dir_j, &eye);
+                }
+                enforce_symmetry(&mut h);
+                h_ij[i][j] = h.clone();
+                h_ij[j][i] = h;
+            }
+        }
+
+        let mut k_i = Vec::with_capacity(k);
+        for i in 0..k {
+            k_i.push(-k_mat.dot(&h_i[i]).dot(&k_mat));
+        }
+        let mut k_ij: Vec<Vec<Array2<f64>>> = (0..k)
+            .map(|_| (0..k).map(|_| Array2::<f64>::zeros((p, p))).collect())
+            .collect();
+        for i in 0..k {
+            for j in 0..=i {
+                let kij = k_mat.dot(&h_i[j]).dot(&k_mat).dot(&h_i[i]).dot(&k_mat)
+                    + k_mat.dot(&h_i[i]).dot(&k_mat).dot(&h_i[j]).dot(&k_mat)
+                    - k_mat.dot(&h_ij[i][j]).dot(&k_mat);
+                k_ij[i][j] = kij.clone();
+                k_ij[j][i] = kij;
+            }
+        }
+
+        #[derive(Clone)]
+        struct Jet {
+            v: f64,
+            g: Array1<f64>,
+            h: Array2<f64>,
+        }
+        impl Jet {
+            fn constant(v: f64, k: usize) -> Self {
+                Self {
+                    v,
+                    g: Array1::zeros(k),
+                    h: Array2::zeros((k, k)),
+                }
+            }
+            fn add(&self, other: &Self) -> Self {
+                Self {
+                    v: self.v + other.v,
+                    g: &self.g + &other.g,
+                    h: &self.h + &other.h,
+                }
+            }
+            fn scale(&self, a: f64) -> Self {
+                Self {
+                    v: self.v * a,
+                    g: self.g.mapv(|x| x * a),
+                    h: self.h.mapv(|x| x * a),
+                }
+            }
+            fn mul(&self, other: &Self) -> Self {
+                let k = self.g.len();
+                let mut h = &self.h * other.v + &other.h * self.v;
+                for i in 0..k {
+                    for j in 0..k {
+                        h[[i, j]] += self.g[i] * other.g[j] + other.g[i] * self.g[j];
+                    }
+                }
+                Self {
+                    v: self.v * other.v,
+                    g: &self.g * other.v + &other.g * self.v,
+                    h,
+                }
+            }
+            fn square(&self) -> Self {
+                self.mul(self)
+            }
+            fn cube(&self) -> Self {
+                self.mul(self).mul(self)
+            }
+        }
+
+        let mut hdiag = Vec::with_capacity(n);
+        for row in 0..n {
+            let x = x_dense.row(row);
+            let mut jet = Jet::constant(x.dot(&k_mat.dot(&x.to_owned())), k);
+            for a in 0..k {
+                jet.g[a] = x.dot(&k_i[a].dot(&x.to_owned()));
+            }
+            for a in 0..k {
+                for b in 0..k {
+                    jet.h[[a, b]] = x.dot(&k_ij[a][b].dot(&x.to_owned()));
+                }
+            }
+            hdiag.push(jet);
+        }
+        let mut cjet = Vec::with_capacity(n);
+        let mut djet = Vec::with_capacity(n);
+        for row in 0..n {
+            let mut eta = Jet::constant(0.0, k);
+            for a in 0..k {
+                eta.g[a] = eta_i[a][row];
+                for b in 0..k {
+                    eta.h[[a, b]] = x_dense.row(row).dot(&beta_ij[a][b]);
+                }
+            }
+            let mut c = Jet::constant(c_array[row], k);
+            let mut d = Jet::constant(d_array[row], k);
+            for a in 0..k {
+                c.g[a] = d_array[row] * eta.g[a];
+                d.g[a] = e_array[row] * eta.g[a];
+                for b in 0..k {
+                    c.h[[a, b]] = d_array[row] * eta.h[[a, b]] + e_array[row] * eta.g[a] * eta.g[b];
+                    d.h[[a, b]] = e_array[row] * eta.h[[a, b]] + f_array[row] * eta.g[a] * eta.g[b];
+                }
+            }
+            cjet.push(c);
+            djet.push(d);
+        }
+
+        let mut total = Jet::constant(0.0, k);
+        for row in 0..n {
+            total = total.add(&djet[row].mul(&hdiag[row].square()).scale(-0.125));
+        }
+        for irow in 0..n {
+            let xi = x_dense.row(irow).to_owned();
+            for jrow in 0..n {
+                let xj = x_dense.row(jrow).to_owned();
+                let mut kg = Jet::constant(xi.dot(&k_mat.dot(&xj)), k);
+                for a in 0..k {
+                    kg.g[a] = xi.dot(&k_i[a].dot(&xj));
+                }
+                for a in 0..k {
+                    for b in 0..k {
+                        kg.h[[a, b]] = xi.dot(&k_ij[a][b].dot(&xj));
+                    }
+                }
+                let term = cjet[irow]
+                    .mul(&cjet[jrow])
+                    .mul(&kg.cube())
+                    .scale(1.0 / 12.0);
+                total = total.add(&term);
+            }
+        }
+        let mut qjets: Vec<Jet> = (0..p).map(|_| Jet::constant(0.0, k)).collect();
+        for row in 0..n {
+            let wh = cjet[row].mul(&hdiag[row]);
+            for col in 0..p {
+                qjets[col] = qjets[col].add(&wh.scale(x_dense[[row, col]]));
+            }
+        }
+        for a in 0..p {
+            for b in 0..p {
+                let mut kj = Jet::constant(k_mat[[a, b]], k);
+                for i in 0..k {
+                    kj.g[i] = k_i[i][[a, b]];
+                }
+                for i in 0..k {
+                    for j in 0..k {
+                        kj.h[[i, j]] = k_ij[i][j][[a, b]];
+                    }
+                }
+                total = total.add(&qjets[a].mul(&kj).mul(&qjets[b]).scale(0.125));
+            }
+        }
+        if total.h.iter().any(|v| !v.is_finite()) {
+            return Err(EstimationError::InvalidInput(
+                "Tierney-Kadane analytic Hessian produced a non-finite entry".to_string(),
+            ));
+        }
+        Ok(total.h)
+    }
+
     fn tierney_kadane_analytic_core(
         &self,
         x_dense: &Array2<f64>,
@@ -835,12 +1125,14 @@ impl<'a> RemlState<'a> {
         c_array: &Array1<f64>,
         d_array: &Array1<f64>,
         e_array: &Array1<f64>,
+        f_array: &Array1<f64>,
         tk_penalties: &[crate::construction::CanonicalPenalty],
         lambdas: &[f64],
         ext_coords: &[super::unified::HyperCoord],
         beta: &Array1<f64>,
         firth_op: Option<&super::FirthDenseOperator>,
         compute_gradient: bool,
+        compute_hessian: bool,
         h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
     ) -> Result<TkCorrectionTerms, EstimationError> {
         let p = x_dense.ncols();
@@ -859,6 +1151,7 @@ impl<'a> RemlState<'a> {
             return Ok(TkCorrectionTerms {
                 value,
                 gradient: None,
+                hessian: None,
             });
         }
 
@@ -926,9 +1219,26 @@ impl<'a> RemlState<'a> {
             &shared,
             &mut gram,
         )?;
+        let hessian = if compute_hessian {
+            Some(Self::tk_hessian_rho_canonical_logit(
+                x_dense,
+                c_array,
+                d_array,
+                e_array,
+                f_array,
+                tk_penalties,
+                lambdas,
+                beta,
+                firth_op,
+                h_inv_solve,
+            )?)
+        } else {
+            None
+        };
         Ok(TkCorrectionTerms {
             value,
             gradient: Some(gradient),
+            hessian,
         })
     }
 
@@ -943,17 +1253,19 @@ impl<'a> RemlState<'a> {
             return Ok(TkCorrectionTerms {
                 value: 0.0,
                 gradient: None,
+                hessian: None,
             });
         }
         if !self.config.firth_bias_reduction {
             return Ok(TkCorrectionTerms {
                 value: 0.0,
                 gradient: None,
+                hessian: None,
             });
         }
 
         let pirls_result = bundle.pirls_result.as_ref();
-        let (c_array, d_array, e_array) = self.hessian_cde_arrays(pirls_result)?;
+        let (c_array, d_array, e_array, f_array) = self.hessian_cdef_arrays(pirls_result)?;
         if let Some(idx) = c_array.iter().position(|v| !v.is_finite()) {
             return Err(EstimationError::InvalidInput(format!(
                 "Tierney-Kadane correction received non-finite c derivative at row {idx}: {}",
@@ -967,16 +1279,19 @@ impl<'a> RemlState<'a> {
             )));
         }
         let compute_gradient = compute_gradient_for_tk(mode);
-        if mode == super::unified::EvalMode::ValueGradientHessian {
-            return Err(EstimationError::InvalidInput(
-                "Tierney-Kadane outer Hessian requires analytic second derivatives".to_string(),
-            ));
-        }
         if c_array.is_empty() || d_array.is_empty() {
             return Ok(TkCorrectionTerms {
                 value: 0.0,
                 gradient: if compute_gradient {
                     Some(Array1::zeros(rho.len() + ext_coords.len()))
+                } else {
+                    None
+                },
+                hessian: if mode == super::unified::EvalMode::ValueGradientHessian {
+                    Some(Array2::zeros((
+                        rho.len() + ext_coords.len(),
+                        rho.len() + ext_coords.len(),
+                    )))
                 } else {
                     None
                 },
@@ -1028,12 +1343,14 @@ impl<'a> RemlState<'a> {
                 &c_array,
                 &d_array,
                 &e_array,
+                &f_array,
                 &self.canonical_penalties,
                 &lambdas,
                 ext_coords,
                 &beta,
                 firth_op.as_deref(),
                 compute_gradient,
+                mode == super::unified::EvalMode::ValueGradientHessian,
                 &h_inv_solve,
             );
         }
@@ -1172,12 +1489,14 @@ impl<'a> RemlState<'a> {
             &c_array,
             &d_array,
             &e_array,
+            &f_array,
             &tk_penalties,
             &lambdas,
             ext_coords,
             &beta,
             firth_op.as_deref(),
             compute_gradient,
+            mode == super::unified::EvalMode::ValueGradientHessian,
             &h_inv_solve,
         )
     }
@@ -1209,6 +1528,12 @@ impl<'a> RemlState<'a> {
         tk_terms: TkCorrectionTerms,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         result.cost += tk_terms.value;
+        if let Some(tk_hess) = tk_terms.hessian.as_ref() {
+            result
+                .hessian
+                .add_rho_block_dense(tk_hess)
+                .map_err(EstimationError::InvalidInput)?;
+        }
         if let (Some(ref mut grad), Some(tk_grad)) = (result.gradient.as_mut(), tk_terms.gradient) {
             if tk_grad.len() == grad.len() {
                 **grad += &tk_grad;
@@ -1514,6 +1839,37 @@ impl<'a> RemlState<'a> {
             })?;
 
         Ok((c_array, d_array, e_array))
+    }
+
+    fn hessian_cdef_arrays(
+        &self,
+        pirls_result: &PirlsResult,
+    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
+        let (c_array, d_array, e_array) = self.hessian_cde_arrays(pirls_result)?;
+        let link_function = self.config.link_function();
+        let canonical_logit = matches!(link_function, LinkFunction::Logit)
+            && self.runtime_mixture_link_state.is_none();
+        if !canonical_logit {
+            return Err(EstimationError::InvalidInput(
+                "Tierney-Kadane outer Hessian is implemented for canonical Binomial Logit Firth fits only".to_string(),
+            ));
+        }
+        let mut f_array = Array1::<f64>::zeros(e_array.len());
+        use rayon::prelude::*;
+        let final_eta = &pirls_result.final_eta;
+        let weights = &self.weights;
+        let f_s = f_array.as_slice_mut().expect("f_array must be contiguous");
+        f_s.par_iter_mut().enumerate().for_each(|(i, f_o)| {
+            let eta_raw = final_eta[i];
+            let eta_used = eta_raw.clamp(-700.0_f64, 700.0_f64);
+            if eta_raw != eta_used {
+                *f_o = 0.0;
+            } else {
+                let jet = crate::mixture_link::logit_inverse_link_jet5(eta_used);
+                *f_o = weights[i].max(0.0) * jet.d5;
+            }
+        });
+        Ok((c_array, d_array, e_array, f_array))
     }
 
     /// Compute soft prior cost without needing workspace
