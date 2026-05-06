@@ -9278,12 +9278,7 @@ fn joint_outer_evaluate_efs(
         } else {
             Box::new(BorrowedJointDerivProvider {
                 compute_dh,
-<<<<<<< ours
                 compute_d2h,
-=======
-                compute_d2h: compute_d2h_ref,
-                family_outer_hessian_operator: None,
->>>>>>> theirs
             })
         };
 
