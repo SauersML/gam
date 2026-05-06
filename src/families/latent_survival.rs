@@ -1452,6 +1452,67 @@ struct LatentSurvivalJointSlices {
     total: usize,
 }
 
+#[derive(Clone)]
+struct LatentSurvivalJointGradientAccum {
+    ll: f64,
+    gradient: Array1<f64>,
+}
+
+#[derive(Clone)]
+struct LatentSurvivalJointDenseAccum {
+    ll: f64,
+    gradient: Array1<f64>,
+    hessian: Array2<f64>,
+}
+
+#[derive(Clone)]
+struct LatentSurvivalDenseHessianAccum {
+    hessian: Array2<f64>,
+}
+
+/// Process latent-survival rows in fixed contiguous chunks, using one
+/// accumulator per rayon task and reducing those accumulators in chunk-index
+/// order so gradient/Hessian assembly stays deterministic across runs.
+fn deterministic_latent_survival_row_reduction<Acc, Init, Process, Combine>(
+    n_rows: usize,
+    init: Init,
+    process_row: Process,
+    mut combine: Combine,
+) -> Result<Acc, String>
+where
+    Acc: Send,
+    Init: Fn() -> Acc + Sync,
+    Process: Fn(usize, &mut Acc) -> Result<(), String> + Sync,
+    Combine: FnMut(&mut Acc, Acc),
+{
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    const TARGET_CHUNK_COUNT: usize = 32;
+    if n_rows == 0 {
+        return Ok(init());
+    }
+    let chunk_size = n_rows.div_ceil(TARGET_CHUNK_COUNT).max(1);
+    let n_chunks = n_rows.div_ceil(chunk_size);
+    let chunk_accumulators: Vec<Acc> = (0..n_chunks)
+        .into_par_iter()
+        .map(|chunk_idx| -> Result<Acc, String> {
+            let start = chunk_idx * chunk_size;
+            let end = (start + chunk_size).min(n_rows);
+            let mut acc = init();
+            for row_idx in start..end {
+                process_row(row_idx, &mut acc)?;
+            }
+            Ok(acc)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let mut total = init();
+    for acc in chunk_accumulators {
+        combine(&mut total, acc);
+    }
+    Ok(total)
+}
+
 impl LatentSurvivalFamily {
     fn joint_slices(&self) -> LatentSurvivalJointSlices {
         let p_time = self.x_time_exit.ncols();
@@ -1701,49 +1762,60 @@ impl LatentSurvivalFamily {
         let sigma = self.latent_sd(block_states)?;
         let slices = self.joint_slices();
         let include_log_sigma = slices.log_sigma.is_some();
-        let mut ll = 0.0;
-        let mut gradient = Array1::<f64>::zeros(slices.total);
-        for row_idx in 0..self.event_target.len() {
-            let wi = self.weights[row_idx];
-            if wi <= MIN_WEIGHT {
-                continue;
-            }
-            let event_type = if self.event_target[row_idx] >= 1 {
-                LatentSurvivalEventType::ExactEvent
-            } else {
-                LatentSurvivalEventType::RightCensored
-            };
-            let row = build_latent_survival_row(
-                row_idx,
-                self.hazard_loading,
-                event_type,
-                q_entry[row_idx],
-                q_exit[row_idx],
-                qdot_exit[row_idx],
-                self.unloaded_mass_entry[row_idx],
-                self.unloaded_mass_exit[row_idx],
-                self.unloaded_hazard_exit[row_idx],
-            )?;
-            let (row_ll, primary_gradient, _) = latent_survival_row_primary_gradient_hessian(
-                &self.quadctx,
-                &row,
-                q_entry[row_idx],
-                q_exit[row_idx],
-                qdot_exit[row_idx],
-                mu[row_idx],
-                sigma,
-                include_log_sigma,
-            )?;
-            ll += wi * row_ll;
-            self.add_pullback_primary_gradient(
-                &mut gradient,
-                row_idx,
-                &slices,
-                &primary_gradient,
-                wi,
-            );
-        }
-        Ok((ll, gradient))
+        let total = slices.total;
+        let acc = deterministic_latent_survival_row_reduction(
+            self.event_target.len(),
+            || LatentSurvivalJointGradientAccum {
+                ll: 0.0,
+                gradient: Array1::<f64>::zeros(total),
+            },
+            |row_idx, acc| {
+                let wi = self.weights[row_idx];
+                if wi <= MIN_WEIGHT {
+                    return Ok(());
+                }
+                let event_type = if self.event_target[row_idx] >= 1 {
+                    LatentSurvivalEventType::ExactEvent
+                } else {
+                    LatentSurvivalEventType::RightCensored
+                };
+                let row = build_latent_survival_row(
+                    row_idx,
+                    self.hazard_loading,
+                    event_type,
+                    q_entry[row_idx],
+                    q_exit[row_idx],
+                    qdot_exit[row_idx],
+                    self.unloaded_mass_entry[row_idx],
+                    self.unloaded_mass_exit[row_idx],
+                    self.unloaded_hazard_exit[row_idx],
+                )?;
+                let (row_ll, primary_gradient, _) = latent_survival_row_primary_gradient_hessian(
+                    &self.quadctx,
+                    &row,
+                    q_entry[row_idx],
+                    q_exit[row_idx],
+                    qdot_exit[row_idx],
+                    mu[row_idx],
+                    sigma,
+                    include_log_sigma,
+                )?;
+                acc.ll += wi * row_ll;
+                self.add_pullback_primary_gradient(
+                    &mut acc.gradient,
+                    row_idx,
+                    &slices,
+                    &primary_gradient,
+                    wi,
+                );
+                Ok(())
+            },
+            |total_acc, chunk_acc| {
+                total_acc.ll += chunk_acc.ll;
+                total_acc.gradient += &chunk_acc.gradient;
+            },
+        )?;
+        Ok((acc.ll, acc.gradient))
     }
 
     /// Block-diagonal-only pullback: writes only time-time, mean-mean, and
@@ -1915,57 +1987,69 @@ impl LatentSurvivalFamily {
         let sigma = self.latent_sd(block_states)?;
         let slices = self.joint_slices();
         let include_log_sigma = slices.log_sigma.is_some();
-        let mut ll = 0.0;
-        let mut gradient = Array1::<f64>::zeros(slices.total);
-        let mut hessian = Array2::<f64>::zeros((slices.total, slices.total));
-        for row_idx in 0..self.event_target.len() {
-            let wi = self.weights[row_idx];
-            if wi <= MIN_WEIGHT {
-                continue;
-            }
-            let event_type = if self.event_target[row_idx] >= 1 {
-                LatentSurvivalEventType::ExactEvent
-            } else {
-                LatentSurvivalEventType::RightCensored
-            };
-            let row = build_latent_survival_row(
-                row_idx,
-                self.hazard_loading,
-                event_type,
-                q_entry[row_idx],
-                q_exit[row_idx],
-                qdot_exit[row_idx],
-                self.unloaded_mass_entry[row_idx],
-                self.unloaded_mass_exit[row_idx],
-                self.unloaded_hazard_exit[row_idx],
-            )?;
-            let (row_ll, primary_gradient, primary_hessian) =
-                latent_survival_row_primary_gradient_hessian(
-                    &self.quadctx,
-                    &row,
+        let total = slices.total;
+        let acc = deterministic_latent_survival_row_reduction(
+            self.event_target.len(),
+            || LatentSurvivalJointDenseAccum {
+                ll: 0.0,
+                gradient: Array1::<f64>::zeros(total),
+                hessian: Array2::<f64>::zeros((total, total)),
+            },
+            |row_idx, acc| {
+                let wi = self.weights[row_idx];
+                if wi <= MIN_WEIGHT {
+                    return Ok(());
+                }
+                let event_type = if self.event_target[row_idx] >= 1 {
+                    LatentSurvivalEventType::ExactEvent
+                } else {
+                    LatentSurvivalEventType::RightCensored
+                };
+                let row = build_latent_survival_row(
+                    row_idx,
+                    self.hazard_loading,
+                    event_type,
                     q_entry[row_idx],
                     q_exit[row_idx],
                     qdot_exit[row_idx],
-                    mu[row_idx],
-                    sigma,
-                    include_log_sigma,
+                    self.unloaded_mass_entry[row_idx],
+                    self.unloaded_mass_exit[row_idx],
+                    self.unloaded_hazard_exit[row_idx],
                 )?;
-            ll += wi * row_ll;
-            self.add_pullback_primary_gradient(
-                &mut gradient,
-                row_idx,
-                &slices,
-                &primary_gradient,
-                wi,
-            );
-            self.add_pullback_primary_hessian(
-                &mut hessian,
-                row_idx,
-                &slices,
-                &(wi * primary_hessian),
-            );
-        }
-        Ok((ll, gradient, hessian))
+                let (row_ll, primary_gradient, primary_hessian) =
+                    latent_survival_row_primary_gradient_hessian(
+                        &self.quadctx,
+                        &row,
+                        q_entry[row_idx],
+                        q_exit[row_idx],
+                        qdot_exit[row_idx],
+                        mu[row_idx],
+                        sigma,
+                        include_log_sigma,
+                    )?;
+                acc.ll += wi * row_ll;
+                self.add_pullback_primary_gradient(
+                    &mut acc.gradient,
+                    row_idx,
+                    &slices,
+                    &primary_gradient,
+                    wi,
+                );
+                self.add_pullback_primary_hessian(
+                    &mut acc.hessian,
+                    row_idx,
+                    &slices,
+                    &(wi * primary_hessian),
+                );
+                Ok(())
+            },
+            |total_acc, chunk_acc| {
+                total_acc.ll += chunk_acc.ll;
+                total_acc.gradient += &chunk_acc.gradient;
+                total_acc.hessian += &chunk_acc.hessian;
+            },
+        )?;
+        Ok((acc.ll, acc.gradient, acc.hessian))
     }
 
     fn exact_newton_joint_hessian_directional_derivative_dense(
@@ -1984,43 +2068,58 @@ impl LatentSurvivalFamily {
             ));
         }
         let include_log_sigma = slices.log_sigma.is_some();
-        let mut out = Array2::<f64>::zeros((slices.total, slices.total));
-        for row_idx in 0..self.event_target.len() {
-            let wi = self.weights[row_idx];
-            if wi <= MIN_WEIGHT {
-                continue;
-            }
-            let event_type = if self.event_target[row_idx] >= 1 {
-                LatentSurvivalEventType::ExactEvent
-            } else {
-                LatentSurvivalEventType::RightCensored
-            };
-            let row = build_latent_survival_row(
-                row_idx,
-                self.hazard_loading,
-                event_type,
-                q_entry[row_idx],
-                q_exit[row_idx],
-                qdot_exit[row_idx],
-                self.unloaded_mass_entry[row_idx],
-                self.unloaded_mass_exit[row_idx],
-                self.unloaded_hazard_exit[row_idx],
-            )?;
-            let direction = self.row_primary_direction_from_flat(row_idx, &slices, d_beta_flat);
-            let third = latent_survival_row_primary_third_contracted(
-                &self.quadctx,
-                &row,
-                q_entry[row_idx],
-                q_exit[row_idx],
-                qdot_exit[row_idx],
-                mu[row_idx],
-                sigma,
-                &direction,
-                include_log_sigma,
-            )?;
-            self.add_pullback_primary_hessian(&mut out, row_idx, &slices, &(wi * third));
-        }
-        Ok(out)
+        let total = slices.total;
+        let acc = deterministic_latent_survival_row_reduction(
+            self.event_target.len(),
+            || LatentSurvivalDenseHessianAccum {
+                hessian: Array2::<f64>::zeros((total, total)),
+            },
+            |row_idx, acc| {
+                let wi = self.weights[row_idx];
+                if wi <= MIN_WEIGHT {
+                    return Ok(());
+                }
+                let event_type = if self.event_target[row_idx] >= 1 {
+                    LatentSurvivalEventType::ExactEvent
+                } else {
+                    LatentSurvivalEventType::RightCensored
+                };
+                let row = build_latent_survival_row(
+                    row_idx,
+                    self.hazard_loading,
+                    event_type,
+                    q_entry[row_idx],
+                    q_exit[row_idx],
+                    qdot_exit[row_idx],
+                    self.unloaded_mass_entry[row_idx],
+                    self.unloaded_mass_exit[row_idx],
+                    self.unloaded_hazard_exit[row_idx],
+                )?;
+                let direction = self.row_primary_direction_from_flat(row_idx, &slices, d_beta_flat);
+                let third = latent_survival_row_primary_third_contracted(
+                    &self.quadctx,
+                    &row,
+                    q_entry[row_idx],
+                    q_exit[row_idx],
+                    qdot_exit[row_idx],
+                    mu[row_idx],
+                    sigma,
+                    &direction,
+                    include_log_sigma,
+                )?;
+                self.add_pullback_primary_hessian(
+                    &mut acc.hessian,
+                    row_idx,
+                    &slices,
+                    &(wi * third),
+                );
+                Ok(())
+            },
+            |total_acc, chunk_acc| {
+                total_acc.hessian += &chunk_acc.hessian;
+            },
+        )?;
+        Ok(acc.hessian)
     }
 
     fn exact_newton_joint_hessian_second_directional_derivative_dense(
@@ -2041,45 +2140,62 @@ impl LatentSurvivalFamily {
             ));
         }
         let include_log_sigma = slices.log_sigma.is_some();
-        let mut out = Array2::<f64>::zeros((slices.total, slices.total));
-        for row_idx in 0..self.event_target.len() {
-            let wi = self.weights[row_idx];
-            if wi <= MIN_WEIGHT {
-                continue;
-            }
-            let event_type = if self.event_target[row_idx] >= 1 {
-                LatentSurvivalEventType::ExactEvent
-            } else {
-                LatentSurvivalEventType::RightCensored
-            };
-            let row = build_latent_survival_row(
-                row_idx,
-                self.hazard_loading,
-                event_type,
-                q_entry[row_idx],
-                q_exit[row_idx],
-                qdot_exit[row_idx],
-                self.unloaded_mass_entry[row_idx],
-                self.unloaded_mass_exit[row_idx],
-                self.unloaded_hazard_exit[row_idx],
-            )?;
-            let direction_u = self.row_primary_direction_from_flat(row_idx, &slices, d_beta_u_flat);
-            let direction_v = self.row_primary_direction_from_flat(row_idx, &slices, d_beta_v_flat);
-            let fourth = latent_survival_row_primary_fourth_contracted(
-                &self.quadctx,
-                &row,
-                q_entry[row_idx],
-                q_exit[row_idx],
-                qdot_exit[row_idx],
-                mu[row_idx],
-                sigma,
-                &direction_u,
-                &direction_v,
-                include_log_sigma,
-            )?;
-            self.add_pullback_primary_hessian(&mut out, row_idx, &slices, &(wi * fourth));
-        }
-        Ok(out)
+        let total = slices.total;
+        let acc = deterministic_latent_survival_row_reduction(
+            self.event_target.len(),
+            || LatentSurvivalDenseHessianAccum {
+                hessian: Array2::<f64>::zeros((total, total)),
+            },
+            |row_idx, acc| {
+                let wi = self.weights[row_idx];
+                if wi <= MIN_WEIGHT {
+                    return Ok(());
+                }
+                let event_type = if self.event_target[row_idx] >= 1 {
+                    LatentSurvivalEventType::ExactEvent
+                } else {
+                    LatentSurvivalEventType::RightCensored
+                };
+                let row = build_latent_survival_row(
+                    row_idx,
+                    self.hazard_loading,
+                    event_type,
+                    q_entry[row_idx],
+                    q_exit[row_idx],
+                    qdot_exit[row_idx],
+                    self.unloaded_mass_entry[row_idx],
+                    self.unloaded_mass_exit[row_idx],
+                    self.unloaded_hazard_exit[row_idx],
+                )?;
+                let direction_u =
+                    self.row_primary_direction_from_flat(row_idx, &slices, d_beta_u_flat);
+                let direction_v =
+                    self.row_primary_direction_from_flat(row_idx, &slices, d_beta_v_flat);
+                let fourth = latent_survival_row_primary_fourth_contracted(
+                    &self.quadctx,
+                    &row,
+                    q_entry[row_idx],
+                    q_exit[row_idx],
+                    qdot_exit[row_idx],
+                    mu[row_idx],
+                    sigma,
+                    &direction_u,
+                    &direction_v,
+                    include_log_sigma,
+                )?;
+                self.add_pullback_primary_hessian(
+                    &mut acc.hessian,
+                    row_idx,
+                    &slices,
+                    &(wi * fourth),
+                );
+                Ok(())
+            },
+            |total_acc, chunk_acc| {
+                total_acc.hessian += &chunk_acc.hessian;
+            },
+        )?;
+        Ok(acc.hessian)
     }
 }
 
@@ -2681,6 +2797,45 @@ mod tests {
         array![0.15, 0.25, 0.1, -0.15, 0.35_f64.ln()]
     }
 
+    fn survival_stress_test_family(n: usize) -> LatentSurvivalFamily {
+        LatentSurvivalFamily {
+            event_target: Array1::from_iter((0..n).map(|i| if i % 3 == 0 { 1u8 } else { 0u8 })),
+            weights: Array1::from_iter((0..n).map(|i| 0.55 + 0.03 * ((i % 7) as f64))),
+            latent_sd_fixed: None,
+            hazard_loading: HazardLoading::LoadedVsUnloaded,
+            unloaded_mass_entry: Array1::from_iter(
+                (0..n).map(|i| 0.015 + 0.0015 * ((i % 11) as f64)),
+            ),
+            unloaded_mass_exit: Array1::from_iter((0..n).map(|i| 0.06 + 0.002 * ((i % 13) as f64))),
+            unloaded_hazard_exit: Array1::from_iter((0..n).map(|i| {
+                if i % 4 == 0 {
+                    0.018 + 0.001 * ((i % 5) as f64)
+                } else {
+                    0.0
+                }
+            })),
+            x_time_entry: Array2::from_shape_fn((n, 4), |(i, j)| {
+                0.2 + 0.03 * ((i + 2 * j) % 9) as f64 - if j == 1 { 0.12 } else { 0.0 }
+            }),
+            x_time_exit: Array2::from_shape_fn((n, 4), |(i, j)| {
+                0.35 + 0.025 * ((2 * i + j) % 10) as f64 - if j == 2 { 0.08 } else { 0.0 }
+            }),
+            x_time_derivative_exit: Array2::from_shape_fn((n, 4), |(i, j)| {
+                0.45 + 0.015 * ((i + 3 * j) % 8) as f64
+            }),
+            x_mean: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::from_shape_fn(
+                (n, 3),
+                |(i, j)| 0.1 + 0.04 * ((3 * i + j) % 7) as f64 - if j == 0 { 0.18 } else { 0.0 },
+            ))),
+            time_linear_constraints: None,
+            quadctx: Arc::new(QuadratureContext::new()),
+        }
+    }
+
+    fn survival_stress_test_joint_beta() -> Array1<f64> {
+        array![0.18, 0.11, 0.07, 0.13, -0.09, 0.05, 0.12, 0.42_f64.ln()]
+    }
+
     fn latent_survival_states_from_joint_beta(
         family: &LatentSurvivalFamily,
         joint_beta: &Array1<f64>,
@@ -2948,6 +3103,64 @@ mod tests {
                 -((&gradient_plus - &gradient_minus) / (2.0 * h))
             );
         }
+    }
+
+    #[test]
+    fn latent_survival_exact_joint_parallel_stress_is_repeatable() {
+        let family = survival_stress_test_family(96);
+        let beta = survival_stress_test_joint_beta();
+        let states = latent_survival_states_from_joint_beta(&family, &beta);
+        let direction_u = array![0.03, -0.02, 0.01, 0.04, -0.015, 0.025, -0.005, 0.02];
+        let direction_v = array![-0.01, 0.035, -0.025, 0.015, 0.02, -0.01, 0.03, -0.015];
+
+        let (ll_a, grad_a) = family
+            .evaluate_exact_newton_joint_gradient_dense(&states)
+            .expect("stress joint gradient evaluation");
+        let (ll_b, grad_b) = family
+            .evaluate_exact_newton_joint_gradient_dense(&states)
+            .expect("repeat stress joint gradient evaluation");
+        assert_eq!(ll_a.to_bits(), ll_b.to_bits());
+        assert_eq!(grad_a, grad_b);
+
+        let (joint_ll_a, joint_grad_a, hess_a) = family
+            .evaluate_exact_newton_joint_dense(&states)
+            .expect("stress joint dense evaluation");
+        let (joint_ll_b, joint_grad_b, hess_b) = family
+            .evaluate_exact_newton_joint_dense(&states)
+            .expect("repeat stress joint dense evaluation");
+        assert_eq!(joint_ll_a.to_bits(), joint_ll_b.to_bits());
+        assert_eq!(joint_grad_a, joint_grad_b);
+        assert_eq!(hess_a, hess_b);
+        assert!(hess_a.iter().all(|value| value.is_finite()));
+        assert!(max_relative_array2(&hess_a, &hess_a.t().to_owned()) < 1e-12);
+
+        let dh_a = family
+            .exact_newton_joint_hessian_directional_derivative_dense(&states, &direction_u)
+            .expect("stress joint dH evaluation");
+        let dh_b = family
+            .exact_newton_joint_hessian_directional_derivative_dense(&states, &direction_u)
+            .expect("repeat stress joint dH evaluation");
+        assert_eq!(dh_a, dh_b);
+        assert!(dh_a.iter().all(|value| value.is_finite()));
+        assert!(max_relative_array2(&dh_a, &dh_a.t().to_owned()) < 1e-12);
+
+        let d2h_a = family
+            .exact_newton_joint_hessian_second_directional_derivative_dense(
+                &states,
+                &direction_u,
+                &direction_v,
+            )
+            .expect("stress joint d2H evaluation");
+        let d2h_b = family
+            .exact_newton_joint_hessian_second_directional_derivative_dense(
+                &states,
+                &direction_u,
+                &direction_v,
+            )
+            .expect("repeat stress joint d2H evaluation");
+        assert_eq!(d2h_a, d2h_b);
+        assert!(d2h_a.iter().all(|value| value.is_finite()));
+        assert!(max_relative_array2(&d2h_a, &d2h_a.t().to_owned()) < 1e-12);
     }
 
     #[test]
