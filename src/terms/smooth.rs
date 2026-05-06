@@ -4400,6 +4400,10 @@ fn apply_global_smooth_identifiability(
 
     let mut processed_owner_indices = Vec::<usize>::with_capacity(smooth.terms.len());
 
+    use rayon::iter::{
+        IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+    };
+
     for &idx in &ownership_order {
         let term = &smooth.terms[idx];
         let termspec = &smoothspecs[idx];
@@ -4410,15 +4414,25 @@ fn apply_global_smooth_identifiability(
             Vec::new()
         } else {
             let overlap_tol = 1e-10;
+            let owner_cross_checks = processed_owner_indices
+                .iter()
+                .copied()
+                .filter(|&owner_idx| {
+                    smooth_is_owned_by_prior_term(&smoothspecs[owner_idx], termspec)
+                })
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .map(|owner_idx| {
+                    let owner_design = local_designs[owner_idx]
+                        .as_ref()
+                        .expect("owner design must be available before dependent smooth");
+                    design_cross_relative_residual(&design_local, owner_design)
+                        .map(|rel| (owner_idx, rel))
+                })
+                .collect::<Vec<_>>();
             let mut out = Vec::new();
-            for owner_idx in processed_owner_indices.iter().copied() {
-                if !smooth_is_owned_by_prior_term(&smoothspecs[owner_idx], termspec) {
-                    continue;
-                }
-                let owner_design = local_designs[owner_idx]
-                    .as_ref()
-                    .expect("owner design must be available before dependent smooth");
-                let rel = design_cross_relative_residual(&design_local, owner_design)?;
+            for check in owner_cross_checks {
+                let (owner_idx, rel) = check?;
                 if rel > overlap_tol {
                     out.push(owner_idx);
                 }
@@ -4492,8 +4506,6 @@ fn apply_global_smooth_identifiability(
             }
         }
 
-        let mut penalties_constrained =
-            Vec::<Array2<f64>>::with_capacity(term.penalties_local.len());
         let active_penaltyinfo = term
             .penaltyinfo_local
             .iter()
@@ -4508,30 +4520,33 @@ fn apply_global_smooth_identifiability(
                 term.penalties_local.len()
             )));
         }
-        for s_local in &term.penalties_local {
-            let s_con = if let Some(z) = z_opt.as_ref() {
-                let zt_s = z.t().dot(s_local);
-                zt_s.dot(z)
-            } else {
-                s_local.clone()
-            };
-            penalties_constrained.push(s_con);
-        }
+        let penalties_constrained: Vec<Array2<f64>> = term
+            .penalties_local
+            .par_iter()
+            .map(|s_local| {
+                if let Some(z) = z_opt.as_ref() {
+                    let zt_s = z.t().dot(s_local);
+                    zt_s.dot(z)
+                } else {
+                    s_local.clone()
+                }
+            })
+            .collect();
         let penalty_candidates = penalties_constrained
-            .into_iter()
-            .zip(active_penaltyinfo.into_iter())
-            .map(|(matrix, info)| -> Result<PenaltyCandidate, BasisError> {
+            .into_par_iter()
+            .zip(active_penaltyinfo.into_par_iter())
+            .map(|(matrix, info)| {
                 let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
-                Ok(PenaltyCandidate {
+                PenaltyCandidate {
                     nullspace_dim_hint: info.nullspace_dim_hint,
                     matrix,
                     source: info.source,
                     normalization_scale: info.normalization_scale * c_new,
                     kronecker_factors: None,
                     op: None,
-                })
+                }
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Vec<_>>();
         let (penalties_constrained, nullspace_constrained, penaltyinfo_constrained) =
             filter_active_penalty_candidates(penalty_candidates)?;
         let linear_constraints_constrained =
