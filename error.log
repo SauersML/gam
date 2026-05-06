@@ -14340,3 +14340,651 @@ index d30a37928ca299908a3f020cabfbe01152a16217..6b66d044ce004acbea97733a619b5727
 
 ----- PATCH END -----
 
+[2026-05-06T21:01:28.927877+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T21:01:28.942510+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:01:28.942591+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:01:30.955674+00:00] apply_result: mode=apply id=task_e_69fb93cc0a3083248d2f59e6c88b85b9 status=Partial applied=2 skipped=0 conflicts=1 cmd=(cd /Users/user/gam && git apply --3way /var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/.tmpqlDVQa/patch.diff)
+stdout_tail=
+
+stderr_tail=
+Applied patch to 'src/families/custom_family.rs' cleanly.
+Applied patch to 'src/solver/reml/unified.rs' with conflicts.
+Applied patch to 'tests/autodiff_custom_family_joint_laml.rs' cleanly.
+U src/solver/reml/unified.rs
+
+patch_summary: kind=git-diff lines=596 chars=23888 cwd=/Users/user/gam ; head=
+diff --git a/src/families/custom_family.rs b/src/families/custom_family.rs
+index e901472ee99b0e33b9e194ac2d36bef076665274..dd0fa3f3750a989bfee677ebe080706acd9bda81 100644
+--- a/src/families/custom_family.rs
++++ b/src/families/custom_family.rs
+@@ -8531,54 +8531,57 @@ impl ExtCoordBundle {
+ 
+ /// Build the canonical unified REML/LAML assembly for a custom-family outer
+ /// evaluation.
+ fn build_custom_family_inner_assembly<'dp>(
+     inner: &BlockwiseInnerResult,
+     specs: &[ParameterBlockSpec],
+     per_block: &[Array1<f64>],
+     beta_flat: &Array1<f64>,
+     hessian_op: Arc<dyn crate::solver::estimate::reml::unified::HessianOperator>,
+     ranges: &[(usize, usize)],
+     total: usize,
+     ridge: f64,
+     rho_curvature_scale: f64,
+     hessian_logdet_correction: f64,
+     include_logde…
+----- PATCH BEGIN -----
+diff --git a/src/families/custom_family.rs b/src/families/custom_family.rs
+index e901472ee99b0e33b9e194ac2d36bef076665274..dd0fa3f3750a989bfee677ebe080706acd9bda81 100644
+--- a/src/families/custom_family.rs
++++ b/src/families/custom_family.rs
+@@ -8531,54 +8531,57 @@ impl ExtCoordBundle {
+ 
+ /// Build the canonical unified REML/LAML assembly for a custom-family outer
+ /// evaluation.
+ fn build_custom_family_inner_assembly<'dp>(
+     inner: &BlockwiseInnerResult,
+     specs: &[ParameterBlockSpec],
+     per_block: &[Array1<f64>],
+     beta_flat: &Array1<f64>,
+     hessian_op: Arc<dyn crate::solver::estimate::reml::unified::HessianOperator>,
+     ranges: &[(usize, usize)],
+     total: usize,
+     ridge: f64,
+     rho_curvature_scale: f64,
+     hessian_logdet_correction: f64,
+     include_logdet_h: bool,
+     include_logdet_s: bool,
+     options: &BlockwiseFitOptions,
+     deriv_provider: Box<dyn HessianDerivativeProvider + 'dp>,
+     ext_bundle: Option<ExtCoordBundle>,
+ ) -> Result<(crate::estimate::reml::assembly::InnerAssembly<'dp>, usize), String> {
+     use crate::estimate::reml::assembly::{
+         InnerAssembly, PenaltyBlockDesc, penalty_coords_from_blocks,
+     };
+ 
+     // Collect dense penalty matrices so references stay valid for the assembler.
+-    let per_block_penalties_dense: Vec<Vec<Array2<f64>>> = specs
+-        .iter()
+-        .map(|s| s.penalties.iter().map(|p| p.to_dense()).collect())
+-        .collect();
++    let per_block_penalties_dense: Vec<Vec<Array2<f64>>> = {
++        use rayon::iter::{IntoParallelIterator, ParallelIterator};
++        (0..specs.len())
++            .into_par_iter()
++            .map(|b| specs[b].penalties.iter().map(|p| p.to_dense()).collect())
++            .collect()
++    };
+     let block_descs: Vec<PenaltyBlockDesc> = (0..specs.len())
+         .flat_map(|b| {
+             let (start, end) = ranges[b];
+             per_block_penalties_dense[b]
+                 .iter()
+                 .map(move |dense| PenaltyBlockDesc {
+                     matrix: dense,
+                     range_start: start,
+                     range_end: end,
+                 })
+         })
+         .collect();
+     let penalty_coords = penalty_coords_from_blocks(&block_descs, total)?;
+ 
+     // Compute penalty logdet derivatives.
+     let per_block_penalties: Vec<&[Array2<f64>]> = per_block_penalties_dense
+         .iter()
+         .map(|v| v.as_slice())
+         .collect();
+     let penalty_logdet_ridge = if options.ridge_policy.include_penalty_logdet {
+         ridge
+     } else {
+         0.0
+     };
+     let per_block_nullspace_dims: Vec<&[usize]> =
+@@ -10412,84 +10415,86 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
+                     Some(source) => Some(source),
+                     None => exact_newton_joint_hessian_symmetrized(
+                         family,
+                         &inner.block_states,
+                         specs,
+                         total,
+                         "joint exact-newton Hessian shape mismatch in joint hyper evaluator",
+                     )
+                     .map(|source| source.map(JointHessianSource::Dense))?,
+                 }
+                 .ok_or_else(|| -> CustomFamilyError {
+                     "joint exact-newton Hessian unavailable for full [rho, psi] outer calculus"
+                         .to_string()
+                         .into()
+                 })?,
+                 1.0,
+                 0.0,
+                 false,
+             )
+         };
+ 
+         // Build the exact pseudologdet eigenspace for each penalty block so
+         // the value, ψ gradient, ψψ Hessian, and ρψ mixed block all
+         // differentiate the same log|S|_+ objective.
+         let s_logdet_blocks = if include_logdet_s {
+-            let mut blocks = Vec::with_capacity(specs.len());
+-            for (b, spec) in specs.iter().enumerate() {
+-                let p = spec.design.ncols();
+-                let lambdas = per_block[b].mapv(f64::exp);
+-                let mut s_lambda = Array2::<f64>::zeros((p, p));
+-                for (k, s) in spec.penalties.iter().enumerate() {
+-                    s.add_scaled_to(lambdas[k], &mut s_lambda);
+-                }
+-                if options.ridge_policy.include_penalty_logdet {
+-                    for d in 0..p {
+-                        s_lambda[[d, d]] += ridge;
++            use rayon::iter::{IntoParallelIterator, ParallelIterator};
++            let block_results: Vec<Result<PenaltyPseudologdet, String>> = (0..specs.len())
++                .into_par_iter()
++                .map(|b| {
++                    let spec = &specs[b];
++                    let p = spec.design.ncols();
++                    let lambdas = per_block[b].mapv(f64::exp);
++                    let mut s_lambda = Array2::<f64>::zeros((p, p));
++                    for (k, s) in spec.penalties.iter().enumerate() {
++                        s.add_scaled_to(lambdas[k], &mut s_lambda);
+                     }
+-                }
+-                let structural_nullity = if !spec.nullspace_dims.is_empty()
+-                    && spec.nullspace_dims.len() == spec.penalties.len()
+-                {
+-                    let penalties_dense: Vec<Array2<f64>> = spec
+-                        .penalties
+-                        .iter()
+-                        .map(|penalty| penalty.to_dense())
+-                        .collect();
+-                    Some(exact_intersection_nullity(
+-                        &penalties_dense,
+-                        &spec.nullspace_dims,
+-                    ))
+-                } else {
+-                    None
+-                };
+-                blocks.push(PenaltyPseudologdet::from_assembled_with_nullity(
+-                    s_lambda,
+-                    structural_nullity,
+-                )?);
+-            }
+-            Some(blocks)
++                    if options.ridge_policy.include_penalty_logdet {
++                        for d in 0..p {
++                            s_lambda[[d, d]] += ridge;
++                        }
++                    }
++                    let structural_nullity = if !spec.nullspace_dims.is_empty()
++                        && spec.nullspace_dims.len() == spec.penalties.len()
++                    {
++                        let penalties_dense: Vec<Array2<f64>> = spec
++                            .penalties
++                            .iter()
++                            .map(|penalty| penalty.to_dense())
++                            .collect();
++                        Some(exact_intersection_nullity(
++                            &penalties_dense,
++                            &spec.nullspace_dims,
++                        ))
++                    } else {
++                        None
++                    };
++                    PenaltyPseudologdet::from_assembled_with_nullity(s_lambda, structural_nullity)
++                })
++                .collect();
++            let blocks: Result<Vec<_>, _> = block_results.into_iter().collect();
++            Some(blocks?)
+         } else {
+             None
+         };
+ 
+         // Build ψ HyperCoords, pair callbacks, and drift derivative callback.
+         let hessian_beta_independent = !family.exact_newton_joint_hessian_beta_dependent();
+         let psi_workspace = if eval_mode != EvalMode::ValueOnly
+             && (eval_mode == EvalMode::ValueGradientHessian
+                 || family.exact_newton_joint_psi_workspace_for_first_order_terms())
+         {
+             family.exact_newton_joint_psi_workspace_with_options(
+                 synced_joint_states.as_ref(),
+                 specs,
+                 derivative_blocks.as_ref(),
+                 options,
+             )?
+         } else {
+             None
+         };
+ 
+         let rho_slice = rho_current
+             .as_slice()
+             .ok_or_else(|| "outer rho vector must be contiguous".to_string())?;
+         let ext_bundle = if eval_mode == EvalMode::ValueOnly {
+             None
+@@ -11164,84 +11169,86 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
+         };
+         (
+             match h_joint_unpen {
+                 Some(source) => Some(source),
+                 None => exact_newton_joint_hessian_symmetrized(
+                     family,
+                     &inner.block_states,
+                     specs,
+                     total,
+                     "joint exact-newton Hessian shape mismatch in joint hyper EFS evaluator",
+                 )
+                 .map(|source| source.map(JointHessianSource::Dense))?,
+             }
+             .ok_or_else(|| -> CustomFamilyError {
+                 "joint exact-newton Hessian unavailable for full [rho, psi] fixed-point outer calculus"
+                     .to_string()
+                     .into()
+             })?,
+             1.0,
+             0.0,
+             false,
+         )
+     };
+ 
+     let s_logdet_blocks = if include_logdet_s {
+-        let mut blocks = Vec::with_capacity(specs.len());
+-        for (b, spec) in specs.iter().enumerate() {
+-            let p = spec.design.ncols();
+-            let lambdas = per_block[b].mapv(f64::exp);
+-            let mut s_lambda = Array2::<f64>::zeros((p, p));
+-            for (k, s) in spec.penalties.iter().enumerate() {
+-                s.add_scaled_to(lambdas[k], &mut s_lambda);
+-            }
+-            if options.ridge_policy.include_penalty_logdet {
+-                for d in 0..p {
+-                    s_lambda[[d, d]] += ridge;
++        use rayon::iter::{IntoParallelIterator, ParallelIterator};
++        let block_results: Vec<Result<PenaltyPseudologdet, String>> = (0..specs.len())
++            .into_par_iter()
++            .map(|b| {
++                let spec = &specs[b];
++                let p = spec.design.ncols();
++                let lambdas = per_block[b].mapv(f64::exp);
++                let mut s_lambda = Array2::<f64>::zeros((p, p));
++                for (k, s) in spec.penalties.iter().enumerate() {
++                    s.add_scaled_to(lambdas[k], &mut s_lambda);
+                 }
+-            }
+-            let structural_nullity = if !spec.nullspace_dims.is_empty()
+-                && spec.nullspace_dims.len() == spec.penalties.len()
+-            {
+-                let penalties_dense: Vec<Array2<f64>> = spec
+-                    .penalties
+-                    .iter()
+-                    .map(|penalty| penalty.to_dense())
+-                    .collect();
+-                Some(exact_intersection_nullity(
+-                    &penalties_dense,
+-                    &spec.nullspace_dims,
+-                ))
+-            } else {
+-                None
+-            };
+-            blocks.push(PenaltyPseudologdet::from_assembled_with_nullity(
+-                s_lambda,
+-                structural_nullity,
+-            )?);
+-        }
+-        Some(blocks)
++                if options.ridge_policy.include_penalty_logdet {
++                    for d in 0..p {
++                        s_lambda[[d, d]] += ridge;
++                    }
++                }
++                let structural_nullity = if !spec.nullspace_dims.is_empty()
++                    && spec.nullspace_dims.len() == spec.penalties.len()
++                {
++                    let penalties_dense: Vec<Array2<f64>> = spec
++                        .penalties
++                        .iter()
++                        .map(|penalty| penalty.to_dense())
++                        .collect();
++                    Some(exact_intersection_nullity(
++                        &penalties_dense,
++                        &spec.nullspace_dims,
++                    ))
++                } else {
++                    None
++                };
++                PenaltyPseudologdet::from_assembled_with_nullity(s_lambda, structural_nullity)
++            })
++            .collect();
++        let blocks: Result<Vec<_>, _> = block_results.into_iter().collect();
++        Some(blocks?)
+     } else {
+         None
+     };
+ 
+     let hessian_beta_independent = !family.exact_newton_joint_hessian_beta_dependent();
+     let psi_workspace = if family.exact_newton_joint_psi_workspace_for_first_order_terms() {
+         family.exact_newton_joint_psi_workspace_with_options(
+             synced_joint_states.as_ref(),
+             specs,
+             derivative_blocks.as_ref(),
+             options,
+         )?
+     } else {
+         None
+     };
+     let rho_slice = rho_current
+         .as_slice()
+         .ok_or_else(|| "outer rho vector must be contiguous".to_string())?;
+     let psi_coords = build_psi_hyper_coords(
+         family,
+         synced_joint_states.as_ref(),
+         specs,
+         derivative_blocks.as_ref(),
+         &beta_flat,
+         rho_slice,
+diff --git a/src/solver/reml/unified.rs b/src/solver/reml/unified.rs
+index 3f93c29430becb5e5f288a4902893a85d01371bd..59c31adc3d7452d3e07d6dabdfa95381f18e3f0f 100644
+--- a/src/solver/reml/unified.rs
++++ b/src/solver/reml/unified.rs
+@@ -6549,108 +6549,111 @@ impl UnifiedOuterHessianOperator {
+ }
+ 
+ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessianOperator {
+     fn dim(&self) -> usize {
+         self.coords.len()
+     }
+ 
+     fn matvec(&self, alpha: &Array1<f64>) -> Result<Array1<f64>, String> {
+         if alpha.len() != self.coords.len() {
+             return Err(format!(
+                 "outer Hessian alpha length mismatch: got {}, expected {}",
+                 alpha.len(),
+                 self.coords.len()
+             ));
+         }
+         let mut a_alpha = 0.0;
+         for (idx, coord) in self.coords.iter().enumerate() {
+             if alpha[idx] != 0.0 {
+                 a_alpha += alpha[idx] * coord.a;
+             }
+         }
+         let correction_m_alpha = self.signed_mode_combo_for_correction(alpha);
+         let callback_neg_m_alpha =
+             matches!(self.kernel, OuterHessianDerivativeKernel::Callback { .. })
+                 .then(|| -&correction_m_alpha);
+-        let mut out = Array1::<f64>::zeros(self.coords.len());
+-
+-        for idx in 0..self.coords.len() {
+-            let coord = &self.coords[idx];
+-            let pair_a = self.pair_a.row(idx).dot(alpha);
+-            let pair_ld_s = self.pair_ld_s.row(idx).dot(alpha);
+-            let g_dot_v_alpha = self.g_dot_v.row(idx).dot(alpha);
+-            let base_h2 = self.base_h2.row(idx).dot(alpha);
+-            let m_terms = self.m_pair_trace.row(idx).dot(alpha);
+-
+-            let cross_trace = match self.cross_trace.as_ref() {
+-                Some(ct) => ct.row(idx).dot(alpha),
+-                None => 0.0,
+-            };
++        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+ 
+-            let correction = if self.incl_logdet_h {
+-                match &self.kernel {
+-                    OuterHessianDerivativeKernel::ScalarGlm { .. } => {
+-                        self.scalar_correction_trace(idx, alpha, &coord.v, &correction_m_alpha)?
+-                    }
+-                    OuterHessianDerivativeKernel::Callback { .. } => {
+-                        let second_v = &self
+-                            .callback_second_modes
+-                            .as_ref()
+-                            .expect("callback second modes")[idx];
+-                        let rhs = self.pair_rhs_combo(idx, alpha);
+-                        self.callback_correction_trace(
+-                            &rhs,
+-                            second_v,
+-                            callback_neg_m_alpha
++        let values: Result<Vec<f64>, String> = (0..self.coords.len())
++            .into_par_iter()
++            .map(|idx| {
++                let coord = &self.coords[idx];
++                let pair_a = self.pair_a.row(idx).dot(alpha);
++                let pair_ld_s = self.pair_ld_s.row(idx).dot(alpha);
++                let g_dot_v_alpha = self.g_dot_v.row(idx).dot(alpha);
++                let base_h2 = self.base_h2.row(idx).dot(alpha);
++                let m_terms = self.m_pair_trace.row(idx).dot(alpha);
++
++                let cross_trace = match self.cross_trace.as_ref() {
++                    Some(ct) => ct.row(idx).dot(alpha),
++                    None => 0.0,
++                };
++
++                let correction = if self.incl_logdet_h {
++                    match &self.kernel {
++                        OuterHessianDerivativeKernel::ScalarGlm { .. } => {
++                            self.scalar_correction_trace(idx, alpha, &coord.v, &correction_m_alpha)?
++                        }
++                        OuterHessianDerivativeKernel::Callback { .. } => {
++                            let second_v = &self
++                                .callback_second_modes
+                                 .as_ref()
+-                                .expect("callback negated mode"),
+-                        )?
++                                .expect("callback second modes")[idx];
++                            let rhs = self.pair_rhs_combo(idx, alpha);
++                            self.callback_correction_trace(
++                                &rhs,
++                                second_v,
++                                callback_neg_m_alpha
++                                    .as_ref()
++                                    .expect("callback negated mode"),
++                            )?
++                        }
+                     }
+-                }
+-            } else {
+-                0.0
+-            };
++                } else {
++                    0.0
++                };
+ 
+-            out[idx] = outer_hessian_entry(
+-                coord.a,
+-                a_alpha,
+-                g_dot_v_alpha,
+-                pair_a,
+-                cross_trace,
+-                base_h2 + m_terms + correction,
+-                pair_ld_s,
+-                self.profiled_phi,
+-                self.profiled_nu,
+-                self.profiled_dp_cgrad,
+-                self.profiled_dp_cgrad2,
+-                self.is_profiled,
+-                self.incl_logdet_h,
+-                self.incl_logdet_s,
+-            );
+-        }
++                Ok(outer_hessian_entry(
++                    coord.a,
++                    a_alpha,
++                    g_dot_v_alpha,
++                    pair_a,
++                    cross_trace,
++                    base_h2 + m_terms + correction,
++                    pair_ld_s,
++                    self.profiled_phi,
++                    self.profiled_nu,
++                    self.profiled_dp_cgrad,
++                    self.profiled_dp_cgrad2,
++                    self.is_profiled,
++                    self.incl_logdet_h,
++                    self.incl_logdet_s,
++                ))
++            })
++            .collect();
+ 
+-        Ok(out)
++        Ok(Array1::from_vec(values?))
+     }
+ }
+ 
+ fn build_outer_hessian_operator(
+     solution: &InnerSolution<'_>,
+     lambdas: &[f64],
+     effective_deriv: &dyn HessianDerivativeProvider,
+     kernel: OuterHessianDerivativeKernel,
+ ) -> Result<UnifiedOuterHessianOperator, String> {
+     let hop = Arc::clone(&solution.hessian_op);
+     let k = lambdas.len();
+     let ext_dim = solution.ext_coords.len();
+     let total = k + ext_dim;
+     let curvature_lambdas: Vec<f64> = lambdas
+         .iter()
+         .copied()
+         .map(|lambda| rho_curvature_lambda(solution, lambda))
+         .collect();
+ 
+     let (incl_logdet_h, incl_logdet_s) = match &solution.dispersion {
+         DispersionHandling::ProfiledGaussian => (true, true),
+         DispersionHandling::Fixed {
+             include_logdet_h,
+             include_logdet_s,
+             ..
+diff --git a/tests/autodiff_custom_family_joint_laml.rs b/tests/autodiff_custom_family_joint_laml.rs
+index 964858c4d96207ac431e433da571f14734950d18..778fe7d74df08601329590ad0aadf588bb8042ae 100644
+--- a/tests/autodiff_custom_family_joint_laml.rs
++++ b/tests/autodiff_custom_family_joint_laml.rs
+@@ -605,25 +605,116 @@ fn exact_joint_quadratic_lamlgradient_requires_joint_stationarity() {
+         );
+         let (_, jac) = engine.derivative(&[rho]);
+         let gradfd = (coupled_quarticobjective_f64(rho + 1e-6, center, quartic, beta2ridge)
+             - coupled_quarticobjective_f64(rho - 1e-6, center, quartic, beta2ridge))
+             / (2.0 * 1e-6);
+ 
+         assert!(
+             (result.objective - value_nd).abs() < 5e-7,
+             "exact_joint_stationarity objective mismatch at rho={rho}: analytic={} num_dual={} closed_form={}",
+             result.objective,
+             value_nd,
+             coupled_quarticobjective_f64(rho, center, quartic, beta2ridge)
+         );
+         assert_manual_ad_band!(
+             "exact_joint_stationarity",
+             rho,
+             "gradient",
+             result.gradient[0],
+             "num_dual" => grad_nd,
+             "ad_trait" => jac[(0, 0)],
+             "fd" => gradfd,
+             "autodiff" => grad_autodiff
+         );
+     }
+ }
++
++#[test]
++fn exact_joint_quadratic_lamlhessian_matches_gradient_finite_difference() {
++    let center = 0.7;
++    let quartic = 0.18;
++    let beta2ridge = 1.4;
++    let family = CoupledQuarticExactFamily {
++        center,
++        quartic,
++        beta2ridge,
++    };
++    let specs = vec![
++        ParameterBlockSpec {
++            name: "shape".to_string(),
++            design: DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(array![[1.0]])),
++            offset: array![0.0],
++            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
++            nullspace_dims: vec![0],
++            initial_log_lambdas: array![0.0],
++            initial_beta: Some(array![0.0]),
++        },
++        ParameterBlockSpec {
++            name: "aux".to_string(),
++            design: DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(array![[1.0]])),
++            offset: array![0.0],
++            penalties: vec![],
++            nullspace_dims: vec![],
++            initial_log_lambdas: Array1::zeros(0),
++            initial_beta: Some(array![0.0]),
++        },
++    ];
++    let derivative_blocks = vec![
++        Vec::<CustomFamilyBlockPsiDerivative>::new(),
++        Vec::<CustomFamilyBlockPsiDerivative>::new(),
++    ];
++    let options = BlockwiseFitOptions {
++        use_remlobjective: true,
++        compute_covariance: false,
++        ridge_floor: 1e-12,
++        ..BlockwiseFitOptions::default()
++    };
++
++    for rho in [-0.9, -0.15, 0.75] {
++        let result = evaluate_custom_family_joint_hyper(
++            &family,
++            &specs,
++            &options,
++            &array![rho],
++            &derivative_blocks,
++            None,
++            gam::families::custom_family::EvalMode::ValueGradientHessian,
++        )
++        .expect("exact joint hyper hessian eval");
++        let hessian = result
++            .outer_hessian
++            .materialize_dense()
++            .expect("dense hessian materialization")
++            .expect("analytic hessian");
++
++        let step = 1e-5;
++        let gp = evaluate_custom_family_joint_hyper(
++            &family,
++            &specs,
++            &options,
++            &array![rho + step],
++            &derivative_blocks,
++            None,
++            gam::families::custom_family::EvalMode::ValueAndGradient,
++        )
++        .expect("plus gradient")
++        .gradient[0];
++        let gm = evaluate_custom_family_joint_hyper(
++            &family,
++            &specs,
++            &options,
++            &array![rho - step],
++            &derivative_blocks,
++            None,
++            gam::families::custom_family::EvalMode::ValueAndGradient,
++        )
++        .expect("minus gradient")
++        .gradient[0];
++        let fd_hessian = (gp - gm) / (2.0 * step);
++        assert!(
++            (hessian[[0, 0]] - fd_hessian).abs() < 6e-3,
++            "exact_joint_laml Hessian mismatch at rho={rho}: analytic={} fd={}",
++            hessian[[0, 0]],
++            fd_hessian
++        );
++    }
++}
+
+----- PATCH END -----
+
+[2026-05-06T21:03:04.634808+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T21:03:04.657703+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:03:04.657763+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:03:20.082730+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T21:03:20.121724+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:03:20.121834+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:03:35.183260+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T21:03:35.185059+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:03:35.185146+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:03:50.392858+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T21:03:50.395162+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:03:50.395213+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:04:04.842455+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T21:04:04.844886+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:04:04.844962+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc

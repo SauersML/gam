@@ -3804,23 +3804,63 @@ fn build_term_collection_design_inner(
     data: ArrayView2<'_, f64>,
     spec: &TermCollectionSpec,
 ) -> Result<TermCollectionDesign, BasisError> {
+    use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+
     let n = data.nrows();
     let p_data = data.ncols();
-    let smooth_raw = build_smooth_design(data, &spec.smooth_terms)?;
-    let random_blocks: Vec<RandomEffectBlock> = spec
-        .random_effect_terms
-        .iter()
-        .map(|term| build_random_effect_block(data, term))
-        .collect::<Result<_, _>>()?;
+    let p_intercept = 1usize;
+    let p_lin = spec.linear_terms.len();
 
-    for linear in &spec.linear_terms {
-        if linear.feature_col >= p_data {
-            return Err(BasisError::DimensionMismatch(format!(
-                "linear term '{}' feature column {} out of bounds for {} columns",
-                linear.name, linear.feature_col, p_data
-            )));
-        }
-    }
+    // Smooth construction, random-effect construction, and linear-column
+    // extraction are independent at this stage. Run them concurrently, but keep
+    // each result in spec order so the final global layout remains stable:
+    // [intercept | linear | random_effects | smooth].
+    let (smooth_raw_result, (random_blocks_result, linear_block_result)) = rayon::join(
+        || build_smooth_design(data, &spec.smooth_terms),
+        || {
+            rayon::join(
+                || {
+                    spec.random_effect_terms
+                        .par_iter()
+                        .map(|term| build_random_effect_block(data, term))
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .collect::<Result<Vec<_>, _>>()
+                },
+                || -> Result<Option<Array2<f64>>, BasisError> {
+                    if p_lin == 0 {
+                        return Ok(None);
+                    }
+
+                    let linear_columns = (0..p_lin)
+                        .into_par_iter()
+                        .map(|j| {
+                            let linear = &spec.linear_terms[j];
+                            if linear.feature_col >= p_data {
+                                return Err(BasisError::DimensionMismatch(format!(
+                                    "linear term '{}' feature column {} out of bounds for {} columns",
+                                    linear.name, linear.feature_col, p_data
+                                )));
+                            }
+                            Ok(data.column(linear.feature_col).to_owned())
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .collect::<Result<Vec<_>, _>>()?;
+
+                    let mut out = Array2::<f64>::zeros((n, p_lin));
+                    for (j, column) in linear_columns.iter().enumerate() {
+                        out.column_mut(j).assign(column);
+                    }
+                    Ok(Some(out))
+                },
+            )
+        },
+    );
+
+    let smooth_raw = smooth_raw_result?;
+    let random_blocks = random_blocks_result?;
+    let linear_block = linear_block_result?;
 
     let smooth = apply_global_smooth_identifiability(
         smooth_raw,
@@ -3829,21 +3869,9 @@ fn build_term_collection_design_inner(
         &spec.smooth_terms,
     )?;
 
-    let p_intercept = 1usize;
-    let p_lin = spec.linear_terms.len();
     let p_rand: usize = random_blocks.iter().map(|b| b.num_groups).sum();
     let p_smooth = smooth.total_smooth_cols();
     let p_total = p_intercept + p_lin + p_rand + p_smooth;
-
-    let linear_block = if p_lin > 0 {
-        let mut out = Array2::<f64>::zeros((n, p_lin));
-        for (j, linear) in spec.linear_terms.iter().enumerate() {
-            out.column_mut(j).assign(&data.column(linear.feature_col));
-        }
-        Some(out)
-    } else {
-        None
-    };
 
     let mut linear_ranges = Vec::<(String, Range<usize>)>::with_capacity(p_lin);
     for (j, linear) in spec.linear_terms.iter().enumerate() {
