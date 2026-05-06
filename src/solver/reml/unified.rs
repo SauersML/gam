@@ -6693,65 +6693,68 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
         let callback_neg_m_alpha =
             matches!(self.kernel, OuterHessianDerivativeKernel::Callback { .. })
                 .then(|| -&correction_m_alpha);
-        let mut out = Array1::<f64>::zeros(self.coords.len());
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-        for idx in 0..self.coords.len() {
-            let coord = &self.coords[idx];
-            let pair_a = self.pair_a.row(idx).dot(alpha);
-            let pair_ld_s = self.pair_ld_s.row(idx).dot(alpha);
-            let g_dot_v_alpha = self.g_dot_v.row(idx).dot(alpha);
-            let base_h2 = self.base_h2.row(idx).dot(alpha);
-            let m_terms = self.m_pair_trace.row(idx).dot(alpha);
+        let values: Result<Vec<f64>, String> = (0..self.coords.len())
+            .into_par_iter()
+            .map(|idx| {
+                let coord = &self.coords[idx];
+                let pair_a = self.pair_a.row(idx).dot(alpha);
+                let pair_ld_s = self.pair_ld_s.row(idx).dot(alpha);
+                let g_dot_v_alpha = self.g_dot_v.row(idx).dot(alpha);
+                let base_h2 = self.base_h2.row(idx).dot(alpha);
+                let m_terms = self.m_pair_trace.row(idx).dot(alpha);
 
-            let cross_trace = match self.cross_trace.as_ref() {
-                Some(ct) => ct.row(idx).dot(alpha),
-                None => 0.0,
-            };
+                let cross_trace = match self.cross_trace.as_ref() {
+                    Some(ct) => ct.row(idx).dot(alpha),
+                    None => 0.0,
+                };
 
-            let correction = if self.incl_logdet_h {
-                match &self.kernel {
-                    OuterHessianDerivativeKernel::Gaussian => 0.0,
-                    OuterHessianDerivativeKernel::ScalarGlm { .. } => {
-                        self.scalar_correction_trace(idx, alpha, &coord.v, &correction_m_alpha)?
-                    }
-                    OuterHessianDerivativeKernel::Callback { .. } => {
-                        let second_v = &self
-                            .callback_second_modes
-                            .as_ref()
-                            .expect("callback second modes")[idx];
-                        let rhs = self.pair_rhs_combo(idx, alpha);
-                        self.callback_correction_trace(
-                            &rhs,
-                            second_v,
-                            callback_neg_m_alpha
+                let correction = if self.incl_logdet_h {
+                    match &self.kernel {
+                        OuterHessianDerivativeKernel::Gaussian => 0.0,
+                        OuterHessianDerivativeKernel::ScalarGlm { .. } => {
+                            self.scalar_correction_trace(idx, alpha, &coord.v, &correction_m_alpha)?
+                        }
+                        OuterHessianDerivativeKernel::Callback { .. } => {
+                            let second_v = &self
+                                .callback_second_modes
                                 .as_ref()
-                                .expect("callback negated mode"),
-                        )?
+                                .expect("callback second modes")[idx];
+                            let rhs = self.pair_rhs_combo(idx, alpha);
+                            self.callback_correction_trace(
+                                &rhs,
+                                second_v,
+                                callback_neg_m_alpha
+                                    .as_ref()
+                                    .expect("callback negated mode"),
+                            )?
+                        }
                     }
-                }
-            } else {
-                0.0
-            };
+                } else {
+                    0.0
+                };
 
-            out[idx] = outer_hessian_entry(
-                coord.a,
-                a_alpha,
-                g_dot_v_alpha,
-                pair_a,
-                cross_trace,
-                base_h2 + m_terms + correction,
-                pair_ld_s,
-                self.profiled_phi,
-                self.profiled_nu,
-                self.profiled_dp_cgrad,
-                self.profiled_dp_cgrad2,
-                self.is_profiled,
-                self.incl_logdet_h,
-                self.incl_logdet_s,
-            );
-        }
+                Ok(outer_hessian_entry(
+                    coord.a,
+                    a_alpha,
+                    g_dot_v_alpha,
+                    pair_a,
+                    cross_trace,
+                    base_h2 + m_terms + correction,
+                    pair_ld_s,
+                    self.profiled_phi,
+                    self.profiled_nu,
+                    self.profiled_dp_cgrad,
+                    self.profiled_dp_cgrad2,
+                    self.is_profiled,
+                    self.incl_logdet_h,
+                    self.incl_logdet_s,
+                ))
+            })
+            .collect();
 
-        Ok(out)
+        Ok(Array1::from_vec(values?))
     }
 }
 

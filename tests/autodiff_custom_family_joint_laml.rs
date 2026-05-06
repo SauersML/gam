@@ -627,3 +627,94 @@ fn exact_joint_quadratic_lamlgradient_requires_joint_stationarity() {
         );
     }
 }
+
+#[test]
+fn exact_joint_quadratic_lamlhessian_matches_gradient_finite_difference() {
+    let center = 0.7;
+    let quartic = 0.18;
+    let beta2ridge = 1.4;
+    let family = CoupledQuarticExactFamily {
+        center,
+        quartic,
+        beta2ridge,
+    };
+    let specs = vec![
+        ParameterBlockSpec {
+            name: "shape".to_string(),
+            design: DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(array![[1.0]])),
+            offset: array![0.0],
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
+            nullspace_dims: vec![0],
+            initial_log_lambdas: array![0.0],
+            initial_beta: Some(array![0.0]),
+        },
+        ParameterBlockSpec {
+            name: "aux".to_string(),
+            design: DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(array![[1.0]])),
+            offset: array![0.0],
+            penalties: vec![],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(array![0.0]),
+        },
+    ];
+    let derivative_blocks = vec![
+        Vec::<CustomFamilyBlockPsiDerivative>::new(),
+        Vec::<CustomFamilyBlockPsiDerivative>::new(),
+    ];
+    let options = BlockwiseFitOptions {
+        use_remlobjective: true,
+        compute_covariance: false,
+        ridge_floor: 1e-12,
+        ..BlockwiseFitOptions::default()
+    };
+
+    for rho in [-0.9, -0.15, 0.75] {
+        let result = evaluate_custom_family_joint_hyper(
+            &family,
+            &specs,
+            &options,
+            &array![rho],
+            &derivative_blocks,
+            None,
+            gam::families::custom_family::EvalMode::ValueGradientHessian,
+        )
+        .expect("exact joint hyper hessian eval");
+        let hessian = result
+            .outer_hessian
+            .materialize_dense()
+            .expect("dense hessian materialization")
+            .expect("analytic hessian");
+
+        let step = 1e-5;
+        let gp = evaluate_custom_family_joint_hyper(
+            &family,
+            &specs,
+            &options,
+            &array![rho + step],
+            &derivative_blocks,
+            None,
+            gam::families::custom_family::EvalMode::ValueAndGradient,
+        )
+        .expect("plus gradient")
+        .gradient[0];
+        let gm = evaluate_custom_family_joint_hyper(
+            &family,
+            &specs,
+            &options,
+            &array![rho - step],
+            &derivative_blocks,
+            None,
+            gam::families::custom_family::EvalMode::ValueAndGradient,
+        )
+        .expect("minus gradient")
+        .gradient[0];
+        let fd_hessian = (gp - gm) / (2.0 * step);
+        assert!(
+            (hessian[[0, 0]] - fd_hessian).abs() < 6e-3,
+            "exact_joint_laml Hessian mismatch at rho={rho}: analytic={} fd={}",
+            hessian[[0, 0]],
+            fd_hessian
+        );
+    }
+}
