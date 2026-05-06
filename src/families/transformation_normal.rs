@@ -3409,8 +3409,7 @@ impl TransformationNormalFamily {
                         let basis = endpoint_basis[e];
                         endpoint_psi[e] = basis[0] * acc.gamma_psi[0];
                         for k in 1..p_resp {
-                            endpoint_psi[e] +=
-                                2.0 * basis[k] * acc.gamma[k] * acc.gamma_psi[k];
+                            endpoint_psi[e] += 2.0 * basis[k] * acc.gamma[k] * acc.gamma_psi[k];
                         }
                     }
 
@@ -3455,8 +3454,7 @@ impl TransformationNormalFamily {
                                 acc.endpoint_psi_dir[col][e] +=
                                     2.0 * basis[k] * (g_dir * g_psi + g * g_psi_dir);
                                 acc.endpoint_vv[col][e] += 2.0 * basis[k] * g_dir * g_dir;
-                                acc.endpoint_psi_vv[col][e] +=
-                                    4.0 * basis[k] * g_dir * g_psi_dir;
+                                acc.endpoint_psi_vv[col][e] += 4.0 * basis[k] * g_dir * g_psi_dir;
                             }
                         }
                     }
@@ -7097,15 +7095,16 @@ impl HyperOperator for TransformationNormalPsiHessianOperator {
     fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
         debug_assert_eq!(factor.nrows(), self.dim());
         let n = self.family.response_val_basis.nrows();
-        let cov = self
-            .family
-            .covariate_design
-            .try_row_chunk(0..n)
-            .expect("validated CTN psi Hessian projected trace covariate chunk should not fail");
+        let cov =
+            self.family.covariate_design.try_row_chunk(0..n).expect(
+                "validated CTN psi Hessian projected trace covariate chunk should not fail",
+            );
         let cov_psi = self
             .tensor_op()
             .materialize_cov_first_axis(self.axis)
-            .expect("validated CTN psi Hessian projected trace covariate derivative should not fail");
+            .expect(
+                "validated CTN psi Hessian projected trace covariate derivative should not fail",
+            );
         self.family
             .scop_psi_hessian_trace_factor_from_cov(
                 &self.beta,
