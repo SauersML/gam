@@ -3302,27 +3302,6 @@ impl PenaltySubspaceTrace {
         self.trace_projected_logdet_reduced(&self.reduce_operator(a))
     }
 
-    /// Apply the projected logdet kernel `K = U_S · H_proj⁻¹ · U_Sᵀ` to a
-    /// vector `v`, yielding `K · v`.  Computed factor-by-factor as
-    /// `U_S · (H_proj⁻¹ · (U_Sᵀ · v))` so cost is `O(p · r + r²)` and the
-    /// result is identically zero on `null(U_S)`.
-    ///
-    /// Test-only: documents the projected-kernel action that
-    /// [`Self::xt_projected_kernel_x_diagonal`] inlines for production
-    /// (the prod path streams `Z = X · U_S` row-chunked rather than
-    /// invoking `apply` per row).  The companion test
-    /// `subspace_apply_adjoint_shortcut_matches_dense_projected_trace`
-    /// verifies the identity `tr(K · C[u]) = uᵀ · Xᵀ(c ⊙ h^{G,proj})` that
-    /// the production leverage shortcut depends on.  Note the corresponding
-    /// `z_c` stays gated by `H⁻¹` (not `K`) so the IFT mode-response
-    /// semantics line up with `compute_outer_hessian`.
-    #[cfg(test)]
-    pub fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
-        let v_proj = self.u_s.t().dot(v);
-        let y_proj = self.h_proj_inverse.dot(&v_proj);
-        self.u_s.dot(&y_proj)
-    }
-
     /// Projected leverage `h^{G,proj}_i = Xᵢᵀ · K · Xᵢ` for every row of `x`.
     ///
     /// Computed in bulk as `Z = X · U_S` (`n × r`) then
@@ -11773,16 +11752,18 @@ mod tests {
     }
 
     #[test]
-    fn subspace_apply_adjoint_shortcut_matches_dense_projected_trace() {
-        // Math contract for §10: under K = U_S H_proj⁻¹ U_Sᵀ and
-        //   C[u] = Xᵀ diag(c ⊙ Xu) X
-        // the identity
-        //   tr(K · C[u]) = uᵀ · Xᵀ(c ⊙ h^{G,proj})
-        // holds with h^{G,proj}_i = Xᵢᵀ · K · Xᵢ.  This test contracts both
-        // sides on a tiny fixture so the leverage / adjoint_z_c shortcut
-        // in `build_outer_hessian_operator` (under subspace) is provably
-        // bit-equivalent to the dense `trace_projected_logdet(C[u])` path.
-        // (H itself is not needed here — only U_S and H_proj⁻¹ define K.)
+    fn subspace_projected_leverage_and_adjoint_shortcut_match_dense() {
+        // Locks down both production identities used by the subspace
+        // leverage shortcut in `build_outer_hessian_operator`:
+        //
+        //   (1) `xt_projected_kernel_x_diagonal(X)_i = Xᵢᵀ · K · Xᵢ` per row
+        //   (2) `tr(K · C[u]) = uᵀ · Xᵀ(c ⊙ h^{G,proj})`
+        //       with `K = U_S H_proj⁻¹ U_Sᵀ` and `C[u] = Xᵀ diag(c ⊙ Xu) X`.
+        //
+        // (1) is the per-row contract `xt_projected_kernel_x_diagonal`
+        // promises (its docstring); (2) is the math identity that the
+        // leverage / `adjoint_z_c` shortcut relies on for its `O(n·r)`
+        // adjoint-trick replacement of the dense materialised correction.
         let u_s = array![[1.0, 0.0], [0.0, 1.0], [0.0, 0.0], [0.0, 0.0]];
         let det = 3.0_f64 * 5.0 - 0.1 * 0.1;
         let h_proj_inverse = array![[5.0 / det, -0.1 / det], [-0.1 / det, 3.0 / det]];
@@ -11791,20 +11772,7 @@ mod tests {
             h_proj_inverse: h_proj_inverse.clone(),
         };
 
-        // Sanity-check `apply`: K should annihilate the null subspace and
-        // act as U_S H_proj⁻¹ U_Sᵀ on the identified subspace.
-        let v_null = array![0.0, 0.0, 0.7, -0.3];
-        let kv_null = subspace.apply(&v_null);
-        for &entry in kv_null.iter() {
-            assert_relative_eq!(entry, 0.0, epsilon = 1e-14);
-        }
-        let v_id = array![0.4, -0.2, 0.0, 0.0];
-        let kv_id = subspace.apply(&v_id);
-        // Last two entries (null components) must be zero by construction.
-        assert_relative_eq!(kv_id[2], 0.0, epsilon = 1e-14);
-        assert_relative_eq!(kv_id[3], 0.0, epsilon = 1e-14);
-
-        let x = array![
+        let x_data = array![
             [1.0, 0.2, 0.5, 0.3],
             [1.0, 1.1, -0.2, 0.4],
             [1.0, -0.8, 0.7, -0.1],
@@ -11812,20 +11780,23 @@ mod tests {
         ];
         let c = array![0.31_f64, -0.27, 0.19, -0.11];
 
-        // Dense reference K and h^{G,proj}.
+        // Dense reference K = U_S · H_proj⁻¹ · U_Sᵀ.
         let k_dense = u_s.dot(&h_proj_inverse).dot(&u_s.t());
-        let n = x.nrows();
-        let mut h_g_proj = Array1::<f64>::zeros(n);
+        let n = x_data.nrows();
+
+        // (1) Production helper vs per-row dense reference.
+        let x_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x_data.clone()));
+        let h_g_proj = subspace.xt_projected_kernel_x_diagonal(&x_design);
+        assert_eq!(h_g_proj.len(), n);
         for i in 0..n {
-            let row = x.row(i).to_owned();
-            let kx = subspace.apply(&row);
-            h_g_proj[i] = row.dot(&kx);
-            // Cross-check against the dense kernel.
-            let kx_dense = k_dense.dot(&row);
-            assert_relative_eq!(h_g_proj[i], row.dot(&kx_dense), epsilon = 1e-12);
+            let row = x_data.row(i).to_owned();
+            let kx = k_dense.dot(&row);
+            assert_relative_eq!(h_g_proj[i], row.dot(&kx), epsilon = 1e-12);
         }
 
-        // Probe several u directions, including ones with null components.
+        // (2) Adjoint shortcut: tr(K · C[u]) = uᵀ · Xᵀ(c ⊙ h^{G,proj}).
+        // Probe u directions including ones lifting into null(U_S).
         let probes = [
             array![0.6_f64, -0.4, 0.0, 0.0],
             array![0.0_f64, 0.0, 0.5, 0.7],
@@ -11833,40 +11804,27 @@ mod tests {
             array![1.0_f64, 1.0, 1.0, 1.0],
         ];
         for u in probes.iter() {
-            // C[u] = Xᵀ diag(c ⊙ Xu) X — dense reference.
-            let xu = x.dot(u);
-            let mut weighted_x = x.clone();
+            let xu = x_data.dot(u);
+            let mut weighted_x = x_data.clone();
             for i in 0..n {
                 let w = c[i] * xu[i];
                 for j in 0..weighted_x.ncols() {
                     weighted_x[[i, j]] *= w;
                 }
             }
-            let c_u_dense = x.t().dot(&weighted_x);
+            let c_u_dense = x_data.t().dot(&weighted_x);
 
-            // LHS: tr(K · C[u]) via the projected logdet path.
+            // LHS: tr(K · C[u]) via the production projected-logdet path.
             let lhs = subspace.trace_projected_logdet(&c_u_dense);
 
-            // RHS: uᵀ · Xᵀ(c ⊙ h^{G,proj}).
+            // RHS: uᵀ · Xᵀ(c ⊙ h^{G,proj}) using the production helper's output.
             let mut weighted = Array1::<f64>::zeros(n);
             for i in 0..n {
                 weighted[i] = c[i] * h_g_proj[i];
             }
-            let rhs_vec = x.t().dot(&weighted);
-            let rhs = u.dot(&rhs_vec);
+            let rhs = u.dot(&x_data.t().dot(&weighted));
 
             assert_relative_eq!(lhs, rhs, epsilon = 1e-12, max_relative = 1e-12);
-
-            // Also verify the adjoint form: z_c = K · Xᵀ(c ⊙ h^{G,proj}).
-            // Then `Σⱼ αⱼ · pair_rhs_dot(idx, j, z_c.view())` reduces to
-            // `(Aᵢβ)ᵀ z_c` style products in the operator, which equals
-            // `(Aᵢβ)ᵀ · K · Xᵀ(c ⊙ h^{G,proj})` by linearity.  The local
-            // contract here is just that `K · w` annihilates null(U_S).
-            let z_c = subspace.apply(&rhs_vec);
-            let z_c_dense = k_dense.dot(&rhs_vec);
-            for i in 0..z_c.len() {
-                assert_relative_eq!(z_c[i], z_c_dense[i], epsilon = 1e-12);
-            }
         }
     }
 
