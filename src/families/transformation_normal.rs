@@ -10853,6 +10853,75 @@ mod tests {
     }
 
     #[test]
+    fn ctn_psi_workspace_second_order_matches_per_pair_path() {
+        let psi = array![0.15, -0.10];
+        let (family, derivative_blocks, state, spec) = toy_family_and_derivatives(&psi);
+        let states = vec![state.clone()];
+        let specs = vec![spec];
+        let n_psi = derivative_blocks[0].len();
+
+        let workspace = family
+            .exact_newton_joint_psi_workspace(&states, &specs, &derivative_blocks)
+            .expect("CTN ψ workspace constructor")
+            .expect("CTN ψ workspace must be present");
+
+        for psi_i in 0..n_psi {
+            for psi_j in psi_i..n_psi {
+                let direct = family
+                    .exact_newton_joint_psisecond_order_terms(
+                        &states,
+                        &specs,
+                        &derivative_blocks,
+                        psi_i,
+                        psi_j,
+                    )
+                    .expect("direct ψ-ψ terms")
+                    .expect("direct ψ-ψ terms must be present");
+                let cached = workspace
+                    .second_order_terms(psi_i, psi_j)
+                    .expect("workspace ψ-ψ terms")
+                    .expect("workspace ψ-ψ terms must be present");
+
+                let obj_diff = (cached.objective_psi_psi - direct.objective_psi_psi).abs();
+                let obj_scale = direct.objective_psi_psi.abs().max(1.0);
+                assert!(
+                    obj_diff <= 1.0e-12 * obj_scale,
+                    "ψ workspace objective_psi_psi[{psi_i},{psi_j}] mismatch: cached={}, direct={}, |diff|={obj_diff}",
+                    cached.objective_psi_psi,
+                    direct.objective_psi_psi,
+                );
+
+                assert_eq!(
+                    cached.score_psi_psi.len(),
+                    direct.score_psi_psi.len(),
+                    "ψ workspace score_psi_psi length mismatch at pair ({psi_i},{psi_j})"
+                );
+                for idx in 0..direct.score_psi_psi.len() {
+                    let diff = (cached.score_psi_psi[idx] - direct.score_psi_psi[idx]).abs();
+                    let scale = direct.score_psi_psi[idx].abs().max(1.0);
+                    assert!(
+                        diff <= 1.0e-12 * scale,
+                        "ψ workspace score_psi_psi[pair=({psi_i},{psi_j}), idx={idx}] mismatch: cached={}, direct={}, |diff|={diff}",
+                        cached.score_psi_psi[idx],
+                        direct.score_psi_psi[idx],
+                    );
+                }
+
+                let cached_op = cached
+                    .hessian_psi_psi_operator
+                    .as_ref()
+                    .expect("workspace ψ-ψ Hessian operator must be present");
+                let direct_op = direct
+                    .hessian_psi_psi_operator
+                    .as_ref()
+                    .expect("direct ψ-ψ Hessian operator must be present");
+                assert_eq!(cached_op.dim(), direct_op.dim());
+                assert_eq!(cached_op.dim(), state.beta.len());
+            }
+        }
+    }
+
+    #[test]
     fn transformation_normal_joint_psi_second_order_terms_are_operator_backed() {
         let psi = array![0.15, -0.10];
         let (family, derivative_blocks, state, spec) = toy_family_and_derivatives(&psi);
