@@ -49,7 +49,7 @@ use crate::solver::estimate::{
 };
 use crate::terms::construction::kronecker_product;
 use crate::types::{InverseLink, LinkFunction};
-use ndarray::{Array1, Array2, s};
+use ndarray::{Array1, Array2, Axis, s};
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
 use statrs::function::erf::erfc;
@@ -4389,13 +4389,33 @@ fn initial_log_lambdas<T>(
     Ok(rho)
 }
 
-fn weighted_crossprod_dense_stable(
+const DENSE_WEIGHTED_CROSSPROD_PARALLEL_FLOP_THRESHOLD: u64 = 200_000;
+const DENSE_ROW_SCALE_PARALLEL_ELEM_THRESHOLD: usize = 100_000;
+const DENSE_ROW_CHUNKS_PER_THREAD: usize = 4;
+
+#[inline]
+fn should_use_survival_rayon(work_items: u64) -> bool {
+    rayon::current_num_threads() > 1
+        && rayon::current_thread_index().is_none()
+        && work_items >= DENSE_WEIGHTED_CROSSPROD_PARALLEL_FLOP_THRESHOLD
+}
+
+#[inline]
+fn dense_row_chunk_count(nrows: usize) -> usize {
+    let max_chunks = rayon::current_num_threads()
+        .saturating_mul(DENSE_ROW_CHUNKS_PER_THREAD)
+        .max(1);
+    nrows.min(max_chunks).max(1)
+}
+
+fn accumulate_weighted_crossprod_dense_stable_rows(
+    out: &mut Array2<f64>,
     left: &Array2<f64>,
     weights: &Array1<f64>,
     right: &Array2<f64>,
-) -> Result<Array2<f64>, String> {
-    let mut out = Array2::<f64>::zeros((left.ncols(), right.ncols()));
-    for i in 0..weights.len() {
+    rows: std::ops::Range<usize>,
+) {
+    for i in rows {
         let wi = weights[i];
         if wi == 0.0 {
             continue;
@@ -4415,6 +4435,111 @@ fn weighted_crossprod_dense_stable(
             }
         }
     }
+}
+
+fn accumulate_weighted_crossprod_dense_rows(
+    out: &mut Array2<f64>,
+    left: &Array2<f64>,
+    weights: &Array1<f64>,
+    right: &Array2<f64>,
+    rows: std::ops::Range<usize>,
+) -> bool {
+    for i in rows {
+        let wi = weights[i];
+        if wi == 0.0 {
+            continue;
+        }
+        for j in 0..left.ncols() {
+            let lij = left[[i, j]];
+            if lij == 0.0 {
+                continue;
+            }
+            let weighted_lij = wi * lij;
+            if !weighted_lij.is_finite() {
+                return false;
+            }
+            for k in 0..right.ncols() {
+                let rijk = right[[i, k]];
+                if rijk == 0.0 {
+                    continue;
+                }
+                let contrib = weighted_lij * rijk;
+                let updated = out[[j, k]] + contrib;
+                if !contrib.is_finite() || !updated.is_finite() {
+                    return false;
+                }
+                out[[j, k]] = updated;
+            }
+        }
+    }
+    true
+}
+
+fn weighted_crossprod_dense_stable(
+    left: &Array2<f64>,
+    weights: &Array1<f64>,
+    right: &Array2<f64>,
+) -> Result<Array2<f64>, String> {
+    if left.nrows() != weights.len() || right.nrows() != weights.len() {
+        return Err(format!(
+            "weighted_crossprod_dense stable row mismatch: left is {}x{}, weights has {}, right is {}x{}",
+            left.nrows(),
+            left.ncols(),
+            weights.len(),
+            right.nrows(),
+            right.ncols()
+        ));
+    }
+
+    let nrows = weights.len();
+    let out_dim = (left.ncols(), right.ncols());
+    let work = (nrows as u64)
+        .saturating_mul(left.ncols() as u64)
+        .saturating_mul(right.ncols() as u64);
+
+    let out = if nrows > 1 && should_use_survival_rayon(work) {
+        use rayon::prelude::*;
+
+        let chunk_count = dense_row_chunk_count(nrows);
+        let chunk_rows = nrows.div_ceil(chunk_count);
+        let partials: Vec<Array2<f64>> = (0..chunk_count)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * chunk_rows;
+                let end = (start + chunk_rows).min(nrows);
+                let mut local = Array2::<f64>::zeros(out_dim);
+                if start < end {
+                    accumulate_weighted_crossprod_dense_stable_rows(
+                        &mut local,
+                        left,
+                        weights,
+                        right,
+                        start..end,
+                    );
+                }
+                local
+            })
+            .collect();
+
+        let mut reduced = Array2::<f64>::zeros(out_dim);
+        for local in partials {
+            for (dst, src) in reduced.iter_mut().zip(local.iter()) {
+                *dst = safe_sum2(*dst, *src);
+            }
+        }
+        reduced
+    } else {
+        let mut serial = Array2::<f64>::zeros(out_dim);
+        accumulate_weighted_crossprod_dense_stable_rows(
+            &mut serial,
+            left,
+            weights,
+            right,
+            0..nrows,
+        );
+        serial
+    };
+
     if out.iter().any(|value| !value.is_finite()) {
         return Err(
             "weighted_crossprod_dense stable accumulation produced non-finite values".to_string(),
@@ -4451,31 +4576,82 @@ fn weighted_crossprod_dense_with_parallelism(
         return Err("weighted_crossprod_dense inputs contain non-finite design values".to_string());
     }
 
+    let nrows = weights.len();
     let sanitized_weights = sanitize_survival_weight_vector(weights);
-    let mut weighted_right = right.clone();
-    let mut fast_path_ok = true;
-    'outer: for i in 0..weighted_right.nrows() {
-        let wi = sanitized_weights[i];
-        if wi == 0.0 {
-            weighted_right.row_mut(i).fill(0.0);
-            continue;
-        }
-        if wi == 1.0 {
-            continue;
-        }
-        for j in 0..weighted_right.ncols() {
-            let scaled = wi * weighted_right[[i, j]];
-            if !scaled.is_finite() {
-                fast_path_ok = false;
-                break 'outer;
+    let work = (nrows as u64)
+        .saturating_mul(left.ncols() as u64)
+        .saturating_mul(right.ncols() as u64);
+
+    if nrows > 1 && should_use_survival_rayon(work) {
+        use rayon::prelude::*;
+
+        let out_dim = (left.ncols(), right.ncols());
+        let chunk_count = dense_row_chunk_count(nrows);
+        let chunk_rows = nrows.div_ceil(chunk_count);
+        let partials: Vec<Option<Array2<f64>>> = (0..chunk_count)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * chunk_rows;
+                let end = (start + chunk_rows).min(nrows);
+                let mut local = Array2::<f64>::zeros(out_dim);
+                if start < end
+                    && !accumulate_weighted_crossprod_dense_rows(
+                        &mut local,
+                        left,
+                        &sanitized_weights,
+                        right,
+                        start..end,
+                    )
+                {
+                    return None;
+                }
+                Some(local)
+            })
+            .collect();
+
+        if partials.iter().all(Option::is_some) {
+            let mut out = Array2::<f64>::zeros(out_dim);
+            let mut fast_path_ok = true;
+            'reduce: for local in partials.into_iter().flatten() {
+                for (dst, src) in out.iter_mut().zip(local.iter()) {
+                    let updated = *dst + *src;
+                    if !updated.is_finite() {
+                        fast_path_ok = false;
+                        break 'reduce;
+                    }
+                    *dst = updated;
+                }
             }
-            weighted_right[[i, j]] = scaled;
+            if fast_path_ok {
+                return Ok(out);
+            }
         }
-    }
-    if fast_path_ok {
-        let out = fast_atb_with_parallelism(left, &weighted_right, par);
-        if out.iter().all(|value| value.is_finite()) {
-            return Ok(out);
+    } else {
+        let mut weighted_right = right.clone();
+        let mut fast_path_ok = true;
+        'outer: for i in 0..weighted_right.nrows() {
+            let wi = sanitized_weights[i];
+            if wi == 0.0 {
+                weighted_right.row_mut(i).fill(0.0);
+                continue;
+            }
+            if wi == 1.0 {
+                continue;
+            }
+            for j in 0..weighted_right.ncols() {
+                let scaled = wi * weighted_right[[i, j]];
+                if !scaled.is_finite() {
+                    fast_path_ok = false;
+                    break 'outer;
+                }
+                weighted_right[[i, j]] = scaled;
+            }
+        }
+        if fast_path_ok {
+            let out = fast_atb_with_parallelism(left, &weighted_right, par);
+            if out.iter().all(|value| value.is_finite()) {
+                return Ok(out);
+            }
         }
     }
 
@@ -4491,9 +4667,36 @@ fn scale_dense_rows(mat: &Array2<f64>, coeffs: &Array1<f64>) -> Result<Array2<f6
         ));
     }
     let sanitized_coeffs = sanitize_survival_weight_vector(coeffs);
-    let out = Array2::from_shape_fn(mat.dim(), |(i, j)| {
-        safe_product(mat[[i, j]], sanitized_coeffs[i])
-    });
+    let work = mat.nrows().saturating_mul(mat.ncols());
+    let mut out = mat.clone();
+
+    if mat.nrows() > 1
+        && rayon::current_num_threads() > 1
+        && rayon::current_thread_index().is_none()
+        && work >= DENSE_ROW_SCALE_PARALLEL_ELEM_THRESHOLD
+    {
+        use rayon::prelude::*;
+
+        let chunk_count = dense_row_chunk_count(mat.nrows());
+        let chunk_rows = mat.nrows().div_ceil(chunk_count);
+        out.axis_chunks_iter_mut(Axis(0), chunk_rows)
+            .into_par_iter()
+            .enumerate()
+            .for_each(|(chunk_idx, mut rows)| {
+                let start = chunk_idx * chunk_rows;
+                for (local_i, mut row) in rows.rows_mut().into_iter().enumerate() {
+                    let coeff = sanitized_coeffs[start + local_i];
+                    row.mapv_inplace(|value| safe_product(value, coeff));
+                }
+            });
+    } else {
+        for i in 0..out.nrows() {
+            let coeff = sanitized_coeffs[i];
+            out.row_mut(i)
+                .mapv_inplace(|value| safe_product(value, coeff));
+        }
+    }
+
     if out.iter().any(|value| value.is_nan()) {
         return Err("row scaling produced NaN values".to_string());
     }
