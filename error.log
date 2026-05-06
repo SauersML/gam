@@ -6104,3 +6104,968 @@ index d3ef6aa260341fce526e0c4f2023d89bea0b2867..fce9f506b308bb7f7d6e66468d7d5d4d
 [2026-05-06T20:27:28.084054+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
 [2026-05-06T20:27:28.085601+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
 [2026-05-06T20:27:28.085665+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:27:39.350955+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:27:39.352678+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:27:39.352757+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:27:50.742779+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:27:50.744310+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:27:50.744352+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:27:52.078889+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:27:52.081548+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:27:52.081622+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:00.207697+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:28:00.209392+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:00.209441+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:02.061957+00:00] apply_result: mode=apply id=task_e_69fb92fa91dc83248dbdd5ddebb90160 status=Partial applied=0 skipped=0 conflicts=1 cmd=(cd /Users/user/gam && git apply --3way /var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/.tmpxrS6a6/patch.diff)
+stdout_tail=
+
+stderr_tail=
+Applied patch to 'src/families/survival_location_scale.rs' with conflicts.
+U src/families/survival_location_scale.rs
+
+patch_summary: kind=git-diff lines=265 chars=10468 cwd=/Users/user/gam ; head=
+diff --git a/src/families/survival_location_scale.rs b/src/families/survival_location_scale.rs
+index d3ef6aa260341fce526e0c4f2023d89bea0b2867..8c479bf23b11368d041c7ff2a29a955ac1e53e11 100644
+--- a/src/families/survival_location_scale.rs
++++ b/src/families/survival_location_scale.rs
+@@ -25,50 +25,51 @@ use crate::families::scale_design::{
+ use crate::matrix::{
+     BlockDesignOperator, DenseDesignMatrix, DesignBlock, DesignMatrix, EmbeddedColumnBlock,
+     EmbeddedSquareBlock, MultiChannelOperator, RowwiseKroneckerOperator, SymmetricMatrix,
+ };
+ use crate::mixture_link::{
+     component_inverse_link_jet, inverse_link_jet_for_inverse_link,
+     inverse_link_pdffourth_derivative_for_inverse_link,
+     inverse_link_pdfthird_derivative_for_inverse_link,
+ };
+ use crate::pirls::LinearInequalityCo…
+----- PATCH BEGIN -----
+diff --git a/src/families/survival_location_scale.rs b/src/families/survival_location_scale.rs
+index d3ef6aa260341fce526e0c4f2023d89bea0b2867..8c479bf23b11368d041c7ff2a29a955ac1e53e11 100644
+--- a/src/families/survival_location_scale.rs
++++ b/src/families/survival_location_scale.rs
+@@ -25,50 +25,51 @@ use crate::families::scale_design::{
+ use crate::matrix::{
+     BlockDesignOperator, DenseDesignMatrix, DesignBlock, DesignMatrix, EmbeddedColumnBlock,
+     EmbeddedSquareBlock, MultiChannelOperator, RowwiseKroneckerOperator, SymmetricMatrix,
+ };
+ use crate::mixture_link::{
+     component_inverse_link_jet, inverse_link_jet_for_inverse_link,
+     inverse_link_pdffourth_derivative_for_inverse_link,
+     inverse_link_pdfthird_derivative_for_inverse_link,
+ };
+ use crate::pirls::LinearInequalityConstraints;
+ use crate::probability::erfcx_nonnegative;
+ use crate::probability::{normal_cdf, normal_pdf};
+ use crate::smooth::{
+     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
+     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
+     freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
+     spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivativeinfo_list,
+ };
+ use crate::solver::estimate::UnifiedFitResult;
+ use crate::solver::estimate::{
+     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
+ };
+ use crate::terms::construction::kronecker_product;
+ use crate::types::{InverseLink, LinkFunction};
+ use ndarray::{Array1, Array2, s};
++use rayon::prelude::*;
+ use statrs::function::erf::erfc;
+ use std::collections::HashMap;
+ use std::sync::Arc;
+ 
+ #[inline]
+ fn softplus(x: f64) -> f64 {
+     if x.is_nan() {
+         f64::NAN
+     } else if x == f64::INFINITY {
+         f64::INFINITY
+     } else if x == f64::NEG_INFINITY {
+         0.0
+     } else if x >= 0.0 {
+         x + (-x).exp().ln_1p()
+     } else {
+         x.exp().ln_1p()
+     }
+ }
+ 
+ // ---------------------------------------------------------------------------
+ // Overflow-safe arithmetic for the survival exact-Newton chain
+ // ---------------------------------------------------------------------------
+ //
+ // The survival location-scale model computes inv_sigma = exp(-eta_ls) and
+ // multiplies it through many intermediate quantities (q0, qdot, g, ...).
+@@ -1318,50 +1319,51 @@ fn split_survival_psi_design(
+                 2 * n,
+                 3 * n,
+             ));
+         }
+         Ok((
+             x_psi.slice(s![0..n, ..]).to_owned(),
+             x_psi.slice(s![n..2 * n, ..]).to_owned(),
+         ))
+     } else {
+         if x_psi.nrows() != n {
+             return Err(format!(
+                 "{label} psi design row mismatch: got {}, expected {}",
+                 x_psi.nrows(),
+                 n
+             ));
+         }
+         Ok((x_psi.clone(), x_psi.clone()))
+     }
+ }
+ 
+ impl SurvivalLocationScaleFamily {
+     const BLOCK_TIME: usize = 0;
+     const BLOCK_THRESHOLD: usize = 1;
+     const BLOCK_LOG_SIGMA: usize = 2;
+     const BLOCK_LINK_WIGGLE: usize = 3;
++    const EVALUATE_PARALLEL_ROW_THRESHOLD: usize = 1024;
+ 
+     #[inline]
+     fn time_wiggle_range(&self) -> std::ops::Range<usize> {
+         let p_total = self.x_time_exit.ncols();
+         let p_w = self.time_wiggle_ncols.min(p_total);
+         p_total - p_w..p_total
+     }
+ 
+     #[inline]
+     fn time_derivative_lower_bound(&self) -> f64 {
+         assert!(self.derivative_guard.is_finite() && self.derivative_guard > 0.0);
+         self.derivative_guard
+     }
+ 
+     fn max_feasible_time_step(
+         &self,
+         beta: &Array1<f64>,
+         delta: &Array1<f64>,
+     ) -> Result<Option<f64>, String> {
+         let Some(lower_bounds) = self.time_coefficient_lower_bounds.as_ref() else {
+             return Err(
+                 "survival location-scale time block missing structural coefficient lower bounds"
+                     .to_string(),
+             );
+         };
+@@ -7803,69 +7805,138 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
+ impl CustomFamily for SurvivalLocationScaleFamily {
+     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+         true
+     }
+ 
+     fn coefficient_hessian_cost(&self, specs: &[crate::custom_family::ParameterBlockSpec]) -> u64 {
+         // Survival location-scale couples its blocks (threshold/time/log-σ
+         // and any link/time wiggles) through the survival likelihood: every
+         // row contributes a dense outer-product over (Σ p_b) coefficients.
+         crate::custom_family::joint_coupled_coefficient_hessian_cost(self.n as u64, specs)
+     }
+ 
+     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+         let n = self.n;
+         let dynamic = self.build_dynamic_geometry(block_states)?;
+         let mut ll = 0.0;
+ 
+         // Per-row derivative collection — used for gradient only.
+         let mut grad_time_eta_h0 = Array1::<f64>::zeros(n);
+         let mut grad_time_eta_h1 = Array1::<f64>::zeros(n);
+         let mut grad_time_eta_d = Array1::<f64>::zeros(n);
+         let mut d1_q0 = Array1::<f64>::zeros(n);
+         let mut d1_q1 = Array1::<f64>::zeros(n);
+         let mut d1_qdot = Array1::<f64>::zeros(n);
+ 
+-        for i in 0..n {
+-            let state = self.row_predictor_state(
+-                dynamic.h_entry[i],
+-                dynamic.h_exit[i],
+-                dynamic.hdot_exit[i],
+-                dynamic.q_entry[i],
+-                dynamic.q_exit[i],
+-                dynamic.qdot_exit[i],
+-            );
+-            let Some(row) = self.row_derivatives(i, state)? else {
+-                continue;
++        let assign_row_derivatives =
++            |i: usize,
++             row: SurvivalRowDerivatives,
++             d1_q0: &mut Array1<f64>,
++             d1_q1: &mut Array1<f64>,
++             d1_qdot: &mut Array1<f64>,
++             grad_time_eta_h0: &mut Array1<f64>,
++             grad_time_eta_h1: &mut Array1<f64>,
++             grad_time_eta_d: &mut Array1<f64>| {
++                d1_q0[i] = row.d1_q0;
++                d1_q1[i] = row.d1_q1;
++                d1_qdot[i] = row.d1_qdot1;
++                grad_time_eta_h0[i] = row.grad_time_eta_h0;
++                grad_time_eta_h1[i] = row.grad_time_eta_h1;
++                grad_time_eta_d[i] = row.grad_time_eta_d;
+             };
+-            ll += row.ll;
+-            d1_q0[i] = row.d1_q0;
+-            d1_q1[i] = row.d1_q1;
+-            d1_qdot[i] = row.d1_qdot1;
+-            grad_time_eta_h0[i] = row.grad_time_eta_h0;
+-            grad_time_eta_h1[i] = row.grad_time_eta_h1;
+-            grad_time_eta_d[i] = row.grad_time_eta_d;
++
++        if n >= Self::EVALUATE_PARALLEL_ROW_THRESHOLD && rayon::current_num_threads() > 1 {
++            struct RowDerivativeAccumulator {
++                ll: f64,
++                rows: Vec<(usize, SurvivalRowDerivatives)>,
++            }
++
++            let make_acc = || RowDerivativeAccumulator {
++                ll: 0.0,
++                rows: Vec::new(),
++            };
++            let acc = (0..n)
++                .into_par_iter()
++                .try_fold(make_acc, |mut acc, i| -> Result<_, String> {
++                    let state = self.row_predictor_state(
++                        dynamic.h_entry[i],
++                        dynamic.h_exit[i],
++                        dynamic.hdot_exit[i],
++                        dynamic.q_entry[i],
++                        dynamic.q_exit[i],
++                        dynamic.qdot_exit[i],
++                    );
++                    if let Some(row) = self.row_derivatives(i, state)? {
++                        acc.ll += row.ll;
++                        acc.rows.push((i, row));
++                    }
++                    Ok(acc)
++                })
++                .try_reduce(make_acc, |mut a, mut b| {
++                    a.ll += b.ll;
++                    a.rows.append(&mut b.rows);
++                    Ok::<_, String>(a)
++                })?;
++
++            ll = acc.ll;
++            for (i, row) in acc.rows {
++                assign_row_derivatives(
++                    i,
++                    row,
++                    &mut d1_q0,
++                    &mut d1_q1,
++                    &mut d1_qdot,
++                    &mut grad_time_eta_h0,
++                    &mut grad_time_eta_h1,
++                    &mut grad_time_eta_d,
++                );
++            }
++        } else {
++            for i in 0..n {
++                let state = self.row_predictor_state(
++                    dynamic.h_entry[i],
++                    dynamic.h_exit[i],
++                    dynamic.hdot_exit[i],
++                    dynamic.q_entry[i],
++                    dynamic.q_exit[i],
++                    dynamic.qdot_exit[i],
++                );
++                let Some(row) = self.row_derivatives(i, state)? else {
++                    continue;
++                };
++                ll += row.ll;
++                assign_row_derivatives(
++                    i,
++                    row,
++                    &mut d1_q0,
++                    &mut d1_q1,
++                    &mut d1_qdot,
++                    &mut grad_time_eta_h0,
++                    &mut grad_time_eta_h1,
++                    &mut grad_time_eta_d,
++                );
++            }
+         }
+ 
+         // Per-block gradients (O(n·p_k) each, no Hessian algebra).
+         let grad_time = dynamic.time_jac_entry.t().dot(&grad_time_eta_h0)
+             + dynamic.time_jac_exit.t().dot(&grad_time_eta_h1)
+             + dynamic.time_jac_deriv.t().dot(&grad_time_eta_d);
+ 
+         let grad_t = if let (Some(x_t_entry), Some(x_t_deriv)) = (
+             self.x_threshold_entry.as_ref(),
+             self.x_threshold_deriv.as_ref(),
+         ) {
+             let grad_exit = &d1_q1 * &dynamic.dq_t_exit + &d1_qdot * &dynamic.dqdot_t;
+             let grad_entry = &d1_q0 * &dynamic.dq_t_entry;
+             let grad_deriv = &d1_qdot * &dynamic.dqdot_td;
+             self.x_threshold.transpose_vector_multiply(&grad_exit)
+                 + x_t_entry.transpose_vector_multiply(&grad_entry)
+                 + x_t_deriv.transpose_vector_multiply(&grad_deriv)
+         } else {
+             self.x_threshold.transpose_vector_multiply(
+                 &(&d1_q1 * &dynamic.dq_t_exit
+                     + &d1_q0 * &dynamic.dq_t_entry
+                     + &d1_qdot * &dynamic.dqdot_t),
+             )
+         };
+ 
+
+----- PATCH END -----
+
+[2026-05-06T20:28:14.176067+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:28:14.177987+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:14.178065+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:37.987877+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:28:37.989574+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:37.989626+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:40.202178+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:28:40.205099+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:40.205182+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:46.578299+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:28:46.579833+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:46.579904+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:57.971914+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:28:57.973604+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:57.973658+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:59.618273+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:28:59.621161+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:59.621269+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:29:05.750842+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:29:05.752621+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:29:05.752686+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:29:15.814919+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:29:15.816578+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:29:15.816627+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:29:17.540626+00:00] apply_result: mode=apply id=task_e_69fb938423f08324829c6c7a0c34c82d status=Partial applied=0 skipped=0 conflicts=1 cmd=(cd /Users/user/gam && git apply --3way /var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/.tmpl93aDi/patch.diff)
+stdout_tail=
+
+stderr_tail=
+Applied patch to 'src/solver/reml/unified.rs' with conflicts.
+U src/solver/reml/unified.rs
+
+patch_summary: kind=git-diff lines=596 chars=24284 cwd=/Users/user/gam ; head=
+diff --git a/src/solver/reml/unified.rs b/src/solver/reml/unified.rs
+index 3f93c29430becb5e5f288a4902893a85d01371bd..d3e15e2445435726afc7aaff9ab355c62b21b2e2 100644
+--- a/src/solver/reml/unified.rs
++++ b/src/solver/reml/unified.rs
+@@ -10027,218 +10027,253 @@ impl StochasticTraceTargets<'_> {
+                 implicit_ops,
+             } => dense_matrices.len() + implicit_ops.len(),
+         }
+     }
+ }
+ 
+ impl StochasticTraceEstimator {
+     /// Create a new estimator with the given configuration.
+     pub fn new(config: StochasticTraceConfig) -> Self {
+         Self { config }
+     }
+ 
+     /// Create with default configuration.
+     pub fn with_defaults() -> Self {
+         Self::new(StochasticTraceConfig::default())
+----- PATCH BEGIN -----
+diff --git a/src/solver/reml/unified.rs b/src/solver/reml/unified.rs
+index 3f93c29430becb5e5f288a4902893a85d01371bd..d3e15e2445435726afc7aaff9ab355c62b21b2e2 100644
+--- a/src/solver/reml/unified.rs
++++ b/src/solver/reml/unified.rs
+@@ -10027,218 +10027,253 @@ impl StochasticTraceTargets<'_> {
+                 implicit_ops,
+             } => dense_matrices.len() + implicit_ops.len(),
+         }
+     }
+ }
+ 
+ impl StochasticTraceEstimator {
+     /// Create a new estimator with the given configuration.
+     pub fn new(config: StochasticTraceConfig) -> Self {
+         Self { config }
+     }
+ 
+     /// Create with default configuration.
+     pub fn with_defaults() -> Self {
+         Self::new(StochasticTraceConfig::default())
+     }
+ 
+     fn for_outer_hessian(dim: usize, n_coords: usize) -> Self {
+         Self::new(StochasticTraceConfig::outer_hessian(dim, n_coords))
+     }
+ 
+     fn estimate_from_probe_batch<F>(
+         &self,
+         hop: &dyn HessianOperator,
+         n_coords: usize,
+-        mut evaluate_probe: F,
++        evaluate_probe: F,
+     ) -> Vec<f64>
+     where
+-        F: FnMut(&Array1<f64>, &Array1<f64>, &mut [f64]),
++        F: Fn(&Array1<f64>, &Array1<f64>, &mut [f64]) + Sync,
+     {
++        use rayon::iter::{IntoParallelIterator, ParallelIterator};
++
+         if n_coords == 0 {
+             return Vec::new();
+         }
+ 
+         let p = hop.dim();
+         if p == 0 {
+             return vec![0.0; n_coords];
+         }
+ 
+         let mut means = vec![0.0_f64; n_coords];
+         let mut m2s = vec![0.0_f64; n_coords];
+-        let mut probe_values = vec![0.0_f64; n_coords];
+         let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
+         let check_interval = 4;
++        let solve_rel_tol = self.config.solve_rel_tol;
++        let mut n_done = 0usize;
++
++        while n_done < self.config.n_probes_max {
++            let batch_len = check_interval.min(self.config.n_probes_max - n_done);
++            let probes: Vec<Array1<f64>> = (0..batch_len)
++                .map(|_| {
++                    let mut z = Array1::<f64>::zeros(p);
++                    rademacher_probe_into(z.view_mut(), &mut rng_state);
++                    z
++                })
++                .collect();
+ 
+-        let mut z = Array1::<f64>::zeros(p);
+-        for m in 0..self.config.n_probes_max {
+-            rademacher_probe_into(z.view_mut(), &mut rng_state);
+-            let w = hop.stochastic_trace_solve(&z, self.config.solve_rel_tol);
+-            evaluate_probe(&z, &w, &mut probe_values);
++            let batch_values: Vec<Vec<f64>> = probes
++                .into_par_iter()
++                .map(|z| {
++                    let w = hop.stochastic_trace_solve(&z, solve_rel_tol);
++                    let mut values = vec![0.0_f64; n_coords];
++                    evaluate_probe(&z, &w, &mut values);
++                    values
++                })
++                .collect();
+ 
+-            for k in 0..n_coords {
+-                let q_k = probe_values[k];
+-                let count = (m + 1) as f64;
+-                let delta = q_k - means[k];
+-                means[k] += delta / count;
+-                let delta2 = q_k - means[k];
+-                m2s[k] += delta * delta2;
++            for probe_values in batch_values {
++                n_done += 1;
++                let count = n_done as f64;
++                for k in 0..n_coords {
++                    let q_k = probe_values[k];
++                    let delta = q_k - means[k];
++                    means[k] += delta / count;
++                    let delta2 = q_k - means[k];
++                    m2s[k] += delta * delta2;
++                }
+             }
+ 
+-            let n_done = m + 1;
+-            if n_done >= self.config.n_probes_min && n_done % check_interval == 0 {
+-                if self.check_convergence(n_done, &means, &m2s) {
+-                    break;
+-                }
++            if n_done >= self.config.n_probes_min
++                && n_done % check_interval == 0
++                && self.check_convergence(n_done, &means, &m2s)
++            {
++                break;
+             }
+         }
+ 
+         means
+     }
+ 
+     fn estimate_matrix_from_probe_batch<F>(
+         &self,
+         hop: &dyn HessianOperator,
+         n_coords: usize,
+-        mut evaluate_probe: F,
++        evaluate_probe: F,
+     ) -> Array2<f64>
+     where
+-        F: FnMut(&Array1<f64>, &mut Array2<f64>),
++        F: Fn(&Array1<f64>, &mut Array2<f64>) + Sync,
+     {
++        use rayon::iter::{IntoParallelIterator, ParallelIterator};
++
+         if n_coords == 0 {
+             return Array2::zeros((0, 0));
+         }
+         let p = hop.dim();
+         if p == 0 {
+             return Array2::zeros((n_coords, n_coords));
+         }
+ 
+         let mut means = Array2::<f64>::zeros((n_coords, n_coords));
+         let mut m2s = Array2::<f64>::zeros((n_coords, n_coords));
+-        let mut probe_values = Array2::<f64>::zeros((n_coords, n_coords));
+         let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
+         let check_interval = 4;
+-        let mut z = Array1::<f64>::zeros(p);
+-
+-        for m in 0..self.config.n_probes_max {
+-            rademacher_probe_into(z.view_mut(), &mut rng_state);
+-            probe_values.fill(0.0);
+-            evaluate_probe(&z, &mut probe_values);
+-
+-            let count = (m + 1) as f64;
+-            for d in 0..n_coords {
+-                for e in 0..n_coords {
+-                    let q = probe_values[[d, e]];
+-                    let delta = q - means[[d, e]];
+-                    means[[d, e]] += delta / count;
+-                    let delta2 = q - means[[d, e]];
+-                    m2s[[d, e]] += delta * delta2;
++        let mut n_done = 0usize;
++
++        while n_done < self.config.n_probes_max {
++            let batch_len = check_interval.min(self.config.n_probes_max - n_done);
++            let probes: Vec<Array1<f64>> = (0..batch_len)
++                .map(|_| {
++                    let mut z = Array1::<f64>::zeros(p);
++                    rademacher_probe_into(z.view_mut(), &mut rng_state);
++                    z
++                })
++                .collect();
++
++            let batch_values: Vec<Array2<f64>> = probes
++                .into_par_iter()
++                .map(|z| {
++                    let mut values = Array2::<f64>::zeros((n_coords, n_coords));
++                    evaluate_probe(&z, &mut values);
++                    values
++                })
++                .collect();
++
++            for probe_values in batch_values {
++                n_done += 1;
++                let count = n_done as f64;
++                for d in 0..n_coords {
++                    for e in 0..n_coords {
++                        let q = probe_values[[d, e]];
++                        let delta = q - means[[d, e]];
++                        means[[d, e]] += delta / count;
++                        let delta2 = q - means[[d, e]];
++                        m2s[[d, e]] += delta * delta2;
++                    }
+                 }
+             }
+ 
+-            let n_done = m + 1;
+             if n_done >= self.config.n_probes_min
+                 && n_done % check_interval == 0
+                 && self.check_matrix_convergence(n_done, &means, &m2s)
+             {
+                 break;
+             }
+         }
+ 
+         for d in 0..n_coords {
+             for e in (d + 1)..n_coords {
+                 let avg = 0.5 * (means[[d, e]] + means[[e, d]]);
+                 means[[d, e]] = avg;
+                 means[[e, d]] = avg;
+             }
+         }
+         means
+     }
+ 
+     fn estimate_hinv_traces(
+         &self,
+         hop: &dyn HessianOperator,
+         targets: StochasticTraceTargets<'_>,
+     ) -> Vec<f64> {
+         let n_coords = targets.len();
+         if n_coords == 0 {
+             return Vec::new();
+         }
+ 
+         match targets {
+             StochasticTraceTargets::Dense(matrices) => {
+-                let mut a_w = Array1::<f64>::zeros(hop.dim());
+                 self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
++                    let mut a_w = Array1::<f64>::zeros(w.len());
+                     for k in 0..matrices.len() {
+                         dense_matvec_into(matrices[k], w.view(), a_w.view_mut());
+                         probe_values[k] = z.dot(&a_w);
+                     }
+                 })
+             }
+             StochasticTraceTargets::Mixed {
+                 dense_matrices,
+                 operators,
+-            } => {
+-                let mut a_w = Array1::<f64>::zeros(hop.dim());
+-                self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
+-                    for k in 0..dense_matrices.len() {
+-                        dense_matvec_into(dense_matrices[k], w.view(), a_w.view_mut());
+-                        probe_values[k] = z.dot(&a_w);
+-                    }
++            } => self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
++                let mut a_w = Array1::<f64>::zeros(w.len());
++                for k in 0..dense_matrices.len() {
++                    dense_matvec_into(dense_matrices[k], w.view(), a_w.view_mut());
++                    probe_values[k] = z.dot(&a_w);
++                }
+ 
+-                    let dense_count = dense_matrices.len();
+-                    for (oi, op) in operators.iter().enumerate() {
+-                        let k = dense_count + oi;
+-                        if op.has_fast_bilinear_view() {
+-                            probe_values[k] = op.bilinear_view(w.view(), z.view());
+-                        } else {
+-                            op.mul_vec_into(w.view(), a_w.view_mut());
+-                            probe_values[k] = z.dot(&a_w);
+-                        }
++                let dense_count = dense_matrices.len();
++                for (oi, op) in operators.iter().enumerate() {
++                    let k = dense_count + oi;
++                    if op.has_fast_bilinear_view() {
++                        probe_values[k] = op.bilinear_view(w.view(), z.view());
++                    } else {
++                        op.mul_vec_into(w.view(), a_w.view_mut());
++                        probe_values[k] = z.dot(&a_w);
+                     }
+-                })
+-            }
++                }
++            }),
+             StochasticTraceTargets::Structural {
+                 dense_matrices,
+                 implicit_ops,
+             } => {
+                 if implicit_ops.is_empty() {
+                     let no_ops: [&dyn HyperOperator; 0] = [];
+                     return self.estimate_hinv_traces(
+                         hop,
+                         StochasticTraceTargets::Mixed {
+                             dense_matrices,
+                             operators: &no_ops,
+                         },
+                     );
+                 }
+ 
+                 let x_design = implicit_ops[0].x_design.clone();
+-                let mut x_vec = Array1::<f64>::zeros(x_design.nrows());
+-                let mut y_vec = Array1::<f64>::zeros(x_design.nrows());
+-                let mut a_w = Array1::<f64>::zeros(hop.dim());
+                 self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
++                    let mut x_vec = Array1::<f64>::zeros(x_design.nrows());
++                    let mut y_vec = Array1::<f64>::zeros(x_design.nrows());
++                    let mut a_w = Array1::<f64>::zeros(w.len());
+                     design_matrix_apply_view_into(x_design.as_ref(), z.view(), x_vec.view_mut());
+                     design_matrix_apply_view_into(x_design.as_ref(), w.view(), y_vec.view_mut());
+ 
+                     for k in 0..dense_matrices.len() {
+                         dense_matvec_into(dense_matrices[k], w.view(), a_w.view_mut());
+                         probe_values[k] = z.dot(&a_w);
+                     }
+ 
+                     let dense_count = dense_matrices.len();
+                     for (oi, op) in implicit_ops.iter().enumerate() {
+                         let k = dense_count + oi;
+                         probe_values[k] = op.bilinear_with_shared_x(&x_vec, &y_vec, z, w);
+                     }
+                 })
+             }
+         }
+     }
+ 
+     /// Estimate a single trace `tr(H⁻¹ A)` using the same batched Hutchinson
+     /// core as the multi-coordinate path.
+     pub fn estimate_single_trace(&self, hop: &dyn HessianOperator, matrix: &Array2<f64>) -> f64 {
+         let matrices = [matrix];
+         self.estimate_hinv_traces(hop, StochasticTraceTargets::Dense(&matrices))[0]
+     }
+ 
+@@ -10358,69 +10393,73 @@ impl StochasticTraceEstimator {
+         if total == 0 {
+             return Array2::zeros((0, 0));
+         }
+ 
+         let p = hop.dim();
+         if p == 0 {
+             return Array2::zeros((total, total));
+         }
+ 
+         if total == 1 {
+             let value = if n_dense == 1 {
+                 self.estimate_second_order_single_dense(hop, dense_matrices[0])
+             } else {
+                 self.estimate_second_order_single_implicit(hop, implicit_ops[0])
+             };
+             return Array2::from_elem((1, 1), value);
+         }
+ 
+         // Get the shared X reference from the first implicit operator.
+         let x_design = if n_ops > 0 {
+             Some(implicit_ops[0].x_design.clone())
+         } else {
+             None
+         };
+ 
+-        let mut q_columns = Array2::zeros((p, total));
+-        let mut dense_a_u: Vec<Array1<f64>> = (0..n_dense).map(|_| Array1::zeros(p)).collect();
+         let n_obs = implicit_ops.first().map(|op| op.w_diag.len()).unwrap_or(0);
+-        let mut x_vec = Array1::<f64>::zeros(n_obs);
+-        let mut y_vec = Array1::<f64>::zeros(n_obs);
+-        let mut x_r: Vec<Array1<f64>> = (0..total).map(|_| Array1::zeros(n_obs)).collect();
+-        let mut implicit_dx_u: Vec<Array1<f64>> =
+-            (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
+-        let mut implicit_w_dx_u: Vec<Array1<f64>> =
+-            (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
+-        let mut implicit_w_y: Vec<Array1<f64>> = (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
+-        let mut implicit_dx_r: Vec<Vec<Array1<f64>>> = (0..n_ops)
+-            .map(|_| (0..total).map(|_| Array1::zeros(n_obs)).collect())
+-            .collect();
+-        let mut implicit_u_s: Vec<Array1<f64>> = (0..n_ops).map(|_| Array1::zeros(p)).collect();
+-        let mut implicit_n_work = Array1::<f64>::zeros(n_obs);
+-        let mut implicit_p_work = Array1::<f64>::zeros(p);
+ 
+         self.estimate_matrix_from_probe_batch(hop, total, |z, probe_values| {
++            let mut q_columns = Array2::zeros((p, total));
++            let mut dense_a_u: Vec<Array1<f64>> =
++                (0..n_dense).map(|_| Array1::zeros(p)).collect();
++            let mut x_vec = Array1::<f64>::zeros(n_obs);
++            let mut y_vec = Array1::<f64>::zeros(n_obs);
++            let mut x_r: Vec<Array1<f64>> = (0..total).map(|_| Array1::zeros(n_obs)).collect();
++            let mut implicit_dx_u: Vec<Array1<f64>> =
++                (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
++            let mut implicit_w_dx_u: Vec<Array1<f64>> =
++                (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
++            let mut implicit_w_y: Vec<Array1<f64>> =
++                (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
++            let mut implicit_dx_r: Vec<Vec<Array1<f64>>> = (0..n_ops)
++                .map(|_| (0..total).map(|_| Array1::zeros(n_obs)).collect())
++                .collect();
++            let mut implicit_u_s: Vec<Array1<f64>> =
++                (0..n_ops).map(|_| Array1::zeros(p)).collect();
++            let mut implicit_n_work = Array1::<f64>::zeros(n_obs);
++            let mut implicit_p_work = Array1::<f64>::zeros(p);
++
+             // Step 1: u = H⁻¹ z (shared solve)
+             let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
+ 
+             if let Some(ref x) = x_design {
+                 design_matrix_apply_view_into(x.as_ref(), z.view(), x_vec.view_mut());
+             }
+ 
+             // Step 2: Form q_e = A_e z for all axes e.
+             // For dense: q_e = dense_matrix * z
+             // For implicit: q_e = op.matvec_with_shared_xz(&x_vec, &z)
+             for e in 0..n_dense {
+                 dense_matvec_into(dense_matrices[e], z.view(), q_columns.column_mut(e));
+             }
+             for (oi, op) in implicit_ops.iter().enumerate() {
+                 let e = n_dense + oi;
+                 op.matvec_with_shared_xz_into(
+                     &x_vec,
+                     z.view(),
+                     q_columns.column_mut(e),
+                     implicit_n_work.view_mut(),
+                     implicit_p_work.view_mut(),
+                 );
+             }
+ 
+             // Step 3: R = H⁻¹ [q_1, ..., q_D] (block solve, total RHS)
+@@ -10562,121 +10601,120 @@ impl StochasticTraceEstimator {
+         hop: &dyn HessianOperator,
+         dense_matrices: &[&Array2<f64>],
+         operators: &[&dyn HyperOperator],
+     ) -> Array2<f64> {
+         let n_dense = dense_matrices.len();
+         let n_ops = operators.len();
+         let total = n_dense + n_ops;
+         if total == 0 {
+             return Array2::zeros((0, 0));
+         }
+ 
+         let p = hop.dim();
+         if p == 0 {
+             return Array2::zeros((total, total));
+         }
+ 
+         if total == 1 {
+             let value = if n_dense == 1 {
+                 self.estimate_second_order_single_dense(hop, dense_matrices[0])
+             } else {
+                 self.estimate_second_order_single_operator(hop, operators[0])
+             };
+             return Array2::from_elem((1, 1), value);
+         }
+ 
+-        let mut q_columns = Array2::zeros((p, total));
+-        let mut a_u_columns = Array2::zeros((p, total));
+-
+         self.estimate_matrix_from_probe_batch(hop, total, |z, probe_values| {
++            let mut q_columns = Array2::zeros((p, total));
++            let mut a_u_columns = Array2::zeros((p, total));
+             let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
+ 
+             for e in 0..n_dense {
+                 dense_matvec_into(dense_matrices[e], z.view(), q_columns.column_mut(e));
+                 dense_matvec_into(dense_matrices[e], u.view(), a_u_columns.column_mut(e));
+             }
+             for (oi, op) in operators.iter().enumerate() {
+                 let e = n_dense + oi;
+                 op.mul_vec_into(z.view(), q_columns.column_mut(e));
+                 op.mul_vec_into(u.view(), a_u_columns.column_mut(e));
+             }
+ 
+             let r = hop.stochastic_trace_solve_multi(&q_columns, self.config.solve_rel_tol);
+ 
+             for d in 0..total {
+                 let a_d_u = a_u_columns.column(d);
+                 for e in d..total {
+                     let r_e = r.column(e);
+                     let val = a_d_u.dot(&r_e);
+                     probe_values[[d, e]] = val;
+                     if d != e {
+                         let r_d = r.column(d);
+                         let val_sym = a_u_columns.column(e).dot(&r_d);
+                         probe_values[[e, d]] = val_sym;
+                     }
+                 }
+             }
+         })
+     }
+ 
+     fn estimate_second_order_single_dense(
+         &self,
+         hop: &dyn HessianOperator,
+         matrix: &Array2<f64>,
+     ) -> f64 {
+         let p = hop.dim();
+         if p == 0 {
+             return 0.0;
+         }
+ 
+-        let mut q = Array1::<f64>::zeros(p);
+         self.estimate_matrix_from_probe_batch(hop, 1, |z, probe_values| {
++            let mut q = Array1::<f64>::zeros(p);
+             let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
+             dense_matvec_into(matrix, z.view(), q.view_mut());
+             let r = hop.stochastic_trace_solve(&q, self.config.solve_rel_tol);
+             probe_values[[0, 0]] = dense_bilinear(matrix, u.view(), r.view());
+         })[[0, 0]]
+     }
+ 
+     fn estimate_second_order_single_implicit(
+         &self,
+         hop: &dyn HessianOperator,
+         op: &ImplicitHyperOperator,
+     ) -> f64 {
+         let p = hop.dim();
+         if p == 0 {
+             return 0.0;
+         }
+ 
+         let n_obs = op.w_diag.len();
+-        let mut x_z = Array1::<f64>::zeros(n_obs);
+-        let mut x_u = Array1::<f64>::zeros(n_obs);
+-        let mut x_r = Array1::<f64>::zeros(n_obs);
+-        let mut n_work = Array1::<f64>::zeros(n_obs);
+-        let mut p_work = Array1::<f64>::zeros(p);
+-        let mut q = Array1::<f64>::zeros(p);
+         self.estimate_matrix_from_probe_batch(hop, 1, |z, probe_values| {
++            let mut x_z = Array1::<f64>::zeros(n_obs);
++            let mut x_u = Array1::<f64>::zeros(n_obs);
++            let mut x_r = Array1::<f64>::zeros(n_obs);
++            let mut n_work = Array1::<f64>::zeros(n_obs);
++            let mut p_work = Array1::<f64>::zeros(p);
++            let mut q = Array1::<f64>::zeros(p);
+             let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
+             design_matrix_apply_view_into(&op.x_design, z.view(), x_z.view_mut());
+             op.matvec_with_shared_xz_into(
+                 &x_z,
+                 z.view(),
+                 q.view_mut(),
+                 n_work.view_mut(),
+                 p_work.view_mut(),
+             );
+             let r = hop.stochastic_trace_solve(&q, self.config.solve_rel_tol);
+ 
+             design_matrix_apply_view_into(&op.x_design, u.view(), x_u.view_mut());
+             design_matrix_apply_view_into(&op.x_design, r.view(), x_r.view_mut());
+             let dx_u = op
+                 .implicit_deriv
+                 .forward_mul(op.axis, &u.view())
+                 .expect("radial scalar evaluation failed during implicit derivative forward_mul");
+             let dx_r = op
+                 .implicit_deriv
+                 .forward_mul(op.axis, &r.view())
+                 .expect("radial scalar evaluation failed during implicit derivative forward_mul");
+ 
+             let w = &*op.w_diag;
+             let mut value = 0.0;
+             for i in 0..w.len() {
+@@ -10686,53 +10724,53 @@ impl StochasticTraceEstimator {
+             }
+             // Non-Gaussian fixed-β third-derivative correction:
+             //   uᵀ Xᵀ diag(c ⊙ X_{ψ_d} β̂) X r = Σ_i (X u)_i · c_x_psi_beta_i · (X r)_i
+             if let Some(c_x_psi_beta) = op.c_x_psi_beta.as_ref() {
+                 let c = c_x_psi_beta.as_ref();
+                 for i in 0..w.len() {
+                     value += x_u[i] * c[i] * x_r[i];
+                 }
+             }
+             value += dense_bilinear(&op.s_psi, r.view(), u.view());
+ 
+             probe_values[[0, 0]] = value;
+         })[[0, 0]]
+     }
+ 
+     fn estimate_second_order_single_operator(
+         &self,
+         hop: &dyn HessianOperator,
+         op: &dyn HyperOperator,
+     ) -> f64 {
+         let p = hop.dim();
+         if p == 0 {
+             return 0.0;
+         }
+ 
+-        let mut q = Array1::<f64>::zeros(p);
+-        let mut a_u = Array1::<f64>::zeros(p);
+         self.estimate_matrix_from_probe_batch(hop, 1, |z, probe_values| {
++            let mut q = Array1::<f64>::zeros(p);
++            let mut a_u = Array1::<f64>::zeros(p);
+             let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
+             op.mul_vec_into(z.view(), q.view_mut());
+             op.mul_vec_into(u.view(), a_u.view_mut());
+             let r = hop.stochastic_trace_solve(&q, self.config.solve_rel_tol);
+             probe_values[[0, 0]] = a_u.dot(&r);
+         })[[0, 0]]
+     }
+ 
+     /// Check the adaptive stopping criterion.
+     ///
+     /// Returns `true` if all coordinates have converged:
+     /// ```text
+     /// max_k  s_{M,k} / (√M · max(|q̄_{M,k}|, τ_rel))  ≤  ε
+     /// ```
+     fn check_convergence(&self, n: usize, means: &[f64], m2s: &[f64]) -> bool {
+         if n < 2 {
+             return false;
+         }
+         let sqrt_n = (n as f64).sqrt();
+         let n_f = n as f64;
+ 
+         for k in 0..means.len() {
+             let variance = m2s[k] / (n_f - 1.0);
+             let std_dev = variance.max(0.0).sqrt();
+             let denom = sqrt_n * means[k].abs().max(self.config.tau_rel);
+
+----- PATCH END -----
+
+[2026-05-06T20:29:39.238569+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:29:39.240067+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:29:39.240121+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:30:10.982972+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:30:10.984674+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:30:10.984734+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:30:12.971011+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:30:12.974178+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:30:12.974290+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
