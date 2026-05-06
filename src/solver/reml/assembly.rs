@@ -58,14 +58,6 @@ pub(crate) fn row_scale_dense_into(x: &Array2<f64>, scale: &Array1<f64>, out: &m
         });
 }
 
-/// Return `diag(scale) · x` without exposing the reusable-buffer API.
-#[allow(dead_code)]
-pub(crate) fn row_scale_dense(x: &Array2<f64>, scale: &Array1<f64>) -> Array2<f64> {
-    let mut out = Array2::<f64>::zeros(x.raw_dim());
-    row_scale_dense_into(x, scale, &mut out);
-    out
-}
-
 fn accumulate_weighted_cross_rows(
     out: &mut Array2<f64>,
     left: &Array2<f64>,

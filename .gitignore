@@ -2,6 +2,7 @@ target/
 target-*/
 Cargo.lock
 libbuild.rmeta
+error.log
 __pycache__/
 bench/**/__pycache__/
 benchmarks/**/__pycache__/
