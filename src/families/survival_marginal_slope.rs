@@ -24,8 +24,8 @@ use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
     CoeffSupport, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView, add_optional_matrix,
     add_optional_vector, add_scaled_coeff4, add_two_surface_psi_outer,
-    build_denested_partition_cells as shared_denested_partition_cells, eval_coeff4_at,
-    is_sigma_aux_index as shared_is_sigma_aux_index,
+    build_denested_partition_cells as shared_denested_partition_cells, chunked_row_reduction,
+    eval_coeff4_at, is_sigma_aux_index as shared_is_sigma_aux_index,
     observed_denested_cell_partials as shared_observed_denested_cell_partials, outer_row_indices,
     outer_score_scale, probit_frailty_scale, probit_frailty_scale_multi_dir_jet,
     psi_derivative_location, scale_coeff4,
@@ -2837,6 +2837,7 @@ impl SurvivalMarginalSlopeFamily {
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let outer_scale = outer_score_scale(options, self.n);
+        // Bit-deterministic reduction: see `chunked_row_reduction`.
         let (
             mut objective_psi,
             mut score_t,
@@ -2845,55 +2846,39 @@ impl SurvivalMarginalSlopeFamily {
             mut score_h,
             mut score_w,
             mut acc,
-        ) = row_iter
-            .into_par_iter()
-            .try_fold(
-                || {
-                    (
-                        0.0,
-                        Array1::zeros(p_t),
-                        Array1::zeros(p_m),
-                        Array1::zeros(p_g),
-                        Array1::zeros(p_h),
-                        Array1::zeros(p_w),
-                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-                    )
-                },
-                |mut a, row| -> Result<_, String> {
-                    let (obj, grad, hess) =
-                        self.row_sigma_primary_terms(row, block_states, false)?;
-                    a.0 += obj;
-                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-                    self.accumulate_score_with_q_geometry(
-                        row, &q_geom, &grad, &mut a.1, &mut a.2, &mut a.3,
-                    )?;
-                    a.6.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess)?;
-                    Ok(a)
-                },
-            )
-            .try_reduce(
-                || {
-                    (
-                        0.0,
-                        Array1::zeros(p_t),
-                        Array1::zeros(p_m),
-                        Array1::zeros(p_g),
-                        Array1::zeros(p_h),
-                        Array1::zeros(p_w),
-                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-                    )
-                },
-                |mut a, b| {
-                    a.0 += b.0;
-                    a.1 += &b.1;
-                    a.2 += &b.2;
-                    a.3 += &b.3;
-                    a.4 += &b.4;
-                    a.5 += &b.5;
-                    a.6.add(&b.6);
-                    Ok(a)
-                },
-            )?;
+        ) = chunked_row_reduction(
+            row_iter.as_slice(),
+            || {
+                (
+                    0.0,
+                    Array1::zeros(p_t),
+                    Array1::zeros(p_m),
+                    Array1::zeros(p_g),
+                    Array1::zeros(p_h),
+                    Array1::zeros(p_w),
+                    BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                )
+            },
+            |row, a| -> Result<(), String> {
+                let (obj, grad, hess) = self.row_sigma_primary_terms(row, block_states, false)?;
+                a.0 += obj;
+                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                self.accumulate_score_with_q_geometry(
+                    row, &q_geom, &grad, &mut a.1, &mut a.2, &mut a.3,
+                )?;
+                a.6.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess)?;
+                Ok(())
+            },
+            |total, chunk| {
+                total.0 += chunk.0;
+                total.1 += &chunk.1;
+                total.2 += &chunk.2;
+                total.3 += &chunk.3;
+                total.4 += &chunk.4;
+                total.5 += &chunk.5;
+                total.6.add(&chunk.6);
+            },
+        )?;
 
         if outer_scale != 1.0 {
             objective_psi *= outer_scale;
@@ -2959,6 +2944,7 @@ impl SurvivalMarginalSlopeFamily {
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let outer_scale = outer_score_scale(options, self.n);
+        // Bit-deterministic reduction: see `chunked_row_reduction`.
         let (
             mut objective_psi_psi,
             mut score_t,
@@ -2967,55 +2953,39 @@ impl SurvivalMarginalSlopeFamily {
             mut score_h,
             mut score_w,
             mut acc,
-        ) = row_iter
-            .into_par_iter()
-            .try_fold(
-                || {
-                    (
-                        0.0,
-                        Array1::zeros(p_t),
-                        Array1::zeros(p_m),
-                        Array1::zeros(p_g),
-                        Array1::zeros(p_h),
-                        Array1::zeros(p_w),
-                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-                    )
-                },
-                |mut a, row| -> Result<_, String> {
-                    let (obj, grad, hess) =
-                        self.row_sigma_primary_terms(row, block_states, true)?;
-                    a.0 += obj;
-                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-                    self.accumulate_score_with_q_geometry(
-                        row, &q_geom, &grad, &mut a.1, &mut a.2, &mut a.3,
-                    )?;
-                    a.6.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess)?;
-                    Ok(a)
-                },
-            )
-            .try_reduce(
-                || {
-                    (
-                        0.0,
-                        Array1::zeros(p_t),
-                        Array1::zeros(p_m),
-                        Array1::zeros(p_g),
-                        Array1::zeros(p_h),
-                        Array1::zeros(p_w),
-                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-                    )
-                },
-                |mut a, b| {
-                    a.0 += b.0;
-                    a.1 += &b.1;
-                    a.2 += &b.2;
-                    a.3 += &b.3;
-                    a.4 += &b.4;
-                    a.5 += &b.5;
-                    a.6.add(&b.6);
-                    Ok(a)
-                },
-            )?;
+        ) = chunked_row_reduction(
+            row_iter.as_slice(),
+            || {
+                (
+                    0.0,
+                    Array1::zeros(p_t),
+                    Array1::zeros(p_m),
+                    Array1::zeros(p_g),
+                    Array1::zeros(p_h),
+                    Array1::zeros(p_w),
+                    BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                )
+            },
+            |row, a| -> Result<(), String> {
+                let (obj, grad, hess) = self.row_sigma_primary_terms(row, block_states, true)?;
+                a.0 += obj;
+                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                self.accumulate_score_with_q_geometry(
+                    row, &q_geom, &grad, &mut a.1, &mut a.2, &mut a.3,
+                )?;
+                a.6.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess)?;
+                Ok(())
+            },
+            |total, chunk| {
+                total.0 += chunk.0;
+                total.1 += &chunk.1;
+                total.2 += &chunk.2;
+                total.3 += &chunk.3;
+                total.4 += &chunk.4;
+                total.5 += &chunk.5;
+                total.6.add(&chunk.6);
+            },
+        )?;
 
         if outer_scale != 1.0 {
             objective_psi_psi *= outer_scale;
@@ -3086,56 +3056,52 @@ impl SurvivalMarginalSlopeFamily {
         let primary_dim = N_PRIMARY;
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let outer_scale = outer_score_scale(options, self.n);
-        let mut acc = row_iter
-            .into_par_iter()
-            .try_fold(
-                || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-                |mut acc, row| -> Result<_, String> {
-                    let row_dir = self.row_primary_direction_from_flat_dynamic(
+        // Bit-deterministic reduction: see `chunked_row_reduction`.
+        let mut acc = chunked_row_reduction(
+            row_iter.as_slice(),
+            || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+            |row, acc| -> Result<(), String> {
+                let row_dir = self.row_primary_direction_from_flat_dynamic(
+                    row,
+                    block_states,
+                    &slices,
+                    d_beta_flat,
+                )?;
+                let mut grad = Array1::<f64>::zeros(primary_dim);
+                for a in 0..primary_dim {
+                    let da = unit_primary_direction(a);
+                    let scale = self.sigma_scale_jet(3, &[1], &[])?;
+                    grad[a] = self.row_neglog_directional_with_scale_jet(
                         row,
                         block_states,
-                        &slices,
-                        d_beta_flat,
+                        &[Array1::zeros(primary_dim), row_dir.clone(), da],
+                        &scale,
                     )?;
-                    let mut grad = Array1::<f64>::zeros(primary_dim);
-                    for a in 0..primary_dim {
-                        let da = unit_primary_direction(a);
-                        let scale = self.sigma_scale_jet(3, &[1], &[])?;
-                        grad[a] = self.row_neglog_directional_with_scale_jet(
+                }
+                let mut hess = Array2::<f64>::zeros((primary_dim, primary_dim));
+                for a in 0..primary_dim {
+                    let da = unit_primary_direction(a);
+                    for b in a..primary_dim {
+                        let db = unit_primary_direction(b);
+                        let scale = self.sigma_scale_jet(4, &[1], &[])?;
+                        let value = self.row_neglog_directional_with_scale_jet(
                             row,
                             block_states,
-                            &[Array1::zeros(primary_dim), row_dir.clone(), da],
+                            &[Array1::zeros(primary_dim), row_dir.clone(), da.clone(), db],
                             &scale,
                         )?;
+                        hess[[a, b]] = value;
+                        hess[[b, a]] = value;
                     }
-                    let mut hess = Array2::<f64>::zeros((primary_dim, primary_dim));
-                    for a in 0..primary_dim {
-                        let da = unit_primary_direction(a);
-                        for b in a..primary_dim {
-                            let db = unit_primary_direction(b);
-                            let scale = self.sigma_scale_jet(4, &[1], &[])?;
-                            let value = self.row_neglog_directional_with_scale_jet(
-                                row,
-                                block_states,
-                                &[Array1::zeros(primary_dim), row_dir.clone(), da.clone(), db],
-                                &scale,
-                            )?;
-                            hess[[a, b]] = value;
-                            hess[[b, a]] = value;
-                        }
-                    }
-                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-                    acc.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess)?;
-                    Ok(acc)
-                },
-            )
-            .try_reduce(
-                || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-                |mut a, b| {
-                    a.add(&b);
-                    Ok(a)
-                },
-            )?;
+                }
+                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                acc.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess)?;
+                Ok(())
+            },
+            |total, chunk| {
+                total.add(&chunk);
+            },
+        )?;
         if outer_scale != 1.0 {
             acc.scale_assign(outer_scale);
         }
