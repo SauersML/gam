@@ -529,6 +529,12 @@ pub struct ExactNewtonJointGradientEvaluation {
 ///
 /// matching the three-term convention in [`outer_gradient_entry`] (penalty +
 /// trace − det).
+pub struct BatchedOuterHessianTerms {
+    /// Exact profiled outer Hessian over θ = (ρ, ψ), assembled or exposed in
+    /// operator form by the family in one amortized evaluation.
+    pub outer_hessian: crate::solver::outer_strategy::HessianResult,
+}
+
 pub struct BatchedOuterGradientTerms {
     /// Explicit ∂J/∂θ_j contributions evaluated at the converged β̂ holding
     /// β fixed (i.e. the part that does NOT flow through H or S):
@@ -994,6 +1000,30 @@ pub trait CustomFamily {
         _hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     ) -> Result<Option<BatchedOuterGradientTerms>, String> {
         Ok(None)
+    }
+
+    /// Optional batched analytic-Hessian / HVP hook.
+    ///
+    /// This is the Hessian-side analogue of
+    /// [`Self::batched_outer_gradient_terms`]: families that can share a
+    /// single factorization, row-leverage stream, or directional θθ kernel
+    /// across all explicit outer-Hessian terms return the exact profiled
+    /// Hessian here.  The evaluator uses this hook only for Hessian-capable
+    /// families and only after the inner mode has been fitted; default
+    /// `None` leaves unsupported families on their existing exact path.
+    fn batched_outer_hessian_terms(
+        &self,
+        _block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        _derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        _rho: &Array1<f64>,
+        _hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+    ) -> Result<Option<BatchedOuterHessianTerms>, String> {
+        Ok(self
+            .outer_hyper_hessian_operator(specs)
+            .map(|operator| BatchedOuterHessianTerms {
+                outer_hessian: crate::solver::outer_strategy::HessianResult::Operator(operator),
+            }))
     }
 
     /// Explicit name for the inner coefficient-space Hessian HVP capability.
@@ -4456,6 +4486,57 @@ fn outer_eval_result_to_joint_hyper_result(
         warm_start: CustomFamilyWarmStart {
             inner: result.warm_start,
         },
+    }
+}
+
+struct OwnedDenseOuterHessianOperator {
+    matrix: Array2<f64>,
+}
+
+impl crate::solver::outer_strategy::OuterHessianOperator for OwnedDenseOuterHessianOperator {
+    fn dim(&self) -> usize {
+        self.matrix.nrows()
+    }
+
+    fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+        if v.len() != self.matrix.ncols() {
+            return Err(format!(
+                "batched dense outer Hessian matvec length mismatch: got {}, expected {}",
+                v.len(),
+                self.matrix.ncols()
+            ));
+        }
+        Ok(self.matrix.dot(v))
+    }
+
+    fn is_cheap_to_materialize(&self) -> bool {
+        true
+    }
+}
+
+fn custom_family_batched_outer_hessian_operator<F: CustomFamily>(
+    family: &F,
+    states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    rho: &Array1<f64>,
+    workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+    eval_mode: EvalMode,
+) -> Result<Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>, String> {
+    if eval_mode != EvalMode::ValueGradientHessian {
+        return Ok(None);
+    }
+    let Some(terms) =
+        family.batched_outer_hessian_terms(states, specs, derivative_blocks, rho, workspace)?
+    else {
+        return Ok(None);
+    };
+    match terms.outer_hessian {
+        crate::solver::outer_strategy::HessianResult::Operator(operator) => Ok(Some(operator)),
+        crate::solver::outer_strategy::HessianResult::Analytic(matrix) => {
+            Ok(Some(Arc::new(OwnedDenseOuterHessianOperator { matrix })))
+        }
+        crate::solver::outer_strategy::HessianResult::Unavailable => Ok(None),
     }
 }
 
@@ -8341,7 +8422,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 /// expects the actual perturbation direction `δβ`, so we negate `v_k` before calling it.
 struct BorrowedJointDerivProvider<'a> {
     compute_dh: &'a dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+<<<<<<< ours
     compute_d2h: &'a dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+=======
+    compute_d2h:
+        Option<&'a dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>>,
+    family_outer_hessian_operator:
+        Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
+>>>>>>> theirs
 }
 
 // SAFETY: Only used synchronously within the same stack frame that creates it.
@@ -8405,6 +8493,12 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
     fn has_corrections(&self) -> bool {
         true
     }
+
+    fn family_outer_hessian_operator(
+        &self,
+    ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
+        self.family_outer_hessian_operator.clone()
+    }
 }
 
 struct OwnedJointDerivProvider {
@@ -8414,6 +8508,8 @@ struct OwnedJointDerivProvider {
             + Send
             + Sync,
     >,
+    family_outer_hessian_operator:
+        Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
 }
 
 impl HessianDerivativeProvider for OwnedJointDerivProvider {
@@ -8480,6 +8576,12 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
                 second: Arc::clone(&self.compute_d2h),
             },
         )
+    }
+
+    fn family_outer_hessian_operator(
+        &self,
+    ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
+        self.family_outer_hessian_operator.clone()
     }
 }
 
@@ -8940,6 +9042,9 @@ fn joint_outer_evaluate(
         >,
     >,
     ext_bundle: Option<ExtCoordBundle>,
+    batched_outer_hessian_operator: Option<
+        Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
+    >,
 ) -> Result<OuterObjectiveEvalResult, String> {
     let joint_trace_diagonal_ridge = moderidge + if !strict_spd { extra_logdet_ridge } else { 0.0 };
     let scaled_joint_trace_diagonal_ridge = rho_curvature_scale * joint_trace_diagonal_ridge;
@@ -8950,11 +9055,17 @@ fn joint_outer_evaluate(
             Box::new(OwnedJointDerivProvider {
                 compute_dh: owned_dh,
                 compute_d2h: owned_d2h,
+                family_outer_hessian_operator: batched_outer_hessian_operator.clone(),
             })
         } else {
             Box::new(BorrowedJointDerivProvider {
                 compute_dh,
+<<<<<<< ours
                 compute_d2h,
+=======
+                compute_d2h: compute_d2h_ref,
+                family_outer_hessian_operator: batched_outer_hessian_operator.clone(),
+>>>>>>> theirs
             })
         };
 
@@ -9174,11 +9285,17 @@ fn joint_outer_evaluate_efs(
             Box::new(OwnedJointDerivProvider {
                 compute_dh: owned_dh,
                 compute_d2h: owned_d2h,
+                family_outer_hessian_operator: None,
             })
         } else {
             Box::new(BorrowedJointDerivProvider {
                 compute_dh,
+<<<<<<< ours
                 compute_d2h,
+=======
+                compute_d2h: compute_d2h_ref,
+                family_outer_hessian_operator: None,
+>>>>>>> theirs
             })
         };
 
@@ -10802,6 +10919,15 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             Some(owned_compute_dh),
             Some(owned_compute_d2h),
             ext_bundle,
+            custom_family_batched_outer_hessian_operator(
+                family,
+                synced_joint_states.as_ref(),
+                specs,
+                derivative_blocks.as_ref(),
+                rho_current,
+                hessian_workspace.clone(),
+                eval_mode,
+            )?,
         )?;
 
         // The unified evaluator produces gradient/Hessian of size (rho_dim + psi_dim),
@@ -10894,6 +11020,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         None,
                         None,
                         None,
+                        None,
                     )?;
                     // Assemble the gradient via the universal three-term formula:
                     //   grad[k] = obj_θ[k] + 0.5 * tr(H⁻¹ Ḣ_k) - 0.5 * tr(S⁺ Ṡ_k).
@@ -10966,6 +11093,15 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             None,
             None,
             None, // no ext_coords when psi_dim == 0
+            custom_family_batched_outer_hessian_operator(
+                family,
+                &inner.block_states,
+                specs,
+                derivative_blocks.as_ref(),
+                rho_current,
+                None,
+                eval_mode,
+            )?,
         )?;
 
         return Ok(eval_result);
@@ -11248,6 +11384,15 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         None,
         None,
         None, // no ext_coords for generic single-block fallback
+        custom_family_batched_outer_hessian_operator(
+            family,
+            &inner.block_states,
+            specs,
+            derivative_blocks.as_ref(),
+            rho_current,
+            None,
+            eval_mode,
+        )?,
     )?;
 
     Ok(eval_result)
@@ -12714,6 +12859,107 @@ pub(crate) fn fit_custom_family_fixed_log_lambdas<
 
 #[cfg(test)]
 mod tests {
+    #[derive(Clone)]
+    struct BatchedOuterHessianTestFamily {
+        matrix: Array2<f64>,
+    }
+
+    struct TestOuterHessianOperator {
+        matrix: Array2<f64>,
+    }
+
+    impl crate::solver::outer_strategy::OuterHessianOperator for TestOuterHessianOperator {
+        fn dim(&self) -> usize {
+            self.matrix.nrows()
+        }
+
+        fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+            Ok(self.matrix.dot(v))
+        }
+
+        fn is_cheap_to_materialize(&self) -> bool {
+            true
+        }
+    }
+
+    impl CustomFamily for BatchedOuterHessianTestFamily {
+        fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+            Ok(FamilyEvaluation {
+                log_likelihood: 0.0,
+                blockworking_sets: vec![],
+            })
+        }
+
+        fn outer_hyper_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+            true
+        }
+
+        fn outer_hyper_hessian_operator(
+            &self,
+            _specs: &[ParameterBlockSpec],
+        ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
+            Some(Arc::new(TestOuterHessianOperator {
+                matrix: self.matrix.clone(),
+            }))
+        }
+    }
+
+    #[test]
+    fn batched_outer_hessian_terms_materialize_to_exact_small_matrix() {
+        let exact = array![[4.0, -1.0], [-1.0, 3.0]];
+        let family = BatchedOuterHessianTestFamily {
+            matrix: exact.clone(),
+        };
+        let terms = family
+            .batched_outer_hessian_terms(&[], &[], &[], &array![0.0, 0.0], None)
+            .expect("batched Hessian hook succeeds")
+            .expect("test family exposes batched HVP terms");
+        let operator = match terms.outer_hessian {
+            crate::solver::outer_strategy::HessianResult::Operator(operator) => operator,
+            _ => panic!("batched hook should expose an operator"),
+        };
+        let dense = operator
+            .mul_mat(Array2::<f64>::eye(2).view())
+            .expect("operator materializes on small exact case");
+        assert_eq!(dense, exact);
+    }
+
+    #[test]
+    fn batched_outer_hessian_operator_selected_only_for_hessian_eval() {
+        let family = BatchedOuterHessianTestFamily {
+            matrix: array![[2.0, 0.5], [0.5, 5.0]],
+        };
+        let selected = custom_family_batched_outer_hessian_operator(
+            &family,
+            &[],
+            &[],
+            &[],
+            &array![1.0, -1.0],
+            None,
+            EvalMode::ValueGradientHessian,
+        )
+        .expect("selection check succeeds");
+        assert!(
+            selected.is_some(),
+            "supported Hessian/HVP families should select the batched operator path"
+        );
+
+        let not_selected = custom_family_batched_outer_hessian_operator(
+            &family,
+            &[],
+            &[],
+            &[],
+            &array![1.0, -1.0],
+            None,
+            EvalMode::ValueAndGradient,
+        )
+        .expect("non-Hessian selection check succeeds");
+        assert!(
+            not_selected.is_none(),
+            "batched Hessian terms must not run for gradient-only evaluations"
+        );
+    }
+
     use super::*;
     use crate::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu};
     use crate::families::gamlss::{BinomialLocationScaleFamily, BinomialLocationScaleWiggleFamily};
