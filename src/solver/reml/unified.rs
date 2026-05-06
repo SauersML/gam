@@ -11303,6 +11303,103 @@ mod tests {
     use approx::assert_relative_eq;
     use ndarray::array;
 
+    struct SentinelOuterHessianOperator {
+        matrix: Array2<f64>,
+    }
+
+    impl crate::solver::outer_strategy::OuterHessianOperator for SentinelOuterHessianOperator {
+        fn dim(&self) -> usize {
+            self.matrix.nrows()
+        }
+
+        fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+            Ok(self.matrix.dot(v))
+        }
+
+        fn is_cheap_to_materialize(&self) -> bool {
+            true
+        }
+    }
+
+    struct FamilyOperatorOnlyDerivatives {
+        op: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
+    }
+
+    impl HessianDerivativeProvider for FamilyOperatorOnlyDerivatives {
+        fn hessian_derivative_correction(
+            &self,
+            _: &Array1<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            Ok(None)
+        }
+
+        fn has_corrections(&self) -> bool {
+            false
+        }
+
+        fn outer_hessian_derivative_kernel(&self) -> Option<OuterHessianDerivativeKernel> {
+            None
+        }
+
+        fn family_outer_hessian_operator(
+            &self,
+        ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
+            Some(Arc::clone(&self.op))
+        }
+    }
+
+    #[test]
+    fn value_gradient_hessian_prefers_family_supplied_outer_operator() {
+        let hop = Arc::new(DenseSpectralOperator::from_symmetric(&Array2::eye(2)).unwrap());
+        let family_matrix = array![[42.0]];
+        let family_operator = Arc::new(SentinelOuterHessianOperator {
+            matrix: family_matrix.clone(),
+        });
+        let deriv_provider = FamilyOperatorOnlyDerivatives {
+            op: family_operator,
+        };
+
+        let solution = InnerSolution {
+            log_likelihood: -1.25,
+            penalty_quadratic: 0.4,
+            hessian_op: hop,
+            beta: array![0.5, -0.25],
+            penalty_coords: vec![PenaltyCoordinate::from_dense_root(Array2::eye(2))],
+            penalty_logdet: PenaltyLogdetDerivs {
+                value: 0.0,
+                first: array![0.0],
+                second: Some(array![[0.0]]),
+            },
+            deriv_provider: Box::new(deriv_provider),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: None,
+            hessian_logdet_correction: 0.0,
+            penalty_subspace_trace: None,
+            rho_curvature_scale: 1.0,
+            n_observations: 2,
+            nullspace_dim: 0.0,
+            dispersion: DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: true,
+            },
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+            barrier_config: None,
+        };
+
+        let result = reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
+            .expect("family outer operator evaluation");
+        let crate::solver::outer_strategy::HessianResult::Operator(op) = result.hessian else {
+            panic!("expected family-supplied operator Hessian route");
+        };
+        let dense = op.materialize_dense().expect("sentinel materialization");
+        assert_eq!(dense, family_matrix);
+    }
+
     #[test]
     fn test_dense_spectral_operator_simple() {
         // 2×2 diagonal matrix: H = diag(2, 5)
