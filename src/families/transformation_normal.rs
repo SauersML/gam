@@ -33,10 +33,11 @@ use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyPsiDerivativeOperator, ExactNewtonJointGradientEvaluation,
     ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
-    ExactNewtonJointPsiTerms, FamilyEvaluation, MaterializablePsiDerivativeOperator,
-    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, build_block_spatial_psi_derivatives,
-    custom_family_outer_derivatives, evaluate_custom_family_joint_hyper,
-    evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
+    ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, FamilyEvaluation,
+    MaterializablePsiDerivativeOperator, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
+    build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
+    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, fit_custom_family,
+    fit_custom_family_fixed_log_lambdas,
 };
 use crate::families::gamlss::{
     initializewiggle_knots_from_seed, solve_penalizedweighted_projection,
@@ -55,7 +56,9 @@ use crate::smooth::{
     spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::UnifiedFitResult;
-use crate::solver::estimate::reml::unified::{HyperOperator, ProjectedFactorCache};
+use crate::solver::estimate::reml::unified::{
+    DriftDerivResult, HyperOperator, ProjectedFactorCache,
+};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
@@ -3653,16 +3656,17 @@ impl TransformationNormalFamily {
 
         impl PsiPairBatchedAccum {
             fn new(p_total: usize, p_resp: usize, rank: usize) -> Self {
+                let projected_len = p_resp * rank;
                 Self {
                     hvp: Array2::<f64>::zeros((p_total, rank)),
                     gamma: vec![0.0; p_resp],
                     gamma_i: vec![0.0; p_resp],
                     gamma_j: vec![0.0; p_resp],
                     gamma_ij: vec![0.0; p_resp],
-                    gamma_dot: vec![0.0; p_resp],
-                    gamma_i_dot: vec![0.0; p_resp],
-                    gamma_j_dot: vec![0.0; p_resp],
-                    gamma_ij_dot: vec![0.0; p_resp],
+                    gamma_dot: vec![0.0; projected_len],
+                    gamma_i_dot: vec![0.0; projected_len],
+                    gamma_j_dot: vec![0.0; projected_len],
+                    gamma_ij_dot: vec![0.0; projected_len],
                 }
             }
 
@@ -3742,32 +3746,49 @@ impl TransformationNormalFamily {
                         }
                     }
 
-                    for col in 0..rank {
-                        for k in 0..p_resp {
-                            let dir_k = factor.slice(s![k * p_cov..(k + 1) * p_cov, col]);
-                            acc.gamma_dot[k] = dir_k.dot(&cov_row);
-                            acc.gamma_i_dot[k] = dir_k.dot(&cov_i_row);
-                            acc.gamma_j_dot[k] = dir_k.dot(&cov_j_row);
-                            acc.gamma_ij_dot[k] = dir_k.dot(&cov_ij_row);
+                    acc.gamma_dot.fill(0.0);
+                    acc.gamma_i_dot.fill(0.0);
+                    acc.gamma_j_dot.fill(0.0);
+                    acc.gamma_ij_dot.fill(0.0);
+                    for k in 0..p_resp {
+                        let factor_row_base = k * p_cov;
+                        let projected_base = k * rank;
+                        for cidx in 0..p_cov {
+                            let factor_row = factor_row_base + cidx;
+                            let cov_v = cov_row[cidx];
+                            let cov_i_v = cov_i_row[cidx];
+                            let cov_j_v = cov_j_row[cidx];
+                            let cov_ij_v = cov_ij_row[cidx];
+                            for col in 0..rank {
+                                let coeff = factor[[factor_row, col]];
+                                let idx = projected_base + col;
+                                acc.gamma_dot[idx] += coeff * cov_v;
+                                acc.gamma_i_dot[idx] += coeff * cov_i_v;
+                                acc.gamma_j_dot[idx] += coeff * cov_j_v;
+                                acc.gamma_ij_dot[idx] += coeff * cov_ij_v;
+                            }
                         }
+                    }
 
-                        let mut h_dot = rv[0] * acc.gamma_dot[0];
-                        let mut hp_dot = rd[0] * acc.gamma_dot[0];
-                        let mut h_i_dot = rv[0] * acc.gamma_i_dot[0];
-                        let mut h_j_dot = rv[0] * acc.gamma_j_dot[0];
-                        let mut h_ij_dot = rv[0] * acc.gamma_ij_dot[0];
-                        let mut hp_i_dot = rd[0] * acc.gamma_i_dot[0];
-                        let mut hp_j_dot = rd[0] * acc.gamma_j_dot[0];
-                        let mut hp_ij_dot = rd[0] * acc.gamma_ij_dot[0];
+                    for col in 0..rank {
+                        let mut h_dot = rv[0] * acc.gamma_dot[col];
+                        let mut hp_dot = rd[0] * acc.gamma_dot[col];
+                        let mut h_i_dot = rv[0] * acc.gamma_i_dot[col];
+                        let mut h_j_dot = rv[0] * acc.gamma_j_dot[col];
+                        let mut h_ij_dot = rv[0] * acc.gamma_ij_dot[col];
+                        let mut hp_i_dot = rd[0] * acc.gamma_i_dot[col];
+                        let mut hp_j_dot = rd[0] * acc.gamma_j_dot[col];
+                        let mut hp_ij_dot = rd[0] * acc.gamma_ij_dot[col];
                         for k in 1..p_resp {
+                            let idx = k * rank + col;
                             let g = acc.gamma[k];
                             let gi = acc.gamma_i[k];
                             let gj = acc.gamma_j[k];
                             let gij = acc.gamma_ij[k];
-                            let u = acc.gamma_dot[k];
-                            let ui = acc.gamma_i_dot[k];
-                            let uj = acc.gamma_j_dot[k];
-                            let uij = acc.gamma_ij_dot[k];
+                            let u = acc.gamma_dot[idx];
+                            let ui = acc.gamma_i_dot[idx];
+                            let uj = acc.gamma_j_dot[idx];
+                            let uij = acc.gamma_ij_dot[idx];
                             h_dot += 2.0 * rv[k] * g * u;
                             hp_dot += 2.0 * rd[k] * g * u;
                             h_i_dot += 2.0 * rv[k] * (u * gi + g * ui);
@@ -3784,26 +3805,28 @@ impl TransformationNormalFamily {
                         let mut endpoint_ij_d = [0.0; 2];
                         for e in 0..2 {
                             let basis = endpoint_basis[e];
-                            endpoint_d[e] = basis[0] * acc.gamma_dot[0];
-                            endpoint_i_d[e] = basis[0] * acc.gamma_i_dot[0];
-                            endpoint_j_d[e] = basis[0] * acc.gamma_j_dot[0];
-                            endpoint_ij_d[e] = basis[0] * acc.gamma_ij_dot[0];
+                            endpoint_d[e] = basis[0] * acc.gamma_dot[col];
+                            endpoint_i_d[e] = basis[0] * acc.gamma_i_dot[col];
+                            endpoint_j_d[e] = basis[0] * acc.gamma_j_dot[col];
+                            endpoint_ij_d[e] = basis[0] * acc.gamma_ij_dot[col];
                             for k in 1..p_resp {
-                                endpoint_d[e] += 2.0 * basis[k] * acc.gamma[k] * acc.gamma_dot[k];
+                                let idx = k * rank + col;
+                                endpoint_d[e] +=
+                                    2.0 * basis[k] * acc.gamma[k] * acc.gamma_dot[idx];
                                 endpoint_i_d[e] += 2.0
                                     * basis[k]
-                                    * (acc.gamma_dot[k] * acc.gamma_i[k]
-                                        + acc.gamma[k] * acc.gamma_i_dot[k]);
+                                    * (acc.gamma_dot[idx] * acc.gamma_i[k]
+                                        + acc.gamma[k] * acc.gamma_i_dot[idx]);
                                 endpoint_j_d[e] += 2.0
                                     * basis[k]
-                                    * (acc.gamma_dot[k] * acc.gamma_j[k]
-                                        + acc.gamma[k] * acc.gamma_j_dot[k]);
+                                    * (acc.gamma_dot[idx] * acc.gamma_j[k]
+                                        + acc.gamma[k] * acc.gamma_j_dot[idx]);
                                 endpoint_ij_d[e] += 2.0
                                     * basis[k]
-                                    * (acc.gamma_j_dot[k] * acc.gamma_i[k]
-                                        + acc.gamma_j[k] * acc.gamma_i_dot[k]
-                                        + acc.gamma_dot[k] * acc.gamma_ij[k]
-                                        + acc.gamma[k] * acc.gamma_ij_dot[k]);
+                                    * (acc.gamma_j_dot[idx] * acc.gamma_i[k]
+                                        + acc.gamma_j[k] * acc.gamma_i_dot[idx]
+                                        + acc.gamma_dot[idx] * acc.gamma_ij[k]
+                                        + acc.gamma[k] * acc.gamma_ij_dot[idx]);
                             }
                         }
 
@@ -3817,10 +3840,10 @@ impl TransformationNormalFamily {
                                 acc.gamma_ij[k],
                             );
                             let (u, ui, uj, uij) = (
-                                acc.gamma_dot[k],
-                                acc.gamma_i_dot[k],
-                                acc.gamma_j_dot[k],
-                                acc.gamma_ij_dot[k],
+                                acc.gamma_dot[k * rank + col],
+                                acc.gamma_i_dot[k * rank + col],
+                                acc.gamma_j_dot[k * rank + col],
+                                acc.gamma_ij_dot[k * rank + col],
                             );
                             for cidx in 0..p_cov {
                                 let c = cov_row[cidx];
@@ -6034,6 +6057,48 @@ impl CustomFamily for TransformationNormalFamily {
         Ok(Some(
             Arc::new(workspace) as Arc<dyn ExactNewtonJointHessianWorkspace>
         ))
+    }
+
+    fn exact_newton_joint_psi_workspace(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        Ok(Some(Arc::new(TransformationNormalPsiWorkspace::new(
+            self.clone(),
+            block_states.to_vec(),
+            specs.to_vec(),
+            derivative_blocks.to_vec(),
+        ))))
+    }
+
+    fn exact_newton_joint_psi_workspace_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        _options: &BlockwiseFitOptions,
+    ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        // CTN's psi calculus is row-deterministic and does not consume the
+        // outer-only stratified subsample, so the with-options variant simply
+        // forwards to the shared constructor. Keeping this method explicit
+        // matches the survival-marginal-slope override pattern.
+        Ok(Some(Arc::new(TransformationNormalPsiWorkspace::new(
+            self.clone(),
+            block_states.to_vec(),
+            specs.to_vec(),
+            derivative_blocks.to_vec(),
+        ))))
+    }
+
+    fn exact_newton_joint_psi_workspace_for_first_order_terms(&self) -> bool {
+        // CTN's per-axis [`scop_psi_terms`] kernel walks all `n` rows serially
+        // and is invoked once per ψ axis. Opting in here amortizes the per-row
+        // state load across axes and parallelizes the row walk via the
+        // workspace's [`compute_all_axes`] kernel — the dominant outer
+        // gradient-evaluation cost at biobank scale.
+        true
     }
 
     fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
@@ -10334,6 +10399,90 @@ mod tests {
     }
 
     #[test]
+    fn ctn_psi_workspace_first_order_matches_per_axis_path_bit_equivalent() {
+        // Bit-equivalence guard for `TransformationNormalPsiWorkspace`. The
+        // workspace's single-pass kernel must produce the same per-axis
+        // `objective_psi` and `score_psi` as the per-axis `scop_psi_terms`
+        // path that the previous CTN code path used. We compare across every
+        // ψ axis at once — there is no axis whose accumulated state can
+        // mask a bug in another axis.
+        let psi = array![0.15, -0.10];
+        let (family, derivative_blocks, state, spec) = toy_family_and_derivatives(&psi);
+        let states = vec![state.clone()];
+        let specs = vec![spec];
+        let n_psi = derivative_blocks[0].len();
+        assert!(
+            n_psi >= 2,
+            "toy CTN fixture must expose at least 2 ψ axes for the workspace check, got {n_psi}"
+        );
+
+        // Per-axis ground truth via the existing direct hook.
+        let mut per_axis: Vec<ExactNewtonJointPsiTerms> = Vec::with_capacity(n_psi);
+        for psi_index in 0..n_psi {
+            per_axis.push(
+                family
+                    .exact_newton_joint_psi_terms(&states, &specs, &derivative_blocks, psi_index)
+                    .expect("per-axis ψ terms")
+                    .expect("per-axis ψ terms must be present"),
+            );
+        }
+
+        // All-axes pass via the workspace.
+        let workspace = family
+            .exact_newton_joint_psi_workspace(&states, &specs, &derivative_blocks)
+            .expect("CTN ψ workspace constructor")
+            .expect("CTN ψ workspace must be present");
+
+        for psi_index in 0..n_psi {
+            let cached = workspace
+                .first_order_terms(psi_index)
+                .expect("workspace first-order terms")
+                .expect("workspace first-order terms must be present");
+            let expected = &per_axis[psi_index];
+
+            // Objective: the workspace fold is order-permutation-equivalent
+            // to the per-axis fold; allow a tiny floating-point slack on top
+            // of bit equality so reductions over different chunk shapes
+            // (rayon's deterministic-order fold groups rows differently than
+            // the serial loop) do not flake the test.
+            let obj_diff = (cached.objective_psi - expected.objective_psi).abs();
+            let obj_scale = expected.objective_psi.abs().max(1.0);
+            assert!(
+                obj_diff <= 1.0e-12 * obj_scale,
+                "ψ workspace objective_psi[axis={psi_index}] mismatch: cached={}, per-axis={}, |diff|={obj_diff}",
+                cached.objective_psi,
+                expected.objective_psi,
+            );
+
+            assert_eq!(
+                cached.score_psi.len(),
+                expected.score_psi.len(),
+                "ψ workspace score_psi length mismatch at axis {psi_index}"
+            );
+            for idx in 0..expected.score_psi.len() {
+                let diff = (cached.score_psi[idx] - expected.score_psi[idx]).abs();
+                let scale = expected.score_psi[idx].abs().max(1.0);
+                assert!(
+                    diff <= 1.0e-12 * scale,
+                    "ψ workspace score_psi[axis={psi_index}, idx={idx}] mismatch: cached={}, per-axis={}, |diff|={diff}",
+                    cached.score_psi[idx],
+                    expected.score_psi[idx],
+                );
+            }
+
+            // The per-axis matrix-free Hessian operator must remain present
+            // and dimension-matching; we do not compare its action here
+            // because the operator is constructed directly from the same
+            // `row_quantities` cache the per-axis path uses.
+            let cached_op = cached
+                .hessian_psi_operator
+                .as_ref()
+                .expect("workspace ψ Hessian operator must be present");
+            assert_eq!(cached_op.dim(), state.beta.len());
+        }
+    }
+
+    #[test]
     fn transformation_normal_joint_psi_second_order_terms_are_operator_backed() {
         let psi = array![0.15, -0.10];
         let (family, derivative_blocks, state, spec) = toy_family_and_derivatives(&psi);
@@ -11724,6 +11873,431 @@ impl MaterializablePsiDerivativeOperator for TensorKroneckerPsiOperator {
         axis: usize,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
         Ok(self.materialize_lifted(&self.response_val_basis, &self.materialize_cov_first(axis)?))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-evaluation ψ workspace
+// ---------------------------------------------------------------------------
+
+/// Per-evaluation ψ workspace for `TransformationNormalFamily`.
+///
+/// The CTN row-streaming first-order ψ kernel ([`scop_psi_terms`]) walks all
+/// `n` rows serially and is invoked once per ψ axis. At biobank scale that is
+/// the dominant outer-evaluation cost. All `n_psi` axes share the same per-row
+/// state — `γ`, `h`, `h'`, `endpoint_q`, the response basis rows `rv`/`rd`,
+/// the covariate row, and the row weight. The only per-axis input is
+/// `cov_psi[axis] = ∂C/∂ψ_axis`, which is already cached at the operator level
+/// via [`TensorKroneckerPsiOperator::materialize_cov_first_axis_arc`].
+///
+/// This workspace
+///
+/// 1. precomputes all per-axis ψ first-order terms in a single rayon
+///    fold/reduce over rows so the per-row state is loaded once and reused
+///    across axes, and
+/// 2. caches the resulting per-axis terms so subsequent
+///    `first_order_terms(idx)` lookups are O(p_total) clones rather than full
+///    row walks.
+///
+/// `second_order_terms` and `hessian_directional_derivative` are not cached
+/// here; they delegate back to the existing `CustomFamily` direct hooks. Those
+/// paths are already operator-backed and fire only at full-Hessian outer
+/// evaluations (the dominant cost we are addressing here is gradient-mode).
+struct TransformationNormalPsiWorkspace {
+    family: TransformationNormalFamily,
+    block_states: Vec<ParameterBlockState>,
+    specs: Vec<ParameterBlockSpec>,
+    derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+    cache: Mutex<Option<Vec<Option<ExactNewtonJointPsiTerms>>>>,
+}
+
+impl TransformationNormalPsiWorkspace {
+    fn new(
+        family: TransformationNormalFamily,
+        block_states: Vec<ParameterBlockState>,
+        specs: Vec<ParameterBlockSpec>,
+        derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+    ) -> Self {
+        Self {
+            family,
+            block_states,
+            specs,
+            derivative_blocks,
+            cache: Mutex::new(None),
+        }
+    }
+
+    /// Compute all per-axis ψ first-order terms in a single parallel row pass.
+    ///
+    /// Each row's per-row state (γ, h, h', endpoint_q, rv, rd, cov_row, weight)
+    /// is loaded once and reused across every ψ axis, in contrast to the
+    /// per-axis [`scop_psi_terms`] path that reloads it once per axis. Op
+    /// counts are identical to the per-axis path; only the loop nesting and
+    /// reduction shape change.
+    fn compute_all_axes(&self) -> Result<Vec<Option<ExactNewtonJointPsiTerms>>, String> {
+        if self.block_states.len() != 1 {
+            return Err(format!(
+                "TransformationNormalFamily expects 1 block, got {}",
+                self.block_states.len()
+            ));
+        }
+        if self.derivative_blocks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let block_derivs = &self.derivative_blocks[0];
+        let n_psi = block_derivs.len();
+        if n_psi == 0 {
+            return Ok(Vec::new());
+        }
+
+        let beta = &self.block_states[0].beta;
+        let row = self.family.row_quantities(beta)?;
+        let n = self.family.response_val_basis.nrows();
+        let p_resp = self.family.response_val_basis.ncols();
+        let p_cov = self.family.covariate_design.ncols();
+        let p_total = p_resp * p_cov;
+        if beta.len() != p_total {
+            return Err(format!(
+                "TransformationNormalPsiWorkspace beta length {} != p_resp({p_resp}) * p_cov({p_cov})",
+                beta.len()
+            ));
+        }
+        let beta_mat = beta
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("ψ workspace beta reshape failed: {e}"))?;
+
+        // Resolve and validate the shared tensor-Kronecker ψ operator across
+        // every axis. CTN is single-block so all entries point at the same
+        // operator instance.
+        let mut tensor_op: Option<&TensorKroneckerPsiOperator> = None;
+        let mut op_arcs: Vec<Arc<dyn CustomFamilyPsiDerivativeOperator>> = Vec::with_capacity(n_psi);
+        let mut axes: Vec<usize> = Vec::with_capacity(n_psi);
+        for deriv in block_derivs.iter() {
+            let op_arc = deriv
+                .implicit_operator
+                .as_ref()
+                .ok_or_else(|| {
+                    "TransformationNormalFamily ψ workspace requires implicit operator on each axis"
+                        .to_string()
+                })?
+                .clone();
+            let op = op_arc
+                .as_any()
+                .downcast_ref::<TensorKroneckerPsiOperator>()
+                .ok_or_else(|| {
+                    "TransformationNormalFamily ψ workspace requires tensor-backed operator"
+                        .to_string()
+                })?;
+            if let Some(existing) = tensor_op {
+                if !std::ptr::eq(existing, op) {
+                    return Err(
+                        "TransformationNormalFamily ψ workspace requires a shared tensor operator \
+                         across all axes"
+                            .to_string(),
+                    );
+                }
+            } else {
+                tensor_op = Some(op);
+            }
+            axes.push(deriv.implicit_axis);
+            op_arcs.push(op_arc);
+        }
+        let op = tensor_op.expect("at least one axis ensured above");
+
+        // Materialize the per-axis covariate ψ-derivative blocks once. Each
+        // call hits the operator-level cache; subsequent calls within this
+        // workspace reuse the same Arc<Array2<f64>>.
+        let mut cov_psi_axes: Vec<Arc<Array2<f64>>> = Vec::with_capacity(n_psi);
+        for &axis in &axes {
+            let cov_psi = op
+                .materialize_cov_first_axis_arc(axis)
+                .map_err(|e| format!("ψ workspace materialize_cov_first axis {axis}: {e}"))?;
+            if cov_psi.nrows() != n || cov_psi.ncols() != p_cov {
+                return Err(format!(
+                    "ψ workspace covariate derivative shape {}x{} for axis {axis} != expected {}x{}",
+                    cov_psi.nrows(),
+                    cov_psi.ncols(),
+                    n,
+                    p_cov
+                ));
+            }
+            cov_psi_axes.push(cov_psi);
+        }
+
+        let cov = self
+            .family
+            .covariate_design
+            .try_row_chunk(0..n)
+            .map_err(|e| format!("ψ workspace covariate row chunk: {e}"))?;
+        let weights = self.family.weights.as_ref();
+        let h = row.h.as_ref();
+        let h_prime = row.h_prime.as_ref();
+        let endpoint_q = row.endpoint_q.as_ref();
+        let endpoint_basis = [
+            self.family
+                .response_upper_basis
+                .as_slice()
+                .ok_or_else(|| "ψ workspace endpoint upper basis is not contiguous".to_string())?,
+            self.family
+                .response_lower_basis
+                .as_slice()
+                .ok_or_else(|| "ψ workspace endpoint lower basis is not contiguous".to_string())?,
+        ];
+
+        // Single-pass row walk: for each row, load the per-row state once and
+        // accumulate every axis's `objective_psi`/`score_psi` in lockstep.
+        struct PsiAllAxesAccum {
+            objective_psi: Vec<f64>,
+            score_psi: Vec<Array1<f64>>,
+        }
+
+        impl PsiAllAxesAccum {
+            fn new(n_psi: usize, p_total: usize) -> Self {
+                Self {
+                    objective_psi: vec![0.0; n_psi],
+                    score_psi: (0..n_psi).map(|_| Array1::<f64>::zeros(p_total)).collect(),
+                }
+            }
+
+            fn merge(mut self, rhs: Self) -> Self {
+                for (a, v) in rhs.objective_psi.into_iter().enumerate() {
+                    self.objective_psi[a] += v;
+                }
+                for (a, score) in rhs.score_psi.into_iter().enumerate() {
+                    self.score_psi[a].scaled_add(1.0, &score);
+                }
+                self
+            }
+        }
+
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let cov_psi_views: Vec<&Array2<f64>> =
+            cov_psi_axes.iter().map(|arc| arc.as_ref()).collect();
+        let cov_psi_views = &cov_psi_views;
+
+        let accum = (0..n)
+            .into_par_iter()
+            .fold(
+                || PsiAllAxesAccum::new(n_psi, p_total),
+                |mut acc, i| {
+                    let cov_row = cov.row(i);
+                    let rv = self.family.response_val_basis.row(i);
+                    let rd = self.family.response_deriv_basis.row(i);
+                    let wi = weights[i];
+                    let hi = h[i];
+                    let hp = h_prime[i];
+                    let inv_hp = 1.0 / hp;
+                    let inv_hp_sq = inv_hp * inv_hp;
+                    let q = &endpoint_q[i];
+                    let gamma_row = row.gamma.row(i);
+
+                    let mut gamma = vec![0.0; p_resp];
+                    for k in 0..p_resp {
+                        gamma[k] = gamma_row[k];
+                    }
+
+                    // β-only (axis-independent) per-row factors.
+                    let mut h_factor = vec![0.0; p_resp];
+                    let mut hp_factor = vec![0.0; p_resp];
+                    h_factor[0] = rv[0];
+                    hp_factor[0] = rd[0];
+                    for k in 1..p_resp {
+                        h_factor[k] = 2.0 * rv[k] * gamma[k];
+                        hp_factor[k] = 2.0 * rd[k] * gamma[k];
+                    }
+                    let mut endpoint_factor = vec![[0.0_f64; 2]; p_resp];
+                    for e in 0..2 {
+                        let basis = endpoint_basis[e];
+                        endpoint_factor[0][e] = basis[0];
+                        for k in 1..p_resp {
+                            endpoint_factor[k][e] = 2.0 * basis[k] * gamma[k];
+                        }
+                    }
+
+                    // Per-axis: compute γψ via β·psi_row, then update the
+                    // axis's running objective + score block. The k×c inner
+                    // loop matches `scop_psi_terms` operation-for-operation.
+                    let mut gamma_psi = vec![0.0; p_resp];
+                    let mut hpsi_cov_factor = vec![0.0; p_resp];
+                    let mut hppsi_cov_factor = vec![0.0; p_resp];
+                    let mut hpsi_psi_factor = vec![0.0; p_resp];
+                    let mut hppsi_psi_factor = vec![0.0; p_resp];
+                    let mut endpoint_psi = [0.0_f64; 2];
+                    let mut endpoint_psi_cov_factor = vec![[0.0_f64; 2]; p_resp];
+                    let mut endpoint_psi_psi_factor = vec![[0.0_f64; 2]; p_resp];
+
+                    for axis_idx in 0..n_psi {
+                        let cov_psi = cov_psi_views[axis_idx];
+                        let psi_row = cov_psi.row(i);
+
+                        for k in 0..p_resp {
+                            gamma_psi[k] = beta_mat.row(k).dot(&psi_row);
+                        }
+
+                        let mut h_psi = rv[0] * gamma_psi[0];
+                        let mut hp_psi = rd[0] * gamma_psi[0];
+                        for k in 1..p_resp {
+                            h_psi += 2.0 * rv[k] * gamma[k] * gamma_psi[k];
+                            hp_psi += 2.0 * rd[k] * gamma[k] * gamma_psi[k];
+                        }
+
+                        for e in 0..2 {
+                            let basis = endpoint_basis[e];
+                            endpoint_psi[e] = basis[0] * gamma_psi[0];
+                            endpoint_psi_psi_factor[0][e] = basis[0];
+                            endpoint_psi_cov_factor[0][e] = 0.0;
+                            for k in 1..p_resp {
+                                endpoint_psi[e] += 2.0 * basis[k] * gamma[k] * gamma_psi[k];
+                                endpoint_psi_cov_factor[k][e] = 2.0 * basis[k] * gamma_psi[k];
+                                endpoint_psi_psi_factor[k][e] = 2.0 * basis[k] * gamma[k];
+                            }
+                        }
+
+                        acc.objective_psi[axis_idx] += wi
+                            * (hi * h_psi - hp_psi * inv_hp + endpoint_chain_first(q, endpoint_psi));
+
+                        hpsi_psi_factor[0] = rv[0];
+                        hppsi_psi_factor[0] = rd[0];
+                        hpsi_cov_factor[0] = 0.0;
+                        hppsi_cov_factor[0] = 0.0;
+                        for k in 1..p_resp {
+                            hpsi_cov_factor[k] = 2.0 * rv[k] * gamma_psi[k];
+                            hppsi_cov_factor[k] = 2.0 * rd[k] * gamma_psi[k];
+                            hpsi_psi_factor[k] = 2.0 * rv[k] * gamma[k];
+                            hppsi_psi_factor[k] = 2.0 * rd[k] * gamma[k];
+                        }
+
+                        let score_axis = &mut acc.score_psi[axis_idx];
+                        for k in 0..p_resp {
+                            for c in 0..p_cov {
+                                let idx = k * p_cov + c;
+                                let h_a = h_factor[k] * cov_row[c];
+                                let hp_a = hp_factor[k] * cov_row[c];
+                                let hpsi_a = hpsi_cov_factor[k] * cov_row[c]
+                                    + hpsi_psi_factor[k] * psi_row[c];
+                                let hppsi_a = hppsi_cov_factor[k] * cov_row[c]
+                                    + hppsi_psi_factor[k] * psi_row[c];
+                                let endpoint_a = [
+                                    endpoint_factor[k][0] * cov_row[c],
+                                    endpoint_factor[k][1] * cov_row[c],
+                                ];
+                                let endpoint_psi_a = [
+                                    endpoint_psi_cov_factor[k][0] * cov_row[c]
+                                        + endpoint_psi_psi_factor[k][0] * psi_row[c],
+                                    endpoint_psi_cov_factor[k][1] * cov_row[c]
+                                        + endpoint_psi_psi_factor[k][1] * psi_row[c],
+                                ];
+                                score_axis[idx] += wi
+                                    * (h_a * h_psi + hi * hpsi_a - hppsi_a * inv_hp
+                                        + hp_psi * hp_a * inv_hp_sq
+                                        + endpoint_chain_second(
+                                            q,
+                                            endpoint_psi,
+                                            endpoint_a,
+                                            endpoint_psi_a,
+                                        ));
+                            }
+                        }
+                    }
+
+                    acc
+                },
+            )
+            .reduce(
+                || PsiAllAxesAccum::new(n_psi, p_total),
+                PsiAllAxesAccum::merge,
+            );
+
+        // Re-attach the per-axis matrix-free first-order Hessian operators.
+        // Each operator is constructed against the shared row_quantities cache
+        // we already built — identical to the per-axis path.
+        let PsiAllAxesAccum {
+            objective_psi,
+            mut score_psi,
+        } = accum;
+        let mut out: Vec<Option<ExactNewtonJointPsiTerms>> = Vec::with_capacity(n_psi);
+        for (axis_idx, &axis) in axes.iter().enumerate() {
+            let hessian_psi_operator: Arc<dyn HyperOperator> =
+                Arc::new(TransformationNormalPsiHessianOperator::new(
+                    Arc::new(self.family.clone()),
+                    beta.clone(),
+                    Arc::clone(&op_arcs[axis_idx]),
+                    axis,
+                    Arc::clone(&row.gamma),
+                    Arc::clone(&row.h),
+                    Arc::clone(&row.h_prime),
+                    Arc::clone(&row.endpoint_q),
+                ));
+            // Take the per-axis score buffer out of the accumulator without
+            // cloning. The order matches the construction order so each axis
+            // is consumed exactly once.
+            let score_axis = std::mem::replace(&mut score_psi[axis_idx], Array1::<f64>::zeros(0));
+            out.push(Some(ExactNewtonJointPsiTerms {
+                objective_psi: objective_psi[axis_idx],
+                score_psi: score_axis,
+                hessian_psi: Array2::zeros((0, 0)),
+                hessian_psi_operator: Some(hessian_psi_operator),
+            }));
+        }
+        Ok(out)
+    }
+}
+
+impl ExactNewtonJointPsiWorkspace for TransformationNormalPsiWorkspace {
+    fn first_order_terms(
+        &self,
+        psi_index: usize,
+    ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        let mut guard = self
+            .cache
+            .lock()
+            .map_err(|_| "TransformationNormalPsiWorkspace cache poisoned".to_string())?;
+        if guard.is_none() {
+            let computed = self.compute_all_axes()?;
+            *guard = Some(computed);
+        }
+        let cached = guard.as_ref().expect("populated above");
+        if psi_index >= cached.len() {
+            return Ok(None);
+        }
+        Ok(cached[psi_index].clone())
+    }
+
+    fn second_order_terms(
+        &self,
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        // Defer to the existing direct hook. CTN's psi-psi second-order path
+        // is already operator-backed and only fires at full-Hessian outer
+        // evaluations, so caching it here would not be a hot-path win.
+        self.family.exact_newton_joint_psisecond_order_terms(
+            &self.block_states,
+            &self.specs,
+            &self.derivative_blocks,
+            psi_i,
+            psi_j,
+        )
+    }
+
+    fn hessian_directional_derivative(
+        &self,
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<DriftDerivResult>, String> {
+        // Defer to the existing direct hook and wrap the dense result. The
+        // CTN drift `D_β H_ψ[u]` is dense-only at present.
+        Ok(self
+            .family
+            .exact_newton_joint_psihessian_directional_derivative(
+                &self.block_states,
+                &self.specs,
+                &self.derivative_blocks,
+                psi_index,
+                d_beta_flat,
+            )?
+            .map(DriftDerivResult::Dense))
     }
 }
 
