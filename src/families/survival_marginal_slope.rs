@@ -13004,8 +13004,18 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         // flex path produces a
         // `SurvivalMarginalSlopeExactNewtonJointHessianWorkspace`. Both
         // route the joint Hessian through Hv operators rather than dense
-        // assembly. This advertises β-space representation support only; it
-        // does not imply a profiled outer θ-HVP.
+        // assembly.
+        true
+    }
+
+    fn outer_hyper_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+        // The exact outer Hessian over θ=(ρ,ψ[,log σ]) can be applied without
+        // pairwise θθ materialization: coefficient-Hessian drift terms use the
+        // joint-Hessian workspace's directional-derivative operators, and ψ
+        // drift terms use `SurvivalMarginalSlopePsiWorkspace` to return
+        // `DriftDerivResult::Operator`. Advertising this capability lets the
+        // outer planner keep ARC/Newton curvature at large n or large ψ_dim
+        // while routing the representation through matrix-free HVPs.
         true
     }
 
@@ -14066,40 +14076,12 @@ pub fn fit_survival_marginal_slope_terms(
             joint_gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-    // Same biobank-scale gate as bernoulli marginal-slope — see comment block
-    // in `bernoulli_marginal_slope::fit_bernoulli_marginal_slope_terms` for
-    // the rationale. At biobank shape the per-row third/fourth-derivative
-    // outer-Hessian work dominates wall-clock; declare Hessian as
-    // `Unavailable` for large problems so the planner falls back to BFGS
-    // (gradient-only) on the analytic gradient.
-    let n_obs = data.nrows();
-    let psi_dim = setup.log_kappa_dim();
-    let biobank_scale = n_obs > 50_000 || psi_dim > 30;
-    // CRITICAL: when biobank_scale fires we ALSO override the
-    // BlockwiseFitOptions to set `use_outer_hessian=false`. The optimize-
-    // joint path consumes our local `analytic_joint_hessian_available`
-    // value and gates the planner on it; but the survival main fit also
-    // ends up running through the `fit_custom_family` blockwise outer-loop
-    // path (visible as `[OUTER] custom family: ...` in CI logs), and that
-    // path computes its Hessian capability via
-    // `custom_family_outer_derivatives` which only consults
-    // `options.use_outer_hessian` and the family's declared 2nd-order
-    // capability — bypassing our gate entirely. CI run 25338491995 showed
-    // this exact failure mode: at biobank n=320k psi_dim=23 the planner
-    // selected `solver=Arc, hessian=Analytic` despite the gate being
-    // tripped. Setting `use_outer_hessian=false` in the options bag
-    // forces both paths to declare the outer Hessian unavailable, routing
-    // to BFGS.
-    let mut options_override = options.clone();
-    if biobank_scale {
-        options_override.use_outer_hessian = false;
-        log::info!(
-            "[survival-marginal-slope] declining analytic outer Hessian for n={n_obs}, psi_dim={psi_dim}; routing to BFGS (use_outer_hessian=false)"
-        );
-    }
-    let options: &BlockwiseFitOptions = &options_override;
+    // Survival marginal-slope now exposes exact coefficient-space and ψ-space
+    // Hessian directional derivatives as HyperOperators (see the workspace
+    // overrides below). Keep analytic curvature advertised at biobank scale;
+    // the unified REML/LAML planner chooses the matrix-free outer-HVP route for
+    // large `(n, p, K)` shapes instead of falling back to first-order BFGS.
     let analytic_joint_hessian_available = analytic_joint_derivatives_available
-        && !biobank_scale
         && matches!(
             joint_hessian,
             crate::solver::outer_strategy::Derivative::Analytic
@@ -15058,6 +15040,39 @@ mod tests {
             family.exact_outer_derivative_order(&specs, &BlockwiseFitOptions::default()),
             ExactOuterDerivativeOrder::Second
         );
+    }
+
+    #[test]
+    fn survival_marginal_slope_advertises_outer_hvp_at_large_psi_dim() {
+        let n = 2usize;
+        let family = make_block_psi_test_family(n);
+        let specs = vec![
+            dummy_penalized_blockspec(0, 0),
+            dummy_penalized_blockspec(1, 31),
+            dummy_penalized_blockspec(1, 1),
+        ];
+        let options = BlockwiseFitOptions {
+            use_remlobjective: true,
+            use_outer_hessian: true,
+            ..BlockwiseFitOptions::default()
+        };
+
+        let (gradient, hessian) = custom_family_outer_derivatives(&family, &specs, &options);
+
+        assert!(family.inner_coefficient_hessian_hvp_available(&specs));
+        assert!(family.outer_hyper_hessian_hvp_available(&specs));
+        assert_eq!(
+            family.exact_outer_derivative_order(&specs, &options),
+            ExactOuterDerivativeOrder::Second
+        );
+        assert!(
+            crate::solver::estimate::reml::unified::prefer_outer_hessian_operator(50_001, 2, 32,)
+        );
+        assert_eq!(
+            gradient,
+            crate::solver::outer_strategy::Derivative::Analytic
+        );
+        assert_eq!(hessian, crate::solver::outer_strategy::Derivative::Analytic);
     }
 
     #[test]
@@ -17469,6 +17484,51 @@ mod tests {
         let exp = &raw * factor;
         let rel = rel_diff_array2_survival(&scaled, &exp);
         assert!(rel < 1e-12, "drift rel {}", rel);
+    }
+
+    #[test]
+    fn survival_psi_workspace_hessian_directional_derivative_is_operator_and_matches_dense() {
+        let n = 40usize;
+        let family = make_block_psi_test_family(n);
+        let states = block_psi_test_block_states(&family, 0.15, 0.25);
+        let derivative_blocks = block_psi_test_marginal_derivative_blocks(n);
+        let specs = vec![dummy_blockspec(0), dummy_blockspec(1), dummy_blockspec(1)];
+        let slices = block_slices(&family, &states);
+        let mut d_beta_flat = Array1::<f64>::zeros(slices.total);
+        d_beta_flat[slices.marginal.start] = 0.05;
+        d_beta_flat[slices.logslope.start] = -0.04;
+
+        let dense = family
+            .psi_hessian_directional_derivative_with_options(
+                &states,
+                &derivative_blocks,
+                0,
+                &d_beta_flat,
+                &BlockwiseFitOptions::default(),
+            )
+            .expect("dense drift")
+            .expect("dense drift available");
+        let workspace = family
+            .exact_newton_joint_psi_workspace_with_options(
+                &states,
+                &specs,
+                &derivative_blocks,
+                &BlockwiseFitOptions::default(),
+            )
+            .expect("workspace")
+            .expect("workspace available");
+        let result = workspace
+            .hessian_directional_derivative(0, &d_beta_flat)
+            .expect("workspace drift")
+            .expect("workspace drift available");
+
+        let crate::solver::estimate::reml::unified::DriftDerivResult::Operator(op) = result else {
+            panic!("survival psi drift should use operator representation");
+        };
+        assert_eq!(op.dim(), dense.nrows());
+        let operator_dense = op.to_dense();
+        let rel = rel_diff_array2_survival(&operator_dense, &dense);
+        assert!(rel < 1e-12, "operator/dense drift rel {rel}");
     }
 
     #[test]
