@@ -14,7 +14,9 @@ use crate::types::RhoPrior;
 use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::parallel::prelude::*;
-use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
+use ndarray::{
+    Array, Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, s,
+};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -9747,75 +9749,137 @@ pub fn build_matern_collocation_operator_matrices(
     let mut d2_raw = Array2::<f64>::zeros((p * d * d, p));
     let metric_weights = aniso_log_scales.map(centered_aniso_metric_weights);
     const R_EPS: f64 = 1e-12;
-    for k in 0..p {
-        let scale_k = row_scales[k];
-        for j in 0..p {
-            // Distance: anisotropic r = |Ah| when eta present, isotropic |h| otherwise.
-            let r = if let Some(eta) = aniso_log_scales {
-                aniso_distance_and_components(
-                    centers.row(k).as_slice().unwrap(),
-                    centers.row(j).as_slice().unwrap(),
-                    eta,
-                )
-                .0
-            } else {
-                stable_euclidean_norm((0..d).map(|c| centers[[k, c]] - centers[[j, c]]))
-            };
-            if matches!(nu, MaternNu::Half) && r <= R_EPS && d > 1 {
-                return Err(BasisError::InvalidInput(
-                    "Matérn nu=1/2 has singular Laplacian at center collisions for d>1; choose nu>=3/2 or avoid collocation at centers".to_string(),
-                ));
-            }
-            let (phi, _, phi_rr, phi_r_over_r) =
-                if matches!(nu, MaternNu::Half) && r <= R_EPS && d == 1 {
-                    // In 1D: Delta phi = phi'' and the singular phi'/r term is absent.
-                    let s = 1.0 / length_scale;
-                    let e = 1.0;
-                    (e, -s * e, s * s * e, 0.0)
+    // Row blocks are independent: output rows [k] in d0, [k*d..(k+1)*d] in d1,
+    // and [k*d*d..(k+1)*d*d] in d2 are disjoint for each collocation row k.
+    // Keep small assemblies serial to avoid Rayon scheduling overhead.
+    const MATERN_COLLOCATION_PAR_WORK_THRESHOLD: usize = 32_768;
+    const MATERN_COLLOCATION_ROW_BLOCK: usize = 32;
+    let assembly_work = p
+        .saturating_mul(p)
+        .saturating_mul(d.max(1))
+        .saturating_mul(d.max(1));
+    let row_block_size = MATERN_COLLOCATION_ROW_BLOCK.min(p.max(1));
+    let assemble_chunk = |ci: usize,
+                          mut d0_chunk: ArrayViewMut2<'_, f64>,
+                          mut d1_chunk: ArrayViewMut2<'_, f64>,
+                          mut d2_chunk: ArrayViewMut2<'_, f64>|
+     -> Result<(), BasisError> {
+        let chunk_start = ci * row_block_size;
+        for local_k in 0..d0_chunk.nrows() {
+            let k = chunk_start + local_k;
+            let scale_k = row_scales[k];
+            for j in 0..p {
+                // Distance: anisotropic r = |Ah| when eta present, isotropic |h| otherwise.
+                let r = if let Some(eta) = aniso_log_scales {
+                    aniso_distance_and_components(
+                        centers.row(k).as_slice().unwrap(),
+                        centers.row(j).as_slice().unwrap(),
+                        eta,
+                    )
+                    .0
                 } else {
-                    matern_kernel_radial_tripletwith_safe_ratio(r, length_scale, nu)?
+                    stable_euclidean_norm((0..d).map(|c| centers[[k, c]] - centers[[j, c]]))
                 };
-            d0_raw[[k, j]] = scale_k * phi;
-            if r > R_EPS {
-                for c in 0..d {
-                    let delta = centers[[k, c]] - centers[[j, c]];
-                    d1_raw[[k * d + c, j]] = scale_k * phi_r_over_r * delta;
+                if matches!(nu, MaternNu::Half) && r <= R_EPS && d > 1 {
+                    return Err(BasisError::InvalidInput(
+                        "Matérn nu=1/2 has singular Laplacian at center collisions for d>1; choose nu>=3/2 or avoid collocation at centers".to_string(),
+                    ));
                 }
-            } else {
-                // Symmetry at center-center coincidence.
-                for c in 0..d {
-                    d1_raw[[k * d + c, j]] = 0.0;
-                }
-            }
-            let t = if r > R_EPS {
-                (phi_rr - phi_r_over_r) / (r * r)
-            } else {
-                0.0
-            };
-            for a in 0..d {
-                let h_a = centers[[k, a]] - centers[[j, a]];
-                let w_a = metric_weights.as_ref().map(|w| w[a]).unwrap_or(1.0);
-                for b in 0..d {
-                    let h_b = centers[[k, b]] - centers[[j, b]];
-                    let w_b = metric_weights.as_ref().map(|w| w[b]).unwrap_or(1.0);
-                    let diagonal = if a == b { phi_r_over_r * w_a } else { 0.0 };
-                    let mixed = if r > R_EPS {
-                        t * w_a * h_a * w_b * h_b
+                let (phi, _, phi_rr, phi_r_over_r) =
+                    if matches!(nu, MaternNu::Half) && r <= R_EPS && d == 1 {
+                        // In 1D: Delta phi = phi'' and the singular phi'/r term is absent.
+                        let s = 1.0 / length_scale;
+                        let e = 1.0;
+                        (e, -s * e, s * s * e, 0.0)
                     } else {
-                        0.0
+                        matern_kernel_radial_tripletwith_safe_ratio(r, length_scale, nu)?
                     };
-                    let row = (k * d + a) * d + b;
-                    d2_raw[[row, j]] = scale_k * (diagonal + mixed);
+                d0_chunk[[local_k, j]] = scale_k * phi;
+                if r > R_EPS {
+                    for c in 0..d {
+                        let delta = centers[[k, c]] - centers[[j, c]];
+                        d1_chunk[[local_k * d + c, j]] = scale_k * phi_r_over_r * delta;
+                    }
+                } else {
+                    // Symmetry at center-center coincidence.
+                    for c in 0..d {
+                        d1_chunk[[local_k * d + c, j]] = 0.0;
+                    }
                 }
-            }
-            if !d0_raw[[k, j]].is_finite()
-                || ((k * d * d)..((k + 1) * d * d)).any(|row| !d2_raw[[row, j]].is_finite())
-            {
-                return Err(BasisError::InvalidInput(format!(
-                    "non-finite Matérn collocation operator entry at row={k}, col={j}, r={r}, nu={nu:?}"
-                )));
+                let t = if r > R_EPS {
+                    (phi_rr - phi_r_over_r) / (r * r)
+                } else {
+                    0.0
+                };
+                for a in 0..d {
+                    let h_a = centers[[k, a]] - centers[[j, a]];
+                    let w_a = metric_weights.as_ref().map(|w| w[a]).unwrap_or(1.0);
+                    for b in 0..d {
+                        let h_b = centers[[k, b]] - centers[[j, b]];
+                        let w_b = metric_weights.as_ref().map(|w| w[b]).unwrap_or(1.0);
+                        let diagonal = if a == b { phi_r_over_r * w_a } else { 0.0 };
+                        let mixed = if r > R_EPS {
+                            t * w_a * h_a * w_b * h_b
+                        } else {
+                            0.0
+                        };
+                        let row = (local_k * d + a) * d + b;
+                        d2_chunk[[row, j]] = scale_k * (diagonal + mixed);
+                    }
+                }
+                if !d0_chunk[[local_k, j]].is_finite()
+                    || ((local_k * d * d)..((local_k + 1) * d * d))
+                        .any(|row| !d2_chunk[[row, j]].is_finite())
+                {
+                    return Err(BasisError::InvalidInput(format!(
+                        "non-finite Matérn collocation operator entry at row={k}, col={j}, r={r}, nu={nu:?}"
+                    )));
+                }
             }
         }
+        Ok(())
+    };
+    if d == 0 && p > 0 {
+        for k in 0..p {
+            let scale_k = row_scales[k];
+            for j in 0..p {
+                let (phi, _, _, _) =
+                    matern_kernel_radial_tripletwith_safe_ratio(0.0, length_scale, nu)?;
+                d0_raw[[k, j]] = scale_k * phi;
+                if !d0_raw[[k, j]].is_finite() {
+                    return Err(BasisError::InvalidInput(format!(
+                        "non-finite Matérn collocation operator entry at row={k}, col={j}, r=0, nu={nu:?}"
+                    )));
+                }
+            }
+        }
+    } else if assembly_work >= MATERN_COLLOCATION_PAR_WORK_THRESHOLD && p > 1 {
+        d0_raw
+            .axis_chunks_iter_mut(Axis(0), row_block_size)
+            .into_par_iter()
+            .zip(
+                d1_raw
+                    .axis_chunks_iter_mut(Axis(0), row_block_size * d)
+                    .into_par_iter(),
+            )
+            .zip(
+                d2_raw
+                    .axis_chunks_iter_mut(Axis(0), row_block_size * d * d)
+                    .into_par_iter(),
+            )
+            .enumerate()
+            .try_for_each(|(ci, ((d0_chunk, d1_chunk), d2_chunk))| {
+                assemble_chunk(ci, d0_chunk, d1_chunk, d2_chunk)
+            })?;
+    } else if p > 0 {
+        d0_raw
+            .axis_chunks_iter_mut(Axis(0), row_block_size)
+            .zip(d1_raw.axis_chunks_iter_mut(Axis(0), row_block_size * d))
+            .zip(d2_raw.axis_chunks_iter_mut(Axis(0), row_block_size * d * d))
+            .enumerate()
+            .try_for_each(|(ci, ((d0_chunk, d1_chunk), d2_chunk))| {
+                assemble_chunk(ci, d0_chunk, d1_chunk, d2_chunk)
+            })?;
     }
     let (d0_kernel, d1_kernel, d2_kernel) = if let Some(z) = identifiability_transform {
         let z = z.to_owned();
