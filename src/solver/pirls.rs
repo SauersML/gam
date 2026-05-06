@@ -1669,22 +1669,19 @@ impl<'a> GamWorkingModel<'a> {
     /// 2. **Outer REML**: They define the Laplace Hessian H_obs = X'W_obs X + S.
     ///    The outer log|H| and trace terms MUST use observed information for the
     ///    exact Laplace approximation. See response.md Section 3.
-    fn hessian_curvature_arrays(
-        &self,
+    fn update_hessian_curvature_arrays(
+        &mut self,
         requested: HessianCurvatureKind,
-    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>, HessianCurvatureKind), EstimationError>
-    {
+    ) -> Result<HessianCurvatureKind, EstimationError> {
         if requested == HessianCurvatureKind::Fisher || !self.supports_observed_hessian_curvature()
         {
-            return Ok((
-                self.lastweights.clone(),
-                self.last_c.clone(),
-                self.last_d.clone(),
-                HessianCurvatureKind::Fisher,
-            ));
+            self.lasthessian_weights.assign(&self.lastweights);
+            self.lasthessian_c.assign(&self.last_c);
+            self.lasthessian_d.assign(&self.last_d);
+            return Ok(HessianCurvatureKind::Fisher);
         }
 
-        let (hessian_weights, hessian_c, hessian_d) = compute_observed_hessian_curvature_arrays(
+        compute_observed_hessian_curvature_arrays_into(
             self.likelihood,
             &self.link_kind,
             &self.workspace.eta_buf,
@@ -1695,13 +1692,11 @@ impl<'a> GamWorkingModel<'a> {
             &self.last_d3mu_deta3,
             &self.lastweights,
             self.priorweights,
+            &mut self.lasthessian_weights,
+            &mut self.lasthessian_c,
+            &mut self.lasthessian_d,
         )?;
-        Ok((
-            hessian_weights,
-            hessian_c,
-            hessian_d,
-            HessianCurvatureKind::Observed,
-        ))
+        Ok(HessianCurvatureKind::Observed)
     }
 
     fn sparse_penalized_hessian(
@@ -1859,8 +1854,6 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 )?;
             }
         }
-        let weights = self.lastweights.clone();
-        let mu = self.lastmu.clone();
         let mut firth = FirthDiagnostics::Inactive;
         if self.firth_bias_reduction {
             // IMPORTANT: Jeffreys/Firth bias reduction must be computed in the
@@ -1953,8 +1946,8 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             };
             ndarray::Zip::from(&mut self.lastz)
                 .and(&hat_diag)
-                .and(&weights)
-                .and(&mu)
+                .and(&self.lastweights)
+                .and(&self.lastmu)
                 .par_for_each(|zi, &hii, &wi, &mui| {
                     if wi > 0.0 {
                         *zi += hii * (0.5 - mui) / wi;
@@ -1970,7 +1963,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             .and(&mut self.workspace.working_residual)
             .and(&self.workspace.eta_buf)
             .and(z)
-            .and(&weights)
+            .and(&self.lastweights)
             .par_for_each(|wr, r, &eta, &zi, &wi| {
                 let residual = eta - zi;
                 *r = residual;
@@ -1984,20 +1977,22 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let s_beta = self.penalty.apply(beta.as_ref());
         let s_beta_norm = array1_l2_norm(&s_beta);
         gradient += &s_beta;
-        let (hessian_weights, hessian_c, hessian_d, hessian_curvature) =
-            self.hessian_curvature_arrays(requested_curvature)?;
-        // Store the exact (un-floored) statistical weights for the REML outer
-        // objective.  The floor for solver conditioning is applied below only
-        // when assembling the penalized Hessian for the linear solve.
-        self.lasthessian_weights.assign(&hessian_weights);
-        self.lasthessian_c.assign(&hessian_c);
-        self.lasthessian_d.assign(&hessian_d);
+        let hessian_curvature = self.update_hessian_curvature_arrays(requested_curvature)?;
         self.lasthessian_curvature = hessian_curvature;
 
-        // Build solver-side weights: apply a per-observation SPD floor so the
-        // Newton linear system is well-conditioned, without contaminating the
-        // model weights stored in `lasthessian_weights`.
-        let solver_weights = solver_hessian_weights(&hessian_weights, &self.lastweights);
+        // Build solver-side weights in the reusable n-buffer: apply a
+        // per-observation SPD floor so the Newton linear system is
+        // well-conditioned, without contaminating the model weights stored in
+        // `lasthessian_weights`.
+        if self.workspace.matvec_buf.len() != n {
+            self.workspace.matvec_buf = Array1::zeros(n);
+        }
+        solver_hessian_weights_into(
+            &self.lasthessian_weights,
+            &self.lastweights,
+            &mut self.workspace.matvec_buf,
+        );
+        let solver_weights = std::mem::take(&mut self.workspace.matvec_buf);
 
         let (penalized_hessian, sparsehessian, ridge_used) = if matches!(
             self.coordinate_design,
@@ -2022,6 +2017,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             )?;
             (penalized_hessian, None, ridge_used)
         };
+        self.workspace.matvec_buf = solver_weights;
 
         // Match the stabilized Hessian used by the outer LAML objective.
         // If a ridge is needed, we treat it as an explicit penalty term:
@@ -2032,10 +2028,10 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         // that drives log|H| and the implicit-gradient correction.
         let deviance = self
             .likelihood
-            .loglik_deviance(self.y, &mu, self.priorweights)?;
+            .loglik_deviance(self.y, &self.lastmu, self.priorweights)?;
         let log_likelihood = calculate_loglikelihood_omitting_constants(
             self.y,
-            &mu,
+            &self.lastmu,
             self.likelihood,
             self.priorweights,
         );
@@ -7806,19 +7802,21 @@ fn solver_hessian_weight_floor(fisher_weight: f64) -> f64 {
 /// Newton linear system X'W X + S stays numerically usable. This floor is
 /// purely a linear-algebra concern: the exact statistical weights stored in
 /// `lasthessian_weights` / `finalweights` are not affected.
-fn solver_hessian_weights(
+fn solver_hessian_weights_into(
     hessian_weights: &Array1<f64>,
     fisher_weights: &Array1<f64>,
-) -> Array1<f64> {
-    let mut out = Array1::<f64>::zeros(hessian_weights.len());
-    ndarray::Zip::from(&mut out)
+    out: &mut Array1<f64>,
+) {
+    if out.len() != hessian_weights.len() {
+        *out = Array1::<f64>::zeros(hessian_weights.len());
+    }
+    ndarray::Zip::from(out)
         .and(hessian_weights)
         .and(fisher_weights)
         .par_for_each(|o, &w, &fw| {
             let floor = solver_hessian_weight_floor(fw);
             *o = if w.is_finite() && w > floor { w } else { floor };
         });
-    out
 }
 
 /// Compute vectorised observed-information curvature arrays (w_obs, c_obs, d_obs)
@@ -7838,7 +7836,7 @@ fn solver_hessian_weights(
 /// See `observed_weight_noncanonical` for the per-observation formulas and
 /// response.md Section 3 for the mathematical justification of why observed
 /// (not Fisher) information is required.
-fn compute_observed_hessian_curvature_arrays(
+fn compute_observed_hessian_curvature_arrays_into(
     likelihood: GlmLikelihoodSpec,
     inverse_link: &InverseLink,
     eta: &Array1<f64>,
@@ -7849,38 +7847,55 @@ fn compute_observed_hessian_curvature_arrays(
     d3mu_deta3: &Array1<f64>,
     fisher_weights: &Array1<f64>,
     priorweights: ArrayView1<'_, f64>,
-) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
+    hessian_weights: &mut Array1<f64>,
+    hessian_c: &mut Array1<f64>,
+    hessian_d: &mut Array1<f64>,
+) -> Result<(), EstimationError> {
     assert!(supports_observed_hessian_curvature_for_likelihood(
         likelihood,
         inverse_link
     ));
     let n = eta.len();
+    if hessian_weights.len() != n {
+        *hessian_weights = Array1::<f64>::zeros(n);
+    }
+    if hessian_c.len() != n {
+        *hessian_c = Array1::<f64>::zeros(n);
+    }
+    if hessian_d.len() != n {
+        *hessian_d = Array1::<f64>::zeros(n);
+    }
+
     let weight_family = weight_family_for_glm_likelihood(likelihood);
     let weight_link = weight_link_for_inverse_link(inverse_link);
     let phi = fixed_glm_dispersion(likelihood);
+
     // Parallel per-row weight assembly. At biobank scale (n = 320k) this loop
-    // dominates `update_with_curvature` in non-canonical paths because each
-    // row independently calls
-    // `inverse_link_pdfthird_derivative_for_inverse_link` and
-    // `observed_weight_dispatch` (function-call per row, no vectorization).
-    // Rows are fully independent, so par_iter + collect_into_vec gives a
-    // direct N-thread speedup. Errors propagate via `try_fold` -> `try_reduce`
-    // pattern with the first-encountered failure winning, matching the prior
-    // serial early-return semantics.
-    //
-    // Indexed collection via `try_fold(... |row_acc| ... )` would force a
-    // per-row Vec allocation on each thread; instead we materialize three
-    // pre-zeroed Array1 buffers and write into raw slices via
-    // chunks_mut + zip with the input chunks. This avoids any per-row heap
-    // traffic and keeps the hot path branch-free apart from the finite/positive
-    // guards.
-    let row_results: Result<Vec<(f64, f64, f64)>, EstimationError> = (0..n)
-        .into_par_iter()
-        .map(|i| -> Result<(f64, f64, f64), EstimationError> {
+    // dominates non-canonical paths because each row independently evaluates
+    // inverse-link jets and residual-dependent observed curvature. Write
+    // directly into reusable output slices rather than collecting row tuples,
+    // which removes an O(n) temporary allocation on every PIRLS update.
+    hessian_weights
+        .as_slice_mut()
+        .expect("hessian weights must be contiguous")
+        .par_iter_mut()
+        .zip(
+            hessian_c
+                .as_slice_mut()
+                .expect("hessian c must be contiguous")
+                .par_iter_mut(),
+        )
+        .zip(
+            hessian_d
+                .as_slice_mut()
+                .expect("hessian d must be contiguous")
+                .par_iter_mut(),
+        )
+        .enumerate()
+        .try_for_each(|(i, ((w_out, c_out), d_out))| -> Result<(), EstimationError> {
             let eta_used = eta_for_observed_hessian_jet(inverse_link, eta[i]);
             let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
-                inverse_link,
-                eta_used,
+                inverse_link, eta_used,
             )?;
             let jet = MixtureInverseLinkJet {
                 mu: mu[i],
@@ -7900,11 +7915,6 @@ fn compute_observed_hessian_curvature_arrays(
                 h4,
             );
             let fisher_weight = fisher_weights[i].max(0.0);
-            // Same finite/positive guards as the prior serial loop. Solver
-            // conditioning floors are applied separately by
-            // `solver_hessian_weights`; replacing invalid observed rows with
-            // Fisher rows here would silently turn the advertised observed-LAML
-            // objective into a mixed surrogate.
             if !(w_obs.is_finite() && w_obs > 0.0) {
                 return Err(EstimationError::InvalidInput(format!(
                     "observed Hessian curvature is not positive finite at row {i}: observed={w_obs}, fisher={fisher_weight}"
@@ -7915,18 +7925,44 @@ fn compute_observed_hessian_curvature_arrays(
                     "observed Hessian curvature derivatives are non-finite at row {i}: c={c_obs}, d={d_obs}"
                 )));
             }
-            Ok((w_obs, c_obs, d_obs))
+            *w_out = w_obs;
+            *c_out = c_obs;
+            *d_out = d_obs;
+            Ok(())
         })
-        .collect();
-    let row_results = row_results?;
+}
+
+fn compute_observed_hessian_curvature_arrays(
+    likelihood: GlmLikelihoodSpec,
+    inverse_link: &InverseLink,
+    eta: &Array1<f64>,
+    y: ArrayView1<'_, f64>,
+    mu: &Array1<f64>,
+    dmu_deta: &Array1<f64>,
+    d2mu_deta2: &Array1<f64>,
+    d3mu_deta3: &Array1<f64>,
+    fisher_weights: &Array1<f64>,
+    priorweights: ArrayView1<'_, f64>,
+) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
+    let n = eta.len();
     let mut hessian_weights = Array1::<f64>::zeros(n);
     let mut hessian_c = Array1::<f64>::zeros(n);
     let mut hessian_d = Array1::<f64>::zeros(n);
-    for (i, (w, c, d)) in row_results.into_iter().enumerate() {
-        hessian_weights[i] = w;
-        hessian_c[i] = c;
-        hessian_d[i] = d;
-    }
+    compute_observed_hessian_curvature_arrays_into(
+        likelihood,
+        inverse_link,
+        eta,
+        y,
+        mu,
+        dmu_deta,
+        d2mu_deta2,
+        d3mu_deta3,
+        fisher_weights,
+        priorweights,
+        &mut hessian_weights,
+        &mut hessian_c,
+        &mut hessian_d,
+    )?;
     Ok((hessian_weights, hessian_c, hessian_d))
 }
 
