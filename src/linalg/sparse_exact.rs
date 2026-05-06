@@ -833,35 +833,49 @@ pub fn build_sparse_penalty_blocks_from_canonical(
         }
     }
 
-    let mut blocks = Vec::with_capacity(penalties.len());
-    for (term_index, cp) in penalties.iter().enumerate() {
-        let p_start = cp.col_range.start;
-        let p_end = cp.col_range.end;
-        let s_k_block_dense = cp.local_penalty();
-        let s_k_sparse =
-            embed_dense_block_to_sparse_symmetric_upper(&s_k_block_dense, p_start, p, ZERO_TOL)?;
+    use rayon::prelude::*;
 
-        let mut s_k_block_upper_entries = Vec::<(usize, usize, f64)>::new();
-        for col in 0..s_k_block_dense.ncols() {
-            for row in 0..=col {
-                let value = s_k_block_dense[[row, col]];
-                if value.abs() > ZERO_TOL {
-                    s_k_block_upper_entries.push((row, col, value));
+    // `par_iter()` over a slice is indexed, and Rayon preserves the input
+    // sequence when collecting into a `Vec`, so the final blocks remain in
+    // canonical penalty order even though each block is built independently.
+    let block_results: Vec<Result<SparsePenaltyBlock, EstimationError>> = penalties
+        .par_iter()
+        .enumerate()
+        .map(|(term_index, cp)| {
+            let p_start = cp.col_range.start;
+            let p_end = cp.col_range.end;
+            let s_k_block_dense = cp.local_penalty();
+            let s_k_sparse = embed_dense_block_to_sparse_symmetric_upper(
+                &s_k_block_dense,
+                p_start,
+                p,
+                ZERO_TOL,
+            )?;
+
+            let mut s_k_block_upper_entries = Vec::<(usize, usize, f64)>::new();
+            for col in 0..s_k_block_dense.ncols() {
+                for row in 0..=col {
+                    let value = s_k_block_dense[[row, col]];
+                    if value.abs() > ZERO_TOL {
+                        s_k_block_upper_entries.push((row, col, value));
+                    }
                 }
             }
-        }
 
-        blocks.push(SparsePenaltyBlock {
-            term_index,
-            p_start,
-            p_end,
-            positive_eigenvalues: Arc::new(cp.positive_eigenvalues.clone()),
-            block_support_strict: true,
-            s_k_sparse,
-            s_k_block_dense: Arc::new(s_k_block_dense),
-            s_k_block_upper_entries: Arc::new(s_k_block_upper_entries),
-        });
-    }
+            Ok(SparsePenaltyBlock {
+                term_index,
+                p_start,
+                p_end,
+                positive_eigenvalues: Arc::new(cp.positive_eigenvalues.clone()),
+                block_support_strict: true,
+                s_k_sparse,
+                s_k_block_dense: Arc::new(s_k_block_dense),
+                s_k_block_upper_entries: Arc::new(s_k_block_upper_entries),
+            })
+        })
+        .collect();
+
+    let blocks = block_results.into_iter().collect::<Result<Vec<_>, _>>()?;
     Ok(Some(blocks))
 }
 
@@ -1463,6 +1477,45 @@ mod tests {
             "values differ: left={a:.12e}, right={b:.12e}, |diff|={:.12e}, tol={tol:.12e}",
             (a - b).abs()
         );
+    }
+
+    #[test]
+    fn canonical_sparse_penalty_blocks_preserve_input_order() {
+        fn canonical_penalty(
+            col_range: std::ops::Range<usize>,
+            local: Array2<f64>,
+            positive_eigenvalues: Vec<f64>,
+            total_dim: usize,
+        ) -> crate::construction::CanonicalPenalty {
+            crate::construction::CanonicalPenalty {
+                root: Array2::<f64>::zeros((0, col_range.len())),
+                col_range,
+                total_dim,
+                nullity: 0,
+                local,
+                positive_eigenvalues,
+                op: None,
+            }
+        }
+
+        let penalties = vec![
+            canonical_penalty(2..4, array![[2.0, 0.5], [0.5, 3.0]], vec![2.0, 3.0], 5),
+            canonical_penalty(0..1, array![[7.0]], vec![7.0], 5),
+            canonical_penalty(4..5, array![[11.0]], vec![11.0], 5),
+        ];
+
+        let blocks = build_sparse_penalty_blocks_from_canonical(&penalties, 5)
+            .unwrap()
+            .expect("non-overlapping canonical blocks should be sparse-block compatible");
+
+        let observed: Vec<(usize, usize, usize)> = blocks
+            .iter()
+            .map(|block| (block.term_index, block.p_start, block.p_end))
+            .collect();
+        assert_eq!(observed, vec![(0, 2, 4), (1, 0, 1), (2, 4, 5)]);
+        assert_eq!(&*blocks[0].positive_eigenvalues, &vec![2.0, 3.0]);
+        assert_eq!(&*blocks[1].positive_eigenvalues, &vec![7.0]);
+        assert_eq!(&*blocks[2].positive_eigenvalues, &vec![11.0]);
     }
 
     #[test]
