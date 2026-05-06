@@ -366,6 +366,13 @@ pub struct OffsetChannelResiduals {
     pub derivative: Array1<f64>,
 }
 
+/// Per-observation Hessians of the unpenalized survival NLL with respect
+/// to additive offset channels in `(entry, exit, derivative)` order.
+#[derive(Clone, Debug)]
+pub struct OffsetChannelCurvatures {
+    pub rows: Vec<[[f64; 3]; 3]>,
+}
+
 #[derive(Debug)]
 pub struct WorkingModelSurvival {
     age_entry: Array1<f64>,

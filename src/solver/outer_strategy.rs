@@ -5825,6 +5825,23 @@ mod tests {
     }
 
     #[test]
+    fn plan_survival_baseline_exact_hessian_selects_arc() {
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Analytic,
+            n_params: 3,
+            psi_dim: 0,
+            fixed_point_available: false,
+            barrier_config: None,
+            prefer_gradient_only: false,
+            disable_fixed_point: false,
+        };
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Arc);
+        assert_eq!(p.hessian_source, HessianSource::Analytic);
+    }
+
+    #[test]
     fn plan_no_hessian_few_params_selects_bfgs() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
