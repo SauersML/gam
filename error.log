@@ -6083,3 +6083,24 @@ index d3ef6aa260341fce526e0c4f2023d89bea0b2867..fce9f506b308bb7f7d6e66468d7d5d4d
 [2026-05-06T20:26:40.326990+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
 [2026-05-06T20:26:40.328654+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
 [2026-05-06T20:26:40.328715+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:26:51.473261+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:26:51.475020+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:26:51.475102+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:26:54.315976+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:26:54.318840+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:26:54.318965+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:27:01.364939+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:27:01.366725+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:27:01.366803+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:27:03.431442+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:27:03.434525+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:27:03.434654+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:27:11.153476+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:27:11.155759+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:27:11.155892+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:27:19.950421+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:27:19.952889+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:27:19.952968+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:27:28.084054+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:27:28.085601+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:27:28.085665+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
