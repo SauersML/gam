@@ -2,6 +2,7 @@ use super::*;
 use crate::linalg::utils::enforce_symmetry;
 use crate::mixture_link::logit_inverse_link_jet5;
 use ndarray::{ShapeBuilder, Zip};
+use rayon::slice::ParallelSliceMut;
 
 const FIRTH_DERIVATIVE_PARALLEL_MIN_N: usize = 16_384;
 const FIRTH_ROW_SCALE_PARALLEL_MIN_CELLS: usize = 200_000;
@@ -40,6 +41,87 @@ impl<'a> RemlState<'a> {
                 .for_each(|mut row, w| row *= *w);
         }
         out
+    }
+
+    #[inline]
+    fn dense_product_likely_uses_inner_parallelism(m: usize, n: usize, k: usize) -> bool {
+        // Keep this in sync with faer_ndarray::matmul_parallelism.  When a
+        // dense product is large enough for faer/BLAS-style internal
+        // parallelism, do not also wrap sibling products in rayon::join: that
+        // can oversubscribe CPU threads and slow down the REML hot path.
+        const PAR_MIN_FLOP_SCALE: usize = 2_000_000;
+        const PAR_MIN_LONG_DIM: usize = 256;
+        let flop_scale = m.saturating_mul(n).saturating_mul(k);
+        let long_dim = m.max(n).max(k);
+        flop_scale >= PAR_MIN_FLOP_SCALE && long_dim >= PAR_MIN_LONG_DIM
+    }
+
+    #[inline]
+    fn should_join_independent_dense_products(products: &[(usize, usize, usize)]) -> bool {
+        const JOIN_MIN_TOTAL_FLOP_SCALE: usize = 128 * 1024;
+        if rayon::current_num_threads() <= 1 {
+            return false;
+        }
+        let mut total_flop_scale = 0usize;
+        for &(m, n, k) in products {
+            if Self::dense_product_likely_uses_inner_parallelism(m, n, k) {
+                return false;
+            }
+            total_flop_scale =
+                total_flop_scale.saturating_add(m.saturating_mul(n).saturating_mul(k));
+        }
+        total_flop_scale >= JOIN_MIN_TOTAL_FLOP_SCALE
+    }
+
+    #[inline]
+    fn scale_rows_by_inverse_observation_weight_sqrt(
+        out: &mut Array2<f64>,
+        observation_weight_sqrt: Option<&Array1<f64>>,
+    ) {
+        let Some(scale) = observation_weight_sqrt else {
+            return;
+        };
+        debug_assert_eq!(out.nrows(), scale.len());
+        let ncols = out.ncols();
+        if ncols == 0 {
+            return;
+        }
+        const PAR_MIN_CELLS: usize = 64 * 1024;
+        let cells = out.nrows().saturating_mul(ncols);
+        if cells >= PAR_MIN_CELLS && rayon::current_num_threads() > 1 && out.is_standard_layout() {
+            if let Some(slice) = out.as_slice_memory_order_mut() {
+                slice
+                    .par_chunks_mut(ncols)
+                    .enumerate()
+                    .for_each(|(row, row_values)| {
+                        let s = scale[row];
+                        if s > 0.0 {
+                            let inv = s.recip();
+                            for value in row_values {
+                                *value *= inv;
+                            }
+                        } else {
+                            for value in row_values {
+                                *value = 0.0;
+                            }
+                        }
+                    });
+                return;
+            }
+        }
+        for row in 0..out.nrows() {
+            let s = scale[row];
+            if s > 0.0 {
+                let inv = s.recip();
+                for col in 0..ncols {
+                    out[[row, col]] *= inv;
+                }
+            } else {
+                for col in 0..ncols {
+                    out[[row, col]] = 0.0;
+                }
+            }
+        }
     }
 
     #[inline]
@@ -1530,30 +1612,33 @@ impl FirthDenseOperator {
         // ─────────────────────────────────────────────────────────────────
         //  η̇ vectors in β-rhs space (η_V := X V, η_{i,V} := X_i V, etc.)
         // ─────────────────────────────────────────────────────────────────
-        let eta_v = fast_ab(&self.x_dense, rhs); // n×m
-        let eta_i_v = fast_ab(x_tau_i, rhs); // n×m
-        let eta_j_v = fast_ab(x_tau_j, rhs); // n×m
+        let (eta_v, eta_i_v, eta_j_v) = if RemlState::should_join_independent_dense_products(&[
+            (n, m, p),
+            (n, m, p),
+            (n, m, p),
+        ]) {
+            let (eta_v, (eta_i_v, eta_j_v)) = rayon::join(
+                || fast_ab(&self.x_dense, rhs),
+                || rayon::join(|| fast_ab(x_tau_i, rhs), || fast_ab(x_tau_j, rhs)),
+            );
+            (eta_v, eta_i_v, eta_j_v)
+        } else {
+            (
+                fast_ab(&self.x_dense, rhs),
+                fast_ab(x_tau_i, rhs),
+                fast_ab(x_tau_j, rhs),
+            )
+        }; // n×m blocks
         // X_{ij} V from the reduced second-derivative design:
         //   reduce_explicit_design: X_{r,τ} = diag(√a) X_τ Q,
         //   invert:  X_{ij} = diag(1/√a) X_{r,ij} Qᵀ.
         let eta_ij_v: Array2<f64> = if x_tau_tau_is_some {
             let qt_v = fast_atb(&self.q_basis, rhs); // r×m
             let mut out = fast_ab(x_rij, &qt_v); // n×m in sqrt(a)-scaled space
-            if let Some(scale) = self.observation_weight_sqrt.as_ref() {
-                for row in 0..out.nrows() {
-                    let s = scale[row];
-                    if s > 0.0 {
-                        let inv = s.recip();
-                        for col in 0..out.ncols() {
-                            out[[row, col]] *= inv;
-                        }
-                    } else {
-                        for col in 0..out.ncols() {
-                            out[[row, col]] = 0.0;
-                        }
-                    }
-                }
-            }
+            RemlState::scale_rows_by_inverse_observation_weight_sqrt(
+                &mut out,
+                self.observation_weight_sqrt.as_ref(),
+            );
             out
         } else {
             Array2::<f64>::zeros((n, m))
@@ -1610,19 +1695,36 @@ impl FirthDenseOperator {
         //        + 2 diag(X_{r,i} K X_{r,j}ᵀ).
         // Using diag(A Bᵀ) = rowwise_dot(A, B):
         let dh_ij: Array1<f64> = {
-            let mut acc = Array1::<f64>::zeros(n);
+            let r = k.ncols();
+            let can_join = RemlState::should_join_independent_dense_products(&[
+                (n, r, r),
+                (n, r, r),
+                (n, r, r),
+                (n, r, r),
+            ]);
+            let (xr_kddot, ri_kdot_j, rj_kdot_i, ri_k) = if can_join {
+                let ((xr_kddot, ri_kdot_j), (rj_kdot_i, ri_k)) = rayon::join(
+                    || rayon::join(|| fast_ab(x_r, &k_ddot), || fast_ab(x_ri, dot_k_j)),
+                    || rayon::join(|| fast_ab(x_rj, dot_k_i), || fast_ab(x_ri, k)),
+                );
+                (xr_kddot, ri_kdot_j, rj_kdot_i, ri_k)
+            } else {
+                (
+                    fast_ab(x_r, &k_ddot),
+                    fast_ab(x_ri, dot_k_j),
+                    fast_ab(x_rj, dot_k_i),
+                    fast_ab(x_ri, k),
+                )
+            };
+
+            let mut acc = Self::rowwise_dot(&xr_kddot, x_r);
+            acc = acc + 2.0 * Self::rowwise_dot(&ri_kdot_j, x_r);
+            acc = acc + 2.0 * Self::rowwise_dot(&rj_kdot_i, x_r);
+            acc = acc + 2.0 * Self::rowwise_dot(&ri_k, x_rj);
             if x_tau_tau_is_some {
                 let rij_k = fast_ab(x_rij, k);
                 acc = acc + 2.0 * Self::rowwise_dot(&rij_k, x_r);
             }
-            let xr_kddot = fast_ab(x_r, &k_ddot);
-            acc = acc + Self::rowwise_dot(&xr_kddot, x_r);
-            let ri_kdot_j = fast_ab(x_ri, dot_k_j);
-            acc = acc + 2.0 * Self::rowwise_dot(&ri_kdot_j, x_r);
-            let rj_kdot_i = fast_ab(x_rj, dot_k_i);
-            acc = acc + 2.0 * Self::rowwise_dot(&rj_kdot_i, x_r);
-            let ri_k = fast_ab(x_ri, k);
-            acc = acc + 2.0 * Self::rowwise_dot(&ri_k, x_rj);
             acc
         };
 
@@ -1678,22 +1780,13 @@ impl FirthDenseOperator {
             // form X_{ij}ᵀ Y as q_basis · (X_{r,ij}ᵀ · diag(1/√a)·Y) = Q · X_{r,ij}ᵀ (Y unscaled).
             // When no observation weights, X_{r,ij} = X_{ij} Q and
             //   X_{ij}ᵀ Y = Q X_{r,ij}ᵀ Y.
-            let y = &eta_v * &gamma_col;
-            let xt_ij_y: Array2<f64> = if let Some(scale) = self.observation_weight_sqrt.as_ref() {
+            let y: Array2<f64> = &eta_v * &gamma_col;
+            let xt_ij_y: Array2<f64> = if self.observation_weight_sqrt.is_some() {
                 let mut y_scaled = y.clone();
-                for row in 0..y_scaled.nrows() {
-                    let s = scale[row];
-                    if s > 0.0 {
-                        let inv = s.recip();
-                        for col in 0..y_scaled.ncols() {
-                            y_scaled[[row, col]] *= inv;
-                        }
-                    } else {
-                        for col in 0..y_scaled.ncols() {
-                            y_scaled[[row, col]] = 0.0;
-                        }
-                    }
-                }
+                RemlState::scale_rows_by_inverse_observation_weight_sqrt(
+                    &mut y_scaled,
+                    self.observation_weight_sqrt.as_ref(),
+                );
                 self.q_basis.dot(&x_rij.t().dot(&y_scaled))
             } else {
                 self.q_basis.dot(&x_rij.t().dot(&y))
@@ -1798,26 +1891,16 @@ impl FirthDenseOperator {
             if x_tau_tau_is_some {
                 // X_{ij}ᵀ (w1 ⊙ Q V)
                 let y = q_v * &w1_col;
-                let contrib: Array2<f64> =
-                    if let Some(scale) = self.observation_weight_sqrt.as_ref() {
-                        let mut y_scaled = y.clone();
-                        for row in 0..y_scaled.nrows() {
-                            let s = scale[row];
-                            if s > 0.0 {
-                                let inv = s.recip();
-                                for col in 0..y_scaled.ncols() {
-                                    y_scaled[[row, col]] *= inv;
-                                }
-                            } else {
-                                for col in 0..y_scaled.ncols() {
-                                    y_scaled[[row, col]] = 0.0;
-                                }
-                            }
-                        }
-                        self.q_basis.dot(&x_rij.t().dot(&y_scaled))
-                    } else {
-                        self.q_basis.dot(&x_rij.t().dot(&y))
-                    };
+                let contrib: Array2<f64> = if self.observation_weight_sqrt.is_some() {
+                    let mut y_scaled = y.clone();
+                    RemlState::scale_rows_by_inverse_observation_weight_sqrt(
+                        &mut y_scaled,
+                        self.observation_weight_sqrt.as_ref(),
+                    );
+                    self.q_basis.dot(&x_rij.t().dot(&y_scaled))
+                } else {
+                    self.q_basis.dot(&x_rij.t().dot(&y))
+                };
                 out = out + contrib;
             }
             out
