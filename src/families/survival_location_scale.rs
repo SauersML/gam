@@ -8532,7 +8532,27 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         // Survival location-scale couples its blocks (threshold/time/log-σ
         // and any link/time wiggles) through the survival likelihood: every
         // row contributes a dense outer-product over (Σ p_b) coefficients.
+        // At biobank scale the joint outer evaluator routes the coefficient
+        // Hessian through its matrix-free HVP path; the cost remains an honest
+        // dense-assembly diagnostic, while exact outer derivative order is now
+        // driven by the explicit outer-HVP capability below rather than by a
+        // first-order downgrade gate.
         crate::custom_family::joint_coupled_coefficient_hessian_cost(self.n as u64, specs)
+    }
+
+    fn outer_hyper_hessian_hvp_available(
+        &self,
+        _specs: &[crate::custom_family::ParameterBlockSpec],
+    ) -> bool {
+        true
+    }
+
+    fn outer_hyper_hessian_dense_available(
+        &self,
+        specs: &[crate::custom_family::ParameterBlockSpec],
+    ) -> bool {
+        let p_total: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
+        !crate::custom_family::use_joint_matrix_free_path(p_total, self.n)
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
@@ -10228,18 +10248,7 @@ fn fit_survival_location_scale(
     spec: SurvivalLocationScaleSpec,
 ) -> Result<UnifiedFitResult, String> {
     let prepared = prepare_survival_location_scale_model(&spec)?;
-    // Same biobank-scale outer-Hessian gate as the marginal-slope and
-    // gamlss families. At biobank n the analytic outer Hessian dominates
-    // wall-clock; route to BFGS on the analytic gradient instead.
-    let n_obs = spec.age_entry.len();
-    let biobank_scale = n_obs > 50_000;
-    let mut options = survival_blockwise_fit_options(&spec);
-    if biobank_scale && options.use_outer_hessian {
-        options.use_outer_hessian = false;
-        log::info!(
-            "[survival-location-scale] declining analytic outer Hessian for n={n_obs}; routing to BFGS"
-        );
-    }
+    let options = survival_blockwise_fit_options(&spec);
     let fit = fit_custom_family(&prepared.family, &prepared.blockspecs, &options)?;
     finalize_survival_location_scale_fit(&prepared, &fit)
 }
@@ -10998,6 +11007,71 @@ mod tests {
         assert!(
             expected > crate::custom_family::default_coefficient_hessian_cost(&specs),
             "joint-coupled cost must exceed block-diagonal default by the cross-block fill"
+        );
+    }
+
+    #[test]
+    fn survival_location_scale_advertises_outer_hvp_at_biobank_dimensions() {
+        let family = survival_exact_newton_test_family();
+        let mk_spec = |name: &str, p: usize| ParameterBlockSpec {
+            name: name.to_string(),
+            design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((
+                family.n, p,
+            )))),
+            offset: Array1::zeros(family.n),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+        };
+        let specs = vec![
+            mk_spec("time", 200),
+            mk_spec("threshold", 200),
+            mk_spec("log_sigma", 200),
+        ];
+
+        assert!(family.outer_hyper_hessian_hvp_available(&specs));
+        assert!(crate::custom_family::use_joint_matrix_free_path(
+            specs.iter().map(|spec| spec.design.ncols()).sum(),
+            family.n,
+        ));
+        assert!(
+            !family.outer_hyper_hessian_dense_available(&specs),
+            "biobank-scale survival location-scale should expose the outer Hessian through HVPs, not dense pairwise assembly"
+        );
+    }
+
+    #[test]
+    fn survival_location_scale_planner_keeps_analytic_hessian_at_biobank_dimensions() {
+        let family = survival_exact_newton_test_family();
+        let mk_spec = |name: &str, p: usize| ParameterBlockSpec {
+            name: name.to_string(),
+            design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((
+                family.n, p,
+            )))),
+            offset: Array1::zeros(family.n),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+        };
+        let specs = vec![
+            mk_spec("time", 200),
+            mk_spec("threshold", 200),
+            mk_spec("log_sigma", 200),
+        ];
+        let options = crate::custom_family::BlockwiseFitOptions::default();
+
+        let (gradient, hessian) =
+            crate::custom_family::custom_family_outer_derivatives(&family, &specs, &options);
+        assert_eq!(
+            gradient,
+            crate::solver::outer_strategy::Derivative::Analytic
+        );
+        assert_eq!(
+            hessian,
+            crate::solver::outer_strategy::Derivative::Analytic,
+            "large survival location-scale fits must not be demoted to BFGS when the explicit HVP operator covers the dimensions"
         );
     }
 
