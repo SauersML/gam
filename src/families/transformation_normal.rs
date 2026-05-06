@@ -2317,14 +2317,10 @@ impl TransformationNormalFamily {
                     hp_v_probe[j] += 2.0 * rd[k] * gamma_v_k * pg;
                     endpoint_probe[0][j] += 2.0 * self.response_upper_basis[k] * gamma_k * pg;
                     endpoint_probe[1][j] += 2.0 * self.response_lower_basis[k] * gamma_k * pg;
-                    endpoint_u_probe[0][j] +=
-                        2.0 * self.response_upper_basis[k] * gamma_u_k * pg;
-                    endpoint_u_probe[1][j] +=
-                        2.0 * self.response_lower_basis[k] * gamma_u_k * pg;
-                    endpoint_v_probe[0][j] +=
-                        2.0 * self.response_upper_basis[k] * gamma_v_k * pg;
-                    endpoint_v_probe[1][j] +=
-                        2.0 * self.response_lower_basis[k] * gamma_v_k * pg;
+                    endpoint_u_probe[0][j] += 2.0 * self.response_upper_basis[k] * gamma_u_k * pg;
+                    endpoint_u_probe[1][j] += 2.0 * self.response_lower_basis[k] * gamma_u_k * pg;
+                    endpoint_v_probe[0][j] += 2.0 * self.response_upper_basis[k] * gamma_v_k * pg;
+                    endpoint_v_probe[1][j] += 2.0 * self.response_lower_basis[k] * gamma_v_k * pg;
                 }
             }
             let q = row_quantities.endpoint_q[i];
