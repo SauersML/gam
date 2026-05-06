@@ -4882,11 +4882,11 @@ pub fn reml_laml_evaluate(
         // O(K·n·p²) assembly is ≈ 2·10¹⁰ FLOPs and dominates wall-clock; the
         // operator path absorbs it via O(n·p) HVPs.
         //
-        // The matrix-free operator path uses the full-space `G_ε(H)` kernel
-        // throughout; it does not yet route through the projected kernel
-        // that the rank-deficient LAML fix demands.  Fall through to the
-        // analytic `compute_outer_hessian` path (which does apply the
-        // projection) whenever a `penalty_subspace_trace` is installed.
+        // The matrix-free operator path supports both full-space and projected
+        // logdet kernels.  When a `penalty_subspace_trace` is installed, the
+        // operator traces first/second Hessian drifts through
+        // `U_S (U_Sᵀ H U_S)⁻¹ U_Sᵀ`, matching the dense analytic path without
+        // forcing p×p assembly solely for rank-deficient penalties.
         let n_obs = effective_deriv
             .scalar_glm_ingredients()
             .map(|ing| ing.x.nrows())
@@ -4899,10 +4899,7 @@ pub fn reml_laml_evaluate(
         );
         // Decompose the routing decision so the [OUTER hessian-route] log
         // can attribute *which* clause selected the path, including the
-        // rank-deficient fall-through (subspace_trace forces dense even at
-        // biobank-shape large k). This is the empirical evidence we need
-        // for priority item (d) — without these markers the routing edge
-        // case at k≥32 + rank-deficient penalties is invisible.
+        // projected rank-deficient route at biobank-shape large k.
         let large_p = p_dim >= MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD;
         let large_n_and_moderate_p = n_obs >= MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD
             && p_dim >= MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N;
@@ -4910,14 +4907,14 @@ pub fn reml_laml_evaluate(
             n_obs.saturating_mul(p_dim) >= MATRIX_FREE_OUTER_HESSIAN_NP_THRESHOLD;
         let large_k = k_outer >= MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD;
         let scale_prefers_operator = prefer_outer_hessian_operator(n_obs, p_dim, k_outer);
-        let subspace_forces_dense = solution.penalty_subspace_trace.is_some();
+        let has_subspace_trace = solution.penalty_subspace_trace.is_some();
         let use_operator = hessian_kernel.is_some()
             && use_outer_hessian_operator_path(
                 n_obs,
                 p_dim,
                 k_outer,
                 callback_operator_kernel,
-                subspace_forces_dense,
+                has_subspace_trace,
             );
         // Reason mnemonic: which clause carried the routing.  Ordered so
         // the most specific reason wins; "kernel_absent" wins over
@@ -4925,8 +4922,8 @@ pub fn reml_laml_evaluate(
         // unconditionally.
         let route_reason = if hessian_kernel.is_none() {
             "kernel_absent"
-        } else if subspace_forces_dense && scale_prefers_operator {
-            "subspace_forced_dense"
+        } else if has_subspace_trace && scale_prefers_operator {
+            "subspace_projected_operator"
         } else if callback_operator_kernel {
             "callback_kernel"
         } else if large_k {
@@ -4944,7 +4941,7 @@ pub fn reml_laml_evaluate(
         log::info!(
             "[OUTER hessian-route] choice={route_choice} reason={route_reason} \
              n={n_obs} p={p_dim} k={k_outer} \
-             callback_kernel={callback_operator_kernel} subspace_trace={subspace_forces_dense} \
+             callback_kernel={callback_operator_kernel} subspace_trace={has_subspace_trace} \
              scale_prefers_operator={scale_prefers_operator}"
         );
         let assembly_start = std::time::Instant::now();
@@ -5179,6 +5176,39 @@ fn compute_fourth_derivative_trace_matrix(
             row.mapv_inplace(|value| value * scale);
         });
     Ok(Some(crate::faer_ndarray::fast_atb(&x_modes, &weighted)))
+}
+
+fn scalar_glm_second_derivative_correction_result(
+    c_array: &Array1<f64>,
+    d_array: Option<&Array1<f64>>,
+    x: &DesignMatrix,
+    v_k: &Array1<f64>,
+    v_l: &Array1<f64>,
+    u_kl: &Array1<f64>,
+) -> Result<Option<DriftDerivResult>, String> {
+    let x_vk = x.matrixvectormultiply(v_k);
+    let x_vl = x.matrixvectormultiply(v_l);
+    let x_ukl = x.matrixvectormultiply(u_kl);
+
+    let n = x.nrows();
+    let mut weights = Array1::zeros(n);
+    Zip::from(&mut weights)
+        .and(c_array)
+        .and(&x_ukl)
+        .par_for_each(|w, &c, &xu| *w = c * xu);
+
+    if let Some(d_array) = d_array {
+        Zip::from(&mut weights)
+            .and(d_array)
+            .and(&x_vk)
+            .and(&x_vl)
+            .par_for_each(|w, &d, &xvk, &xvl| *w += d * xvk * xvl);
+    }
+
+    let result = x
+        .compute_xtwx(&weights)
+        .map_err(|e| format!("scalar_glm_second_derivative_correction xtwx: {e}"))?;
+    Ok(Some(DriftDerivResult::Dense(result)))
 }
 
 /// Compute the IFT second-derivative correction contribution to h2_trace.
@@ -6475,6 +6505,7 @@ struct UnifiedOuterHessianOperator {
     incl_logdet_h: bool,
     incl_logdet_s: bool,
     kernel: OuterHessianDerivativeKernel,
+    subspace: Option<Arc<PenaltySubspaceTrace>>,
     adjoint_z_c: Option<Array1<f64>>,
     leverage: Option<Array1<f64>>,
     fourth_trace: Option<Array2<f64>>,
@@ -6544,9 +6575,6 @@ impl UnifiedOuterHessianOperator {
         v_i: &Array1<f64>,
         m_alpha: &Array1<f64>,
     ) -> Result<f64, String> {
-        let z_c = self.adjoint_z_c.as_ref().ok_or_else(|| {
-            "missing adjoint trace cache for scalar outer Hessian operator".to_string()
-        })?;
         let OuterHessianDerivativeKernel::ScalarGlm {
             c_array,
             d_array,
@@ -6555,6 +6583,34 @@ impl UnifiedOuterHessianOperator {
         else {
             return Err("scalar correction requested for non-scalar kernel".to_string());
         };
+
+        if let Some(subspace) = self.subspace.as_deref() {
+            let rhs = self.pair_rhs_combo(idx, alpha);
+            let u = self.hop.solve(&rhs);
+            let mut v_alpha = Array1::<f64>::zeros(self.hop.dim());
+            for (j, &alpha_j) in alpha.iter().enumerate() {
+                if alpha_j != 0.0 {
+                    v_alpha.scaled_add(alpha_j, &self.coords[j].v);
+                }
+            }
+            let correction = scalar_glm_second_derivative_correction_result(
+                c_array,
+                d_array.as_ref(),
+                x,
+                v_i,
+                &v_alpha,
+                &u,
+            )?;
+            return Ok(match correction {
+                Some(DriftDerivResult::Dense(matrix)) => subspace.trace_projected_logdet(&matrix),
+                Some(DriftDerivResult::Operator(op)) => subspace.trace_operator(op.as_ref()),
+                None => 0.0,
+            });
+        }
+
+        let z_c = self.adjoint_z_c.as_ref().ok_or_else(|| {
+            "missing adjoint trace cache for scalar outer Hessian operator".to_string()
+        })?;
         let ingredients = ScalarGlmIngredients {
             c_array,
             d_array: d_array.as_ref(),
@@ -6605,7 +6661,11 @@ impl UnifiedOuterHessianOperator {
             operators: vec![term1.into_operator(), term2.into_operator()],
             dim_hint: self.hop.dim(),
         };
-        Ok(self.hop.trace_logdet_operator(&combined))
+        if let Some(subspace) = self.subspace.as_deref() {
+            Ok(subspace.trace_operator(&combined))
+        } else {
+            Ok(self.hop.trace_logdet_operator(&combined))
+        }
     }
 }
 
@@ -6737,27 +6797,12 @@ fn build_outer_hessian_operator(
 
     let mut coords = Vec::with_capacity(total);
     let mut rho_penalty_a_k_betas: Vec<Array1<f64>> = Vec::with_capacity(k);
-    // Dispatch helper for the per-coord `H⁻¹ · v` solve. When the
-    // solution carries a `PenaltySubspaceTrace` (rank-deficient LAML
-    // fix), the projected kernel `K = U_S · H_proj⁻¹ · U_Sᵀ` should
-    // be applied instead of the full-space inverse — see
-    // `PenaltySubspaceTrace::apply`. The routing gate in the caller
-    // (`compute_reml_or_laml_with_mode`) currently blocks subspace
-    // cases from reaching `build_outer_hessian_operator`, so the
-    // `subspace.is_some()` branch is unreachable in production today;
-    // wiring the dispatch site sets up the structure for the
-    // (planned) gate relaxation that finally routes the rank-
-    // deficient case through the matrix-free path. Until that
-    // happens, behavior is bit-identical to the previous direct
-    // `hop.solve(...)` call.
+    // Mode responses are fixed-β stationarity derivatives and always use
+    // the full Hessian solve.  Rank-deficient LAML changes only the logdet
+    // trace kernel, handled below through `subspace`; projecting these solves
+    // would change β_i/β_ij curvature semantics.
     let subspace = solution.penalty_subspace_trace.as_deref();
-    let dispatch_solve = |v: &Array1<f64>| -> Array1<f64> {
-        if let Some(s) = subspace {
-            s.apply(v)
-        } else {
-            hop.solve(v)
-        }
-    };
+    let dispatch_solve = |v: &Array1<f64>| -> Array1<f64> { hop.solve(v) };
     for idx in 0..k {
         let coord = &solution.penalty_coords[idx];
         let penalty_a_k_beta_vec = penalty_a_k_beta(coord, &solution.beta, lambdas[idx]);
@@ -6855,7 +6900,10 @@ fn build_outer_hessian_operator(
     for idx in 0..k {
         pair_a[[idx, idx]] = coords[idx].a;
         pair_g[idx][idx] = Some(coords[idx].g.clone());
-        let base = if solution.penalty_coords[idx].is_block_local() {
+        let base = if let Some(kernel) = subspace {
+            let a_k = solution.penalty_coords[idx].scaled_dense_matrix(curvature_lambdas[idx]);
+            kernel.trace_projected_logdet(&a_k)
+        } else if solution.penalty_coords[idx].is_block_local() {
             let (block, start, end) = solution.penalty_coords[idx].scaled_block_local(1.0);
             hop.trace_logdet_block_local(&block, curvature_lambdas[idx], start, end)
         } else {
@@ -6877,13 +6925,12 @@ fn build_outer_hessian_operator(
                 (rho_idx, ext_idx, pair)
             })
             .collect();
-        // `build_outer_hessian_operator` only fires when the projected-logdet
-        // kernel is absent (see guard in `reml_laml_evaluate`), so the
-        // full-space trace here is correct.  Batch all second-drift traces so
-        // `--scale-dimensions` pays one shared Hutchinson solve stream for the
-        // whole rho-ext block instead of one estimator per pair.
+        // Batch all second-drift traces so `--scale-dimensions` pays one
+        // shared Hutchinson solve stream for the whole rho-ext block instead
+        // of one estimator per pair.  Projected subspace traces skip the
+        // stochastic shortcut inside `compute_base_h2_traces`.
         let pair_refs: Vec<&HyperCoordPair> = entries.iter().map(|(_, _, pair)| pair).collect();
-        let bases = compute_base_h2_traces(hop.as_ref(), &pair_refs, None);
+        let bases = compute_base_h2_traces(hop.as_ref(), &pair_refs, subspace);
         for ((rho_idx, ext_idx, pair), base) in entries.into_iter().zip(bases.into_iter()) {
             let row = rho_idx;
             let col = k + ext_idx;
@@ -6911,7 +6958,7 @@ fn build_outer_hessian_operator(
             })
             .collect();
         let pair_refs: Vec<&HyperCoordPair> = entries.iter().map(|(_, _, pair)| pair).collect();
-        let bases = compute_base_h2_traces(hop.as_ref(), &pair_refs, None);
+        let bases = compute_base_h2_traces(hop.as_ref(), &pair_refs, subspace);
         for ((ii, jj, pair), base) in entries.into_iter().zip(bases.into_iter()) {
             let row = k + ii;
             let col = k + jj;
@@ -6946,7 +6993,7 @@ fn build_outer_hessian_operator(
                     &beta_i,
                     &beta_j,
                     solution.fixed_drift_deriv.as_ref(),
-                    None,
+                    subspace,
                 );
                 ((ii, jj), trace)
             })
@@ -6970,7 +7017,49 @@ fn build_outer_hessian_operator(
     let cross_trace: Option<Array2<f64>> = if incl_logdet_h {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let dense_hop_opt = hop.as_dense_spectral();
-        if hop.prefers_stochastic_trace_estimation() && hop.logdet_traces_match_hinv_kernel() {
+        if let Some(kernel) = subspace {
+            let reduced: Vec<Array2<f64>> = coords
+                .iter()
+                .map(|coord| {
+                    let mut out = Array2::<f64>::zeros((
+                        kernel.h_proj_inverse.nrows(),
+                        kernel.h_proj_inverse.ncols(),
+                    ));
+                    if let Some(matrix) = coord.total_drift.dense.as_ref() {
+                        out += &kernel.reduce(matrix);
+                    }
+                    for op in &coord.total_drift.operators {
+                        out += &kernel.reduce_operator(op.as_ref());
+                    }
+                    out
+                })
+                .collect();
+            let pairs: Vec<(usize, usize)> = (0..total)
+                .flat_map(|ii| (ii..total).map(move |jj| (ii, jj)))
+                .collect();
+            let pair_values: Vec<((usize, usize), f64)> = pairs
+                .into_par_iter()
+                .map(|(ii, jj)| {
+                    let value =
+                        -kernel.trace_projected_logdet_cross_reduced(&reduced[ii], &reduced[jj]);
+                    ((ii, jj), value)
+                })
+                .collect();
+            let mut ct = Array2::<f64>::zeros((total, total));
+            for ((ii, jj), value) in pair_values {
+                if !value.is_finite() {
+                    return Err(format!(
+                        "outer Hessian operator projected cross_trace[{ii}, {jj}] is non-finite ({value})"
+                    ));
+                }
+                ct[[ii, jj]] = value;
+                if ii != jj {
+                    ct[[jj, ii]] = value;
+                }
+            }
+            Some(ct)
+        } else if hop.prefers_stochastic_trace_estimation() && hop.logdet_traces_match_hinv_kernel()
+        {
             // Matrix-free backends expose the SPD logdet kernel
             //   ∂² log|H|[A_i,A_j] = -tr(H⁻¹ A_i H⁻¹ A_j).
             //
@@ -7126,7 +7215,7 @@ fn build_outer_hessian_operator(
         None
     };
 
-    let leverage = if incl_logdet_h {
+    let leverage = if incl_logdet_h && subspace.is_none() {
         match &kernel {
             OuterHessianDerivativeKernel::Gaussian => None,
             OuterHessianDerivativeKernel::ScalarGlm { x, .. } => {
@@ -7219,6 +7308,7 @@ fn build_outer_hessian_operator(
         incl_logdet_h,
         incl_logdet_s,
         kernel,
+        subspace: solution.penalty_subspace_trace.clone(),
         adjoint_z_c,
         leverage,
         fourth_trace,
@@ -11565,6 +11655,179 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn projected_operator_hessian_matches_dense_subspace_trace() {
+        let h = array![[3.0, 0.2], [0.2, 5.0]];
+        let hop = Arc::new(DenseSpectralOperator::from_symmetric(&h).unwrap());
+        let beta = array![0.4, -0.7];
+        let penalty_root = array![[0.0, 1.0]];
+        let ext_drift = array![[0.45, -0.15], [-0.15, 0.35]];
+        let x = array![[1.0, 0.2], [1.0, 1.1], [1.0, -0.8], [1.0, 0.5]];
+        let c_array = array![0.31, -0.27, 0.19, -0.11];
+        let d_array = array![0.17, -0.11, 0.23, 0.07];
+        let deriv_provider = SinglePredictorGlmDerivatives {
+            c_array,
+            d_array: Some(d_array),
+            x_transformed: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x)),
+        };
+        let h_proj = h[[1, 1]];
+
+        let solution = InnerSolution {
+            log_likelihood: -2.3,
+            penalty_quadratic: 0.6,
+            hessian_op: hop.clone(),
+            beta,
+            penalty_coords: vec![PenaltyCoordinate::from_dense_root(penalty_root)],
+            penalty_logdet: PenaltyLogdetDerivs {
+                value: 0.0,
+                first: array![0.4],
+                second: Some(array![[0.13]]),
+            },
+            deriv_provider: Box::new(deriv_provider),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: None,
+            hessian_logdet_correction: h_proj.ln() - hop.logdet(),
+            penalty_subspace_trace: Some(Arc::new(PenaltySubspaceTrace {
+                u_s: array![[0.0], [1.0]],
+                h_proj_inverse: array![[1.0 / h_proj]],
+            })),
+            rho_curvature_scale: 1.0,
+            n_observations: 4,
+            nullspace_dim: 1.0,
+            dispersion: DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: true,
+            },
+            ext_coords: vec![HyperCoord {
+                a: -0.21,
+                g: array![0.33, -0.42],
+                drift: HyperCoordDrift::from_operator(Arc::new(DenseMatrixHyperOperator {
+                    matrix: ext_drift,
+                })),
+                ld_s: 0.07,
+                b_depends_on_beta: false,
+                is_penalty_like: false,
+                firth_g: None,
+                tk_eta_fixed: None,
+                tk_x_fixed: None,
+            }],
+            ext_coord_pair_fn: Some(Box::new(|_, _| HyperCoordPair {
+                a: 0.09,
+                g: array![0.16, -0.12],
+                b_mat: array![[0.08, 0.03], [0.03, -0.04]],
+                b_operator: None,
+                ld_s: -0.05,
+            })),
+            rho_ext_pair_fn: Some(Box::new(|_, _| HyperCoordPair {
+                a: -0.14,
+                g: array![-0.18, 0.22],
+                b_mat: array![[0.05, -0.02], [-0.02, 0.07]],
+                b_operator: None,
+                ld_s: 0.04,
+            })),
+            fixed_drift_deriv: None,
+            barrier_config: None,
+        };
+        let rho: Vec<f64> = vec![0.2_f64];
+        let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
+
+        let dense = compute_outer_hessian(
+            &solution,
+            &rho,
+            &lambdas,
+            solution.hessian_op.as_ref(),
+            solution.deriv_provider.as_ref(),
+        )
+        .unwrap();
+        let kernel = solution
+            .deriv_provider
+            .outer_hessian_derivative_kernel()
+            .unwrap();
+        let operator = build_outer_hessian_operator(
+            &solution,
+            &lambdas,
+            solution.deriv_provider.as_ref(),
+            kernel,
+        )
+        .unwrap();
+        let materialized =
+            crate::solver::outer_strategy::OuterHessianOperator::materialize_dense(&operator)
+                .unwrap();
+
+        for row in 0..dense.nrows() {
+            for col in 0..dense.ncols() {
+                assert_relative_eq!(
+                    materialized[[row, col]],
+                    dense[[row, col]],
+                    epsilon = 1e-10,
+                    max_relative = 1e-10
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn subspace_trace_large_k_routes_to_projected_operator() {
+        let h = array![[3.0, 0.2], [0.2, 5.0]];
+        let hop = Arc::new(DenseSpectralOperator::from_symmetric(&h).unwrap());
+        let pcoord = PenaltyCoordinate::from_dense_root(array![[0.0, 1.0]]);
+        let k = MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD;
+        let x = array![[1.0, 0.2], [1.0, 1.1], [1.0, -0.8], [1.0, 0.5]];
+        let deriv_provider = SinglePredictorGlmDerivatives {
+            c_array: array![0.31, -0.27, 0.19, -0.11],
+            d_array: Some(array![0.17, -0.11, 0.23, 0.07]),
+            x_transformed: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x)),
+        };
+        let h_proj = h[[1, 1]];
+        let solution = InnerSolution {
+            log_likelihood: -2.3,
+            penalty_quadratic: 0.6,
+            hessian_op: hop.clone(),
+            beta: array![0.4, -0.7],
+            penalty_coords: vec![pcoord; k],
+            penalty_logdet: PenaltyLogdetDerivs {
+                value: 0.0,
+                first: Array1::zeros(k),
+                second: Some(Array2::zeros((k, k))),
+            },
+            deriv_provider: Box::new(deriv_provider),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: None,
+            hessian_logdet_correction: h_proj.ln() - hop.logdet(),
+            penalty_subspace_trace: Some(Arc::new(PenaltySubspaceTrace {
+                u_s: array![[0.0], [1.0]],
+                h_proj_inverse: array![[1.0 / h_proj]],
+            })),
+            rho_curvature_scale: 1.0,
+            n_observations: 4,
+            nullspace_dim: 1.0,
+            dispersion: DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: true,
+            },
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+            barrier_config: None,
+        };
+        let rho = vec![0.0_f64; k];
+        let result =
+            reml_laml_evaluate(&solution, &rho, EvalMode::ValueGradientHessian, None).unwrap();
+
+        assert!(
+            matches!(
+                result.hessian,
+                crate::solver::outer_strategy::HessianResult::Operator(_)
+            ),
+            "large-k subspace-trace case should use projected outer Hessian operator"
+        );
     }
 
     #[test]
