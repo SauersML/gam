@@ -2249,8 +2249,9 @@ impl<'a> RemlState<'a> {
                 };
                 // Shift the (ρ, β) history one step before storing the new
                 // pair, so the previous-pair slot always holds the
-                // pre-most-recent solve. Used by `predict_warm_start_beta`
-                // for tangent-line extrapolation across outer iterations.
+                // pre-most-recent solve. Used by
+                // `predict_warm_start_beta_with_source` for tangent-line
+                // extrapolation across outer iterations.
                 {
                     let mut prev_beta_w = self.prev_warm_start_beta.write().unwrap();
                     let mut prev_rho_w = self.prev_warm_start_rho.write().unwrap();
@@ -2519,38 +2520,26 @@ impl<'a> RemlState<'a> {
         )
     }
 
-    /// Predict β at `new_rho` via tangent-line extrapolation across the
-    /// last two (ρ, β) pairs. Returns `None` if either pair is missing,
-    /// the ρ-step direction is degenerate, or the extrapolation step
-    /// `α` exceeds the adaptive safety cap (default 1.5 — see
-    /// `adaptive_tangent_alpha_cap` for the residual-driven policy
-    /// that loosens to 2.0 when prior IFT predictions were excellent
-    /// and tightens to 0.5 when the local linear approximation has
-    /// been shown to collapse toward flat warm-start).
+    /// Predict β at `new_rho` together with a tag identifying which
+    /// predictor produced it (IFT first-order Jacobian or tangent-line
+    /// extrapolation across the last two (ρ, β) pairs). Returns `None`
+    /// when no predictor can be applied — the warm-start machinery is
+    /// disabled, neither cache is populated, the ρ-step direction is
+    /// degenerate, or the extrapolation step `α` exceeds the adaptive
+    /// safety cap (default 1.5 — see `adaptive_tangent_alpha_cap` for
+    /// the residual-driven policy that loosens to 2.0 when prior IFT
+    /// predictions were excellent and tightens to 0.5 when the local
+    /// linear approximation has been shown to collapse toward flat
+    /// warm-start).
     ///
-    /// Falls back to the stored `warm_start_beta` (which is `β(ρ_k)` —
-    /// the standard "use last β as-is" warm start) when no prediction
-    /// is possible. So this is strictly an improvement: when prediction
-    /// is safe, we use it; otherwise we use the existing flat warm-start.
-    /// Discard-source wrapper around `predict_warm_start_beta_with_source`.
-    /// Production callers (`execute_pirls_if_needed`) use the
-    /// `_with_source` variant directly so they can route per-predictor
-    /// quality markers; this thin wrapper is kept for the smaller call
-    /// sites and forward-compat documentation pointers (e.g. comments
-    /// throughout the runtime referencing "predict_warm_start_beta"
-    /// continue to make sense).
-    #[allow(dead_code)]
-    pub(crate) fn predict_warm_start_beta(&self, new_rho: &Array1<f64>) -> Option<Coefficients> {
-        self.predict_warm_start_beta_with_source(new_rho)
-            .map(|(c, _)| c)
-    }
-
-    /// Predict β with a tag identifying which predictor produced it.
-    /// The wrapper above discards the tag; callers that need to emit
-    /// per-predictor quality markers (the [IFT-QUALITY] /
-    /// [TANGENT-QUALITY] chain in `execute_pirls_if_needed`) consume
-    /// this richer return so each marker is attributed correctly to
-    /// the predictor that actually produced the β.
+    /// Callers fall back to the stored `warm_start_beta` (`β(ρ_k)` —
+    /// the standard "use last β as-is" warm start) on `None`. So this
+    /// is strictly an improvement: when prediction is safe, we use it;
+    /// otherwise we use the existing flat warm-start. The source tag
+    /// drives per-predictor quality markers (the [IFT-QUALITY] /
+    /// [TANGENT-QUALITY] chain in `execute_pirls_if_needed`) so each
+    /// marker is attributed correctly to the predictor that actually
+    /// produced the β.
     pub(crate) fn predict_warm_start_beta_with_source(
         &self,
         new_rho: &Array1<f64>,
