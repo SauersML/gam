@@ -12328,16 +12328,90 @@ impl ExactNewtonJointPsiWorkspace for TransformationNormalPsiWorkspace {
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        // Defer to the existing direct hook. CTN's psi-psi second-order path
-        // is already operator-backed and only fires at full-Hessian outer
-        // evaluations, so caching it here would not be a hot-path win.
-        self.family.exact_newton_joint_psisecond_order_terms(
-            &self.block_states,
-            &self.specs,
-            &self.derivative_blocks,
+        let mut guard = self
+            .cache
+            .lock()
+            .map_err(|_| "TransformationNormalPsiWorkspace cache poisoned".to_string())?;
+        if guard.is_none() {
+            let computed = self.compute_all_axes()?;
+            *guard = Some(computed);
+        }
+        let cached = guard.as_ref().expect("populated above");
+        if psi_i >= cached.len() || psi_j >= cached.len() {
+            return Ok(None);
+        }
+
+        let start = std::time::Instant::now();
+        let entry_i = &cached[psi_i];
+        let entry_j = &cached[psi_j];
+        let op = entry_i
+            .op_arc
+            .as_any()
+            .downcast_ref::<TensorKroneckerPsiOperator>()
+            .ok_or_else(|| {
+                "TransformationNormalPsiWorkspace ψ-ψ terms require tensor-backed operator"
+                    .to_string()
+            })?;
+        if entry_j
+            .op_arc
+            .as_any()
+            .downcast_ref::<TensorKroneckerPsiOperator>()
+            .is_none()
+        {
+            return Err(
+                "TransformationNormalPsiWorkspace ψ-ψ terms require tensor-backed operator on both axes"
+                    .to_string(),
+            );
+        }
+
+        let (objective_psi_psi, score_psi_psi, _) = self
+            .family
+            .scop_psi_psi_value_score_hvp_from_operator(
+                entry_i.beta.as_ref(),
+                op,
+                entry_i.axis,
+                entry_j.axis,
+                entry_i.row_gamma.view(),
+                entry_i.row_h.view(),
+                entry_i.row_h_prime.view(),
+                entry_i.endpoint_q.as_slice(),
+                None,
+            )?;
+        if !objective_psi_psi.is_finite() || !score_psi_psi.iter().all(|v| v.is_finite()) {
+            return Err(format!(
+                "TransformationNormalPsiWorkspace ψ-ψ terms produced non-finite values at \
+                 psi_i={psi_i}, psi_j={psi_j}: obj_finite={}, score_all_finite={}",
+                objective_psi_psi.is_finite(),
+                score_psi_psi.iter().all(|v| v.is_finite()),
+            ));
+        }
+
+        let hessian_psi_psi_operator: Box<dyn HyperOperator> =
+            Box::new(TransformationNormalPsiPsiHessianOperator::new(
+                Arc::new(self.family.clone()),
+                (*entry_i.beta).clone(),
+                Arc::clone(&entry_i.op_arc),
+                entry_i.axis,
+                entry_j.axis,
+                Arc::clone(&entry_i.row_gamma),
+                Arc::clone(&entry_i.row_h),
+                Arc::clone(&entry_i.row_h_prime),
+                Arc::clone(&entry_i.endpoint_q),
+            ));
+        log::info!(
+            "[STAGE] CTN psi-psi workspace pair (psi_i={}, psi_j={}, axes={},{}) elapsed={:.3}s",
             psi_i,
             psi_j,
-        )
+            entry_i.axis,
+            entry_j.axis,
+            start.elapsed().as_secs_f64(),
+        );
+        Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
+            objective_psi_psi,
+            score_psi_psi,
+            hessian_psi_psi: Array2::zeros((0, 0)),
+            hessian_psi_psi_operator: Some(hessian_psi_psi_operator),
+        }))
     }
 
     fn hessian_directional_derivative(
