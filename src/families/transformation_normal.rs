@@ -2352,16 +2352,6 @@ impl TransformationNormalFamily {
                 } else {
                     2.0 * rd[k] * gamma_v[k]
                 };
-                let h_second_probe = if k == 0 {
-                    0.0
-                } else {
-                    2.0 * rv[k] * gamma_probe[k]
-                };
-                let hp_second_probe = if k == 0 {
-                    0.0
-                } else {
-                    2.0 * rd[k] * gamma_probe[k]
-                };
                 let endpoint_factor = [
                     if k == 0 {
                         self.response_upper_basis[0]
