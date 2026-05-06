@@ -18332,3 +18332,1098 @@ index d3ef6aa260341fce526e0c4f2023d89bea0b2867..28cfc66c70c28d9c3ea16654ee2a13a7
 [2026-05-06T21:14:43.503099+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
 [2026-05-06T21:14:43.505119+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
 [2026-05-06T21:14:43.505188+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:14:59.160574+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T21:14:59.162726+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:14:59.162799+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:15:01.699596+00:00] apply_result: mode=apply id=task_e_69fb93b7e5708324aff6c4b4b8b1916c status=Partial applied=1 skipped=0 conflicts=9 cmd=(cd /Users/user/gam && git apply --3way /var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/.tmp4Vp7RQ/patch.diff)
+stdout_tail=
+
+stderr_tail=
+Applied patch to 'src/families/bernoulli_marginal_slope.rs' with conflicts.
+Applied patch to 'src/families/gamlss.rs' with conflicts.
+Applied patch to 'src/families/latent_survival.rs' with conflicts.
+Applied patch to 'src/families/survival_location_scale.rs' with conflicts.
+Applied patch to 'src/families/survival_marginal_slope.rs' with conflicts.
+Applied patch to 'src/families/transformation_normal.rs' with conflicts.
+Applied patch to 'src/solver/outer_strategy.rs' cleanly.
+Applied patch to 'src/solver/reml/runtime.rs' with conflicts.
+Applied patch to 'src/solver/reml/unified.rs' with conflicts.
+Applied patch to 'src/terms/smooth.rs' with conflicts.
+U src/families/bernoulli_marginal_slope.rs
+U src/families/gamlss.rs
+U src/families/latent_survival.rs
+U src/families/survival_location_scale.rs
+U src/families/survival_marginal_slope.rs
+U src/families/transformation_normal.rs
+U src/solver/reml/runtime.rs
+U src/solver/reml/unified.rs
+U src/terms/smooth.rs
+
+patch_summary: kind=git-diff lines=1048 chars=50739 cwd=/Users/user/gam ; head=
+diff --git a/src/families/bernoulli_marginal_slope.rs b/src/families/bernoulli_marginal_slope.rs
+index 4a7c4d764a035398db03ba4d65da829fd2e54e9d..433094264cfc24feec50e4b0cb271ff41274406c 100644
+--- a/src/families/bernoulli_marginal_slope.rs
++++ b/src/families/bernoulli_marginal_slope.rs
+@@ -8303,90 +8303,57 @@ pub fn fit_bernoulli_marginal_slope_terms(
+         }
+     };
+ 
+     let marginal_terms = spatial_length_scale_term_indices(&marginalspec_boot);
+     let logslope_terms = spatial_length_scale_term_indices(&logslopespec_boot);
+     let marginal_has_spatial = !marginal_terms.is_empty();
+     let logslope_has_spatial = !logslope_terms.is_empty();
+     let analytic_joint_derivatives_available =
+         marginal_has_spatial || logslope_has_spatial || setup.log_kappa_dim() == 0;
+     if se…
+----- PATCH BEGIN -----
+diff --git a/src/families/bernoulli_marginal_slope.rs b/src/families/bernoulli_marginal_slope.rs
+index 4a7c4d764a035398db03ba4d65da829fd2e54e9d..433094264cfc24feec50e4b0cb271ff41274406c 100644
+--- a/src/families/bernoulli_marginal_slope.rs
++++ b/src/families/bernoulli_marginal_slope.rs
+@@ -8303,90 +8303,57 @@ pub fn fit_bernoulli_marginal_slope_terms(
+         }
+     };
+ 
+     let marginal_terms = spatial_length_scale_term_indices(&marginalspec_boot);
+     let logslope_terms = spatial_length_scale_term_indices(&logslopespec_boot);
+     let marginal_has_spatial = !marginal_terms.is_empty();
+     let logslope_has_spatial = !logslope_terms.is_empty();
+     let analytic_joint_derivatives_available =
+         marginal_has_spatial || logslope_has_spatial || setup.log_kappa_dim() == 0;
+     if setup.log_kappa_dim() > 0 && !analytic_joint_derivatives_available {
+         return Err(
+             "exact bernoulli marginal-slope spatial optimization requires analytic joint psi derivatives"
+                 .to_string(),
+         );
+     }
+     let initial_rho = setup.theta0().slice(s![..setup.rho_dim()]).to_owned();
+     let initial_blocks = build_blocks(&initial_rho, &marginal_design, &logslope_design)?;
+     let initial_family = make_family(&marginal_design, &logslope_design, initial_sigma);
+     let (joint_gradient, joint_hessian) =
+         custom_family_outer_derivatives(&initial_family, &initial_blocks, options);
+     let analytic_joint_gradient_available = analytic_joint_derivatives_available
+         && matches!(
+             joint_gradient,
+             crate::solver::outer_strategy::Derivative::Analytic
+         );
+-    // Size-gate the analytic outer Hessian. The exact analytic-Hessian path
+-    // assembles per-row third- and fourth-derivative tensors via
+-    // `row_primary_third_contracted_recompute` / `…_fourth…ordered` and the
+-    // `cubic_cell_kernel` cell-moment routines, with cost
+-    // O(n · ψ-axes · per-row cell moments) per outer eval. At biobank shape
+-    // (n ≈ 320k, ψ-dim ≈ 16 + linkwiggle/timewiggle/scale-dim knots ≈ 44+)
+-    // this dominates wall-clock and prevents convergence inside the 50-min
+-    // CI budget. When the problem is "biobank-shaped", declare the Hessian
+-    // as `Unavailable`; the bernoulli-marginal-slope path also passes
+-    // `disable_fixed_point: true` (β-dependent joint Hessian violates the
+-    // EFS/HybridEFS structural invariant — see the comment at the
+-    // `optimize_spatial_length_scale_exact_joint` call site below), so the
+-    // planner falls back to BFGS quasi-Newton on the analytic gradient. BFGS
+-    // takes more outer iterations than Arc but each iteration is just one
+-    // gradient evaluation (no per-row third/fourth-derivative work), and the
+-    // overall wall-clock is much better at scale.
+-    //
+-    // Small fixtures (`n ≤ 50_000` AND `ψ_dim ≤ 30`) keep the analytic path so
+-    // existing convergence-regression tests are unaffected.
+-    let n_obs = data_view.nrows();
+-    let psi_dim = setup.log_kappa_dim();
+-    let biobank_scale = n_obs > 50_000 || psi_dim > 30;
+-    // CRITICAL (same fix as survival_marginal_slope.rs): the gate value
+-    // alone is insufficient because the bernoulli main fit also runs
+-    // through `fit_custom_family`'s blockwise outer-loop, which derives
+-    // Hessian capability from `options.use_outer_hessian` rather than
+-    // our local gate. CI run 25338491995 showed bernoulli at biobank
+-    // n=320k psi_dim=32 routing to ARC + analytic Hessian and hitting
+-    // 50-min job timeout. Override the options bag so the planner sees
+-    // `use_outer_hessian=false`, forcing BFGS.
+-    let mut options_override = options.clone();
+-    if biobank_scale {
+-        options_override.use_outer_hessian = false;
+-        log::info!(
+-            "[bernoulli-marginal-slope] declining analytic outer Hessian for n={n_obs}, psi_dim={psi_dim}; routing to BFGS (use_outer_hessian=false)"
+-        );
+-    }
+-    let options: &BlockwiseFitOptions = &options_override;
++    // Exact second-order capability is independent of problem size. These
++    // families expose analytic joint Hessian/HVP geometry through the
++    // custom-family evaluator; runtime representation selection chooses dense
++    // materialization or exact matrix-free Hessian-vector products. Do not
++    // force `use_outer_hessian=false` as a cost fallback: that would hide the
++    // exact-curvature route from the global outer planner.
+     let analytic_joint_hessian_available = analytic_joint_derivatives_available
+-        && !biobank_scale
+         && matches!(
+             joint_hessian,
+             crate::solver::outer_strategy::Derivative::Analytic
+         );
+     let kappa_options_ref: &SpatialLengthScaleOptimizationOptions = kappa_options;
+     let sigma_from_theta = |theta: &Array1<f64>| -> Option<f64> {
+         if sigma_learnable {
+             Some(theta[setup.rho_dim() + setup.log_kappa_dim()].exp())
+         } else {
+             initial_sigma
+         }
+     };
+     let derivative_block_cache = RefCell::new(
+         None::<(
+             Array1<f64>,
+             Arc<Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>>,
+         )>,
+     );
+     let theta_matches = |left: &Array1<f64>, right: &Array1<f64>| -> bool {
+         left.len() == right.len()
+             && left
+                 .iter()
+                 .zip(right.iter())
+                 .all(|(lhs, rhs)| (*lhs - *rhs).abs() <= 1e-12 * (1.0 + lhs.abs().max(rhs.abs())))
+     };
+diff --git a/src/families/gamlss.rs b/src/families/gamlss.rs
+index 2a8d4a6eda5b3057bc8b1ef07017c5cb164aff2d..fa2f2b998858619fe5c45fab6ef8cf52400276b2 100644
+--- a/src/families/gamlss.rs
++++ b/src/families/gamlss.rs
+@@ -1764,64 +1764,54 @@ trait LocationScaleFamilyBuilder {
+ 
+     fn extra_rho0(&self) -> Result<Array1<f64>, String> {
+         Ok(Array1::zeros(0))
+     }
+ 
+     fn augment_result_designs(&self, _: &mut TermCollectionDesign, _: &mut TermCollectionDesign) {}
+ 
+     fn build_psiderivative_blocks(
+         &self,
+         _: ndarray::ArrayView2<'_, f64>,
+         _: &TermCollectionSpec,
+         _: &TermCollectionSpec,
+         _: &TermCollectionDesign,
+         _: &TermCollectionDesign,
+     ) -> Result<Vec<Vec<CustomFamilyBlockPsiDerivative>>, String> {
+         Err("spatial psi derivatives are unavailable for this location-scale family".to_string())
+     }
+ }
+ 
+ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
+     data: ndarray::ArrayView2<'_, f64>,
+     builder: B,
+     options: &BlockwiseFitOptions,
+     kappa_options: &SpatialLengthScaleOptimizationOptions,
+ ) -> Result<BlockwiseTermFitResult, String> {
+-    // Same biobank-scale outer-Hessian gate as the marginal-slope families
+-    // (see survival_marginal_slope.rs:13286). At biobank n the analytic
+-    // outer Hessian dominates wall-clock; route to BFGS on the analytic
+-    // gradient instead.
+-    let n_obs = data.nrows();
+-    let biobank_scale = n_obs > 50_000;
+-    let mut options_override = options.clone();
+-    if biobank_scale && options_override.use_outer_hessian {
+-        options_override.use_outer_hessian = false;
+-        log::info!(
+-            "[gamlss-location-scale] declining analytic outer Hessian for n={n_obs}; routing to BFGS"
+-        );
+-    }
+-    let options: &BlockwiseFitOptions = &options_override;
++    // Preserve explicit second-order capability for the global outer planner.
++    // The custom-family evaluator decides dense-vs-HVP representation at
++    // runtime; this path must not synthesize a BFGS cost fallback by clearing
++    // `use_outer_hessian`.
+ 
+     let mut mean_beta_hint: Option<Array1<f64>> = None;
+     let mut noise_beta_hint: Option<Array1<f64>> = None;
+     let extra_rho0 = builder.extra_rho0()?;
+ 
+     let mean_boot_design =
+         build_term_collection_design(data, builder.meanspec()).map_err(|e| e.to_string())?;
+     let noise_boot_design =
+         build_term_collection_design(data, builder.noisespec()).map_err(|e| e.to_string())?;
+     let mean_bootspec = freeze_term_collection_from_design(builder.meanspec(), &mean_boot_design)
+         .map_err(|e| e.to_string())?;
+     let noise_bootspec =
+         freeze_term_collection_from_design(builder.noisespec(), &noise_boot_design)
+             .map_err(|e| e.to_string())?;
+ 
+     let require_exact_spatial_joint = builder.require_exact_spatial_joint();
+     let analytic_joint_derivatives_check = if builder.exact_spatial_joint_supported() {
+         builder
+             .build_psiderivative_blocks(
+                 data,
+                 &mean_bootspec,
+                 &noise_bootspec,
+                 &mean_boot_design,
+                 &noise_boot_design,
+             )
+@@ -2954,64 +2944,54 @@ pub(crate) fn select_binomial_mean_link_wiggle_basis_from_pilot(
+     select_wiggle_basis_from_seed(q_seed.view(), wiggle_cfg, wiggle_penalty_orders)
+ }
+ 
+ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
+     data: ndarray::ArrayView2<'_, f64>,
+     pilot_spec: &TermCollectionSpec,
+     pilot_design: &TermCollectionDesign,
+     pilot_fit: &UnifiedFitResult,
+     y: &Array1<f64>,
+     weights: &Array1<f64>,
+     link_kind: InverseLink,
+     selected_wiggle_basis: SelectedWiggleBasis,
+     options: &BlockwiseFitOptions,
+     kappa_options: &SpatialLengthScaleOptimizationOptions,
+ ) -> Result<BinomialMeanWiggleTermFitResult, String> {
+     const RHO_BOUND: f64 = 12.0;
+ 
+     validate_term_weights(
+         data,
+         y.len(),
+         weights,
+         "fit_binomial_mean_wiggle_terms_with_selected_basis",
+     )?;
+     validate_binomial_response(y, "fit_binomial_mean_wiggle_terms_with_selected_basis")?;
+ 
+-    // Same biobank-scale outer-Hessian gate as the marginal-slope families
+-    // (see survival_marginal_slope.rs:13286). At biobank n the analytic
+-    // outer Hessian dominates wall-clock; route to BFGS on the analytic
+-    // gradient instead.
+-    let n_obs = data.nrows();
+-    let biobank_scale = n_obs > 50_000;
+-    let mut options_override = options.clone();
+-    if biobank_scale && options_override.use_outer_hessian {
+-        options_override.use_outer_hessian = false;
+-        log::info!(
+-            "[gamlss-binomial-mean-wiggle] declining analytic outer Hessian for n={n_obs}; routing to BFGS"
+-        );
+-    }
+-    let options: &BlockwiseFitOptions = &options_override;
++    // Preserve explicit second-order capability for the global outer planner.
++    // The custom-family evaluator decides dense-vs-HVP representation at
++    // runtime; this path must not synthesize a BFGS cost fallback by clearing
++    // `use_outer_hessian`.
+ 
+     let SelectedWiggleBasis {
+         knots: wiggle_knots,
+         degree: wiggle_degree,
+         block: wiggle_block,
+         ..
+     } = selected_wiggle_basis;
+ 
+     let spatial_terms = spatial_length_scale_term_indices(pilot_spec);
+     if spatial_terms.is_empty() {
+         let fit = fit_binomial_mean_wiggle(
+             BinomialMeanWiggleSpec {
+                 y: y.clone(),
+                 weights: weights.clone(),
+                 link_kind,
+                 wiggle_knots: wiggle_knots.clone(),
+                 wiggle_degree,
+                 eta_block: ParameterBlockInput {
+                     design: pilot_design.design.clone(),
+                     offset: Array1::zeros(y.len()),
+                     penalties: pilot_design
+                         .penalties
+                         .iter()
+                         .map(|bp| crate::solver::estimate::PenaltySpec::from_blockwise_ref(bp))
+                         .collect(),
+diff --git a/src/families/latent_survival.rs b/src/families/latent_survival.rs
+index c22b6ce542b0a479b9472bc6cd7857ee09485731..a508f723f54541b4ba857e3d30e67382b50dfbaf 100644
+--- a/src/families/latent_survival.rs
++++ b/src/families/latent_survival.rs
+@@ -306,117 +306,98 @@ pub fn fit_latent_survival_terms(
+     let time_prepared = prepare_latent_time_block(&spec.time_block, spec.derivative_guard)?;
+ 
+     let family = LatentSurvivalFamily {
+         event_target: spec.event_target.clone(),
+         weights: spec.weights.clone(),
+         latent_sd_fixed: latent_sd,
+         hazard_loading,
+         unloaded_mass_entry: spec.unloaded_mass_entry.clone(),
+         unloaded_mass_exit: spec.unloaded_mass_exit.clone(),
+         unloaded_hazard_exit: spec.unloaded_hazard_exit.clone(),
+         x_time_entry: time_prepared.design_entry.clone(),
+         x_time_exit: time_prepared.design_exit.clone(),
+         x_time_derivative_exit: time_prepared.design_derivative_exit.clone(),
+         x_mean: mean_design.design.clone(),
+         time_linear_constraints: time_prepared.linear_constraints.clone(),
+         quadctx: Arc::new(QuadratureContext::new()),
+     };
+ 
+     let mut blocks = vec![
+         build_time_blockspec(&time_prepared, &spec.time_block),
+         build_mean_blockspec(&mean_design, spec.mean_offset.clone()),
+     ];
+     if latent_sd.is_none() {
+         blocks.push(build_log_sigma_blockspec(0.5));
+     }
+-    // Same biobank-scale outer-Hessian gate as the marginal-slope families
+-    // (see survival_marginal_slope.rs:13286). At biobank n the analytic
+-    // outer Hessian dominates wall-clock; route to BFGS on the analytic
+-    // gradient instead.
+-    let n_obs = data.nrows();
+-    let biobank_scale = n_obs > 50_000;
+-    let mut options_override = options.clone();
+-    if biobank_scale && options_override.use_outer_hessian {
+-        options_override.use_outer_hessian = false;
+-        log::info!(
+-            "[latent-survival] declining analytic outer Hessian for n={n_obs}; routing to BFGS"
+-        );
+-    }
+-    let options: &BlockwiseFitOptions = &options_override;
++    // Preserve explicit second-order capability; custom-family runtime chooses
++    // dense analytic Hessian or exact HVP representation instead of this path
++    // forcing a planner-visible BFGS cost fallback.
+     let fit = fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())?;
+     let latent_sd = family.latent_sd(&fit.block_states)?;
+     Ok(LatentSurvivalTermFitResult {
+         fit,
+         design: mean_design,
+         resolvedspec,
+         latent_sd,
+     })
+ }
+ 
+ pub fn fit_latent_binary_terms(
+     data: ArrayView2<'_, f64>,
+     spec: LatentBinaryTermSpec,
+     frailty: FrailtySpec,
+     options: &BlockwiseFitOptions,
+ ) -> Result<LatentBinaryTermFitResult, String> {
+     let latent_sd = validate_latent_binary_inputs(data, &spec, &frailty)?;
+     let (_, hazard_loading) = fixed_latent_hazard_frailty(&frailty, "latent-binary")?;
+     let mean_design =
+         build_term_collection_design(data, &spec.meanspec).map_err(|e| e.to_string())?;
+     let resolvedspec = freeze_term_collection_from_design(&spec.meanspec, &mean_design)
+         .map_err(|e| e.to_string())?;
+     let time_prepared = prepare_latent_time_block(&spec.time_block, spec.derivative_guard)?;
+ 
+     let family = LatentBinaryFamily {
+         event_target: spec.event_target.clone(),
+         weights: spec.weights.clone(),
+         latent_sd,
+         hazard_loading,
+         unloaded_mass_entry: spec.unloaded_mass_entry.clone(),
+         unloaded_mass_exit: spec.unloaded_mass_exit.clone(),
+         x_time_entry: time_prepared.design_entry.clone(),
+         x_time_exit: time_prepared.design_exit.clone(),
+         x_mean: mean_design.design.clone(),
+         time_linear_constraints: time_prepared.linear_constraints.clone(),
+         quadctx: Arc::new(QuadratureContext::new()),
+     };
+ 
+     let blocks = vec![
+         build_time_blockspec(&time_prepared, &spec.time_block),
+         build_mean_blockspec(&mean_design, spec.mean_offset.clone()),
+     ];
+-    // Same biobank-scale outer-Hessian gate as latent-survival above.
+-    let n_obs = data.nrows();
+-    let biobank_scale = n_obs > 50_000;
+-    let mut options_override = options.clone();
+-    if biobank_scale && options_override.use_outer_hessian {
+-        options_override.use_outer_hessian = false;
+-        log::info!(
+-            "[latent-binary] declining analytic outer Hessian for n={n_obs}; routing to BFGS"
+-        );
+-    }
+-    let options: &BlockwiseFitOptions = &options_override;
++    // Preserve explicit second-order capability; custom-family runtime chooses
++    // dense analytic Hessian or exact HVP representation instead of this path
++    // forcing a planner-visible BFGS cost fallback.
+     let fit = fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())?;
+     Ok(LatentBinaryTermFitResult {
+         fit,
+         design: mean_design,
+         resolvedspec,
+     })
+ }
+ 
+ fn validate_latent_survival_inputs(
+     data: ArrayView2<'_, f64>,
+     spec: &LatentSurvivalTermSpec,
+     frailty: &FrailtySpec,
+ ) -> Result<Option<f64>, String> {
+     let (sigma, hazard_loading) = match frailty {
+         FrailtySpec::HazardMultiplier {
+             sigma_fixed,
+             loading,
+         } => {
+             if let Some(sigma) = sigma_fixed
+                 && (!sigma.is_finite() || *sigma < 0.0)
+             {
+                 return Err(format!(
+                     "latent-survival requires a finite hazard-multiplier sigma >= 0, got {sigma}"
+                 ));
+             }
+diff --git a/src/families/survival_location_scale.rs b/src/families/survival_location_scale.rs
+index d3ef6aa260341fce526e0c4f2023d89bea0b2867..d941da20d9630c635865141d01bce8aca0997370 100644
+--- a/src/families/survival_location_scale.rs
++++ b/src/families/survival_location_scale.rs
+@@ -9389,62 +9389,54 @@ impl CustomFamily for SurvivalLocationScaleFamily {
+                 ));
+             }
+             for j in 0..beta.len() {
+                 let lb = lower_bounds[j];
+                 if lb.is_finite() && beta[j] < lb {
+                     beta[j] = lb;
+                 }
+             }
+         } else if block_idx == Self::BLOCK_LINK_WIGGLE && self.x_link_wiggle.is_some() {
+             // Link-wiggle coefficients are structurally non-negative (see
+             // max_feasible_link_wiggle_step, which checks beta[j] >= 0).
+             for j in 0..beta.len() {
+                 if beta[j] < 0.0 {
+                     beta[j] = 0.0;
+                 }
+             }
+         }
+         Ok(beta)
+     }
+ }
+ 
+ fn fit_survival_location_scale(
+     spec: SurvivalLocationScaleSpec,
+ ) -> Result<UnifiedFitResult, String> {
+     let prepared = prepare_survival_location_scale_model(&spec)?;
+-    // Same biobank-scale outer-Hessian gate as the marginal-slope and
+-    // gamlss families. At biobank n the analytic outer Hessian dominates
+-    // wall-clock; route to BFGS on the analytic gradient instead.
+-    let n_obs = spec.age_entry.len();
+-    let biobank_scale = n_obs > 50_000;
+-    let mut options = survival_blockwise_fit_options(&spec);
+-    if biobank_scale && options.use_outer_hessian {
+-        options.use_outer_hessian = false;
+-        log::info!(
+-            "[survival-location-scale] declining analytic outer Hessian for n={n_obs}; routing to BFGS"
+-        );
+-    }
++    let options = survival_blockwise_fit_options(&spec);
++    // Preserve explicit second-order capability; custom-family runtime chooses
++    // dense analytic Hessian or exact HVP representation instead of this path
++    // forcing a planner-visible BFGS cost fallback.
+     let fit = fit_custom_family(&prepared.family, &prepared.blockspecs, &options)?;
+     finalize_survival_location_scale_fit(&prepared, &fit)
+ }
+ 
+ pub(crate) fn select_survival_link_wiggle_basis_from_pilot(
+     pilot: &SurvivalLocationScaleTermFitResult,
+     wiggle_cfg: &WiggleBlockConfig,
+     wiggle_penalty_orders: &[usize],
+ ) -> Result<SelectedWiggleBasis, String> {
+     let eta_threshold = pilot
+         .threshold_design
+         .design
+         .dot(&pilot.fit.beta_threshold());
+     let eta_log_sigma = pilot
+         .log_sigma_design
+         .design
+         .dot(&pilot.fit.beta_log_sigma());
+     let q_seed = Array1::from_iter(
+         eta_threshold
+             .iter()
+             .zip(eta_log_sigma.iter())
+             .map(|(&threshold, &ls)| survival_q0_from_eta(threshold, ls)),
+     );
+     select_wiggle_basis_from_seed(q_seed.view(), wiggle_cfg, wiggle_penalty_orders)
+ }
+diff --git a/src/families/survival_marginal_slope.rs b/src/families/survival_marginal_slope.rs
+index aae1fe908e2a64acbd1b02f7795027eddcabed7c..ff4dd8043dfef87f5a79063cfd578e4653e2ac7f 100644
+--- a/src/families/survival_marginal_slope.rs
++++ b/src/families/survival_marginal_slope.rs
+@@ -13596,84 +13596,57 @@ pub fn fit_survival_marginal_slope_terms(
+ 
+     let marginal_terms = spatial_length_scale_term_indices(&marginalspec_boot);
+     let logslope_terms = spatial_length_scale_term_indices(&logslopespec_boot);
+     let marginal_has_spatial = !marginal_terms.is_empty();
+     let logslope_has_spatial = !logslope_terms.is_empty();
+     let analytic_joint_derivatives_available =
+         marginal_has_spatial || logslope_has_spatial || setup.log_kappa_dim() == 0;
+ 
+     if setup.log_kappa_dim() > 0 && !analytic_joint_derivatives_available {
+         return Err(
+             "exact survival marginal-slope spatial optimization requires analytic joint psi derivatives"
+                 .to_string(),
+         );
+     }
+ 
+     let initial_rho = setup.theta0().slice(s![..setup.rho_dim()]).to_owned();
+     let initial_blocks = build_blocks(&initial_rho, &marginal_design, &logslope_design)?;
+     let initial_family = make_family(&marginal_design, &logslope_design, initial_sigma);
+     let (joint_gradient, joint_hessian) =
+         custom_family_outer_derivatives(&initial_family, &initial_blocks, options);
+     let analytic_joint_gradient_available = analytic_joint_derivatives_available
+         && matches!(
+             joint_gradient,
+             crate::solver::outer_strategy::Derivative::Analytic
+         );
+-    // Same biobank-scale gate as bernoulli marginal-slope — see comment block
+-    // in `bernoulli_marginal_slope::fit_bernoulli_marginal_slope_terms` for
+-    // the rationale. At biobank shape the per-row third/fourth-derivative
+-    // outer-Hessian work dominates wall-clock; declare Hessian as
+-    // `Unavailable` for large problems so the planner falls back to BFGS
+-    // (gradient-only) on the analytic gradient.
+-    let n_obs = data.nrows();
+-    let psi_dim = setup.log_kappa_dim();
+-    let biobank_scale = n_obs > 50_000 || psi_dim > 30;
+-    // CRITICAL: when biobank_scale fires we ALSO override the
+-    // BlockwiseFitOptions to set `use_outer_hessian=false`. The optimize-
+-    // joint path consumes our local `analytic_joint_hessian_available`
+-    // value and gates the planner on it; but the survival main fit also
+-    // ends up running through the `fit_custom_family` blockwise outer-loop
+-    // path (visible as `[OUTER] custom family: ...` in CI logs), and that
+-    // path computes its Hessian capability via
+-    // `custom_family_outer_derivatives` which only consults
+-    // `options.use_outer_hessian` and the family's declared 2nd-order
+-    // capability — bypassing our gate entirely. CI run 25338491995 showed
+-    // this exact failure mode: at biobank n=320k psi_dim=23 the planner
+-    // selected `solver=Arc, hessian=Analytic` despite the gate being
+-    // tripped. Setting `use_outer_hessian=false` in the options bag
+-    // forces both paths to declare the outer Hessian unavailable, routing
+-    // to BFGS.
+-    let mut options_override = options.clone();
+-    if biobank_scale {
+-        options_override.use_outer_hessian = false;
+-        log::info!(
+-            "[survival-marginal-slope] declining analytic outer Hessian for n={n_obs}, psi_dim={psi_dim}; routing to BFGS (use_outer_hessian=false)"
+-        );
+-    }
+-    let options: &BlockwiseFitOptions = &options_override;
++    // Exact second-order capability is independent of problem size. These
++    // families expose analytic joint Hessian/HVP geometry through the
++    // custom-family evaluator; runtime representation selection chooses dense
++    // materialization or exact matrix-free Hessian-vector products. Do not
++    // force `use_outer_hessian=false` as a cost fallback: that would hide the
++    // exact-curvature route from the global outer planner.
+     let analytic_joint_hessian_available = analytic_joint_derivatives_available
+-        && !biobank_scale
+         && matches!(
+             joint_hessian,
+             crate::solver::outer_strategy::Derivative::Analytic
+         );
+     let kappa_options_ref: &SpatialLengthScaleOptimizationOptions = kappa_options;
+     let derivative_block_cache = RefCell::new(
+         None::<(
+             Array1<f64>,
+             Arc<Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>>,
+         )>,
+     );
+     let theta_matches = |left: &Array1<f64>, right: &Array1<f64>| -> bool {
+         left.len() == right.len()
+             && left
+                 .iter()
+                 .zip(right.iter())
+                 .all(|(lhs, rhs)| (*lhs - *rhs).abs() <= 1e-12 * (1.0 + lhs.abs().max(rhs.abs())))
+     };
+     let sigma_from_theta = |theta: &Array1<f64>| -> Option<f64> {
+         initial_sigma.map(|_| theta[setup.rho_dim() + setup.log_kappa_dim()].exp())
+     };
+     let get_derivative_blocks = |theta: &Array1<f64>,
+                                  specs: &[TermCollectionSpec],
+                                  designs: &[TermCollectionDesign]|
+      -> Result<
+diff --git a/src/families/transformation_normal.rs b/src/families/transformation_normal.rs
+index 88eacd9401e41f65a0bf49f5df5e2b8b8a1b0d84..24ea97366e22dd0261c1e826581d5bc563a530d7 100644
+--- a/src/families/transformation_normal.rs
++++ b/src/families/transformation_normal.rs
+@@ -14701,120 +14701,55 @@ pub struct TransformationNormalFitResult {
+     pub family: TransformationNormalFamily,
+     pub fit: UnifiedFitResult,
+     pub covariate_spec_resolved: TermCollectionSpec,
+     pub covariate_design: TermCollectionDesign,
+     pub score_calibration: TransformationScoreCalibration,
+ }
+ 
+ /// Fit a conditional transformation model with N-block spatial length-scale
+ /// optimization over the covariate side.
+ ///
+ /// The response-direction basis is built once (it does not depend on κ).
+ /// If no spatial length-scale terms are present in the covariate spec, the
+ /// model is fit directly. Otherwise, the N-block joint hyper-parameter
+ /// optimizer is used with a single block (the covariate spec).
+ pub fn fit_transformation_normal(
+     response: &Array1<f64>,
+     weights: &Array1<f64>,
+     offset: &Array1<f64>,
+     covariate_data: ArrayView2<'_, f64>,
+     covariate_spec: &TermCollectionSpec,
+     config: &TransformationNormalConfig,
+     options: &BlockwiseFitOptions,
+     kappa_options: &SpatialLengthScaleOptimizationOptions,
+     warm_start: Option<&TransformationWarmStart>,
+ ) -> Result<TransformationNormalFitResult, String> {
+-    let mut options = options.clone();
+-    // Biobank-scale fallback for CTN: the analytic outer Hessian is only
+-    // safe at biobank scale when the unified evaluator can express it as a
+-    // matrix-free Hv operator (`build_outer_hessian_operator` →
+-    // `HessianResult::Operator` → `run_operator_trust_region`'s
+-    // Steihaug-Toint CG) instead of materializing the full
+-    // `O(K · n · p²)` dense pairwise LAML Hessian.
+-    //
+-    // CTN's `CustomFamilyDerivProvider` returns
+-    // `OuterHessianDerivativeKernel::Callback { compute_dh, compute_d2h }`
+-    // unconditionally, so the unified evaluator's `use_operator` predicate
+-    // (`reml_laml_evaluate`, src/solver/reml/unified.rs:4827) selects the
+-    // operator path whenever a Hessian is requested and
+-    // `solution.penalty_subspace_trace.is_none()` — and custom-family never
+-    // installs a `penalty_subspace_trace`. The operator path then absorbs
+-    // the per-outer-eval `O(K · n · p²)` cost via `O(n · p)` HVPs, which is
+-    // the regime CTN actually needs at the n=20k stratified-subsample shape
+-    // used by the biobank-scale margslope jobs.
+-    //
+-    // This formalizes the previous unconditional `n > 10_000 ⇒ decline
+-    // analytic outer Hessian` bandaid (CI run 25351074828, 2026-05-04:
+-    // 7-min ARC iters with the dense pairwise assembly) as: "decline
+-    // analytic Hessian when the dense `compute_outer_hessian` path would
+-    // run AND `n` is biobank-scale." Whenever the operator path is
+-    // available the optimizer keeps analytic curvature; whenever it is
+-    // unavailable at biobank scale, we fall back to BFGS instead of
+-    // running the `O(K² · n · p²)` dense assembly.
+-    //
+-    // Mirrors the operator-availability gate at
+-    // `src/solver/reml/runtime.rs:115` for the standard-GAM path; this
+-    // gate covers the CTN custom-family path that goes through
+-    // `fit_custom_family` and `joint_outer_evaluate → reml_laml_evaluate`.
+-    let n_obs = covariate_data.nrows();
+-    let ctn_biobank_threshold = 10_000usize;
+-    // CTN's outer-Hv kernel is always
+-    // `OuterHessianDerivativeKernel::Callback` (built from the
+-    // family-supplied `compute_dh` / `compute_d2h` closures by
+-    // `CustomFamilyDerivProvider::outer_hessian_derivative_kernel`,
+-    // src/families/custom_family.rs:8290). The unified evaluator's
+-    // `callback_operator_kernel` arm of `use_operator`
+-    // (src/solver/reml/unified.rs:4823) therefore fires unconditionally
+-    // for CTN — the operator representation is selected regardless of the
+-    // `(n, p, K)` crossover that `prefer_outer_hessian_operator` tests.
+-    //
+-    // We additionally consult the `(n, p, K)` predicate for symmetry with
+-    // the standard-GAM gate (`runtime.rs:115`) and as a defensive lower
+-    // bound: any future refactor that loses the callback short-circuit
+-    // still has the same scale-based safety net the standard-GAM path
+-    // uses. We pass conservative lower bounds for `(p, K)` because the
+-    // exact dimensions are only known after the response/covariate bases
+-    // are built later in this function.
+-    let ctn_kernel_is_callback = true;
+-    let n_obs_for_predicate = n_obs;
+-    let p_dim_lower_bound = covariate_data.ncols();
+-    let k_lower_bound: usize = 0;
+-    let operator_path_available = ctn_kernel_is_callback
+-        || crate::solver::estimate::reml::unified::prefer_outer_hessian_operator(
+-            n_obs_for_predicate,
+-            p_dim_lower_bound,
+-            k_lower_bound,
+-        );
+-    if n_obs > ctn_biobank_threshold && options.use_outer_hessian && !operator_path_available {
+-        options.use_outer_hessian = false;
+-        log::info!(
+-            "[transformation-normal] declining analytic outer Hessian for \
+-             n={n_obs} (matrix-free operator path unavailable, dense LAML \
+-             pairwise assembly is O(K²·n·p²)); routing to BFGS"
+-        );
+-    }
+-    let options = options;
++    // Keep explicit Hessian capability visible to the global outer planner.
++    // CTN supplies callback HVP kernels, so runtime representation selection
++    // routes exact curvature through the operator trust-region instead of this
++    // constructor synthesizing a planner-visible BFGS cost fallback.
++    let options = options.clone();
+     let covariate_spec = covariate_spec.clone();
+ 
+     // 1. Build a bootstrap covariate design first so the response basis can
+     // adapt to the tensor width instead of always using the global default.
+     let boot_design = build_term_collection_design(covariate_data, &covariate_spec)
+         .map_err(|e| format!("failed to build bootstrap covariate design: {e}"))?;
+     let boot_spec = freeze_term_collection_from_design(&covariate_spec, &boot_design)
+         .map_err(|e| format!("failed to freeze bootstrap covariate spatial basis centers: {e}"))?;
+     let mut effective_config = config.clone();
+     effective_config.response_num_internal_knots =
+         effective_response_num_internal_knots(config, response.len(), boot_design.design.ncols());
+ 
+     // 2. Build response basis ONCE — it is independent of κ once the effective
+     // response complexity has been chosen.
+     let (resp_val, resp_deriv, resp_penalties, resp_knots, resp_transform) =
+         build_response_basis(response, &effective_config)?;
+ 
+     // 3. Check whether spatial κ optimization is needed.
+     let spatial_terms = spatial_length_scale_term_indices(&covariate_spec);
+ 
+     if spatial_terms.is_empty() || !kappa_options.enabled {
+         // ------------------------------------------------------------------
+         // NO κ: build family directly, fit, return.
+         // ------------------------------------------------------------------
+         let cov_design = boot_design;
+diff --git a/src/solver/outer_strategy.rs b/src/solver/outer_strategy.rs
+index d30a37928ca299908a3f020cabfbe01152a16217..eb33be916b578cdf3128185b0d9f01672c9cf2db 100644
+--- a/src/solver/outer_strategy.rs
++++ b/src/solver/outer_strategy.rs
+@@ -6486,50 +6486,72 @@ mod tests {
+         // same — (Analytic, Analytic) → ARC + Analytic. Runtime selects
+         // operator HVPs via `use_joint_matrix_free_path`.
+         let cap = cap_for_routing(Derivative::Analytic, Derivative::Analytic, 3);
+         let p = plan(&cap);
+         assert_eq!(p.solver, Solver::Arc);
+         assert_eq!(p.hessian_source, HessianSource::Analytic);
+     }
+ 
+     #[test]
+     fn plan_hybrid_efs_not_selected_few_params() {
+         let cap = OuterCapability {
+             gradient: Derivative::Analytic,
+             hessian: Derivative::Unavailable,
+             n_params: 5,
+             psi_dim: 1,
+             fixed_point_available: true,
+             barrier_config: None,
+             prefer_gradient_only: false,
+             disable_fixed_point: false,
+         };
+         let p = plan(&cap);
+         assert_eq!(p.solver, Solver::Bfgs);
+         assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
+     }
+ 
++    #[test]
++    fn plan_exact_hvp_capability_selects_arc_even_when_fixed_point_is_available() {
++        // Large spatial/custom-family problems may also expose EFS/HybridEFS
++        // fixed-point traces, but an explicit dense Hessian or exact HVP
++        // operator is stronger geometry. The planner must therefore select
++        // ARC + Analytic rather than cost-demoting to BFGS/EFS when the
++        // evaluator advertises second-order capability.
++        let cap = OuterCapability {
++            gradient: Derivative::Analytic,
++            hessian: Derivative::Analytic,
++            n_params: 64,
++            psi_dim: 16,
++            fixed_point_available: true,
++            barrier_config: None,
++            prefer_gradient_only: true,
++            disable_fixed_point: false,
++        };
++        let p = plan(&cap);
++        assert_eq!(p.solver, Solver::Arc);
++        assert_eq!(p.hessian_source, HessianSource::Analytic);
++    }
++
+     #[test]
+     fn plan_hybrid_efs_not_selected_with_analytic_hessian() {
+         // Arc is always preferred when analytic Hessian is available,
+         // even with ψ coordinates.
+         let cap = OuterCapability {
+             gradient: Derivative::Analytic,
+             hessian: Derivative::Analytic,
+             n_params: 20,
+             psi_dim: 1,
+             fixed_point_available: true,
+             barrier_config: None,
+             prefer_gradient_only: false,
+             disable_fixed_point: false,
+         };
+         let p = plan(&cap);
+         assert_eq!(p.solver, Solver::Arc);
+     }
+ 
+     #[test]
+     fn plan_pure_efs_not_hybrid_when_all_penalty_like() {
+         // When all coords are penalty-like (no ψ), pure EFS is selected
+         // even if has_psi_coords is false.
+         let cap = OuterCapability {
+             gradient: Derivative::Analytic,
+             hessian: Derivative::Unavailable,
+diff --git a/src/solver/reml/runtime.rs b/src/solver/reml/runtime.rs
+index dcd73d6a801f0e196fcb96017a3103cb197c3851..eaf9826f7c72873911135e2f4177ca4a8478551f 100644
+--- a/src/solver/reml/runtime.rs
++++ b/src/solver/reml/runtime.rs
+@@ -94,87 +94,50 @@ struct DerivativeContext {
+     barrier_config: Option<super::unified::BarrierConfig>,
+ }
+ 
+ impl<'a> RemlState<'a> {
+     pub(crate) fn analytic_outer_hessian_enabled(&self) -> bool {
+         // The Tierney-Kadane skewness correction has analytic value and
+         // first ρ-derivative paths (`tierney_kadane_analytic_core`), but
+         // its analytic outer-Hessian is not implemented. Production requires
+         // analytic second derivatives for Hessian mode.
+         // `tierney_kadane_terms` therefore returns an `InvalidInput` error
+         // for `ValueGradientHessian` mode whenever TK is active (Firth +
+         // non-identity link). Without gating the outer evaluator that
+         // failure cascades through seed validation and aborts the entire
+         // REML fit (e.g. the `cli_firth_fit_*` integration test). Treat
+         // analytic outer Hessian as disabled in those configurations so
+         // the optimizer falls back to its gradient-only descent path
+         // (BFGS / quasi-Newton); the spectral exact Hessian path is then
+         // not requested and TK never sees `ValueGradientHessian`. The
+         // explicit safety guard in `tierney_kadane_terms` still rejects
+         // any caller that constructs Hessian mode directly (covered by
+         // `firth_exacthessian_rejects_without_tk_second_derivatives`).
+         if self.config.firth_bias_reduction && self.config.link_function() != LinkFunction::Identity
+         {
+             return false;
+         }
+-        // Biobank-scale fallback: the analytic outer Hessian is only safe
+-        // at biobank scale when the unified evaluator can express it as a
+-        // matrix-free Hv operator (`build_outer_hessian_operator` /
+-        // `HessianResult::Operator`) instead of materializing the full
+-        // `O(K · n · p²)` dense pairwise LAML Hessian. The operator
+-        // representation is selected by `prefer_outer_hessian_operator`
+-        // when `(n, p, K)` cross the assembly-cost crossover.
+-        //
+-        // This formalizes the previous unconditional `n > 50_000` bandaid
+-        // (CI run 25354126629, 2026-05-04: standard-GAM probit at n=320k,
+-        // p=42 hit the 40-min cmd timeout) as: "decline analytic Hessian
+-        // when the dense `compute_outer_hessian` path would run AND `n` is
+-        // biobank-scale." Whenever the operator path is available the
+-        // optimizer keeps analytic curvature; whenever the operator path
+-        // is unavailable (small `n·p`, narrow basis, or
+-        // `penalty_subspace_trace.is_some()` forcing the projected dense
+-        // kernel) at biobank scale, we fall back to BFGS instead of
+-        // running the `O(K² · n · p²)` dense assembly.
+-        //
+-        // Mirrors the gates in survival_marginal_slope.rs / bernoulli_
+-        // marginal_slope.rs / latent_survival.rs etc. for the custom-
+-        // family path; this gate covers the standard-GAM path that goes
+-        // through `fit_gam` rather than `fit_custom_family`.
+-        let n_obs = self.x.nrows();
+-        let p_dim = self.x.ncols();
+-        let k_outer = self.canonical_penalties.len();
+-        let operator_path_available =
+-            super::unified::prefer_outer_hessian_operator(n_obs, p_dim, k_outer);
+-        if n_obs > 50_000 && !operator_path_available {
+-            log::info!(
+-                "[standard-GAM] declining analytic outer Hessian for \
+-                 n={n_obs} p={p_dim} k={k_outer} (matrix-free operator \
+-                 path unavailable, dense LAML pairwise assembly is \
+-                 O(k²·n·p²)); routing to BFGS"
+-            );
+-            return false;
+-        }
+         true
+     }
+ 
+     pub(super) fn sparse_exact_beta_original(&self, pirls_result: &PirlsResult) -> Array1<f64> {
+         match pirls_result.coordinate_frame {
+             pirls::PirlsCoordinateFrame::OriginalSparseNative => {
+                 pirls_result.beta_transformed.as_ref().clone()
+             }
+             pirls::PirlsCoordinateFrame::TransformedQs => pirls_result
+                 .reparam_result
+                 .qs
+                 .dot(pirls_result.beta_transformed.as_ref()),
+         }
+     }
+ 
+     fn bundle_matrix_in_original_basis(
+         &self,
+         pirls_result: &PirlsResult,
+         matrix: &Array2<f64>,
+     ) -> Array2<f64> {
+         match pirls_result.coordinate_frame {
+             pirls::PirlsCoordinateFrame::OriginalSparseNative => matrix.clone(),
+             pirls::PirlsCoordinateFrame::TransformedQs => {
+                 let qs = &pirls_result.reparam_result.qs;
+                 let tmp = qs.dot(matrix);
+diff --git a/src/solver/reml/unified.rs b/src/solver/reml/unified.rs
+index 3f93c29430becb5e5f288a4902893a85d01371bd..9e76ad079bc10026aa4b9732f47f3a0041f78464 100644
+--- a/src/solver/reml/unified.rs
++++ b/src/solver/reml/unified.rs
+@@ -4847,52 +4847,51 @@ pub fn reml_laml_evaluate(
+         // that the rank-deficient LAML fix demands.  Fall through to the
+         // analytic `compute_outer_hessian` path (which does apply the
+         // projection) whenever a `penalty_subspace_trace` is installed.
+         let n_obs = effective_deriv
+             .scalar_glm_ingredients()
+             .map(|ing| ing.x.nrows())
+             .unwrap_or(solution.n_observations);
+         let p_dim = hop.dim();
+         let k_outer = k + solution.ext_coords.len();
+         let callback_operator_kernel = matches!(
+             hessian_kernel,
+             Some(OuterHessianDerivativeKernel::Callback { .. })
+         );
+         // Decompose the routing decision so the [OUTER hessian-route] log
+         // can attribute *which* clause selected the path, including the
+         // rank-deficient fall-through (subspace_trace forces dense even at
+         // biobank-shape large k). This is the empirical evidence we need
+         // for priority item (d) — without these markers the routing edge
+         // case at k≥32 + rank-deficient penalties is invisible.
+         let large_p = p_dim >= MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD;
+         let large_n_and_moderate_p = n_obs >= MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD
+             && p_dim >= MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N;
+         let large_linear_work =
+             n_obs.saturating_mul(p_dim) >= MATRIX_FREE_OUTER_HESSIAN_NP_THRESHOLD;
+         let large_k = k_outer >= MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD;
+-        let scale_prefers_operator =
+-            large_p || large_n_and_moderate_p || large_linear_work || large_k;
++        let scale_prefers_operator = prefer_outer_hessian_operator(n_obs, p_dim, k_outer);
+         let subspace_forces_dense = solution.penalty_subspace_trace.is_some();
+         let use_operator = hessian_kernel.is_some()
+             && (callback_operator_kernel || scale_prefers_operator)
+             && !subspace_forces_dense;
+         // Reason mnemonic: which clause carried the routing.  Ordered so
+         // the most specific reason wins; "kernel_absent" wins over
+         // everything else because that disables the operator path
+         // unconditionally.
+         let route_reason = if hessian_kernel.is_none() {
+             "kernel_absent"
+         } else if subspace_forces_dense && scale_prefers_operator {
+             "subspace_forced_dense"
+         } else if callback_operator_kernel {
+             "callback_kernel"
+         } else if large_k {
+             "large_k"
+         } else if large_p {
+             "large_p"
+         } else if large_n_and_moderate_p {
+             "large_n_moderate_p"
+         } else if large_linear_work {
+             "large_linear_work"
+         } else {
+             "below_crossover"
+         };
+diff --git a/src/terms/smooth.rs b/src/terms/smooth.rs
+index f40232dea758c6a89e4fb396fe0b91401ddc63dc..8c22678d12d0b3593acd1bf613807b1aea51dab3 100644
+--- a/src/terms/smooth.rs
++++ b/src/terms/smooth.rs
+@@ -10846,76 +10846,58 @@ fn try_exact_joint_spatial_length_scale_optimization(
+ /// κ = exp(ψ̄). No sum-to-zero constraint is enforced during optimization.
+ fn try_exact_joint_spatial_aniso_optimization(
+     data: ArrayView2<'_, f64>,
+     y: ArrayView1<'_, f64>,
+     weights: ArrayView1<'_, f64>,
+     offset: ArrayView1<'_, f64>,
+     resolvedspec: &TermCollectionSpec,
+     baseline_design: &TermCollectionDesign,
+     family: LikelihoodFamily,
+     options: &FitOptions,
+     spatial_terms: &[usize],
+     dims_per_term: &[usize],
+     theta0: &Array1<f64>,
+     lower: &Array1<f64>,
+     upper: &Array1<f64>,
+     rho_dim: usize,
+     kappa_options: &SpatialLengthScaleOptimizationOptions,
+ ) -> Result<Array1<f64>, EstimationError> {
+     // Use bounds and design metadata for validation.
+     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
+     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
+     use crate::solver::outer_strategy::{Derivative, OuterEval, OuterEvalOrder};
+ 
+     let theta_dim = theta0.len();
+     let psi_dim = theta_dim - rho_dim;
+-    // Capability is always available for these families (every variant routes
+-    // through the unified outer-Hessian path — see
+-    // `exact_joint_spatial_outer_hessian_available`). Gate the *use* of the
+-    // analytic outer Hessian on problem size. The exact analytic Hessian
+-    // requires per-row third/fourth-derivative work in
+-    // `cubic_cell_kernel`/`bernoulli_marginal_slope`, with cost
+-    // O(n · ψ-axes · per-row cell moments). At biobank scale (n ≈ 320k,
+-    // ψ-axes ≈ 16 + linkwiggle/timewiggle/scale-dim knots) this dominates
+-    // wall-clock for every outer eval and prevents convergence inside the
+-    // 50-min CI budget. When we cross the threshold, declare hessian as
+-    // `Unavailable`; the planner then routes to `Solver::HybridEfs`
+-    // (multiplicative fixed-point on ρ + preconditioned ψ gradient via the
+-    // EFS trace Gram), which costs O(1) H⁻¹ solves per outer iteration and
+-    // does not need the third/fourth-derivative tensors. Small fixtures
+-    // (`n ≤ 50k` AND `ψ_dim ≤ 30`) keep the analytic path so existing
+-    // convergence-regression tests are unaffected.
+-    let n_obs = data.nrows();
++    // Capability is independent of problem size. The unified evaluator can
++    // return either a dense analytic Hessian or an exact matrix-free Hessian
++    // operator, so the planner must see second-order capability whenever the
++    // family/design supports that evaluator path. Runtime representation
++    // selection handles dense-vs-HVP cost; no BFGS/HybridEFS cost demotion is
++    // synthesized here.
+     let analytic_outer_hessian_available =
+-        exact_joint_spatial_outer_hessian_available(family, baseline_design)
+-            && n_obs <= 50_000
+-            && psi_dim <= 30;
+-    if !analytic_outer_hessian_available {
+-        log::info!(
+-            "[spatial-aniso-joint] declining analytic outer Hessian for n={n_obs}, psi_dim={psi_dim}; routing to HybridEFS"
+-        );
+-    }
++        exact_joint_spatial_outer_hessian_available(family, baseline_design);
+     let prefer_gradient_only = false;
+ 
+     log::trace!(
+         "[spatial-aniso-joint] starting analytic optimization: rho_dim={}, psi_dim={}, dims_per_term={:?}",
+         rho_dim,
+         psi_dim,
+         dims_per_term,
+     );
+ 
+     // Shared context for the optimization closures. Holds immutable references
+     // to data/spec/options and the realized-design cache.
+     struct AnisoJointContext<'d> {
+         data: ArrayView2<'d, f64>,
+         rho_dim: usize,
+         cache: SingleBlockExactJointDesignCache<'d>,
+         evaluator: crate::estimate::ExternalJointHyperEvaluator<'d>,
+     }
+ 
+     impl<'d> AnisoJointContext<'d> {
+         /// Full evaluation on the current realized design + hyper_dirs.
+         fn eval_full(
+             &mut self,
+             theta: &Array1<f64>,
+             order: OuterEvalOrder,
+             analytic_outer_hessian_available: bool,
+@@ -11152,62 +11134,54 @@ fn try_exact_joint_spatial_aniso_optimization(
+ ///     → unified REML evaluator
+ /// This gives BFGS/Newton quadratic convergence on the length-scale parameters.
+ fn try_exact_joint_spatial_isotropic_optimization(
+     data: ArrayView2<'_, f64>,
+     y: ArrayView1<'_, f64>,
+     weights: ArrayView1<'_, f64>,
+     offset: ArrayView1<'_, f64>,
+     resolvedspec: &TermCollectionSpec,
+     baseline_design: &TermCollectionDesign,
+     family: LikelihoodFamily,
+     options: &FitOptions,
+     spatial_terms: &[usize],
+     dims_per_term: &[usize],
+     theta0: &Array1<f64>,
+     lower: &Array1<f64>,
+     upper: &Array1<f64>,
+     rho_dim: usize,
+     kappa_options: &SpatialLengthScaleOptimizationOptions,
+ ) -> Result<Array1<f64>, EstimationError> {
+     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
+     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
+     use crate::solver::outer_strategy::{Derivative, OuterEval, OuterEvalOrder};
+ 
+     let theta_dim = theta0.len();
+     let kappa_dim = theta_dim - rho_dim;
+-    // Same biobank-scale gate as the aniso path — see comment block on the
+-    // sibling helper for the rationale.
+-    let n_obs = data.nrows();
++    // Capability is independent of problem size; dense-vs-operator Hessian
++    // representation is selected by the evaluator at runtime.
+     let analytic_outer_hessian_available =
+-        exact_joint_spatial_outer_hessian_available(family, baseline_design)
+-            && n_obs <= 50_000
+-            && kappa_dim <= 30;
+-    if !analytic_outer_hessian_available {
+-        log::info!(
+-            "[spatial-iso-joint] declining analytic outer Hessian for n={n_obs}, kappa_dim={kappa_dim}; routing to HybridEFS"
+-        );
+-    }
++        exact_joint_spatial_outer_hessian_available(family, baseline_design);
+     let prefer_gradient_only = false;
+ 
+     log::trace!(
+         "[spatial-iso-joint] starting analytic optimization: rho_dim={}, kappa_dim={}, dims_per_term={:?}",
+         rho_dim,
+         kappa_dim,
+         dims_per_term,
+     );
+ 
+     struct IsoJointContext<'d> {
+         data: ArrayView2<'d, f64>,
+         rho_dim: usize,
+         cache: SingleBlockExactJointDesignCache<'d>,
+         evaluator: crate::estimate::ExternalJointHyperEvaluator<'d>,
+     }
+ 
+     impl<'d> IsoJointContext<'d> {
+         /// Full evaluation on the current realized design + hyper_dirs.
+         fn eval_full(
+             &mut self,
+             theta: &Array1<f64>,
+             order: OuterEvalOrder,
+             analytic_outer_hessian_available: bool,
+         ) -> Result<
+             (
+
+----- PATCH END -----
+

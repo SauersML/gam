@@ -6668,6 +6668,28 @@ mod tests {
     }
 
     #[test]
+    fn plan_exact_hvp_capability_selects_arc_even_when_fixed_point_is_available() {
+        // Large spatial/custom-family problems may also expose EFS/HybridEFS
+        // fixed-point traces, but an explicit dense Hessian or exact HVP
+        // operator is stronger geometry. The planner must therefore select
+        // ARC + Analytic rather than cost-demoting to BFGS/EFS when the
+        // evaluator advertises second-order capability.
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Analytic,
+            n_params: 64,
+            psi_dim: 16,
+            fixed_point_available: true,
+            barrier_config: None,
+            prefer_gradient_only: true,
+            disable_fixed_point: false,
+        };
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Arc);
+        assert_eq!(p.hessian_source, HessianSource::Analytic);
+    }
+
+    #[test]
     fn plan_hybrid_efs_not_selected_with_analytic_hessian() {
         // Arc is always preferred when analytic Hessian is available,
         // even with ψ coordinates.
