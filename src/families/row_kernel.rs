@@ -472,6 +472,18 @@ impl<const K: usize, T: RowKernel<K>> RowKernelHessianWorkspace<K, T> {
 impl<const K: usize, T: RowKernel<K> + 'static> ExactNewtonJointHessianWorkspace
     for RowKernelHessianWorkspace<K, T>
 {
+    fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+        // The cached row-kernel state already encodes everything needed to
+        // accumulate the dense joint Hessian in one row pass via
+        // `row_kernel_hessian_dense`. Without this override the trace path
+        // calls `MatrixFreeSpdOperator::materialize_dense_operator`, which
+        // rebuilds the same dense matrix by applying the Hv operator to
+        // every canonical basis vector — a `p × O(n*K^2)` redundant
+        // re-stream of the row data. At biobank scale (n≈320k, p≈200) that
+        // is hundreds of seconds of pure waste per outer-Hessian build.
+        Ok(Some(row_kernel_hessian_dense(&*self.kern, &self.cache)))
+    }
+
     fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         let sl = v.as_slice().ok_or("hessian_matvec: non-contiguous input")?;
         Ok(Some(row_kernel_hessian_matvec(
