@@ -50,10 +50,18 @@ use crate::solver::estimate::{
 use crate::terms::construction::kronecker_product;
 use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, s};
+<<<<<<< ours
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+=======
+use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+use rayon::slice::ParallelSliceMut;
+>>>>>>> theirs
 use statrs::function::erf::erfc;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+const SURVIVAL_ROW_PARALLEL_THRESHOLD: usize = 256;
+const SURVIVAL_ROW_PARALLEL_CHUNK: usize = 64;
 
 #[inline]
 fn softplus(x: f64) -> f64 {
@@ -5807,23 +5815,57 @@ fn exact_survival_response_moments(
         return Err("predict_survival_location_scale: row mismatch across inputs".to_string());
     }
 
-    let quadctx = crate::quadrature::QuadratureContext::new();
     let x_threshold_dense = input.x_threshold.to_dense_arc();
     let x_log_sigma_dense = input.x_log_sigma.to_dense_arc();
     let mut first = Array1::<f64>::zeros(n);
     let mut second = Array1::<f64>::zeros(n);
-    for row in 0..n {
-        let (m1, m2) = exact_survival_response_moments_row(
-            input,
-            fit,
-            covariance,
-            &x_threshold_dense,
-            &x_log_sigma_dense,
-            row,
-            &quadctx,
-        )?;
-        first[row] = m1;
-        second[row] = m2;
+    if n >= SURVIVAL_ROW_PARALLEL_THRESHOLD {
+        let first_slice = first
+            .as_slice_mut()
+            .expect("fresh Array1 response moments are contiguous");
+        let second_slice = second
+            .as_slice_mut()
+            .expect("fresh Array1 response moments are contiguous");
+        first_slice
+            .par_chunks_mut(SURVIVAL_ROW_PARALLEL_CHUNK)
+            .zip(second_slice.par_chunks_mut(SURVIVAL_ROW_PARALLEL_CHUNK))
+            .enumerate()
+            .try_for_each(
+                |(chunk_idx, (first_chunk, second_chunk))| -> Result<(), String> {
+                    let row_start = chunk_idx * SURVIVAL_ROW_PARALLEL_CHUNK;
+                    let quadctx = crate::quadrature::QuadratureContext::new();
+                    for offset in 0..first_chunk.len() {
+                        let row = row_start + offset;
+                        let (m1, m2) = exact_survival_response_moments_row(
+                            input,
+                            fit,
+                            covariance,
+                            &x_threshold_dense,
+                            &x_log_sigma_dense,
+                            row,
+                            &quadctx,
+                        )?;
+                        first_chunk[offset] = m1;
+                        second_chunk[offset] = m2;
+                    }
+                    Ok(())
+                },
+            )?;
+    } else {
+        let quadctx = crate::quadrature::QuadratureContext::new();
+        for row in 0..n {
+            let (m1, m2) = exact_survival_response_moments_row(
+                input,
+                fit,
+                covariance,
+                &x_threshold_dense,
+                &x_log_sigma_dense,
+                row,
+                &quadctx,
+            )?;
+            first[row] = m1;
+            second[row] = m2;
+        }
     }
     Ok((first, second))
 }
@@ -10034,21 +10076,52 @@ pub fn predict_survival_location_scalewith_uncertainty(
     let x_t_dense = input.x_threshold.to_dense();
     let x_ls_dense = input.x_log_sigma.to_dense();
     let mut grad = Array2::<f64>::zeros((n, p_total));
-    for i in 0..n {
-        for j in 0..p_time {
-            grad[[i, j]] = predictors.time_jac[[i, j]];
-        }
-        let scale = dq_dq0.as_ref().map_or(1.0, |v| v[i]);
-        for j in 0..p_t {
-            grad[[i, p_time + j]] = -scale * inv_sigma[i] * x_t_dense[[i, j]];
-        }
-        let coeff_ls = scale * predictors.eta_t[i] * inv_sigma[i];
-        for j in 0..p_ls {
-            grad[[i, p_time + p_t + j]] = coeff_ls * x_ls_dense[[i, j]];
-        }
-        if let Some(xw) = wiggle_design {
-            for j in 0..pw {
-                grad[[i, p_time + p_t + p_ls + j]] = xw[[i, j]];
+    if p_total > 0 && n >= SURVIVAL_ROW_PARALLEL_THRESHOLD {
+        let rows_per_chunk = SURVIVAL_ROW_PARALLEL_CHUNK;
+        let chunk_len = rows_per_chunk * p_total;
+        grad.as_slice_mut()
+            .expect("fresh gradient matrix is contiguous")
+            .par_chunks_mut(chunk_len)
+            .enumerate()
+            .for_each(|(chunk_idx, grad_chunk)| {
+                let row_start = chunk_idx * rows_per_chunk;
+                for (local_row, row_grad) in grad_chunk.chunks_mut(p_total).enumerate() {
+                    let i = row_start + local_row;
+                    for j in 0..p_time {
+                        row_grad[j] = predictors.time_jac[[i, j]];
+                    }
+                    let scale = dq_dq0.map_or(1.0, |v| v[i]);
+                    for j in 0..p_t {
+                        row_grad[p_time + j] = -scale * inv_sigma[i] * x_t_dense[[i, j]];
+                    }
+                    let coeff_ls = scale * predictors.eta_t[i] * inv_sigma[i];
+                    for j in 0..p_ls {
+                        row_grad[p_time + p_t + j] = coeff_ls * x_ls_dense[[i, j]];
+                    }
+                    if let Some(xw) = wiggle_design {
+                        for j in 0..pw {
+                            row_grad[p_time + p_t + p_ls + j] = xw[[i, j]];
+                        }
+                    }
+                }
+            });
+    } else {
+        for i in 0..n {
+            for j in 0..p_time {
+                grad[[i, j]] = predictors.time_jac[[i, j]];
+            }
+            let scale = dq_dq0.map_or(1.0, |v| v[i]);
+            for j in 0..p_t {
+                grad[[i, p_time + j]] = -scale * inv_sigma[i] * x_t_dense[[i, j]];
+            }
+            let coeff_ls = scale * predictors.eta_t[i] * inv_sigma[i];
+            for j in 0..p_ls {
+                grad[[i, p_time + p_t + j]] = coeff_ls * x_ls_dense[[i, j]];
+            }
+            if let Some(xw) = wiggle_design {
+                for j in 0..pw {
+                    grad[[i, p_time + p_t + p_ls + j]] = xw[[i, j]];
+                }
             }
         }
     }
@@ -10082,9 +10155,25 @@ pub fn predict_survival_location_scalewith_uncertainty(
         let second = posterior_second_moment
             .as_ref()
             .expect("response-sd path computes exact response moments");
-        Some(Array1::from_iter(
-            (0..n).map(|i| (second[i] - mean[i] * mean[i]).max(0.0).sqrt()),
-        ))
+        let mut sd = Array1::<f64>::zeros(n);
+        if n >= SURVIVAL_ROW_PARALLEL_THRESHOLD {
+            sd.as_slice_mut()
+                .expect("fresh response standard-error array is contiguous")
+                .par_chunks_mut(SURVIVAL_ROW_PARALLEL_CHUNK)
+                .enumerate()
+                .for_each(|(chunk_idx, sd_chunk)| {
+                    let row_start = chunk_idx * SURVIVAL_ROW_PARALLEL_CHUNK;
+                    for (offset, slot) in sd_chunk.iter_mut().enumerate() {
+                        let i = row_start + offset;
+                        *slot = (second[i] - mean[i] * mean[i]).max(0.0).sqrt();
+                    }
+                });
+        } else {
+            for i in 0..n {
+                sd[i] = (second[i] - mean[i] * mean[i]).max(0.0).sqrt();
+            }
+        }
+        Some(sd)
     } else {
         None
     };
