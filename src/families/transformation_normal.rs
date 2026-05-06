@@ -12911,6 +12911,48 @@ mod tests {
     }
 
     #[test]
+    fn ctn_large_n_outer_hvp_capability_selects_operator_path() {
+        let psi = array![0.15, -0.10];
+        let (family, derivative_blocks, _, spec) = toy_family_and_derivatives(&psi);
+        let specs = std::slice::from_ref(&spec);
+        assert!(family.outer_hyper_hessian_hvp_available(specs));
+
+        let rho_dim = spec.initial_log_lambdas.len();
+        let psi_dim = derivative_blocks[0].len();
+        let k_outer = rho_dim + psi_dim;
+        assert!(
+            crate::solver::estimate::reml::unified::use_outer_hessian_operator_path(
+                crate::solver::estimate::reml::unified::MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD,
+                crate::solver::estimate::reml::unified::MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N,
+                k_outer,
+                true,
+                false,
+            )
+        );
+        assert!(
+            crate::solver::estimate::reml::unified::use_outer_hessian_operator_path(
+                crate::solver::estimate::reml::unified::MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD,
+                spec.design.ncols(),
+                k_outer,
+                true,
+                false,
+            )
+        );
+
+        let options = BlockwiseFitOptions {
+            use_remlobjective: true,
+            use_outer_hessian: true,
+            ..BlockwiseFitOptions::default()
+        };
+        let (gradient, hessian) = custom_family_outer_derivatives(&family, specs, &options);
+        assert_eq!(
+            gradient,
+            crate::solver::outer_strategy::Derivative::Analytic
+        );
+        assert_eq!(hessian, crate::solver::outer_strategy::Derivative::Analytic);
+    }
+
+    #[test]
     fn ctn_joint_hessian_workspace_dh_operator_matches_dense() {
         let psi = array![0.15, -0.10];
         let (family, _, state, spec) = toy_family_and_derivatives(&psi);
@@ -15010,76 +15052,11 @@ pub fn fit_transformation_normal(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
     warm_start: Option<&TransformationWarmStart>,
 ) -> Result<TransformationNormalFitResult, String> {
-    let mut options = options.clone();
-    // Biobank-scale fallback for CTN: the analytic outer Hessian is only
-    // safe at biobank scale when the unified evaluator can express it as a
-    // matrix-free Hv operator (`build_outer_hessian_operator` →
-    // `HessianResult::Operator` → `run_operator_trust_region`'s
-    // Steihaug-Toint CG) instead of materializing the full
-    // `O(K · n · p²)` dense pairwise LAML Hessian.
-    //
-    // CTN's `CustomFamilyDerivProvider` returns
-    // `OuterHessianDerivativeKernel::Callback { compute_dh, compute_d2h }`
-    // unconditionally, so the unified evaluator's `use_operator` predicate
-    // (`reml_laml_evaluate`, src/solver/reml/unified.rs:4827) selects the
-    // operator path whenever a Hessian is requested and
-    // `solution.penalty_subspace_trace.is_none()` — and custom-family never
-    // installs a `penalty_subspace_trace`. The operator path then absorbs
-    // the per-outer-eval `O(K · n · p²)` cost via `O(n · p)` HVPs, which is
-    // the regime CTN actually needs at the n=20k stratified-subsample shape
-    // used by the biobank-scale margslope jobs.
-    //
-    // This formalizes the previous unconditional `n > 10_000 ⇒ decline
-    // analytic outer Hessian` bandaid (CI run 25351074828, 2026-05-04:
-    // 7-min ARC iters with the dense pairwise assembly) as: "decline
-    // analytic Hessian when the dense `compute_outer_hessian` path would
-    // run AND `n` is biobank-scale." Whenever the operator path is
-    // available the optimizer keeps analytic curvature; whenever it is
-    // unavailable at biobank scale, we fall back to BFGS instead of
-    // running the `O(K² · n · p²)` dense assembly.
-    //
-    // Mirrors the operator-availability gate at
-    // `src/solver/reml/runtime.rs:115` for the standard-GAM path; this
-    // gate covers the CTN custom-family path that goes through
-    // `fit_custom_family` and `joint_outer_evaluate → reml_laml_evaluate`.
-    let n_obs = covariate_data.nrows();
-    let ctn_biobank_threshold = 10_000usize;
-    // CTN's outer-Hv kernel is always
-    // `OuterHessianDerivativeKernel::Callback` (built from the
-    // family-supplied `compute_dh` / `compute_d2h` closures by
-    // `CustomFamilyDerivProvider::outer_hessian_derivative_kernel`,
-    // src/families/custom_family.rs:8290). The unified evaluator's
-    // `callback_operator_kernel` arm of `use_operator`
-    // (src/solver/reml/unified.rs:4823) therefore fires unconditionally
-    // for CTN — the operator representation is selected regardless of the
-    // `(n, p, K)` crossover that `prefer_outer_hessian_operator` tests.
-    //
-    // We additionally consult the `(n, p, K)` predicate for symmetry with
-    // the standard-GAM gate (`runtime.rs:115`) and as a defensive lower
-    // bound: any future refactor that loses the callback short-circuit
-    // still has the same scale-based safety net the standard-GAM path
-    // uses. We pass conservative lower bounds for `(p, K)` because the
-    // exact dimensions are only known after the response/covariate bases
-    // are built later in this function.
-    let ctn_kernel_is_callback = true;
-    let n_obs_for_predicate = n_obs;
-    let p_dim_lower_bound = covariate_data.ncols();
-    let k_lower_bound: usize = 0;
-    let operator_path_available = ctn_kernel_is_callback
-        || crate::solver::estimate::reml::unified::prefer_outer_hessian_operator(
-            n_obs_for_predicate,
-            p_dim_lower_bound,
-            k_lower_bound,
-        );
-    if n_obs > ctn_biobank_threshold && options.use_outer_hessian && !operator_path_available {
-        options.use_outer_hessian = false;
-        log::info!(
-            "[transformation-normal] declining analytic outer Hessian for \
-             n={n_obs} (matrix-free operator path unavailable, dense LAML \
-             pairwise assembly is O(K²·n·p²)); routing to BFGS"
-        );
-    }
-    let options = options;
+    let options = options.clone();
+    // CTN advertises profiled outer-Hessian HVP support and supplies the
+    // callback derivative kernel consumed by the unified REML/LAML evaluator.
+    // Keep analytic curvature enabled here: the evaluator routes CTN Hessians
+    // through the matrix-free operator path instead of dense pairwise assembly.
     let covariate_spec = covariate_spec.clone();
 
     // 1. Build a bootstrap covariate design first so the response basis can
