@@ -7291,6 +7291,21 @@ const PSI_GRAM_PINV_TOL: f64 = 1e-8;
 /// early iterations when the quadratic model may be inaccurate.
 const PSI_INITIAL_ALPHA: f64 = 1.0;
 
+/// Minimum number of scalar ρ/τ EFS candidates before `compute_hybrid_efs_update`
+/// fans out with rayon.  Smaller blocks are common (1-4 smoothing parameters),
+/// where task scheduling costs dominate the independent arithmetic.
+const HYBRID_EFS_SCALAR_PAR_THRESHOLD: usize = 8;
+
+/// Minimum number of independent ψ-ψ Gram entries before exact trace assembly
+/// fans out with rayon.  This is expressed in upper-triangle pair count rather
+/// than `n_psi` so 5 ψ coordinates (15 pairs) stay serial while moderate
+/// anisotropic/design-moving blocks parallelize.
+const HYBRID_EFS_GRAM_PAIR_PAR_THRESHOLD: usize = 24;
+
+/// Minimum number of ψ drifts before materialization/projection is done in
+/// parallel during exact Gram assembly.
+const HYBRID_EFS_PSI_DRIFT_PAR_THRESHOLD: usize = 8;
+
 /// Result of the hybrid EFS update, containing both the step vector and
 /// metadata needed for backtracking on the ψ block.
 pub struct HybridEfsResult {
@@ -7384,12 +7399,38 @@ pub fn compute_hybrid_efs_update(
     );
 
     // ── ρ coordinates: universal-form EFS (see compute_efs_update) ──
-    for idx in 0..k {
-        let coord = &solution.penalty_coords[idx];
-        let lambda = rho[idx].exp();
-        let a_i = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambda);
-        let q_eff = efs_q_eff(a_i, &solution.dispersion, dp_cgrad, profiled_scale);
-        if let Some(step) = efs_log_step_from_grad(q_eff, gradient[idx]) {
+    //
+    // The per-coordinate candidate construction is independent: each candidate
+    // reads only the converged β̂, the coordinate root, ρᵢ, and gᵢ.  Build
+    // candidates in parallel once the block is large enough, then keep the
+    // actual update write-back serial so fallback/backtracking decisions still
+    // see a deterministic step vector.
+    let rho_candidates: Vec<(usize, Option<f64>)> =
+        if k >= HYBRID_EFS_SCALAR_PAR_THRESHOLD && rayon::current_thread_index().is_none() {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            (0..k)
+                .into_par_iter()
+                .map(|idx| {
+                    let coord = &solution.penalty_coords[idx];
+                    let lambda = rho[idx].exp();
+                    let a_i = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambda);
+                    let q_eff = efs_q_eff(a_i, &solution.dispersion, dp_cgrad, profiled_scale);
+                    (idx, efs_log_step_from_grad(q_eff, gradient[idx]))
+                })
+                .collect()
+        } else {
+            (0..k)
+                .map(|idx| {
+                    let coord = &solution.penalty_coords[idx];
+                    let lambda = rho[idx].exp();
+                    let a_i = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambda);
+                    let q_eff = efs_q_eff(a_i, &solution.dispersion, dp_cgrad, profiled_scale);
+                    (idx, efs_log_step_from_grad(q_eff, gradient[idx]))
+                })
+                .collect()
+        };
+    for (idx, candidate) in rho_candidates {
+        if let Some(step) = candidate {
             steps[idx] = step;
         }
     }
@@ -7401,18 +7442,53 @@ pub fn compute_hybrid_efs_update(
     // collected and processed jointly via the ψ-ψ trace Gram matrix below.
     let mut psi_local_indices: Vec<usize> = Vec::new(); // index within ext_coords
     let mut psi_global_indices: Vec<usize> = Vec::new(); // index in full θ vector
+    let mut tau_local_indices: Vec<usize> = Vec::new(); // penalty-like ext coords
 
+    // Classify ext coordinates serially.  This preserves ψ ordering for the
+    // returned metadata and keeps the penalty-like-vs-design-moving decision
+    // out of the parallel update fill.
     for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
         let g_idx = k + ext_idx;
         if coord.is_penalty_like {
-            let q_eff = efs_q_eff(coord.a, &solution.dispersion, dp_cgrad, profiled_scale);
-            if let Some(step) = efs_log_step_from_grad(q_eff, gradient[g_idx]) {
-                steps[g_idx] = step;
-            }
+            tau_local_indices.push(ext_idx);
         } else {
             // ψ coordinate: collect for joint preconditioned gradient.
             psi_local_indices.push(ext_idx);
             psi_global_indices.push(g_idx);
+        }
+    }
+
+    let tau_candidates: Vec<(usize, Option<f64>)> = if tau_local_indices.len()
+        >= HYBRID_EFS_SCALAR_PAR_THRESHOLD
+        && rayon::current_thread_index().is_none()
+    {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        tau_local_indices
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|ext_idx| {
+                let coord = &solution.ext_coords[ext_idx];
+                let g_idx = k + ext_idx;
+                let q_eff = efs_q_eff(coord.a, &solution.dispersion, dp_cgrad, profiled_scale);
+                (g_idx, efs_log_step_from_grad(q_eff, gradient[g_idx]))
+            })
+            .collect()
+    } else {
+        tau_local_indices
+            .iter()
+            .map(|&ext_idx| {
+                let coord = &solution.ext_coords[ext_idx];
+                let g_idx = k + ext_idx;
+                let q_eff = efs_q_eff(coord.a, &solution.dispersion, dp_cgrad, profiled_scale);
+                (g_idx, efs_log_step_from_grad(q_eff, gradient[g_idx]))
+            })
+            .collect()
+    };
+    for (g_idx, candidate) in tau_candidates {
+        if let Some(step) = candidate {
+            steps[g_idx] = step;
         }
     }
 
@@ -7514,42 +7590,128 @@ pub fn compute_hybrid_efs_update(
             )
         } else {
             let mut gram = ndarray::Array2::<f64>::zeros((n_psi, n_psi));
-            let drift_ops: Vec<Option<Arc<dyn HyperOperator>>> = psi_local_indices
-                .iter()
-                .map(|&li| {
-                    let drift = &solution.ext_coords[li].drift;
-                    hyper_coord_drift_operator_arc(drift, hop.dim())
-                })
-                .collect();
-            let dense_drifts: Vec<Option<Array2<f64>>> = psi_local_indices
-                .iter()
-                .enumerate()
-                .map(|(idx, &li)| {
-                    let drift = &solution.ext_coords[li].drift;
-                    drift_ops[idx].is_none().then(|| drift.materialize())
-                })
-                .collect();
-            if let Some(dense_hop) = hop.as_dense_spectral() {
-                let projected_drifts: Vec<Array2<f64>> = (0..n_psi)
+            let parallel_psi_drifts = n_psi >= HYBRID_EFS_PSI_DRIFT_PAR_THRESHOLD
+                && rayon::current_thread_index().is_none();
+            let drift_ops: Vec<Option<Arc<dyn HyperOperator>>> = if parallel_psi_drifts {
+                use rayon::iter::{IntoParallelIterator, ParallelIterator};
+                (0..n_psi)
+                    .into_par_iter()
                     .map(|idx| {
-                        if let Some(op) = drift_ops[idx].as_ref() {
-                            dense_hop.projected_operator(&dense_hop.w_factor, op.as_ref())
-                        } else {
-                            dense_hop.projected_matrix(
-                                dense_drifts[idx]
-                                    .as_ref()
-                                    .expect("dense drift should be cached"),
-                            )
-                        }
+                        let drift = &solution.ext_coords[psi_local_indices[idx]].drift;
+                        hyper_coord_drift_operator_arc(drift, hop.dim())
                     })
-                    .collect();
-                for d in 0..n_psi {
-                    for e in d..n_psi {
-                        let val = dense_hop
-                            .trace_projected_cross(&projected_drifts[d], &projected_drifts[e]);
+                    .collect()
+            } else {
+                psi_local_indices
+                    .iter()
+                    .map(|&li| {
+                        let drift = &solution.ext_coords[li].drift;
+                        hyper_coord_drift_operator_arc(drift, hop.dim())
+                    })
+                    .collect()
+            };
+            let dense_drifts: Vec<Option<Array2<f64>>> = if parallel_psi_drifts {
+                use rayon::iter::{IntoParallelIterator, ParallelIterator};
+                (0..n_psi)
+                    .into_par_iter()
+                    .map(|idx| {
+                        let drift = &solution.ext_coords[psi_local_indices[idx]].drift;
+                        drift_ops[idx].is_none().then(|| drift.materialize())
+                    })
+                    .collect()
+            } else {
+                psi_local_indices
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, &li)| {
+                        let drift = &solution.ext_coords[li].drift;
+                        drift_ops[idx].is_none().then(|| drift.materialize())
+                    })
+                    .collect()
+            };
+            let pair_count = n_psi * (n_psi + 1) / 2;
+            let parallel_gram_pairs = pair_count >= HYBRID_EFS_GRAM_PAIR_PAR_THRESHOLD
+                && rayon::current_thread_index().is_none();
+            if let Some(dense_hop) = hop.as_dense_spectral() {
+                let projected_drifts: Vec<Array2<f64>> = if parallel_psi_drifts {
+                    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+                    (0..n_psi)
+                        .into_par_iter()
+                        .map(|idx| {
+                            if let Some(op) = drift_ops[idx].as_ref() {
+                                dense_hop.projected_operator(&dense_hop.w_factor, op.as_ref())
+                            } else {
+                                dense_hop.projected_matrix(
+                                    dense_drifts[idx]
+                                        .as_ref()
+                                        .expect("dense drift should be cached"),
+                                )
+                            }
+                        })
+                        .collect()
+                } else {
+                    (0..n_psi)
+                        .map(|idx| {
+                            if let Some(op) = drift_ops[idx].as_ref() {
+                                dense_hop.projected_operator(&dense_hop.w_factor, op.as_ref())
+                            } else {
+                                dense_hop.projected_matrix(
+                                    dense_drifts[idx]
+                                        .as_ref()
+                                        .expect("dense drift should be cached"),
+                                )
+                            }
+                        })
+                        .collect()
+                };
+                if parallel_gram_pairs {
+                    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+                    let pairs: Vec<(usize, usize)> = (0..n_psi)
+                        .flat_map(|d| (d..n_psi).map(move |e| (d, e)))
+                        .collect();
+                    let pair_values: Vec<(usize, usize, f64)> = pairs
+                        .into_par_iter()
+                        .map(|(d, e)| {
+                            let val = dense_hop
+                                .trace_projected_cross(&projected_drifts[d], &projected_drifts[e]);
+                            (d, e, val)
+                        })
+                        .collect();
+                    for (d, e, val) in pair_values {
                         gram[[d, e]] = val;
                         gram[[e, d]] = val;
                     }
+                } else {
+                    for d in 0..n_psi {
+                        for e in d..n_psi {
+                            let val = dense_hop
+                                .trace_projected_cross(&projected_drifts[d], &projected_drifts[e]);
+                            gram[[d, e]] = val;
+                            gram[[e, d]] = val;
+                        }
+                    }
+                }
+            } else if parallel_gram_pairs {
+                use rayon::iter::{IntoParallelIterator, ParallelIterator};
+                let pairs: Vec<(usize, usize)> = (0..n_psi)
+                    .flat_map(|d| (d..n_psi).map(move |e| (d, e)))
+                    .collect();
+                let pair_values: Vec<(usize, usize, f64)> = pairs
+                    .into_par_iter()
+                    .map(|(d, e)| {
+                        let val = trace_hinv_cached_drift_cross(
+                            hop,
+                            dense_drifts[d].as_ref(),
+                            drift_ops[d].as_deref(),
+                            dense_drifts[e].as_ref(),
+                            drift_ops[e].as_deref(),
+                        );
+                        (d, e, val)
+                    })
+                    .collect();
+                for (d, e, val) in pair_values {
+                    gram[[d, e]] = val;
+                    gram[[e, d]] = val;
                 }
             } else {
                 for d in 0..n_psi {
