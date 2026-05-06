@@ -8358,46 +8358,12 @@ pub fn fit_bernoulli_marginal_slope_terms(
             joint_gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-    // Size-gate the analytic outer Hessian. The exact analytic-Hessian path
-    // assembles per-row third- and fourth-derivative tensors via
-    // `row_primary_third_contracted_recompute` / `…_fourth…ordered` and the
-    // `cubic_cell_kernel` cell-moment routines, with cost
-    // O(n · ψ-axes · per-row cell moments) per outer eval. At biobank shape
-    // (n ≈ 320k, ψ-dim ≈ 16 + linkwiggle/timewiggle/scale-dim knots ≈ 44+)
-    // this dominates wall-clock and prevents convergence inside the 50-min
-    // CI budget. When the problem is "biobank-shaped", declare the Hessian
-    // as `Unavailable`; the bernoulli-marginal-slope path also passes
-    // `disable_fixed_point: true` (β-dependent joint Hessian violates the
-    // EFS/HybridEFS structural invariant — see the comment at the
-    // `optimize_spatial_length_scale_exact_joint` call site below), so the
-    // planner falls back to BFGS quasi-Newton on the analytic gradient. BFGS
-    // takes more outer iterations than Arc but each iteration is just one
-    // gradient evaluation (no per-row third/fourth-derivative work), and the
-    // overall wall-clock is much better at scale.
-    //
-    // Small fixtures (`n ≤ 50_000` AND `ψ_dim ≤ 30`) keep the analytic path so
-    // existing convergence-regression tests are unaffected.
-    let n_obs = data_view.nrows();
-    let psi_dim = setup.log_kappa_dim();
-    let biobank_scale = n_obs > 50_000 || psi_dim > 30;
-    // CRITICAL (same fix as survival_marginal_slope.rs): the gate value
-    // alone is insufficient because the bernoulli main fit also runs
-    // through `fit_custom_family`'s blockwise outer-loop, which derives
-    // Hessian capability from `options.use_outer_hessian` rather than
-    // our local gate. CI run 25338491995 showed bernoulli at biobank
-    // n=320k psi_dim=32 routing to ARC + analytic Hessian and hitting
-    // 50-min job timeout. Override the options bag so the planner sees
-    // `use_outer_hessian=false`, forcing BFGS.
-    let mut options_override = options.clone();
-    if biobank_scale {
-        options_override.use_outer_hessian = false;
-        log::info!(
-            "[bernoulli-marginal-slope] declining analytic outer Hessian for n={n_obs}, psi_dim={psi_dim}; routing to BFGS (use_outer_hessian=false)"
-        );
-    }
-    let options: &BlockwiseFitOptions = &options_override;
+    // Keep the analytic outer Hessian advertised at biobank scale. The
+    // row-tensor terms below are represented through block-local
+    // `HyperOperator`s and cached exact-Hessian workspaces, so ARC/trust-region
+    // can consume exact HVPs without falling back to BFGS merely because the
+    // realized problem is large.
     let analytic_joint_hessian_available = analytic_joint_derivatives_available
-        && !biobank_scale
         && matches!(
             joint_hessian,
             crate::solver::outer_strategy::Derivative::Analytic
@@ -15675,6 +15641,100 @@ mod tests {
 
         let rel = rel_diff_array2(&with_full, &baseline);
         assert!(rel < 1e-12, "joint Hessian dH drift rel {}", rel);
+    }
+
+    #[test]
+    fn bernoulli_jointhessian_directional_operator_matches_dense_small_case() {
+        let n = 17usize;
+        let family = make_block_psi_test_family(n);
+        let states = block_psi_test_block_states(&family, 0.15, 0.25);
+        let cache = family
+            .build_exact_eval_cache(&states)
+            .expect("exact eval cache");
+        let slices = &cache.slices;
+        let mut d_beta_flat = Array1::<f64>::zeros(slices.total);
+        d_beta_flat[slices.marginal.start] = 0.05;
+        d_beta_flat[slices.logslope.start] = -0.04;
+
+        let dense = family
+            .exact_newton_joint_hessian_directional_derivative_from_cache_with_options(
+                &states,
+                &d_beta_flat,
+                &cache,
+                &BlockwiseFitOptions::default(),
+            )
+            .expect("dense dH")
+            .expect("dH present");
+        let operator = family
+            .exact_newton_joint_hessian_directional_derivative_operator_from_cache_with_options(
+                &states,
+                &d_beta_flat,
+                &cache,
+                &BlockwiseFitOptions::default(),
+            )
+            .expect("operator dH")
+            .expect("dH operator present");
+
+        let rel = rel_diff_array2(&operator.to_dense(), &dense);
+        assert!(rel < 1e-12, "operator dH rel {}", rel);
+    }
+
+    #[test]
+    fn bernoulli_jointhessian_second_directional_operator_matches_dense_small_case() {
+        let n = 17usize;
+        let family = make_block_psi_test_family(n);
+        let states = block_psi_test_block_states(&family, 0.15, 0.25);
+        let cache = family
+            .build_exact_eval_cache(&states)
+            .expect("exact eval cache");
+        let slices = &cache.slices;
+        let mut d_beta_u = Array1::<f64>::zeros(slices.total);
+        d_beta_u[slices.marginal.start] = 0.05;
+        d_beta_u[slices.logslope.start] = -0.04;
+        let mut d_beta_v = Array1::<f64>::zeros(slices.total);
+        d_beta_v[slices.marginal.start] = -0.03;
+        d_beta_v[slices.logslope.start] = 0.02;
+
+        let dense = family
+            .exact_newton_joint_hessiansecond_directional_derivative_from_cache_with_options(
+                &states,
+                &d_beta_u,
+                &d_beta_v,
+                &cache,
+                &BlockwiseFitOptions::default(),
+            )
+            .expect("dense d2H")
+            .expect("d2H present");
+        let operator = family
+            .exact_newton_joint_hessiansecond_directional_derivative_operator_from_cache_with_options(
+                &states,
+                &d_beta_u,
+                &d_beta_v,
+                &cache,
+                &BlockwiseFitOptions::default(),
+            )
+            .expect("operator d2H")
+            .expect("d2H operator present");
+
+        let rel = rel_diff_array2(&operator.to_dense(), &dense);
+        assert!(rel < 1e-12, "operator d2H rel {}", rel);
+    }
+
+    #[test]
+    fn bernoulli_large_scale_outer_derivatives_keep_analytic_hessian_route() {
+        let n = 50_001usize;
+        let family = make_block_psi_test_family(n);
+        let specs = vec![dummy_blockspec(1, n), dummy_blockspec(1, n)];
+        let options = BlockwiseFitOptions::default();
+
+        let (gradient, hessian) =
+            crate::custom_family::custom_family_outer_derivatives(&family, &specs, &options);
+
+        assert_eq!(
+            gradient,
+            crate::solver::outer_strategy::Derivative::Analytic
+        );
+        assert_eq!(hessian, crate::solver::outer_strategy::Derivative::Analytic);
     }
 
     #[test]
