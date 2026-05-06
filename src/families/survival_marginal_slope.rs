@@ -9808,8 +9808,7 @@ impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointH
         // p canonical-basis HVP loop and just wrap the dense matvec. At
         // biobank scale (p_total≈200) this trims hundreds of seconds per
         // outer-Hessian build.
-        self.family
-            .exact_newton_joint_hessian(&self.block_states)
+        self.family.exact_newton_joint_hessian(&self.block_states)
     }
 
     fn hessian_matvec(&self, beta_flat: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
