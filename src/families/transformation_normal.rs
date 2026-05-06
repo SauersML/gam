@@ -61,7 +61,7 @@ use crate::solver::estimate::reml::unified::{
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use std::cell::RefCell;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -7983,6 +7983,7 @@ struct TransformationNormalPsiDhMatrixFreeOperator {
     op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
     axis: usize,
     row_quantities: TransformationNormalRowQuantityCache,
+    dense_cache: OnceLock<Array2<f64>>,
 }
 
 impl TransformationNormalPsiDhMatrixFreeOperator {
@@ -8001,6 +8002,7 @@ impl TransformationNormalPsiDhMatrixFreeOperator {
             op,
             axis,
             row_quantities,
+            dense_cache: OnceLock::new(),
         }
     }
 
@@ -8014,6 +8016,20 @@ impl TransformationNormalPsiDhMatrixFreeOperator {
             .downcast_ref::<TensorKroneckerPsiOperator>()
             .expect("validated CTN psi dH operator must remain tensor-backed")
     }
+
+    fn dense_matrix(&self) -> &Array2<f64> {
+        self.dense_cache.get_or_init(|| {
+            self.family
+                .scop_psi_hessian_directional_derivative(
+                    &self.beta,
+                    &self.direction,
+                    &self.row_quantities,
+                    self.tensor_op(),
+                    self.axis,
+                )
+                .expect("validated CTN psi dH dense materialization inputs should not fail")
+        })
+    }
 }
 
 impl HyperOperator for TransformationNormalPsiDhMatrixFreeOperator {
@@ -8022,7 +8038,13 @@ impl HyperOperator for TransformationNormalPsiDhMatrixFreeOperator {
     }
 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
-        self.to_dense().dot(v)
+        debug_assert_eq!(v.len(), self.p_total());
+        self.dense_matrix().dot(v)
+    }
+
+    fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
+        debug_assert_eq!(factor.nrows(), self.p_total());
+        self.dense_matrix().dot(factor)
     }
 
     fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
@@ -8063,15 +8085,7 @@ impl HyperOperator for TransformationNormalPsiDhMatrixFreeOperator {
     }
 
     fn to_dense(&self) -> Array2<f64> {
-        self.family
-            .scop_psi_hessian_directional_derivative(
-                &self.beta,
-                &self.direction,
-                &self.row_quantities,
-                self.tensor_op(),
-                self.axis,
-            )
-            .expect("validated CTN psi dH dense materialization inputs should not fail")
+        self.dense_matrix().clone()
     }
 
     fn is_implicit(&self) -> bool {
@@ -12537,16 +12551,41 @@ mod tests {
         let DriftDerivResult::Operator(drift_op) = drift_op else {
             panic!("CTN workspace psi dH must be operator-backed");
         };
+        let probe = toy_probe_vector(state.beta.len(), 90_001_u64);
+        let got_vec = drift_op.mul_vec(&probe);
+        let want_vec = analytic.dot(&probe);
+        for i in 0..state.beta.len() {
+            let vec_tol = 1.0e-10 * want_vec[i].abs().max(1.0) + 1.0e-10;
+            assert!(
+                (got_vec[i] - want_vec[i]).abs() <= vec_tol,
+                "workspace psi dH matvec mismatch at {i}: got={:.6e}, want={:.6e}",
+                got_vec[i],
+                want_vec[i],
+            );
+        }
         let mut factor = Array2::<f64>::zeros((state.beta.len(), 3));
         for (col, seed) in [91_001_u64, 92_001_u64, 93_001_u64].into_iter().enumerate() {
             factor
                 .column_mut(col)
                 .assign(&toy_probe_vector(state.beta.len(), seed));
         }
+        let got_mat = drift_op.mul_mat(&factor);
+        let want_mat = analytic.dot(&factor);
+        for row in 0..state.beta.len() {
+            for col in 0..factor.ncols() {
+                let mat_tol = 1.0e-10 * want_mat[[row, col]].abs().max(1.0) + 1.0e-10;
+                assert!(
+                    (got_mat[[row, col]] - want_mat[[row, col]]).abs() <= mat_tol,
+                    "workspace psi dH matmat mismatch at ({row}, {col}): got={:.6e}, want={:.6e}",
+                    got_mat[[row, col]],
+                    want_mat[[row, col]],
+                );
+            }
+        }
         let got_trace = drift_op.trace_projected_factor(&factor);
         let want_trace = factor
             .iter()
-            .zip(analytic.dot(&factor).iter())
+            .zip(want_mat.iter())
             .map(|(&f, &bf)| f * bf)
             .sum::<f64>();
         let trace_tol = 1.0e-10 * want_trace.abs().max(1.0) + 1.0e-10;
