@@ -1,5 +1,6 @@
 use crate::matrix::{DesignMatrix, FactorizedSystem, SymmetricMatrix};
 use ndarray::{Array1, Array2, ArrayView2, s};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::ops::Range;
 
 const PREDICTION_TARGET_WORK_BYTES: usize = 8 * 1024 * 1024;
@@ -110,6 +111,125 @@ pub(crate) fn prediction_chunk_rows(
         .min(n_rows.max(1))
 }
 
+struct LocalCovarianceChunk {
+    start: usize,
+    end: usize,
+    values: Vec<Vec<Array1<f64>>>,
+}
+
+fn compute_local_covariance_chunk(
+    backend: &PredictionCovarianceBackend<'_>,
+    rows: Range<usize>,
+    local_dim: usize,
+    gradients: Vec<Array2<f64>>,
+) -> Result<LocalCovarianceChunk, String> {
+    if gradients.len() != local_dim {
+        return Err(format!(
+            "rowwise_local_covariances chunk builder returned {} local components, expected {}",
+            gradients.len(),
+            local_dim
+        ));
+    }
+    let parameter_dim = backend.nrows();
+    let start = rows.start;
+    let end = rows.end;
+    let rows_in_chunk = end - start;
+
+    // Pack all local-gradient blocks as a single multi-RHS solve:
+    // rhs[:, component*R .. (component+1)*R] = gradients[component].t().
+    // This amortizes dense matrix multiplies / factorized solves across the
+    // whole chunk and avoids per-row RHS allocations.
+    let mut rhs = Array2::<f64>::zeros((parameter_dim, rows_in_chunk * local_dim));
+    for (component, grad) in gradients.iter().enumerate() {
+        if grad.nrows() != rows_in_chunk || grad.ncols() != parameter_dim {
+            return Err(format!(
+                "rowwise_local_covariances component {component} has shape {}x{}, expected {}x{}",
+                grad.nrows(),
+                grad.ncols(),
+                rows_in_chunk,
+                parameter_dim
+            ));
+        }
+        let col_start = component * rows_in_chunk;
+        let col_end = col_start + rows_in_chunk;
+        rhs.slice_mut(s![.., col_start..col_end]).assign(&grad.t());
+    }
+
+    let solved = backend.apply_columns(&rhs)?;
+    if solved.nrows() != parameter_dim || solved.ncols() != rows_in_chunk * local_dim {
+        return Err(format!(
+            "rowwise_local_covariances backend returned {}x{}, expected {}x{}",
+            solved.nrows(),
+            solved.ncols(),
+            parameter_dim,
+            rows_in_chunk * local_dim
+        ));
+    }
+
+    let mut values: Vec<Vec<Array1<f64>>> = (0..local_dim)
+        .map(|_| {
+            (0..local_dim)
+                .map(|_| Array1::<f64>::zeros(rows_in_chunk))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // Build the per-row local covariance entries. For each (a, b), row r is
+    // gradients[a][r, :] · solved[:, b*R + r]. Off-diagonal entries are
+    // symmetrized to preserve the previous factorized-backend round-off behavior.
+    for a in 0..local_dim {
+        let g_a = gradients[a].view();
+        for b in a..local_dim {
+            let s_b = solved.slice(s![.., b * rows_in_chunk..(b + 1) * rows_in_chunk]);
+            if a == b {
+                for local_row in 0..rows_in_chunk {
+                    values[a][b][local_row] = g_a.row(local_row).dot(&s_b.column(local_row));
+                }
+            } else {
+                let g_b = gradients[b].view();
+                let s_a = solved.slice(s![.., a * rows_in_chunk..(a + 1) * rows_in_chunk]);
+                for local_row in 0..rows_in_chunk {
+                    let v_ab = g_a.row(local_row).dot(&s_b.column(local_row));
+                    let v_ba = g_b.row(local_row).dot(&s_a.column(local_row));
+                    let value = 0.5 * (v_ab + v_ba);
+                    values[a][b][local_row] = value;
+                    values[b][a][local_row] = value;
+                }
+            }
+        }
+    }
+
+    Ok(LocalCovarianceChunk { start, end, values })
+}
+
+fn empty_local_covariance_output(n_rows: usize, local_dim: usize) -> Vec<Vec<Array1<f64>>> {
+    (0..local_dim)
+        .map(|_| {
+            (0..local_dim)
+                .map(|_| Array1::<f64>::zeros(n_rows))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn assemble_local_covariance_chunks(
+    n_rows: usize,
+    local_dim: usize,
+    chunks: Vec<LocalCovarianceChunk>,
+) -> Vec<Vec<Array1<f64>>> {
+    let mut out = empty_local_covariance_output(n_rows, local_dim);
+    for chunk in chunks {
+        for a in 0..local_dim {
+            for b in 0..local_dim {
+                out[a][b]
+                    .slice_mut(s![chunk.start..chunk.end])
+                    .assign(&chunk.values[a][b]);
+            }
+        }
+    }
+    out
+}
+
 pub fn rowwise_local_covariances<F>(
     backend: &PredictionCovarianceBackend<'_>,
     n_rows: usize,
@@ -124,106 +244,47 @@ where
     }
     let parameter_dim = backend.nrows();
     let chunk_rows = prediction_chunk_rows(parameter_dim, local_dim, n_rows);
-    let mut out: Vec<Vec<Array1<f64>>> = (0..local_dim)
-        .map(|_| {
-            (0..local_dim)
-                .map(|_| Array1::<f64>::zeros(n_rows))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-
+    let mut chunks = Vec::new();
     let mut start = 0usize;
     while start < n_rows {
         let end = (start + chunk_rows).min(n_rows);
         let rows = start..end;
         let gradients = build_chunk(rows.clone())?;
-        if gradients.len() != local_dim {
-            return Err(format!(
-                "rowwise_local_covariances chunk builder returned {} local components, expected {}",
-                gradients.len(),
-                local_dim
-            ));
-        }
-        let rows_in_chunk = end - start;
-        // Pack RHS by transposing each gradient block in one shot:
-        //   rhs[:, component*R .. (component+1)*R] = gradients[component].t()
-        // This replaces the per-row `rhs.slice_mut(...).assign(grad.row(r).t())`
-        // loop with O(local_dim) ndarray block assignments — same memory motion
-        // but with contiguous column-block destinations and a single bounds
-        // check per component.
-        let mut rhs = Array2::<f64>::zeros((parameter_dim, rows_in_chunk * local_dim));
-        for (component, grad) in gradients.iter().enumerate() {
-            if grad.nrows() != rows_in_chunk || grad.ncols() != parameter_dim {
-                return Err(format!(
-                    "rowwise_local_covariances component {component} has shape {}x{}, expected {}x{}",
-                    grad.nrows(),
-                    grad.ncols(),
-                    rows_in_chunk,
-                    parameter_dim
-                ));
-            }
-            let col_start = component * rows_in_chunk;
-            let col_end = col_start + rows_in_chunk;
-            rhs.slice_mut(s![.., col_start..col_end]).assign(&grad.t());
-        }
-
-        let solved = backend.apply_columns(&rhs)?;
-        if solved.nrows() != parameter_dim || solved.ncols() != rows_in_chunk * local_dim {
-            return Err(format!(
-                "rowwise_local_covariances backend returned {}x{}, expected {}x{}",
-                solved.nrows(),
-                solved.ncols(),
-                parameter_dim,
-                rows_in_chunk * local_dim
-            ));
-        }
-
-        // Build the per-row local covariance entries.
-        //
-        // For each (a, b) the value at row r is
-        //   v_ab[r] = gradients[a][r, :]  ·  solved[:, b*R + r]
-        // which is the diagonal of  G_a · S_b  where
-        //   G_a = gradients[a]                     (R × P)
-        //   S_b = solved[:, b*R .. (b+1)*R]        (P × R)
-        // We hoist the per-component slice of `solved` once per outer index
-        // rather than re-deriving the column for each `local_row`, and the
-        // off-diagonal symmetrization (0.5 * (v_ab + v_ba)) is preserved
-        // exactly: `solved` is generally non-symmetric for factorized backends
-        // due to floating-point round-off, so we keep the explicit average to
-        // match the original numerics.
-        for a in 0..local_dim {
-            let g_a = gradients[a].view();
-            for b in a..local_dim {
-                let s_b = solved.slice(s![.., b * rows_in_chunk..(b + 1) * rows_in_chunk]);
-                if a == b {
-                    let mut col = out[a][b].slice_mut(s![start..end]);
-                    for local_row in 0..rows_in_chunk {
-                        col[local_row] = g_a.row(local_row).dot(&s_b.column(local_row));
-                    }
-                } else {
-                    let g_b = gradients[b].view();
-                    let s_a = solved.slice(s![.., a * rows_in_chunk..(a + 1) * rows_in_chunk]);
-                    {
-                        let mut col_ab = out[a][b].slice_mut(s![start..end]);
-                        for local_row in 0..rows_in_chunk {
-                            let v_ab = g_a.row(local_row).dot(&s_b.column(local_row));
-                            let v_ba = g_b.row(local_row).dot(&s_a.column(local_row));
-                            col_ab[local_row] = 0.5 * (v_ab + v_ba);
-                        }
-                    }
-                    // Mirror to the (b, a) entry; disjoint from out[a][b]
-                    // because a != b here.
-                    let copy = out[a][b].slice(s![start..end]).to_owned();
-                    let mut col_ba = out[b][a].slice_mut(s![start..end]);
-                    col_ba.assign(&copy);
-                }
-            }
-        }
-
+        chunks.push(compute_local_covariance_chunk(
+            backend, rows, local_dim, gradients,
+        )?);
         start = end;
     }
+    Ok(assemble_local_covariance_chunks(n_rows, local_dim, chunks))
+}
 
-    Ok(out)
+pub fn rowwise_local_covariances_parallel<F>(
+    backend: &PredictionCovarianceBackend<'_>,
+    n_rows: usize,
+    local_dim: usize,
+    build_chunk: F,
+) -> Result<Vec<Vec<Array1<f64>>>, String>
+where
+    F: Fn(Range<usize>) -> Result<Vec<Array2<f64>>, String> + Sync,
+{
+    if local_dim == 0 {
+        return Err("rowwise_local_covariances requires local_dim > 0".to_string());
+    }
+    let parameter_dim = backend.nrows();
+    let chunk_rows = prediction_chunk_rows(parameter_dim, local_dim, n_rows);
+    let n_chunks = n_rows.div_ceil(chunk_rows);
+    let mut chunks = (0..n_chunks)
+        .into_par_iter()
+        .map(|chunk_idx| {
+            let start = chunk_idx * chunk_rows;
+            let end = (start + chunk_rows).min(n_rows);
+            let rows = start..end;
+            let gradients = build_chunk(rows.clone())?;
+            compute_local_covariance_chunk(backend, rows, local_dim, gradients)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    chunks.sort_by_key(|chunk| chunk.start);
+    Ok(assemble_local_covariance_chunks(n_rows, local_dim, chunks))
 }
 
 #[cfg(test)]
@@ -299,6 +360,54 @@ mod tests {
             let g = grads.row(i).to_owned();
             let expected = g.dot(&covariance.dot(&g));
             assert!((out[0][0][i] - expected).abs() <= 1e-10);
+        }
+    }
+
+    #[test]
+    fn parallel_rowwise_local_covariances_match_serial_for_many_chunks() {
+        let p = 96usize;
+        let n = 1537usize;
+        let covariance = Array2::from_shape_fn((p, p), |(i, j)| {
+            if i == j {
+                1.0 + (i as f64) * 0.001
+            } else {
+                0.0005 / (1.0 + i.abs_diff(j) as f64)
+            }
+        });
+        let backend = PredictionCovarianceBackend::from_dense(covariance.view());
+        let grads0 = Array2::from_shape_fn((n, p), |(i, j)| {
+            ((i % 17) as f64 - 8.0) * 0.01 + ((j % 11) as f64) * 0.002
+        });
+        let grads1 = Array2::from_shape_fn((n, p), |(i, j)| {
+            ((i % 13) as f64) * 0.003 - ((j % 7) as f64) * 0.004
+        });
+
+        let serial = rowwise_local_covariances(&backend, n, 2, |rows| {
+            Ok(vec![
+                grads0.slice(s![rows.clone(), ..]).to_owned(),
+                grads1.slice(s![rows, ..]).to_owned(),
+            ])
+        })
+        .expect("serial local covariances");
+        let parallel = rowwise_local_covariances_parallel(&backend, n, 2, |rows| {
+            Ok(vec![
+                grads0.slice(s![rows.clone(), ..]).to_owned(),
+                grads1.slice(s![rows, ..]).to_owned(),
+            ])
+        })
+        .expect("parallel local covariances");
+
+        for a in 0..2 {
+            for b in 0..2 {
+                for i in 0..n {
+                    assert!(
+                        (serial[a][b][i] - parallel[a][b][i]).abs() <= 1e-12,
+                        "entry ({a},{b}) row {i}: serial={} parallel={}",
+                        serial[a][b][i],
+                        parallel[a][b][i]
+                    );
+                }
+            }
         }
     }
 
