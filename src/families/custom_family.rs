@@ -9719,6 +9719,9 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
     let mut coords = Vec::new();
     let mut psi_global = 0usize;
 
+    let build_psi_hyper_coords_start = std::time::Instant::now();
+    let total_axes: usize = derivative_blocks.iter().map(|b| b.len()).sum();
+
     for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
         let (start, end) = ranges[block_idx];
         let p_block = end - start;
@@ -9805,6 +9808,13 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
             psi_global += 1;
         }
     }
+
+    log::info!(
+        "[STAGE] build_psi_hyper_coords axis_count={} workspace_present={} elapsed={:.3}s",
+        total_axes,
+        psi_workspace.is_some(),
+        build_psi_hyper_coords_start.elapsed().as_secs_f64(),
+    );
 
     Ok(coords)
 }
@@ -10318,7 +10328,14 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     // When psi_dim > 0, exact Newton is required because the ψ derivative
     // callbacks use exact Newton trait methods. When psi_dim == 0,
     // build_joint_hessian_closures handles both exact Newton and surrogate.
+    let cthf_internal_psi_branch_start = std::time::Instant::now();
     if psi_dim > 0 {
+        log::info!(
+            "[STAGE] cthf_internal psi_dim={} eval_mode={:?} pre_unified elapsed={:.3}s",
+            psi_dim,
+            eval_mode,
+            cthf_internal_psi_branch_start.elapsed().as_secs_f64(),
+        );
         // ψ coordinates present: require exact Newton Hessian for consistency
         // with the psi derivative callbacks.
         let beta_flat = flatten_state_betas(&inner.block_states, specs);
@@ -10587,6 +10604,12 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         // The unified evaluator produces gradient/Hessian of size (rho_dim + psi_dim),
         // with ρ coordinates first and ψ coordinates appended — matching the expected
         // output order of CustomFamilyJointHyperResult.
+        log::info!(
+            "[STAGE] cthf_internal psi_dim={} eval_mode={:?} post_unified elapsed={:.3}s",
+            psi_dim,
+            eval_mode,
+            cthf_internal_psi_branch_start.elapsed().as_secs_f64(),
+        );
         return Ok(eval_result);
     }
 
