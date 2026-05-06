@@ -4858,6 +4858,13 @@ pub fn reml_laml_evaluate(
                  scale_prefers_operator=irrelevant",
                 subspace = solution.penalty_subspace_trace.is_some(),
             );
+            if family_op.dim() != k_outer {
+                return Err(format!(
+                    "family outer Hessian operator dimension mismatch: got {}, expected {}",
+                    family_op.dim(),
+                    k_outer
+                ));
+            }
             let assembly_start = std::time::Instant::now();
             let mut hessian = crate::solver::outer_strategy::HessianResult::Operator(family_op);
             if let Some((_, _, Some(ref ph))) = prior_cost_gradient {
@@ -12380,6 +12387,114 @@ mod tests {
 
         let result = reml_laml_evaluate(&solution, &[], EvalMode::ValueOnly, None).unwrap();
         assert_relative_eq!(result.cost, -firth_value, epsilon = 1e-12);
+    }
+
+    struct FixedOuterHessianOperator {
+        matrix: Array2<f64>,
+    }
+
+    impl crate::solver::outer_strategy::OuterHessianOperator for FixedOuterHessianOperator {
+        fn dim(&self) -> usize {
+            self.matrix.nrows()
+        }
+
+        fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+            if v.len() != self.dim() {
+                return Err(format!(
+                    "fixed test outer Hessian dimension mismatch: got {}, expected {}",
+                    v.len(),
+                    self.dim()
+                ));
+            }
+            Ok(self.matrix.dot(v))
+        }
+
+        fn is_cheap_to_materialize(&self) -> bool {
+            true
+        }
+    }
+
+    struct FamilyOperatorDerivatives {
+        op: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
+    }
+
+    impl HessianDerivativeProvider for FamilyOperatorDerivatives {
+        fn hessian_derivative_correction(
+            &self,
+            _: &Array1<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            panic!("family operator dispatch should not request pairwise first derivatives")
+        }
+
+        fn hessian_second_derivative_correction(
+            &self,
+            _: &Array1<f64>,
+            _: &Array1<f64>,
+            _: &Array1<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            panic!("family operator dispatch should not request pairwise second derivatives")
+        }
+
+        fn has_corrections(&self) -> bool {
+            false
+        }
+
+        fn family_outer_hessian_operator(
+            &self,
+        ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
+            Some(Arc::clone(&self.op))
+        }
+    }
+
+    #[test]
+    fn family_outer_hessian_operator_short_circuits_dense_pairwise_assembly() {
+        let supplied = array![[2.5]];
+        let provider_op: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator> =
+            Arc::new(FixedOuterHessianOperator {
+                matrix: supplied.clone(),
+            });
+        let solution = InnerSolution {
+            log_likelihood: 0.0,
+            penalty_quadratic: 0.4,
+            hessian_op: Arc::new(DenseSpectralOperator::from_symmetric(&array![[3.0]]).unwrap()),
+            beta: array![0.2],
+            penalty_coords: vec![PenaltyCoordinate::from_dense_root(array![[1.0]])],
+            penalty_logdet: PenaltyLogdetDerivs {
+                value: 0.0,
+                first: array![1.0],
+                second: Some(array![[0.0]]),
+            },
+            deriv_provider: Box::new(FamilyOperatorDerivatives { op: provider_op }),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: None,
+            hessian_logdet_correction: 0.0,
+            penalty_subspace_trace: None,
+            rho_curvature_scale: 1.0,
+            n_observations: 1,
+            nullspace_dim: 0.0,
+            dispersion: DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: true,
+            },
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+            barrier_config: None,
+        };
+
+        let result =
+            reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None).unwrap();
+        let crate::solver::outer_strategy::HessianResult::Operator(op) = result.hessian else {
+            panic!("expected family-supplied operator Hessian");
+        };
+        assert_eq!(op.dim(), 1);
+        let hv = op.matvec(&array![4.0]).unwrap();
+        assert_relative_eq!(hv[0], 10.0, epsilon = 1e-12);
+        let dense = op.materialize_dense().unwrap();
+        assert_relative_eq!(dense[[0, 0]], supplied[[0, 0]], epsilon = 1e-12);
     }
 
     struct FixedCorrectionDerivatives {
