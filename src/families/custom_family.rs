@@ -11564,15 +11564,78 @@ fn apply_joint_block_penalty_into(
     out: &mut Array1<f64>,
 ) {
     debug_assert_eq!(out.len(), vector.len());
+    debug_assert!(s_lambdas.len() <= ranges.len());
     out.fill(0.0);
-    for (b, s_lambda) in s_lambdas.iter().enumerate() {
-        let (start, end) = ranges[b];
-        let block = vector.slice(s![start..end]);
-        let out_slice = out.slice_mut(s![start..end]);
-        crate::linalg::faer_ndarray::fast_av_view_into(s_lambda, &block, out_slice);
+
+    if s_lambdas.len() <= 1 {
+        for (b, s_lambda) in s_lambdas.iter().enumerate() {
+            let (start, end) = ranges[b];
+            let block = vector.slice(s![start..end]);
+            let mut out_slice = out.slice_mut(s![start..end]);
+            crate::linalg::faer_ndarray::fast_av_view_into(s_lambda, &block, out_slice.view_mut());
+        }
+        if diagonal_ridge > 0.0 {
+            out.scaled_add(diagonal_ridge, vector);
+        }
+        return;
     }
+
+    if out.as_slice_mut().is_none() {
+        for (b, s_lambda) in s_lambdas.iter().enumerate() {
+            let (start, end) = ranges[b];
+            let block = vector.slice(s![start..end]);
+            let mut out_slice = out.slice_mut(s![start..end]);
+            crate::linalg::faer_ndarray::fast_av_view_into(s_lambda, &block, out_slice.view_mut());
+        }
+        if diagonal_ridge > 0.0 {
+            out.scaled_add(diagonal_ridge, vector);
+        }
+        return;
+    }
+
+    {
+        let out_values = out
+            .as_slice_mut()
+            .expect("joint penalty output should be contiguous");
+        let mut out_blocks = Vec::with_capacity(s_lambdas.len());
+        let mut remaining = out_values;
+        let mut cursor = 0usize;
+        for &(start, end) in ranges.iter().take(s_lambdas.len()) {
+            debug_assert!(start >= cursor);
+            debug_assert!(end >= start);
+            let (_, after_gap) = remaining.split_at_mut(start - cursor);
+            let (out_block, after_block) = after_gap.split_at_mut(end - start);
+            out_blocks.push(out_block);
+            remaining = after_block;
+            cursor = end;
+        }
+
+        use rayon::prelude::*;
+
+        out_blocks
+            .into_par_iter()
+            .enumerate()
+            .for_each(|(b, out_block)| {
+                let (start, end) = ranges[b];
+                let block = vector.slice(s![start..end]);
+                let out_view = ArrayViewMut1::from(out_block.as_mut());
+                crate::linalg::faer_ndarray::fast_av_view_into(&s_lambdas[b], &block, out_view);
+            });
+    }
+
     if diagonal_ridge > 0.0 {
-        out.scaled_add(diagonal_ridge, vector);
+        if let (Some(out_values), Some(vector_values)) = (out.as_slice_mut(), vector.as_slice()) {
+            use rayon::prelude::*;
+
+            out_values
+                .par_iter_mut()
+                .zip(vector_values.par_iter())
+                .for_each(|(out_value, vector_value)| {
+                    *out_value += diagonal_ridge * *vector_value;
+                });
+        } else {
+            out.scaled_add(diagonal_ridge, vector);
+        }
     }
 }
 
