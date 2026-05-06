@@ -3311,11 +3311,58 @@ impl PenaltySubspaceTrace {
     /// in `build_outer_hessian_operator`.  Per-row leverage
     /// `h^{G,proj}_i = Xᵢᵀ · K · Xᵢ` is computed by applying this to each
     /// row of `X`; `z_c = K · Xᵀ(c ⊙ h^{G,proj})` is a single application.
-    #[cfg(test)]
     pub fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
         let v_proj = self.u_s.t().dot(v);
         let y_proj = self.h_proj_inverse.dot(&v_proj);
         self.u_s.dot(&y_proj)
+    }
+
+    /// Projected leverage `h^{G,proj}_i = Xᵢᵀ · K · Xᵢ` for every row of `x`.
+    ///
+    /// Computed in bulk as `Z = X · U_S` (`n × r`) then
+    /// `h^{G,proj}_i = (Z H_proj⁻¹ Zᵀ)_{ii} = Σ_{a,b} Z_{ia} (H_proj⁻¹)_{ab} Z_{ib}`,
+    /// total cost `O(n · p · r + n · r²)` — strictly cheaper than `n` calls
+    /// to [`Self::apply`] because the `n × p · p × r` GEMM streams the
+    /// `p`-axis once.  Streams `X` through `try_row_chunk` so operator-backed
+    /// (Lazy) designs at biobank scale never densify the full `(n × p)` block.
+    pub fn xt_projected_kernel_x_diagonal(&self, x: &DesignMatrix) -> Array1<f64> {
+        let n = x.nrows();
+        let p = x.ncols();
+        let r = self.u_s.ncols();
+        debug_assert_eq!(self.u_s.nrows(), p);
+        debug_assert_eq!(self.h_proj_inverse.nrows(), r);
+        debug_assert_eq!(self.h_proj_inverse.ncols(), r);
+
+        let block = {
+            const TARGET_CHUNK_FLOATS: usize = 1 << 16;
+            (TARGET_CHUNK_FLOATS / p.max(1)).clamp(1, n.max(1))
+        };
+
+        let mut h = Array1::<f64>::zeros(n);
+        let mut start = 0usize;
+        while start < n {
+            let end = (start + block).min(n);
+            let rows = x.try_row_chunk(start..end).unwrap_or_else(|err| {
+                panic!("xt_projected_kernel_x_diagonal: row chunk failed: {err}")
+            });
+            // Z_chunk = rows · U_S  ((end-start) × r).
+            let z_chunk = crate::faer_ndarray::fast_ab(&rows.to_owned(), &self.u_s);
+            // h_i = Σ_{a,b} Z_{ia} (H_proj⁻¹)_{ab} Z_{ib}.
+            for i in 0..(end - start) {
+                let row_z = z_chunk.row(i);
+                let mut acc = 0.0;
+                for a in 0..r {
+                    let mut inner = 0.0;
+                    for b in 0..r {
+                        inner += self.h_proj_inverse[[a, b]] * row_z[b];
+                    }
+                    acc += row_z[a] * inner;
+                }
+                h[start + i] = acc;
+            }
+            start = end;
+        }
+        h
     }
 }
 
@@ -5166,39 +5213,6 @@ fn compute_fourth_derivative_trace_matrix(
     Ok(Some(crate::faer_ndarray::fast_atb(&x_modes, &weighted)))
 }
 
-fn scalar_glm_second_derivative_correction_result(
-    c_array: &Array1<f64>,
-    d_array: Option<&Array1<f64>>,
-    x: &DesignMatrix,
-    v_k: &Array1<f64>,
-    v_l: &Array1<f64>,
-    u_kl: &Array1<f64>,
-) -> Result<Option<DriftDerivResult>, String> {
-    let x_vk = x.matrixvectormultiply(v_k);
-    let x_vl = x.matrixvectormultiply(v_l);
-    let x_ukl = x.matrixvectormultiply(u_kl);
-
-    let n = x.nrows();
-    let mut weights = Array1::zeros(n);
-    Zip::from(&mut weights)
-        .and(c_array)
-        .and(&x_ukl)
-        .par_for_each(|w, &c, &xu| *w = c * xu);
-
-    if let Some(d_array) = d_array {
-        Zip::from(&mut weights)
-            .and(d_array)
-            .and(&x_vk)
-            .and(&x_vl)
-            .par_for_each(|w, &d, &xvk, &xvl| *w += d * xvk * xvl);
-    }
-
-    let result = x
-        .compute_xtwx(&weights)
-        .map_err(|e| format!("scalar_glm_second_derivative_correction xtwx: {e}"))?;
-    Ok(Some(DriftDerivResult::Dense(result)))
-}
-
 /// Compute the IFT second-derivative correction contribution to h2_trace.
 ///
 /// This is the SINGLE implementation of the formula:
@@ -6572,30 +6586,10 @@ impl UnifiedOuterHessianOperator {
             return Err("scalar correction requested for non-scalar kernel".to_string());
         };
 
-        if let Some(subspace) = self.subspace.as_deref() {
-            let rhs = self.pair_rhs_combo(idx, alpha);
-            let u = self.hop.solve(&rhs);
-            let mut v_alpha = Array1::<f64>::zeros(self.hop.dim());
-            for (j, &alpha_j) in alpha.iter().enumerate() {
-                if alpha_j != 0.0 {
-                    v_alpha.scaled_add(alpha_j, &self.coords[j].v);
-                }
-            }
-            let correction = scalar_glm_second_derivative_correction_result(
-                c_array,
-                d_array.as_ref(),
-                x,
-                v_i,
-                &v_alpha,
-                &u,
-            )?;
-            return Ok(match correction {
-                Some(DriftDerivResult::Dense(matrix)) => subspace.trace_projected_logdet(&matrix),
-                Some(DriftDerivResult::Operator(op)) => subspace.trace_operator(op.as_ref()),
-                None => 0.0,
-            });
-        }
-
+        // Cheap adjoint shortcut: works for both full-Hessian and projected
+        // (subspace) regimes because §10 populates `leverage`/`adjoint_z_c`
+        // with the projected `h^{G,proj}` and `K · v` under subspace, and
+        // the identity tr(Kernel · C[u]) = uᵀ Xᵀ(c ⊙ h^G) carries through.
         let z_c = self.adjoint_z_c.as_ref().ok_or_else(|| {
             "missing adjoint trace cache for scalar outer Hessian operator".to_string()
         })?;
@@ -7206,12 +7200,22 @@ fn build_outer_hessian_operator(
         None
     };
 
-    let leverage = if incl_logdet_h && subspace.is_none() {
+    // Leverage and the scalar-GLM adjoint-z_c cache support both the
+    // full-Hessian and projected-subspace paths.  Under subspace,
+    //   h^{G,proj}_i = Xᵢᵀ · K · Xᵢ     (K = U_S H_proj⁻¹ U_Sᵀ)
+    //   z_c^{proj}   = K · Xᵀ(c ⊙ h^{G,proj})
+    // and the adjoint identity
+    //   tr(K · C[u]) = uᵀ · Xᵀ(c ⊙ h^{G,proj})
+    // lets `scalar_correction_trace` take the cheap branch instead of
+    // materialising the second-derivative correction.  Verified bit-for-bit
+    // by `subspace_apply_adjoint_shortcut_matches_dense_projected_trace`.
+    let leverage = if incl_logdet_h {
         match &kernel {
             OuterHessianDerivativeKernel::Gaussian => None,
-            OuterHessianDerivativeKernel::ScalarGlm { x, .. } => {
-                Some(hop.xt_logdet_kernel_x_diagonal(x))
-            }
+            OuterHessianDerivativeKernel::ScalarGlm { x, .. } => match subspace {
+                Some(s) => Some(s.xt_projected_kernel_x_diagonal(x)),
+                None => Some(hop.xt_logdet_kernel_x_diagonal(x)),
+            },
             OuterHessianDerivativeKernel::Callback { .. } => None,
         }
     } else {
@@ -7222,19 +7226,24 @@ fn build_outer_hessian_operator(
             (
                 OuterHessianDerivativeKernel::ScalarGlm {
                     c_array,
-                    d_array,
+                    d_array: _,
                     x,
                 },
                 Some(h_g),
-            ) => Some(compute_adjoint_z_c(
-                &ScalarGlmIngredients {
-                    c_array,
-                    d_array: d_array.as_ref(),
-                    x,
-                },
-                hop.as_ref(),
-                h_g,
-            )?),
+            ) => {
+                // v = Xᵀ(c ⊙ h^G).  Same v in both regimes; the kernel
+                // applied to v differs (H⁻¹ vs K).
+                let mut weighted = Array1::<f64>::zeros(c_array.len());
+                Zip::from(&mut weighted)
+                    .and(c_array)
+                    .and(h_g)
+                    .for_each(|w, &c, &h| *w = c * h);
+                let v = x.transpose_vector_multiply(&weighted);
+                match subspace {
+                    Some(s) => Some(s.apply(&v)),
+                    None => Some(hop.solve(&v)),
+                }
+            }
             _ => None,
         }
     } else {
