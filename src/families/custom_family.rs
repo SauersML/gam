@@ -14126,11 +14126,8 @@ mod tests {
             v: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
             assert_eq!(block_idx, 0);
-            Ok(Some(array![[2.0
-                * self.curvature
-                * self.second_scale
-                * u[0]
-                * v[0]]]))
+            let value = 2.0 * self.curvature * self.second_scale * u[0] * v[0];
+            Ok(Some(array![[value]]))
         }
     }
 
