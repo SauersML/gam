@@ -237,6 +237,19 @@ pub fn fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S2, Ix2>,
 ) -> Array2<f64> {
+    let (n_a, p) = a.dim();
+    let (_, q) = b.dim();
+    fast_atb_with_parallelism(a, b, matmul_parallelism(p, q, n_a))
+}
+
+/// Compute A^T * B with an explicit faer parallelism policy for callers that
+/// are already running independent products in an outer Rayon task.
+#[inline]
+pub fn fast_atb_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    a: &ArrayBase<S1, Ix2>,
+    b: &ArrayBase<S2, Ix2>,
+    par: Par,
+) -> Array2<f64> {
     use faer::linalg::matmul::matmul;
     use faer::{Accum, Mat};
 
@@ -257,7 +270,6 @@ pub fn fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let b_ref = bview.as_ref();
 
     // dst = A^T * B
-    let par = matmul_parallelism(p, q, n_a);
     matmul(
         result.as_mut(),
         Accum::Replace,
@@ -480,6 +492,18 @@ pub fn fast_xt_diag_x<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     x: &ArrayBase<S1, Ix2>,
     w: &ArrayBase<S2, Ix1>,
 ) -> Array2<f64> {
+    let (_, p) = x.dim();
+    fast_xt_diag_x_with_parallelism(x, w, matmul_parallelism(p, p, x.nrows()))
+}
+
+/// Compute A^T * diag(W) * A with an explicit faer parallelism policy for
+/// callers that parallelize multiple independent Hessian blocks externally.
+#[inline]
+pub fn fast_xt_diag_x_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    x: &ArrayBase<S1, Ix2>,
+    w: &ArrayBase<S2, Ix1>,
+    par: Par,
+) -> Array2<f64> {
     use faer::Accum;
     use faer::linalg::matmul::matmul;
     use ndarray::{ShapeBuilder, s};
@@ -526,7 +550,6 @@ pub fn fast_xt_diag_x<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         let wx_slice = wx_chunk.slice(s![0..rows, ..]);
         let x_view = FaerArrayView::new(&x_slice);
         let wx_view = FaerArrayView::new(&wx_slice);
-        let par = matmul_parallelism(p, p, rows);
         matmul(
             out_view.as_mut(),
             Accum::Add,
