@@ -4288,29 +4288,18 @@ fn smooth_intrinsic_parametric_feature_cols(
     term: &SmoothTermSpec,
 ) -> Vec<usize> {
     // Ownership rule for spatial polynomial directions:
-    // explicit linear terms own only their matching axes; otherwise an
-    // unpenalized TPS nullspace must be projected out. When double-penalty is
-    // active the nullspace is already regularized, so it remains in the smooth.
+    // explicit linear terms own only their matching axes. A standalone TPS term
+    // owns its centered polynomial nullspace, matching the usual thin-plate
+    // spline model surface; projecting it out leaves small-k univariate TPS
+    // terms with only nonlinear residual columns.
     let feature_cols = smooth_term_feature_cols(term);
     let has_model_owned_overlap = linear_terms
         .iter()
         .any(|linear| feature_cols.contains(&linear.feature_col));
-    if has_model_owned_overlap {
+    if !has_model_owned_overlap {
         return Vec::new();
     }
-
-    match &term.basis {
-        SmoothBasisSpec::ThinPlate {
-            feature_cols, spec, ..
-        } if matches!(
-            spec.identifiability,
-            SpatialIdentifiability::OrthogonalToParametric
-        ) && !spec.double_penalty =>
-        {
-            feature_cols.clone()
-        }
-        _ => Vec::new(),
-    }
+    feature_cols
 }
 
 fn apply_global_smooth_identifiability(
@@ -14559,6 +14548,45 @@ mod tests {
         assert!(
             rel <= 1e-10,
             "B-spline smooth should be orthogonal to [1, x] when linear(x) is present; rel={rel}"
+        );
+    }
+
+    #[test]
+    fn standalone_tps_keeps_centered_linear_nullspace() {
+        let data = array![[-1.5], [-0.7], [0.2], [0.8], [1.6]];
+        let centers = array![[-1.5], [0.2], [1.6]];
+        let smooth = SmoothTermSpec {
+            name: "s_x".to_string(),
+            basis: SmoothBasisSpec::ThinPlate {
+                feature_cols: vec![0],
+                spec: ThinPlateBasisSpec {
+                    center_strategy: CenterStrategy::UserProvided(centers),
+                    length_scale: 1.0,
+                    double_penalty: false,
+                    identifiability: SpatialIdentifiability::OrthogonalToParametric,
+                    radial_reparam: None,
+                },
+                input_scales: None,
+            },
+            shape: ShapeConstraint::None,
+        };
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![smooth],
+        };
+
+        let design = build_term_collection_design(data.view(), &spec).expect("tps design");
+
+        assert_eq!(design.smooth.term_designs[0].ncols(), 2);
+        assert_eq!(design.smooth.nullspace_dims, vec![1]);
+        let intercept = Array2::<f64>::ones((data.nrows(), 1));
+        let rel =
+            orthogonality_relative_residual_for_design(&design.smooth.term_designs[0], intercept.view())
+                .expect("intercept residual");
+        assert!(
+            rel <= 1e-10,
+            "standalone TPS should be centered against the intercept while retaining its linear nullspace; rel={rel}"
         );
     }
 
