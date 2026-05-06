@@ -2076,7 +2076,7 @@ where
         let initial_link_kind = cfg.link_kind.clone();
         let problem = OuterProblem::new(theta_dim)
             .with_gradient(Derivative::Analytic)
-            .with_hessian(Derivative::Unavailable)
+            .with_hessian(Derivative::Analytic)
             .with_psi_dim(mixture_dim + sas_dim)
             .with_barrier(self::reml::unified::BarrierConfig::from_constraints(
                 fit_linear_constraints.as_ref(),
@@ -2190,13 +2190,13 @@ where
                 // Use the unified REML evaluator with link ext_coords.
                 // This computes ρ gradient AND link parameter gradient jointly
                 // through the same HyperCoord infrastructure used for aniso ψ.
-                let eval_mode = self::reml::unified::EvalMode::ValueAndGradient;
+                let eval_mode = self::reml::unified::EvalMode::ValueGradientHessian;
                 let result = state.evaluate_unified_with_link_ext(&rho, eval_mode)?;
 
                 let cost = result.cost + sas_ridge_cost(theta);
                 let mut grad = result.gradient.ok_or_else(|| {
                     EstimationError::InvalidInput(
-                        "unified evaluator returned no gradient in ValueAndGradient mode"
+                        "unified evaluator returned no gradient in ValueGradientHessian mode"
                             .to_string(),
                     )
                 })?;
@@ -2209,17 +2209,28 @@ where
                     theta_dim
                 );
 
+                let grad_effective = grad.clone();
+                let mut hessian = materialize_link_outer_hessian(result.hessian, theta_dim)?;
+
                 // SAS epsilon reparameterization chain rule.
                 if use_sas && !use_beta_logistic {
-                    let (_, d_eps_d_raw) = sas_effective_epsilon(theta[k]);
+                    let (_, d_eps_d_raw, d2_eps_d_raw2) = sas_effective_epsilon_second(theta[k]);
+                    for j in 0..theta_dim {
+                        hessian[[k, j]] *= d_eps_d_raw;
+                        hessian[[j, k]] *= d_eps_d_raw;
+                    }
+                    hessian[[k, k]] += grad_effective[k] * d2_eps_d_raw2;
                     grad[k] *= d_eps_d_raw;
                 }
-                // SAS log_delta ridge + barrier gradient.
+                // SAS log_delta ridge + barrier gradient/Hessian.
                 if use_sas && !use_beta_logistic && sasridgeweight > 0.0 {
                     let log_delta = theta[k + 1];
                     grad[k + 1] += sasridgeweight * log_delta;
-                    let (_, barriergrad) = sas_log_delta_edge_barriercostgrad(log_delta);
+                    hessian[[k + 1, k + 1]] += sasridgeweight;
+                    let (_, barriergrad, barrierhess) =
+                        sas_log_delta_edge_barriercostgradhess(log_delta);
                     grad[k + 1] += barriergrad;
+                    hessian[[k + 1, k + 1]] += barrierhess;
                 }
 
                 let cost_sec = tcost.elapsed().as_secs_f64();
@@ -2233,7 +2244,7 @@ where
                 Ok(OuterEval {
                     cost,
                     gradient: grad,
-                    hessian: HessianResult::Unavailable,
+                    hessian: HessianResult::Analytic(hessian),
                 })
             },
             Some(|state: &mut &mut self::reml::RemlState<'_>| {
@@ -4780,6 +4791,56 @@ fn sas_effective_epsilon(raw_epsilon: f64) -> (f64, f64) {
     (epsilon, d_epsilon_d_raw)
 }
 
+#[inline]
+fn sas_effective_epsilon_second(raw_epsilon: f64) -> (f64, f64, f64) {
+    let bound = sas_epsilon_bound().max(f64::EPSILON);
+    let t = (raw_epsilon / bound).tanh();
+    let first = 1.0 - t * t;
+    let second = -2.0 * t * first / bound;
+    (bound * t, first, second)
+}
+
+#[inline]
+fn sas_log_delta_edge_barriercostgradhess(raw_log_delta: f64) -> (f64, f64, f64) {
+    let w = sas_log_delta_edge_barrierweight();
+    if w <= 0.0 || !raw_log_delta.is_finite() {
+        return (0.0, 0.0, 0.0);
+    }
+    let b = sas_log_delta_bound().max(f64::EPSILON);
+    let t = (raw_log_delta / b).tanh();
+    let one_minus_t2 = (1.0 - t * t).max(1e-12);
+    let cost = -w * one_minus_t2.ln();
+    let grad = (2.0 * w / b) * t;
+    let hess = (2.0 * w / (b * b)) * one_minus_t2;
+    (cost, grad, hess)
+}
+
+fn materialize_link_outer_hessian(
+    hessian: crate::solver::outer_strategy::HessianResult,
+    theta_dim: usize,
+) -> Result<Array2<f64>, EstimationError> {
+    match hessian.materialize_dense() {
+        Ok(Some(h)) => {
+            if h.nrows() != theta_dim || h.ncols() != theta_dim {
+                return Err(EstimationError::InvalidInput(format!(
+                    "unified evaluator Hessian shape {}x{} != theta_dim {}",
+                    h.nrows(),
+                    h.ncols(),
+                    theta_dim
+                )));
+            }
+            Ok(h)
+        }
+        Ok(None) => Err(EstimationError::InvalidInput(
+            "unified evaluator returned no analytic Hessian in ValueGradientHessian mode"
+                .to_string(),
+        )),
+        Err(err) => Err(EstimationError::InvalidInput(format!(
+            "failed to materialize analytic link Hessian: {err}"
+        ))),
+    }
+}
+
 /// Evaluate the analytic gradient of the external REML objective.
 pub fn evaluate_externalgradient<X>(
     y: ArrayView1<'_, f64>,
@@ -4927,6 +4988,42 @@ mod estimate_policy_tests {
     use ndarray::{Array1, Array2, array};
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
+
+    #[test]
+    fn sas_raw_epsilon_hessian_chain_rule_matches_chained_gradient_slope() {
+        let raw0 = 1.3_f64;
+        let (eps0, d1, d2) = sas_effective_epsilon_second(raw0);
+        let g0 = array![0.4, -0.7, 0.2];
+        let h_eff = array![[2.0, 0.3, -0.1], [0.3, 1.5, 0.25], [-0.1, 0.25, 0.8]];
+
+        let analytic = h_eff[[0, 0]] * d1 * d1 + g0[0] * d2;
+        let chained_grad = |raw: f64| {
+            let (eps, deps_draw) = sas_effective_epsilon(raw);
+            let delta = array![eps - eps0, 0.0, 0.0];
+            let g_eff = &g0 + &h_eff.dot(&delta);
+            g_eff[0] * deps_draw
+        };
+        let h = 1e-6;
+        let fd = (chained_grad(raw0 + h) - chained_grad(raw0 - h)) / (2.0 * h);
+        assert!(
+            (analytic - fd).abs() < 2e-8,
+            "SAS raw epsilon Hessian chain rule mismatch: analytic={analytic:.12e} fd={fd:.12e}"
+        );
+    }
+
+    #[test]
+    fn sas_log_delta_barrier_hessian_matches_gradient_slope() {
+        let raw = 2.25_f64;
+        let (_, _, analytic_hess) = sas_log_delta_edge_barriercostgradhess(raw);
+        let h = 1e-6;
+        let (_, gp) = sas_log_delta_edge_barriercostgrad(raw + h);
+        let (_, gm) = sas_log_delta_edge_barriercostgrad(raw - h);
+        let fd = (gp - gm) / (2.0 * h);
+        assert!(
+            (analytic_hess - fd).abs() < 2e-9,
+            "SAS log-delta barrier Hessian mismatch: analytic={analytic_hess:.12e} fd={fd:.12e}"
+        );
+    }
 
     fn decode_invariant_test_fit() -> UnifiedFitResult {
         UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
