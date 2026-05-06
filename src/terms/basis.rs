@@ -8305,6 +8305,60 @@ fn duchon_kernel_radial_triplet(
     Ok(triplet)
 }
 
+#[inline(always)]
+fn lower_triangular_offset(row: usize) -> usize {
+    row * (row + 1) / 2
+}
+
+fn symmetric_matrix_from_lower_values(k: usize, values: &[f64]) -> Array2<f64> {
+    debug_assert_eq!(values.len(), k * (k + 1) / 2);
+    let mut g = Array2::<f64>::zeros((k, k));
+    let mut idx = 0usize;
+    for i in 0..k {
+        for j in 0..=i {
+            let v = values[idx];
+            g[[i, j]] = v;
+            if i != j {
+                g[[j, i]] = v;
+            }
+            idx += 1;
+        }
+    }
+    g
+}
+
+fn transform_closed_form_raw_block(
+    raw: &Array2<f64>,
+    kernel_nullspace: Option<&Array2<f64>>,
+    polynomial_block_cols: usize,
+    outer_identifiability: Option<&Array2<f64>>,
+) -> Array2<f64> {
+    let kernel_block = if let Some(z) = kernel_nullspace {
+        let zt = fast_atb(z, raw);
+        fast_ab(&zt, z)
+    } else {
+        raw.clone()
+    };
+    let kernel_cols = kernel_block.nrows();
+    let total_pre = kernel_cols + polynomial_block_cols;
+    let padded = if polynomial_block_cols == 0 {
+        kernel_block
+    } else {
+        let mut padded = Array2::<f64>::zeros((total_pre, total_pre));
+        padded
+            .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+            .assign(&kernel_block);
+        padded
+    };
+    let total = if let Some(t) = outer_identifiability {
+        let tt = fast_atb(t, &padded);
+        fast_ab(&tt, t)
+    } else {
+        padded
+    };
+    symmetrize(&total)
+}
+
 fn symmetrize(matrix: &Array2<f64>) -> Array2<f64> {
     (matrix + &matrix.t().to_owned()) * 0.5
 }
@@ -8412,42 +8466,30 @@ pub fn closed_form_anisotropic_pair_block(
     };
     let powers = closed_form_penalty::AnisoMetricPowers::new(eta_raw);
 
-    // Parallelize the K(K+1)/2 lower-triangular pair-block evaluations.
-    // Each pair eval is independent; outputs are scattered into a symmetric
-    // dense Array2 after the parallel reduction.
+    // Parallelize by independent lower-triangular rows. This keeps one lag
+    // scratch buffer per worker row, avoids the sqrt-based flat-index decode
+    // in the hot loop, and still evaluates each symmetric pair only once.
     let n_pairs = k * (k + 1) / 2;
-    let values: Vec<f64> = (0..n_pairs)
-        .into_par_iter()
-        .map(|idx| {
-            // Map flat lower-triangular index to (i, j) with j ≤ i.
-            // i is the largest integer with i*(i+1)/2 ≤ idx.
-            let i = ((-1.0 + (1.0 + 8.0 * idx as f64).sqrt()) * 0.5).floor() as usize;
-            let i = if i * (i + 1) / 2 > idx { i - 1 } else { i };
-            let j = idx - i * (i + 1) / 2;
-            let mut r_buf: SmallVec<[f64; 16]> = SmallVec::with_capacity(d);
-            r_buf.resize(d, 0.0);
+    let mut values = vec![0.0_f64; n_pairs];
+    let values_ptr = SendPtr(values.as_mut_ptr());
+    (0..k).into_par_iter().for_each(|i| {
+        let row_ptr = values_ptr.add(lower_triangular_offset(i));
+        let mut r_buf: SmallVec<[f64; 16]> = SmallVec::with_capacity(d);
+        r_buf.resize(d, 0.0);
+        for j in 0..=i {
             for axis in 0..d {
                 r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
             }
-            closed_form_anisotropic_pair_value_with_powers(
+            let value = closed_form_anisotropic_pair_value_with_powers(
                 q, m, s, kappa, eta_raw, &powers, &r_buf, r_eps,
-            )
-        })
-        .collect();
-
-    let mut g = Array2::<f64>::zeros((k, k));
-    let mut idx = 0usize;
-    for i in 0..k {
-        for j in 0..=i {
-            let v = values[idx];
-            g[[i, j]] = v;
-            if i != j {
-                g[[j, i]] = v;
+            );
+            unsafe {
+                *row_ptr.add(j) = value;
             }
-            idx += 1;
         }
-    }
-    g
+    });
+
+    symmetric_matrix_from_lower_values(k, &values)
 }
 
 /// Pure-Duchon (κ=0) variant of [`closed_form_anisotropic_pair_block`].
@@ -8492,35 +8534,23 @@ pub fn closed_form_anisotropic_pair_block_pure(
     };
     let powers = closed_form_penalty::AnisoMetricPowers::new(&eta_centered);
 
-    // Parallelize the K(K+1)/2 lower-triangular pair-block evaluations.
+    // Parallelize by independent lower-triangular rows and evaluate each
+    // symmetric pair once while reusing a single lag scratch buffer per row.
     let n_pairs = k * (k + 1) / 2;
     let eta_slice: &[f64] = eta_centered.as_slice();
-    let values: Vec<f64> = (0..n_pairs)
-        .into_par_iter()
-        .map(|idx| {
-            let i = ((-1.0 + (1.0 + 8.0 * idx as f64).sqrt()) * 0.5).floor() as usize;
-            let i = if i * (i + 1) / 2 > idx { i - 1 } else { i };
-            let j = idx - i * (i + 1) / 2;
-            let mut r_buf: SmallVec<[f64; 16]> = SmallVec::with_capacity(d);
-            r_buf.resize(d, 0.0);
+    let mut values = vec![0.0_f64; n_pairs];
+    let values_ptr = SendPtr(values.as_mut_ptr());
+    (0..k).into_par_iter().for_each(|i| {
+        let row_ptr = values_ptr.add(lower_triangular_offset(i));
+        let mut r_buf: SmallVec<[f64; 16]> = SmallVec::with_capacity(d);
+        r_buf.resize(d, 0.0);
+        for j in 0..=i {
             for axis in 0..d {
                 r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
             }
-            if i == j {
-                // Self-pair (R = 0). When the analytic finite-part limit
-                // is known (math team Letter A §3) prefer it over the
-                // ε-regularization fallback. For pure Duchon (κ = 0) the
-                // q = 0 kernel is f(R) = R_{2(m+s)}^d(R) = c · R^p with
-                // p = 4(m+s) - d (non-log case). Then h_q(0) takes the
-                // explicit closed form
-                //
-                //   h_1(0) = -s_1 · F_{2,0},   F_{2,0} = f''(0)
-                //   h_2(0) = (F_{4,0}/3) · (s_1² + 2 s_2),   F_{4,0} = f^{(4)}(0)
-                //
-                // with F_{2q,0} = 0 when p > 2q, c · p!/(p − 2q)! when
-                // p = 2q, and divergent (Hadamard) otherwise. We handle
-                // the finite cases analytically and fall back to
-                // ε-regularization for the divergent / log-typed cases.
+            let value = if i == j {
+                // Self-pair (R = 0). Prefer the exact finite-part limit when
+                // available, otherwise use the same ε-regularized convention.
                 if let Some(closed) =
                     closed_form_penalty::pure_duchon_self_pair_value(q, d, m, s, eta_slice)
                 {
@@ -8541,23 +8571,14 @@ pub fn closed_form_anisotropic_pair_block_pure(
                     * closed_form_penalty::anisotropic_duchon_penalty_radial_with_powers(
                         q, m, s, 0.0, eta_slice, &powers, &r_buf,
                     )
+            };
+            unsafe {
+                *row_ptr.add(j) = value;
             }
-        })
-        .collect();
-
-    let mut g = Array2::<f64>::zeros((k, k));
-    let mut idx = 0usize;
-    for i in 0..k {
-        for j in 0..=i {
-            let v = values[idx];
-            g[[i, j]] = v;
-            if i != j {
-                g[[j, i]] = v;
-            }
-            idx += 1;
         }
-    }
-    g
+    });
+
+    symmetric_matrix_from_lower_values(k, &values)
 }
 
 /// Closed-form pair-block penalty for the thin-plate spline (TPS) basis.
@@ -8733,9 +8754,12 @@ pub fn closed_form_matern_pair_block(
         binom_coeffs.push(coeff);
     }
 
-    let mut g = Array2::<f64>::zeros((k, k));
-    for i in 0..k {
-        for j in i..k {
+    let n_pairs = k * (k + 1) / 2;
+    let mut values = vec![0.0_f64; n_pairs];
+    let values_ptr = SendPtr(values.as_mut_ptr());
+    (0..k).into_par_iter().for_each(|i| {
+        let row_ptr = values_ptr.add(lower_triangular_offset(i));
+        for j in 0..=i {
             // Anisotropic distance: r_eff² = Σ_a (Δ_a · exp(η_a))².
             let mut r2 = 0.0_f64;
             for axis in 0..d {
@@ -8755,13 +8779,12 @@ pub fn closed_form_matern_pair_block(
                 acc +=
                     binom_coeffs[jj] * closed_form_penalty::matern_kernel_value(d, order, kappa, r);
             }
-            g[[i, j]] = acc;
-            if i != j {
-                g[[j, i]] = acc;
+            unsafe {
+                *row_ptr.add(j) = acc;
             }
         }
-    }
-    Some(g)
+    });
+    Some(symmetric_matrix_from_lower_values(k, &values))
 }
 
 /// Median off-diagonal anisotropic lag scaled by 1e-6, used for
@@ -8884,77 +8907,73 @@ pub fn closed_form_psi_derivatives_in_total_basis(
         };
     let powers = closed_form_penalty::AnisoMetricPowers::new(eta_raw);
 
-    let mut g = Array2::<f64>::zeros((k, k));
-    let mut g_psi = Array2::<f64>::zeros((k, k));
-    let mut g_psi_psi = Array2::<f64>::zeros((k, k));
-    let mut r_buf = vec![0.0_f64; d];
-    for i in 0..k {
+    let n_pairs = k * (k + 1) / 2;
+    let mut g_values = vec![0.0_f64; n_pairs];
+    let mut g_psi_values = vec![0.0_f64; n_pairs];
+    let mut g_psi_psi_values = vec![0.0_f64; n_pairs];
+    let g_ptr = SendPtr(g_values.as_mut_ptr());
+    let g_psi_ptr = SendPtr(g_psi_values.as_mut_ptr());
+    let g_psi_psi_ptr = SendPtr(g_psi_psi_values.as_mut_ptr());
+    (0..k).into_par_iter().for_each(|i| {
+        let row_offset = lower_triangular_offset(i);
+        let g_row = g_ptr.add(row_offset);
+        let g_psi_row = g_psi_ptr.add(row_offset);
+        let g_psi_psi_row = g_psi_psi_ptr.add(row_offset);
+        let mut r_buf: SmallVec<[f64; 16]> = SmallVec::with_capacity(d);
+        r_buf.resize(d, 0.0);
+        let mut r_eps_buf: SmallVec<[f64; 16]> = SmallVec::with_capacity(d);
+        r_eps_buf.resize(d, 0.0);
+        if d > 0 {
+            r_eps_buf[0] = r_eps * eta_raw[0].exp();
+        }
         for j in 0..=i {
             for axis in 0..d {
                 r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
             }
             let bundle = if i == j {
-                if let Some(bundle) = closed_form_penalty::analytic_self_pair_bundle(
-                    q, p_order, s_order, kappa, eta_raw,
-                ) {
-                    bundle
-                } else {
-                    let mut r_eps_buf = vec![0.0_f64; d];
-                    if d > 0 {
-                        r_eps_buf[0] = r_eps * eta_raw[0].exp();
-                    }
-                    closed_form_penalty::pair_block_radial_with_j_second_derivatives_with_powers(
-                        q, p_order, s_order, kappa, eta_raw, &powers, &r_eps_buf,
-                    )
-                }
+                closed_form_penalty::analytic_self_pair_bundle(q, p_order, s_order, kappa, eta_raw)
+                    .unwrap_or_else(|| {
+                        closed_form_penalty::pair_block_radial_with_j_second_derivatives_with_powers(
+                            q, p_order, s_order, kappa, eta_raw, &powers, &r_eps_buf,
+                        )
+                    })
             } else {
                 closed_form_penalty::pair_block_radial_with_j_second_derivatives_with_powers(
                     q, p_order, s_order, kappa, eta_raw, &powers, &r_buf,
                 )
             };
-            let val = bundle.value;
-            let val_psi = kappa * bundle.d_kappa;
-            let val_psi_psi = kappa * kappa * bundle.d2_kappa + kappa * bundle.d_kappa;
-            g[[i, j]] = val;
-            g_psi[[i, j]] = val_psi;
-            g_psi_psi[[i, j]] = val_psi_psi;
-            if i != j {
-                g[[j, i]] = val;
-                g_psi[[j, i]] = val_psi;
-                g_psi_psi[[j, i]] = val_psi_psi;
+            unsafe {
+                *g_row.add(j) = bundle.value;
+                *g_psi_row.add(j) = kappa * bundle.d_kappa;
+                *g_psi_psi_row.add(j) = kappa * kappa * bundle.d2_kappa + kappa * bundle.d_kappa;
             }
         }
-    }
+    });
+    let g = symmetric_matrix_from_lower_values(k, &g_values);
+    let g_psi = symmetric_matrix_from_lower_values(k, &g_psi_values);
+    let g_psi_psi = symmetric_matrix_from_lower_values(k, &g_psi_psi_values);
 
     // Apply Z + poly-pad + T to each of g, g_psi, g_psi_psi identically.
-    let transform = |raw: Array2<f64>| -> Array2<f64> {
-        let kernel_block = if let Some(z) = kernel_nullspace {
-            let zt = fast_atb(z, &raw);
-            fast_ab(&zt, z)
-        } else {
-            raw
-        };
-        let kernel_cols = kernel_block.nrows();
-        let total_pre = kernel_cols + polynomial_block_cols;
-        let padded = if polynomial_block_cols == 0 {
-            kernel_block
-        } else {
-            let mut padded = Array2::<f64>::zeros((total_pre, total_pre));
-            padded
-                .slice_mut(s![0..kernel_cols, 0..kernel_cols])
-                .assign(&kernel_block);
-            padded
-        };
-        let total = if let Some(t) = outer_identifiability {
-            let tt = fast_atb(t, &padded);
-            fast_ab(&tt, t)
-        } else {
-            padded
-        };
-        symmetrize(&total)
-    };
-
-    (transform(g), transform(g_psi), transform(g_psi_psi))
+    (
+        transform_closed_form_raw_block(
+            &g,
+            kernel_nullspace,
+            polynomial_block_cols,
+            outer_identifiability,
+        ),
+        transform_closed_form_raw_block(
+            &g_psi,
+            kernel_nullspace,
+            polynomial_block_cols,
+            outer_identifiability,
+        ),
+        transform_closed_form_raw_block(
+            &g_psi_psi,
+            kernel_nullspace,
+            polynomial_block_cols,
+            outer_identifiability,
+        ),
+    )
 }
 
 /// Closed-form anisotropic penalty `S_q` and its raw-η derivatives — full
@@ -9002,97 +9021,149 @@ pub fn closed_form_aniso_psi_derivatives_in_total_basis(
         };
     let powers = closed_form_penalty::AnisoMetricPowers::new(eta_raw);
 
-    // Allocate raw K×K matrices: value, per-axis first, per-axis diagonal
-    // second, and full d×d cross matrix indexed as cross[a][b] (we fill all
-    // (a, b) pairs to avoid branching downstream; symmetric in a, b).
-    let mut g = Array2::<f64>::zeros((k, k));
-    let mut g_eta: Vec<Array2<f64>> = (0..d).map(|_| Array2::<f64>::zeros((k, k))).collect();
-    let mut g_eta2_diag: Vec<Array2<f64>> = (0..d).map(|_| Array2::<f64>::zeros((k, k))).collect();
-    let mut g_eta2_cross: Vec<Vec<Array2<f64>>> = (0..d)
-        .map(|_| (0..d).map(|_| Array2::<f64>::zeros((k, k))).collect())
+    let cross_pairs: Vec<(usize, usize)> =
+        (0..d).flat_map(|a| (a..d).map(move |b| (a, b))).collect();
+    let n_pairs = k * (k + 1) / 2;
+    let mut g_values = vec![0.0_f64; n_pairs];
+    let mut g_eta_values: Vec<Vec<f64>> = (0..d).map(|_| vec![0.0_f64; n_pairs]).collect();
+    let mut g_eta2_diag_values: Vec<Vec<f64>> = (0..d).map(|_| vec![0.0_f64; n_pairs]).collect();
+    let mut g_eta2_cross_values: Vec<Vec<f64>> =
+        cross_pairs.iter().map(|_| vec![0.0_f64; n_pairs]).collect();
+
+    let g_ptr = SendPtr(g_values.as_mut_ptr());
+    let g_eta_ptrs: Vec<SendPtr> = g_eta_values
+        .iter_mut()
+        .map(|values| SendPtr(values.as_mut_ptr()))
+        .collect();
+    let g_eta2_diag_ptrs: Vec<SendPtr> = g_eta2_diag_values
+        .iter_mut()
+        .map(|values| SendPtr(values.as_mut_ptr()))
+        .collect();
+    let g_eta2_cross_ptrs: Vec<SendPtr> = g_eta2_cross_values
+        .iter_mut()
+        .map(|values| SendPtr(values.as_mut_ptr()))
         .collect();
 
-    let mut r_buf = vec![0.0_f64; d];
-    for i in 0..k {
+    (0..k).into_par_iter().for_each(|i| {
+        let row_offset = lower_triangular_offset(i);
+        let g_row = g_ptr.add(row_offset);
+        let g_eta_rows: Vec<*mut f64> = g_eta_ptrs
+            .iter()
+            .map(|ptr| ptr.add(row_offset))
+            .collect();
+        let g_eta2_diag_rows: Vec<*mut f64> = g_eta2_diag_ptrs
+            .iter()
+            .map(|ptr| ptr.add(row_offset))
+            .collect();
+        let g_eta2_cross_rows: Vec<*mut f64> = g_eta2_cross_ptrs
+            .iter()
+            .map(|ptr| ptr.add(row_offset))
+            .collect();
+        let mut r_buf: SmallVec<[f64; 16]> = SmallVec::with_capacity(d);
+        r_buf.resize(d, 0.0);
+        let mut r_eps_buf: SmallVec<[f64; 16]> = SmallVec::with_capacity(d);
+        r_eps_buf.resize(d, 0.0);
+        if d > 0 {
+            r_eps_buf[0] = r_eps * eta_raw[0].exp();
+        }
         for j in 0..=i {
             for axis in 0..d {
                 r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
             }
             let bundle = if i == j {
-                if let Some(bundle) = closed_form_penalty::analytic_self_pair_bundle(
-                    q, p_order, s_order, kappa, eta_raw,
-                ) {
-                    bundle
-                } else {
-                    let mut r_eps_buf = vec![0.0_f64; d];
-                    if d > 0 {
-                        r_eps_buf[0] = r_eps * eta_raw[0].exp();
-                    }
-                    closed_form_penalty::pair_block_radial_with_j_second_derivatives_with_powers(
-                        q, p_order, s_order, kappa, eta_raw, &powers, &r_eps_buf,
-                    )
-                }
+                closed_form_penalty::analytic_self_pair_bundle(q, p_order, s_order, kappa, eta_raw)
+                    .unwrap_or_else(|| {
+                        closed_form_penalty::pair_block_radial_with_j_second_derivatives_with_powers(
+                            q, p_order, s_order, kappa, eta_raw, &powers, &r_eps_buf,
+                        )
+                    })
             } else {
                 closed_form_penalty::pair_block_radial_with_j_second_derivatives_with_powers(
                     q, p_order, s_order, kappa, eta_raw, &powers, &r_buf,
                 )
             };
-            g[[i, j]] = bundle.value;
-            for a in 0..d {
-                g_eta[a][[i, j]] = bundle.d_eta[a];
-                g_eta2_diag[a][[i, j]] = bundle.d2_eta[a][a];
-                for b in 0..d {
-                    g_eta2_cross[a][b][[i, j]] = bundle.d2_eta[a][b];
-                }
-            }
-            if i != j {
-                g[[j, i]] = bundle.value;
+            unsafe {
+                *g_row.add(j) = bundle.value;
                 for a in 0..d {
-                    g_eta[a][[j, i]] = bundle.d_eta[a];
-                    g_eta2_diag[a][[j, i]] = bundle.d2_eta[a][a];
-                    for b in 0..d {
-                        g_eta2_cross[a][b][[j, i]] = bundle.d2_eta[a][b];
-                    }
+                    *g_eta_rows[a].add(j) = bundle.d_eta[a];
+                    *g_eta2_diag_rows[a].add(j) = bundle.d2_eta[a][a];
+                }
+                for (idx, &(a, b)) in cross_pairs.iter().enumerate() {
+                    *g_eta2_cross_rows[idx].add(j) = bundle.d2_eta[a][b];
                 }
             }
         }
-    }
+    });
 
-    // Apply Z + poly-pad + T to a raw K×K matrix.
-    let transform = |raw: &Array2<f64>| -> Array2<f64> {
-        let kernel_block = if let Some(z) = kernel_nullspace {
-            let zt = fast_atb(z, raw);
-            fast_ab(&zt, z)
-        } else {
-            raw.clone()
-        };
-        let kernel_cols = kernel_block.nrows();
-        let total_pre = kernel_cols + polynomial_block_cols;
-        let padded = if polynomial_block_cols == 0 {
-            kernel_block
-        } else {
-            let mut padded = Array2::<f64>::zeros((total_pre, total_pre));
-            padded
-                .slice_mut(s![0..kernel_cols, 0..kernel_cols])
-                .assign(&kernel_block);
-            padded
-        };
-        let total = if let Some(t) = outer_identifiability {
-            let tt = fast_atb(t, &padded);
-            fast_ab(&tt, t)
-        } else {
-            padded
-        };
-        symmetrize(&total)
-    };
-
-    let s = transform(&g);
-    let s_first: Vec<Array2<f64>> = g_eta.iter().map(transform).collect();
-    let s_second_diag: Vec<Array2<f64>> = g_eta2_diag.iter().map(transform).collect();
-    let s_second_cross: Vec<Vec<Array2<f64>>> = g_eta2_cross
+    let g = symmetric_matrix_from_lower_values(k, &g_values);
+    let g_eta: Vec<Array2<f64>> = g_eta_values
         .iter()
-        .map(|row| row.iter().map(transform).collect())
+        .map(|values| symmetric_matrix_from_lower_values(k, values))
         .collect();
+    let g_eta2_diag: Vec<Array2<f64>> = g_eta2_diag_values
+        .iter()
+        .map(|values| symmetric_matrix_from_lower_values(k, values))
+        .collect();
+    let g_eta2_cross_unique: Vec<Array2<f64>> = g_eta2_cross_values
+        .iter()
+        .map(|values| symmetric_matrix_from_lower_values(k, values))
+        .collect();
+
+    // Apply Z + poly-pad + T to raw K×K matrices.
+    let s = transform_closed_form_raw_block(
+        &g,
+        kernel_nullspace,
+        polynomial_block_cols,
+        outer_identifiability,
+    );
+    let s_first: Vec<Array2<f64>> = g_eta
+        .par_iter()
+        .map(|raw| {
+            transform_closed_form_raw_block(
+                raw,
+                kernel_nullspace,
+                polynomial_block_cols,
+                outer_identifiability,
+            )
+        })
+        .collect();
+    let s_second_diag: Vec<Array2<f64>> = g_eta2_diag
+        .par_iter()
+        .map(|raw| {
+            transform_closed_form_raw_block(
+                raw,
+                kernel_nullspace,
+                polynomial_block_cols,
+                outer_identifiability,
+            )
+        })
+        .collect();
+    let transformed_cross_unique: Vec<Array2<f64>> = g_eta2_cross_unique
+        .par_iter()
+        .map(|raw| {
+            transform_closed_form_raw_block(
+                raw,
+                kernel_nullspace,
+                polynomial_block_cols,
+                outer_identifiability,
+            )
+        })
+        .collect();
+    let out_dim = s.nrows();
+    let mut s_second_cross: Vec<Vec<Array2<f64>>> = (0..d)
+        .map(|_| {
+            (0..d)
+                .map(|_| Array2::<f64>::zeros((out_dim, out_dim)))
+                .collect()
+        })
+        .collect();
+    for (idx, &(a, b)) in cross_pairs.iter().enumerate() {
+        let block = &transformed_cross_unique[idx];
+        s_second_cross[a][b] = block.clone();
+        if a != b {
+            s_second_cross[b][a] = block.clone();
+        }
+    }
     (s, s_first, s_second_diag, s_second_cross)
 }
 
