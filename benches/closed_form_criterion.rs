@@ -46,11 +46,13 @@ use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_ma
 use ndarray::{Array1, Array2};
 
 use gam::terms::basis::{
-    closed_form_anisotropic_pair_block,
+    MaternNu, closed_form_aniso_psi_derivatives_in_total_basis, closed_form_anisotropic_pair_block,
+    closed_form_matern_pair_block,
     closed_form_penalty::{
         anisotropic_duchon_penalty_radial, isotropic_duchon_penalty,
         pair_block_radial_with_j_second_derivatives,
     },
+    closed_form_psi_derivatives_in_total_basis,
 };
 use gam::terms::closed_form_operator::ClosedFormPenaltyOperator;
 use gam::terms::penalty_op::PenaltyOp;
@@ -185,6 +187,73 @@ fn bench_isotropic_kernel(c: &mut Criterion) {
         })
     });
 
+    group.finish();
+}
+
+fn bench_derivative_matrix_assembly(c: &mut Criterion) {
+    let mut group = c.benchmark_group("derivative_matrix_assembly");
+    group.sample_size(10);
+    for &k in &[100_usize, 200, 500] {
+        let centers = synthetic_centers(k, D_TYPICAL);
+        let eta: Vec<f64> = (0..D_TYPICAL)
+            .map(|axis| 0.05 * ((axis as f64) - 0.5 * (D_TYPICAL as f64 - 1.0)))
+            .collect();
+        group.bench_with_input(BenchmarkId::new("log_kappa", k), &k, |b, _| {
+            b.iter(|| {
+                let bundle = closed_form_psi_derivatives_in_total_basis(
+                    centers.view(),
+                    /* q = */ 2,
+                    M_TYPICAL,
+                    S_TYPICAL,
+                    KAPPA_TYPICAL,
+                    Some(&eta),
+                    None,
+                    0,
+                    None,
+                );
+                black_box(bundle)
+            })
+        });
+        group.bench_with_input(BenchmarkId::new("anisotropic_eta", k), &k, |b, _| {
+            b.iter(|| {
+                let bundle = closed_form_aniso_psi_derivatives_in_total_basis(
+                    centers.view(),
+                    /* q = */ 2,
+                    M_TYPICAL,
+                    S_TYPICAL,
+                    KAPPA_TYPICAL,
+                    Some(&eta),
+                    None,
+                    0,
+                    None,
+                );
+                black_box(bundle)
+            })
+        });
+    }
+    group.finish();
+}
+
+fn bench_matern_pair_block_assembly(c: &mut Criterion) {
+    let mut group = c.benchmark_group("matern_pair_block_assembly");
+    group.sample_size(10);
+    for &k in &[200_usize, 500, 1000, 2000] {
+        let centers = synthetic_centers(k, 3);
+        let eta = vec![0.10_f64, -0.05, 0.02];
+        group.bench_with_input(BenchmarkId::from_parameter(k), &k, |b, _| {
+            b.iter(|| {
+                let g = closed_form_matern_pair_block(
+                    centers.view(),
+                    /* q = */ 2,
+                    /* length_scale = */ 1.0,
+                    MaternNu::NineHalves,
+                    Some(&eta),
+                )
+                .expect("ν=9/2 d=3 q=2 converges");
+                black_box(g)
+            })
+        });
+    }
     group.finish();
 }
 
@@ -340,6 +409,8 @@ criterion_group!(
     bench_pair_block_assembly,
     bench_pair_block_bundle,
     bench_isotropic_kernel,
+    bench_derivative_matrix_assembly,
+    bench_matern_pair_block_assembly,
     bench_operator_matvec,
     bench_hessian_solve_dense_vs_implicit,
 );

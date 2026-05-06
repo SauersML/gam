@@ -160,7 +160,8 @@ impl ClosedFormPenaltyOperator {
     }
 
     fn raw_diagonal_value(&self) -> f64 {
-        let r0 = vec![0.0_f64; self.centers.ncols()];
+        let mut r0: SmallVec<[f64; 16]> = SmallVec::with_capacity(self.centers.ncols());
+        r0.resize(self.centers.ncols(), 0.0);
         closed_form_anisotropic_pair_value_with_powers(
             self.q,
             self.m,
@@ -168,7 +169,7 @@ impl ClosedFormPenaltyOperator {
             self.kappa,
             &self.eta_raw,
             &self.eta_metric_powers,
-            &r0,
+            r0.as_slice(),
             self.diagonal_epsilon,
         )
     }
