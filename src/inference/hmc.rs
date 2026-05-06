@@ -1024,11 +1024,11 @@ fn gamma_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1
 #[cfg(test)]
 mod tests {
     use super::{
-        FamilyNutsInputs, GlmFlatInputs, JointBetaRhoInputs, JointBetaRhoPosterior, NutsConfig,
-        NutsFamily, NutsPosterior, SharedData, firth_jeffreys_logp_and_grad,
-        joint_family_logp_and_grad, laplace_directional_cubic_diagnostic,
-        run_joint_beta_rho_sampling, run_logit_polya_gamma_gibbs,
-        run_nuts_sampling_flattened_family,
+        FamilyNutsInputs, GlmFlatInputs, JointBetaRhoInputs, JointBetaRhoPosterior,
+        LinkWigglePosterior, LinkWiggleSplineArtifacts, NutsConfig, NutsFamily, NutsPosterior,
+        SharedData, firth_jeffreys_logp_and_grad, joint_family_logp_and_grad,
+        laplace_directional_cubic_diagnostic, run_joint_beta_rho_sampling,
+        run_logit_polya_gamma_gibbs, run_nuts_sampling_flattened_family,
     };
     use crate::construction::CanonicalPenalty;
     use crate::matrix::DesignMatrix;
@@ -1051,6 +1051,52 @@ mod tests {
         let lo = NutsPosterior::sigmoid_stable(-1000.0);
         assert!(hi <= 1.0 && hi >= 1.0 - 1e-12);
         assert!(lo >= 0.0 && lo <= 1e-12);
+    }
+
+    #[test]
+    fn link_wiggle_posterior_whitening_uses_supplied_explicit_joint_hessian() {
+        let x = array![[1.0], [1.0], [1.0]];
+        let y = array![0.0, 1.0, 1.0];
+        let weights = Array1::ones(3);
+        let penalty_base = Array2::zeros((1, 1));
+        let penalty_link = Array2::zeros((1, 1));
+        let mode_beta = array![0.2];
+        let mode_theta = array![0.05];
+        let hessian = array![[4.0, 1.0], [1.0, 3.0]];
+        let spline = LinkWiggleSplineArtifacts {
+            knot_range: (-1.0, 1.0),
+            knot_vector: Array1::from_vec(vec![-1.0, -1.0, -1.0, 1.0, 1.0, 1.0]),
+            degree: 2,
+        };
+
+        let posterior = LinkWigglePosterior::new(
+            x.view(),
+            y.view(),
+            weights.view(),
+            penalty_base.view(),
+            penalty_link.view(),
+            mode_beta.view(),
+            mode_theta.view(),
+            hessian.view(),
+            spline,
+            NutsFamily::BinomialLogit,
+            1.0,
+        )
+        .expect("link-wiggle posterior should accept explicit SPD joint Hessian");
+
+        let reconstructed_cov = posterior.chol().dot(&posterior.chol().t());
+        let eye_from_hessian = hessian.dot(&reconstructed_cov);
+        for r in 0..2 {
+            for c in 0..2 {
+                let expected = if r == c { 1.0 } else { 0.0 };
+                assert!(
+                    (eye_from_hessian[[r, c]] - expected).abs() < 1e-10,
+                    "whitening did not use the supplied explicit joint Hessian at ({r},{c}): got {} expected {}",
+                    eye_from_hessian[[r, c]],
+                    expected
+                );
+            }
+        }
     }
 
     #[test]

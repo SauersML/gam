@@ -12774,12 +12774,15 @@ fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'static>(
     specs: &[ParameterBlockSpec],
     states: &[ParameterBlockState],
     per_block_log_lambdas: &[Array1<f64>],
-) -> Option<FitGeometry> {
+) -> Result<Option<FitGeometry>, String> {
     if specs.len() != per_block_log_lambdas.len() {
-        return None;
+        return Ok(None);
     }
     if specs.len() == 1 {
-        let eval = family.evaluate(states).ok()?;
+        let eval = family.evaluate(states).ok();
+        let Some(eval) = eval else {
+            return Ok(None);
+        };
         let [
             BlockWorkingSet::Diagonal {
                 working_response,
@@ -12787,36 +12790,53 @@ fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'static>(
             },
         ] = eval.blockworking_sets.as_slice()
         else {
-            return None;
+            return Ok(None);
         };
         let spec = &specs[0];
         let lambdas = per_block_log_lambdas[0].mapv(f64::exp);
-        let mut h = spec.design.diag_xtw_x(working_weights).ok()?;
+        let Some(mut h) = spec.design.diag_xtw_x(working_weights).ok() else {
+            return Ok(None);
+        };
         for (k, s) in spec.penalties.iter().enumerate() {
             let s_dense = s.as_dense_cow();
             h.scaled_add(lambdas[k], &*s_dense);
         }
-        return Some(FitGeometry {
+        return Ok(Some(FitGeometry {
             penalized_hessian: h,
             working_weights: working_weights.clone(),
             working_response: working_response.clone(),
-        });
+        }));
     }
 
+    let requires_explicit_joint_hessian = specs.iter().enumerate().any(|(idx, spec)| {
+        custom_family_block_role(&spec.name, idx, specs.len())
+            == crate::solver::estimate::BlockRole::LinkWiggle
+    });
     let total_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
-    let mut h = exact_newton_joint_hessian_symmetrized(
+    let Some(mut h) = exact_newton_joint_hessian_symmetrized(
         family,
         states,
         specs,
         total_p,
         "compute_joint_geometry",
-    )
-    .ok()??;
+    )?
+    else {
+        if requires_explicit_joint_hessian {
+            return Err(
+                "link-wiggle fits require an exact explicit joint Hessian for posterior sampling"
+                    .to_string(),
+            );
+        }
+        return Ok(None);
+    };
     let ranges = block_param_ranges(specs);
     for (block_idx, spec) in specs.iter().enumerate() {
-        let lambdas = per_block_log_lambdas.get(block_idx)?.mapv(f64::exp);
+        let Some(block_log_lambdas) = per_block_log_lambdas.get(block_idx) else {
+            return Ok(None);
+        };
+        let lambdas = block_log_lambdas.mapv(f64::exp);
         if lambdas.len() != spec.penalties.len() {
-            return None;
+            return Ok(None);
         }
         let (start, end) = ranges[block_idx];
         let block_dim = end - start;
@@ -12832,16 +12852,16 @@ fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'static>(
             } else if dense.nrows() == total_p && dense.ncols() == total_p {
                 h.scaled_add(scale, &*dense);
             } else {
-                return None;
+                return Ok(None);
             }
         }
     }
     let working_len = states.first().map(|state| state.eta.len()).unwrap_or(0);
-    Some(FitGeometry {
+    Ok(Some(FitGeometry {
         penalized_hessian: h,
         working_weights: Array1::zeros(working_len),
         working_response: Array1::zeros(working_len),
-    })
+    }))
 }
 
 pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
@@ -12874,7 +12894,8 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
             0.0
         };
         let no_pen = vec![Array1::zeros(0); specs.len()];
-        let geometry = compute_joint_geometry(family, specs, &inner.block_states, &no_pen);
+        let geometry = compute_joint_geometry(family, specs, &inner.block_states, &no_pen)
+            .map_err(CustomFamilyError::Optimization)?;
         let penalized_objective = checked_penalizedobjective(
             inner.log_likelihood,
             inner.penalty_value,
@@ -13138,7 +13159,8 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     let covariance_conditional =
         compute_joint_covariance_required(family, specs, &inner.block_states, &per_block, options)?;
 
-    let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block);
+    let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block)
+        .map_err(CustomFamilyError::Optimization)?;
     let penalized_objective = checked_penalizedobjective(
         inner.log_likelihood,
         inner.penalty_value,
@@ -13200,7 +13222,8 @@ pub(crate) fn fit_custom_family_fixed_log_lambdas<
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     let covariance_conditional =
         compute_joint_covariance_required(family, specs, &inner.block_states, &per_block, options)?;
-    let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block);
+    let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block)
+        .map_err(CustomFamilyError::Optimization)?;
     let penalized_objective = checked_penalizedobjective(
         inner.log_likelihood,
         inner.penalty_value,
