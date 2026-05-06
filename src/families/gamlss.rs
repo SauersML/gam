@@ -20315,6 +20315,186 @@ mod tests {
         }
     }
 
+    /// Bit-equivalence guard for the `hessian_dense` hook. The dispatch site
+    /// `exact_newton_joint_hessian_source_from_workspace` prefers
+    /// `hessian_dense` over the canonical-basis HVP fallback at biobank
+    /// scale; this test pins the dense build against the same column-by-
+    /// column HVP path it replaces. Any future regression in the GEMM
+    /// fill (e.g. swapped block coordinates, sign error in `coeff_ml`)
+    /// fails here before it can corrupt outer-Hessian assembly.
+    #[test]
+    fn gaussian_location_scale_hessian_dense_matches_canonical_basis_hvp_path() {
+        let (family, states, specs) = gls_workspace_fixture();
+        let total = states[0].beta.len() + states[1].beta.len();
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+
+        let dense = workspace
+            .hessian_dense()
+            .expect("hessian_dense call")
+            .expect("hessian_dense present");
+        assert_eq!(dense.nrows(), total);
+        assert_eq!(dense.ncols(), total);
+
+        // Reconstruct H column-by-column via canonical-basis HVPs (the path
+        // the dense build replaces).
+        let mut assembled = Array2::<f64>::zeros((total, total));
+        for j in 0..total {
+            let mut e = Array1::<f64>::zeros(total);
+            e[j] = 1.0;
+            let col = workspace
+                .hessian_matvec(&e)
+                .expect("matvec call")
+                .expect("matvec present");
+            assembled.column_mut(j).assign(&col);
+        }
+        let assembled_sym = 0.5 * (&assembled + &assembled.t());
+
+        let max_rel = dense
+            .iter()
+            .zip(assembled_sym.iter())
+            .map(|(d, a)| ((d - a) / d.abs().max(a.abs()).max(1.0)).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_rel < 1e-12,
+            "GLS hessian_dense vs canonical HVP max relative diff: {max_rel:.3e}"
+        );
+    }
+
+    /// Bit-equivalence guard for the binomial location-scale dense Hessian
+    /// hook. Same structure as the Gaussian non-wiggle test.
+    #[test]
+    fn binomial_location_scale_hessian_dense_matches_canonical_basis_hvp_path() {
+        let (family, states, specs) = bls_workspace_fixture();
+        let total = states[0].beta.len() + states[1].beta.len();
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+
+        let dense = workspace
+            .hessian_dense()
+            .expect("hessian_dense call")
+            .expect("hessian_dense present");
+        assert_eq!(dense.nrows(), total);
+        assert_eq!(dense.ncols(), total);
+
+        let mut assembled = Array2::<f64>::zeros((total, total));
+        for j in 0..total {
+            let mut e = Array1::<f64>::zeros(total);
+            e[j] = 1.0;
+            let col = workspace
+                .hessian_matvec(&e)
+                .expect("matvec call")
+                .expect("matvec present");
+            assembled.column_mut(j).assign(&col);
+        }
+        let assembled_sym = 0.5 * (&assembled + &assembled.t());
+
+        let max_rel = dense
+            .iter()
+            .zip(assembled_sym.iter())
+            .map(|(d, a)| ((d - a) / d.abs().max(a.abs()).max(1.0)).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_rel < 1e-12,
+            "BLS hessian_dense vs canonical HVP max relative diff: {max_rel:.3e}"
+        );
+    }
+
+    /// Bit-equivalence guard for the Gaussian location-scale-wiggle dense
+    /// Hessian hook. Pins all six wiggle GEMMs (h_mm, h_ml, h_ll, h_mw_b,
+    /// h_mw_d, h_lw, h_ww — note the GLS wiggle only has a single
+    /// ls↔wiggle GEMM because σ-chain doesn't enter the wiggle term)
+    /// against the canonical-basis HVP path.
+    #[test]
+    fn gaussian_location_scale_wiggle_hessian_dense_matches_canonical_basis_hvp_path() {
+        let (family, states, specs, _xmu, _xls, _xw) = gls_wiggle_workspace_fixture();
+        let total = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+
+        let dense = workspace
+            .hessian_dense()
+            .expect("hessian_dense call")
+            .expect("hessian_dense present");
+        assert_eq!(dense.nrows(), total);
+        assert_eq!(dense.ncols(), total);
+
+        let mut assembled = Array2::<f64>::zeros((total, total));
+        for j in 0..total {
+            let mut e = Array1::<f64>::zeros(total);
+            e[j] = 1.0;
+            let col = workspace
+                .hessian_matvec(&e)
+                .expect("matvec call")
+                .expect("matvec present");
+            assembled.column_mut(j).assign(&col);
+        }
+        let assembled_sym = 0.5 * (&assembled + &assembled.t());
+
+        let max_rel = dense
+            .iter()
+            .zip(assembled_sym.iter())
+            .map(|(d, a)| ((d - a) / d.abs().max(a.abs()).max(1.0)).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_rel < 1e-12,
+            "GLSW hessian_dense vs canonical HVP max relative diff: {max_rel:.3e}"
+        );
+    }
+
+    /// Bit-equivalence guard for the binomial location-scale-wiggle dense
+    /// Hessian hook. Pins all eight wiggle GEMMs (h_tt, h_tl, h_ll,
+    /// h_tw_b, h_tw_d, h_lw_b, h_lw_d, h_ww) against the canonical-basis
+    /// HVP path.
+    #[test]
+    fn binomial_location_scale_wiggle_hessian_dense_matches_canonical_basis_hvp_path() {
+        let (family, states, specs, _xt, _xls, _xw) = bls_wiggle_workspace_fixture();
+        let total = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+
+        let dense = workspace
+            .hessian_dense()
+            .expect("hessian_dense call")
+            .expect("hessian_dense present");
+        assert_eq!(dense.nrows(), total);
+        assert_eq!(dense.ncols(), total);
+
+        let mut assembled = Array2::<f64>::zeros((total, total));
+        for j in 0..total {
+            let mut e = Array1::<f64>::zeros(total);
+            e[j] = 1.0;
+            let col = workspace
+                .hessian_matvec(&e)
+                .expect("matvec call")
+                .expect("matvec present");
+            assembled.column_mut(j).assign(&col);
+        }
+        let assembled_sym = 0.5 * (&assembled + &assembled.t());
+
+        let max_rel = dense
+            .iter()
+            .zip(assembled_sym.iter())
+            .map(|(d, a)| ((d - a) / d.abs().max(a.abs()).max(1.0)).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_rel < 1e-12,
+            "BLSW hessian_dense vs canonical HVP max relative diff: {max_rel:.3e}"
+        );
+    }
+
     #[test]
     fn gaussian_location_scale_workspace_dh_operator_matches_dense() {
         let (family, states, specs) = gls_workspace_fixture();
