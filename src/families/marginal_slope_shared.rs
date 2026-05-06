@@ -799,6 +799,69 @@ pub fn assert_outer_only(_opts: &crate::custom_family::BlockwiseFitOptions, _con
     // intentionally empty in Phase 1
 }
 
+/// Deterministic-order parallel reduction over a row-index slice.
+///
+/// Splits `rows` into a fixed number of contiguous chunks
+/// (`TARGET_CHUNK_COUNT`), processes each chunk sequentially in parallel
+/// via `process_row`, and combines the per-chunk accumulators in
+/// chunk-index order via `combine` on the calling thread. The chunk size
+/// is a pure function of `rows.len()`, so the reduction tree is fixed
+/// across calls regardless of rayon's thread-pool size or work-stealing
+/// decisions.
+///
+/// `try_fold/try_reduce` over `rows.into_par_iter()` does **not** have
+/// this property: rayon's adaptive splitter sets chunk boundaries based
+/// on `current_num_threads()` and runtime work-stealing, so two calls
+/// with identical inputs can return ULP-different floating-point sums
+/// when the rayon pool has different concurrent activity. Tests that
+/// compare two reductions and rely on bit-for-bit equality flake under
+/// load with that pattern. This primitive is the per-family deterministic
+/// row-reduction that the bernoulli / survival sigma-ψ paths funnel
+/// through; their per-row contributions are the dominant non-deterministic
+/// source in the marginal-slope outer-loop score / Hessian sums.
+pub(crate) fn chunked_row_reduction<Acc, Init, Process, Combine>(
+    rows: &[usize],
+    init: Init,
+    process_row: Process,
+    mut combine: Combine,
+) -> Result<Acc, String>
+where
+    Acc: Send,
+    Init: Fn() -> Acc + Sync,
+    Process: Fn(usize, &mut Acc) -> Result<(), String> + Sync,
+    Combine: FnMut(&mut Acc, Acc),
+{
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    const TARGET_CHUNK_COUNT: usize = 32;
+    let n = rows.len();
+    if n == 0 {
+        return Ok(init());
+    }
+    let chunk_size = n.div_ceil(TARGET_CHUNK_COUNT).max(1);
+    let n_chunks = n.div_ceil(chunk_size);
+    // `(0..n_chunks).into_par_iter()` is `IndexedParallelIterator`, so the
+    // `.collect::<Vec<_>>()` below preserves chunk-index order regardless
+    // of work-stealing. That ordered `Vec` is what makes the sequential
+    // `combine` deterministic.
+    let chunk_states: Vec<Acc> = (0..n_chunks)
+        .into_par_iter()
+        .map(|chunk_idx| -> Result<Acc, String> {
+            let start = chunk_idx * chunk_size;
+            let end = (start + chunk_size).min(n);
+            let mut acc = init();
+            for &row in &rows[start..end] {
+                process_row(row, &mut acc)?;
+            }
+            Ok(acc)
+        })
+        .collect::<Result<Vec<Acc>, String>>()?;
+    let mut total = init();
+    for chunk in chunk_states {
+        combine(&mut total, chunk);
+    }
+    Ok(total)
+}
+
 // ---------------------------------------------------------------------------
 // Phase 4: biobank-scale outer-score subsample auto-injection.
 //
