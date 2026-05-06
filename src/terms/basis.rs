@@ -13460,6 +13460,91 @@ fn build_matern_design_psi_aniso_derivatives(
     )
 }
 
+fn build_matern_aniso_primary_raw_derivative_matrices(
+    centers: ArrayView2<'_, f64>,
+    eta: &[f64],
+    length_scale: f64,
+    nu: MaternNu,
+) -> Result<(Vec<Array2<f64>>, Vec<Array2<f64>>), BasisError> {
+    let k = centers.nrows();
+    let dim = centers.ncols();
+    let row_blocks: Result<Vec<_>, BasisError> = (0..k)
+        .into_par_iter()
+        .map(|i| {
+            let ci: Vec<f64> = (0..dim).map(|a| centers[[i, a]]).collect();
+            let mut first_by_axis = vec![Vec::with_capacity(k - i); dim];
+            let mut second_diag_by_axis = vec![Vec::with_capacity(k - i); dim];
+            for j in i..k {
+                let cj: Vec<f64> = (0..dim).map(|a| centers[[j, a]]).collect();
+                let (r, s_vec) = aniso_distance_and_components(&ci, &cj, eta);
+                let (_, q, t, _, _) = matern_aniso_extended_radial_scalars(r, length_scale, nu)?;
+                for a in 0..dim {
+                    let s_a = s_vec[a];
+                    first_by_axis[a].push(q * s_a);
+                    second_diag_by_axis[a].push(2.0 * q * s_a + t * s_a * s_a);
+                }
+            }
+            Ok((first_by_axis, second_diag_by_axis))
+        })
+        .collect();
+
+    let row_blocks = row_blocks?;
+    let mut raw_first = vec![Array2::<f64>::zeros((k, k)); dim];
+    let mut raw_second_diag = vec![Array2::<f64>::zeros((k, k)); dim];
+    for (i, (first_by_axis, second_diag_by_axis)) in row_blocks.into_iter().enumerate() {
+        for (offset, j) in (i..k).enumerate() {
+            for a in 0..dim {
+                let d1 = first_by_axis[a][offset];
+                let d2 = second_diag_by_axis[a][offset];
+                raw_first[a][[i, j]] = d1;
+                raw_first[a][[j, i]] = d1;
+                raw_second_diag[a][[i, j]] = d2;
+                raw_second_diag[a][[j, i]] = d2;
+            }
+        }
+    }
+
+    Ok((raw_first, raw_second_diag))
+}
+
+fn build_matern_aniso_raw_cross_derivative_matrix(
+    centers: ArrayView2<'_, f64>,
+    eta: &[f64],
+    length_scale: f64,
+    nu: MaternNu,
+    axis_a: usize,
+    axis_b: usize,
+) -> Result<Array2<f64>, BasisError> {
+    let k = centers.nrows();
+    let dim = centers.ncols();
+    let row_blocks: Result<Vec<_>, BasisError> = (0..k)
+        .into_par_iter()
+        .map(|i| {
+            let ci: Vec<f64> = (0..dim).map(|ax| centers[[i, ax]]).collect();
+            let mut values = Vec::with_capacity(k - i);
+            for j in i..k {
+                let cj: Vec<f64> = (0..dim).map(|ax| centers[[j, ax]]).collect();
+                let (r, s_vec) = aniso_distance_and_components(&ci, &cj, eta);
+                let (_, _, t_val, _, _) =
+                    matern_aniso_extended_radial_scalars(r, length_scale, nu)?;
+                values.push(t_val * s_vec[axis_a] * s_vec[axis_b]);
+            }
+            Ok(values)
+        })
+        .collect();
+
+    let row_blocks = row_blocks?;
+    let mut raw_cross = Array2::<f64>::zeros((k, k));
+    for (i, values) in row_blocks.into_iter().enumerate() {
+        for (offset, j) in (i..k).enumerate() {
+            let value = values[offset];
+            raw_cross[[i, j]] = value;
+            raw_cross[[j, i]] = value;
+        }
+    }
+    Ok(raw_cross)
+}
+
 /// Build per-axis ψ_a derivatives for anisotropic Matérn terms, including
 /// both design-matrix and penalty derivatives.
 ///
@@ -13502,25 +13587,13 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         let total_cols = kernel_cols + usize::from(spec.include_intercept);
         let mut primary_first = vec![Array2::<f64>::zeros((total_cols, total_cols)); dim];
         let mut primary_second_diag = vec![Array2::<f64>::zeros((total_cols, total_cols)); dim];
-        let mut raw_first = vec![Array2::<f64>::zeros((k, k)); dim];
-        let mut raw_second_diag = vec![Array2::<f64>::zeros((k, k)); dim];
-        for i in 0..k {
-            let ci: Vec<f64> = (0..dim).map(|a| centers[[i, a]]).collect();
-            for j in i..k {
-                let cj: Vec<f64> = (0..dim).map(|a| centers[[j, a]]).collect();
-                let (r, s_vec) = aniso_distance_and_components(&ci, &cj, eta);
-                let (_, q, t, _, _) =
-                    matern_aniso_extended_radial_scalars(r, spec.length_scale, spec.nu)?;
-                for a in 0..dim {
-                    let d1 = q * s_vec[a];
-                    let d2 = 2.0 * q * s_vec[a] + t * s_vec[a] * s_vec[a];
-                    raw_first[a][[i, j]] = d1;
-                    raw_first[a][[j, i]] = d1;
-                    raw_second_diag[a][[i, j]] = d2;
-                    raw_second_diag[a][[j, i]] = d2;
-                }
-            }
-        }
+        let (mut raw_first, mut raw_second_diag) =
+            build_matern_aniso_primary_raw_derivative_matrices(
+                centers.view(),
+                eta,
+                spec.length_scale,
+                spec.nu,
+            )?;
         for a in 0..dim {
             // raw_first[a] / raw_second_diag[a] are dropped after this loop.
             // When there is no identifiability transform we previously cloned
@@ -13579,20 +13652,14 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
                 if a == b || b >= eta_owned.len() {
                     return Ok(Vec::new());
                 }
-                let mut raw_cross = Array2::<f64>::zeros((k, k));
-                for i in 0..k {
-                    let ci_v: Vec<f64> = (0..dim).map(|ax| centers_owned[[i, ax]]).collect();
-                    for j_idx in i..k {
-                        let cj_v: Vec<f64> =
-                            (0..dim).map(|ax| centers_owned[[j_idx, ax]]).collect();
-                        let (r, s_vec) = aniso_distance_and_components(&ci_v, &cj_v, &eta_owned);
-                        let (_, _, t_val, _, _) =
-                            matern_aniso_extended_radial_scalars(r, length_scale, nu)?;
-                        let val = t_val * s_vec[a] * s_vec[b];
-                        raw_cross[[i, j_idx]] = val;
-                        raw_cross[[j_idx, i]] = val;
-                    }
-                }
+                let raw_cross = build_matern_aniso_raw_cross_derivative_matrix(
+                    centers_owned.view(),
+                    &eta_owned,
+                    length_scale,
+                    nu,
+                    a,
+                    b,
+                )?;
                 let projected: Array2<f64> = if let Some(z) = z_owned.as_ref() {
                     z.t().dot(&raw_cross).dot(z)
                 } else {
