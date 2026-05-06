@@ -8357,7 +8357,16 @@ impl DenseSpectralOperator {
 
     #[inline]
     fn projected_operator(&self, factor: &Array2<f64>, op: &dyn HyperOperator) -> Array2<f64> {
-        op.projected_matrix(factor)
+        let start = std::time::Instant::now();
+        let result = op.projected_matrix(factor);
+        log::info!(
+            "[STAGE] DenseSpectralOperator::projected_operator dim={} rank={} implicit={} elapsed={:.3}s",
+            self.n_dim,
+            factor.ncols(),
+            op.is_implicit(),
+            start.elapsed().as_secs_f64(),
+        );
+        result
     }
 
     #[inline]
@@ -8447,7 +8456,16 @@ impl HessianOperator for DenseSpectralOperator {
     }
 
     fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
-        op.trace_projected_factor_cached(&self.w_factor, &self.projected_factor_cache)
+        let start = std::time::Instant::now();
+        let result = op.trace_projected_factor_cached(&self.w_factor, &self.projected_factor_cache);
+        log::info!(
+            "[STAGE] DenseSpectralOperator::trace_hinv_operator dim={} rank={} implicit={} elapsed={:.3}s",
+            self.n_dim,
+            self.w_factor.ncols(),
+            op.is_implicit(),
+            start.elapsed().as_secs_f64(),
+        );
+        result
     }
 
     fn trace_hinv_matrix_operator_cross(
@@ -8465,12 +8483,23 @@ impl HessianOperator for DenseSpectralOperator {
         left: &dyn HyperOperator,
         right: &dyn HyperOperator,
     ) -> f64 {
+        let start = std::time::Instant::now();
         let left_proj = self.projected_operator(&self.w_factor, left);
-        if std::ptr::addr_eq(left, right) {
-            return self.trace_projected_cross(&left_proj, &left_proj);
-        }
-        let right_proj = self.projected_operator(&self.w_factor, right);
-        self.trace_projected_cross(&left_proj, &right_proj)
+        let result = if std::ptr::addr_eq(left, right) {
+            self.trace_projected_cross(&left_proj, &left_proj)
+        } else {
+            let right_proj = self.projected_operator(&self.w_factor, right);
+            self.trace_projected_cross(&left_proj, &right_proj)
+        };
+        log::info!(
+            "[STAGE] DenseSpectralOperator::trace_hinv_operator_cross dim={} rank={} left_implicit={} right_implicit={} elapsed={:.3}s",
+            self.n_dim,
+            self.w_factor.ncols(),
+            left.is_implicit(),
+            right.is_implicit(),
+            start.elapsed().as_secs_f64(),
+        );
+        result
     }
 
     fn trace_logdet_gradient(&self, a: &Array2<f64>) -> f64 {
@@ -8581,7 +8610,16 @@ impl HessianOperator for DenseSpectralOperator {
     }
 
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
-        op.trace_projected_factor_cached(&self.g_factor, &self.projected_factor_cache)
+        let start = std::time::Instant::now();
+        let result = op.trace_projected_factor_cached(&self.g_factor, &self.projected_factor_cache);
+        log::info!(
+            "[STAGE] DenseSpectralOperator::trace_logdet_operator dim={} rank={} implicit={} elapsed={:.3}s",
+            self.n_dim,
+            self.g_factor.ncols(),
+            op.is_implicit(),
+            start.elapsed().as_secs_f64(),
+        );
+        result
     }
 
     fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {
