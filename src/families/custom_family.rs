@@ -6605,6 +6605,49 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
                 }
             },
         );
+        let family_owned = family.clone();
+        let states_owned = block_states.to_vec();
+        let specs_owned = specs.to_vec();
+        let owned_compute_dh =
+            Arc::new(
+                move |v_k: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
+                    match family_owned
+                        .joint_outer_hyper_surrogate_hessian_directional_derivative_with_specs(
+                            &states_owned,
+                            &specs_owned,
+                            v_k,
+                        )? {
+                        Some(h) => Ok(Some(DriftDerivResult::Dense(symmetrized_square_matrix(
+                            h,
+                            total,
+                            "joint surrogate dH shape mismatch",
+                        )?))),
+                        None => Err("joint surrogate dH unavailable for analytic outer gradient"
+                            .to_string()),
+                    }
+                },
+            );
+        let family_owned = family.clone();
+        let states_owned = block_states.to_vec();
+        let specs_owned = specs.to_vec();
+        let owned_compute_d2h = Arc::new(
+            move |u: &Array1<f64>, v: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
+                match family_owned
+                    .joint_outer_hyper_surrogate_hessian_second_directional_derivative_with_specs(
+                        &states_owned,
+                        &specs_owned,
+                        u,
+                        v,
+                    )? {
+                    Some(m) => Ok(Some(DriftDerivResult::Dense(symmetrized_square_matrix(
+                        m,
+                        total,
+                        "joint surrogate d2H shape mismatch",
+                    )?))),
+                    None => Ok(None),
+                }
+            },
+        );
         return Ok(Some(JointHessianBundle {
             source: JointHessianSource::Dense(h_joint_unpen),
             beta_flat,
@@ -9946,8 +9989,8 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                 family.pseudo_logdet_mode(),
                 compute_dh.as_ref(),
                 compute_d2h.as_ref(),
-                None,
-                None,
+                Some(owned_compute_dh),
+                Some(owned_compute_d2h),
                 None,
             )
         } else {
@@ -11401,6 +11444,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         owned_compute_d2h: _,
                         rho_curvature_scale,
                         hessian_logdet_correction,
+                        ..
                     } = joint_bundle_value_only;
                     let value_only = joint_outer_evaluate(
                         &inner,
