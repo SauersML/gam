@@ -1554,93 +1554,105 @@ pub fn precompute_reparam_invariant_from_canonical(
         col_range: Range<usize>,
         q_pen_local: Array2<f64>,  // block_dim × pen_rank
         q_null_local: Array2<f64>, // block_dim × null_rank
+        /// Largest balanced eigenvalue contributed by this block.
+        max_balanced_eigenvalue: f64,
         /// Column offset of this block's penalized directions within global Q_pen.
         pen_col_offset: usize,
         /// Column offset of this block's null directions within global Q_null.
         null_col_offset: usize,
     }
 
-    let mut block_results = Vec::with_capacity(block_groups.len());
-    let mut global_max_bal = 0.0_f64;
+    // BTreeMap iteration defines the deterministic block order; collecting the
+    // indexed parallel iterator preserves that order while eigendecomposing each
+    // independent canonical penalty block concurrently.
+    let block_specs: Vec<_> = block_groups.iter().collect();
+    let mut block_results: Vec<BlockResult> = block_specs
+        .into_par_iter()
+        .map(
+            |(&(start, end), refs)| -> Result<BlockResult, EstimationError> {
+                let block_dim = end - start;
 
-    for (&(start, end), refs) in &block_groups {
-        let block_dim = end - start;
-
-        // Build local balanced sum.
-        let mut s_balanced_local = Array2::zeros((block_dim, block_dim));
-        let mut block_has_nonzero = false;
-        for pref in refs {
-            let cp = &penalties[pref.penalty_index];
-            let local = cp.local_ref();
-            let frob_norm = local.iter().map(|&x| x * x).sum::<f64>().sqrt();
-            if frob_norm > 1e-12 {
-                s_balanced_local.scaled_add(1.0 / frob_norm, local);
-                block_has_nonzero = true;
-            }
-        }
-
-        if !block_has_nonzero {
-            block_results.push(BlockResult {
-                col_range: start..end,
-                q_pen_local: Array2::zeros((block_dim, 0)),
-                q_null_local: Array2::eye(block_dim),
-                pen_col_offset: 0,  // set later
-                null_col_offset: 0, // set later
-            });
-            continue;
-        }
-
-        // Eigendecompose the local balanced penalty.
-        let (bal_eigenvalues, bal_eigenvectors) =
-            robust_eigh(&s_balanced_local, Side::Lower, "balanced penalty block")?;
-
-        let mut order: Vec<usize> = (0..block_dim).collect();
-        order.sort_by(|&i, &j| {
-            bal_eigenvalues[j]
-                .partial_cmp(&bal_eigenvalues[i])
-                .unwrap_or(Ordering::Equal)
-                .then(i.cmp(&j))
-        });
-
-        let max_bal = order
-            .iter()
-            .map(|&idx| bal_eigenvalues[idx].abs())
-            .fold(0.0_f64, f64::max);
-        let rank_tol = if max_bal > 0.0 {
-            max_bal * 1e-12
-        } else {
-            1e-12
-        };
-        let penalized_rank = order
-            .iter()
-            .take_while(|&&idx| bal_eigenvalues[idx] > rank_tol)
-            .count();
-        let null_count = block_dim - penalized_rank;
-
-        let mut q_pen_local = Array2::zeros((block_dim, penalized_rank));
-        let mut q_null_local = Array2::zeros((block_dim, null_count));
-        for (col_idx, &idx) in order.iter().enumerate() {
-            if col_idx < penalized_rank {
-                for row in 0..block_dim {
-                    q_pen_local[[row, col_idx]] = bal_eigenvectors[[row, idx]];
+                // Build local balanced sum.
+                let mut s_balanced_local = Array2::zeros((block_dim, block_dim));
+                let mut block_has_nonzero = false;
+                for pref in refs {
+                    let cp = &penalties[pref.penalty_index];
+                    let local = cp.local_ref();
+                    let frob_norm = local.iter().map(|&x| x * x).sum::<f64>().sqrt();
+                    if frob_norm > 1e-12 {
+                        s_balanced_local.scaled_add(1.0 / frob_norm, local);
+                        block_has_nonzero = true;
+                    }
                 }
-            } else {
-                let null_col = col_idx - penalized_rank;
-                for row in 0..block_dim {
-                    q_null_local[[row, null_col]] = bal_eigenvectors[[row, idx]];
-                }
-            }
-        }
 
-        global_max_bal = global_max_bal.max(max_bal);
-        block_results.push(BlockResult {
-            col_range: start..end,
-            q_pen_local,
-            q_null_local,
-            pen_col_offset: 0,  // set later
-            null_col_offset: 0, // set later
-        });
-    }
+                if !block_has_nonzero {
+                    return Ok(BlockResult {
+                        col_range: start..end,
+                        q_pen_local: Array2::zeros((block_dim, 0)),
+                        q_null_local: Array2::eye(block_dim),
+                        max_balanced_eigenvalue: 0.0,
+                        pen_col_offset: 0,  // set later
+                        null_col_offset: 0, // set later
+                    });
+                }
+
+                // Eigendecompose the local balanced penalty.
+                let (bal_eigenvalues, bal_eigenvectors) =
+                    robust_eigh(&s_balanced_local, Side::Lower, "balanced penalty block")?;
+
+                let mut order: Vec<usize> = (0..block_dim).collect();
+                order.sort_by(|&i, &j| {
+                    bal_eigenvalues[j]
+                        .partial_cmp(&bal_eigenvalues[i])
+                        .unwrap_or(Ordering::Equal)
+                        .then(i.cmp(&j))
+                });
+
+                let max_bal = order
+                    .iter()
+                    .map(|&idx| bal_eigenvalues[idx].abs())
+                    .fold(0.0_f64, f64::max);
+                let rank_tol = if max_bal > 0.0 {
+                    max_bal * 1e-12
+                } else {
+                    1e-12
+                };
+                let penalized_rank = order
+                    .iter()
+                    .take_while(|&&idx| bal_eigenvalues[idx] > rank_tol)
+                    .count();
+                let null_count = block_dim - penalized_rank;
+
+                let mut q_pen_local = Array2::zeros((block_dim, penalized_rank));
+                let mut q_null_local = Array2::zeros((block_dim, null_count));
+                for (col_idx, &idx) in order.iter().enumerate() {
+                    if col_idx < penalized_rank {
+                        for row in 0..block_dim {
+                            q_pen_local[[row, col_idx]] = bal_eigenvectors[[row, idx]];
+                        }
+                    } else {
+                        let null_col = col_idx - penalized_rank;
+                        for row in 0..block_dim {
+                            q_null_local[[row, null_col]] = bal_eigenvectors[[row, idx]];
+                        }
+                    }
+                }
+
+                Ok(BlockResult {
+                    col_range: start..end,
+                    q_pen_local,
+                    q_null_local,
+                    max_balanced_eigenvalue: max_bal,
+                    pen_col_offset: 0,  // set later
+                    null_col_offset: 0, // set later
+                })
+            },
+        )
+        .collect::<Result<_, _>>()?;
+    let global_max_bal = block_results
+        .iter()
+        .map(|br| br.max_balanced_eigenvalue)
+        .fold(0.0_f64, f64::max);
 
     // Compute column offsets for each block in the global Q_pen / Q_null layout.
     let total_pen_rank: usize = block_results.iter().map(|br| br.q_pen_local.ncols()).sum();
