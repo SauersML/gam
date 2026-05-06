@@ -7274,13 +7274,12 @@ impl CustomFamily for TransformationNormalFamily {
     fn exact_newton_joint_psi_workspace(
         &self,
         block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
+        _specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
         Ok(Some(Arc::new(TransformationNormalPsiWorkspace::new(
             self.clone(),
             block_states.to_vec(),
-            specs.to_vec(),
             derivative_blocks.to_vec(),
         ))))
     }
@@ -7288,7 +7287,7 @@ impl CustomFamily for TransformationNormalFamily {
     fn exact_newton_joint_psi_workspace_with_options(
         &self,
         block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
+        _specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
         _options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
@@ -7299,7 +7298,6 @@ impl CustomFamily for TransformationNormalFamily {
         Ok(Some(Arc::new(TransformationNormalPsiWorkspace::new(
             self.clone(),
             block_states.to_vec(),
-            specs.to_vec(),
             derivative_blocks.to_vec(),
         ))))
     }
@@ -12083,6 +12081,116 @@ mod tests {
         }
     }
 
+    /// Direct kernel-level bit-equivalence guard for the fused all-axes
+    /// projected-trace path (Fix #2). Compares
+    /// [`scop_psi_hessian_trace_factor_all_axes_chunk_from_cov`] called once
+    /// with every ψ axis's `cov_psi` against
+    /// [`scop_psi_hessian_trace_factor_from_cov`] called once per axis. Both
+    /// kernels accumulate over the same rows in the same parallel rayon
+    /// reduction tree, so the fused output must equal the per-axis output to
+    /// well within any reasonable floating-point reduction tolerance.
+    #[test]
+    fn ctn_psi_hessian_trace_all_axes_matches_per_axis_path_bit_equivalent() {
+        let psi = array![0.15, -0.10];
+        let (family, derivative_blocks, state, _spec) = toy_family_and_derivatives(&psi);
+        let n_psi = derivative_blocks[0].len();
+        assert!(
+            n_psi >= 2,
+            "toy CTN fixture must expose at least 2 ψ axes for the fused trace check, got {n_psi}"
+        );
+
+        let row_quantities = family
+            .row_quantities(&state.beta)
+            .expect("toy CTN row quantities");
+
+        // Build a non-trivial dense factor so every block of the ψ-Hessian
+        // contributes to the projected trace. Three columns exercise both the
+        // diagonal and off-diagonal Kronecker structure.
+        let p_total = state.beta.len();
+        let rank = 3;
+        let mut factor = Array2::<f64>::zeros((p_total, rank));
+        for col in 0..rank {
+            let seed = 17_001_u64.wrapping_add(col as u64 * 13_337);
+            factor
+                .column_mut(col)
+                .assign(&toy_probe_vector(p_total, seed));
+        }
+
+        // Materialise covariate and per-axis cov_psi over the full row range.
+        let cov_arc = family
+            .covariate_dense_arc()
+            .expect("toy CTN covariate dense");
+        let cov: &Array2<f64> = cov_arc.as_ref();
+        let block_derivs = &derivative_blocks[0];
+        let op_arc = block_derivs[0]
+            .implicit_operator
+            .as_ref()
+            .expect("toy CTN ψ operator")
+            .clone();
+        let op = op_arc
+            .as_any()
+            .downcast_ref::<TensorKroneckerPsiOperator>()
+            .expect("toy CTN ψ operator must be tensor-backed");
+        let mut cov_psi_arrays: Vec<Array2<f64>> = Vec::with_capacity(n_psi);
+        for deriv in block_derivs.iter() {
+            cov_psi_arrays.push(
+                op.materialize_cov_first_axis(deriv.implicit_axis)
+                    .expect("toy CTN ψ cov derivative materialise"),
+            );
+        }
+        let cov_psi_views: Vec<ArrayView2<'_, f64>> =
+            cov_psi_arrays.iter().map(|m| m.view()).collect();
+
+        // Per-axis ground truth: invoke the legacy single-axis kernel n_psi
+        // times.
+        let per_axis_traces: Vec<f64> = (0..n_psi)
+            .map(|axis_idx| {
+                family
+                    .scop_psi_hessian_trace_factor_from_cov(
+                        &state.beta,
+                        &row_quantities,
+                        block_derivs[axis_idx].implicit_axis,
+                        cov,
+                        &cov_psi_arrays[axis_idx],
+                        factor.view(),
+                    )
+                    .expect("per-axis ψ projected trace")
+            })
+            .collect();
+
+        // Fused all-axes pass: a single row-streaming traversal across every
+        // axis. Calling the chunked kernel with `row_start=0` and the full-n
+        // covariate views is equivalent to streaming a single chunk that
+        // covers the entire dataset.
+        let fused_traces = family
+            .scop_psi_hessian_trace_factor_all_axes_chunk_from_cov(
+                &state.beta,
+                &row_quantities,
+                0,
+                cov.view(),
+                &cov_psi_views,
+                factor.view(),
+            )
+            .expect("fused all-axes ψ projected trace");
+
+        assert_eq!(
+            per_axis_traces.len(),
+            fused_traces.len(),
+            "per-axis vs fused trace length mismatch"
+        );
+        for (axis_idx, (&per_axis, &fused)) in
+            per_axis_traces.iter().zip(fused_traces.iter()).enumerate()
+        {
+            let scale = per_axis.abs().max(fused.abs()).max(1.0);
+            let abs_diff = (per_axis - fused).abs();
+            let rel_diff = abs_diff / scale;
+            assert!(
+                rel_diff < 1.0e-12,
+                "axis {axis_idx}: per-axis kernel = {per_axis:.6e}, fused kernel = {fused:.6e}, |Δ| = {abs_diff:.3e}, rel = {rel_diff:.3e}"
+            );
+        }
+    }
+
     #[test]
     fn ctn_psi_workspace_second_order_matches_per_pair_path() {
         let psi = array![0.15, -0.10];
@@ -12288,7 +12396,7 @@ mod tests {
         };
 
         let beta_plus = &state.beta + &(direction.clone() * h);
-        let beta_minus = &state.beta - &(direction * h);
+        let beta_minus = &state.beta - &(direction.clone() * h);
         let fd = (eval_hess(&beta_plus) - eval_hess(&beta_minus)) / (2.0 * h);
         assert_matrix_derivativefd(
             &fd,
@@ -13662,7 +13770,6 @@ struct TransformationNormalPsiWorkspacePairCacheEntry {
 struct TransformationNormalPsiWorkspace {
     family: TransformationNormalFamily,
     block_states: Vec<ParameterBlockState>,
-    specs: Vec<ParameterBlockSpec>,
     derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
     cache: Mutex<Option<Vec<TransformationNormalPsiWorkspaceCacheEntry>>>,
     pair_cache:
@@ -13673,13 +13780,11 @@ impl TransformationNormalPsiWorkspace {
     fn new(
         family: TransformationNormalFamily,
         block_states: Vec<ParameterBlockState>,
-        specs: Vec<ParameterBlockSpec>,
         derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
     ) -> Self {
         Self {
             family,
             block_states,
-            specs,
             derivative_blocks,
             cache: Mutex::new(None),
             pair_cache: Mutex::new(None),
