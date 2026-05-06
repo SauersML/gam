@@ -2999,6 +2999,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     // (dense for small work, operator HVP for large work) instead of routing to
     // gradient-only BFGS by observation count.
 
+
     let SelectedWiggleBasis {
         knots: wiggle_knots,
         degree: wiggle_degree,
@@ -10789,6 +10790,271 @@ impl BinomialMeanWiggleFamily {
         }
         Ok(None)
     }
+
+    fn bmw_static_hessian_operator(
+        &self,
+        block_states: &[ParameterBlockState],
+        x_eta_arc: Arc<Array2<f64>>,
+    ) -> Result<Arc<RowCoeffOperator>, String> {
+        if block_states.len() != 2 {
+            return Err(format!(
+                "BinomialMeanWiggleFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let eta = &block_states[Self::BLOCK_ETA].eta;
+        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
+        let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
+        let n = self.y.len();
+        if eta.len() != n || etaw.len() != n || self.weights.len() != n {
+            return Err("BinomialMeanWiggleFamily input size mismatch".to_string());
+        }
+        let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
+        let p_eta = x_eta_arc.ncols();
+        let pw = geom.basis.ncols();
+        let mut coeff_eta = Array1::<f64>::zeros(n);
+        let mut coeff_etaw_b = Array1::<f64>::zeros(n);
+        let mut coeff_etaw_d1 = Array1::<f64>::zeros(n);
+        let mut coeff_ww = Array1::<f64>::zeros(n);
+        for row in 0..n {
+            let q = eta[row] + etaw[row];
+            let (m1, m2, _) = self.neglog_q_derivatives(self.y[row], self.weights[row], q)?;
+            let a = geom.dq_dq0[row];
+            let b = geom.d2q_dq02[row];
+            coeff_eta[row] = hessian_coeff_fromobjective_q_terms(m1, m2, a, a, b);
+            coeff_etaw_b[row] = m2 * a;
+            coeff_etaw_d1[row] = m1;
+            coeff_ww[row] = m2;
+        }
+        Ok(Arc::new(RowCoeffOperator::from_directions(
+            vec![p_eta, pw],
+            vec![
+                (0, x_eta_arc),
+                (1, Arc::new(geom.basis)),
+                (1, Arc::new(geom.basis_d1)),
+            ],
+            vec![
+                (0, 0, coeff_eta),
+                (0, 1, coeff_etaw_b),
+                (0, 2, coeff_etaw_d1),
+                (1, 1, coeff_ww),
+            ],
+            n,
+        )))
+    }
+
+    fn bmw_directional_operator(
+        &self,
+        block_states: &[ParameterBlockState],
+        x_eta_arc: Arc<Array2<f64>>,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    {
+        if block_states.len() != 2 {
+            return Err(format!(
+                "BinomialMeanWiggleFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let eta = &block_states[Self::BLOCK_ETA].eta;
+        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
+        let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
+        let n = self.y.len();
+        if eta.len() != n || etaw.len() != n || self.weights.len() != n {
+            return Err("BinomialMeanWiggleFamily input size mismatch".to_string());
+        }
+        let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
+        let p_eta = x_eta_arc.ncols();
+        let pw = geom.basis.ncols();
+        let total = p_eta + pw;
+        if d_beta_flat.len() != total {
+            return Err(format!(
+                "BinomialMeanWiggleFamily joint d_beta length mismatch: got {}, expected {}",
+                d_beta_flat.len(),
+                total
+            ));
+        }
+        let u_eta = d_beta_flat.slice(s![0..p_eta]).to_owned();
+        let uw = d_beta_flat.slice(s![p_eta..total]).to_owned();
+        let xi = fast_av(x_eta_arc.as_ref(), &u_eta);
+        let phi = fast_av(&geom.basis, &uw);
+        let basis1_u = fast_av(&geom.basis_d1, &uw);
+        let basis2_u = fast_av(&geom.basis_d2, &uw);
+
+        let mut coeff_eta = Array1::<f64>::zeros(n);
+        let mut coeff_etaw_b = Array1::<f64>::zeros(n);
+        let mut coeff_etaw_d1 = Array1::<f64>::zeros(n);
+        let mut coeff_etaw_d2 = Array1::<f64>::zeros(n);
+        let mut coeff_ww_bb = Array1::<f64>::zeros(n);
+        let mut coeff_ww_db = Array1::<f64>::zeros(n);
+        for row in 0..n {
+            let q = eta[row] + etaw[row];
+            let (m1, m2, m3) = self.neglog_q_derivatives(self.y[row], self.weights[row], q)?;
+            let a = geom.dq_dq0[row];
+            let b = geom.d2q_dq02[row];
+            let c = geom.d3q_dq03[row];
+            let q_u = a * xi[row] + phi[row];
+            let a_u = b * xi[row] + basis1_u[row];
+            let b_u = c * xi[row] + basis2_u[row];
+            coeff_eta[row] = directionalhessian_coeff_fromobjective_q_terms(
+                m1, m2, m3, q_u, a, a, b, a_u, a_u, b_u,
+            );
+            coeff_etaw_b[row] = m3 * q_u * a + m2 * a_u;
+            coeff_etaw_d1[row] = m2 * (a * xi[row] + q_u);
+            coeff_etaw_d2[row] = m1 * xi[row];
+            coeff_ww_bb[row] = m3 * q_u;
+            coeff_ww_db[row] = m2 * xi[row];
+        }
+        Ok(Some(Arc::new(RowCoeffOperator::from_directions(
+            vec![p_eta, pw],
+            vec![
+                (0, x_eta_arc),
+                (1, Arc::new(geom.basis)),
+                (1, Arc::new(geom.basis_d1)),
+                (1, Arc::new(geom.basis_d2)),
+            ],
+            vec![
+                (0, 0, coeff_eta),
+                (0, 1, coeff_etaw_b),
+                (0, 2, coeff_etaw_d1),
+                (0, 3, coeff_etaw_d2),
+                (1, 1, coeff_ww_bb),
+                (1, 2, coeff_ww_db),
+            ],
+            n,
+        ))))
+    }
+
+    fn bmw_second_directional_operator(
+        &self,
+        block_states: &[ParameterBlockState],
+        x_eta_arc: Arc<Array2<f64>>,
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    {
+        if block_states.len() != 2 {
+            return Err(format!(
+                "BinomialMeanWiggleFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let eta = &block_states[Self::BLOCK_ETA].eta;
+        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
+        let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
+        let n = self.y.len();
+        if eta.len() != n || etaw.len() != n || self.weights.len() != n {
+            return Err("BinomialMeanWiggleFamily input size mismatch".to_string());
+        }
+        let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
+        let p_eta = x_eta_arc.ncols();
+        let pw = geom.basis.ncols();
+        let total = p_eta + pw;
+        if d_beta_u_flat.len() != total || d_beta_v_flat.len() != total {
+            return Err(format!(
+                "BinomialMeanWiggleFamily joint second d_beta length mismatch: got {} and {}, expected {}",
+                d_beta_u_flat.len(),
+                d_beta_v_flat.len(),
+                total
+            ));
+        }
+        let u_eta = d_beta_u_flat.slice(s![0..p_eta]).to_owned();
+        let v_eta = d_beta_v_flat.slice(s![0..p_eta]).to_owned();
+        let uw = d_beta_u_flat.slice(s![p_eta..total]).to_owned();
+        let vw = d_beta_v_flat.slice(s![p_eta..total]).to_owned();
+
+        let xi_u = fast_av(x_eta_arc.as_ref(), &u_eta);
+        let xi_v = fast_av(x_eta_arc.as_ref(), &v_eta);
+        let phi_u = fast_av(&geom.basis, &uw);
+        let phi_v = fast_av(&geom.basis, &vw);
+        let b1u = fast_av(&geom.basis_d1, &uw);
+        let b1v = fast_av(&geom.basis_d1, &vw);
+        let b2u = fast_av(&geom.basis_d2, &uw);
+        let b2v = fast_av(&geom.basis_d2, &vw);
+        let b3u = fast_av(&geom.basis_d3, &uw);
+        let b3v = fast_av(&geom.basis_d3, &vw);
+
+        let mut coeff_eta = Array1::<f64>::zeros(n);
+        let mut coeff_etaw_b = Array1::<f64>::zeros(n);
+        let mut coeff_etaw_d1 = Array1::<f64>::zeros(n);
+        let mut coeff_etaw_d2 = Array1::<f64>::zeros(n);
+        let mut coeff_etaw_d3 = Array1::<f64>::zeros(n);
+        let mut coeff_ww_bb = Array1::<f64>::zeros(n);
+        let mut coeff_ww_db = Array1::<f64>::zeros(n);
+        let mut coeff_ww_ddb = Array1::<f64>::zeros(n);
+        let mut coeff_ww_dd = Array1::<f64>::zeros(n);
+
+        for row in 0..n {
+            let q = eta[row] + etaw[row];
+            let (m1, m2, m3) = self.neglog_q_derivatives(self.y[row], self.weights[row], q)?;
+            let m4 = self.neglog_q_fourth_derivative(self.y[row], self.weights[row], q)?;
+            let a = geom.dq_dq0[row];
+            let b = geom.d2q_dq02[row];
+            let c = geom.d3q_dq03[row];
+            let d = geom.d4q_dq04[row];
+
+            let q_u = a * xi_u[row] + phi_u[row];
+            let a_u = b * xi_u[row] + b1u[row];
+            let b_u = c * xi_u[row] + b2u[row];
+            let q_v = a * xi_v[row] + phi_v[row];
+            let a_v = b * xi_v[row] + b1v[row];
+            let b_v = c * xi_v[row] + b2v[row];
+            let q_uv = b * xi_u[row] * xi_v[row] + b1u[row] * xi_v[row] + b1v[row] * xi_u[row];
+            let a_uv = c * xi_u[row] * xi_v[row] + b2u[row] * xi_v[row] + b2v[row] * xi_u[row];
+            let b_uv = d * xi_u[row] * xi_v[row] + b3u[row] * xi_v[row] + b3v[row] * xi_u[row];
+
+            coeff_eta[row] = second_directionalhessian_coeff_fromobjective_q_terms(
+                m1, m2, m3, m4, q_u, q_v, q_uv, a, a, b, a_u, a_v, a_u, a_v, a_uv, a_uv, b_u, b_v,
+                b_uv,
+            );
+            let d2_c_b = m4 * q_u * q_v * a + m3 * (q_uv * a + q_u * a_v + q_v * a_u) + m2 * a_uv;
+            let dc_b_u = m3 * q_u * a + m2 * a_u;
+            let dc_b_v = m3 * q_v * a + m2 * a_v;
+            let c_b_static = m2 * a;
+            let d2_c_b1 = m3 * q_u * q_v + m2 * q_uv;
+            let dc_b1_u = m2 * q_u;
+            let dc_b1_v = m2 * q_v;
+
+            coeff_etaw_b[row] = d2_c_b;
+            coeff_etaw_d1[row] = dc_b_u * xi_v[row] + dc_b_v * xi_u[row] + d2_c_b1;
+            coeff_etaw_d2[row] =
+                c_b_static * xi_u[row] * xi_v[row] + dc_b1_u * xi_v[row] + dc_b1_v * xi_u[row];
+            coeff_etaw_d3[row] = m1 * xi_u[row] * xi_v[row];
+
+            let dw = m2;
+            let dw_u = m3 * q_u;
+            let dw_v = m3 * q_v;
+            let dw_uv = m4 * q_u * q_v + m3 * q_uv;
+            let xixj = xi_u[row] * xi_v[row];
+            coeff_ww_bb[row] = dw_uv;
+            coeff_ww_db[row] = dw_v * xi_u[row] + dw_u * xi_v[row];
+            coeff_ww_ddb[row] = dw * xixj;
+            coeff_ww_dd[row] = 2.0 * dw * xixj;
+        }
+
+        Ok(Some(Arc::new(RowCoeffOperator::from_directions(
+            vec![p_eta, pw],
+            vec![
+                (0, x_eta_arc),
+                (1, Arc::new(geom.basis)),
+                (1, Arc::new(geom.basis_d1)),
+                (1, Arc::new(geom.basis_d2)),
+                (1, Arc::new(geom.basis_d3)),
+            ],
+            vec![
+                (0, 0, coeff_eta),
+                (0, 1, coeff_etaw_b),
+                (0, 2, coeff_etaw_d1),
+                (0, 3, coeff_etaw_d2),
+                (0, 4, coeff_etaw_d3),
+                (1, 1, coeff_ww_bb),
+                (1, 2, coeff_ww_db),
+                (1, 3, coeff_ww_ddb),
+                (2, 2, coeff_ww_dd),
+            ],
+            n,
+        ))))
+    }
 }
 
 impl CustomFamily for BinomialMeanWiggleFamily {
@@ -10797,11 +11063,14 @@ impl CustomFamily for BinomialMeanWiggleFamily {
     }
 
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
-        // Mean and link-wiggle blocks couple through the binomial weight,
-        // giving a dense joint Hessian of size (p_μ + p_w)² per row. This
-        // family does not yet expose a matrix-free joint workspace, so the
-        // honest per-evaluation cost remains the dense build.
-        crate::custom_family::joint_coupled_coefficient_hessian_cost(self.y.len() as u64, specs)
+        // The mean-wiggle Hessian is exposed as a row-coefficient operator,
+        // so the hot representation cost is one Θ(n · (p_eta + p_w)) HVP
+        // rather than dense Θ(n · (p_eta + p_w)^2) assembly.
+        let p_total = specs
+            .iter()
+            .map(|s| s.design.ncols() as u64)
+            .fold(0u64, |acc, p| acc.saturating_add(p));
+        (self.y.len() as u64).saturating_mul(p_total.max(1))
     }
 
     fn block_linear_constraints(
@@ -10936,6 +11205,21 @@ impl CustomFamily for BinomialMeanWiggleFamily {
     }
 
     fn block_geometry_is_dynamic(&self) -> bool {
+        true
+    }
+
+    fn exact_newton_joint_hessian_workspace(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        let x_eta = self.dense_eta_design_fromspecs(specs)?.into_owned();
+        let workspace =
+            BinomialMeanWiggleHessianWorkspace::new(self.clone(), block_states.to_vec(), x_eta)?;
+        Ok(Some(Arc::new(workspace)))
+    }
+
+    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
         true
     }
 
@@ -11587,6 +11871,83 @@ impl CustomFamily for BinomialMeanWiggleFamily {
             ),
             hessian_psi_operator: None,
         }))
+    }
+}
+
+struct BinomialMeanWiggleHessianWorkspace {
+    family: BinomialMeanWiggleFamily,
+    block_states: Vec<ParameterBlockState>,
+    x_eta: Arc<Array2<f64>>,
+    hessian_operator: Arc<RowCoeffOperator>,
+}
+
+impl BinomialMeanWiggleHessianWorkspace {
+    fn new(
+        family: BinomialMeanWiggleFamily,
+        block_states: Vec<ParameterBlockState>,
+        x_eta: Array2<f64>,
+    ) -> Result<Self, String> {
+        let x_eta = Arc::new(x_eta);
+        let hessian_operator = family.bmw_static_hessian_operator(&block_states, x_eta.clone())?;
+        Ok(Self {
+            family,
+            block_states,
+            x_eta,
+            hessian_operator,
+        })
+    }
+}
+
+impl ExactNewtonJointHessianWorkspace for BinomialMeanWiggleHessianWorkspace {
+    fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
+        Ok(Some(
+            crate::solver::estimate::reml::unified::HyperOperator::mul_vec(
+                self.hessian_operator.as_ref(),
+                v,
+            ),
+        ))
+    }
+
+    fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
+        Ok(None)
+    }
+
+    fn directional_derivative(
+        &self,
+        _d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        Ok(None)
+    }
+
+    fn directional_derivative_operator(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    {
+        self.family
+            .bmw_directional_operator(&self.block_states, self.x_eta.clone(), d_beta_flat)
+    }
+
+    fn second_directional_derivative(
+        &self,
+        _d_beta_u_flat: &Array1<f64>,
+        _d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        Ok(None)
+    }
+
+    fn second_directional_derivative_operator(
+        &self,
+        d_beta_u: &Array1<f64>,
+        d_beta_v: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    {
+        self.family.bmw_second_directional_operator(
+            &self.block_states,
+            self.x_eta.clone(),
+            d_beta_u,
+            d_beta_v,
+        )
     }
 }
 
@@ -26258,5 +26619,193 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn binomial_mean_wiggle_operator_fixture() -> (
+        BinomialMeanWiggleFamily,
+        Vec<ParameterBlockState>,
+        Vec<ParameterBlockSpec>,
+        Array2<f64>,
+    ) {
+        let x_eta = array![
+            [1.0, -0.9],
+            [1.0, -0.45],
+            [1.0, -0.1],
+            [1.0, 0.2],
+            [1.0, 0.55],
+            [1.0, 0.9],
+        ];
+        let beta_eta = array![-0.15, 0.7];
+        let eta = x_eta.dot(&beta_eta);
+        let degree = 3usize;
+        let knots = initialize_monotone_wiggle_knots_from_seed(eta.view(), degree, 4)
+            .expect("mean-wiggle knots");
+        let family = BinomialMeanWiggleFamily {
+            y: array![0.0, 1.0, 0.0, 1.0, 1.0, 0.0],
+            weights: array![1.0, 0.8, 1.2, 1.0, 0.7, 1.1],
+            link_kind: InverseLink::Standard(LinkFunction::Logit),
+            wiggle_knots: knots,
+            wiggle_degree: degree,
+            policy: crate::resource::ResourcePolicy::default_library(),
+        };
+        let basis = family.wiggle_design(eta.view()).expect("wiggle basis");
+        let beta_w = Array1::from_iter((0..basis.ncols()).map(|j| 0.015 * (j as f64 + 1.0)));
+        let etaw = basis.dot(&beta_w);
+        let states = vec![
+            ParameterBlockState {
+                beta: beta_eta,
+                eta: eta.clone(),
+            },
+            ParameterBlockState {
+                beta: beta_w,
+                eta: etaw,
+            },
+        ];
+        let specs = vec![
+            ParameterBlockSpec {
+                name: "eta".to_string(),
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x_eta.clone())),
+                offset: Array1::zeros(eta.len()),
+                penalties: vec![],
+                nullspace_dims: vec![],
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+            ParameterBlockSpec {
+                name: "wiggle".to_string(),
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(basis)),
+                offset: Array1::zeros(eta.len()),
+                penalties: vec![],
+                nullspace_dims: vec![],
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+        ];
+        (family, states, specs, x_eta)
+    }
+
+    fn assert_close_matrix(a: &Array2<f64>, b: &Array2<f64>, tol: f64, label: &str) {
+        assert_eq!(a.dim(), b.dim(), "{label} shape mismatch");
+        let max_err = a
+            .iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| (x - y).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_err < tol,
+            "{label} max error {max_err:.3e} >= {tol:.3e}"
+        );
+    }
+
+    #[test]
+    fn binomial_mean_wiggle_hessian_operators_match_dense_derivatives() {
+        let (family, states, specs, x_eta) = binomial_mean_wiggle_operator_fixture();
+        let p_eta = x_eta.ncols();
+        let pw = states[BinomialMeanWiggleFamily::BLOCK_WIGGLE].beta.len();
+        let total = p_eta + pw;
+        let dir_u = Array1::from_iter((0..total).map(|j| 0.03 * (j as f64 + 1.0).sin()));
+        let dir_v = Array1::from_iter((0..total).map(|j| -0.02 * (j as f64 + 0.5).cos()));
+
+        let dense_h = family
+            .exact_newton_joint_hessian_with_specs(&states, &specs)
+            .expect("dense H")
+            .expect("dense H available");
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace")
+            .expect("workspace available");
+        let h_columns =
+            Array2::from_shape_fn((total, total), |(i, j)| if i == j { 1.0 } else { 0.0 });
+        let op_h = crate::solver::estimate::reml::unified::HyperOperator::mul_mat(
+            family
+                .bmw_static_hessian_operator(&states, Arc::new(x_eta.clone()))
+                .expect("static op")
+                .as_ref(),
+            &h_columns,
+        );
+        assert_close_matrix(&op_h, &dense_h, 1e-10, "static H operator");
+        let hv = workspace
+            .hessian_matvec(&dir_u)
+            .expect("workspace HVP")
+            .expect("workspace HVP available");
+        let hv_dense = dense_h.dot(&dir_u);
+        let hv_err = (&hv - &hv_dense).mapv(f64::abs).sum();
+        assert!(hv_err < 1e-10, "workspace HVP mismatch {hv_err:.3e}");
+
+        let dense_dh = family
+            .exact_newton_joint_hessian_directional_derivative_with_specs(&states, &specs, &dir_u)
+            .expect("dense dH")
+            .expect("dense dH available");
+        let op_dh = workspace
+            .directional_derivative_operator(&dir_u)
+            .expect("dH operator")
+            .expect("dH operator available")
+            .to_dense();
+        assert_close_matrix(&op_dh, &dense_dh, 1e-10, "directional dH operator");
+
+        let dense_d2h = family
+            .exact_newton_joint_hessian_second_directional_derivative_with_specs(
+                &states, &specs, &dir_u, &dir_v,
+            )
+            .expect("dense d2H")
+            .expect("dense d2H available");
+        let op_d2h = workspace
+            .second_directional_derivative_operator(&dir_u, &dir_v)
+            .expect("d2H operator")
+            .expect("d2H operator available")
+            .to_dense();
+        assert_close_matrix(
+            &op_d2h,
+            &dense_d2h,
+            1e-10,
+            "second directional d2H operator",
+        );
+    }
+
+    #[test]
+    fn binomial_mean_wiggle_planner_keeps_second_order_at_large_n() {
+        let n = 50_001usize;
+        let family = BinomialMeanWiggleFamily {
+            y: Array1::zeros(n),
+            weights: Array1::ones(n),
+            link_kind: InverseLink::Standard(LinkFunction::Logit),
+            wiggle_knots: initialize_monotone_wiggle_knots_from_seed(
+                Array1::linspace(-1.0, 1.0, 9).view(),
+                3,
+                4,
+            )
+            .expect("large-n knots"),
+            wiggle_degree: 3,
+            policy: crate::resource::ResourcePolicy::default_library(),
+        };
+        let specs = vec![
+            ParameterBlockSpec {
+                name: "eta".to_string(),
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros(
+                    (n, 2),
+                ))),
+                offset: Array1::zeros(n),
+                penalties: vec![],
+                nullspace_dims: vec![],
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+            ParameterBlockSpec {
+                name: "wiggle".to_string(),
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros(
+                    (n, 34),
+                ))),
+                offset: Array1::zeros(n),
+                penalties: vec![],
+                nullspace_dims: vec![],
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+        ];
+        assert!(family.inner_coefficient_hessian_hvp_available(&specs));
+        assert_eq!(
+            family.exact_outer_derivative_order(&specs, &BlockwiseFitOptions::default()),
+            crate::custom_family::ExactOuterDerivativeOrder::Second
+        );
     }
 }
