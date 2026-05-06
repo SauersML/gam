@@ -6,10 +6,12 @@ use faer::linalg::solvers::Solve;
 use faer::sparse::linalg::solvers::Llt as SparseLlt;
 use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
 use ndarray::{Array1, Array2, ArrayBase, Data, Ix1, Ix2};
+use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 const ZERO_TOL: f64 = 1e-12;
+const PARALLEL_SPARSE_FILL_COLUMN_THRESHOLD: usize = 64;
 
 #[derive(Clone)]
 pub struct SparseExactFactor {
@@ -57,31 +59,29 @@ pub fn dense_to_sparse(
 ) -> Result<SparseColMat<usize, f64>, EstimationError> {
     let nrows = matrix.nrows();
     let ncols = matrix.ncols();
-    // Direct column-major CSC construction.  Two-pass: count nnz per column,
-    // then fill row indices and values.  Skips the O(nnz log nnz) sort/dedup
-    // that `try_new_from_triplets` performs on unsorted input.
-    let mut col_ptr = vec![0usize; ncols + 1];
-    for col in 0..ncols {
-        let mut count = 0usize;
-        for row in 0..nrows {
-            if matrix[[row, col]].abs() > tol {
-                count += 1;
+    // Direct column-major CSC construction.  Three-pass: count nnz per
+    // column in parallel, perform the prefix sum serially, then fill each
+    // deterministic column slice in parallel.  Columns are still traversed
+    // in order and rows are written in ascending order within each column,
+    // preserving the same canonical CSC ordering as the previous serial
+    // implementation without requiring a triplet sort/dedup pass.
+    let counts: Vec<usize> = (0..ncols)
+        .into_par_iter()
+        .map(|col| {
+            let mut count = 0usize;
+            for row in 0..nrows {
+                if matrix[[row, col]].abs() > tol {
+                    count += 1;
+                }
             }
-        }
-        col_ptr[col + 1] = col_ptr[col] + count;
-    }
+            count
+        })
+        .collect();
+    let col_ptr = prefix_sum_counts(&counts);
     let nnz = col_ptr[ncols];
-    let mut row_idx = Vec::with_capacity(nnz);
-    let mut values = Vec::with_capacity(nnz);
-    for col in 0..ncols {
-        for row in 0..nrows {
-            let value = matrix[[row, col]];
-            if value.abs() > tol {
-                row_idx.push(row);
-                values.push(value);
-            }
-        }
-    }
+    let mut row_idx = vec![0usize; nnz];
+    let mut values = vec![0.0; nnz];
+    fill_dense_to_sparse_columns(matrix, tol, 0, ncols, &col_ptr, &mut row_idx, &mut values);
     let symbolic = SymbolicSparseColMat::<usize>::new_checked(nrows, ncols, col_ptr, None, row_idx);
     Ok(SparseColMat::<usize, f64>::new(symbolic, values))
 }
@@ -106,35 +106,43 @@ fn embed_dense_block_to_sparse_symmetric_upper(
     }
     // Direct CSC build over the upper triangle of `local`, embedded at
     // `(offset, offset)` in a `total_dim x total_dim` matrix.  Columns
-    // outside [offset, offset+block_n) are empty; within-block columns
-    // already iterate rows in increasing order, satisfying CSC sort
-    // invariants without the triplet sort/dedup pass.
+    // outside [offset, offset+block_n) are empty; within-block columns are
+    // counted in parallel, prefix-summed serially, and filled in parallel
+    // while preserving row-ascending order within each column.
+    let counts: Vec<usize> = (0..block_n)
+        .into_par_iter()
+        .map(|c| {
+            let mut count = 0usize;
+            for r in 0..=c {
+                if local[[r, c]].abs() > tol {
+                    count += 1;
+                }
+            }
+            count
+        })
+        .collect();
+    let block_col_ptr = prefix_sum_counts(&counts);
     let mut col_ptr = vec![0usize; total_dim + 1];
     for c in 0..block_n {
-        let mut count = 0usize;
-        for r in 0..=c {
-            if local[[r, c]].abs() > tol {
-                count += 1;
-            }
-        }
-        col_ptr[offset + c + 1] = col_ptr[offset + c] + count;
+        col_ptr[offset + c + 1] = block_col_ptr[c + 1];
     }
-    let nnz_in_block_end = col_ptr[offset + block_n];
+    let nnz_in_block_end = block_col_ptr[block_n];
     for c in (offset + block_n)..total_dim {
         col_ptr[c + 1] = nnz_in_block_end;
     }
     let nnz = col_ptr[total_dim];
-    let mut row_idx = Vec::with_capacity(nnz);
-    let mut values = Vec::with_capacity(nnz);
-    for c in 0..block_n {
-        for r in 0..=c {
-            let value = local[[r, c]];
-            if value.abs() > tol {
-                row_idx.push(offset + r);
-                values.push(value);
-            }
-        }
-    }
+    let mut row_idx = vec![0usize; nnz];
+    let mut values = vec![0.0; nnz];
+    fill_embedded_symmetric_upper_columns(
+        local,
+        offset,
+        tol,
+        0,
+        block_n,
+        &block_col_ptr,
+        &mut row_idx,
+        &mut values,
+    );
     let symbolic =
         SymbolicSparseColMat::<usize>::new_checked(total_dim, total_dim, col_ptr, None, row_idx);
     Ok(SparseColMat::<usize, f64>::new(symbolic, values))
@@ -151,36 +159,224 @@ pub fn dense_to_sparse_symmetric_upper(
 ) -> Result<SparseColMat<usize, f64>, EstimationError> {
     let nrows = matrix.nrows();
     let ncols = matrix.ncols();
-    // Direct CSC build over the upper triangle.  Iterating `for col { for row in 0..=col }`
-    // naturally produces CSC-sorted (column-major, row-ascending) entries, so we can
-    // populate col_ptr/row_idx/values directly without a triplet sort.
-    let mut col_ptr = vec![0usize; ncols + 1];
+    // Direct CSC build over the upper triangle.  Counts and fills are
+    // parallelized by column, with a serial prefix sum between them so every
+    // column writes to a deterministic, non-overlapping slice.  Iterating rows
+    // from low to high within each column keeps CSC row indices sorted exactly
+    // as in the previous serial implementation.
     let row_limit = nrows.min(ncols);
-    for col in 0..ncols {
-        let mut count = 0usize;
-        let row_end = (col + 1).min(row_limit);
-        for row in 0..row_end {
-            if matrix[[row, col]].abs() > tol {
-                count += 1;
+    let counts: Vec<usize> = (0..ncols)
+        .into_par_iter()
+        .map(|col| {
+            let mut count = 0usize;
+            let row_end = (col + 1).min(row_limit);
+            for row in 0..row_end {
+                if matrix[[row, col]].abs() > tol {
+                    count += 1;
+                }
             }
-        }
-        col_ptr[col + 1] = col_ptr[col] + count;
-    }
+            count
+        })
+        .collect();
+    let col_ptr = prefix_sum_counts(&counts);
     let nnz = col_ptr[ncols];
-    let mut row_idx = Vec::with_capacity(nnz);
-    let mut values = Vec::with_capacity(nnz);
-    for col in 0..ncols {
-        let row_end = (col + 1).min(row_limit);
-        for row in 0..row_end {
-            let value = matrix[[row, col]];
-            if value.abs() > tol {
-                row_idx.push(row);
-                values.push(value);
-            }
-        }
-    }
+    let mut row_idx = vec![0usize; nnz];
+    let mut values = vec![0.0; nnz];
+    fill_dense_symmetric_upper_columns(
+        matrix,
+        tol,
+        row_limit,
+        0,
+        ncols,
+        &col_ptr,
+        &mut row_idx,
+        &mut values,
+    );
     let symbolic = SymbolicSparseColMat::<usize>::new_checked(nrows, ncols, col_ptr, None, row_idx);
     Ok(SparseColMat::<usize, f64>::new(symbolic, values))
+}
+
+fn prefix_sum_counts(counts: &[usize]) -> Vec<usize> {
+    let mut col_ptr = Vec::with_capacity(counts.len() + 1);
+    col_ptr.push(0);
+    let mut running = 0usize;
+    for &count in counts {
+        running += count;
+        col_ptr.push(running);
+    }
+    col_ptr
+}
+
+fn fill_dense_to_sparse_columns(
+    matrix: &Array2<f64>,
+    tol: f64,
+    col_start: usize,
+    col_end: usize,
+    col_ptr: &[usize],
+    row_idx: &mut [usize],
+    values: &mut [f64],
+) {
+    if col_end - col_start <= PARALLEL_SPARSE_FILL_COLUMN_THRESHOLD {
+        let base = col_ptr[col_start];
+        for col in col_start..col_end {
+            let mut write = col_ptr[col] - base;
+            for row in 0..matrix.nrows() {
+                let value = matrix[[row, col]];
+                if value.abs() > tol {
+                    row_idx[write] = row;
+                    values[write] = value;
+                    write += 1;
+                }
+            }
+        }
+        return;
+    }
+
+    let mid = col_start + (col_end - col_start) / 2;
+    let split = col_ptr[mid] - col_ptr[col_start];
+    let (left_rows, right_rows) = row_idx.split_at_mut(split);
+    let (left_values, right_values) = values.split_at_mut(split);
+    rayon::join(
+        || {
+            fill_dense_to_sparse_columns(
+                matrix,
+                tol,
+                col_start,
+                mid,
+                col_ptr,
+                left_rows,
+                left_values,
+            );
+        },
+        || {
+            fill_dense_to_sparse_columns(
+                matrix,
+                tol,
+                mid,
+                col_end,
+                col_ptr,
+                right_rows,
+                right_values,
+            );
+        },
+    );
+}
+
+fn fill_dense_symmetric_upper_columns(
+    matrix: &Array2<f64>,
+    tol: f64,
+    row_limit: usize,
+    col_start: usize,
+    col_end: usize,
+    col_ptr: &[usize],
+    row_idx: &mut [usize],
+    values: &mut [f64],
+) {
+    if col_end - col_start <= PARALLEL_SPARSE_FILL_COLUMN_THRESHOLD {
+        let base = col_ptr[col_start];
+        for col in col_start..col_end {
+            let row_end = (col + 1).min(row_limit);
+            let mut write = col_ptr[col] - base;
+            for row in 0..row_end {
+                let value = matrix[[row, col]];
+                if value.abs() > tol {
+                    row_idx[write] = row;
+                    values[write] = value;
+                    write += 1;
+                }
+            }
+        }
+        return;
+    }
+
+    let mid = col_start + (col_end - col_start) / 2;
+    let split = col_ptr[mid] - col_ptr[col_start];
+    let (left_rows, right_rows) = row_idx.split_at_mut(split);
+    let (left_values, right_values) = values.split_at_mut(split);
+    rayon::join(
+        || {
+            fill_dense_symmetric_upper_columns(
+                matrix,
+                tol,
+                row_limit,
+                col_start,
+                mid,
+                col_ptr,
+                left_rows,
+                left_values,
+            );
+        },
+        || {
+            fill_dense_symmetric_upper_columns(
+                matrix,
+                tol,
+                row_limit,
+                mid,
+                col_end,
+                col_ptr,
+                right_rows,
+                right_values,
+            );
+        },
+    );
+}
+
+fn fill_embedded_symmetric_upper_columns(
+    local: &Array2<f64>,
+    offset: usize,
+    tol: f64,
+    col_start: usize,
+    col_end: usize,
+    col_ptr: &[usize],
+    row_idx: &mut [usize],
+    values: &mut [f64],
+) {
+    if col_end - col_start <= PARALLEL_SPARSE_FILL_COLUMN_THRESHOLD {
+        let base = col_ptr[col_start];
+        for col in col_start..col_end {
+            let mut write = col_ptr[col] - base;
+            for row in 0..=col {
+                let value = local[[row, col]];
+                if value.abs() > tol {
+                    row_idx[write] = offset + row;
+                    values[write] = value;
+                    write += 1;
+                }
+            }
+        }
+        return;
+    }
+
+    let mid = col_start + (col_end - col_start) / 2;
+    let split = col_ptr[mid] - col_ptr[col_start];
+    let (left_rows, right_rows) = row_idx.split_at_mut(split);
+    let (left_values, right_values) = values.split_at_mut(split);
+    rayon::join(
+        || {
+            fill_embedded_symmetric_upper_columns(
+                local,
+                offset,
+                tol,
+                col_start,
+                mid,
+                col_ptr,
+                left_rows,
+                left_values,
+            );
+        },
+        || {
+            fill_embedded_symmetric_upper_columns(
+                local,
+                offset,
+                tol,
+                mid,
+                col_end,
+                col_ptr,
+                right_rows,
+                right_values,
+            );
+        },
+    );
 }
 
 pub fn sparse_to_dense_symmetric_upper_public(matrix: &SparseColMat<usize, f64>) -> Array2<f64> {
