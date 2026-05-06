@@ -1549,25 +1549,16 @@ impl ProjectedFactorCache {
         key: ProjectedFactorKey,
         compute: impl FnOnce() -> Array2<f64>,
     ) -> Arc<Array2<f64>> {
-        if let Some(value) = self
-            .entries
-            .lock()
-            .expect("projected factor cache lock poisoned")
-            .get(&key)
-            .cloned()
-        {
-            return value;
-        }
-
-        let computed = Arc::new(compute());
         let mut entries = self
             .entries
             .lock()
             .expect("projected factor cache lock poisoned");
-        entries
-            .entry(key)
-            .or_insert_with(|| computed.clone())
-            .clone()
+        if let Some(value) = entries.get(&key).cloned() {
+            return value;
+        }
+        let computed = Arc::new(compute());
+        entries.insert(key, computed.clone());
+        computed
     }
 }
 
@@ -1595,25 +1586,16 @@ impl ProjectedFactorCache {
         key: ProjectedTraceRowsKey,
         compute: impl FnOnce() -> ProjectedTraceRows,
     ) -> Arc<ProjectedTraceRows> {
-        if let Some(value) = self
-            .row_traces
-            .lock()
-            .expect("projected trace row cache lock poisoned")
-            .get(&key)
-            .cloned()
-        {
-            return value;
-        }
-
-        let computed = Arc::new(compute());
         let mut entries = self
             .row_traces
             .lock()
             .expect("projected trace row cache lock poisoned");
-        entries
-            .entry(key)
-            .or_insert_with(|| computed.clone())
-            .clone()
+        if let Some(value) = entries.get(&key).cloned() {
+            return value;
+        }
+        let computed = Arc::new(compute());
+        entries.insert(key, computed.clone());
+        computed
     }
 }
 
