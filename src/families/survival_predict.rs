@@ -255,140 +255,120 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
         None
     };
 
-    // Evaluate each (row, t) cell. The natural vectorization (T outer × n inner
-    // calls into the predictor) is a meaningful refactor: each cell currently
-    // builds a 1-row time basis for `t_entry = age_entry[i].min(t_query)` which
-    // differs per row, so the inversion would require batching the time-basis
-    // build across rows for each fixed `t_query`. Leaving the per-cell shape in
-    // place — measure first if survival predict becomes a hot path.
-    for i in 0..n {
-        let row_eta_exit_input = if per_row_eval {
-            vec![age_exit[i]]
-        } else {
-            eval_times.clone()
-        };
-        for (j, &t_query) in row_eta_exit_input.iter().enumerate() {
-            let t_entry = age_entry[i].min(t_query);
-            let single_entry = Array1::from_elem(1, t_entry);
-            let single_exit = Array1::from_elem(1, t_query);
-            let mut row_time =
-                build_survival_time_basis(&single_entry, &single_exit, time_cfg.clone(), None)?;
-            if let Some(anchor_row) = time_anchor_row_cached.as_ref() {
-                center_survival_time_designs_at_anchor(
-                    &mut row_time.x_entry_time,
-                    &mut row_time.x_exit_time,
-                    anchor_row,
-                )?;
-            }
-            let (_r_eta_entry, r_eta_exit, r_deriv_exit) =
-                build_survival_time_offsets_for_likelihood(
-                    &single_entry,
-                    &single_exit,
-                    &baseline_cfg,
-                    saved_likelihood_mode,
-                    None,
-                )?;
+    // Evaluate each row independently.  For an explicit time grid, each worker
+    // reuses the row's covariate slice across all grid times and returns a
+    // complete row, avoiding synchronized writes into the output matrices.
+    struct SurvivalPredictionRow {
+        hazard: Vec<f64>,
+        survival: Vec<f64>,
+        cumulative_hazard: Vec<f64>,
+        linear_predictor: f64,
+    }
 
-            let (eta_t, cum_t, haz_t) = match saved_likelihood_mode {
-                SurvivalLikelihoodMode::MarginalSlope => {
-                    let ctx = marginal_slope_ctx.as_ref().ok_or_else(|| {
-                        "internal error: marginal-slope context missing for marginal-slope mode"
-                            .to_string()
-                    })?;
-                    evaluate_marginal_slope_row(
-                        i,
-                        ctx,
-                        &row_time,
-                        &r_eta_exit,
-                        &r_deriv_exit,
-                        primary_offset[i],
-                    )?
+    let row_results: Result<Vec<SurvivalPredictionRow>, String> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let cov_row = if matches!(
+                saved_likelihood_mode,
+                SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull
+            ) {
+                Some(design_row_owned(
+                    &cov_design.design,
+                    i,
+                    "survival predict covariate row",
+                )?)
+            } else {
+                None
+            };
+            let evaluate_at = |t_query: f64| -> Result<(f64, f64, f64), String> {
+                let t_entry = age_entry[i].min(t_query);
+                let single_entry = Array1::from_elem(1, t_entry);
+                let single_exit = Array1::from_elem(1, t_query);
+                let mut row_time =
+                    build_survival_time_basis(&single_entry, &single_exit, time_cfg.clone(), None)?;
+                if let Some(anchor_row) = time_anchor_row_cached.as_ref() {
+                    center_survival_time_designs_at_anchor(
+                        &mut row_time.x_entry_time,
+                        &mut row_time.x_exit_time,
+                        anchor_row,
+                    )?;
                 }
-                SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
-                    let cov_row =
-                        design_row_owned(&cov_design.design, i, "survival predict covariate row")?;
-                    evaluate_rp_row(
-                        model,
-                        &row_time,
-                        &cov_row,
-                        r_eta_exit[0] + primary_offset[i],
-                    )?
+                let (_r_eta_entry, r_eta_exit, r_deriv_exit) =
+                    build_survival_time_offsets_for_likelihood(
+                        &single_entry,
+                        &single_exit,
+                        &baseline_cfg,
+                        saved_likelihood_mode,
+                        None,
+                    )?;
+
+                match saved_likelihood_mode {
+                    SurvivalLikelihoodMode::MarginalSlope => {
+                        let ctx = marginal_slope_ctx.as_ref().ok_or_else(|| {
+                            "internal error: marginal-slope context missing for marginal-slope mode"
+                                .to_string()
+                        })?;
+                        evaluate_marginal_slope_row(
+                            i,
+                            ctx,
+                            &row_time,
+                            &r_eta_exit,
+                            &r_deriv_exit,
+                            primary_offset[i],
+                        )
+                    }
+                    SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
+                        let cov_row = cov_row.as_ref().ok_or_else(|| {
+                            "internal error: covariate row missing for Royston-Parmar prediction"
+                                .to_string()
+                        })?;
+                        evaluate_rp_row(
+                            model,
+                            &row_time,
+                            cov_row,
+                            r_eta_exit[0] + primary_offset[i],
+                        )
+                    }
+                    SurvivalLikelihoodMode::Latent
+                    | SurvivalLikelihoodMode::LatentBinary
+                    | SurvivalLikelihoodMode::LocationScale => {
+                        Err("unreachable: unsupported likelihood_mode filtered earlier".to_string())
+                    }
                 }
-                SurvivalLikelihoodMode::Latent
-                | SurvivalLikelihoodMode::LatentBinary
-                | SurvivalLikelihoodMode::LocationScale => {
-                    return Err(
-                        "unreachable: unsupported likelihood_mode filtered earlier".to_string()
-                    );
-                }
+            };
+
+            let mut row = SurvivalPredictionRow {
+                hazard: vec![0.0; t_cols],
+                survival: vec![0.0; t_cols],
+                cumulative_hazard: vec![0.0; t_cols],
+                linear_predictor: 0.0,
             };
             if per_row_eval {
-                linear_predictor[i] = eta_t;
-                hazard[[i, 0]] = haz_t;
-                cumulative_hazard[[i, 0]] = cum_t;
-                survival[[i, 0]] = (-cum_t).exp().clamp(0.0, 1.0);
+                let (eta_t, cum_t, haz_t) = evaluate_at(age_exit[i])?;
+                row.linear_predictor = eta_t;
+                row.hazard[0] = haz_t;
+                row.cumulative_hazard[0] = cum_t;
+                row.survival[0] = (-cum_t).exp().clamp(0.0, 1.0);
             } else {
-                hazard[[i, j]] = haz_t;
-                cumulative_hazard[[i, j]] = cum_t;
-                survival[[i, j]] = (-cum_t).exp().clamp(0.0, 1.0);
+                for (j, &t_query) in eval_times.iter().enumerate() {
+                    let (_eta_t, cum_t, haz_t) = evaluate_at(t_query)?;
+                    row.hazard[j] = haz_t;
+                    row.cumulative_hazard[j] = cum_t;
+                    row.survival[j] = (-cum_t).exp().clamp(0.0, 1.0);
+                }
+                let (eta_t, _, _) = evaluate_at(age_exit[i])?;
+                row.linear_predictor = eta_t;
             }
-        }
-        if !per_row_eval {
-            // Track the linear predictor at each row's own exit time.
-            let t_exit = age_exit[i];
-            let t_entry = age_entry[i].min(t_exit);
-            let single_entry = Array1::from_elem(1, t_entry);
-            let single_exit = Array1::from_elem(1, t_exit);
-            let mut row_time =
-                build_survival_time_basis(&single_entry, &single_exit, time_cfg.clone(), None)?;
-            if let Some(anchor_row) = time_anchor_row_cached.as_ref() {
-                center_survival_time_designs_at_anchor(
-                    &mut row_time.x_entry_time,
-                    &mut row_time.x_exit_time,
-                    anchor_row,
-                )?;
-            }
-            let (_, r_eta_exit, r_deriv_exit) = build_survival_time_offsets_for_likelihood(
-                &single_entry,
-                &single_exit,
-                &baseline_cfg,
-                saved_likelihood_mode,
-                None,
-            )?;
-            let (eta_t, _, _) = match saved_likelihood_mode {
-                SurvivalLikelihoodMode::MarginalSlope => {
-                    let ctx = marginal_slope_ctx.as_ref().ok_or_else(|| {
-                        "internal error: marginal-slope context missing for marginal-slope mode"
-                            .to_string()
-                    })?;
-                    evaluate_marginal_slope_row(
-                        i,
-                        ctx,
-                        &row_time,
-                        &r_eta_exit,
-                        &r_deriv_exit,
-                        primary_offset[i],
-                    )?
-                }
-                SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
-                    let cov_row =
-                        design_row_owned(&cov_design.design, i, "survival predict covariate row")?;
-                    evaluate_rp_row(
-                        model,
-                        &row_time,
-                        &cov_row,
-                        r_eta_exit[0] + primary_offset[i],
-                    )?
-                }
-                SurvivalLikelihoodMode::Latent
-                | SurvivalLikelihoodMode::LatentBinary
-                | SurvivalLikelihoodMode::LocationScale => {
-                    return Err(
-                        "unreachable: unsupported likelihood_mode filtered earlier".to_string()
-                    );
-                }
-            };
-            linear_predictor[i] = eta_t;
+            Ok(row)
+        })
+        .collect();
+
+    for (i, row) in row_results?.into_iter().enumerate() {
+        linear_predictor[i] = row.linear_predictor;
+        for j in 0..t_cols {
+            hazard[[i, j]] = row.hazard[j];
+            cumulative_hazard[[i, j]] = row.cumulative_hazard[j];
+            survival[[i, j]] = row.survival[j];
         }
     }
 
@@ -759,17 +739,30 @@ fn predict_survival_location_scale_batch(
     use crate::families::survival_construction::evaluate_survival_time_basis_row;
     use crate::families::survival_location_scale::{
         SurvivalLocationScalePredictInput, predict_survival_location_scale,
+        predict_survival_location_scale_from_linear_components,
     };
     use crate::matrix::DesignMatrix;
 
-    if time_grid.is_some() {
-        return Err(
-            "predict_survival location-scale path does not support time_grid yet; \
-             omit time_grid for per-row exit-time evaluation"
-                .to_string(),
-        );
-    }
     let n = age_entry.len();
+    let per_row_eval = time_grid.is_none();
+    let eval_times: Vec<f64> = match time_grid {
+        Some(grid) => {
+            if grid.is_empty() {
+                return Err("survival time_grid must contain at least one time".to_string());
+            }
+            for (idx, &t) in grid.iter().enumerate() {
+                if !t.is_finite() || t < 0.0 {
+                    return Err(format!(
+                        "survival time_grid requires finite non-negative times (index {idx})",
+                    ));
+                }
+            }
+            grid.to_vec()
+        }
+        None => Vec::new(),
+    };
+    let t_cols = if per_row_eval { 1 } else { eval_times.len() };
+    let eval_width = if per_row_eval { 1 } else { t_cols + 1 };
     let saved_likelihood_mode = SurvivalLikelihoodMode::LocationScale;
     let baseline_cfg = saved_survival_runtime_baseline_config(model, saved_likelihood_mode)?;
     let time_cfg = load_survival_time_basis_config_from_model(model)?;
@@ -794,17 +787,52 @@ fn predict_survival_location_scale_batch(
         require_structural_survival_time_basis(&time_build.basisname, "saved survival sampling")?;
     }
     let saved_inverse_link = resolve_survival_inverse_link_from_saved(model)?;
+    let (eval_entry, eval_exit) = if per_row_eval {
+        (age_entry.clone(), age_exit.clone())
+    } else {
+        let total = n * eval_width;
+        let mut entry = Array1::<f64>::zeros(total);
+        let mut exit = Array1::<f64>::zeros(total);
+        {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let pairs: Vec<(f64, f64)> = (0..total)
+                .into_par_iter()
+                .map(|k| {
+                    let i = k / eval_width;
+                    let col = k % eval_width;
+                    let t = if col < t_cols {
+                        eval_times[col]
+                    } else {
+                        age_exit[i]
+                    };
+                    (age_entry[i].min(t), t)
+                })
+                .collect();
+            for (k, (t0, t1)) in pairs.into_iter().enumerate() {
+                entry[k] = t0;
+                exit[k] = t1;
+            }
+        }
+        (entry, exit)
+    };
+    let mut time_build =
+        build_survival_time_basis(&eval_entry, &eval_exit, time_cfg.clone(), None)?;
+    center_survival_time_designs_at_anchor(
+        &mut time_build.x_entry_time,
+        &mut time_build.x_exit_time,
+        &time_anchor_row,
+    )?;
     let (mut eta_offset_entry, mut eta_offset_exit, mut derivative_offset_exit) =
         build_survival_time_offsets_for_likelihood(
-            age_entry,
-            age_exit,
+            &eval_entry,
+            &eval_exit,
             &baseline_cfg,
             saved_likelihood_mode,
             Some(&saved_inverse_link),
         )?;
     add_survival_time_derivative_guard_offset(
-        age_entry,
-        age_exit,
+        &eval_entry,
+        &eval_exit,
         time_anchor,
         survival_derivative_guard_for_likelihood(saved_likelihood_mode),
         &mut eta_offset_entry,
@@ -842,75 +870,142 @@ fn predict_survival_location_scale_batch(
     let x_time_exit_dense = time_build
         .x_exit_time
         .try_to_dense_by_chunks("survival location-scale prediction time-exit design")?;
+    let total_rows = eval_exit.len();
     let x_time_exit = if let Some(runtime) = saved_timewiggle_runtime.as_ref() {
-        let mut full = Array2::<f64>::zeros((n, x_time_exit_dense.ncols() + runtime.beta.len()));
+        let mut full =
+            Array2::<f64>::zeros((total_rows, x_time_exit_dense.ncols() + runtime.beta.len()));
         full.slice_mut(s![.., 0..x_time_exit_dense.ncols()])
             .assign(&x_time_exit_dense);
         full
     } else {
         x_time_exit_dense
     };
+
+    let repeat_rows = |matrix: &DesignMatrix, label: &str| -> Result<DesignMatrix, String> {
+        if per_row_eval {
+            return Ok(matrix.clone());
+        }
+        let dense = matrix.try_to_dense_by_chunks(label)?;
+        let mut repeated = Array2::<f64>::zeros((total_rows, dense.ncols()));
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let rows: Vec<Vec<f64>> = (0..total_rows)
+            .into_par_iter()
+            .map(|k| dense.row(k / eval_width).to_vec())
+            .collect();
+        for (k, row) in rows.into_iter().enumerate() {
+            for (j, value) in row.into_iter().enumerate() {
+                repeated[[k, j]] = value;
+            }
+        }
+        Ok(DesignMatrix::from(repeated))
+    };
+    let threshold_matrix = repeat_rows(
+        &threshold_design.design,
+        "survival location-scale prediction threshold design",
+    )?;
+    let raw_sigma_matrix = repeat_rows(
+        &raw_sigma_design.design,
+        "survival location-scale prediction log-sigma design",
+    )?;
+
     let time_design = DesignMatrix::from(x_time_exit.clone());
     let survival_primary_design =
-        DesignMatrix::hstack(vec![time_design, threshold_design.design.clone()])?;
+        DesignMatrix::hstack(vec![time_design, threshold_matrix.clone()])?;
     let prepared_sigma_design = if let Some(transform) = survival_noise_transform.as_ref() {
-        build_scale_deviation_operator(
-            survival_primary_design,
-            raw_sigma_design.design.clone(),
-            transform,
-        )?
+        build_scale_deviation_operator(survival_primary_design, raw_sigma_matrix, transform)?
     } else {
-        raw_sigma_design.design.clone()
+        raw_sigma_matrix
     };
     let link_wiggle_knots = model
         .linkwiggle_knots
         .as_ref()
         .map(|k| Array1::from_vec(k.clone()));
     let link_wiggle_degree = model.linkwiggle_degree;
-    let pred_input = SurvivalLocationScalePredictInput {
-        x_time_exit,
-        eta_time_offset_exit: eta_offset_exit,
-        time_wiggle_knots: saved_timewiggle_runtime
-            .as_ref()
-            .map(|w| Array1::from_vec(w.knots.clone())),
-        time_wiggle_degree: saved_timewiggle_runtime.as_ref().map(|w| w.degree),
-        time_wiggle_ncols: saved_timewiggle_runtime
-            .as_ref()
-            .map_or(0, |w| w.beta.len()),
-        x_threshold: threshold_design.design.clone(),
-        eta_threshold_offset: primary_offset.clone(),
-        x_log_sigma: prepared_sigma_design,
-        eta_log_sigma_offset: noise_offset.clone(),
-        x_link_wiggle: None,
-        link_wiggle_knots,
-        link_wiggle_degree,
-        inverse_link: saved_inverse_link.clone(),
-    };
-    let pred = predict_survival_location_scale(&pred_input, &saved_fit)
-        .map_err(|err| format!("survival location-scale predict failed: {err}"))?;
+    let time_wiggle_knots = saved_timewiggle_runtime
+        .as_ref()
+        .map(|w| Array1::from_vec(w.knots.clone()));
+    let time_wiggle_degree = saved_timewiggle_runtime.as_ref().map(|w| w.degree);
+    let time_wiggle_ncols = saved_timewiggle_runtime
+        .as_ref()
+        .map_or(0, |w| w.beta.len());
 
-    // Map plugin survival to (hazard, survival, cumulative_hazard) per row.
-    // The location-scale predict path returns survival probability at each
-    // row's exit; without a time grid we surface that at column 0 and leave
-    // hazard/cumulative-hazard derived from the same scalar.
-    let mut survival = Array2::<f64>::zeros((n, 1));
-    let mut cumulative_hazard = Array2::<f64>::zeros((n, 1));
-    let hazard = Array2::<f64>::from_elem((n, 1), f64::NAN);
-    ndarray::Zip::from(survival.column_mut(0))
-        .and(cumulative_hazard.column_mut(0))
-        .and(&pred.survival_prob)
-        .par_for_each(|s, ch, &raw| {
-            let surv = raw.clamp(1e-300, 1.0);
+    let expand_vector = |values: &Array1<f64>| -> Array1<f64> {
+        if per_row_eval {
+            values.clone()
+        } else {
+            Array1::from_shape_fn(total_rows, |k| values[k / eval_width])
+        }
+    };
+    let pred = if per_row_eval {
+        let pred_input = SurvivalLocationScalePredictInput {
+            x_time_exit,
+            eta_time_offset_exit: eta_offset_exit,
+            time_wiggle_knots,
+            time_wiggle_degree,
+            time_wiggle_ncols,
+            x_threshold: threshold_matrix,
+            eta_threshold_offset: primary_offset.clone(),
+            x_log_sigma: prepared_sigma_design,
+            eta_log_sigma_offset: noise_offset.clone(),
+            x_link_wiggle: None,
+            link_wiggle_knots,
+            link_wiggle_degree,
+            inverse_link: saved_inverse_link.clone(),
+        };
+        predict_survival_location_scale(&pred_input, &saved_fit)
+    } else {
+        let beta_threshold = saved_fit.beta_threshold();
+        let beta_log_sigma = saved_fit.beta_log_sigma();
+        let eta_t_subject =
+            cov_design.design.matrixvectormultiply(&beta_threshold) + primary_offset;
+        let eta_ls_subject = prepared_sigma_design.matrixvectormultiply(&beta_log_sigma)
+            + &expand_vector(noise_offset);
+        let eta_t = expand_vector(&eta_t_subject);
+        predict_survival_location_scale_from_linear_components(
+            &x_time_exit,
+            &eta_offset_exit,
+            time_wiggle_knots.as_ref(),
+            time_wiggle_degree,
+            time_wiggle_ncols,
+            &eta_t,
+            &eta_ls_subject,
+            link_wiggle_knots.as_ref(),
+            link_wiggle_degree,
+            &saved_inverse_link,
+            &saved_fit,
+        )
+    }
+    .map_err(|err| format!("survival location-scale predict failed: {err}"))?;
+
+    let mut survival = Array2::<f64>::zeros((n, t_cols));
+    let mut cumulative_hazard = Array2::<f64>::zeros((n, t_cols));
+    let hazard = Array2::<f64>::from_elem((n, t_cols), f64::NAN);
+    ndarray::Zip::indexed(&mut survival)
+        .and(&mut cumulative_hazard)
+        .par_for_each(|(i, j), s, ch| {
+            let k = if per_row_eval { i } else { i * eval_width + j };
+            let surv = pred.survival_prob[k].clamp(1e-300, 1.0);
             *s = surv;
             *ch = -surv.ln();
         });
 
+    let linear_predictor = if per_row_eval {
+        pred.eta
+    } else {
+        Array1::from_shape_fn(n, |i| pred.eta[i * eval_width + t_cols])
+    };
+    let times = if per_row_eval {
+        age_exit.to_vec()
+    } else {
+        eval_times
+    };
+
     Ok(SurvivalPredictResult {
-        times: age_exit.to_vec(),
+        times,
         hazard,
         survival,
         cumulative_hazard,
-        linear_predictor: pred.eta,
+        linear_predictor,
         likelihood_mode: saved_likelihood_mode,
     })
 }
