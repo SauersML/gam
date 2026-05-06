@@ -6082,19 +6082,19 @@ fn run_sample_standard_link_wiggle(
         ));
     }
 
-    // Joint Hessian from saved inference
-    let hessian = fit.penalized_hessian().ok_or_else(|| {
-        "link-wiggle model is missing penalized Hessian; refit with inference enabled".to_string()
-    })?;
-    if hessian.nrows() != p_total || hessian.ncols() != p_total {
-        return Err(format!(
-            "link-wiggle sample: Hessian is {}x{} but expected {}x{}",
-            hessian.nrows(),
-            hessian.ncols(),
-            p_total,
-            p_total,
-        ));
-    }
+    // Posterior whitening depends on the exact joint curvature, including the
+    // mean/link-wiggle cross-block terms from the nonlinear basis drift.  Use
+    // the saved explicit geometry rather than the compatibility inference
+    // slot, which older/non-exact exports may populate with placeholder data.
+    let hessian = &fit
+        .geometry
+        .as_ref()
+        .ok_or_else(|| {
+            "link-wiggle model is missing explicit joint Hessian geometry; refit with exact Hessian export"
+                .to_string()
+        })?
+        .penalized_hessian;
+    validate_explicit_link_wiggle_joint_hessian(hessian, p_total)?;
 
     let n_base_penalties = design.penalties.len();
     let base_lambdas = fit
@@ -8745,6 +8745,44 @@ fn invert_symmetric_matrix(a: &Array2<f64>) -> Result<Array2<f64>, String> {
         return Err("inversion produced non-finite entries".to_string());
     }
     Ok(out)
+}
+
+fn validate_explicit_link_wiggle_joint_hessian(
+    hessian: &Array2<f64>,
+    expected_dim: usize,
+) -> Result<(), String> {
+    if hessian.nrows() != expected_dim || hessian.ncols() != expected_dim {
+        return Err(format!(
+            "link-wiggle sample: explicit joint Hessian is {}x{} but expected {}x{}",
+            hessian.nrows(),
+            hessian.ncols(),
+            expected_dim,
+            expected_dim,
+        ));
+    }
+    validate_all_finite(
+        "link-wiggle explicit joint Hessian",
+        hessian.iter().copied(),
+    )?;
+    let mut max_abs = 0.0_f64;
+    for r in 0..expected_dim {
+        for c in 0..expected_dim {
+            max_abs = max_abs.max(hessian[[r, c]].abs());
+            let scale = hessian[[r, c]].abs().max(hessian[[c, r]].abs()).max(1.0);
+            if (hessian[[r, c]] - hessian[[c, r]]).abs() > 1e-9 * scale {
+                return Err(format!(
+                    "link-wiggle sample: explicit joint Hessian is not symmetric at ({r},{c})"
+                ));
+            }
+        }
+    }
+    if max_abs == 0.0 {
+        return Err(
+            "link-wiggle sample: explicit joint Hessian is all zeros; refit with exact Hessian export"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn weighted_penalty_matrix(
