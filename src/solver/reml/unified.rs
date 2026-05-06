@@ -7202,13 +7202,16 @@ fn build_outer_hessian_operator(
 
     // Leverage and the scalar-GLM adjoint-z_c cache support both the
     // full-Hessian and projected-subspace paths.  Under subspace,
-    //   h^{G,proj}_i = Xᵢᵀ · K · Xᵢ     (K = U_S H_proj⁻¹ U_Sᵀ)
-    //   z_c^{proj}   = K · Xᵀ(c ⊙ h^{G,proj})
+    //   h^{G,proj}_i = Xᵢᵀ · K · Xᵢ      (K = U_S H_proj⁻¹ U_Sᵀ)
+    //   z_c^{proj}   = H⁻¹ · Xᵀ(c ⊙ h^{G,proj})
     // and the adjoint identity
     //   tr(K · C[u]) = uᵀ · Xᵀ(c ⊙ h^{G,proj})
-    // lets `scalar_correction_trace` take the cheap branch instead of
-    // materialising the second-derivative correction.  Verified bit-for-bit
-    // by `subspace_apply_adjoint_shortcut_matches_dense_projected_trace`.
+    // (with u = H⁻¹ · rhs unchanged) lets `scalar_correction_trace` take
+    // the cheap branch via `(rhs)ᵀ z_c^{proj} = rhsᵀ H⁻¹ Xᵀ(c ⊙ h^{G,proj})
+    //                                      = uᵀ Xᵀ(c ⊙ h^{G,proj}) = tr(K C[u])`
+    // instead of materialising the second-derivative correction.  Only the
+    // leverage swaps to the projected diagonal; z_c stays gated by `H⁻¹`
+    // so the IFT mode-response semantics line up with `compute_outer_hessian`.
     let leverage = if incl_logdet_h {
         match &kernel {
             OuterHessianDerivativeKernel::Gaussian => None,
@@ -7226,24 +7229,19 @@ fn build_outer_hessian_operator(
             (
                 OuterHessianDerivativeKernel::ScalarGlm {
                     c_array,
-                    d_array: _,
+                    d_array,
                     x,
                 },
                 Some(h_g),
-            ) => {
-                // v = Xᵀ(c ⊙ h^G).  Same v in both regimes; the kernel
-                // applied to v differs (H⁻¹ vs K).
-                let mut weighted = Array1::<f64>::zeros(c_array.len());
-                Zip::from(&mut weighted)
-                    .and(c_array)
-                    .and(h_g)
-                    .for_each(|w, &c, &h| *w = c * h);
-                let v = x.transpose_vector_multiply(&weighted);
-                match subspace {
-                    Some(s) => Some(s.apply(&v)),
-                    None => Some(hop.solve(&v)),
-                }
-            }
+            ) => Some(compute_adjoint_z_c(
+                &ScalarGlmIngredients {
+                    c_array,
+                    d_array: d_array.as_ref(),
+                    x,
+                },
+                hop.as_ref(),
+                h_g,
+            )?),
             _ => None,
         }
     } else {
