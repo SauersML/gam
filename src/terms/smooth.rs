@@ -3211,6 +3211,411 @@ impl SmoothDesign {
     }
 }
 
+struct LocalSmoothTermBuild {
+    dim: usize,
+    design: DesignMatrix,
+    penalties: Vec<Array2<f64>>,
+    ops: Vec<Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>>,
+    nullspaces: Vec<usize>,
+    penaltyinfo: Vec<PenaltyInfo>,
+    pre_dropped_penaltyinfo: Vec<PenaltyInfo>,
+    metadata: BasisMetadata,
+    linear_constraints: Option<LinearInequalityConstraints>,
+    box_reparam: bool,
+    kronecker_factored: Option<KroneckerFactoredBasis>,
+}
+
+fn build_single_local_smooth_term(
+    data: ArrayView2<'_, f64>,
+    term: &SmoothTermSpec,
+    workspace: &mut crate::basis::BasisWorkspace,
+) -> Result<LocalSmoothTermBuild, BasisError> {
+    if term.shape != ShapeConstraint::None && !shape_supports_basis(term) {
+        return Err(BasisError::InvalidInput(format!(
+            "ShapeConstraint::{:?} is unsupported for term '{}'",
+            term.shape, term.name
+        )));
+    }
+    let mut shape_axis_col: Option<usize> = None;
+    let mut built: BasisBuildResult = match &term.basis {
+        SmoothBasisSpec::BSpline1D { feature_col, spec } => {
+            if *feature_col >= data.ncols() {
+                return Err(BasisError::DimensionMismatch(format!(
+                    "term '{}' feature column {} out of bounds for {} columns",
+                    term.name,
+                    feature_col,
+                    data.ncols()
+                )));
+            }
+            let mut spec_local = spec.clone();
+            if term.shape != ShapeConstraint::None {
+                // Shape-constrained B-splines are anchored by construction.
+                // Sum-to-zero side constraints conflict with monotonic/convex cones.
+                spec_local.identifiability = BSplineIdentifiability::None;
+            }
+            build_bspline_basis_1d(data.column(*feature_col), &spec_local)?
+        }
+        SmoothBasisSpec::ThinPlate {
+            feature_cols,
+            spec,
+            input_scales,
+        } => {
+            if term.shape != ShapeConstraint::None {
+                if feature_cols.len() != 1 {
+                    return Err(BasisError::InvalidInput(format!(
+                        "ShapeConstraint::{:?} for term '{}' on ThinPlate basis requires exactly 1 feature axis; found {}",
+                        term.shape,
+                        term.name,
+                        feature_cols.len()
+                    )));
+                }
+                shape_axis_col = Some(feature_cols[0]);
+            }
+            let mut x = select_columns(data, feature_cols)?;
+            // Auto-standardize multivariate inputs: use stored scales (prediction)
+            // or compute fresh ones (training). Same standardization-vs-
+            // length-scale compensation as Matérn / hybrid Duchon: divide
+            // the user's L by σ_geom so kernel(‖x_std − c_std‖/L_eff)
+            // matches the original-coord kernel for uniform σ.
+            let (scales, length_scale_eff) = if let Some(s) = input_scales {
+                apply_input_standardization(&mut x, s);
+                (
+                    Some(s.clone()),
+                    compensate_length_scale_for_standardization(spec.length_scale, s),
+                )
+            } else if let Some(s) = compute_spatial_input_scales(x.view()) {
+                apply_input_standardization(&mut x, &s);
+                let l_eff = compensate_length_scale_for_standardization(spec.length_scale, &s);
+                (Some(s), l_eff)
+            } else {
+                (None, spec.length_scale)
+            };
+            let mut spec_local = spec.clone();
+            spec_local.length_scale = length_scale_eff;
+            if matches!(
+                spec_local.identifiability,
+                SpatialIdentifiability::OrthogonalToParametric
+            ) {
+                spec_local.identifiability = SpatialIdentifiability::None;
+            }
+            let mut result = build_thin_plate_basis(x.view(), &spec_local).map_err(|err| {
+                rewrite_thin_plate_knots_error(err, &term.name, feature_cols.len(), spec)
+            })?;
+            // Inject input scales into metadata; also restore the user's
+            // original length_scale (not the σ_geom-compensated one) so a
+            // metadata-driven rebuild that re-applies compensation does not
+            // double-divide. The build may auto-promote to Duchon when
+            // canonical TPS is infeasible (k < polynomial-nullspace size);
+            // in that case patch the Duchon metadata variant so predict-time
+            // round-trips through the same standardized data path.
+            match &mut result.metadata {
+                BasisMetadata::ThinPlate {
+                    input_scales: ms,
+                    length_scale,
+                    ..
+                } => {
+                    *ms = scales;
+                    *length_scale = spec.length_scale;
+                }
+                BasisMetadata::Duchon {
+                    input_scales: ms,
+                    length_scale,
+                    ..
+                } => {
+                    *ms = scales;
+                    // The ThinPlate auto-promotion path delegates to
+                    // `build_duchon_basis` with `Some(spec_local.length_scale)`,
+                    // which is the σ_geom-compensated value. The metadata
+                    // therefore records the compensated kernel range, but the
+                    // freeze→replay round trip plugs that value back into a
+                    // user-facing `DuchonBasisSpec.length_scale` whose builder
+                    // applies the σ_geom compensation a second time. Restore
+                    // the user-facing scale here so replay re-compensates
+                    // exactly once and reproduces the realized fit-time basis.
+                    *length_scale = Some(spec.length_scale);
+                }
+                _ => {}
+            }
+            result
+        }
+        SmoothBasisSpec::Matern {
+            feature_cols,
+            spec,
+            input_scales,
+        } => {
+            if term.shape != ShapeConstraint::None {
+                if feature_cols.len() != 1 {
+                    return Err(BasisError::InvalidInput(format!(
+                        "ShapeConstraint::{:?} for term '{}' on Matern basis requires exactly 1 feature axis; found {}",
+                        term.shape,
+                        term.name,
+                        feature_cols.len()
+                    )));
+                }
+                shape_axis_col = Some(feature_cols[0]);
+            }
+            let mut x = select_columns(data, feature_cols)?;
+            // Auto-standardization (per-axis division by σ_a) reinterprets
+            // the user's `length_scale` from original data coordinates
+            // into post-standardization coordinates: for uniform σ_a = σ,
+            // `kernel(‖x_std − c_std‖/L)` equals `kernel(‖x − c‖/(σ·L))`,
+            // so the effective kernel range shrinks by σ. To keep
+            // `length_scale` consistently expressed in *original* data
+            // coordinates regardless of axis variances, we standardize
+            // and divide L by σ_geom = (∏σ_a)^(1/d). For uniform σ this
+            // recovers the user's kernel exactly; for anisotropic data
+            // the resulting per-axis effective scales σ_a / σ_geom are
+            // the standard Mahalanobis preconditioning and preserve the
+            // geometric-mean kernel range. Storing the σ vector in
+            // metadata.input_scales makes the same transformation
+            // replayable at predict time.
+            let (scales, length_scale_eff) = if let Some(s) = input_scales {
+                apply_input_standardization(&mut x, s);
+                (
+                    Some(s.clone()),
+                    compensate_length_scale_for_standardization(spec.length_scale, s),
+                )
+            } else if let Some(s) = compute_spatial_input_scales(x.view()) {
+                apply_input_standardization(&mut x, &s);
+                let l_eff = compensate_length_scale_for_standardization(spec.length_scale, &s);
+                (Some(s), l_eff)
+            } else {
+                (None, spec.length_scale)
+            };
+            let mut spec_local = spec.clone();
+            spec_local.length_scale = length_scale_eff;
+            let mut result = build_matern_basiswithworkspace(x.view(), &spec_local, workspace)?;
+            if let BasisMetadata::Matern {
+                input_scales,
+                length_scale,
+                ..
+            } = &mut result.metadata
+            {
+                *input_scales = scales;
+                *length_scale = spec.length_scale;
+            }
+            result
+        }
+        SmoothBasisSpec::Duchon {
+            feature_cols,
+            spec,
+            input_scales,
+        } => {
+            if term.shape != ShapeConstraint::None {
+                if feature_cols.len() != 1 {
+                    return Err(BasisError::InvalidInput(format!(
+                        "ShapeConstraint::{:?} for term '{}' on Duchon basis requires exactly 1 feature axis; found {}",
+                        term.shape,
+                        term.name,
+                        feature_cols.len()
+                    )));
+                }
+                shape_axis_col = Some(feature_cols[0]);
+            }
+            let mut x = select_columns(data, feature_cols)?;
+            // Hybrid Duchon (length_scale=Some) is governed by the same
+            // standardization-vs-length-scale equivalence as Matérn: the
+            // user's `length_scale` is interpreted in original data
+            // coordinates, but auto-standardization (per-axis division by
+            // σ_a) reinterprets it as σ_geom · L. Pre-multiply by 1/σ_geom
+            // so kernel(‖x_std − c_std‖/L_eff) reproduces the user's
+            // original-coord kernel exactly for uniform σ_a, and reduces
+            // to standard Mahalanobis preconditioning for anisotropic σ.
+            // Pure Duchon (length_scale=None) is scale-free and needs no
+            // compensation.
+            let (scales, length_scale_eff) = if let Some(s) = input_scales {
+                apply_input_standardization(&mut x, s);
+                (
+                    Some(s.clone()),
+                    compensate_optional_length_scale_for_standardization(spec.length_scale, s),
+                )
+            } else if let Some(s) = compute_spatial_input_scales(x.view()) {
+                apply_input_standardization(&mut x, &s);
+                let l_eff =
+                    compensate_optional_length_scale_for_standardization(spec.length_scale, &s);
+                (Some(s), l_eff)
+            } else {
+                (None, spec.length_scale)
+            };
+            let mut spec_local = spec.clone();
+            spec_local.length_scale = length_scale_eff;
+            if matches!(
+                spec_local.identifiability,
+                SpatialIdentifiability::OrthogonalToParametric
+            ) {
+                spec_local.identifiability = SpatialIdentifiability::None;
+            }
+            let mut result = build_duchon_basiswithworkspace(x.view(), &spec_local, workspace)?;
+            if let BasisMetadata::Duchon {
+                input_scales,
+                length_scale,
+                ..
+            } = &mut result.metadata
+            {
+                *input_scales = scales;
+                *length_scale = spec.length_scale;
+            }
+            result
+        }
+        SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
+            build_tensor_bspline_basis(data, feature_cols, spec)?
+        }
+    };
+
+    match &term.basis {
+        SmoothBasisSpec::Matern { .. } => {
+            let (penalties, nullspace_dims, penaltyinfo) =
+                matern_operator_penalty_triplet_from_metadata(&built.metadata)?;
+            built.penalties = penalties;
+            built.nullspace_dims = nullspace_dims;
+            built.penaltyinfo = penaltyinfo;
+        }
+        _ => {}
+    }
+
+    let p_local = built.design.ncols();
+    let mut metadata = built.metadata.clone();
+    // Extract factored Kronecker representation before consuming fields.
+    // Invalidate it if shape transforms will be applied (they break structure).
+    let kron_factored = if term.shape == ShapeConstraint::None {
+        built.kronecker_factored
+    } else {
+        None
+    };
+    let mut design_t = built.design;
+    let mut penalties_t: Vec<Array2<f64>> = built.penalties;
+    // Ops vector parallel to `penalties_t`. Survives unchanged through the
+    // identity path; nulled element-wise when `T^T S T` reparametrization
+    // is applied (operator no longer bit-equivalent to the transformed
+    // matrix); wrapped in `ScaledPenaltyOp` after Frobenius normalization.
+    let mut ops_t: Vec<Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>> = built.ops;
+    if matches!(
+        spatial_identifiability_policy(term),
+        Some(SpatialIdentifiability::OrthogonalToParametric)
+    ) {
+        metadata = freeze_raw_spatial_metadata(metadata, design_t.ncols());
+    }
+
+    let active_penaltyinfo_t = built
+        .penaltyinfo
+        .iter()
+        .filter(|info| info.active)
+        .cloned()
+        .collect::<Vec<_>>();
+    let pre_dropped_penaltyinfo_t = built
+        .penaltyinfo
+        .iter()
+        .filter(|info| !info.active)
+        .cloned()
+        .collect::<Vec<_>>();
+    let use_box_reparam =
+        term.shape != ShapeConstraint::None && shape_uses_box_reparameterization(&term.basis);
+    if let Some((order, sign)) = shape_order_and_sign(term.shape)
+        && use_box_reparam
+    {
+        let t = cumulative_sum_transform_matrix(p_local, order, sign);
+        // Coefficient-side transform: wrap the design in an operator that
+        // applies T on the coefficient side, preserving sparsity/operator
+        // structure of the inner design.
+        let inner_dense = match design_t {
+            DesignMatrix::Dense(d) => d,
+            DesignMatrix::Sparse(sp) => crate::matrix::DenseDesignMatrix::from(
+                sp.try_to_dense_arc("shape-constrained coefficient transform")
+                    .map_err(BasisError::InvalidInput)?,
+            ),
+        };
+        let coeff_op = crate::matrix::CoefficientTransformOperator::new(inner_dense, t.clone())
+            .map_err(|e| BasisError::InvalidInput(format!("CoefficientTransformOperator: {e}")))?;
+        design_t = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(coeff_op)));
+        penalties_t = penalties_t
+            .into_iter()
+            .map(|s_local| {
+                // Congruence transform preserves PSD:
+                //   S_new = T^T S T.
+                let tt_s = t.t().dot(&s_local);
+                tt_s.dot(&t)
+            })
+            .collect();
+        // T^T S T invalidates op-form bit-equivalence; drop ops here.
+        ops_t = vec![None; penalties_t.len()];
+    }
+    if penalties_t.len() != active_penaltyinfo_t.len() {
+        return Err(BasisError::InvalidInput(format!(
+            "internal penalty metadata mismatch for term '{}': active penalties={}, active infos={}",
+            term.name,
+            penalties_t.len(),
+            active_penaltyinfo_t.len()
+        )));
+    }
+    if ops_t.len() != penalties_t.len() {
+        ops_t = vec![None; penalties_t.len()];
+    }
+    let penalty_candidates = penalties_t
+        .into_iter()
+        .zip(active_penaltyinfo_t.into_iter())
+        .zip(ops_t.into_iter())
+        .map(
+            |((matrix, info), op_in)| -> Result<PenaltyCandidate, BasisError> {
+                let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
+                // Frobenius rescale: wrap inner op in `ScaledPenaltyOp(1/c_new)`
+                // so `op.as_dense() == matrix` post-normalization.
+                let scaled_op = if c_new > 0.0 && c_new.is_finite() {
+                    op_in.map(|op| {
+                        std::sync::Arc::new(crate::terms::penalty_op::ScaledPenaltyOp::new(
+                            op,
+                            1.0 / c_new,
+                        ))
+                            as std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>
+                    })
+                } else {
+                    None
+                };
+                Ok(PenaltyCandidate {
+                    nullspace_dim_hint: info.nullspace_dim_hint,
+                    matrix,
+                    source: info.source,
+                    normalization_scale: info.normalization_scale * c_new,
+                    kronecker_factors: None,
+                    op: scaled_op,
+                })
+            },
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+    let (penalties_t, nullspaces_t, penaltyinfo_t, ops_t) =
+        crate::terms::basis::filter_active_penalty_candidates_with_ops(penalty_candidates)?;
+    let linear_constraints_local = if term.shape != ShapeConstraint::None && !use_box_reparam {
+        let axis = shape_axis_col.ok_or_else(|| {
+            BasisError::InvalidInput(format!(
+                "internal shape-constraint axis missing for term '{}'",
+                term.name
+            ))
+        })?;
+        let (x_shape_eval, design_shape_eval) =
+            build_shape_constraint_design_1d(data, term, &metadata, axis)?;
+        build_shape_linear_constraints_1d(
+            x_shape_eval.view(),
+            design_shape_eval.view(),
+            term.shape,
+        )?
+    } else {
+        None
+    };
+
+    Ok(LocalSmoothTermBuild {
+        dim: p_local,
+        design: design_t,
+        penalties: penalties_t,
+        ops: ops_t,
+        nullspaces: nullspaces_t,
+        penaltyinfo: penaltyinfo_t,
+        pre_dropped_penaltyinfo: pre_dropped_penaltyinfo_t,
+        metadata,
+        linear_constraints: linear_constraints_local,
+        box_reparam: use_box_reparam,
+        kronecker_factored: kron_factored,
+    })
+}
+
 pub fn build_smooth_design(
     data: ArrayView2<'_, f64>,
     terms: &[SmoothTermSpec],
@@ -3219,8 +3624,12 @@ pub fn build_smooth_design(
     build_smooth_design_withworkspace(data, terms, &mut ws)
 }
 
-/// Like `build_smooth_design` but reuses a persistent workspace for
-/// distance-matrix caching across repeated κ-proposal basis rebuilds.
+/// Like `build_smooth_design`, but honors the caller workspace policy while
+/// building each planned smooth term with an independent per-term workspace.
+///
+/// Independent workspaces avoid shared mutable distance-cache state during the
+/// parallel term build; the final design, penalties, and metadata are assembled
+/// in the original smooth-term order.
 pub fn build_smooth_design_withworkspace(
     data: ArrayView2<'_, f64>,
     terms: &[SmoothTermSpec],
@@ -3232,411 +3641,23 @@ pub fn build_smooth_design_withworkspace(
             "joint spatial center planner returned no smooth blocks".to_string(),
         )
     })?;
-    let mut local_designs = Vec::<DesignMatrix>::with_capacity(terms.len());
-    let mut local_penalties = Vec::<Vec<Array2<f64>>>::with_capacity(terms.len());
-    let mut local_ops =
-        Vec::<Vec<Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>>>::with_capacity(
-            terms.len(),
-        );
-    let mut local_nullspaces = Vec::<Vec<usize>>::with_capacity(terms.len());
-    let mut local_penaltyinfo = Vec::<Vec<PenaltyInfo>>::with_capacity(terms.len());
-    let mut local_pre_dropped_penaltyinfo = Vec::<Vec<PenaltyInfo>>::with_capacity(terms.len());
-    let mut local_metadata = Vec::<BasisMetadata>::with_capacity(terms.len());
-    let mut local_dims = Vec::<usize>::with_capacity(terms.len());
-    let mut local_linear_constraints =
-        Vec::<Option<LinearInequalityConstraints>>::with_capacity(terms.len());
-    let mut local_box_reparam = Vec::<bool>::with_capacity(terms.len());
-    let mut local_kronecker_factored =
-        Vec::<Option<KroneckerFactoredBasis>>::with_capacity(terms.len());
+    let policy = workspace.policy().clone();
+    let mut local_builds: Vec<LocalSmoothTermBuild> = {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        planned_terms
+            .into_par_iter()
+            .map(|term| {
+                let mut term_workspace = crate::basis::BasisWorkspace::with_policy(policy.clone());
+                build_single_local_smooth_term(data, &term, &mut term_workspace)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
 
-    for term in &planned_terms {
-        if term.shape != ShapeConstraint::None && !shape_supports_basis(term) {
-            return Err(BasisError::InvalidInput(format!(
-                "ShapeConstraint::{:?} is unsupported for term '{}'",
-                term.shape, term.name
-            )));
-        }
-        let mut shape_axis_col: Option<usize> = None;
-        let mut built: BasisBuildResult = match &term.basis {
-            SmoothBasisSpec::BSpline1D { feature_col, spec } => {
-                if *feature_col >= data.ncols() {
-                    return Err(BasisError::DimensionMismatch(format!(
-                        "term '{}' feature column {} out of bounds for {} columns",
-                        term.name,
-                        feature_col,
-                        data.ncols()
-                    )));
-                }
-                let mut spec_local = spec.clone();
-                if term.shape != ShapeConstraint::None {
-                    // Shape-constrained B-splines are anchored by construction.
-                    // Sum-to-zero side constraints conflict with monotonic/convex cones.
-                    spec_local.identifiability = BSplineIdentifiability::None;
-                }
-                build_bspline_basis_1d(data.column(*feature_col), &spec_local)?
-            }
-            SmoothBasisSpec::ThinPlate {
-                feature_cols,
-                spec,
-                input_scales,
-            } => {
-                if term.shape != ShapeConstraint::None {
-                    if feature_cols.len() != 1 {
-                        return Err(BasisError::InvalidInput(format!(
-                            "ShapeConstraint::{:?} for term '{}' on ThinPlate basis requires exactly 1 feature axis; found {}",
-                            term.shape,
-                            term.name,
-                            feature_cols.len()
-                        )));
-                    }
-                    shape_axis_col = Some(feature_cols[0]);
-                }
-                let mut x = select_columns(data, feature_cols)?;
-                // Auto-standardize multivariate inputs: use stored scales (prediction)
-                // or compute fresh ones (training). Same standardization-vs-
-                // length-scale compensation as Matérn / hybrid Duchon: divide
-                // the user's L by σ_geom so kernel(‖x_std − c_std‖/L_eff)
-                // matches the original-coord kernel for uniform σ.
-                let (scales, length_scale_eff) = if let Some(s) = input_scales {
-                    apply_input_standardization(&mut x, s);
-                    (
-                        Some(s.clone()),
-                        compensate_length_scale_for_standardization(spec.length_scale, s),
-                    )
-                } else if let Some(s) = compute_spatial_input_scales(x.view()) {
-                    apply_input_standardization(&mut x, &s);
-                    let l_eff = compensate_length_scale_for_standardization(spec.length_scale, &s);
-                    (Some(s), l_eff)
-                } else {
-                    (None, spec.length_scale)
-                };
-                let mut spec_local = spec.clone();
-                spec_local.length_scale = length_scale_eff;
-                if matches!(
-                    spec_local.identifiability,
-                    SpatialIdentifiability::OrthogonalToParametric
-                ) {
-                    spec_local.identifiability = SpatialIdentifiability::None;
-                }
-                let mut result = build_thin_plate_basis(x.view(), &spec_local).map_err(|err| {
-                    rewrite_thin_plate_knots_error(err, &term.name, feature_cols.len(), spec)
-                })?;
-                // Inject input scales into metadata; also restore the user's
-                // original length_scale (not the σ_geom-compensated one) so a
-                // metadata-driven rebuild that re-applies compensation does not
-                // double-divide. The build may auto-promote to Duchon when
-                // canonical TPS is infeasible (k < polynomial-nullspace size);
-                // in that case patch the Duchon metadata variant so predict-time
-                // round-trips through the same standardized data path.
-                match &mut result.metadata {
-                    BasisMetadata::ThinPlate {
-                        input_scales: ms,
-                        length_scale,
-                        ..
-                    } => {
-                        *ms = scales;
-                        *length_scale = spec.length_scale;
-                    }
-                    BasisMetadata::Duchon {
-                        input_scales: ms,
-                        length_scale,
-                        ..
-                    } => {
-                        *ms = scales;
-                        // The ThinPlate auto-promotion path delegates to
-                        // `build_duchon_basis` with `Some(spec_local.length_scale)`,
-                        // which is the σ_geom-compensated value. The metadata
-                        // therefore records the compensated kernel range, but the
-                        // freeze→replay round trip plugs that value back into a
-                        // user-facing `DuchonBasisSpec.length_scale` whose builder
-                        // applies the σ_geom compensation a second time. Restore
-                        // the user-facing scale here so replay re-compensates
-                        // exactly once and reproduces the realized fit-time basis.
-                        *length_scale = Some(spec.length_scale);
-                    }
-                    _ => {}
-                }
-                result
-            }
-            SmoothBasisSpec::Matern {
-                feature_cols,
-                spec,
-                input_scales,
-            } => {
-                if term.shape != ShapeConstraint::None {
-                    if feature_cols.len() != 1 {
-                        return Err(BasisError::InvalidInput(format!(
-                            "ShapeConstraint::{:?} for term '{}' on Matern basis requires exactly 1 feature axis; found {}",
-                            term.shape,
-                            term.name,
-                            feature_cols.len()
-                        )));
-                    }
-                    shape_axis_col = Some(feature_cols[0]);
-                }
-                let mut x = select_columns(data, feature_cols)?;
-                // Auto-standardization (per-axis division by σ_a) reinterprets
-                // the user's `length_scale` from original data coordinates
-                // into post-standardization coordinates: for uniform σ_a = σ,
-                // `kernel(‖x_std − c_std‖/L)` equals `kernel(‖x − c‖/(σ·L))`,
-                // so the effective kernel range shrinks by σ. To keep
-                // `length_scale` consistently expressed in *original* data
-                // coordinates regardless of axis variances, we standardize
-                // and divide L by σ_geom = (∏σ_a)^(1/d). For uniform σ this
-                // recovers the user's kernel exactly; for anisotropic data
-                // the resulting per-axis effective scales σ_a / σ_geom are
-                // the standard Mahalanobis preconditioning and preserve the
-                // geometric-mean kernel range. Storing the σ vector in
-                // metadata.input_scales makes the same transformation
-                // replayable at predict time.
-                let (scales, length_scale_eff) = if let Some(s) = input_scales {
-                    apply_input_standardization(&mut x, s);
-                    (
-                        Some(s.clone()),
-                        compensate_length_scale_for_standardization(spec.length_scale, s),
-                    )
-                } else if let Some(s) = compute_spatial_input_scales(x.view()) {
-                    apply_input_standardization(&mut x, &s);
-                    let l_eff = compensate_length_scale_for_standardization(spec.length_scale, &s);
-                    (Some(s), l_eff)
-                } else {
-                    (None, spec.length_scale)
-                };
-                let mut spec_local = spec.clone();
-                spec_local.length_scale = length_scale_eff;
-                let mut result = build_matern_basiswithworkspace(x.view(), &spec_local, workspace)?;
-                if let BasisMetadata::Matern {
-                    input_scales,
-                    length_scale,
-                    ..
-                } = &mut result.metadata
-                {
-                    *input_scales = scales;
-                    *length_scale = spec.length_scale;
-                }
-                result
-            }
-            SmoothBasisSpec::Duchon {
-                feature_cols,
-                spec,
-                input_scales,
-            } => {
-                if term.shape != ShapeConstraint::None {
-                    if feature_cols.len() != 1 {
-                        return Err(BasisError::InvalidInput(format!(
-                            "ShapeConstraint::{:?} for term '{}' on Duchon basis requires exactly 1 feature axis; found {}",
-                            term.shape,
-                            term.name,
-                            feature_cols.len()
-                        )));
-                    }
-                    shape_axis_col = Some(feature_cols[0]);
-                }
-                let mut x = select_columns(data, feature_cols)?;
-                // Hybrid Duchon (length_scale=Some) is governed by the same
-                // standardization-vs-length-scale equivalence as Matérn: the
-                // user's `length_scale` is interpreted in original data
-                // coordinates, but auto-standardization (per-axis division by
-                // σ_a) reinterprets it as σ_geom · L. Pre-multiply by 1/σ_geom
-                // so kernel(‖x_std − c_std‖/L_eff) reproduces the user's
-                // original-coord kernel exactly for uniform σ_a, and reduces
-                // to standard Mahalanobis preconditioning for anisotropic σ.
-                // Pure Duchon (length_scale=None) is scale-free and needs no
-                // compensation.
-                let (scales, length_scale_eff) = if let Some(s) = input_scales {
-                    apply_input_standardization(&mut x, s);
-                    (
-                        Some(s.clone()),
-                        compensate_optional_length_scale_for_standardization(spec.length_scale, s),
-                    )
-                } else if let Some(s) = compute_spatial_input_scales(x.view()) {
-                    apply_input_standardization(&mut x, &s);
-                    let l_eff =
-                        compensate_optional_length_scale_for_standardization(spec.length_scale, &s);
-                    (Some(s), l_eff)
-                } else {
-                    (None, spec.length_scale)
-                };
-                let mut spec_local = spec.clone();
-                spec_local.length_scale = length_scale_eff;
-                if matches!(
-                    spec_local.identifiability,
-                    SpatialIdentifiability::OrthogonalToParametric
-                ) {
-                    spec_local.identifiability = SpatialIdentifiability::None;
-                }
-                let mut result = build_duchon_basiswithworkspace(x.view(), &spec_local, workspace)?;
-                if let BasisMetadata::Duchon {
-                    input_scales,
-                    length_scale,
-                    ..
-                } = &mut result.metadata
-                {
-                    *input_scales = scales;
-                    *length_scale = spec.length_scale;
-                }
-                result
-            }
-            SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
-                build_tensor_bspline_basis(data, feature_cols, spec)?
-            }
-        };
-
-        match &term.basis {
-            SmoothBasisSpec::Matern { .. } => {
-                let (penalties, nullspace_dims, penaltyinfo) =
-                    matern_operator_penalty_triplet_from_metadata(&built.metadata)?;
-                built.penalties = penalties;
-                built.nullspace_dims = nullspace_dims;
-                built.penaltyinfo = penaltyinfo;
-            }
-            _ => {}
-        }
-
-        let p_local = built.design.ncols();
-        let mut metadata = built.metadata.clone();
-        // Extract factored Kronecker representation before consuming fields.
-        // Invalidate it if shape transforms will be applied (they break structure).
-        let kron_factored = if term.shape == ShapeConstraint::None {
-            built.kronecker_factored
-        } else {
-            None
-        };
-        let mut design_t = built.design;
-        let mut penalties_t: Vec<Array2<f64>> = built.penalties;
-        // Ops vector parallel to `penalties_t`. Survives unchanged through the
-        // identity path; nulled element-wise when `T^T S T` reparametrization
-        // is applied (operator no longer bit-equivalent to the transformed
-        // matrix); wrapped in `ScaledPenaltyOp` after Frobenius normalization.
-        let mut ops_t: Vec<Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>> =
-            built.ops;
-        if matches!(
-            spatial_identifiability_policy(term),
-            Some(SpatialIdentifiability::OrthogonalToParametric)
-        ) {
-            metadata = freeze_raw_spatial_metadata(metadata, design_t.ncols());
-        }
-
-        let active_penaltyinfo_t = built
-            .penaltyinfo
-            .iter()
-            .filter(|info| info.active)
-            .cloned()
-            .collect::<Vec<_>>();
-        let pre_dropped_penaltyinfo_t = built
-            .penaltyinfo
-            .iter()
-            .filter(|info| !info.active)
-            .cloned()
-            .collect::<Vec<_>>();
-        let use_box_reparam =
-            term.shape != ShapeConstraint::None && shape_uses_box_reparameterization(&term.basis);
-        if let Some((order, sign)) = shape_order_and_sign(term.shape)
-            && use_box_reparam
-        {
-            let t = cumulative_sum_transform_matrix(p_local, order, sign);
-            // Coefficient-side transform: wrap the design in an operator that
-            // applies T on the coefficient side, preserving sparsity/operator
-            // structure of the inner design.
-            let inner_dense = match design_t {
-                DesignMatrix::Dense(d) => d,
-                DesignMatrix::Sparse(sp) => crate::matrix::DenseDesignMatrix::from(
-                    sp.try_to_dense_arc("shape-constrained coefficient transform")
-                        .map_err(BasisError::InvalidInput)?,
-                ),
-            };
-            let coeff_op = crate::matrix::CoefficientTransformOperator::new(inner_dense, t.clone())
-                .map_err(|e| {
-                    BasisError::InvalidInput(format!("CoefficientTransformOperator: {e}"))
-                })?;
-            design_t =
-                DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(coeff_op)));
-            penalties_t = penalties_t
-                .into_iter()
-                .map(|s_local| {
-                    // Congruence transform preserves PSD:
-                    //   S_new = T^T S T.
-                    let tt_s = t.t().dot(&s_local);
-                    tt_s.dot(&t)
-                })
-                .collect();
-            // T^T S T invalidates op-form bit-equivalence; drop ops here.
-            ops_t = vec![None; penalties_t.len()];
-        }
-        if penalties_t.len() != active_penaltyinfo_t.len() {
-            return Err(BasisError::InvalidInput(format!(
-                "internal penalty metadata mismatch for term '{}': active penalties={}, active infos={}",
-                term.name,
-                penalties_t.len(),
-                active_penaltyinfo_t.len()
-            )));
-        }
-        if ops_t.len() != penalties_t.len() {
-            ops_t = vec![None; penalties_t.len()];
-        }
-        let penalty_candidates = penalties_t
-            .into_iter()
-            .zip(active_penaltyinfo_t.into_iter())
-            .zip(ops_t.into_iter())
-            .map(
-                |((matrix, info), op_in)| -> Result<PenaltyCandidate, BasisError> {
-                    let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
-                    // Frobenius rescale: wrap inner op in `ScaledPenaltyOp(1/c_new)`
-                    // so `op.as_dense() == matrix` post-normalization.
-                    let scaled_op = if c_new > 0.0 && c_new.is_finite() {
-                        op_in.map(|op| {
-                            std::sync::Arc::new(crate::terms::penalty_op::ScaledPenaltyOp::new(
-                                op,
-                                1.0 / c_new,
-                            ))
-                                as std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>
-                        })
-                    } else {
-                        None
-                    };
-                    Ok(PenaltyCandidate {
-                        nullspace_dim_hint: info.nullspace_dim_hint,
-                        matrix,
-                        source: info.source,
-                        normalization_scale: info.normalization_scale * c_new,
-                        kronecker_factors: None,
-                        op: scaled_op,
-                    })
-                },
-            )
-            .collect::<Result<Vec<_>, _>>()?;
-        let (penalties_t, nullspaces_t, penaltyinfo_t, ops_t) =
-            crate::terms::basis::filter_active_penalty_candidates_with_ops(penalty_candidates)?;
-        let linear_constraints_local = if term.shape != ShapeConstraint::None && !use_box_reparam {
-            let axis = shape_axis_col.ok_or_else(|| {
-                BasisError::InvalidInput(format!(
-                    "internal shape-constraint axis missing for term '{}'",
-                    term.name
-                ))
-            })?;
-            let (x_shape_eval, design_shape_eval) =
-                build_shape_constraint_design_1d(data, term, &metadata, axis)?;
-            build_shape_linear_constraints_1d(
-                x_shape_eval.view(),
-                design_shape_eval.view(),
-                term.shape,
-            )?
-        } else {
-            None
-        };
-
-        local_dims.push(p_local);
-        local_designs.push(design_t);
-        local_penalties.push(penalties_t);
-        local_ops.push(ops_t);
-        local_nullspaces.push(nullspaces_t);
-        local_penaltyinfo.push(penaltyinfo_t);
-        local_pre_dropped_penaltyinfo.push(pre_dropped_penaltyinfo_t);
-        local_metadata.push(metadata);
-        local_linear_constraints.push(linear_constraints_local);
-        local_box_reparam.push(use_box_reparam);
-        local_kronecker_factored.push(kron_factored);
-    }
+    let local_dims: Vec<usize> = local_builds.iter().map(|built| built.dim).collect();
+    let local_designs: Vec<DesignMatrix> = local_builds
+        .iter()
+        .map(|built| built.design.clone())
+        .collect();
 
     let total_p: usize = local_dims.iter().sum();
     let mut terms_out = Vec::<SmoothTerm>::with_capacity(terms.len());
@@ -3653,29 +3674,31 @@ pub fn build_smooth_design_withworkspace(
     for (idx, term) in terms.iter().enumerate() {
         let p_local = local_dims[idx];
         let col_end = col_start + p_local;
-        let lb_local = if local_box_reparam[idx] {
+        let lb_local = if local_builds[idx].box_reparam {
             shape_lower_bounds_local(term.shape, p_local)
         } else {
             None
         };
 
-        let activeinfos = local_penaltyinfo[idx]
+        let activeinfos = local_builds[idx]
+            .penaltyinfo
             .iter()
             .filter(|info| info.active)
             .collect::<Vec<_>>();
-        if activeinfos.len() != local_penalties[idx].len() {
+        if activeinfos.len() != local_builds[idx].penalties.len() {
             return Err(BasisError::InvalidInput(format!(
                 "internal penalty info mismatch for term '{}': activeinfos={}, penalties={}",
                 term.name,
                 activeinfos.len(),
-                local_penalties[idx].len()
+                local_builds[idx].penalties.len()
             )));
         }
-        for (((s_local, &ns), info), op_local) in local_penalties[idx]
+        for (((s_local, &ns), info), op_local) in local_builds[idx]
+            .penalties
             .iter()
-            .zip(local_nullspaces[idx].iter())
+            .zip(local_builds[idx].nullspaces.iter())
             .zip(activeinfos.into_iter())
-            .zip(local_ops[idx].iter())
+            .zip(local_builds[idx].ops.iter())
         {
             let global_index = penalties_global.len();
             penalties_global.push(
@@ -3691,13 +3714,17 @@ pub fn build_smooth_design_withworkspace(
                 penalty,
             });
         }
-        for info in local_penaltyinfo[idx].iter().filter(|info| !info.active) {
+        for info in local_builds[idx]
+            .penaltyinfo
+            .iter()
+            .filter(|info| !info.active)
+        {
             dropped_penaltyinfo_global.push(DroppedPenaltyBlockInfo {
                 termname: Some(term.name.clone()),
                 penalty: info.clone(),
             });
         }
-        for info in &local_pre_dropped_penaltyinfo[idx] {
+        for info in &local_builds[idx].pre_dropped_penaltyinfo {
             dropped_penaltyinfo_global.push(DroppedPenaltyBlockInfo {
                 termname: Some(term.name.clone()),
                 penalty: info.clone(),
@@ -3708,15 +3735,15 @@ pub fn build_smooth_design_withworkspace(
             name: term.name.clone(),
             coeff_range: col_start..col_end,
             shape: term.shape,
-            penalties_local: local_penalties[idx].clone(),
-            nullspace_dims: local_nullspaces[idx].clone(),
-            penaltyinfo_local: local_penaltyinfo[idx].clone(),
-            metadata: local_metadata[idx].clone(),
+            penalties_local: local_builds[idx].penalties.clone(),
+            nullspace_dims: local_builds[idx].nullspaces.clone(),
+            penaltyinfo_local: local_builds[idx].penaltyinfo.clone(),
+            metadata: local_builds[idx].metadata.clone(),
             lower_bounds_local: lb_local.clone(),
-            linear_constraints_local: local_linear_constraints[idx].clone(),
-            kronecker_factored: local_kronecker_factored[idx].take(),
+            linear_constraints_local: local_builds[idx].linear_constraints.clone(),
+            kronecker_factored: local_builds[idx].kronecker_factored.take(),
         });
-        if let Some(lin_local) = &local_linear_constraints[idx] {
+        if let Some(lin_local) = &local_builds[idx].linear_constraints {
             for r in 0..lin_local.a.nrows() {
                 let mut row = Array1::<f64>::zeros(total_p);
                 row.slice_mut(s![col_start..col_end])
