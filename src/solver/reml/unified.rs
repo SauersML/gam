@@ -4412,6 +4412,7 @@ pub fn reml_laml_evaluate(
     mode: EvalMode,
     prior_cost_gradient: Option<(f64, Array1<f64>, Option<Array2<f64>>)>,
 ) -> Result<RemlLamlResult, String> {
+    let cost_phase_start = std::time::Instant::now();
     let k = rho.len();
     let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
     let curvature_lambdas: Vec<f64> = lambdas
@@ -4512,6 +4513,14 @@ pub fn reml_laml_evaluate(
             hessian: crate::solver::outer_strategy::HessianResult::Unavailable,
         });
     }
+
+    log::info!(
+        "[STAGE] reml_laml cost_only_done k={} ext_dim={} dim={} elapsed={:.3}s",
+        k,
+        solution.ext_coords.len(),
+        hop.dim(),
+        cost_phase_start.elapsed().as_secs_f64(),
+    );
 
     // ─── Gradient (uses SAME hop, SAME intermediates) ───
 
@@ -4750,6 +4759,7 @@ pub fn reml_laml_evaluate(
     // derivatives g_i = F_{βi}. IFT gives β_i = -H^{-1}g_i, exactly like
     // the ρ block.
     for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
+        let ext_coord_start = std::time::Instant::now();
         let grad_idx = k + ext_idx;
 
         // Mode response magnitude: v_i = H⁻¹(g_i), with β_i = −v_i.
@@ -4806,6 +4816,11 @@ pub fn reml_laml_evaluate(
             profiled_scale,
             incl_logdet_h,
             incl_logdet_s,
+        );
+        log::info!(
+            "[STAGE] reml_laml ext_coord_trace ext_idx={} elapsed={:.3}s",
+            ext_idx,
+            ext_coord_start.elapsed().as_secs_f64(),
         );
     }
 
@@ -9646,6 +9661,7 @@ impl MatrixFreeSpdOperator {
         if !self.exact_dense_spectral_budget_ok() {
             return None;
         }
+        let materialize_start = std::time::Instant::now();
         let mut matrix = Array2::<f64>::zeros((self.n_dim, self.n_dim));
         let mut basis = Array1::<f64>::zeros(self.n_dim);
         for j in 0..self.n_dim {
@@ -9664,7 +9680,14 @@ impl MatrixFreeSpdOperator {
                 matrix[[j, i]] = avg;
             }
         }
-        DenseSpectralOperator::from_symmetric(&matrix).ok()
+        let result = DenseSpectralOperator::from_symmetric(&matrix).ok();
+        log::info!(
+            "[STAGE] matrix_free_spd materialize n_dim={} matvec_count={} elapsed={:.3}s",
+            self.n_dim,
+            self.n_dim,
+            materialize_start.elapsed().as_secs_f64(),
+        );
+        result
     }
 
     fn dense_spectral(&self) -> Option<&DenseSpectralOperator> {
@@ -9722,7 +9745,15 @@ impl HessianOperator for MatrixFreeSpdOperator {
     }
 
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
-        self.exact_dense_spectral().trace_logdet_operator(op)
+        let trace_start = std::time::Instant::now();
+        let result = self.exact_dense_spectral().trace_logdet_operator(op);
+        log::info!(
+            "[STAGE] matrix_free_spd trace_logdet_operator implicit={} dim={} elapsed={:.3}s",
+            op.is_implicit(),
+            op.dim(),
+            trace_start.elapsed().as_secs_f64(),
+        );
+        result
     }
 
     fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {

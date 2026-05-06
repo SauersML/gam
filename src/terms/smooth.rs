@@ -4293,13 +4293,13 @@ fn smooth_intrinsic_parametric_feature_cols(
     // spline model surface; projecting it out leaves small-k univariate TPS
     // terms with only nonlinear residual columns.
     let feature_cols = smooth_term_feature_cols(term);
-    let has_model_owned_overlap = linear_terms
-        .iter()
-        .any(|linear| feature_cols.contains(&linear.feature_col));
-    if !has_model_owned_overlap {
-        return Vec::new();
+    let mut owned = Vec::new();
+    for linear in linear_terms {
+        if feature_cols.contains(&linear.feature_col) && !owned.contains(&linear.feature_col) {
+            owned.push(linear.feature_col);
+        }
     }
-    feature_cols
+    owned
 }
 
 fn apply_global_smooth_identifiability(
@@ -14581,12 +14581,47 @@ mod tests {
         assert_eq!(design.smooth.term_designs[0].ncols(), 2);
         assert_eq!(design.smooth.nullspace_dims, vec![1]);
         let intercept = Array2::<f64>::ones((data.nrows(), 1));
-        let rel =
-            orthogonality_relative_residual_for_design(&design.smooth.term_designs[0], intercept.view())
-                .expect("intercept residual");
+        let rel = orthogonality_relative_residual_for_design(
+            &design.smooth.term_designs[0],
+            intercept.view(),
+        )
+        .expect("intercept residual");
         assert!(
             rel <= 1e-10,
             "standalone TPS should be centered against the intercept while retaining its linear nullspace; rel={rel}"
+        );
+    }
+
+    #[test]
+    fn spatial_parametric_ownership_projects_only_explicit_linear_axes() {
+        let term = SmoothTermSpec {
+            name: "s_xy".to_string(),
+            basis: SmoothBasisSpec::ThinPlate {
+                feature_cols: vec![0, 1],
+                spec: ThinPlateBasisSpec {
+                    center_strategy: CenterStrategy::EqualMass { num_centers: 4 },
+                    length_scale: 1.0,
+                    double_penalty: false,
+                    identifiability: SpatialIdentifiability::OrthogonalToParametric,
+                    radial_reparam: None,
+                },
+                input_scales: None,
+            },
+            shape: ShapeConstraint::None,
+        };
+        let linear_terms = vec![LinearTermSpec {
+            name: "x0".to_string(),
+            feature_col: 0,
+            double_penalty: false,
+            coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+            coefficient_min: None,
+            coefficient_max: None,
+        }];
+
+        assert_eq!(
+            smooth_intrinsic_parametric_feature_cols(&linear_terms, &term),
+            vec![0],
+            "a linear term on x0 should not claim the smooth's x1 nullspace"
         );
     }
 

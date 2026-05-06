@@ -4277,9 +4277,9 @@ impl TransformationNormalFamily {
         rows: std::ops::Range<usize>,
     ) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>, Array2<f64>), String> {
         let cov = self
-            .covariate_design
-            .try_row_chunk(rows.clone())
-            .map_err(|e| format!("SCOP psi-psi covariate row chunk failed: {e}"))?;
+            .covariate_dense_arc()?
+            .slice(s![rows.clone(), ..])
+            .to_owned();
         let cov_i = op
             .cov_first_axis_row_chunk(axis_i, rows.clone())
             .map_err(|e| format!("SCOP psi-psi covariate first-axis row chunk(i) failed: {e}"))?;
