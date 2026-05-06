@@ -127,8 +127,9 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
         self.assertEqual(sc.basis_type, "duchon")
         self.assertFalse(sc.double_penalty)
 
-    def test_mgcv_select_penalty_matches_rust_spatial_nullspace_semantics(self) -> None:
-        self.assertTrue(_FUZZ._mgcv_select_penalty(_scenario(basis_type="tps", double_penalty=False)))
+    def test_mgcv_select_penalty_matches_rust_double_penalty_semantics(self) -> None:
+        self.assertFalse(_FUZZ._mgcv_select_penalty(_scenario(basis_type="tps", double_penalty=False)))
+        self.assertTrue(_FUZZ._mgcv_select_penalty(_scenario(basis_type="tps", double_penalty=True)))
         self.assertFalse(_FUZZ._mgcv_select_penalty(_scenario(basis_type="duchon", double_penalty=True)))
         self.assertFalse(_FUZZ._mgcv_select_penalty(_scenario(basis_type="ps", double_penalty=False)))
         self.assertTrue(_FUZZ._mgcv_select_penalty(_scenario(basis_type="ps", double_penalty=True)))

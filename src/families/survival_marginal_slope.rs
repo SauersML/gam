@@ -9838,11 +9838,7 @@ impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointH
         Ok(Some(self.joint_hessian_operator.mul_vec(beta_flat)))
     }
 
-    fn hessian_matvec_into(
-        &self,
-        v: &Array1<f64>,
-        out: &mut Array1<f64>,
-    ) -> Result<bool, String> {
+    fn hessian_matvec_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<bool, String> {
         // Forward to HyperOperator's existing `mul_vec_into`, which writes the
         // matvec result directly into the caller-owned buffer with no
         // intermediate allocation. Used by inner-Newton PCG so each CG iter

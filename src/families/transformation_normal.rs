@@ -3549,6 +3549,7 @@ impl TransformationNormalFamily {
     fn scop_psi_psi_bilinear_from_cov(
         &self,
         beta: &Array1<f64>,
+        cached_gamma: ArrayView2<'_, f64>,
         cached_h: ArrayView1<'_, f64>,
         cached_h_prime: ArrayView1<'_, f64>,
         cov: ArrayView2<'_, f64>,
@@ -3590,6 +3591,15 @@ impl TransformationNormalFamily {
                 "SCOP psi-psi bilinear row-quantity cache length mismatch: h={}, h_prime={}, expected={n}",
                 cached_h.len(),
                 cached_h_prime.len()
+            ));
+        }
+        if cached_gamma.nrows() != n || cached_gamma.ncols() != p_resp {
+            return Err(format!(
+                "SCOP psi-psi bilinear gamma cache shape {}x{} != expected {}x{}",
+                cached_gamma.nrows(),
+                cached_gamma.ncols(),
+                n,
+                p_resp
             ));
         }
         for (name, mat) in [
@@ -3677,12 +3687,13 @@ impl TransformationNormalFamily {
                     let global_row = row_start + row_idx;
                     let rv = self.response_val_basis.row(global_row);
                     let rd = self.response_deriv_basis.row(global_row);
+                    let gamma_row = cached_gamma.row(row_idx);
 
                     for k in 0..p_resp {
                         let beta_k = beta_mat.row(k);
                         let left_k = left_mat.row(k);
                         let right_k = right_mat.row(k);
-                        acc.gamma[k] = beta_k.dot(&cov_row);
+                        acc.gamma[k] = gamma_row[k];
                         acc.gamma_i[k] = beta_k.dot(&cov_i_row);
                         acc.gamma_j[k] = beta_k.dot(&cov_j_row);
                         acc.gamma_ij[k] = beta_k.dot(&cov_ij_row);
@@ -4357,6 +4368,7 @@ impl TransformationNormalFamily {
         op: &TensorKroneckerPsiOperator,
         axis_i: usize,
         axis_j: usize,
+        cached_gamma: ArrayView2<'_, f64>,
         cached_h: ArrayView1<'_, f64>,
         cached_h_prime: ArrayView1<'_, f64>,
         endpoint_q: &[LogNormalCdfDiffDerivatives],
@@ -4378,6 +4390,16 @@ impl TransformationNormalFamily {
                 cached_h_prime.len()
             ));
         }
+        let p_resp = self.response_val_basis.ncols();
+        if cached_gamma.nrows() != n || cached_gamma.ncols() != p_resp {
+            return Err(format!(
+                "SCOP psi-psi bilinear operator gamma cache shape {}x{} != expected {}x{}",
+                cached_gamma.nrows(),
+                cached_gamma.ncols(),
+                n,
+                p_resp
+            ));
+        }
         let rows_per_chunk = self.scop_psi_pair_rows_per_chunk(p_cov).min(n.max(1));
         let mut total = 0.0;
         for start in (0..n).step_by(rows_per_chunk) {
@@ -4387,6 +4409,7 @@ impl TransformationNormalFamily {
                 self.scop_psi_pair_cov_chunks(op, axis_i, axis_j, rows.clone())?;
             total += self.scop_psi_psi_bilinear_from_cov(
                 beta,
+                cached_gamma.slice(s![start..end, ..]),
                 cached_h.slice(s![start..end]),
                 cached_h_prime.slice(s![start..end]),
                 cov.view(),
@@ -6131,6 +6154,7 @@ impl HyperOperator for TransformationNormalPsiPsiHessianOperator {
                 self.tensor_op(),
                 self.axis_i,
                 self.axis_j,
+                self.row_gamma.view(),
                 self.row_h.view(),
                 self.row_h_prime.view(),
                 self.endpoint_q.as_slice(),
