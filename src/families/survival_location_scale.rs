@@ -5493,37 +5493,99 @@ fn prediction_linear_predictors(
 ) -> Result<PredictionLinearPredictors, String> {
     validate_predict_inverse_link(&input.inverse_link)?;
     let n = input.x_time_exit.nrows();
-    let beta_time = fit.beta_time();
     let beta_threshold = fit.beta_threshold();
     let beta_log_sigma = fit.beta_log_sigma();
-    let beta_link_wiggle = fit.beta_link_wiggle();
-    if input.x_time_exit.ncols() != beta_time.len() {
-        return Err(format!(
-            "predict_survival_location_scale: time design/beta mismatch: {} vs {}",
-            input.x_time_exit.ncols(),
-            beta_time.len()
-        ));
-    }
-    if input.eta_time_offset_exit.len() != n
-        || input.x_threshold.nrows() != n
+    if input.x_threshold.nrows() != n
         || input.eta_threshold_offset.len() != n
         || input.x_log_sigma.nrows() != n
         || input.eta_log_sigma_offset.len() != n
     {
         return Err("predict_survival_location_scale: row mismatch across inputs".to_string());
     }
-    let h_base = fast_av(&input.x_time_exit, &beta_time) + &input.eta_time_offset_exit;
+    let eta_t =
+        input.x_threshold.matrixvectormultiply(&beta_threshold) + &input.eta_threshold_offset;
+    let eta_ls =
+        input.x_log_sigma.matrixvectormultiply(&beta_log_sigma) + &input.eta_log_sigma_offset;
+    prediction_linear_predictors_from_components(
+        &input.x_time_exit,
+        &input.eta_time_offset_exit,
+        input.time_wiggle_knots.as_ref(),
+        input.time_wiggle_degree,
+        input.time_wiggle_ncols,
+        &eta_t,
+        &eta_ls,
+        input.link_wiggle_knots.as_ref(),
+        input.link_wiggle_degree,
+        fit,
+    )
+}
+
+pub(crate) fn predict_survival_location_scale_from_linear_components(
+    x_time_exit: &Array2<f64>,
+    eta_time_offset_exit: &Array1<f64>,
+    time_wiggle_knots: Option<&Array1<f64>>,
+    time_wiggle_degree: Option<usize>,
+    time_wiggle_ncols: usize,
+    eta_t: &Array1<f64>,
+    eta_ls: &Array1<f64>,
+    link_wiggle_knots: Option<&Array1<f64>>,
+    link_wiggle_degree: Option<usize>,
+    inverse_link: &InverseLink,
+    fit: &UnifiedFitResult,
+) -> Result<SurvivalLocationScalePredictResult, String> {
+    validate_predict_inverse_link(inverse_link)?;
+    let predictors = prediction_linear_predictors_from_components(
+        x_time_exit,
+        eta_time_offset_exit,
+        time_wiggle_knots,
+        time_wiggle_degree,
+        time_wiggle_ncols,
+        eta_t,
+        eta_ls,
+        link_wiggle_knots,
+        link_wiggle_degree,
+        fit,
+    )?;
+    survival_location_scale_response_from_predictors(inverse_link, predictors)
+}
+
+fn prediction_linear_predictors_from_components(
+    x_time_exit: &Array2<f64>,
+    eta_time_offset_exit: &Array1<f64>,
+    time_wiggle_knots: Option<&Array1<f64>>,
+    time_wiggle_degree: Option<usize>,
+    time_wiggle_ncols: usize,
+    eta_t: &Array1<f64>,
+    eta_ls: &Array1<f64>,
+    link_wiggle_knots: Option<&Array1<f64>>,
+    link_wiggle_degree: Option<usize>,
+    fit: &UnifiedFitResult,
+) -> Result<PredictionLinearPredictors, String> {
+    let n = x_time_exit.nrows();
+    let beta_time = fit.beta_time();
+    let beta_link_wiggle = fit.beta_link_wiggle();
+    if x_time_exit.ncols() != beta_time.len() {
+        return Err(format!(
+            "predict_survival_location_scale: time design/beta mismatch: {} vs {}",
+            x_time_exit.ncols(),
+            beta_time.len()
+        ));
+    }
+    if eta_time_offset_exit.len() != n || eta_t.len() != n || eta_ls.len() != n {
+        return Err("predict_survival_location_scale: row mismatch across inputs".to_string());
+    }
+    let h_base = fast_av(x_time_exit, &beta_time) + eta_time_offset_exit;
     let mut h = h_base.clone();
-    let mut time_jac = input.x_time_exit.clone();
-    if input.time_wiggle_ncols > 0 {
+    let mut time_jac = x_time_exit.clone();
+    if time_wiggle_ncols > 0 {
         let p_time = beta_time.len();
-        let p_w = input.time_wiggle_ncols.min(p_time);
+        let p_w = time_wiggle_ncols.min(p_time);
         let time_tail = p_time - p_w..p_time;
-        let knots = input.time_wiggle_knots.as_ref().ok_or_else(|| {
+        let knots = time_wiggle_knots.ok_or_else(|| {
             "predict_survival_location_scale: timewiggle coefficients are missing knot metadata"
                 .to_string()
         })?;
-        let degree = input.time_wiggle_degree.ok_or_else(|| {
+        let degree = time_wiggle_degree.ok_or_else(|| {
             "predict_survival_location_scale: timewiggle coefficients are missing degree metadata"
                 .to_string()
         })?;
@@ -5544,28 +5606,15 @@ fn prediction_linear_predictors(
         }
         let dq = fast_av(&time_basis_d1, &beta_time_w) + 1.0;
         h = &h_base + &fast_av(&time_basis, &beta_time_w);
-        time_jac = scale_dense_rows(&input.x_time_exit, &dq)?;
+        time_jac = scale_dense_rows(x_time_exit, &dq)?;
         time_jac
             .slice_mut(s![.., time_tail.start..time_tail.end])
             .assign(&time_basis);
     }
-    let eta_t =
-        input.x_threshold.matrixvectormultiply(&beta_threshold) + &input.eta_threshold_offset;
-    let eta_ls =
-        input.x_log_sigma.matrixvectormultiply(&beta_log_sigma) + &input.eta_log_sigma_offset;
-    let resolved_wiggle_knots = input
-        .link_wiggle_knots
-        .as_ref()
-        .or(fit.artifacts.survival_link_wiggle_knots.as_ref());
-    let resolved_wiggle_degree = input
-        .link_wiggle_degree
-        .or(fit.artifacts.survival_link_wiggle_degree);
-    let q0 = Array1::from_iter(
-        eta_t
-            .iter()
-            .zip(eta_ls.iter())
-            .map(|(&t, &ls)| survival_q0_from_eta(t, ls)),
-    );
+    let resolved_wiggle_knots =
+        link_wiggle_knots.or(fit.artifacts.survival_link_wiggle_knots.as_ref());
+    let resolved_wiggle_degree = link_wiggle_degree.or(fit.artifacts.survival_link_wiggle_degree);
+    let q0 = Array1::from_shape_fn(n, |i| survival_q0_from_eta(eta_t[i], eta_ls[i]));
     let (wiggle_design, dq_dq0, etaw) = if let Some(betaw) = beta_link_wiggle.as_ref() {
         let knots = resolved_wiggle_knots.ok_or_else(|| {
             "predict_survival_location_scale: link-wiggle coefficients are missing knot metadata"
@@ -5599,8 +5648,8 @@ fn prediction_linear_predictors(
     Ok(PredictionLinearPredictors {
         h,
         time_jac,
-        eta_t,
-        eta_ls,
+        eta_t: eta_t.clone(),
+        eta_ls: eta_ls.clone(),
         etaw,
         wiggle_design,
         dq_dq0,
@@ -10277,27 +10326,46 @@ pub fn predict_survival_location_scale(
     fit: &UnifiedFitResult,
 ) -> Result<SurvivalLocationScalePredictResult, String> {
     let predictors = prediction_linear_predictors(input, fit)?;
-    let n = input.x_time_exit.nrows();
+    survival_location_scale_response_from_predictors(&input.inverse_link, predictors)
+}
+
+fn survival_location_scale_response_from_predictors(
+    inverse_link: &InverseLink,
+    predictors: PredictionLinearPredictors,
+) -> Result<SurvivalLocationScalePredictResult, String> {
+    use ndarray::Zip;
+
+    let n = predictors.h.len();
     let inv_sigma = predictors.eta_ls.mapv(exp_sigma_inverse_from_eta_scalar);
-    let eta = Array1::from_iter(
-        predictors
-            .h
-            .iter()
-            .zip(predictors.eta_t.iter())
-            .zip(inv_sigma.iter())
-            .enumerate()
-            .map(|(i, ((&hh, &tt), &r))| {
-                let mut q = hh - tt * r;
-                if let Some(w) = predictors.etaw.as_ref() {
-                    q += w[i];
-                }
-                q
+    let mut eta = Array1::<f64>::zeros(n);
+    match predictors.etaw.as_ref() {
+        Some(etaw) => Zip::from(&mut eta)
+            .and(&predictors.h)
+            .and(&predictors.eta_t)
+            .and(&inv_sigma)
+            .and(etaw)
+            .par_for_each(|q, &hh, &tt, &r, &w| {
+                *q = hh - tt * r + w;
             }),
-    );
-    let mut survival_prob = Array1::<f64>::zeros(n);
-    for (i, &v) in eta.iter().enumerate() {
-        survival_prob[i] = inverse_link_survival_prob_checked(&input.inverse_link, v)?;
+        None => Zip::from(&mut eta)
+            .and(&predictors.h)
+            .and(&predictors.eta_t)
+            .and(&inv_sigma)
+            .par_for_each(|q, &hh, &tt, &r| {
+                *q = hh - tt * r;
+            }),
     }
+    let survival_values: Result<Vec<f64>, String> = {
+        use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+        eta.as_slice()
+            .ok_or_else(|| {
+                "predict_survival_location_scale: eta storage is not contiguous".to_string()
+            })?
+            .par_iter()
+            .map(|&v| inverse_link_survival_prob_checked(inverse_link, v))
+            .collect()
+    };
+    let survival_prob = Array1::from_vec(survival_values?);
     Ok(SurvivalLocationScalePredictResult { eta, survival_prob })
 }
 
@@ -12609,6 +12677,55 @@ mod tests {
 
         assert!((pred.eta[0] - expected_eta).abs() <= 1e-12);
         assert!((pred.survival_prob[0] - expected_survival).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn component_prediction_matches_full_design_for_repeated_prediction_grid() {
+        let fit = test_survival_fit(array![0.4, -0.1], array![0.2, 0.3], array![-0.5, 0.1], None);
+        let inverse_link = residual_distribution_inverse_link(ResidualDistribution::Gaussian);
+        let x_time_exit = array![[1.0, 0.2], [1.0, 0.8], [0.5, -0.3], [0.5, 0.4]];
+        let x_threshold = array![[1.0, -0.2], [1.0, -0.2], [0.0, 0.6], [0.0, 0.6]];
+        let x_log_sigma = array![[1.0, 0.3], [1.0, 0.3], [0.0, -0.4], [0.0, -0.4]];
+        let eta_time_offset_exit = array![0.2, 0.25, -0.1, -0.05];
+        let eta_threshold_offset = array![0.7, 0.7, -0.2, -0.2];
+        let eta_log_sigma_offset = array![0.4, 0.4, -0.3, -0.3];
+        let full_input = SurvivalLocationScalePredictInput {
+            x_time_exit: x_time_exit.clone(),
+            eta_time_offset_exit: eta_time_offset_exit.clone(),
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+            x_threshold: DesignMatrix::from(x_threshold.clone()),
+            eta_threshold_offset: eta_threshold_offset.clone(),
+            x_log_sigma: DesignMatrix::from(x_log_sigma.clone()),
+            eta_log_sigma_offset: eta_log_sigma_offset.clone(),
+            x_link_wiggle: None,
+            link_wiggle_knots: None,
+            link_wiggle_degree: None,
+            inverse_link: inverse_link.clone(),
+        };
+        let full = predict_survival_location_scale(&full_input, &fit).expect("full predict");
+        let eta_t = x_threshold.dot(&fit.beta_threshold()) + eta_threshold_offset;
+        let eta_ls = x_log_sigma.dot(&fit.beta_log_sigma()) + eta_log_sigma_offset;
+        let component = predict_survival_location_scale_from_linear_components(
+            &x_time_exit,
+            &eta_time_offset_exit,
+            None,
+            None,
+            0,
+            &eta_t,
+            &eta_ls,
+            None,
+            None,
+            &inverse_link,
+            &fit,
+        )
+        .expect("component predict");
+
+        for i in 0..full.eta.len() {
+            assert!((full.eta[i] - component.eta[i]).abs() <= 1e-12);
+            assert!((full.survival_prob[i] - component.survival_prob[i]).abs() <= 1e-12);
+        }
     }
 
     #[test]
