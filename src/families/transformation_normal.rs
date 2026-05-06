@@ -12122,6 +12122,19 @@ impl TransformationNormalPsiWorkspace {
                 }
 
                 let mut acc = PsiAllAxesAccum::new(n_psi, p_total);
+                let mut gamma = vec![0.0; p_resp];
+                let mut h_factor = vec![0.0; p_resp];
+                let mut hp_factor = vec![0.0; p_resp];
+                let mut endpoint_factor = vec![[0.0_f64; 2]; p_resp];
+                let mut gamma_psi = vec![0.0; p_resp];
+                let mut hpsi_cov_factor = vec![0.0; p_resp];
+                let mut hppsi_cov_factor = vec![0.0; p_resp];
+                let mut hpsi_psi_factor = vec![0.0; p_resp];
+                let mut hppsi_psi_factor = vec![0.0; p_resp];
+                let mut endpoint_psi = [0.0_f64; 2];
+                let mut endpoint_psi_cov_factor = vec![[0.0_f64; 2]; p_resp];
+                let mut endpoint_psi_psi_factor = vec![[0.0_f64; 2]; p_resp];
+
                 for local_i in 0..(end - start) {
                     let i = start + local_i;
                     let cov_row = cov.row(local_i);
@@ -12135,20 +12148,16 @@ impl TransformationNormalPsiWorkspace {
                     let q = &endpoint_q[i];
                     let gamma_row = row.gamma.row(i);
 
-                    let mut gamma = vec![0.0; p_resp];
                     for k in 0..p_resp {
                         gamma[k] = gamma_row[k];
                     }
 
-                    let mut h_factor = vec![0.0; p_resp];
-                    let mut hp_factor = vec![0.0; p_resp];
                     h_factor[0] = rv[0];
                     hp_factor[0] = rd[0];
                     for k in 1..p_resp {
                         h_factor[k] = 2.0 * rv[k] * gamma[k];
                         hp_factor[k] = 2.0 * rd[k] * gamma[k];
                     }
-                    let mut endpoint_factor = vec![[0.0_f64; 2]; p_resp];
                     for e in 0..2 {
                         let basis = endpoint_basis[e];
                         endpoint_factor[0][e] = basis[0];
@@ -12156,15 +12165,6 @@ impl TransformationNormalPsiWorkspace {
                             endpoint_factor[k][e] = 2.0 * basis[k] * gamma[k];
                         }
                     }
-
-                    let mut gamma_psi = vec![0.0; p_resp];
-                    let mut hpsi_cov_factor = vec![0.0; p_resp];
-                    let mut hppsi_cov_factor = vec![0.0; p_resp];
-                    let mut hpsi_psi_factor = vec![0.0; p_resp];
-                    let mut hppsi_psi_factor = vec![0.0; p_resp];
-                    let mut endpoint_psi = [0.0_f64; 2];
-                    let mut endpoint_psi_cov_factor = vec![[0.0_f64; 2]; p_resp];
-                    let mut endpoint_psi_psi_factor = vec![[0.0_f64; 2]; p_resp];
 
                     for axis_idx in 0..n_psi {
                         let psi_row = cov_psi_chunks[axis_idx].row(local_i);
