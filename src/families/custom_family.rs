@@ -4710,8 +4710,22 @@ fn refresh_all_block_etas<F: CustomFamily + Clone + Send + Sync + 'static>(
     specs: &[ParameterBlockSpec],
     states: &mut [ParameterBlockState],
 ) -> Result<(), String> {
-    for b in 0..specs.len() {
-        refresh_single_block_eta(family, specs, states, b)?;
+    if family.block_geometry_is_dynamic() {
+        for b in 0..specs.len() {
+            refresh_single_block_eta(family, specs, states, b)?;
+        }
+        return Ok(());
+    }
+
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    let refreshed_etas: Vec<Array1<f64>> = (0..specs.len())
+        .into_par_iter()
+        .map(|b| specs[b].design.matrixvectormultiply(&states[b].beta) + &specs[b].offset)
+        .collect();
+
+    for (state, eta) in states.iter_mut().zip(refreshed_etas) {
+        state.eta = eta;
     }
     Ok(())
 }
