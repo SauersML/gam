@@ -132,12 +132,37 @@ struct InnerProgressSnapshot {
     last_accept_rho: Option<f64>,
 }
 
+/// Exact dense-materialization route exposed by an outer Hessian operator.
+///
+/// The optimizer uses this as a work-model contract before turning a
+/// matrix-free analytic Hessian into a dense ARC model. `Unavailable` means
+/// callers must stay matrix-free; the remaining variants are all analytic
+/// (never numerical finite-difference Hessians) but differ in how much
+/// per-column HVP overhead they imply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OuterHessianMaterialization {
+    /// Dense materialization is not part of this operator's contract.
+    Unavailable,
+    /// Materialization is exact but implemented by cheap repeated HVP probes.
+    RepeatedHvp,
+    /// Materialization is exact and can apply many HVP directions together.
+    BatchedHvp,
+    /// Materialization is exact and can be assembled without basis probing.
+    Explicit,
+}
+
+impl OuterHessianMaterialization {
+    fn is_available(self) -> bool {
+        !matches!(self, Self::Unavailable)
+    }
+}
+
 /// Matrix-free outer Hessian operator.
 ///
 /// This is the exact outer Hessian action `H_outer * v` evaluated at the
 /// current outer point, without requiring dense materialization.
 ///
-/// The trait provides three increasingly batched primitives:
+/// The trait provides four increasingly materialized primitives:
 ///
 /// - [`matvec`](Self::matvec) — single column, the only one implementors must
 ///   provide.
@@ -145,14 +170,15 @@ struct InnerProgressSnapshot {
 ///   column-by-column `matvec`. Implementors override this when they can
 ///   amortize per-Hv-apply overhead (cached factorizations, parallel matvecs)
 ///   across many right-hand-sides.
-/// - [`is_cheap_to_materialize`](Self::is_cheap_to_materialize) — an explicit
-///   work-model hint for callers deciding whether probing every column is
-///   affordable.
+/// - [`materialization_capability`](Self::materialization_capability) — an
+///   explicit work-model contract that tells ARC whether dense exact
+///   materialization is unavailable, cheap repeated-HVP, batched-HVP, or
+///   explicit.
 /// - [`materialize_dense`](Self::materialize_dense) — the special case
 ///   `mul_mat(I_dim)` followed by a symmetric average of the off-diagonals to
-///   absorb round-off asymmetry. Callers should only use this for planning
-///   when [`is_cheap_to_materialize`](Self::is_cheap_to_materialize) is true,
-///   or for post-fit code paths that explicitly need a concrete matrix.
+///   absorb round-off asymmetry. ARC callers only use this when
+///   [`materialization_capability`](Self::materialization_capability) advertises
+///   an exact dense route, preserving the no-numerical-Hessian policy.
 pub trait OuterHessianOperator: Send + Sync {
     fn dim(&self) -> usize;
     fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String>;
@@ -162,8 +188,30 @@ pub trait OuterHessianOperator: Send + Sync {
     /// The default is deliberately conservative. For operator-backed Duchon,
     /// CTN, survival, or other row-streaming kernels, `dim <= 64` does not
     /// imply cheap materialization: each column may trigger a full data pass.
+    ///
+    /// New implementations should prefer overriding
+    /// [`materialization_capability`](Self::materialization_capability) so the
+    /// caller can distinguish cheap repeated probes from true batched/explicit
+    /// Hessian materialization.
     fn is_cheap_to_materialize(&self) -> bool {
         false
+    }
+
+    /// Exact dense-materialization capability for this operator.
+    ///
+    /// The default preserves the historical work-model hook: operators that
+    /// already opted into cheap probing via
+    /// [`is_cheap_to_materialize`](Self::is_cheap_to_materialize) are treated
+    /// as exact repeated-HVP materializers. Backends that can amortize or avoid
+    /// basis probes should override this to return
+    /// [`OuterHessianMaterialization::BatchedHvp`] or
+    /// [`OuterHessianMaterialization::Explicit`].
+    fn materialization_capability(&self) -> OuterHessianMaterialization {
+        if self.is_cheap_to_materialize() {
+            OuterHessianMaterialization::RepeatedHvp
+        } else {
+            OuterHessianMaterialization::Unavailable
+        }
     }
 
     /// Apply the operator to all `m` columns of `factor`, returning a
@@ -235,6 +283,11 @@ pub trait OuterHessianOperator: Send + Sync {
                 dense[[col, row]] = sym;
             }
         }
+        if !dense.iter().all(|value| value.is_finite()) {
+            return Err(
+                "outer Hessian dense materialization produced non-finite entries".to_string(),
+            );
+        }
         Ok(dense)
     }
 }
@@ -298,6 +351,10 @@ impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {
     fn is_cheap_to_materialize(&self) -> bool {
         self.base.is_cheap_to_materialize()
     }
+
+    fn materialization_capability(&self) -> OuterHessianMaterialization {
+        self.base.materialization_capability()
+    }
 }
 
 /// Upper safety bound for operator materialization after the operator has
@@ -346,6 +403,10 @@ impl<'a> OuterHessianOperator for HvApplyCounter<'a> {
         self.count
             .fetch_add(factor.ncols() as u64, std::sync::atomic::Ordering::Relaxed);
         self.inner.mul_mat(factor)
+    }
+
+    fn materialization_capability(&self) -> OuterHessianMaterialization {
+        self.inner.materialization_capability()
     }
 }
 
@@ -1640,7 +1701,10 @@ fn validate_second_order_seed_hessian(
     if layout.n_params > SECOND_ORDER_GEOMETRY_PROBE_MAX_PARAMS || !eval.hessian.is_analytic() {
         return Ok(());
     }
-    if matches!(&eval.hessian, HessianResult::Operator(op) if !op.is_cheap_to_materialize()) {
+    if matches!(
+        &eval.hessian,
+        HessianResult::Operator(op) if !op.materialization_capability().is_available()
+    ) {
         return Ok(());
     }
 
@@ -2274,7 +2338,7 @@ struct OuterSecondOrderBridge<'a> {
     layout: OuterThetaLayout,
     hessian_source: HessianSource,
     /// When the evaluator returns `HessianResult::Operator(op)` and the
-    /// operator declares dense probing cheap, the bridge may basis-probe the
+    /// operator advertises an exact dense route, the bridge may materialize the
     /// operator into a dense K×K matrix so the dense ARC path can run an exact
     /// factorization instead of operator-CG.
     materialize_operator_max_dim: usize,
@@ -2479,12 +2543,13 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
             HessianSource::Analytic => match eval.hessian {
                 HessianResult::Analytic(h) => Some(h),
                 HessianResult::Operator(ref op)
-                    if op.is_cheap_to_materialize()
+                    if op.materialization_capability().is_available()
                         && op.dim() <= self.materialize_operator_max_dim =>
                 {
-                    // Work-model-approved operator: basis-probe the Hv
-                    // operator into a dense K×K matrix so the dense ARC path
-                    // can run an exact factorization.
+                    // Work-model-approved exact operator materialization:
+                    // batched/explicit backends can avoid one full pass per
+                    // basis column while still feeding dense ARC an analytic
+                    // K×K matrix.
                     Some(
                         op.materialize_dense()
                             .map_err(|message| ObjectiveEvalError::Fatal {
@@ -3420,6 +3485,7 @@ impl OuterHessianOperator for BorrowedDenseOuterHessian<'_> {
     }
 }
 
+
 /// Pick the post-rejection trust radius. If the cubic model just
 /// predicted a decrease >1e6 × |cost| (i.e. the local function is wildly
 /// non-quadratic at the proposed step), and a Newton-step-scale derived
@@ -3972,6 +4038,7 @@ fn run_operator_trust_region(
         if materialize_dense_after_rejection
             && dense_model.is_none()
             && op_arc.dim() <= OPERATOR_DENSE_REUSE_MAX_DIM
+            && op_arc.materialization_capability().is_available()
         {
             let materialize_start = std::time::Instant::now();
             match op_arc.materialize_dense() {
@@ -4809,7 +4876,7 @@ fn run_outer_with_plan(
                 let cheap_materializable_operator = matches!(
                     seed_eval.hessian,
                     HessianResult::Operator(ref op)
-                        if op.is_cheap_to_materialize()
+                        if op.materialization_capability().is_available()
                             && op.dim() <= OUTER_HVP_MATERIALIZE_MAX_DIM
                 );
                 if cheap_materializable_operator {
@@ -7382,6 +7449,7 @@ mod tests {
     fn operator_arc_reuses_dense_model_after_rejection() {
         struct CountingIdentityOuterHessianOperator {
             matvec_calls: Arc<std::sync::atomic::AtomicUsize>,
+            batched_mul_mat_calls: Arc<std::sync::atomic::AtomicUsize>,
         }
 
         impl OuterHessianOperator for CountingIdentityOuterHessianOperator {
@@ -7394,10 +7462,21 @@ mod tests {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(v.clone())
             }
+
+            fn mul_mat(&self, factor: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+                self.batched_mul_mat_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(factor.to_owned())
+            }
+
+            fn materialization_capability(&self) -> OuterHessianMaterialization {
+                OuterHessianMaterialization::BatchedHvp
+            }
         }
 
         struct RejectingObjective {
             matvec_calls: Arc<std::sync::atomic::AtomicUsize>,
+            batched_mul_mat_calls: Arc<std::sync::atomic::AtomicUsize>,
         }
 
         impl OuterObjective for RejectingObjective {
@@ -7433,6 +7512,7 @@ mod tests {
                     hessian: HessianResult::Operator(Arc::new(
                         CountingIdentityOuterHessianOperator {
                             matvec_calls: Arc::clone(&self.matvec_calls),
+                            batched_mul_mat_calls: Arc::clone(&self.batched_mul_mat_calls),
                         },
                     )),
                 })
@@ -7442,8 +7522,10 @@ mod tests {
         }
 
         let matvec_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let batched_mul_mat_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut obj = RejectingObjective {
             matvec_calls: Arc::clone(&matvec_calls),
+            batched_mul_mat_calls: Arc::clone(&batched_mul_mat_calls),
         };
         let seed = array![0.0];
         let initial_eval = obj
@@ -7467,9 +7549,15 @@ mod tests {
         assert!(!result.converged);
         assert_eq!(
             matvec_calls.load(std::sync::atomic::Ordering::Relaxed),
-            3,
-            "first rejected step uses two HVPs; dense materialization uses one \
-             sequential HVP; later rejected steps must reuse the dense model"
+            2,
+            "first rejected step uses two HVPs; batched dense materialization must not \
+             fall back to an extra per-column matvec"
+        );
+        assert_eq!(
+            batched_mul_mat_calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "post-rejection dense ARC reuse must materialize through the operator's \
+             batched mul_mat path exactly once"
         );
     }
 
