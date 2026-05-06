@@ -3811,8 +3811,7 @@ impl TransformationNormalFamily {
                             endpoint_ij_d[e] = basis[0] * acc.gamma_ij_dot[col];
                             for k in 1..p_resp {
                                 let idx = k * rank + col;
-                                endpoint_d[e] +=
-                                    2.0 * basis[k] * acc.gamma[k] * acc.gamma_dot[idx];
+                                endpoint_d[e] += 2.0 * basis[k] * acc.gamma[k] * acc.gamma_dot[idx];
                                 endpoint_i_d[e] += 2.0
                                     * basis[k]
                                     * (acc.gamma_dot[idx] * acc.gamma_i[k]
@@ -9135,6 +9134,23 @@ impl TensorKroneckerPsiOperator {
         op.row_chunk_first(deriv.implicit_axis, rows)
     }
 
+    fn cov_first_axis_row_chunk_streaming(
+        &self,
+        axis: usize,
+        rows: std::ops::Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        let deriv = self.cov_deriv(axis)?;
+        if deriv.x_psi.nrows() == self.n_data() && deriv.x_psi.ncols() == self.p_cov() {
+            return Ok(deriv.x_psi.slice(s![rows, ..]).to_owned());
+        }
+        let Some(op) = deriv.implicit_operator.as_ref() else {
+            return Err(crate::terms::basis::BasisError::InvalidInput(format!(
+                "missing covariate psi streaming row chunk operator for axis {axis}"
+            )));
+        };
+        op.row_chunk_first(deriv.implicit_axis, rows)
+    }
+
     fn cov_second_axis_row_chunk(
         &self,
         axis_d: usize,
@@ -11887,8 +11903,9 @@ impl MaterializablePsiDerivativeOperator for TensorKroneckerPsiOperator {
 /// the dominant outer-evaluation cost. All `n_psi` axes share the same per-row
 /// state — `γ`, `h`, `h'`, `endpoint_q`, the response basis rows `rv`/`rd`,
 /// the covariate row, and the row weight. The only per-axis input is
-/// `cov_psi[axis] = ∂C/∂ψ_axis`, which is already cached at the operator level
-/// via [`TensorKroneckerPsiOperator::materialize_cov_first_axis_arc`].
+/// `cov_psi[axis] = ∂C/∂ψ_axis`, which this workspace streams in bounded row
+/// chunks so the exact all-axis gradient never has to cache all
+/// `n * p_cov * n_psi` derivative entries at once.
 ///
 /// This workspace
 ///
@@ -11946,9 +11963,7 @@ impl TransformationNormalPsiWorkspace {
     /// per-axis [`scop_psi_terms`] path that reloads it once per axis. Op
     /// counts are identical to the per-axis path; only the loop nesting and
     /// reduction shape change.
-    fn compute_all_axes(
-        &self,
-    ) -> Result<Vec<TransformationNormalPsiWorkspaceCacheEntry>, String> {
+    fn compute_all_axes(&self) -> Result<Vec<TransformationNormalPsiWorkspaceCacheEntry>, String> {
         if self.block_states.len() != 1 {
             return Err(format!(
                 "TransformationNormalFamily expects 1 block, got {}",
@@ -11984,7 +11999,8 @@ impl TransformationNormalPsiWorkspace {
         // Resolve and validate the shared tensor-Kronecker ψ operator across
         // every axis. CTN is single-block so all entries point at the same
         // operator instance; we still loop to validate the contract.
-        let mut op_arcs: Vec<Arc<dyn CustomFamilyPsiDerivativeOperator>> = Vec::with_capacity(n_psi);
+        let mut op_arcs: Vec<Arc<dyn CustomFamilyPsiDerivativeOperator>> =
+            Vec::with_capacity(n_psi);
         let mut axes: Vec<usize> = Vec::with_capacity(n_psi);
         for deriv in block_derivs.iter() {
             let op_arc = deriv
@@ -12011,7 +12027,7 @@ impl TransformationNormalPsiWorkspace {
             op_arcs.push(op_arc);
         }
         // The shared instance is whichever axis we resolve first; downcast it
-        // again for materialization. CTN's `build_tensor_psi_derivatives`
+        // again for row-chunk streaming. CTN's `build_tensor_psi_derivatives`
         // guarantees this is the same instance across every axis.
         let shared_op_arc = Arc::clone(&op_arcs[0]);
         let op = shared_op_arc
@@ -12019,45 +12035,19 @@ impl TransformationNormalPsiWorkspace {
             .downcast_ref::<TensorKroneckerPsiOperator>()
             .expect("validated tensor-backed above");
 
-        // Materialize the per-axis covariate ψ-derivative blocks once. Each
-        // call hits the operator-level cache; subsequent calls within this
-        // workspace reuse the same Arc<Array2<f64>>.
-        let mut cov_psi_axes: Vec<Arc<Array2<f64>>> = Vec::with_capacity(n_psi);
-        for &axis in &axes {
-            let cov_psi = op
-                .materialize_cov_first_axis_arc(axis)
-                .map_err(|e| format!("ψ workspace materialize_cov_first axis {axis}: {e}"))?;
-            if cov_psi.nrows() != n || cov_psi.ncols() != p_cov {
-                return Err(format!(
-                    "ψ workspace covariate derivative shape {}x{} for axis {axis} != expected {}x{}",
-                    cov_psi.nrows(),
-                    cov_psi.ncols(),
-                    n,
-                    p_cov
-                ));
-            }
-            cov_psi_axes.push(cov_psi);
-        }
-
-        let cov = self
-            .family
-            .covariate_design
-            .try_row_chunk(0..n)
-            .map_err(|e| format!("ψ workspace covariate row chunk: {e}"))?;
         let weights = self.family.weights.as_ref();
         let h = row.h.as_ref();
         let h_prime = row.h_prime.as_ref();
         let endpoint_q = row.endpoint_q.as_ref();
-        let endpoint_basis = [
-            self.family
-                .response_upper_basis
-                .as_slice()
-                .ok_or_else(|| "ψ workspace endpoint upper basis is not contiguous".to_string())?,
-            self.family
-                .response_lower_basis
-                .as_slice()
-                .ok_or_else(|| "ψ workspace endpoint lower basis is not contiguous".to_string())?,
-        ];
+        let endpoint_basis =
+            [
+                self.family.response_upper_basis.as_slice().ok_or_else(|| {
+                    "ψ workspace endpoint upper basis is not contiguous".to_string()
+                })?,
+                self.family.response_lower_basis.as_slice().ok_or_else(|| {
+                    "ψ workspace endpoint lower basis is not contiguous".to_string()
+                })?,
+            ];
 
         // Single-pass row walk: for each row, load the per-row state once and
         // accumulate every axis's `objective_psi`/`score_psi` in lockstep.
@@ -12085,17 +12075,51 @@ impl TransformationNormalPsiWorkspace {
             }
         }
 
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let cov_psi_views: Vec<&Array2<f64>> =
-            cov_psi_axes.iter().map(|arc| arc.as_ref()).collect();
-        let cov_psi_views = &cov_psi_views;
+        let policy = ResourcePolicy::default_library();
+        let row_bytes = p_cov
+            .saturating_mul(n_psi + 1)
+            .saturating_mul(std::mem::size_of::<f64>())
+            .max(1);
+        let target_chunk_bytes =
+            (16 * 1024 * 1024).min((policy.max_single_materialization_bytes / 8).max(row_bytes));
+        let chunk_rows = (target_chunk_bytes / row_bytes).clamp(1, n.max(1));
+        let row_chunks: Vec<(usize, usize)> = (0..n)
+            .step_by(chunk_rows)
+            .map(|start| (start, (start + chunk_rows).min(n)))
+            .collect();
 
-        let accum = (0..n)
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let partials: Vec<Result<PsiAllAxesAccum, String>> = row_chunks
             .into_par_iter()
-            .fold(
-                || PsiAllAxesAccum::new(n_psi, p_total),
-                |mut acc, i| {
-                    let cov_row = cov.row(i);
+            .map(|(start, end)| {
+                let cov = self
+                    .family
+                    .covariate_design
+                    .try_row_chunk(start..end)
+                    .map_err(|e| format!("ψ workspace covariate row chunk {start}..{end}: {e}"))?;
+                let mut cov_psi_chunks: Vec<Array2<f64>> = Vec::with_capacity(n_psi);
+                for &axis in &axes {
+                    let cov_psi = op
+                        .cov_first_axis_row_chunk_streaming(axis, start..end)
+                        .map_err(|e| {
+                            format!("ψ workspace covariate ψ row chunk axis {axis} {start}..{end}: {e}")
+                        })?;
+                    if cov_psi.nrows() != end - start || cov_psi.ncols() != p_cov {
+                        return Err(format!(
+                            "ψ workspace covariate derivative chunk shape {}x{} for axis {axis} rows {start}..{end} != expected {}x{}",
+                            cov_psi.nrows(),
+                            cov_psi.ncols(),
+                            end - start,
+                            p_cov
+                        ));
+                    }
+                    cov_psi_chunks.push(cov_psi);
+                }
+
+                let mut acc = PsiAllAxesAccum::new(n_psi, p_total);
+                for local_i in 0..(end - start) {
+                    let i = start + local_i;
+                    let cov_row = cov.row(local_i);
                     let rv = self.family.response_val_basis.row(i);
                     let rd = self.family.response_deriv_basis.row(i);
                     let wi = weights[i];
@@ -12111,7 +12135,6 @@ impl TransformationNormalPsiWorkspace {
                         gamma[k] = gamma_row[k];
                     }
 
-                    // β-only (axis-independent) per-row factors.
                     let mut h_factor = vec![0.0; p_resp];
                     let mut hp_factor = vec![0.0; p_resp];
                     h_factor[0] = rv[0];
@@ -12129,9 +12152,6 @@ impl TransformationNormalPsiWorkspace {
                         }
                     }
 
-                    // Per-axis: compute γψ via β·psi_row, then update the
-                    // axis's running objective + score block. The k×c inner
-                    // loop matches `scop_psi_terms` operation-for-operation.
                     let mut gamma_psi = vec![0.0; p_resp];
                     let mut hpsi_cov_factor = vec![0.0; p_resp];
                     let mut hppsi_cov_factor = vec![0.0; p_resp];
@@ -12142,8 +12162,7 @@ impl TransformationNormalPsiWorkspace {
                     let mut endpoint_psi_psi_factor = vec![[0.0_f64; 2]; p_resp];
 
                     for axis_idx in 0..n_psi {
-                        let cov_psi = cov_psi_views[axis_idx];
-                        let psi_row = cov_psi.row(i);
+                        let psi_row = cov_psi_chunks[axis_idx].row(local_i);
 
                         for k in 0..p_resp {
                             gamma_psi[k] = beta_mat.row(k).dot(&psi_row);
@@ -12169,7 +12188,9 @@ impl TransformationNormalPsiWorkspace {
                         }
 
                         acc.objective_psi[axis_idx] += wi
-                            * (hi * h_psi - hp_psi * inv_hp + endpoint_chain_first(q, endpoint_psi));
+                            * (hi * h_psi
+                                - hp_psi * inv_hp
+                                + endpoint_chain_first(q, endpoint_psi));
 
                         hpsi_psi_factor[0] = rv[0];
                         hppsi_psi_factor[0] = rd[0];
@@ -12214,14 +12235,14 @@ impl TransformationNormalPsiWorkspace {
                             }
                         }
                     }
-
-                    acc
-                },
-            )
-            .reduce(
-                || PsiAllAxesAccum::new(n_psi, p_total),
-                PsiAllAxesAccum::merge,
-            );
+                }
+                Ok(acc)
+            })
+            .collect();
+        let mut accum = PsiAllAxesAccum::new(n_psi, p_total);
+        for partial in partials {
+            accum = accum.merge(partial?);
+        }
 
         // Stash the cached numeric data plus per-axis operator handles. The
         // matrix-free `TransformationNormalPsiHessianOperator` is reconstructed
