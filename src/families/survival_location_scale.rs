@@ -4821,6 +4821,259 @@ struct SurvivalBaseQScalars {
     q_llll: f64,
 }
 
+struct SurvivalDynamicGeometryRowsMut<'a> {
+    q_exit: &'a mut [f64],
+    q_entry: &'a mut [f64],
+    qdot_exit: &'a mut [f64],
+    dq_t_exit: &'a mut [f64],
+    dq_t_entry: &'a mut [f64],
+    dq_ls_exit: &'a mut [f64],
+    dq_ls_entry: &'a mut [f64],
+    d2q_tls_exit: &'a mut [f64],
+    d2q_tls_entry: &'a mut [f64],
+    d2q_ls_exit: &'a mut [f64],
+    d2q_ls_entry: &'a mut [f64],
+    d3q_tls_ls_exit: &'a mut [f64],
+    d3q_tls_ls_entry: &'a mut [f64],
+    d3q_ls_exit: &'a mut [f64],
+    d3q_ls_entry: &'a mut [f64],
+    d4q_tls_ls_ls_exit: &'a mut [f64],
+    d4q_tls_ls_ls_entry: &'a mut [f64],
+    d4q_ls_exit: &'a mut [f64],
+    d4q_ls_entry: &'a mut [f64],
+    dqdot_t: &'a mut [f64],
+    dqdot_ls: &'a mut [f64],
+    dqdot_td: &'a mut [f64],
+    dqdot_lsd: &'a mut [f64],
+    d2qdot_tt: &'a mut [f64],
+    d2qdot_tls: &'a mut [f64],
+    d2qdot_ttd: &'a mut [f64],
+    d2qdot_tlsd: &'a mut [f64],
+    d2qdot_ls: &'a mut [f64],
+    d2qdot_lstd: &'a mut [f64],
+    d2qdot_lslsd: &'a mut [f64],
+}
+
+impl<'a> SurvivalDynamicGeometryRowsMut<'a> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.q_exit.len()
+    }
+
+    fn split_at_mut(self, mid: usize) -> (Self, Self) {
+        let (q_exit_l, q_exit_r) = self.q_exit.split_at_mut(mid);
+        let (q_entry_l, q_entry_r) = self.q_entry.split_at_mut(mid);
+        let (qdot_exit_l, qdot_exit_r) = self.qdot_exit.split_at_mut(mid);
+        let (dq_t_exit_l, dq_t_exit_r) = self.dq_t_exit.split_at_mut(mid);
+        let (dq_t_entry_l, dq_t_entry_r) = self.dq_t_entry.split_at_mut(mid);
+        let (dq_ls_exit_l, dq_ls_exit_r) = self.dq_ls_exit.split_at_mut(mid);
+        let (dq_ls_entry_l, dq_ls_entry_r) = self.dq_ls_entry.split_at_mut(mid);
+        let (d2q_tls_exit_l, d2q_tls_exit_r) = self.d2q_tls_exit.split_at_mut(mid);
+        let (d2q_tls_entry_l, d2q_tls_entry_r) = self.d2q_tls_entry.split_at_mut(mid);
+        let (d2q_ls_exit_l, d2q_ls_exit_r) = self.d2q_ls_exit.split_at_mut(mid);
+        let (d2q_ls_entry_l, d2q_ls_entry_r) = self.d2q_ls_entry.split_at_mut(mid);
+        let (d3q_tls_ls_exit_l, d3q_tls_ls_exit_r) = self.d3q_tls_ls_exit.split_at_mut(mid);
+        let (d3q_tls_ls_entry_l, d3q_tls_ls_entry_r) = self.d3q_tls_ls_entry.split_at_mut(mid);
+        let (d3q_ls_exit_l, d3q_ls_exit_r) = self.d3q_ls_exit.split_at_mut(mid);
+        let (d3q_ls_entry_l, d3q_ls_entry_r) = self.d3q_ls_entry.split_at_mut(mid);
+        let (d4q_tls_ls_ls_exit_l, d4q_tls_ls_ls_exit_r) =
+            self.d4q_tls_ls_ls_exit.split_at_mut(mid);
+        let (d4q_tls_ls_ls_entry_l, d4q_tls_ls_ls_entry_r) =
+            self.d4q_tls_ls_ls_entry.split_at_mut(mid);
+        let (d4q_ls_exit_l, d4q_ls_exit_r) = self.d4q_ls_exit.split_at_mut(mid);
+        let (d4q_ls_entry_l, d4q_ls_entry_r) = self.d4q_ls_entry.split_at_mut(mid);
+        let (dqdot_t_l, dqdot_t_r) = self.dqdot_t.split_at_mut(mid);
+        let (dqdot_ls_l, dqdot_ls_r) = self.dqdot_ls.split_at_mut(mid);
+        let (dqdot_td_l, dqdot_td_r) = self.dqdot_td.split_at_mut(mid);
+        let (dqdot_lsd_l, dqdot_lsd_r) = self.dqdot_lsd.split_at_mut(mid);
+        let (d2qdot_tt_l, d2qdot_tt_r) = self.d2qdot_tt.split_at_mut(mid);
+        let (d2qdot_tls_l, d2qdot_tls_r) = self.d2qdot_tls.split_at_mut(mid);
+        let (d2qdot_ttd_l, d2qdot_ttd_r) = self.d2qdot_ttd.split_at_mut(mid);
+        let (d2qdot_tlsd_l, d2qdot_tlsd_r) = self.d2qdot_tlsd.split_at_mut(mid);
+        let (d2qdot_ls_l, d2qdot_ls_r) = self.d2qdot_ls.split_at_mut(mid);
+        let (d2qdot_lstd_l, d2qdot_lstd_r) = self.d2qdot_lstd.split_at_mut(mid);
+        let (d2qdot_lslsd_l, d2qdot_lslsd_r) = self.d2qdot_lslsd.split_at_mut(mid);
+
+        (
+            Self {
+                q_exit: q_exit_l,
+                q_entry: q_entry_l,
+                qdot_exit: qdot_exit_l,
+                dq_t_exit: dq_t_exit_l,
+                dq_t_entry: dq_t_entry_l,
+                dq_ls_exit: dq_ls_exit_l,
+                dq_ls_entry: dq_ls_entry_l,
+                d2q_tls_exit: d2q_tls_exit_l,
+                d2q_tls_entry: d2q_tls_entry_l,
+                d2q_ls_exit: d2q_ls_exit_l,
+                d2q_ls_entry: d2q_ls_entry_l,
+                d3q_tls_ls_exit: d3q_tls_ls_exit_l,
+                d3q_tls_ls_entry: d3q_tls_ls_entry_l,
+                d3q_ls_exit: d3q_ls_exit_l,
+                d3q_ls_entry: d3q_ls_entry_l,
+                d4q_tls_ls_ls_exit: d4q_tls_ls_ls_exit_l,
+                d4q_tls_ls_ls_entry: d4q_tls_ls_ls_entry_l,
+                d4q_ls_exit: d4q_ls_exit_l,
+                d4q_ls_entry: d4q_ls_entry_l,
+                dqdot_t: dqdot_t_l,
+                dqdot_ls: dqdot_ls_l,
+                dqdot_td: dqdot_td_l,
+                dqdot_lsd: dqdot_lsd_l,
+                d2qdot_tt: d2qdot_tt_l,
+                d2qdot_tls: d2qdot_tls_l,
+                d2qdot_ttd: d2qdot_ttd_l,
+                d2qdot_tlsd: d2qdot_tlsd_l,
+                d2qdot_ls: d2qdot_ls_l,
+                d2qdot_lstd: d2qdot_lstd_l,
+                d2qdot_lslsd: d2qdot_lslsd_l,
+            },
+            Self {
+                q_exit: q_exit_r,
+                q_entry: q_entry_r,
+                qdot_exit: qdot_exit_r,
+                dq_t_exit: dq_t_exit_r,
+                dq_t_entry: dq_t_entry_r,
+                dq_ls_exit: dq_ls_exit_r,
+                dq_ls_entry: dq_ls_entry_r,
+                d2q_tls_exit: d2q_tls_exit_r,
+                d2q_tls_entry: d2q_tls_entry_r,
+                d2q_ls_exit: d2q_ls_exit_r,
+                d2q_ls_entry: d2q_ls_entry_r,
+                d3q_tls_ls_exit: d3q_tls_ls_exit_r,
+                d3q_tls_ls_entry: d3q_tls_ls_entry_r,
+                d3q_ls_exit: d3q_ls_exit_r,
+                d3q_ls_entry: d3q_ls_entry_r,
+                d4q_tls_ls_ls_exit: d4q_tls_ls_ls_exit_r,
+                d4q_tls_ls_ls_entry: d4q_tls_ls_ls_entry_r,
+                d4q_ls_exit: d4q_ls_exit_r,
+                d4q_ls_entry: d4q_ls_entry_r,
+                dqdot_t: dqdot_t_r,
+                dqdot_ls: dqdot_ls_r,
+                dqdot_td: dqdot_td_r,
+                dqdot_lsd: dqdot_lsd_r,
+                d2qdot_tt: d2qdot_tt_r,
+                d2qdot_tls: d2qdot_tls_r,
+                d2qdot_ttd: d2qdot_ttd_r,
+                d2qdot_tlsd: d2qdot_tlsd_r,
+                d2qdot_ls: d2qdot_ls_r,
+                d2qdot_lstd: d2qdot_lstd_r,
+                d2qdot_lslsd: d2qdot_lslsd_r,
+            },
+        )
+    }
+}
+
+struct SurvivalDynamicGeometryRowInputs<'a> {
+    eta_t_exit: ndarray::ArrayView1<'a, f64>,
+    eta_ls_exit: ndarray::ArrayView1<'a, f64>,
+    eta_t_entry: ndarray::ArrayView1<'a, f64>,
+    eta_ls_entry: ndarray::ArrayView1<'a, f64>,
+    eta_t_deriv_exit: &'a Array1<f64>,
+    eta_ls_deriv_exit: &'a Array1<f64>,
+    wiggle_exit: Option<&'a SurvivalWiggleGeometry>,
+    wiggle_entry: Option<&'a SurvivalWiggleGeometry>,
+    link_beta: Option<ndarray::ArrayView1<'a, f64>>,
+}
+
+const SURVIVAL_DYNAMIC_GEOMETRY_PAR_CHUNK: usize = 1024;
+
+fn fill_survival_dynamic_geometry_rows(
+    rows: SurvivalDynamicGeometryRowsMut<'_>,
+    row_start: usize,
+    inputs: &SurvivalDynamicGeometryRowInputs<'_>,
+) {
+    let len = rows.len();
+    if len <= SURVIVAL_DYNAMIC_GEOMETRY_PAR_CHUNK {
+        fill_survival_dynamic_geometry_rows_serial(rows, row_start, inputs);
+    } else {
+        let mid = len / 2;
+        let (left, right) = rows.split_at_mut(mid);
+        rayon::join(
+            || fill_survival_dynamic_geometry_rows(left, row_start, inputs),
+            || fill_survival_dynamic_geometry_rows(right, row_start + mid, inputs),
+        );
+    }
+}
+
+fn fill_survival_dynamic_geometry_rows_serial(
+    rows: SurvivalDynamicGeometryRowsMut<'_>,
+    row_start: usize,
+    inputs: &SurvivalDynamicGeometryRowInputs<'_>,
+) {
+    for offset in 0..rows.len() {
+        let i = row_start + offset;
+        let base_exit = survival_base_q_scalars(inputs.eta_t_exit[i], inputs.eta_ls_exit[i]);
+        let base_entry = survival_base_q_scalars(inputs.eta_t_entry[i], inputs.eta_ls_entry[i]);
+        let exit_dyn = if let (Some(wig), Some(beta_w)) = (inputs.wiggle_exit, inputs.link_beta) {
+            compose_survival_dynamic_q(
+                base_exit,
+                inputs.eta_t_deriv_exit[i],
+                inputs.eta_ls_deriv_exit[i],
+                wig.basis.row(i).dot(&beta_w),
+                wig.dq_dq0[i],
+                wig.d2q_dq02[i],
+                wig.d3q_dq03[i],
+                wig.d4q_dq04[i],
+            )
+        } else {
+            compose_survival_dynamic_q(
+                base_exit,
+                inputs.eta_t_deriv_exit[i],
+                inputs.eta_ls_deriv_exit[i],
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+            )
+        };
+        let entry_dyn = if let (Some(wig), Some(beta_w)) = (inputs.wiggle_entry, inputs.link_beta) {
+            compose_survival_dynamic_q(
+                base_entry,
+                0.0,
+                0.0,
+                wig.basis.row(i).dot(&beta_w),
+                wig.dq_dq0[i],
+                wig.d2q_dq02[i],
+                wig.d3q_dq03[i],
+                wig.d4q_dq04[i],
+            )
+        } else {
+            compose_survival_dynamic_q(base_entry, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+        };
+        rows.q_exit[offset] = exit_dyn.q;
+        rows.q_entry[offset] = entry_dyn.q;
+        rows.qdot_exit[offset] = exit_dyn.qdot;
+        rows.dq_t_exit[offset] = exit_dyn.q_t;
+        rows.dq_t_entry[offset] = entry_dyn.q_t;
+        rows.dq_ls_exit[offset] = exit_dyn.q_ls;
+        rows.dq_ls_entry[offset] = entry_dyn.q_ls;
+        rows.d2q_tls_exit[offset] = exit_dyn.q_tl;
+        rows.d2q_tls_entry[offset] = entry_dyn.q_tl;
+        rows.d2q_ls_exit[offset] = exit_dyn.q_ll;
+        rows.d2q_ls_entry[offset] = entry_dyn.q_ll;
+        rows.d3q_tls_ls_exit[offset] = exit_dyn.q_tl_ls;
+        rows.d3q_tls_ls_entry[offset] = entry_dyn.q_tl_ls;
+        rows.d3q_ls_exit[offset] = exit_dyn.q_ll_ls;
+        rows.d3q_ls_entry[offset] = entry_dyn.q_ll_ls;
+        rows.d4q_tls_ls_ls_exit[offset] = exit_dyn.q_tl_ls_ls;
+        rows.d4q_tls_ls_ls_entry[offset] = entry_dyn.q_tl_ls_ls;
+        rows.d4q_ls_exit[offset] = exit_dyn.q_llll;
+        rows.d4q_ls_entry[offset] = entry_dyn.q_llll;
+        rows.dqdot_t[offset] = exit_dyn.qdot_t;
+        rows.dqdot_ls[offset] = exit_dyn.qdot_ls;
+        rows.dqdot_td[offset] = exit_dyn.qdot_td;
+        rows.dqdot_lsd[offset] = exit_dyn.qdot_lsd;
+        rows.d2qdot_tt[offset] = exit_dyn.qdot_tt;
+        rows.d2qdot_tls[offset] = exit_dyn.qdot_tls;
+        rows.d2qdot_ttd[offset] = exit_dyn.qdot_ttd;
+        rows.d2qdot_tlsd[offset] = exit_dyn.qdot_tlsd;
+        rows.d2qdot_ls[offset] = exit_dyn.qdot_ll;
+        rows.d2qdot_lstd[offset] = exit_dyn.qdot_lstd;
+        rows.d2qdot_lslsd[offset] = exit_dyn.qdot_llsd;
+    }
+}
+
 #[derive(Clone, Copy)]
 struct SurvivalDynamicQScalars {
     q: f64,
@@ -5329,91 +5582,132 @@ impl SurvivalLocationScaleFamily {
         let mut d2qdot_lstd = Array1::<f64>::zeros(n);
         let mut d2qdot_lslsd = Array1::<f64>::zeros(n);
 
-        for i in 0..n {
-            let base_exit = survival_base_q_scalars(eta_t_exit[i], eta_ls_exit[i]);
-            let base_entry = survival_base_q_scalars(eta_t_entry[i], eta_ls_entry[i]);
-            let exit_dyn = if let Some(wig) = wiggle_exit.as_ref() {
-                compose_survival_dynamic_q(
-                    base_exit,
-                    eta_t_deriv_exit[i],
-                    eta_ls_deriv_exit[i],
-                    wig.basis
-                        .row(i)
-                        .dot(&block_states[Self::BLOCK_LINK_WIGGLE].beta),
-                    wig.dq_dq0[i],
-                    wig.d2q_dq02[i],
-                    wig.d3q_dq03[i],
-                    wig.d4q_dq04[i],
-                )
-            } else {
-                compose_survival_dynamic_q(
-                    base_exit,
-                    eta_t_deriv_exit[i],
-                    eta_ls_deriv_exit[i],
-                    0.0,
-                    1.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                )
-            };
-            let entry_dyn = if let Some(wig) = wiggle_entry.as_ref() {
-                compose_survival_dynamic_q(
-                    base_entry,
-                    0.0,
-                    0.0,
-                    wig.basis
-                        .row(i)
-                        .dot(&block_states[Self::BLOCK_LINK_WIGGLE].beta),
-                    wig.dq_dq0[i],
-                    wig.d2q_dq02[i],
-                    wig.d3q_dq03[i],
-                    wig.d4q_dq04[i],
-                )
-            } else {
-                compose_survival_dynamic_q(base_entry, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
-            };
-            q_exit[i] = exit_dyn.q;
-            q_entry[i] = entry_dyn.q;
-            qdot_exit[i] = exit_dyn.qdot;
-            dq_t_exit[i] = exit_dyn.q_t;
-            dq_t_entry[i] = entry_dyn.q_t;
-            dq_ls_exit[i] = exit_dyn.q_ls;
-            dq_ls_entry[i] = entry_dyn.q_ls;
-            d2q_tls_exit[i] = exit_dyn.q_tl;
-            d2q_tls_entry[i] = entry_dyn.q_tl;
-            d2q_ls_exit[i] = exit_dyn.q_ll;
-            d2q_ls_entry[i] = entry_dyn.q_ll;
-            d3q_tls_ls_exit[i] = exit_dyn.q_tl_ls;
-            d3q_tls_ls_entry[i] = entry_dyn.q_tl_ls;
-            d3q_ls_exit[i] = exit_dyn.q_ll_ls;
-            d3q_ls_entry[i] = entry_dyn.q_ll_ls;
-            d4q_tls_ls_ls_exit[i] = exit_dyn.q_tl_ls_ls;
-            d4q_tls_ls_ls_entry[i] = entry_dyn.q_tl_ls_ls;
-            d4q_ls_exit[i] = exit_dyn.q_llll;
-            d4q_ls_entry[i] = entry_dyn.q_llll;
-            dqdot_t[i] = exit_dyn.qdot_t;
-            dqdot_ls[i] = exit_dyn.qdot_ls;
-            dqdot_td[i] = exit_dyn.qdot_td;
-            dqdot_lsd[i] = exit_dyn.qdot_lsd;
-            d2qdot_tt[i] = exit_dyn.qdot_tt;
-            d2qdot_tls[i] = exit_dyn.qdot_tls;
-            d2qdot_ttd[i] = exit_dyn.qdot_ttd;
-            d2qdot_tlsd[i] = exit_dyn.qdot_tlsd;
-            d2qdot_ls[i] = exit_dyn.qdot_ll;
-            d2qdot_lstd[i] = exit_dyn.qdot_lstd;
-            d2qdot_lslsd[i] = exit_dyn.qdot_llsd;
-        }
+        let dynamic_row_inputs = SurvivalDynamicGeometryRowInputs {
+            eta_t_exit,
+            eta_ls_exit,
+            eta_t_entry,
+            eta_ls_entry,
+            eta_t_deriv_exit: &eta_t_deriv_exit,
+            eta_ls_deriv_exit: &eta_ls_deriv_exit,
+            wiggle_exit: wiggle_exit.as_ref(),
+            wiggle_entry: wiggle_entry.as_ref(),
+            link_beta: beta_w,
+        };
+        let dynamic_rows = SurvivalDynamicGeometryRowsMut {
+            q_exit: q_exit.as_slice_mut().expect("q_exit must be contiguous"),
+            q_entry: q_entry.as_slice_mut().expect("q_entry must be contiguous"),
+            qdot_exit: qdot_exit
+                .as_slice_mut()
+                .expect("qdot_exit must be contiguous"),
+            dq_t_exit: dq_t_exit
+                .as_slice_mut()
+                .expect("dq_t_exit must be contiguous"),
+            dq_t_entry: dq_t_entry
+                .as_slice_mut()
+                .expect("dq_t_entry must be contiguous"),
+            dq_ls_exit: dq_ls_exit
+                .as_slice_mut()
+                .expect("dq_ls_exit must be contiguous"),
+            dq_ls_entry: dq_ls_entry
+                .as_slice_mut()
+                .expect("dq_ls_entry must be contiguous"),
+            d2q_tls_exit: d2q_tls_exit
+                .as_slice_mut()
+                .expect("d2q_tls_exit must be contiguous"),
+            d2q_tls_entry: d2q_tls_entry
+                .as_slice_mut()
+                .expect("d2q_tls_entry must be contiguous"),
+            d2q_ls_exit: d2q_ls_exit
+                .as_slice_mut()
+                .expect("d2q_ls_exit must be contiguous"),
+            d2q_ls_entry: d2q_ls_entry
+                .as_slice_mut()
+                .expect("d2q_ls_entry must be contiguous"),
+            d3q_tls_ls_exit: d3q_tls_ls_exit
+                .as_slice_mut()
+                .expect("d3q_tls_ls_exit must be contiguous"),
+            d3q_tls_ls_entry: d3q_tls_ls_entry
+                .as_slice_mut()
+                .expect("d3q_tls_ls_entry must be contiguous"),
+            d3q_ls_exit: d3q_ls_exit
+                .as_slice_mut()
+                .expect("d3q_ls_exit must be contiguous"),
+            d3q_ls_entry: d3q_ls_entry
+                .as_slice_mut()
+                .expect("d3q_ls_entry must be contiguous"),
+            d4q_tls_ls_ls_exit: d4q_tls_ls_ls_exit
+                .as_slice_mut()
+                .expect("d4q_tls_ls_ls_exit must be contiguous"),
+            d4q_tls_ls_ls_entry: d4q_tls_ls_ls_entry
+                .as_slice_mut()
+                .expect("d4q_tls_ls_ls_entry must be contiguous"),
+            d4q_ls_exit: d4q_ls_exit
+                .as_slice_mut()
+                .expect("d4q_ls_exit must be contiguous"),
+            d4q_ls_entry: d4q_ls_entry
+                .as_slice_mut()
+                .expect("d4q_ls_entry must be contiguous"),
+            dqdot_t: dqdot_t.as_slice_mut().expect("dqdot_t must be contiguous"),
+            dqdot_ls: dqdot_ls
+                .as_slice_mut()
+                .expect("dqdot_ls must be contiguous"),
+            dqdot_td: dqdot_td
+                .as_slice_mut()
+                .expect("dqdot_td must be contiguous"),
+            dqdot_lsd: dqdot_lsd
+                .as_slice_mut()
+                .expect("dqdot_lsd must be contiguous"),
+            d2qdot_tt: d2qdot_tt
+                .as_slice_mut()
+                .expect("d2qdot_tt must be contiguous"),
+            d2qdot_tls: d2qdot_tls
+                .as_slice_mut()
+                .expect("d2qdot_tls must be contiguous"),
+            d2qdot_ttd: d2qdot_ttd
+                .as_slice_mut()
+                .expect("d2qdot_ttd must be contiguous"),
+            d2qdot_tlsd: d2qdot_tlsd
+                .as_slice_mut()
+                .expect("d2qdot_tlsd must be contiguous"),
+            d2qdot_ls: d2qdot_ls
+                .as_slice_mut()
+                .expect("d2qdot_ls must be contiguous"),
+            d2qdot_lstd: d2qdot_lstd
+                .as_slice_mut()
+                .expect("d2qdot_lstd must be contiguous"),
+            d2qdot_lslsd: d2qdot_lslsd
+                .as_slice_mut()
+                .expect("d2qdot_lslsd must be contiguous"),
+        };
+        fill_survival_dynamic_geometry_rows(dynamic_rows, 0, &dynamic_row_inputs);
 
         let wiggle_qdot_basis_exit = wiggle_exit.as_ref().map(|wig| {
+            use rayon::prelude::*;
+
             let mut out = wig.basis_d1.clone();
-            let r = Array1::from_iter((0..n).map(|i| {
-                let base_exit = survival_base_q_scalars(eta_t_exit[i], eta_ls_exit[i]);
-                survival_q0dot_from_base(base_exit, eta_t_deriv_exit[i], eta_ls_deriv_exit[i])
-            }));
-            for i in 0..n {
-                out.row_mut(i).mapv_inplace(|v| v * r[i]);
-            }
+            let r = Array1::from_vec(
+                (0..n)
+                    .into_par_iter()
+                    .map(|i| {
+                        let base_exit = survival_base_q_scalars(eta_t_exit[i], eta_ls_exit[i]);
+                        survival_q0dot_from_base(
+                            base_exit,
+                            eta_t_deriv_exit[i],
+                            eta_ls_deriv_exit[i],
+                        )
+                    })
+                    .collect(),
+            );
+            let ncols = out.ncols();
+            out.as_slice_mut()
+                .expect("wiggle qdot basis must be contiguous")
+                .par_chunks_mut(ncols)
+                .enumerate()
+                .for_each(|(i, row)| {
+                    for value in row {
+                        *value *= r[i];
+                    }
+                });
             out
         });
 
