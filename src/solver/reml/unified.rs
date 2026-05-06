@@ -33,11 +33,7 @@
 //! with a different numerical threshold.
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Zip};
-<<<<<<< ours
 use rayon::prelude::*;
-=======
-use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
->>>>>>> theirs
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
