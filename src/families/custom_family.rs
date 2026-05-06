@@ -6653,8 +6653,8 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
             beta_flat,
             compute_dh,
             compute_d2h,
-            owned_compute_dh: None,
-            owned_compute_d2h: None,
+            owned_compute_dh: Some(owned_compute_dh),
+            owned_compute_d2h: Some(owned_compute_d2h),
             rho_curvature_scale: 1.0,
             hessian_logdet_correction: 0.0,
         }));
