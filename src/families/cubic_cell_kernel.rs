@@ -504,6 +504,29 @@ fn require_moments_degree(
 }
 
 #[inline]
+fn require_scratch_capacity(
+    required_len: usize,
+    capacity: usize,
+    label: &str,
+) -> Result<(), String> {
+    if required_len > capacity {
+        return Err(format!(
+            "{label} polynomial convolution scratch too small: need {required_len}, have {capacity}"
+        ));
+    }
+    Ok(())
+}
+
+#[inline]
+fn convolution_chain_len(lengths: &[usize]) -> usize {
+    if lengths.is_empty() || lengths.iter().any(|&len| len == 0) {
+        0
+    } else {
+        lengths.iter().sum::<usize>() - (lengths.len() - 1)
+    }
+}
+
+#[inline]
 fn first_coefficients_degree(label: &str, coefficients: &[f64]) -> Result<usize, String> {
     coefficients
         .len()
@@ -544,11 +567,41 @@ pub fn cell_third_derivative_from_moments(
 
     let third_term = moment_dot_with_coefficients_unchecked(third_coefficients_rst, moments);
 
-    // Capacity bound for cubic-eta (4) ⊗ first-coefficient slices (≤4 each)
-    // ⊗ extras: max output length is 4 + 4 + 4 + 4 - 3 = 13 for the
-    // four-factor convolution in `cubic_coeff_term`. Sizing to 32 absorbs
-    // any larger test input without bounds-checking the slice path.
+    // This is a deliberately serial leaf kernel: each call performs only a
+    // handful of fixed-size polynomial convolutions, so Rayon fan-out belongs
+    // at the surrounding row/cell batch level rather than inside this hot path.
     const SCRATCH: usize = 32;
+    let max_linear_conv_len = [
+        convolution_chain_len(&[
+            eta.len(),
+            second_coefficients_rs.len(),
+            first_coefficients_t.len(),
+        ]),
+        convolution_chain_len(&[
+            eta.len(),
+            second_coefficients_rt.len(),
+            first_coefficients_s.len(),
+        ]),
+        convolution_chain_len(&[
+            eta.len(),
+            second_coefficients_st.len(),
+            first_coefficients_r.len(),
+        ]),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+    let max_cubic_conv_len = convolution_chain_len(&[
+        7,
+        first_coefficients_r.len(),
+        first_coefficients_s.len(),
+        first_coefficients_t.len(),
+    ]);
+    require_scratch_capacity(
+        max_linear_conv_len.max(max_cubic_conv_len),
+        SCRATCH,
+        "third derivative",
+    )?;
     let mut buf_a = [0.0_f64; SCRATCH];
     let mut buf_b = [0.0_f64; SCRATCH];
 
@@ -668,10 +721,105 @@ pub fn cell_fourth_derivative_from_moments(
 
     let fourth_term = moment_dot_with_coefficients_unchecked(fourth_coefficients_rstu, moments);
 
-    // Capacity bound: max output length is len(eta)+len(r)+len(s)+len(t)+len(u)−4
-    // = 4+4+4+4+4−4 = 16 for the quintuple convolution; sizing to 32 absorbs
-    // larger test inputs.
+    // This is a deliberately serial leaf kernel: each call performs only a
+    // handful of fixed-size polynomial convolutions, so Rayon fan-out belongs
+    // at the surrounding row/cell batch level rather than inside this hot path.
     const SCRATCH: usize = 32;
+    let max_linear_conv_len = [
+        convolution_chain_len(&[
+            eta.len(),
+            third_coefficients_rst.len(),
+            first_coefficients_u.len(),
+        ]),
+        convolution_chain_len(&[
+            eta.len(),
+            third_coefficients_rsu.len(),
+            first_coefficients_t.len(),
+        ]),
+        convolution_chain_len(&[
+            eta.len(),
+            third_coefficients_rtu.len(),
+            first_coefficients_s.len(),
+        ]),
+        convolution_chain_len(&[
+            eta.len(),
+            third_coefficients_stu.len(),
+            first_coefficients_r.len(),
+        ]),
+        convolution_chain_len(&[
+            eta.len(),
+            second_coefficients_rs.len(),
+            second_coefficients_tu.len(),
+        ]),
+        convolution_chain_len(&[
+            eta.len(),
+            second_coefficients_rt.len(),
+            second_coefficients_su.len(),
+        ]),
+        convolution_chain_len(&[
+            eta.len(),
+            second_coefficients_ru.len(),
+            second_coefficients_st.len(),
+        ]),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+    let max_quad_conv_len = [
+        convolution_chain_len(&[
+            7,
+            second_coefficients_rs.len(),
+            first_coefficients_t.len(),
+            first_coefficients_u.len(),
+        ]),
+        convolution_chain_len(&[
+            7,
+            second_coefficients_rt.len(),
+            first_coefficients_s.len(),
+            first_coefficients_u.len(),
+        ]),
+        convolution_chain_len(&[
+            7,
+            second_coefficients_ru.len(),
+            first_coefficients_s.len(),
+            first_coefficients_t.len(),
+        ]),
+        convolution_chain_len(&[
+            7,
+            second_coefficients_st.len(),
+            first_coefficients_r.len(),
+            first_coefficients_u.len(),
+        ]),
+        convolution_chain_len(&[
+            7,
+            second_coefficients_su.len(),
+            first_coefficients_r.len(),
+            first_coefficients_t.len(),
+        ]),
+        convolution_chain_len(&[
+            7,
+            second_coefficients_tu.len(),
+            first_coefficients_r.len(),
+            first_coefficients_s.len(),
+        ]),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+    let max_quartic_conv_len = convolution_chain_len(&[
+        10,
+        first_coefficients_r.len(),
+        first_coefficients_s.len(),
+        first_coefficients_t.len(),
+        first_coefficients_u.len(),
+    ]);
+    require_scratch_capacity(
+        max_linear_conv_len
+            .max(max_quad_conv_len)
+            .max(max_quartic_conv_len),
+        SCRATCH,
+        "fourth derivative",
+    )?;
     let mut buf_a = [0.0_f64; SCRATCH];
     let mut buf_b = [0.0_f64; SCRATCH];
 
@@ -2134,6 +2282,43 @@ mod tests {
         )
         .expect_err("empty first coefficients should be rejected");
         assert!(fourth_err.contains("s first-derivative coefficients must be non-empty"));
+    }
+
+    #[test]
+    fn fourth_derivative_rejects_overlong_scratch_convolutions() {
+        let cell = DenestedCubicCell {
+            left: -1.0,
+            right: 1.0,
+            c0: 0.0,
+            c1: 1.0,
+            c2: 0.0,
+            c3: 0.0,
+        };
+        let long_first = [1.0; 10];
+        let zero = [0.0; 1];
+        let moments = [1.0; 64];
+
+        let err = cell_fourth_derivative_from_moments(
+            cell,
+            &long_first,
+            &long_first,
+            &long_first,
+            &long_first,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &moments,
+        )
+        .expect_err("oversized convolution should be rejected before writing scratch");
+        assert!(err.contains("fourth derivative polynomial convolution scratch too small"));
     }
 
     #[test]
