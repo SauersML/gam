@@ -7332,9 +7332,8 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
     refresh_all_block_etas(family, specs, states)?;
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
-    let mut s_lambdas = Vec::with_capacity(specs.len());
-    let mut penalty_logdet_s_total = 0.0;
-    for (b, spec) in specs.iter().enumerate() {
+    let compute_block_logdet_term = |b: usize| -> Result<(Array2<f64>, f64), String> {
+        let spec = &specs[b];
         let (start, end) = ranges[b];
         let p = end - start;
         let lambdas = block_log_lambdas[b].mapv(f64::exp);
@@ -7342,7 +7341,7 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
         for (k, s) in spec.penalties.iter().enumerate() {
             s.add_scaled_to(lambdas[k], &mut s_lambda);
         }
-        if include_logdet_s {
+        let block_logdet = if include_logdet_s {
             // Exact pseudo-logdet on the positive eigenspace, consistent with
             // the derivatives in compute_block_penalty_logdet_derivs.
             // Uses structural nullity from spec.nullspace_dims to partition
@@ -7358,7 +7357,7 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
                     s_for_logdet[[i, i]] += ridge;
                 }
             }
-            let block_logdet = match s_for_logdet.eigh(faer::Side::Lower) {
+            match s_for_logdet.eigh(faer::Side::Lower) {
                 Ok((evals, _)) => {
                     // Structural nullity determines the split: bottom m₀ eigenvalues
                     // are structural zeros, top (p - m₀) are the positive subspace.
@@ -7400,10 +7399,34 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // does not corrupt REML gradients.
                     penalty_logdet_cholesky_fallback(&s_for_logdet, ridge, b, p, &eigh_err)?
                 }
-            };
-            penalty_logdet_s_total += block_logdet;
-        }
+            }
+        } else {
+            0.0
+        };
+        Ok((s_lambda, block_logdet))
+    };
+
+    // Per-block penalty assembly and eigendecomposition are independent.
+    // Use rayon only from non-rayon callers so inner operator/eigendecomp work
+    // does not nest under an existing worker. Collecting an indexed range into
+    // a Vec preserves block order; totals are accumulated sequentially below
+    // to keep floating-point summation deterministic.
+    let block_terms: Vec<Result<(Array2<f64>, f64), String>> =
+        if specs.len() > 1 && rayon::current_thread_index().is_none() {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            (0..specs.len())
+                .into_par_iter()
+                .map(compute_block_logdet_term)
+                .collect()
+        } else {
+            (0..specs.len()).map(compute_block_logdet_term).collect()
+        };
+    let mut s_lambdas = Vec::with_capacity(block_terms.len());
+    let mut penalty_logdet_s_total = 0.0;
+    for block_term in block_terms {
+        let (s_lambda, block_logdet) = block_term?;
         s_lambdas.push(s_lambda);
+        penalty_logdet_s_total += block_logdet;
     }
     // Try the shared scale-aware exact curvature path first.
     if let Some(curvature) = family.exact_newton_outer_curvature(states)? {
