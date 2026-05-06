@@ -2,7 +2,7 @@
 - Finite differences is never preferred and should only be used if all other methods (including BFGS) are not feasible.
 - Posterior mean must always be the default (never MAP).
 - Analytic, closed-forms should be supported in general for all model types.
-- Penalties must target the final function. If a constrained model intentionally uses a latent coefficient prior instead, that model must document the latent target explicitly and must not describe the penalty as final-function roughness.
+- Penalties must always be on the final function itself, never on the model coefficients.
 - Fitting and inference must be fast on all scales of data, but especially large-scale data where it matters the most (with seamless transitions between strategies).
 - Never vendor external software.
 - The program must never run out of memory on reasonably-resourced computers.
