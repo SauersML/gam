@@ -1,6 +1,7 @@
 use crate::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
 use csv::{ReaderBuilder, StringRecord};
-use ndarray::Array2;
+use ndarray::{Array2, Axis};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -275,17 +276,16 @@ fn load_delimited_inferred(
         );
     }
 
-    // Phase 1: sample rows for schema inference, accumulate into column vecs.
-    let mut col_vecs: Vec<Vec<f64>> = vec![Vec::new(); p];
-    let mut sample_strings: Vec<Vec<String>> = vec![Vec::new(); p];
-    let mut sample_count: usize = 0;
+    // Phase 1: stream CSV structure exactly as before, but keep projected,
+    // trimmed fields in row-major order. Field validation, type conversion,
+    // inference, and row-to-column transposition happen after the streaming
+    // read so those CPU-heavy passes can run in parallel across independent
+    // columns. If a later row has malformed CSV width, defer returning that
+    // error until previously streamed rows have been validated to preserve the
+    // serial row-major error precedence.
+    let mut raw_fields = Vec::<String>::new();
     let mut total_rows: usize = 0;
-
-    // Per-column inference state (mirrors infer_schema_column logic).
-    let mut all_numeric: Vec<bool> = vec![true; p];
-    let mut all_binary: Vec<bool> = vec![true; p];
-    let mut level_index: Vec<HashMap<String, usize>> = vec![HashMap::new(); p];
-    let mut levels: Vec<Vec<String>> = vec![Vec::new(); p];
+    let mut stream_error: Option<String> = None;
 
     let t_stream = std::time::Instant::now();
     let mut record = StringRecord::new();
@@ -294,84 +294,26 @@ fn load_delimited_inferred(
         .map_err(|e| format!("failed reading row: {e}"))?
     {
         if record.len() != all_headers.len() {
-            return Err(format!(
+            stream_error = Some(format!(
                 "row width mismatch at row {}: got {} fields, expected {}",
                 total_rows + 1,
                 record.len(),
                 all_headers.len()
             ));
+            break;
         }
         total_rows += 1;
 
-        for j in 0..p {
-            let raw = record.get(selected_indices[j]).unwrap().trim();
-            if raw.is_empty() {
-                return Err(format!(
-                    "empty field at row {}, column '{}'",
-                    total_rows, &headers[j]
-                ));
-            }
-
-            // Schema inference on sample window.
-            if sample_count < SCHEMA_SAMPLE_ROWS {
-                if let Ok(v) = raw.parse::<f64>() {
-                    if !v.is_finite() {
-                        return Err(format!(
-                            "non-finite value at row {}, column '{}'",
-                            total_rows, &headers[j]
-                        ));
-                    }
-                    if (v - 0.0).abs() >= 1e-12 && (v - 1.0).abs() >= 1e-12 {
-                        all_binary[j] = false;
-                    }
-                    col_vecs[j].push(v);
-                } else {
-                    all_numeric[j] = false;
-                    all_binary[j] = false;
-                    if !level_index[j].contains_key(raw) {
-                        level_index[j].insert(raw.to_string(), levels[j].len());
-                        levels[j].push(raw.to_string());
-                    }
-                    // Store raw string; we'll encode after schema is finalized.
-                    sample_strings[j].push(raw.to_string());
-                    col_vecs[j].push(f64::NAN); // placeholder
-                }
-            } else {
-                // After sample window: we still accumulate inference state for
-                // correctness (a column that looks binary in the first 1024 rows
-                // may contain 2.5 on row 1025).
-                if let Ok(v) = raw.parse::<f64>() {
-                    if !v.is_finite() {
-                        return Err(format!(
-                            "non-finite value at row {}, column '{}'",
-                            total_rows, &headers[j]
-                        ));
-                    }
-                    if (v - 0.0).abs() >= 1e-12 && (v - 1.0).abs() >= 1e-12 {
-                        all_binary[j] = false;
-                    }
-                    col_vecs[j].push(v);
-                } else {
-                    all_numeric[j] = false;
-                    all_binary[j] = false;
-                    if !level_index[j].contains_key(raw) {
-                        level_index[j].insert(raw.to_string(), levels[j].len());
-                        levels[j].push(raw.to_string());
-                    }
-                    let idx = *level_index[j].get(raw).unwrap();
-                    col_vecs[j].push(idx as f64);
-                }
-            }
-        }
-        if sample_count < SCHEMA_SAMPLE_ROWS {
-            sample_count += 1;
+        for &selected_idx in &selected_indices {
+            let raw = record.get(selected_idx).unwrap().trim();
+            raw_fields.push(raw.to_string());
         }
     }
 
     let stream_ms = t_stream.elapsed().as_secs_f64() * 1000.0;
     if stream_ms > 100.0 {
         log::info!(
-            "[DATA-LOAD] delim_stream+infer | n_rows={} | n_cols={} | {:.1}ms",
+            "[DATA-LOAD] delim_stream | n_rows={} | n_cols={} | {:.1}ms",
             total_rows,
             p,
             stream_ms
@@ -379,55 +321,49 @@ fn load_delimited_inferred(
     }
 
     if total_rows == 0 {
+        if let Some(err) = stream_error {
+            return Err(err);
+        }
         return Err("file has no rows".to_string());
     }
 
     let t_schema = std::time::Instant::now();
+    let sample_count = total_rows.min(SCHEMA_SAMPLE_ROWS);
+    let inferred_columns = (0..p)
+        .into_par_iter()
+        .map(|j| infer_delimited_column(&raw_fields, total_rows, p, j, &headers[j], sample_count))
+        .collect::<Vec<_>>();
+
+    let first_error = inferred_columns
+        .iter()
+        .filter_map(|result| result.as_ref().err())
+        .min_by_key(|err| (err.row, err.col));
+    if let Some(err) = first_error {
+        return Err(err.message.clone());
+    }
+    if let Some(err) = stream_error {
+        return Err(err);
+    }
+
+    let inferred_columns = inferred_columns
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+
     // Build schema from inference state.
     let mut schema_cols = Vec::<SchemaColumn>::with_capacity(p);
     let mut column_kinds = Vec::<ColumnKindTag>::with_capacity(p);
-    for j in 0..p {
-        let kind = if all_numeric[j] {
-            if all_binary[j] {
-                ColumnKindTag::Binary
-            } else {
-                ColumnKindTag::Continuous
-            }
-        } else {
-            ColumnKindTag::Categorical
-        };
-        column_kinds.push(kind);
+    for (j, inferred) in inferred_columns.iter().enumerate() {
+        column_kinds.push(inferred.kind);
         schema_cols.push(SchemaColumn {
             name: headers[j].clone(),
-            kind,
-            levels: if matches!(kind, ColumnKindTag::Categorical) {
-                levels[j].clone()
+            kind: inferred.kind,
+            levels: if matches!(inferred.kind, ColumnKindTag::Categorical) {
+                inferred.levels.clone()
             } else {
                 Vec::new()
             },
         });
-    }
-
-    // Fix up the sample-window rows for categorical columns: the NaN
-    // placeholders need to be replaced with integer level codes.
-    for j in 0..p {
-        if matches!(column_kinds[j], ColumnKindTag::Categorical) {
-            let map = &level_index[j];
-            let mut str_idx = 0;
-            for i in 0..sample_count.min(total_rows) {
-                if col_vecs[j][i].is_nan() {
-                    let raw = &sample_strings[j][str_idx];
-                    str_idx += 1;
-                    let code = *map.get(raw.as_str()).ok_or_else(|| {
-                        format!(
-                            "internal error: sample string '{}' missing from level map for column '{}'",
-                            raw, &headers[j]
-                        )
-                    })?;
-                    col_vecs[j][i] = code as f64;
-                }
-            }
-        }
     }
     let schema_ms = t_schema.elapsed().as_secs_f64() * 1000.0;
     if schema_ms > 100.0 {
@@ -436,7 +372,7 @@ fn load_delimited_inferred(
             .filter(|k| matches!(k, ColumnKindTag::Categorical))
             .count();
         log::info!(
-            "[DATA-LOAD] delim_finalize_schema | n_cols={} | n_cat={} | {:.1}ms",
+            "[DATA-LOAD] delim_convert+infer | n_cols={} | n_cat={} | {:.1}ms",
             p,
             n_cat,
             schema_ms
@@ -444,20 +380,17 @@ fn load_delimited_inferred(
     }
 
     let t_assemble = std::time::Instant::now();
-    // Assemble into Array2 (column-major fill is cache-friendly for column vecs).
+    // Assemble into Array2 from independent column vectors in parallel.
     let mut values = Array2::<f64>::zeros((total_rows, p));
-    for j in 0..p {
-        for (i, &v) in col_vecs[j].iter().enumerate() {
-            if !v.is_finite() {
-                return Err(format!(
-                    "non-finite value at row {}, column '{}'",
-                    i + 1,
-                    &headers[j]
-                ));
+    values
+        .axis_iter_mut(Axis(1))
+        .into_par_iter()
+        .zip(inferred_columns.par_iter())
+        .for_each(|(mut out_col, inferred)| {
+            for (dst, &src) in out_col.iter_mut().zip(inferred.values.iter()) {
+                *dst = src;
             }
-            values[[i, j]] = v;
-        }
-    }
+        });
     let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1000.0;
     if assemble_ms > 100.0 {
         log::info!(
@@ -476,6 +409,153 @@ fn load_delimited_inferred(
         values,
         schema,
         column_kinds,
+    })
+}
+
+struct InferredDelimitedColumn {
+    values: Vec<f64>,
+    kind: ColumnKindTag,
+    levels: Vec<String>,
+}
+
+#[derive(Debug)]
+struct DelimitedInferenceError {
+    row: usize,
+    col: usize,
+    message: String,
+}
+
+fn infer_delimited_column(
+    raw_fields: &[String],
+    total_rows: usize,
+    n_cols: usize,
+    col: usize,
+    header: &str,
+    sample_count: usize,
+) -> Result<InferredDelimitedColumn, DelimitedInferenceError> {
+    // Per-column inference state (mirrors infer_schema_column logic).
+    let mut values = Vec::<f64>::with_capacity(total_rows);
+    let mut all_numeric = true;
+    let mut all_binary = true;
+    let mut level_index = HashMap::<String, usize>::new();
+    let mut levels = Vec::<String>::new();
+
+    for row_idx in 0..total_rows {
+        let raw = raw_fields[row_idx * n_cols + col].as_str();
+        if raw.is_empty() {
+            return Err(DelimitedInferenceError {
+                row: row_idx + 1,
+                col,
+                message: format!("empty field at row {}, column '{}'", row_idx + 1, header),
+            });
+        }
+
+        // Schema inference on sample window.
+        if row_idx < sample_count {
+            if let Ok(v) = raw.parse::<f64>() {
+                if !v.is_finite() {
+                    return Err(DelimitedInferenceError {
+                        row: row_idx + 1,
+                        col,
+                        message: format!(
+                            "non-finite value at row {}, column '{}'",
+                            row_idx + 1,
+                            header
+                        ),
+                    });
+                }
+                if (v - 0.0).abs() >= 1e-12 && (v - 1.0).abs() >= 1e-12 {
+                    all_binary = false;
+                }
+                values.push(v);
+            } else {
+                all_numeric = false;
+                all_binary = false;
+                if !level_index.contains_key(raw) {
+                    level_index.insert(raw.to_string(), levels.len());
+                    levels.push(raw.to_string());
+                }
+                // Store a placeholder for sample-window strings; once the
+                // final column kind is known, categorical columns are fixed up
+                // with the same level codes as the previous serial path.
+                values.push(f64::NAN);
+            }
+        } else if let Ok(v) = raw.parse::<f64>() {
+            // After sample window: we still accumulate inference state for
+            // correctness (a column that looks binary in the first 1024 rows
+            // may contain 2.5 on row 1025).
+            if !v.is_finite() {
+                return Err(DelimitedInferenceError {
+                    row: row_idx + 1,
+                    col,
+                    message: format!(
+                        "non-finite value at row {}, column '{}'",
+                        row_idx + 1,
+                        header
+                    ),
+                });
+            }
+            if (v - 0.0).abs() >= 1e-12 && (v - 1.0).abs() >= 1e-12 {
+                all_binary = false;
+            }
+            values.push(v);
+        } else {
+            all_numeric = false;
+            all_binary = false;
+            if !level_index.contains_key(raw) {
+                level_index.insert(raw.to_string(), levels.len());
+                levels.push(raw.to_string());
+            }
+            let idx = *level_index.get(raw).unwrap();
+            values.push(idx as f64);
+        }
+    }
+
+    let kind = if all_numeric {
+        if all_binary {
+            ColumnKindTag::Binary
+        } else {
+            ColumnKindTag::Continuous
+        }
+    } else {
+        ColumnKindTag::Categorical
+    };
+
+    if matches!(kind, ColumnKindTag::Categorical) {
+        for row_idx in 0..sample_count {
+            if values[row_idx].is_nan() {
+                let raw = raw_fields[row_idx * n_cols + col].as_str();
+                let code = *level_index.get(raw).ok_or_else(|| DelimitedInferenceError {
+                    row: row_idx + 1,
+                    col,
+                    message: format!(
+                        "internal error: sample string '{}' missing from level map for column '{}'",
+                        raw, header
+                    ),
+                })?;
+                values[row_idx] = code as f64;
+            }
+        }
+    }
+
+    for (row_idx, &v) in values.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(DelimitedInferenceError {
+                row: row_idx + 1,
+                col,
+                message: format!(
+                    "non-finite value at row {}, column '{}'",
+                    row_idx + 1,
+                    header
+                ),
+            });
+        }
+    }
+
+    Ok(InferredDelimitedColumn {
+        values,
+        kind,
+        levels,
     })
 }
 
