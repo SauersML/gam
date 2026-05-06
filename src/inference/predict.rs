@@ -19,9 +19,14 @@ use crate::mixture_link::{
     mixture_inverse_link_jetwith_rho_partials_into, sas_inverse_link_jetwith_param_partials,
 };
 use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
+use crate::quadrature::QuadratureContext;
 use crate::types::{InverseLink, LikelihoodFamily};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+thread_local! {
+    static PREDICT_QUADRATURE_CONTEXT: QuadratureContext = QuadratureContext::new();
+}
 
 /// Compute standard errors from a covariance matrix (sqrt of diagonal).
 pub fn se_from_covariance(cov: &Array2<f64>) -> Array1<f64> {
@@ -2608,27 +2613,37 @@ impl PredictableModel for BinomialLocationScalePredictor {
                 Array1::ones(q0_chunk.len())
             };
             let rows_in_chunk = q0_chunk.len();
-            let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
-            for i in 0..rows_in_chunk {
-                let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
-                    &self.inverse_link,
-                    eta_chunk[i],
-                )
-                .map_err(|e| e.to_string())?;
-                let dphi = jet.d1;
-                let scale = dq_dq0[i];
-                let dprob_deta_t = dphi * scale * (-1.0 / sigma_chunk[i]);
-                let dprob_deta_s = dphi * scale * (eta_t_chunk[i] / sigma_chunk[i]);
-                for j in 0..p_t {
-                    grad[[i, j]] = dprob_deta_t * x_t[[i, j]];
-                }
-                for j in 0..p_s {
-                    grad[[i, p_t + j]] = dprob_deta_s * x_s[[i, j]];
-                }
-                if let Some(wd) = wiggle_design.as_ref() {
-                    for j in 0..p_w {
-                        grad[[i, p_t + p_s + j]] = dphi * wd[[i, j]];
+            let row_gradients: Result<Vec<Vec<f64>>, String> = (0..rows_in_chunk)
+                .into_par_iter()
+                .map(|i| {
+                    let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
+                        &self.inverse_link,
+                        eta_chunk[i],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let dphi = jet.d1;
+                    let scale = dq_dq0[i];
+                    let dprob_deta_t = dphi * scale * (-1.0 / sigma_chunk[i]);
+                    let dprob_deta_s = dphi * scale * (eta_t_chunk[i] / sigma_chunk[i]);
+                    let mut row = vec![0.0; p_total];
+                    for j in 0..p_t {
+                        row[j] = dprob_deta_t * x_t[[i, j]];
                     }
+                    for j in 0..p_s {
+                        row[p_t + j] = dprob_deta_s * x_s[[i, j]];
+                    }
+                    if let Some(wd) = wiggle_design.as_ref() {
+                        for j in 0..p_w {
+                            row[p_t + p_s + j] = dphi * wd[[i, j]];
+                        }
+                    }
+                    Ok(row)
+                })
+                .collect();
+            let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
+            for (i, row) in row_gradients?.into_iter().enumerate() {
+                for (j, value) in row.into_iter().enumerate() {
+                    grad[[i, j]] = value;
                 }
             }
             Ok(vec![grad])
@@ -2643,12 +2658,12 @@ impl PredictableModel for BinomialLocationScalePredictor {
                 p_s,
                 "binomial location-scale posterior mean",
             )?;
-            let quadctx = crate::quadrature::QuadratureContext::new();
-            Array1::from_vec(
-                (0..eta_t.len())
-                    .map(|i| {
+            let values: Result<Vec<_>, _> = (0..eta_t.len())
+                .into_par_iter()
+                .map(|i| {
+                    PREDICT_QUADRATURE_CONTEXT.with(|quadctx| {
                         projected_bivariate_posterior_mean_result(
-                            &quadctx,
+                            quadctx,
                             [eta_t[i], eta_s[i]],
                             [
                                 [var_t[i].max(0.0), cov_ts[i]],
@@ -2665,8 +2680,9 @@ impl PredictableModel for BinomialLocationScalePredictor {
                             },
                         )
                     })
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
+                })
+                .collect();
+            Array1::from_vec(values?)
         } else {
             let runtime = self.link_wiggle.as_ref().expect("checked above");
             let betaw = Array1::from_vec(runtime.beta.clone());
@@ -2679,7 +2695,6 @@ impl PredictableModel for BinomialLocationScalePredictor {
                 .map_err(EstimationError::InvalidInput)?
                 .slice(ndarray::s![p_t + p_s..p_total, ..])
                 .to_owned();
-            let quadctx = crate::quadrature::QuadratureContext::new();
             let mut out = Array1::<f64>::zeros(eta.len());
             let chunk_rows = prediction_chunk_rows(p_total, 2, eta.len());
             let mut start = 0usize;
@@ -2702,7 +2717,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
                 let solved = backend
                     .apply_columns(&rhs)
                     .map_err(EstimationError::InvalidInput)?;
-                for local_row in 0..rows_in_chunk {
+                let compute_chunk_row = |quadctx: &QuadratureContext, local_row: usize| {
                     let i = start + local_row;
                     let solved_t = solved.slice(ndarray::s![.., local_row]);
                     let solved_ls = solved.slice(ndarray::s![.., rows_in_chunk + local_row]);
@@ -2740,8 +2755,8 @@ impl PredictableModel for BinomialLocationScalePredictor {
                             covw_cond[[r, c]] -= k0[r] * suv_t[c] + k1[r] * suv_ls[c];
                         }
                     }
-                    out[i] = crate::quadrature::normal_expectation_2d_adaptive_result(
-                        &quadctx,
+                    crate::quadrature::normal_expectation_2d_adaptive_result(
+                        quadctx,
                         [eta_t[i], eta_s[i]],
                         [[var_t, cov_tls], [cov_tls, var_ls]],
                         |t, ls| {
@@ -2760,7 +2775,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
                                 }
                             }
                             let jet = crate::quadrature::integrated_inverse_link_jetwith_state(
-                                &quadctx,
+                                quadctx,
                                 self.inverse_link.link_function(),
                                 meanw,
                                 varw.max(0.0).sqrt(),
@@ -2769,7 +2784,17 @@ impl PredictableModel for BinomialLocationScalePredictor {
                             )?;
                             Ok::<f64, EstimationError>(jet.mean.clamp(0.0, 1.0))
                         },
-                    )?;
+                    )
+                };
+                let chunk_values: Result<Vec<f64>, EstimationError> = (0..rows_in_chunk)
+                    .into_par_iter()
+                    .map(|local_row| {
+                        PREDICT_QUADRATURE_CONTEXT
+                            .with(|quadctx| compute_chunk_row(quadctx, local_row))
+                    })
+                    .collect();
+                for (local_row, value) in chunk_values?.into_iter().enumerate() {
+                    out[start + local_row] = value;
                 }
                 start = end;
             }
