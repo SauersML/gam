@@ -235,6 +235,7 @@ pub struct TransformationNormalFamily {
 #[derive(Clone)]
 struct TransformationNormalRowQuantityCache {
     beta: Arc<Array1<f64>>,
+    gamma: Arc<Array2<f64>>,
     h: Arc<Array1<f64>>,
     h_prime: Arc<Array1<f64>>,
     endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
@@ -1162,6 +1163,7 @@ impl TransformationNormalFamily {
         )?;
         let row_quantities = TransformationNormalRowQuantityCache {
             beta: Arc::new(beta.clone()),
+            gamma: Arc::new(gamma),
             h: Arc::new(h),
             h_prime: Arc::new(h_prime),
             endpoint_q: Arc::new(derived.endpoint_q),
@@ -2611,6 +2613,7 @@ impl TransformationNormalFamily {
                 beta.clone(),
                 Arc::clone(&op_arc),
                 axis,
+                Arc::clone(&row_quantities.gamma),
                 Arc::clone(&row_quantities.h),
                 Arc::clone(&row_quantities.h_prime),
                 Arc::clone(&row_quantities.endpoint_q),
@@ -2895,6 +2898,7 @@ impl TransformationNormalFamily {
     fn scop_psi_psi_value_score_hvp_from_cov(
         &self,
         beta: &Array1<f64>,
+        cached_gamma: ArrayView2<'_, f64>,
         cached_h: ArrayView1<'_, f64>,
         cached_h_prime: ArrayView1<'_, f64>,
         cov: ArrayView2<'_, f64>,
@@ -2933,6 +2937,15 @@ impl TransformationNormalFamily {
                 "SCOP psi-psi row-quantity cache length mismatch: h={}, h_prime={}, expected={n}",
                 cached_h.len(),
                 cached_h_prime.len()
+            ));
+        }
+        if cached_gamma.nrows() != n || cached_gamma.ncols() != p_resp {
+            return Err(format!(
+                "SCOP psi-psi gamma cache shape {}x{} != expected {}x{}",
+                cached_gamma.nrows(),
+                cached_gamma.ncols(),
+                n,
+                p_resp
             ));
         }
         for (name, mat) in [
@@ -3025,10 +3038,11 @@ impl TransformationNormalFamily {
                         let global_row = row_start + row_idx;
                         let rv = self.response_val_basis.row(global_row);
                         let rd = self.response_deriv_basis.row(global_row);
+                        let gamma_row = cached_gamma.row(row_idx);
 
                         for k in 0..p_resp {
                             let beta_k = beta_mat.row(k);
-                            acc.gamma[k] = beta_k.dot(&cov_row);
+                            acc.gamma[k] = gamma_row[k];
                             acc.gamma_i[k] = beta_k.dot(&cov_i_row);
                             acc.gamma_j[k] = beta_k.dot(&cov_j_row);
                             acc.gamma_ij[k] = beta_k.dot(&cov_ij_row);
@@ -3893,6 +3907,7 @@ impl TransformationNormalFamily {
     fn scop_psi_psi_trace_factor_from_cov(
         &self,
         beta: &Array1<f64>,
+        cached_gamma: ArrayView2<'_, f64>,
         cached_h: ArrayView1<'_, f64>,
         cached_h_prime: ArrayView1<'_, f64>,
         cov: ArrayView2<'_, f64>,
@@ -3920,6 +3935,15 @@ impl TransformationNormalFamily {
                 "SCOP psi-psi projected trace length mismatch: beta={}, factor_rows={}, expected={p_total}",
                 beta.len(),
                 factor.nrows()
+            ));
+        }
+        if cached_gamma.nrows() != n || cached_gamma.ncols() != p_resp {
+            return Err(format!(
+                "SCOP psi-psi projected trace gamma cache shape {}x{} != expected {}x{}",
+                cached_gamma.nrows(),
+                cached_gamma.ncols(),
+                n,
+                p_resp
             ));
         }
         let factor_data = factor.as_slice().ok_or_else(|| {
@@ -4011,10 +4035,11 @@ impl TransformationNormalFamily {
                     let global_row = row_start + row_idx;
                     let rv = self.response_val_basis.row(global_row);
                     let rd = self.response_deriv_basis.row(global_row);
+                    let gamma_row = cached_gamma.row(row_idx);
 
                     for k in 0..p_resp {
                         let beta_k = beta_mat.row(k);
-                        acc.gamma[k] = beta_k.dot(&cov_row);
+                        acc.gamma[k] = gamma_row[k];
                         acc.gamma_i[k] = beta_k.dot(&cov_i_row);
                         acc.gamma_j[k] = beta_k.dot(&cov_j_row);
                         acc.gamma_ij[k] = beta_k.dot(&cov_ij_row);
@@ -4261,6 +4286,7 @@ impl TransformationNormalFamily {
         op: &TensorKroneckerPsiOperator,
         axis_i: usize,
         axis_j: usize,
+        cached_gamma: ArrayView2<'_, f64>,
         cached_h: ArrayView1<'_, f64>,
         cached_h_prime: ArrayView1<'_, f64>,
         endpoint_q: &[LogNormalCdfDiffDerivatives],
@@ -4283,6 +4309,15 @@ impl TransformationNormalFamily {
                 cached_h_prime.len()
             ));
         }
+        if cached_gamma.nrows() != n || cached_gamma.ncols() != p_resp {
+            return Err(format!(
+                "SCOP psi-psi operator gamma cache shape {}x{} != expected {}x{}",
+                cached_gamma.nrows(),
+                cached_gamma.ncols(),
+                n,
+                p_resp
+            ));
+        }
         let rows_per_chunk = self.scop_psi_pair_rows_per_chunk(p_cov).min(n.max(1));
         let mut objective = 0.0;
         let mut score = Array1::<f64>::zeros(p_total);
@@ -4295,6 +4330,7 @@ impl TransformationNormalFamily {
                 self.scop_psi_pair_cov_chunks(op, axis_i, axis_j, rows.clone())?;
             let (obj_chunk, score_chunk, hvp_chunk) = self.scop_psi_psi_value_score_hvp_from_cov(
                 beta,
+                cached_gamma.slice(s![start..end, ..]),
                 cached_h.slice(s![start..end]),
                 cached_h_prime.slice(s![start..end]),
                 cov.view(),
@@ -5405,6 +5441,7 @@ impl CustomFamily for TransformationNormalFamily {
                 op,
                 axis_i,
                 axis_j,
+                row.gamma.view(),
                 row.h.view(),
                 row.h_prime.view(),
                 row.endpoint_q.as_slice(),
@@ -5422,6 +5459,7 @@ impl CustomFamily for TransformationNormalFamily {
                 ),
                 axis_i,
                 axis_j,
+                Arc::clone(&row.gamma),
                 Arc::clone(&row.h),
                 Arc::clone(&row.h_prime),
                 Arc::clone(&row.endpoint_q),
@@ -5832,6 +5870,7 @@ impl TransformationNormalPsiHessianOperator {
         beta: Array1<f64>,
         op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
         axis: usize,
+        row_gamma: Arc<Array2<f64>>,
         row_h: Arc<Array1<f64>>,
         row_h_prime: Arc<Array1<f64>>,
         endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
@@ -5844,6 +5883,7 @@ impl TransformationNormalPsiHessianOperator {
             axis,
             row_quantities: TransformationNormalRowQuantityCache {
                 beta: Arc::new(beta),
+                gamma: row_gamma,
                 h: row_h,
                 h_prime: row_h_prime,
                 endpoint_q,
@@ -5944,6 +5984,7 @@ struct TransformationNormalPsiPsiHessianOperator {
     op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
     axis_i: usize,
     axis_j: usize,
+    row_gamma: Arc<Array2<f64>>,
     row_h: Arc<Array1<f64>>,
     row_h_prime: Arc<Array1<f64>>,
     endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
@@ -5956,6 +5997,7 @@ impl TransformationNormalPsiPsiHessianOperator {
         op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
         axis_i: usize,
         axis_j: usize,
+        row_gamma: Arc<Array2<f64>>,
         row_h: Arc<Array1<f64>>,
         row_h_prime: Arc<Array1<f64>>,
         endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
@@ -5966,6 +6008,7 @@ impl TransformationNormalPsiPsiHessianOperator {
             op,
             axis_i,
             axis_j,
+            row_gamma,
             row_h,
             row_h_prime,
             endpoint_q,
@@ -5990,6 +6033,7 @@ impl TransformationNormalPsiPsiHessianOperator {
                 self.tensor_op(),
                 self.axis_i,
                 self.axis_j,
+                self.row_gamma.view(),
                 self.row_h.view(),
                 self.row_h_prime.view(),
                 self.endpoint_q.as_slice(),
@@ -6015,6 +6059,7 @@ impl TransformationNormalPsiPsiHessianOperator {
             self.family
                 .scop_psi_psi_value_score_hvp_from_cov(
                     &self.beta,
+                    self.row_gamma.slice(s![row_start..row_end, ..]),
                     self.row_h.slice(s![row_start..row_end]),
                     self.row_h_prime.slice(s![row_start..row_end]),
                     cov.view(),
@@ -6052,6 +6097,7 @@ impl TransformationNormalPsiPsiHessianOperator {
         self.family
             .scop_psi_psi_trace_factor_from_cov(
                 &self.beta,
+                self.row_gamma.slice(s![row_start..row_end, ..]),
                 self.row_h.slice(s![row_start..row_end]),
                 self.row_h_prime.slice(s![row_start..row_end]),
                 cov.view(),
