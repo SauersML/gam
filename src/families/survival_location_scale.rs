@@ -50,12 +50,8 @@ use crate::solver::estimate::{
 use crate::terms::construction::kronecker_product;
 use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, s};
-<<<<<<< ours
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
-=======
-use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
->>>>>>> theirs
 use statrs::function::erf::erfc;
 use std::collections::HashMap;
 use std::sync::Arc;
