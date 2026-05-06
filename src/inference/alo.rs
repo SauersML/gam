@@ -779,6 +779,8 @@ pub struct MultiBlockAloInput<'a> {
 pub fn compute_multiblock_alo(
     input: &MultiBlockAloInput,
 ) -> Result<MultiBlockAloDiagnostics, EstimationError> {
+    use rayon::prelude::*;
+
     let n = input.n_obs;
     let b = input.n_blocks;
     let p_tot = input.penalized_hessian_inv.nrows();
@@ -802,203 +804,332 @@ pub fn compute_multiblock_alo(
     }
 
     let col_offsets = multiblock_col_offsets(input.block_designs);
-    let chunk_size = multiblock_alo_chunk_size(p_tot, b, n);
+    let (chunk_size, max_concurrent_chunks) = multiblock_alo_parallel_plan(p_tot, b, n);
+    let chunk_starts: Vec<usize> = (0..n).step_by(chunk_size).collect();
+
+    // Each Rayon worker owns its small B×B/B-vector scratch buffers via
+    // `map_init`, avoiding cross-thread mutation and avoiding per-observation
+    // allocations.  The much larger Q panels are bounded by the parallel chunk
+    // size and by wave-level concurrency, so at most roughly one global memory
+    // budget worth of p_total × chunk_len panels can be live across workers.
+    let mut chunk_results: Vec<Result<MultiBlockAloChunkDiagnostics, EstimationError>> =
+        Vec::with_capacity(chunk_starts.len());
+    for chunk_wave in chunk_starts.chunks(max_concurrent_chunks) {
+        let mut wave_results: Vec<Result<MultiBlockAloChunkDiagnostics, EstimationError>> =
+            chunk_wave
+                .par_iter()
+                .map_init(
+                    || MultiBlockAloScratch::new(b),
+                    |scratch, &chunk_start| {
+                        let chunk_end = (chunk_start + chunk_size).min(n);
+                        compute_multiblock_alo_chunk(
+                            input,
+                            &col_offsets,
+                            chunk_start,
+                            chunk_end,
+                            scratch,
+                        )
+                    },
+                )
+                .collect();
+        chunk_results.append(&mut wave_results);
+    }
 
     let mut eta_tilde = Vec::with_capacity(n);
     let mut leverage = Array1::<f64>::zeros(n);
     let mut alo_variance = Vec::with_capacity(n);
     let mut cook_distance = Array1::<f64>::zeros(n);
 
-    // Hoisted scratch buffers reused across all observations and chunks.
-    // Row-major flat layout (size b*b) avoids per-iteration ndarray allocations.
-    let bb_sz = b * b;
-    let mut a_i = vec![0.0f64; bb_sz];
-    let mut wa = vec![0.0f64; bb_sz]; // W_i A_i
-    let mut aw = vec![0.0f64; bb_sz]; // A_i W_i
-    let mut imwa = vec![0.0f64; bb_sz]; // I - W_i A_i (LU-decomposed in place)
-    let mut imaw = vec![0.0f64; bb_sz]; // I - A_i W_i (LU-decomposed in place)
-    let mut perm_imwa = vec![0usize; b];
-    let mut perm_imaw = vec![0usize; b];
-    let mut delta_eta = vec![0.0f64; b];
-    let mut rhs_buf = vec![0.0f64; b];
-    let mut w_u = vec![0.0f64; b];
-    let mut var_diag_buf = vec![0.0f64; b];
-    let mut w_flat = vec![0.0f64; bb_sz];
-    let mut lu_scratch = vec![0.0f64; b];
+    let mut chunks = Vec::with_capacity(chunk_results.len());
+    for result in chunk_results {
+        chunks.push(result?);
+    }
+    chunks.sort_unstable_by_key(|chunk| chunk.chunk_start);
 
-    for chunk_start in (0..n).step_by(chunk_size) {
-        let chunk_end = (chunk_start + chunk_size).min(n);
-        let chunk_len = chunk_end - chunk_start;
-        let mut q_blocks = Vec::with_capacity(b);
-        for blk in 0..b {
-            let x_chunk_t = input.block_designs[blk]
-                .slice(s![chunk_start..chunk_end, ..])
-                .t()
-                .to_owned();
-            let off_b = col_offsets[blk];
-            let h_slice = input
-                .penalized_hessian_inv
-                .slice(s![.., off_b..off_b + x_chunk_t.nrows()])
-                .to_owned();
-            q_blocks.push(h_slice.dot(&x_chunk_t));
+    for chunk in chunks {
+        let chunk_start = chunk.chunk_start;
+        eta_tilde.extend(chunk.eta_tilde);
+        alo_variance.extend(chunk.alo_variance);
+        for (local_i, lev) in chunk.leverage.into_iter().enumerate() {
+            leverage[chunk_start + local_i] = lev;
         }
-
-        for local_i in 0..chunk_len {
-            let i = chunk_start + local_i;
-            let w_i = &input.block_weights[i];
-
-            // Flatten W_i once per observation (row-major).
-            for r in 0..b {
-                for c in 0..b {
-                    w_flat[r * b + c] = w_i[(r, c)];
-                }
-            }
-
-            // --- Assemble A_i = X_i H⁻¹ X_iᵀ  (B × B), row-major flat. ---
-            for a in 0..b {
-                let x_a = &input.block_designs[a];
-                let p_a = x_a.ncols();
-                let off_a = col_offsets[a];
-                let xa_row = x_a.row(i);
-                for bb in 0..b {
-                    let q_bb = &q_blocks[bb];
-                    let mut dot = 0.0f64;
-                    for k in 0..p_a {
-                        dot += xa_row[k] * q_bb[(off_a + k, local_i)];
-                    }
-                    a_i[a * b + bb] = dot;
-                }
-            }
-
-            // WA = W_i · A_i (row-major).
-            mat_mul_flat(&w_flat, &a_i, &mut wa, b);
-            // AW = A_i · W_i (row-major).
-            mat_mul_flat(&a_i, &w_flat, &mut aw, b);
-
-            // Trace of H_ii = A_i W_i (= AW): leverage[i].
-            // (Original code wrote H_ii = A · W — the same operator we already have in `aw`.)
-            let mut tr = 0.0f64;
-            for d in 0..b {
-                tr += aw[d * b + d];
-            }
-            leverage[i] = tr;
-
-            // Build (I - W A) and (I - A W) into imwa/imaw.
-            for r in 0..b {
-                for c in 0..b {
-                    let idx = r * b + c;
-                    let id = if r == c { 1.0 } else { 0.0 };
-                    imwa[idx] = id - wa[idx];
-                    imaw[idx] = id - aw[idx];
-                }
-            }
-
-            // Factor in place with partial pivoting; ridge on the diagonal if singular.
-            // Equivalence with original: original computed det via det_small, regularized
-            // by adding eps=1e-6 to the diagonal when |det| < 1e-12, then re-factored on
-            // the regularized matrix. Here we factor directly; if any pivot is below the
-            // singular threshold we add the ridge once and re-factor — same numerical path.
-            if !lu_factor_in_place(&mut imwa, &mut perm_imwa, b) {
-                for r in 0..b {
-                    for c in 0..b {
-                        let idx = r * b + c;
-                        let id = if r == c { 1.0 } else { 0.0 };
-                        imwa[idx] = id - wa[idx];
-                    }
-                }
-                for d in 0..b {
-                    imwa[d * b + d] += 1e-6;
-                }
-                let _ = lu_factor_in_place(&mut imwa, &mut perm_imwa, b);
-            }
-            if !lu_factor_in_place(&mut imaw, &mut perm_imaw, b) {
-                for r in 0..b {
-                    for c in 0..b {
-                        let idx = r * b + c;
-                        let id = if r == c { 1.0 } else { 0.0 };
-                        imaw[idx] = id - aw[idx];
-                    }
-                }
-                for d in 0..b {
-                    imaw[d * b + d] += 1e-6;
-                }
-                let _ = lu_factor_in_place(&mut imaw, &mut perm_imaw, b);
-            }
-
-            // v_i = (I - W A)⁻¹ s_i  -- solve into rhs_buf.
-            let s_i = &input.scores[i];
-            for k in 0..b {
-                rhs_buf[k] = s_i[k];
-            }
-            lu_solve_in_place(&imwa, &perm_imwa, &mut rhs_buf, &mut lu_scratch, b);
-            // delta_eta = A_i · v_i
-            for r in 0..b {
-                let mut acc = 0.0f64;
-                let row_off = r * b;
-                for k in 0..b {
-                    acc += a_i[row_off + k] * rhs_buf[k];
-                }
-                delta_eta[r] = acc;
-            }
-
-            let eta_i = &input.eta_hat[i];
-            let mut corrected = Array1::<f64>::zeros(b);
-            for d in 0..b {
-                corrected[d] = eta_i[d] + delta_eta[d];
-            }
-            eta_tilde.push(corrected);
-
-            // Cook's distance: δη^T W δη.
-            let mut cook = 0.0f64;
-            for r in 0..b {
-                let mut w_delta_r = 0.0f64;
-                let row_off = r * b;
-                for k in 0..b {
-                    w_delta_r += w_flat[row_off + k] * delta_eta[k];
-                }
-                cook += delta_eta[r] * w_delta_r;
-            }
-            cook_distance[i] = cook;
-
-            // var_diag[d] = a_d^T (I-WA)⁻¹ W (I-AW)⁻¹ a_d
-            // where a_d is the d-th row of A_i.
-            // Reuses already-factored imwa and imaw (one LU factorization each, reused
-            // across all B right-hand sides — major saving over the original which redid
-            // both LU decompositions B times per observation).
-            for d in 0..b {
-                let row_off = d * b;
-                // u_d = (I - A W)⁻¹ a_d
-                for k in 0..b {
-                    rhs_buf[k] = a_i[row_off + k];
-                }
-                lu_solve_in_place(&imaw, &perm_imaw, &mut rhs_buf, &mut lu_scratch, b);
-                // w_u = W u_d
-                for r in 0..b {
-                    let mut acc = 0.0f64;
-                    let wr = r * b;
-                    for k in 0..b {
-                        acc += w_flat[wr + k] * rhs_buf[k];
-                    }
-                    w_u[r] = acc;
-                }
-                // t_d = (I - W A)⁻¹ w_u  (back-solve in place using w_u as RHS).
-                lu_solve_in_place(&imwa, &perm_imwa, &mut w_u, &mut lu_scratch, b);
-                // v_dd = a_d^T t_d
-                let mut v_dd = 0.0f64;
-                for k in 0..b {
-                    v_dd += a_i[row_off + k] * w_u[k];
-                }
-                var_diag_buf[d] = v_dd.max(0.0);
-            }
-            let mut var_diag = Array1::<f64>::zeros(b);
-            for d in 0..b {
-                var_diag[d] = var_diag_buf[d];
-            }
-            alo_variance.push(var_diag);
+        for (local_i, cook) in chunk.cook_distance.into_iter().enumerate() {
+            cook_distance[chunk_start + local_i] = cook;
         }
     }
 
     Ok(MultiBlockAloDiagnostics {
+        eta_tilde,
+        leverage,
+        alo_variance,
+        cook_distance,
+    })
+}
+
+#[inline]
+fn multiblock_alo_parallel_plan(p_tot: usize, n_blocks: usize, n_obs: usize) -> (usize, usize) {
+    if p_tot == 0 || n_blocks == 0 || n_obs == 0 {
+        return (1, 1);
+    }
+    let bytes_per_obs = (p_tot * n_blocks * std::mem::size_of::<f64>()).max(1);
+    let workers = rayon::current_num_threads().max(1);
+    let max_concurrent_chunks = (MULTIBLOCK_ALO_MEMORY_BUDGET_BYTES / bytes_per_obs)
+        .max(1)
+        .min(workers);
+    let per_worker_budget =
+        (MULTIBLOCK_ALO_MEMORY_BUDGET_BYTES / max_concurrent_chunks).max(bytes_per_obs);
+    let budget_obs = (per_worker_budget / bytes_per_obs).max(1);
+    (budget_obs.min(n_obs), max_concurrent_chunks)
+}
+
+struct MultiBlockAloScratch {
+    a_i: Vec<f64>,
+    wa: Vec<f64>,
+    aw: Vec<f64>,
+    imwa: Vec<f64>,
+    imaw: Vec<f64>,
+    perm_imwa: Vec<usize>,
+    perm_imaw: Vec<usize>,
+    delta_eta: Vec<f64>,
+    rhs_buf: Vec<f64>,
+    w_u: Vec<f64>,
+    var_diag_buf: Vec<f64>,
+    w_flat: Vec<f64>,
+    lu_scratch: Vec<f64>,
+}
+
+impl MultiBlockAloScratch {
+    fn new(b: usize) -> Self {
+        let bb_sz = b * b;
+        Self {
+            a_i: vec![0.0f64; bb_sz],
+            wa: vec![0.0f64; bb_sz],
+            aw: vec![0.0f64; bb_sz],
+            imwa: vec![0.0f64; bb_sz],
+            imaw: vec![0.0f64; bb_sz],
+            perm_imwa: vec![0usize; b],
+            perm_imaw: vec![0usize; b],
+            delta_eta: vec![0.0f64; b],
+            rhs_buf: vec![0.0f64; b],
+            w_u: vec![0.0f64; b],
+            var_diag_buf: vec![0.0f64; b],
+            w_flat: vec![0.0f64; bb_sz],
+            lu_scratch: vec![0.0f64; b],
+        }
+    }
+}
+
+struct MultiBlockAloChunkDiagnostics {
+    chunk_start: usize,
+    eta_tilde: Vec<Array1<f64>>,
+    leverage: Vec<f64>,
+    alo_variance: Vec<Array1<f64>>,
+    cook_distance: Vec<f64>,
+}
+
+fn compute_multiblock_alo_chunk(
+    input: &MultiBlockAloInput,
+    col_offsets: &[usize],
+    chunk_start: usize,
+    chunk_end: usize,
+    scratch: &mut MultiBlockAloScratch,
+) -> Result<MultiBlockAloChunkDiagnostics, EstimationError> {
+    let b = input.n_blocks;
+    let chunk_len = chunk_end - chunk_start;
+
+    let mut q_blocks = Vec::with_capacity(b);
+    for blk in 0..b {
+        let x_chunk_t = input.block_designs[blk]
+            .slice(s![chunk_start..chunk_end, ..])
+            .t()
+            .to_owned();
+        let off_b = col_offsets[blk];
+        let h_slice = input
+            .penalized_hessian_inv
+            .slice(s![.., off_b..off_b + x_chunk_t.nrows()])
+            .to_owned();
+        q_blocks.push(h_slice.dot(&x_chunk_t));
+    }
+
+    let mut eta_tilde = Vec::with_capacity(chunk_len);
+    let mut leverage = vec![0.0f64; chunk_len];
+    let mut alo_variance = Vec::with_capacity(chunk_len);
+    let mut cook_distance = vec![0.0f64; chunk_len];
+
+    for local_i in 0..chunk_len {
+        let i = chunk_start + local_i;
+        let w_i = &input.block_weights[i];
+
+        // Flatten W_i once per observation (row-major).
+        for r in 0..b {
+            for c in 0..b {
+                scratch.w_flat[r * b + c] = w_i[(r, c)];
+            }
+        }
+
+        // --- Assemble A_i = X_i H⁻¹ X_iᵀ  (B × B), row-major flat. ---
+        for a in 0..b {
+            let x_a = &input.block_designs[a];
+            let p_a = x_a.ncols();
+            let off_a = col_offsets[a];
+            let xa_row = x_a.row(i);
+            for bb in 0..b {
+                let q_bb = &q_blocks[bb];
+                let mut dot = 0.0f64;
+                for k in 0..p_a {
+                    dot += xa_row[k] * q_bb[(off_a + k, local_i)];
+                }
+                scratch.a_i[a * b + bb] = dot;
+            }
+        }
+
+        // WA = W_i · A_i (row-major).
+        mat_mul_flat(&scratch.w_flat, &scratch.a_i, &mut scratch.wa, b);
+        // AW = A_i · W_i (row-major).
+        mat_mul_flat(&scratch.a_i, &scratch.w_flat, &mut scratch.aw, b);
+
+        // Trace of H_ii = A_i W_i (= AW): leverage[i].
+        // (Original code wrote H_ii = A · W — the same operator we already have in `aw`.)
+        let mut tr = 0.0f64;
+        for d in 0..b {
+            tr += scratch.aw[d * b + d];
+        }
+        leverage[local_i] = tr;
+
+        // Build (I - W A) and (I - A W) into imwa/imaw.
+        for r in 0..b {
+            for c in 0..b {
+                let idx = r * b + c;
+                let id = if r == c { 1.0 } else { 0.0 };
+                scratch.imwa[idx] = id - scratch.wa[idx];
+                scratch.imaw[idx] = id - scratch.aw[idx];
+            }
+        }
+
+        // Factor in place with partial pivoting; ridge on the diagonal if singular.
+        // Equivalence with original: original computed det via det_small, regularized
+        // by adding eps=1e-6 to the diagonal when |det| < 1e-12, then re-factored on
+        // the regularized matrix. Here we factor directly; if any pivot is below the
+        // singular threshold we add the ridge once and re-factor — same numerical path.
+        if !lu_factor_in_place(&mut scratch.imwa, &mut scratch.perm_imwa, b) {
+            for r in 0..b {
+                for c in 0..b {
+                    let idx = r * b + c;
+                    let id = if r == c { 1.0 } else { 0.0 };
+                    scratch.imwa[idx] = id - scratch.wa[idx];
+                }
+            }
+            for d in 0..b {
+                scratch.imwa[d * b + d] += 1e-6;
+            }
+            let _ = lu_factor_in_place(&mut scratch.imwa, &mut scratch.perm_imwa, b);
+        }
+        if !lu_factor_in_place(&mut scratch.imaw, &mut scratch.perm_imaw, b) {
+            for r in 0..b {
+                for c in 0..b {
+                    let idx = r * b + c;
+                    let id = if r == c { 1.0 } else { 0.0 };
+                    scratch.imaw[idx] = id - scratch.aw[idx];
+                }
+            }
+            for d in 0..b {
+                scratch.imaw[d * b + d] += 1e-6;
+            }
+            let _ = lu_factor_in_place(&mut scratch.imaw, &mut scratch.perm_imaw, b);
+        }
+
+        // v_i = (I - W A)⁻¹ s_i  -- solve into rhs_buf.
+        let s_i = &input.scores[i];
+        for k in 0..b {
+            scratch.rhs_buf[k] = s_i[k];
+        }
+        lu_solve_in_place(
+            &scratch.imwa,
+            &scratch.perm_imwa,
+            &mut scratch.rhs_buf,
+            &mut scratch.lu_scratch,
+            b,
+        );
+        // delta_eta = A_i · v_i
+        for r in 0..b {
+            let mut acc = 0.0f64;
+            let row_off = r * b;
+            for k in 0..b {
+                acc += scratch.a_i[row_off + k] * scratch.rhs_buf[k];
+            }
+            scratch.delta_eta[r] = acc;
+        }
+
+        let eta_i = &input.eta_hat[i];
+        let mut corrected = Array1::<f64>::zeros(b);
+        for d in 0..b {
+            corrected[d] = eta_i[d] + scratch.delta_eta[d];
+        }
+        eta_tilde.push(corrected);
+
+        // Cook's distance: δη^T W δη.
+        let mut cook = 0.0f64;
+        for r in 0..b {
+            let mut w_delta_r = 0.0f64;
+            let row_off = r * b;
+            for k in 0..b {
+                w_delta_r += scratch.w_flat[row_off + k] * scratch.delta_eta[k];
+            }
+            cook += scratch.delta_eta[r] * w_delta_r;
+        }
+        cook_distance[local_i] = cook;
+
+        // var_diag[d] = a_d^T (I-WA)⁻¹ W (I-AW)⁻¹ a_d
+        // where a_d is the d-th row of A_i.
+        // Reuses already-factored imwa and imaw (one LU factorization each, reused
+        // across all B right-hand sides — major saving over the original which redid
+        // both LU decompositions B times per observation).
+        for d in 0..b {
+            let row_off = d * b;
+            // u_d = (I - A W)⁻¹ a_d
+            for k in 0..b {
+                scratch.rhs_buf[k] = scratch.a_i[row_off + k];
+            }
+            lu_solve_in_place(
+                &scratch.imaw,
+                &scratch.perm_imaw,
+                &mut scratch.rhs_buf,
+                &mut scratch.lu_scratch,
+                b,
+            );
+            // w_u = W u_d
+            for r in 0..b {
+                let mut acc = 0.0f64;
+                let wr = r * b;
+                for k in 0..b {
+                    acc += scratch.w_flat[wr + k] * scratch.rhs_buf[k];
+                }
+                scratch.w_u[r] = acc;
+            }
+            // t_d = (I - W A)⁻¹ w_u  (back-solve in place using w_u as RHS).
+            lu_solve_in_place(
+                &scratch.imwa,
+                &scratch.perm_imwa,
+                &mut scratch.w_u,
+                &mut scratch.lu_scratch,
+                b,
+            );
+            // v_dd = a_d^T t_d
+            let mut v_dd = 0.0f64;
+            for k in 0..b {
+                v_dd += scratch.a_i[row_off + k] * scratch.w_u[k];
+            }
+            scratch.var_diag_buf[d] = v_dd.max(0.0);
+        }
+        let mut var_diag = Array1::<f64>::zeros(b);
+        for d in 0..b {
+            var_diag[d] = scratch.var_diag_buf[d];
+        }
+        alo_variance.push(var_diag);
+    }
+
+    Ok(MultiBlockAloChunkDiagnostics {
+        chunk_start,
         eta_tilde,
         leverage,
         alo_variance,
