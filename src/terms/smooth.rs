@@ -6414,7 +6414,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             Array1<f64>,
             f64,
             Array1<f64>,
-            Array2<f64>,
+            HessianResult,
             CustomFamilyWarmStart,
         )>,
     }
@@ -6531,7 +6531,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                     crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian
                 ) && analytic_outer_hessian_available
                 {
-                    HessianResult::Analytic(cached_hess.clone())
+                    cached_hess.clone()
                 } else {
                     HessianResult::Unavailable
                 },
@@ -6566,38 +6566,35 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             ));
         }
         let hessian_result = if need_hessian {
-            let hessian = result
-                .outer_hessian
-                .materialize_dense()
-                .map_err(EstimationError::RemlOptimizationFailed)?
-                .ok_or_else(|| {
-                    EstimationError::RemlOptimizationFailed(
-                        "exact spatial adaptive objective did not return an outer Hessian"
-                            .to_string(),
-                    )
-                })?;
-            if hessian.nrows() != theta.len() || hessian.ncols() != theta.len() {
-                return Err(EstimationError::RemlOptimizationFailed(format!(
-                    "exact spatial adaptive outer Hessian shape mismatch: got {}x{}, expected {}x{}",
-                    hessian.nrows(),
-                    hessian.ncols(),
-                    theta.len(),
-                    theta.len(),
-                )));
-            }
-            if hessian.iter().any(|v| !v.is_finite()) {
+            if !result.outer_hessian.is_analytic() {
                 return Err(EstimationError::RemlOptimizationFailed(
-                    "exact spatial adaptive outer Hessian contained non-finite values".to_string(),
+                    "exact spatial adaptive objective did not return an exact outer Hessian"
+                        .to_string(),
                 ));
+            }
+            match result.outer_hessian.dim() {
+                Some(dim) if dim == theta.len() => {}
+                Some(dim) => {
+                    return Err(EstimationError::RemlOptimizationFailed(format!(
+                        "exact spatial adaptive outer Hessian dimension mismatch: got {dim}, expected {}",
+                        theta.len(),
+                    )));
+                }
+                None => {
+                    return Err(EstimationError::RemlOptimizationFailed(
+                        "exact spatial adaptive objective did not report an outer Hessian dimension"
+                            .to_string(),
+                    ));
+                }
             }
             st.last_eval = Some((
                 theta.clone(),
                 result.objective,
                 result.gradient.clone(),
-                hessian.clone(),
+                result.outer_hessian.clone(),
                 result.warm_start.clone(),
             ));
-            HessianResult::Analytic(hessian)
+            result.outer_hessian
         } else {
             HessianResult::Unavailable
         };
@@ -19166,6 +19163,15 @@ mod tests {
         ];
         let analytic = evaluate_theta(&theta, true);
         assert_eq!(analytic.gradient.len(), theta.len());
+        assert!(
+            analytic.outer_hessian.is_analytic(),
+            "adaptive joint hyper evaluation must expose exact Hessian curvature"
+        );
+        assert_eq!(
+            analytic.outer_hessian.dim(),
+            Some(theta.len()),
+            "adaptive joint hyper Hessian must span all lambda/epsilon coordinates"
+        );
         let analytic_hessian = analytic
             .outer_hessian
             .clone()
