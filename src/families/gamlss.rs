@@ -1814,20 +1814,10 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<BlockwiseTermFitResult, String> {
-    // Same biobank-scale outer-Hessian gate as the marginal-slope families
-    // (see survival_marginal_slope.rs:13286). At biobank n the analytic
-    // outer Hessian dominates wall-clock; route to BFGS on the analytic
-    // gradient instead.
-    let n_obs = data.nrows();
-    let biobank_scale = n_obs > 50_000;
-    let mut options_override = options.clone();
-    if biobank_scale && options_override.use_outer_hessian {
-        options_override.use_outer_hessian = false;
-        log::info!(
-            "[gamlss-location-scale] declining analytic outer Hessian for n={n_obs}; routing to BFGS"
-        );
-    }
-    let options: &BlockwiseFitOptions = &options_override;
+    // Large-n location-scale fits keep the caller's explicit Hessian request.
+    // The unified REML evaluator chooses a dense or matrix-free exact
+    // representation from the realized (n, p, K) work model, so there is no
+    // biobank-scale downgrade to BFGS here.
 
     let mut mean_beta_hint: Option<Array1<f64>> = None;
     let mut noise_beta_hint: Option<Array1<f64>> = None;
@@ -3004,20 +2994,10 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     )?;
     validate_binomial_response(y, "fit_binomial_mean_wiggle_terms_with_selected_basis")?;
 
-    // Same biobank-scale outer-Hessian gate as the marginal-slope families
-    // (see survival_marginal_slope.rs:13286). At biobank n the analytic
-    // outer Hessian dominates wall-clock; route to BFGS on the analytic
-    // gradient instead.
-    let n_obs = data.nrows();
-    let biobank_scale = n_obs > 50_000;
-    let mut options_override = options.clone();
-    if biobank_scale && options_override.use_outer_hessian {
-        options_override.use_outer_hessian = false;
-        log::info!(
-            "[gamlss-binomial-mean-wiggle] declining analytic outer Hessian for n={n_obs}; routing to BFGS"
-        );
-    }
-    let options: &BlockwiseFitOptions = &options_override;
+    // Large-n binomial mean-wiggle fits keep the caller's explicit Hessian
+    // request. The unified evaluator chooses the scalable exact representation
+    // (dense for small work, operator HVP for large work) instead of routing to
+    // gradient-only BFGS by observation count.
 
     let SelectedWiggleBasis {
         knots: wiggle_knots,
@@ -20046,6 +20026,81 @@ mod tests {
         assert!(
             expected > crate::custom_family::default_coefficient_hessian_cost(&specs),
             "joint-coupled cost must exceed block-diagonal default by the cross-block fill"
+        );
+    }
+
+    #[test]
+    fn large_n_gaussian_location_scale_keeps_exact_outer_hessian_plan() {
+        let n = 50_001usize;
+        let p_mu = 20usize;
+        let p_log_sigma = 20usize;
+        let family = GaussianLocationScaleFamily {
+            y: Array1::zeros(n),
+            weights: Array1::from_elem(n, 1.0),
+            mu_design: None,
+            log_sigma_design: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
+            cached_row_scalars: std::sync::RwLock::new(None),
+        };
+        let specs = vec![
+            ParameterBlockSpec {
+                name: "mu".to_string(),
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros(
+                    (n, p_mu),
+                ))),
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+            ParameterBlockSpec {
+                name: "log_sigma".to_string(),
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros(
+                    (n, p_log_sigma),
+                ))),
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+        ];
+
+        let options = BlockwiseFitOptions::default();
+        let (gradient, hessian) =
+            crate::custom_family::custom_family_outer_derivatives(&family, &specs, &options);
+        assert_eq!(
+            gradient,
+            crate::solver::outer_strategy::Derivative::Analytic
+        );
+        assert_eq!(
+            hessian,
+            crate::solver::outer_strategy::Derivative::Analytic,
+            "large-n GAMLSS location-scale fits must advertise exact second-order curvature instead of triggering the historical BFGS downgrade"
+        );
+
+        let p_total = p_mu + p_log_sigma;
+        assert!(
+            crate::solver::estimate::reml::unified::prefer_outer_hessian_operator(n, p_total, 2),
+            "the large-n work model should select the scalable explicit Hessian-operator representation"
+        );
+
+        let plan =
+            crate::solver::outer_strategy::plan(&crate::solver::outer_strategy::OuterCapability {
+                gradient,
+                hessian,
+                n_params: 2,
+                psi_dim: 0,
+                fixed_point_available: false,
+                barrier_config: None,
+                prefer_gradient_only: false,
+                disable_fixed_point: true,
+            });
+        assert_eq!(plan.solver, crate::solver::outer_strategy::Solver::Arc);
+        assert_eq!(
+            plan.hessian_source,
+            crate::solver::outer_strategy::HessianSource::Analytic
         );
     }
 
