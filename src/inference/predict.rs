@@ -5683,63 +5683,75 @@ mod tests {
         let mut mean_abs_raw_bias = [0.0_f64; 3];
         let mut mean_abs_bc_bias = [0.0_f64; 3];
 
-        // Use a single deterministic LCG stream across all n for the design
-        // rows — different n share the same seed prefix so the X-RNG state
-        // for the first min(n_a, n_b) rows is identical, isolating the
-        // ratio drop to scale alone rather than to a confounding draw.
-        for (kn, &n) in ns.iter().enumerate() {
-            let mut rng = Lcg::new(0xBEEFu64);
-            let mut x_data = vec![0.0_f64; n * p];
-            for i in 0..n {
-                x_data[i * p] = 1.0;
-                for j in 1..p {
-                    x_data[i * p + j] = rng.normal();
+        // Use independent outer cases as the parallel work unit. Each case
+        // builds its own design and performs two small dense SPD solves; keep
+        // those solves serial to avoid fine-grained Rayon overhead inside the
+        // dense elimination kernel itself.
+        //
+        // Each n still starts from the same deterministic LCG seed. Different
+        // n therefore share the same seed prefix for their first min(n_a, n_b)
+        // rows, isolating the ratio drop to scale alone rather than to a
+        // confounding draw.
+        let bias_by_n: Vec<(usize, f64, f64)> = (0..ns.len())
+            .into_par_iter()
+            .map(|kn| {
+                let n = ns[kn];
+                let mut rng = Lcg::new(0xBEEFu64);
+                let mut x_data = vec![0.0_f64; n * p];
+                for i in 0..n {
+                    x_data[i * p] = 1.0;
+                    for j in 1..p {
+                        x_data[i * p + j] = rng.normal();
+                    }
                 }
-            }
-            let x = Array2::from_shape_vec((n, p), x_data).expect("X shape");
-            let xtx = x.t().dot(&x);
-            let mut h = xtx.clone();
-            for k in 0..p {
-                h[[k, k]] += lambda;
-            }
+                let x = Array2::from_shape_vec((n, p), x_data).expect("X shape");
+                let xtx = x.t().dot(&x);
+                let mut h = xtx.clone();
+                for k in 0..p {
+                    h[[k, k]] += lambda;
+                }
 
-            // E[β̂ | X] = β - H⁻¹ S β = (XᵀX + λI)⁻¹ XᵀX β.
-            let xtx_beta = xtx.dot(&beta_true);
-            let beta_mean = solve_dense_spd(&h, &xtx_beta);
-            // b̂(β̂) at β̂ = E[β̂|X]: b̂ = H⁻¹ λ β̂.
-            let s_beta_mean = beta_mean.mapv(|v| lambda * v);
-            let b_hat = solve_dense_spd(&h, &s_beta_mean);
+                // E[β̂ | X] = β - H⁻¹ S β = (XᵀX + λI)⁻¹ XᵀX β.
+                let xtx_beta = xtx.dot(&beta_true);
+                let beta_mean = solve_dense_spd(&h, &xtx_beta);
+                // b̂(β̂) at β̂ = E[β̂|X]: b̂ = H⁻¹ λ β̂.
+                let s_beta_mean = beta_mean.mapv(|v| lambda * v);
+                let b_hat = solve_dense_spd(&h, &s_beta_mean);
 
-            let cov = Array2::<f64>::eye(p);
-            let fit = test_fit_with_bias_correction(beta_mean.clone(), cov, Some(b_hat));
+                let cov = Array2::<f64>::eye(p);
+                let fit = test_fit_with_bias_correction(beta_mean.clone(), cov, Some(b_hat));
 
-            let pred_raw = predict_gamwith_uncertainty(
-                xt.clone(),
-                beta_mean.view(),
-                offset.view(),
-                crate::types::LikelihoodFamily::GaussianIdentity,
-                &fit,
-                &bc_options(false),
-            )
-            .expect("raw predict");
-            let pred_bc = predict_gamwith_uncertainty(
-                xt.clone(),
-                beta_mean.view(),
-                offset.view(),
-                crate::types::LikelihoodFamily::GaussianIdentity,
-                &fit,
-                &bc_options(true),
-            )
-            .expect("bc predict");
+                let pred_raw = predict_gamwith_uncertainty(
+                    xt.clone(),
+                    beta_mean.view(),
+                    offset.view(),
+                    crate::types::LikelihoodFamily::GaussianIdentity,
+                    &fit,
+                    &bc_options(false),
+                )
+                .expect("raw predict");
+                let pred_bc = predict_gamwith_uncertainty(
+                    xt.clone(),
+                    beta_mean.view(),
+                    offset.view(),
+                    crate::types::LikelihoodFamily::GaussianIdentity,
+                    &fit,
+                    &bc_options(true),
+                )
+                .expect("bc predict");
 
-            let mut acc_raw = 0.0;
-            let mut acc_bc = 0.0;
-            for i in 0..m {
-                acc_raw += (pred_raw.eta[i] - eta_true[i]).abs();
-                acc_bc += (pred_bc.eta[i] - eta_true[i]).abs();
-            }
-            mean_abs_raw_bias[kn] = acc_raw / m as f64;
-            mean_abs_bc_bias[kn] = acc_bc / m as f64;
+                let mut acc_raw = 0.0;
+                let mut acc_bc = 0.0;
+                for i in 0..m {
+                    acc_raw += (pred_raw.eta[i] - eta_true[i]).abs();
+                    acc_bc += (pred_bc.eta[i] - eta_true[i]).abs();
+                }
+                (kn, acc_raw / m as f64, acc_bc / m as f64)
+            })
+            .collect();
+        for (kn, raw, bc) in bias_by_n {
+            mean_abs_raw_bias[kn] = raw;
+            mean_abs_bc_bias[kn] = bc;
         }
 
         // Raw bias should itself be decreasing in n (sanity check; otherwise
