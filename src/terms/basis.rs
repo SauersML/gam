@@ -14,7 +14,9 @@ use crate::types::RhoPrior;
 use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::parallel::prelude::*;
-use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
+use ndarray::{
+    Array, Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, s,
+};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -4871,27 +4873,40 @@ fn select_equal_mass_centers(
     let mut leaves = vec![Leaf { start: 0, end: n }];
 
     let choose_split_dim = |slice: &[usize]| -> usize {
-        let mut best_dim = 0usize;
-        let mut best_span = f64::NEG_INFINITY;
-        for j in 0..d {
-            let mut minv = f64::INFINITY;
-            let mut maxv = f64::NEG_INFINITY;
-            for &idx in slice {
-                let v = data[[idx, j]];
-                if v < minv {
-                    minv = v;
+        // Score candidate split dimensions in parallel, but keep each dimension's
+        // row scan in serial row order and use the same strict-`>` update rule
+        // (with lowest-dimension tie breaking) as the original greedy splitter.
+        (0..d)
+            .into_par_iter()
+            .map(|j| {
+                let mut minv = f64::INFINITY;
+                let mut maxv = f64::NEG_INFINITY;
+                for &idx in slice {
+                    let v = data[[idx, j]];
+                    if v < minv {
+                        minv = v;
+                    }
+                    if v > maxv {
+                        maxv = v;
+                    }
                 }
-                if v > maxv {
-                    maxv = v;
+                let span = maxv - minv;
+                let span = if span.is_nan() {
+                    f64::NEG_INFINITY
+                } else {
+                    span
+                };
+                (j, span)
+            })
+            .reduce_with(|a, b| {
+                if b.1 > a.1 || (b.1 == a.1 && b.0 < a.0) {
+                    b
+                } else {
+                    a
                 }
-            }
-            let span = maxv - minv;
-            if span > best_span {
-                best_span = span;
-                best_dim = j;
-            }
-        }
-        best_dim
+            })
+            .map(|(j, _)| j)
+            .unwrap_or(0)
     };
 
     while leaves.len() < num_centers {
@@ -4952,19 +4967,29 @@ fn select_equal_mass_centers(
             *v /= m.max(1.0);
         }
 
-        let mut best_idx = slice[0];
-        let mut best_d2 = f64::INFINITY;
-        for &idx in slice {
-            let mut d2 = 0.0;
-            for j in 0..d {
-                let delta = data[[idx, j]] - centroid[j];
-                d2 += delta * delta;
-            }
-            if d2 < best_d2 || (d2 == best_d2 && idx < best_idx) {
-                best_d2 = d2;
-                best_idx = idx;
-            }
-        }
+        let best_idx = slice
+            .par_iter()
+            .filter_map(|&idx| {
+                let mut d2 = 0.0;
+                for j in 0..d {
+                    let delta = data[[idx, j]] - centroid[j];
+                    d2 += delta * delta;
+                }
+                if d2.is_finite() {
+                    Some((idx, d2))
+                } else {
+                    None
+                }
+            })
+            .reduce_with(|a, b| {
+                if b.1 < a.1 || (b.1 == a.1 && b.0 < a.0) {
+                    b
+                } else {
+                    a
+                }
+            })
+            .map(|(idx, _)| idx)
+            .unwrap_or(slice[0]);
         centers.row_mut(c).assign(&data.row(best_idx));
     }
     Ok(centers)
@@ -9724,75 +9749,137 @@ pub fn build_matern_collocation_operator_matrices(
     let mut d2_raw = Array2::<f64>::zeros((p * d * d, p));
     let metric_weights = aniso_log_scales.map(centered_aniso_metric_weights);
     const R_EPS: f64 = 1e-12;
-    for k in 0..p {
-        let scale_k = row_scales[k];
-        for j in 0..p {
-            // Distance: anisotropic r = |Ah| when eta present, isotropic |h| otherwise.
-            let r = if let Some(eta) = aniso_log_scales {
-                aniso_distance_and_components(
-                    centers.row(k).as_slice().unwrap(),
-                    centers.row(j).as_slice().unwrap(),
-                    eta,
-                )
-                .0
-            } else {
-                stable_euclidean_norm((0..d).map(|c| centers[[k, c]] - centers[[j, c]]))
-            };
-            if matches!(nu, MaternNu::Half) && r <= R_EPS && d > 1 {
-                return Err(BasisError::InvalidInput(
-                    "Matérn nu=1/2 has singular Laplacian at center collisions for d>1; choose nu>=3/2 or avoid collocation at centers".to_string(),
-                ));
-            }
-            let (phi, _, phi_rr, phi_r_over_r) =
-                if matches!(nu, MaternNu::Half) && r <= R_EPS && d == 1 {
-                    // In 1D: Delta phi = phi'' and the singular phi'/r term is absent.
-                    let s = 1.0 / length_scale;
-                    let e = 1.0;
-                    (e, -s * e, s * s * e, 0.0)
+    // Row blocks are independent: output rows [k] in d0, [k*d..(k+1)*d] in d1,
+    // and [k*d*d..(k+1)*d*d] in d2 are disjoint for each collocation row k.
+    // Keep small assemblies serial to avoid Rayon scheduling overhead.
+    const MATERN_COLLOCATION_PAR_WORK_THRESHOLD: usize = 32_768;
+    const MATERN_COLLOCATION_ROW_BLOCK: usize = 32;
+    let assembly_work = p
+        .saturating_mul(p)
+        .saturating_mul(d.max(1))
+        .saturating_mul(d.max(1));
+    let row_block_size = MATERN_COLLOCATION_ROW_BLOCK.min(p.max(1));
+    let assemble_chunk = |ci: usize,
+                          mut d0_chunk: ArrayViewMut2<'_, f64>,
+                          mut d1_chunk: ArrayViewMut2<'_, f64>,
+                          mut d2_chunk: ArrayViewMut2<'_, f64>|
+     -> Result<(), BasisError> {
+        let chunk_start = ci * row_block_size;
+        for local_k in 0..d0_chunk.nrows() {
+            let k = chunk_start + local_k;
+            let scale_k = row_scales[k];
+            for j in 0..p {
+                // Distance: anisotropic r = |Ah| when eta present, isotropic |h| otherwise.
+                let r = if let Some(eta) = aniso_log_scales {
+                    aniso_distance_and_components(
+                        centers.row(k).as_slice().unwrap(),
+                        centers.row(j).as_slice().unwrap(),
+                        eta,
+                    )
+                    .0
                 } else {
-                    matern_kernel_radial_tripletwith_safe_ratio(r, length_scale, nu)?
+                    stable_euclidean_norm((0..d).map(|c| centers[[k, c]] - centers[[j, c]]))
                 };
-            d0_raw[[k, j]] = scale_k * phi;
-            if r > R_EPS {
-                for c in 0..d {
-                    let delta = centers[[k, c]] - centers[[j, c]];
-                    d1_raw[[k * d + c, j]] = scale_k * phi_r_over_r * delta;
+                if matches!(nu, MaternNu::Half) && r <= R_EPS && d > 1 {
+                    return Err(BasisError::InvalidInput(
+                        "Matérn nu=1/2 has singular Laplacian at center collisions for d>1; choose nu>=3/2 or avoid collocation at centers".to_string(),
+                    ));
                 }
-            } else {
-                // Symmetry at center-center coincidence.
-                for c in 0..d {
-                    d1_raw[[k * d + c, j]] = 0.0;
-                }
-            }
-            let t = if r > R_EPS {
-                (phi_rr - phi_r_over_r) / (r * r)
-            } else {
-                0.0
-            };
-            for a in 0..d {
-                let h_a = centers[[k, a]] - centers[[j, a]];
-                let w_a = metric_weights.as_ref().map(|w| w[a]).unwrap_or(1.0);
-                for b in 0..d {
-                    let h_b = centers[[k, b]] - centers[[j, b]];
-                    let w_b = metric_weights.as_ref().map(|w| w[b]).unwrap_or(1.0);
-                    let diagonal = if a == b { phi_r_over_r * w_a } else { 0.0 };
-                    let mixed = if r > R_EPS {
-                        t * w_a * h_a * w_b * h_b
+                let (phi, _, phi_rr, phi_r_over_r) =
+                    if matches!(nu, MaternNu::Half) && r <= R_EPS && d == 1 {
+                        // In 1D: Delta phi = phi'' and the singular phi'/r term is absent.
+                        let s = 1.0 / length_scale;
+                        let e = 1.0;
+                        (e, -s * e, s * s * e, 0.0)
                     } else {
-                        0.0
+                        matern_kernel_radial_tripletwith_safe_ratio(r, length_scale, nu)?
                     };
-                    let row = (k * d + a) * d + b;
-                    d2_raw[[row, j]] = scale_k * (diagonal + mixed);
+                d0_chunk[[local_k, j]] = scale_k * phi;
+                if r > R_EPS {
+                    for c in 0..d {
+                        let delta = centers[[k, c]] - centers[[j, c]];
+                        d1_chunk[[local_k * d + c, j]] = scale_k * phi_r_over_r * delta;
+                    }
+                } else {
+                    // Symmetry at center-center coincidence.
+                    for c in 0..d {
+                        d1_chunk[[local_k * d + c, j]] = 0.0;
+                    }
                 }
-            }
-            if !d0_raw[[k, j]].is_finite()
-                || ((k * d * d)..((k + 1) * d * d)).any(|row| !d2_raw[[row, j]].is_finite())
-            {
-                return Err(BasisError::InvalidInput(format!(
-                    "non-finite Matérn collocation operator entry at row={k}, col={j}, r={r}, nu={nu:?}"
-                )));
+                let t = if r > R_EPS {
+                    (phi_rr - phi_r_over_r) / (r * r)
+                } else {
+                    0.0
+                };
+                for a in 0..d {
+                    let h_a = centers[[k, a]] - centers[[j, a]];
+                    let w_a = metric_weights.as_ref().map(|w| w[a]).unwrap_or(1.0);
+                    for b in 0..d {
+                        let h_b = centers[[k, b]] - centers[[j, b]];
+                        let w_b = metric_weights.as_ref().map(|w| w[b]).unwrap_or(1.0);
+                        let diagonal = if a == b { phi_r_over_r * w_a } else { 0.0 };
+                        let mixed = if r > R_EPS {
+                            t * w_a * h_a * w_b * h_b
+                        } else {
+                            0.0
+                        };
+                        let row = (local_k * d + a) * d + b;
+                        d2_chunk[[row, j]] = scale_k * (diagonal + mixed);
+                    }
+                }
+                if !d0_chunk[[local_k, j]].is_finite()
+                    || ((local_k * d * d)..((local_k + 1) * d * d))
+                        .any(|row| !d2_chunk[[row, j]].is_finite())
+                {
+                    return Err(BasisError::InvalidInput(format!(
+                        "non-finite Matérn collocation operator entry at row={k}, col={j}, r={r}, nu={nu:?}"
+                    )));
+                }
             }
         }
+        Ok(())
+    };
+    if d == 0 && p > 0 {
+        for k in 0..p {
+            let scale_k = row_scales[k];
+            for j in 0..p {
+                let (phi, _, _, _) =
+                    matern_kernel_radial_tripletwith_safe_ratio(0.0, length_scale, nu)?;
+                d0_raw[[k, j]] = scale_k * phi;
+                if !d0_raw[[k, j]].is_finite() {
+                    return Err(BasisError::InvalidInput(format!(
+                        "non-finite Matérn collocation operator entry at row={k}, col={j}, r=0, nu={nu:?}"
+                    )));
+                }
+            }
+        }
+    } else if assembly_work >= MATERN_COLLOCATION_PAR_WORK_THRESHOLD && p > 1 {
+        d0_raw
+            .axis_chunks_iter_mut(Axis(0), row_block_size)
+            .into_par_iter()
+            .zip(
+                d1_raw
+                    .axis_chunks_iter_mut(Axis(0), row_block_size * d)
+                    .into_par_iter(),
+            )
+            .zip(
+                d2_raw
+                    .axis_chunks_iter_mut(Axis(0), row_block_size * d * d)
+                    .into_par_iter(),
+            )
+            .enumerate()
+            .try_for_each(|(ci, ((d0_chunk, d1_chunk), d2_chunk))| {
+                assemble_chunk(ci, d0_chunk, d1_chunk, d2_chunk)
+            })?;
+    } else if p > 0 {
+        d0_raw
+            .axis_chunks_iter_mut(Axis(0), row_block_size)
+            .zip(d1_raw.axis_chunks_iter_mut(Axis(0), row_block_size * d))
+            .zip(d2_raw.axis_chunks_iter_mut(Axis(0), row_block_size * d * d))
+            .enumerate()
+            .try_for_each(|(ci, ((d0_chunk, d1_chunk), d2_chunk))| {
+                assemble_chunk(ci, d0_chunk, d1_chunk, d2_chunk)
+            })?;
     }
     let (d0_kernel, d1_kernel, d2_kernel) = if let Some(z) = identifiability_transform {
         let z = z.to_owned();
@@ -13373,6 +13460,91 @@ fn build_matern_design_psi_aniso_derivatives(
     )
 }
 
+fn build_matern_aniso_primary_raw_derivative_matrices(
+    centers: ArrayView2<'_, f64>,
+    eta: &[f64],
+    length_scale: f64,
+    nu: MaternNu,
+) -> Result<(Vec<Array2<f64>>, Vec<Array2<f64>>), BasisError> {
+    let k = centers.nrows();
+    let dim = centers.ncols();
+    let row_blocks: Result<Vec<_>, BasisError> = (0..k)
+        .into_par_iter()
+        .map(|i| {
+            let ci: Vec<f64> = (0..dim).map(|a| centers[[i, a]]).collect();
+            let mut first_by_axis = vec![Vec::with_capacity(k - i); dim];
+            let mut second_diag_by_axis = vec![Vec::with_capacity(k - i); dim];
+            for j in i..k {
+                let cj: Vec<f64> = (0..dim).map(|a| centers[[j, a]]).collect();
+                let (r, s_vec) = aniso_distance_and_components(&ci, &cj, eta);
+                let (_, q, t, _, _) = matern_aniso_extended_radial_scalars(r, length_scale, nu)?;
+                for a in 0..dim {
+                    let s_a = s_vec[a];
+                    first_by_axis[a].push(q * s_a);
+                    second_diag_by_axis[a].push(2.0 * q * s_a + t * s_a * s_a);
+                }
+            }
+            Ok((first_by_axis, second_diag_by_axis))
+        })
+        .collect();
+
+    let row_blocks = row_blocks?;
+    let mut raw_first = vec![Array2::<f64>::zeros((k, k)); dim];
+    let mut raw_second_diag = vec![Array2::<f64>::zeros((k, k)); dim];
+    for (i, (first_by_axis, second_diag_by_axis)) in row_blocks.into_iter().enumerate() {
+        for (offset, j) in (i..k).enumerate() {
+            for a in 0..dim {
+                let d1 = first_by_axis[a][offset];
+                let d2 = second_diag_by_axis[a][offset];
+                raw_first[a][[i, j]] = d1;
+                raw_first[a][[j, i]] = d1;
+                raw_second_diag[a][[i, j]] = d2;
+                raw_second_diag[a][[j, i]] = d2;
+            }
+        }
+    }
+
+    Ok((raw_first, raw_second_diag))
+}
+
+fn build_matern_aniso_raw_cross_derivative_matrix(
+    centers: ArrayView2<'_, f64>,
+    eta: &[f64],
+    length_scale: f64,
+    nu: MaternNu,
+    axis_a: usize,
+    axis_b: usize,
+) -> Result<Array2<f64>, BasisError> {
+    let k = centers.nrows();
+    let dim = centers.ncols();
+    let row_blocks: Result<Vec<_>, BasisError> = (0..k)
+        .into_par_iter()
+        .map(|i| {
+            let ci: Vec<f64> = (0..dim).map(|ax| centers[[i, ax]]).collect();
+            let mut values = Vec::with_capacity(k - i);
+            for j in i..k {
+                let cj: Vec<f64> = (0..dim).map(|ax| centers[[j, ax]]).collect();
+                let (r, s_vec) = aniso_distance_and_components(&ci, &cj, eta);
+                let (_, _, t_val, _, _) =
+                    matern_aniso_extended_radial_scalars(r, length_scale, nu)?;
+                values.push(t_val * s_vec[axis_a] * s_vec[axis_b]);
+            }
+            Ok(values)
+        })
+        .collect();
+
+    let row_blocks = row_blocks?;
+    let mut raw_cross = Array2::<f64>::zeros((k, k));
+    for (i, values) in row_blocks.into_iter().enumerate() {
+        for (offset, j) in (i..k).enumerate() {
+            let value = values[offset];
+            raw_cross[[i, j]] = value;
+            raw_cross[[j, i]] = value;
+        }
+    }
+    Ok(raw_cross)
+}
+
 /// Build per-axis ψ_a derivatives for anisotropic Matérn terms, including
 /// both design-matrix and penalty derivatives.
 ///
@@ -13415,25 +13587,13 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         let total_cols = kernel_cols + usize::from(spec.include_intercept);
         let mut primary_first = vec![Array2::<f64>::zeros((total_cols, total_cols)); dim];
         let mut primary_second_diag = vec![Array2::<f64>::zeros((total_cols, total_cols)); dim];
-        let mut raw_first = vec![Array2::<f64>::zeros((k, k)); dim];
-        let mut raw_second_diag = vec![Array2::<f64>::zeros((k, k)); dim];
-        for i in 0..k {
-            let ci: Vec<f64> = (0..dim).map(|a| centers[[i, a]]).collect();
-            for j in i..k {
-                let cj: Vec<f64> = (0..dim).map(|a| centers[[j, a]]).collect();
-                let (r, s_vec) = aniso_distance_and_components(&ci, &cj, eta);
-                let (_, q, t, _, _) =
-                    matern_aniso_extended_radial_scalars(r, spec.length_scale, spec.nu)?;
-                for a in 0..dim {
-                    let d1 = q * s_vec[a];
-                    let d2 = 2.0 * q * s_vec[a] + t * s_vec[a] * s_vec[a];
-                    raw_first[a][[i, j]] = d1;
-                    raw_first[a][[j, i]] = d1;
-                    raw_second_diag[a][[i, j]] = d2;
-                    raw_second_diag[a][[j, i]] = d2;
-                }
-            }
-        }
+        let (mut raw_first, mut raw_second_diag) =
+            build_matern_aniso_primary_raw_derivative_matrices(
+                centers.view(),
+                eta,
+                spec.length_scale,
+                spec.nu,
+            )?;
         for a in 0..dim {
             // raw_first[a] / raw_second_diag[a] are dropped after this loop.
             // When there is no identifiability transform we previously cloned
@@ -13492,20 +13652,14 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
                 if a == b || b >= eta_owned.len() {
                     return Ok(Vec::new());
                 }
-                let mut raw_cross = Array2::<f64>::zeros((k, k));
-                for i in 0..k {
-                    let ci_v: Vec<f64> = (0..dim).map(|ax| centers_owned[[i, ax]]).collect();
-                    for j_idx in i..k {
-                        let cj_v: Vec<f64> =
-                            (0..dim).map(|ax| centers_owned[[j_idx, ax]]).collect();
-                        let (r, s_vec) = aniso_distance_and_components(&ci_v, &cj_v, &eta_owned);
-                        let (_, _, t_val, _, _) =
-                            matern_aniso_extended_radial_scalars(r, length_scale, nu)?;
-                        let val = t_val * s_vec[a] * s_vec[b];
-                        raw_cross[[i, j_idx]] = val;
-                        raw_cross[[j_idx, i]] = val;
-                    }
-                }
+                let raw_cross = build_matern_aniso_raw_cross_derivative_matrix(
+                    centers_owned.view(),
+                    &eta_owned,
+                    length_scale,
+                    nu,
+                    a,
+                    b,
+                )?;
                 let projected: Array2<f64> = if let Some(z) = z_owned.as_ref() {
                     z.t().dot(&raw_cross).dot(z)
                 } else {

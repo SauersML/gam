@@ -107,6 +107,32 @@ fn multiblock_alo_chunk_size(p_tot: usize, n_blocks: usize, n_obs: usize) -> usi
     budget_obs.min(n_obs)
 }
 
+#[inline]
+fn multiblock_alo_parallel_leverage_chunk_size(
+    p_tot: usize,
+    n_blocks: usize,
+    n_obs: usize,
+    max_workers: usize,
+) -> usize {
+    if p_tot == 0 || n_blocks == 0 || n_obs == 0 {
+        return 1;
+    }
+
+    // Each parallel leverage chunk owns q_storage for all block RHS products
+    // (B * p_tot * chunk_len) plus one transposed design chunk across all
+    // blocks (p_tot * chunk_len).  Divide the global scratch budget by the
+    // maximum number of chunks Rayon can execute concurrently so total live
+    // per-chunk scratch remains bounded.
+    let workers = max_workers.max(1);
+    let per_worker_budget = (MULTIBLOCK_ALO_MEMORY_BUDGET_BYTES / workers).max(1);
+    let elem_count_per_obs = p_tot.saturating_mul(n_blocks.saturating_add(1)).max(1);
+    let bytes_per_obs = elem_count_per_obs
+        .saturating_mul(std::mem::size_of::<f64>())
+        .max(1);
+    let budget_obs = (per_worker_budget / bytes_per_obs).max(1);
+    budget_obs.min(n_obs)
+}
+
 fn compute_alo_diagnostics_from_pirls_impl(
     base: &pirls::PirlsResult,
     y: ArrayView1<f64>,
@@ -145,8 +171,12 @@ fn compute_alo_diagnostics_from_pirls_impl(
     let e = &base.reparam_result.e_transformed;
     let ridge = base.ridge_passport.laplacehessianridge().max(0.0);
 
-    // ALO needs dense Hessian for chunked column solves via StableSolver.
-    let h_dense_for_alo = base.stabilizedhessian_transformed.to_dense();
+    // ALO needs the exact penalized Hessian materialized densely for chunked
+    // column solves via StableSolver.  The PIRLS export path validates the
+    // matrix instead of falling back to a numerical Hessian approximation.
+    let h_dense_for_alo = base.dense_stabilizedhessian_transformed(
+        "ALO diagnostics require exact dense stabilized penalized Hessian",
+    )?;
 
     // Build model-agnostic AloInput from PIRLS geometry, then delegate.
     let input = AloInput {
@@ -345,6 +375,8 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
     let w_h = input.hessian_weights;
     let w_s = input.score_weights;
 
+    validate_alo_solve_setup(input, n, p)?;
+
     let factor = StableSolver::new("alo penalized hessian")
         .factorize(input.penalized_hessian)
         .map_err(|_| EstimationError::ModelIsIllConditioned {
@@ -516,6 +548,97 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
         leverage: aii,
         fisherweights: w_h.clone(),
     })
+}
+
+fn validate_alo_solve_setup(input: &AloInput, n: usize, p: usize) -> Result<(), EstimationError> {
+    let h = input.penalized_hessian;
+    if h.nrows() != p || h.ncols() != p {
+        return Err(EstimationError::InvalidInput(format!(
+            "ALO diagnostics require a dense exact penalized Hessian with shape {p}x{p}; got {}x{}",
+            h.nrows(),
+            h.ncols()
+        )));
+    }
+    if h.iter().any(|v| !v.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "ALO diagnostics require a finite dense exact penalized Hessian".to_string(),
+        ));
+    }
+    let sym_tol = 1e-8;
+    for i in 0..p {
+        for j in 0..i {
+            let a = h[[i, j]];
+            let b = h[[j, i]];
+            let scale = a.abs().max(b.abs()).max(1.0);
+            if (a - b).abs() > sym_tol * scale {
+                return Err(EstimationError::InvalidInput(format!(
+                    "ALO diagnostics require a symmetric dense exact penalized Hessian; entries ({i},{j}) and ({j},{i}) differ by {:.3e}",
+                    (a - b).abs()
+                )));
+            }
+        }
+    }
+
+    let vector_lengths = [
+        ("hessian_weights", input.hessian_weights.len()),
+        ("score_weights", input.score_weights.len()),
+        ("working_response", input.working_response.len()),
+        ("eta", input.eta.len()),
+        ("offset", input.offset.len()),
+    ];
+    for (name, len) in vector_lengths {
+        if len != n {
+            return Err(EstimationError::InvalidInput(format!(
+                "ALO diagnostics require {name} length {n}; got {len}"
+            )));
+        }
+    }
+    if input.hessian_weights.iter().any(|v| !v.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "ALO diagnostics require finite Hessian-side weights".to_string(),
+        ));
+    }
+    if input.score_weights.iter().any(|v| !v.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "ALO diagnostics require finite score-side weights".to_string(),
+        ));
+    }
+    if input.working_response.iter().any(|v| !v.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "ALO diagnostics require finite working responses".to_string(),
+        ));
+    }
+    if input.eta.iter().any(|v| !v.is_finite()) || input.offset.iter().any(|v| !v.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "ALO diagnostics require finite linear predictors and offsets".to_string(),
+        ));
+    }
+    if !input.phi.is_finite() || input.phi <= 0.0 {
+        return Err(EstimationError::InvalidInput(format!(
+            "ALO diagnostics require positive finite dispersion phi; got {}",
+            input.phi
+        )));
+    }
+    if !input.ridge.is_finite() || input.ridge < 0.0 {
+        return Err(EstimationError::InvalidInput(format!(
+            "ALO diagnostics require a finite non-negative Hessian ridge; got {}",
+            input.ridge
+        )));
+    }
+    if let Some(e) = input.penalty_root {
+        if e.ncols() != p {
+            return Err(EstimationError::InvalidInput(format!(
+                "ALO diagnostics require penalty root to have {p} columns; got {}",
+                e.ncols()
+            )));
+        }
+        if e.iter().any(|v| !v.is_finite()) {
+            return Err(EstimationError::InvalidInput(
+                "ALO diagnostics require finite penalty-root entries".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Compute ALO diagnostics (eta_tilde, SE, leverage) from a fitted GAM result.
@@ -979,28 +1102,21 @@ pub fn compute_multiblock_alo_leverages(
     penalized_hessian_inv: &Array2<f64>,
     block_weights: &[Array2<f64>],
 ) -> Result<Array1<f64>, EstimationError> {
+    use rayon::prelude::*;
+
     let n = n_obs;
     let b = n_blocks;
     let p_tot = penalized_hessian_inv.nrows();
 
     let col_offsets = multiblock_col_offsets(block_designs);
-    let chunk_size = multiblock_alo_chunk_size(p_tot, b, n);
+    let max_workers = rayon::current_num_threads();
+    let chunk_size = multiblock_alo_parallel_leverage_chunk_size(p_tot, b, n, max_workers);
 
     let mut leverage = Array1::<f64>::zeros(n);
 
-    // Hoisted scratch: B×B flat row-major buffers for A_i, W_i and AW = A·W,
-    // plus a per-block (chunk_size_max × p_blk) row-major copy of the chunked
-    // X_blk so its rows are contiguous (cheap inner dot products).
-    let bb_sz = b * b;
-    let mut a_i = vec![0.0f64; bb_sz];
-    let mut aw = vec![0.0f64; bb_sz];
-    let mut w_flat = vec![0.0f64; bb_sz];
-
-    // Column-major faer storage for q_blocks: q_k has shape (p_tot, chunk_len)
-    // with contiguous columns, so `col_as_slice(local_i)` is a direct stripe.
-    let mut q_storage: Vec<FaerMat<f64>> = (0..b).map(|_| FaerMat::<f64>::zeros(0, 0)).collect();
-
-    // Per-block H_inv stripe scratch (p_tot × p_blk) reused across chunks.
+    // Per-block H_inv stripe scratch (p_tot × p_blk) is read-only once built
+    // and shared by the parallel chunks.  Only per-chunk q/XT/B×B scratch is
+    // replicated across Rayon workers.
     let block_widths: Vec<usize> = block_designs.iter().map(|d| d.ncols()).collect();
     let mut h_stripes: Vec<FaerMat<f64>> = block_widths
         .iter()
@@ -1019,93 +1135,107 @@ pub fn compute_multiblock_alo_leverages(
         }
     }
 
-    // Per-block X^T scratch in column-major faer storage (p_blk × chunk_len).
-    let mut xt_storage: Vec<FaerMat<f64>> = block_widths
-        .iter()
-        .map(|&p_blk| FaerMat::<f64>::zeros(p_blk, 0))
-        .collect();
+    leverage
+        .as_slice_mut()
+        .expect("newly allocated Array1 is contiguous")
+        .par_chunks_mut(chunk_size)
+        .enumerate()
+        .for_each(|(chunk_idx, leverage_chunk)| {
+            let chunk_start = chunk_idx * chunk_size;
+            let chunk_len = leverage_chunk.len();
+            let chunk_end = chunk_start + chunk_len;
 
-    for chunk_start in (0..n).step_by(chunk_size) {
-        let chunk_end = (chunk_start + chunk_size).min(n);
-        let chunk_len = chunk_end - chunk_start;
+            // Chunk-local scratch: B×B flat row-major buffers for A_i, W_i
+            // and AW = A·W.  Each worker writes only its `leverage_chunk`, so
+            // output writes are disjoint and require no synchronization.
+            let bb_sz = b * b;
+            let mut a_i = vec![0.0f64; bb_sz];
+            let mut aw = vec![0.0f64; bb_sz];
+            let mut w_flat = vec![0.0f64; bb_sz];
 
-        // Build q_blocks[blk] = H_inv[:, off..off+p_blk] · X_blk[chunk, :]^T
-        // entirely in column-major faer storage so subsequent column reads
-        // are contiguous f64 stripes — replaces the per-chunk `to_owned()`
-        // ndarray slicing + row-major `dot()` from the original.
-        for blk in 0..b {
-            let p_blk = block_widths[blk];
+            // Column-major faer storage for q_blocks: q_k has shape
+            // (p_tot, chunk_len) with contiguous columns, so
+            // `col_as_slice(local_i)` is a direct stripe.
+            let mut q_storage: Vec<FaerMat<f64>> = block_widths
+                .iter()
+                .map(|_| FaerMat::<f64>::zeros(p_tot, chunk_len))
+                .collect();
 
-            // Resize XT to (p_blk × chunk_len) and copy the design chunk
-            // transposed into column-major layout.
-            if xt_storage[blk].ncols() != chunk_len {
-                xt_storage[blk] = FaerMat::<f64>::zeros(p_blk, chunk_len);
-            }
-            let x_chunk = block_designs[blk].slice(s![chunk_start..chunk_end, ..]);
-            let xt = &mut xt_storage[blk];
-            for local_i in 0..chunk_len {
-                let row = x_chunk.row(local_i);
-                for j in 0..p_blk {
-                    xt[(j, local_i)] = row[j];
-                }
-            }
+            // Per-block X^T scratch in column-major faer storage
+            // (p_blk × chunk_len), owned by this chunk to keep the matmul input
+            // contiguous without sharing mutable scratch across threads.
+            let mut xt_storage: Vec<FaerMat<f64>> = block_widths
+                .iter()
+                .map(|&p_blk| FaerMat::<f64>::zeros(p_blk, chunk_len))
+                .collect();
 
-            // Resize q to (p_tot × chunk_len) and run faer matmul.
-            if q_storage[blk].ncols() != chunk_len {
-                q_storage[blk] = FaerMat::<f64>::zeros(p_tot, chunk_len);
-            }
-            let q = &mut q_storage[blk];
-            matmul(
-                q.as_mut(),
-                Accum::Replace,
-                h_stripes[blk].as_ref(),
-                xt_storage[blk].as_ref(),
-                1.0,
-                Par::Seq,
-            );
-        }
+            // Build q_blocks[blk] = H_inv[:, off..off+p_blk] · X_blk[chunk, :]^T
+            // entirely in column-major faer storage so subsequent column reads
+            // are contiguous f64 stripes — replaces the per-chunk `to_owned()`
+            // ndarray slicing + row-major `dot()` from the original.
+            for blk in 0..b {
+                let p_blk = block_widths[blk];
 
-        for local_i in 0..chunk_len {
-            let i = chunk_start + local_i;
-            let w_i = &block_weights[i];
-
-            // Flatten W_i once per observation (row-major).
-            for r in 0..b {
-                for c in 0..b {
-                    w_flat[r * b + c] = w_i[(r, c)];
-                }
-            }
-
-            // Assemble A_i[a, k] = X_a[i, :] · q_k[off_a:off_a+p_a, local_i].
-            // For each k, read its column once (contiguous f64 stripe), then
-            // for each a take the matching offset slab.
-            for r in 0..bb_sz {
-                a_i[r] = 0.0;
-            }
-            for k in 0..b {
-                let q_k = &q_storage[k];
-                let q_col = q_k.col_as_slice(local_i);
-                for a in 0..b {
-                    let p_a = block_widths[a];
-                    let off_a = col_offsets[a];
-                    let xa_row = block_designs[a].row(i);
-                    let mut dot = 0.0f64;
-                    for j in 0..p_a {
-                        dot = xa_row[j].mul_add(q_col[off_a + j], dot);
+                let x_chunk = block_designs[blk].slice(s![chunk_start..chunk_end, ..]);
+                let xt = &mut xt_storage[blk];
+                for local_i in 0..chunk_len {
+                    let row = x_chunk.row(local_i);
+                    for j in 0..p_blk {
+                        xt[(j, local_i)] = row[j];
                     }
-                    a_i[a * b + k] = dot;
                 }
+
+                matmul(
+                    q_storage[blk].as_mut(),
+                    Accum::Replace,
+                    h_stripes[blk].as_ref(),
+                    xt_storage[blk].as_ref(),
+                    1.0,
+                    Par::Seq,
+                );
             }
 
-            // AW = A_i · W_i (B×B), then leverage = trace(AW) = sum_{a,k} A[a,k]·W[k,a].
-            mat_mul_flat(&a_i, &w_flat, &mut aw, b);
-            let mut tr = 0.0f64;
-            for d in 0..b {
-                tr += aw[d * b + d];
+            for local_i in 0..chunk_len {
+                let i = chunk_start + local_i;
+                let w_i = &block_weights[i];
+
+                // Flatten W_i once per observation (row-major).
+                for r in 0..b {
+                    for c in 0..b {
+                        w_flat[r * b + c] = w_i[(r, c)];
+                    }
+                }
+
+                // Assemble A_i[a, k] = X_a[i, :] · q_k[off_a:off_a+p_a, local_i].
+                // For each k, read its column once (contiguous f64 stripe), then
+                // for each a take the matching offset slab.
+                for r in 0..bb_sz {
+                    a_i[r] = 0.0;
+                }
+                for k in 0..b {
+                    let q_k = &q_storage[k];
+                    let q_col = q_k.col_as_slice(local_i);
+                    for a in 0..b {
+                        let p_a = block_widths[a];
+                        let off_a = col_offsets[a];
+                        let xa_row = block_designs[a].row(i);
+                        let mut dot = 0.0f64;
+                        for j in 0..p_a {
+                            dot = xa_row[j].mul_add(q_col[off_a + j], dot);
+                        }
+                        a_i[a * b + k] = dot;
+                    }
+                }
+
+                // AW = A_i · W_i (B×B), then leverage = trace(AW) = sum_{a,k} A[a,k]·W[k,a].
+                mat_mul_flat(&a_i, &w_flat, &mut aw, b);
+                let mut tr = 0.0f64;
+                for d in 0..b {
+                    tr += aw[d * b + d];
+                }
+                leverage_chunk[local_i] = tr;
             }
-            leverage[i] = tr;
-        }
-    }
+        });
 
     Ok(leverage)
 }

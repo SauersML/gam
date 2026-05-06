@@ -6104,3 +6104,3421 @@ index d3ef6aa260341fce526e0c4f2023d89bea0b2867..fce9f506b308bb7f7d6e66468d7d5d4d
 [2026-05-06T20:27:28.084054+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
 [2026-05-06T20:27:28.085601+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
 [2026-05-06T20:27:28.085665+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:27:39.350955+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:27:39.352678+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:27:39.352757+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:27:50.742779+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:27:50.744310+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:27:50.744352+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:27:52.078889+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:27:52.081548+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:27:52.081622+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:00.207697+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:28:00.209392+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:00.209441+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:02.061957+00:00] apply_result: mode=apply id=task_e_69fb92fa91dc83248dbdd5ddebb90160 status=Partial applied=0 skipped=0 conflicts=1 cmd=(cd /Users/user/gam && git apply --3way /var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/.tmpxrS6a6/patch.diff)
+stdout_tail=
+
+stderr_tail=
+Applied patch to 'src/families/survival_location_scale.rs' with conflicts.
+U src/families/survival_location_scale.rs
+
+patch_summary: kind=git-diff lines=265 chars=10468 cwd=/Users/user/gam ; head=
+diff --git a/src/families/survival_location_scale.rs b/src/families/survival_location_scale.rs
+index d3ef6aa260341fce526e0c4f2023d89bea0b2867..8c479bf23b11368d041c7ff2a29a955ac1e53e11 100644
+--- a/src/families/survival_location_scale.rs
++++ b/src/families/survival_location_scale.rs
+@@ -25,50 +25,51 @@ use crate::families::scale_design::{
+ use crate::matrix::{
+     BlockDesignOperator, DenseDesignMatrix, DesignBlock, DesignMatrix, EmbeddedColumnBlock,
+     EmbeddedSquareBlock, MultiChannelOperator, RowwiseKroneckerOperator, SymmetricMatrix,
+ };
+ use crate::mixture_link::{
+     component_inverse_link_jet, inverse_link_jet_for_inverse_link,
+     inverse_link_pdffourth_derivative_for_inverse_link,
+     inverse_link_pdfthird_derivative_for_inverse_link,
+ };
+ use crate::pirls::LinearInequalityCo…
+----- PATCH BEGIN -----
+diff --git a/src/families/survival_location_scale.rs b/src/families/survival_location_scale.rs
+index d3ef6aa260341fce526e0c4f2023d89bea0b2867..8c479bf23b11368d041c7ff2a29a955ac1e53e11 100644
+--- a/src/families/survival_location_scale.rs
++++ b/src/families/survival_location_scale.rs
+@@ -25,50 +25,51 @@ use crate::families::scale_design::{
+ use crate::matrix::{
+     BlockDesignOperator, DenseDesignMatrix, DesignBlock, DesignMatrix, EmbeddedColumnBlock,
+     EmbeddedSquareBlock, MultiChannelOperator, RowwiseKroneckerOperator, SymmetricMatrix,
+ };
+ use crate::mixture_link::{
+     component_inverse_link_jet, inverse_link_jet_for_inverse_link,
+     inverse_link_pdffourth_derivative_for_inverse_link,
+     inverse_link_pdfthird_derivative_for_inverse_link,
+ };
+ use crate::pirls::LinearInequalityConstraints;
+ use crate::probability::erfcx_nonnegative;
+ use crate::probability::{normal_cdf, normal_pdf};
+ use crate::smooth::{
+     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
+     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
+     freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
+     spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivativeinfo_list,
+ };
+ use crate::solver::estimate::UnifiedFitResult;
+ use crate::solver::estimate::{
+     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
+ };
+ use crate::terms::construction::kronecker_product;
+ use crate::types::{InverseLink, LinkFunction};
+ use ndarray::{Array1, Array2, s};
++use rayon::prelude::*;
+ use statrs::function::erf::erfc;
+ use std::collections::HashMap;
+ use std::sync::Arc;
+ 
+ #[inline]
+ fn softplus(x: f64) -> f64 {
+     if x.is_nan() {
+         f64::NAN
+     } else if x == f64::INFINITY {
+         f64::INFINITY
+     } else if x == f64::NEG_INFINITY {
+         0.0
+     } else if x >= 0.0 {
+         x + (-x).exp().ln_1p()
+     } else {
+         x.exp().ln_1p()
+     }
+ }
+ 
+ // ---------------------------------------------------------------------------
+ // Overflow-safe arithmetic for the survival exact-Newton chain
+ // ---------------------------------------------------------------------------
+ //
+ // The survival location-scale model computes inv_sigma = exp(-eta_ls) and
+ // multiplies it through many intermediate quantities (q0, qdot, g, ...).
+@@ -1318,50 +1319,51 @@ fn split_survival_psi_design(
+                 2 * n,
+                 3 * n,
+             ));
+         }
+         Ok((
+             x_psi.slice(s![0..n, ..]).to_owned(),
+             x_psi.slice(s![n..2 * n, ..]).to_owned(),
+         ))
+     } else {
+         if x_psi.nrows() != n {
+             return Err(format!(
+                 "{label} psi design row mismatch: got {}, expected {}",
+                 x_psi.nrows(),
+                 n
+             ));
+         }
+         Ok((x_psi.clone(), x_psi.clone()))
+     }
+ }
+ 
+ impl SurvivalLocationScaleFamily {
+     const BLOCK_TIME: usize = 0;
+     const BLOCK_THRESHOLD: usize = 1;
+     const BLOCK_LOG_SIGMA: usize = 2;
+     const BLOCK_LINK_WIGGLE: usize = 3;
++    const EVALUATE_PARALLEL_ROW_THRESHOLD: usize = 1024;
+ 
+     #[inline]
+     fn time_wiggle_range(&self) -> std::ops::Range<usize> {
+         let p_total = self.x_time_exit.ncols();
+         let p_w = self.time_wiggle_ncols.min(p_total);
+         p_total - p_w..p_total
+     }
+ 
+     #[inline]
+     fn time_derivative_lower_bound(&self) -> f64 {
+         assert!(self.derivative_guard.is_finite() && self.derivative_guard > 0.0);
+         self.derivative_guard
+     }
+ 
+     fn max_feasible_time_step(
+         &self,
+         beta: &Array1<f64>,
+         delta: &Array1<f64>,
+     ) -> Result<Option<f64>, String> {
+         let Some(lower_bounds) = self.time_coefficient_lower_bounds.as_ref() else {
+             return Err(
+                 "survival location-scale time block missing structural coefficient lower bounds"
+                     .to_string(),
+             );
+         };
+@@ -7803,69 +7805,138 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
+ impl CustomFamily for SurvivalLocationScaleFamily {
+     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+         true
+     }
+ 
+     fn coefficient_hessian_cost(&self, specs: &[crate::custom_family::ParameterBlockSpec]) -> u64 {
+         // Survival location-scale couples its blocks (threshold/time/log-σ
+         // and any link/time wiggles) through the survival likelihood: every
+         // row contributes a dense outer-product over (Σ p_b) coefficients.
+         crate::custom_family::joint_coupled_coefficient_hessian_cost(self.n as u64, specs)
+     }
+ 
+     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+         let n = self.n;
+         let dynamic = self.build_dynamic_geometry(block_states)?;
+         let mut ll = 0.0;
+ 
+         // Per-row derivative collection — used for gradient only.
+         let mut grad_time_eta_h0 = Array1::<f64>::zeros(n);
+         let mut grad_time_eta_h1 = Array1::<f64>::zeros(n);
+         let mut grad_time_eta_d = Array1::<f64>::zeros(n);
+         let mut d1_q0 = Array1::<f64>::zeros(n);
+         let mut d1_q1 = Array1::<f64>::zeros(n);
+         let mut d1_qdot = Array1::<f64>::zeros(n);
+ 
+-        for i in 0..n {
+-            let state = self.row_predictor_state(
+-                dynamic.h_entry[i],
+-                dynamic.h_exit[i],
+-                dynamic.hdot_exit[i],
+-                dynamic.q_entry[i],
+-                dynamic.q_exit[i],
+-                dynamic.qdot_exit[i],
+-            );
+-            let Some(row) = self.row_derivatives(i, state)? else {
+-                continue;
++        let assign_row_derivatives =
++            |i: usize,
++             row: SurvivalRowDerivatives,
++             d1_q0: &mut Array1<f64>,
++             d1_q1: &mut Array1<f64>,
++             d1_qdot: &mut Array1<f64>,
++             grad_time_eta_h0: &mut Array1<f64>,
++             grad_time_eta_h1: &mut Array1<f64>,
++             grad_time_eta_d: &mut Array1<f64>| {
++                d1_q0[i] = row.d1_q0;
++                d1_q1[i] = row.d1_q1;
++                d1_qdot[i] = row.d1_qdot1;
++                grad_time_eta_h0[i] = row.grad_time_eta_h0;
++                grad_time_eta_h1[i] = row.grad_time_eta_h1;
++                grad_time_eta_d[i] = row.grad_time_eta_d;
+             };
+-            ll += row.ll;
+-            d1_q0[i] = row.d1_q0;
+-            d1_q1[i] = row.d1_q1;
+-            d1_qdot[i] = row.d1_qdot1;
+-            grad_time_eta_h0[i] = row.grad_time_eta_h0;
+-            grad_time_eta_h1[i] = row.grad_time_eta_h1;
+-            grad_time_eta_d[i] = row.grad_time_eta_d;
++
++        if n >= Self::EVALUATE_PARALLEL_ROW_THRESHOLD && rayon::current_num_threads() > 1 {
++            struct RowDerivativeAccumulator {
++                ll: f64,
++                rows: Vec<(usize, SurvivalRowDerivatives)>,
++            }
++
++            let make_acc = || RowDerivativeAccumulator {
++                ll: 0.0,
++                rows: Vec::new(),
++            };
++            let acc = (0..n)
++                .into_par_iter()
++                .try_fold(make_acc, |mut acc, i| -> Result<_, String> {
++                    let state = self.row_predictor_state(
++                        dynamic.h_entry[i],
++                        dynamic.h_exit[i],
++                        dynamic.hdot_exit[i],
++                        dynamic.q_entry[i],
++                        dynamic.q_exit[i],
++                        dynamic.qdot_exit[i],
++                    );
++                    if let Some(row) = self.row_derivatives(i, state)? {
++                        acc.ll += row.ll;
++                        acc.rows.push((i, row));
++                    }
++                    Ok(acc)
++                })
++                .try_reduce(make_acc, |mut a, mut b| {
++                    a.ll += b.ll;
++                    a.rows.append(&mut b.rows);
++                    Ok::<_, String>(a)
++                })?;
++
++            ll = acc.ll;
++            for (i, row) in acc.rows {
++                assign_row_derivatives(
++                    i,
++                    row,
++                    &mut d1_q0,
++                    &mut d1_q1,
++                    &mut d1_qdot,
++                    &mut grad_time_eta_h0,
++                    &mut grad_time_eta_h1,
++                    &mut grad_time_eta_d,
++                );
++            }
++        } else {
++            for i in 0..n {
++                let state = self.row_predictor_state(
++                    dynamic.h_entry[i],
++                    dynamic.h_exit[i],
++                    dynamic.hdot_exit[i],
++                    dynamic.q_entry[i],
++                    dynamic.q_exit[i],
++                    dynamic.qdot_exit[i],
++                );
++                let Some(row) = self.row_derivatives(i, state)? else {
++                    continue;
++                };
++                ll += row.ll;
++                assign_row_derivatives(
++                    i,
++                    row,
++                    &mut d1_q0,
++                    &mut d1_q1,
++                    &mut d1_qdot,
++                    &mut grad_time_eta_h0,
++                    &mut grad_time_eta_h1,
++                    &mut grad_time_eta_d,
++                );
++            }
+         }
+ 
+         // Per-block gradients (O(n·p_k) each, no Hessian algebra).
+         let grad_time = dynamic.time_jac_entry.t().dot(&grad_time_eta_h0)
+             + dynamic.time_jac_exit.t().dot(&grad_time_eta_h1)
+             + dynamic.time_jac_deriv.t().dot(&grad_time_eta_d);
+ 
+         let grad_t = if let (Some(x_t_entry), Some(x_t_deriv)) = (
+             self.x_threshold_entry.as_ref(),
+             self.x_threshold_deriv.as_ref(),
+         ) {
+             let grad_exit = &d1_q1 * &dynamic.dq_t_exit + &d1_qdot * &dynamic.dqdot_t;
+             let grad_entry = &d1_q0 * &dynamic.dq_t_entry;
+             let grad_deriv = &d1_qdot * &dynamic.dqdot_td;
+             self.x_threshold.transpose_vector_multiply(&grad_exit)
+                 + x_t_entry.transpose_vector_multiply(&grad_entry)
+                 + x_t_deriv.transpose_vector_multiply(&grad_deriv)
+         } else {
+             self.x_threshold.transpose_vector_multiply(
+                 &(&d1_q1 * &dynamic.dq_t_exit
+                     + &d1_q0 * &dynamic.dq_t_entry
+                     + &d1_qdot * &dynamic.dqdot_t),
+             )
+         };
+ 
+
+----- PATCH END -----
+
+[2026-05-06T20:28:14.176067+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:28:14.177987+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:14.178065+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:37.987877+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:28:37.989574+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:37.989626+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:40.202178+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:28:40.205099+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:40.205182+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:46.578299+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:28:46.579833+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:46.579904+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:57.971914+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:28:57.973604+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:57.973658+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:59.618273+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:28:59.621161+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:28:59.621269+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:29:05.750842+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:29:05.752621+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:29:05.752686+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:29:15.814919+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:29:15.816578+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:29:15.816627+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:29:17.540626+00:00] apply_result: mode=apply id=task_e_69fb938423f08324829c6c7a0c34c82d status=Partial applied=0 skipped=0 conflicts=1 cmd=(cd /Users/user/gam && git apply --3way /var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/.tmpl93aDi/patch.diff)
+stdout_tail=
+
+stderr_tail=
+Applied patch to 'src/solver/reml/unified.rs' with conflicts.
+U src/solver/reml/unified.rs
+
+patch_summary: kind=git-diff lines=596 chars=24284 cwd=/Users/user/gam ; head=
+diff --git a/src/solver/reml/unified.rs b/src/solver/reml/unified.rs
+index 3f93c29430becb5e5f288a4902893a85d01371bd..d3e15e2445435726afc7aaff9ab355c62b21b2e2 100644
+--- a/src/solver/reml/unified.rs
++++ b/src/solver/reml/unified.rs
+@@ -10027,218 +10027,253 @@ impl StochasticTraceTargets<'_> {
+                 implicit_ops,
+             } => dense_matrices.len() + implicit_ops.len(),
+         }
+     }
+ }
+ 
+ impl StochasticTraceEstimator {
+     /// Create a new estimator with the given configuration.
+     pub fn new(config: StochasticTraceConfig) -> Self {
+         Self { config }
+     }
+ 
+     /// Create with default configuration.
+     pub fn with_defaults() -> Self {
+         Self::new(StochasticTraceConfig::default())
+----- PATCH BEGIN -----
+diff --git a/src/solver/reml/unified.rs b/src/solver/reml/unified.rs
+index 3f93c29430becb5e5f288a4902893a85d01371bd..d3e15e2445435726afc7aaff9ab355c62b21b2e2 100644
+--- a/src/solver/reml/unified.rs
++++ b/src/solver/reml/unified.rs
+@@ -10027,218 +10027,253 @@ impl StochasticTraceTargets<'_> {
+                 implicit_ops,
+             } => dense_matrices.len() + implicit_ops.len(),
+         }
+     }
+ }
+ 
+ impl StochasticTraceEstimator {
+     /// Create a new estimator with the given configuration.
+     pub fn new(config: StochasticTraceConfig) -> Self {
+         Self { config }
+     }
+ 
+     /// Create with default configuration.
+     pub fn with_defaults() -> Self {
+         Self::new(StochasticTraceConfig::default())
+     }
+ 
+     fn for_outer_hessian(dim: usize, n_coords: usize) -> Self {
+         Self::new(StochasticTraceConfig::outer_hessian(dim, n_coords))
+     }
+ 
+     fn estimate_from_probe_batch<F>(
+         &self,
+         hop: &dyn HessianOperator,
+         n_coords: usize,
+-        mut evaluate_probe: F,
++        evaluate_probe: F,
+     ) -> Vec<f64>
+     where
+-        F: FnMut(&Array1<f64>, &Array1<f64>, &mut [f64]),
++        F: Fn(&Array1<f64>, &Array1<f64>, &mut [f64]) + Sync,
+     {
++        use rayon::iter::{IntoParallelIterator, ParallelIterator};
++
+         if n_coords == 0 {
+             return Vec::new();
+         }
+ 
+         let p = hop.dim();
+         if p == 0 {
+             return vec![0.0; n_coords];
+         }
+ 
+         let mut means = vec![0.0_f64; n_coords];
+         let mut m2s = vec![0.0_f64; n_coords];
+-        let mut probe_values = vec![0.0_f64; n_coords];
+         let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
+         let check_interval = 4;
++        let solve_rel_tol = self.config.solve_rel_tol;
++        let mut n_done = 0usize;
++
++        while n_done < self.config.n_probes_max {
++            let batch_len = check_interval.min(self.config.n_probes_max - n_done);
++            let probes: Vec<Array1<f64>> = (0..batch_len)
++                .map(|_| {
++                    let mut z = Array1::<f64>::zeros(p);
++                    rademacher_probe_into(z.view_mut(), &mut rng_state);
++                    z
++                })
++                .collect();
+ 
+-        let mut z = Array1::<f64>::zeros(p);
+-        for m in 0..self.config.n_probes_max {
+-            rademacher_probe_into(z.view_mut(), &mut rng_state);
+-            let w = hop.stochastic_trace_solve(&z, self.config.solve_rel_tol);
+-            evaluate_probe(&z, &w, &mut probe_values);
++            let batch_values: Vec<Vec<f64>> = probes
++                .into_par_iter()
++                .map(|z| {
++                    let w = hop.stochastic_trace_solve(&z, solve_rel_tol);
++                    let mut values = vec![0.0_f64; n_coords];
++                    evaluate_probe(&z, &w, &mut values);
++                    values
++                })
++                .collect();
+ 
+-            for k in 0..n_coords {
+-                let q_k = probe_values[k];
+-                let count = (m + 1) as f64;
+-                let delta = q_k - means[k];
+-                means[k] += delta / count;
+-                let delta2 = q_k - means[k];
+-                m2s[k] += delta * delta2;
++            for probe_values in batch_values {
++                n_done += 1;
++                let count = n_done as f64;
++                for k in 0..n_coords {
++                    let q_k = probe_values[k];
++                    let delta = q_k - means[k];
++                    means[k] += delta / count;
++                    let delta2 = q_k - means[k];
++                    m2s[k] += delta * delta2;
++                }
+             }
+ 
+-            let n_done = m + 1;
+-            if n_done >= self.config.n_probes_min && n_done % check_interval == 0 {
+-                if self.check_convergence(n_done, &means, &m2s) {
+-                    break;
+-                }
++            if n_done >= self.config.n_probes_min
++                && n_done % check_interval == 0
++                && self.check_convergence(n_done, &means, &m2s)
++            {
++                break;
+             }
+         }
+ 
+         means
+     }
+ 
+     fn estimate_matrix_from_probe_batch<F>(
+         &self,
+         hop: &dyn HessianOperator,
+         n_coords: usize,
+-        mut evaluate_probe: F,
++        evaluate_probe: F,
+     ) -> Array2<f64>
+     where
+-        F: FnMut(&Array1<f64>, &mut Array2<f64>),
++        F: Fn(&Array1<f64>, &mut Array2<f64>) + Sync,
+     {
++        use rayon::iter::{IntoParallelIterator, ParallelIterator};
++
+         if n_coords == 0 {
+             return Array2::zeros((0, 0));
+         }
+         let p = hop.dim();
+         if p == 0 {
+             return Array2::zeros((n_coords, n_coords));
+         }
+ 
+         let mut means = Array2::<f64>::zeros((n_coords, n_coords));
+         let mut m2s = Array2::<f64>::zeros((n_coords, n_coords));
+-        let mut probe_values = Array2::<f64>::zeros((n_coords, n_coords));
+         let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
+         let check_interval = 4;
+-        let mut z = Array1::<f64>::zeros(p);
+-
+-        for m in 0..self.config.n_probes_max {
+-            rademacher_probe_into(z.view_mut(), &mut rng_state);
+-            probe_values.fill(0.0);
+-            evaluate_probe(&z, &mut probe_values);
+-
+-            let count = (m + 1) as f64;
+-            for d in 0..n_coords {
+-                for e in 0..n_coords {
+-                    let q = probe_values[[d, e]];
+-                    let delta = q - means[[d, e]];
+-                    means[[d, e]] += delta / count;
+-                    let delta2 = q - means[[d, e]];
+-                    m2s[[d, e]] += delta * delta2;
++        let mut n_done = 0usize;
++
++        while n_done < self.config.n_probes_max {
++            let batch_len = check_interval.min(self.config.n_probes_max - n_done);
++            let probes: Vec<Array1<f64>> = (0..batch_len)
++                .map(|_| {
++                    let mut z = Array1::<f64>::zeros(p);
++                    rademacher_probe_into(z.view_mut(), &mut rng_state);
++                    z
++                })
++                .collect();
++
++            let batch_values: Vec<Array2<f64>> = probes
++                .into_par_iter()
++                .map(|z| {
++                    let mut values = Array2::<f64>::zeros((n_coords, n_coords));
++                    evaluate_probe(&z, &mut values);
++                    values
++                })
++                .collect();
++
++            for probe_values in batch_values {
++                n_done += 1;
++                let count = n_done as f64;
++                for d in 0..n_coords {
++                    for e in 0..n_coords {
++                        let q = probe_values[[d, e]];
++                        let delta = q - means[[d, e]];
++                        means[[d, e]] += delta / count;
++                        let delta2 = q - means[[d, e]];
++                        m2s[[d, e]] += delta * delta2;
++                    }
+                 }
+             }
+ 
+-            let n_done = m + 1;
+             if n_done >= self.config.n_probes_min
+                 && n_done % check_interval == 0
+                 && self.check_matrix_convergence(n_done, &means, &m2s)
+             {
+                 break;
+             }
+         }
+ 
+         for d in 0..n_coords {
+             for e in (d + 1)..n_coords {
+                 let avg = 0.5 * (means[[d, e]] + means[[e, d]]);
+                 means[[d, e]] = avg;
+                 means[[e, d]] = avg;
+             }
+         }
+         means
+     }
+ 
+     fn estimate_hinv_traces(
+         &self,
+         hop: &dyn HessianOperator,
+         targets: StochasticTraceTargets<'_>,
+     ) -> Vec<f64> {
+         let n_coords = targets.len();
+         if n_coords == 0 {
+             return Vec::new();
+         }
+ 
+         match targets {
+             StochasticTraceTargets::Dense(matrices) => {
+-                let mut a_w = Array1::<f64>::zeros(hop.dim());
+                 self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
++                    let mut a_w = Array1::<f64>::zeros(w.len());
+                     for k in 0..matrices.len() {
+                         dense_matvec_into(matrices[k], w.view(), a_w.view_mut());
+                         probe_values[k] = z.dot(&a_w);
+                     }
+                 })
+             }
+             StochasticTraceTargets::Mixed {
+                 dense_matrices,
+                 operators,
+-            } => {
+-                let mut a_w = Array1::<f64>::zeros(hop.dim());
+-                self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
+-                    for k in 0..dense_matrices.len() {
+-                        dense_matvec_into(dense_matrices[k], w.view(), a_w.view_mut());
+-                        probe_values[k] = z.dot(&a_w);
+-                    }
++            } => self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
++                let mut a_w = Array1::<f64>::zeros(w.len());
++                for k in 0..dense_matrices.len() {
++                    dense_matvec_into(dense_matrices[k], w.view(), a_w.view_mut());
++                    probe_values[k] = z.dot(&a_w);
++                }
+ 
+-                    let dense_count = dense_matrices.len();
+-                    for (oi, op) in operators.iter().enumerate() {
+-                        let k = dense_count + oi;
+-                        if op.has_fast_bilinear_view() {
+-                            probe_values[k] = op.bilinear_view(w.view(), z.view());
+-                        } else {
+-                            op.mul_vec_into(w.view(), a_w.view_mut());
+-                            probe_values[k] = z.dot(&a_w);
+-                        }
++                let dense_count = dense_matrices.len();
++                for (oi, op) in operators.iter().enumerate() {
++                    let k = dense_count + oi;
++                    if op.has_fast_bilinear_view() {
++                        probe_values[k] = op.bilinear_view(w.view(), z.view());
++                    } else {
++                        op.mul_vec_into(w.view(), a_w.view_mut());
++                        probe_values[k] = z.dot(&a_w);
+                     }
+-                })
+-            }
++                }
++            }),
+             StochasticTraceTargets::Structural {
+                 dense_matrices,
+                 implicit_ops,
+             } => {
+                 if implicit_ops.is_empty() {
+                     let no_ops: [&dyn HyperOperator; 0] = [];
+                     return self.estimate_hinv_traces(
+                         hop,
+                         StochasticTraceTargets::Mixed {
+                             dense_matrices,
+                             operators: &no_ops,
+                         },
+                     );
+                 }
+ 
+                 let x_design = implicit_ops[0].x_design.clone();
+-                let mut x_vec = Array1::<f64>::zeros(x_design.nrows());
+-                let mut y_vec = Array1::<f64>::zeros(x_design.nrows());
+-                let mut a_w = Array1::<f64>::zeros(hop.dim());
+                 self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
++                    let mut x_vec = Array1::<f64>::zeros(x_design.nrows());
++                    let mut y_vec = Array1::<f64>::zeros(x_design.nrows());
++                    let mut a_w = Array1::<f64>::zeros(w.len());
+                     design_matrix_apply_view_into(x_design.as_ref(), z.view(), x_vec.view_mut());
+                     design_matrix_apply_view_into(x_design.as_ref(), w.view(), y_vec.view_mut());
+ 
+                     for k in 0..dense_matrices.len() {
+                         dense_matvec_into(dense_matrices[k], w.view(), a_w.view_mut());
+                         probe_values[k] = z.dot(&a_w);
+                     }
+ 
+                     let dense_count = dense_matrices.len();
+                     for (oi, op) in implicit_ops.iter().enumerate() {
+                         let k = dense_count + oi;
+                         probe_values[k] = op.bilinear_with_shared_x(&x_vec, &y_vec, z, w);
+                     }
+                 })
+             }
+         }
+     }
+ 
+     /// Estimate a single trace `tr(H⁻¹ A)` using the same batched Hutchinson
+     /// core as the multi-coordinate path.
+     pub fn estimate_single_trace(&self, hop: &dyn HessianOperator, matrix: &Array2<f64>) -> f64 {
+         let matrices = [matrix];
+         self.estimate_hinv_traces(hop, StochasticTraceTargets::Dense(&matrices))[0]
+     }
+ 
+@@ -10358,69 +10393,73 @@ impl StochasticTraceEstimator {
+         if total == 0 {
+             return Array2::zeros((0, 0));
+         }
+ 
+         let p = hop.dim();
+         if p == 0 {
+             return Array2::zeros((total, total));
+         }
+ 
+         if total == 1 {
+             let value = if n_dense == 1 {
+                 self.estimate_second_order_single_dense(hop, dense_matrices[0])
+             } else {
+                 self.estimate_second_order_single_implicit(hop, implicit_ops[0])
+             };
+             return Array2::from_elem((1, 1), value);
+         }
+ 
+         // Get the shared X reference from the first implicit operator.
+         let x_design = if n_ops > 0 {
+             Some(implicit_ops[0].x_design.clone())
+         } else {
+             None
+         };
+ 
+-        let mut q_columns = Array2::zeros((p, total));
+-        let mut dense_a_u: Vec<Array1<f64>> = (0..n_dense).map(|_| Array1::zeros(p)).collect();
+         let n_obs = implicit_ops.first().map(|op| op.w_diag.len()).unwrap_or(0);
+-        let mut x_vec = Array1::<f64>::zeros(n_obs);
+-        let mut y_vec = Array1::<f64>::zeros(n_obs);
+-        let mut x_r: Vec<Array1<f64>> = (0..total).map(|_| Array1::zeros(n_obs)).collect();
+-        let mut implicit_dx_u: Vec<Array1<f64>> =
+-            (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
+-        let mut implicit_w_dx_u: Vec<Array1<f64>> =
+-            (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
+-        let mut implicit_w_y: Vec<Array1<f64>> = (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
+-        let mut implicit_dx_r: Vec<Vec<Array1<f64>>> = (0..n_ops)
+-            .map(|_| (0..total).map(|_| Array1::zeros(n_obs)).collect())
+-            .collect();
+-        let mut implicit_u_s: Vec<Array1<f64>> = (0..n_ops).map(|_| Array1::zeros(p)).collect();
+-        let mut implicit_n_work = Array1::<f64>::zeros(n_obs);
+-        let mut implicit_p_work = Array1::<f64>::zeros(p);
+ 
+         self.estimate_matrix_from_probe_batch(hop, total, |z, probe_values| {
++            let mut q_columns = Array2::zeros((p, total));
++            let mut dense_a_u: Vec<Array1<f64>> =
++                (0..n_dense).map(|_| Array1::zeros(p)).collect();
++            let mut x_vec = Array1::<f64>::zeros(n_obs);
++            let mut y_vec = Array1::<f64>::zeros(n_obs);
++            let mut x_r: Vec<Array1<f64>> = (0..total).map(|_| Array1::zeros(n_obs)).collect();
++            let mut implicit_dx_u: Vec<Array1<f64>> =
++                (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
++            let mut implicit_w_dx_u: Vec<Array1<f64>> =
++                (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
++            let mut implicit_w_y: Vec<Array1<f64>> =
++                (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
++            let mut implicit_dx_r: Vec<Vec<Array1<f64>>> = (0..n_ops)
++                .map(|_| (0..total).map(|_| Array1::zeros(n_obs)).collect())
++                .collect();
++            let mut implicit_u_s: Vec<Array1<f64>> =
++                (0..n_ops).map(|_| Array1::zeros(p)).collect();
++            let mut implicit_n_work = Array1::<f64>::zeros(n_obs);
++            let mut implicit_p_work = Array1::<f64>::zeros(p);
++
+             // Step 1: u = H⁻¹ z (shared solve)
+             let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
+ 
+             if let Some(ref x) = x_design {
+                 design_matrix_apply_view_into(x.as_ref(), z.view(), x_vec.view_mut());
+             }
+ 
+             // Step 2: Form q_e = A_e z for all axes e.
+             // For dense: q_e = dense_matrix * z
+             // For implicit: q_e = op.matvec_with_shared_xz(&x_vec, &z)
+             for e in 0..n_dense {
+                 dense_matvec_into(dense_matrices[e], z.view(), q_columns.column_mut(e));
+             }
+             for (oi, op) in implicit_ops.iter().enumerate() {
+                 let e = n_dense + oi;
+                 op.matvec_with_shared_xz_into(
+                     &x_vec,
+                     z.view(),
+                     q_columns.column_mut(e),
+                     implicit_n_work.view_mut(),
+                     implicit_p_work.view_mut(),
+                 );
+             }
+ 
+             // Step 3: R = H⁻¹ [q_1, ..., q_D] (block solve, total RHS)
+@@ -10562,121 +10601,120 @@ impl StochasticTraceEstimator {
+         hop: &dyn HessianOperator,
+         dense_matrices: &[&Array2<f64>],
+         operators: &[&dyn HyperOperator],
+     ) -> Array2<f64> {
+         let n_dense = dense_matrices.len();
+         let n_ops = operators.len();
+         let total = n_dense + n_ops;
+         if total == 0 {
+             return Array2::zeros((0, 0));
+         }
+ 
+         let p = hop.dim();
+         if p == 0 {
+             return Array2::zeros((total, total));
+         }
+ 
+         if total == 1 {
+             let value = if n_dense == 1 {
+                 self.estimate_second_order_single_dense(hop, dense_matrices[0])
+             } else {
+                 self.estimate_second_order_single_operator(hop, operators[0])
+             };
+             return Array2::from_elem((1, 1), value);
+         }
+ 
+-        let mut q_columns = Array2::zeros((p, total));
+-        let mut a_u_columns = Array2::zeros((p, total));
+-
+         self.estimate_matrix_from_probe_batch(hop, total, |z, probe_values| {
++            let mut q_columns = Array2::zeros((p, total));
++            let mut a_u_columns = Array2::zeros((p, total));
+             let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
+ 
+             for e in 0..n_dense {
+                 dense_matvec_into(dense_matrices[e], z.view(), q_columns.column_mut(e));
+                 dense_matvec_into(dense_matrices[e], u.view(), a_u_columns.column_mut(e));
+             }
+             for (oi, op) in operators.iter().enumerate() {
+                 let e = n_dense + oi;
+                 op.mul_vec_into(z.view(), q_columns.column_mut(e));
+                 op.mul_vec_into(u.view(), a_u_columns.column_mut(e));
+             }
+ 
+             let r = hop.stochastic_trace_solve_multi(&q_columns, self.config.solve_rel_tol);
+ 
+             for d in 0..total {
+                 let a_d_u = a_u_columns.column(d);
+                 for e in d..total {
+                     let r_e = r.column(e);
+                     let val = a_d_u.dot(&r_e);
+                     probe_values[[d, e]] = val;
+                     if d != e {
+                         let r_d = r.column(d);
+                         let val_sym = a_u_columns.column(e).dot(&r_d);
+                         probe_values[[e, d]] = val_sym;
+                     }
+                 }
+             }
+         })
+     }
+ 
+     fn estimate_second_order_single_dense(
+         &self,
+         hop: &dyn HessianOperator,
+         matrix: &Array2<f64>,
+     ) -> f64 {
+         let p = hop.dim();
+         if p == 0 {
+             return 0.0;
+         }
+ 
+-        let mut q = Array1::<f64>::zeros(p);
+         self.estimate_matrix_from_probe_batch(hop, 1, |z, probe_values| {
++            let mut q = Array1::<f64>::zeros(p);
+             let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
+             dense_matvec_into(matrix, z.view(), q.view_mut());
+             let r = hop.stochastic_trace_solve(&q, self.config.solve_rel_tol);
+             probe_values[[0, 0]] = dense_bilinear(matrix, u.view(), r.view());
+         })[[0, 0]]
+     }
+ 
+     fn estimate_second_order_single_implicit(
+         &self,
+         hop: &dyn HessianOperator,
+         op: &ImplicitHyperOperator,
+     ) -> f64 {
+         let p = hop.dim();
+         if p == 0 {
+             return 0.0;
+         }
+ 
+         let n_obs = op.w_diag.len();
+-        let mut x_z = Array1::<f64>::zeros(n_obs);
+-        let mut x_u = Array1::<f64>::zeros(n_obs);
+-        let mut x_r = Array1::<f64>::zeros(n_obs);
+-        let mut n_work = Array1::<f64>::zeros(n_obs);
+-        let mut p_work = Array1::<f64>::zeros(p);
+-        let mut q = Array1::<f64>::zeros(p);
+         self.estimate_matrix_from_probe_batch(hop, 1, |z, probe_values| {
++            let mut x_z = Array1::<f64>::zeros(n_obs);
++            let mut x_u = Array1::<f64>::zeros(n_obs);
++            let mut x_r = Array1::<f64>::zeros(n_obs);
++            let mut n_work = Array1::<f64>::zeros(n_obs);
++            let mut p_work = Array1::<f64>::zeros(p);
++            let mut q = Array1::<f64>::zeros(p);
+             let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
+             design_matrix_apply_view_into(&op.x_design, z.view(), x_z.view_mut());
+             op.matvec_with_shared_xz_into(
+                 &x_z,
+                 z.view(),
+                 q.view_mut(),
+                 n_work.view_mut(),
+                 p_work.view_mut(),
+             );
+             let r = hop.stochastic_trace_solve(&q, self.config.solve_rel_tol);
+ 
+             design_matrix_apply_view_into(&op.x_design, u.view(), x_u.view_mut());
+             design_matrix_apply_view_into(&op.x_design, r.view(), x_r.view_mut());
+             let dx_u = op
+                 .implicit_deriv
+                 .forward_mul(op.axis, &u.view())
+                 .expect("radial scalar evaluation failed during implicit derivative forward_mul");
+             let dx_r = op
+                 .implicit_deriv
+                 .forward_mul(op.axis, &r.view())
+                 .expect("radial scalar evaluation failed during implicit derivative forward_mul");
+ 
+             let w = &*op.w_diag;
+             let mut value = 0.0;
+             for i in 0..w.len() {
+@@ -10686,53 +10724,53 @@ impl StochasticTraceEstimator {
+             }
+             // Non-Gaussian fixed-β third-derivative correction:
+             //   uᵀ Xᵀ diag(c ⊙ X_{ψ_d} β̂) X r = Σ_i (X u)_i · c_x_psi_beta_i · (X r)_i
+             if let Some(c_x_psi_beta) = op.c_x_psi_beta.as_ref() {
+                 let c = c_x_psi_beta.as_ref();
+                 for i in 0..w.len() {
+                     value += x_u[i] * c[i] * x_r[i];
+                 }
+             }
+             value += dense_bilinear(&op.s_psi, r.view(), u.view());
+ 
+             probe_values[[0, 0]] = value;
+         })[[0, 0]]
+     }
+ 
+     fn estimate_second_order_single_operator(
+         &self,
+         hop: &dyn HessianOperator,
+         op: &dyn HyperOperator,
+     ) -> f64 {
+         let p = hop.dim();
+         if p == 0 {
+             return 0.0;
+         }
+ 
+-        let mut q = Array1::<f64>::zeros(p);
+-        let mut a_u = Array1::<f64>::zeros(p);
+         self.estimate_matrix_from_probe_batch(hop, 1, |z, probe_values| {
++            let mut q = Array1::<f64>::zeros(p);
++            let mut a_u = Array1::<f64>::zeros(p);
+             let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
+             op.mul_vec_into(z.view(), q.view_mut());
+             op.mul_vec_into(u.view(), a_u.view_mut());
+             let r = hop.stochastic_trace_solve(&q, self.config.solve_rel_tol);
+             probe_values[[0, 0]] = a_u.dot(&r);
+         })[[0, 0]]
+     }
+ 
+     /// Check the adaptive stopping criterion.
+     ///
+     /// Returns `true` if all coordinates have converged:
+     /// ```text
+     /// max_k  s_{M,k} / (√M · max(|q̄_{M,k}|, τ_rel))  ≤  ε
+     /// ```
+     fn check_convergence(&self, n: usize, means: &[f64], m2s: &[f64]) -> bool {
+         if n < 2 {
+             return false;
+         }
+         let sqrt_n = (n as f64).sqrt();
+         let n_f = n as f64;
+ 
+         for k in 0..means.len() {
+             let variance = m2s[k] / (n_f - 1.0);
+             let std_dev = variance.max(0.0).sqrt();
+             let denom = sqrt_n * means[k].abs().max(self.config.tau_rel);
+
+----- PATCH END -----
+
+[2026-05-06T20:29:39.238569+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:29:39.240067+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:29:39.240121+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:30:10.982972+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:30:10.984674+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:30:10.984734+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:30:12.971011+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:30:12.974178+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:30:12.974290+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:30:21.701320+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:30:21.702941+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:30:21.702991+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:30:37.437765+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:30:37.439607+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:30:37.439716+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:30:39.248133+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:30:39.250941+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:30:39.251291+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:30:46.133340+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:30:46.134945+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:30:46.134999+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:30:56.526209+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:30:56.528047+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:30:56.528141+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:30:58.312601+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:30:58.315278+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:30:58.315348+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:31:08.630744+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:31:08.632273+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:31:08.632314+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:31:32.402241+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:31:32.435135+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:31:32.435228+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:31:34.092059+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:31:34.093566+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:31:34.093609+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:31:46.381175+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:31:46.383039+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:31:46.383098+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:31:56.749283+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:31:56.750769+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:31:56.750808+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:32:04.097576+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:32:04.099494+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:32:04.099561+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:32:19.166147+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:32:19.167733+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:32:19.167778+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:32:26.597421+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:32:26.599158+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:32:26.599209+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:32:37.434209+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:32:37.435886+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:32:37.435944+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:32:39.111831+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:32:39.114817+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:32:39.114900+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:32:46.316425+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:32:46.318107+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:32:46.318170+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:32:55.649179+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:32:55.650957+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:32:55.651017+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:33:02.588563+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:33:02.590291+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:33:02.590355+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:33:11.719436+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:33:11.722126+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:33:11.722251+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:33:19.157397+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:33:19.159117+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:33:19.159164+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:33:22.162479+00:00] apply_result: mode=apply id=task_e_69fb93a0e4108324809b7d3025d38ab4 status=Partial applied=1 skipped=0 conflicts=1 cmd=(cd /Users/user/gam && git apply --3way /var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/.tmptE3nGL/patch.diff)
+stdout_tail=
+
+stderr_tail=
+Applied patch to 'src/solver/reml/assembly.rs' cleanly.
+Applied patch to 'src/solver/reml/firth.rs' with conflicts.
+U src/solver/reml/firth.rs
+
+patch_summary: kind=git-diff lines=501 chars=18364 cwd=/Users/user/gam ; head=
+diff --git a/src/solver/reml/assembly.rs b/src/solver/reml/assembly.rs
+index ec023ffe8fa0214e85ffaa7c3626f0b281258e0e..ba4abacd6e36dd077aa56a220c2c1f2aa96ed976 100644
+--- a/src/solver/reml/assembly.rs
++++ b/src/solver/reml/assembly.rs
+@@ -1,44 +1,238 @@
+ //! Canonical `InnerSolution` assembler.
+ //!
+ //! No production code outside this module may construct
+ //! `InnerSolutionBuilder::new(...)` or call `reml_laml_evaluate(...)`.
+ //! Tests are exempt.
+ //!
+ //! All families and runtime paths provide ingredients and call
+ //! [`InnerAssembly::evaluate`] or [`InnerAssembly::build`].
+ 
+ use super::FirthDenseOperator;
+ use super::unified::{
+     BarrierConfig, DispersionHandling, EvalMode, FixedDriftDerivFn, HessianDerivativeProvider,
+     HessianOperator, HyperCoord, HyperCoordPair, InnerSolut…
+----- PATCH BEGIN -----
+diff --git a/src/solver/reml/assembly.rs b/src/solver/reml/assembly.rs
+index ec023ffe8fa0214e85ffaa7c3626f0b281258e0e..ba4abacd6e36dd077aa56a220c2c1f2aa96ed976 100644
+--- a/src/solver/reml/assembly.rs
++++ b/src/solver/reml/assembly.rs
+@@ -1,44 +1,238 @@
+ //! Canonical `InnerSolution` assembler.
+ //!
+ //! No production code outside this module may construct
+ //! `InnerSolutionBuilder::new(...)` or call `reml_laml_evaluate(...)`.
+ //! Tests are exempt.
+ //!
+ //! All families and runtime paths provide ingredients and call
+ //! [`InnerAssembly::evaluate`] or [`InnerAssembly::build`].
+ 
+ use super::FirthDenseOperator;
+ use super::unified::{
+     BarrierConfig, DispersionHandling, EvalMode, FixedDriftDerivFn, HessianDerivativeProvider,
+     HessianOperator, HyperCoord, HyperCoordPair, InnerSolution, InnerSolutionBuilder,
+     PenaltyCoordinate, PenaltyLogdetDerivs, PenaltySubspaceTrace, RemlLamlResult,
+     penalty_matrix_root, reml_laml_evaluate,
+ };
++use crate::faer_ndarray::fast_xt_diag_y;
+ use ndarray::{Array1, Array2};
++use rayon::iter::{IntoParallelIterator, ParallelIterator};
+ use std::sync::Arc;
+ 
++// ═══════════════════════════════════════════════════════════════════════════
++//  Streaming weighted dense-design products
++// ═══════════════════════════════════════════════════════════════════════════
++
++/// Dense weighted-product work below this approximate flop count stays on the
++/// caller thread and uses the existing faer GEMM path. Above the threshold we
++/// stream rows through rayon-local accumulation buffers to avoid materializing
++/// weighted n×p design copies at biobank scale.
++const DENSE_WEIGHTED_PRODUCT_PAR_FLOPS: usize = 8_000_000;
++
++#[inline]
++fn dense_weighted_chunk_rows(cols: usize) -> usize {
++    const TARGET_BYTES: usize = 2 * 1024 * 1024;
++    const MIN_ROWS: usize = 256;
++    const MAX_ROWS: usize = 4096;
++    let bytes_per_row = cols.max(1) * std::mem::size_of::<f64>();
++    (TARGET_BYTES / bytes_per_row).clamp(MIN_ROWS, MAX_ROWS)
++}
++
++/// Write `diag(scale) · x` into `out`, preserving `out`'s allocation when its
++/// shape already matches `x`.
++///
++/// This replaces the former clone-and-row-scale pattern used by REML assembly
++/// tests and Firth kernels. It is intentionally simple and deterministic for a
++/// fixed row order.
++pub(crate) fn row_scale_dense_into(x: &Array2<f64>, scale: &Array1<f64>, out: &mut Array2<f64>) {
++    debug_assert_eq!(x.nrows(), scale.len(), "scale length must match row count");
++    if out.raw_dim() != x.raw_dim() {
++        *out = Array2::<f64>::zeros(x.raw_dim());
++    }
++    ndarray::Zip::from(out.rows_mut())
++        .and(x.rows())
++        .and(scale.view())
++        .for_each(|mut dst, src, &w| {
++            dst.assign(&src);
++            dst *= w;
++        });
++}
++
++/// Return `diag(scale) · x` without exposing the reusable-buffer API.
++pub(crate) fn row_scale_dense(x: &Array2<f64>, scale: &Array1<f64>) -> Array2<f64> {
++    let mut out = Array2::<f64>::zeros(x.raw_dim());
++    row_scale_dense_into(x, scale, &mut out);
++    out
++}
++
++fn accumulate_weighted_cross_rows(
++    out: &mut Array2<f64>,
++    left: &Array2<f64>,
++    right: &Array2<f64>,
++    weights: &Array1<f64>,
++    row_start: usize,
++    row_end: usize,
++) {
++    let p = left.ncols();
++    let q = right.ncols();
++    for i in row_start..row_end {
++        let wi = weights[i];
++        if wi == 0.0 {
++            continue;
++        }
++        for a in 0..p {
++            let scaled = wi * left[[i, a]];
++            if scaled == 0.0 {
++                continue;
++            }
++            for b in 0..q {
++                out[[a, b]] += scaled * right[[i, b]];
++            }
++        }
++    }
++}
++
++fn accumulate_xt_diag_x_upper_rows(
++    out: &mut Array2<f64>,
++    x: &Array2<f64>,
++    diag: &Array1<f64>,
++    row_start: usize,
++    row_end: usize,
++) {
++    let p = x.ncols();
++    for i in row_start..row_end {
++        let wi = diag[i];
++        if wi == 0.0 {
++            continue;
++        }
++        for a in 0..p {
++            let scaled = wi * x[[i, a]];
++            if scaled == 0.0 {
++                continue;
++            }
++            for b in a..p {
++                out[[a, b]] += scaled * x[[i, b]];
++            }
++        }
++    }
++}
++
++/// Compute `leftᵀ diag(weights) right` using streamed row-block
++/// accumulation for large products. The parallel path allocates one dense
++/// p×q accumulator per rayon worker/task instead of allocating an n×q weighted
++/// design matrix.
++pub(crate) fn weighted_cross_dense(
++    left: &Array2<f64>,
++    right: &Array2<f64>,
++    weights: &Array1<f64>,
++) -> Array2<f64> {
++    debug_assert_eq!(left.nrows(), right.nrows());
++    debug_assert_eq!(left.nrows(), weights.len());
++    let n = weights.len();
++    let p = left.ncols();
++    let q = right.ncols();
++    if n == 0 || p == 0 || q == 0 {
++        return Array2::<f64>::zeros((p, q));
++    }
++
++    let work = n.saturating_mul(p).saturating_mul(q);
++    if rayon::current_num_threads() <= 1 || work < DENSE_WEIGHTED_PRODUCT_PAR_FLOPS {
++        return fast_xt_diag_y(left, weights, right);
++    }
++
++    let chunk_rows = dense_weighted_chunk_rows(p + q).min(n);
++    let chunks = n.div_ceil(chunk_rows);
++    (0..chunks)
++        .into_par_iter()
++        .fold(
++            || Array2::<f64>::zeros((p, q)),
++            |mut local, chunk| {
++                let start = chunk * chunk_rows;
++                let end = (start + chunk_rows).min(n);
++                accumulate_weighted_cross_rows(&mut local, left, right, weights, start, end);
++                local
++            },
++        )
++        .reduce(
++            || Array2::<f64>::zeros((p, q)),
++            |mut a, b| {
++                a += &b;
++                a
++            },
++        )
++}
++
++/// Compute `xᵀ diag(diag) x`. For small products this reuses `weighted` as an
++/// n×p row-scaled scratch and dispatches to faer GEMM. For large products it
++/// streams rows into rayon-local p×p buffers and mirrors the accumulated upper
++/// triangle, avoiding weighted design materialization.
++pub(crate) fn xt_diag_x_dense_into(
++    x: &Array2<f64>,
++    diag: &Array1<f64>,
++    weighted: &mut Array2<f64>,
++) -> Array2<f64> {
++    let (n, p) = x.dim();
++    debug_assert_eq!(diag.len(), n, "diag length must match row count");
++    if n == 0 || p == 0 {
++        return Array2::<f64>::zeros((p, p));
++    }
++
++    let work = n.saturating_mul(p).saturating_mul(p);
++    if rayon::current_num_threads() <= 1 || work < DENSE_WEIGHTED_PRODUCT_PAR_FLOPS {
++        row_scale_dense_into(x, diag, weighted);
++        return crate::faer_ndarray::fast_atb(x, weighted);
++    }
++
++    let chunk_rows = dense_weighted_chunk_rows(p).min(n);
++    let chunks = n.div_ceil(chunk_rows);
++    let mut out = (0..chunks)
++        .into_par_iter()
++        .fold(
++            || Array2::<f64>::zeros((p, p)),
++            |mut local, chunk| {
++                let start = chunk * chunk_rows;
++                let end = (start + chunk_rows).min(n);
++                accumulate_xt_diag_x_upper_rows(&mut local, x, diag, start, end);
++                local
++            },
++        )
++        .reduce(
++            || Array2::<f64>::zeros((p, p)),
++            |mut a, b| {
++                a += &b;
++                a
++            },
++        );
++    for a in 0..p {
++        for b in 0..a {
++            out[[a, b]] = out[[b, a]];
++        }
++    }
++    out
++}
++
+ // ═══════════════════════════════════════════════════════════════════════════
+ //  InnerAssembly — the single entry point for InnerSolution construction
+ // ═══════════════════════════════════════════════════════════════════════════
+ 
+ /// All ingredients needed to assemble an `InnerSolution`.
+ ///
+ /// Callers fill in the required fields and override optional ones as needed.
+ /// The assembler builds the `InnerSolution` via `InnerSolutionBuilder` and
+ /// calls `reml_laml_evaluate` — the only production code path that does so.
+ pub struct InnerAssembly<'dp> {
+     // === Required core ===
+     pub log_likelihood: f64,
+     pub penalty_quadratic: f64,
+     pub beta: Array1<f64>,
+     pub n_observations: usize,
+     pub hessian_op: std::sync::Arc<dyn HessianOperator>,
+     pub penalty_coords: Vec<PenaltyCoordinate>,
+     pub penalty_logdet: PenaltyLogdetDerivs,
+     pub dispersion: DispersionHandling,
+     pub rho_curvature_scale: f64,
+     pub hessian_logdet_correction: f64,
+     pub penalty_subspace_trace: Option<Arc<PenaltySubspaceTrace>>,
+ 
+     // === Optional decorations (sensible defaults when None/zero) ===
+     pub deriv_provider: Option<Box<dyn HessianDerivativeProvider + 'dp>>,
+@@ -178,25 +372,124 @@ where
+     G: Fn(&Array1<f64>) -> Array1<f64>,
+     H: Fn(&Array1<f64>) -> Option<Array2<f64>>,
+ {
+     if mode == EvalMode::ValueOnly {
+         let pc = cost_fn(rho);
+         if pc.abs() > 0.0 {
+             Some((pc, Array1::zeros(rho.len()), None))
+         } else {
+             None
+         }
+     } else {
+         let pc = cost_fn(rho);
+         let pg = grad_fn(rho);
+         let ph = if mode == EvalMode::ValueGradientHessian {
+             hess_fn(rho)
+         } else {
+             None
+         };
+         if pc.abs() > 0.0 || pg.iter().any(|&v| v != 0.0) {
+             Some((pc, pg, ph))
+         } else {
+             None
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use approx::assert_relative_eq;
++    use ndarray::Array2;
++
++    fn assert_matrix_close(
++        got: &Array2<f64>,
++        expected: &Array2<f64>,
++        epsilon: f64,
++        max_relative: f64,
++    ) {
++        assert_eq!(got.dim(), expected.dim());
++        for ((i, j), &value) in got.indexed_iter() {
++            assert_relative_eq!(
++                value,
++                expected[[i, j]],
++                epsilon = epsilon,
++                max_relative = max_relative
++            );
++        }
++    }
++
++    fn deterministic_matrix(n: usize, p: usize, phase: f64) -> Array2<f64> {
++        Array2::from_shape_fn((n, p), |(i, j)| {
++            let a = ((i as f64 + 1.0) * (j as f64 + 3.0) + phase).sin();
++            let b = ((i as f64 + 5.0) / (j as f64 + 2.0) + phase).cos();
++            0.25 * a + 0.75 * b
++        })
++    }
++
++    fn deterministic_weights(n: usize) -> Array1<f64> {
++        Array1::from_shape_fn(n, |i| {
++            if i % 17 == 0 {
++                0.0
++            } else {
++                0.2 + ((i as f64 + 1.0) * 0.013).sin().abs()
++            }
++        })
++    }
++
++    fn weighted_cross_reference(
++        left: &Array2<f64>,
++        right: &Array2<f64>,
++        weights: &Array1<f64>,
++    ) -> Array2<f64> {
++        let mut out = Array2::<f64>::zeros((left.ncols(), right.ncols()));
++        for i in 0..weights.len() {
++            for a in 0..left.ncols() {
++                let scaled = weights[i] * left[[i, a]];
++                for b in 0..right.ncols() {
++                    out[[a, b]] += scaled * right[[i, b]];
++                }
++            }
++        }
++        out
++    }
++
++    #[test]
++    fn row_scale_dense_into_reuses_buffer_and_matches_reference() {
++        let x = deterministic_matrix(37, 11, 0.3);
++        let weights = deterministic_weights(x.nrows());
++        let mut out = Array2::<f64>::zeros(x.raw_dim());
++        let ptr = out.as_ptr();
++        row_scale_dense_into(&x, &weights, &mut out);
++        assert_eq!(out.as_ptr(), ptr);
++        for i in 0..x.nrows() {
++            for j in 0..x.ncols() {
++                assert_relative_eq!(out[[i, j]], x[[i, j]] * weights[i], epsilon = 0.0);
++            }
++        }
++    }
++
++    #[test]
++    fn weighted_cross_dense_matches_rowwise_reference_at_biobank_block_size() {
++        let left = deterministic_matrix(2048, 96, 0.1);
++        let right = deterministic_matrix(2048, 64, 0.7);
++        let weights = deterministic_weights(left.nrows());
++        let got = weighted_cross_dense(&left, &right, &weights);
++        let expected = weighted_cross_reference(&left, &right, &weights);
++        assert_matrix_close(&got, &expected, 5e-10, 5e-12);
++    }
++
++    #[test]
++    fn xt_diag_x_dense_into_matches_symmetric_reference_at_biobank_block_size() {
++        let x = deterministic_matrix(1024, 96, 1.1);
++        let weights = deterministic_weights(x.nrows());
++        let mut scratch = Array2::<f64>::zeros((0, 0));
++        let got = xt_diag_x_dense_into(&x, &weights, &mut scratch);
++        let expected = weighted_cross_reference(&x, &x, &weights);
++        assert_matrix_close(&got, &expected, 3e-10, 5e-12);
++        for i in 0..got.nrows() {
++            for j in 0..got.ncols() {
++                assert_relative_eq!(got[[i, j]], got[[j, i]], epsilon = 0.0);
++            }
++        }
++    }
++}
+diff --git a/src/solver/reml/firth.rs b/src/solver/reml/firth.rs
+index 2107bc758ca02294f440ea6f0c749925cb3e8838..ceab9a73bec094d46be06814752266111ecceb4f 100644
+--- a/src/solver/reml/firth.rs
++++ b/src/solver/reml/firth.rs
+@@ -1,125 +1,56 @@
+ use super::*;
+ use crate::linalg::utils::enforce_symmetry;
+ use crate::mixture_link::logit_inverse_link_jet5;
+-use ndarray::ShapeBuilder;
+ 
+ impl<'a> RemlState<'a> {
+     pub(crate) fn xt_diag_x_dense_into(
+         x: &Array2<f64>,
+         diag: &Array1<f64>,
+         weighted: &mut Array2<f64>,
+     ) -> Array2<f64> {
+-        let (n, p) = x.dim();
+-        if n == 0 || p == 0 {
+-            return Array2::<f64>::zeros((p, p));
+-        }
+-        const STREAMING_BYTES_THRESHOLD: usize = 8 * 1024 * 1024;
+-        let dense_work_bytes = n
+-            .checked_mul(p)
+-            .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()))
+-            .unwrap_or(usize::MAX);
+-        if dense_work_bytes > STREAMING_BYTES_THRESHOLD {
+-            return Self::xt_diag_x_dense_chunked_into(x, diag, weighted);
+-        }
+-        if weighted.raw_dim() != x.raw_dim() {
+-            *weighted = Array2::<f64>::zeros(x.raw_dim());
+-        }
+-        weighted.assign(x);
+-        ndarray::Zip::from(weighted.rows_mut())
+-            .and(diag.view())
+-            .for_each(|mut row, w| row *= *w);
+-        fast_atb(x, weighted)
+-    }
+-
+-    #[inline]
+-    fn dense_diag_gram_chunkrows(p: usize) -> usize {
+-        const MIN_ROWS: usize = 512;
+-        const MAX_ROWS: usize = 2048;
+-        const TARGET_BYTES: usize = 2 * 1024 * 1024;
+-        let bytes_per_row = p.max(1) * std::mem::size_of::<f64>();
+-        (TARGET_BYTES / bytes_per_row).clamp(MIN_ROWS, MAX_ROWS)
+-    }
+-
+-    pub(crate) fn xt_diag_x_dense_chunked_into(
+-        x: &Array2<f64>,
+-        diag: &Array1<f64>,
+-        weighted_chunk: &mut Array2<f64>,
+-    ) -> Array2<f64> {
+-        let (n, p) = x.dim();
+-        debug_assert_eq!(diag.len(), n, "diag length must match row count");
+-        if n == 0 || p == 0 {
+-            return Array2::<f64>::zeros((p, p));
+-        }
+-
+-        let chunkrows = Self::dense_diag_gram_chunkrows(p).min(n);
+-        if weighted_chunk.nrows() != chunkrows || weighted_chunk.ncols() != p {
+-            *weighted_chunk = Array2::zeros((chunkrows, p).f());
+-        }
+-
+-        let mut out = Array2::<f64>::zeros((p, p));
+-        for row_start in (0..n).step_by(chunkrows) {
+-            let rows = (n - row_start).min(chunkrows);
+-            {
+-                let mut chunk = weighted_chunk.slice_mut(s![0..rows, ..]);
+-                for local_row in 0..rows {
+-                    let src_row = row_start + local_row;
+-                    let scale = diag[src_row];
+-                    for col in 0..p {
+-                        chunk[[local_row, col]] = x[[src_row, col]] * scale;
+-                    }
+-                }
+-            }
+-            let x_chunk = x.slice(s![row_start..row_start + rows, ..]);
+-            let weighted_view = weighted_chunk.slice(s![0..rows, ..]);
+-            out += &fast_atb(&x_chunk, &weighted_view);
+-        }
+-        out
++        super::assembly::xt_diag_x_dense_into(x, diag, weighted)
+     }
+ 
+     pub(crate) fn row_scale(x: &Array2<f64>, scale: &Array1<f64>) -> Array2<f64> {
+-        let mut out = x.clone();
+-        ndarray::Zip::from(out.rows_mut())
+-            .and(scale.view())
+-            .for_each(|mut row, w| row *= *w);
+-        out
++        super::assembly::row_scale_dense(x, scale)
+     }
+ 
+     #[inline]
+     fn logit_fisher_weight_derivatives(eta: f64) -> (f64, f64, f64, f64, f64) {
+         let jet = logit_inverse_link_jet5(eta);
+         (jet.d1, jet.d2, jet.d3, jet.d4, jet.d5)
+     }
+ 
+     pub(crate) fn weighted_cross(
+         left: &Array2<f64>,
+         right: &Array2<f64>,
+         weights: &Array1<f64>,
+     ) -> Array2<f64> {
+         debug_assert_eq!(left.nrows(), right.nrows());
+         debug_assert_eq!(left.nrows(), weights.len());
+-        crate::faer_ndarray::fast_xt_diag_y(left, weights, right)
++        super::assembly::weighted_cross_dense(left, right, weights)
+     }
+ 
+     pub(crate) fn trace_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+         debug_assert_eq!(a.nrows(), b.ncols());
+         debug_assert_eq!(a.ncols(), b.nrows());
+         let elems = a.nrows().saturating_mul(a.ncols());
+         if elems >= 32 * 32 {
+             let aview = FaerArrayView::new(a);
+             let bview = FaerArrayView::new(b);
+             return faer_frob_inner(aview.as_ref(), bview.as_ref().transpose());
+         }
+         let m = a.nrows();
+         let n = a.ncols();
+         kahan_sum((0..m).map(|i| {
+             let mut acc = 0.0_f64;
+             for j in 0..n {
+                 acc += a[[i, j]] * b[[j, i]];
+             }
+             acc
+         }))
+     }
+ 
+     pub(crate) fn reducedweighted_gram(z: &Array2<f64>, weights: &Array1<f64>) -> Array2<f64> {
+         // Returns Zᵀ diag(weights) Z (exact).
+         //
+
+----- PATCH END -----
+
+[2026-05-06T20:34:39.407885+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:34:39.410099+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:34:39.410198+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:34:54.585005+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:34:54.586686+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:34:54.586744+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:35:08.464003+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:35:08.465668+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:35:08.465718+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:35:24.387387+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:35:24.389021+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:35:24.389083+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:35:27.365735+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:35:27.368965+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:35:27.369068+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:35:40.694540+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:35:40.696194+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:35:40.696258+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:35:42.451485+00:00] apply_result: mode=apply id=task_e_69fb93b7224c8324a69210c4f7903a3f status=Partial applied=0 skipped=0 conflicts=1 cmd=(cd /Users/user/gam && git apply --3way /var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/.tmpToq3MD/patch.diff)
+stdout_tail=
+
+stderr_tail=
+Applied patch to 'src/solver/reml/firth.rs' with conflicts.
+U src/solver/reml/firth.rs
+
+patch_summary: kind=git-diff lines=507 chars=25284 cwd=/Users/user/gam ; head=
+diff --git a/src/solver/reml/firth.rs b/src/solver/reml/firth.rs
+index 2107bc758ca02294f440ea6f0c749925cb3e8838..f3085f46ff2162048ab28ea88dafee6b273061e3 100644
+--- a/src/solver/reml/firth.rs
++++ b/src/solver/reml/firth.rs
+@@ -1,29 +1,30 @@
+ use super::*;
+ use crate::linalg::utils::enforce_symmetry;
+ use crate::mixture_link::logit_inverse_link_jet5;
+ use ndarray::ShapeBuilder;
++use rayon::slice::ParallelSliceMut;
+ 
+ impl<'a> RemlState<'a> {
+     pub(crate) fn xt_diag_x_dense_into(
+         x: &Array2<f64>,
+         diag: &Array1<f64>,
+         weighted: &mut Array2<f64>,
+     ) -> Array2<f64> {
+         let (n, p) = x.dim();
+         if n == 0 || p == 0 {
+             return Array2::<f64>::zeros((p, p));
+----- PATCH BEGIN -----
+diff --git a/src/solver/reml/firth.rs b/src/solver/reml/firth.rs
+index 2107bc758ca02294f440ea6f0c749925cb3e8838..f3085f46ff2162048ab28ea88dafee6b273061e3 100644
+--- a/src/solver/reml/firth.rs
++++ b/src/solver/reml/firth.rs
+@@ -1,29 +1,30 @@
+ use super::*;
+ use crate::linalg::utils::enforce_symmetry;
+ use crate::mixture_link::logit_inverse_link_jet5;
+ use ndarray::ShapeBuilder;
++use rayon::slice::ParallelSliceMut;
+ 
+ impl<'a> RemlState<'a> {
+     pub(crate) fn xt_diag_x_dense_into(
+         x: &Array2<f64>,
+         diag: &Array1<f64>,
+         weighted: &mut Array2<f64>,
+     ) -> Array2<f64> {
+         let (n, p) = x.dim();
+         if n == 0 || p == 0 {
+             return Array2::<f64>::zeros((p, p));
+         }
+         const STREAMING_BYTES_THRESHOLD: usize = 8 * 1024 * 1024;
+         let dense_work_bytes = n
+             .checked_mul(p)
+             .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()))
+             .unwrap_or(usize::MAX);
+         if dense_work_bytes > STREAMING_BYTES_THRESHOLD {
+             return Self::xt_diag_x_dense_chunked_into(x, diag, weighted);
+         }
+         if weighted.raw_dim() != x.raw_dim() {
+             *weighted = Array2::<f64>::zeros(x.raw_dim());
+         }
+         weighted.assign(x);
+         ndarray::Zip::from(weighted.rows_mut())
+             .and(diag.view())
+@@ -62,50 +63,131 @@ impl<'a> RemlState<'a> {
+             {
+                 let mut chunk = weighted_chunk.slice_mut(s![0..rows, ..]);
+                 for local_row in 0..rows {
+                     let src_row = row_start + local_row;
+                     let scale = diag[src_row];
+                     for col in 0..p {
+                         chunk[[local_row, col]] = x[[src_row, col]] * scale;
+                     }
+                 }
+             }
+             let x_chunk = x.slice(s![row_start..row_start + rows, ..]);
+             let weighted_view = weighted_chunk.slice(s![0..rows, ..]);
+             out += &fast_atb(&x_chunk, &weighted_view);
+         }
+         out
+     }
+ 
+     pub(crate) fn row_scale(x: &Array2<f64>, scale: &Array1<f64>) -> Array2<f64> {
+         let mut out = x.clone();
+         ndarray::Zip::from(out.rows_mut())
+             .and(scale.view())
+             .for_each(|mut row, w| row *= *w);
+         out
+     }
+ 
++    #[inline]
++    fn dense_product_likely_uses_inner_parallelism(m: usize, n: usize, k: usize) -> bool {
++        // Keep this in sync with faer_ndarray::matmul_parallelism.  When a
++        // dense product is large enough for faer/BLAS-style internal
++        // parallelism, do not also wrap sibling products in rayon::join: that
++        // can oversubscribe CPU threads and slow down the REML hot path.
++        const PAR_MIN_FLOP_SCALE: usize = 2_000_000;
++        const PAR_MIN_LONG_DIM: usize = 256;
++        let flop_scale = m.saturating_mul(n).saturating_mul(k);
++        let long_dim = m.max(n).max(k);
++        flop_scale >= PAR_MIN_FLOP_SCALE && long_dim >= PAR_MIN_LONG_DIM
++    }
++
++    #[inline]
++    fn should_join_independent_dense_products(products: &[(usize, usize, usize)]) -> bool {
++        const JOIN_MIN_TOTAL_FLOP_SCALE: usize = 128 * 1024;
++        if rayon::current_num_threads() <= 1 {
++            return false;
++        }
++        let mut total_flop_scale = 0usize;
++        for &(m, n, k) in products {
++            if Self::dense_product_likely_uses_inner_parallelism(m, n, k) {
++                return false;
++            }
++            total_flop_scale =
++                total_flop_scale.saturating_add(m.saturating_mul(n).saturating_mul(k));
++        }
++        total_flop_scale >= JOIN_MIN_TOTAL_FLOP_SCALE
++    }
++
++    #[inline]
++    fn scale_rows_by_inverse_observation_weight_sqrt(
++        out: &mut Array2<f64>,
++        observation_weight_sqrt: Option<&Array1<f64>>,
++    ) {
++        let Some(scale) = observation_weight_sqrt else {
++            return;
++        };
++        debug_assert_eq!(out.nrows(), scale.len());
++        let ncols = out.ncols();
++        if ncols == 0 {
++            return;
++        }
++        const PAR_MIN_CELLS: usize = 64 * 1024;
++        let cells = out.nrows().saturating_mul(ncols);
++        if cells >= PAR_MIN_CELLS && rayon::current_num_threads() > 1 && out.is_standard_layout() {
++            if let Some(slice) = out.as_slice_memory_order_mut() {
++                slice
++                    .par_chunks_mut(ncols)
++                    .enumerate()
++                    .for_each(|(row, row_values)| {
++                        let s = scale[row];
++                        if s > 0.0 {
++                            let inv = s.recip();
++                            for value in row_values {
++                                *value *= inv;
++                            }
++                        } else {
++                            for value in row_values {
++                                *value = 0.0;
++                            }
++                        }
++                    });
++                return;
++            }
++        }
++        for row in 0..out.nrows() {
++            let s = scale[row];
++            if s > 0.0 {
++                let inv = s.recip();
++                for col in 0..ncols {
++                    out[[row, col]] *= inv;
++                }
++            } else {
++                for col in 0..ncols {
++                    out[[row, col]] = 0.0;
++                }
++            }
++        }
++    }
++
+     #[inline]
+     fn logit_fisher_weight_derivatives(eta: f64) -> (f64, f64, f64, f64, f64) {
+         let jet = logit_inverse_link_jet5(eta);
+         (jet.d1, jet.d2, jet.d3, jet.d4, jet.d5)
+     }
+ 
+     pub(crate) fn weighted_cross(
+         left: &Array2<f64>,
+         right: &Array2<f64>,
+         weights: &Array1<f64>,
+     ) -> Array2<f64> {
+         debug_assert_eq!(left.nrows(), right.nrows());
+         debug_assert_eq!(left.nrows(), weights.len());
+         crate::faer_ndarray::fast_xt_diag_y(left, weights, right)
+     }
+ 
+     pub(crate) fn trace_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+         debug_assert_eq!(a.nrows(), b.ncols());
+         debug_assert_eq!(a.ncols(), b.nrows());
+         let elems = a.nrows().saturating_mul(a.ncols());
+         if elems >= 32 * 32 {
+             let aview = FaerArrayView::new(a);
+             let bview = FaerArrayView::new(b);
+             return faer_frob_inner(aview.as_ref(), bview.as_ref().transpose());
+         }
+@@ -1507,74 +1589,77 @@ impl FirthDenseOperator {
+         let z = &self.z_reduced;
+         let x_r = &self.x_reduced;
+         let k = &self.k_reduced;
+         let x_ri = &kernel.x_tau_i_reduced;
+         let x_rj = &kernel.x_tau_j_reduced;
+         let deta_i = &kernel.deta_i_partial;
+         let deta_j = &kernel.deta_j_partial;
+         let dh_i = &kernel.dot_h_i_partial;
+         let dh_j = &kernel.dot_h_j_partial;
+         let dot_k_i = &kernel.dot_k_i_reduced;
+         let dot_k_j = &kernel.dot_k_j_reduced;
+         let dot_i_i = &kernel.dot_i_i_partial;
+         let dot_i_j = &kernel.dot_i_j_partial;
+ 
+         // Optional second-design pieces: default to zero when the design is
+         // τ-linear (η̈_{ij} = 0, X_{ij} = 0).
+         let x_tau_tau_is_some = kernel.x_tau_tau_reduced.is_some();
+         let x_rij_zero = Array2::<f64>::zeros(x_r.raw_dim());
+         let x_rij: &Array2<f64> = kernel.x_tau_tau_reduced.as_ref().unwrap_or(&x_rij_zero);
+         let zeros_n = Array1::<f64>::zeros(n);
+         let deta_ij = kernel.deta_ij_partial.as_ref().unwrap_or(&zeros_n);
+ 
+         // ─────────────────────────────────────────────────────────────────
+         //  η̇ vectors in β-rhs space (η_V := X V, η_{i,V} := X_i V, etc.)
+         // ─────────────────────────────────────────────────────────────────
+-        let eta_v = fast_ab(&self.x_dense, rhs); // n×m
+-        let eta_i_v = fast_ab(x_tau_i, rhs); // n×m
+-        let eta_j_v = fast_ab(x_tau_j, rhs); // n×m
++        let (eta_v, eta_i_v, eta_j_v) = if RemlState::should_join_independent_dense_products(&[
++            (n, m, p),
++            (n, m, p),
++            (n, m, p),
++        ]) {
++            let (eta_v, (eta_i_v, eta_j_v)) = rayon::join(
++                || fast_ab(&self.x_dense, rhs),
++                || rayon::join(|| fast_ab(x_tau_i, rhs), || fast_ab(x_tau_j, rhs)),
++            );
++            (eta_v, eta_i_v, eta_j_v)
++        } else {
++            (
++                fast_ab(&self.x_dense, rhs),
++                fast_ab(x_tau_i, rhs),
++                fast_ab(x_tau_j, rhs),
++            )
++        }; // n×m blocks
+         // X_{ij} V from the reduced second-derivative design:
+         //   reduce_explicit_design: X_{r,τ} = diag(√a) X_τ Q,
+         //   invert:  X_{ij} = diag(1/√a) X_{r,ij} Qᵀ.
+         let eta_ij_v: Array2<f64> = if x_tau_tau_is_some {
+             let qt_v = fast_atb(&self.q_basis, rhs); // r×m
+             let mut out = fast_ab(x_rij, &qt_v); // n×m in sqrt(a)-scaled space
+-            if let Some(scale) = self.observation_weight_sqrt.as_ref() {
+-                for row in 0..out.nrows() {
+-                    let s = scale[row];
+-                    if s > 0.0 {
+-                        let inv = s.recip();
+-                        for col in 0..out.ncols() {
+-                            out[[row, col]] *= inv;
+-                        }
+-                    } else {
+-                        for col in 0..out.ncols() {
+-                            out[[row, col]] = 0.0;
+-                        }
+-                    }
+-                }
+-            }
++            RemlState::scale_rows_by_inverse_observation_weight_sqrt(
++                &mut out,
++                self.observation_weight_sqrt.as_ref(),
++            );
+             out
+         } else {
+             Array2::<f64>::zeros((n, m))
+         };
+ 
+         // ─────────────────────────────────────────────────────────────────
+         //  Shared per-direction reduced operators
+         //    A_τ = K İ K   (reduced analog of T_τ = K I_τ K)
+         //    K̇_τ = -A_τ  (already cached)
+         // ─────────────────────────────────────────────────────────────────
+         let a_i_reduced = -dot_k_i; // K İ_i K = -K̇_i
+         let a_j_reduced = -dot_k_j;
+ 
+         // ─────────────────────────────────────────────────────────────────
+         //  Ï_{ij}  — second cross derivative of reduced Fisher
+         // ─────────────────────────────────────────────────────────────────
+         //   Ï_{ij} = X_{r,ij}ᵀ W X_r + X_rᵀ W X_{r,ij}
+         //          + X_{r,i}ᵀ W X_{r,j} + X_{r,j}ᵀ W X_{r,i}
+         //          + X_{r,i}ᵀ Ẇ_j X_r + X_rᵀ Ẇ_j X_{r,i}
+         //          + X_{r,j}ᵀ Ẇ_i X_r + X_rᵀ Ẇ_i X_{r,j}
+         //          + X_rᵀ Ẅ_{ij} X_r.
+         //   Ẇ_α   = diag(w' ⊙ η̇_α),  Ẅ_{ij} = diag(w'' ⊙ η̇_i ⊙ η̇_j + w' ⊙ η̈_ij).
+         let dw_i = &self.w1 * deta_i;
+         let dw_j = &self.w1 * deta_j;
+         let ddw_ij = &(&self.w2 * &(deta_i * deta_j)) + &(&self.w1 * deta_ij);
+@@ -1587,63 +1672,80 @@ impl FirthDenseOperator {
+         i_ddot = i_ddot + RemlState::weighted_cross(x_rj, x_ri, &self.w);
+         i_ddot = i_ddot + RemlState::weighted_cross(x_ri, x_r, &dw_j);
+         i_ddot = i_ddot + RemlState::weighted_cross(x_r, x_ri, &dw_j);
+         i_ddot = i_ddot + RemlState::weighted_cross(x_rj, x_r, &dw_i);
+         i_ddot = i_ddot + RemlState::weighted_cross(x_r, x_rj, &dw_i);
+         i_ddot = i_ddot + crate::faer_ndarray::fast_xt_diag_x(x_r, &ddw_ij);
+ 
+         // K̈_{ij} = −K Ï K + K İ_i K İ_j K + K İ_j K İ_i K.
+         //   Using K İ_α K = −K̇_α = a_α_reduced, the two product terms collapse to
+         //   K İ_i K İ_j K = a_i_reduced · İ_j · K,
+         //   K İ_j K İ_i K = a_j_reduced · İ_i · K.
+         let k_ddot: Array2<f64> = -k.dot(&i_ddot).dot(k)
+             + a_i_reduced.dot(dot_i_j).dot(k)
+             + a_j_reduced.dot(dot_i_i).dot(k);
+ 
+         // ─────────────────────────────────────────────────────────────────
+         //  ḧ_{ij}
+         // ─────────────────────────────────────────────────────────────────
+         //   ḧ_ij = 2 diag(X_{r,ij} K X_rᵀ)
+         //        + diag(X_r K̈_ij X_rᵀ)
+         //        + 2 diag(X_{r,i} K̇_j X_rᵀ)
+         //        + 2 diag(X_{r,j} K̇_i X_rᵀ)
+         //        + 2 diag(X_{r,i} K X_{r,j}ᵀ).
+         // Using diag(A Bᵀ) = rowwise_dot(A, B):
+         let dh_ij: Array1<f64> = {
+-            let mut acc = Array1::<f64>::zeros(n);
++            let r = k.ncols();
++            let can_join = RemlState::should_join_independent_dense_products(&[
++                (n, r, r),
++                (n, r, r),
++                (n, r, r),
++                (n, r, r),
++            ]);
++            let (xr_kddot, ri_kdot_j, rj_kdot_i, ri_k) = if can_join {
++                let ((xr_kddot, ri_kdot_j), (rj_kdot_i, ri_k)) = rayon::join(
++                    || rayon::join(|| fast_ab(x_r, &k_ddot), || fast_ab(x_ri, dot_k_j)),
++                    || rayon::join(|| fast_ab(x_rj, dot_k_i), || fast_ab(x_ri, k)),
++                );
++                (xr_kddot, ri_kdot_j, rj_kdot_i, ri_k)
++            } else {
++                (
++                    fast_ab(x_r, &k_ddot),
++                    fast_ab(x_ri, dot_k_j),
++                    fast_ab(x_rj, dot_k_i),
++                    fast_ab(x_ri, k),
++                )
++            };
++
++            let mut acc = Self::rowwise_dot(&xr_kddot, x_r);
++            acc = acc + 2.0 * Self::rowwise_dot(&ri_kdot_j, x_r);
++            acc = acc + 2.0 * Self::rowwise_dot(&rj_kdot_i, x_r);
++            acc = acc + 2.0 * Self::rowwise_dot(&ri_k, x_rj);
+             if x_tau_tau_is_some {
+                 let rij_k = fast_ab(x_rij, k);
+                 acc = acc + 2.0 * Self::rowwise_dot(&rij_k, x_r);
+             }
+-            let xr_kddot = fast_ab(x_r, &k_ddot);
+-            acc = acc + Self::rowwise_dot(&xr_kddot, x_r);
+-            let ri_kdot_j = fast_ab(x_ri, dot_k_j);
+-            acc = acc + 2.0 * Self::rowwise_dot(&ri_kdot_j, x_r);
+-            let rj_kdot_i = fast_ab(x_rj, dot_k_i);
+-            acc = acc + 2.0 * Self::rowwise_dot(&rj_kdot_i, x_r);
+-            let ri_k = fast_ab(x_ri, k);
+-            acc = acc + 2.0 * Self::rowwise_dot(&ri_k, x_rj);
+             acc
+         };
+ 
+         // ─────────────────────────────────────────────────────────────────
+         //  Γ, Γ̇_i, Γ̇_j, Γ̈_ij  (diagonal row-weight n-vectors)
+         // ─────────────────────────────────────────────────────────────────
+         //   γ        = w'' ⊙ h
+         //   γ̇_i     = w''' ⊙ η̇_i ⊙ h + w'' ⊙ ḣ_i
+         //   γ̈_ij   = w'''' ⊙ η̇_i ⊙ η̇_j ⊙ h
+         //            + w''' ⊙ η̈_ij ⊙ h
+         //            + w''' ⊙ η̇_i ⊙ ḣ_j
+         //            + w''' ⊙ η̇_j ⊙ ḣ_i
+         //            + w'' ⊙ ḧ_ij
+         let gamma = &self.w2 * &self.h_diag;
+         let gamma_dot_i = &(&(&self.w3 * deta_i) * &self.h_diag) + &(&self.w2 * dh_i);
+         let gamma_dot_j = &(&(&self.w3 * deta_j) * &self.h_diag) + &(&self.w2 * dh_j);
+         let gamma_ddot = &(&(&(&self.w4 * deta_i) * deta_j) * &self.h_diag)
+             + &(&(&(&self.w3 * deta_ij) * &self.h_diag)
+                 + &(&(&self.w3 * deta_i) * dh_j)
+                 + &(&(&self.w3 * deta_j) * dh_i)
+                 + &(&self.w2 * &dh_ij));
+ 
+         // ─────────────────────────────────────────────────────────────────
+         //  Diagonal-term β-rhs contributions:
+         //    ∂²(XᵀΓX)/∂τ_i∂τ_j · V
+@@ -1655,66 +1757,57 @@ impl FirthDenseOperator {
+         // ─────────────────────────────────────────────────────────────────
+         let mut diag_term = Array2::<f64>::zeros((p, m));
+         let gamma_col = gamma.view().insert_axis(Axis(1));
+         let gamma_i_col = gamma_dot_i.view().insert_axis(Axis(1));
+         let gamma_j_col = gamma_dot_j.view().insert_axis(Axis(1));
+         let gamma_ij_col = gamma_ddot.view().insert_axis(Axis(1));
+ 
+         // X_iᵀ (γ ⊙ η_{j,V}) + X_jᵀ (γ ⊙ η_{i,V})
+         diag_term = diag_term + fast_atb(x_tau_i, &(&eta_j_v * &gamma_col));
+         diag_term = diag_term + fast_atb(x_tau_j, &(&eta_i_v * &gamma_col));
+         // X_iᵀ (γ̇_j ⊙ η_V) + X_jᵀ (γ̇_i ⊙ η_V)
+         diag_term = diag_term + fast_atb(x_tau_i, &(&eta_v * &gamma_j_col));
+         diag_term = diag_term + fast_atb(x_tau_j, &(&eta_v * &gamma_i_col));
+         // Xᵀ (γ̇_j ⊙ η_{i,V}) + Xᵀ (γ̇_i ⊙ η_{j,V})
+         diag_term = diag_term + fast_ab(&self.x_dense_t, &(&eta_i_v * &gamma_j_col));
+         diag_term = diag_term + fast_ab(&self.x_dense_t, &(&eta_j_v * &gamma_i_col));
+         // Xᵀ (γ̈_ij ⊙ η_V)
+         diag_term = diag_term + fast_ab(&self.x_dense_t, &(&eta_v * &gamma_ij_col));
+         // X_{ij}ᵀ (γ ⊙ η_V) + Xᵀ (γ ⊙ η_{ij,V})
+         if x_tau_tau_is_some {
+             // X_{ij}ᵀ = Q X_{r,ij}ᵀ · diag(1/√a)  (inverse of the reduce shim),
+             // but caller supplies the reduced second-derivative design.  We
+             // form X_{ij}ᵀ Y as q_basis · (X_{r,ij}ᵀ · diag(1/√a)·Y) = Q · X_{r,ij}ᵀ (Y unscaled).
+             // When no observation weights, X_{r,ij} = X_{ij} Q and
+             //   X_{ij}ᵀ Y = Q X_{r,ij}ᵀ Y.
+-            let y = &eta_v * &gamma_col;
+-            let xt_ij_y: Array2<f64> = if let Some(scale) = self.observation_weight_sqrt.as_ref() {
++            let y: Array2<f64> = &eta_v * &gamma_col;
++            let xt_ij_y: Array2<f64> = if self.observation_weight_sqrt.is_some() {
+                 let mut y_scaled = y.clone();
+-                for row in 0..y_scaled.nrows() {
+-                    let s = scale[row];
+-                    if s > 0.0 {
+-                        let inv = s.recip();
+-                        for col in 0..y_scaled.ncols() {
+-                            y_scaled[[row, col]] *= inv;
+-                        }
+-                    } else {
+-                        for col in 0..y_scaled.ncols() {
+-                            y_scaled[[row, col]] = 0.0;
+-                        }
+-                    }
+-                }
++                RemlState::scale_rows_by_inverse_observation_weight_sqrt(
++                    &mut y_scaled,
++                    self.observation_weight_sqrt.as_ref(),
++                );
+                 self.q_basis.dot(&x_rij.t().dot(&y_scaled))
+             } else {
+                 self.q_basis.dot(&x_rij.t().dot(&y))
+             };
+             diag_term = diag_term + xt_ij_y;
+             diag_term = diag_term + self.x_dense_t.dot(&(&eta_ij_v * &gamma_col));
+         }
+ 
+         // ─────────────────────────────────────────────────────────────────
+         //  BᵀPB branch — 9-term expansion.
+         //
+         //  Represent each B-like operator as an "n-row scaling vector for the
+         //  X part plus tails along X_τ and X_{ij}".  For rhs V, define the
+         //  row-scaled η-space blocks R(B) = diag(scale) X V + tails.  Then
+         //  Bᵀ (P action) R is assembled by row-scaling and left-multiplying
+         //  the appropriate full designs.
+         // ─────────────────────────────────────────────────────────────────
+ 
+         // B V row-block (eta-space):  B V = diag(w') X V.
+         let w1_col = self.w1.view().insert_axis(Axis(1));
+         let b_v = &eta_v * &w1_col;
+ 
+         // Ḃ_i V = diag(w'' ⊙ η̇_i) X V + diag(w') X_i V.
+         let w2_deta_i = &self.w2 * deta_i;
+         let w2_deta_j = &self.w2 * deta_j;
+@@ -1775,70 +1868,60 @@ impl FirthDenseOperator {
+         //   term2 = Ḃ_iᵀ P Ḃ_j V + Ḃ_jᵀ P Ḃ_i V
+         //   term3 = Ḃ_iᵀ Ṗ_j B V + Bᵀ Ṗ_j Ḃ_i V
+         //   term4 = Ḃ_jᵀ Ṗ_i B V + Bᵀ Ṗ_i Ḃ_j V
+         //   term5 = Bᵀ P̈_ij B V
+         //
+         // "Bᵀ Q V" with B = diag(w') X equals left_scaled_xt(w1, Q V).
+         // "Ḃ_iᵀ Q V" = diag(w'' ⊙ η̇_i) X acting on the left, plus
+         //              diag(w') X_i on the left.  In transpose:
+         //   Ḃ_iᵀ Q V = Xᵀ (diag(w'' ⊙ η̇_i) Q V) + X_iᵀ (diag(w') Q V).
+         // "B̈_ijᵀ Q V" mirrors B̈_ij above in transpose.
+ 
+         let apply_bdot_tau_t =
+             |scale_deta: &Array1<f64>, x_tau_mat: &Array2<f64>, q_v: &Array2<f64>| {
+                 let scale_col = scale_deta.view().insert_axis(Axis(1));
+                 self.x_dense_t.dot(&(q_v * &scale_col)) + x_tau_mat.t().dot(&(q_v * &w1_col))
+             };
+ 
+         let apply_bddot_ij_t = |q_v: &Array2<f64>| -> Array2<f64> {
+             let scale_col_full = bddot_scale.view().insert_axis(Axis(1));
+             let mut out = self.x_dense_t.dot(&(q_v * &scale_col_full));
+             out = out + x_tau_j.t().dot(&(q_v * &w2_deta_i_col));
+             out = out + x_tau_i.t().dot(&(q_v * &w2_deta_j_col));
+             if x_tau_tau_is_some {
+                 // X_{ij}ᵀ (w1 ⊙ Q V)
+                 let y = q_v * &w1_col;
+-                let contrib: Array2<f64> =
+-                    if let Some(scale) = self.observation_weight_sqrt.as_ref() {
+-                        let mut y_scaled = y.clone();
+-                        for row in 0..y_scaled.nrows() {
+-                            let s = scale[row];
+-                            if s > 0.0 {
+-                                let inv = s.recip();
+-                                for col in 0..y_scaled.ncols() {
+-                                    y_scaled[[row, col]] *= inv;
+-                                }
+-                            } else {
+-                                for col in 0..y_scaled.ncols() {
+-                                    y_scaled[[row, col]] = 0.0;
+-                                }
+-                            }
+-                        }
+-                        self.q_basis.dot(&x_rij.t().dot(&y_scaled))
+-                    } else {
+-                        self.q_basis.dot(&x_rij.t().dot(&y))
+-                    };
++                let contrib: Array2<f64> = if self.observation_weight_sqrt.is_some() {
++                    let mut y_scaled = y.clone();
++                    RemlState::scale_rows_by_inverse_observation_weight_sqrt(
++                        &mut y_scaled,
++                        self.observation_weight_sqrt.as_ref(),
++                    );
++                    self.q_basis.dot(&x_rij.t().dot(&y_scaled))
++                } else {
++                    self.q_basis.dot(&x_rij.t().dot(&y))
++                };
+                 out = out + contrib;
+             }
+             out
+         };
+ 
+         // term1
+         let t1a = apply_bddot_ij_t(&p_bv);
+         let t1b = self.left_scaled_xt(&self.w1, &p_bddot_ij_v);
+         // term2
+         let t2a = apply_bdot_tau_t(&w2_deta_i, x_tau_i, &p_bdot_j_v);
+         let t2b = apply_bdot_tau_t(&w2_deta_j, x_tau_j, &p_bdot_i_v);
+         // term3: Ḃ_iᵀ Ṗ_j B V + Bᵀ Ṗ_j Ḃ_i V
+         let t3a = apply_bdot_tau_t(&w2_deta_i, x_tau_i, &pdot_j_bv);
+         let t3b = self.left_scaled_xt(&self.w1, &pdot_j_bdot_i_v);
+         // term4: Ḃ_jᵀ Ṗ_i B V + Bᵀ Ṗ_i Ḃ_j V
+         let t4a = apply_bdot_tau_t(&w2_deta_j, x_tau_j, &pdot_i_bv);
+         let t4b = self.left_scaled_xt(&self.w1, &pdot_i_bdot_j_v);
+         // term5
+         let t5 = self.left_scaled_xt(&self.w1, &p_ddot_b_v);
+ 
+         let d2_bpb = t1a + t1b + t2a + t2b + t3a + t3b + t4a + t4b + t5;
+ 
+         0.5 * (diag_term - d2_bpb)
+     }
+ 
+
+----- PATCH END -----
+
+[2026-05-06T20:36:13.584405+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:36:13.586324+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:36:13.586379+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:36:30.957398+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:36:30.959094+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:36:30.959147+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:36:47.382001+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:36:47.384015+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:36:47.384113+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:37:02.670775+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:37:02.673205+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:37:02.673263+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:37:04.439365+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:37:04.442301+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:37:04.442422+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:37:06.853075+00:00] apply_result: mode=apply id=task_e_69fb93404bb883248861e9e584e7177c status=Partial applied=0 skipped=0 conflicts=1 cmd=(cd /Users/user/gam && git apply --3way /var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/.tmpvSKb0v/patch.diff)
+stdout_tail=
+
+stderr_tail=
+Applied patch to 'src/families/transformation_normal.rs' with conflicts.
+U src/families/transformation_normal.rs
+
+patch_summary: kind=git-diff lines=767 chars=34314 cwd=/Users/user/gam ; head=
+diff --git a/src/families/transformation_normal.rs b/src/families/transformation_normal.rs
+index 88eacd9401e41f65a0bf49f5df5e2b8b8a1b0d84..212a2c926e4080227682ccca7ccf91d959d2a52f 100644
+--- a/src/families/transformation_normal.rs
++++ b/src/families/transformation_normal.rs
+@@ -91,50 +91,60 @@ impl Default for TransformationNormalConfig {
+             response_extra_penalty_orders: vec![1],
+             double_penalty: true,
+         }
+     }
+ }
+ 
+ /// Baseline cap for the tensor-product width used by the transformation-normal
+ /// response basis. Small datasets should stay compact because the fit
+ /// repeatedly factorizes dense penalized Hessians.
+ const BASE_TRANSFORMATION_TENSOR_WIDTH: usize = 160;
+ /// Large samples can support a richer response basis without the aggressive
+ /// under…
+----- PATCH BEGIN -----
+diff --git a/src/families/transformation_normal.rs b/src/families/transformation_normal.rs
+index 88eacd9401e41f65a0bf49f5df5e2b8b8a1b0d84..212a2c926e4080227682ccca7ccf91d959d2a52f 100644
+--- a/src/families/transformation_normal.rs
++++ b/src/families/transformation_normal.rs
+@@ -91,50 +91,60 @@ impl Default for TransformationNormalConfig {
+             response_extra_penalty_orders: vec![1],
+             double_penalty: true,
+         }
+     }
+ }
+ 
+ /// Baseline cap for the tensor-product width used by the transformation-normal
+ /// response basis. Small datasets should stay compact because the fit
+ /// repeatedly factorizes dense penalized Hessians.
+ const BASE_TRANSFORMATION_TENSOR_WIDTH: usize = 160;
+ /// Large samples can support a richer response basis without the aggressive
+ /// underfitting forced by the small-sample cap above. This upper cap keeps the
+ /// tensor width bounded even when the covariate side is narrow.
+ const LARGE_SAMPLE_TRANSFORMATION_TENSOR_WIDTH: usize = 320;
+ /// E[log |Z|] for Z ~ N(0, 1), used to put local log-absolute residual
+ /// projections on the standard-normal scale.
+ const STANDARD_NORMAL_MEAN_LOG_ABS: f64 = -0.635_181_422_730_739_1;
+ /// Relative tolerance for response-grid deduplication and zero-width-gap
+ /// skipping. Used by both the fit-time grid builder
+ /// (`transformation_monotonicity_response_grid`) and the predict-time
+ /// derivative-grid builder. Kept in sync so the two grids generate the
+ /// same point set on identical inputs (otherwise predict could hit a
+ /// distinct grid point that the fit-time barrier never bounded).
+ pub const TRANSFORMATION_GRID_RELATIVE_TOL: f64 = 1.0e-12;
+ 
++/// Minimum row-by-output work estimate before SCOP row-contribution reductions
++/// switch to Rayon. Below this threshold the sequential path avoids parallel
++/// scheduling overhead and preserves the original accumulation order.
++const SCOP_ROW_REDUCTION_PARALLEL_MIN_WORK: usize = 65_536;
++
++#[inline]
++fn scop_use_parallel_row_reduction(n_rows: usize, output_len: usize) -> bool {
++    n_rows > 1 && n_rows.saturating_mul(output_len) >= SCOP_ROW_REDUCTION_PARALLEL_MIN_WORK
++}
++
+ /// Strict-feasibility margin for `h' > 0` on the monotonicity grid. Used
+ /// both by the fit-time fraction-to-boundary line search (so accepted β
+ /// keeps `h'(grid) ≥ EPS`) and by the predict-time monotonicity check
+ /// in `inference::predict_input` (which rejects predictions whose minimum
+ /// `h'` on the response grid drops below this threshold). Keeping these
+ /// in sync prevents the predict path from rejecting fits that the
+ /// optimizer accepted as feasible — and vice versa.
+ pub const TRANSFORMATION_MONOTONICITY_EPS: f64 = 1.0e-8;
+ /// Absolute bound for feasible transformation scores on the standard-normal
+ /// scale. The CTN likelihood targets `h(Y|x) ~ N(0,1)`; accepting exact-Newton
+ /// iterates with finite positive `h'` but astronomical `|h|` lets curvature
+ /// diagnostics overflow into meaningless values. This is a numerical runaway
+ /// guard, not a statistical plausibility filter: startup seeds can temporarily
+ /// land outside practically observable normal quantiles before the line search
+ /// moves them back into the likelihood's high-density region.
+ pub const TRANSFORMATION_NORMAL_H_ABS_MAX: f64 = 1.0e6;
+ /// Maximum number of response quantiles drawn into the monotonicity grid.
+ /// Shared between fit and predict so the grid construction is identical.
+ pub const TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES: usize = 129;
+ /// Number of equal subdivisions inserted between consecutive grid points
+ /// (knots + quantiles). Shared between fit and predict.
+ pub const TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS: usize = 4;
+ /// Number of dense-spectral factor columns processed per exact ψψ HVP row pass.
+ /// At biobank CTN dimensions p≈800, this keeps the per-worker accumulator well
+ /// under 1 MiB while reducing repeated SCOP row-invariant work by 32× relative
+@@ -1909,53 +1919,51 @@ impl TransformationNormalFamily {
+         if beta.len() != p_total || direction.len() != p_total || probe.len() != p_total {
+             return Err(format!(
+                 "SCOP dH matvec length mismatch: beta={}, direction={}, probe={}, expected={p_total}",
+                 beta.len(),
+                 direction.len(),
+                 probe.len()
+             ));
+         }
+         let beta_mat = beta
+             .view()
+             .into_shape_with_order((p_resp, p_cov))
+             .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
+         let dir_mat = direction
+             .view()
+             .into_shape_with_order((p_resp, p_cov))
+             .map_err(|e| format!("SCOP direction reshape failed: {e}"))?;
+         let probe_mat = probe
+             .view()
+             .into_shape_with_order((p_resp, p_cov))
+             .map_err(|e| format!("SCOP probe reshape failed: {e}"))?;
+         let cov = self
+             .covariate_dense_arc()
+             .map_err(|e| format!("SCOP dH matvec requires cached covariate design: {e}"))?;
+         let weights = self.weights.as_ref();
+         let h_prime = row_quantities.h_prime.as_ref();
+-        let mut out = Array1::<f64>::zeros(p_total);
+-
+-        for i in 0..n {
++        let add_row = |out: &mut Array1<f64>, i: usize| {
+             let cov_row = cov.row(i);
+             let rv = self.response_val_basis.row(i);
+             let rd = self.response_deriv_basis.row(i);
+             let wi = weights[i];
+             let hp = h_prime[i];
+             let inv_hp = 1.0 / hp;
+             let inv_hp_sq = inv_hp * inv_hp;
+             let inv_hp_cu = inv_hp_sq * inv_hp;
+ 
+             let mut gamma = vec![0.0; p_resp];
+             let mut gamma_dir = vec![0.0; p_resp];
+             let mut gamma_probe = vec![0.0; p_resp];
+             for k in 0..p_resp {
+                 gamma[k] = beta_mat.row(k).dot(&cov_row);
+                 gamma_dir[k] = dir_mat.row(k).dot(&cov_row);
+                 gamma_probe[k] = probe_mat.row(k).dot(&cov_row);
+             }
+ 
+             let mut h_dir = rv[0] * gamma_dir[0];
+             let mut hp_dir = rd[0] * gamma_dir[0];
+             let mut h_probe = rv[0] * gamma_probe[0];
+             let mut hp_probe = rd[0] * gamma_probe[0];
+             let mut h_dir_probe = 0.0;
+             let mut hp_dir_probe = 0.0;
+             let mut endpoint_dir = [
+@@ -2058,104 +2066,128 @@ impl TransformationNormalFamily {
+                         normalizer_scalar +=
+                             q.second[a][b] * endpoint_dir[b] * endpoint_factor_probe[a];
+                         normalizer_scalar += q.second[a][b]
+                             * (endpoint_factor_dir[a] * endpoint_probe[b]
+                                 + endpoint_factor[a] * endpoint_dir_probe[b]);
+                         for c_ep in 0..2 {
+                             normalizer_scalar += q.third[a][b][c_ep]
+                                 * endpoint_dir[c_ep]
+                                 * endpoint_factor[a]
+                                 * endpoint_probe[b];
+                         }
+                     }
+                 }
+                 let scalar = wi
+                     * (h_factor_dir * h_probe
+                         + h_factor * h_dir_probe
+                         + h_dir * h_second_probe
+                         + (hp_factor_dir * hp_probe + hp_factor * hp_dir_probe) * inv_hp_sq
+                         - 2.0 * hp_factor * hp_probe * hp_dir * inv_hp_cu
+                         + hp_second_probe * hp_dir * inv_hp_sq
+                         + normalizer_scalar);
+                 for c in 0..p_cov {
+                     out[k * p_cov + c] += scalar * cov_row[c];
+                 }
+             }
+-        }
++        };
++
++        let out = if scop_use_parallel_row_reduction(n, p_total) {
++            use rayon::iter::{IntoParallelIterator, ParallelIterator};
++            (0..n)
++                .into_par_iter()
++                .fold(
++                    || Array1::<f64>::zeros(p_total),
++                    |mut acc, i| {
++                        add_row(&mut acc, i);
++                        acc
++                    },
++                )
++                .reduce(
++                    || Array1::<f64>::zeros(p_total),
++                    |mut lhs, rhs| {
++                        lhs += &rhs;
++                        lhs
++                    },
++                )
++        } else {
++            let mut out = Array1::<f64>::zeros(p_total);
++            for i in 0..n {
++                add_row(&mut out, i);
++            }
++            out
++        };
+ 
+         Ok(out)
+     }
+ 
+     fn scop_hessian_second_directional_matvec(
+         &self,
+         beta: &Array1<f64>,
+         direction_u: &Array1<f64>,
+         direction_v: &Array1<f64>,
+         row_quantities: &TransformationNormalRowQuantityCache,
+         probe: &Array1<f64>,
+     ) -> Result<Array1<f64>, String> {
+         let n = self.response_val_basis.nrows();
+         let p_resp = self.response_val_basis.ncols();
+         let p_cov = self.covariate_design.ncols();
+         let p_total = p_resp * p_cov;
+         if beta.len() != p_total
+             || direction_u.len() != p_total
+             || direction_v.len() != p_total
+             || probe.len() != p_total
+         {
+             return Err(format!(
+                 "SCOP d2H matvec length mismatch: beta={}, u={}, v={}, probe={}, expected={p_total}",
+                 beta.len(),
+                 direction_u.len(),
+                 direction_v.len(),
+                 probe.len()
+             ));
+         }
+         let beta_mat = beta
+             .view()
+             .into_shape_with_order((p_resp, p_cov))
+             .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
+         let dir_u_mat = direction_u
+             .view()
+             .into_shape_with_order((p_resp, p_cov))
+             .map_err(|e| format!("SCOP u direction reshape failed: {e}"))?;
+         let dir_v_mat = direction_v
+             .view()
+             .into_shape_with_order((p_resp, p_cov))
+             .map_err(|e| format!("SCOP v direction reshape failed: {e}"))?;
+         let probe_mat = probe
+             .view()
+             .into_shape_with_order((p_resp, p_cov))
+             .map_err(|e| format!("SCOP probe reshape failed: {e}"))?;
+         let cov = self
+             .covariate_dense_arc()
+             .map_err(|e| format!("SCOP d2H matvec requires cached covariate design: {e}"))?;
+         let weights = self.weights.as_ref();
+         let h_prime = row_quantities.h_prime.as_ref();
+-        let mut out = Array1::<f64>::zeros(p_total);
+-
+-        for i in 0..n {
++        let add_row = |out: &mut Array1<f64>, i: usize| {
+             let cov_row = cov.row(i);
+             let rv = self.response_val_basis.row(i);
+             let rd = self.response_deriv_basis.row(i);
+             let wi = weights[i];
+             let hp = h_prime[i];
+             let inv_hp = 1.0 / hp;
+             let inv_hp_sq = inv_hp * inv_hp;
+             let inv_hp_cu = inv_hp_sq * inv_hp;
+             let inv_hp_qu = inv_hp_sq * inv_hp_sq;
+ 
+             let mut gamma = vec![0.0; p_resp];
+             let mut gamma_u = vec![0.0; p_resp];
+             let mut gamma_v = vec![0.0; p_resp];
+             let mut gamma_probe = vec![0.0; p_resp];
+             for k in 0..p_resp {
+                 gamma[k] = beta_mat.row(k).dot(&cov_row);
+                 gamma_u[k] = dir_u_mat.row(k).dot(&cov_row);
+                 gamma_v[k] = dir_v_mat.row(k).dot(&cov_row);
+                 gamma_probe[k] = probe_mat.row(k).dot(&cov_row);
+             }
+ 
+             let mut hp_u = rd[0] * gamma_u[0];
+             let mut hp_v = rd[0] * gamma_v[0];
+             let mut hp_probe = rd[0] * gamma_probe[0];
+             let mut h_uv = 0.0;
+@@ -2331,51 +2363,77 @@ impl TransformationNormalFamily {
+                                 + endpoint_factor_v[a] * endpoint_u_probe[b]);
+                     }
+                 }
+                 let scalar = wi
+                     * (h_factor_u * h_v_probe
+                         + h_factor_v * h_u_probe
+                         + h_uv * h_second_probe
+                         + (hp_factor_u * hp_v_probe + hp_factor_v * hp_u_probe) * inv_hp_sq
+                         - 2.0
+                             * (hp_factor_u * hp_probe + hp_factor * hp_u_probe)
+                             * hp_v
+                             * inv_hp_cu
+                         - 2.0
+                             * (hp_factor_v * hp_probe + hp_factor * hp_v_probe)
+                             * hp_u
+                             * inv_hp_cu
+                         - 2.0 * hp_factor * hp_probe * hp_uv * inv_hp_cu
+                         + 6.0 * hp_factor * hp_probe * hp_u * hp_v * inv_hp_qu
+                         + hp_second_probe * hp_uv * inv_hp_sq
+                         - 2.0 * hp_second_probe * hp_u * hp_v * inv_hp_cu
+                         + normalizer_scalar);
+                 for c in 0..p_cov {
+                     out[k * p_cov + c] += scalar * cov_row[c];
+                 }
+             }
+-        }
++        };
++
++        let out = if scop_use_parallel_row_reduction(n, p_total) {
++            use rayon::iter::{IntoParallelIterator, ParallelIterator};
++            (0..n)
++                .into_par_iter()
++                .fold(
++                    || Array1::<f64>::zeros(p_total),
++                    |mut acc, i| {
++                        add_row(&mut acc, i);
++                        acc
++                    },
++                )
++                .reduce(
++                    || Array1::<f64>::zeros(p_total),
++                    |mut lhs, rhs| {
++                        lhs += &rhs;
++                        lhs
++                    },
++                )
++        } else {
++            let mut out = Array1::<f64>::zeros(p_total);
++            for i in 0..n {
++                add_row(&mut out, i);
++            }
++            out
++        };
+ 
+         Ok(out)
+     }
+ 
+     fn scop_hessian_diagonal(
+         &self,
+         beta: &Array1<f64>,
+         row_quantities: &TransformationNormalRowQuantityCache,
+     ) -> Result<Array1<f64>, String> {
+         let n = self.response_val_basis.nrows();
+         let p_resp = self.response_val_basis.ncols();
+         let p_cov = self.covariate_design.ncols();
+         let p_total = p_resp * p_cov;
+         if beta.len() != p_total {
+             return Err(format!(
+                 "SCOP Hessian diagonal beta length {} != expected {p_total}",
+                 beta.len()
+             ));
+         }
+         let beta_mat = beta
+             .view()
+             .into_shape_with_order((p_resp, p_cov))
+             .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
+         let cov = self
+             .covariate_dense_arc()
+@@ -2485,152 +2543,174 @@ impl TransformationNormalFamily {
+             ));
+         }
+         let beta_mat = beta
+             .view()
+             .into_shape_with_order((p_resp, p_cov))
+             .map_err(|e| format!("SCOP psi beta reshape failed: {e}"))?;
+         let cov = self
+             .covariate_dense_arc()
+             .map_err(|e| format!("SCOP psi terms require cached covariate design: {e}"))?;
+         let cov_psi = op
+             .materialize_cov_first_axis(axis)
+             .map_err(|e| format!("SCOP psi materialize_cov_first failed: {e}"))?;
+         if cov_psi.nrows() != n || cov_psi.ncols() != p_cov {
+             return Err(format!(
+                 "SCOP psi covariate derivative shape {}x{} != expected {}x{}",
+                 cov_psi.nrows(),
+                 cov_psi.ncols(),
+                 n,
+                 p_cov
+             ));
+         }
+ 
+         let weights = self.weights.as_ref();
+         let h = row_quantities.h.as_ref();
+         let h_prime = row_quantities.h_prime.as_ref();
+-        let mut objective_psi = 0.0;
+-        let mut score_psi = Array1::<f64>::zeros(p_total);
+-
+-        for i in 0..n {
++        let endpoint_basis = [
++            self.response_upper_basis
++                .as_slice()
++                .ok_or_else(|| "SCOP endpoint upper basis is not contiguous".to_string())?,
++            self.response_lower_basis
++                .as_slice()
++                .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
++        ];
++        let add_row = |score_psi: &mut Array1<f64>, i: usize| -> f64 {
+             let cov_row = cov.row(i);
+             let psi_row = cov_psi.row(i);
+             let rv = self.response_val_basis.row(i);
+             let rd = self.response_deriv_basis.row(i);
+             let wi = weights[i];
+             let hi = h[i];
+             let hp = h_prime[i];
+             let inv_hp = 1.0 / hp;
+             let inv_hp_sq = inv_hp * inv_hp;
+             let q = row_quantities.endpoint_q[i];
+             let gamma_row = row_quantities.gamma.row(i);
+ 
+             let mut gamma = vec![0.0; p_resp];
+             let mut gamma_psi = vec![0.0; p_resp];
+             for k in 0..p_resp {
+                 gamma[k] = gamma_row[k];
+                 gamma_psi[k] = beta_mat.row(k).dot(&psi_row);
+             }
+ 
+             let mut h_psi = rv[0] * gamma_psi[0];
+             let mut hp_psi = rd[0] * gamma_psi[0];
+             for k in 1..p_resp {
+                 h_psi += 2.0 * rv[k] * gamma[k] * gamma_psi[k];
+                 hp_psi += 2.0 * rd[k] * gamma[k] * gamma_psi[k];
+             }
+ 
+-            let endpoint_basis = [
+-                self.response_upper_basis
+-                    .as_slice()
+-                    .ok_or_else(|| "SCOP endpoint upper basis is not contiguous".to_string())?,
+-                self.response_lower_basis
+-                    .as_slice()
+-                    .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
+-            ];
+             let mut endpoint_psi = [0.0; 2];
+             let mut endpoint_factor = vec![[0.0; 2]; p_resp];
+             let mut endpoint_psi_cov_factor = vec![[0.0; 2]; p_resp];
+             let mut endpoint_psi_psi_factor = vec![[0.0; 2]; p_resp];
+             for e in 0..2 {
+                 let basis = endpoint_basis[e];
+                 endpoint_psi[e] = basis[0] * gamma_psi[0];
+                 endpoint_factor[0][e] = basis[0];
+                 endpoint_psi_psi_factor[0][e] = basis[0];
+                 for k in 1..p_resp {
+                     endpoint_psi[e] += 2.0 * basis[k] * gamma[k] * gamma_psi[k];
+                     endpoint_factor[k][e] = 2.0 * basis[k] * gamma[k];
+                     endpoint_psi_cov_factor[k][e] = 2.0 * basis[k] * gamma_psi[k];
+                     endpoint_psi_psi_factor[k][e] = 2.0 * basis[k] * gamma[k];
+                 }
+             }
+ 
+-            objective_psi +=
+-                wi * (hi * h_psi - hp_psi * inv_hp + endpoint_chain_first(&q, endpoint_psi));
+-
+             let mut h_factor = vec![0.0; p_resp];
+             let mut hp_factor = vec![0.0; p_resp];
+             let mut hpsi_cov_factor = vec![0.0; p_resp];
+             let mut hppsi_cov_factor = vec![0.0; p_resp];
+             let mut hpsi_psi_factor = vec![0.0; p_resp];
+             let mut hppsi_psi_factor = vec![0.0; p_resp];
+             h_factor[0] = rv[0];
+             hp_factor[0] = rd[0];
+             hpsi_psi_factor[0] = rv[0];
+             hppsi_psi_factor[0] = rd[0];
+             for k in 1..p_resp {
+                 h_factor[k] = 2.0 * rv[k] * gamma[k];
+                 hp_factor[k] = 2.0 * rd[k] * gamma[k];
+                 hpsi_cov_factor[k] = 2.0 * rv[k] * gamma_psi[k];
+                 hppsi_cov_factor[k] = 2.0 * rd[k] * gamma_psi[k];
+                 hpsi_psi_factor[k] = 2.0 * rv[k] * gamma[k];
+                 hppsi_psi_factor[k] = 2.0 * rd[k] * gamma[k];
+             }
+ 
+             for k in 0..p_resp {
+                 for c in 0..p_cov {
+                     let idx = k * p_cov + c;
+                     let h_a = h_factor[k] * cov_row[c];
+                     let hp_a = hp_factor[k] * cov_row[c];
+                     let hpsi_a = hpsi_cov_factor[k] * cov_row[c] + hpsi_psi_factor[k] * psi_row[c];
+                     let hppsi_a =
+                         hppsi_cov_factor[k] * cov_row[c] + hppsi_psi_factor[k] * psi_row[c];
+                     let endpoint_a = [
+                         endpoint_factor[k][0] * cov_row[c],
+                         endpoint_factor[k][1] * cov_row[c],
+                     ];
+                     let endpoint_psi_a = [
+                         endpoint_psi_cov_factor[k][0] * cov_row[c]
+                             + endpoint_psi_psi_factor[k][0] * psi_row[c],
+                         endpoint_psi_cov_factor[k][1] * cov_row[c]
+                             + endpoint_psi_psi_factor[k][1] * psi_row[c],
+                     ];
+                     score_psi[idx] += wi
+                         * (h_a * h_psi + hi * hpsi_a - hppsi_a * inv_hp
+                             + hp_psi * hp_a * inv_hp_sq
+                             + endpoint_chain_second(&q, endpoint_psi, endpoint_a, endpoint_psi_a));
+                 }
+             }
+-        }
++            wi * (hi * h_psi - hp_psi * inv_hp + endpoint_chain_first(&q, endpoint_psi))
++        };
++
++        let (objective_psi, score_psi) = if scop_use_parallel_row_reduction(n, p_total) {
++            use rayon::iter::{IntoParallelIterator, ParallelIterator};
++            (0..n)
++                .into_par_iter()
++                .fold(
++                    || (0.0, Array1::<f64>::zeros(p_total)),
++                    |(mut objective_acc, mut score_acc), i| {
++                        objective_acc += add_row(&mut score_acc, i);
++                        (objective_acc, score_acc)
++                    },
++                )
++                .reduce(
++                    || (0.0, Array1::<f64>::zeros(p_total)),
++                    |(objective_lhs, mut score_lhs), (objective_rhs, score_rhs)| {
++                        score_lhs += &score_rhs;
++                        (objective_lhs + objective_rhs, score_lhs)
++                    },
++                )
++        } else {
++            let mut objective_psi = 0.0;
++            let mut score_psi = Array1::<f64>::zeros(p_total);
++            for i in 0..n {
++                objective_psi += add_row(&mut score_psi, i);
++            }
++            (objective_psi, score_psi)
++        };
+ 
+         let hessian_psi_operator: Arc<dyn HyperOperator> =
+             Arc::new(TransformationNormalPsiHessianOperator::new(
+                 Arc::new(self.clone()),
+                 beta.clone(),
+                 Arc::clone(&op_arc),
+                 axis,
+                 Arc::clone(&row_quantities.gamma),
+                 Arc::clone(&row_quantities.h),
+                 Arc::clone(&row_quantities.h_prime),
+                 Arc::clone(&row_quantities.endpoint_q),
+             ));
+ 
+         Ok(ExactNewtonJointPsiTerms {
+             objective_psi,
+             score_psi,
+             hessian_psi: Array2::zeros((0, 0)),
+             hessian_psi_operator: Some(hessian_psi_operator),
+         })
+     }
+ 
+     fn scop_psi_hessian_apply_from_operator(
+         &self,
+         beta: &Array1<f64>,
+         row_quantities: &TransformationNormalRowQuantityCache,
+@@ -2690,75 +2770,128 @@ impl TransformationNormalFamily {
+         let dir_mat = direction
+             .view()
+             .into_shape_with_order((p_resp, p_cov))
+             .map_err(|e| format!("SCOP psi Hessian apply direction reshape failed: {e}"))?;
+         if cov_psi.nrows() != n || cov_psi.ncols() != p_cov {
+             return Err(format!(
+                 "SCOP psi Hessian apply covariate derivative shape {}x{} for axis {axis} != expected {}x{}",
+                 cov_psi.nrows(),
+                 cov_psi.ncols(),
+                 n,
+                 p_cov
+             ));
+         }
+ 
+         let weights = self.weights.as_ref();
+         let h = row_quantities.h.as_ref();
+         let h_prime = row_quantities.h_prime.as_ref();
+         let endpoint_basis = [
+             self.response_upper_basis
+                 .as_slice()
+                 .ok_or_else(|| "SCOP endpoint upper basis is not contiguous".to_string())?,
+             self.response_lower_basis
+                 .as_slice()
+                 .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
+         ];
+-        let mut out = Array1::<f64>::zeros(p_total);
+-        let mut gamma = vec![0.0; p_resp];
+-        let mut gamma_dir = vec![0.0; p_resp];
+-        let mut gamma_psi = vec![0.0; p_resp];
+-        let mut gamma_psi_dir = vec![0.0; p_resp];
+-        let mut endpoint_factor = vec![[0.0; 2]; p_resp];
+-        let mut endpoint_factor_dir = vec![[0.0; 2]; p_resp];
+-        let mut endpoint_psi_cov_factor = vec![[0.0; 2]; p_resp];
+-        let mut endpoint_psi_psi_factor = vec![[0.0; 2]; p_resp];
+-        let mut endpoint_psi_cov_factor_dir = vec![[0.0; 2]; p_resp];
+-        let mut endpoint_psi_psi_factor_dir = vec![[0.0; 2]; p_resp];
+-        let mut h_factor = vec![0.0; p_resp];
+-        let mut hp_factor = vec![0.0; p_resp];
+-        let mut h_factor_dir = vec![0.0; p_resp];
+-        let mut hp_factor_dir = vec![0.0; p_resp];
+-        let mut hpsi_cov_factor = vec![0.0; p_resp];
+-        let mut hppsi_cov_factor = vec![0.0; p_resp];
+-        let mut hpsi_psi_factor = vec![0.0; p_resp];
+-        let mut hppsi_psi_factor = vec![0.0; p_resp];
+-        let mut hpsi_cov_factor_dir = vec![0.0; p_resp];
+-        let mut hppsi_cov_factor_dir = vec![0.0; p_resp];
+-        let mut hpsi_psi_factor_dir = vec![0.0; p_resp];
+-        let mut hppsi_psi_factor_dir = vec![0.0; p_resp];
++        struct PsiHessianApplyScratch {
++            gamma: Vec<f64>,
++            gamma_dir: Vec<f64>,
++            gamma_psi: Vec<f64>,
++            gamma_psi_dir: Vec<f64>,
++            endpoint_factor: Vec<[f64; 2]>,
++            endpoint_factor_dir: Vec<[f64; 2]>,
++            endpoint_psi_cov_factor: Vec<[f64; 2]>,
++            endpoint_psi_psi_factor: Vec<[f64; 2]>,
++            endpoint_psi_cov_factor_dir: Vec<[f64; 2]>,
++            endpoint_psi_psi_factor_dir: Vec<[f64; 2]>,
++            h_factor: Vec<f64>,
++            hp_factor: Vec<f64>,
++            h_factor_dir: Vec<f64>,
++            hp_factor_dir: Vec<f64>,
++            hpsi_cov_factor: Vec<f64>,
++            hppsi_cov_factor: Vec<f64>,
++            hpsi_psi_factor: Vec<f64>,
++            hppsi_psi_factor: Vec<f64>,
++            hpsi_cov_factor_dir: Vec<f64>,
++            hppsi_cov_factor_dir: Vec<f64>,
++            hpsi_psi_factor_dir: Vec<f64>,
++            hppsi_psi_factor_dir: Vec<f64>,
++        }
++
++        impl PsiHessianApplyScratch {
++            fn new(p_resp: usize) -> Self {
++                Self {
++                    gamma: vec![0.0; p_resp],
++                    gamma_dir: vec![0.0; p_resp],
++                    gamma_psi: vec![0.0; p_resp],
++                    gamma_psi_dir: vec![0.0; p_resp],
++                    endpoint_factor: vec![[0.0; 2]; p_resp],
++                    endpoint_factor_dir: vec![[0.0; 2]; p_resp],
++                    endpoint_psi_cov_factor: vec![[0.0; 2]; p_resp],
++                    endpoint_psi_psi_factor: vec![[0.0; 2]; p_resp],
++                    endpoint_psi_cov_factor_dir: vec![[0.0; 2]; p_resp],
++                    endpoint_psi_psi_factor_dir: vec![[0.0; 2]; p_resp],
++                    h_factor: vec![0.0; p_resp],
++                    hp_factor: vec![0.0; p_resp],
++                    h_factor_dir: vec![0.0; p_resp],
++                    hp_factor_dir: vec![0.0; p_resp],
++                    hpsi_cov_factor: vec![0.0; p_resp],
++                    hppsi_cov_factor: vec![0.0; p_resp],
++                    hpsi_psi_factor: vec![0.0; p_resp],
++                    hppsi_psi_factor: vec![0.0; p_resp],
++                    hpsi_cov_factor_dir: vec![0.0; p_resp],
++                    hppsi_cov_factor_dir: vec![0.0; p_resp],
++                    hpsi_psi_factor_dir: vec![0.0; p_resp],
++                    hppsi_psi_factor_dir: vec![0.0; p_resp],
++                }
++            }
++        }
++
++        let add_row = |out: &mut Array1<f64>, scratch: &mut PsiHessianApplyScratch, i: usize| {
++            let gamma = &mut scratch.gamma;
++            let gamma_dir = &mut scratch.gamma_dir;
++            let gamma_psi = &mut scratch.gamma_psi;
++            let gamma_psi_dir = &mut scratch.gamma_psi_dir;
++            let endpoint_factor = &mut scratch.endpoint_factor;
++            let endpoint_factor_dir = &mut scratch.endpoint_factor_dir;
++            let endpoint_psi_cov_factor = &mut scratch.endpoint_psi_cov_factor;
++            let endpoint_psi_psi_factor = &mut scratch.endpoint_psi_psi_factor;
++            let endpoint_psi_cov_factor_dir = &mut scratch.endpoint_psi_cov_factor_dir;
++            let endpoint_psi_psi_factor_dir = &mut scratch.endpoint_psi_psi_factor_dir;
++            let h_factor = &mut scratch.h_factor;
++            let hp_factor = &mut scratch.hp_factor;
++            let h_factor_dir = &mut scratch.h_factor_dir;
++            let hp_factor_dir = &mut scratch.hp_factor_dir;
++            let hpsi_cov_factor = &mut scratch.hpsi_cov_factor;
++            let hppsi_cov_factor = &mut scratch.hppsi_cov_factor;
++            let hpsi_psi_factor = &mut scratch.hpsi_psi_factor;
++            let hppsi_psi_factor = &mut scratch.hppsi_psi_factor;
++            let hpsi_cov_factor_dir = &mut scratch.hpsi_cov_factor_dir;
++            let hppsi_cov_factor_dir = &mut scratch.hppsi_cov_factor_dir;
++            let hpsi_psi_factor_dir = &mut scratch.hpsi_psi_factor_dir;
++            let hppsi_psi_factor_dir = &mut scratch.hppsi_psi_factor_dir;
+ 
+-        for i in 0..n {
+             let cov_row = cov.row(i);
+             let psi_row = cov_psi.row(i);
+             let rv = self.response_val_basis.row(i);
+             let rd = self.response_deriv_basis.row(i);
+             let wi = weights[i];
+             let hi = h[i];
+             let hp = h_prime[i];
+             let inv_hp = 1.0 / hp;
+             let inv_hp_sq = inv_hp * inv_hp;
+             let inv_hp_cu = inv_hp_sq * inv_hp;
+             let q = row_quantities.endpoint_q[i];
+             let gamma_row = row_quantities.gamma.row(i);
+ 
+             for k in 0..p_resp {
+                 gamma[k] = gamma_row[k];
+                 gamma_dir[k] = dir_mat.row(k).dot(&cov_row);
+                 gamma_psi[k] = beta_mat.row(k).dot(&psi_row);
+                 gamma_psi_dir[k] = dir_mat.row(k).dot(&psi_row);
+             }
+ 
+             let mut h_dir = rv[0] * gamma_dir[0];
+             let mut hp_dir = rd[0] * gamma_dir[0];
+             let mut h_psi = rv[0] * gamma_psi[0];
+             let mut hp_psi = rd[0] * gamma_psi[0];
+             let mut h_psi_dir = rv[0] * gamma_psi_dir[0];
+@@ -2870,51 +3003,89 @@ impl TransformationNormalFamily {
+                         endpoint_psi_cov_factor_dir[k][0] * cov_row[c]
+                             + endpoint_psi_psi_factor_dir[k][0] * psi_row[c],
+                         endpoint_psi_cov_factor_dir[k][1] * cov_row[c]
+                             + endpoint_psi_psi_factor_dir[k][1] * psi_row[c],
+                     ];
+                     let value =
+                         h_a_dir * h_psi + h_a * h_psi_dir + h_dir * hpsi_a + hi * hpsi_a_dir
+                             - hppsi_a_dir * inv_hp
+                             - hppsi_a * d_inv_hp
+                             + hp_psi_dir * hp_a * inv_hp_sq
+                             + hp_psi * hp_a_dir * inv_hp_sq
+                             + hp_psi * hp_a * d_inv_hp_sq
+                             + endpoint_chain_third(
+                                 &q,
+                                 endpoint_psi,
+                                 endpoint_a,
+                                 endpoint_dir,
+                                 endpoint_psi_a,
+                                 endpoint_psi_dir,
+                                 endpoint_a_dir,
+                                 endpoint_psi_a_dir,
+                             );
+                     out[idx] += wi * value;
+                 }
+             }
+-        }
++        };
++
++        let out = if scop_use_parallel_row_reduction(n, p_total) {
++            use rayon::iter::{IntoParallelIterator, ParallelIterator};
++            (0..n)
++                .into_par_iter()
++                .fold(
++                    || {
++                        (
++                            Array1::<f64>::zeros(p_total),
++                            PsiHessianApplyScratch::new(p_resp),
++                        )
++                    },
++                    |(mut acc, mut scratch), i| {
++                        add_row(&mut acc, &mut scratch, i);
++                        (acc, scratch)
++                    },
++                )
++                .reduce(
++                    || {
++                        (
++                            Array1::<f64>::zeros(p_total),
++                            PsiHessianApplyScratch::new(p_resp),
++                        )
++                    },
++                    |(mut lhs, scratch), (rhs, _)| {
++                        lhs += &rhs;
++                        (lhs, scratch)
++                    },
++                )
++                .0
++        } else {
++            let mut out = Array1::<f64>::zeros(p_total);
++            let mut scratch = PsiHessianApplyScratch::new(p_resp);
++            for i in 0..n {
++                add_row(&mut out, &mut scratch, i);
++            }
++            out
++        };
+ 
+         Ok(out)
+     }
+ 
+     fn scop_psi_hessian_hvp_mat_from_cov(
+         &self,
+         beta: &Array1<f64>,
+         row_quantities: &TransformationNormalRowQuantityCache,
+         axis: usize,
+         cov: &Array2<f64>,
+         cov_psi: &Array2<f64>,
+         factor: ArrayView2<'_, f64>,
+     ) -> Result<Array2<f64>, String> {
+         let n = self.response_val_basis.nrows();
+         let p_resp = self.response_val_basis.ncols();
+         let p_cov = self.covariate_design.ncols();
+         let p_total = p_resp * p_cov;
+         let rank = factor.ncols();
+         if cov.nrows() != n || cov.ncols() != p_cov {
+             return Err(format!(
+                 "SCOP psi Hessian batched apply covariate shape {}x{} != expected {}x{}",
+                 cov.nrows(),
+                 cov.ncols(),
+                 n,
+                 p_cov
+
+----- PATCH END -----
+
+[2026-05-06T20:37:32.243525+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:37:32.245537+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:37:32.245644+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:37:45.921626+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T20:37:45.923566+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:37:45.923660+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T20:37:49.296269+00:00] apply_result: mode=apply id=task_e_69fb93d80ff88324b6b8713372d3dbe8 status=Partial applied=0 skipped=0 conflicts=1 cmd=(cd /Users/user/gam && git apply --3way /var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/.tmpbaRo4h/patch.diff)
+stdout_tail=
+
+stderr_tail=
+Applied patch to 'src/solver/reml/unified.rs' with conflicts.
+U src/solver/reml/unified.rs
+
+patch_summary: kind=git-diff lines=454 chars=20797 cwd=/Users/user/gam ; head=
+diff --git a/src/solver/reml/unified.rs b/src/solver/reml/unified.rs
+index 3f93c29430becb5e5f288a4902893a85d01371bd..21f698768a7fb78e5df533cf397e9fad6e7ac9dc 100644
+--- a/src/solver/reml/unified.rs
++++ b/src/solver/reml/unified.rs
+@@ -11,50 +11,51 @@
+ //! pattern, block structure, and family type. It is always:
+ //!
+ //! ```text
+ //! V(ρ) = −ℓ(β̂) + ½ β̂ᵀS(ρ)β̂ + ½ log|H| − ½ log|S|₊ + corrections
+ //! ```
+ //!
+ //! What differs across backends is how the inner solver finds β̂, how
+ //! logdet/trace/solve operations dispatch (dense eigendecomposition vs sparse
+ //! Cholesky vs block-coupled), and what family-specific derivative information
+ //! is available.
+ //!
+ //! This module separates those concerns:
+ //! - [`HessianOperator`]: backend-specific linear algebra (l…
+----- PATCH BEGIN -----
+diff --git a/src/solver/reml/unified.rs b/src/solver/reml/unified.rs
+index 3f93c29430becb5e5f288a4902893a85d01371bd..21f698768a7fb78e5df533cf397e9fad6e7ac9dc 100644
+--- a/src/solver/reml/unified.rs
++++ b/src/solver/reml/unified.rs
+@@ -11,50 +11,51 @@
+ //! pattern, block structure, and family type. It is always:
+ //!
+ //! ```text
+ //! V(ρ) = −ℓ(β̂) + ½ β̂ᵀS(ρ)β̂ + ½ log|H| − ½ log|S|₊ + corrections
+ //! ```
+ //!
+ //! What differs across backends is how the inner solver finds β̂, how
+ //! logdet/trace/solve operations dispatch (dense eigendecomposition vs sparse
+ //! Cholesky vs block-coupled), and what family-specific derivative information
+ //! is available.
+ //!
+ //! This module separates those concerns:
+ //! - [`HessianOperator`]: backend-specific linear algebra (logdet, trace, solve)
+ //! - [`InnerSolution`]: the converged inner state (β̂, penalties, factorization)
+ //! - [`reml_laml_evaluate`]: the single formula, written once
+ //!
+ //! # Spectral Consistency Guarantee
+ //!
+ //! The `HessianOperator` trait ensures that `logdet()` (used in cost) and
+ //! `trace_hinv_product()` (used in gradient) are computed from the same
+ //! internal decomposition. This eliminates the class of bugs where cost uses
+ //! Cholesky-based logdet while gradient uses eigendecomposition-based traces
+ //! with a different numerical threshold.
+ 
+ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Zip};
++use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+ use std::collections::HashMap;
+ use std::sync::{Arc, Mutex, OnceLock};
+ 
+ use crate::faer_ndarray::FaerEigh;
+ use crate::linalg::matrix::DesignMatrix;
+ 
+ // ═══════════════════════════════════════════════════════════════════════════
+ //  Core traits
+ // ═══════════════════════════════════════════════════════════════════════════
+ 
+ /// Abstract interface for Hessian linear algebra operations.
+ ///
+ /// All operations use the SAME internal decomposition, ensuring spectral
+ /// consistency between logdet (used in cost) and trace/solve (used in gradient).
+ ///
+ /// Implementors:
+ /// - `DenseSpectralOperator`: eigendecomposition of dense H
+ /// - Sparse Cholesky operators (external implementations)
+ /// - `BlockCoupledOperator`: eigendecomposition of joint multi-block H
+ pub trait HessianOperator: Send + Sync {
+     /// log|H|₊ — pseudo-logdet using only active eigenvalues/pivots.
+     fn logdet(&self) -> f64;
+ 
+     /// tr(H₊⁻¹ A) — trace of pseudo-inverse times a symmetric matrix.
+     /// Uses the SAME decomposition as `logdet`.
+@@ -4477,78 +4478,85 @@ pub fn reml_laml_evaluate(
+             Err(e) => {
+                 log::warn!("BarrierDerivativeProvider skipped (infeasible): {e}");
+                 None
+             }
+         }
+     } else {
+         None
+     };
+     let effective_deriv: &dyn HessianDerivativeProvider = match barrier_deriv_holder {
+         Some(ref bdp) => bdp,
+         None => &*solution.deriv_provider,
+     };
+ 
+     // Extract logdet flags once (same for all coordinates).
+     let (incl_logdet_h, incl_logdet_s) = match &solution.dispersion {
+         DispersionHandling::ProfiledGaussian => (true, true),
+         DispersionHandling::Fixed {
+             include_logdet_h,
+             include_logdet_s,
+             ..
+         } => (*include_logdet_h, *include_logdet_s),
+     };
+ 
+     let ext_dim = solution.ext_coords.len();
+     let mut grad = Array1::zeros(k + ext_dim);
+-    let rho_penalty_a_k_betas: Vec<Array1<f64>> = solution
+-        .penalty_coords
+-        .iter()
+-        .zip(lambdas.iter().copied())
+-        .map(|(coord, lambda)| penalty_a_k_beta(coord, &solution.beta, lambda))
++    // Coordinate-local fixed-β penalty terms, mode responses, and family
++    // derivative corrections are independent within a single outer evaluation.
++    // Keep the dependency-ordered BFGS/line-search loops serial, but use rayon
++    // here so each accepted outer iterate evaluates its objective derivatives
++    // by farming out the per-coordinate Hessian/gradient work.
++    let rho_penalty_a_k_betas: Vec<Array1<f64>> = (0..k)
++        .into_par_iter()
++        .map(|idx| penalty_a_k_beta(&solution.penalty_coords[idx], &solution.beta, lambdas[idx]))
+         .collect();
+-    let rho_curvature_a_k_betas: Vec<Array1<f64>> = solution
+-        .penalty_coords
+-        .iter()
+-        .zip(curvature_lambdas.iter().copied())
+-        .map(|(coord, lambda)| penalty_a_k_beta(coord, &solution.beta, lambda))
++    let rho_curvature_a_k_betas: Vec<Array1<f64>> = (0..k)
++        .into_par_iter()
++        .map(|idx| {
++            penalty_a_k_beta(
++                &solution.penalty_coords[idx],
++                &solution.beta,
++                curvature_lambdas[idx],
++            )
++        })
+         .collect();
+     let need_rho_v = effective_deriv.has_corrections();
+     let rho_v_ks: Option<Vec<Array1<f64>>> = if need_rho_v {
+         Some(
+             rho_curvature_a_k_betas
+-                .iter()
++                .par_iter()
+                 .map(|a_k_beta| hop.solve(a_k_beta))
+                 .collect(),
+         )
+     } else {
+         None
+     };
+     let rho_corrections: Vec<Option<DriftDerivResult>> = if effective_deriv.has_corrections() {
+         rho_v_ks
+             .as_ref()
+             .expect("rho mode responses required for Hessian corrections")
+-            .iter()
++            .par_iter()
+             .map(|v_k| effective_deriv.hessian_derivative_correction_result(v_k))
+             .collect::<Result<Vec<_>, _>>()?
+     } else {
+         (0..k).map(|_| None).collect()
+     };
+ 
+     // --- Stochastic trace estimation decision ---
+     //
+     // Hutchinson traces based on H^{-1} are only valid for logdet-gradient
+     // terms on backends where the logdet kernel is exactly H^{-1}.
+     // Smooth spectral regularization uses G_eps(H) instead, so those backends
+     // must stay on the exact trace path.  The rank-deficient LAML fix also
+     // replaces the kernel with the projected `U_S · (U_Sᵀ H U_S)⁻¹ · U_Sᵀ`,
+     // which the Hutchinson path cannot produce — stay exact when it is active.
+     let total_p = hop.dim();
+     let use_stochastic_traces = can_use_stochastic_logdet_hinv_kernel(hop, total_p, incl_logdet_h)
+         && solution.penalty_subspace_trace.is_none();
+ 
+     // When using stochastic traces, pre-collect all H_k drifts (both rho and
+     // ext coordinates) and batch them through a single StochasticTraceEstimator.
+     // This amortizes the H^{-1} solve cost: ONE solve per probe, shared across
+     // all k + ext_dim coordinates. The collector must inspect the fully
+     // assembled drift (base coordinate plus SCOP/family correction) before
+     // deciding dense vs operator; checking only the base coordinate misses
+     // matrix-free derivative corrections and silently densifies them.
+@@ -4620,172 +4628,195 @@ pub fn reml_laml_evaluate(
+         };
+ 
+         let mut result = Vec::with_capacity(k + ext_dim);
+         let n_dense_total = coord_has_operator.iter().filter(|&&b| !b).count();
+         let mut dense_cursor = 0usize;
+         let mut operator_cursor = n_dense_total;
+         for &has_operator in &coord_has_operator {
+             if has_operator {
+                 result.push(raw_traces[operator_cursor]);
+                 operator_cursor += 1;
+             } else {
+                 result.push(raw_traces[dense_cursor]);
+                 dense_cursor += 1;
+             }
+         }
+         Some(result)
+     } else {
+         None
+     };
+ 
+     // ── Gradient: one shared formula for ALL coordinate types ──
+     //
+     // Both ρ and ext coordinates are processed through outer_gradient_entry()
+     // so that the three-term formula (penalty + trace − det) is written once.
+ 
+-    for idx in 0..k {
+-        let coord = &solution.penalty_coords[idx];
+-        let a_k_beta = &rho_penalty_a_k_betas[idx];
++    let rho_grad_entries: Vec<(usize, f64)> = (0..k)
++        .into_par_iter()
++        .map(|idx| {
++            let coord = &solution.penalty_coords[idx];
++            let a_k_beta = &rho_penalty_a_k_betas[idx];
+ 
+-        // Cost derivative: a_i = ½ β̂ᵀ Aₖ β̂.
+-        let a_i = 0.5 * solution.beta.dot(a_k_beta);
++            // Cost derivative: a_i = ½ β̂ᵀ Aₖ β̂.
++            let a_i = 0.5 * solution.beta.dot(a_k_beta);
+ 
+-        // Trace term: tr(K · Ḣₖ) where Ḣₖ = Aₖ + C[vₖ].
+-        //
+-        // Kernel choice mirrors the ψ/τ block: full-space `G_ε(H)` when the
+-        // cost uses the unprojected `log|H|`, or the identified-subspace
+-        // kernel `U_S · (U_Sᵀ H U_S)⁻¹ · U_Sᵀ` when the rank-deficient LAML
+-        // fix is active.  `Aₖ = λₖ Sₖ` is zero on `null(S)` by construction,
+-        // but the third-derivative correction `C[vₖ] = X'·diag(c ⊙ X vₖ)·X`
+-        // leaks onto the intercept direction for non-Gaussian families — so
+-        // the two kernels disagree whenever `hessian_logdet_correction ≠ 0`
+-        // and `c_array ≠ 0`.
+-        let trace_logdet_i = if !incl_logdet_h {
+-            0.0
+-        } else if let Some(ref stoch_traces) = stochastic_trace_values {
+-            stoch_traces[idx]
+-        } else if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
+-            let drift = penalty_total_drift_result(
+-                coord,
+-                curvature_lambdas[idx],
+-                rho_corrections[idx].as_ref(),
+-            );
+-            match drift {
+-                DriftDerivResult::Dense(matrix) => kernel.trace_projected_logdet(&matrix),
+-                DriftDerivResult::Operator(op) => kernel.trace_operator(op.as_ref()),
+-            }
+-        } else if coord.is_block_local() && rho_corrections[idx].is_none() {
+-            let (block, start, end) = coord.scaled_block_local(1.0);
+-            hop.trace_logdet_block_local(&block, curvature_lambdas[idx], start, end)
+-        } else {
+-            penalty_total_drift_result(coord, curvature_lambdas[idx], rho_corrections[idx].as_ref())
++            // Trace term: tr(K · Ḣₖ) where Ḣₖ = Aₖ + C[vₖ].
++            //
++            // Kernel choice mirrors the ψ/τ block: full-space `G_ε(H)` when the
++            // cost uses the unprojected `log|H|`, or the identified-subspace
++            // kernel `U_S · (U_Sᵀ H U_S)⁻¹ · U_Sᵀ` when the rank-deficient LAML
++            // fix is active.  `Aₖ = λₖ Sₖ` is zero on `null(S)` by construction,
++            // but the third-derivative correction `C[vₖ] = X'·diag(c ⊙ X vₖ)·X`
++            // leaks onto the intercept direction for non-Gaussian families — so
++            // the two kernels disagree whenever `hessian_logdet_correction ≠ 0`
++            // and `c_array ≠ 0`.
++            let trace_logdet_i = if !incl_logdet_h {
++                0.0
++            } else if let Some(ref stoch_traces) = stochastic_trace_values {
++                stoch_traces[idx]
++            } else if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
++                let drift = penalty_total_drift_result(
++                    coord,
++                    curvature_lambdas[idx],
++                    rho_corrections[idx].as_ref(),
++                );
++                match drift {
++                    DriftDerivResult::Dense(matrix) => kernel.trace_projected_logdet(&matrix),
++                    DriftDerivResult::Operator(op) => kernel.trace_operator(op.as_ref()),
++                }
++            } else if coord.is_block_local() && rho_corrections[idx].is_none() {
++                let (block, start, end) = coord.scaled_block_local(1.0);
++                hop.trace_logdet_block_local(&block, curvature_lambdas[idx], start, end)
++            } else {
++                penalty_total_drift_result(
++                    coord,
++                    curvature_lambdas[idx],
++                    rho_corrections[idx].as_ref(),
++                )
+                 .trace_logdet(hop)
+-        };
++            };
+ 
+-        grad[idx] = outer_gradient_entry(
+-            a_i,
+-            trace_logdet_i,
+-            solution.penalty_logdet.first[idx],
+-            &solution.dispersion,
+-            dp_cgrad,
+-            profiled_scale,
+-            incl_logdet_h,
+-            incl_logdet_s,
+-        );
++            (
++                idx,
++                outer_gradient_entry(
++                    a_i,
++                    trace_logdet_i,
++                    solution.penalty_logdet.first[idx],
++                    &solution.dispersion,
++                    dp_cgrad,
++                    profiled_scale,
++                    incl_logdet_h,
++                    incl_logdet_s,
++                ),
++            )
++        })
++        .collect();
++    for (idx, value) in rho_grad_entries {
++        grad[idx] = value;
+     }
+ 
+     // Extended hyperparameter gradient (ψ/τ coordinates).
+     //
+     // Uses the SAME outer_gradient_entry() formula as ρ coordinates above.
+     //
+     // All extended coordinates store canonical fixed-β stationarity
+     // derivatives g_i = F_{βi}. IFT gives β_i = -H^{-1}g_i, exactly like
+     // the ρ block.
+-    for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
+-        let ext_coord_start = std::time::Instant::now();
+-        let grad_idx = k + ext_idx;
++    let ext_grad_entries: Result<Vec<(usize, f64)>, String> = (0..ext_dim)
++        .into_par_iter()
++        .map(|ext_idx| {
++            let coord = &solution.ext_coords[ext_idx];
++            let ext_coord_start = std::time::Instant::now();
++            let grad_idx = k + ext_idx;
+ 
+-        // Mode response magnitude: v_i = H⁻¹(g_i), with β_i = −v_i.
+-        let v_i = hop.solve(&coord.g);
++            // Mode response magnitude: v_i = H⁻¹(g_i), with β_i = −v_i.
++            let v_i = hop.solve(&coord.g);
+ 
+-        // Trace term: tr(K · Ḣ_i) where Ḣ_i = B_i + D_β H[−v_i].
+-        //
+-        // Kernel choice pairs with the cost:
+-        //   * Default cost `½ log|H|` (or `Σ log r_ε(σ_j)` under Smooth spectral
+-        //     regularization) → K = G_ε(H), computed full-space.
+-        //   * Rank-deficient LAML fix (`hessian_logdet_correction ≠ 0`) uses
+-        //     cost `½ log|U_Sᵀ H U_S|_+` on the identified subspace, which
+-        //     pairs with K = U_S · (U_Sᵀ H U_S)⁻¹ · U_Sᵀ.
+-        //
+-        // For non-Gaussian families the total drift includes
+-        // `D_β H[−v_i]`, which has non-zero
+-        // support on `null(S)` whenever `X` contains an all-ones intercept
+-        // column — the null direction of `S_λ`.  Using the full-space
+-        // `G_ε(H)` there picks up a spurious null-space contribution absent
+-        // from `d log|U_Sᵀ H U_S|_+/dτ`; the projected kernel reroutes the
+-        // trace through `range(S_+)` only, matching the cost exactly.
+-        // Gaussian identity skips this path harmlessly because `c = 0` forces
+-        // `D_β H = 0`, so `Ḣ` already lives entirely in `range(S_+)²`.
+-        let trace_logdet_i = if !incl_logdet_h {
+-            0.0
+-        } else if let Some(ref stoch_traces) = stochastic_trace_values {
+-            stoch_traces[k + ext_idx]
+-        } else {
+-            let correction = if effective_deriv.has_corrections() {
+-                effective_deriv.hessian_derivative_correction_result(&v_i)?
++            // Trace term: tr(K · Ḣ_i) where Ḣ_i = B_i + D_β H[−v_i].
++            //
++            // Kernel choice pairs with the cost:
++            //   * Default cost `½ log|H|` (or `Σ log r_ε(σ_j)` under Smooth spectral
++            //     regularization) → K = G_ε(H), computed full-space.
++            //   * Rank-deficient LAML fix (`hessian_logdet_correction ≠ 0`) uses
++            //     cost `½ log|U_Sᵀ H U_S|_+` on the identified subspace, which
++            //     pairs with K = U_S · (U_Sᵀ H U_S)⁻¹ · U_Sᵀ.
++            //
++            // For non-Gaussian families the total drift includes
++            // `D_β H[−v_i]`, which has non-zero
++            // support on `null(S)` whenever `X` contains an all-ones intercept
++            // column — the null direction of `S_λ`.  Using the full-space
++            // `G_ε(H)` there picks up a spurious null-space contribution absent
++            // from `d log|U_Sᵀ H U_S|_+/dτ`; the projected kernel reroutes the
++            // trace through `range(S_+)` only, matching the cost exactly.
++            // Gaussian identity skips this path harmlessly because `c = 0` forces
++            // `D_β H = 0`, so `Ḣ` already lives entirely in `range(S_+)²`.
++            let trace_logdet_i = if !incl_logdet_h {
++                0.0
++            } else if let Some(ref stoch_traces) = stochastic_trace_values {
++                stoch_traces[k + ext_idx]
+             } else {
+-                None
+-            };
+-            let drift =
+-                hyper_coord_total_drift_result(&coord.drift, correction.as_ref(), hop.dim());
+-            match (&solution.penalty_subspace_trace, drift) {
+-                (Some(kernel), DriftDerivResult::Dense(matrix)) => {
+-                    kernel.trace_projected_logdet(&matrix)
+-                }
+-                (Some(kernel), DriftDerivResult::Operator(op)) => {
+-                    kernel.trace_operator(op.as_ref())
++                let correction = if effective_deriv.has_corrections() {
++                    effective_deriv.hessian_derivative_correction_result(&v_i)?
++                } else {
++                    None
++                };
++                let drift =
++                    hyper_coord_total_drift_result(&coord.drift, correction.as_ref(), hop.dim());
++                match (&solution.penalty_subspace_trace, drift) {
++                    (Some(kernel), DriftDerivResult::Dense(matrix)) => {
++                        kernel.trace_projected_logdet(&matrix)
++                    }
++                    (Some(kernel), DriftDerivResult::Operator(op)) => {
++                        kernel.trace_operator(op.as_ref())
++                    }
++                    (None, DriftDerivResult::Dense(matrix)) => hop.trace_logdet_h_k(&matrix, None),
++                    (None, DriftDerivResult::Operator(op)) => {
++                        hop.trace_logdet_operator(op.as_ref())
++                    }
+                 }
+-                (None, DriftDerivResult::Dense(matrix)) => hop.trace_logdet_h_k(&matrix, None),
+-                (None, DriftDerivResult::Operator(op)) => hop.trace_logdet_operator(op.as_ref()),
+-            }
+-        };
++            };
+ 
+-        grad[grad_idx] = outer_gradient_entry(
+-            coord.a,
+-            trace_logdet_i,
+-            coord.ld_s,
+-            &solution.dispersion,
+-            dp_cgrad,
+-            profiled_scale,
+-            incl_logdet_h,
+-            incl_logdet_s,
+-        );
+-        log::info!(
+-            "[STAGE] reml_laml ext_coord_trace ext_idx={} elapsed={:.3}s",
+-            ext_idx,
+-            ext_coord_start.elapsed().as_secs_f64(),
+-        );
++            let value = outer_gradient_entry(
++                coord.a,
++                trace_logdet_i,
++                coord.ld_s,
++                &solution.dispersion,
++                dp_cgrad,
++                profiled_scale,
++                incl_logdet_h,
++                incl_logdet_s,
++            );
++            log::info!(
++                "[STAGE] reml_laml ext_coord_trace ext_idx={} elapsed={:.3}s",
++                ext_idx,
++                ext_coord_start.elapsed().as_secs_f64(),
++            );
++            Ok((grad_idx, value))
++        })
++        .collect();
++    for (idx, value) in ext_grad_entries? {
++        grad[idx] = value;
+     }
+ 
+     // Add correction gradients (ρ-only).
+     if let Some(tk_grad) = &solution.tk_gradient {
+         {
+             let mut sl = grad.slice_mut(ndarray::s![..k]);
+             sl += tk_grad;
+         }
+     }
+ 
+     // Add prior gradient (ρ-only).
+     if let Some((_, ref pg, _)) = prior_cost_gradient {
+         {
+             let mut sl = grad.slice_mut(ndarray::s![..k]);
+             sl += pg;
+         }
+     }
+ 
+     if let Some((idx, value)) = grad.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+         return Err(format!(
+             "REML/LAML gradient contains non-finite entry at index {idx}: {value}"
+         ));
+     }
+ 
+     // Outer Hessian (if requested).
+
+----- PATCH END -----
+

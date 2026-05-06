@@ -9,7 +9,8 @@ use crate::inference::model::{
     SavedAnchoredDeviationRuntime, SavedLatentZNormalization, SavedLinkWiggleRuntime,
 };
 use crate::inference::prediction_linalg::{
-    PredictionCovarianceBackend, design_row_chunk, prediction_chunk_rows, rowwise_local_covariances,
+    PredictionCovarianceBackend, design_row_chunk, prediction_chunk_rows,
+    rowwise_local_covariances_parallel,
 };
 use crate::linalg::utils::predict_gam_dimension_mismatch_message;
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
@@ -42,9 +43,9 @@ fn local_covariances_with_backend<F>(
     build_chunk: F,
 ) -> Result<Vec<Vec<Array1<f64>>>, EstimationError>
 where
-    F: FnMut(std::ops::Range<usize>) -> Result<Vec<Array2<f64>>, String>,
+    F: Fn(std::ops::Range<usize>) -> Result<Vec<Array2<f64>>, String> + Sync,
 {
-    rowwise_local_covariances(backend, n_rows, local_dim, build_chunk)
+    rowwise_local_covariances_parallel(backend, n_rows, local_dim, build_chunk)
         .map_err(EstimationError::InvalidInput)
 }
 
@@ -361,7 +362,7 @@ fn linear_predictor_se_from_backend<F>(
     build_chunk: F,
 ) -> Result<Array1<f64>, EstimationError>
 where
-    F: FnMut(std::ops::Range<usize>) -> Result<Vec<Array2<f64>>, String>,
+    F: Fn(std::ops::Range<usize>) -> Result<Vec<Array2<f64>>, String> + Sync,
 {
     let local = local_covariances_with_backend(backend, n_rows, 1, build_chunk)?;
     Ok(local[0][0].mapv(|v| v.max(0.0).sqrt()))
@@ -2691,38 +2692,37 @@ impl PredictableModel for BinomialLocationScalePredictor {
                 let x_ls = design_row_chunk(design_noise, rows.clone())
                     .map_err(EstimationError::InvalidInput)?;
                 let mut rhs = Array2::<f64>::zeros((p_total, rows_in_chunk * 2));
-                for local_row in 0..rows_in_chunk {
-                    rhs.slice_mut(ndarray::s![0..p_t, local_row])
-                        .assign(&x_t.row(local_row).t());
-                    rhs.slice_mut(ndarray::s![p_t..p_t + p_s, rows_in_chunk + local_row])
-                        .assign(&x_ls.row(local_row).t());
-                }
+                rhs.slice_mut(ndarray::s![0..p_t, 0..rows_in_chunk])
+                    .assign(&x_t.t());
+                rhs.slice_mut(ndarray::s![
+                    p_t..p_t + p_s,
+                    rows_in_chunk..2 * rows_in_chunk
+                ])
+                .assign(&x_ls.t());
                 let solved = backend
                     .apply_columns(&rhs)
                     .map_err(EstimationError::InvalidInput)?;
                 for local_row in 0..rows_in_chunk {
                     let i = start + local_row;
-                    let solved_t = solved.slice(ndarray::s![.., local_row]).to_owned();
-                    let solved_ls = solved
-                        .slice(ndarray::s![.., rows_in_chunk + local_row])
-                        .to_owned();
+                    let solved_t = solved.slice(ndarray::s![.., local_row]);
+                    let solved_ls = solved.slice(ndarray::s![.., rows_in_chunk + local_row]);
                     let var_t = x_t
                         .row(local_row)
-                        .dot(&solved_t.slice(ndarray::s![0..p_t]).to_owned())
+                        .dot(&solved_t.slice(ndarray::s![0..p_t]))
                         .max(0.0);
                     let var_ls = x_ls
                         .row(local_row)
-                        .dot(&solved_ls.slice(ndarray::s![p_t..p_t + p_s]).to_owned())
+                        .dot(&solved_ls.slice(ndarray::s![p_t..p_t + p_s]))
                         .max(0.0);
                     let cov_tls_t = x_t
                         .row(local_row)
-                        .dot(&solved_ls.slice(ndarray::s![0..p_t]).to_owned());
+                        .dot(&solved_ls.slice(ndarray::s![0..p_t]));
                     let cov_tls_ls = x_ls
                         .row(local_row)
-                        .dot(&solved_t.slice(ndarray::s![p_t..p_t + p_s]).to_owned());
+                        .dot(&solved_t.slice(ndarray::s![p_t..p_t + p_s]));
                     let cov_tls = 0.5 * (cov_tls_t + cov_tls_ls);
-                    let suv_t = solved_t.slice(ndarray::s![p_t + p_s..p_total]).to_owned();
-                    let suv_ls = solved_ls.slice(ndarray::s![p_t + p_s..p_total]).to_owned();
+                    let suv_t = solved_t.slice(ndarray::s![p_t + p_s..p_total]);
+                    let suv_ls = solved_ls.slice(ndarray::s![p_t + p_s..p_total]);
                     let det = (var_t * var_ls - cov_tls * cov_tls).max(1e-12);
                     let inv_uu = [
                         [var_ls / det, -cov_tls / det],
@@ -3704,7 +3704,7 @@ fn predict_gam_posterior_mean_from_backend(
     beta: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
     backend: &PredictionCovarianceBackend<'_>,
-    strategy: &dyn FamilyStrategy,
+    strategy: &(dyn FamilyStrategy + Sync),
     label: &str,
 ) -> Result<PredictPosteriorMeanResult, EstimationError> {
     predict_gam_posterior_mean_from_backendwith_bc(x, beta, offset, backend, strategy, label, None)
@@ -3715,7 +3715,7 @@ fn predict_gam_posterior_mean_from_backendwith_bc(
     beta: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
     backend: &PredictionCovarianceBackend<'_>,
-    strategy: &dyn FamilyStrategy,
+    strategy: &(dyn FamilyStrategy + Sync),
     label: &str,
     bias_correction_beta: Option<ArrayView1<'_, f64>>,
 ) -> Result<PredictPosteriorMeanResult, EstimationError> {
@@ -3758,10 +3758,9 @@ fn predict_gam_posterior_mean_from_backendwith_bc(
     let etavar = linear_predictorvariance_from_backend(&x, backend)?;
     let eta_standard_error = etavar.mapv(|v| v.max(0.0).sqrt());
     let quadctx = crate::quadrature::QuadratureContext::new();
-    let means: Result<Vec<f64>, EstimationError> = eta
-        .iter()
-        .zip(eta_standard_error.iter())
-        .map(|(&e, &se)| strategy.posterior_mean(&quadctx, e, se))
+    let means: Result<Vec<f64>, EstimationError> = (0..eta.len())
+        .into_par_iter()
+        .map(|i| strategy.posterior_mean(&quadctx, eta[i], eta_standard_error[i]))
         .collect();
 
     Ok(PredictPosteriorMeanResult {
@@ -4118,81 +4117,76 @@ where
     //   E[μ²]  = 1 - 2I(1) + I(2),
     //   Var(μ) = I(2) - I(1)^2.
     // These identities characterize the exact cloglog moments under Gaussian η uncertainty.
-    let mut mean_standard_error = Array1::<f64>::zeros(eta.len());
-    let mut mix_partials = mixture_state
-        .as_ref()
-        .map(|state| {
-            vec![
-                InverseLinkJet {
-                    mu: 0.0,
-                    d1: 0.0,
-                    d2: 0.0,
-                    d3: 0.0,
-                };
-                state.rho.len()
-            ]
-        })
-        .unwrap_or_default();
-    for i in 0..eta.len() {
-        let se_i = etavar[i].max(0.0).sqrt();
-        let (_, mut meanvar) = strategy.posterior_meanvariance(&quadctx, eta[i], se_i)?;
-        if matches!(family, crate::types::LikelihoodFamily::BinomialSas)
-            && let Some(cov_theta) = fitted_link_state.as_ref().and_then(|s| match s {
-                FittedLinkState::Sas { covariance, .. } => covariance.as_ref(),
-                _ => None,
+    let mean_standard_error = Array1::from_vec(
+        (0..eta.len())
+            .into_par_iter()
+            .map(|i| -> Result<f64, EstimationError> {
+                let se_i = etavar[i].max(0.0).sqrt();
+                let (_, mut meanvar) = strategy.posterior_meanvariance(&quadctx, eta[i], se_i)?;
+                if matches!(family, crate::types::LikelihoodFamily::BinomialSas)
+                    && let Some(cov_theta) = fitted_link_state.as_ref().and_then(|s| match s {
+                        FittedLinkState::Sas { covariance, .. } => covariance.as_ref(),
+                        _ => None,
+                    })
+                {
+                    let sas = sas_state.ok_or_else(|| {
+                        EstimationError::InvalidInput(
+                            "BinomialSas uncertainty requires fitted sas_epsilon/sas_log_delta"
+                                .to_string(),
+                        )
+                    })?;
+                    let jets =
+                        sas_inverse_link_jetwith_param_partials(eta[i], sas.epsilon, sas.log_delta);
+                    let g = [jets.djet_depsilon.mu, jets.djet_dlog_delta.mu];
+                    meanvar += quadratic_form(cov_theta, &g)?;
+                }
+                if matches!(family, crate::types::LikelihoodFamily::BinomialBetaLogistic)
+                    && let Some(cov_theta) = fitted_link_state.as_ref().and_then(|s| match s {
+                        FittedLinkState::BetaLogistic { covariance, .. } => covariance.as_ref(),
+                        _ => None,
+                    })
+                {
+                    let sas = sas_state.ok_or_else(|| {
+                        EstimationError::InvalidInput(
+                            "BinomialBetaLogistic uncertainty requires fitted parameters"
+                                .to_string(),
+                        )
+                    })?;
+                    let jets = beta_logistic_inverse_link_jetwith_param_partials(
+                        eta[i],
+                        sas.log_delta,
+                        sas.epsilon,
+                    );
+                    let g = [jets.djet_depsilon.mu, jets.djet_dlog_delta.mu];
+                    meanvar += quadratic_form(cov_theta, &g)?;
+                }
+                if matches!(family, crate::types::LikelihoodFamily::BinomialMixture)
+                    && let Some(cov_theta) = fitted_link_state.as_ref().and_then(|s| match s {
+                        FittedLinkState::Mixture { covariance, .. } => covariance.as_ref(),
+                        _ => None,
+                    })
+                    && let Some(state) = mixture_state.as_ref()
+                {
+                    let mut mix_partials = vec![
+                        InverseLinkJet {
+                            mu: 0.0,
+                            d1: 0.0,
+                            d2: 0.0,
+                            d3: 0.0,
+                        };
+                        state.rho.len()
+                    ];
+                    mixture_inverse_link_jetwith_rho_partials_into(
+                        state,
+                        eta[i],
+                        &mut mix_partials,
+                    );
+                    meanvar += quadratic_form_from_jetmu(cov_theta, &mix_partials)?;
+                }
+                Ok(meanvar.max(0.0).sqrt())
             })
-        {
-            let sas = sas_state.ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "BinomialSas uncertainty requires fitted sas_epsilon/sas_log_delta".to_string(),
-                )
-            })?;
-            let jets = sas_inverse_link_jetwith_param_partials(eta[i], sas.epsilon, sas.log_delta);
-            let g = [jets.djet_depsilon.mu, jets.djet_dlog_delta.mu];
-            meanvar += quadratic_form(cov_theta, &g)?;
-        }
-        if matches!(family, crate::types::LikelihoodFamily::BinomialBetaLogistic)
-            && let Some(cov_theta) = fitted_link_state.as_ref().and_then(|s| match s {
-                FittedLinkState::BetaLogistic { covariance, .. } => covariance.as_ref(),
-                _ => None,
-            })
-        {
-            let sas = sas_state.ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "BinomialBetaLogistic uncertainty requires fitted parameters".to_string(),
-                )
-            })?;
-            let jets = beta_logistic_inverse_link_jetwith_param_partials(
-                eta[i],
-                sas.log_delta,
-                sas.epsilon,
-            );
-            let g = [jets.djet_depsilon.mu, jets.djet_dlog_delta.mu];
-            meanvar += quadratic_form(cov_theta, &g)?;
-        }
-        if matches!(family, crate::types::LikelihoodFamily::BinomialMixture)
-            && let Some(cov_theta) = fitted_link_state.as_ref().and_then(|s| match s {
-                FittedLinkState::Mixture { covariance, .. } => covariance.as_ref(),
-                _ => None,
-            })
-            && let Some(state) = mixture_state.as_ref()
-        {
-            if mix_partials.len() != state.rho.len() {
-                mix_partials = vec![
-                    InverseLinkJet {
-                        mu: 0.0,
-                        d1: 0.0,
-                        d2: 0.0,
-                        d3: 0.0,
-                    };
-                    state.rho.len()
-                ];
-            }
-            mixture_inverse_link_jetwith_rho_partials_into(state, eta[i], &mut mix_partials);
-            meanvar += quadratic_form_from_jetmu(cov_theta, &mix_partials)?;
-        }
-        mean_standard_error[i] = meanvar.max(0.0).sqrt();
-    }
+            .collect::<Result<Vec<_>, _>>()?,
+    );
 
     let (mut mean_lower, mut mean_upper) = match options.mean_interval_method {
         MeanIntervalMethod::Delta => (

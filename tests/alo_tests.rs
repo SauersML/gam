@@ -1,5 +1,6 @@
 use faer::Side;
-use gam::alo::compute_alo_diagnostics_from_pirls;
+use gam::alo::{AloInput, compute_alo_diagnostics_from_pirls, compute_alo_from_input};
+use gam::construction::CanonicalPenalty;
 use gam::faer_ndarray::{FaerArrayView, FaerColView, factorize_symmetricwith_fallback, fast_ata};
 use gam::pirls::{self, PenaltyConfig, PirlsConfig, PirlsProblem};
 use gam::types::{
@@ -80,6 +81,60 @@ fn fit_unpenalized(
     res
 }
 
+fn fit_identity_penalized(
+    x: &Array2<f64>,
+    y: &Array1<f64>,
+    w_prior: &Array1<f64>,
+    link: LinkFunction,
+    lambda: f64,
+) -> pirls::PirlsResult {
+    let rho = Array1::from_vec(vec![lambda.ln()]);
+    let offset = Array1::<f64>::zeros(x.nrows());
+    let root = Array2::<f64>::eye(x.ncols());
+    let local = root.t().dot(&root);
+    let canonical = vec![CanonicalPenalty {
+        root,
+        col_range: 0..x.ncols(),
+        total_dim: x.ncols(),
+        nullity: 0,
+        local,
+        positive_eigenvalues: vec![1.0; x.ncols()],
+        op: None,
+    }];
+    let cfg = PirlsConfig {
+        likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+        link_kind: InverseLink::Standard(link),
+        max_iterations: 100,
+        convergence_tolerance: 1e-10,
+        firth_bias_reduction: false,
+        initial_lm_lambda: None,
+    };
+    let (res, _) = pirls::fit_model_for_fixed_rho(
+        LogSmoothingParamsView::new(rho.view()),
+        PirlsProblem {
+            x: x.view(),
+            offset: offset.view(),
+            y: y.view(),
+            priorweights: w_prior.view(),
+            covariate_se: None,
+        },
+        PenaltyConfig {
+            canonical_penalties: &canonical,
+            balanced_penalty_root: None,
+            reparam_invariant: None,
+            p: x.ncols(),
+            coefficient_lower_bounds: None,
+            linear_constraints_original: None,
+            penalty_shrinkage_floor: None,
+            kronecker_factored: None,
+        },
+        &cfg,
+        None,
+    )
+    .expect("identity-penalized PIRLS fit");
+    res
+}
+
 fn beta_in_original_basis(fit: &pirls::PirlsResult) -> Array1<f64> {
     fit.reparam_result.qs.dot(fit.beta_transformed.as_ref())
 }
@@ -109,6 +164,79 @@ fn loo_compare(
         (sum_sq_se / n as f64).sqrt(),
         max_abs_se,
     )
+}
+
+#[test]
+fn alo_uses_exact_dense_stabilized_hessian_export_from_penalized_pirls() {
+    let n = 90;
+    let p = 6;
+    let (x, y, _) = generate_synthetic_binary_data(n, p, 2026);
+    let w = Array1::<f64>::ones(n);
+    let fit = fit_identity_penalized(&x, &y, &w, LinkFunction::Probit, 0.35);
+
+    let exported = fit
+        .dense_stabilizedhessian_transformed("ALO test exact Hessian export")
+        .expect("exact dense Hessian export");
+    assert_eq!(exported.nrows(), p);
+    assert_eq!(exported.ncols(), p);
+    assert!(exported.iter().all(|v| v.is_finite()));
+
+    let x_transformed = fit.x_transformed.to_dense();
+    let sqrtw = fit.finalweights.mapv(f64::sqrt);
+    let mut weighted_x = x_transformed.clone();
+    weighted_x *= &sqrtw.view().insert_axis(Axis(1));
+    let mut expected = weighted_x.t().dot(&weighted_x);
+    expected += &fit.reparam_result.s_transformed;
+    let ridge = fit.ridge_passport.laplacehessianridge().max(0.0);
+    for d in 0..p {
+        expected[[d, d]] += ridge;
+    }
+
+    let max_abs_diff = exported
+        .iter()
+        .zip(expected.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_abs_diff <= 1e-8,
+        "exported ALO Hessian must be the exact penalized PIRLS Hessian; max_abs_diff={max_abs_diff:.3e}"
+    );
+
+    let alo = compute_alo_diagnostics_from_pirls(&fit, y.view(), LinkFunction::Probit)
+        .expect("ALO should accept exact dense Hessian exported from penalized PIRLS");
+    assert_eq!(alo.leverage.len(), n);
+    assert!(alo.leverage.iter().all(|v| v.is_finite()));
+}
+
+#[test]
+fn alo_solve_setup_rejects_non_square_dense_hessian_instead_of_workaround() {
+    let design = Array2::from_shape_vec((3, 2), vec![1.0, 0.0, 1.0, 1.0, 1.0, 2.0]).unwrap();
+    let bad_hessian = Array2::<f64>::ones((2, 1));
+    let hessian_weights = Array1::from_vec(vec![0.25, 0.25, 0.25]);
+    let score_weights = hessian_weights.clone();
+    let working_response = Array1::from_vec(vec![0.0, 0.5, 1.0]);
+    let eta = Array1::from_vec(vec![0.1, 0.2, 0.3]);
+    let offset = Array1::<f64>::zeros(3);
+    let input = AloInput {
+        design: &design,
+        penalized_hessian: &bad_hessian,
+        hessian_weights: &hessian_weights,
+        score_weights: &score_weights,
+        working_response: &working_response,
+        eta: &eta,
+        offset: &offset,
+        link: LinkFunction::Logit,
+        phi: 1.0,
+        penalty_root: None,
+        ridge: 0.0,
+    };
+
+    let err = compute_alo_from_input(&input).expect_err("bad Hessian shape must fail setup");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("dense exact penalized Hessian with shape 2x2"),
+        "unexpected ALO setup error: {msg}"
+    );
 }
 
 #[test]
