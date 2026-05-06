@@ -303,6 +303,16 @@ struct DynamicQBlockwiseAccumulator {
     hess_link_dev: Option<Array2<f64>>,
 }
 
+#[derive(Clone)]
+struct DynamicQCoreHessianBlocks {
+    hess_time: Array2<f64>,
+    hess_marginal: Array2<f64>,
+    hess_logslope: Array2<f64>,
+    hess_time_marginal: Array2<f64>,
+    hess_time_logslope: Array2<f64>,
+    hess_marginal_logslope: Array2<f64>,
+}
+
 impl DynamicQBlockwiseAccumulator {
     fn new(slices: &BlockSlices) -> Self {
         Self {
@@ -4849,18 +4859,16 @@ impl SurvivalMarginalSlopeFamily {
         Ok(())
     }
 
-    fn accumulate_dynamic_q_core_hessian(
+    fn dynamic_q_core_hessian_blocks(
         &self,
         row: usize,
-        slices: &BlockSlices,
+        p_t: usize,
+        p_m: usize,
+        p_g: usize,
         q_geom: &SurvivalMarginalSlopeDynamicRow,
         primary_gradient: ndarray::ArrayView1<'_, f64>,
         primary_hessian: ArrayView2<'_, f64>,
-        joint_hessian: &mut Array2<f64>,
-    ) -> Result<(), String> {
-        let p_t = slices.time.len();
-        let p_m = slices.marginal.len();
-        let p_g = slices.logslope.len();
+    ) -> Result<DynamicQCoreHessianBlocks, String> {
         let dq_time = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
         let dq_marginal = [
             &q_geom.dq0_marginal,
@@ -4882,83 +4890,295 @@ impl SurvivalMarginalSlopeFamily {
             &q_geom.d2q1_time_marginal,
             &q_geom.d2qd1_time_marginal,
         ];
+        let logslope_chunk = self
+            .logslope_design
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("dynamic_q_core_hessian_blocks logslope try_row_chunk: {e}"))?;
+        let logslope_row = logslope_chunk.row(0).to_owned();
 
-        for a in 0..p_t {
-            for b in 0..p_t {
-                let mut value = 0.0;
-                for q_u in 0..3 {
-                    for q_v in 0..3 {
-                        value += primary_hessian[[q_u, q_v]] * dq_time[q_u][a] * dq_time[q_v][b];
-                    }
-                    value += primary_gradient[q_u] * d2q_time_time[q_u][[a, b]];
-                }
-                joint_hessian[[slices.time.start + a, slices.time.start + b]] += value;
-            }
-        }
+        // Build independent, thread-local Hessian blocks in parallel.  The
+        // caller performs the only mutation of the destination Hessian after
+        // these blocks have been reduced, so no worker writes to shared output.
+        let (
+            (hess_time, hess_marginal),
+            (hess_logslope, (hess_time_marginal, (hess_time_logslope, hess_marginal_logslope))),
+        ) = rayon::join(
+            || {
+                rayon::join(
+                    || {
+                        let mut block = Array2::<f64>::zeros((p_t, p_t));
+                        for a in 0..p_t {
+                            for b in 0..p_t {
+                                let mut value = 0.0;
+                                for q_u in 0..3 {
+                                    for q_v in 0..3 {
+                                        value += primary_hessian[[q_u, q_v]]
+                                            * dq_time[q_u][a]
+                                            * dq_time[q_v][b];
+                                    }
+                                    value += primary_gradient[q_u] * d2q_time_time[q_u][[a, b]];
+                                }
+                                block[[a, b]] = value;
+                            }
+                        }
+                        block
+                    },
+                    || {
+                        let mut block = Array2::<f64>::zeros((p_m, p_m));
+                        for a in 0..p_m {
+                            for b in 0..p_m {
+                                let mut value = 0.0;
+                                for q_u in 0..3 {
+                                    for q_v in 0..3 {
+                                        value += primary_hessian[[q_u, q_v]]
+                                            * dq_marginal[q_u][a]
+                                            * dq_marginal[q_v][b];
+                                    }
+                                    value +=
+                                        primary_gradient[q_u] * d2q_marginal_marginal[q_u][[a, b]];
+                                }
+                                block[[a, b]] = value;
+                            }
+                        }
+                        block
+                    },
+                )
+            },
+            || {
+                rayon::join(
+                    || {
+                        let mut block = Array2::<f64>::zeros((p_g, p_g));
+                        for a in 0..p_g {
+                            let xa = logslope_row[a];
+                            if xa == 0.0 {
+                                continue;
+                            }
+                            for b in 0..p_g {
+                                block[[a, b]] = primary_hessian[[3, 3]] * xa * logslope_row[b];
+                            }
+                        }
+                        block
+                    },
+                    || {
+                        rayon::join(
+                            || {
+                                let mut block = Array2::<f64>::zeros((p_t, p_m));
+                                for a in 0..p_t {
+                                    for b in 0..p_m {
+                                        let mut value = 0.0;
+                                        for q_u in 0..3 {
+                                            for q_v in 0..3 {
+                                                value += primary_hessian[[q_u, q_v]]
+                                                    * dq_time[q_u][a]
+                                                    * dq_marginal[q_v][b];
+                                            }
+                                            value += primary_gradient[q_u]
+                                                * d2q_time_marginal[q_u][[a, b]];
+                                        }
+                                        block[[a, b]] = value;
+                                    }
+                                }
+                                block
+                            },
+                            || {
+                                rayon::join(
+                                    || {
+                                        let mut block = Array2::<f64>::zeros((p_t, p_g));
+                                        for a in 0..p_t {
+                                            let mut weight = 0.0;
+                                            for q_u in 0..3 {
+                                                weight +=
+                                                    primary_hessian[[q_u, 3]] * dq_time[q_u][a];
+                                            }
+                                            for b in 0..p_g {
+                                                block[[a, b]] = weight * logslope_row[b];
+                                            }
+                                        }
+                                        block
+                                    },
+                                    || {
+                                        let mut block = Array2::<f64>::zeros((p_m, p_g));
+                                        for a in 0..p_m {
+                                            let mut weight = 0.0;
+                                            for q_u in 0..3 {
+                                                weight +=
+                                                    primary_hessian[[q_u, 3]] * dq_marginal[q_u][a];
+                                            }
+                                            for b in 0..p_g {
+                                                block[[a, b]] = weight * logslope_row[b];
+                                            }
+                                        }
+                                        block
+                                    },
+                                )
+                            },
+                        )
+                    },
+                )
+            },
+        );
 
-        for a in 0..p_m {
-            for b in 0..p_m {
-                let mut value = 0.0;
-                for q_u in 0..3 {
-                    for q_v in 0..3 {
-                        value +=
-                            primary_hessian[[q_u, q_v]] * dq_marginal[q_u][a] * dq_marginal[q_v][b];
-                    }
-                    value += primary_gradient[q_u] * d2q_marginal_marginal[q_u][[a, b]];
-                }
-                joint_hessian[[slices.marginal.start + a, slices.marginal.start + b]] += value;
-            }
-        }
+        Ok(DynamicQCoreHessianBlocks {
+            hess_time,
+            hess_marginal,
+            hess_logslope,
+            hess_time_marginal,
+            hess_time_logslope,
+            hess_marginal_logslope,
+        })
+    }
 
-        self.logslope_design
-            .syr_row_into_view(
-                row,
-                primary_hessian[[3, 3]],
-                joint_hessian.slice_mut(s![slices.logslope.clone(), slices.logslope.clone()]),
-            )
-            .map_err(|e| format!("accumulate_dynamic_q_core_hessian logslope syr: {e}"))?;
-
-        for a in 0..p_t {
-            for b in 0..p_m {
-                let mut value = 0.0;
-                for q_u in 0..3 {
-                    for q_v in 0..3 {
-                        value +=
-                            primary_hessian[[q_u, q_v]] * dq_time[q_u][a] * dq_marginal[q_v][b];
-                    }
-                    value += primary_gradient[q_u] * d2q_time_marginal[q_u][[a, b]];
-                }
-                joint_hessian[[slices.time.start + a, slices.marginal.start + b]] += value;
-                joint_hessian[[slices.marginal.start + b, slices.time.start + a]] += value;
-            }
-        }
-
+    fn dynamic_q_core_diagonal_hessian_blocks(
+        &self,
+        row: usize,
+        p_t: usize,
+        p_m: usize,
+        p_g: usize,
+        q_geom: &SurvivalMarginalSlopeDynamicRow,
+        primary_gradient: ndarray::ArrayView1<'_, f64>,
+        primary_hessian: ArrayView2<'_, f64>,
+    ) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), String> {
+        let dq_time = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
+        let dq_marginal = [
+            &q_geom.dq0_marginal,
+            &q_geom.dq1_marginal,
+            &q_geom.dqd1_marginal,
+        ];
+        let d2q_time_time = [
+            &q_geom.d2q0_time_time,
+            &q_geom.d2q1_time_time,
+            &q_geom.d2qd1_time_time,
+        ];
+        let d2q_marginal_marginal = [
+            &q_geom.d2q0_marginal_marginal,
+            &q_geom.d2q1_marginal_marginal,
+            &q_geom.d2qd1_marginal_marginal,
+        ];
         let logslope_chunk = self
             .logslope_design
             .try_row_chunk(row..row + 1)
             .map_err(|e| {
-                format!("accumulate_dynamic_q_core_hessian logslope try_row_chunk: {e}")
+                format!("dynamic_q_core_diagonal_hessian_blocks logslope try_row_chunk: {e}")
             })?;
-        let logslope_row = logslope_chunk.row(0);
+        let logslope_row = logslope_chunk.row(0).to_owned();
+
+        let ((hess_time, hess_marginal), hess_logslope) = rayon::join(
+            || {
+                let (hess_time, hess_marginal) = rayon::join(
+                    || {
+                        let mut block = Array2::<f64>::zeros((p_t, p_t));
+                        for a in 0..p_t {
+                            for b in 0..p_t {
+                                let mut value = 0.0;
+                                for q_u in 0..3 {
+                                    for q_v in 0..3 {
+                                        value += primary_hessian[[q_u, q_v]]
+                                            * dq_time[q_u][a]
+                                            * dq_time[q_v][b];
+                                    }
+                                    value += primary_gradient[q_u] * d2q_time_time[q_u][[a, b]];
+                                }
+                                block[[a, b]] = value;
+                            }
+                        }
+                        block
+                    },
+                    || {
+                        let mut block = Array2::<f64>::zeros((p_m, p_m));
+                        for a in 0..p_m {
+                            for b in 0..p_m {
+                                let mut value = 0.0;
+                                for q_u in 0..3 {
+                                    for q_v in 0..3 {
+                                        value += primary_hessian[[q_u, q_v]]
+                                            * dq_marginal[q_u][a]
+                                            * dq_marginal[q_v][b];
+                                    }
+                                    value +=
+                                        primary_gradient[q_u] * d2q_marginal_marginal[q_u][[a, b]];
+                                }
+                                block[[a, b]] = value;
+                            }
+                        }
+                        block
+                    },
+                );
+                (hess_time, hess_marginal)
+            },
+            || {
+                let mut block = Array2::<f64>::zeros((p_g, p_g));
+                for a in 0..p_g {
+                    let xa = logslope_row[a];
+                    if xa == 0.0 {
+                        continue;
+                    }
+                    for b in 0..p_g {
+                        block[[a, b]] = primary_hessian[[3, 3]] * xa * logslope_row[b];
+                    }
+                }
+                block
+            },
+        );
+        Ok((hess_time, hess_marginal, hess_logslope))
+    }
+
+    fn accumulate_dynamic_q_core_hessian(
+        &self,
+        row: usize,
+        slices: &BlockSlices,
+        q_geom: &SurvivalMarginalSlopeDynamicRow,
+        primary_gradient: ndarray::ArrayView1<'_, f64>,
+        primary_hessian: ArrayView2<'_, f64>,
+        joint_hessian: &mut Array2<f64>,
+    ) -> Result<(), String> {
+        let p_t = slices.time.len();
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+        let blocks = self.dynamic_q_core_hessian_blocks(
+            row,
+            p_t,
+            p_m,
+            p_g,
+            q_geom,
+            primary_gradient,
+            primary_hessian,
+        )?;
+
         for a in 0..p_t {
-            let mut weight = 0.0;
-            for q_u in 0..3 {
-                weight += primary_hessian[[q_u, 3]] * dq_time[q_u][a];
+            for b in 0..p_t {
+                joint_hessian[[slices.time.start + a, slices.time.start + b]] +=
+                    blocks.hess_time[[a, b]];
             }
+        }
+        for a in 0..p_m {
+            for b in 0..p_m {
+                joint_hessian[[slices.marginal.start + a, slices.marginal.start + b]] +=
+                    blocks.hess_marginal[[a, b]];
+            }
+        }
+        for a in 0..p_g {
             for b in 0..p_g {
-                let value = weight * logslope_row[b];
+                joint_hessian[[slices.logslope.start + a, slices.logslope.start + b]] +=
+                    blocks.hess_logslope[[a, b]];
+            }
+        }
+        for a in 0..p_t {
+            for b in 0..p_m {
+                let value = blocks.hess_time_marginal[[a, b]];
+                joint_hessian[[slices.time.start + a, slices.marginal.start + b]] += value;
+                joint_hessian[[slices.marginal.start + b, slices.time.start + a]] += value;
+            }
+        }
+        for a in 0..p_t {
+            for b in 0..p_g {
+                let value = blocks.hess_time_logslope[[a, b]];
                 joint_hessian[[slices.time.start + a, slices.logslope.start + b]] += value;
                 joint_hessian[[slices.logslope.start + b, slices.time.start + a]] += value;
             }
         }
-
         for a in 0..p_m {
-            let mut weight = 0.0;
-            for q_u in 0..3 {
-                weight += primary_hessian[[q_u, 3]] * dq_marginal[q_u][a];
-            }
             for b in 0..p_g {
-                let value = weight * logslope_row[b];
+                let value = blocks.hess_marginal_logslope[[a, b]];
                 joint_hessian[[slices.marginal.start + a, slices.logslope.start + b]] += value;
                 joint_hessian[[slices.logslope.start + b, slices.marginal.start + a]] += value;
             }
@@ -5008,54 +5228,22 @@ impl SurvivalMarginalSlopeFamily {
         hess_time: &mut Array2<f64>,
         hess_marginal: &mut Array2<f64>,
         hess_logslope: &mut Array2<f64>,
-    ) {
-        let d2q_time_time = [
-            &q_geom.d2q0_time_time,
-            &q_geom.d2q1_time_time,
-            &q_geom.d2qd1_time_time,
-        ];
-        let d2q_marginal_marginal = [
-            &q_geom.d2q0_marginal_marginal,
-            &q_geom.d2q1_marginal_marginal,
-            &q_geom.d2qd1_marginal_marginal,
-        ];
-        let dq_time = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
-        let dq_marginal = [
-            &q_geom.dq0_marginal,
-            &q_geom.dq1_marginal,
-            &q_geom.dqd1_marginal,
-        ];
+    ) -> Result<(), String> {
+        let (local_time, local_marginal, local_logslope) = self
+            .dynamic_q_core_diagonal_hessian_blocks(
+                row,
+                hess_time.nrows(),
+                hess_marginal.nrows(),
+                hess_logslope.nrows(),
+                q_geom,
+                primary_gradient,
+                primary_hessian,
+            )?;
 
-        for a in 0..hess_time.nrows() {
-            for b in 0..hess_time.ncols() {
-                let mut value = 0.0;
-                for q_u in 0..3 {
-                    for q_v in 0..3 {
-                        value += primary_hessian[[q_u, q_v]] * dq_time[q_u][a] * dq_time[q_v][b];
-                    }
-                    value += primary_gradient[q_u] * d2q_time_time[q_u][[a, b]];
-                }
-                hess_time[[a, b]] += value;
-            }
-        }
-
-        for a in 0..hess_marginal.nrows() {
-            for b in 0..hess_marginal.ncols() {
-                let mut value = 0.0;
-                for q_u in 0..3 {
-                    for q_v in 0..3 {
-                        value +=
-                            primary_hessian[[q_u, q_v]] * dq_marginal[q_u][a] * dq_marginal[q_v][b];
-                    }
-                    value += primary_gradient[q_u] * d2q_marginal_marginal[q_u][[a, b]];
-                }
-                hess_marginal[[a, b]] += value;
-            }
-        }
-
-        self.logslope_design
-            .syr_row_into(row, primary_hessian[[3, 3]], hess_logslope)
-            .expect("survival logslope block syr");
+        *hess_time += &local_time;
+        *hess_marginal += &local_marginal;
+        *hess_logslope += &local_logslope;
+        Ok(())
     }
 
     fn accumulate_dynamic_q_blockwise_row(
@@ -5083,7 +5271,7 @@ impl SurvivalMarginalSlopeFamily {
             &mut acc.hess_time,
             &mut acc.hess_marginal,
             &mut acc.hess_logslope,
-        );
+        )?;
         if let (Some(primary_range), Some(gradient), Some(hessian)) = (
             primary.h.as_ref(),
             acc.grad_score_warp.as_mut(),
