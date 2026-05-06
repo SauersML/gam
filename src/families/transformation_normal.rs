@@ -6989,9 +6989,6 @@ struct TransformationNormalPsiHessianOperator {
     beta: Array1<f64>,
     op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
     axis: usize,
-    trace_axes: Option<Arc<Vec<usize>>>,
-    trace_axis_pos: usize,
-    trace_cache_id: usize,
     row_quantities: TransformationNormalRowQuantityCache,
 }
 
@@ -7006,49 +7003,12 @@ impl TransformationNormalPsiHessianOperator {
         row_h_prime: Arc<Array1<f64>>,
         endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
     ) -> Self {
-        Self::new_with_trace_axes(
-            family,
-            beta,
-            op,
-            axis,
-            None,
-            0,
-            row_gamma,
-            row_h,
-            row_h_prime,
-            endpoint_q,
-        )
-    }
-
-    fn new_with_trace_axes(
-        family: Arc<TransformationNormalFamily>,
-        beta: Array1<f64>,
-        op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
-        axis: usize,
-        trace_axes: Option<Arc<Vec<usize>>>,
-        trace_axis_pos: usize,
-        row_gamma: Arc<Array2<f64>>,
-        row_h: Arc<Array1<f64>>,
-        row_h_prime: Arc<Array1<f64>>,
-        endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
-    ) -> Self {
         let log_likelihood = 0.0;
-        let op_ptr = Arc::as_ptr(&op) as *const () as usize;
-        let row_ptr = Arc::as_ptr(&row_gamma) as usize;
-        let axes_ptr = trace_axes
-            .as_ref()
-            .map(|axes| Arc::as_ptr(axes) as usize)
-            .unwrap_or(axis);
-        let trace_cache_id =
-            op_ptr ^ row_ptr.rotate_left(17) ^ axes_ptr.rotate_left(31) ^ 0x51f1_5eED_usize;
         Self {
             family,
             beta: beta.clone(),
             op,
             axis,
-            trace_axes,
-            trace_axis_pos,
-            trace_cache_id,
             row_quantities: TransformationNormalRowQuantityCache {
                 beta: Arc::new(beta),
                 gamma: row_gamma,
@@ -12791,8 +12751,6 @@ struct TransformationNormalPsiWorkspaceCacheEntry {
     score_psi: Array1<f64>,
     op_arc: Arc<dyn CustomFamilyPsiDerivativeOperator>,
     axis: usize,
-    trace_axes: Arc<Vec<usize>>,
-    trace_axis_pos: usize,
     row_gamma: Arc<Array2<f64>>,
     row_h: Arc<Array1<f64>>,
     row_h_prime: Arc<Array1<f64>>,
@@ -13156,7 +13114,6 @@ impl TransformationNormalPsiWorkspace {
             mut score_psi,
         } = accum;
         let beta_arc = Arc::new(beta.clone());
-        let trace_axes = Arc::new(axes.clone());
         let mut out: Vec<TransformationNormalPsiWorkspaceCacheEntry> = Vec::with_capacity(n_psi);
         for (axis_idx, &axis) in axes.iter().enumerate() {
             // Take the per-axis score buffer out of the accumulator without
@@ -13168,8 +13125,6 @@ impl TransformationNormalPsiWorkspace {
                 score_psi: score_axis,
                 op_arc: Arc::clone(&op_arcs[axis_idx]),
                 axis,
-                trace_axes: Arc::clone(&trace_axes),
-                trace_axis_pos: axis_idx,
                 row_gamma: Arc::clone(&row.gamma),
                 row_h: Arc::clone(&row.h),
                 row_h_prime: Arc::clone(&row.h_prime),
