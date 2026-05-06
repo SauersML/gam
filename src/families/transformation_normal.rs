@@ -3502,15 +3502,17 @@ impl TransformationNormalFamily {
     ///
     /// Returns a `Vec<f64>` of length `cov_psi_per_axis.len()` with the trace
     /// of each axis's projected ψ-Hessian.
-    fn scop_psi_hessian_trace_factor_all_axes_from_cov(
+    fn scop_psi_hessian_trace_factor_all_axes_chunk_from_cov(
         &self,
         beta: &Array1<f64>,
         row_quantities: &TransformationNormalRowQuantityCache,
-        cov: &Array2<f64>,
+        row_start: usize,
+        cov: ArrayView2<'_, f64>,
         cov_psi_per_axis: &[ArrayView2<'_, f64>],
         factor: ArrayView2<'_, f64>,
     ) -> Result<Vec<f64>, String> {
-        let n = self.response_val_basis.nrows();
+        let total_n = self.response_val_basis.nrows();
+        let n = cov.nrows();
         let p_resp = self.response_val_basis.ncols();
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
@@ -3519,9 +3521,15 @@ impl TransformationNormalFamily {
         if n_psi == 0 {
             return Ok(Vec::new());
         }
+        if row_start > total_n || row_start + n > total_n {
+            return Err(format!(
+                "SCOP psi Hessian projected trace row window [{row_start}, {}) exceeds n={total_n}",
+                row_start + n
+            ));
+        }
         if cov.nrows() != n || cov.ncols() != p_cov {
             return Err(format!(
-                "SCOP psi Hessian projected trace covariate shape {}x{} != expected {}x{}",
+                "SCOP psi Hessian projected trace covariate chunk shape {}x{} != expected {}x{}",
                 cov.nrows(),
                 cov.ncols(),
                 n,
@@ -3531,7 +3539,7 @@ impl TransformationNormalFamily {
         for (axis, cov_psi) in cov_psi_per_axis.iter().enumerate() {
             if cov_psi.nrows() != n || cov_psi.ncols() != p_cov {
                 return Err(format!(
-                    "SCOP psi Hessian projected trace covariate derivative shape {}x{} for axis {axis} != expected {}x{}",
+                    "SCOP psi Hessian projected trace covariate derivative chunk shape {}x{} for axis {axis} != expected {}x{}",
                     cov_psi.nrows(),
                     cov_psi.ncols(),
                     n,
@@ -3619,8 +3627,9 @@ impl TransformationNormalFamily {
             .into_par_iter()
             .fold(
                 || PsiAllAxesTraceAccum::new(p_resp, rank, n_psi),
-                |mut acc, i| {
-                    let cov_row = cov.row(i);
+                |mut acc, local_i| {
+                    let i = row_start + local_i;
+                    let cov_row = cov.row(local_i);
                     let rv = self.response_val_basis.row(i);
                     let rd = self.response_deriv_basis.row(i);
                     let wi = weights[i];
@@ -3681,7 +3690,7 @@ impl TransformationNormalFamily {
 
                     // ---- Axis-DEP per-(row,axis) state ----
                     for axis_idx in 0..n_psi {
-                        let psi_row = cov_psi_per_axis[axis_idx].row(i);
+                        let psi_row = cov_psi_per_axis[axis_idx].row(local_i);
 
                         for k in 0..p_resp {
                             acc.gamma_psi[k] = beta_mat.row(k).dot(&psi_row);
@@ -7414,7 +7423,9 @@ impl TransformationNormalPsiHessianOperator {
                 .family
                 .covariate_design
                 .try_row_chunk(rows.clone())
-                .expect("validated CTN psi Hessian projected trace covariate chunk should not fail");
+                .expect(
+                    "validated CTN psi Hessian projected trace covariate chunk should not fail",
+                );
             let mut cov_psi_chunks: Vec<Array2<f64>> = Vec::with_capacity(axes.len());
             for &axis in axes {
                 cov_psi_chunks.push(
@@ -7434,7 +7445,9 @@ impl TransformationNormalPsiHessianOperator {
                     &cov_psi_views,
                     factor.view(),
                 )
-                .expect("validated CTN psi Hessian all-axis projected trace inputs should not fail");
+                .expect(
+                    "validated CTN psi Hessian all-axis projected trace inputs should not fail",
+                );
             debug_assert_eq!(chunk_traces.len(), traces.len());
             for (total, value) in traces.iter_mut().zip(chunk_traces.into_iter()) {
                 *total += value;
@@ -11583,6 +11596,13 @@ mod tests {
             .exact_newton_joint_psi_workspace(&states, &specs, &derivative_blocks)
             .expect("CTN ψ workspace constructor")
             .expect("CTN ψ workspace must be present");
+        let mut shared_factor = Array2::<f64>::zeros((state.beta.len(), 3));
+        for (col, seed) in [70_001_u64, 80_001_u64, 90_001_u64].into_iter().enumerate() {
+            shared_factor
+                .column_mut(col)
+                .assign(&toy_probe_vector(state.beta.len(), seed));
+        }
+        let projected_cache = ProjectedFactorCache::default();
 
         for psi_index in 0..n_psi {
             let cached = workspace
@@ -11630,6 +11650,14 @@ mod tests {
                 .as_ref()
                 .expect("workspace ψ Hessian operator must be present");
             assert_eq!(cached_op.dim(), state.beta.len());
+            let cached_trace =
+                cached_op.trace_projected_factor_cached(&shared_factor, &projected_cache);
+            let direct_trace = cached_op.trace_projected_factor(&shared_factor);
+            let trace_tol = 1.0e-10 * direct_trace.abs().max(1.0) + 1.0e-10;
+            assert!(
+                (cached_trace - direct_trace).abs() <= trace_tol,
+                "workspace ψ cached projected trace mismatch at axis {psi_index}: cached={cached_trace:.6e}, direct={direct_trace:.6e}",
+            );
         }
     }
 
@@ -13145,6 +13173,8 @@ struct TransformationNormalPsiWorkspaceCacheEntry {
     score_psi: Array1<f64>,
     op_arc: Arc<dyn CustomFamilyPsiDerivativeOperator>,
     axis: usize,
+    trace_axes: Arc<Vec<usize>>,
+    trace_axis_pos: usize,
     row_gamma: Arc<Array2<f64>>,
     row_h: Arc<Array1<f64>>,
     row_h_prime: Arc<Array1<f64>>,
@@ -13508,6 +13538,7 @@ impl TransformationNormalPsiWorkspace {
             mut score_psi,
         } = accum;
         let beta_arc = Arc::new(beta.clone());
+        let trace_axes = Arc::new(axes.clone());
         let mut out: Vec<TransformationNormalPsiWorkspaceCacheEntry> = Vec::with_capacity(n_psi);
         for (axis_idx, &axis) in axes.iter().enumerate() {
             // Take the per-axis score buffer out of the accumulator without
@@ -13519,6 +13550,8 @@ impl TransformationNormalPsiWorkspace {
                 score_psi: score_axis,
                 op_arc: Arc::clone(&op_arcs[axis_idx]),
                 axis,
+                trace_axes: Arc::clone(&trace_axes),
+                trace_axis_pos: axis_idx,
                 row_gamma: Arc::clone(&row.gamma),
                 row_h: Arc::clone(&row.h),
                 row_h_prime: Arc::clone(&row.h_prime),
@@ -13755,11 +13788,13 @@ impl ExactNewtonJointPsiWorkspace for TransformationNormalPsiWorkspace {
         // numeric `score_psi` buffer is cloned because `ExactNewtonJointPsiTerms`
         // is not `Clone`-derivable through the `dyn HyperOperator` field.
         let hessian_psi_operator: Arc<dyn HyperOperator> =
-            Arc::new(TransformationNormalPsiHessianOperator::new(
+            Arc::new(TransformationNormalPsiHessianOperator::new_with_trace_axes(
                 Arc::new(self.family.clone()),
                 (*entry.beta).clone(),
                 Arc::clone(&entry.op_arc),
                 entry.axis,
+                Arc::clone(&entry.trace_axes),
+                entry.trace_axis_pos,
                 Arc::clone(&entry.row_gamma),
                 Arc::clone(&entry.row_h),
                 Arc::clone(&entry.row_h_prime),
