@@ -6254,6 +6254,15 @@ struct JointHessianBundle<'a> {
     compute_dh: Box<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + 'a>,
     compute_d2h:
         Box<dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String> + 'a>,
+    owned_compute_dh:
+        Option<Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>>,
+    owned_compute_d2h: Option<
+        Arc<
+            dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>
+                + Send
+                + Sync,
+        >,
+    >,
     rho_curvature_scale: f64,
     hessian_logdet_correction: f64,
 }
@@ -6437,13 +6446,33 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
             total,
             true,
             1.0,
-            hessian_workspace,
+            hessian_workspace.clone(),
         ));
+        let owned_compute_dh = exact_newton_dh_closure_owned(
+            family.clone(),
+            Arc::clone(&synced),
+            specs.to_vec(),
+            total,
+            true,
+            1.0,
+            hessian_workspace.clone(),
+        );
+        let owned_compute_d2h = exact_newton_d2h_closure_owned(
+            family.clone(),
+            Arc::clone(&synced),
+            specs.to_vec(),
+            total,
+            true,
+            1.0,
+            hessian_workspace.clone(),
+        );
         return Ok(Some(JointHessianBundle {
             source: h_joint_unpen,
             beta_flat,
             compute_dh,
             compute_d2h,
+            owned_compute_dh: Some(owned_compute_dh),
+            owned_compute_d2h: Some(owned_compute_d2h),
             rho_curvature_scale: curvature.rho_curvature_scale,
             hessian_logdet_correction: curvature.hessian_logdet_correction,
         }));
@@ -6492,13 +6521,33 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
             total,
             false,
             1.0,
-            hessian_workspace,
+            hessian_workspace.clone(),
         ));
+        let owned_compute_dh = exact_newton_dh_closure_owned(
+            family.clone(),
+            Arc::clone(&synced),
+            specs.to_vec(),
+            total,
+            false,
+            1.0,
+            hessian_workspace.clone(),
+        );
+        let owned_compute_d2h = exact_newton_d2h_closure_owned(
+            family.clone(),
+            Arc::clone(&synced),
+            specs.to_vec(),
+            total,
+            false,
+            1.0,
+            hessian_workspace.clone(),
+        );
         return Ok(Some(JointHessianBundle {
             source: h_joint_unpen,
             beta_flat,
             compute_dh,
             compute_d2h,
+            owned_compute_dh: Some(owned_compute_dh),
+            owned_compute_d2h: Some(owned_compute_d2h),
             rho_curvature_scale: 1.0,
             hessian_logdet_correction: 0.0,
         }));
@@ -6561,6 +6610,8 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
             beta_flat,
             compute_dh,
             compute_d2h,
+            owned_compute_dh: None,
+            owned_compute_d2h: None,
             rho_curvature_scale: 1.0,
             hessian_logdet_correction: 0.0,
         }));
@@ -9843,6 +9894,8 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                 beta_flat,
                 compute_dh,
                 compute_d2h,
+                owned_compute_dh: _,
+                owned_compute_d2h: _,
                 rho_curvature_scale,
                 hessian_logdet_correction,
             } = joint_bundle;
@@ -11316,6 +11369,8 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         beta_flat,
                         compute_dh,
                         compute_d2h,
+                        owned_compute_dh: _,
+                        owned_compute_d2h: _,
                         rho_curvature_scale,
                         hessian_logdet_correction,
                     } = joint_bundle_value_only;
@@ -11389,6 +11444,8 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             beta_flat,
             compute_dh,
             compute_d2h,
+            owned_compute_dh,
+            owned_compute_d2h,
             rho_curvature_scale,
             hessian_logdet_correction,
         } = joint_bundle;
@@ -11414,8 +11471,8 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             family.pseudo_logdet_mode(),
             compute_dh.as_ref(),
             compute_d2h.as_ref(),
-            None,
-            None,
+            owned_compute_dh,
+            owned_compute_d2h,
             None, // no ext_coords when psi_dim == 0
             custom_family_batched_outer_hessian_operator(
                 family,
