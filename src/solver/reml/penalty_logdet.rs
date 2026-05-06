@@ -56,14 +56,23 @@
 
 use faer::Side;
 use ndarray::{Array1, Array2, s};
+use rayon::prelude::*;
 
 use crate::faer_ndarray::FaerEigh;
 
-/// Check whether a set of penalties have mutually disjoint column ranges.
-fn are_penalties_disjoint(penalties: &[crate::construction::CanonicalPenalty]) -> bool {
+/// Check whether penalty ranges decompose into independent exact blocks.
+///
+/// Multiple smoothing components may share the same block (for example tensor
+/// product marginals); those can still be factorized block-local.  Only partial
+/// overlaps force the dense assembled fallback.
+fn are_penalties_block_factored(penalties: &[crate::construction::CanonicalPenalty]) -> bool {
     for (i, a) in penalties.iter().enumerate() {
         for b in &penalties[i + 1..] {
-            if a.col_range.start < b.col_range.end && b.col_range.start < a.col_range.end {
+            let overlaps =
+                a.col_range.start < b.col_range.end && b.col_range.start < a.col_range.end;
+            let same_range =
+                a.col_range.start == b.col_range.start && a.col_range.end == b.col_range.end;
+            if overlaps && !same_range {
                 return false;
             }
         }
@@ -116,6 +125,14 @@ fn structural_nullity_from_penalties(
 ///
 /// Holds the eigendecomposition and precomputed W-factor so that derivative
 /// queries are efficient without redundant factorizations.
+#[derive(Clone, Debug)]
+struct PenaltyBlockSpan {
+    start: usize,
+    end: usize,
+    rank_start: usize,
+    rank_end: usize,
+}
+
 #[derive(Clone)]
 pub struct PenaltyPseudologdet {
     /// W factor: p × rank, with W W^T = S⁺.
@@ -130,6 +147,8 @@ pub struct PenaltyPseudologdet {
     rank: usize,
     /// log|S|₊ = Σ log σ_i for positive eigenvalues.
     value: f64,
+    /// Block/rank spans when the penalty eigenspace was assembled from disjoint blocks.
+    block_spans: Vec<PenaltyBlockSpan>,
 }
 
 impl PenaltyPseudologdet {
@@ -172,11 +191,12 @@ impl PenaltyPseudologdet {
                 inv_evals_sq: Array1::zeros(0),
                 rank: 0,
                 value: 0.0,
+                block_spans: Vec::new(),
             });
         }
 
         // Check if all penalty blocks are disjoint.
-        let disjoint = are_penalties_disjoint(penalties);
+        let disjoint = are_penalties_block_factored(penalties);
 
         if disjoint {
             // Block-factored path: assemble and eigendecompose per-block.
@@ -272,53 +292,71 @@ impl PenaltyPseudologdet {
             }
         }
 
-        // Process each block.
+        // Process each block independently.  Keep the eigenspace local until
+        // final assembly so large smooth bases do not allocate one p_total×rank
+        // temporary per block.
         struct BlockResult {
-            w_cols: Array2<f64>,      // p_total × block_rank
-            u_null_cols: Array2<f64>, // p_total × block_nullity
+            start: usize,
+            end: usize,
+            w_local: Array2<f64>,
+            u_null_local: Array2<f64>,
             inv_evals_sq: Vec<f64>,
             value: f64,
             rank: usize,
             nullity: usize,
         }
 
-        let mut block_results: Vec<BlockResult> = Vec::new();
-
-        for bd in &blocks {
-            let structural_nullity = Some(super::unified::exact_intersection_nullity(
-                &bd.component_matrices,
-                &bd.component_nullities,
-            ));
-            let block_pld =
-                Self::from_assembled_with_nullity(bd.local.clone(), structural_nullity)?;
-            block_results.push(BlockResult {
-                w_cols: {
-                    // Embed block W-factor into p_total space.
-                    let bs = bd.end - bd.start;
-                    let mut embedded = Array2::<f64>::zeros((p_total, block_pld.rank));
-                    if block_pld.rank > 0 {
-                        embedded
-                            .slice_mut(s![bd.start..bd.end, ..])
-                            .assign(&block_pld.w_factor.slice(s![..bs, ..]));
-                    }
-                    embedded
-                },
-                u_null_cols: {
-                    let block_nullity = block_pld.u_null.as_ref().map_or(0, Array2::ncols);
-                    let mut embedded = Array2::<f64>::zeros((p_total, block_nullity));
-                    if let Some(block_u_null) = block_pld.u_null.as_ref() {
-                        embedded
-                            .slice_mut(s![bd.start..bd.end, ..])
-                            .assign(block_u_null);
-                    }
-                    embedded
-                },
-                inv_evals_sq: block_pld.inv_evals_sq.to_vec(),
-                value: block_pld.value,
-                rank: block_pld.rank,
-                nullity: block_pld.u_null.as_ref().map_or(0, Array2::ncols),
-            });
-        }
+        let mut block_results: Vec<BlockResult> = if rayon::current_thread_index().is_some() {
+            blocks
+                .iter()
+                .map(|bd| {
+                    let structural_nullity = Some(super::unified::exact_intersection_nullity(
+                        &bd.component_matrices,
+                        &bd.component_nullities,
+                    ));
+                    let block_pld =
+                        Self::from_assembled_with_nullity(bd.local.clone(), structural_nullity)?;
+                    let nullity = block_pld.u_null.as_ref().map_or(0, Array2::ncols);
+                    Ok(BlockResult {
+                        start: bd.start,
+                        end: bd.end,
+                        w_local: block_pld.w_factor,
+                        u_null_local: block_pld
+                            .u_null
+                            .unwrap_or_else(|| Array2::<f64>::zeros((bd.end - bd.start, 0))),
+                        inv_evals_sq: block_pld.inv_evals_sq.to_vec(),
+                        value: block_pld.value,
+                        rank: block_pld.rank,
+                        nullity,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        } else {
+            blocks
+                .par_iter()
+                .map(|bd| {
+                    let structural_nullity = Some(super::unified::exact_intersection_nullity(
+                        &bd.component_matrices,
+                        &bd.component_nullities,
+                    ));
+                    let block_pld =
+                        Self::from_assembled_with_nullity(bd.local.clone(), structural_nullity)?;
+                    let nullity = block_pld.u_null.as_ref().map_or(0, Array2::ncols);
+                    Ok(BlockResult {
+                        start: bd.start,
+                        end: bd.end,
+                        w_local: block_pld.w_factor,
+                        u_null_local: block_pld
+                            .u_null
+                            .unwrap_or_else(|| Array2::<f64>::zeros((bd.end - bd.start, 0))),
+                        inv_evals_sq: block_pld.inv_evals_sq.to_vec(),
+                        value: block_pld.value,
+                        rank: block_pld.rank,
+                        nullity,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        };
 
         // Also add uncovered dimensions as trivial "block results".
         if ridge > 0.0 {
@@ -326,11 +364,13 @@ impl PenaltyPseudologdet {
             let scale = 1.0 / ridge.sqrt();
             for (idx, &c) in covered.iter().enumerate() {
                 if !c {
-                    let mut w_col = Array2::<f64>::zeros((p_total, 1));
-                    w_col[[idx, 0]] = scale;
+                    let mut w_col = Array2::<f64>::zeros((1, 1));
+                    w_col[[0, 0]] = scale;
                     block_results.push(BlockResult {
-                        w_cols: w_col,
-                        u_null_cols: Array2::<f64>::zeros((p_total, 0)),
+                        start: idx,
+                        end: idx + 1,
+                        w_local: w_col,
+                        u_null_local: Array2::<f64>::zeros((1, 0)),
                         inv_evals_sq: vec![inv_ridge_sq],
                         value: ridge.ln(),
                         rank: 1,
@@ -346,15 +386,22 @@ impl PenaltyPseudologdet {
 
         let mut w_factor_combined = Array2::<f64>::zeros((p_total, total_rank));
         let mut inv_evals_sq_combined = Array1::<f64>::zeros(total_rank);
+        let mut block_spans = Vec::with_capacity(block_results.len());
         let mut col_offset = 0;
         for br in &block_results {
             if br.rank > 0 {
                 w_factor_combined
-                    .slice_mut(s![.., col_offset..col_offset + br.rank])
-                    .assign(&br.w_cols);
+                    .slice_mut(s![br.start..br.end, col_offset..col_offset + br.rank])
+                    .assign(&br.w_local);
                 for (i, &v) in br.inv_evals_sq.iter().enumerate() {
                     inv_evals_sq_combined[col_offset + i] = v;
                 }
+                block_spans.push(PenaltyBlockSpan {
+                    start: br.start,
+                    end: br.end,
+                    rank_start: col_offset,
+                    rank_end: col_offset + br.rank,
+                });
                 col_offset += br.rank;
             }
         }
@@ -372,8 +419,8 @@ impl PenaltyPseudologdet {
             let mut null_col = 0;
             for br in &block_results {
                 if br.nullity > 0 {
-                    u0.slice_mut(s![.., null_col..null_col + br.nullity])
-                        .assign(&br.u_null_cols);
+                    u0.slice_mut(s![br.start..br.end, null_col..null_col + br.nullity])
+                        .assign(&br.u_null_local);
                     null_col += br.nullity;
                 }
             }
@@ -398,6 +445,7 @@ impl PenaltyPseudologdet {
             inv_evals_sq: inv_evals_sq_combined,
             rank: total_rank,
             value: total_value,
+            block_spans,
         })
     }
 
@@ -417,6 +465,7 @@ impl PenaltyPseudologdet {
                 inv_evals_sq: Array1::zeros(0),
                 rank: 0,
                 value: 0.0,
+                block_spans: Vec::new(),
             });
         }
 
@@ -459,6 +508,7 @@ impl PenaltyPseudologdet {
                 inv_evals_sq: Array1::zeros(0),
                 rank: 0,
                 value: 0.0,
+                block_spans: Vec::new(),
             });
         }
 
@@ -511,6 +561,7 @@ impl PenaltyPseudologdet {
                 inv_evals_sq: Array1::zeros(0),
                 rank: 0,
                 value: 0.0,
+                block_spans: Vec::new(),
             });
         }
 
@@ -571,6 +622,7 @@ impl PenaltyPseudologdet {
             inv_evals_sq,
             rank,
             value,
+            block_spans: Vec::new(),
         })
     }
 
@@ -658,28 +710,56 @@ impl PenaltyPseudologdet {
         }
 
         // Reduced representations: Y_k = W^T S_k W (unscaled).
-        let y_k: Vec<Array2<f64>> = s_k_matrices.iter().map(|s| self.reduced(s)).collect();
+        // These K projections are independent and dominate derivative time for
+        // large bases, so evaluate them in parallel outside existing rayon jobs.
+        let y_k: Vec<Array2<f64>> = if rayon::current_thread_index().is_some() {
+            s_k_matrices.iter().map(|s| self.reduced(s)).collect()
+        } else {
+            s_k_matrices.par_iter().map(|s| self.reduced(s)).collect()
+        };
 
         // First derivatives: ∂_ρk L = λ_k tr(Y_k).
+        let first_vals: Vec<f64> = y_k
+            .iter()
+            .enumerate()
+            .map(|(idx, y)| lambdas[idx] * (0..self.rank).map(|i| y[[i, i]]).sum::<f64>())
+            .collect();
         let mut det1 = Array1::<f64>::zeros(k);
-        for (idx, y) in y_k.iter().enumerate() {
-            let tr: f64 = (0..self.rank).map(|i| y[[i, i]]).sum();
-            det1[idx] = lambdas[idx] * tr;
+        for (idx, value) in first_vals.into_iter().enumerate() {
+            det1[idx] = value;
         }
 
         // Second derivatives: ∂²_ρk ρl L = δ_{kl} ∂_ρk L − λ_k λ_l tr(Y_k Y_l).
         // Y_k is symmetric (W^T S_k W with S_k symmetric), so tr(Y_k Y_l) = tr(Y_k Y_l^T).
+        let pairs = (0..k).flat_map(|ki| (0..=ki).map(move |li| (ki, li)));
+        let pair_vals: Vec<(usize, usize, f64)> = if rayon::current_thread_index().is_some() {
+            pairs
+                .map(|(ki, li)| {
+                    let tr_ab = Self::trace_dense_product(&y_k[ki], &y_k[li]);
+                    let mut val = -lambdas[ki] * lambdas[li] * tr_ab;
+                    if ki == li {
+                        val += det1[ki];
+                    }
+                    (ki, li, val)
+                })
+                .collect()
+        } else {
+            pairs
+                .par_bridge()
+                .map(|(ki, li)| {
+                    let tr_ab = Self::trace_dense_product(&y_k[ki], &y_k[li]);
+                    let mut val = -lambdas[ki] * lambdas[li] * tr_ab;
+                    if ki == li {
+                        val += det1[ki];
+                    }
+                    (ki, li, val)
+                })
+                .collect()
+        };
         let mut det2 = Array2::<f64>::zeros((k, k));
-        for ki in 0..k {
-            for li in 0..=ki {
-                let tr_ab = Self::trace_dense_product(&y_k[ki], &y_k[li]);
-                let mut val = -lambdas[ki] * lambdas[li] * tr_ab;
-                if ki == li {
-                    val += det1[ki];
-                }
-                det2[[ki, li]] = val;
-                det2[[li, ki]] = val;
-            }
+        for (ki, li, val) in pair_vals {
+            det2[[ki, li]] = val;
+            det2[[li, ki]] = val;
         }
 
         (det1, det2)
@@ -697,34 +777,104 @@ impl PenaltyPseudologdet {
             return (Array1::zeros(k), Array2::zeros((k, k)));
         }
 
-        let y_k: Vec<Array2<f64>> = penalties
-            .iter()
-            .map(|penalty| {
-                let start = penalty.col_range.start;
-                let end = penalty.col_range.end;
-                let w_block = self.w_factor.slice(s![start..end, ..]).to_owned();
+        struct ReducedPenalty {
+            span: Option<usize>,
+            y: Array2<f64>,
+        }
+
+        let project = |penalty: &crate::construction::CanonicalPenalty| {
+            let start = penalty.col_range.start;
+            let end = penalty.col_range.end;
+            if let Some((span_idx, span)) = self
+                .block_spans
+                .iter()
+                .enumerate()
+                .find(|(_, span)| span.start <= start && end <= span.end)
+            {
+                let local_start = start - span.start;
+                let local_end = local_start + (end - start);
+                let w_block = self
+                    .w_factor
+                    .slice(s![start..end, span.rank_start..span.rank_end]);
                 let local_w = penalty.local.dot(&w_block);
-                w_block.t().dot(&local_w)
-            })
-            .collect();
+                let y = self
+                    .w_factor
+                    .slice(s![start..end, span.rank_start..span.rank_end])
+                    .t()
+                    .dot(&local_w);
+                debug_assert_eq!(local_end - local_start, penalty.local.nrows());
+                ReducedPenalty {
+                    span: Some(span_idx),
+                    y,
+                }
+            } else {
+                // Overlapping/global fallback: still avoid cloning the block view.
+                let w_block = self.w_factor.slice(s![start..end, ..]);
+                let local_w = penalty.local.dot(&w_block);
+                ReducedPenalty {
+                    span: None,
+                    y: w_block.t().dot(&local_w),
+                }
+            }
+        };
+
+        let y_k: Vec<ReducedPenalty> = if rayon::current_thread_index().is_some() {
+            penalties.iter().map(project).collect()
+        } else {
+            penalties.par_iter().map(project).collect()
+        };
 
         let mut det1 = Array1::<f64>::zeros(k);
-        for (idx, y) in y_k.iter().enumerate() {
-            let tr: f64 = (0..self.rank).map(|i| y[[i, i]]).sum();
+        for (idx, reduced) in y_k.iter().enumerate() {
+            let tr: f64 = (0..reduced.y.nrows()).map(|i| reduced.y[[i, i]]).sum();
             det1[idx] = lambdas[idx] * tr;
         }
 
+        let pairs = (0..k).flat_map(|ki| (0..=ki).map(move |li| (ki, li)));
+        let pair_vals: Vec<(usize, usize, f64)> = if rayon::current_thread_index().is_some() {
+            pairs
+                .map(|(ki, li)| {
+                    let same_span = match (y_k[ki].span, y_k[li].span) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => true,
+                    };
+                    let tr_ab = if same_span {
+                        Self::trace_dense_product(&y_k[ki].y, &y_k[li].y)
+                    } else {
+                        0.0
+                    };
+                    let mut val = -lambdas[ki] * lambdas[li] * tr_ab;
+                    if ki == li {
+                        val += det1[ki];
+                    }
+                    (ki, li, val)
+                })
+                .collect()
+        } else {
+            pairs
+                .par_bridge()
+                .map(|(ki, li)| {
+                    let same_span = match (y_k[ki].span, y_k[li].span) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => true,
+                    };
+                    let tr_ab = if same_span {
+                        Self::trace_dense_product(&y_k[ki].y, &y_k[li].y)
+                    } else {
+                        0.0
+                    };
+                    let mut val = -lambdas[ki] * lambdas[li] * tr_ab;
+                    if ki == li {
+                        val += det1[ki];
+                    }
+                    (ki, li, val)
+                })
+                .collect()
+        };
         let mut det2 = Array2::<f64>::zeros((k, k));
-        for ki in 0..k {
-            for li in 0..=ki {
-                let tr_ab = Self::trace_dense_product(&y_k[ki], &y_k[li]);
-                let mut val = -lambdas[ki] * lambdas[li] * tr_ab;
-                if ki == li {
-                    val += det1[ki];
-                }
-                det2[[ki, li]] = val;
-                det2[[li, ki]] = val;
-            }
+        for (ki, li, val) in pair_vals {
+            det2[[ki, li]] = val;
+            det2[[li, ki]] = val;
         }
 
         (det1, det2)
@@ -1053,6 +1203,66 @@ mod tests {
             block_factored.value(),
             assembled.value()
         );
+    }
+
+    #[test]
+    fn test_block_factored_rho_derivatives_match_dense_without_cross_block_work() {
+        let p_total = 6;
+        let lambdas = [1.7_f64, 0.4_f64, 2.3_f64];
+        let penalties = vec![
+            crate::construction::CanonicalPenalty {
+                root: array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]],
+                col_range: 0..3,
+                total_dim: p_total,
+                nullity: 1,
+                local: array![[1.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 0.0]],
+                positive_eigenvalues: vec![1.0, 4.0],
+                op: None,
+            },
+            crate::construction::CanonicalPenalty {
+                root: array![[0.0, 0.0, 3.0]],
+                col_range: 0..3,
+                total_dim: p_total,
+                nullity: 2,
+                local: array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 9.0]],
+                positive_eigenvalues: vec![9.0],
+                op: None,
+            },
+            crate::construction::CanonicalPenalty {
+                root: array![[1.5, 0.0, 0.0], [0.0, 0.0, 0.5]],
+                col_range: 3..6,
+                total_dim: p_total,
+                nullity: 1,
+                local: array![[2.25, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.25]],
+                positive_eigenvalues: vec![2.25, 0.25],
+                op: None,
+            },
+        ];
+
+        let block_factored =
+            PenaltyPseudologdet::from_penalties(&penalties, &lambdas, 0.0, p_total).unwrap();
+        assert_eq!(block_factored.block_spans.len(), 2);
+
+        let mut dense_components = Vec::new();
+        for penalty in &penalties {
+            let mut full = Array2::<f64>::zeros((p_total, p_total));
+            penalty.accumulate_weighted(&mut full, 1.0);
+            dense_components.push(full);
+        }
+        let dense = PenaltyPseudologdet::from_components(&dense_components, &lambdas, 0.0).unwrap();
+
+        let (block_first, block_second) =
+            block_factored.rho_derivatives_from_penalties(&penalties, &lambdas);
+        let (dense_first, dense_second) = dense.rho_derivatives(&dense_components, &lambdas);
+
+        for k in 0..lambdas.len() {
+            assert!((block_first[k] - dense_first[k]).abs() < 1e-11);
+            for l in 0..lambdas.len() {
+                assert!((block_second[[k, l]] - dense_second[[k, l]]).abs() < 1e-10);
+            }
+        }
+        assert!(block_second[[0, 2]].abs() < 1e-12);
+        assert!(block_second[[1, 2]].abs() < 1e-12);
     }
 
     #[test]

@@ -33,6 +33,7 @@
 //! with a different numerical threshold.
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Zip};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -10058,17 +10059,32 @@ pub fn compute_block_penalty_logdet_derivs(
     use super::penalty_logdet::PenaltyPseudologdet;
 
     let total_k: usize = per_block_rho.iter().map(|r| r.len()).sum();
-    let mut log_det_total = 0.0;
-    let mut first = Array1::zeros(total_k);
-    let mut second = Array2::zeros((total_k, total_k));
-    let mut at = 0usize;
+    let block_offsets: Vec<usize> = per_block_rho
+        .iter()
+        .scan(0usize, |at, rho| {
+            let current = *at;
+            *at += rho.len();
+            Some(current)
+        })
+        .collect();
 
-    for (b, block_rho) in per_block_rho.iter().enumerate() {
+    struct BlockPenaltyLogdetResult {
+        offset: usize,
+        value: f64,
+        first: Array1<f64>,
+        second: Array2<f64>,
+    }
+
+    let compute_block = |(b, block_rho): (usize, &Array1<f64>)| {
         let penalties = per_block_penalties[b];
         let kb = block_rho.len();
         if penalties.is_empty() || kb == 0 {
-            at += kb;
-            continue;
+            return Ok(BlockPenaltyLogdetResult {
+                offset: block_offsets[b],
+                value: 0.0,
+                first: Array1::zeros(kb),
+                second: Array2::zeros((kb, kb)),
+            });
         }
         let lambdas: Vec<f64> = block_rho.iter().map(|&r| r.exp()).collect();
 
@@ -10094,23 +10110,44 @@ pub fn compute_block_penalty_logdet_derivs(
         )
         .map_err(|e| format!("penalty logdet failed for block {b}: {e}"))?;
 
-        // Value: log|S_b|₊.
-        log_det_total += pld.value();
+        let value = pld.value();
+        let (first, second) = pld.rho_derivatives(penalties, &lambdas);
+        Ok(BlockPenaltyLogdetResult {
+            offset: block_offsets[b],
+            value,
+            first,
+            second,
+        })
+    };
 
-        // First and second derivatives w.r.t. ρ, from one eigendecomposition.
-        let (block_first, block_second) = pld.rho_derivatives(penalties, &lambdas);
+    let block_results: Vec<BlockPenaltyLogdetResult> = if rayon::current_thread_index().is_some() {
+        per_block_rho
+            .iter()
+            .enumerate()
+            .map(compute_block)
+            .collect::<Result<Vec<_>, String>>()?
+    } else {
+        per_block_rho
+            .par_iter()
+            .enumerate()
+            .map(compute_block)
+            .collect::<Result<Vec<_>, String>>()?
+    };
 
-        // Write into global arrays at the correct offsets.
+    let mut log_det_total = 0.0;
+    let mut first = Array1::zeros(total_k);
+    let mut second = Array2::zeros((total_k, total_k));
+    for block in block_results {
+        log_det_total += block.value;
+        let kb = block.first.len();
         for k in 0..kb {
-            first[at + k] = block_first[k];
+            first[block.offset + k] = block.first[k];
         }
         for k in 0..kb {
             for l in 0..kb {
-                second[[at + k, at + l]] = block_second[[k, l]];
+                second[[block.offset + k, block.offset + l]] = block.second[[k, l]];
             }
         }
-
-        at += kb;
     }
 
     Ok(PenaltyLogdetDerivs {
