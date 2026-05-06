@@ -9424,7 +9424,6 @@ fn joint_outer_evaluate(
                 + Sync,
         >,
     >,
-    outer_hessian_operator: Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
     ext_bundle: Option<ExtCoordBundle>,
     batched_outer_hessian_operator: Option<
         Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
@@ -11296,7 +11295,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             &compute_d2h,
             Some(owned_compute_dh),
             Some(owned_compute_d2h),
-            family.outer_hyper_hessian_operator(specs),
             ext_bundle,
             custom_family_batched_outer_hessian_operator(
                 family,
@@ -11766,7 +11764,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         &compute_d2h,
         None,
         None,
-        family.outer_hyper_hessian_operator(specs),
         None, // no ext_coords for generic single-block fallback
         custom_family_batched_outer_hessian_operator(
             family,
