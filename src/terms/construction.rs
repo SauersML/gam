@@ -1235,52 +1235,63 @@ pub fn create_balanced_penalty_root_from_canonical(
         col_range: Range<usize>,
         root: Array2<f64>, // rank_b × block_dim
     }
-    let mut total_rank = 0usize;
-    let mut block_roots = Vec::with_capacity(block_groups.len());
+    // Materialize the BTreeMap order first. Rayon preserves Vec collection
+    // order for indexed parallel iterators, so assembly below remains stable by
+    // ascending column range while independent block eigendecompositions run in
+    // parallel.
+    let ordered_blocks: Vec<((usize, usize), Vec<&CanonicalPenalty>)> =
+        block_groups.into_iter().collect();
+    let block_roots: Vec<BlockRoot> = ordered_blocks
+        .into_par_iter()
+        .map(
+            |((start, end), cps)| -> Result<Option<BlockRoot>, EstimationError> {
+                let block_dim = end - start;
+                let mut s_balanced_local = Array2::zeros((block_dim, block_dim));
 
-    for (&(start, end), cps) in &block_groups {
-        let block_dim = end - start;
-        let mut s_balanced_local = Array2::zeros((block_dim, block_dim));
+                for cp in cps {
+                    let local = cp.local_ref();
+                    let frob_norm = local.iter().map(|&x| x * x).sum::<f64>().sqrt();
+                    if frob_norm > 1e-12 {
+                        s_balanced_local.scaled_add(1.0 / frob_norm, local);
+                    }
+                }
 
-        for cp in cps {
-            let local = cp.local_ref();
-            let frob_norm = local.iter().map(|&x| x * x).sum::<f64>().sqrt();
-            if frob_norm > 1e-12 {
-                s_balanced_local.scaled_add(1.0 / frob_norm, local);
-            }
-        }
+                let (eigenvalues, eigenvectors) =
+                    robust_eigh(&s_balanced_local, Side::Lower, "balanced penalty block")?;
+                let max_eig = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
+                let tolerance = if max_eig > 0.0 {
+                    max_eig * 1e-12
+                } else {
+                    1e-12
+                };
+                let block_rank = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
 
-        let (eigenvalues, eigenvectors) =
-            robust_eigh(&s_balanced_local, Side::Lower, "balanced penalty block")?;
-        let max_eig = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
-        let tolerance = if max_eig > 0.0 {
-            max_eig * 1e-12
-        } else {
-            1e-12
-        };
-        let block_rank = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
+                if block_rank == 0 {
+                    return Ok(None);
+                }
 
-        if block_rank == 0 {
-            continue;
-        }
+                let mut root = Array2::zeros((block_rank, block_dim));
+                let mut row_idx = 0;
+                for (i, &eigenval) in eigenvalues.iter().enumerate() {
+                    if eigenval > tolerance {
+                        let sqrt_ev = eigenval.sqrt();
+                        let evec = eigenvectors.column(i);
+                        root.row_mut(row_idx).assign(&(&evec * sqrt_ev));
+                        row_idx += 1;
+                    }
+                }
 
-        let mut root = Array2::zeros((block_rank, block_dim));
-        let mut row_idx = 0;
-        for (i, &eigenval) in eigenvalues.iter().enumerate() {
-            if eigenval > tolerance {
-                let sqrt_ev = eigenval.sqrt();
-                let evec = eigenvectors.column(i);
-                root.row_mut(row_idx).assign(&(&evec * sqrt_ev));
-                row_idx += 1;
-            }
-        }
-
-        total_rank += block_rank;
-        block_roots.push(BlockRoot {
-            col_range: start..end,
-            root,
-        });
-    }
+                Ok(Some(BlockRoot {
+                    col_range: start..end,
+                    root,
+                }))
+            },
+        )
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    let total_rank: usize = block_roots.iter().map(|br| br.root.nrows()).sum();
 
     if total_rank == 0 {
         return Ok(Array2::zeros((0, p)));
