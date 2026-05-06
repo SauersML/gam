@@ -7646,18 +7646,14 @@ impl HyperOperator for TransformationNormalDhMatrixFreeOperator {
 
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
         debug_assert_eq!(factor.nrows(), self.p_total());
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let p = factor.nrows();
-        let k = factor.ncols();
-        let cols: Vec<Array1<f64>> = (0..k)
-            .into_par_iter()
-            .map(|c| self.apply(&factor.column(c).to_owned()))
-            .collect();
-        let mut out = Array2::<f64>::zeros((p, k));
-        for (c, bv) in cols.into_iter().enumerate() {
-            out.column_mut(c).assign(&bv);
-        }
-        out
+        self.family
+            .scop_hessian_directional_matmat(
+                &self.beta,
+                &self.direction,
+                &self.row_quantities,
+                factor,
+            )
+            .expect("validated CTN dH batched operator inputs should not fail")
     }
 
     fn to_dense(&self) -> Array2<f64> {
@@ -7730,18 +7726,15 @@ impl HyperOperator for TransformationNormalD2hMatrixFreeOperator {
 
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
         debug_assert_eq!(factor.nrows(), self.p_total());
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let p = factor.nrows();
-        let k = factor.ncols();
-        let cols: Vec<Array1<f64>> = (0..k)
-            .into_par_iter()
-            .map(|c| self.apply(&factor.column(c).to_owned()))
-            .collect();
-        let mut out = Array2::<f64>::zeros((p, k));
-        for (c, bv) in cols.into_iter().enumerate() {
-            out.column_mut(c).assign(&bv);
-        }
-        out
+        self.family
+            .scop_hessian_second_directional_matmat(
+                &self.beta,
+                &self.direction_u,
+                &self.direction_v,
+                &self.row_quantities,
+                factor,
+            )
+            .expect("validated CTN d2H batched operator inputs should not fail")
     }
 
     fn to_dense(&self) -> Array2<f64> {
@@ -12650,6 +12643,30 @@ mod tests {
             }
         }
 
+        let matmat_probes = vec![toy_probe_vector(p, 104), toy_probe_vector(p, 105)];
+        let mut probe_mat = Array2::<f64>::zeros((p, matmat_probes.len()));
+        for (j, w) in matmat_probes.iter().enumerate() {
+            probe_mat.column_mut(j).assign(w);
+        }
+        let row_quantities = family.row_quantities(&state.beta).expect("row quantities");
+        let want_mat = dense.dot(&probe_mat);
+        let got_mat = family
+            .scop_hessian_matmat(&state.beta, &row_quantities, &probe_mat)
+            .expect("batched Hessian matmat");
+        for i in 0..p {
+            for j in 0..matmat_probes.len() {
+                let tol = 1e-12 * want_mat[[i, j]].abs().max(1.0) + 1e-12;
+                assert!(
+                    (want_mat[[i, j]] - got_mat[[i, j]]).abs() <= tol,
+                    "H matmat[{}, {}] mismatch: dense={:.6e}, op={:.6e}",
+                    i,
+                    j,
+                    want_mat[[i, j]],
+                    got_mat[[i, j]]
+                );
+            }
+        }
+
         // Diagonal must agree element-wise (matrix-free pre-square path vs. dense gram).
         let diag_op = workspace
             .hessian_diagonal()
@@ -12843,6 +12860,25 @@ mod tests {
             toy_probe_vector(p, 203),
             toy_probe_vector(p, 204),
         ];
+        let mut probe_mat = Array2::<f64>::zeros((p, probes.len()));
+        for (j, w) in probes.iter().enumerate() {
+            probe_mat.column_mut(j).assign(w);
+        }
+        let want_mat = dense_dh.dot(&probe_mat);
+        let got_mat = dh_op.mul_mat(&probe_mat);
+        for i in 0..p {
+            for j in 0..probes.len() {
+                let tol = 1e-12 * want_mat[[i, j]].abs().max(1.0) + 1e-12;
+                assert!(
+                    (want_mat[[i, j]] - got_mat[[i, j]]).abs() <= tol,
+                    "dH op matmat[{}, {}] mismatch: dense={:.6e}, op={:.6e}",
+                    i,
+                    j,
+                    want_mat[[i, j]],
+                    got_mat[[i, j]]
+                );
+            }
+        }
         for (k, w) in probes.iter().enumerate() {
             assert_eq!(w.len(), p);
             let want = dense_dh.dot(w);
@@ -12891,6 +12927,25 @@ mod tests {
             toy_probe_vector(p, 304),
             toy_probe_vector(p, 305),
         ];
+        let mut probe_mat = Array2::<f64>::zeros((p, probes.len()));
+        for (j, w) in probes.iter().enumerate() {
+            probe_mat.column_mut(j).assign(w);
+        }
+        let want_mat = dense_d2h.dot(&probe_mat);
+        let got_mat = d2h_op.mul_mat(&probe_mat);
+        for i in 0..p {
+            for j in 0..probes.len() {
+                let tol = 1e-12 * want_mat[[i, j]].abs().max(1.0) + 1e-12;
+                assert!(
+                    (want_mat[[i, j]] - got_mat[[i, j]]).abs() <= tol,
+                    "d2H op matmat[{}, {}] mismatch: dense={:.6e}, op={:.6e}",
+                    i,
+                    j,
+                    want_mat[[i, j]],
+                    got_mat[[i, j]]
+                );
+            }
+        }
         for (k, w) in probes.iter().enumerate() {
             assert_eq!(w.len(), p);
             let want = dense_d2h.dot(w);
