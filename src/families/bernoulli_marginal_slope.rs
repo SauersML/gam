@@ -4316,7 +4316,20 @@ impl BernoulliMarginalSlopeFamily {
         dir_u: &Array1<f64>,
         dir_v: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
-        if !self.effective_flex_active(block_states)? {
+        let flex_active = self.effective_flex_active(block_states)?;
+        let expected_dir_len = if flex_active { cache.primary.total } else { 2 };
+        if dir_u.len() != expected_dir_len || dir_v.len() != expected_dir_len {
+            return Err(format!(
+                "bernoulli fourth contracted row {row}: direction lengths ({},{}) != {expected_dir_len}",
+                dir_u.len(),
+                dir_v.len()
+            ));
+        }
+
+        // Keep this row-local helper serial. All expensive callers parallelize
+        // across independent rows/chunks so Rayon workers do not nest inside
+        // the high-allocation per-row cell-kernel transport below.
+        if !flex_active {
             let marginal = self.marginal_link_map(block_states[0].eta[row])?;
             let g = block_states[1].eta[row];
             let kern = RigidProbitKernel::new(
@@ -4337,9 +4350,7 @@ impl BernoulliMarginalSlopeFamily {
             out[[1, 1]] = f[1][1];
             return Ok(out);
         }
-        if dir_u.iter().all(|value| value.abs() <= 0.0)
-            || dir_v.iter().all(|value| value.abs() <= 0.0)
-        {
+        if dir_u.iter().all(|value| *value == 0.0) || dir_v.iter().all(|value| *value == 0.0) {
             return Ok(Array2::<f64>::zeros((
                 cache.primary.total,
                 cache.primary.total,
@@ -8645,6 +8656,61 @@ mod tests {
             beta,
             eta: Array1::zeros(n_rows),
         }
+    }
+
+    #[test]
+    fn row_primary_fourth_contracted_rejects_bad_direction_lengths() {
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![1.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.25]),
+            gaussian_frailty_sd: None,
+            base_link: bernoulli_marginal_slope_probit_link(),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
+            score_warp: None,
+            link_dev: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: array![0.15],
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: array![0.2],
+            },
+        ];
+        let cache = family
+            .build_exact_eval_cache(&block_states)
+            .expect("exact eval cache");
+        let row_ctx = family
+            .build_row_exact_context(0, &block_states)
+            .expect("row context");
+        let bad_dir = array![1.0];
+        let good_dir = array![0.0, 1.0];
+
+        let err = family
+            .row_primary_fourth_contracted_recompute_ordered(
+                0,
+                &block_states,
+                &cache,
+                &row_ctx,
+                &bad_dir,
+                &good_dir,
+            )
+            .expect_err("bad direction length should be rejected before indexing");
+
+        assert!(
+            err.contains("direction lengths (1,2) != 2"),
+            "unexpected error: {err}"
+        );
     }
 
     fn base_spec(
