@@ -6153,30 +6153,57 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     let adaptive_opts = options.adaptive_regularization.clone().unwrap_or_default();
     let adaptive_penalty_indices = exact_spatial_adaptive_penalty_index_set(runtime_caches);
     let p_total = baseline.design.design.ncols();
-    let mut retained_penalties = Vec::<Array2<f64>>::new();
-    let mut retained_nullspace_dims = Vec::<usize>::new();
-    let mut retained_log_lambdas = Vec::<f64>::new();
-    let mut retained_global_indices = Vec::<usize>::new();
+    struct RetainedPenaltySetup {
+        global_idx: usize,
+        global_penalty: Array2<f64>,
+        nullspace_dim: usize,
+        log_lambda: f64,
+        col_range: Range<usize>,
+        hessian_piece: Array2<f64>,
+    }
+    use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+    let retained_setups = baseline
+        .design
+        .penalties
+        .par_iter()
+        .enumerate()
+        .map(|(idx, bp)| {
+            if adaptive_penalty_indices.contains(&idx) {
+                return None;
+            }
+            let lambda = baseline.fit.lambdas[idx];
+            Some(RetainedPenaltySetup {
+                global_idx: idx,
+                global_penalty: bp.to_global(p_total),
+                nullspace_dim: baseline
+                    .design
+                    .nullspace_dims
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(0),
+                log_lambda: lambda.max(1e-12).ln(),
+                col_range: bp.col_range.clone(),
+                hessian_piece: bp.local.mapv(|v| lambda * v),
+            })
+        })
+        .collect::<Vec<_>>();
+    let retained_count = retained_setups
+        .iter()
+        .filter(|setup| setup.is_some())
+        .count();
+    let mut retained_penalties = Vec::<Array2<f64>>::with_capacity(retained_count);
+    let mut retained_nullspace_dims = Vec::<usize>::with_capacity(retained_count);
+    let mut retained_log_lambdas = Vec::<f64>::with_capacity(retained_count);
+    let mut retained_global_indices = Vec::<usize>::with_capacity(retained_count);
     let mut fixed_quadratichessian = Array2::<f64>::zeros((p_total, p_total));
-    for (idx, bp) in baseline.design.penalties.iter().enumerate() {
-        if adaptive_penalty_indices.contains(&idx) {
-            continue;
-        }
-        retained_penalties.push(bp.to_global(p_total));
-        retained_nullspace_dims.push(
-            baseline
-                .design
-                .nullspace_dims
-                .get(idx)
-                .copied()
-                .unwrap_or(0),
-        );
-        retained_log_lambdas.push(baseline.fit.lambdas[idx].max(1e-12).ln());
-        retained_global_indices.push(idx);
-        let r = &bp.col_range;
+    for setup in retained_setups.into_iter().flatten() {
+        retained_penalties.push(setup.global_penalty);
+        retained_nullspace_dims.push(setup.nullspace_dim);
+        retained_log_lambdas.push(setup.log_lambda);
+        retained_global_indices.push(setup.global_idx);
         fixed_quadratichessian
-            .slice_mut(s![r.start..r.end, r.start..r.end])
-            .scaled_add(baseline.fit.lambdas[idx], &bp.local);
+            .slice_mut(s![setup.col_range.clone(), setup.col_range])
+            .scaled_add(1.0, &setup.hessian_piece);
     }
 
     let (eps_0_init, eps_g_init, eps_c_init) = compute_initial_epsilons(
@@ -6189,17 +6216,27 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     for (idx, value) in retained_log_lambdas.iter().enumerate() {
         initial_theta[idx] = *value;
     }
+    let adaptive_log_lambda_components = runtime_caches
+        .par_iter()
+        .map(|cache| {
+            [
+                baseline.fit.lambdas[cache.mass_penalty_global_idx]
+                    .max(1e-12)
+                    .ln(),
+                baseline.fit.lambdas[cache.tension_penalty_global_idx]
+                    .max(1e-12)
+                    .ln(),
+                baseline.fit.lambdas[cache.stiffness_penalty_global_idx]
+                    .max(1e-12)
+                    .ln(),
+            ]
+        })
+        .collect::<Vec<_>>();
     let mut at = retained_penalties.len();
-    for cache in runtime_caches {
-        initial_theta[at] = baseline.fit.lambdas[cache.mass_penalty_global_idx]
-            .max(1e-12)
-            .ln();
-        initial_theta[at + 1] = baseline.fit.lambdas[cache.tension_penalty_global_idx]
-            .max(1e-12)
-            .ln();
-        initial_theta[at + 2] = baseline.fit.lambdas[cache.stiffness_penalty_global_idx]
-            .max(1e-12)
-            .ln();
+    for logs in &adaptive_log_lambda_components {
+        initial_theta[at] = logs[0];
+        initial_theta[at + 1] = logs[1];
+        initial_theta[at + 2] = logs[2];
         at += 3;
     }
     initial_theta[at] = eps_0_init.max(adaptive_opts.min_epsilon).ln();
@@ -6214,9 +6251,8 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         ));
     let derivative_blocks = vec![
         hyperspecs
-            .iter()
-            .enumerate()
-            .map(|(_, _)| CustomFamilyBlockPsiDerivative {
+            .par_iter()
+            .map(|_| CustomFamilyBlockPsiDerivative {
                 penalty_index: None,
                 x_psi: Array2::<f64>::zeros((0, 0)),
                 s_psi: Array2::<f64>::zeros((0, 0)),
