@@ -5422,32 +5422,6 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
-    /// Write-into variant of `exact_newton_joint_hessian_matvec_from_cache`.
-    /// Same parallel try_fold/try_reduce pattern, but writes the final
-    /// reduction into the caller-owned `out` buffer, avoiding the per-call
-    /// allocation that the legacy owned-return form forces. Used by the
-    /// inner-Newton PCG hot path (biobank scale).
-    #[allow(dead_code)] // wired by a follow-up commit; method exists so the API surface is committed
-    fn exact_newton_joint_hessian_matvec_into_from_cache(
-        &self,
-        direction: &Array1<f64>,
-        block_states: &[ParameterBlockState],
-        cache: &BernoulliMarginalSlopeExactEvalCache,
-        out: &mut Array1<f64>,
-    ) -> Result<(), String> {
-        let result =
-            self.exact_newton_joint_hessian_matvec_from_cache(direction, block_states, cache)?;
-        if result.len() != out.len() {
-            return Err(format!(
-                "exact_newton_joint_hessian_matvec_into_from_cache: result len {} != out len {}",
-                result.len(),
-                out.len()
-            ));
-        }
-        out.assign(&result);
-        Ok(())
-    }
-
     fn exact_newton_joint_hessian_matvec_from_cache(
         &self,
         direction: &Array1<f64>,
