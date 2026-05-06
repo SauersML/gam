@@ -1211,92 +1211,147 @@ impl TransformationNormalFamily {
         let weights = self.weights.as_ref();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
-        let mut gradient = Array1::<f64>::zeros(p_total);
-        let mut hessian = Array2::<f64>::zeros((p_total, p_total));
-        let mut gamma = vec![0.0; p_resp];
-        let mut dh_factor = vec![0.0; p_resp];
-        let mut dhp_factor = vec![0.0; p_resp];
-        let mut second_diag = vec![0.0; p_resp];
-        let mut lower_factor = vec![0.0; p_resp];
-        let mut upper_factor = vec![0.0; p_resp];
+        let endpoint_q = row_quantities.endpoint_q.as_ref();
+        let response_val_basis = &self.response_val_basis;
+        let response_deriv_basis = &self.response_deriv_basis;
+        let response_lower_basis = &self.response_lower_basis;
+        let response_upper_basis = &self.response_upper_basis;
 
-        for i in 0..n {
-            let cov_row = cov.row(i);
-            let rv = self.response_val_basis.row(i);
-            let rd = self.response_deriv_basis.row(i);
-            let wi = weights[i];
-            let hi = h[i];
-            let hp = h_prime[i];
-            let inv_hp = 1.0 / hp;
-            let inv_hp_sq = inv_hp * inv_hp;
+        struct ScopAccum {
+            gradient: Array1<f64>,
+            hessian: Array2<f64>,
+        }
 
-            for k in 0..p_resp {
-                gamma[k] = beta_mat.row(k).dot(&cov_row);
-            }
-
-            let q = row_quantities.endpoint_q[i];
-            lower_factor[0] = self.response_lower_basis[0];
-            upper_factor[0] = self.response_upper_basis[0];
-            for k in 1..p_resp {
-                lower_factor[k] = 2.0 * self.response_lower_basis[k] * gamma[k];
-                upper_factor[k] = 2.0 * self.response_upper_basis[k] * gamma[k];
-            }
-
-            second_diag.fill(0.0);
-            dh_factor[0] = rv[0];
-            dhp_factor[0] = rd[0];
-            for k in 1..p_resp {
-                dh_factor[k] = 2.0 * rv[k] * gamma[k];
-                dhp_factor[k] = 2.0 * rd[k] * gamma[k];
-                second_diag[k] = 2.0 * (hi * rv[k] - rd[k] * inv_hp);
-            }
-
-            for k in 0..p_resp {
-                let normalizer_score_factor =
-                    q.first[0] * upper_factor[k] + q.first[1] * lower_factor[k];
-                let score_factor =
-                    wi * (-hi * dh_factor[k] + dhp_factor[k] * inv_hp - normalizer_score_factor);
-                for c in 0..p_cov {
-                    gradient[k * p_cov + c] += score_factor * cov_row[c];
+        impl ScopAccum {
+            fn new(p_total: usize) -> Self {
+                Self {
+                    gradient: Array1::<f64>::zeros(p_total),
+                    hessian: Array2::<f64>::zeros((p_total, p_total)),
                 }
             }
+        }
 
-            for k in 0..p_resp {
-                for l in 0..p_resp {
-                    let mut block_factor =
-                        dh_factor[k] * dh_factor[l] + dhp_factor[k] * dhp_factor[l] * inv_hp_sq;
-                    if k == l {
-                        block_factor += second_diag[k];
+        let policy = ResourcePolicy::default_library();
+        let accum_bytes = p_total
+            .saturating_mul(p_total.saturating_add(1))
+            .saturating_mul(std::mem::size_of::<f64>())
+            .max(1);
+        let memory_bound_chunks = (policy.max_single_materialization_bytes / accum_bytes).max(1);
+        let target_chunks = rayon::current_num_threads()
+            .saturating_mul(4)
+            .max(1)
+            .min(memory_bound_chunks)
+            .min(n.max(1));
+        let chunk_rows = n.max(1).div_ceil(target_chunks);
+        let row_chunks: Vec<(usize, usize)> = (0..n)
+            .step_by(chunk_rows)
+            .map(|start| (start, (start + chunk_rows).min(n)))
+            .collect();
+
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        // Rayon collects this indexed iterator into `Vec` in row-chunk order;
+        // the final serial fold below preserves that order so results do not
+        // depend on worker scheduling.
+        let partials: Vec<ScopAccum> = row_chunks
+            .into_par_iter()
+            .map(|(start, end)| {
+                let mut acc = ScopAccum::new(p_total);
+                let mut gamma = vec![0.0; p_resp];
+                let mut dh_factor = vec![0.0; p_resp];
+                let mut dhp_factor = vec![0.0; p_resp];
+                let mut second_diag = vec![0.0; p_resp];
+                let mut lower_factor = vec![0.0; p_resp];
+                let mut upper_factor = vec![0.0; p_resp];
+
+                for i in start..end {
+                    let cov_row = cov.row(i);
+                    let rv = response_val_basis.row(i);
+                    let rd = response_deriv_basis.row(i);
+                    let wi = weights[i];
+                    let hi = h[i];
+                    let hp = h_prime[i];
+                    let inv_hp = 1.0 / hp;
+                    let inv_hp_sq = inv_hp * inv_hp;
+
+                    for k in 0..p_resp {
+                        gamma[k] = beta_mat.row(k).dot(&cov_row);
                     }
-                    let upper_ab = if k == l && k > 0 {
-                        2.0 * self.response_upper_basis[k]
-                    } else {
-                        0.0
-                    };
-                    let lower_ab = if k == l && k > 0 {
-                        2.0 * self.response_lower_basis[k]
-                    } else {
-                        0.0
-                    };
-                    block_factor += q.first[0] * upper_ab
-                        + q.first[1] * lower_ab
-                        + q.second[0][0] * upper_factor[k] * upper_factor[l]
-                        + q.second[0][1] * upper_factor[k] * lower_factor[l]
-                        + q.second[1][0] * lower_factor[k] * upper_factor[l]
-                        + q.second[1][1] * lower_factor[k] * lower_factor[l];
-                    block_factor *= wi;
-                    if block_factor == 0.0 {
-                        continue;
+
+                    let q = endpoint_q[i];
+                    lower_factor[0] = response_lower_basis[0];
+                    upper_factor[0] = response_upper_basis[0];
+                    for k in 1..p_resp {
+                        lower_factor[k] = 2.0 * response_lower_basis[k] * gamma[k];
+                        upper_factor[k] = 2.0 * response_upper_basis[k] * gamma[k];
                     }
-                    for c in 0..p_cov {
-                        let row_idx = k * p_cov + c;
-                        let left = block_factor * cov_row[c];
-                        for d in 0..p_cov {
-                            hessian[[row_idx, l * p_cov + d]] += left * cov_row[d];
+
+                    second_diag.fill(0.0);
+                    dh_factor[0] = rv[0];
+                    dhp_factor[0] = rd[0];
+                    for k in 1..p_resp {
+                        dh_factor[k] = 2.0 * rv[k] * gamma[k];
+                        dhp_factor[k] = 2.0 * rd[k] * gamma[k];
+                        second_diag[k] = 2.0 * (hi * rv[k] - rd[k] * inv_hp);
+                    }
+
+                    for k in 0..p_resp {
+                        let normalizer_score_factor =
+                            q.first[0] * upper_factor[k] + q.first[1] * lower_factor[k];
+                        let score_factor = wi
+                            * (-hi * dh_factor[k] + dhp_factor[k] * inv_hp
+                                - normalizer_score_factor);
+                        for c in 0..p_cov {
+                            acc.gradient[k * p_cov + c] += score_factor * cov_row[c];
+                        }
+                    }
+
+                    for k in 0..p_resp {
+                        for l in 0..p_resp {
+                            let mut block_factor = dh_factor[k] * dh_factor[l]
+                                + dhp_factor[k] * dhp_factor[l] * inv_hp_sq;
+                            if k == l {
+                                block_factor += second_diag[k];
+                            }
+                            let upper_ab = if k == l && k > 0 {
+                                2.0 * response_upper_basis[k]
+                            } else {
+                                0.0
+                            };
+                            let lower_ab = if k == l && k > 0 {
+                                2.0 * response_lower_basis[k]
+                            } else {
+                                0.0
+                            };
+                            block_factor += q.first[0] * upper_ab
+                                + q.first[1] * lower_ab
+                                + q.second[0][0] * upper_factor[k] * upper_factor[l]
+                                + q.second[0][1] * upper_factor[k] * lower_factor[l]
+                                + q.second[1][0] * lower_factor[k] * upper_factor[l]
+                                + q.second[1][1] * lower_factor[k] * lower_factor[l];
+                            block_factor *= wi;
+                            if block_factor == 0.0 {
+                                continue;
+                            }
+                            for c in 0..p_cov {
+                                let row_idx = k * p_cov + c;
+                                let left = block_factor * cov_row[c];
+                                for d in 0..p_cov {
+                                    acc.hessian[[row_idx, l * p_cov + d]] += left * cov_row[d];
+                                }
+                            }
                         }
                     }
                 }
-            }
+
+                acc
+            })
+            .collect();
+
+        let mut gradient = Array1::<f64>::zeros(p_total);
+        let mut hessian = Array2::<f64>::zeros((p_total, p_total));
+        for partial in partials {
+            gradient.scaled_add(1.0, &partial.gradient);
+            hessian.scaled_add(1.0, &partial.hessian);
         }
 
         Ok((gradient, hessian))
