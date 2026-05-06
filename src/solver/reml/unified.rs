@@ -10424,17 +10424,12 @@ impl StochasticTraceEstimator {
         let mut x_vec = Array1::<f64>::zeros(n_obs);
         let mut y_vec = Array1::<f64>::zeros(n_obs);
         let mut x_r: Vec<Array1<f64>> = (0..total).map(|_| Array1::zeros(n_obs)).collect();
-        let mut implicit_dx_u: Vec<Array1<f64>> =
-            (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
-        let mut implicit_w_dx_u: Vec<Array1<f64>> =
-            (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
-        let mut implicit_w_y: Vec<Array1<f64>> = (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
-        let mut implicit_dx_r: Vec<Vec<Array1<f64>>> = (0..n_ops)
-            .map(|_| (0..total).map(|_| Array1::zeros(n_obs)).collect())
-            .collect();
-        let mut implicit_u_s: Vec<Array1<f64>> = (0..n_ops).map(|_| Array1::zeros(p)).collect();
-        let mut implicit_n_work = Array1::<f64>::zeros(n_obs);
-        let mut implicit_p_work = Array1::<f64>::zeros(p);
+
+        struct ImplicitSecondOrderScratch {
+            w_dx_u: Array1<f64>,
+            w_y: Array1<f64>,
+            u_s: Array1<f64>,
+        }
 
         self.estimate_matrix_from_probe_batch(hop, total, |z, probe_values| {
             // Step 1: u = H⁻¹ z (shared solve)
@@ -10444,21 +10439,33 @@ impl StochasticTraceEstimator {
                 design_matrix_apply_view_into(x.as_ref(), z.view(), x_vec.view_mut());
             }
 
-            // Step 2: Form q_e = A_e z for all axes e.
-            // For dense: q_e = dense_matrix * z
-            // For implicit: q_e = op.matvec_with_shared_xz(&x_vec, &z)
-            for e in 0..n_dense {
-                dense_matvec_into(dense_matrices[e], z.view(), q_columns.column_mut(e));
-            }
-            for (oi, op) in implicit_ops.iter().enumerate() {
-                let e = n_dense + oi;
-                op.matvec_with_shared_xz_into(
-                    &x_vec,
-                    z.view(),
-                    q_columns.column_mut(e),
-                    implicit_n_work.view_mut(),
-                    implicit_p_work.view_mut(),
-                );
+            // Step 2: Form q_e = A_e z for all axes e. Each operator column is
+            // independent, so fill the destination columns in parallel while
+            // keeping only per-worker implicit matvec scratch.
+            {
+                use ndarray::Axis;
+                use ndarray::parallel::prelude::*;
+
+                q_columns
+                    .axis_iter_mut(Axis(1))
+                    .into_par_iter()
+                    .enumerate()
+                    .for_each(|(e, q_col)| {
+                        if e < n_dense {
+                            dense_matvec_into(dense_matrices[e], z.view(), q_col);
+                        } else {
+                            let op = implicit_ops[e - n_dense];
+                            let mut n_work = Array1::<f64>::zeros(n_obs);
+                            let mut p_work = Array1::<f64>::zeros(p);
+                            op.matvec_with_shared_xz_into(
+                                &x_vec,
+                                z.view(),
+                                q_col,
+                                n_work.view_mut(),
+                                p_work.view_mut(),
+                            );
+                        }
+                    });
             }
 
             // Step 3: R = H⁻¹ [q_1, ..., q_D] (block solve, total RHS)
@@ -10466,7 +10473,7 @@ impl StochasticTraceEstimator {
 
             // Step 4: Compute T[d, e] = u^T A_d r_e for all (d, e) pairs.
             // For dense A_d: T[d, e] = (A_d^T u)^T r_e = (A_d u)^T r_e (A_d symmetric)
-            // For implicit A_d: use bilinear_with_shared_x or direct bilinear.
+            // For implicit A_d: use shared X multiplies and bounded per-pair scratch.
 
             // Precompute X u and X r_e for implicit operators.
             if let Some(ref x) = x_design {
@@ -10478,117 +10485,101 @@ impl StochasticTraceEstimator {
                 dense_matvec_into(dense_matrices[d], u.view(), dense_a_u[d].view_mut());
             }
 
-            // Precompute X r_e for all axes e (for implicit operators).
+            // Precompute X r_e for all axes e (for implicit operators). These
+            // columns are independent and reused by every implicit row.
             if let Some(ref x) = x_design {
-                for (e, x_r_e) in x_r.iter_mut().enumerate() {
+                use rayon::prelude::*;
+                x_r.par_iter_mut().enumerate().for_each(|(e, x_r_e)| {
                     design_matrix_apply_view_into(x.as_ref(), r.column(e), x_r_e.view_mut());
-                }
+                });
             }
 
-            // Precompute (∂X/∂ψ_d) u for each implicit axis (reused across all e).
-            for (idx, op) in implicit_ops.iter().enumerate() {
-                implicit_dx_u[idx].assign(
-                    &op.implicit_deriv.forward_mul(op.axis, &u.view()).expect(
-                        "radial scalar evaluation failed during implicit derivative forward_mul",
-                    ),
-                );
-                let w = &*op.w_diag;
-                for i in 0..w.len() {
-                    implicit_w_dx_u[idx][i] = w[i] * implicit_dx_u[idx][i];
-                    implicit_w_y[idx][i] = w[i] * y_vec[i];
-                }
-                for e in 0..total {
-                    implicit_dx_r[idx][e].assign(
-                        &op.implicit_deriv.forward_mul(op.axis, &r.column(e)).expect(
-                            "radial scalar evaluation failed during implicit derivative forward_mul",
-                        ),
-                    );
-                }
-            }
-
-            // Precompute u^T S_psi for each implicit axis (for penalty dot products).
-            for (idx, op) in implicit_ops.iter().enumerate() {
-                dense_transpose_matvec_into(&op.s_psi, u.view(), implicit_u_s[idx].view_mut());
-            }
-
-            for d in 0..total {
-                for e in d..total {
-                    let r_e = r.column(e);
-
-                    let val = if d < n_dense {
-                        // Dense A_d: u^T A_d r_e = (A_d u)^T r_e
-                        dense_a_u[d].dot(&r_e)
-                    } else {
-                        // Implicit A_d: compute u^T A_d r_e using shared X multiplies.
-                        // u^T A_d r_e = ((∂X/∂ψ_d)u)^T (W X r_e) + (Xu)^T (W (∂X/∂ψ_d) r_e)
-                        //             + u^T S_psi r_e
-                        let oi = d - n_dense;
-                        let x_re = &x_r[e];
-
-                        let w_dx_u = &implicit_w_dx_u[oi];
-                        let w_y = &implicit_w_y[oi];
-                        let dx_re = &implicit_dx_r[oi][e];
-
-                        let mut design_val = 0.0f64;
-                        for i in 0..w_dx_u.len() {
-                            design_val += w_dx_u[i] * x_re[i];
-                            design_val += w_y[i] * dx_re[i];
+            // Precompute row-wise implicit quantities that are reused across all
+            // columns. Deliberately do not materialize (∂X/∂ψ_d) r_e for every
+            // d×e pair; those n_obs-sized vectors are built inside the pair task
+            // below, which bounds scratch by the number of active rayon workers
+            // rather than n_ops * total.
+            let implicit_scratch: Vec<ImplicitSecondOrderScratch> = {
+                use rayon::iter::{IntoParallelIterator, ParallelIterator};
+                (0..n_ops)
+                    .into_par_iter()
+                    .map(|idx| {
+                        let op = implicit_ops[idx];
+                        let dx_u = op
+                            .implicit_deriv
+                            .forward_mul(op.axis, &u.view())
+                            .expect(
+                                "radial scalar evaluation failed during implicit derivative forward_mul",
+                            );
+                        let w = &*op.w_diag;
+                        let mut w_dx_u = Array1::<f64>::zeros(n_obs);
+                        let mut w_y = Array1::<f64>::zeros(n_obs);
+                        for i in 0..w.len() {
+                            w_dx_u[i] = w[i] * dx_u[i];
+                            w_y[i] = w[i] * y_vec[i];
                         }
+                        let mut u_s = Array1::<f64>::zeros(p);
+                        dense_transpose_matvec_into(&op.s_psi, u.view(), u_s.view_mut());
+                        ImplicitSecondOrderScratch { w_dx_u, w_y, u_s }
+                    })
+                    .collect()
+            };
 
-                        // Non-Gaussian fixed-β third-derivative correction:
-                        //   uᵀ Xᵀ diag(c ⊙ X_{ψ_d} β̂) X r_e
-                        //   = Σ_i y_vec[i] · c_x_psi_beta_i · x_re[i]
-                        if let Some(c_x_psi_beta) = implicit_ops[oi].c_x_psi_beta.as_ref() {
-                            let c = c_x_psi_beta.as_ref();
-                            for i in 0..w_dx_u.len() {
-                                design_val += y_vec[i] * c[i] * x_re[i];
-                            }
-                        }
-
-                        // Penalty: u^T S_psi r_e = (S_psi^T u)^T r_e
-                        let penalty_val = implicit_u_s[oi].dot(&r_e);
-
-                        design_val + penalty_val
-                    };
-
-                    probe_values[[d, e]] = val;
-                    if d != e {
-                        // For the symmetric entry, compute u^T A_e r_d
-                        let r_d = r.column(d);
-
-                        let val_sym = if e < n_dense {
-                            dense_a_u[e].dot(&r_d)
+            let pairs: Vec<(usize, usize)> = (0..total)
+                .flat_map(|d| (0..total).map(move |e| (d, e)))
+                .collect();
+            let pair_values: Vec<(usize, usize, f64)> = {
+                use rayon::iter::{IntoParallelIterator, ParallelIterator};
+                pairs
+                    .into_par_iter()
+                    .map(|(d, e)| {
+                        let r_e = r.column(e);
+                        let val = if d < n_dense {
+                            // Dense A_d: u^T A_d r_e = (A_d u)^T r_e
+                            dense_a_u[d].dot(&r_e)
                         } else {
-                            let oi = e - n_dense;
-                            let x_rd = &x_r[d];
-
-                            let w_dx_u = &implicit_w_dx_u[oi];
-                            let w_y = &implicit_w_y[oi];
-                            let dx_rd = &implicit_dx_r[oi][d];
+                            // Implicit A_d: compute u^T A_d r_e using shared X multiplies.
+                            // u^T A_d r_e = ((∂X/∂ψ_d)u)^T (W X r_e)
+                            //             + (Xu)^T (W (∂X/∂ψ_d) r_e)
+                            //             + u^T S_psi r_e
+                            let oi = d - n_dense;
+                            let op = implicit_ops[oi];
+                            let scratch = &implicit_scratch[oi];
+                            let x_re = &x_r[e];
+                            let dx_re = op
+                                .implicit_deriv
+                                .forward_mul(op.axis, &r_e)
+                                .expect(
+                                    "radial scalar evaluation failed during implicit derivative forward_mul",
+                                );
 
                             let mut design_val = 0.0f64;
-                            for i in 0..w_dx_u.len() {
-                                design_val += w_dx_u[i] * x_rd[i];
-                                design_val += w_y[i] * dx_rd[i];
+                            for i in 0..scratch.w_dx_u.len() {
+                                design_val += scratch.w_dx_u[i] * x_re[i];
+                                design_val += scratch.w_y[i] * dx_re[i];
                             }
 
                             // Non-Gaussian fixed-β third-derivative correction:
-                            //   uᵀ Xᵀ diag(c ⊙ X_{ψ_e} β̂) X r_d
-                            //   = Σ_i y_vec[i] · c_x_psi_beta_i · x_rd[i]
-                            if let Some(c_x_psi_beta) = implicit_ops[oi].c_x_psi_beta.as_ref() {
+                            //   uᵀ Xᵀ diag(c ⊙ X_{ψ_d} β̂) X r_e
+                            //   = Σ_i y_vec[i] · c_x_psi_beta_i · x_re[i]
+                            if let Some(c_x_psi_beta) = op.c_x_psi_beta.as_ref() {
                                 let c = c_x_psi_beta.as_ref();
-                                for i in 0..w_dx_u.len() {
-                                    design_val += y_vec[i] * c[i] * x_rd[i];
+                                for i in 0..scratch.w_dx_u.len() {
+                                    design_val += y_vec[i] * c[i] * x_re[i];
                                 }
                             }
 
-                            let penalty_val = implicit_u_s[oi].dot(&r_d);
+                            // Penalty: u^T S_psi r_e = (S_psi^T u)^T r_e
+                            let penalty_val = scratch.u_s.dot(&r_e);
                             design_val + penalty_val
                         };
+                        (d, e, val)
+                    })
+                    .collect()
+            };
 
-                        probe_values[[e, d]] = val_sym;
-                    }
-                }
+            for (d, e, val) in pair_values {
+                probe_values[[d, e]] = val;
             }
         })
     }
