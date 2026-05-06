@@ -7024,84 +7024,149 @@ fn build_matern_operator_penalty_aniso_derivatives(
     }
     let metric_weights = centered_aniso_metric_weights(eta);
 
-    for k in 0..p {
-        for j in 0..p {
+    struct CenterRowAccumulator {
+        k: usize,
+        d0: Array1<f64>,
+        d1: Array2<f64>,
+        d2: Array2<f64>,
+        d0_eta: Vec<Array1<f64>>,
+        d1_eta: Vec<Array2<f64>>,
+        d2_eta: Vec<Array2<f64>>,
+        d0_eta2: Vec<Array1<f64>>,
+        d1_eta2: Vec<Array2<f64>>,
+        d2_eta2: Vec<Array2<f64>>,
+    }
+
+    let row_accumulators: Vec<CenterRowAccumulator> = (0..p)
+        .into_par_iter()
+        .map(|k| -> Result<CenterRowAccumulator, BasisError> {
             let ci: Vec<f64> = (0..d).map(|a| centers[[k, a]]).collect();
-            let cj: Vec<f64> = (0..d).map(|a| centers[[j, a]]).collect();
-            let (r, s_vec) = aniso_distance_and_components(&ci, &cj, eta);
+            let mut d0 = Array1::<f64>::zeros(p);
+            let mut d1 = Array2::<f64>::zeros((d, p));
+            let mut d2 = Array2::<f64>::zeros((d * d, p));
+            let mut d0_eta: Vec<Array1<f64>> = (0..dim).map(|_| Array1::zeros(p)).collect();
+            let mut d1_eta: Vec<Array2<f64>> = (0..dim).map(|_| Array2::zeros((d, p))).collect();
+            let mut d2_eta: Vec<Array2<f64>> =
+                (0..dim).map(|_| Array2::zeros((d * d, p))).collect();
+            let mut d0_eta2: Vec<Array1<f64>> = (0..dim).map(|_| Array1::zeros(p)).collect();
+            let mut d1_eta2: Vec<Array2<f64>> = (0..dim).map(|_| Array2::zeros((d, p))).collect();
+            let mut d2_eta2: Vec<Array2<f64>> =
+                (0..dim).map(|_| Array2::zeros((d * d, p))).collect();
 
-            let (phi, q, t, dt_dr, d2t_dr2) =
-                matern_aniso_extended_radial_scalars(r, length_scale, nu)?;
+            for j in 0..p {
+                let cj: Vec<f64> = (0..d).map(|a| centers[[j, a]]).collect();
+                let (r, s_vec) = aniso_distance_and_components(&ci, &cj, eta);
 
-            // --- D₀ ---
-            d0_raw[[k, j]] = phi;
+                let (phi, q, t, dt_dr, d2t_dr2) =
+                    matern_aniso_extended_radial_scalars(r, length_scale, nu)?;
 
-            // --- D₁ (gradient) ---
-            for axis in 0..d {
-                let h_b = ci[axis] - cj[axis];
-                let w_b = metric_weights[axis];
-                let row = k * d + axis;
-                d1_raw[[row, j]] = q * w_b * h_b;
-            }
+                // --- D₀ ---
+                d0[j] = phi;
 
-            // --- D₂ (full Hessian, row layout point × axis × axis) ---
-            for b in 0..d {
-                let h_b = ci[b] - cj[b];
-                let w_b = metric_weights[b];
-                for c in 0..d {
-                    let h_c = ci[c] - cj[c];
-                    let w_c = metric_weights[c];
-                    let row = (k * d + b) * d + c;
-                    d2_raw[[row, j]] = hessian_operator_entry(q, t, h_b, h_c, w_b, w_c, b, c);
-                }
-            }
-
-            // --- Per-axis η_a derivatives ---
-            for a in 0..dim {
-                let s_a = s_vec[a];
-
-                // ∂D₀/∂η_a = q · s_a
-                d0_raw_eta[a][[k, j]] = q * s_a;
-                // ∂²D₀/∂η_a² = t · s_a² + 2q · s_a
-                d0_raw_eta2[a][[k, j]] = t * s_a * s_a + 2.0 * q * s_a;
-
-                // ∂D₁/∂η_a: for each axis b, ∂(q · h_b)/∂η_a = (dq/dη_a) · h_b = t · s_a · h_b
-                for b in 0..d {
-                    let h_b = ci[b] - cj[b];
-                    let w_b = metric_weights[b];
-                    let row = k * d + b;
-                    d1_raw_eta[a][[row, j]] = if a == b {
-                        w_b * h_b * (t * s_a + 2.0 * q)
-                    } else {
-                        w_b * h_b * t * s_a
-                    };
-                    d1_raw_eta2[a][[row, j]] = if a == b && r > 1e-14 {
-                        w_b * h_b * (dt_dr * s_a * s_a / r + 6.0 * t * s_a + 4.0 * q)
-                    } else if a == b {
-                        0.0
-                    } else if r > 1e-14 {
-                        w_b * h_b * (dt_dr * s_a * s_a / r + 2.0 * t * s_a)
-                    } else {
-                        0.0
-                    };
+                // --- D₁ (gradient) ---
+                for axis in 0..d {
+                    let h_b = ci[axis] - cj[axis];
+                    let w_b = metric_weights[axis];
+                    d1[[axis, j]] = q * w_b * h_b;
                 }
 
+                // --- D₂ (full Hessian, row layout point × axis × axis) ---
                 for b in 0..d {
                     let h_b = ci[b] - cj[b];
                     let w_b = metric_weights[b];
                     for c in 0..d {
                         let h_c = ci[c] - cj[c];
                         let w_c = metric_weights[c];
-                        let row = (k * d + b) * d + c;
-                        d2_raw_eta[a][[row, j]] = hessian_operator_eta_entry(
-                            q, t, dt_dr, r, s_a, h_b, h_c, w_b, w_c, a, b, c,
-                        );
-                        d2_raw_eta2[a][[row, j]] = hessian_operator_eta2_entry(
-                            q, t, dt_dr, d2t_dr2, r, s_a, h_b, h_c, w_b, w_c, a, b, c,
-                        );
+                        let row = b * d + c;
+                        d2[[row, j]] = hessian_operator_entry(q, t, h_b, h_c, w_b, w_c, b, c);
+                    }
+                }
+
+                // --- Per-axis η_a derivatives ---
+                for a in 0..dim {
+                    let s_a = s_vec[a];
+
+                    // ∂D₀/∂η_a = q · s_a
+                    d0_eta[a][j] = q * s_a;
+                    // ∂²D₀/∂η_a² = t · s_a² + 2q · s_a
+                    d0_eta2[a][j] = t * s_a * s_a + 2.0 * q * s_a;
+
+                    // ∂D₁/∂η_a: for each axis b, ∂(q · h_b)/∂η_a = (dq/dη_a) · h_b = t · s_a · h_b
+                    for b in 0..d {
+                        let h_b = ci[b] - cj[b];
+                        let w_b = metric_weights[b];
+                        d1_eta[a][[b, j]] = if a == b {
+                            w_b * h_b * (t * s_a + 2.0 * q)
+                        } else {
+                            w_b * h_b * t * s_a
+                        };
+                        d1_eta2[a][[b, j]] = if a == b && r > 1e-14 {
+                            w_b * h_b * (dt_dr * s_a * s_a / r + 6.0 * t * s_a + 4.0 * q)
+                        } else if a == b {
+                            0.0
+                        } else if r > 1e-14 {
+                            w_b * h_b * (dt_dr * s_a * s_a / r + 2.0 * t * s_a)
+                        } else {
+                            0.0
+                        };
+                    }
+
+                    for b in 0..d {
+                        let h_b = ci[b] - cj[b];
+                        let w_b = metric_weights[b];
+                        for c in 0..d {
+                            let h_c = ci[c] - cj[c];
+                            let w_c = metric_weights[c];
+                            let row = b * d + c;
+                            d2_eta[a][[row, j]] = hessian_operator_eta_entry(
+                                q, t, dt_dr, r, s_a, h_b, h_c, w_b, w_c, a, b, c,
+                            );
+                            d2_eta2[a][[row, j]] = hessian_operator_eta2_entry(
+                                q, t, dt_dr, d2t_dr2, r, s_a, h_b, h_c, w_b, w_c, a, b, c,
+                            );
+                        }
                     }
                 }
             }
+
+            Ok(CenterRowAccumulator {
+                k,
+                d0,
+                d1,
+                d2,
+                d0_eta,
+                d1_eta,
+                d2_eta,
+                d0_eta2,
+                d1_eta2,
+                d2_eta2,
+            })
+        })
+        .collect::<Result<Vec<_>, BasisError>>()?;
+
+    for row in row_accumulators {
+        let k = row.k;
+        d0_raw.row_mut(k).assign(&row.d0);
+        d1_raw.slice_mut(s![k * d..(k + 1) * d, ..]).assign(&row.d1);
+        d2_raw
+            .slice_mut(s![k * d * d..(k + 1) * d * d, ..])
+            .assign(&row.d2);
+
+        for a in 0..dim {
+            d0_raw_eta[a].row_mut(k).assign(&row.d0_eta[a]);
+            d1_raw_eta[a]
+                .slice_mut(s![k * d..(k + 1) * d, ..])
+                .assign(&row.d1_eta[a]);
+            d2_raw_eta[a]
+                .slice_mut(s![k * d * d..(k + 1) * d * d, ..])
+                .assign(&row.d2_eta[a]);
+            d0_raw_eta2[a].row_mut(k).assign(&row.d0_eta2[a]);
+            d1_raw_eta2[a]
+                .slice_mut(s![k * d..(k + 1) * d, ..])
+                .assign(&row.d1_eta2[a]);
+            d2_raw_eta2[a]
+                .slice_mut(s![k * d * d..(k + 1) * d * d, ..])
+                .assign(&row.d2_eta2[a]);
         }
     }
 
