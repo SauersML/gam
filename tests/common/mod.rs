@@ -125,7 +125,11 @@ pub fn fit_power_law(points: &[(f64, f64)]) -> Option<PowerLawFit> {
             (y - pred).powi(2)
         })
         .sum();
-    let r2 = if ss_tot > 0.0 { 1.0 - ss_res / ss_tot } else { 0.0 };
+    let r2 = if ss_tot > 0.0 {
+        1.0 - ss_res / ss_tot
+    } else {
+        0.0
+    };
     let max_abs_log_resid: f64 = logs
         .iter()
         .map(|(x, y)| (y - (log_a + alpha * x)).abs())
@@ -220,7 +224,10 @@ pub fn report_power_law_full(
             BudgetVerdict::OverBudget
         };
         let verdict_str = match verdict_enum {
-            BudgetVerdict::Fits => format!("FITS ({:.0}× headroom)", budget_y / pred.max(f64::MIN_POSITIVE)),
+            BudgetVerdict::Fits => format!(
+                "FITS ({:.0}× headroom)",
+                budget_y / pred.max(f64::MIN_POSITIVE)
+            ),
             BudgetVerdict::OverBudget => format!(
                 "OVER BUDGET by {:.0}s ({:.1} min, {:.2}× over)",
                 pred - budget_y,

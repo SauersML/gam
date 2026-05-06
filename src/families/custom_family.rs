@@ -4227,11 +4227,7 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
     /// the inner-Newton biobank-scale hot path (Bernoulli marginal-slope and
     /// survival marginal-slope) override this to write directly into the
     /// caller-owned buffer, eliminating per-PCG-iter `Array1` allocations.
-    fn hessian_matvec_into(
-        &self,
-        v: &Array1<f64>,
-        out: &mut Array1<f64>,
-    ) -> Result<bool, String> {
+    fn hessian_matvec_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<bool, String> {
         match self.hessian_matvec(v)? {
             Some(result) => {
                 if result.len() != out.len() {
@@ -5728,8 +5724,7 @@ enum JointHessianSource {
         /// At biobank scale (~6400 inner CG iters per outer iter, p~200) this
         /// removes thousands of small Vec<f64> allocations from the tightest
         /// loop. Wired from `workspace.hessian_matvec_into`.
-        apply_into:
-            Arc<dyn Fn(&Array1<f64>, &mut Array1<f64>) -> Result<(), String> + Send + Sync>,
+        apply_into: Arc<dyn Fn(&Array1<f64>, &mut Array1<f64>) -> Result<(), String> + Send + Sync>,
         diagonal: Array1<f64>,
     },
 }
@@ -7576,13 +7571,59 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 options.ridge_policy,
                 &block_constraints,
             )?;
-            if residual <= inner_tol && step_inf <= inner_tol {
+
+            // Scale-aware tolerances. The objective check was already
+            // relative (`inner_tol * (1 + |obj|)`), but the step and
+            // residual checks were absolute against the bare `inner_tol`
+            // — at biobank scale (n ≈ 320k), β iterates can keep moving
+            // by ~1e-5 per cycle along the monotonicity-feasible
+            // manifold even after the likelihood has gone flat, and the
+            // joint gradient ‖·‖_∞ is O(|obj|), not O(1). Running
+            // 50-100 cycles past objective convergence is the
+            // dominant inner-PIRLS cost at biobank scale. Switching to
+            // relative scaling (`inner_tol * (1 + ‖β‖_∞)` for steps,
+            // `inner_tol * (1 + |obj|)` for the gradient residual)
+            // exits PIRLS as soon as the optimum is statistically
+            // resolved, without loosening behavior at small n where
+            // ‖β‖_∞ ≈ 1 and |obj| ≈ 1 give tolerances within 2× of
+            // the historical absolute 1e-6.
+            let beta_inf = states
+                .iter()
+                .flat_map(|s| s.beta.iter().copied())
+                .map(f64::abs)
+                .fold(0.0_f64, f64::max);
+            let step_tol = inner_tol * (1.0 + beta_inf);
+            let objective_tol = inner_tol * (1.0 + lastobjective.abs());
+            let residual_tol = objective_tol;
+
+            // Per-cycle observability for the convergence test. Surfaces
+            // WHICH criterion is binding (proposed step, accepted step,
+            // residual, objective change) at every iteration so CI logs
+            // distinguish "Newton hasn't proposed a small step yet"
+            // (algorithm still working) from "step is small but residual
+            // won't drop below tol" (tolerance scaling problem). Without
+            // this, the only visible signal is the objective itself,
+            // which is insufficient to choose the right algorithmic
+            // remedy.
+            log::info!(
+                "[PIRLS/joint-Newton convergence] cycle {:>3} | step_inf={:.3e} (tol={:.3e}) | accepted_step_inf={:.3e} | residual={:.3e} (tol={:.3e}) | obj_change={:.3e} (tol={:.3e}) | beta_inf={:.3e}",
+                cycle,
+                step_inf,
+                step_tol,
+                accepted_step_inf,
+                residual,
+                residual_tol,
+                objective_change,
+                objective_tol,
+                beta_inf,
+            );
+
+            if residual <= residual_tol && step_inf <= step_tol {
                 converged = true;
                 break;
             }
-            let objective_tol = inner_tol * (1.0 + lastobjective.abs());
-            if accepted_step_inf <= inner_tol && objective_change <= objective_tol {
-                if residual <= inner_tol {
+            if accepted_step_inf <= step_tol && objective_change <= objective_tol {
+                if residual <= residual_tol {
                     converged = true;
                 }
                 break;
@@ -7879,7 +7920,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         lastobjective = objective;
         cycles_done = cycle + 1;
 
+        // Scale-aware tolerances — see the matching joint-Newton path
+        // above for the rationale. At biobank scale absolute step/residual
+        // tolerances against `inner_tol = 1e-6` keep this loop spinning
+        // long after the objective has gone flat.
+        let beta_inf = states
+            .iter()
+            .flat_map(|s| s.beta.iter().copied())
+            .map(f64::abs)
+            .fold(0.0_f64, f64::max);
+        let step_tol = inner_tol * (1.0 + beta_inf);
         let objective_tol = inner_tol * (1.0 + objective.abs());
+        let residual_tol = objective_tol;
         // For single-block models the blockwise iteration IS the joint
         // iteration, so block-conditional convergence implies joint
         // convergence.  The exact_newton_joint_stationarity check can
@@ -7896,13 +7948,24 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 ridge,
                 options.ridge_policy,
             )?
-            .map(|residual| residual <= inner_tol)
+            .map(|residual| residual <= residual_tol)
             .unwrap_or(true)
         } else {
             true
         };
-        if max_accepted_beta_step <= inner_tol && objective_change <= objective_tol {
-            if exact_joint_stationarity_ok || max_proposed_beta_step <= inner_tol {
+        log::info!(
+            "[PIRLS/blockwise convergence] cycle {:>3} | max_proposed_step={:.3e} (tol={:.3e}) | max_accepted_step={:.3e} | obj_change={:.3e} (tol={:.3e}) | beta_inf={:.3e} | joint_stationarity_ok={}",
+            cycle,
+            max_proposed_beta_step,
+            step_tol,
+            max_accepted_beta_step,
+            objective_change,
+            objective_tol,
+            beta_inf,
+            exact_joint_stationarity_ok,
+        );
+        if max_accepted_beta_step <= step_tol && objective_change <= objective_tol {
+            if exact_joint_stationarity_ok || max_proposed_beta_step <= step_tol {
                 converged = true;
             }
             break;
@@ -8023,7 +8086,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .filter(|(_, active)| !**active)
                 .map(|(v, _)| v.abs())
                 .fold(0.0_f64, f64::max);
-            if res_inf_free <= inner_tol {
+            // Scale-aware residual tolerance — the joint stationarity
+            // residual ‖∇ℓ − Sβ‖_∞ scales with |obj| (≈ O(n) at biobank
+            // scale), so the historical absolute `inner_tol = 1e-6` is
+            // unachievable here even at the true minimum. Same rationale
+            // as the joint-Newton convergence test above.
+            let polish_obj = -cached_eval.log_likelihood + current_penalty;
+            let polish_residual_tol = inner_tol * (1.0 + polish_obj.abs());
+            if res_inf_free <= polish_residual_tol {
                 converged = true;
                 break;
             }

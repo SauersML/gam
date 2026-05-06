@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::{fit_power_law, report_power_law_full, BudgetVerdict, PowerLawFit};
+use common::{BudgetVerdict, PowerLawFit, fit_power_law, report_power_law_full};
 
 /// Fit a clean `y = 2 · x^1.5` line and verify recovery to ~10 significant
 /// figures (log-log OLS on noiseless data is exact up to roundoff).
@@ -20,7 +20,10 @@ fn fit_recovers_clean_power_law() {
     let xs = [1.0_f64, 2.0, 4.0, 8.0, 16.0, 32.0];
     let alpha_true = 1.5_f64;
     let a_true = 2.0_f64;
-    let points: Vec<(f64, f64)> = xs.iter().map(|&x| (x, a_true * x.powf(alpha_true))).collect();
+    let points: Vec<(f64, f64)> = xs
+        .iter()
+        .map(|&x| (x, a_true * x.powf(alpha_true)))
+        .collect();
     let fit = fit_power_law(&points).expect("clean data should fit");
     assert!(
         (fit.alpha - alpha_true).abs() < 1e-10,
@@ -77,8 +80,9 @@ fn fit_rejects_degenerate_x_collapse() {
 /// enough that `report_power_law`'s refuse-to-extrapolate gate fires.
 #[test]
 fn fit_flags_outlier_in_max_log_resid() {
-    let mut points: Vec<(f64, f64)> =
-        (1..=10).map(|i| (i as f64, 2.0 * (i as f64).powf(1.5))).collect();
+    let mut points: Vec<(f64, f64)> = (1..=10)
+        .map(|i| (i as f64, 2.0 * (i as f64).powf(1.5)))
+        .collect();
     // Force one point to be 2× the truth — log-distance ln(2) ≈ 0.69.
     points[3].1 *= 2.0;
     let fit = fit_power_law(&points).expect("noisy data still fits");
@@ -94,8 +98,7 @@ fn fit_flags_outlier_in_max_log_resid() {
 #[test]
 fn fit_reports_input_length() {
     for n in 3..=8 {
-        let points: Vec<(f64, f64)> =
-            (1..=n).map(|i| (i as f64, (i as f64).powi(2))).collect();
+        let points: Vec<(f64, f64)> = (1..=n).map(|i| (i as f64, (i as f64).powi(2))).collect();
         let fit = fit_power_law(&points).expect("clean fit");
         assert_eq!(fit.n_points, n, "n_points mismatch for input of length {n}");
     }
@@ -130,7 +133,10 @@ fn report_extrapolation_verdicts_track_budget_boundary() {
     let xs = [1_000.0_f64, 5_000.0, 10_000.0, 50_000.0, 100_000.0];
     let alpha_true = 1.0_f64;
     let a_true = 0.001_f64;
-    let points: Vec<(f64, f64)> = xs.iter().map(|&x| (x, a_true * x.powf(alpha_true))).collect();
+    let points: Vec<(f64, f64)> = xs
+        .iter()
+        .map(|&x| (x, a_true * x.powf(alpha_true)))
+        .collect();
     let extrapolate = [("under", 30_000.0), ("over", 90_000.0)];
     let report = report_power_law_full("[BOUNDARY]", &points, &extrapolate, 60.0)
         .expect("clean fit should produce a report");
@@ -192,7 +198,9 @@ fn fit_recovers_random_clean_power_laws() {
     // in a full RNG dependency.
     let mut seed = 0xDEAD_BEEFu64;
     let mut next = || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((seed >> 33) as u32) as f64 / (u32::MAX as f64)
     };
     let mut max_alpha_err = 0.0_f64;
@@ -202,10 +210,16 @@ fn fit_recovers_random_clean_power_laws() {
         let alpha_true = -2.0 + 4.0 * next();
         let a_true = 1e-3 * (1e6_f64).powf(next());
         // 6 x values in [1, 1000].
-        let xs: Vec<f64> = (0..6).map(|i| 1.0 + (1000.0 - 1.0) * (i as f64 / 5.0)).collect();
-        let points: Vec<(f64, f64)> = xs.iter().map(|&x| (x, a_true * x.powf(alpha_true))).collect();
-        let fit = fit_power_law(&points)
-            .unwrap_or_else(|| panic!("clean random fit must succeed: alpha={alpha_true}, a={a_true}"));
+        let xs: Vec<f64> = (0..6)
+            .map(|i| 1.0 + (1000.0 - 1.0) * (i as f64 / 5.0))
+            .collect();
+        let points: Vec<(f64, f64)> = xs
+            .iter()
+            .map(|&x| (x, a_true * x.powf(alpha_true)))
+            .collect();
+        let fit = fit_power_law(&points).unwrap_or_else(|| {
+            panic!("clean random fit must succeed: alpha={alpha_true}, a={a_true}")
+        });
         max_alpha_err = max_alpha_err.max((fit.alpha - alpha_true).abs());
         max_a_err = max_a_err.max((fit.a - a_true).abs() / a_true.abs());
     }

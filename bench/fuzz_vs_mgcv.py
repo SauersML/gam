@@ -897,8 +897,6 @@ def _mgcv_ps_basis_dim_from_rust_internal_knots(internal_knots: int, degree: int
 def _mgcv_select_penalty(sc: typing.Any) -> bool:
     if sc.basis_type == "duchon":
         return False
-    if sc.basis_type == "tps":
-        return True
     return bool(sc.double_penalty)
 
 

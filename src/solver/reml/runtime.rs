@@ -2307,9 +2307,7 @@ impl<'a> RemlState<'a> {
                     cache_w.replace(super::IftWarmStartCache {
                         beta_original,
                         rho: ndarray::Array1::zeros(0),
-                        penalized_hessian_transformed: pr
-                            .penalized_hessian_transformed
-                            .clone(),
+                        penalized_hessian_transformed: pr.penalized_hessian_transformed.clone(),
                         qs: pr.reparam_result.qs.clone(),
                         frame_was_original,
                         lambda_s_beta_blocks,
@@ -2389,7 +2387,11 @@ impl<'a> RemlState<'a> {
         // (finite non-negative residual → Some).
         let last_residual_bits = self.last_ift_prediction_residual.load(Ordering::Relaxed);
         let r = f64::from_bits(last_residual_bits);
-        let last_residual = if r.is_finite() && r >= 0.0 { Some(r) } else { None };
+        let last_residual = if r.is_finite() && r >= 0.0 {
+            Some(r)
+        } else {
+            None
+        };
         // Early short-circuit: detect both the no-op case (every
         // |Δρ_k| below the numerical-noise floor → predictor reduces
         // to identity) AND the large-Δρ rejection case (|Δρ| exceeds
@@ -2493,8 +2495,7 @@ impl<'a> RemlState<'a> {
                     self.p,
                     factorize_start.elapsed().as_secs_f64(),
                 );
-                let arc: Arc<dyn crate::linalg::matrix::FactorizedSystem> =
-                    Arc::from(new_factor);
+                let arc: Arc<dyn crate::linalg::matrix::FactorizedSystem> = Arc::from(new_factor);
                 let mut write_guard = self.ift_cached_factor.write().unwrap();
                 // Race window: another reader may have populated the
                 // slot between our drop(read_guard) and the write lock
@@ -2539,10 +2540,7 @@ impl<'a> RemlState<'a> {
     /// throughout the runtime referencing "predict_warm_start_beta"
     /// continue to make sense).
     #[allow(dead_code)]
-    pub(crate) fn predict_warm_start_beta(
-        &self,
-        new_rho: &Array1<f64>,
-    ) -> Option<Coefficients> {
+    pub(crate) fn predict_warm_start_beta(&self, new_rho: &Array1<f64>) -> Option<Coefficients> {
         self.predict_warm_start_beta_with_source(new_rho)
             .map(|(c, _)| c)
     }
@@ -2573,9 +2571,7 @@ impl<'a> RemlState<'a> {
         // eliminating the O(p) array-comparison-against-cached-β that
         // the prior implementation needed to re-derive noop-ness here.
         // Map outcome → source enum without further work.
-        if let Some((predicted, outcome)) =
-            self.predict_warm_start_beta_ift_with_outcome(new_rho)
-        {
+        if let Some((predicted, outcome)) = self.predict_warm_start_beta_ift_with_outcome(new_rho) {
             log::debug!("[warm-start] IFT prediction accepted");
             let source = match outcome {
                 IftPredictionOutcome::Predicted => WarmStartPredictionSource::Ift,
@@ -2649,7 +2645,8 @@ impl<'a> RemlState<'a> {
             // if d_rho_norm_sq passed the prior finiteness check.
             log::info!(
                 "[TANGENT-REJECTED] reason=nonfinite_alpha step_dot_d={:.3e} d_rho_norm_sq={:.3e}",
-                step_dot_d, d_rho_norm_sq,
+                step_dot_d,
+                d_rho_norm_sq,
             );
             return Some((cur_beta, WarmStartPredictionSource::Flat));
         }
@@ -2668,7 +2665,11 @@ impl<'a> RemlState<'a> {
         // — see the comment there for the encoding rationale.
         let last_residual_bits = self.last_ift_prediction_residual.load(Ordering::Relaxed);
         let r = f64::from_bits(last_residual_bits);
-        let last_residual = if r.is_finite() && r >= 0.0 { Some(r) } else { None };
+        let last_residual = if r.is_finite() && r >= 0.0 {
+            Some(r)
+        } else {
+            None
+        };
         let alpha_cap = adaptive_tangent_alpha_cap(last_residual);
         if alpha <= 0.0 || alpha > alpha_cap {
             // Emit a structured reject marker so the bench runner can
@@ -2686,7 +2687,9 @@ impl<'a> RemlState<'a> {
             };
             log::info!(
                 "[TANGENT-REJECTED] reason={} alpha={:.3e} cap={:.3e}",
-                reason, alpha, alpha_cap,
+                reason,
+                alpha,
+                alpha_cap,
             );
             return Some((cur_beta, WarmStartPredictionSource::Flat));
         }
@@ -2707,7 +2710,8 @@ impl<'a> RemlState<'a> {
         if alpha.abs() <= TANGENT_ALPHA_NOOP_EPS {
             log::info!(
                 "[TANGENT-NOOP] reason=alpha_below_eps alpha={:.3e} eps={:.3e}",
-                alpha, TANGENT_ALPHA_NOOP_EPS,
+                alpha,
+                TANGENT_ALPHA_NOOP_EPS,
             );
             return Some((cur_beta, WarmStartPredictionSource::Flat));
         }
@@ -2722,7 +2726,8 @@ impl<'a> RemlState<'a> {
         if !predicted.iter().all(|v: &f64| v.is_finite()) {
             log::info!(
                 "[TANGENT-REJECTED] reason=non_finite_predicted alpha={:.3e} cap={:.3e}",
-                alpha, alpha_cap,
+                alpha,
+                alpha_cap,
             );
             return Some((cur_beta, WarmStartPredictionSource::Flat));
         }
@@ -2733,7 +2738,10 @@ impl<'a> RemlState<'a> {
             step_dot_d.abs(),
             d_rho_norm_sq,
         );
-        Some((Coefficients::new(predicted), WarmStartPredictionSource::TangentLine))
+        Some((
+            Coefficients::new(predicted),
+            WarmStartPredictionSource::TangentLine,
+        ))
     }
 
     pub(crate) fn setwarm_start_original_beta(&self, beta_original: Option<ArrayView1<'_, f64>>) {
@@ -3156,9 +3164,7 @@ impl<'a> RemlState<'a> {
         let predicted_warm_start = predicted_warm_start_with_source
             .as_ref()
             .map(|(c, _)| c.clone());
-        let prediction_source = predicted_warm_start_with_source
-            .as_ref()
-            .map(|(_, s)| *s);
+        let prediction_source = predicted_warm_start_with_source.as_ref().map(|(_, s)| *s);
         let pirls_result = {
             let warm_start_holder = self.warm_start_beta.read().unwrap();
             let fallback_warm_start_ref = if self.warm_start_enabled.load(Ordering::Relaxed) {
@@ -3166,9 +3172,7 @@ impl<'a> RemlState<'a> {
             } else {
                 None
             };
-            let warm_start_ref = predicted_warm_start
-                .as_ref()
-                .or(fallback_warm_start_ref);
+            let warm_start_ref = predicted_warm_start.as_ref().or(fallback_warm_start_ref);
             let mut pirls_config = self.config.as_pirls_config();
             let original_cap = pirls_config.max_iterations;
             if in_screening {
@@ -3348,10 +3352,8 @@ impl<'a> RemlState<'a> {
                         // array-comparison `was_noop` check is now
                         // redundant; the source enum is the single
                         // source of truth.
-                        let was_noop = matches!(
-                            prediction_source,
-                            Some(WarmStartPredictionSource::Flat),
-                        );
+                        let was_noop =
+                            matches!(prediction_source, Some(WarmStartPredictionSource::Flat),);
                         let converged_original = match pirls_result.coordinate_frame {
                             pirls::PirlsCoordinateFrame::OriginalSparseNative => {
                                 pirls_result.beta_transformed.as_ref().clone()
@@ -3483,10 +3485,8 @@ impl<'a> RemlState<'a> {
                     if pirls_result.final_lm_lambda.is_finite()
                         && pirls_result.final_lm_lambda > 0.0
                     {
-                        self.last_pirls_lm_lambda.store(
-                            pirls_result.final_lm_lambda.to_bits(),
-                            Ordering::Relaxed,
-                        );
+                        self.last_pirls_lm_lambda
+                            .store(pirls_result.final_lm_lambda.to_bits(), Ordering::Relaxed);
                     }
                     // Persist the accepted gain ratio so the cap
                     // schedule can adapt to inner Newton model fidelity
@@ -4059,7 +4059,10 @@ fn predict_warm_start_beta_ift_inner_with_outcome(
             max_abs_drho,
             k,
         );
-        return Some((Coefficients::new(beta_cur.clone()), IftPredictionOutcome::Noop));
+        return Some((
+            Coefficients::new(beta_cur.clone()),
+            IftPredictionOutcome::Noop,
+        ));
     }
 
     if !rhs_original.iter().all(|v| v.is_finite()) {
@@ -4156,7 +4159,10 @@ fn predict_warm_start_beta_ift_inner_with_outcome(
         rhs_in_h_basis.dot(&rhs_in_h_basis).sqrt(),
         solution_original.dot(&solution_original).sqrt(),
     );
-    Some((Coefficients::new(predicted), IftPredictionOutcome::Predicted))
+    Some((
+        Coefficients::new(predicted),
+        IftPredictionOutcome::Predicted,
+    ))
 }
 
 impl<'a> RemlState<'a> {
@@ -6876,22 +6882,16 @@ mod ift_warm_start_tests {
         let s1 = Array2::from_shape_vec(
             (p, p),
             vec![
-                2.0, 0.3, 0.0, 0.0, 0.0,
-                0.3, 2.5, 0.4, 0.0, 0.0,
-                0.0, 0.4, 1.8, 0.2, 0.0,
-                0.0, 0.0, 0.2, 1.2, 0.1,
-                0.0, 0.0, 0.0, 0.1, 1.5,
+                2.0, 0.3, 0.0, 0.0, 0.0, 0.3, 2.5, 0.4, 0.0, 0.0, 0.0, 0.4, 1.8, 0.2, 0.0, 0.0,
+                0.0, 0.2, 1.2, 0.1, 0.0, 0.0, 0.0, 0.1, 1.5,
             ],
         )
         .unwrap();
         let s2 = Array2::from_shape_vec(
             (p, p),
             vec![
-                1.1, 0.0, 0.2, 0.0, 0.1,
-                0.0, 0.9, 0.0, 0.3, 0.0,
-                0.2, 0.0, 1.4, 0.0, 0.2,
-                0.0, 0.3, 0.0, 1.7, 0.0,
-                0.1, 0.0, 0.2, 0.0, 2.1,
+                1.1, 0.0, 0.2, 0.0, 0.1, 0.0, 0.9, 0.0, 0.3, 0.0, 0.2, 0.0, 1.4, 0.0, 0.2, 0.0,
+                0.3, 0.0, 1.7, 0.0, 0.1, 0.0, 0.2, 0.0, 2.1,
             ],
         )
         .unwrap();
@@ -6928,14 +6928,9 @@ mod ift_warm_start_tests {
 
         // Small Δρ — well within the 2.0 cap.
         let new_rho = ndarray::array![0.25_f64, -0.05];
-        let predicted = predict_warm_start_beta_ift_from_cache(
-            &cache,
-            &canonical,
-            &new_rho,
-            p,
-            None,
-        )
-        .expect("IFT predictor should accept small Δρ");
+        let predicted =
+            predict_warm_start_beta_ift_from_cache(&cache, &canonical, &new_rho, p, None)
+                .expect("IFT predictor should accept small Δρ");
 
         // Check the linearized FOC residual:
         //   H_pen · (β_pred − β_cur) + Σ_k Δρ_k · e^{ρ_k} · S_k · β_cur ≈ 0
@@ -6985,22 +6980,16 @@ mod ift_warm_start_tests {
         let s1 = Array2::from_shape_vec(
             (p, p),
             vec![
-                1.0, 0.2, 0.0, 0.0, 0.0,
-                0.2, 1.5, 0.1, 0.0, 0.0,
-                0.0, 0.1, 1.3, 0.0, 0.0,
-                0.0, 0.0, 0.0, 0.0, 0.0,
-                0.0, 0.0, 0.0, 0.0, 0.0,
+                1.0, 0.2, 0.0, 0.0, 0.0, 0.2, 1.5, 0.1, 0.0, 0.0, 0.0, 0.1, 1.3, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
             ],
         )
         .unwrap();
         let s2 = Array2::from_shape_vec(
             (p, p),
             vec![
-                0.0, 0.0, 0.0, 0.0, 0.0,
-                0.0, 0.0, 0.0, 0.0, 0.0,
-                0.0, 0.0, 1.1, 0.05, 0.0,
-                0.0, 0.0, 0.05, 1.7, 0.0,
-                0.0, 0.0, 0.0, 0.0, 2.1,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.1, 0.05, 0.0, 0.0,
+                0.0, 0.05, 1.7, 0.0, 0.0, 0.0, 0.0, 0.0, 2.1,
             ],
         )
         .unwrap();
@@ -7051,14 +7040,9 @@ mod ift_warm_start_tests {
         };
 
         let new_rho = ndarray::array![0.25_f64, -0.05];
-        let predicted_inline = predict_warm_start_beta_ift_from_cache(
-            &cache_inline,
-            &canonical,
-            &new_rho,
-            p,
-            None,
-        )
-        .expect("inline-path predict");
+        let predicted_inline =
+            predict_warm_start_beta_ift_from_cache(&cache_inline, &canonical, &new_rho, p, None)
+                .expect("inline-path predict");
         let predicted_precompute = predict_warm_start_beta_ift_from_cache(
             &cache_precompute,
             &canonical,
@@ -7094,14 +7078,9 @@ mod ift_warm_start_tests {
             frame_was_original: true,
             lambda_s_beta_blocks: Some(vec![ndarray::Array1::zeros(0)]), // length 1, expected 2
         };
-        let predicted_fallback = predict_warm_start_beta_ift_from_cache(
-            &cache_wrong_len,
-            &canonical,
-            &new_rho,
-            p,
-            None,
-        )
-        .expect("wrong-length precompute should still predict via inline fallback");
+        let predicted_fallback =
+            predict_warm_start_beta_ift_from_cache(&cache_wrong_len, &canonical, &new_rho, p, None)
+                .expect("wrong-length precompute should still predict via inline fallback");
         for i in 0..p {
             let diff = (predicted_inline.0[i] - predicted_fallback.0[i]).abs();
             assert!(
@@ -7187,10 +7166,7 @@ mod ift_warm_start_tests {
         let s1 = Array2::from_shape_vec(
             (p, p),
             vec![
-                1.5, 0.2, 0.0, 0.0,
-                0.2, 1.8, 0.1, 0.0,
-                0.0, 0.1, 1.2, 0.05,
-                0.0, 0.0, 0.05, 1.4,
+                1.5, 0.2, 0.0, 0.0, 0.2, 1.8, 0.1, 0.0, 0.0, 0.1, 1.2, 0.05, 0.0, 0.0, 0.05, 1.4,
             ],
         )
         .unwrap();
@@ -7213,10 +7189,7 @@ mod ift_warm_start_tests {
         let raw = Array2::from_shape_vec(
             (p, p),
             vec![
-                1.0, 0.5, 0.0, 0.1,
-                0.0, 1.0, 0.3, 0.0,
-                0.2, 0.0, 1.0, 0.4,
-                0.0, 0.1, 0.0, 1.0,
+                1.0, 0.5, 0.0, 0.1, 0.0, 1.0, 0.3, 0.0, 0.2, 0.0, 1.0, 0.4, 0.0, 0.1, 0.0, 1.0,
             ],
         )
         .unwrap();
@@ -7260,22 +7233,12 @@ mod ift_warm_start_tests {
         };
 
         let new_rho = ndarray::array![0.3_f64];
-        let predicted_tfd = predict_warm_start_beta_ift_from_cache(
-            &cache_tfd,
-            &canonical,
-            &new_rho,
-            p,
-            None,
-        )
-        .expect("tfd predict");
-        let predicted_orig = predict_warm_start_beta_ift_from_cache(
-            &cache_orig,
-            &canonical,
-            &new_rho,
-            p,
-            None,
-        )
-        .expect("orig predict");
+        let predicted_tfd =
+            predict_warm_start_beta_ift_from_cache(&cache_tfd, &canonical, &new_rho, p, None)
+                .expect("tfd predict");
+        let predicted_orig =
+            predict_warm_start_beta_ift_from_cache(&cache_orig, &canonical, &new_rho, p, None)
+                .expect("orig predict");
 
         for i in 0..p {
             assert!(
@@ -7292,11 +7255,8 @@ mod ift_warm_start_tests {
     #[test]
     fn ift_predictor_rejects_large_drho() {
         let p = 3usize;
-        let s1 = Array2::from_shape_vec(
-            (p, p),
-            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-        )
-        .unwrap();
+        let s1 = Array2::from_shape_vec((p, p), vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+            .unwrap();
         let cp1 = dense_canonical_from_local(s1, p);
         let canonical = vec![cp1];
         let beta_cur = ndarray::array![1.0, 1.0, 1.0];
@@ -7322,13 +7282,8 @@ mod ift_warm_start_tests {
         );
         // With excellent prior quality (residual=0.005) the adaptive cap
         // expands to 4.0, so |Δρ|=3 is now ACCEPTED.
-        let predicted_good_history = predict_warm_start_beta_ift_from_cache(
-            &cache,
-            &canonical,
-            &new_rho,
-            p,
-            Some(0.005),
-        );
+        let predicted_good_history =
+            predict_warm_start_beta_ift_from_cache(&cache, &canonical, &new_rho, p, Some(0.005));
         assert!(
             predicted_good_history.is_some(),
             "predictor should accept Δρ=3 under expanded cap (good prior quality)",
@@ -7356,11 +7311,8 @@ mod ift_warm_start_tests {
         use crate::estimate::reml::IftWarmStartCache;
 
         let p = 3usize;
-        let s1 = Array2::from_shape_vec(
-            (p, p),
-            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-        )
-        .unwrap();
+        let s1 = Array2::from_shape_vec((p, p), vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+            .unwrap();
         let cp1 = dense_canonical_from_local(s1, p);
         let canonical = vec![cp1];
         let beta_cur = ndarray::array![0.5_f64, -0.3, 1.7];
@@ -7377,10 +7329,9 @@ mod ift_warm_start_tests {
         // Δρ = 1e-15 is well below IFT_WARM_START_DRHO_EPS (1e-12);
         // every component of the new ρ is essentially the cached ρ.
         let new_rho = ndarray::array![1e-15_f64];
-        let predicted = super::predict_warm_start_beta_ift_from_cache(
-            &cache, &canonical, &new_rho, p, None,
-        )
-        .expect("noop must return Some(β_cur)");
+        let predicted =
+            super::predict_warm_start_beta_ift_from_cache(&cache, &canonical, &new_rho, p, None)
+                .expect("noop must return Some(β_cur)");
         for i in 0..p {
             assert_eq!(
                 predicted.0[i], beta_cur[i],
@@ -7405,8 +7356,7 @@ mod ift_warm_start_tests {
             lambda_s_beta_blocks: None,
         };
         let new_rho = ndarray::array![0.1_f64];
-        let predicted =
-            predict_warm_start_beta_ift_from_cache(&cache, &[], &new_rho, p, None);
+        let predicted = predict_warm_start_beta_ift_from_cache(&cache, &[], &new_rho, p, None);
         assert!(predicted.is_none());
     }
 
@@ -7474,9 +7424,8 @@ mod ift_warm_start_tests {
             }
             canonical.push(dense_canonical_from_local(s, p));
         }
-        let beta_cur = ndarray::Array1::from_shape_fn(p, |i| {
-            (i as f64 * 0.1).sin() + (i as f64 * 0.05).cos()
-        });
+        let beta_cur =
+            ndarray::Array1::from_shape_fn(p, |i| (i as f64 * 0.1).sin() + (i as f64 * 0.05).cos());
         // Serial reference.
         let serial: Vec<ndarray::Array1<f64>> = canonical
             .iter()
@@ -7557,11 +7506,8 @@ mod ift_warm_start_tests {
     #[test]
     fn ift_predictor_rejects_dim_mismatches() {
         let p = 3usize;
-        let s1 = Array2::from_shape_vec(
-            (p, p),
-            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-        )
-        .unwrap();
+        let s1 = Array2::from_shape_vec((p, p), vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+            .unwrap();
         let cp1 = dense_canonical_from_local(s1, p);
         let canonical = vec![cp1];
         let beta_cur = ndarray::array![1.0_f64, 1.0, 1.0];
@@ -7569,9 +7515,7 @@ mod ift_warm_start_tests {
         let cache = super::super::IftWarmStartCache {
             beta_original: beta_cur,
             rho: rho_cur,
-            penalized_hessian_transformed: SymmetricMatrix::Dense(
-                Array2::<f64>::eye(p) * 2.0,
-            ),
+            penalized_hessian_transformed: SymmetricMatrix::Dense(Array2::<f64>::eye(p) * 2.0),
             qs: Array2::eye(p),
             frame_was_original: true,
             lambda_s_beta_blocks: None,
@@ -7591,8 +7535,7 @@ mod ift_warm_start_tests {
         );
         // beta dim mismatch: cache has p=3 β, caller passes p=4.
         assert!(
-            predict_warm_start_beta_ift_from_cache(&cache, &canonical, &new_rho, 4, None)
-                .is_none(),
+            predict_warm_start_beta_ift_from_cache(&cache, &canonical, &new_rho, 4, None).is_none(),
             "beta dim mismatch must reject",
         );
     }
