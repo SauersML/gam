@@ -14988,3 +14988,1419 @@ index 964858c4d96207ac431e433da571f14734950d18..778fe7d74df08601329590ad0aadf588
 [2026-05-06T21:04:04.842455+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
 [2026-05-06T21:04:04.844886+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
 [2026-05-06T21:04:04.844962+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:04:23.968098+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T21:04:23.970203+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:04:23.970244+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:04:25.805649+00:00] apply_result: mode=apply id=task_e_69fb93c46adc832481bd54380d57854a status=Partial applied=0 skipped=0 conflicts=1 cmd=(cd /Users/user/gam && git apply --3way /var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/.tmp1kVRZ5/patch.diff)
+stdout_tail=
+
+stderr_tail=
+Applied patch to 'src/inference/data.rs' with conflicts.
+U src/inference/data.rs
+
+patch_summary: kind=git-diff lines=577 chars=22932 cwd=/Users/user/gam ; head=
+diff --git a/src/inference/data.rs b/src/inference/data.rs
+index e0271f2f64fb1610f365e50ea9e58919f2888c40..56dfae8faf8e75db5f5ebd62b98c45010f7f38a1 100644
+--- a/src/inference/data.rs
++++ b/src/inference/data.rs
+@@ -1,28 +1,28 @@
+ use crate::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
+ use csv::{ReaderBuilder, StringRecord};
+-use ndarray::Array2;
++use ndarray::{Array2, Axis};
+ use std::collections::{HashMap, HashSet};
+ use std::path::Path;
+ 
+ // ---------------------------------------------------------------------------
+ // Public types
+ // ---------------------------------------------------------------------------
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub enum UnseenCategoryPolicy {
+     Error,
+ }
+----- PATCH BEGIN -----
+diff --git a/src/inference/data.rs b/src/inference/data.rs
+index e0271f2f64fb1610f365e50ea9e58919f2888c40..56dfae8faf8e75db5f5ebd62b98c45010f7f38a1 100644
+--- a/src/inference/data.rs
++++ b/src/inference/data.rs
+@@ -1,28 +1,28 @@
+ use crate::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
+ use csv::{ReaderBuilder, StringRecord};
+-use ndarray::Array2;
++use ndarray::{Array2, Axis};
+ use std::collections::{HashMap, HashSet};
+ use std::path::Path;
+ 
+ // ---------------------------------------------------------------------------
+ // Public types
+ // ---------------------------------------------------------------------------
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub enum UnseenCategoryPolicy {
+     Error,
+ }
+ 
+ #[derive(Clone, Debug)]
+ pub struct EncodedDataset {
+     pub headers: Vec<String>,
+     pub values: Array2<f64>,
+     pub schema: DataSchema,
+     pub column_kinds: Vec<ColumnKindTag>,
+ }
+ 
+ impl EncodedDataset {
+     pub fn column_map(&self) -> HashMap<String, usize> {
+         self.headers
+             .iter()
+             .enumerate()
+@@ -767,60 +767,179 @@ fn parse_cell_with_schema(
+                 },
+             }
+         }
+     };
+     if !val.is_finite() {
+         return Err(format!(
+             "non-finite value at row {}, column '{}'",
+             row, col_name
+         ));
+     }
+     Ok(val)
+ }
+ 
+ // Inner type used by load_delimited_with_schema; defined here to keep
+ // parse_cell_with_schema usable without forward-declaring inside the fn.
+ struct ColMeta {
+     kind: ColumnKindTag,
+     level_map: Option<HashMap<String, f64>>,
+     schema_col: SchemaColumn,
+ }
+ 
+ // ---------------------------------------------------------------------------
+ // Parquet — columnar, zero StringRecord, schema from metadata
+ // ---------------------------------------------------------------------------
+ 
++enum ParquetBatchColumn {
++    Numeric(Vec<f64>),
++    Strings(Vec<String>),
++}
++
++fn decode_parquet_batch_column(
++    col: &dyn arrow::array::Array,
++    n_rows: usize,
++    base_row: usize,
++    header: &str,
++    is_string_col: bool,
++) -> Result<ParquetBatchColumn, String> {
++    use arrow::array::{
++        Array as ArrowArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
++        Int32Array, Int64Array, LargeStringArray, StringArray, UInt8Array, UInt16Array,
++        UInt32Array, UInt64Array,
++    };
++    use arrow::datatypes::DataType;
++
++    if col.null_count() > 0 {
++        for i in 0..n_rows {
++            if col.is_null(i) {
++                return Err(format!(
++                    "null value at row {}, column '{}'",
++                    base_row + i + 1,
++                    header
++                ));
++            }
++        }
++    }
++
++    if is_string_col {
++        if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
++            return Ok(ParquetBatchColumn::Strings(
++                (0..n_rows).map(|i| arr.value(i).to_string()).collect(),
++            ));
++        }
++        if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
++            return Ok(ParquetBatchColumn::Strings(
++                (0..n_rows).map(|i| arr.value(i).to_string()).collect(),
++            ));
++        }
++
++        // Dictionary-encoded strings are not directly a StringArray. Cast only
++        // those remaining string-like arrays rather than falling back for every
++        // Utf8/LargeUtf8 column.
++        let casted = arrow::compute::cast(col, &DataType::Utf8)
++            .map_err(|e| format!("failed to cast column '{}' to string: {e}", header))?;
++        let arr = casted
++            .as_any()
++            .downcast_ref::<StringArray>()
++            .ok_or_else(|| format!("column '{}' could not be read as string after cast", header))?;
++        return Ok(ParquetBatchColumn::Strings(
++            (0..n_rows).map(|i| arr.value(i).to_string()).collect(),
++        ));
++    }
++
++    let mut values = Vec::with_capacity(n_rows);
++    match col.data_type() {
++        DataType::Float64 => {
++            let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
++            values.extend(arr.values().iter().copied());
++        }
++        DataType::Float32 => {
++            let arr = col.as_any().downcast_ref::<Float32Array>().unwrap();
++            values.extend(arr.values().iter().map(|&v| v as f64));
++        }
++        DataType::Int64 => {
++            let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
++            values.extend(arr.values().iter().map(|&v| v as f64));
++        }
++        DataType::Int32 => {
++            let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
++            values.extend(arr.values().iter().map(|&v| v as f64));
++        }
++        DataType::Int16 => {
++            let arr = col.as_any().downcast_ref::<Int16Array>().unwrap();
++            values.extend(arr.values().iter().map(|&v| v as f64));
++        }
++        DataType::Int8 => {
++            let arr = col.as_any().downcast_ref::<Int8Array>().unwrap();
++            values.extend(arr.values().iter().map(|&v| v as f64));
++        }
++        DataType::UInt64 => {
++            let arr = col.as_any().downcast_ref::<UInt64Array>().unwrap();
++            values.extend(arr.values().iter().map(|&v| v as f64));
++        }
++        DataType::UInt32 => {
++            let arr = col.as_any().downcast_ref::<UInt32Array>().unwrap();
++            values.extend(arr.values().iter().map(|&v| v as f64));
++        }
++        DataType::UInt16 => {
++            let arr = col.as_any().downcast_ref::<UInt16Array>().unwrap();
++            values.extend(arr.values().iter().map(|&v| v as f64));
++        }
++        DataType::UInt8 => {
++            let arr = col.as_any().downcast_ref::<UInt8Array>().unwrap();
++            values.extend(arr.values().iter().map(|&v| v as f64));
++        }
++        DataType::Boolean => {
++            let arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
++            values.extend((0..n_rows).map(|i| if arr.value(i) { 1.0 } else { 0.0 }));
++        }
++        other => {
++            return Err(format!(
++                "unsupported parquet column type {:?} for column '{}'",
++                other, header
++            ));
++        }
++    }
++
++    if let Some(i) = values.iter().position(|v| !v.is_finite()) {
++        return Err(format!(
++            "non-finite value at row {}, column '{}'",
++            base_row + i + 1,
++            header
++        ));
++    }
++
++    Ok(ParquetBatchColumn::Numeric(values))
++}
++
+ fn load_parquet_inferred(
+     path: &Path,
+     requested_columns: &[String],
+ ) -> Result<EncodedDataset, String> {
+-    use arrow::array::{
+-        Array as ArrowArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
+-        Int32Array, Int64Array, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+-    };
+     use arrow::datatypes::DataType;
+     use parquet::arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
++    use rayon::prelude::*;
+     use std::fs::File;
+ 
+     let t_open = std::time::Instant::now();
+     let file = File::open(path)
+         .map_err(|e| format!("failed to open parquet '{}': {e}", path.display()))?;
+     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+         .map_err(|e| format!("failed to read parquet metadata '{}': {e}", path.display()))?;
+ 
+     let full_schema = builder.schema().clone();
+     let all_headers: Vec<String> = full_schema
+         .fields()
+         .iter()
+         .map(|f| f.name().clone())
+         .collect();
+     let selected_indices = resolve_requested_columns(&all_headers, requested_columns)?;
+     let headers = projected_headers(&all_headers, &selected_indices);
+     let selected_fields = selected_indices
+         .iter()
+         .map(|&idx| full_schema.fields()[idx].clone())
+         .collect::<Vec<_>>();
+     let projection =
+         ProjectionMask::roots(builder.parquet_schema(), selected_indices.iter().copied());
+     let reader = builder
+         .with_projection(projection)
+         .build()
+@@ -831,266 +950,191 @@ fn load_parquet_inferred(
+         log::info!(
+             "[DATA-LOAD] parquet_open+meta | n_headers={} | n_proj={} | {:.1}ms",
+             all_headers.len(),
+             p,
+             open_ms
+         );
+     }
+ 
+     let t_batches = std::time::Instant::now();
+     // Collect all batches.
+     let mut col_vecs: Vec<Vec<f64>> = vec![Vec::new(); p];
+     // For string columns: accumulate raw strings to build level maps.
+     let mut string_cols: Vec<Option<Vec<String>>> = (0..p).map(|_| None).collect();
+     let mut is_string_col: Vec<bool> = vec![false; p];
+ 
+     for (j, field) in selected_fields.iter().enumerate() {
+         match field.data_type() {
+             DataType::Utf8 | DataType::LargeUtf8 | DataType::Dictionary(_, _) => {
+                 is_string_col[j] = true;
+                 string_cols[j] = Some(Vec::new());
+             }
+             _ => {}
+         }
+     }
+ 
++    let mut rows_seen = 0usize;
+     for batch_result in reader {
+         let batch =
+             batch_result.map_err(|e| format!("failed to read parquet record batch: {e}"))?;
+         let n_rows = batch.num_rows();
+ 
+-        for j in 0..p {
+-            let col = batch.column(j);
+-            if is_string_col[j] {
+-                // String/dictionary column → accumulate raw strings.
+-                let strings = string_cols[j].as_mut().unwrap();
+-                // Try to get as StringArray (handles Utf8, LargeUtf8, Dictionary).
+-                let str_arr = col.as_any().downcast_ref::<StringArray>();
+-                if let Some(arr) = str_arr {
+-                    for i in 0..n_rows {
+-                        if ArrowArray::is_null(arr, i) {
+-                            return Err(format!(
+-                                "null value at row {}, column '{}'",
+-                                col_vecs[j].len() + i + 1,
+-                                &headers[j]
+-                            ));
+-                        }
+-                        strings.push(arr.value(i).to_string());
+-                    }
+-                } else {
+-                    // Dictionary-encoded or LargeUtf8: cast to StringArray via arrow cast.
+-                    let casted = arrow::compute::cast(col, &DataType::Utf8).map_err(|e| {
+-                        format!("failed to cast column '{}' to string: {e}", &headers[j])
+-                    })?;
+-                    let arr = casted
+-                        .as_any()
+-                        .downcast_ref::<StringArray>()
+-                        .ok_or_else(|| {
+-                            format!(
+-                                "column '{}' could not be read as string after cast",
+-                                &headers[j]
+-                            )
+-                        })?;
+-                    for i in 0..n_rows {
+-                        if ArrowArray::is_null(arr, i) {
+-                            return Err(format!(
+-                                "null value at row {}, column '{}'",
+-                                col_vecs[j].len() + i + 1,
+-                                &headers[j]
+-                            ));
+-                        }
+-                        strings.push(arr.value(i).to_string());
+-                    }
+-                }
+-                // Push NaN placeholders into col_vecs; will be replaced.
+-                for _ in 0..n_rows {
+-                    col_vecs[j].push(f64::NAN);
+-                }
+-            } else {
+-                // Numeric / boolean column → parse to f64.
+-                let base_row = col_vecs[j].len();
+-                // Check for nulls.
+-                if col.null_count() > 0 {
+-                    for i in 0..n_rows {
+-                        if col.is_null(i) {
+-                            return Err(format!(
+-                                "null value at row {}, column '{}'",
+-                                base_row + i + 1,
+-                                &headers[j]
+-                            ));
+-                        }
+-                    }
+-                }
+-                match col.data_type() {
+-                    DataType::Float64 => {
+-                        let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
+-                        col_vecs[j].extend(arr.values().iter().copied());
+-                    }
+-                    DataType::Float32 => {
+-                        let arr = col.as_any().downcast_ref::<Float32Array>().unwrap();
+-                        col_vecs[j].extend(arr.values().iter().map(|&v| v as f64));
+-                    }
+-                    DataType::Int64 => {
+-                        let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+-                        col_vecs[j].extend(arr.values().iter().map(|&v| v as f64));
+-                    }
+-                    DataType::Int32 => {
+-                        let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
+-                        col_vecs[j].extend(arr.values().iter().map(|&v| v as f64));
+-                    }
+-                    DataType::Int16 => {
+-                        let arr = col.as_any().downcast_ref::<Int16Array>().unwrap();
+-                        col_vecs[j].extend(arr.values().iter().map(|&v| v as f64));
+-                    }
+-                    DataType::Int8 => {
+-                        let arr = col.as_any().downcast_ref::<Int8Array>().unwrap();
+-                        col_vecs[j].extend(arr.values().iter().map(|&v| v as f64));
+-                    }
+-                    DataType::UInt64 => {
+-                        let arr = col.as_any().downcast_ref::<UInt64Array>().unwrap();
+-                        col_vecs[j].extend(arr.values().iter().map(|&v| v as f64));
+-                    }
+-                    DataType::UInt32 => {
+-                        let arr = col.as_any().downcast_ref::<UInt32Array>().unwrap();
+-                        col_vecs[j].extend(arr.values().iter().map(|&v| v as f64));
+-                    }
+-                    DataType::UInt16 => {
+-                        let arr = col.as_any().downcast_ref::<UInt16Array>().unwrap();
+-                        col_vecs[j].extend(arr.values().iter().map(|&v| v as f64));
+-                    }
+-                    DataType::UInt8 => {
+-                        let arr = col.as_any().downcast_ref::<UInt8Array>().unwrap();
+-                        col_vecs[j].extend(arr.values().iter().map(|&v| v as f64));
+-                    }
+-                    DataType::Boolean => {
+-                        let arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
+-                        for i in 0..n_rows {
+-                            col_vecs[j].push(if arr.value(i) { 1.0 } else { 0.0 });
+-                        }
+-                    }
+-                    other => {
+-                        return Err(format!(
+-                            "unsupported parquet column type {:?} for column '{}'",
+-                            other, &headers[j]
+-                        ));
+-                    }
++        let decoded_columns: Vec<Result<ParquetBatchColumn, String>> = (0..p)
++            .into_par_iter()
++            .map(|j| {
++                decode_parquet_batch_column(
++                    batch.column(j).as_ref(),
++                    n_rows,
++                    rows_seen,
++                    &headers[j],
++                    is_string_col[j],
++                )
++            })
++            .collect();
++
++        for (j, decoded) in decoded_columns.into_iter().enumerate() {
++            match decoded? {
++                ParquetBatchColumn::Strings(mut strings) => {
++                    debug_assert!(is_string_col[j]);
++                    string_cols[j].as_mut().unwrap().append(&mut strings);
++                    let new_len = col_vecs[j].len() + n_rows;
++                    col_vecs[j].resize(new_len, f64::NAN);
+                 }
+-                // Validate finiteness for this batch.
+-                for i in base_row..col_vecs[j].len() {
+-                    if !col_vecs[j][i].is_finite() {
+-                        return Err(format!(
+-                            "non-finite value at row {}, column '{}'",
+-                            i + 1,
+-                            &headers[j]
+-                        ));
+-                    }
++                ParquetBatchColumn::Numeric(mut values) => {
++                    debug_assert!(!is_string_col[j]);
++                    col_vecs[j].append(&mut values);
+                 }
+             }
+         }
++        rows_seen += n_rows;
+     }
+ 
+     let total_rows = col_vecs[0].len();
+     let batches_ms = t_batches.elapsed().as_secs_f64() * 1000.0;
+     if batches_ms > 100.0 {
+         log::info!(
+             "[DATA-LOAD] parquet_batches_decode | n_rows={} | n_cols={} | {:.1}ms",
+             total_rows,
+             p,
+             batches_ms
+         );
+     }
+     if total_rows == 0 {
+         return Err("parquet file has no rows".to_string());
+     }
+ 
+     let t_schema = std::time::Instant::now();
+     // Build schema: infer kind from data.
+     let mut schema_cols = Vec::<SchemaColumn>::with_capacity(p);
+     let mut column_kinds = Vec::<ColumnKindTag>::with_capacity(p);
+ 
+-    for j in 0..p {
+-        if is_string_col[j] {
+-            // Categorical.
+-            let strings = string_cols[j].as_ref().unwrap();
+-            let mut level_index: HashMap<String, usize> = HashMap::new();
+-            let mut levels_vec: Vec<String> = Vec::new();
+-            for s in strings {
+-                if !level_index.contains_key(s.as_str()) {
+-                    level_index.insert(s.clone(), levels_vec.len());
+-                    levels_vec.push(s.clone());
++    let finalized_columns: Vec<(Vec<f64>, ColumnKindTag, SchemaColumn)> = col_vecs
++        .into_par_iter()
++        .zip(string_cols.into_par_iter())
++        .zip(is_string_col.into_par_iter())
++        .zip(headers.par_iter())
++        .map(|(((mut col_values, strings), is_string), header)| {
++            if is_string {
++                // Categorical. Preserve level order by scanning each column in
++                // row order; columns are independent and can be finalized in
++                // parallel without changing schema order after collection.
++                let strings = strings.expect("string column storage missing");
++                let mut level_index: HashMap<String, usize> = HashMap::new();
++                let mut levels_vec: Vec<String> = Vec::new();
++                for s in &strings {
++                    if !level_index.contains_key(s.as_str()) {
++                        level_index.insert(s.clone(), levels_vec.len());
++                        levels_vec.push(s.clone());
++                    }
+                 }
+-            }
+-            // Encode into col_vecs.
+-            for (i, s) in strings.iter().enumerate() {
+-                col_vecs[j][i] = *level_index.get(s.as_str()).unwrap() as f64;
+-            }
+-            column_kinds.push(ColumnKindTag::Categorical);
+-            schema_cols.push(SchemaColumn {
+-                name: headers[j].clone(),
+-                kind: ColumnKindTag::Categorical,
+-                levels: levels_vec,
+-            });
+-        } else {
+-            // Numeric: check if binary.
+-            let all_binary = col_vecs[j]
+-                .iter()
+-                .all(|&v| (v - 0.0).abs() < 1e-12 || (v - 1.0).abs() < 1e-12);
+-            let kind = if all_binary {
+-                ColumnKindTag::Binary
++                for (i, s) in strings.iter().enumerate() {
++                    col_values[i] = *level_index.get(s.as_str()).unwrap() as f64;
++                }
++                (
++                    col_values,
++                    ColumnKindTag::Categorical,
++                    SchemaColumn {
++                        name: header.clone(),
++                        kind: ColumnKindTag::Categorical,
++                        levels: levels_vec,
++                    },
++                )
+             } else {
+-                ColumnKindTag::Continuous
+-            };
+-            column_kinds.push(kind);
+-            schema_cols.push(SchemaColumn {
+-                name: headers[j].clone(),
+-                kind,
+-                levels: Vec::new(),
+-            });
+-        }
++                // Numeric: check if binary.
++                let all_binary = col_values
++                    .iter()
++                    .all(|&v| (v - 0.0).abs() < 1e-12 || (v - 1.0).abs() < 1e-12);
++                let kind = if all_binary {
++                    ColumnKindTag::Binary
++                } else {
++                    ColumnKindTag::Continuous
++                };
++                (
++                    col_values,
++                    kind,
++                    SchemaColumn {
++                        name: header.clone(),
++                        kind,
++                        levels: Vec::new(),
++                    },
++                )
++            }
++        })
++        .collect();
++
++    let mut col_vecs = Vec::with_capacity(p);
++    for (col_values, kind, schema_col) in finalized_columns {
++        col_vecs.push(col_values);
++        column_kinds.push(kind);
++        schema_cols.push(schema_col);
+     }
+     let schema_ms = t_schema.elapsed().as_secs_f64() * 1000.0;
+     if schema_ms > 100.0 {
+         let n_cat = column_kinds
+             .iter()
+             .filter(|k| matches!(k, ColumnKindTag::Categorical))
+             .count();
+         log::info!(
+             "[DATA-LOAD] parquet_finalize_schema | n_cols={} | n_cat={} | {:.1}ms",
+             p,
+             n_cat,
+             schema_ms
+         );
+     }
+ 
+     let t_assemble = std::time::Instant::now();
+-    // Assemble Array2.
++    // Assemble Array2. Rows are independent; keep column order from col_vecs.
+     let mut values = Array2::<f64>::zeros((total_rows, p));
+-    for j in 0..p {
+-        for (i, &v) in col_vecs[j].iter().enumerate() {
+-            values[[i, j]] = v;
+-        }
+-    }
++    values
++        .axis_iter_mut(Axis(0))
++        .into_par_iter()
++        .enumerate()
++        .for_each(|(i, mut row)| {
++            for j in 0..p {
++                row[j] = col_vecs[j][i];
++            }
++        });
+     let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1000.0;
+     if assemble_ms > 100.0 {
+         log::info!(
+             "[DATA-LOAD] parquet_assemble_array2 | n_rows={} | n_cols={} | {:.1}ms",
+             total_rows,
+             p,
+             assemble_ms
+         );
+     }
+ 
+     Ok(EncodedDataset {
+         headers,
+         values,
+         schema: DataSchema {
+             columns: schema_cols,
+         },
+         column_kinds,
+     })
+ }
+ 
+ fn load_parquet_with_schema(
+     path: &Path,
+     schema: &DataSchema,
+     unseen_policy: UnseenCategoryPolicy,
+     requested_columns: &[String],
+
+----- PATCH END -----
+
+[2026-05-06T21:04:53.563186+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T21:04:53.565561+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:04:53.565628+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:05:03.234293+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T21:05:03.236361+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:05:03.236445+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:05:13.156504+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T21:05:13.158318+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:05:13.158382+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:05:15.507431+00:00] apply_result: mode=apply id=task_e_69fb93d1940c83249a1593092ff56aa7 status=Partial applied=1 skipped=0 conflicts=1 cmd=(cd /Users/user/gam && git apply --3way /var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/.tmpgDKwJQ/patch.diff)
+stdout_tail=
+
+stderr_tail=
+Applied patch to 'src/families/custom_family.rs' with conflicts.
+Applied patch to 'src/solver/reml/unified.rs' cleanly.
+U src/families/custom_family.rs
+
+patch_summary: kind=git-diff lines=753 chars=30096 cwd=/Users/user/gam ; head=
+diff --git a/src/families/custom_family.rs b/src/families/custom_family.rs
+index e901472ee99b0e33b9e194ac2d36bef076665274..653cdb7eafcc6fed085609b32e25f9a7ada0c605 100644
+--- a/src/families/custom_family.rs
++++ b/src/families/custom_family.rs
+@@ -8225,50 +8225,52 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
+         penalty_value,
+         cycles: cycles_done,
+         converged,
+         block_logdet_h,
+         block_logdet_s,
+         s_lambdas,
+     })
+ }
+ 
+ /// Borrowed derivative provider for joint models that wraps closures with
+ /// non-`'static` lifetimes.
+ ///
+ /// The closures borrow data from the calling stack frame (family, synced states,
+ /// specs), so we use borrowed closures with a non-`'static` lifetime.
+ /// Instead we borrow the closures a…
+----- PATCH BEGIN -----
+diff --git a/src/families/custom_family.rs b/src/families/custom_family.rs
+index e901472ee99b0e33b9e194ac2d36bef076665274..653cdb7eafcc6fed085609b32e25f9a7ada0c605 100644
+--- a/src/families/custom_family.rs
++++ b/src/families/custom_family.rs
+@@ -8225,50 +8225,52 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
+         penalty_value,
+         cycles: cycles_done,
+         converged,
+         block_logdet_h,
+         block_logdet_s,
+         s_lambdas,
+     })
+ }
+ 
+ /// Borrowed derivative provider for joint models that wraps closures with
+ /// non-`'static` lifetimes.
+ ///
+ /// The closures borrow data from the calling stack frame (family, synced states,
+ /// specs), so we use borrowed closures with a non-`'static` lifetime.
+ /// Instead we borrow the closures and implement `HessianDerivativeProvider` directly.
+ ///
+ /// # Sign convention
+ ///
+ /// The unified evaluator passes `v_k = H⁻¹(A_k β̂)` to `hessian_derivative_correction`.
+ /// By the implicit function theorem, `dβ̂/dρ_k = −v_k`. The stored `compute_dh`
+ /// expects the actual perturbation direction `δβ`, so we negate `v_k` before calling it.
+ struct BorrowedJointDerivProvider<'a> {
+     compute_dh: &'a dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+     compute_d2h:
+         Option<&'a dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>>,
++    family_outer_hessian_operator:
++        Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
+ }
+ 
+ // SAFETY: Only used synchronously within the same stack frame that creates it.
+ // The provider is constructed, boxed, passed to `unified_joint_cost_gradient`,
+ // consumed by the unified evaluator, and dropped — all within a single call to
+ // `joint_outer_evaluate`. No cross-thread sharing occurs.
+ unsafe impl Send for BorrowedJointDerivProvider<'_> {}
+ unsafe impl Sync for BorrowedJointDerivProvider<'_> {}
+ 
+ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
+     fn hessian_derivative_correction(
+         &self,
+         v_k: &Array1<f64>,
+     ) -> Result<Option<Array2<f64>>, String> {
+         Ok(self
+             .hessian_derivative_correction_result(v_k)?
+             .map(|result| result.into_operator().to_dense()))
+     }
+ 
+     fn hessian_derivative_correction_result(
+         &self,
+         v_k: &Array1<f64>,
+     ) -> Result<Option<DriftDerivResult>, String> {
+         let neg_v = -v_k;
+         (self.compute_dh)(&neg_v)
+@@ -8291,59 +8293,67 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
+         v_l: &Array1<f64>,
+         u_kl: &Array1<f64>,
+     ) -> Result<Option<DriftDerivResult>, String> {
+         let Some(d2h) = self.compute_d2h.as_ref() else {
+             return Ok(None);
+         };
+         let Some(term1) = (self.compute_dh)(u_kl)? else {
+             return Ok(None);
+         };
+         let neg_v_k = -v_k;
+         let neg_v_l = -v_l;
+         let Some(term2) = d2h(&neg_v_l, &neg_v_k)? else {
+             return Ok(None);
+         };
+         let op = crate::solver::estimate::reml::unified::CompositeHyperOperator {
+             dense: None,
+             operators: vec![term1.into_operator(), term2.into_operator()],
+             dim_hint: u_kl.len(),
+         };
+         Ok(Some(DriftDerivResult::Operator(Arc::new(op))))
+     }
+ 
+     fn has_corrections(&self) -> bool {
+         true
+     }
++
++    fn family_outer_hessian_operator(
++        &self,
++    ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
++        self.family_outer_hessian_operator.clone()
++    }
+ }
+ 
+ struct OwnedJointDerivProvider {
+     compute_dh: Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
+     compute_d2h: Arc<
+         dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>
+             + Send
+             + Sync,
+     >,
++    family_outer_hessian_operator:
++        Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
+ }
+ 
+ impl HessianDerivativeProvider for OwnedJointDerivProvider {
+     fn hessian_derivative_correction(
+         &self,
+         v_k: &Array1<f64>,
+     ) -> Result<Option<Array2<f64>>, String> {
+         Ok(self
+             .hessian_derivative_correction_result(v_k)?
+             .map(|result| result.into_operator().to_dense()))
+     }
+ 
+     fn hessian_derivative_correction_result(
+         &self,
+         v_k: &Array1<f64>,
+     ) -> Result<Option<DriftDerivResult>, String> {
+         let neg_v = -v_k;
+         (self.compute_dh)(&neg_v)
+     }
+ 
+     fn hessian_second_derivative_correction(
+         &self,
+         v_k: &Array1<f64>,
+         v_l: &Array1<f64>,
+         u_kl: &Array1<f64>,
+@@ -8367,50 +8377,56 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
+         let Some(term2) = (self.compute_d2h)(&neg_v_l, &neg_v_k)? else {
+             return Ok(None);
+         };
+         let op = crate::solver::estimate::reml::unified::CompositeHyperOperator {
+             dense: None,
+             operators: vec![term1.into_operator(), term2.into_operator()],
+             dim_hint: u_kl.len(),
+         };
+         Ok(Some(DriftDerivResult::Operator(Arc::new(op))))
+     }
+ 
+     fn has_corrections(&self) -> bool {
+         true
+     }
+ 
+     fn outer_hessian_derivative_kernel(
+         &self,
+     ) -> Option<crate::solver::estimate::reml::unified::OuterHessianDerivativeKernel> {
+         Some(
+             crate::solver::estimate::reml::unified::OuterHessianDerivativeKernel::Callback {
+                 first: Arc::clone(&self.compute_dh),
+                 second: Arc::clone(&self.compute_d2h),
+             },
+         )
+     }
++
++    fn family_outer_hessian_operator(
++        &self,
++    ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
++        self.family_outer_hessian_operator.clone()
++    }
+ }
+ 
+ /// Optional bundle of extended (ψ) hyperparameter coordinate data to attach
+ /// to an `InnerSolution` before calling the unified evaluator.
+ struct ExtCoordBundle {
+     coords: Vec<HyperCoord>,
+     ext_ext_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
+     rho_ext_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
+     drift_fn: Option<FixedDriftDerivFn>,
+ }
+ 
+ struct ScaledHyperOperator {
+     inner: Arc<dyn HyperOperator>,
+     scale: f64,
+ }
+ 
+ impl HyperOperator for ScaledHyperOperator {
+     fn dim(&self) -> usize {
+         self.inner.dim()
+     }
+ 
+     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+         self.inner.mul_vec(v).mapv(|value| self.scale * value)
+     }
+ 
+@@ -8825,69 +8841,74 @@ fn joint_outer_evaluate(
+     ranges: &[(usize, usize)],
+     total: usize,
+     ridge: f64,
+     moderidge: f64,
+     extra_logdet_ridge: f64,
+     rho_curvature_scale: f64,
+     hessian_logdet_correction: f64,
+     include_logdet_h: bool,
+     include_logdet_s: bool,
+     strict_spd: bool,
+     eval_mode: EvalMode,
+     options: &BlockwiseFitOptions,
+     pseudo_logdet_mode: PseudoLogdetMode,
+     compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+     compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+     owned_compute_dh: Option<
+         Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
+     >,
+     owned_compute_d2h: Option<
+         Arc<
+             dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>
+                 + Send
+                 + Sync,
+         >,
+     >,
++    family_outer_hessian_operator: Option<
++        Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
++    >,
+     ext_bundle: Option<ExtCoordBundle>,
+ ) -> Result<OuterObjectiveEvalResult, String> {
+     let joint_trace_diagonal_ridge = moderidge + if !strict_spd { extra_logdet_ridge } else { 0.0 };
+     let scaled_joint_trace_diagonal_ridge = rho_curvature_scale * joint_trace_diagonal_ridge;
+ 
+     // Build derivative provider from the caller-supplied closures.
+     let provider_box: Box<dyn HessianDerivativeProvider + '_> =
+         if let (Some(owned_dh), Some(owned_d2h)) = (owned_compute_dh, owned_compute_d2h) {
+             Box::new(OwnedJointDerivProvider {
+                 compute_dh: owned_dh,
+                 compute_d2h: owned_d2h,
++                family_outer_hessian_operator: family_outer_hessian_operator.clone(),
+             })
+         } else {
+             let compute_d2h_ref: Option<
+                 &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+             > = Some(compute_d2h);
+             Box::new(BorrowedJointDerivProvider {
+                 compute_dh,
+                 compute_d2h: compute_d2h_ref,
++                family_outer_hessian_operator: family_outer_hessian_operator.clone(),
+             })
+         };
+ 
+     let scaled_s_lambdas: Vec<Array2<f64>> = inner
+         .s_lambdas
+         .iter()
+         .map(|matrix| {
+             if rho_curvature_scale == 1.0 {
+                 matrix.clone()
+             } else {
+                 matrix.mapv(|value| rho_curvature_scale * value)
+             }
+         })
+         .collect();
+ 
+     let hessian_op: Arc<dyn crate::solver::estimate::reml::unified::HessianOperator> =
+         if use_joint_matrix_free_path(total, joint_observation_count(&inner.block_states)) {
+             let ranges_vec = ranges.to_vec();
+             let s_lambdas = Arc::new(scaled_s_lambdas.clone());
+             let trace_diagonal_ridge = scaled_joint_trace_diagonal_ridge
+                 + rho_curvature_scale * JOINT_TRACE_STABILITY_RIDGE;
+             match h_joint_unpen {
+                 JointHessianSource::Dense(h_joint) => {
+                     let h_joint = Arc::new(h_joint);
+                     let apply_h = Arc::clone(&h_joint);
+@@ -9063,58 +9084,60 @@ fn joint_outer_evaluate_efs(
+     strict_spd: bool,
+     options: &BlockwiseFitOptions,
+     pseudo_logdet_mode: PseudoLogdetMode,
+     compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+     compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+     owned_compute_dh: Option<
+         Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
+     >,
+     owned_compute_d2h: Option<
+         Arc<
+             dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>
+                 + Send
+                 + Sync,
+         >,
+     >,
+     ext_bundle: Option<ExtCoordBundle>,
+ ) -> Result<crate::solver::outer_strategy::EfsEval, String> {
+     let joint_trace_diagonal_ridge = moderidge + if !strict_spd { extra_logdet_ridge } else { 0.0 };
+     let scaled_joint_trace_diagonal_ridge = rho_curvature_scale * joint_trace_diagonal_ridge;
+ 
+     let provider_box: Box<dyn HessianDerivativeProvider + '_> =
+         if let (Some(owned_dh), Some(owned_d2h)) = (owned_compute_dh, owned_compute_d2h) {
+             Box::new(OwnedJointDerivProvider {
+                 compute_dh: owned_dh,
+                 compute_d2h: owned_d2h,
++                family_outer_hessian_operator: None,
+             })
+         } else {
+             let compute_d2h_ref: Option<
+                 &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+             > = Some(compute_d2h);
+             Box::new(BorrowedJointDerivProvider {
+                 compute_dh,
+                 compute_d2h: compute_d2h_ref,
++                family_outer_hessian_operator: None,
+             })
+         };
+ 
+     let scaled_s_lambdas: Vec<Array2<f64>> = inner
+         .s_lambdas
+         .iter()
+         .map(|matrix| {
+             if rho_curvature_scale == 1.0 {
+                 matrix.clone()
+             } else {
+                 matrix.mapv(|value| rho_curvature_scale * value)
+             }
+         })
+         .collect();
+ 
+     let hessian_op: Arc<dyn crate::solver::estimate::reml::unified::HessianOperator> =
+         if use_joint_matrix_free_path(total, joint_observation_count(&inner.block_states)) {
+             let ranges_vec = ranges.to_vec();
+             let s_lambdas = Arc::new(scaled_s_lambdas.clone());
+             let trace_diagonal_ridge = scaled_joint_trace_diagonal_ridge
+                 + rho_curvature_scale * JOINT_TRACE_STABILITY_RIDGE;
+             match h_joint_unpen {
+                 JointHessianSource::Dense(h_joint) => {
+                     let h_joint = Arc::new(h_joint);
+                     let apply_h = Arc::clone(&h_joint);
+@@ -10598,50 +10621,53 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
+         // Route through the unified path (joint_outer_evaluate → reml_laml_evaluate).
+         let eval_result = joint_outer_evaluate(
+             &inner,
+             specs,
+             &per_block,
+             rho_current,
+             &beta_flat,
+             h_joint_unpen,
+             &ranges,
+             total,
+             ridge,
+             moderidge,
+             extra_logdet_ridge,
+             rho_curvature_scale,
+             hessian_logdet_correction,
+             include_logdet_h,
+             include_logdet_s,
+             strict_spd,
+             eval_mode,
+             options,
+             family.pseudo_logdet_mode(),
+             &compute_dh,
+             &compute_d2h,
+             Some(owned_compute_dh),
+             Some(owned_compute_d2h),
++            (eval_mode == EvalMode::ValueGradientHessian)
++                .then(|| family.outer_hyper_hessian_operator(specs))
++                .flatten(),
+             ext_bundle,
+         )?;
+ 
+         // The unified evaluator produces gradient/Hessian of size (rho_dim + psi_dim),
+         // with ρ coordinates first and ψ coordinates appended — matching the expected
+         // output order of CustomFamilyJointHyperResult.
+         log::info!(
+             "[STAGE] cthf_internal psi_dim={} eval_mode={:?} post_unified elapsed={:.3}s",
+             psi_dim,
+             eval_mode,
+             cthf_internal_psi_branch_start.elapsed().as_secs_f64(),
+         );
+         return Ok(eval_result);
+     }
+ 
+     // ── ρ-only path (psi_dim == 0): route through unified evaluator ──
+     //
+     // Batched fast-path: if the family overrides `batched_outer_gradient_terms`
+     // and we are in `ValueAndGradient` mode, factor H once at the family level
+     // and amortize all K trace computations in a single streaming pass.
+     // The cost is still computed via the unified `ValueOnly` path; only the
+     // gradient assembly is replaced. See `BatchedOuterGradientTerms`.
+     if eval_mode == EvalMode::ValueAndGradient {
+         let beta_flat_for_batch = flatten_state_betas(&inner.block_states, specs);
+         let synced_states_for_batch = synchronized_states_from_flat_beta(
+@@ -10691,50 +10717,51 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
+                     let value_only = joint_outer_evaluate(
+                         &inner,
+                         specs,
+                         &per_block,
+                         rho_current,
+                         &beta_flat,
+                         h_joint_unpen,
+                         &ranges,
+                         total,
+                         ridge,
+                         moderidge,
+                         extra_logdet_ridge,
+                         rho_curvature_scale,
+                         hessian_logdet_correction,
+                         include_logdet_h,
+                         include_logdet_s,
+                         strict_spd,
+                         EvalMode::ValueOnly,
+                         options,
+                         family.pseudo_logdet_mode(),
+                         compute_dh.as_ref(),
+                         compute_d2h.as_ref(),
+                         None,
+                         None,
+                         None,
++                        None,
+                     )?;
+                     // Assemble the gradient via the universal three-term formula:
+                     //   grad[k] = obj_θ[k] + 0.5 * tr(H⁻¹ Ḣ_k) - 0.5 * tr(S⁺ Ṡ_k).
+                     // This matches `outer_gradient_entry` for fixed-dispersion
+                     // families. Profiled-Gaussian families (which scale the
+                     // penalty term by dp_cgrad / profiled_scale) currently fall
+                     // back to the generic path because they should not opt in
+                     // to this hook.
+                     let mut gradient = Array1::<f64>::zeros(expected);
+                     for j in 0..expected {
+                         let trace_term = if include_logdet_h {
+                             0.5 * batch.trace_h_inv_hdot[j]
+                         } else {
+                             0.0
+                         };
+                         let det_term = if include_logdet_s {
+                             0.5 * batch.trace_s_pinv_sdot[j]
+                         } else {
+                             0.0
+                         };
+                         gradient[j] = batch.objective_theta[j] + trace_term - det_term;
+                     }
+                     return Ok(OuterObjectiveEvalResult {
+                         objective: value_only.objective,
+                         gradient,
+@@ -10762,50 +10789,53 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
+         } = joint_bundle;
+         let eval_result = joint_outer_evaluate(
+             &inner,
+             specs,
+             &per_block,
+             rho_current,
+             &beta_flat,
+             h_joint_unpen,
+             &ranges,
+             total,
+             ridge,
+             moderidge,
+             extra_logdet_ridge,
+             rho_curvature_scale,
+             hessian_logdet_correction,
+             include_logdet_h,
+             include_logdet_s,
+             strict_spd,
+             eval_mode,
+             options,
+             family.pseudo_logdet_mode(),
+             compute_dh.as_ref(),
+             compute_d2h.as_ref(),
+             None,
+             None,
++            (eval_mode == EvalMode::ValueGradientHessian)
++                .then(|| family.outer_hyper_hessian_operator(specs))
++                .flatten(),
+             None, // no ext_coords when psi_dim == 0
+         )?;
+ 
+         return Ok(eval_result);
+     }
+ 
+     // Joint Hessian unavailable via either exact Newton or surrogate.
+     // The generic fallback is only mathematically defensible for single-block
+     // families — multi-block families with coupled likelihood curvature require
+     // the joint path.
+     if family.requires_joint_outer_hyper_path() {
+         return Err(
+             "outer hyper-derivative evaluation requires a joint exact path for this family"
+                 .to_string()
+                 .into(),
+         );
+     }
+ 
+     // Generic fallback: single-block only. Extract the per-block Hessian and
+     // route through joint_outer_evaluate with the single block as the "joint"
+     // system.
+     if specs.len() != 1 {
+         return Err(
+             "generic outer fallback is only valid for single-block families; multi-block families must provide a joint outer path"
+                 .to_string()
+@@ -10949,50 +10979,53 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
+ 
+     let eval_result = joint_outer_evaluate(
+         &inner,
+         specs,
+         &per_block,
+         rho_current,
+         &beta_flat,
+         JointHessianSource::Dense(h_joint_unpen),
+         &ranges,
+         total,
+         ridge,
+         moderidge,
+         extra_logdet_ridge,
+         1.0,
+         0.0,
+         include_logdet_h,
+         include_logdet_s,
+         strict_spd,
+         eval_mode,
+         options,
+         family.pseudo_logdet_mode(),
+         &compute_dh,
+         &compute_d2h,
+         None,
+         None,
++        (eval_mode == EvalMode::ValueGradientHessian)
++            .then(|| family.outer_hyper_hessian_operator(specs))
++            .flatten(),
+         None, // no ext_coords for generic single-block fallback
+     )?;
+ 
+     Ok(eval_result)
+ }
+ 
+ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync + 'static>(
+     family: &F,
+     specs: &[ParameterBlockSpec],
+     options: &BlockwiseFitOptions,
+     rho_current: &Array1<f64>,
+     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+     warm_start: Option<&CustomFamilyWarmStart>,
+     eval_mode: EvalMode,
+ ) -> Result<CustomFamilyJointHyperResult, CustomFamilyError> {
+     let penalty_counts = validate_blockspecs(specs)?;
+     let eval_result = evaluate_custom_family_hyper_internal(
+         family,
+         specs,
+         options,
+         &penalty_counts,
+         rho_current,
+         derivative_blocks,
+         warm_start.map(|w| &w.inner),
+         eval_mode,
+diff --git a/src/solver/reml/unified.rs b/src/solver/reml/unified.rs
+index 3f93c29430becb5e5f288a4902893a85d01371bd..1d6831e613f4d4e814226ec9f569cefd3418d954 100644
+--- a/src/solver/reml/unified.rs
++++ b/src/solver/reml/unified.rs
+@@ -4795,50 +4795,57 @@ pub fn reml_laml_evaluate(
+         // the historical kernel-based assembly path; CTN/survival/GAMLSS
+         // families that implement a directional θθ HVP will return Some(op)
+         // here and skip the kernel-based dispatch entirely.
+         if let Some(family_op) = effective_deriv.family_outer_hessian_operator() {
+             // Family's own exact Hv operator. Emit the same routing markers
+             // as the kernel-based path so the bench runner's outer_h
+             // aggregation captures this route too — without these the
+             // family-op count silently disappears from the verdict, and
+             // CTN/survival/GAMLSS fits look like they never built an outer
+             // Hessian at all. The "family_op" reason is distinguishable
+             // from the kernel-based reasons so the analyzer can tell which
+             // representation a particular fit actually used.
+             let n_obs = effective_deriv
+                 .scalar_glm_ingredients()
+                 .map(|ing| ing.x.nrows())
+                 .unwrap_or(solution.n_observations);
+             let p_dim = hop.dim();
+             let k_outer = k + solution.ext_coords.len();
+             log::info!(
+                 "[OUTER hessian-route] choice=operator reason=family_op \
+                  n={n_obs} p={p_dim} k={k_outer} \
+                  callback_kernel=false subspace_trace={subspace} \
+                  scale_prefers_operator=irrelevant",
+                 subspace = solution.penalty_subspace_trace.is_some(),
+             );
++            if family_op.dim() != k_outer {
++                return Err(format!(
++                    "family outer Hessian operator dimension mismatch: got {}, expected {}",
++                    family_op.dim(),
++                    k_outer
++                ));
++            }
+             let assembly_start = std::time::Instant::now();
+             let mut hessian = crate::solver::outer_strategy::HessianResult::Operator(family_op);
+             if let Some((_, _, Some(ref ph))) = prior_cost_gradient {
+                 hessian.add_rho_block_dense(ph)?;
+             }
+             log::info!(
+                 "[OUTER hessian-elapsed] choice=operator reason=family_op \
+                  n={n_obs} p={p_dim} k={k_outer} elapsed={:.3}s",
+                 assembly_start.elapsed().as_secs_f64(),
+             );
+             return Ok(RemlLamlResult {
+                 cost,
+                 gradient: Some(grad),
+                 hessian,
+             });
+         }
+         let hessian_kernel = effective_deriv.outer_hessian_derivative_kernel();
+         // Cost selects representation (operator vs dense), not capability.
+         // The (n, p, K) scale rule routes biobank-scale problems through the
+         // matrix-free Hv operator path even when the per-axis thresholds
+         // (`p >= 512` or `K >= 32`) alone do not fire.  At Matern biobank
+         // scale (n=320 000, p=101, K=6) the dense path's per-outer-eval
+         // O(K·n·p²) assembly is ≈ 2·10¹⁰ FLOPs and dominates wall-clock; the
+         // operator path absorbs it via O(n·p) HVPs.
+         //
+@@ -11590,50 +11597,158 @@ mod tests {
+             deriv_provider: Box::new(GaussianDerivatives),
+             tk_correction: 0.0,
+             tk_gradient: None,
+             firth: Some(ExactJeffreysTerm::new(firth_op)),
+             hessian_logdet_correction: 0.0,
+             penalty_subspace_trace: None,
+             rho_curvature_scale: 1.0,
+             n_observations: x.nrows(),
+             nullspace_dim: 0.0,
+             dispersion: DispersionHandling::Fixed {
+                 phi: 1.0,
+                 include_logdet_h: true,
+                 include_logdet_s: false,
+             },
+             ext_coords: Vec::new(),
+             ext_coord_pair_fn: None,
+             rho_ext_pair_fn: None,
+             fixed_drift_deriv: None,
+             barrier_config: None,
+         };
+ 
+         let result = reml_laml_evaluate(&solution, &[], EvalMode::ValueOnly, None).unwrap();
+         assert_relative_eq!(result.cost, -firth_value, epsilon = 1e-12);
+     }
+ 
++    struct FixedOuterHessianOperator {
++        matrix: Array2<f64>,
++    }
++
++    impl crate::solver::outer_strategy::OuterHessianOperator for FixedOuterHessianOperator {
++        fn dim(&self) -> usize {
++            self.matrix.nrows()
++        }
++
++        fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
++            if v.len() != self.dim() {
++                return Err(format!(
++                    "fixed test outer Hessian dimension mismatch: got {}, expected {}",
++                    v.len(),
++                    self.dim()
++                ));
++            }
++            Ok(self.matrix.dot(v))
++        }
++
++        fn is_cheap_to_materialize(&self) -> bool {
++            true
++        }
++    }
++
++    struct FamilyOperatorDerivatives {
++        op: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
++    }
++
++    impl HessianDerivativeProvider for FamilyOperatorDerivatives {
++        fn hessian_derivative_correction(
++            &self,
++            _: &Array1<f64>,
++        ) -> Result<Option<Array2<f64>>, String> {
++            panic!("family operator dispatch should not request pairwise first derivatives")
++        }
++
++        fn hessian_second_derivative_correction(
++            &self,
++            _: &Array1<f64>,
++            _: &Array1<f64>,
++            _: &Array1<f64>,
++        ) -> Result<Option<Array2<f64>>, String> {
++            panic!("family operator dispatch should not request pairwise second derivatives")
++        }
++
++        fn has_corrections(&self) -> bool {
++            false
++        }
++
++        fn family_outer_hessian_operator(
++            &self,
++        ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
++            Some(Arc::clone(&self.op))
++        }
++    }
++
++    #[test]
++    fn family_outer_hessian_operator_short_circuits_dense_pairwise_assembly() {
++        let supplied = array![[2.5]];
++        let provider_op: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator> =
++            Arc::new(FixedOuterHessianOperator {
++                matrix: supplied.clone(),
++            });
++        let solution = InnerSolution {
++            log_likelihood: 0.0,
++            penalty_quadratic: 0.4,
++            hessian_op: Arc::new(DenseSpectralOperator::from_symmetric(&array![[3.0]]).unwrap()),
++            beta: array![0.2],
++            penalty_coords: vec![PenaltyCoordinate::from_dense_root(array![[1.0]])],
++            penalty_logdet: PenaltyLogdetDerivs {
++                value: 0.0,
++                first: array![1.0],
++                second: Some(array![[0.0]]),
++            },
++            deriv_provider: Box::new(FamilyOperatorDerivatives { op: provider_op }),
++            tk_correction: 0.0,
++            tk_gradient: None,
++            firth: None,
++            hessian_logdet_correction: 0.0,
++            penalty_subspace_trace: None,
++            rho_curvature_scale: 1.0,
++            n_observations: 1,
++            nullspace_dim: 0.0,
++            dispersion: DispersionHandling::Fixed {
++                phi: 1.0,
++                include_logdet_h: true,
++                include_logdet_s: true,
++            },
++            ext_coords: Vec::new(),
++            ext_coord_pair_fn: None,
++            rho_ext_pair_fn: None,
++            fixed_drift_deriv: None,
++            barrier_config: None,
++        };
++
++        let result =
++            reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None).unwrap();
++        let crate::solver::outer_strategy::HessianResult::Operator(op) = result.hessian else {
++            panic!("expected family-supplied operator Hessian");
++        };
++        assert_eq!(op.dim(), 1);
++        let hv = op.matvec(&array![4.0]).unwrap();
++        assert_relative_eq!(hv[0], 10.0, epsilon = 1e-12);
++        let dense = op.materialize_dense().unwrap();
++        assert_relative_eq!(dense[[0, 0]], supplied[[0, 0]], epsilon = 1e-12);
++    }
++
+     struct FixedCorrectionDerivatives {
+         correction: Array2<f64>,
+     }
+ 
+     impl HessianDerivativeProvider for FixedCorrectionDerivatives {
+         fn hessian_derivative_correction(
+             &self,
+             _: &Array1<f64>,
+         ) -> Result<Option<Array2<f64>>, String> {
+             Ok(Some(self.correction.clone()))
+         }
+ 
+         fn has_corrections(&self) -> bool {
+             true
+         }
+     }
+ 
+     fn build_projected_rho_gradient_solution(rho: f64) -> InnerSolution<'static> {
+         let lambda = rho.exp();
+         let h = array![[3.0 + 4.0 * rho, 0.0], [0.0, 5.0 + lambda],];
+         let full_logdet = h[[0, 0]].ln() + h[[1, 1]].ln();
+         let projected_logdet = h[[1, 1]].ln();
+ 
+         InnerSolution {
+             log_likelihood: 0.0,
+
+----- PATCH END -----
+
+[2026-05-06T21:07:52.037363+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T21:07:52.041253+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:07:52.041344+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:08:02.320820+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T21:08:02.322994+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:08:02.323097+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:08:12.566853+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-06T21:08:12.569645+00:00] auth: mode=ChatGPT account_id=abdbf273-3413-4de3-9c3c-25bcde177adc
+[2026-05-06T21:08:12.569775+00:00] auth: set ChatGPT-Account-Id header: abdbf273-3413-4de3-9c3c-25bcde177adc
