@@ -2519,11 +2519,12 @@ impl TransformationNormalFamily {
             let inv_hp = 1.0 / hp;
             let inv_hp_sq = inv_hp * inv_hp;
             let q = row_quantities.endpoint_q[i];
+            let gamma_row = row_quantities.gamma.row(i);
 
             let mut gamma = vec![0.0; p_resp];
             let mut gamma_psi = vec![0.0; p_resp];
             for k in 0..p_resp {
-                gamma[k] = beta_mat.row(k).dot(&cov_row);
+                gamma[k] = gamma_row[k];
                 gamma_psi[k] = beta_mat.row(k).dot(&psi_row);
             }
 
@@ -2747,9 +2748,10 @@ impl TransformationNormalFamily {
             let inv_hp_sq = inv_hp * inv_hp;
             let inv_hp_cu = inv_hp_sq * inv_hp;
             let q = row_quantities.endpoint_q[i];
+            let gamma_row = row_quantities.gamma.row(i);
 
             for k in 0..p_resp {
-                gamma[k] = beta_mat.row(k).dot(&cov_row);
+                gamma[k] = gamma_row[k];
                 gamma_dir[k] = dir_mat.row(k).dot(&cov_row);
                 gamma_psi[k] = beta_mat.row(k).dot(&psi_row);
                 gamma_psi_dir[k] = dir_mat.row(k).dot(&psi_row);
