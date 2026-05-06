@@ -12328,32 +12328,43 @@ impl ExactNewtonJointPsiWorkspace for TransformationNormalPsiWorkspace {
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        let mut guard = self
-            .cache
-            .lock()
-            .map_err(|_| "TransformationNormalPsiWorkspace cache poisoned".to_string())?;
-        if guard.is_none() {
-            let computed = self.compute_all_axes()?;
-            *guard = Some(computed);
-        }
-        let cached = guard.as_ref().expect("populated above");
-        if psi_i >= cached.len() || psi_j >= cached.len() {
-            return Ok(None);
-        }
+        let (axis_i, axis_j, op_i, op_j, row_gamma, row_h, row_h_prime, endpoint_q, beta) = {
+            let mut guard = self
+                .cache
+                .lock()
+                .map_err(|_| "TransformationNormalPsiWorkspace cache poisoned".to_string())?;
+            if guard.is_none() {
+                let computed = self.compute_all_axes()?;
+                *guard = Some(computed);
+            }
+            let cached = guard.as_ref().expect("populated above");
+            if psi_i >= cached.len() || psi_j >= cached.len() {
+                return Ok(None);
+            }
+            let entry_i = &cached[psi_i];
+            let entry_j = &cached[psi_j];
+            (
+                entry_i.axis,
+                entry_j.axis,
+                Arc::clone(&entry_i.op_arc),
+                Arc::clone(&entry_j.op_arc),
+                Arc::clone(&entry_i.row_gamma),
+                Arc::clone(&entry_i.row_h),
+                Arc::clone(&entry_i.row_h_prime),
+                Arc::clone(&entry_i.endpoint_q),
+                Arc::clone(&entry_i.beta),
+            )
+        };
 
         let start = std::time::Instant::now();
-        let entry_i = &cached[psi_i];
-        let entry_j = &cached[psi_j];
-        let op = entry_i
-            .op_arc
+        let op = op_i
             .as_any()
             .downcast_ref::<TensorKroneckerPsiOperator>()
             .ok_or_else(|| {
                 "TransformationNormalPsiWorkspace ψ-ψ terms require tensor-backed operator"
                     .to_string()
             })?;
-        if entry_j
-            .op_arc
+        if op_j
             .as_any()
             .downcast_ref::<TensorKroneckerPsiOperator>()
             .is_none()
@@ -12364,17 +12375,16 @@ impl ExactNewtonJointPsiWorkspace for TransformationNormalPsiWorkspace {
             );
         }
 
-        let (objective_psi_psi, score_psi_psi, _) = self
-            .family
-            .scop_psi_psi_value_score_hvp_from_operator(
-                entry_i.beta.as_ref(),
+        let (objective_psi_psi, score_psi_psi, _) =
+            self.family.scop_psi_psi_value_score_hvp_from_operator(
+                beta.as_ref(),
                 op,
-                entry_i.axis,
-                entry_j.axis,
-                entry_i.row_gamma.view(),
-                entry_i.row_h.view(),
-                entry_i.row_h_prime.view(),
-                entry_i.endpoint_q.as_slice(),
+                axis_i,
+                axis_j,
+                row_gamma.view(),
+                row_h.view(),
+                row_h_prime.view(),
+                endpoint_q.as_slice(),
                 None,
             )?;
         if !objective_psi_psi.is_finite() || !score_psi_psi.iter().all(|v| v.is_finite()) {
@@ -12389,21 +12399,21 @@ impl ExactNewtonJointPsiWorkspace for TransformationNormalPsiWorkspace {
         let hessian_psi_psi_operator: Box<dyn HyperOperator> =
             Box::new(TransformationNormalPsiPsiHessianOperator::new(
                 Arc::new(self.family.clone()),
-                (*entry_i.beta).clone(),
-                Arc::clone(&entry_i.op_arc),
-                entry_i.axis,
-                entry_j.axis,
-                Arc::clone(&entry_i.row_gamma),
-                Arc::clone(&entry_i.row_h),
-                Arc::clone(&entry_i.row_h_prime),
-                Arc::clone(&entry_i.endpoint_q),
+                beta.as_ref().clone(),
+                Arc::clone(&op_i),
+                axis_i,
+                axis_j,
+                Arc::clone(&row_gamma),
+                Arc::clone(&row_h),
+                Arc::clone(&row_h_prime),
+                Arc::clone(&endpoint_q),
             ));
         log::info!(
             "[STAGE] CTN psi-psi workspace pair (psi_i={}, psi_j={}, axes={},{}) elapsed={:.3}s",
             psi_i,
             psi_j,
-            entry_i.axis,
-            entry_j.axis,
+            axis_i,
+            axis_j,
             start.elapsed().as_secs_f64(),
         );
         Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
