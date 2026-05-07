@@ -147,6 +147,12 @@ CTN_RESPONSE_INTERNAL_KNOTS_CAP = 32
 BIOBANK_DUCHON16D_ORDER = 0
 BIOBANK_DUCHON16D_POWER = 8
 BIOBANK_DUCHON16D_LENGTH_SCALE = 1.0
+# CTN-preflight Duchon order is named separately from the main margslope
+# Duchon order so the two can diverge when needed (the conditional-CDF
+# surface and the marginal-slope intercept surface have different geometric
+# anchoring requirements). Both default to `0` (Zero polynomial nullspace)
+# today.
+BIOBANK_DUCHON16D_CTN_ORDER = 0
 PGS_RAW_COLUMN = "pgs_raw"
 PGS_CTN_Z_COLUMN = "pgs_ctn_z"
 PGS_CTN_FIT_SUBSAMPLE_N = 5000
@@ -537,11 +543,12 @@ def _pc_std_columns(pc_count: int) -> list[str]:
     return [f"pc{i}_std" for i in range(1, int(pc_count) + 1)]
 
 
-def _biobank_duchon_pc_term(pc_count: int, centers: int) -> str:
+def _biobank_duchon_pc_term(pc_count: int, centers: int, *, order: int | None = None) -> str:
     pc_cols = ", ".join(_pc_std_columns(pc_count))
+    resolved_order = BIOBANK_DUCHON16D_ORDER if order is None else order
     return (
         f"duchon({pc_cols}, centers={centers}, "
-        f"order={BIOBANK_DUCHON16D_ORDER}, power={BIOBANK_DUCHON16D_POWER}, "
+        f"order={resolved_order}, power={BIOBANK_DUCHON16D_POWER}, "
         f"length_scale={BIOBANK_DUCHON16D_LENGTH_SCALE:g})"
     )
 
@@ -593,7 +600,10 @@ def _mgcv_pc_smooth_term(spatial_basis: str, pc_count: int, k: int) -> str:
 
 
 def _ctn_formula(pc_count: int, centers: int) -> str:
-    return f"{PGS_RAW_COLUMN} ~ {_biobank_duchon_pc_term(pc_count, centers)}"
+    return (
+        f"{PGS_RAW_COLUMN} ~ "
+        f"{_biobank_duchon_pc_term(pc_count, centers, order=BIOBANK_DUCHON16D_CTN_ORDER)}"
+    )
 
 
 def _attach_column(rows: list[dict[str, str]], column: str, values: list[float]) -> list[dict[str, Any]]:
