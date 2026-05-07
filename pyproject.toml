@@ -5,21 +5,49 @@ build-backend = "maturin"
 [project]
 name = "gam"
 version = "0.1.15"
-description = "Formula-first Python bindings for the gam Rust engine"
-readme = "README.md"
+description = "Formula-first generalized additive models with a high-performance Rust core"
+readme = "python/README.md"
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{ name = "SauersML" }]
+keywords = [
+  "gam",
+  "generalized-additive-models",
+  "regression",
+  "smoothing-splines",
+  "thin-plate-spline",
+  "reml",
+  "statistics",
+  "machine-learning",
+  "rust",
+]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Science/Research",
-  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: Microsoft :: Windows",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: Implementation :: CPython",
   "Programming Language :: Rust",
   "Topic :: Scientific/Engineering",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+  "Topic :: Scientific/Engineering :: Mathematics",
+  "Typing :: Typed",
 ]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/SauersML/gam"
+Repository = "https://github.com/SauersML/gam"
+Issues = "https://github.com/SauersML/gam/issues"
+Changelog = "https://github.com/SauersML/gam/releases"
 
 [project.optional-dependencies]
 test = [
