@@ -419,15 +419,11 @@ def validate_method_spec(spec: MethodSpec) -> None:
             raise RuntimeError(
                 f"unsupported disease backend '{spec.backend}' for '{spec.name}'"
             )
-        if spec.marginal_slope:
-            if spec.mean_linkwiggle_knots is None:
-                raise RuntimeError(
-                    f"disease marginal-slope method '{spec.name}' must set mean_linkwiggle_knots"
-                )
-            if spec.logslope_linkwiggle_knots is None:
-                raise RuntimeError(
-                    f"disease marginal-slope method '{spec.name}' must set logslope_linkwiggle_knots"
-                )
+        # Rigid (no link / score deviation) margslope methods legitimately
+        # leave both linkwiggle-knots fields unset. Downstream consumers
+        # treat `None` as "no linkwiggle term" and skip adding it to the
+        # formula. The min-knot floor (>=3) is enforced separately above
+        # for any non-None value.
         if spec.survival_likelihood is not None or spec.survival_distribution is not None:
             raise RuntimeError(
                 f"disease method '{spec.name}' cannot set survival_likelihood or survival_distribution"
