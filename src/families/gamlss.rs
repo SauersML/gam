@@ -2999,7 +2999,6 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     // (dense for small work, operator HVP for large work) instead of routing to
     // gradient-only BFGS by observation count.
 
-
     let SelectedWiggleBasis {
         knots: wiggle_knots,
         degree: wiggle_degree,
