@@ -1550,6 +1550,9 @@ pub fn build_saved_survival_marginal_slope_predictor(
         model.latent_z_normalization.ok_or_else(|| {
             "saved survival marginal-slope model missing latent_z_normalization".to_string()
         })?,
+        model.latent_measure.clone().ok_or_else(|| {
+            "saved survival marginal-slope model missing latent_measure".to_string()
+        })?,
         0.0,
         model.logslope_baseline.ok_or_else(|| {
             "saved survival marginal-slope model missing logslope_baseline".to_string()

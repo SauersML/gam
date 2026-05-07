@@ -8072,6 +8072,10 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         Ok(None)
     }
 
+    fn has_explicit_joint_hessian(&self) -> bool {
+        true
+    }
+
     fn exact_newton_joint_hessian(
         &self,
         block_states: &[ParameterBlockState],

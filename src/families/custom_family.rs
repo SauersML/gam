@@ -1187,15 +1187,17 @@ pub trait CustomFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Array2<f64>>, String> {
+        // Outer-side gate — see `outer_default_trustworthy_for_joint_hessian`
+        // for the architectural rationale.  When the gate trips, we refuse
+        // the call entirely instead of letting either of the block-diagonal
+        // defaults (`exact_newton_joint_hessian` / `_from_working_sets`) leak
+        // into outer REML trace algebra.
+        if !self.outer_default_trustworthy_for_joint_hessian(specs) {
+            return Ok(None);
+        }
         match self.exact_newton_joint_hessian(block_states)? {
             Some(hessian) => Ok(Some(hessian)),
-            None => {
-                if specs.len() <= 1 || self.likelihood_blocks_uncoupled() {
-                    exact_newton_joint_hessian_from_working_sets(self, block_states, specs)
-                } else {
-                    Ok(None)
-                }
-            }
+            None => exact_newton_joint_hessian_from_working_sets(self, block_states, specs),
         }
     }
 
@@ -1207,6 +1209,41 @@ pub trait CustomFamily {
     /// multi-block specs.
     fn likelihood_blocks_uncoupled(&self) -> bool {
         false
+    }
+
+    /// Whether the family has an explicit override of `exact_newton_joint_hessian`
+    /// (or its `_with_specs` variant) that returns the *true* coupled joint
+    /// Hessian rather than the trait's block-diagonal default.
+    ///
+    /// Default `false`.  Production families that override
+    /// `exact_newton_joint_hessian` with their analytic coupled curvature must
+    /// set this to `true` so the outer-REML path can trust the override
+    /// downstream of `exact_newton_joint_hessian_with_specs`.  The trait can't
+    /// detect override status by reflection, so this marker is the contract
+    /// signal.
+    fn has_explicit_joint_hessian(&self) -> bool {
+        false
+    }
+
+    /// Internal helper: do the outer-REML `_with_specs` defaults trust the
+    /// inner-fit's block-diagonal-from-blocks output for this family?
+    ///
+    /// Trustworthy iff:
+    /// - single-block (no cross-block coupling possible), or
+    /// - the family has declared its blocks uncoupled in the likelihood
+    ///   Hessian (`likelihood_blocks_uncoupled` ⇒ block-diagonal IS exact),
+    ///   or
+    /// - the family has an explicit joint-Hessian override
+    ///   (`has_explicit_joint_hessian` ⇒ what we receive from
+    ///   `exact_newton_joint_hessian` is the true coupled Hessian, not the
+    ///   block-diagonal default).
+    fn outer_default_trustworthy_for_joint_hessian(
+        &self,
+        specs: &[ParameterBlockSpec],
+    ) -> bool {
+        specs.len() <= 1
+            || self.likelihood_blocks_uncoupled()
+            || self.has_explicit_joint_hessian()
     }
 
     /// Optional scale-aware exact joint curvature for the outer REML calculus.
@@ -1310,6 +1347,15 @@ pub trait CustomFamily {
         specs: &[ParameterBlockSpec],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        // Same outer-side gate as `exact_newton_joint_hessian_with_specs`.
+        // The default `exact_newton_joint_hessian_directional_derivative` and
+        // `_from_working_sets` both build a block-diagonal `D_β H[u]`; for
+        // coupled multi-block families that drops the cross-block
+        // `∂²L_ab/∂β_a∂β_b · u_b` rows that drive the outer mode-response
+        // correction.  Refuse the default entirely unless trusted.
+        if !self.outer_default_trustworthy_for_joint_hessian(specs) {
+            return Ok(None);
+        }
         match self.exact_newton_joint_hessian_directional_derivative(block_states, d_beta_flat)? {
             Some(hessian) => Ok(Some(hessian)),
             None => exact_newton_joint_hessian_directional_derivative_from_working_sets(
@@ -1346,10 +1392,18 @@ pub trait CustomFamily {
     fn exact_newton_joint_hessian_second_directional_derivative_with_specs(
         &self,
         block_states: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
         d_beta_u_flat: &Array1<f64>,
         d_betav_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        // Outer-side gate (matching the Hessian and first-directional-derivative
+        // paths above).  The default delegates to
+        // `exact_newton_joint_hessiansecond_directional_derivative`, whose
+        // own default is per-block block-diagonal; for coupled multi-block
+        // families that's silently wrong for outer trace assembly.
+        if !self.outer_default_trustworthy_for_joint_hessian(specs) {
+            return Ok(None);
+        }
         self.exact_newton_joint_hessiansecond_directional_derivative(
             block_states,
             d_beta_u_flat,
