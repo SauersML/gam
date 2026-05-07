@@ -630,7 +630,22 @@ def generate_scenario(seed: int, family_filter: typing.Any=None, model_type_filt
     # both surface.
     knots = choice([3, 3, 4, 5, 7, 8, 10, 12, 15, 18, 20, 25])
     double_penalty = rng.random() < 0.5
-    noise_sd = choice([0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0])
+    # noise_sd is in units of signal_sd. With gaussian noise and additive
+    # signal, the population R² is 1 / (1 + noise_sd²). The previous grid
+    # (0.01 .. 10.0) put two of nine choices at R² < 0.05 (null / unlearnable)
+    # and four at R² > 0.94 (saturated), so most trials carried no useful
+    # discriminative information. Sample a target R² across the learnable
+    # spectrum — weak (~0.15) through very strong (~0.95) — and convert
+    # analytically. Add a small jitter so seeds don't snap to identical
+    # population R² across structures.
+    target_r2 = choice([
+        0.15, 0.20, 0.25, 0.30,        # weak — mostly noise, tests gating
+        0.40, 0.50, 0.60,              # moderate — primary regime
+        0.70, 0.80, 0.85,              # strong
+        0.90, 0.95,                    # very strong, but not saturated
+    ])
+    target_r2 = float(np.clip(target_r2 + rng.uniform(-0.04, 0.04), 0.10, 0.97))
+    noise_sd = float(np.sqrt((1.0 - target_r2) / target_r2))
     # Bias toward pathological noise distributions (cauchy / contaminated /
     # sparse_outlier / mixture / periodic_het) that exercise the IRLS
     # robustness path. Plain gaussian is still reachable but down-weighted.
@@ -850,7 +865,16 @@ def generate_data(sc: FuzzScenario) -> typing.Any:
     elif sc.family == "binomial":
         eta = eta - np.mean(eta)
         eta_sd = max(np.std(eta), 1e-8)
-        eta = eta * 2.0 / eta_sd
+        # Logit-scale signal strength. Previously hardcoded at 2.0, so every
+        # binomial trial had ~AUC 0.85 — no variation in difficulty. Drive
+        # logit_sd from the same noise_sd field used for gaussian: the
+        # logistic latent has SD π/√3, so logit_sd / (π/√3) plays the role
+        # of SNR. noise_sd ∈ [~0.18, ~2.4] maps to logit_sd ∈ [~0.75, ~10],
+        # spanning weak (AUC ≈ 0.65) through near-perfect (AUC ≈ 0.99)
+        # separability.
+        logit_sd = (np.pi / np.sqrt(3.0)) / max(float(sc.noise_sd), 1e-3)
+        logit_sd = float(np.clip(logit_sd, 0.6, 10.0))
+        eta = eta * logit_sd / eta_sd
         y = rng.binomial(1, 1 / (1 + np.exp(-eta))).astype(float)
 
     df = pd.DataFrame(X, columns=cols)
