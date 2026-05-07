@@ -265,81 +265,22 @@ pub fn build_predict_input_for_model(
                 .transformation_score_calibration
                 .as_ref()
                 .ok_or("saved transformation-normal model missing score calibration")?;
-            let d = calibration.feature_cols.len();
-            if calibration.feature_center.len() != d || calibration.feature_scale.len() != d {
-                return Err(format!(
-                    "saved transformation-normal calibration normalization mismatch: feature_cols={}, center={}, scale={}",
-                    d,
-                    calibration.feature_center.len(),
-                    calibration.feature_scale.len()
-                ));
+            calibration.validate("saved transformation-normal score calibration")?;
+
+            if resp_knots.is_empty() {
+                return Err("saved transformation-normal response knots are empty".to_string());
             }
-            for center in &calibration.rbf_centers {
-                if center.len() != d {
-                    return Err(format!(
-                        "saved transformation-normal RBF center width {} != feature width {d}",
-                        center.len()
-                    ));
-                }
+            let mut response_lower_basis = vec![0.0; p_resp];
+            let mut response_upper_basis = vec![0.0; p_resp];
+            response_lower_basis[0] = 1.0;
+            response_upper_basis[0] = 1.0;
+            for col in 0..p_shape {
+                response_upper_basis[col + 1] = resp_transform.column(col).sum();
             }
-            if !(calibration.global_sd.is_finite() && calibration.global_sd > 1.0e-12)
-                || !calibration.global_mean.is_finite()
-                || !(calibration.rbf_bandwidth.is_finite() && calibration.rbf_bandwidth > 0.0)
-            {
-                return Err(format!(
-                    "saved transformation-normal score calibration has invalid global mean/sd/bandwidth: mean={}, sd={}, bandwidth={}",
-                    calibration.global_mean, calibration.global_sd, calibration.rbf_bandwidth
-                ));
-            }
-            let p_poly = 1 + d + d * (d + 1) / 2;
-            let p_calib = p_poly + calibration.rbf_centers.len();
-            if calibration.location_beta.len() != p_calib
-                || calibration.log_scale_beta.len() != p_calib
-            {
-                return Err(format!(
-                    "saved transformation-normal calibration/design mismatch: location_beta={}, log_scale_beta={}, p_calib={p_calib}",
-                    calibration.location_beta.len(),
-                    calibration.log_scale_beta.len()
-                ));
-            }
-            let mut calib_mat = ndarray::Array2::<f64>::zeros((n, p_calib));
-            for i in 0..n {
-                calib_mat[[i, 0]] = 1.0;
-                let mut z = vec![0.0; d];
-                for (j, &col) in calibration.feature_cols.iter().enumerate() {
-                    if col >= data.ncols() {
-                        return Err(format!(
-                            "saved transformation-normal calibration feature column {col} out of range for {} columns",
-                            data.ncols()
-                        ));
-                    }
-                    z[j] = (design_input[[i, col]] - calibration.feature_center[j])
-                        / calibration.feature_scale[j];
-                    calib_mat[[i, 1 + j]] = z[j];
-                }
-                let mut col_out = 1 + d;
-                for a in 0..d {
-                    for b in a..d {
-                        calib_mat[[i, col_out]] = z[a] * z[b];
-                        col_out += 1;
-                    }
-                }
-                for (m, center) in calibration.rbf_centers.iter().enumerate() {
-                    let dist2 = (0..d)
-                        .map(|j| {
-                            let r = z[j] - center[j];
-                            r * r
-                        })
-                        .sum::<f64>();
-                    calib_mat[[i, p_poly + m]] = (-0.5 * dist2
-                        / (calibration.rbf_bandwidth * calibration.rbf_bandwidth))
-                        .exp();
-                }
-            }
-            let location_beta = ndarray::Array1::from_vec(calibration.location_beta.clone());
-            let log_scale_beta = ndarray::Array1::from_vec(calibration.log_scale_beta.clone());
-            let score_location = calib_mat.dot(&location_beta);
-            let score_log_scale = calib_mat.dot(&log_scale_beta);
+            let response_lower_floor_offset =
+                TRANSFORMATION_MONOTONICITY_EPS * (resp_knots[0] - response_median);
+            let response_upper_floor_offset = TRANSFORMATION_MONOTONICITY_EPS
+                * (resp_knots[resp_knots.len() - 1] - response_median);
 
             // Under SCOP-CTN with I-spline shape components,
             // `h'(y, x) = ε + Σ_{r≥1} M_r(y) · γ_r(x)²`. Both M_r and γ_r²
@@ -372,48 +313,50 @@ pub fn build_predict_input_for_model(
                 ));
             }
 
-            // h_i = b(x_i) + Σ_{r>=1} resp_row[i,r] · γ_r(x_i)^2.
-            // The bilinear form is independent across i, so par_map_collect.
-            let h_vec: Vec<Result<f64, String>> = (0..n)
+            // h_i and finite-support endpoints share the same γ_r(x_i). The
+            // prediction score is the fitted PIT, not a post-h location/scale
+            // normalization.
+            let pit_vec: Vec<Result<f64, String>> = (0..n)
                 .into_par_iter()
                 .map(|i| {
                     let resp_row = resp_val.row(i);
                     let cov_row = cov_mat.row(i);
-                    let mut val = resp_row[0] * beta_mat.row(0).dot(&cov_row);
-                    let mut max_abs_gamma = beta_mat.row(0).dot(&cov_row).abs();
+                    let gamma0 = beta_mat.row(0).dot(&cov_row);
+                    let mut val = resp_row[0] * gamma0;
+                    let mut lower = response_lower_basis[0] * gamma0;
+                    let mut upper = response_upper_basis[0] * gamma0;
+                    let mut max_abs_gamma = gamma0.abs();
                     for r in 1..p_resp {
                         let gamma = beta_mat.row(r).dot(&cov_row);
                         max_abs_gamma = max_abs_gamma.max(gamma.abs());
                         val += resp_row[r] * gamma * gamma;
+                        lower += response_lower_basis[r] * gamma * gamma;
+                        upper += response_upper_basis[r] * gamma * gamma;
                     }
-                    if !val.is_finite() || val.abs() > TRANSFORMATION_NORMAL_H_ABS_MAX {
+                    let h = val
+                        + offset[i]
+                        + monotonicity_eps * (response_new[i] - response_median);
+                    let h_lower = lower + offset[i] + response_lower_floor_offset;
+                    let h_upper = upper + offset[i] + response_upper_floor_offset;
+                    if !h.is_finite() || !h_lower.is_finite() || !h_upper.is_finite() {
                         let max_abs_cov = cov_row.iter().copied().map(f64::abs).fold(0.0, f64::max);
                         return Err(format!(
-                            "prediction failed: transformation-normal h at row {i} is {val:.6e}, outside the standard-normal bound ±{TRANSFORMATION_NORMAL_H_ABS_MAX}; max_abs_covariate_basis={max_abs_cov:.6e}, max_abs_gamma={max_abs_gamma:.6e}"
+                            "prediction failed: transformation-normal finite-support scores at row {i} are not finite: h={h:.6e}, lower={h_lower:.6e}, upper={h_upper:.6e}; max_abs_covariate_basis={max_abs_cov:.6e}, max_abs_gamma={max_abs_gamma:.6e}"
                         ));
                     }
-                    Ok(val + monotonicity_eps * (response_new[i] - response_median))
+                    transformation_normal_pit_score(h, h_lower, h_upper, calibration.clip_eps)
+                        .map_err(|err| format!("prediction failed at row {i}: {err}"))
                 })
                 .collect();
-            let h =
-                ndarray::Array1::<f64>::from_vec(h_vec.into_iter().collect::<Result<Vec<_>, _>>()?);
-            let h_with_offset = h + offset;
-            let calibrated = ndarray::Array1::from_iter(
-                h_with_offset
-                    .iter()
-                    .zip(score_location.iter())
-                    .zip(score_log_scale.iter())
-                    .map(|((&raw, &location), &log_scale)| {
-                        ((raw - location) / log_scale.exp() - calibration.global_mean)
-                            / calibration.global_sd
-                    }),
+            let calibrated = ndarray::Array1::<f64>::from_vec(
+                pit_vec.into_iter().collect::<Result<Vec<_>, _>>()?,
             );
             if calibrated
                 .iter()
                 .any(|value| !value.is_finite() || value.abs() > TRANSFORMATION_NORMAL_H_ABS_MAX)
             {
                 return Err(
-                    "prediction failed: transformation-normal score calibration produced non-finite or out-of-range z values"
+                    "prediction failed: transformation-normal PIT produced non-finite or out-of-range z values"
                         .to_string(),
                 );
             }

@@ -3277,15 +3277,24 @@ impl FitInference {
     }
 }
 
-/// Validate that a saved penalized Hessian is an explicit dense precision
-/// matrix suitable for HMC/NUTS whitening.
+/// Validate the *structural integrity* of an exported penalized Hessian.
 ///
-/// The HMC path whitens with a Cholesky factor of this matrix, so upstream fits
-/// must not export placeholders, missing curvature hidden behind a covariance,
-/// or nonsymmetric/non-SPD matrices. This check intentionally validates only
-/// already-materialized dense Hessians; it does not synthesize curvature from
-/// numerical differences or invert a covariance fallback.
-pub fn validate_explicit_dense_hessian_for_whitening(
+/// Checks shape, finiteness, non-zero (no placeholder), and symmetry. This is
+/// the right gate for fit-export: every consumer (HMC, sampling, covariance
+/// inversion, diagnostics) needs these invariants, and the cost is `O(p²)`
+/// once at construction.
+///
+/// **Does not** check positive definiteness.  Strict-PD via bare Cholesky is
+/// too narrow a gate for fit-export: legitimate fits can produce penalized
+/// Hessians that are positive *semi*-definite — boundary-projected
+/// coefficients in structurally constrained blocks lose curvature in active
+/// directions; partially converged outer fits (small `outer_max_iter`) may
+/// still have negative diagonal entries; rank-deficient penalty subspaces
+/// require an LM δ-ridge that the inner solver applies during the fit but
+/// that is not (and should not be) baked into the exported `H + Σ λ_k S_k`.
+/// Whether strict-PD is required is a *consumer* property — see
+/// [`validate_explicit_dense_hessian_for_whitening`] for the HMC-side gate.
+pub fn validate_dense_hessian_export(
     label: &str,
     hessian: &Array2<f64>,
     expected_dim: usize,
@@ -3305,7 +3314,7 @@ pub fn validate_explicit_dense_hessian_for_whitening(
     validate_all_finite_estimation(label, hessian.iter().copied())?;
     if !hessian.iter().any(|value| value.abs() > 0.0) {
         return Err(EstimationError::InvalidInput(format!(
-            "{label} must be an explicit dense Hessian; zero placeholders are not usable for HMC/NUTS whitening"
+            "{label} must be an explicit dense Hessian; zero placeholders are not allowed at fit export"
         )));
     }
     let symmetry_tol = 1e-10;
@@ -3316,10 +3325,35 @@ pub fn validate_explicit_dense_hessian_for_whitening(
             let scale = 1.0_f64.max(a.abs()).max(b.abs());
             if (a - b).abs() > symmetry_tol * scale {
                 return Err(EstimationError::InvalidInput(format!(
-                    "{label} must be symmetric for HMC/NUTS whitening; entries ({i},{j})={a} and ({j},{i})={b} differ"
+                    "{label} must be symmetric at fit export; entries ({i},{j})={a} and ({j},{i})={b} differ"
                 )));
             }
         }
+    }
+    Ok(())
+}
+
+/// Validate that a saved penalized Hessian is an explicit dense precision
+/// matrix suitable for HMC/NUTS whitening.
+///
+/// The HMC path whitens with a Cholesky factor of this matrix, so HMC's own
+/// entry layer must reject placeholders, missing curvature hidden behind a
+/// covariance, nonsymmetric, or non-SPD matrices. This check is intentionally
+/// the strictest of the validation chain — it composes the structural gate
+/// from [`validate_dense_hessian_export`] with a bare Cholesky that does not
+/// add a δ-ridge (HMC's whitening Jacobian is sensitive to any artificial
+/// floor).  Call this from the HMC entry, not from `try_from_parts`: not
+/// every fit is consumed by HMC, and rejecting partially-converged or
+/// boundary-projected fits at construction would block legitimate non-HMC
+/// downstream uses.
+pub fn validate_explicit_dense_hessian_for_whitening(
+    label: &str,
+    hessian: &Array2<f64>,
+    expected_dim: usize,
+) -> Result<(), EstimationError> {
+    validate_dense_hessian_export(label, hessian, expected_dim)?;
+    if expected_dim == 0 {
+        return Ok(());
     }
     hessian
         .to_owned()
@@ -3531,7 +3565,7 @@ impl UnifiedFitResult {
                     p
                 )));
             }
-            validate_explicit_dense_hessian_for_whitening(
+            validate_dense_hessian_export(
                 "UnifiedFitResult inference penalized Hessian",
                 &inf.penalized_hessian,
                 p,
@@ -3639,7 +3673,7 @@ impl UnifiedFitResult {
                     p
                 )));
             }
-            validate_explicit_dense_hessian_for_whitening(
+            validate_dense_hessian_export(
                 "UnifiedFitResult geometry penalized Hessian",
                 &geom.penalized_hessian,
                 p,

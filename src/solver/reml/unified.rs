@@ -4927,8 +4927,8 @@ pub fn reml_laml_evaluate(
         let large_k = k_outer >= MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD;
         let scale_prefers_operator = prefer_outer_hessian_operator(n_obs, p_dim, k_outer);
         let has_subspace_trace = solution.penalty_subspace_trace.is_some();
-        let use_operator = hessian_kernel.is_some()
-            && use_outer_hessian_operator_path(n_obs, p_dim, k_outer);
+        let use_operator =
+            hessian_kernel.is_some() && use_outer_hessian_operator_path(n_obs, p_dim, k_outer);
         // Reason mnemonic: which clause carried the routing.  Ordered so
         // the most specific reason wins; "kernel_absent" wins over
         // everything else because that disables the operator path

@@ -889,7 +889,16 @@ pub trait CustomFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        exact_newton_joint_hessian_from_exact_blocks(self, block_states)
+        // Same coupling guard as `exact_newton_joint_hessian_with_specs`:
+        // for multi-block families, the default block-diagonal assembly drops
+        // any cross-block `∂²L/∂β_a∂β_b` curvature and is only valid when the
+        // family explicitly opts in via `likelihood_blocks_uncoupled()`.  See
+        // that method for rationale.
+        if block_states.len() <= 1 || self.likelihood_blocks_uncoupled() {
+            exact_newton_joint_hessian_from_exact_blocks(self, block_states)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Optional exact joint log-likelihood / score evaluation in flattened
@@ -1145,6 +1154,18 @@ pub trait CustomFamily {
     /// the family instance itself did not cache the same designs.
     ///
     /// The default implementation delegates to `exact_newton_joint_hessian`.
+    ///
+    /// For multi-block families, the working-set fallback only fires when the
+    /// family has explicitly declared its blocks are uncoupled in the
+    /// likelihood Hessian via `likelihood_blocks_uncoupled() = true`.  This
+    /// is critical: `exact_newton_joint_hessian_from_working_sets` produces a
+    /// strictly block-diagonal joint Hessian, which silently drops cross-block
+    /// `∂²L/∂β_a∂β_b` terms for coupled likelihoods (GAMLSS μ-σ, marginal
+    /// slope, survival location-scale, etc.).  Default `false` ⇒ multi-block
+    /// custom families must override `exact_newton_joint_hessian` (or
+    /// `exact_newton_outer_curvature`) and the higher layer surfaces a loud
+    /// "joint outer path required" error rather than silently using
+    /// block-diagonal curvature.
     fn exact_newton_joint_hessian_with_specs(
         &self,
         block_states: &[ParameterBlockState],
@@ -1152,8 +1173,24 @@ pub trait CustomFamily {
     ) -> Result<Option<Array2<f64>>, String> {
         match self.exact_newton_joint_hessian(block_states)? {
             Some(hessian) => Ok(Some(hessian)),
-            None => exact_newton_joint_hessian_from_working_sets(self, block_states, specs),
+            None => {
+                if specs.len() <= 1 || self.likelihood_blocks_uncoupled() {
+                    exact_newton_joint_hessian_from_working_sets(self, block_states, specs)
+                } else {
+                    Ok(None)
+                }
+            }
         }
+    }
+
+    /// Whether the family's log-likelihood Hessian is block-diagonal in the
+    /// joint coefficient vector — i.e. `∂²L/∂β_a∂β_b = 0` for every pair of
+    /// distinct blocks `a ≠ b`.  Default `false` (assume coupling, the safe
+    /// answer); families whose blocks share no η/W coupling override to
+    /// `true` to opt into the default working-set joint-Hessian assembly for
+    /// multi-block specs.
+    fn likelihood_blocks_uncoupled(&self) -> bool {
+        false
     }
 
     /// Optional scale-aware exact joint curvature for the outer REML calculus.
@@ -7742,13 +7779,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     // joint-Newton cycle, which is strictly worse than the blockwise dense
     // Cholesky path — keep them on blockwise.
     let matrix_free_joint_requested = use_joint_matrix_free_path(total_joint_p, total_joint_n);
-    let (has_joint_exacthessian, has_workspace_source) = if matrix_free_joint_requested
-        && family.inner_coefficient_hessian_hvp_available(specs)
-    {
-        (true, true)
-    } else {
-        (family.exact_newton_joint_hessian(&states)?.is_some(), false)
-    };
+    let (has_joint_exacthessian, has_workspace_source) =
+        if matrix_free_joint_requested && family.inner_coefficient_hessian_hvp_available(specs) {
+            (true, true)
+        } else {
+            (family.exact_newton_joint_hessian(&states)?.is_some(), false)
+        };
     // Multi-block families have always taken the joint path when an exact
     // joint Hessian is available. Single-block families now also take it when
     // the matrix-free workspace is wired — the joint loop then runs entirely
@@ -7812,46 +7848,43 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     let mut cached_eval: Option<FamilyEvaluation> = None;
     let mut cached_joint_gradient: Option<Array1<f64>> = None;
     let mut cached_joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>> = None;
-    let load_joint_gradient =
-        |states: &[ParameterBlockState]|
-         -> Result<
-            (
-                f64,
-                Option<Array1<f64>>,
-                Option<FamilyEvaluation>,
-                Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
-            ),
-            String,
-        > {
-            let workspace = if matrix_free_joint_workspace {
-                family.exact_newton_joint_hessian_workspace_with_options(states, specs, options)?
-            } else {
-                None
-            };
-            if let Some(workspace_ref) = workspace.as_ref()
-                && let Some(joint_eval) = workspace_ref.joint_gradient_evaluation()?
-            {
-                return Ok((
-                    joint_eval.log_likelihood,
-                    Some(joint_eval.gradient),
-                    None,
-                    Some(Arc::clone(workspace_ref)),
-                ));
-            }
-            if let Some(joint_eval) = family.exact_newton_joint_gradient_evaluation(states, specs)?
-            {
-                return Ok((
-                    joint_eval.log_likelihood,
-                    Some(joint_eval.gradient),
-                    None,
-                    workspace,
-                ));
-            }
-            let eval = family.evaluate(states)?;
-            let log_likelihood = eval.log_likelihood;
-            let gradient = exact_newton_joint_gradient_from_eval(&eval, specs)?;
-            Ok((log_likelihood, gradient, Some(eval), workspace))
+    let load_joint_gradient = |states: &[ParameterBlockState]| -> Result<
+        (
+            f64,
+            Option<Array1<f64>>,
+            Option<FamilyEvaluation>,
+            Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+        ),
+        String,
+    > {
+        let workspace = if matrix_free_joint_workspace {
+            family.exact_newton_joint_hessian_workspace_with_options(states, specs, options)?
+        } else {
+            None
         };
+        if let Some(workspace_ref) = workspace.as_ref()
+            && let Some(joint_eval) = workspace_ref.joint_gradient_evaluation()?
+        {
+            return Ok((
+                joint_eval.log_likelihood,
+                Some(joint_eval.gradient),
+                None,
+                Some(Arc::clone(workspace_ref)),
+            ));
+        }
+        if let Some(joint_eval) = family.exact_newton_joint_gradient_evaluation(states, specs)? {
+            return Ok((
+                joint_eval.log_likelihood,
+                Some(joint_eval.gradient),
+                None,
+                workspace,
+            ));
+        }
+        let eval = family.evaluate(states)?;
+        let log_likelihood = eval.log_likelihood;
+        let gradient = exact_newton_joint_gradient_from_eval(&eval, specs)?;
+        Ok((log_likelihood, gradient, Some(eval), workspace))
+    };
     let mut current_log_likelihood = if use_joint_newton {
         let (log_likelihood, gradient, eval, workspace) = load_joint_gradient(&states)?;
         cached_joint_gradient = gradient;
@@ -7929,8 +7962,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let joint_hessian_source = if use_joint_matrix_free_path(total_p, total_joint_n) {
                 let workspace = match cached_joint_workspace.take() {
                     Some(workspace) => Some(workspace),
-                    None => family
-                        .exact_newton_joint_hessian_workspace_with_options(&states, specs, options)?,
+                    None => family.exact_newton_joint_hessian_workspace_with_options(
+                        &states, specs, options,
+                    )?,
                 };
                 workspace
                     .as_ref()

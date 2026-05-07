@@ -42,9 +42,7 @@ use crate::families::custom_family::{
 use crate::families::gamlss::{
     initializewiggle_knots_from_seed, solve_penalizedweighted_projection,
 };
-use crate::inference::model::{
-    TRANSFORMATION_SCORE_PIT_CLIP_EPS, TransformationScoreCalibration,
-};
+use crate::inference::model::{TRANSFORMATION_SCORE_PIT_CLIP_EPS, TransformationScoreCalibration};
 use crate::matrix::{
     DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator, SymmetricMatrix,
 };
@@ -10514,145 +10512,36 @@ fn calibrate_transformation_scores(
     }
 
     let row_quantities = family.row_quantities(&block_state.beta)?;
-    let h = row_quantities.h.as_ref();
-    let zero_offset = Array1::<f64>::zeros(family.n_obs());
-    let empty_penalties: Vec<PenaltyMatrix> = Vec::new();
-    let empty_log_lambdas = Array1::<f64>::zeros(0);
-    let feature_cols = transformation_calibration_feature_cols(covariate_spec);
-    let (calibration_matrix, feature_center, feature_scale, rbf_centers, rbf_bandwidth) =
-        build_transformation_score_calibration_design(
-            calibration_data,
-            family.weights.as_ref(),
-            &feature_cols,
-            None,
-            None,
-            None,
-            None,
-        )?;
-    let calibration_design = DesignMatrix::from(calibration_matrix);
-    let location_beta = solve_penalizedweighted_projection(
-        &calibration_design,
-        &zero_offset,
-        h,
-        family.weights.as_ref(),
-        &empty_penalties,
-        &empty_log_lambdas,
-        1.0e-12,
-    )?;
-
-    let location = calibration_design.matrixvectormultiply(&location_beta);
-    let centered_h = h - &location;
-    let weight_sum = family.weights.iter().copied().sum::<f64>();
-    if !(weight_sum.is_finite() && weight_sum > 0.0) {
-        return Err("transformation calibration requires positive finite total weight".to_string());
-    }
-    let centered_weighted_sum = centered_h
-        .iter()
-        .zip(family.weights.iter())
-        .map(|(&value, &weight)| weight * value)
-        .sum::<f64>();
-    let centered_mean = centered_weighted_sum / weight_sum;
-    let centered_var = centered_h
-        .iter()
-        .zip(family.weights.iter())
-        .map(|(&value, &weight)| weight * (value - centered_mean).powi(2))
-        .sum::<f64>()
-        / weight_sum;
-    if !(centered_var.is_finite() && centered_var > 1.0e-24) {
-        return Err(format!(
-            "transformation calibration produced non-positive centered score variance {centered_var}"
-        ));
-    }
-
-    let residual_floor = centered_var.sqrt() * 1.0e-6 + 1.0e-12;
-    let log_scale_target = Array1::from_iter(
-        centered_h
-            .iter()
-            .map(|&value| value.abs().max(residual_floor).ln() - STANDARD_NORMAL_MEAN_LOG_ABS),
-    );
-    let log_scale_beta = solve_penalizedweighted_projection(
-        &calibration_design,
-        &zero_offset,
-        &log_scale_target,
-        family.weights.as_ref(),
-        &empty_penalties,
-        &empty_log_lambdas,
-        1.0e-12,
-    )?;
-    let log_scale_eta = calibration_design.matrixvectormultiply(&log_scale_beta);
-    let scaled = Array1::from_iter(
-        centered_h
-            .iter()
-            .zip(log_scale_eta.iter())
-            .map(|(&value, &log_scale)| value / log_scale.exp()),
-    );
-    if scaled.iter().any(|value| !value.is_finite()) {
-        return Err(
-            "transformation calibration produced non-finite conditionally scaled scores"
-                .to_string(),
+    let mut pit_values = Vec::with_capacity(family.n_obs());
+    for i in 0..family.n_obs() {
+        pit_values.push(
+            transformation_normal_pit_score(
+                row_quantities.h[i],
+                row_quantities.h_lower[i],
+                row_quantities.h_upper[i],
+                TRANSFORMATION_SCORE_PIT_CLIP_EPS,
+            )
+            .map_err(|err| {
+                format!("transformation-normal fitted PIT score failed at row {i}: {err}")
+            })?,
         );
     }
-
-    let global_mean = scaled
-        .iter()
-        .zip(family.weights.iter())
-        .map(|(&value, &weight)| weight * value)
-        .sum::<f64>()
-        / weight_sum;
-    let global_var = scaled
-        .iter()
-        .zip(family.weights.iter())
-        .map(|(&value, &weight)| weight * (value - global_mean).powi(2))
-        .sum::<f64>()
-        / weight_sum;
-    if !(global_var.is_finite() && global_var > 1.0e-24) {
-        return Err(format!(
-            "transformation calibration produced non-positive global score variance {global_var}"
-        ));
-    }
-    let global_sd = global_var.sqrt();
-    let calibrated_h = scaled.mapv(|value| (value - global_mean) / global_sd);
+    let calibrated_h = Array1::from_vec(pit_values);
     if calibrated_h
         .iter()
         .any(|value| !value.is_finite() || value.abs() > TRANSFORMATION_NORMAL_H_ABS_MAX)
     {
         return Err(
-            "transformation calibration produced non-finite or out-of-range scores".to_string(),
+            "transformation PIT calibration produced non-finite or out-of-range scores".to_string(),
         );
-    }
-    let log_likelihood = row_quantities
-        .h_prime
-        .iter()
-        .zip(log_scale_eta.iter())
-        .zip(calibrated_h.iter())
-        .zip(family.weights.iter())
-        .map(|(((&hp, &log_scale), &z), &weight)| {
-            weight * (-0.5 * z * z + hp.ln() - log_scale - global_sd.ln())
-        })
-        .sum::<f64>();
-    if !log_likelihood.is_finite() {
-        return Err("transformation calibration produced non-finite log-likelihood".to_string());
     }
 
     if let Some(state) = fit.block_states.first_mut() {
         state.eta = calibrated_h;
     }
-    fit.log_likelihood = log_likelihood;
-    fit.deviance = -2.0 * log_likelihood;
-    Ok((
-        fit,
-        TransformationScoreCalibration {
-            feature_cols,
-            feature_center,
-            feature_scale,
-            rbf_centers,
-            rbf_bandwidth,
-            location_beta: location_beta.to_vec(),
-            log_scale_beta: log_scale_beta.to_vec(),
-            global_mean,
-            global_sd,
-        },
-    ))
+    fit.log_likelihood = row_quantities.log_likelihood;
+    fit.deviance = -2.0 * row_quantities.log_likelihood;
+    Ok((fit, TransformationScoreCalibration::finite_support_pit()))
 }
 
 // ---------------------------------------------------------------------------
@@ -11318,30 +11207,6 @@ mod tests {
     }
 
     #[test]
-    fn transformation_score_calibration_allows_intercept_only_design() {
-        let data = array![[0.0], [1.0], [2.0]];
-        let weights = Array1::ones(data.nrows());
-        let (design, center, scale, rbf_centers, bandwidth) =
-            build_transformation_score_calibration_design(
-                data.view(),
-                &weights,
-                &[],
-                None,
-                None,
-                None,
-                None,
-            )
-            .expect("intercept-only calibration design");
-
-        assert_eq!(design.dim(), (data.nrows(), 1));
-        assert!(design.column(0).iter().all(|&value| value == 1.0));
-        assert!(center.is_empty());
-        assert!(scale.is_empty());
-        assert!(rbf_centers.is_empty());
-        assert_eq!(bandwidth, 1.0);
-    }
-
-    #[test]
     fn tensor_psi_penalty_derivatives_follow_shape_only_scop_layout() {
         let response = array![-1.0, -0.2, 0.6, 1.3];
         let (val_basis, deriv_basis, knots, transform, p_resp) = toy_response_basis(&response);
@@ -11683,6 +11548,18 @@ mod tests {
 
         let mut expected_ll = 0.0;
         for i in 0..direct_h.len() {
+            assert!(
+                (row.h_lower[i] - h_lower[i]).abs() <= 1.0e-14,
+                "h_lower[{i}] mismatch: cached={} direct={}",
+                row.h_lower[i],
+                h_lower[i]
+            );
+            assert!(
+                (row.h_upper[i] - h_upper[i]).abs() <= 1.0e-14,
+                "h_upper[{i}] mismatch: cached={} direct={}",
+                row.h_upper[i],
+                h_upper[i]
+            );
             let hp = direct_h_prime[i];
             let log_z = log_normal_cdf_diff(h_upper[i], h_lower[i]).expect("endpoint mass");
             expected_ll += weights[i] * (-0.5 * direct_h[i] * direct_h[i] + hp.ln() - log_z);
@@ -11706,6 +11583,21 @@ mod tests {
         assert!(q.fourth[0][0][0][0].is_finite());
         assert!(q.first[0] > 0.0);
         assert!(q.first[1] < 0.0);
+    }
+
+    #[test]
+    fn transformation_normal_pit_score_uses_finite_support_normalizer() {
+        let center =
+            transformation_normal_pit_score(0.0, -2.0, 2.0, 1.0e-12).expect("symmetric PIT score");
+        assert!(center.abs() <= 1.0e-12);
+
+        let positive_tail = transformation_normal_pit_score(37.5, 37.0, 38.0, 1.0e-12)
+            .expect("positive-tail PIT score");
+        assert!(positive_tail.is_finite());
+
+        let err = transformation_normal_pit_score(2.1, -2.0, 2.0, 1.0e-12)
+            .expect_err("PIT outside support should fail");
+        assert!(err.contains("outside fitted finite support"));
     }
 
     #[test]
@@ -15352,17 +15244,7 @@ pub fn fit_transformation_normal(
                 fit,
                 covariate_spec_resolved: geometry.covariate_spec_resolved.clone(),
                 covariate_design: geometry.covariate_design.clone(),
-                score_calibration: TransformationScoreCalibration {
-                    feature_cols: Vec::new(),
-                    feature_center: Vec::new(),
-                    feature_scale: Vec::new(),
-                    rbf_centers: Vec::new(),
-                    rbf_bandwidth: 1.0,
-                    location_beta: Vec::new(),
-                    log_scale_beta: Vec::new(),
-                    global_mean: 0.0,
-                    global_sd: 1.0,
-                },
+                score_calibration: TransformationScoreCalibration::finite_support_pit(),
             })
         },
         // exact_fn
