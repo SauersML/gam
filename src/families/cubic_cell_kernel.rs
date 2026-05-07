@@ -2198,6 +2198,124 @@ mod tests {
     use super::*;
     use crate::probability::normal_pdf;
 
+    fn reference_bivariate_normal_cdf_20(h: f64, k: f64, rho: f64) -> f64 {
+        if h == f64::NEG_INFINITY || k == f64::NEG_INFINITY {
+            return 0.0;
+        }
+        if h == f64::INFINITY {
+            return normal_cdf(k);
+        }
+        if k == f64::INFINITY {
+            return normal_cdf(h);
+        }
+        let rho_clamped = rho.clamp(-1.0, 1.0);
+        if rho_clamped >= 1.0 - 1e-12 {
+            return normal_cdf(h.min(k));
+        }
+        if rho_clamped <= -1.0 + 1e-12 {
+            return (normal_cdf(h) - normal_cdf(-k)).clamp(0.0, 1.0);
+        }
+
+        let hs = 0.5 * (h * h + k * k);
+        let asr = rho_clamped.asin();
+        let mut sum = 0.0;
+        for (&node, &weight) in BVN_GL_NODES_20.iter().zip(BVN_GL_WEIGHTS_20.iter()) {
+            let sn = (0.5 * asr * (node + 1.0)).sin();
+            let one_minus = 1.0 - sn * sn;
+            let expo = ((sn * h * k) - hs) / one_minus;
+            sum += weight * expo.exp();
+        }
+        (normal_cdf(h) * normal_cdf(k) + asr * sum / (4.0 * std::f64::consts::PI)).clamp(0.0, 1.0)
+    }
+
+    #[test]
+    fn bivariate_normal_cdf_matches_reference_grid_to_1e_minus_10() {
+        let hs = [-8.0, -5.0, -3.0, -1.5, -0.5, 0.0, 0.25, 1.0, 2.5, 5.0, 8.0];
+        let ks = [-8.0, -4.0, -2.0, -0.75, 0.0, 0.4, 1.25, 3.0, 6.0, 8.0];
+        let rhos = [
+            -0.999_999_999_999,
+            -0.999,
+            -0.95,
+            -0.7,
+            -0.3,
+            -1.0e-12,
+            0.0,
+            1.0e-12,
+            0.3,
+            0.7,
+            0.95,
+            0.999,
+            0.999_999_999_999,
+        ];
+        for &h in &hs {
+            for &k in &ks {
+                for &rho in &rhos {
+                    let actual = bivariate_normal_cdf(h, k, rho).expect("bvn");
+                    let expected = reference_bivariate_normal_cdf_20(h, k, rho);
+                    let scale = expected.abs().max(1.0e-300);
+                    let rel = (actual - expected).abs() / scale;
+                    assert!(
+                        rel < 1.0e-10 || (actual - expected).abs() < 1.0e-14,
+                        "h={h} k={k} rho={rho} actual={actual:.17e} expected={expected:.17e} rel={rel:.3e}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bivariate_normal_cdf_matches_reference_lcg_property_samples() {
+        let mut seed = 0x5eed_cafe_f00d_u64;
+        let mut next_unit = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            ((seed >> 11) as f64) * (1.0 / ((1_u64 << 53) as f64))
+        };
+        for _ in 0..4096 {
+            let h = -8.0 + 16.0 * next_unit();
+            let k = -8.0 + 16.0 * next_unit();
+            let rho = -0.999 + 1.998 * next_unit();
+            let actual = bivariate_normal_cdf(h, k, rho).expect("bvn");
+            let expected = reference_bivariate_normal_cdf_20(h, k, rho);
+            let scale = expected.abs().max(1.0e-300);
+            let rel = (actual - expected).abs() / scale;
+            assert!(
+                rel < 1.0e-10 || (actual - expected).abs() < 1.0e-14,
+                "h={h} k={k} rho={rho} actual={actual:.17e} expected={expected:.17e} rel={rel:.3e}"
+            );
+        }
+    }
+
+    #[test]
+    fn affine_bvn_interval_primitive_matches_two_cdf_difference() {
+        let hs = [-6.0, -2.0, -0.25, 0.0, 0.8, 3.0, 6.0];
+        let bounds = [
+            (-5.0, -2.0),
+            (-3.0, -0.1),
+            (-1.0, 0.0),
+            (-0.25, 0.75),
+            (0.2, 3.5),
+            (2.0, 7.0),
+        ];
+        let rhos = [-0.98, -0.8, -0.25, 0.0, 0.25, 0.8, 0.98];
+        for &h in &hs {
+            for &(left, right) in &bounds {
+                for &rho in &rhos {
+                    let actual =
+                        bivariate_normal_cdf_interval(h, left, right, rho).expect("interval");
+                    let expected = (reference_bivariate_normal_cdf_20(h, right, rho)
+                        - reference_bivariate_normal_cdf_20(h, left, rho))
+                    .clamp(0.0, 1.0);
+                    let scale = expected.abs().max(1.0e-300);
+                    let rel = (actual - expected).abs() / scale;
+                    assert!(
+                        rel < 1.0e-10 || (actual - expected).abs() < 1.0e-12,
+                        "h={h} left={left} right={right} rho={rho} actual={actual:.17e} expected={expected:.17e} rel={rel:.3e}"
+                    );
+                }
+            }
+        }
+    }
+
     fn simpson_integral<F>(left: f64, right: f64, steps: usize, f: F) -> f64
     where
         F: Fn(f64) -> f64,

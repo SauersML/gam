@@ -262,9 +262,9 @@ struct FitArgs {
     /// marginal-slope families.
     #[arg(long = "logslope-formula")]
     logslope_formula: Option<String>,
-    /// Column containing the latent-N(0,1) score z for the Bernoulli
-    /// marginal-slope family. Standardization alone does not justify the
-    /// closed form.
+    /// Column containing the latent score z for the Bernoulli marginal-slope
+    /// family. The fit auto-detects whether to use the standard-normal or
+    /// empirical latent measure for marginal calibration.
     #[arg(long = "z-column")]
     z_column: Option<String>,
     /// Optional non-negative per-row training weights column.
@@ -1397,7 +1397,8 @@ fn run_fit_bernoulli_marginal_slope(
     let routed_score_warp = routed_deviations.score_warp;
     let requested_flex = routed_link_dev.is_some() || routed_score_warp.is_some();
     inference_notes.push(
-        "bernoulli marginal-slope expects z to already be PIT-probit standardized to latent N(0,1) upstream".to_string(),
+        "bernoulli marginal-slope auto-detects the latent score law: standard-normal calibration is used only when z passes diagnostics; otherwise the fitted empirical latent measure is carried through the marginal calibration"
+            .to_string(),
     );
     if parsed.linkwiggle.is_some() {
         inference_notes.push(
@@ -1417,7 +1418,8 @@ fn run_fit_bernoulli_marginal_slope(
     );
     if !requested_flex {
         inference_notes.push(
-            "bernoulli marginal-slope rigid probit mode is algebraic closed-form exact".to_string(),
+            "bernoulli marginal-slope rigid probit mode is exact under the active latent measure"
+                .to_string(),
         );
     } else {
         inference_notes.push(
@@ -9325,6 +9327,7 @@ mod tests {
     use gam::gamlss::{
         buildwiggle_block_input_from_knots, monotone_wiggle_basis_with_derivative_order,
     };
+    use gam::bernoulli_marginal_slope::LatentMeasureKind;
     use gam::inference::data::{
         EncodedDataset as Dataset, UnseenCategoryPolicy, encode_recordswith_schema,
     };

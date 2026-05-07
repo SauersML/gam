@@ -3106,6 +3106,10 @@ impl CustomFamily for LatentSurvivalFamily {
         true
     }
 
+    fn has_explicit_joint_hessian(&self) -> bool {
+        true
+    }
+
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // `evaluate_exact_newton_joint_dense` builds a fully dense joint
         // Hessian over (Σ p_b)² across time, mean, and optional log-σ blocks
@@ -3257,6 +3261,10 @@ impl CustomFamily for LatentSurvivalFamily {
 
 impl CustomFamily for LatentBinaryFamily {
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+        true
+    }
+
+    fn has_explicit_joint_hessian(&self) -> bool {
         true
     }
 

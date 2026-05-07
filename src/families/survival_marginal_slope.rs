@@ -13038,6 +13038,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         self.log_likelihood_only_with_options(block_states, &BlockwiseFitOptions::default())
     }
 
+    fn has_explicit_joint_hessian(&self) -> bool {
+        true
+    }
+
     fn exact_newton_joint_hessian(
         &self,
         block_states: &[ParameterBlockState],
