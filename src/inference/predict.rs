@@ -1,5 +1,7 @@
 use crate::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
-use crate::families::bernoulli_marginal_slope::bernoulli_marginal_link_map;
+use crate::families::bernoulli_marginal_slope::{
+    LatentMeasureKind, bernoulli_marginal_link_map, empirical_intercept_from_marginal,
+};
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
     probit_frailty_scale as marginal_slope_probit_frailty_scale, scale_coeff4,
@@ -875,6 +877,7 @@ pub struct BernoulliMarginalSlopePredictor {
     pub base_link: InverseLink,
     pub z_column: String,
     pub latent_z_normalization: SavedLatentZNormalization,
+    pub latent_measure: LatentMeasureKind,
     pub baseline_marginal: f64,
     pub baseline_logslope: f64,
     pub covariance: Option<Array2<f64>>,
@@ -903,6 +906,45 @@ impl BernoulliMarginalSlopePredictor {
     fn rigid_intercept_from_marginal(&self, marginal_eta: f64, slope: f64) -> f64 {
         let probit_scale = self.probit_frailty_scale();
         marginal_eta * (1.0 + (probit_scale * slope).powi(2)).sqrt() / probit_scale
+    }
+
+    fn empirical_rigid_intercept_and_gradient(
+        &self,
+        marginal_eta: f64,
+        slope: f64,
+        nodes: &[f64],
+        weights: &[f64],
+    ) -> Result<(f64, f64, f64), EstimationError> {
+        let marginal = bernoulli_marginal_link_map(&self.base_link, marginal_eta)
+            .map_err(EstimationError::InvalidInput)?;
+        let scale = self.probit_frailty_scale();
+        let intercept = empirical_intercept_from_marginal(
+            marginal.mu,
+            marginal.q,
+            slope,
+            scale,
+            nodes,
+            weights,
+            None,
+        )
+        .map_err(EstimationError::InvalidInput)?;
+        let observed_slope = scale * slope;
+        let mut f_a = 0.0;
+        let mut f_b = 0.0;
+        for (&node, &weight) in nodes.iter().zip(weights.iter()) {
+            let eta = intercept + observed_slope * node;
+            let pdf = normal_pdf(eta);
+            f_a += weight * pdf;
+            f_b += weight * pdf * scale * node;
+        }
+        if !(f_a.is_finite() && f_a > 0.0 && f_b.is_finite()) {
+            return Err(EstimationError::InvalidInput(format!(
+                "empirical latent prediction calibration derivative is invalid: F_a={f_a}, F_b={f_b}"
+            )));
+        }
+        let a_marginal_eta = marginal.mu1 / f_a;
+        let a_slope = -f_b / f_a;
+        Ok((intercept, a_marginal_eta, a_slope))
     }
 
     fn transform_internal_eta_to_base_scale(
@@ -1064,6 +1106,7 @@ impl BernoulliMarginalSlopePredictor {
         unified: &UnifiedFitResult,
         z_column: String,
         latent_z_normalization: SavedLatentZNormalization,
+        latent_measure: LatentMeasureKind,
         baseline_marginal: f64,
         baseline_logslope: f64,
         base_link: InverseLink,
@@ -1113,6 +1156,19 @@ impl BernoulliMarginalSlopePredictor {
             .map_err(|e| {
                 format!("bernoulli marginal-slope predictor latent z normalization is invalid: {e}")
             })?;
+        latent_measure
+            .validate("bernoulli marginal-slope predictor latent measure")
+            .map_err(|e| {
+                format!("bernoulli marginal-slope predictor latent measure is invalid: {e}")
+            })?;
+        if matches!(latent_measure, LatentMeasureKind::GlobalEmpirical { .. })
+            && (score_warp_runtime.is_some() || link_deviation_runtime.is_some())
+        {
+            return Err(
+                "bernoulli marginal-slope empirical latent-measure prediction requires rigid probit mode; saved flexible models must use a standard-normal CTN-PIT latent measure"
+                    .to_string(),
+            );
+        }
         let blocks = &unified.blocks;
         let expected_blocks = 2
             + usize::from(score_warp_runtime.is_some())
@@ -1154,6 +1210,7 @@ impl BernoulliMarginalSlopePredictor {
             base_link,
             z_column,
             latent_z_normalization,
+            latent_measure,
             baseline_marginal,
             baseline_logslope,
             covariance: unified.beta_covariance().cloned(),
@@ -1374,19 +1431,42 @@ impl BernoulliMarginalSlopePredictor {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        // ── Rigid closed-form path under probit Gaussian frailty ──────
-        // When neither score-warp nor link-deviation is active, z passes
-        // through unwarped and the observed probit index has the closed form
-        //   η_obs = q·√(1 + (s b)²) + s b·z,  s = 1/√(1+σ²).
-        //
-        // The marginal-slope policy is probit-only, so q is exactly η_marg
-        // on the rigid path. Avoiding the Φ→clamp→Φ⁻¹ round trip preserves
-        // bit-exact closed-form behavior.
         if !flex_active {
-            let sb_vec = logslope_eta.mapv(|b| scale * b);
-            let c_vec = sb_vec.mapv(|sb| (1.0 + sb * sb).sqrt());
-            let final_eta_internal =
-                Array1::from_iter((0..n).map(|i| c_vec[i] * marginal_eta[i] + sb_vec[i] * z[i]));
+            let (final_eta_internal, marginal_scales, logslope_scales) = match &self.latent_measure
+            {
+                LatentMeasureKind::StandardNormal => {
+                    let sb_vec = logslope_eta.mapv(|b| scale * b);
+                    let c_vec = sb_vec.mapv(|sb| (1.0 + sb * sb).sqrt());
+                    let final_eta_internal = Array1::from_iter(
+                        (0..n).map(|i| c_vec[i] * marginal_eta[i] + sb_vec[i] * z[i]),
+                    );
+                    let marginal_scales = c_vec;
+                    let logslope_scales = Array1::from_iter((0..n).map(|i| {
+                        marginal_eta[i] * (scale * scale) * logslope_eta[i]
+                            / marginal_scales[i]
+                            + scale * z[i]
+                    }));
+                    (final_eta_internal, marginal_scales, logslope_scales)
+                }
+                LatentMeasureKind::GlobalEmpirical { nodes, weights } => {
+                    let mut final_eta = Array1::<f64>::zeros(n);
+                    let mut marginal_scales = Array1::<f64>::zeros(n);
+                    let mut logslope_scales = Array1::<f64>::zeros(n);
+                    for i in 0..n {
+                        let (intercept, a_marginal, a_slope) = self
+                            .empirical_rigid_intercept_and_gradient(
+                                marginal_eta[i],
+                                logslope_eta[i],
+                                nodes,
+                                weights,
+                            )?;
+                        final_eta[i] = intercept + scale * logslope_eta[i] * z[i];
+                        marginal_scales[i] = a_marginal;
+                        logslope_scales[i] = a_slope + scale * z[i];
+                    }
+                    (final_eta, marginal_scales, logslope_scales)
+                }
+            };
 
             if !need_gradient {
                 return self.transform_internal_eta_to_base_scale(final_eta_internal, None);
@@ -1407,9 +1487,8 @@ impl BernoulliMarginalSlopePredictor {
 
                 for li in 0..(end - start) {
                     let i = start + li;
-                    let c = c_vec[i];
-                    let b = logslope_eta[i];
-                    let g_scale = marginal_eta[i] * (scale * scale) * b / c + scale * z[i];
+                    let c = marginal_scales[i];
+                    let g_scale = logslope_scales[i];
                     let mut row = grad_internal.row_mut(i);
                     for j in 0..marginal_dim {
                         row[j] = c * mc[[li, j]];
@@ -4641,6 +4720,7 @@ mod tests {
             base_link: InverseLink::Standard(crate::types::LinkFunction::Probit),
             z_column: "z".to_string(),
             latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
+            latent_measure: LatentMeasureKind::StandardNormal,
             baseline_marginal: 0.0,
             baseline_logslope: 0.0,
             covariance: None,
@@ -4738,6 +4818,7 @@ mod tests {
             base_link: InverseLink::Standard(crate::types::LinkFunction::Probit),
             z_column: "z".to_string(),
             latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
+            latent_measure: LatentMeasureKind::StandardNormal,
             baseline_marginal: 0.1,
             baseline_logslope: -0.2,
             covariance: None,
@@ -4786,6 +4867,7 @@ mod tests {
             base_link: InverseLink::Standard(crate::types::LinkFunction::Logit),
             z_column: "z".to_string(),
             latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
+            latent_measure: LatentMeasureKind::StandardNormal,
             baseline_marginal: 0.1,
             baseline_logslope: -0.2,
             covariance: None,

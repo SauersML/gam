@@ -4929,16 +4929,15 @@ pub fn reml_laml_evaluate(
         let has_subspace_trace = solution.penalty_subspace_trace.is_some();
         let use_operator =
             hessian_kernel.is_some() && use_outer_hessian_operator_path(n_obs, p_dim, k_outer);
-        // Reason mnemonic: which clause carried the routing.  Ordered so
-        // the most specific reason wins; "kernel_absent" wins over
-        // everything else because that disables the operator path
-        // unconditionally.
+        // Reason mnemonic: which clause carried the routing.  This is purely
+        // a log-telemetry attribution — the actual routing decision is made
+        // above by `use_operator`.  When `choice=dense`, only "kernel_absent"
+        // or "below_crossover" can be the reason (a Callback kernel does NOT
+        // by itself flip the choice; see `use_outer_hessian_operator_path`).
         let route_reason = if hessian_kernel.is_none() {
             "kernel_absent"
         } else if has_subspace_trace && scale_prefers_operator {
             "subspace_projected_operator"
-        } else if callback_operator_kernel {
-            "callback_kernel"
         } else if large_k {
             "large_k"
         } else if large_p {
