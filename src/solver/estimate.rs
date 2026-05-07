@@ -3284,6 +3284,7 @@ impl FitInference {
     }
 }
 
+<<<<<<< ours
 /// Validate the *structural integrity* of an exported penalized Hessian.
 ///
 /// Checks shape, finiteness, non-zero (no placeholder), and symmetry. This is
@@ -3302,6 +3303,17 @@ impl FitInference {
 /// Whether strict-PD is required is a *consumer* property — see
 /// [`validate_explicit_dense_hessian_for_whitening`] for the HMC-side gate.
 pub fn validate_dense_hessian_export(
+=======
+/// Validate that a saved penalized Hessian is an explicit dense precision
+/// matrix suitable for HMC/NUTS whitening.
+///
+/// The HMC path whitens with a Cholesky factor of this matrix, so upstream fits
+/// must not export placeholders, missing curvature hidden behind a covariance,
+/// or nonsymmetric/non-SPD matrices. This check intentionally validates only
+/// already-materialized dense Hessians; it does not synthesize curvature from
+/// numerical differences or invert a covariance fallback.
+pub fn validate_explicit_dense_hessian_for_whitening(
+>>>>>>> theirs
     label: &str,
     hessian: &Array2<f64>,
     expected_dim: usize,
@@ -3321,7 +3333,11 @@ pub fn validate_dense_hessian_export(
     validate_all_finite_estimation(label, hessian.iter().copied())?;
     if !hessian.iter().any(|value| value.abs() > 0.0) {
         return Err(EstimationError::InvalidInput(format!(
+<<<<<<< ours
             "{label} must be an explicit dense Hessian; zero placeholders are not allowed at fit export"
+=======
+            "{label} must be an explicit dense Hessian; zero placeholders are not usable for HMC/NUTS whitening"
+>>>>>>> theirs
         )));
     }
     let symmetry_tol = 1e-10;
@@ -3332,11 +3348,16 @@ pub fn validate_dense_hessian_export(
             let scale = 1.0_f64.max(a.abs()).max(b.abs());
             if (a - b).abs() > symmetry_tol * scale {
                 return Err(EstimationError::InvalidInput(format!(
+<<<<<<< ours
                     "{label} must be symmetric at fit export; entries ({i},{j})={a} and ({j},{i})={b} differ"
+=======
+                    "{label} must be symmetric for HMC/NUTS whitening; entries ({i},{j})={a} and ({j},{i})={b} differ"
+>>>>>>> theirs
                 )));
             }
         }
     }
+<<<<<<< ours
     Ok(())
 }
 
@@ -3362,6 +3383,8 @@ pub fn validate_explicit_dense_hessian_for_whitening(
     if expected_dim == 0 {
         return Ok(());
     }
+=======
+>>>>>>> theirs
     hessian
         .to_owned()
         .cholesky(Side::Lower)
@@ -3572,7 +3595,11 @@ impl UnifiedFitResult {
                     p
                 )));
             }
+<<<<<<< ours
             validate_dense_hessian_export(
+=======
+            validate_explicit_dense_hessian_for_whitening(
+>>>>>>> theirs
                 "UnifiedFitResult inference penalized Hessian",
                 &inf.penalized_hessian,
                 p,
@@ -3680,7 +3707,11 @@ impl UnifiedFitResult {
                     p
                 )));
             }
+<<<<<<< ours
             validate_dense_hessian_export(
+=======
+            validate_explicit_dense_hessian_for_whitening(
+>>>>>>> theirs
                 "UnifiedFitResult geometry penalized Hessian",
                 &geom.penalized_hessian,
                 p,
