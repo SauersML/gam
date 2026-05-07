@@ -1415,11 +1415,12 @@ pub trait CustomFamily {
         d_beta_u_flat: &Array1<f64>,
         d_betav_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        // Outer-side gate (matching the Hessian and first-directional-derivative
-        // paths above).  The default delegates to
-        // `exact_newton_joint_hessiansecond_directional_derivative`, whose
-        // own default is per-block block-diagonal; for coupled multi-block
-        // families that's silently wrong for outer trace assembly.
+        // Same trust dispatch as the Hessian / first-derivative paths.  The
+        // delegated `exact_newton_joint_hessiansecond_directional_derivative`
+        // default is block-diagonal-from-blocks, which is silently wrong for
+        // outer trace assembly on coupled families.  Unlike the lower-order
+        // paths, there is no working-sets fallback — both trusted branches
+        // call the same delegate, so a single helper predicate suffices.
         if !self.outer_default_trustworthy_for_joint_hessian(specs) {
             return Ok(None);
         }
