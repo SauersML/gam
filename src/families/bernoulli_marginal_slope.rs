@@ -1341,6 +1341,25 @@ fn rigid_intercept_from_marginal(marginal_eta: f64, logslope: f64, probit_scale:
 }
 
 #[inline]
+fn rigid_prescale_intercept_from_marginal(
+    marginal_eta: f64,
+    logslope: f64,
+    probit_scale: f64,
+) -> f64 {
+    rigid_intercept_from_marginal(marginal_eta, logslope, probit_scale) / probit_scale
+}
+
+#[inline]
+fn rigid_prescale_intercept_derivative_abs(
+    marginal_eta: f64,
+    logslope: f64,
+    probit_scale: f64,
+) -> f64 {
+    let c = rigid_observed_scale(logslope, probit_scale);
+    probit_scale * normal_pdf(marginal_eta) / c
+}
+
+#[inline]
 fn rigid_observed_eta(marginal_eta: f64, logslope: f64, z: f64, probit_scale: f64) -> f64 {
     rigid_intercept_from_marginal(marginal_eta, logslope, probit_scale)
         + rigid_observed_logslope(logslope, probit_scale) * z
@@ -2169,6 +2188,7 @@ struct CachedDenestedCellMoments {
 struct BernoulliMarginalSlopeRowExactContext {
     intercept: f64,
     m_a: f64,
+    intercept_fast_path: bool,
     /// Degree-9 cell moments at the converged row intercept for the current
     /// PIRLS/Newton cycle. They are independent of the Hessian-vector
     /// direction and can be reused by gradient, diagonal, and matvec passes
@@ -3780,6 +3800,49 @@ impl BernoulliInterceptSolveStats {
 }
 
 impl BernoulliMarginalSlopeFamily {
+    #[inline]
+    fn cache_row_intercept(&self, row: usize, a: f64) {
+        if let Some(cache) = self.intercept_warm_starts.as_ref()
+            && let Some(slot) = cache.get(row)
+        {
+            slot.store(a.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn beta_linf(beta: Option<&Array1<f64>>) -> f64 {
+        beta.map(|b| b.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs())))
+            .unwrap_or(0.0)
+    }
+
+    fn near_zero_deviation_residual_bound(
+        &self,
+        slope: f64,
+        beta_h_linf: f64,
+        beta_w_linf: f64,
+    ) -> f64 {
+        let score_basis_sup = self
+            .score_warp
+            .as_ref()
+            .map(|runtime| runtime.value_basis_l1_sup_norm())
+            .unwrap_or(0.0);
+        let link_basis_sup = self
+            .link_dev
+            .as_ref()
+            .map(|runtime| runtime.value_basis_l1_sup_norm())
+            .unwrap_or(0.0);
+        // At the rigid intercept, deviations perturb the probit argument by at
+        // most `s * (|b|·||h||∞ + ||w||∞)`.  Since `Φ` is globally
+        // `φ(0)`-Lipschitz, the calibration residual changes by no more than
+        // `φ(0)` times this argument bound after integrating against the unit
+        // normal density.  The L1 basis sup-norms give
+        // `||h||∞ <= K_h ||β_h||∞` and `||w||∞ <= K_w ||β_w||∞`; if this is
+        // below the solver's `abs_tol`, the rigid root is already acceptable.
+        normal_pdf(0.0)
+            * self.probit_frailty_scale()
+            * (slope.abs() * score_basis_sup * beta_h_linf + link_basis_sup * beta_w_linf)
+    }
+
     fn solve_row_intercept_base(
         &self,
         row: usize,
@@ -3788,8 +3851,48 @@ impl BernoulliMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
         stats: Option<&BernoulliInterceptSolveStats>,
-    ) -> Result<(f64, f64), String> {
+    ) -> Result<(f64, f64, bool), String> {
         let marginal = self.marginal_link_map(marginal_eta)?;
+        let probit_scale = self.probit_frailty_scale();
+        let target = marginal.mu;
+        let abs_tol = 1e-8_f64.max(1e-4 * target.abs());
+        let rigid_a = rigid_prescale_intercept_from_marginal(marginal.q, slope, probit_scale);
+        let rigid_abs_deriv =
+            rigid_prescale_intercept_derivative_abs(marginal.q, slope, probit_scale);
+
+        let beta_h_linf = Self::beta_linf(beta_h);
+        let beta_w_linf = Self::beta_linf(beta_w);
+        let exact_zero_deviation = beta_h_linf == 0.0 && beta_w_linf == 0.0;
+        if exact_zero_deviation {
+            self.cache_row_intercept(row, rigid_a);
+            return Ok((rigid_a, rigid_abs_deriv, true));
+        }
+
+        let near_zero_bound =
+            self.near_zero_deviation_residual_bound(slope, beta_h_linf, beta_w_linf);
+        let beta_linf_max = beta_h_linf.max(beta_w_linf);
+        if near_zero_bound <= abs_tol && beta_linf_max <= f64::EPSILON.sqrt() {
+            // Numerical guardrail for the conservative perturbation bound: the
+            // exact-zero path above avoids all cell machinery, while this
+            // near-zero path spends one evaluator call to guarantee that every
+            // accepted row satisfies the same residual contract as the solver.
+            // The extra `sqrt(eps)` coefficient cap keeps finite-difference
+            // derivative probes out of this value-only acceptance path;
+            // mathematically nonzero deviations still fall through unless they
+            // are too small to carry stable derivative information.
+            let (f_rigid, _, _) = self.evaluate_denested_calibration_newton(
+                rigid_a,
+                marginal_eta,
+                slope,
+                beta_h,
+                beta_w,
+            )?;
+            if f_rigid.abs() <= abs_tol {
+                self.cache_row_intercept(row, rigid_a);
+                return Ok((rigid_a, rigid_abs_deriv, true));
+            }
+        }
+
         // Use the Newton-only calibration evaluator: `solve_monotone_root`
         // safely degrades its Halley step to Newton when `F''(a) = 0`, and
         // dropping the second derivative lets us skip the order-9
@@ -3838,8 +3941,6 @@ impl BernoulliMarginalSlopeFamily {
         // kernel dominates wall time. With this tolerance the closed-form /
         // affine warm start short-circuits at `monotone_root.rs:26` for the
         // common case, instead of forcing 30+ refinement iters down to 1e-10.
-        let target = marginal.mu;
-        let abs_tol = 1e-8_f64.max(1e-4 * target.abs());
 
         // Two-step Newton probe before paying for the safeguarded bracket.
         // Cycle-0 is cold at biobank scale, so forcing every row through the
@@ -3881,12 +3982,8 @@ impl BernoulliMarginalSlopeFamily {
                             .fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                if let Some(cache) = self.intercept_warm_starts.as_ref()
-                    && let Some(slot) = cache.get(row)
-                {
-                    slot.store(a.to_bits(), Ordering::Relaxed);
-                }
-                return Ok((*a, *abs_deriv));
+                self.cache_row_intercept(row, *a);
+                return Ok((*a, *abs_deriv, false));
             }
         }
 
@@ -3932,13 +4029,9 @@ impl BernoulliMarginalSlopeFamily {
         }
 
         // Cache the converged intercept for the next PIRLS iter.
-        if let Some(cache) = self.intercept_warm_starts.as_ref()
-            && let Some(slot) = cache.get(row)
-        {
-            slot.store(a.to_bits(), Ordering::Relaxed);
-        }
+        self.cache_row_intercept(row, a);
 
-        Ok((a, abs_deriv))
+        Ok((a, abs_deriv, false))
     }
 
     #[cfg(test)]
@@ -3962,7 +4055,7 @@ impl BernoulliMarginalSlopeFamily {
         let slope = block_states[1].eta[row];
         let beta_h = self.score_beta(block_states)?;
         let beta_w = self.link_beta(block_states)?;
-        let (intercept, m_a) = if self.effective_flex_active(block_states)? {
+        let (intercept, m_a, intercept_fast_path) = if self.effective_flex_active(block_states)? {
             self.solve_row_intercept_base(row, marginal_eta, slope, beta_h, beta_w, stats)?
         } else {
             let intercept = match self.latent_measure.empirical_grid() {
@@ -3977,7 +4070,7 @@ impl BernoulliMarginalSlopeFamily {
                     measure_weights,
                 )?,
             };
-            (intercept, f64::NAN)
+            (intercept, f64::NAN, false)
         };
         // Cache degree-9 cell moments at the converged intercept so the
         // many gradient/diagonal/matvec passes that run *after* this point
@@ -4006,6 +4099,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(BernoulliMarginalSlopeRowExactContext {
             intercept,
             m_a,
+            intercept_fast_path,
             degree9_cells,
         })
     }
@@ -4044,6 +4138,15 @@ impl BernoulliMarginalSlopeFamily {
             .map(|row| self.build_row_exact_context_with_stats(row, block_states, Some(&stats)))
             .collect();
         let row_contexts = row_contexts?;
+        let fast_path_rows = row_contexts
+            .iter()
+            .filter(|ctx| ctx.intercept_fast_path)
+            .count();
+        log::debug!(
+            "[BMS exact-cache] row-intercept zero-deviation fast path rows={}/{}",
+            fast_path_rows,
+            n
+        );
         if flex_active {
             log::debug!(
                 "bernoulli marginal-slope intercept seed short-circuit: cached={}, closed_form={}, full_solver={}, max_full_solver_iters={}, seed_residual_bins={{<=1e-12:{}, <=1e-10:{}, <=1e-8:{}, <=abs_tol:{}, >abs_tol:{}}}",
