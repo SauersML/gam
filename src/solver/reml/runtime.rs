@@ -97,20 +97,20 @@ struct DerivativeContext {
 
 impl<'a> RemlState<'a> {
     pub(crate) fn analytic_outer_hessian_enabled(&self) -> bool {
-        // (1) Tierney-Kadane gate: TK has analytic value and first
-        // ρ-derivative paths but no analytic outer Hessian; running
-        // ValueGradientHessian against TK aborts the fit. Disable analytic
-        // Hessian when TK is active (Firth + non-identity link) so the
-        // optimizer falls back to BFGS/quasi-Newton.
-        if self.config.firth_bias_reduction && self.config.link_function() != LinkFunction::Identity
-        {
-            return false;
-        }
-        // (2) Biobank-scale fallback: analytic outer Hessian is only safe
-        // when the unified evaluator can express it as a matrix-free Hv
-        // operator (`prefer_outer_hessian_operator`). Whenever that path
-        // is unavailable at biobank scale, the dense `O(K²·n·p²)` LAML
-        // pairwise assembly would run instead — route to BFGS.
+        // The Tierney-Kadane fallback gate is no longer needed: the analytic
+        // TK value, first ρ-derivative, AND second ρ-derivative paths are
+        // implemented in `tierney_kadane_terms`, which now populates the
+        // `hessian` field whenever the caller requests `ValueGradientHessian`.
+        // The earlier gate (Firth + non-identity link → return false) was
+        // kept during the manual conflict merge that landed the TK Hessian
+        // implementation; it is now stale and was suppressing the analytic
+        // path that was actually in place.
+        //
+        // Biobank-scale fallback: analytic outer Hessian is only safe when
+        // the unified evaluator can express it as a matrix-free Hv operator
+        // (`prefer_outer_hessian_operator`). Whenever that path is
+        // unavailable at biobank scale, the dense `O(K²·n·p²)` LAML pairwise
+        // assembly would run instead — route to BFGS.
         let n_obs = self.x.nrows();
         let p_dim = self.x.ncols();
         let k_outer = self.canonical_penalties.len();
