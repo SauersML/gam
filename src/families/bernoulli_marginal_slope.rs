@@ -37,8 +37,8 @@ use crate::types::{InverseLink, LinkFunction, WigglePenaltyConfig};
 use ndarray::{Array1, Array2, ArrayView2, s};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 mod deviation_runtime;
 pub(crate) mod exact_kernel;
@@ -285,11 +285,7 @@ struct BernoulliMarginalSlopeFamily {
 }
 
 fn new_intercept_warm_start_cache(n: usize) -> Arc<Vec<AtomicU64>> {
-    Arc::new(
-        (0..n)
-            .map(|_| AtomicU64::new(f64::NAN.to_bits()))
-            .collect(),
-    )
+    Arc::new((0..n).map(|_| AtomicU64::new(f64::NAN.to_bits())).collect())
 }
 
 #[derive(Clone, Default)]
@@ -5620,79 +5616,75 @@ impl BernoulliMarginalSlopeFamily {
                     .map(|range| Array1::<f64>::zeros(range.len())),
             )
         };
-        let (log_likelihood, grad_marginal, grad_logslope, grad_h, grad_w) =
-            (0..n.div_ceil(ROW_CHUNK_SIZE))
-                .into_par_iter()
-                .try_fold(make_acc, |mut acc, chunk_idx| -> Result<_, String> {
-                    let start = chunk_idx * ROW_CHUNK_SIZE;
-                    let end = (start + ROW_CHUNK_SIZE).min(n);
-                    let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
-                    for row in start..end {
-                        let row_ctx = Self::row_ctx(cache, row);
-                        let neglog = self.compute_row_analytic_flex_into(
+        let (log_likelihood, grad_marginal, grad_logslope, grad_h, grad_w) = (0..n
+            .div_ceil(ROW_CHUNK_SIZE))
+            .into_par_iter()
+            .try_fold(make_acc, |mut acc, chunk_idx| -> Result<_, String> {
+                let start = chunk_idx * ROW_CHUNK_SIZE;
+                let end = (start + ROW_CHUNK_SIZE).min(n);
+                let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
+                for row in start..end {
+                    let row_ctx = Self::row_ctx(cache, row);
+                    let neglog = self.compute_row_analytic_flex_into(
+                        row,
+                        block_states,
+                        primary,
+                        row_ctx,
+                        false,
+                        &mut scratch,
+                    )?;
+                    acc.0 -= neglog;
+                    {
+                        let mut marginal = acc.1.view_mut();
+                        self.marginal_design.axpy_row_into(
                             row,
-                            block_states,
-                            primary,
-                            row_ctx,
-                            false,
-                            &mut scratch,
+                            Self::exact_newton_score_component_from_objective_gradient(
+                                scratch.grad[0],
+                            ),
+                            &mut marginal,
                         )?;
-                        acc.0 -= neglog;
-                        {
-                            let mut marginal = acc.1.view_mut();
-                            self.marginal_design.axpy_row_into(
-                                row,
+                    }
+                    {
+                        let mut logslope = acc.2.view_mut();
+                        self.logslope_design.axpy_row_into(
+                            row,
+                            Self::exact_newton_score_component_from_objective_gradient(
+                                scratch.grad[1],
+                            ),
+                            &mut logslope,
+                        )?;
+                    }
+                    if let (Some(primary_h), Some(grad_h)) = (primary.h.as_ref(), acc.3.as_mut()) {
+                        for idx in 0..primary_h.len() {
+                            grad_h[idx] +=
                                 Self::exact_newton_score_component_from_objective_gradient(
-                                    scratch.grad[0],
-                                ),
-                                &mut marginal,
-                            )?;
+                                    scratch.grad[primary_h.start + idx],
+                                );
                         }
-                        {
-                            let mut logslope = acc.2.view_mut();
-                            self.logslope_design.axpy_row_into(
-                                row,
+                    }
+                    if let (Some(primary_w), Some(grad_w)) = (primary.w.as_ref(), acc.4.as_mut()) {
+                        for idx in 0..primary_w.len() {
+                            grad_w[idx] +=
                                 Self::exact_newton_score_component_from_objective_gradient(
-                                    scratch.grad[1],
-                                ),
-                                &mut logslope,
-                            )?;
-                        }
-                        if let (Some(primary_h), Some(grad_h)) =
-                            (primary.h.as_ref(), acc.3.as_mut())
-                        {
-                            for idx in 0..primary_h.len() {
-                                grad_h[idx] +=
-                                    Self::exact_newton_score_component_from_objective_gradient(
-                                        scratch.grad[primary_h.start + idx],
-                                    );
-                            }
-                        }
-                        if let (Some(primary_w), Some(grad_w)) =
-                            (primary.w.as_ref(), acc.4.as_mut())
-                        {
-                            for idx in 0..primary_w.len() {
-                                grad_w[idx] +=
-                                    Self::exact_newton_score_component_from_objective_gradient(
-                                        scratch.grad[primary_w.start + idx],
-                                    );
-                            }
+                                    scratch.grad[primary_w.start + idx],
+                                );
                         }
                     }
-                    Ok(acc)
-                })
-                .try_reduce(make_acc, |mut left, right| -> Result<_, String> {
-                    left.0 += right.0;
-                    left.1 += &right.1;
-                    left.2 += &right.2;
-                    if let (Some(lhs), Some(rhs)) = (left.3.as_mut(), right.3.as_ref()) {
-                        *lhs += rhs;
-                    }
-                    if let (Some(lhs), Some(rhs)) = (left.4.as_mut(), right.4.as_ref()) {
-                        *lhs += rhs;
-                    }
-                    Ok(left)
-                })?;
+                }
+                Ok(acc)
+            })
+            .try_reduce(make_acc, |mut left, right| -> Result<_, String> {
+                left.0 += right.0;
+                left.1 += &right.1;
+                left.2 += &right.2;
+                if let (Some(lhs), Some(rhs)) = (left.3.as_mut(), right.3.as_ref()) {
+                    *lhs += rhs;
+                }
+                if let (Some(lhs), Some(rhs)) = (left.4.as_mut(), right.4.as_ref()) {
+                    *lhs += rhs;
+                }
+                Ok(left)
+            })?;
 
         let mut gradient = Array1::<f64>::zeros(slices.total);
         gradient
