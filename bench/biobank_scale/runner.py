@@ -709,7 +709,7 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
     ctn_test_input_path = out_dir / f"{spec.name}.pgs_ctn.test_input.csv"
     ctn_train_pred_path = out_dir / f"{spec.name}.pgs_ctn.train_pred.csv"
     ctn_test_pred_path = out_dir / f"{spec.name}.pgs_ctn.test_pred.csv"
-    formula = _ctn_formula(spec.pc_count, 64)
+    formula = _ctn_formula(spec.pc_count, centers)
     ctn_columns = [PGS_RAW_COLUMN, *_pc_std_columns(spec.pc_count)]
     # Why this isn't a uniform random subsample any more:
     #
