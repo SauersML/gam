@@ -6538,10 +6538,10 @@ impl From<&DesignMatrix> for DesignBlock {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChunkedKernelDesignOperator, DenseDesignMatrix, DenseDesignOperator, DesignMatrix,
-        EmbeddedColumnBlock, MultiChannelOperator, ReparamOperator, RowwiseKroneckerOperator,
-        SparseDesignMatrix, SparseHessianAccumulator, dense_matvec,
-        dense_operator_to_dense_by_chunks, dense_transpose_matvec,
+        ChunkedKernelDesignOperator, CoefficientTransformOperator, DenseDesignMatrix,
+        DenseDesignOperator, DesignMatrix, EmbeddedColumnBlock, MultiChannelOperator,
+        ReparamOperator, RowwiseKroneckerOperator, SparseDesignMatrix, SparseHessianAccumulator,
+        dense_matvec, dense_operator_to_dense_by_chunks, dense_transpose_matvec,
         dense_transpose_weighted_response, dense_xtwx_view,
     };
     use crate::linalg::matrix::LinearOperator;
@@ -6859,6 +6859,75 @@ mod tests {
         assert_eq!(chunk.dim(), (2, 3));
         assert_eq!(chunk[[0, 0]], 0.0);
         assert_eq!(chunk[[1, 1]], 1.5);
+    }
+
+    /// Locks in the dispatch path for the BLAS-3 cross-block fast path:
+    /// when a `CoefficientTransformOperator` is wrapped as
+    /// `DenseDesignMatrix::Lazy`, `DenseDesignMatrix::as_dense_ref` must reach
+    /// the operator's cached materialization. The dispatch goes
+    /// `DenseDesignMatrix::as_dense_ref` → `DenseDesignOperator::as_dense_ref`,
+    /// so the override has to live on `DenseDesignOperator`, not
+    /// `LinearOperator`. A misplaced override on `LinearOperator` is a hard
+    /// build break today (E0407, fixed in b516891), but if `LinearOperator`
+    /// ever grew an `as_dense_ref` slot the silent failure would be
+    /// `BlockDesignOperator::cross_block` falling back to the chunked scalar
+    /// path with no test signal — this assertion is the missing signal.
+    #[test]
+    fn coefficient_transform_operator_exposes_cached_dense_to_block_dispatch() {
+        let inner = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+        let transform = array![[0.5, -1.0, 2.0], [1.0, 0.0, -0.5]];
+        let expected = inner.dot(&transform);
+
+        let op =
+            CoefficientTransformOperator::new(DenseDesignMatrix::from(inner), transform.clone())
+                .expect("coefficient transform operator");
+        let dense_design = DenseDesignMatrix::from(Arc::new(op));
+
+        // Touch the cache through any LinearOperator path (`apply_transpose`
+        // short-circuits through `materialized_combined`). The OnceLock is empty
+        // until something exercises it, so `as_dense_ref` would otherwise
+        // return None before the first hot call.
+        let probe = Array1::from_elem(3, 1.0);
+        let _ = dense_design.apply_transpose(&probe);
+
+        let dense_ref = dense_design
+            .as_dense_ref()
+            .expect("DenseDesignMatrix::as_dense_ref must reach the cached X·T");
+        assert_eq!(dense_ref.dim(), expected.dim());
+        for ((r, c), v) in expected.indexed_iter() {
+            assert!((dense_ref[[r, c]] - v).abs() < 1e-12);
+        }
+    }
+
+    /// Same dispatch lock-in as the test above, but for
+    /// `ChunkedKernelDesignOperator`. The cross-block fast path in
+    /// `BlockDesignOperator::cross_block` matches on
+    /// `(DesignBlock::Dense(_), DesignBlock::Dense(_))` and gates the BLAS-3
+    /// route on `as_dense_ref()` returning `Some`; if the override drifts off
+    /// `DenseDesignOperator` the kernel block silently routes through
+    /// `weighted_cross_chunked` instead.
+    #[test]
+    fn chunked_kernel_operator_exposes_cached_dense_to_block_dispatch() {
+        let data = Arc::new(array![[0.0, 1.0], [1.0, 0.5], [2.0, -1.0]]);
+        let centers = Arc::new(array![[0.0, 0.0], [1.0, 1.0]]);
+        let kernel =
+            |x: &[f64], c: &[f64]| x.iter().zip(c.iter()).map(|(xi, ci)| xi * ci).sum::<f64>();
+        let op = ChunkedKernelDesignOperator::new(data, centers, kernel, None, None)
+            .expect("chunked kernel operator");
+        let expected = op.to_dense();
+
+        let dense_design = DenseDesignMatrix::from(Arc::new(op));
+
+        let probe = Array1::from_elem(3, 1.0);
+        let _ = dense_design.apply_transpose(&probe);
+
+        let dense_ref = dense_design
+            .as_dense_ref()
+            .expect("DenseDesignMatrix::as_dense_ref must reach the cached kernel block");
+        assert_eq!(dense_ref.dim(), expected.dim());
+        for ((r, c), v) in expected.indexed_iter() {
+            assert!((dense_ref[[r, c]] - v).abs() < 1e-12);
+        }
     }
 
     #[test]
