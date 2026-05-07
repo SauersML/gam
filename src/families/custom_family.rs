@@ -6401,7 +6401,7 @@ fn exact_newton_joint_hessian_source_from_workspace(
             if v.len() != total {
                 return Err(format!(
                     "{}: operator input length mismatch: got {}, expected {total}",
-                    context_apply,
+                    &*context_apply,
                     v.len()
                 ));
             }
@@ -6411,14 +6411,14 @@ fn exact_newton_joint_hessian_source_from_workspace(
             if out.len() != total {
                 return Err(format!(
                     "{}: operator matvec length mismatch: got {}, expected {total}",
-                    context_apply,
+                    &*context_apply,
                     out.len()
                 ));
             }
             if out.iter().any(|value| !value.is_finite()) {
                 return Err(format!(
                     "{}: operator matvec returned non-finite values",
-                    context_apply
+                    &*context_apply
                 ));
             }
             Ok(out)
@@ -6427,7 +6427,7 @@ fn exact_newton_joint_hessian_source_from_workspace(
             if v.len() != total || out.len() != total {
                 return Err(format!(
                     "{}: operator input/output length mismatch: v={} out={} expected={total}",
-                    context_apply_into,
+                    &*context_apply_into,
                     v.len(),
                     out.len()
                 ));
@@ -6438,7 +6438,7 @@ fn exact_newton_joint_hessian_source_from_workspace(
             if out.iter().any(|value| !value.is_finite()) {
                 return Err(format!(
                     "{}: operator matvec returned non-finite values",
-                    context_apply_into
+                    &*context_apply_into
                 ));
             }
             Ok(())
