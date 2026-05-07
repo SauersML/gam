@@ -889,16 +889,18 @@ pub trait CustomFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        // Same coupling guard as `exact_newton_joint_hessian_with_specs`:
-        // for multi-block families, the default block-diagonal assembly drops
-        // any cross-block `∂²L/∂β_a∂β_b` curvature and is only valid when the
-        // family explicitly opts in via `likelihood_blocks_uncoupled()`.  See
-        // that method for rationale.
-        if block_states.len() <= 1 || self.likelihood_blocks_uncoupled() {
-            exact_newton_joint_hessian_from_exact_blocks(self, block_states)
-        } else {
-            Ok(None)
-        }
+        // Default block-diagonal assembly from per-block ExactNewton hessians.
+        // This is the inner-fit-side default and is *intentionally* not gated
+        // by `likelihood_blocks_uncoupled()`: the inner joint-Newton loop only
+        // uses this Hessian as a Newton-direction surrogate that is
+        // immediately validated by the line-search + objective decrease, so
+        // even if the family is coupled, an under-resolved block-diagonal
+        // direction will simply backtrack instead of corrupting the outer
+        // REML score.  The strict coupling gate lives one layer up, on
+        // `exact_newton_joint_hessian_with_specs`, where outer REML trace
+        // algebra would silently produce wrong answers from a missing
+        // cross-block term.
+        exact_newton_joint_hessian_from_exact_blocks(self, block_states)
     }
 
     /// Optional exact joint log-likelihood / score evaluation in flattened
@@ -1053,6 +1055,13 @@ pub trait CustomFamily {
     /// Kept separate from outer hyper-Hessian capabilities so CTN/GAMLSS row
     /// operators do not accidentally advertise pairwise θθ calculus as cheap.
     fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+        false
+    }
+
+    fn inner_joint_workspace_gradient_available(
+        &self,
+        _specs: &[ParameterBlockSpec],
+    ) -> bool {
         false
     }
 
@@ -7829,7 +7838,7 @@ fn load_joint_gradient_evaluation<F: CustomFamily + Clone + Send + Sync + 'stati
 ) -> Result<JointGradientLoad, String> {
     let workspace = match preferred_workspace {
         Some(workspace) => Some(workspace),
-        None if prefer_workspace => {
+        None if prefer_workspace && family.inner_joint_workspace_gradient_available(specs) => {
             family.exact_newton_joint_hessian_workspace_with_options(states, specs, options)?
         }
         None => None,
