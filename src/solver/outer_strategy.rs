@@ -3485,7 +3485,6 @@ impl OuterHessianOperator for BorrowedDenseOuterHessian<'_> {
     }
 }
 
-
 /// Pick the post-rejection trust radius. If the cubic model just
 /// predicted a decrease >1e6 × |cost| (i.e. the local function is wildly
 /// non-quadratic at the proposed step), and a Newton-step-scale derived

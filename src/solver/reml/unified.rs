@@ -4928,12 +4928,7 @@ pub fn reml_laml_evaluate(
         let scale_prefers_operator = prefer_outer_hessian_operator(n_obs, p_dim, k_outer);
         let has_subspace_trace = solution.penalty_subspace_trace.is_some();
         let use_operator = hessian_kernel.is_some()
-            && use_outer_hessian_operator_path(
-                n_obs,
-                p_dim,
-                k_outer,
-                callback_operator_kernel,
-            );
+            && use_outer_hessian_operator_path(n_obs, p_dim, k_outer, callback_operator_kernel);
         // Reason mnemonic: which clause carried the routing.  Ordered so
         // the most specific reason wins; "kernel_absent" wins over
         // everything else because that disables the operator path
@@ -11785,8 +11780,7 @@ mod tests {
         let n = x_data.nrows();
 
         // (1) Production helper vs per-row dense reference.
-        let x_design =
-            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x_data.clone()));
+        let x_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x_data.clone()));
         let h_g_proj = subspace.xt_projected_kernel_x_diagonal(&x_design);
         assert_eq!(h_g_proj.len(), n);
         for i in 0..n {
@@ -11856,7 +11850,12 @@ mod tests {
         let penalty_root_0 = array![[0.7, 0.3, 0.6, 0.0]];
         let penalty_root_1 = array![[0.2, 0.5, 0.0, 0.4]];
 
-        let x = array![[1.0, 0.2, 0.5, 0.3], [1.0, 1.1, -0.2, 0.4], [1.0, -0.8, 0.7, -0.1], [1.0, 0.5, 0.3, 0.6]];
+        let x = array![
+            [1.0, 0.2, 0.5, 0.3],
+            [1.0, 1.1, -0.2, 0.4],
+            [1.0, -0.8, 0.7, -0.1],
+            [1.0, 0.5, 0.3, 0.6]
+        ];
         let c_array = array![0.31, -0.27, 0.19, -0.11];
         let d_array = array![0.17, -0.11, 0.23, 0.07];
         let deriv_provider = SinglePredictorGlmDerivatives {
@@ -11956,17 +11955,11 @@ mod tests {
             array![0.7, -0.3],
         ];
         for alpha in alphas.iter() {
-            let hvp =
-                crate::solver::outer_strategy::OuterHessianOperator::matvec(&operator, alpha)
-                    .expect("operator HVP");
+            let hvp = crate::solver::outer_strategy::OuterHessianOperator::matvec(&operator, alpha)
+                .expect("operator HVP");
             let dense_hvp = dense.dot(alpha);
             for i in 0..hvp.len() {
-                assert_relative_eq!(
-                    hvp[i],
-                    dense_hvp[i],
-                    epsilon = 1e-12,
-                    max_relative = 1e-12
-                );
+                assert_relative_eq!(hvp[i], dense_hvp[i], epsilon = 1e-12, max_relative = 1e-12);
             }
         }
     }
