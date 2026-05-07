@@ -1,4 +1,7 @@
 use crate::probability::normal_cdf;
+use crate::resource::{ByteLruCache, ResidentBytes};
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // De-nested cubic transport kernel.
 //
@@ -901,6 +904,124 @@ pub struct DenestedPartitionCell {
 }
 
 impl DenestedPartitionCell {}
+
+#[derive(Clone, Copy, Debug, Eq)]
+pub struct CellFingerprint {
+    c0: u64,
+    c1: u64,
+    c2: u64,
+    c3: u64,
+    left: u64,
+    right: u64,
+}
+
+impl CellFingerprint {
+    #[inline]
+    pub fn new(cell: DenestedCubicCell) -> Self {
+        Self {
+            c0: cell.c0.to_bits(),
+            c1: cell.c1.to_bits(),
+            c2: cell.c2.to_bits(),
+            c3: cell.c3.to_bits(),
+            left: cell.left.to_bits(),
+            right: cell.right.to_bits(),
+        }
+    }
+}
+
+impl PartialEq for CellFingerprint {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.c0 == other.c0
+            && self.c1 == other.c1
+            && self.c2 == other.c2
+            && self.c3 == other.c3
+            && self.left == other.left
+            && self.right == other.right
+    }
+}
+
+impl Hash for CellFingerprint {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.c0.hash(state);
+        self.c1.hash(state);
+        self.c2.hash(state);
+        self.c3.hash(state);
+        self.left.hash(state);
+        self.right.hash(state);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CachedCellMoments {
+    state: CellMomentState,
+}
+
+impl CachedCellMoments {
+    #[inline]
+    pub fn new(state: CellMomentState) -> Self {
+        Self { state }
+    }
+
+    #[inline]
+    pub fn max_degree(&self) -> usize {
+        self.state.moments.len().saturating_sub(1)
+    }
+
+    #[inline]
+    pub fn state_for_degree(&self, max_degree: usize) -> Option<CellMomentState> {
+        if self.max_degree() < max_degree {
+            return None;
+        }
+        let mut state = self.state.clone();
+        state.moments.truncate(max_degree + 1);
+        Some(state)
+    }
+}
+
+impl ResidentBytes for CachedCellMoments {
+    fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(
+            self.state
+                .moments
+                .capacity()
+                .saturating_mul(std::mem::size_of::<f64>()),
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct CellMomentCacheStats {
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+impl CellMomentCacheStats {
+    #[inline]
+    pub fn snapshot(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
+        )
+    }
+
+    #[inline]
+    pub fn hit_rate_delta(&self, before: (u64, u64)) -> (u64, u64, f64) {
+        let (hits, misses) = self.snapshot();
+        let dh = hits.saturating_sub(before.0);
+        let dm = misses.saturating_sub(before.1);
+        let total = dh + dm;
+        let rate = if total == 0 {
+            0.0
+        } else {
+            dh as f64 / total as f64
+        };
+        (dh, dm, rate)
+    }
+}
+
+pub type CellMomentLruCache = ByteLruCache<CellFingerprint, CachedCellMoments>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CellMomentState {
@@ -3101,6 +3222,35 @@ pub fn evaluate_cell_moments(
         }
     }
     evaluate_non_affine_cell_state(cell, branch, max_degree)
+}
+
+/// Evaluate a de-nested cubic cell through a fit-lifetime byte-limited LRU cache.
+///
+/// The fingerprint is an exact bit-cast of `(c0, c1, c2, c3, left, right)`, so
+/// eviction and reuse cannot alias nearby-but-different cells.  A cached entry
+/// computed to a higher degree may satisfy a lower-degree request by truncating
+/// the moment vector, preserving the public [`evaluate_cell_moments`] contract.
+pub fn evaluate_cell_moments_cached(
+    cell: DenestedCubicCell,
+    max_degree: usize,
+    cache: &CellMomentLruCache,
+    stats: Option<&CellMomentCacheStats>,
+) -> Result<CellMomentState, String> {
+    let key = CellFingerprint::new(cell);
+    if let Some(cached) = cache.get(&key) {
+        if let Some(state) = cached.state_for_degree(max_degree) {
+            if let Some(stats) = stats {
+                stats.hits.fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(state);
+        }
+    }
+    if let Some(stats) = stats {
+        stats.misses.fetch_add(1, Ordering::Relaxed);
+    }
+    let state = evaluate_cell_moments(cell, max_degree)?;
+    cache.insert(key, CachedCellMoments::new(state.clone()));
+    Ok(state)
 }
 
 /// Scratch-backed variant of [`evaluate_cell_moments`].
@@ -5636,5 +5786,80 @@ mod tests {
         let got = cell_polynomial_integral_from_moments(&coeffs, &state.moments, "test poly")
             .expect("poly integral");
         assert!((got - expected).abs() < 1e-14);
+    }
+
+    #[test]
+    fn cell_moment_lru_matches_uncached_non_affine_grid() {
+        let cache = CellMomentLruCache::new(16 * 1024 * 1024);
+        let stats = CellMomentCacheStats::default();
+        let c0s = [-0.75, 0.0, 0.5];
+        let c1s = [-1.2, 0.25, 1.1];
+        let c2s = [-0.18, 0.07];
+        let c3s = [0.0, 0.025];
+        let bounds = [(-2.0, -0.5), (-0.25, 1.5)];
+        let degrees = [4usize, 9, 15, 21];
+        for &c0 in &c0s {
+            for &c1 in &c1s {
+                for &c2 in &c2s {
+                    for &c3 in &c3s {
+                        for &(left, right) in &bounds {
+                            for &max_degree in &degrees {
+                                let cell = DenestedCubicCell {
+                                    left,
+                                    right,
+                                    c0,
+                                    c1,
+                                    c2,
+                                    c3,
+                                };
+                                let branch = branch_cell(cell).expect("branch");
+                                if branch == ExactCellBranch::Affine {
+                                    continue;
+                                }
+                                let expected =
+                                    evaluate_non_affine_cell_state(cell, branch, max_degree)
+                                        .expect("uncached non-affine moments");
+                                let got = evaluate_cell_moments_cached(
+                                    cell,
+                                    max_degree,
+                                    &cache,
+                                    Some(&stats),
+                                )
+                                .expect("cached moments");
+                                assert_eq!(got.branch, expected.branch);
+                                assert_eq!(got.moments.len(), max_degree + 1);
+                                let denom = expected.value.abs().max(1.0);
+                                assert!(
+                                    ((got.value - expected.value).abs() / denom) < 1e-10,
+                                    "value mismatch for {cell:?} degree {max_degree}: got {} expected {}",
+                                    got.value,
+                                    expected.value
+                                );
+                                for (idx, (&lhs, &rhs)) in
+                                    got.moments.iter().zip(expected.moments.iter()).enumerate()
+                                {
+                                    let denom = rhs.abs().max(1.0);
+                                    assert!(
+                                        ((lhs - rhs).abs() / denom) < 1e-10,
+                                        "moment {idx} mismatch for {cell:?} degree {max_degree}: got {lhs} expected {rhs}"
+                                    );
+                                }
+                                let warm = evaluate_cell_moments_cached(
+                                    cell,
+                                    max_degree,
+                                    &cache,
+                                    Some(&stats),
+                                )
+                                .expect("warm cached moments");
+                                assert_eq!(warm, got);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let (hits, misses) = stats.snapshot();
+        assert!(hits > 0, "expected warm LRU hits");
+        assert!(misses > 0, "expected cold LRU misses");
     }
 }
