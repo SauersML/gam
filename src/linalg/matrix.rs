@@ -3107,12 +3107,6 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
     fn ncols(&self) -> usize {
         self.total_cols
     }
-    /// Expose the cached [K_eff | poly] materialization so cross-block paths
-    /// can use the Dense × Dense BLAS-3 fast path instead of falling back to
-    /// chunked scalar accumulation.
-    fn as_dense_ref(&self) -> Option<&Array2<f64>> {
-        self.materialized_combined()
-    }
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
         if let Some(combined) = self.materialized_combined() {
             return dense_matvec(combined, vector);
@@ -3250,6 +3244,13 @@ impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
 }
 
 impl<K: SpatialKernelEvaluator> DenseDesignOperator for ChunkedKernelDesignOperator<K> {
+    /// Expose the cached [K_eff | poly] materialization so cross-block paths
+    /// can use the Dense × Dense BLAS-3 fast path instead of falling back to
+    /// chunked scalar accumulation.
+    fn as_dense_ref(&self) -> Option<&Array2<f64>> {
+        self.materialized_combined()
+    }
+
     fn row_chunk_into(
         &self,
         rows: Range<usize>,
@@ -3354,16 +3355,6 @@ impl LinearOperator for CoefficientTransformOperator {
     fn ncols(&self) -> usize {
         self.p_out
     }
-    /// Expose the cached X·T materialization when populated. This is what lets
-    /// `BlockDesignOperator::cross_block` recognize a Dense × Dense pair and
-    /// route to `weighted_crossprod_dense` (BLAS-3 GEMM) instead of the
-    /// scalar `weighted_cross_chunked` triple loop. Without this override the
-    /// default trait impl returns `None`, the fast path is skipped, and a
-    /// 4-block biobank fit (pgs + sex + smooth_age + duchon) pays a 24 s
-    /// cross-block cost per PIRLS curvature build.
-    fn as_dense_ref(&self) -> Option<&Array2<f64>> {
-        self.materialized_combined()
-    }
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
         if let Some(combined) = self.materialized_combined() {
             return dense_matvec(combined, vector);
@@ -3392,6 +3383,17 @@ impl LinearOperator for CoefficientTransformOperator {
 }
 
 impl DenseDesignOperator for CoefficientTransformOperator {
+    /// Expose the cached X·T materialization when populated. This is what lets
+    /// `BlockDesignOperator::cross_block` recognize a Dense × Dense pair and
+    /// route to `weighted_crossprod_dense` (BLAS-3 GEMM) instead of the
+    /// scalar `weighted_cross_chunked` triple loop. Without this override the
+    /// default trait impl returns `None`, the fast path is skipped, and a
+    /// 4-block biobank fit (pgs + sex + smooth_age + duchon) pays a 24 s
+    /// cross-block cost per PIRLS curvature build.
+    fn as_dense_ref(&self) -> Option<&Array2<f64>> {
+        self.materialized_combined()
+    }
+
     fn to_dense(&self) -> Array2<f64> {
         if let Some(combined) = self.materialized_combined() {
             return combined.clone();
