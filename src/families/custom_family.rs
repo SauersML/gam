@@ -8324,6 +8324,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 break;
             }
             for bt in 0..8 {
+                accepted_joint_workspace = None;
                 let alpha = (0.5f64.powi(bt)).min(barrier_ceiling);
                 for b in 0..specs.len() {
                     let (start, end) = ranges[b];
@@ -8366,7 +8367,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     accepted = true;
                     break;
                 }
-                accepted_joint_workspace = None;
             }
             if !accepted {
                 // Restore original betas
