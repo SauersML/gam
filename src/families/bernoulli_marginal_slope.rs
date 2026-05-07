@@ -37,6 +37,7 @@ use crate::types::{InverseLink, LinkFunction, WigglePenaltyConfig};
 use ndarray::{Array1, Array2, ArrayView2, s};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 mod deviation_runtime;
@@ -276,13 +277,19 @@ struct BernoulliMarginalSlopeFamily {
     ///
     /// Slots are initialised to `NaN` (sentinel for "not yet solved") and
     /// overwritten with the converged intercept on every successful call.
-    /// `Mutex<Vec<f64>>` granularity is fine here: the interior critical
-    /// sections are O(1) Vec reads/writes amortised over the dominant
-    /// cell-moment work in the root-solver body. Set to `None` for unit-test
-    /// fixtures that build a `BernoulliMarginalSlopeFamily` directly without
-    /// running the full fit pipeline; production paths go through
-    /// `make_family` which initialises the cache to length-`n` NaN.
-    intercept_warm_starts: Option<Arc<std::sync::Mutex<Vec<f64>>>>,
+    /// Set to `None` for unit-test fixtures that build a
+    /// `BernoulliMarginalSlopeFamily` directly without running the full fit
+    /// pipeline; production paths go through `make_family` which initialises
+    /// the cache to length-`n` NaN.
+    intercept_warm_starts: Option<Arc<Vec<AtomicU64>>>,
+}
+
+fn new_intercept_warm_start_cache(n: usize) -> Arc<Vec<AtomicU64>> {
+    Arc::new(
+        (0..n)
+            .map(|_| AtomicU64::new(f64::NAN.to_bits()))
+            .collect(),
+    )
 }
 
 #[derive(Clone, Default)]
@@ -2003,6 +2010,12 @@ fn add_weighted_chunk_gram(chunk: &Array2<f64>, weights: &Array1<f64>, target: &
 /// pre-solved row context; primary jets are recomputed in chunk-local work
 /// to avoid retaining O(n * p_primary^2) Hessian storage.
 const ROW_CHUNK_SIZE: usize = 1024;
+const EXACT_WORK_LOG_MIN_ROWS: usize = 50_000;
+
+#[inline]
+fn log_exact_work(n: usize) -> bool {
+    n >= EXACT_WORK_LOG_MIN_ROWS
+}
 
 /// Shared precomputed state plus pre-solved per-row contexts. All row
 /// intercepts are solved once during cache construction so that workspace
@@ -3064,10 +3077,8 @@ impl BernoulliMarginalSlopeFamily {
         // (uninitialised) or non-finite (stale), fall back to the closed-
         // form seed.
         let cached_a = self.intercept_warm_starts.as_ref().and_then(|cache| {
-            cache.lock().ok().and_then(|guard| {
-                let value = guard.get(row).copied()?;
-                value.is_finite().then_some(value)
-            })
+            let value = f64::from_bits(cache.get(row)?.load(Ordering::Relaxed));
+            value.is_finite().then_some(value)
         });
         let a_init = cached_a.unwrap_or(a_closed_form);
 
@@ -3119,10 +3130,9 @@ impl BernoulliMarginalSlopeFamily {
 
         // Cache the converged intercept for the next PIRLS iter.
         if let Some(cache) = self.intercept_warm_starts.as_ref()
-            && let Ok(mut guard) = cache.lock()
-            && let Some(slot) = guard.get_mut(row)
+            && let Some(slot) = cache.get(row)
         {
-            *slot = a;
+            slot.store(a.to_bits(), Ordering::Relaxed);
         }
 
         Ok((a, abs_deriv))
@@ -8203,11 +8213,11 @@ pub fn fit_bernoulli_marginal_slope_terms(
         Ok(blocks)
     };
 
+    let intercept_warm_starts = new_intercept_warm_start_cache(y.len());
     let make_family = |marginal_design: &TermCollectionDesign,
                        logslope_design: &TermCollectionDesign,
                        sigma: Option<f64>|
      -> BernoulliMarginalSlopeFamily {
-        let n_rows = y.len();
         BernoulliMarginalSlopeFamily {
             y: Arc::clone(&y),
             weights: Arc::clone(&weights),
@@ -8219,7 +8229,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             score_warp: score_warp_runtime.clone(),
             link_dev: link_dev_runtime.clone(),
             policy: policy.clone(),
-            intercept_warm_starts: Some(Arc::new(std::sync::Mutex::new(vec![f64::NAN; n_rows]))),
+            intercept_warm_starts: Some(Arc::clone(&intercept_warm_starts)),
         }
     };
 
