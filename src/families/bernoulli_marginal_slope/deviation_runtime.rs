@@ -761,7 +761,6 @@ impl DeviationRuntime {
     /// at a span endpoint, an interior root of the derivative, or a tail
     /// value.  Summing per-column suprema gives a conservative row-wise L1
     /// bound that is independent of `x`.
-    #[allow(dead_code)] // staged for the zero-deviation fast-path bound; wired in by a follow-up agent
     pub(crate) fn value_basis_l1_sup_norm(&self) -> f64 {
         let mut total = 0.0;
         for basis_idx in 0..self.basis_dim {
