@@ -3290,7 +3290,7 @@ def _emit_joint_pc_term(
         if pc_basis == "duchon":
             return (
                 f"duchon({cols}, centers={knot_count}, "
-                f"order=1, power={max(1, len(pc_cols) // 2)}, length_scale=1.0)"
+                f"order=0, power={max(1, len(pc_cols) // 2)}, length_scale=1.0)"
             )
         if pc_basis == "matern":
             return f"matern({cols}, centers={knot_count}{dp})"
@@ -3335,7 +3335,7 @@ def _requires_joint_spatial_term(cfg: dict[str, typing.Any] | None) -> bool:
 
 def _rust_duchon_options_for_dimension(dimension: int) -> str:
     power = max(1, dimension // 2)
-    return f", order=1, power={power}, length_scale=1.0"
+    return f", order=0, power={power}, length_scale=1.0"
 
 
 def _rust_joint_spatial_term(basis: str, smooth_cols: list[str], knot_count: int, dp_opt: str) -> str:

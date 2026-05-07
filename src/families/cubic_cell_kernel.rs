@@ -305,29 +305,15 @@ pub fn reduce_sextic_moments(
             "sextic moment reduction encountered non-finite leading coefficient: {lead:.3e}"
         ));
     }
-    // The sextic recurrence divides by `lead = 3·c3²`. `branch_cell`
-    // routes a cell here when its **normalized** non-affine coefficient
-    // `k3 = c3 · (width/2)³` exceeds `NORMALIZED_CELL_BRANCH_TOL = 1e-10`,
-    // which can correspond to a raw `c3` as small as ≈ 1e-10 when the cell
-    // half-width is ≈ 1 — yielding `lead ≈ 3·1e-20 ≈ 1e-19`. Strict raw-
-    // magnitude checks (e.g. `lead > 1e-18`) and the dispatcher's
-    // normalized check disagree at exactly that scale, so a cell can pass
-    // dispatch as Sextic but fail the recurrence's stability bar.
-    //
-    // Use the dispatcher's normalized criterion here too: when the sextic
-    // contribution at the cell's geometric scale is at-or-below the same
-    // `NORMALIZED_CELL_BRANCH_TOL` that decided "non-affine", we know the
-    // sextic correction is below floating-point precision relative to the
-    // cell's scale, and the cleanest answer is the affine moment vector
-    // evaluated at this cell directly (closed form, all degrees, no
-    // unstable division).
-    let half_width = 0.5 * (cell.right - cell.left);
-    let normalized_k3 = if half_width.is_finite() {
-        cell.c3 * half_width.powi(3)
-    } else {
-        cell.c3
-    };
-    if normalized_k3.abs() <= NORMALIZED_CELL_BRANCH_TOL || lead.abs() <= 1e-18 {
+    if let Some(lower_branch) = degenerate_sextic_branch(cell, lead)? {
+        if lower_branch == ExactCellBranch::Quartic {
+            return evaluate_non_affine_cell_state(
+                DenestedCubicCell { c3: 0.0, ..cell },
+                ExactCellBranch::Quartic,
+                max_degree,
+            )
+            .map(|state| state.moments);
+        }
         return evaluate_affine_cell_state(
             DenestedCubicCell {
                 left: cell.left,
@@ -1393,6 +1379,27 @@ pub fn branch_cell(cell: DenestedCubicCell) -> Result<ExactCellBranch, String> {
     }
 }
 
+#[inline]
+fn degenerate_sextic_branch(
+    cell: DenestedCubicCell,
+    lead: f64,
+) -> Result<Option<ExactCellBranch>, String> {
+    // The sextic recurrence divides by `lead = 3*c3^2`. When that division is
+    // unstable, lower the polynomial degree without discarding a material
+    // quadratic coefficient.
+    let (normalized_k2, normalized_k3) = normalized_non_affine_coefficients(
+        cell.left, cell.right, cell.c0, cell.c1, cell.c2, cell.c3,
+    )?;
+    if normalized_k3.abs() > NORMALIZED_CELL_BRANCH_TOL && lead.abs() > 1e-18 {
+        return Ok(None);
+    }
+    if normalized_k2.abs() > NORMALIZED_CELL_BRANCH_TOL {
+        Ok(Some(ExactCellBranch::Quartic))
+    } else {
+        Ok(Some(ExactCellBranch::Affine))
+    }
+}
+
 pub fn bivariate_normal_cdf(h: f64, k: f64, rho: f64) -> Result<f64, String> {
     if !h.is_finite() && !h.is_infinite() {
         return Err("bivariate normal cdf requires finite or infinite h".to_string());
@@ -2063,6 +2070,32 @@ pub fn evaluate_cell_moments(
     if branch == ExactCellBranch::Affine {
         return evaluate_affine_cell_state(cell, max_degree);
     }
+    if branch == ExactCellBranch::Sextic {
+        let lead = sextic_qprime_coefficients(cell.c0, cell.c1, cell.c2, cell.c3)[5];
+        if !lead.is_finite() {
+            return Err(format!(
+                "sextic cell evaluation encountered non-finite leading coefficient: {lead:.3e}"
+            ));
+        }
+        if let Some(lower_branch) = degenerate_sextic_branch(cell, lead)? {
+            return match lower_branch {
+                ExactCellBranch::Quartic => evaluate_non_affine_cell_state(
+                    DenestedCubicCell { c3: 0.0, ..cell },
+                    ExactCellBranch::Quartic,
+                    max_degree,
+                ),
+                ExactCellBranch::Affine => evaluate_affine_cell_state(
+                    DenestedCubicCell {
+                        c2: 0.0,
+                        c3: 0.0,
+                        ..cell
+                    },
+                    max_degree,
+                ),
+                ExactCellBranch::Sextic => unreachable!("sextic cannot be a lowered branch"),
+            };
+        }
+    }
     evaluate_non_affine_cell_state(cell, branch, max_degree)
 }
 
@@ -2531,6 +2564,46 @@ mod tests {
                 target
             );
         }
+    }
+
+    #[test]
+    fn degenerate_sextic_branch_preserves_quadratic_coefficient() {
+        let cell = DenestedCubicCell {
+            left: -1.0,
+            right: 1.0,
+            c0: 0.0,
+            c1: 0.0,
+            c2: 0.1,
+            c3: 2.0e-10,
+        };
+        assert_eq!(branch_cell(cell).unwrap(), ExactCellBranch::Sextic);
+
+        let state = evaluate_cell_moments(cell, 9).expect("degenerate sextic cell");
+        let quartic_cell = DenestedCubicCell { c3: 0.0, ..cell };
+        let quartic = evaluate_cell_moments(quartic_cell, 9).expect("quartic cell");
+        let affine = evaluate_affine_cell_state(
+            DenestedCubicCell {
+                c2: 0.0,
+                c3: 0.0,
+                ..cell
+            },
+            9,
+        )
+        .expect("affine cell");
+
+        assert_eq!(state.branch, ExactCellBranch::Quartic);
+        for k in 0..=9 {
+            assert!(
+                (state.moments[k] - quartic.moments[k]).abs() < 1e-12,
+                "lowered moment M{k} should match the quartic cell: {} vs {}",
+                state.moments[k],
+                quartic.moments[k]
+            );
+        }
+        assert!(
+            (state.moments[0] - affine.moments[0]).abs() > 1e-4,
+            "degenerate sextic handling must not drop the nonzero c2 term"
+        );
     }
 
     #[test]
