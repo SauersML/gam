@@ -3940,8 +3940,7 @@ where
         // through to the rebuild path. Iter 1 always rebuilds because no
         // prior accept has populated `final_state`.
         let cache_curvature_kind = final_state.as_ref().map(|s| s.hessian_curvature);
-        let cached_state_matches =
-            iter > 1 && cache_curvature_kind == Some(preferred_curvature);
+        let cached_state_matches = iter > 1 && cache_curvature_kind == Some(preferred_curvature);
         let mut state = if cached_state_matches {
             final_state
                 .take()
@@ -3979,7 +3978,11 @@ where
             iter,
             state.hessian_curvature,
             curvature_total.as_secs_f64(),
-            if cached_state_matches { "reused_prev_accept" } else { "rebuilt" },
+            if cached_state_matches {
+                "reused_prev_accept"
+            } else {
+                "rebuilt"
+            },
         );
         // Per-iter LM-loop accumulators. Surface where the inner Newton
         // spends time when the LM has to halve repeatedly: solve-direction
