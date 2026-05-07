@@ -10785,6 +10785,84 @@ mod tests {
     }
 
     #[test]
+    fn zero_deviation_intercept_fast_path_matches_denested_calibration() {
+        let seed = Array1::from_iter((0..25).map(|i| -2.4 + 4.8 * i as f64 / 24.0));
+        let score_prepared = build_score_warp_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 8,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build score-warp block");
+        let link_prepared = build_test_link_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 8,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build link-deviation block");
+        let n = seed.len();
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(Array1::zeros(n)),
+            weights: Arc::new(Array1::ones(n)),
+            z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
+            gaussian_frailty_sd: Some(0.65),
+            base_link: bernoulli_marginal_slope_probit_link(),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((n, 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((n, 0)),
+            )),
+            score_warp: Some(score_prepared.runtime.clone()),
+            link_dev: Some(link_prepared.runtime.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: Some(new_intercept_warm_start_cache(n)),
+        };
+        let marginal_eta = 0.35;
+        let slope = -0.8;
+        let beta_h = Array1::zeros(score_prepared.runtime.basis_dim());
+        let beta_w = Array1::zeros(link_prepared.runtime.basis_dim());
+
+        let marginal = family
+            .marginal_link_map(marginal_eta)
+            .expect("marginal map");
+        let scale = family.probit_frailty_scale();
+        let rigid_a = rigid_prescale_intercept_from_marginal(marginal.q, slope, scale);
+        let (f_rigid, f_a_rigid, _) = family
+            .evaluate_denested_calibration_newton(
+                rigid_a,
+                marginal_eta,
+                slope,
+                Some(&beta_h),
+                Some(&beta_w),
+            )
+            .expect("denested zero-deviation calibration");
+        assert!(
+            f_rigid.abs() <= 5e-13,
+            "closed-form rigid intercept residual should be at machine epsilon, got {f_rigid}"
+        );
+        let analytic_deriv = rigid_prescale_intercept_derivative_abs(marginal.q, slope, scale);
+        assert!(
+            (f_a_rigid - analytic_deriv).abs() <= 5e-13,
+            "denested derivative {f_a_rigid} != analytic {analytic_deriv}"
+        );
+
+        let (a_fast, deriv_fast, fast_path) = family
+            .solve_row_intercept_base(0, marginal_eta, slope, Some(&beta_h), Some(&beta_w), None)
+            .expect("zero-deviation solve");
+        assert!(
+            fast_path,
+            "zero coefficients should take analytic fast path"
+        );
+        assert_eq!(a_fast, rigid_a);
+        assert_eq!(deriv_fast, analytic_deriv);
+    }
+
+    #[test]
     fn exact_layout_ignores_dummy_beta_widths_for_empty_design_blocks() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
         let score_prepared = build_score_warp_deviation_block_from_seed(
