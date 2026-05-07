@@ -491,7 +491,14 @@ fn map_hessian_to_original_basis(
     // H_original = Qs * H_transformed * Qs'
     // left_dot_matrix avoids densification for sparse Hessians.
     let tmp = h_t.left_dot_matrix(qs);
-    Ok(tmp.dot(&qs.t()))
+    let mut h = tmp.dot(&qs.t());
+    // Two non-self-adjoint matmuls accumulate ~p · ε rounding noise that
+    // breaks bitwise symmetry even though the analytic result `Q H Qᵀ` is
+    // symmetric whenever `H_transformed` is.  Average opposite entries
+    // explicitly so downstream `validate_dense_hessian_export` doesn't
+    // reject otherwise-valid fits over rounding-noise asymmetry.
+    crate::families::custom_family::symmetrize_dense_in_place(&mut h);
+    Ok(h)
 }
 
 /// Default inner P-IRLS tolerance floor.

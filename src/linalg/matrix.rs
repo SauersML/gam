@@ -77,6 +77,20 @@ pub fn panic_or_error_if_biobank_mode_and_to_dense_called_with_policy(
     p: usize,
     policy: &ResourcePolicy,
 ) -> Result<(), String> {
+    // Strict-operator mode: refuse any dense materialization, regardless of
+    // size.  Callers in this mode have committed to operator-only math; any
+    // dense fallback (cache or otherwise) violates that contract and would
+    // silently turn an analytic-operator path into a hidden dense path at
+    // biobank scale.
+    if matches!(
+        policy.derivative_storage_mode,
+        crate::resource::DerivativeStorageMode::AnalyticOperatorRequired
+    ) {
+        return Err(format!(
+            "{context}: refusing to densify operator-backed design {n}x{p} under \
+             AnalyticOperatorRequired policy; provide an operator-form path"
+        ));
+    }
     let dense_bytes = checked_dense_nbytes(n, p, context)?;
     let limit = policy.max_single_materialization_bytes;
     if dense_bytes > limit {
