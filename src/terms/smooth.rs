@@ -4346,56 +4346,24 @@ fn smooth_intrinsic_parametric_feature_cols(
     // constraint block `C = [1, …]`, alongside which the smooth is then
     // ORTHOGONALIZED via `apply_smooth_transform_to_design`.  Every column
     // returned here is therefore a direction that gets projected OUT of the
-    // smooth's basis — leaving only the nonlinear residual structure.
-    // "Owns" in the comments below means "claims for that projection," not
-    // "keeps in the smooth's column span."
+    // smooth's basis.  The constant intercept is always included by
+    // `build_parametric_constraint_block_for_term`, so this function only
+    // controls the polynomial axes added on top of that intercept.
     //
-    // Ownership rule for spatial polynomial directions:
-    //
-    // 1. Explicit linear terms claim their matching axes — and only those
-    //    axes.  When some (but not all) axes of a multi-axis smooth are
-    //    covered by linear terms, only the covered axes are projected out;
-    //    the smooth retains its remaining polynomial directions in its own
-    //    span (those are not in the parametric block, so the orthogonality
-    //    constraint does not remove them).
-    //
-    // 2. With NO linear-term overlap, a spatial smooth that requested
-    //    `OrthogonalToParametric` claims its full centered polynomial
-    //    nullspace for projection, matching the standard thin-plate /
-    //    Matern model surface where small-k smooths carry only nonlinear
-    //    residual columns.  When `double_penalty` is active the nullspace
-    //    is already regularized inside the smooth, so it is NOT projected
-    //    out — it stays in the smooth's span.
+    // Ownership rule: explicit linear terms claim their matching axes — and
+    // only those axes — for projection.  A standalone smooth (no overlapping
+    // linear term) keeps its full polynomial nullspace and is centered only
+    // against the implicit intercept; this matches the canonical thin-plate
+    // / Duchon model surface where the linear component is part of the
+    // smooth itself.
     let feature_cols = smooth_term_feature_cols(term);
-    let has_overlap = linear_terms
-        .iter()
-        .any(|linear| feature_cols.contains(&linear.feature_col));
-    if has_overlap {
-        let mut owned = Vec::new();
-        for linear in linear_terms {
-            if feature_cols.contains(&linear.feature_col) && !owned.contains(&linear.feature_col) {
-                owned.push(linear.feature_col);
-            }
+    let mut owned = Vec::new();
+    for linear in linear_terms {
+        if feature_cols.contains(&linear.feature_col) && !owned.contains(&linear.feature_col) {
+            owned.push(linear.feature_col);
         }
-        return owned;
     }
-    if !matches!(
-        spatial_identifiability_policy(term),
-        Some(SpatialIdentifiability::OrthogonalToParametric)
-    ) {
-        return Vec::new();
-    }
-    let double_penalty = match &term.basis {
-        SmoothBasisSpec::ThinPlate { spec, .. } => spec.double_penalty,
-        SmoothBasisSpec::Matern { spec, .. } => spec.double_penalty,
-        SmoothBasisSpec::Duchon { .. } => false,
-        _ => false,
-    };
-    if double_penalty {
-        Vec::new()
-    } else {
-        feature_cols
-    }
+    owned
 }
 
 fn apply_global_smooth_identifiability(
@@ -14496,7 +14464,22 @@ mod tests {
     }
 
     #[test]
-    fn thin_plate_default_identifiability_uses_own_feature_nullspace_without_linear_terms() {
+    fn thin_plate_default_identifiability_centers_against_intercept_only_without_linear_terms() {
+        // Without any explicit linear term in the formula, the parametric
+        // constraint block built by `build_parametric_constraint_block_for_term`
+        // contains only the intercept column — see the
+        // `SpatialIdentifiability` docs:
+        //
+        //   "The term-collection builder augments `C` with explicit linear
+        //    terms when those terms are present in the formula."
+        //
+        // So a standalone TPS smooth marked `OrthogonalToParametric` is
+        // orthogonalized only against `[1]`; its full polynomial nullspace
+        // (the linear axes that thin-plate splines own as part of their
+        // canonical model surface) stays in the smooth's column span.
+        // Companions: `standalone_tps_keeps_centered_linear_nullspace` and
+        // `term_collection_joint_duchon_carries_frozen_transform_into_metadata`
+        // assert the dimension count from the same contract.
         let data = array![
             [-1.9, -1.2],
             [-1.3, -0.7],
@@ -14534,24 +14517,22 @@ mod tests {
         let design = build_term_collection_design(data.view(), &spec).unwrap();
         let design_dense = design.design.to_dense();
         let smooth_start = 1 + spec.linear_terms.len();
+        let intercept = Array2::<f64>::ones((data.nrows(), 1));
         for (term_idx, term) in design.smooth.terms.iter().enumerate() {
-            let mut c = Array2::<f64>::zeros((data.nrows(), 2));
-            c.column_mut(0).fill(1.0);
-            c.column_mut(1).assign(&data.column(term_idx));
             let block = design_dense
                 .slice(s![
                     ..,
                     (smooth_start + term.coeff_range.start)..(smooth_start + term.coeff_range.end)
                 ])
                 .to_owned();
-            let cross = block.t().dot(&c);
+            let cross = block.t().dot(&intercept);
             let num = cross.iter().map(|v| v * v).sum::<f64>().sqrt();
             let block_norm = block.iter().map(|v| v * v).sum::<f64>().sqrt();
-            let c_norm = c.iter().map(|v| v * v).sum::<f64>().sqrt();
-            let rel = num / (block_norm * c_norm).max(1e-300);
+            let intercept_norm = intercept.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let rel = num / (block_norm * intercept_norm).max(1e-300);
             assert!(
                 rel <= 1e-10,
-                "ThinPlate term {term_idx} is not orthogonal to its own [1, x] nullspace: {rel:.3e}"
+                "ThinPlate term {term_idx} should be centered against the intercept (no linear terms in formula); got rel={rel:.3e}"
             );
         }
     }
