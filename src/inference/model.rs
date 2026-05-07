@@ -1,5 +1,6 @@
 use crate::basis::BasisOptions;
 use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
+use crate::families::bernoulli_marginal_slope::LatentMeasureKind;
 use crate::families::gamlss::{
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
 };
@@ -211,6 +212,8 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub latent_score_contract: Option<SavedLatentScoreContract>,
     #[serde(default)]
+    pub latent_measure: Option<LatentMeasureKind>,
+    #[serde(default)]
     pub marginal_baseline: Option<f64>,
     #[serde(default)]
     pub logslope_baseline: Option<f64>,
@@ -357,6 +360,7 @@ impl FittedModelPayload {
             z_column: None,
             latent_z_normalization: None,
             latent_score_contract: None,
+            latent_measure: None,
             marginal_baseline: None,
             logslope_baseline: None,
             score_warp_runtime: None,
@@ -1963,6 +1967,7 @@ impl FittedModel {
                     unified,
                     z_column,
                     payload.latent_z_normalization?,
+                    payload.latent_measure.clone()?,
                     payload.marginal_baseline?,
                     payload.logslope_baseline?,
                     self.resolved_inverse_link()
@@ -2096,6 +2101,10 @@ impl FittedModel {
                     .to_string()
             })?;
             z_normalization.validate("marginal-slope model")?;
+            let latent_measure = self.latent_measure.as_ref().ok_or_else(|| {
+                "marginal-slope model is missing latent_measure; refit with current CLI".to_string()
+            })?;
+            latent_measure.validate("marginal-slope model latent_measure")?;
             if self.marginal_baseline.is_none() || self.logslope_baseline.is_none() {
                 return Err(
                     "marginal-slope model is missing baseline offsets; refit with current CLI"
@@ -2167,6 +2176,11 @@ impl FittedModel {
                         .to_string()
                 })?;
                 z_normalization.validate("survival marginal-slope model")?;
+                let latent_measure = self.latent_measure.as_ref().ok_or_else(|| {
+                    "survival marginal-slope model is missing latent_measure; refit with current CLI"
+                        .to_string()
+                })?;
+                latent_measure.validate("survival marginal-slope model latent_measure")?;
                 if self.logslope_baseline.is_none() {
                     return Err(
                         "survival marginal-slope model is missing logslope_baseline; refit with current CLI"
@@ -2496,6 +2510,9 @@ impl FittedModel {
         if let Some(v) = self.latent_z_normalization {
             v.validate("latent_z_normalization")?;
         }
+        if let Some(v) = self.latent_measure.as_ref() {
+            v.validate("latent_measure")?;
+        }
         if let Some(v) = self.survival_beta_time.as_ref() {
             validate_all_finite("survival_beta_time", v.iter().copied())?;
         }
@@ -2724,6 +2741,7 @@ mod tests {
         payload.formula_logslope = Some("1".to_string());
         payload.z_column = Some("z".to_string());
         payload.latent_z_normalization = Some(SavedLatentZNormalization { mean: 0.0, sd: 1.0 });
+        payload.latent_measure = Some(LatentMeasureKind::StandardNormal);
         payload.marginal_baseline = Some(0.0);
         payload.logslope_baseline = Some(0.0);
         payload.link = Some("probit".to_string());
@@ -2747,6 +2765,7 @@ mod tests {
         payload.unified = Some(fit);
         payload.survival_likelihood = Some("marginal-slope".to_string());
         payload.survival_distribution = Some("probit".to_string());
+        payload.latent_measure = Some(LatentMeasureKind::StandardNormal);
         payload
     }
 

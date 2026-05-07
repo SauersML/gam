@@ -77,6 +77,10 @@ harness = false
 name = "spatial_basis_construction"
 harness = false
 
+[[bench]]
+name = "bvn_biobank_shape"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

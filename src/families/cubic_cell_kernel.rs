@@ -1400,7 +1400,8 @@ fn degenerate_sextic_branch(
     }
 }
 
-pub fn bivariate_normal_cdf(h: f64, k: f64, rho: f64) -> Result<f64, String> {
+#[inline]
+fn validate_bvn_args(h: f64, k: f64, rho: f64) -> Result<(), String> {
     if !h.is_finite() && !h.is_infinite() {
         return Err("bivariate normal cdf requires finite or infinite h".to_string());
     }
@@ -1412,6 +1413,45 @@ pub fn bivariate_normal_cdf(h: f64, k: f64, rho: f64) -> Result<f64, String> {
             "bivariate normal cdf requires finite correlation, got {rho}"
         ));
     }
+    Ok(())
+}
+
+#[inline]
+fn bvn_gl_sum(h: f64, k: f64, rho_clamped: f64, asr: f64) -> f64 {
+    // The Drezner-Wesolowsky arcsin representation is integrated with the
+    // same 20-point Gauss-Legendre rule as before, but mirrored node pairs are
+    // evaluated with one sin_cos for the half-angle offset rather than two
+    // independent sin calls.  This preserves the quadrature rule (and hence
+    // the accuracy envelope) while reducing the transcendental work in the
+    // dominant finite-bound path from 20 sin calls to 11 sin/cos evaluations.
+    if rho_clamped == 0.0 {
+        return 0.0;
+    }
+    let hs = 0.5 * (h * h + k * k);
+    let hk = h * k;
+    let half_asr = 0.5 * asr;
+    let (sin_mid, cos_mid) = half_asr.sin_cos();
+    let mut sum = 0.0;
+    for i in 0..10 {
+        let node = BVN_GL_NODES_20[i].abs();
+        let weight = BVN_GL_WEIGHTS_20[i];
+        let (sin_delta, cos_delta) = (half_asr * node).sin_cos();
+
+        let sn_lo = sin_mid * cos_delta - cos_mid * sin_delta;
+        let one_minus_lo = 1.0 - sn_lo * sn_lo;
+        let expo_lo = ((sn_lo * hk) - hs) / one_minus_lo;
+
+        let sn_hi = sin_mid * cos_delta + cos_mid * sin_delta;
+        let one_minus_hi = 1.0 - sn_hi * sn_hi;
+        let expo_hi = ((sn_hi * hk) - hs) / one_minus_hi;
+
+        sum += weight * (expo_lo.exp() + expo_hi.exp());
+    }
+    sum
+}
+
+pub fn bivariate_normal_cdf(h: f64, k: f64, rho: f64) -> Result<f64, String> {
+    validate_bvn_args(h, k, rho)?;
     if h == f64::NEG_INFINITY || k == f64::NEG_INFINITY {
         return Ok(0.0);
     }
@@ -1429,17 +1469,85 @@ pub fn bivariate_normal_cdf(h: f64, k: f64, rho: f64) -> Result<f64, String> {
     if rho_clamped <= -1.0 + 1e-12 {
         return Ok((normal_cdf(h) - normal_cdf(-k)).clamp(0.0, 1.0));
     }
-
-    let hs = 0.5 * (h * h + k * k);
-    let asr = rho_clamped.asin();
-    let mut sum = 0.0;
-    for (&node, &weight) in BVN_GL_NODES_20.iter().zip(BVN_GL_WEIGHTS_20.iter()) {
-        let sn = (0.5 * asr * (node + 1.0)).sin();
-        let one_minus = 1.0 - sn * sn;
-        let expo = ((sn * h * k) - hs) / one_minus;
-        sum += weight * expo.exp();
+    if rho_clamped == 0.0 {
+        return Ok((normal_cdf(h) * normal_cdf(k)).clamp(0.0, 1.0));
     }
+    if h == 0.0 && k == 0.0 {
+        return Ok((0.25 + rho_clamped.asin() / std::f64::consts::TAU).clamp(0.0, 1.0));
+    }
+
+    let asr = rho_clamped.asin();
+    let sum = bvn_gl_sum(h, k, rho_clamped, asr);
     Ok((normal_cdf(h) * normal_cdf(k) + asr * sum / (4.0 * std::f64::consts::PI)).clamp(0.0, 1.0))
+}
+
+#[inline]
+fn bvn_gl_sum_interval(h: f64, left: f64, right: f64, rho_clamped: f64, asr: f64) -> f64 {
+    if rho_clamped == 0.0 {
+        return 0.0;
+    }
+    let h2 = h * h;
+    let right_hs = 0.5 * (h2 + right * right);
+    let left_hs = 0.5 * (h2 + left * left);
+    let half_asr = 0.5 * asr;
+    let (sin_mid, cos_mid) = half_asr.sin_cos();
+    let mut sum = 0.0;
+    for i in 0..10 {
+        let node = BVN_GL_NODES_20[i].abs();
+        let weight = BVN_GL_WEIGHTS_20[i];
+        let (sin_delta, cos_delta) = (half_asr * node).sin_cos();
+
+        let sn_lo = sin_mid * cos_delta - cos_mid * sin_delta;
+        let one_minus_lo = 1.0 - sn_lo * sn_lo;
+        let lo_right = (((sn_lo * h * right) - right_hs) / one_minus_lo).exp();
+        let lo_left = (((sn_lo * h * left) - left_hs) / one_minus_lo).exp();
+
+        let sn_hi = sin_mid * cos_delta + cos_mid * sin_delta;
+        let one_minus_hi = 1.0 - sn_hi * sn_hi;
+        let hi_right = (((sn_hi * h * right) - right_hs) / one_minus_hi).exp();
+        let hi_left = (((sn_hi * h * left) - left_hs) / one_minus_hi).exp();
+
+        sum += weight * ((lo_right - lo_left) + (hi_right - hi_left));
+    }
+    sum
+}
+
+fn bivariate_normal_cdf_interval(h: f64, left: f64, right: f64, rho: f64) -> Result<f64, String> {
+    if right <= left {
+        return Ok(0.0);
+    }
+    if left == f64::NEG_INFINITY && right == f64::INFINITY {
+        return Ok(normal_cdf(h));
+    }
+    if !left.is_finite() || !right.is_finite() {
+        let upper = bivariate_normal_cdf(h, right, rho)?;
+        let lower = bivariate_normal_cdf(h, left, rho)?;
+        return Ok((upper - lower).clamp(0.0, 1.0));
+    }
+    validate_bvn_args(h, left, rho)?;
+    validate_bvn_args(h, right, rho)?;
+    if h == f64::NEG_INFINITY {
+        return Ok(0.0);
+    }
+    if h == f64::INFINITY {
+        return Ok((normal_cdf(right) - normal_cdf(left)).clamp(0.0, 1.0));
+    }
+
+    let rho_clamped = rho.clamp(-1.0, 1.0);
+    if rho_clamped >= 1.0 - 1e-12 || rho_clamped <= -1.0 + 1e-12 {
+        let upper = bivariate_normal_cdf(h, right, rho_clamped)?;
+        let lower = bivariate_normal_cdf(h, left, rho_clamped)?;
+        return Ok((upper - lower).clamp(0.0, 1.0));
+    }
+
+    let cdf_h = normal_cdf(h);
+    let normal_part = cdf_h * (normal_cdf(right) - normal_cdf(left));
+    if rho_clamped == 0.0 {
+        return Ok(normal_part.clamp(0.0, 1.0));
+    }
+    let asr = rho_clamped.asin();
+    let sum = bvn_gl_sum_interval(h, left, right, rho_clamped, asr);
+    Ok((normal_part + asr * sum / (4.0 * std::f64::consts::PI)).clamp(0.0, 1.0))
 }
 
 fn exp_neg_half_square(x: f64) -> f64 {
@@ -1593,21 +1701,7 @@ fn affine_value_from_moment_primitive(alpha: f64, beta: f64, left: f64, right: f
     let s = (1.0 + beta * beta).sqrt();
     let h = alpha / s;
     let rho = -beta / s;
-    let bvn_right = if right == f64::INFINITY {
-        normal_cdf(h)
-    } else if right == f64::NEG_INFINITY {
-        0.0
-    } else {
-        bivariate_normal_cdf(h, right, rho).unwrap_or(0.0)
-    };
-    let bvn_left = if left == f64::NEG_INFINITY {
-        0.0
-    } else if left == f64::INFINITY {
-        normal_cdf(h)
-    } else {
-        bivariate_normal_cdf(h, left, rho).unwrap_or(0.0)
-    };
-    (bvn_right - bvn_left).clamp(0.0, 1.0)
+    bivariate_normal_cdf_interval(h, left, right, rho).unwrap_or(0.0)
 }
 
 /// Evaluate an affine cell (c2=c3=0) with a value/moment-consistent primitive.

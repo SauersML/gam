@@ -182,6 +182,7 @@ pub const DEFAULT_EMPIRICAL_LATENT_GRID_SIZE: usize = 101;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LatentMeasureSpec {
+    Auto { grid_size: usize },
     StandardNormal,
     GlobalEmpirical { grid_size: usize },
 }
@@ -192,11 +193,17 @@ impl LatentMeasureSpec {
             grid_size: DEFAULT_EMPIRICAL_LATENT_GRID_SIZE,
         }
     }
+
+    pub fn auto_default() -> Self {
+        Self::Auto {
+            grid_size: DEFAULT_EMPIRICAL_LATENT_GRID_SIZE,
+        }
+    }
 }
 
 impl Default for LatentMeasureSpec {
     fn default() -> Self {
-        Self::StandardNormal
+        Self::auto_default()
     }
 }
 
@@ -263,6 +270,9 @@ impl LatentMeasureKind {
         }
     }
 
+    fn is_empirical(&self) -> bool {
+        matches!(self, Self::GlobalEmpirical { .. })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -293,7 +303,7 @@ impl LatentZPolicy {
         Self {
             check_mode: LatentZCheckMode::WarnOnly,
             normalization: LatentZNormalizationMode::Frozen { mean: 0.0, sd: 1.0 },
-            latent_measure: LatentMeasureSpec::StandardNormal,
+            latent_measure: LatentMeasureSpec::auto_default(),
             mean_tol_multiplier: 4.0,
             sd_tol_multiplier: 4.0,
             max_abs_skew: 4.0,
@@ -305,7 +315,7 @@ impl LatentZPolicy {
         Self {
             check_mode: LatentZCheckMode::WarnOnly,
             normalization: LatentZNormalizationMode::FitWeighted,
-            latent_measure: LatentMeasureSpec::StandardNormal,
+            latent_measure: LatentMeasureSpec::auto_default(),
             mean_tol_multiplier: 8.0,
             sd_tol_multiplier: 8.0,
             max_abs_skew: 4.0,
@@ -351,14 +361,94 @@ impl LatentZNormalization {
 fn build_latent_measure(
     z: &Array1<f64>,
     weights: &Array1<f64>,
-    spec: LatentMeasureSpec,
+    policy: &LatentZPolicy,
 ) -> Result<LatentMeasureKind, String> {
-    match spec {
+    match policy.latent_measure {
+        LatentMeasureSpec::Auto { grid_size } => {
+            if latent_z_is_standard_normal_enough(z, weights, policy)? {
+                Ok(LatentMeasureKind::StandardNormal)
+            } else {
+                build_global_empirical_latent_measure(z, weights, grid_size)
+            }
+        }
         LatentMeasureSpec::StandardNormal => Ok(LatentMeasureKind::StandardNormal),
         LatentMeasureSpec::GlobalEmpirical { grid_size } => {
             build_global_empirical_latent_measure(z, weights, grid_size)
         }
     }
+}
+
+fn latent_z_is_standard_normal_enough(
+    z: &Array1<f64>,
+    weights: &Array1<f64>,
+    policy: &LatentZPolicy,
+) -> Result<bool, String> {
+    if z.len() != weights.len() {
+        return Err(format!(
+            "latent-measure auto-detection length mismatch: z={}, weights={}",
+            z.len(),
+            weights.len()
+        ));
+    }
+    let weight_sum = weights.iter().copied().sum::<f64>();
+    let weight_sq_sum = weights.iter().map(|&w| w * w).sum::<f64>();
+    if !(weight_sum.is_finite()
+        && weight_sum > 0.0
+        && weight_sq_sum.is_finite()
+        && weight_sq_sum > 0.0)
+    {
+        return Err("latent-measure auto-detection requires positive finite weights".to_string());
+    }
+    let effective_n = weight_sum * weight_sum / weight_sq_sum;
+    if !(effective_n.is_finite() && effective_n > 1.0) {
+        return Err(
+            "latent-measure auto-detection requires at least two effective observations"
+                .to_string(),
+        );
+    }
+    let mean = z
+        .iter()
+        .zip(weights.iter())
+        .map(|(&zi, &wi)| wi * zi)
+        .sum::<f64>()
+        / weight_sum;
+    let var = z
+        .iter()
+        .zip(weights.iter())
+        .map(|(&zi, &wi)| wi * (zi - mean) * (zi - mean))
+        .sum::<f64>()
+        / weight_sum;
+    let sd = var.sqrt();
+    if !(mean.is_finite() && sd.is_finite() && sd > 0.0) {
+        return Ok(false);
+    }
+    let skew = z
+        .iter()
+        .zip(weights.iter())
+        .map(|(&zi, &wi)| {
+            let centered = (zi - mean) / sd;
+            wi * centered.powi(3)
+        })
+        .sum::<f64>()
+        / weight_sum;
+    let excess_kurtosis = z
+        .iter()
+        .zip(weights.iter())
+        .map(|(&zi, &wi)| {
+            let centered = (zi - mean) / sd;
+            wi * centered.powi(4)
+        })
+        .sum::<f64>()
+        / weight_sum
+        - 3.0;
+    let mean_tol = policy.mean_tol_multiplier / effective_n.sqrt();
+    let sd_tol = policy.sd_tol_multiplier / (2.0 * (effective_n - 1.0).max(1.0)).sqrt();
+    Ok(mean.abs() <= mean_tol
+        && (sd - 1.0).abs() <= sd_tol
+        && skew.is_finite()
+        && skew.abs() <= policy.max_abs_skew
+        && excess_kurtosis.is_finite()
+        && excess_kurtosis.abs() <= policy.max_abs_excess_kurtosis)
 }
 
 fn build_global_empirical_latent_measure(
@@ -1314,7 +1404,7 @@ fn empirical_rigid_calibration_eval(
     Ok((f, f_a, f_aa))
 }
 
-fn empirical_intercept_from_marginal(
+pub(crate) fn empirical_intercept_from_marginal(
     target_mu: f64,
     target_q: f64,
     slope: f64,
@@ -3652,11 +3742,9 @@ impl BernoulliMarginalSlopeFamily {
             self.solve_row_intercept_base(row, marginal_eta, slope, beta_h, beta_w)?
         } else {
             let intercept = match self.latent_measure.empirical_grid() {
-                None => rigid_intercept_from_marginal(
-                    marginal.q,
-                    slope,
-                    self.probit_frailty_scale(),
-                ),
+                None => {
+                    rigid_intercept_from_marginal(marginal.q, slope, self.probit_frailty_scale())
+                }
                 Some((nodes, measure_weights)) => self.empirical_rigid_intercept_for_row(
                     row,
                     marginal,
@@ -8693,8 +8781,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         &spec.latent_z_policy,
     )?;
     spec.z = z_standardized;
-    let latent_measure =
-        build_latent_measure(&spec.z, &spec.weights, spec.latent_z_policy.latent_measure)?;
+    let latent_measure = build_latent_measure(&spec.z, &spec.weights, &spec.latent_z_policy)?;
     let pilot_baseline = pooled_probit_baseline(&spec.y, &spec.z, &spec.weights)?;
     let sigma_learnable = matches!(
         &spec.frailty,
