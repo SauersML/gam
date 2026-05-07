@@ -653,7 +653,7 @@ impl OuterCapability {
 pub enum Solver {
     /// Adaptive Regularized Cubic; fastest convergence, requires Hessian.
     Arc,
-    /// L-BFGS; gradient only, builds curvature from history.
+    /// BFGS; gradient only, builds a dense curvature approximation.
     Bfgs,
     /// Extended Fellner-Schall; multiplicative fixed-point iteration.
     /// Only valid when all hyperparameter coordinates are penalty-like.
