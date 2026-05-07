@@ -257,13 +257,12 @@ impl LatentMeasureKind {
     fn empirical_grid(&self) -> Option<(&[f64], &[f64])> {
         match self {
             Self::StandardNormal => None,
-            Self::GlobalEmpirical { nodes, weights } => Some((nodes.as_slice(), weights.as_slice())),
+            Self::GlobalEmpirical { nodes, weights } => {
+                Some((nodes.as_slice(), weights.as_slice()))
+            }
         }
     }
 
-    fn is_empirical(&self) -> bool {
-        matches!(self, Self::GlobalEmpirical { .. })
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -407,9 +406,7 @@ fn build_global_empirical_latent_measure(
     });
     let total_weight = pairs.iter().map(|(_, weight)| *weight).sum::<f64>();
     if !(total_weight.is_finite() && total_weight > 0.0) {
-        return Err(
-            "empirical latent measure requires positive finite total weight".to_string(),
-        );
+        return Err("empirical latent measure requires positive finite total weight".to_string());
     }
 
     let m = grid_size.min(pairs.len());
@@ -1257,6 +1254,100 @@ fn rigid_intercept_from_marginal(marginal_eta: f64, logslope: f64, probit_scale:
 fn rigid_observed_eta(marginal_eta: f64, logslope: f64, z: f64, probit_scale: f64) -> f64 {
     rigid_intercept_from_marginal(marginal_eta, logslope, probit_scale)
         + rigid_observed_logslope(logslope, probit_scale) * z
+}
+
+fn unary_derivatives_normal_cdf(x: f64) -> [f64; 5] {
+    let pdf = normal_pdf(x);
+    [
+        normal_cdf(x),
+        pdf,
+        -x * pdf,
+        (x * x - 1.0) * pdf,
+        (-x.powi(3) + 3.0 * x) * pdf,
+    ]
+}
+
+fn unary_derivatives_normal_pdf(x: f64) -> [f64; 5] {
+    let pdf = normal_pdf(x);
+    [
+        pdf,
+        -x * pdf,
+        (x * x - 1.0) * pdf,
+        (-x.powi(3) + 3.0 * x) * pdf,
+        (x.powi(4) - 6.0 * x * x + 3.0) * pdf,
+    ]
+}
+
+fn unary_derivatives_reciprocal(x: f64) -> [f64; 5] {
+    let x1 = x.max(1e-300);
+    let x2 = x1 * x1;
+    let x3 = x2 * x1;
+    let x4 = x3 * x1;
+    let x5 = x4 * x1;
+    [1.0 / x1, -1.0 / x2, 2.0 / x3, -6.0 / x4, 24.0 / x5]
+}
+
+fn empirical_rigid_calibration_eval(
+    intercept: f64,
+    target_mu: f64,
+    slope: f64,
+    probit_scale: f64,
+    nodes: &[f64],
+    weights: &[f64],
+) -> Result<(f64, f64, f64), String> {
+    let observed_slope = rigid_observed_logslope(slope, probit_scale);
+    let mut f = -target_mu;
+    let mut f_a = 0.0;
+    let mut f_aa = 0.0;
+    for (&node, &weight) in nodes.iter().zip(weights.iter()) {
+        let eta = intercept + observed_slope * node;
+        let pdf = normal_pdf(eta);
+        f += weight * normal_cdf(eta);
+        f_a += weight * pdf;
+        f_aa -= weight * eta * pdf;
+    }
+    if !(f.is_finite() && f_a.is_finite() && f_aa.is_finite() && f_a > 0.0) {
+        return Err(format!(
+            "empirical latent calibration produced invalid root state: f={f}, f_a={f_a}, f_aa={f_aa}"
+        ));
+    }
+    Ok((f, f_a, f_aa))
+}
+
+fn empirical_intercept_from_marginal(
+    target_mu: f64,
+    target_q: f64,
+    slope: f64,
+    probit_scale: f64,
+    nodes: &[f64],
+    weights: &[f64],
+    initial: Option<f64>,
+) -> Result<f64, String> {
+    if !(target_mu.is_finite() && target_mu > 0.0 && target_mu < 1.0) {
+        return Err(format!(
+            "empirical latent calibration requires target mu in (0,1), got {target_mu}"
+        ));
+    }
+    let seed =
+        initial.unwrap_or_else(|| rigid_intercept_from_marginal(target_q, slope, probit_scale));
+    let eval = |a: f64| {
+        empirical_rigid_calibration_eval(a, target_mu, slope, probit_scale, nodes, weights)
+    };
+    let abs_tol = 1e-11_f64.max(1e-9 * target_mu.abs());
+    let (root, _, f_best) = super::monotone_root::solve_monotone_root(
+        eval,
+        seed,
+        "empirical latent intercept",
+        abs_tol,
+        64,
+        48,
+    )?;
+    if f_best.abs() > abs_tol {
+        return Err(format!(
+            "empirical latent intercept solve failed: residual={f_best:.3e} at a={root:.6}, target mu={target_mu:.6}"
+        ));
+    }
+    Ok(root)
 }
 
 /// Rigid probit scalar kernel: closed-form derivatives up to 4th order.
@@ -2252,23 +2343,11 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
     }
 
     fn row_kernel(&self, row: usize) -> Result<(f64, [f64; 2], [[f64; 2]; 2]), String> {
-        let marginal = self
-            .family
-            .marginal_link_map(self.block_states[0].eta[row])?;
+        let marginal_eta = self.block_states[0].eta[row];
+        let marginal = self.family.marginal_link_map(marginal_eta)?;
         let g = self.block_states[1].eta[row];
-        let probit_scale = self.family.probit_frailty_scale();
-        let k = RigidProbitKernel::new(
-            marginal.q,
-            g,
-            self.family.z[row],
-            self.family.y[row],
-            self.family.weights[row],
-            probit_scale,
-        )?;
-        let nll = -self.family.weights[row] * k.logcdf;
-        let grad = rigid_transformed_gradient(marginal, &k);
-        let h = rigid_transformed_hessian(marginal, &k);
-        Ok((nll, grad, h))
+        self.family
+            .rigid_row_kernel_eval(row, marginal_eta, marginal, g)
     }
 
     fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; 2] {
@@ -2369,22 +2448,11 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
     }
 
     fn row_third_contracted(&self, row: usize, dir: &[f64; 2]) -> Result<[[f64; 2]; 2], String> {
-        let marginal = self
-            .family
-            .marginal_link_map(self.block_states[0].eta[row])?;
+        let marginal_eta = self.block_states[0].eta[row];
+        let marginal = self.family.marginal_link_map(marginal_eta)?;
         let g = self.block_states[1].eta[row];
-        let probit_scale = self.family.probit_frailty_scale();
-        let k = RigidProbitKernel::new(
-            marginal.q,
-            g,
-            self.family.z[row],
-            self.family.y[row],
-            self.family.weights[row],
-            probit_scale,
-        )?;
-        Ok(rigid_transformed_third_contracted(
-            marginal, &k, dir[0], dir[1],
-        ))
+        self.family
+            .rigid_row_third_contracted(row, marginal_eta, marginal, g, dir[0], dir[1])
     }
 
     fn row_fourth_contracted(
@@ -2393,22 +2461,19 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         dir_u: &[f64; 2],
         dir_v: &[f64; 2],
     ) -> Result<[[f64; 2]; 2], String> {
-        let marginal = self
-            .family
-            .marginal_link_map(self.block_states[0].eta[row])?;
+        let marginal_eta = self.block_states[0].eta[row];
+        let marginal = self.family.marginal_link_map(marginal_eta)?;
         let g = self.block_states[1].eta[row];
-        let probit_scale = self.family.probit_frailty_scale();
-        let k = RigidProbitKernel::new(
-            marginal.q,
+        self.family.rigid_row_fourth_contracted(
+            row,
+            marginal_eta,
+            marginal,
             g,
-            self.family.z[row],
-            self.family.y[row],
-            self.family.weights[row],
-            probit_scale,
-        )?;
-        Ok(rigid_transformed_fourth_contracted(
-            marginal, &k, dir_u[0], dir_u[1], dir_v[0], dir_v[1],
-        ))
+            dir_u[0],
+            dir_u[1],
+            dir_v[0],
+            dir_v[1],
+        )
     }
 }
 
@@ -2445,6 +2510,245 @@ impl BernoulliMarginalSlopeFamily {
         probit_frailty_scale(self.gaussian_frailty_sd)
     }
 
+    fn empirical_rigid_intercept_for_row(
+        &self,
+        row: usize,
+        marginal: BernoulliMarginalLinkMap,
+        slope: f64,
+        nodes: &[f64],
+        measure_weights: &[f64],
+    ) -> Result<f64, String> {
+        let cached = self.intercept_warm_starts.as_ref().and_then(|cache| {
+            let value = f64::from_bits(cache.get(row)?.load(Ordering::Relaxed));
+            value.is_finite().then_some(value)
+        });
+        let root = empirical_intercept_from_marginal(
+            marginal.mu,
+            marginal.q,
+            slope,
+            self.probit_frailty_scale(),
+            nodes,
+            measure_weights,
+            cached,
+        )?;
+        if let Some(cache) = self.intercept_warm_starts.as_ref()
+            && let Some(slot) = cache.get(row)
+        {
+            slot.store(root.to_bits(), Ordering::Relaxed);
+        }
+        Ok(root)
+    }
+
+    fn empirical_rigid_calibration_jets(
+        &self,
+        intercept: &MultiDirJet,
+        mu: &MultiDirJet,
+        slope: &MultiDirJet,
+        nodes: &[f64],
+        measure_weights: &[f64],
+    ) -> (MultiDirJet, MultiDirJet) {
+        let n_dirs = intercept.coeffs.len().trailing_zeros() as usize;
+        let observed_slope = slope.scale(self.probit_frailty_scale());
+        let mut f = mu.scale(-1.0);
+        let mut f_a = MultiDirJet::zero(n_dirs);
+        for (&node, &weight) in nodes.iter().zip(measure_weights.iter()) {
+            let eta = intercept.add(&observed_slope.scale(node));
+            let cdf = eta.compose_unary(unary_derivatives_normal_cdf(eta.coeff(0)));
+            let pdf = eta.compose_unary(unary_derivatives_normal_pdf(eta.coeff(0)));
+            f = f.add(&cdf.scale(weight));
+            f_a = f_a.add(&pdf.scale(weight));
+        }
+        (f, f_a)
+    }
+
+    fn empirical_rigid_neglog_jet(
+        &self,
+        row: usize,
+        marginal_eta: f64,
+        marginal: BernoulliMarginalLinkMap,
+        slope: f64,
+        directions: &[[f64; 2]],
+        nodes: &[f64],
+        measure_weights: &[f64],
+    ) -> Result<MultiDirJet, String> {
+        let n_dirs = directions.len();
+        let marginal_first = directions.iter().map(|dir| dir[0]).collect::<Vec<_>>();
+        let slope_first = directions.iter().map(|dir| dir[1]).collect::<Vec<_>>();
+        let marginal_eta_jet = MultiDirJet::linear(n_dirs, marginal_eta, &marginal_first);
+        let mu_jet = marginal_eta_jet.compose_unary([
+            marginal.mu,
+            marginal.mu1,
+            marginal.mu2,
+            marginal.mu3,
+            marginal.mu4,
+        ]);
+        let slope_jet = MultiDirJet::linear(n_dirs, slope, &slope_first);
+        let intercept_root =
+            self.empirical_rigid_intercept_for_row(row, marginal, slope, nodes, measure_weights)?;
+        let mut intercept_jet = MultiDirJet::constant(n_dirs, intercept_root);
+        for _ in 0..6 {
+            let (f, f_a) = self.empirical_rigid_calibration_jets(
+                &intercept_jet,
+                &mu_jet,
+                &slope_jet,
+                nodes,
+                measure_weights,
+            );
+            let inv_f_a = f_a.compose_unary(unary_derivatives_reciprocal(f_a.coeff(0)));
+            intercept_jet = intercept_jet.add(&f.mul(&inv_f_a).scale(-1.0));
+            intercept_jet.coeffs[0] = intercept_root;
+        }
+        let observed_slope = slope_jet.scale(self.probit_frailty_scale());
+        let observed_eta = intercept_jet.add(&observed_slope.scale(self.z[row]));
+        let signed = observed_eta.scale(2.0 * self.y[row] - 1.0);
+        Ok(signed.compose_unary(unary_derivatives_neglog_phi(
+            signed.coeff(0),
+            self.weights[row],
+        )))
+    }
+
+    fn rigid_row_kernel_eval(
+        &self,
+        row: usize,
+        marginal_eta: f64,
+        marginal: BernoulliMarginalLinkMap,
+        slope: f64,
+    ) -> Result<(f64, [f64; 2], [[f64; 2]; 2]), String> {
+        match self.latent_measure.empirical_grid() {
+            None => {
+                let kernel = RigidProbitKernel::new(
+                    marginal.q,
+                    slope,
+                    self.z[row],
+                    self.y[row],
+                    self.weights[row],
+                    self.probit_frailty_scale(),
+                )?;
+                Ok((
+                    -self.weights[row] * kernel.logcdf,
+                    rigid_transformed_gradient(marginal, &kernel),
+                    rigid_transformed_hessian(marginal, &kernel),
+                ))
+            }
+            Some((nodes, measure_weights)) => {
+                let jet = self.empirical_rigid_neglog_jet(
+                    row,
+                    marginal_eta,
+                    marginal,
+                    slope,
+                    &[[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]],
+                    nodes,
+                    measure_weights,
+                )?;
+                Ok((
+                    jet.coeff(0),
+                    [jet.coeff(1), jet.coeff(2)],
+                    [
+                        [jet.coeff(1 | 4), jet.coeff(1 | 2)],
+                        [jet.coeff(1 | 2), jet.coeff(2 | 8)],
+                    ],
+                ))
+            }
+        }
+    }
+
+    fn rigid_row_third_contracted(
+        &self,
+        row: usize,
+        marginal_eta: f64,
+        marginal: BernoulliMarginalLinkMap,
+        slope: f64,
+        dir_q: f64,
+        dir_g: f64,
+    ) -> Result<[[f64; 2]; 2], String> {
+        match self.latent_measure.empirical_grid() {
+            None => {
+                let kernel = RigidProbitKernel::new(
+                    marginal.q,
+                    slope,
+                    self.z[row],
+                    self.y[row],
+                    self.weights[row],
+                    self.probit_frailty_scale(),
+                )?;
+                Ok(rigid_transformed_third_contracted(
+                    marginal, &kernel, dir_q, dir_g,
+                ))
+            }
+            Some((nodes, measure_weights)) => {
+                let jet = self.empirical_rigid_neglog_jet(
+                    row,
+                    marginal_eta,
+                    marginal,
+                    slope,
+                    &[
+                        [1.0, 0.0],
+                        [0.0, 1.0],
+                        [1.0, 0.0],
+                        [0.0, 1.0],
+                        [dir_q, dir_g],
+                    ],
+                    nodes,
+                    measure_weights,
+                )?;
+                Ok([
+                    [jet.coeff(1 | 4 | 16), jet.coeff(1 | 2 | 16)],
+                    [jet.coeff(1 | 2 | 16), jet.coeff(2 | 8 | 16)],
+                ])
+            }
+        }
+    }
+
+    fn rigid_row_fourth_contracted(
+        &self,
+        row: usize,
+        marginal_eta: f64,
+        marginal: BernoulliMarginalLinkMap,
+        slope: f64,
+        u_q: f64,
+        u_g: f64,
+        v_q: f64,
+        v_g: f64,
+    ) -> Result<[[f64; 2]; 2], String> {
+        match self.latent_measure.empirical_grid() {
+            None => {
+                let kernel = RigidProbitKernel::new(
+                    marginal.q,
+                    slope,
+                    self.z[row],
+                    self.y[row],
+                    self.weights[row],
+                    self.probit_frailty_scale(),
+                )?;
+                Ok(rigid_transformed_fourth_contracted(
+                    marginal, &kernel, u_q, u_g, v_q, v_g,
+                ))
+            }
+            Some((nodes, measure_weights)) => {
+                let jet = self.empirical_rigid_neglog_jet(
+                    row,
+                    marginal_eta,
+                    marginal,
+                    slope,
+                    &[
+                        [1.0, 0.0],
+                        [0.0, 1.0],
+                        [1.0, 0.0],
+                        [0.0, 1.0],
+                        [u_q, u_g],
+                        [v_q, v_g],
+                    ],
+                    nodes,
+                    measure_weights,
+                )?;
+                Ok([
+                    [jet.coeff(1 | 4 | 16 | 32), jet.coeff(1 | 2 | 16 | 32)],
+                    [jet.coeff(1 | 2 | 16 | 32), jet.coeff(2 | 8 | 16 | 32)],
+                ])
+            }
+        }
+    }
+
     /// Outer-aware variant of `log_likelihood_only`. When
     /// `options.outer_score_subsample` is `None` this iterates over all rows
     /// and returns a value identical (bit-for-bit) to the legacy full-data
@@ -2464,21 +2768,20 @@ impl BernoulliMarginalSlopeFamily {
         let row_iter = outer_row_indices(options, n).to_vec();
         let scale = outer_score_scale(options, n);
         if !flex_active {
-            // Rigid probit: vectorized closed-form.
-            // η_i = q_i·c_i + s_f b_i·z_i  where c_i = √(1+(s_f b_i)²)
-            // ll = Σ w_i · log Φ((2y_i−1)·η_i)
+            // Rigid probit under the active latent measure. Standard-normal
+            // keeps the algebraic Gaussian identity; empirical measure solves
+            // the calibrated intercept against its quadrature grid.
             let b = &block_states[1].eta;
-            let probit_scale = self.probit_frailty_scale();
             let total: Result<f64, String> = row_iter
                 .into_par_iter()
                 .try_fold(
                     || 0.0,
                     |mut ll, i| -> Result<_, String> {
-                        let q_internal = self.marginal_link_map(block_states[0].eta[i])?.q;
-                        let eta_i = rigid_observed_eta(q_internal, b[i], self.z[i], probit_scale);
-                        let signed = (2.0 * self.y[i] - 1.0) * eta_i;
-                        let (log_cdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
-                        ll += self.weights[i] * log_cdf;
+                        let marginal_eta = block_states[0].eta[i];
+                        let marginal = self.marginal_link_map(marginal_eta)?;
+                        let (neglog, _, _) =
+                            self.rigid_row_kernel_eval(i, marginal_eta, marginal, b[i])?;
+                        ll -= neglog;
                         Ok(ll)
                     },
                 )
@@ -3348,10 +3651,21 @@ impl BernoulliMarginalSlopeFamily {
         let (intercept, m_a) = if self.effective_flex_active(block_states)? {
             self.solve_row_intercept_base(row, marginal_eta, slope, beta_h, beta_w)?
         } else {
-            (
-                rigid_intercept_from_marginal(marginal.q, slope, self.probit_frailty_scale()),
-                f64::NAN,
-            )
+            let intercept = match self.latent_measure.empirical_grid() {
+                None => rigid_intercept_from_marginal(
+                    marginal.q,
+                    slope,
+                    self.probit_frailty_scale(),
+                ),
+                Some((nodes, measure_weights)) => self.empirical_rigid_intercept_for_row(
+                    row,
+                    marginal,
+                    slope,
+                    nodes,
+                    measure_weights,
+                )?,
+            };
+            (intercept, f64::NAN)
         };
         Ok(BernoulliMarginalSlopeRowExactContext { intercept, m_a })
     }
@@ -3680,23 +3994,14 @@ impl BernoulliMarginalSlopeFamily {
         }
         // Rigid path: closed-form observed eta with probit frailty scaling.
         // primary.total == 2 (q at 0, g at 1), no h/w blocks.
-        let marginal = self.marginal_link_map(block_states[0].eta[row])?;
+        let marginal_eta = block_states[0].eta[row];
+        let marginal = self.marginal_link_map(marginal_eta)?;
         let g = block_states[1].eta[row];
-        let kern = RigidProbitKernel::new(
-            marginal.q,
-            g,
-            self.z[row],
-            self.y[row],
-            self.weights[row],
-            self.probit_frailty_scale(),
-        )?;
-        let neglog = -self.weights[row] * kern.logcdf;
-        let grad_pair = rigid_transformed_gradient(marginal, &kern);
+        let (neglog, grad_pair, h) = self.rigid_row_kernel_eval(row, marginal_eta, marginal, g)?;
         let mut grad = Array1::<f64>::zeros(2);
         grad[0] = grad_pair[0];
         grad[1] = grad_pair[1];
 
-        let h = rigid_transformed_hessian(marginal, &kern);
         let mut hess = Array2::<f64>::zeros((2, 2));
         hess[[0, 0]] = h[0][0];
         hess[[0, 1]] = h[0][1];
@@ -4094,17 +4399,11 @@ impl BernoulliMarginalSlopeFamily {
         dir: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
         if !self.effective_flex_active(block_states)? {
-            let marginal = self.marginal_link_map(block_states[0].eta[row])?;
+            let marginal_eta = block_states[0].eta[row];
+            let marginal = self.marginal_link_map(marginal_eta)?;
             let g = block_states[1].eta[row];
-            let kern = RigidProbitKernel::new(
-                marginal.q,
-                g,
-                self.z[row],
-                self.y[row],
-                self.weights[row],
-                self.probit_frailty_scale(),
-            )?;
-            let t = rigid_transformed_third_contracted(marginal, &kern, dir[0], dir[1]);
+            let t =
+                self.rigid_row_third_contracted(row, marginal_eta, marginal, g, dir[0], dir[1])?;
             let mut out = Array2::<f64>::zeros((2, 2));
             out[[0, 0]] = t[0][0];
             out[[0, 1]] = t[0][1];
@@ -4619,19 +4918,19 @@ impl BernoulliMarginalSlopeFamily {
         // across independent rows/chunks so Rayon workers do not nest inside
         // the high-allocation per-row cell-kernel transport below.
         if !flex_active {
-            let marginal = self.marginal_link_map(block_states[0].eta[row])?;
+            let marginal_eta = block_states[0].eta[row];
+            let marginal = self.marginal_link_map(marginal_eta)?;
             let g = block_states[1].eta[row];
-            let kern = RigidProbitKernel::new(
-                marginal.q,
+            let f = self.rigid_row_fourth_contracted(
+                row,
+                marginal_eta,
+                marginal,
                 g,
-                self.z[row],
-                self.y[row],
-                self.weights[row],
-                self.probit_frailty_scale(),
+                dir_u[0],
+                dir_u[1],
+                dir_v[0],
+                dir_v[1],
             )?;
-            let f = rigid_transformed_fourth_contracted(
-                marginal, &kern, dir_u[0], dir_u[1], dir_v[0], dir_v[1],
-            );
             let mut out = Array2::<f64>::zeros((2, 2));
             out[[0, 0]] = f[0][0];
             out[[0, 1]] = f[0][1];
@@ -5987,21 +6286,14 @@ impl BernoulliMarginalSlopeFamily {
                 .try_fold(
                     || Array1::<f64>::zeros(slices.total),
                     |mut chunk_out, chunk_idx| -> Result<_, String> {
-                        let probit_scale = self.probit_frailty_scale();
                         let start = chunk_idx * ROW_CHUNK_SIZE;
                         let end = (start + ROW_CHUNK_SIZE).min(n);
                         for row in start..end {
-                            let marginal = self.marginal_link_map(block_states[0].eta[row])?;
+                            let marginal_eta = block_states[0].eta[row];
+                            let marginal = self.marginal_link_map(marginal_eta)?;
                             let g = block_states[1].eta[row];
-                            let k = RigidProbitKernel::new(
-                                marginal.q,
-                                g,
-                                self.z[row],
-                                self.y[row],
-                                self.weights[row],
-                                probit_scale,
-                            )?;
-                            let h = rigid_transformed_hessian(marginal, &k);
+                            let (_, _, h) =
+                                self.rigid_row_kernel_eval(row, marginal_eta, marginal, g)?;
                             let v_q = self
                                 .marginal_design
                                 .dot_row_view(row, direction.slice(s![slices.marginal.clone()]));
@@ -6085,21 +6377,14 @@ impl BernoulliMarginalSlopeFamily {
                 .try_fold(
                     || Array1::<f64>::zeros(slices.total),
                     |mut chunk_diag, chunk_idx| -> Result<_, String> {
-                        let probit_scale = self.probit_frailty_scale();
                         let start = chunk_idx * ROW_CHUNK_SIZE;
                         let end = (start + ROW_CHUNK_SIZE).min(n);
                         for row in start..end {
-                            let marginal = self.marginal_link_map(block_states[0].eta[row])?;
+                            let marginal_eta = block_states[0].eta[row];
+                            let marginal = self.marginal_link_map(marginal_eta)?;
                             let g = block_states[1].eta[row];
-                            let k = RigidProbitKernel::new(
-                                marginal.q,
-                                g,
-                                self.z[row],
-                                self.y[row],
-                                self.weights[row],
-                                probit_scale,
-                            )?;
-                            let h = rigid_transformed_hessian(marginal, &k);
+                            let (_, _, h) =
+                                self.rigid_row_kernel_eval(row, marginal_eta, marginal, g)?;
                             {
                                 let mut m = chunk_diag.slice_mut(s![slices.marginal.clone()]);
                                 self.marginal_design
@@ -6963,24 +7248,23 @@ impl BernoulliMarginalSlopeFamily {
                 .try_fold(
                     || BernoulliBlockHessianAccumulator::new(slices),
                     |mut acc, row| -> Result<_, String> {
-                        let probit_scale = self.probit_frailty_scale();
-                        let marginal = self.marginal_link_map(block_states[0].eta[row])?;
+                        let marginal_eta = block_states[0].eta[row];
+                        let marginal = self.marginal_link_map(marginal_eta)?;
                         let g = block_states[1].eta[row];
-                        let k = RigidProbitKernel::new(
-                            marginal.q,
-                            g,
-                            self.z[row],
-                            self.y[row],
-                            self.weights[row],
-                            probit_scale,
-                        )?;
                         let dq = self
                             .marginal_design
                             .dot_row_view(row, d_beta_flat.slice(s![slices.marginal.clone()]));
                         let dg = self
                             .logslope_design
                             .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
-                        let t = rigid_transformed_third_contracted(marginal, &k, dq, dg);
+                        let t = self.rigid_row_third_contracted(
+                            row,
+                            marginal_eta,
+                            marginal,
+                            g,
+                            dq,
+                            dg,
+                        )?;
                         let t_arr = Array2::from_shape_fn((2, 2), |(a, b)| t[a][b]);
                         acc.add_pullback(self, row, slices, primary, &t_arr);
                         Ok(acc)
@@ -7056,24 +7340,23 @@ impl BernoulliMarginalSlopeFamily {
                 .try_fold(
                     || BernoulliBlockHessianAccumulator::new(slices),
                     |mut acc, row| -> Result<_, String> {
-                        let probit_scale = self.probit_frailty_scale();
-                        let marginal = self.marginal_link_map(block_states[0].eta[row])?;
+                        let marginal_eta = block_states[0].eta[row];
+                        let marginal = self.marginal_link_map(marginal_eta)?;
                         let g = block_states[1].eta[row];
-                        let k = RigidProbitKernel::new(
-                            marginal.q,
-                            g,
-                            self.z[row],
-                            self.y[row],
-                            self.weights[row],
-                            probit_scale,
-                        )?;
                         let dq = self
                             .marginal_design
                             .dot_row_view(row, d_beta_flat.slice(s![slices.marginal.clone()]));
                         let dg = self
                             .logslope_design
                             .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
-                        let t = rigid_transformed_third_contracted(marginal, &k, dq, dg);
+                        let t = self.rigid_row_third_contracted(
+                            row,
+                            marginal_eta,
+                            marginal,
+                            g,
+                            dq,
+                            dg,
+                        )?;
                         let t_arr = Array2::from_shape_fn((2, 2), |(a, b)| t[a][b]);
                         acc.add_pullback(self, row, slices, primary, &t_arr);
                         Ok(acc)
@@ -7169,17 +7452,9 @@ impl BernoulliMarginalSlopeFamily {
             let mut block_acc = row_iter
                 .into_par_iter()
                 .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
-                    let probit_scale = self.probit_frailty_scale();
-                    let marginal = self.marginal_link_map(block_states[0].eta[row])?;
+                    let marginal_eta = block_states[0].eta[row];
+                    let marginal = self.marginal_link_map(marginal_eta)?;
                     let g = block_states[1].eta[row];
-                    let k = RigidProbitKernel::new(
-                        marginal.q,
-                        g,
-                        self.z[row],
-                        self.y[row],
-                        self.weights[row],
-                        probit_scale,
-                    )?;
                     let uq = self
                         .marginal_design
                         .dot_row_view(row, d_beta_u_flat.slice(s![slices.marginal.clone()]));
@@ -7192,7 +7467,16 @@ impl BernoulliMarginalSlopeFamily {
                     let vg = self
                         .logslope_design
                         .dot_row_view(row, d_beta_v_flat.slice(s![slices.logslope.clone()]));
-                    let f = rigid_transformed_fourth_contracted(marginal, &k, uq, ug, vq, vg);
+                    let f = self.rigid_row_fourth_contracted(
+                        row,
+                        marginal_eta,
+                        marginal,
+                        g,
+                        uq,
+                        ug,
+                        vq,
+                        vg,
+                    )?;
                     let f_arr = Array2::from_shape_fn((2, 2), |(a, b)| f[a][b]);
                     acc.add_pullback(self, row, slices, primary, &f_arr);
                     Ok(acc)
@@ -7261,17 +7545,9 @@ impl BernoulliMarginalSlopeFamily {
             let mut block_acc = row_iter
                 .into_par_iter()
                 .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
-                    let probit_scale = self.probit_frailty_scale();
-                    let marginal = self.marginal_link_map(block_states[0].eta[row])?;
+                    let marginal_eta = block_states[0].eta[row];
+                    let marginal = self.marginal_link_map(marginal_eta)?;
                     let g = block_states[1].eta[row];
-                    let k = RigidProbitKernel::new(
-                        marginal.q,
-                        g,
-                        self.z[row],
-                        self.y[row],
-                        self.weights[row],
-                        probit_scale,
-                    )?;
                     let uq = self
                         .marginal_design
                         .dot_row_view(row, d_beta_u_flat.slice(s![slices.marginal.clone()]));
@@ -7284,7 +7560,16 @@ impl BernoulliMarginalSlopeFamily {
                     let vg = self
                         .logslope_design
                         .dot_row_view(row, d_beta_v_flat.slice(s![slices.logslope.clone()]));
-                    let f = rigid_transformed_fourth_contracted(marginal, &k, uq, ug, vq, vg);
+                    let f = self.rigid_row_fourth_contracted(
+                        row,
+                        marginal_eta,
+                        marginal,
+                        g,
+                        uq,
+                        ug,
+                        vq,
+                        vg,
+                    )?;
                     let f_arr = Array2::from_shape_fn((2, 2), |(a, b)| f[a][b]);
                     acc.add_pullback(self, row, slices, primary, &f_arr);
                     Ok(acc)
@@ -7544,7 +7829,6 @@ impl BernoulliMarginalSlopeFamily {
         let n = self.y.len();
         let p_marginal = slices.marginal.len();
         let p_logslope = slices.logslope.len();
-        let probit_scale = self.probit_frailty_scale();
         let make_acc = || {
             (
                 0.0_f64,
@@ -7577,19 +7861,12 @@ impl BernoulliMarginalSlopeFamily {
                         let mut hl_w = Array1::<f64>::zeros(rows);
                         for local_row in 0..rows {
                             let row = start + local_row;
-                            let marginal = self.marginal_link_map(block_states[0].eta[row])?;
+                            let marginal_eta = block_states[0].eta[row];
+                            let marginal = self.marginal_link_map(marginal_eta)?;
                             let g = block_states[1].eta[row];
-                            let kern = RigidProbitKernel::new(
-                                marginal.q,
-                                g,
-                                self.z[row],
-                                self.y[row],
-                                self.weights[row],
-                                probit_scale,
-                            )?;
-                            ll += self.weights[row] * kern.logcdf;
-                            let grad = rigid_transformed_gradient(marginal, &kern);
-                            let h = rigid_transformed_hessian(marginal, &kern);
+                            let (neglog, grad, h) =
+                                self.rigid_row_kernel_eval(row, marginal_eta, marginal, g)?;
+                            ll -= neglog;
                             gm_w[local_row] =
                                 Self::exact_newton_score_component_from_objective_gradient(grad[0]);
                             gl_w[local_row] =
@@ -8416,11 +8693,25 @@ pub fn fit_bernoulli_marginal_slope_terms(
         &spec.latent_z_policy,
     )?;
     spec.z = z_standardized;
+    let latent_measure =
+        build_latent_measure(&spec.z, &spec.weights, spec.latent_z_policy.latent_measure)?;
     let pilot_baseline = pooled_probit_baseline(&spec.y, &spec.z, &spec.weights)?;
     let sigma_learnable = matches!(
         &spec.frailty,
         FrailtySpec::GaussianShift { sigma_fixed: None }
     );
+    if latent_measure.is_empirical() && sigma_learnable {
+        return Err(
+            "empirical latent-measure marginal-slope calibration requires fixed GaussianShift sigma; learnable sigma derivatives must be fit under the standard-normal latent measure"
+                .to_string(),
+        );
+    }
+    if latent_measure.is_empirical() && (spec.score_warp.is_some() || spec.link_dev.is_some()) {
+        return Err(
+            "empirical latent-measure marginal-slope calibration currently requires rigid probit mode; score-warp/link-deviation models must use a CTN-PIT standard-normal latent measure"
+                .to_string(),
+        );
+    }
     let initial_sigma = match &spec.frailty {
         FrailtySpec::GaussianShift {
             sigma_fixed: Some(s),
@@ -8575,6 +8866,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             y: Arc::clone(&y),
             weights: Arc::clone(&weights),
             z: Arc::clone(&z),
+            latent_measure: latent_measure.clone(),
             gaussian_frailty_sd: sigma,
             base_link: spec.base_link.clone(),
             marginal_design: marginal_design.design.clone(),
@@ -8821,6 +9113,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         baseline_marginal: baseline.0,
         baseline_logslope: baseline.1,
         z_normalization,
+        latent_measure,
         score_warp_runtime,
         link_dev_runtime,
         gaussian_frailty_sd: final_sigma_cell.get(),
@@ -8880,6 +9173,7 @@ mod tests {
             y: Arc::new(array![1.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.25]),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -9034,6 +9328,7 @@ mod tests {
             y: Arc::new(y),
             weights: Arc::new(weights),
             z: Arc::new(z),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -9712,6 +10007,7 @@ mod tests {
             y: Arc::new(Array1::zeros(seed.len())),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -9827,6 +10123,7 @@ mod tests {
             y: Arc::new(Array1::zeros(seed.len())),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -9894,6 +10191,7 @@ mod tests {
             y: Arc::new(Array1::zeros(seed.len())),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -9949,6 +10247,7 @@ mod tests {
             y: Arc::new(Array1::zeros(seed.len())),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -10780,6 +11079,7 @@ mod tests {
                 y: Arc::new(array![0.0, 1.0, 1.0]),
                 weights: Arc::new(array![1.0, 0.7, 1.3]),
                 z: Arc::new(z.clone()),
+                latent_measure: LatentMeasureKind::StandardNormal,
                 gaussian_frailty_sd: None,
                 base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -10945,6 +11245,7 @@ mod tests {
                 y: Arc::new(array![0.0, 1.0, 0.0]),
                 weights: Arc::new(Array1::ones(3)),
                 z: Arc::new(seed.clone()),
+                latent_measure: LatentMeasureKind::StandardNormal,
                 gaussian_frailty_sd: None,
                 base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -11107,6 +11408,7 @@ mod tests {
             y: Arc::new(Array1::zeros(n)),
             weights: Arc::new(Array1::from_elem(n, 1.0)),
             z: Arc::new(Array1::zeros(n)),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: marg_design.clone(),
@@ -11158,6 +11460,7 @@ mod tests {
             y: Arc::new(array![1.0]),
             weights: Arc::new(array![1.2]),
             z: Arc::new(array![0.3]),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
@@ -11290,6 +11593,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -11389,6 +11693,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -11483,6 +11788,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -11624,6 +11930,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: scalar_design(),
@@ -11726,6 +12033,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -11852,6 +12160,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -11982,6 +12291,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+                latent_measure: LatentMeasureKind::StandardNormal,
                 gaussian_frailty_sd: None,
                 base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -12131,6 +12441,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+                latent_measure: LatentMeasureKind::StandardNormal,
                 gaussian_frailty_sd: None,
                 base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -12233,6 +12544,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -12312,6 +12624,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -12389,6 +12702,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+                latent_measure: LatentMeasureKind::StandardNormal,
                 gaussian_frailty_sd: None,
                 base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -12473,6 +12787,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+                latent_measure: LatentMeasureKind::StandardNormal,
                 gaussian_frailty_sd: None,
                 base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -12579,6 +12894,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+                latent_measure: LatentMeasureKind::StandardNormal,
                 gaussian_frailty_sd: None,
                 base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -12704,6 +13020,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+                latent_measure: LatentMeasureKind::StandardNormal,
                 gaussian_frailty_sd: None,
                 base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -12852,6 +13169,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -12951,6 +13269,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -13050,6 +13369,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -13160,6 +13480,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -13268,6 +13589,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+                latent_measure: LatentMeasureKind::StandardNormal,
                 gaussian_frailty_sd: None,
                 base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -13393,6 +13715,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+                latent_measure: LatentMeasureKind::StandardNormal,
                 gaussian_frailty_sd: None,
                 base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -13505,6 +13828,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+                latent_measure: LatentMeasureKind::StandardNormal,
                 gaussian_frailty_sd: None,
                 base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -13615,6 +13939,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+                latent_measure: LatentMeasureKind::StandardNormal,
                 gaussian_frailty_sd: None,
                 base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -13749,6 +14074,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -13857,6 +14183,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -13963,6 +14290,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+                latent_measure: LatentMeasureKind::StandardNormal,
                 gaussian_frailty_sd: None,
                 base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -14085,6 +14413,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -14167,6 +14496,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -14249,6 +14579,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -14336,6 +14667,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -14423,6 +14755,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -14499,6 +14832,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -14575,6 +14909,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -14638,6 +14973,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -14691,6 +15027,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+                latent_measure: LatentMeasureKind::StandardNormal,
                 gaussian_frailty_sd: None,
                 base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -14800,6 +15137,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+                latent_measure: LatentMeasureKind::StandardNormal,
                 gaussian_frailty_sd: None,
                 base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -14918,6 +15256,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+                latent_measure: LatentMeasureKind::StandardNormal,
                 gaussian_frailty_sd: None,
                 base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -15061,6 +15400,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+                latent_measure: LatentMeasureKind::StandardNormal,
                 gaussian_frailty_sd: None,
                 base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -15191,6 +15531,7 @@ mod tests {
             y: Arc::new(y.clone()),
             weights: Arc::new(weights.clone()),
             z: Arc::new(z.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -15357,6 +15698,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+                latent_measure: LatentMeasureKind::StandardNormal,
                 gaussian_frailty_sd: None,
                 base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -15425,6 +15767,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+                latent_measure: LatentMeasureKind::StandardNormal,
                 gaussian_frailty_sd: Some(sigma),
                 base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -15516,6 +15859,7 @@ mod tests {
             y: Arc::new(y),
             weights: Arc::new(weights),
             z: Arc::new(z),
+            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
             base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
