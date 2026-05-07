@@ -4316,6 +4316,12 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
         Ok(None)
     }
 
+    fn joint_gradient_evaluation(
+        &self,
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        Ok(None)
+    }
+
     fn hessian_matvec(&self, _: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         Ok(None)
     }
@@ -6226,6 +6232,12 @@ enum JointHessianSource {
     },
 }
 
+#[derive(Clone, Copy)]
+enum JointHessianSourcePreference {
+    PreferDense,
+    RequireOperator,
+}
+
 const EXACT_JOINT_HESSIAN_DENSE_MAX_BYTES: usize = 512 * 1024 * 1024;
 
 fn exact_joint_hessian_dense_bytes(total: usize) -> Result<usize, String> {
@@ -6306,8 +6318,11 @@ fn exact_newton_joint_hessian_source_from_workspace(
     workspace: &Arc<dyn ExactNewtonJointHessianWorkspace>,
     total: usize,
     context: &str,
+    preference: JointHessianSourcePreference,
 ) -> Result<Option<JointHessianSource>, String> {
-    if let Some(mut hessian) = workspace.hessian_dense()? {
+    if matches!(preference, JointHessianSourcePreference::PreferDense)
+        && let Some(mut hessian) = workspace.hessian_dense()?
+    {
         if hessian.nrows() != total || hessian.ncols() != total {
             return Err(format!(
                 "{context}: dense Hessian shape mismatch: got {}x{}, expected {total}x{total}",
@@ -6340,35 +6355,54 @@ fn exact_newton_joint_hessian_source_from_workspace(
         ));
     }
 
-    let zero = Array1::<f64>::zeros(total);
-    let Some(zero_image) = workspace.hessian_matvec(&zero)? else {
-        return Ok(None);
-    };
-    if zero_image.len() != total {
-        return Err(format!(
-            "{context}: operator matvec length mismatch: got {}, expected {}",
-            zero_image.len(),
-            total
-        ));
-    }
-    if zero_image.iter().any(|value| !value.is_finite()) {
-        return Err(format!(
-            "{context}: operator matvec returned non-finite values"
-        ));
-    }
-
     let workspace_apply = Arc::clone(workspace);
     let workspace_apply_into = Arc::clone(workspace);
+    let context_apply: Arc<str> = Arc::from(context);
+    let context_apply_into = Arc::clone(&context_apply);
     Ok(Some(JointHessianSource::Operator {
         apply: Arc::new(move |v: &Array1<f64>| {
+            if v.len() != total {
+                return Err(format!(
+                    "{}: operator input length mismatch: got {}, expected {total}",
+                    context_apply,
+                    v.len()
+                ));
+            }
             let Some(out) = workspace_apply.hessian_matvec(v)? else {
                 return Err("joint exact-newton operator matvec unavailable".to_string());
             };
+            if out.len() != total {
+                return Err(format!(
+                    "{}: operator matvec length mismatch: got {}, expected {total}",
+                    context_apply,
+                    out.len()
+                ));
+            }
+            if out.iter().any(|value| !value.is_finite()) {
+                return Err(format!(
+                    "{}: operator matvec returned non-finite values",
+                    context_apply
+                ));
+            }
             Ok(out)
         }),
         apply_into: Arc::new(move |v: &Array1<f64>, out: &mut Array1<f64>| {
+            if v.len() != total || out.len() != total {
+                return Err(format!(
+                    "{}: operator input/output length mismatch: v={} out={} expected={total}",
+                    context_apply_into,
+                    v.len(),
+                    out.len()
+                ));
+            }
             if !workspace_apply_into.hessian_matvec_into(v, out)? {
                 return Err("joint exact-newton operator matvec unavailable".to_string());
+            }
+            if out.iter().any(|value| !value.is_finite()) {
+                return Err(format!(
+                    "{}: operator matvec returned non-finite values",
+                    context_apply_into
+                ));
             }
             Ok(())
         }),
@@ -6486,6 +6520,7 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
                         workspace,
                         total,
                         "joint exact-newton operator mismatch in outer gradient",
+                        JointHessianSourcePreference::PreferDense,
                     )
                 })
                 .transpose()?
@@ -7510,6 +7545,7 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
                         workspace,
                         total,
                         "joint exact-newton operator mismatch in logdet terms",
+                        JointHessianSourcePreference::PreferDense,
                     )
                 })
                 .transpose()?
@@ -7705,28 +7741,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     // `exact_newton_joint_hessian` would pay a full `Θ(n p²)` Gram build per
     // joint-Newton cycle, which is strictly worse than the blockwise dense
     // Cholesky path — keep them on blockwise.
-    let (has_joint_exacthessian, has_workspace_source) =
-        if use_joint_matrix_free_path(total_joint_p, total_joint_n) {
-            let workspace = family
-                .exact_newton_joint_hessian_workspace_with_options(&states, specs, options)?;
-            if let Some(workspace) = workspace.as_ref() {
-                if exact_newton_joint_hessian_source_from_workspace(
-                    workspace,
-                    total_joint_p,
-                    "joint exact-newton operator mismatch during inner availability probe",
-                )?
-                .is_some()
-                {
-                    (true, true)
-                } else {
-                    (family.exact_newton_joint_hessian(&states)?.is_some(), false)
-                }
-            } else {
-                (family.exact_newton_joint_hessian(&states)?.is_some(), false)
-            }
-        } else {
-            (family.exact_newton_joint_hessian(&states)?.is_some(), false)
-        };
+    let matrix_free_joint_requested = use_joint_matrix_free_path(total_joint_p, total_joint_n);
+    let (has_joint_exacthessian, has_workspace_source) = if matrix_free_joint_requested
+        && family.inner_coefficient_hessian_hvp_available(specs)
+    {
+        (true, true)
+    } else {
+        (family.exact_newton_joint_hessian(&states)?.is_some(), false)
+    };
     // Multi-block families have always taken the joint path when an exact
     // joint Hessian is available. Single-block families now also take it when
     // the matrix-free workspace is wired — the joint loop then runs entirely
@@ -7735,6 +7757,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     // `exact_newton_joint_gradient_evaluation`) and never builds the dense
     // per-block Hessian inside the inner solve.
     let use_joint_newton = has_joint_exacthessian && (specs.len() >= 2 || has_workspace_source);
+    let matrix_free_joint_workspace = matrix_free_joint_requested && has_workspace_source;
     let inner_tol = options.inner_tol;
     let inner_max_cycles = options.inner_max_cycles;
     let inner_max_cycles = capped_inner_max_cycles(options, inner_max_cycles);
@@ -7788,17 +7811,53 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     }
     let mut cached_eval: Option<FamilyEvaluation> = None;
     let mut cached_joint_gradient: Option<Array1<f64>> = None;
-    let mut current_log_likelihood = if use_joint_newton {
-        if let Some(joint_eval) = family.exact_newton_joint_gradient_evaluation(&states, specs)? {
-            cached_joint_gradient = Some(joint_eval.gradient);
-            joint_eval.log_likelihood
-        } else {
-            let eval = family.evaluate(&states)?;
-            cached_joint_gradient = exact_newton_joint_gradient_from_eval(&eval, specs)?;
+    let mut cached_joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>> = None;
+    let load_joint_gradient =
+        |states: &[ParameterBlockState]|
+         -> Result<
+            (
+                f64,
+                Option<Array1<f64>>,
+                Option<FamilyEvaluation>,
+                Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+            ),
+            String,
+        > {
+            let workspace = if matrix_free_joint_workspace {
+                family.exact_newton_joint_hessian_workspace_with_options(states, specs, options)?
+            } else {
+                None
+            };
+            if let Some(workspace_ref) = workspace.as_ref()
+                && let Some(joint_eval) = workspace_ref.joint_gradient_evaluation()?
+            {
+                return Ok((
+                    joint_eval.log_likelihood,
+                    Some(joint_eval.gradient),
+                    None,
+                    Some(Arc::clone(workspace_ref)),
+                ));
+            }
+            if let Some(joint_eval) = family.exact_newton_joint_gradient_evaluation(states, specs)?
+            {
+                return Ok((
+                    joint_eval.log_likelihood,
+                    Some(joint_eval.gradient),
+                    None,
+                    workspace,
+                ));
+            }
+            let eval = family.evaluate(states)?;
             let log_likelihood = eval.log_likelihood;
-            cached_eval = Some(eval);
-            log_likelihood
-        }
+            let gradient = exact_newton_joint_gradient_from_eval(&eval, specs)?;
+            Ok((log_likelihood, gradient, Some(eval), workspace))
+        };
+    let mut current_log_likelihood = if use_joint_newton {
+        let (log_likelihood, gradient, eval, workspace) = load_joint_gradient(&states)?;
+        cached_joint_gradient = gradient;
+        cached_eval = eval;
+        cached_joint_workspace = workspace;
+        log_likelihood
     } else {
         let eval = family.evaluate(&states)?;
         let log_likelihood = eval.log_likelihood;
@@ -7868,14 +7927,19 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 assemble_joint_linear_constraints(&block_constraints, &ranges, total_p)?;
             // Get joint Hessian and block gradients from the current evaluation.
             let joint_hessian_source = if use_joint_matrix_free_path(total_p, total_joint_n) {
-                family
-                    .exact_newton_joint_hessian_workspace_with_options(&states, specs, options)?
+                let workspace = match cached_joint_workspace.take() {
+                    Some(workspace) => Some(workspace),
+                    None => family
+                        .exact_newton_joint_hessian_workspace_with_options(&states, specs, options)?,
+                };
+                workspace
                     .as_ref()
                     .map(|workspace| {
                         exact_newton_joint_hessian_source_from_workspace(
                             workspace,
                             total_p,
                             "joint Newton inner exact-newton operator mismatch",
+                            JointHessianSourcePreference::RequireOperator,
                         )
                     })
                     .transpose()?
@@ -7918,8 +7982,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 
             let trace_diagonal_ridge = joint_mode_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE;
 
-            let (candidate_beta, joint_active_set) = if let Some(constraints) =
-                joint_constraints.as_ref()
+            let solve_joint_constraints_dense = !use_joint_matrix_free_path(total_p, total_joint_n);
+            let (candidate_beta, joint_active_set) = if solve_joint_constraints_dense
+                && let Some(constraints) = joint_constraints.as_ref()
             {
                 let mut lhs = match materialize_joint_hessian_source(
                     &joint_hessian_source,
@@ -8181,19 +8246,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 break; // Fall back to blockwise
             }
 
-            // Re-evaluate for next iteration and convergence check
-            if let Some(joint_eval) =
-                family.exact_newton_joint_gradient_evaluation(&states, specs)?
-            {
-                current_log_likelihood = joint_eval.log_likelihood;
-                cached_joint_gradient = Some(joint_eval.gradient);
-                cached_eval = None;
-            } else {
-                let eval = family.evaluate(&states)?;
-                current_log_likelihood = eval.log_likelihood;
-                cached_joint_gradient = exact_newton_joint_gradient_from_eval(&eval, specs)?;
-                cached_eval = Some(eval);
-            }
+            let (log_likelihood, gradient, eval, workspace) = load_joint_gradient(&states)?;
+            current_log_likelihood = log_likelihood;
+            cached_joint_gradient = gradient;
+            cached_eval = eval;
+            cached_joint_workspace = workspace;
             current_penalty =
                 total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
             lastobjective = -current_log_likelihood + current_penalty;
@@ -11144,6 +11201,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                             workspace,
                             total,
                             "joint exact-newton operator mismatch in joint hyper evaluator",
+                            JointHessianSourcePreference::PreferDense,
                         )
                     })
                     .transpose()?
@@ -12029,6 +12087,7 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
                         workspace,
                         total,
                         "joint exact-newton operator mismatch in joint hyper EFS evaluator",
+                        JointHessianSourcePreference::PreferDense,
                     )
                 })
                 .transpose()?
