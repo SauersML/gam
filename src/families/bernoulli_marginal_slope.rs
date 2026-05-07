@@ -3748,7 +3748,6 @@ impl BernoulliMarginalSlopeFamily {
         let correction = (f / f_a).abs();
         f.abs() <= 1e-10 || correction <= 1e-10 * (1.0 + a.abs())
     }
-
 }
 
 #[derive(Default)]
@@ -4602,9 +4601,7 @@ impl BernoulliMarginalSlopeFamily {
         let cached_cells: Vec<(
             exact::DenestedPartitionCell,
             std::borrow::Cow<'_, exact::CellMomentState>,
-        )> = if need_hessian
-            && let Some(cached) = row_ctx.degree9_cells.as_ref()
-        {
+        )> = if need_hessian && let Some(cached) = row_ctx.degree9_cells.as_ref() {
             cached
                 .iter()
                 .map(|entry| {
@@ -17397,9 +17394,7 @@ mod tests {
                 .expect("cached Hv");
         }
         let cached_elapsed = start_cached.elapsed();
-        eprintln!(
-            "flex Hv cache timing: uncached={uncached_elapsed:?} cached={cached_elapsed:?}"
-        );
+        eprintln!("flex Hv cache timing: uncached={uncached_elapsed:?} cached={cached_elapsed:?}");
         assert!(
             cached_elapsed < uncached_elapsed,
             "expected cached Hv loop to beat uncached: cached={cached_elapsed:?} uncached={uncached_elapsed:?}"

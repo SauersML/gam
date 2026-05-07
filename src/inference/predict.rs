@@ -1442,8 +1442,7 @@ impl BernoulliMarginalSlopePredictor {
                     );
                     let marginal_scales = c_vec;
                     let logslope_scales = Array1::from_iter((0..n).map(|i| {
-                        marginal_eta[i] * (scale * scale) * logslope_eta[i]
-                            / marginal_scales[i]
+                        marginal_eta[i] * (scale * scale) * logslope_eta[i] / marginal_scales[i]
                             + scale * z[i]
                     }));
                     (final_eta_internal, marginal_scales, logslope_scales)
