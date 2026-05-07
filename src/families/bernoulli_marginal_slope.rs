@@ -2915,6 +2915,7 @@ impl BernoulliMarginalSlopeFamily {
                             block_states[1].eta[row],
                             beta_h,
                             beta_w,
+                            None,
                         )?
                         .0;
                     let slope = block_states[1].eta[row];
@@ -3728,6 +3729,57 @@ impl BernoulliMarginalSlopeFamily {
         f.abs() <= 1e-10 || correction <= 1e-10 * (1.0 + a.abs())
     }
 
+}
+
+#[derive(Default)]
+struct BernoulliInterceptSolveStats {
+    cached_short_circuit: AtomicUsize,
+    closed_form_short_circuit: AtomicUsize,
+    full_solver: AtomicUsize,
+    seed_residual_le_1e12: AtomicUsize,
+    seed_residual_le_1e10: AtomicUsize,
+    seed_residual_le_1e8: AtomicUsize,
+    seed_residual_le_abs_tol: AtomicUsize,
+    seed_residual_gt_abs_tol: AtomicUsize,
+    max_full_solver_iters: AtomicUsize,
+}
+
+impl BernoulliInterceptSolveStats {
+    fn record_seed_residual(&self, residual: f64, abs_tol: f64) {
+        let abs = residual.abs();
+        if abs <= 1e-12 {
+            self.seed_residual_le_1e12.fetch_add(1, Ordering::Relaxed);
+        } else if abs <= 1e-10 {
+            self.seed_residual_le_1e10.fetch_add(1, Ordering::Relaxed);
+        } else if abs <= 1e-8 {
+            self.seed_residual_le_1e8.fetch_add(1, Ordering::Relaxed);
+        } else if abs <= abs_tol {
+            self.seed_residual_le_abs_tol
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.seed_residual_gt_abs_tol
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_full_solver(&self, refine_iters: usize) {
+        self.full_solver.fetch_add(1, Ordering::Relaxed);
+        let mut current = self.max_full_solver_iters.load(Ordering::Relaxed);
+        while refine_iters > current {
+            match self.max_full_solver_iters.compare_exchange_weak(
+                current,
+                refine_iters,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(next) => current = next,
+            }
+        }
+    }
+}
+
+impl BernoulliMarginalSlopeFamily {
     fn solve_row_intercept_base(
         &self,
         row: usize,
@@ -3735,6 +3787,7 @@ impl BernoulliMarginalSlopeFamily {
         slope: f64,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
+        stats: Option<&BernoulliInterceptSolveStats>,
     ) -> Result<(f64, f64), String> {
         let marginal = self.marginal_link_map(marginal_eta)?;
         // Use the Newton-only calibration evaluator: `solve_monotone_root`
@@ -3796,34 +3849,49 @@ impl BernoulliMarginalSlopeFamily {
         // Newton basin first. The convergence test (1e-10 absolute or
         // relative correction) is strictly tighter than `abs_tol`, so any
         // accept here is safe. Hard cases still fall through unchanged.
-        let probe_result = (|| -> Result<Option<(f64, f64, f64)>, String> {
+        let probe_result = (|| -> Result<(Option<(f64, f64, f64)>, f64), String> {
             let (f0, f_a0, _) = eval(a_init)?;
+            let seed_residual = f0;
             if Self::row_intercept_newton_is_converged(a_init, f0, f_a0) {
-                return Ok(Some((a_init, f_a0.abs(), f0)));
+                return Ok((Some((a_init, f_a0.abs(), f0)), seed_residual));
             }
             if f_a0.is_finite() && f_a0 != 0.0 {
                 let a1 = a_init - f0 / f_a0;
                 if a1.is_finite() {
                     let (f1, f_a1, _) = eval(a1)?;
                     if Self::row_intercept_newton_is_converged(a1, f1, f_a1) {
-                        return Ok(Some((a1, f_a1.abs(), f1)));
+                        return Ok((Some((a1, f_a1.abs(), f1)), seed_residual));
                     }
                 }
             }
-            Ok(None)
+            Ok((None, seed_residual))
         })();
 
-        if let Ok(Some((a, abs_deriv, _))) = probe_result {
-            if let Some(cache) = self.intercept_warm_starts.as_ref()
-                && let Some(slot) = cache.get(row)
-            {
-                slot.store(a.to_bits(), Ordering::Relaxed);
+        if let Ok((accepted, seed_residual)) = &probe_result {
+            if let Some(stats) = stats {
+                stats.record_seed_residual(*seed_residual, abs_tol);
             }
-            return Ok((a, abs_deriv));
+            if let Some((a, abs_deriv, _)) = accepted {
+                if let Some(stats) = stats {
+                    if cached_a.is_some() {
+                        stats.cached_short_circuit.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        stats
+                            .closed_form_short_circuit
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                if let Some(cache) = self.intercept_warm_starts.as_ref()
+                    && let Some(slot) = cache.get(row)
+                {
+                    slot.store(a.to_bits(), Ordering::Relaxed);
+                }
+                return Ok((*a, *abs_deriv));
+            }
         }
 
-        let mut solve_result = super::monotone_root::solve_monotone_root(
-            eval,
+        let mut solve_result = super::monotone_root::solve_monotone_root_detailed(
+            &eval,
             a_init,
             "bernoulli intercept",
             abs_tol,
@@ -3837,8 +3905,8 @@ impl BernoulliMarginalSlopeFamily {
         // search exhausts; the closed-form seed always sits in the correct
         // basin.
         if cached_a.is_some() && solve_result.is_err() {
-            solve_result = super::monotone_root::solve_monotone_root(
-                eval,
+            solve_result = super::monotone_root::solve_monotone_root_detailed(
+                &eval,
                 a_closed_form,
                 "bernoulli intercept",
                 abs_tol,
@@ -3846,7 +3914,15 @@ impl BernoulliMarginalSlopeFamily {
                 48,
             );
         }
-        let (a, abs_deriv, f_best) = solve_result?;
+        let solve_solution = solve_result?;
+        if let Some(stats) = stats {
+            stats.record_full_solver(solve_solution.refine_iters);
+        }
+        let (a, abs_deriv, f_best) = (
+            solve_solution.root,
+            solve_solution.abs_deriv,
+            solve_solution.residual,
+        );
 
         if f_best.abs() > abs_tol {
             return Err(format!(
@@ -3865,10 +3941,20 @@ impl BernoulliMarginalSlopeFamily {
         Ok((a, abs_deriv))
     }
 
+    #[cfg(test)]
     fn build_row_exact_context(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
+    ) -> Result<BernoulliMarginalSlopeRowExactContext, String> {
+        self.build_row_exact_context_with_stats(row, block_states, None)
+    }
+
+    fn build_row_exact_context_with_stats(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        stats: Option<&BernoulliInterceptSolveStats>,
     ) -> Result<BernoulliMarginalSlopeRowExactContext, String> {
         let marginal_eta = block_states[0].eta[row];
         let marginal = self.marginal_link_map(marginal_eta)?;
@@ -3877,7 +3963,7 @@ impl BernoulliMarginalSlopeFamily {
         let beta_h = self.score_beta(block_states)?;
         let beta_w = self.link_beta(block_states)?;
         let (intercept, m_a) = if self.effective_flex_active(block_states)? {
-            self.solve_row_intercept_base(row, marginal_eta, slope, beta_h, beta_w)?
+            self.solve_row_intercept_base(row, marginal_eta, slope, beta_h, beta_w, stats)?
         } else {
             let intercept = match self.latent_measure.empirical_grid() {
                 None => {
@@ -3952,11 +4038,26 @@ impl BernoulliMarginalSlopeFamily {
             );
         }
         self.preseed_intercept_warm_starts(block_states)?;
+        let stats = BernoulliInterceptSolveStats::default();
         let row_contexts: Result<Vec<_>, String> = (0..n)
             .into_par_iter()
-            .map(|row| self.build_row_exact_context(row, block_states))
+            .map(|row| self.build_row_exact_context_with_stats(row, block_states, Some(&stats)))
             .collect();
         let row_contexts = row_contexts?;
+        if flex_active {
+            log::debug!(
+                "bernoulli marginal-slope intercept seed short-circuit: cached={}, closed_form={}, full_solver={}, max_full_solver_iters={}, seed_residual_bins={{<=1e-12:{}, <=1e-10:{}, <=1e-8:{}, <=abs_tol:{}, >abs_tol:{}}}",
+                stats.cached_short_circuit.load(Ordering::Relaxed),
+                stats.closed_form_short_circuit.load(Ordering::Relaxed),
+                stats.full_solver.load(Ordering::Relaxed),
+                stats.max_full_solver_iters.load(Ordering::Relaxed),
+                stats.seed_residual_le_1e12.load(Ordering::Relaxed),
+                stats.seed_residual_le_1e10.load(Ordering::Relaxed),
+                stats.seed_residual_le_1e8.load(Ordering::Relaxed),
+                stats.seed_residual_le_abs_tol.load(Ordering::Relaxed),
+                stats.seed_residual_gt_abs_tol.load(Ordering::Relaxed),
+            );
+        }
         if log_exact_work(n) {
             log::info!(
                 "[BMS exact-cache] build done n={} p={} flex={} elapsed={:.3}s",
@@ -17067,6 +17168,61 @@ mod tests {
             .expect("uncached diag");
         let rel_diag = rel_diff_array1(&diag_cached, &diag_uncached);
         assert!(rel_diag < 5e-11, "cached diag drift rel {rel_diag}");
+    }
+
+    #[test]
+    #[ignore]
+    fn bernoulli_flex_hvp_cache_timing_biobank_shape_pattern() {
+        // Wall-clock micro-benchmark for the per-row primary-Hessian cache
+        // (`row_primary_hessians`).  The matrix-free CG / inner-Newton loops
+        // contract the same per-row primary Hessian against many trial
+        // directions at the same β, so caching the `r×r` blocks once should
+        // beat rebuilding cell moments + flex jets on every Hv.  Ignored by
+        // default because timing assertions are flaky on shared CI runners;
+        // run locally with `cargo test --release -- --ignored
+        // bernoulli_flex_hvp_cache_timing_biobank_shape_pattern --nocapture`.
+        let (family, states) = make_flex_hvp_cache_test_family(96);
+        let mut cached = family
+            .build_exact_eval_cache(&states)
+            .expect("cached exact eval cache");
+        cached.row_primary_hessians = family
+            .build_row_primary_hessian_cache(&states, &cached)
+            .expect("row Hessian cache");
+        let uncached = BernoulliMarginalSlopeExactEvalCache {
+            slices: cached.slices.clone(),
+            primary: cached.primary.clone(),
+            row_contexts: cached.row_contexts.clone(),
+            row_primary_hessians: None,
+        };
+        let directions: Vec<_> = (0..4)
+            .map(|rep| {
+                Array1::from_iter(
+                    (0..cached.slices.total)
+                        .map(|idx| 0.01 * (((idx * 13 + rep * 7) % 11) as f64 - 5.0)),
+                )
+            })
+            .collect();
+        let start_uncached = std::time::Instant::now();
+        for direction in &directions {
+            let _ = family
+                .exact_newton_joint_hessian_matvec_from_cache(direction, &states, &uncached)
+                .expect("uncached Hv");
+        }
+        let uncached_elapsed = start_uncached.elapsed();
+        let start_cached = std::time::Instant::now();
+        for direction in &directions {
+            let _ = family
+                .exact_newton_joint_hessian_matvec_from_cache(direction, &states, &cached)
+                .expect("cached Hv");
+        }
+        let cached_elapsed = start_cached.elapsed();
+        eprintln!(
+            "flex Hv cache timing: uncached={uncached_elapsed:?} cached={cached_elapsed:?}"
+        );
+        assert!(
+            cached_elapsed < uncached_elapsed,
+            "expected cached Hv loop to beat uncached: cached={cached_elapsed:?} uncached={uncached_elapsed:?}"
+        );
     }
 
     #[test]
