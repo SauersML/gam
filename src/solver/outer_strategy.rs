@@ -137,8 +137,7 @@ struct InnerProgressSnapshot {
 /// The optimizer uses this as a work-model contract before turning a
 /// matrix-free analytic Hessian into a dense ARC model. `Unavailable` means
 /// callers must stay matrix-free; the remaining variants are all analytic
-/// (never numerical finite-difference Hessians) but differ in how much
-/// per-column HVP overhead they imply.
+/// but differ in how much per-column HVP overhead they imply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OuterHessianMaterialization {
     /// Dense materialization is not part of this operator's contract.
