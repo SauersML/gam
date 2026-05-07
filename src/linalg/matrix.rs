@@ -3281,9 +3281,23 @@ pub struct CoefficientTransformOperator {
     transform: Arc<Array2<f64>>,
     n: usize,
     p_out: usize,
+    /// One-time-materialized X · T dense block, populated on first hot use.
+    /// Only allocated when the n × p_out block fits within MATERIALIZE_MAX_BYTES;
+    /// reused across all PIRLS iterations and outer-seed evaluations. Without
+    /// this cache, `BlockDesignOperator::cross_block` (used by per-iter
+    /// curvature builds) calls `row_chunk_into` repeatedly, each time
+    /// re-running `fast_ab(inner_chunk, transform)` — measured ~3.7 s / iter
+    /// at biobank duchon60 shape (n=320 K, p_out=42 effective) for a single
+    /// `update_with_curvature`, all of it allocations + chunked GEMM.
+    materialized: OnceLock<Option<Arc<Array2<f64>>>>,
 }
 
 impl CoefficientTransformOperator {
+    /// Maximum bytes for the one-shot X · T materialization. 1 GiB is generous
+    /// enough to cover biobank-scale (n = 320 K, p_out = 42 → ~107 MiB) and
+    /// rejects pathological designs. Matches ChunkedKernelDesignOperator.
+    const MATERIALIZE_MAX_BYTES: usize = 1024 * 1024 * 1024;
+
     pub fn new(inner: DenseDesignMatrix, transform: Array2<f64>) -> Result<Self, String> {
         let p_inner = inner.ncols();
         if transform.nrows() != p_inner {
@@ -3300,7 +3314,30 @@ impl CoefficientTransformOperator {
             transform: Arc::new(transform),
             n,
             p_out,
+            materialized: OnceLock::new(),
         })
+    }
+
+    /// Get-or-build the materialized X · T dense block. Returns `None` when
+    /// the block would exceed `MATERIALIZE_MAX_BYTES`; in that case callers
+    /// fall back to per-chunk evaluation.
+    fn materialized_combined(&self) -> Option<&Array2<f64>> {
+        self.materialized
+            .get_or_init(|| {
+                let bytes = self
+                    .n
+                    .checked_mul(self.p_out)
+                    .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()));
+                match bytes {
+                    Some(b) if b <= Self::MATERIALIZE_MAX_BYTES => {
+                        let x = self.inner.to_dense();
+                        Some(Arc::new(fast_ab(&x, &self.transform)))
+                    }
+                    _ => None,
+                }
+            })
+            .as_ref()
+            .map(|a| a.as_ref())
     }
 }
 
@@ -3312,14 +3349,25 @@ impl LinearOperator for CoefficientTransformOperator {
         self.p_out
     }
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        if let Some(combined) = self.materialized_combined() {
+            return dense_matvec(combined, vector);
+        }
         let tv = self.transform.dot(vector);
         self.inner.apply(&tv)
     }
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+        if let Some(combined) = self.materialized_combined() {
+            return dense_transpose_matvec(combined, vector);
+        }
         let xtv = self.inner.apply_transpose(vector);
         self.transform.t().dot(&xtv)
     }
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        if let Some(combined) = self.materialized_combined() {
+            let mut xtwx = Array2::<f64>::zeros((self.p_out, self.p_out));
+            streaming_blas_xt_diag_x(combined, weights, &mut xtwx);
+            return Ok(xtwx);
+        }
         let inner_xtwx = self.inner.diag_xtw_x(weights)?;
         // T^T * (X^T W X) * T
         let tmp = fast_ab(&self.transform.t().to_owned(), &inner_xtwx);
@@ -3329,6 +3377,9 @@ impl LinearOperator for CoefficientTransformOperator {
 
 impl DenseDesignOperator for CoefficientTransformOperator {
     fn to_dense(&self) -> Array2<f64> {
+        if let Some(combined) = self.materialized_combined() {
+            return combined.clone();
+        }
         let x = self.inner.to_dense();
         fast_ab(&x, &self.transform)
     }
@@ -3341,6 +3392,10 @@ impl DenseDesignOperator for CoefficientTransformOperator {
             return Err(MatrixMaterializationError::MissingRowChunk {
                 context: "CoefficientTransformOperator::row_chunk_into shape mismatch",
             });
+        }
+        if let Some(combined) = self.materialized_combined() {
+            out.assign(&combined.slice(s![rows, ..]));
+            return Ok(());
         }
         let chunk = self.inner.try_row_chunk(rows)?;
         out.assign(&fast_ab(&chunk, &self.transform));
