@@ -91,17 +91,54 @@ impl SavedLatentZNormalization {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+pub const TRANSFORMATION_SCORE_PIT_CLIP_EPS: f64 = 1.0e-12;
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TransformationScoreKind {
+    FiniteSupportPit,
+}
+
+impl Default for TransformationScoreKind {
+    fn default() -> Self {
+        Self::FiniteSupportPit
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct TransformationScoreCalibration {
-    pub feature_cols: Vec<usize>,
-    pub feature_center: Vec<f64>,
-    pub feature_scale: Vec<f64>,
-    pub rbf_centers: Vec<Vec<f64>>,
-    pub rbf_bandwidth: f64,
-    pub location_beta: Vec<f64>,
-    pub log_scale_beta: Vec<f64>,
-    pub global_mean: f64,
-    pub global_sd: f64,
+    #[serde(default)]
+    pub score_kind: TransformationScoreKind,
+    #[serde(default = "default_transformation_score_pit_clip_eps")]
+    pub clip_eps: f64,
+}
+
+fn default_transformation_score_pit_clip_eps() -> f64 {
+    TRANSFORMATION_SCORE_PIT_CLIP_EPS
+}
+
+impl TransformationScoreCalibration {
+    pub fn finite_support_pit() -> Self {
+        Self {
+            score_kind: TransformationScoreKind::FiniteSupportPit,
+            clip_eps: TRANSFORMATION_SCORE_PIT_CLIP_EPS,
+        }
+    }
+
+    pub fn validate(&self, context: &str) -> Result<(), String> {
+        if self.score_kind != TransformationScoreKind::FiniteSupportPit {
+            return Err(format!(
+                "{context} supports only finite-support CTN PIT score semantics"
+            ));
+        }
+        if !(self.clip_eps.is_finite() && self.clip_eps > 0.0 && self.clip_eps < 0.5) {
+            return Err(format!(
+                "{context} requires PIT clip_eps in (0, 0.5), got {}",
+                self.clip_eps
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -254,8 +291,9 @@ pub struct FittedModelPayload {
     /// Transformation-normal: median of the response used for anchoring.
     #[serde(default)]
     pub transformation_response_median: Option<f64>,
-    /// Transformation-normal saved score calibration:
-    /// z = ((h - X location_beta) / exp(X log_scale_beta) - global_mean) / global_sd.
+    /// Transformation-normal saved score contract. The score is the exact
+    /// finite-support PIT:
+    /// z = Phi^{-1}((Phi(h) - Phi(h_L)) / (Phi(h_U) - Phi(h_L))).
     #[serde(default)]
     pub transformation_score_calibration: Option<TransformationScoreCalibration>,
     #[serde(default)]
@@ -2033,6 +2071,13 @@ impl FittedModel {
         }
         if let Some(spec_noise) = self.resolved_termspec_noise.as_ref() {
             validate_frozen_term_collectionspec(spec_noise, "resolved_termspec_noise")?;
+        }
+        if matches!(self.family_state, FittedFamily::TransformationNormal { .. }) {
+            let score = self.transformation_score_calibration.ok_or_else(|| {
+                "transformation-normal model is missing transformation_score_calibration; refit with current CLI"
+                    .to_string()
+            })?;
+            score.validate("transformation-normal model")?;
         }
         if matches!(self.family_state, FittedFamily::MarginalSlope { .. }) {
             if self.formula_logslope.is_none() {
