@@ -147,23 +147,6 @@ CTN_RESPONSE_INTERNAL_KNOTS_CAP = 32
 BIOBANK_DUCHON16D_ORDER = 0
 BIOBANK_DUCHON16D_POWER = 8
 BIOBANK_DUCHON16D_LENGTH_SCALE = 1.0
-# CTN-preflight Duchon order is named separately from the main margslope
-# Duchon order so the two can diverge when needed (the conditional-CDF
-# surface and the marginal-slope intercept surface have different geometric
-# anchoring requirements). Both default to `0` (Zero polynomial nullspace)
-# today.
-BIOBANK_DUCHON16D_CTN_ORDER = 0
-# Cap on Duchon centers used inside the CTN preflight, independently of the
-# main margslope `centers` budget. The CTN runs on a *stratified* subsample
-# that deliberately oversamples per-axis tail extremes (640 forced rows
-# from per-axis min/max + ~19k uniform fill), so the basis sees a much
-# less even distribution than the main margslope path. With order=Zero +
-# auto-escalated power=9 the constraint nullspace identification becomes
-# ill-conditioned at 24 centers in 16D over that uneven subsample. Cap at
-# 16 centers — still ample for a smooth conditional CDF surface and well
-# within the rank-conditioning envelope of the spectral whitener at
-# `terms/basis.rs:positive_spectral_whitener_from_gram`.
-BIOBANK_DUCHON16D_CTN_CENTERS_CAP = 16
 PGS_RAW_COLUMN = "pgs_raw"
 PGS_CTN_Z_COLUMN = "pgs_ctn_z"
 PGS_CTN_FIT_SUBSAMPLE_N = 5000
@@ -554,12 +537,11 @@ def _pc_std_columns(pc_count: int) -> list[str]:
     return [f"pc{i}_std" for i in range(1, int(pc_count) + 1)]
 
 
-def _biobank_duchon_pc_term(pc_count: int, centers: int, *, order: int | None = None) -> str:
+def _biobank_duchon_pc_term(pc_count: int, centers: int) -> str:
     pc_cols = ", ".join(_pc_std_columns(pc_count))
-    resolved_order = BIOBANK_DUCHON16D_ORDER if order is None else order
     return (
         f"duchon({pc_cols}, centers={centers}, "
-        f"order={resolved_order}, power={BIOBANK_DUCHON16D_POWER}, "
+        f"order={BIOBANK_DUCHON16D_ORDER}, power={BIOBANK_DUCHON16D_POWER}, "
         f"length_scale={BIOBANK_DUCHON16D_LENGTH_SCALE:g})"
     )
 
@@ -611,10 +593,7 @@ def _mgcv_pc_smooth_term(spatial_basis: str, pc_count: int, k: int) -> str:
 
 
 def _ctn_formula(pc_count: int, centers: int) -> str:
-    return (
-        f"{PGS_RAW_COLUMN} ~ "
-        f"{_biobank_duchon_pc_term(pc_count, centers, order=BIOBANK_DUCHON16D_CTN_ORDER)}"
-    )
+    return f"{PGS_RAW_COLUMN} ~ {_biobank_duchon_pc_term(pc_count, centers)}"
 
 
 def _attach_column(rows: list[dict[str, str]], column: str, values: list[float]) -> list[dict[str, Any]]:
@@ -730,10 +709,7 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
     ctn_test_input_path = out_dir / f"{spec.name}.pgs_ctn.test_input.csv"
     ctn_train_pred_path = out_dir / f"{spec.name}.pgs_ctn.train_pred.csv"
     ctn_test_pred_path = out_dir / f"{spec.name}.pgs_ctn.test_pred.csv"
-    # Cap CTN centers below the main margslope budget so the constraint
-    # nullspace stays well-conditioned on the stratified subsample.
-    ctn_centers = min(centers, BIOBANK_DUCHON16D_CTN_CENTERS_CAP)
-    formula = _ctn_formula(spec.pc_count, ctn_centers)
+    formula = _ctn_formula(spec.pc_count, 64)
     ctn_columns = [PGS_RAW_COLUMN, *_pc_std_columns(spec.pc_count)]
     # Why this isn't a uniform random subsample any more:
     #
