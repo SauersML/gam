@@ -1,4 +1,7 @@
-use crate::families::bernoulli_marginal_slope::{DeviationBlockConfig, LatentZPolicy};
+use crate::families::bernoulli_marginal_slope::{
+    DEFAULT_EMPIRICAL_LATENT_GRID_SIZE, DeviationBlockConfig, LatentMeasureSpec,
+    LatentZNormalizationMode, LatentZPolicy,
+};
 use crate::families::survival_construction::SurvivalBaselineTarget;
 use crate::types::{InverseLink, LinkFunction};
 
@@ -12,6 +15,9 @@ pub enum LatentScoreSemantics {
     },
     /// z will be centered/scaled inside the fit.
     FitWeightedNormalization,
+    /// z is carried by its observed empirical latent measure instead of
+    /// pretending the downstream calibration law is standard normal.
+    EmpiricalLatentMeasure { normalize_location_scale: bool },
 }
 
 impl LatentScoreSemantics {
@@ -19,6 +25,19 @@ impl LatentScoreSemantics {
         match self {
             Self::FrozenConditionalNormal { .. } => LatentZPolicy::frozen_transformation_normal(),
             Self::FitWeightedNormalization => LatentZPolicy::exploratory_fit_weighted(),
+            Self::EmpiricalLatentMeasure {
+                normalize_location_scale,
+            } => LatentZPolicy {
+                normalization: if normalize_location_scale {
+                    LatentZNormalizationMode::FitWeighted
+                } else {
+                    LatentZNormalizationMode::None
+                },
+                latent_measure: LatentMeasureSpec::GlobalEmpirical {
+                    grid_size: DEFAULT_EMPIRICAL_LATENT_GRID_SIZE,
+                },
+                ..LatentZPolicy::exploratory_fit_weighted()
+            },
         }
     }
 }

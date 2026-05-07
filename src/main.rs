@@ -14,7 +14,8 @@ use gam::estimate::{
     saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit, saved_sas_state_from_fit,
 };
 use gam::families::bernoulli_marginal_slope::{
-    BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, DeviationRuntime, LatentZPolicy,
+    BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, DeviationRuntime, LatentMeasureKind,
+    LatentZPolicy,
 };
 use gam::families::cubic_cell_kernel as exact_kernel;
 use gam::families::family_meta::{
@@ -1521,6 +1522,7 @@ fn run_fit_bernoulli_marginal_slope(
                 mean: solved.z_normalization.mean,
                 sd: solved.z_normalization.sd,
             },
+            solved.latent_measure.clone(),
             solved.score_warp_runtime.as_ref(),
             solved.link_dev_runtime.as_ref(),
             base_link,
@@ -4720,6 +4722,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 mean: fit.z_normalization.mean,
                 sd: fit.z_normalization.sd,
             });
+            payload.latent_measure = Some(LatentMeasureKind::StandardNormal);
             payload.logslope_baseline = Some(fit.baseline_slope);
             payload.score_warp_runtime = fit
                 .score_warp_runtime
@@ -7147,6 +7150,7 @@ fn build_bernoulli_marginal_slope_saved_model(
     baseline_marginal: f64,
     baseline_logslope: f64,
     latent_z_normalization: SavedLatentZNormalization,
+    latent_measure: LatentMeasureKind,
     score_warp_runtime: Option<&DeviationRuntime>,
     link_dev_runtime: Option<&DeviationRuntime>,
     base_link: InverseLink,
@@ -7169,6 +7173,7 @@ fn build_bernoulli_marginal_slope_saved_model(
     payload.formula_logslope = Some(logslope_formula);
     payload.z_column = Some(z_column);
     payload.latent_z_normalization = Some(latent_z_normalization);
+    payload.latent_measure = Some(latent_measure);
     payload.marginal_baseline = Some(baseline_marginal);
     payload.logslope_baseline = Some(baseline_logslope);
     payload.link = Some(base_link.saved_string());
@@ -11907,6 +11912,7 @@ mod tests {
             0.0,
             0.0,
             SavedLatentZNormalization { mean: 0.2, sd: 1.3 },
+            LatentMeasureKind::StandardNormal,
             None,
             None,
             InverseLink::Standard(LinkFunction::Probit),
@@ -11979,6 +11985,7 @@ mod tests {
             0.0,
             1.0,
             SavedLatentZNormalization { mean: 1.0, sd: 2.0 },
+            LatentMeasureKind::StandardNormal,
             None,
             None,
             InverseLink::Standard(LinkFunction::Probit),
@@ -12032,6 +12039,7 @@ mod tests {
             0.0,
             0.0,
             SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
+            LatentMeasureKind::StandardNormal,
             None,
             None,
             InverseLink::Standard(LinkFunction::Probit),
