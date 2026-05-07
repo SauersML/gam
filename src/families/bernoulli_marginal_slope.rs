@@ -2415,6 +2415,14 @@ struct BernoulliMarginalSlopeExactEvalCache {
     primary: PrimarySlices,
     /// Pre-solved row contexts (intercept, M_a, observed score-warp value).
     row_contexts: Vec<BernoulliMarginalSlopeRowExactContext>,
+    /// Flexible-path per-β per-row primary Hessians (`r×r` blocks flattened
+    /// row-major into one wide `Array2`).  The matrix-free inner Newton/CG
+    /// loop contracts the same primary Hessian against many trial directions
+    /// at the same β; materializing each row's Hessian once per workspace
+    /// avoids rebuilding cell moments + reduced flex jets on every Hv product.
+    /// `None` whenever the flex path is inactive (rigid kernel) or the
+    /// caller did not opt in to materialization.
+    row_primary_hessians: Option<Array2<f64>>,
 }
 
 // ── RowKernel<2> implementation (rigid path only) ────────────────────
@@ -3623,6 +3631,103 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
+    fn row_intercept_closed_form_seed(
+        &self,
+        marginal: BernoulliMarginalLinkMap,
+        slope: f64,
+        beta_w: Option<&Array1<f64>>,
+    ) -> Result<f64, String> {
+        let probit_scale = self.probit_frailty_scale();
+        let a_rigid_pre_scale =
+            rigid_intercept_from_marginal(marginal.q, slope, probit_scale) / probit_scale;
+        if beta_w.is_some() {
+            let v = Array1::from_vec(vec![a_rigid_pre_scale]);
+            let (l_val, l_d1) = self.link_terms_value_d1(&v, beta_w)?;
+            let ell1 = l_d1[0];
+            if ell1 > 1e-8 {
+                let ell0 = l_val[0] - ell1 * a_rigid_pre_scale;
+                let observed_logslope = probit_scale * ell1 * slope;
+                return Ok(
+                    (marginal.q * (1.0 + observed_logslope * observed_logslope).sqrt()
+                        / probit_scale
+                        - ell0)
+                        / ell1,
+                );
+            }
+        }
+        Ok(a_rigid_pre_scale)
+    }
+
+    /// Pre-seed cold (`NaN`) per-row intercept warm-start slots with the
+    /// closed-form rigid/affine seed for the current `(marginal_eta, slope)`
+    /// state, before the parallel root solves run. Slots already populated
+    /// from a prior PIRLS/outer iteration are preserved verbatim — only NaN
+    /// slots are CAS-installed. This avoids recomputing the seed inside every
+    /// `solve_row_intercept_base` call on cold cycle 0.
+    fn preseed_intercept_warm_starts(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<(), String> {
+        if !self.effective_flex_active(block_states)? {
+            return Ok(());
+        }
+        let Some(cache) = self.intercept_warm_starts.as_ref() else {
+            return Ok(());
+        };
+        let beta_w = self.link_beta(block_states)?;
+        let n = self.y.len();
+        if cache.len() != n {
+            return Ok(());
+        }
+        let marginal_eta = &block_states[0].eta;
+        let slope_eta = &block_states[1].eta;
+        let seeds: Result<Vec<f64>, String> = (0..n)
+            .into_par_iter()
+            .map(|row| {
+                let marginal = self.marginal_link_map(marginal_eta[row])?;
+                self.row_intercept_closed_form_seed(marginal, slope_eta[row], beta_w)
+            })
+            .collect();
+        let seeds = seeds?;
+        let nan_bits = f64::NAN.to_bits();
+        let mut preseeded = 0usize;
+        let mut kept_warm = 0usize;
+        for (row, seed) in seeds.iter().enumerate() {
+            let slot = &cache[row];
+            if !seed.is_finite() {
+                continue;
+            }
+            match slot.compare_exchange(
+                nan_bits,
+                seed.to_bits(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => preseeded += 1,
+                Err(prev) => {
+                    if f64::from_bits(prev).is_finite() {
+                        kept_warm += 1;
+                    }
+                }
+            }
+        }
+        log::info!(
+            "[bernoulli intercept warm-start] preseeded={} (cold), kept_warm={} (carried over from previous PIRLS)",
+            preseeded,
+            kept_warm,
+        );
+        Ok(())
+    }
+
+    #[inline]
+    fn row_intercept_newton_is_converged(a: f64, f: f64, f_a: f64) -> bool {
+        if !a.is_finite() || !f.is_finite() || !f_a.is_finite() || f_a == 0.0 {
+            return false;
+        }
+        let correction = (f / f_a).abs();
+        f.abs() <= 1e-10 || correction <= 1e-10 * (1.0 + a.abs())
+    }
+
     fn solve_row_intercept_base(
         &self,
         row: usize,
@@ -3641,35 +3746,13 @@ impl BernoulliMarginalSlopeFamily {
             self.evaluate_denested_calibration_newton(a, marginal_eta, slope, beta_h, beta_w)
         };
 
-        let probit_scale = self.probit_frailty_scale();
-
         // Closed-form fallback initial guess: rigid probit in pre-scale
         // denested coordinates:
         //   a₀ = q·√(1 + (s_f b)²) / s_f,  s_f = 1/√(1+σ²).
         // When link deviation is active, upgrade to affine-link warm start:
         //   s_f·L(u) ≈ s_f·(ℓ₀ + ℓ₁·u)
         //   ⟹  a = (q·√(1 + (s_f ℓ₁ b)²) / s_f − ℓ₀) / ℓ₁
-        let a_closed_form = {
-            let a_rigid_pre_scale =
-                rigid_intercept_from_marginal(marginal.q, slope, probit_scale) / probit_scale;
-            if beta_w.is_some() {
-                let v = Array1::from_vec(vec![a_rigid_pre_scale]);
-                let (l_val, l_d1) = self.link_terms_value_d1(&v, beta_w)?;
-                let ell1 = l_d1[0];
-                if ell1 > 1e-8 {
-                    let ell0 = l_val[0] - ell1 * a_rigid_pre_scale;
-                    let observed_logslope = probit_scale * ell1 * slope;
-                    (marginal.q * (1.0 + observed_logslope * observed_logslope).sqrt()
-                        / probit_scale
-                        - ell0)
-                        / ell1
-                } else {
-                    a_rigid_pre_scale
-                }
-            } else {
-                a_rigid_pre_scale
-            }
-        };
+        let a_closed_form = self.row_intercept_closed_form_seed(marginal, slope, beta_w)?;
 
         // Prefer the previous PIRLS iter's converged intercept as the
         // initial guess; β changes only a little between consecutive PIRLS
@@ -3683,6 +3766,15 @@ impl BernoulliMarginalSlopeFamily {
         });
         let a_init = cached_a.unwrap_or(a_closed_form);
 
+        // Note: an explicit `eval(a_closed_form)` short-circuit at this point
+        // would be redundant. On cold cycle-0 `cached_a` is None, so `a_init`
+        // already equals `a_closed_form` and the two-step Newton probe below
+        // evaluates there with the 1e-10 tolerance from
+        // `row_intercept_newton_is_converged`, matching the exact-root path
+        // in `monotone_root::solve_monotone_root` (see monotone_root.rs:50-66).
+        // On warm cycles, evaluating at `a_closed_form` would add an extra
+        // cell-moment call even when the cached seed is already the root.
+
         // Adaptive acceptance tolerance: for extreme slopes the intercept
         // equation becomes numerically flat and tight absolute precision is
         // not achievable. We accept any bracketed solution at this level, so
@@ -3695,6 +3787,40 @@ impl BernoulliMarginalSlopeFamily {
         // common case, instead of forcing 30+ refinement iters down to 1e-10.
         let target = marginal.mu;
         let abs_tol = 1e-8_f64.max(1e-4 * target.abs());
+
+        // Two-step Newton probe before paying for the safeguarded bracket.
+        // Cycle-0 is cold at biobank scale, so forcing every row through the
+        // bracket spends most of the wall time rebuilding identical degree-4
+        // cell moments. The rigid/affine seed is exact when deviations vanish
+        // and first-order accurate when they are small; probe that local
+        // Newton basin first. The convergence test (1e-10 absolute or
+        // relative correction) is strictly tighter than `abs_tol`, so any
+        // accept here is safe. Hard cases still fall through unchanged.
+        let probe_result = (|| -> Result<Option<(f64, f64, f64)>, String> {
+            let (f0, f_a0, _) = eval(a_init)?;
+            if Self::row_intercept_newton_is_converged(a_init, f0, f_a0) {
+                return Ok(Some((a_init, f_a0.abs(), f0)));
+            }
+            if f_a0.is_finite() && f_a0 != 0.0 {
+                let a1 = a_init - f0 / f_a0;
+                if a1.is_finite() {
+                    let (f1, f_a1, _) = eval(a1)?;
+                    if Self::row_intercept_newton_is_converged(a1, f1, f_a1) {
+                        return Ok(Some((a1, f_a1.abs(), f1)));
+                    }
+                }
+            }
+            Ok(None)
+        })();
+
+        if let Ok(Some((a, abs_deriv, _))) = probe_result {
+            if let Some(cache) = self.intercept_warm_starts.as_ref()
+                && let Some(slot) = cache.get(row)
+            {
+                slot.store(a.to_bits(), Ordering::Relaxed);
+            }
+            return Ok((a, abs_deriv));
+        }
 
         let mut solve_result = super::monotone_root::solve_monotone_root(
             eval,
@@ -3825,6 +3951,7 @@ impl BernoulliMarginalSlopeFamily {
                 flex_active
             );
         }
+        self.preseed_intercept_warm_starts(block_states)?;
         let row_contexts: Result<Vec<_>, String> = (0..n)
             .into_par_iter()
             .map(|row| self.build_row_exact_context(row, block_states))
@@ -3843,7 +3970,64 @@ impl BernoulliMarginalSlopeFamily {
             slices,
             primary,
             row_contexts,
+            row_primary_hessians: None,
         })
+    }
+
+    fn build_row_primary_hessian_cache(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if !self.effective_flex_active(block_states)? {
+            return Ok(None);
+        }
+        let n = self.y.len();
+        let primary = &cache.primary;
+        let r = primary.total;
+        let rows: Result<Vec<_>, String> = (0..n)
+            .into_par_iter()
+            .map(|row| {
+                let row_ctx = Self::row_ctx(cache, row);
+                let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(r);
+                self.compute_row_analytic_flex_into(
+                    row,
+                    block_states,
+                    primary,
+                    row_ctx,
+                    true,
+                    &mut scratch,
+                )?;
+                Ok(scratch.hess.into_raw_vec_and_offset().0)
+            })
+            .collect();
+        let rows = rows?;
+        let mut packed = Array2::<f64>::zeros((n, r * r));
+        for (row, row_hess) in rows.into_iter().enumerate() {
+            packed.row_mut(row).assign(&Array1::from(row_hess));
+        }
+        Ok(Some(packed))
+    }
+
+    /// Look up the cached per-row primary Hessian (`r × r`) materialized at
+    /// the workspace β snapshot when `row_primary_hessians` is populated.
+    /// Returns `None` when the cache is absent or the row index is out of
+    /// range, in which case the caller must fall back to the live row
+    /// kernel.
+    #[inline]
+    fn cached_row_primary_hessian<'a>(
+        cache: &'a BernoulliMarginalSlopeExactEvalCache,
+        row: usize,
+    ) -> Option<ArrayView2<'a, f64>> {
+        let rows = cache.row_primary_hessians.as_ref()?;
+        let r = cache.primary.total;
+        if row >= rows.nrows() {
+            return None;
+        }
+        let width = r.checked_mul(r)?;
+        let start = row.checked_mul(width)?;
+        let end = start.checked_add(width)?;
+        ArrayView2::from_shape((r, r), rows.as_slice()?.get(start..end)?).ok()
     }
 
     fn build_exact_eval_cache(
@@ -6497,15 +6681,20 @@ impl BernoulliMarginalSlopeFamily {
                         let row_ctx = Self::row_ctx(cache, row);
                         let row_dir =
                             self.row_primary_direction_from_flat(row, slices, primary, direction)?;
-                        self.compute_row_analytic_flex_into(
-                            row,
-                            block_states,
-                            primary,
-                            row_ctx,
-                            true,
-                            &mut scratch,
-                        )?;
-                        let row_action = scratch.hess.dot(&row_dir);
+                        let row_action =
+                            if let Some(row_hess) = Self::cached_row_primary_hessian(cache, row) {
+                                row_hess.dot(&row_dir)
+                            } else {
+                                self.compute_row_analytic_flex_into(
+                                    row,
+                                    block_states,
+                                    primary,
+                                    row_ctx,
+                                    true,
+                                    &mut scratch,
+                                )?;
+                                scratch.hess.dot(&row_dir)
+                            };
                         chunk_out +=
                             &self.pullback_primary_vector(row, slices, primary, &row_action)?;
                     }
@@ -6580,21 +6769,38 @@ impl BernoulliMarginalSlopeFamily {
                     let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
                     for row in start..end {
                         let row_ctx = Self::row_ctx(cache, row);
-                        self.compute_row_analytic_flex_into(
-                            row,
-                            block_states,
-                            primary,
-                            row_ctx,
-                            true,
-                            &mut scratch,
-                        )?;
-
+                        // When the per-row primary Hessian is materialized at
+                        // workspace construction (`row_primary_hessians`), the
+                        // entire `r×r` block lives in the cache and we can read
+                        // every diagonal entry directly. Otherwise rebuild the
+                        // scratch Hessian on the fly.
+                        let cached_hess = Self::cached_row_primary_hessian(cache, row);
+                        if cached_hess.is_none() {
+                            self.compute_row_analytic_flex_into(
+                                row,
+                                block_states,
+                                primary,
+                                row_ctx,
+                                true,
+                                &mut scratch,
+                            )?;
+                        }
+                        let h00 = if let Some(row_hess) = cached_hess {
+                            row_hess[[0, 0]]
+                        } else {
+                            scratch.hess[[0, 0]]
+                        };
+                        let h11 = if let Some(row_hess) = cached_hess {
+                            row_hess[[1, 1]]
+                        } else {
+                            scratch.hess[[1, 1]]
+                        };
                         {
                             let mut marginal_diag =
                                 chunk_diag.slice_mut(s![slices.marginal.clone()]);
                             self.marginal_design.squared_axpy_row_into(
                                 row,
-                                scratch.hess[[0, 0]],
+                                h00,
                                 &mut marginal_diag,
                             )?;
                         }
@@ -6603,7 +6809,7 @@ impl BernoulliMarginalSlopeFamily {
                                 chunk_diag.slice_mut(s![slices.logslope.clone()]);
                             self.logslope_design.squared_axpy_row_into(
                                 row,
-                                scratch.hess[[1, 1]],
+                                h11,
                                 &mut logslope_diag,
                             )?;
                         }
@@ -6612,16 +6818,24 @@ impl BernoulliMarginalSlopeFamily {
                             (primary.h.as_ref(), slices.h.as_ref())
                         {
                             for (local_idx, global_idx) in block_h.clone().enumerate() {
-                                chunk_diag[global_idx] += scratch.hess
-                                    [[primary_h.start + local_idx, primary_h.start + local_idx]];
+                                let ii = primary_h.start + local_idx;
+                                chunk_diag[global_idx] += if let Some(row_hess) = cached_hess {
+                                    row_hess[[ii, ii]]
+                                } else {
+                                    scratch.hess[[ii, ii]]
+                                };
                             }
                         }
                         if let (Some(primary_w), Some(block_w)) =
                             (primary.w.as_ref(), slices.w.as_ref())
                         {
                             for (local_idx, global_idx) in block_w.clone().enumerate() {
-                                chunk_diag[global_idx] += scratch.hess
-                                    [[primary_w.start + local_idx, primary_w.start + local_idx]];
+                                let ii = primary_w.start + local_idx;
+                                chunk_diag[global_idx] += if let Some(row_hess) = cached_hess {
+                                    row_hess[[ii, ii]]
+                                } else {
+                                    scratch.hess[[ii, ii]]
+                                };
                             }
                         }
                     }
@@ -8513,7 +8727,13 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
         block_states: Vec<ParameterBlockState>,
         options: BlockwiseFitOptions,
     ) -> Result<Self, String> {
-        let cache = family.build_exact_eval_cache(&block_states)?;
+        let mut cache = family.build_exact_eval_cache(&block_states)?;
+        // Materialize per-row primary Hessians at construction time. The
+        // matrix-free CG / inner-Newton loops contract these against many
+        // trial directions at the same β, so caching the `r×r` blocks once
+        // amortizes the cell-moment + flex-jet rebuild over every Hv product.
+        cache.row_primary_hessians =
+            family.build_row_primary_hessian_cache(&block_states, &cache)?;
         Ok(Self {
             family,
             block_states,
@@ -9328,6 +9548,102 @@ mod tests {
         ParameterBlockState {
             beta,
             eta: Array1::zeros(n_rows),
+        }
+    }
+
+    #[test]
+    fn bernoulli_margslope_warm_start_cache_persists_across_eval_cache_builds() {
+        let n = 256usize;
+        let z = Array1::from_iter((0..n).map(|i| {
+            let t = (i as f64 + 0.5) / n as f64;
+            (12.0 * t).sin() + 0.25 * (37.0 * t).cos()
+        }));
+        let y = Array1::from_iter((0..n).map(|i| if i % 3 == 0 { 1.0 } else { 0.0 }));
+        let weights = Array1::ones(n);
+        let cfg = DeviationBlockConfig {
+            num_internal_knots: 4,
+            ..DeviationBlockConfig::default()
+        };
+        let score_prepared = build_score_warp_deviation_block_from_seed(&z, &cfg)
+            .expect("score-warp deviation block");
+        let q_seed = Array1::from_iter(z.iter().map(|zi| 0.1 + 0.25 * zi));
+        let link_seed = padded_deviation_seed(&q_seed, 1.0, 0.5);
+        let link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
+            &link_seed, &q_seed, &weights, &cfg,
+        )
+        .expect("link-wiggle deviation block");
+
+        let cache = new_intercept_warm_start_cache(n);
+        let make_family = |cache: Option<Arc<Vec<AtomicU64>>>| BernoulliMarginalSlopeFamily {
+            y: Arc::new(y.clone()),
+            weights: Arc::new(weights.clone()),
+            z: Arc::new(z.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
+            gaussian_frailty_sd: None,
+            base_link: bernoulli_marginal_slope_probit_link(),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::ones((n, 1)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::ones((n, 1)),
+            )),
+            score_warp: Some(score_prepared.runtime.clone()),
+            link_dev: Some(link_prepared.runtime.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: cache,
+        };
+        let marginal_eta = Array1::from_iter((0..n).map(|i| 0.15 * ((i as f64) * 0.001).sin()));
+        let slope_eta = Array1::from_iter((0..n).map(|i| 0.35 + 0.02 * ((i as f64) * 0.003).cos()));
+        let states = vec![
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: marginal_eta,
+            },
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: slope_eta,
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(score_prepared.block.design.ncols()),
+                eta: Array1::zeros(n),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(link_prepared.block.design.ncols()),
+                eta: Array1::zeros(n),
+            },
+        ];
+
+        let warm_family = make_family(Some(Arc::clone(&cache)));
+        let first = warm_family
+            .build_exact_eval_cache(&states)
+            .expect("first warm eval cache");
+        let nan_bits = f64::NAN.to_bits();
+        for slot in cache.iter() {
+            let bits = slot.load(Ordering::Relaxed);
+            let v = f64::from_bits(bits);
+            assert!(
+                v.is_finite(),
+                "cache slot should be populated with converged intercept after first build"
+            );
+            assert_ne!(bits, nan_bits);
+        }
+
+        let second = warm_family
+            .build_exact_eval_cache(&states)
+            .expect("second warm eval cache");
+
+        let cold_family = make_family(None);
+        let cold = cold_family
+            .build_exact_eval_cache(&states)
+            .expect("cold reference eval cache");
+        for ((warm_a, warm_b), cold_ctx) in first
+            .row_contexts
+            .iter()
+            .zip(second.row_contexts.iter())
+            .zip(cold.row_contexts.iter())
+        {
+            assert!((warm_a.intercept - cold_ctx.intercept).abs() < 1e-9);
+            assert!((warm_b.intercept - cold_ctx.intercept).abs() < 1e-9);
         }
     }
 
@@ -16627,6 +16943,130 @@ mod tests {
 
         let rel = rel_diff_array2(&with_full, &baseline);
         assert!(rel < 1e-12, "joint Hessian dH drift rel {}", rel);
+    }
+
+    fn make_flex_hvp_cache_test_family(
+        n: usize,
+    ) -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockState>) {
+        let score_seed = Array1::linspace(-2.0, 2.0, n.max(6));
+        let link_seed = Array1::linspace(-1.8, 1.8, n.max(6));
+        let score_prepared = build_score_warp_deviation_block_from_seed(
+            &score_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 3,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build score warp block");
+        let link_prepared = build_test_link_deviation_block_from_seed(
+            &link_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 3,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build link deviation block");
+        let y: Array1<f64> =
+            Array1::from_iter((0..n).map(|i| if (i * 17 + 3) % 7 >= 4 { 1.0 } else { 0.0 }));
+        let weights: Array1<f64> =
+            Array1::from_iter((0..n).map(|i| 0.75 + ((i * 11 + 5) % 5) as f64 * 0.05));
+        let z: Array1<f64> =
+            Array1::from_iter((0..n).map(|i| -1.7 + 3.4 * (i as f64 + 0.5) / n as f64));
+        let marginal_x = Array2::from_shape_fn((n, 2), |(i, j)| {
+            if j == 0 {
+                1.0
+            } else {
+                -0.4 + 0.8 * ((i * 19 + 7) % n) as f64 / n as f64
+            }
+        });
+        let logslope_x = Array2::from_shape_fn((n, 2), |(i, j)| {
+            if j == 0 {
+                1.0
+            } else {
+                0.3 - 0.6 * ((i * 23 + 11) % n) as f64 / n as f64
+            }
+        });
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(y),
+            weights: Arc::new(weights),
+            z: Arc::new(z.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
+            gaussian_frailty_sd: Some(0.15),
+            base_link: bernoulli_marginal_slope_probit_link(),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                marginal_x.clone(),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                logslope_x.clone(),
+            )),
+            score_warp: Some(score_prepared.runtime.clone()),
+            link_dev: Some(link_prepared.runtime.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
+            intercept_warm_starts: None,
+        };
+        let beta_m = array![0.12, -0.04];
+        let beta_g = array![0.35, 0.03];
+        let beta_h = Array1::from_iter(
+            (0..score_prepared.runtime.basis_dim()).map(|idx| 0.0015 * (idx as f64 + 1.0)),
+        );
+        let beta_w = Array1::from_iter(
+            (0..link_prepared.runtime.basis_dim()).map(|idx| -0.001 * (idx as f64 + 1.0)),
+        );
+        let states = vec![
+            ParameterBlockState {
+                beta: beta_m.clone(),
+                eta: marginal_x.dot(&beta_m),
+            },
+            ParameterBlockState {
+                beta: beta_g.clone(),
+                eta: logslope_x.dot(&beta_g),
+            },
+            ParameterBlockState {
+                beta: beta_h,
+                eta: Array1::zeros(z.len()),
+            },
+            ParameterBlockState {
+                beta: beta_w,
+                eta: Array1::zeros(z.len()),
+            },
+        ];
+        (family, states)
+    }
+
+    #[test]
+    fn bernoulli_flex_hvp_cache_matches_uncached_path_small_case() {
+        let (family, states) = make_flex_hvp_cache_test_family(12);
+        let mut cached = family
+            .build_exact_eval_cache(&states)
+            .expect("cached exact eval cache");
+        cached.row_primary_hessians = family
+            .build_row_primary_hessian_cache(&states, &cached)
+            .expect("row Hessian cache");
+        let uncached = BernoulliMarginalSlopeExactEvalCache {
+            slices: cached.slices.clone(),
+            primary: cached.primary.clone(),
+            row_contexts: cached.row_contexts.clone(),
+            row_primary_hessians: None,
+        };
+        let direction =
+            Array1::from_iter((0..cached.slices.total).map(|idx| 0.02 * ((idx % 5) as f64 - 2.0)));
+        let hv_cached = family
+            .exact_newton_joint_hessian_matvec_from_cache(&direction, &states, &cached)
+            .expect("cached Hv");
+        let hv_uncached = family
+            .exact_newton_joint_hessian_matvec_from_cache(&direction, &states, &uncached)
+            .expect("uncached Hv");
+        let rel = rel_diff_array1(&hv_cached, &hv_uncached);
+        assert!(rel < 5e-11, "cached Hv drift rel {rel}");
+
+        let diag_cached = family
+            .exact_newton_joint_hessian_diagonal_from_cache(&states, &cached)
+            .expect("cached diag");
+        let diag_uncached = family
+            .exact_newton_joint_hessian_diagonal_from_cache(&states, &uncached)
+            .expect("uncached diag");
+        let rel_diag = rel_diff_array1(&diag_cached, &diag_uncached);
+        assert!(rel_diag < 5e-11, "cached diag drift rel {rel_diag}");
     }
 
     #[test]
