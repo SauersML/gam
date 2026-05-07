@@ -587,6 +587,23 @@ fn fallback_projected_gradient_direction(
     Ok(Some((d_total + &fallback_step, active)))
 }
 
+fn log_active_set_transition(
+    event: &str,
+    iteration: usize,
+    active_len: usize,
+    constraint: Option<usize>,
+) {
+    log::debug!(
+        "[active-set/QP] iter={} event={} active={} constraint={}",
+        iteration,
+        event,
+        active_len,
+        constraint
+            .map(|idx| idx.to_string())
+            .unwrap_or_else(|| "NA".to_string()),
+    );
+}
+
 fn solve_newton_direction_with_linear_constraints_impl(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
@@ -644,6 +661,7 @@ fn solve_newton_direction_with_linear_constraints_impl(
             if idx < m && !is_active[idx] {
                 active.push(idx);
                 is_active[idx] = true;
+                log_active_set_transition("warm-add", 0, active.len(), Some(idx));
             }
         }
     }
@@ -652,10 +670,11 @@ fn solve_newton_direction_with_linear_constraints_impl(
         if slack <= tol_active && !is_active[i] {
             active.push(i);
             is_active[i] = true;
+            log_active_set_transition("initial-boundary-add", 0, active.len(), Some(i));
         }
     }
 
-    for _ in 0..max_iterations {
+    for iteration in 0..max_iterations {
         let compressed_working = compress_active_working_set(&x, constraints, &active)?;
         let mut residualw = Array1::<f64>::zeros(compressed_working.constraints.a.nrows());
         for r in 0..compressed_working.constraints.a.nrows() {
@@ -689,6 +708,12 @@ fn solve_newton_direction_with_linear_constraints_impl(
                 for active_pos in removal_positions {
                     let idx = active.remove(active_pos);
                     is_active[idx] = false;
+                    log_active_set_transition(
+                        "remove-negative-dual",
+                        iteration,
+                        active.len(),
+                        Some(idx),
+                    );
                 }
                 continue;
             }
@@ -737,6 +762,7 @@ fn solve_newton_direction_with_linear_constraints_impl(
                 active.push(i);
                 is_active[i] = true;
                 added_new_active = true;
+                log_active_set_transition("blocking-add", iteration, active.len(), Some(i));
             }
         }
 
