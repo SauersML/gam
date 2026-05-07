@@ -13290,7 +13290,11 @@ mod tests {
             ],
             Array1::zeros(0),
             1.0,
-            None,
+            // Minimal beta_covariance: total beta = 1 + 0 + 1 = 2. Saved-model
+            // invariant requires either a covariance or a penalized Hessian for
+            // nonlinear families; the test exercises latent-z replay, not
+            // covariance accuracy.
+            Some(Array2::eye(2)),
             None,
             None,
             saved_fit_summary_stub(),
