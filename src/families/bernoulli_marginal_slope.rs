@@ -8534,7 +8534,22 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
-        self.log_likelihood_only_with_options(block_states, &BlockwiseFitOptions::default())
+        Self::log_likelihood_only_with_options(self, block_states, &BlockwiseFitOptions::default())
+    }
+
+    /// Options-aware override: thread the inherent options-aware path so the
+    /// joint-Newton line search agrees with the workspace path on which row
+    /// subset is in scope (the biobank FLEX path always sets an
+    /// outer_score_subsample). Without this override, the cheap fallback in
+    /// `joint_line_search_log_likelihood` evaluated on full n while the
+    /// workspace path evaluated on the subsample, producing mismatched LL
+    /// and bogus accept/reject decisions.
+    fn log_likelihood_only_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        options: &BlockwiseFitOptions,
+    ) -> Result<f64, String> {
+        Self::log_likelihood_only_with_options(self, block_states, options)
     }
 
     fn max_feasible_step_size(
