@@ -1054,10 +1054,7 @@ pub trait CustomFamily {
         false
     }
 
-    fn inner_joint_workspace_gradient_available(
-        &self,
-        _specs: &[ParameterBlockSpec],
-    ) -> bool {
+    fn inner_joint_workspace_gradient_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
         false
     }
 
@@ -1248,13 +1245,8 @@ pub trait CustomFamily {
     ///   (`has_explicit_joint_hessian` ⇒ what we receive from
     ///   `exact_newton_joint_hessian` is the true coupled Hessian, not the
     ///   block-diagonal default).
-    fn outer_default_trustworthy_for_joint_hessian(
-        &self,
-        specs: &[ParameterBlockSpec],
-    ) -> bool {
-        specs.len() <= 1
-            || self.likelihood_blocks_uncoupled()
-            || self.has_explicit_joint_hessian()
+    fn outer_default_trustworthy_for_joint_hessian(&self, specs: &[ParameterBlockSpec]) -> bool {
+        specs.len() <= 1 || self.likelihood_blocks_uncoupled() || self.has_explicit_joint_hessian()
     }
 
     /// Optional scale-aware exact joint curvature for the outer REML calculus.
@@ -8159,6 +8151,19 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 current_penalty,
                 lastobjective,
             );
+            // Per-cycle phase-timing accumulators. Surface where the inner
+            // joint-Newton spends time so a 18-min silent cycle 0 (the
+            // bernoulli marginal-slope FLEX biobank failure mode) becomes a
+            // logged timeline at the end of the cycle. Phases:
+            //   * hessian: joint Hessian source build (matrix-free workspace
+            //     OR dense fallback assembly)
+            //   * pcg:     matrix-free QP solve via solve_spd_pcg_with_info_into
+            //              (already logs its own diagnostics; we accumulate
+            //              here for the end-of-cycle summary)
+            //   * line_search: backtracking step-size search (up to 8 attempts)
+            //   * grad_reload: post-accept joint gradient + workspace refresh
+            let cycle_started = std::time::Instant::now();
+            let hessian_started = std::time::Instant::now();
             let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
             let joint_constraints =
                 assemble_joint_linear_constraints(&block_constraints, &ranges, total_p)?;
@@ -8437,6 +8442,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 }
                 (beta_joint.clone() + &delta, None)
             };
+            // Hessian-source build (and any QP solve immediately above) are
+            // done by the time we reach `delta`. Capture the wall-clock
+            // before the line-search phase so the end-of-cycle summary can
+            // attribute time correctly between the Hessian/QP and the
+            // backtracking step search.
+            let hessian_and_qp_elapsed = hessian_started.elapsed();
+            let line_search_started = std::time::Instant::now();
             let mut delta = &candidate_beta - &beta_joint;
 
             // Trust region: cap step size
@@ -8457,6 +8469,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let mut accepted = false;
             let mut accepted_joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>> =
                 None;
+            let mut line_search_attempts = 0usize;
             let mut barrier_ceiling = 1.0_f64;
             for (block_idx, (start, end)) in ranges.iter().copied().enumerate() {
                 let block_delta = delta.slice(s![start..end]).to_owned();
@@ -8473,7 +8486,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 refresh_all_block_etas(family, specs, &mut states)?;
                 break;
             }
-            for bt in 0..8 {
+            for bt in 0i32..8 {
+                line_search_attempts = (bt + 1) as usize;
                 accepted_joint_workspace = None;
                 let alpha = (0.5f64.powi(bt)).min(barrier_ceiling);
                 for b in 0..specs.len() {
@@ -8518,7 +8532,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     break;
                 }
             }
+            let line_search_elapsed = line_search_started.elapsed();
             if !accepted {
+                log::info!(
+                    "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=false hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} grad_reload=0.000s total={:.3}s",
+                    cycle,
+                    hessian_and_qp_elapsed.as_secs_f64(),
+                    line_search_elapsed.as_secs_f64(),
+                    line_search_attempts,
+                    cycle_started.elapsed().as_secs_f64(),
+                );
                 // Restore original betas
                 for (b, old) in old_beta.iter().enumerate() {
                     states[b].beta.assign(old);
@@ -8527,15 +8550,25 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 break; // Fall back to blockwise
             }
 
-            let (log_likelihood, gradient, eval, workspace) =
-                load_joint_gradient_evaluation(
-                    family,
-                    specs,
-                    options,
-                    &states,
-                    matrix_free_joint_workspace,
-                    accepted_joint_workspace.take(),
-                )?;
+            let grad_reload_started = std::time::Instant::now();
+            let (log_likelihood, gradient, eval, workspace) = load_joint_gradient_evaluation(
+                family,
+                specs,
+                options,
+                &states,
+                matrix_free_joint_workspace,
+                accepted_joint_workspace.take(),
+            )?;
+            let grad_reload_elapsed = grad_reload_started.elapsed();
+            log::info!(
+                "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=true hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} grad_reload={:.3}s total={:.3}s",
+                cycle,
+                hessian_and_qp_elapsed.as_secs_f64(),
+                line_search_elapsed.as_secs_f64(),
+                line_search_attempts,
+                grad_reload_elapsed.as_secs_f64(),
+                cycle_started.elapsed().as_secs_f64(),
+            );
             current_log_likelihood = log_likelihood;
             cached_joint_gradient = gradient;
             cached_eval = eval;
