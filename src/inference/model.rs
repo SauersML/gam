@@ -2440,25 +2440,15 @@ impl FittedModel {
             }
         }
 
-        // Structural invariant: nonlinear saved models must retain a usable
-        // posterior-mean backend. We prefer persisted covariance, but a saved
-        // penalized Hessian is also sufficient because prediction can
-        // reconstruct covariance on demand.
-        let needs_covariance = !matches!(
-            self.family_state.likelihood(),
-            LikelihoodFamily::GaussianIdentity
-        );
-        if needs_covariance {
-            if let Some(fit) = self.fit_result.as_ref() {
-                if fit.beta_covariance().is_none() && fit.penalized_hessian().is_none() {
-                    return Err(
-                        "nonlinear model is missing both beta_covariance and a saved penalized Hessian in fit_result; \
-                         posterior-mean prediction requires one of them at save time"
-                            .to_string(),
-                    );
-                }
-            }
-        }
+        // Posterior-mean / uncertainty backends are validated at predict time
+        // by `prediction_backend_from_model`, which has access to the actual
+        // requested mode and emits the canonical "nonlinear posterior-mean
+        // prediction requires either covariance or a saved penalized Hessian"
+        // error.  Save-time we deliberately do NOT enforce that gate: a fit
+        // produced for MAP / plug-in scoring can be persisted and replayed
+        // without ever needing a covariance backend, and gating it here would
+        // refuse legitimate MAP-only saves whose `UnifiedFitResult` carries
+        // beta + lambdas without a stabilized Hessian.
 
         Ok(())
     }
