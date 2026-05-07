@@ -2160,9 +2160,21 @@ impl HyperOperator for BernoulliBlockHessianOperator {
 }
 
 #[derive(Clone)]
+struct CachedDenestedCellMoments {
+    partition_cell: exact_kernel::DenestedPartitionCell,
+    state_degree9: exact_kernel::CellMomentState,
+}
+
+#[derive(Clone)]
 struct BernoulliMarginalSlopeRowExactContext {
     intercept: f64,
     m_a: f64,
+    /// Degree-9 cell moments at the converged row intercept for the current
+    /// PIRLS/Newton cycle. They are independent of the Hessian-vector
+    /// direction and can be reused by gradient, diagonal, and matvec passes
+    /// instead of re-evaluating `evaluate_cell_moments` /
+    /// `bivariate_normal_cdf` for the same row and cycle.
+    degree9_cells: Option<Vec<CachedDenestedCellMoments>>,
 }
 
 struct BernoulliMarginalSlopeFlexRowScratch {
@@ -3755,7 +3767,35 @@ impl BernoulliMarginalSlopeFamily {
             };
             (intercept, f64::NAN)
         };
-        Ok(BernoulliMarginalSlopeRowExactContext { intercept, m_a })
+        // Cache degree-9 cell moments at the converged intercept so the
+        // many gradient/diagonal/matvec passes that run *after* this point
+        // for the same (row, β) don't re-evaluate `evaluate_cell_moments` /
+        // `bivariate_normal_cdf` on identical inputs. This matters for the
+        // FLEX path (linkwiggle + score-warp), where each per-row Hessian
+        // build runs the cell-moment kernel once per cell per closure call.
+        let degree9_cells = if self.effective_flex_active(block_states)? {
+            let cells = self.denested_partition_cells(intercept, slope, beta_h, beta_w)?;
+            Some(
+                cells
+                    .into_iter()
+                    .map(|partition_cell| {
+                        exact_kernel::evaluate_cell_moments(partition_cell.cell, 9).map(
+                            |state_degree9| CachedDenestedCellMoments {
+                                partition_cell,
+                                state_degree9,
+                            },
+                        )
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+            )
+        } else {
+            None
+        };
+        Ok(BernoulliMarginalSlopeRowExactContext {
+            intercept,
+            m_a,
+            degree9_cells,
+        })
     }
 
     /// Look up the pre-solved row context from the cache.
@@ -4163,12 +4203,45 @@ impl BernoulliMarginalSlopeFamily {
         let mut coeff_au = vec![[0.0; 4]; r];
         let mut coeff_bu = vec![[0.0; 4]; r];
 
-        let cells = self.denested_partition_cells(a, b, beta_h, beta_w)?;
-        for partition_cell in cells {
+        // Reuse the cached degree-9 cell moments from the row context when
+        // present (FLEX path; cache is built once per row in
+        // `build_row_exact_context` after the intercept converges). Only
+        // re-evaluate if the cache is missing or `need_hessian=false` (where
+        // the kernel can use cheaper degree-3 work). The cache is keyed by
+        // (intercept, slope, beta_h, beta_w) — those are fixed for the
+        // duration of one Hessian/gradient/diagonal/matvec pass.
+        let owned_cells;
+        let cached_cells: Vec<(
+            exact::DenestedPartitionCell,
+            std::borrow::Cow<'_, exact::CellMomentState>,
+        )> = if need_hessian
+            && let Some(cached) = row_ctx.degree9_cells.as_ref()
+        {
+            cached
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.partition_cell,
+                        std::borrow::Cow::Borrowed(&entry.state_degree9),
+                    )
+                })
+                .collect()
+        } else {
+            owned_cells = self.denested_partition_cells(a, b, beta_h, beta_w)?;
+            owned_cells
+                .into_iter()
+                .map(|partition_cell| {
+                    let degree = if need_hessian { 9 } else { 3 };
+                    exact::evaluate_cell_moments(partition_cell.cell, degree)
+                        .map(|state| (partition_cell, std::borrow::Cow::Owned(state)))
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        };
+        for (partition_cell, state) in cached_cells {
             let cell = partition_cell.cell;
             let z_mid = exact::interval_probe_point(cell.left, cell.right)?;
             let u_mid = a + b * z_mid;
-            let state = exact::evaluate_cell_moments(cell, if need_hessian { 9 } else { 3 })?;
+            let state: &exact::CellMomentState = &state;
             let (dc_da_raw, dc_db_raw) = exact::denested_cell_coefficient_partials(
                 partition_cell.score_span,
                 partition_cell.link_span,
