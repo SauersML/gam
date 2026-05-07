@@ -8192,7 +8192,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     let penalty_workspace = RefCell::new(Array1::<f64>::zeros(total_p));
                     match &joint_hessian_source {
                         JointHessianSource::Dense(h_joint) => {
-                            crate::linalg::utils::solve_spd_pcg_into(
+                            crate::linalg::utils::solve_spd_pcg_with_info_into(
                                 |v, out| {
                                     // h_joint * v -> out (faer-backed, no alloc)
                                     crate::faer_ndarray::fast_av_view_into(
@@ -8215,10 +8215,20 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 JOINT_PCG_REL_TOL,
                                 JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1),
                             )
+                            .map(|(solution, info)| {
+                                log_joint_pcg_diagnostics(
+                                    cycle,
+                                    total_p,
+                                    total_joint_n,
+                                    &preconditioner_diag,
+                                    &info,
+                                );
+                                solution
+                            })
                         }
                         JointHessianSource::Operator { apply_into, .. } => {
                             let apply_h_into = Arc::clone(apply_into);
-                            crate::linalg::utils::solve_spd_pcg_into(
+                            crate::linalg::utils::solve_spd_pcg_with_info_into(
                                 |v, out| {
                                     if let Err(error) = apply_h_into(v, out) {
                                         log::warn!(
@@ -8241,6 +8251,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 JOINT_PCG_REL_TOL,
                                 JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1),
                             )
+                            .map(|(solution, info)| {
+                                log_joint_pcg_diagnostics(
+                                    cycle,
+                                    total_p,
+                                    total_joint_n,
+                                    &preconditioner_diag,
+                                    &info,
+                                );
+                                solution
+                            })
                         }
                     }
                 } else {
@@ -12527,7 +12547,7 @@ fn block_param_ranges(specs: &[ParameterBlockSpec]) -> Vec<(usize, usize)> {
 
 const JOINT_MATRIX_FREE_MIN_DIM: usize = 512;
 const JOINT_MATRIX_FREE_MIN_ROWS: usize = 50_000;
-const JOINT_MATRIX_FREE_MIN_DIM_AT_LARGE_N: usize = 32;
+const JOINT_MATRIX_FREE_MIN_DIM_AT_LARGE_N: usize = 128;
 const JOINT_MATRIX_FREE_MIN_LINEAR_WORK: usize = 4_000_000;
 const JOINT_TRACE_STABILITY_RIDGE: f64 = 1e-10;
 const JOINT_PCG_REL_TOL: f64 = 1e-8;
@@ -12549,11 +12569,20 @@ fn joint_observation_count(states: &[ParameterBlockState]) -> usize {
 /// for a problem of size `(total_p, total_n)`. Exposed at crate scope so
 /// families with matrix-free operators can branch their `coefficient_hessian_cost`
 /// estimate on the same predicate the evaluator will use at fit time.
+///
+/// For biobank-scale row counts with only tens of coefficients, exact
+/// materialization is bounded by `total_p` Hessian-vector products and then a
+/// tiny dense factorization. That is cheaper and more predictable than PCG when
+/// each matrix-free product streams all rows through expensive FLEX marginal-
+/// slope kernels and the initial joint Hessian is ill-conditioned. Keep the
+/// matrix-free route for genuinely wide joint systems, where `total_p` dense
+/// products and factorization dominate.
 pub(crate) fn use_joint_matrix_free_path(total_p: usize, total_n: usize) -> bool {
     total_p >= JOINT_MATRIX_FREE_MIN_DIM
         || (total_n >= JOINT_MATRIX_FREE_MIN_ROWS
             && total_p >= JOINT_MATRIX_FREE_MIN_DIM_AT_LARGE_N)
-        || total_n.saturating_mul(total_p) >= JOINT_MATRIX_FREE_MIN_LINEAR_WORK
+        || (total_p >= JOINT_MATRIX_FREE_MIN_DIM_AT_LARGE_N
+            && total_n.saturating_mul(total_p) >= JOINT_MATRIX_FREE_MIN_LINEAR_WORK)
 }
 
 fn apply_joint_block_penalty(
@@ -12691,6 +12720,47 @@ fn joint_penalty_preconditioner_diag(
         }
     }
     diag.mapv(|v| v.abs().max(1e-10))
+}
+
+fn log_joint_pcg_diagnostics(
+    cycle: usize,
+    total_p: usize,
+    total_n: usize,
+    preconditioner_diag: &Array1<f64>,
+    info: &crate::linalg::utils::PcgSolveInfo,
+) {
+    let (diag_min, diag_max) = preconditioner_diag.iter().fold(
+        (f64::INFINITY, 0.0_f64),
+        |(min_value, max_value), &value| {
+            if value.is_finite() {
+                (min_value.min(value), max_value.max(value))
+            } else {
+                (min_value, max_value)
+            }
+        },
+    );
+    let diag_ratio = if diag_min.is_finite() && diag_min > 0.0 && diag_max.is_finite() {
+        Some(diag_max / diag_min)
+    } else {
+        None
+    };
+    log::info!(
+        "[PIRLS/blockwise joint-Newton/PCG] cycle={} p={} n={} iters={} rel_res={:.3e} res0={:.3e} res_final={:.3e} res_ratio={:.3e} ritz_cond~{} jacobi_diag_ratio~{}",
+        cycle,
+        total_p,
+        total_n,
+        info.iterations,
+        info.relative_residual_norm,
+        info.initial_residual_norm,
+        info.final_residual_norm,
+        info.residual_reduction,
+        info.condition_estimate
+            .map(|value| format!("{value:.3e}"))
+            .unwrap_or_else(|| "NA".to_string()),
+        diag_ratio
+            .map(|value| format!("{value:.3e}"))
+            .unwrap_or_else(|| "NA".to_string()),
+    );
 }
 
 fn add_joint_penalty_to_matrix(
@@ -13813,21 +13883,36 @@ mod tests {
         assert!(use_joint_matrix_free_path(2048, 4));
         assert!(!use_joint_matrix_free_path(511, 1));
 
-        // n ≥ 50_000 AND p ≥ 32: both must hold.
-        assert!(use_joint_matrix_free_path(32, 50_000));
-        assert!(!use_joint_matrix_free_path(31, 50_000));
-        assert!(!use_joint_matrix_free_path(32, 49_999));
+        // n ≥ 50_000 AND p ≥ 128: both must hold. This keeps p≈51 FLEX
+        // marginal-slope biobank fits on the bounded dense-materialized path.
+        assert!(use_joint_matrix_free_path(128, 50_000));
+        assert!(!use_joint_matrix_free_path(127, 50_000));
+        assert!(!use_joint_matrix_free_path(128, 31_249));
+        assert!(!use_joint_matrix_free_path(51, 320_000));
 
-        // n · p ≥ 4_000_000 is the linear-work fallback. The fixture must
-        // keep `p < JOINT_MATRIX_FREE_MIN_DIM_AT_LARGE_N` so the (n ≥ 50_000
-        // ∧ p ≥ 32) threshold cannot fire and the linear-work boundary is
-        // the only predicate under test.
-        assert!(use_joint_matrix_free_path(20, 200_000));
-        assert!(!use_joint_matrix_free_path(20, 199_999));
+        // n · p ≥ 4_000_000 is the linear-work fallback, but only after the
+        // same moderate-p guard; below that, materializing `p` columns is a
+        // deterministic small-p bound on expensive row-kernel HVPs.
+        assert!(use_joint_matrix_free_path(128, 31_250));
+        assert!(!use_joint_matrix_free_path(127, 31_497));
 
         // Below every threshold: dense path.
         assert!(!use_joint_matrix_free_path(8, 100));
         assert!(!use_joint_matrix_free_path(64, 1000));
+    }
+
+    #[test]
+    #[ignore = "biobank-shape routing/timing guard; cheap but excluded from default unit lane"]
+    fn biobank_shape_margslope_flex_cycle0_uses_bounded_dense_route() {
+        let total_p = 51;
+        let total_n = 320_000;
+        let max_pcg_hvps_before_fix = JOINT_PCG_MAX_ITER_MULTIPLIER * total_p;
+
+        assert_eq!(max_pcg_hvps_before_fix, 204);
+        assert!(
+            !use_joint_matrix_free_path(total_p, total_n),
+            "p=51/n=320k should materialize exactly 51 columns instead of risking up to {max_pcg_hvps_before_fix} expensive PCG matvecs in cycle 0"
+        );
     }
 
     struct CountingHessianWorkspace {

@@ -293,6 +293,106 @@ pub struct PcgSolveInfo {
     pub iterations: usize,
     pub converged: bool,
     pub relative_residual_norm: f64,
+    pub initial_residual_norm: f64,
+    pub final_residual_norm: f64,
+    pub residual_reduction: f64,
+    pub condition_estimate: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct PcgDiagnostics {
+    residuals: Vec<f64>,
+    alpha: Vec<f64>,
+    beta: Vec<f64>,
+}
+
+impl PcgDiagnostics {
+    fn new(initial_residual_norm: f64) -> Self {
+        Self {
+            residuals: vec![initial_residual_norm],
+            alpha: Vec::new(),
+            beta: Vec::new(),
+        }
+    }
+
+    fn push_iteration(&mut self, alpha: f64, beta: Option<f64>, residual_norm: f64) {
+        self.alpha.push(alpha);
+        if let Some(beta) = beta {
+            self.beta.push(beta);
+        }
+        self.residuals.push(residual_norm);
+    }
+
+    fn condition_estimate(&self) -> Option<f64> {
+        // Build the CG Lanczos tridiagonal for the preconditioned operator.
+        // For SPD CG, T has diagonal 1/a_i + b_{i-1}/a_{i-1} and off-diagonal
+        // sqrt(b_i)/a_i. Its extremal eigenvalues are Ritz estimates.
+        let k = self.alpha.len();
+        if k == 0 || k > 256 {
+            return None;
+        }
+        let mut t = ndarray::Array2::<f64>::zeros((k, k));
+        for i in 0..k {
+            let alpha_i = self.alpha[i];
+            if !alpha_i.is_finite() || alpha_i <= 0.0 {
+                return None;
+            }
+            let mut diag = 1.0 / alpha_i;
+            if i > 0 {
+                let beta_prev = self.beta.get(i - 1).copied()?;
+                if !beta_prev.is_finite() || beta_prev < 0.0 {
+                    return None;
+                }
+                diag += beta_prev / self.alpha[i - 1];
+            }
+            t[[i, i]] = diag;
+            if i + 1 < k {
+                let beta_i = self.beta.get(i).copied().unwrap_or(0.0);
+                if !beta_i.is_finite() || beta_i < 0.0 {
+                    return None;
+                }
+                let off = beta_i.sqrt() / alpha_i;
+                t[[i, i + 1]] = off;
+                t[[i + 1, i]] = off;
+            }
+        }
+        let mut lower = f64::INFINITY;
+        let mut upper = 0.0_f64;
+        for i in 0..k {
+            let radius = if i > 0 { t[[i, i - 1]].abs() } else { 0.0 }
+                + if i + 1 < k { t[[i, i + 1]].abs() } else { 0.0 };
+            lower = lower.min(t[[i, i]] - radius);
+            upper = upper.max(t[[i, i]] + radius);
+        }
+        if lower.is_finite() && lower > 0.0 && upper.is_finite() && upper > 0.0 {
+            Some(upper / lower)
+        } else {
+            None
+        }
+    }
+
+    fn info(
+        &self,
+        iterations: usize,
+        converged: bool,
+        rhs_norm: f64,
+        final_residual_norm: f64,
+    ) -> PcgSolveInfo {
+        let initial = self.residuals.first().copied().unwrap_or(rhs_norm);
+        PcgSolveInfo {
+            iterations,
+            converged,
+            relative_residual_norm: final_residual_norm / rhs_norm.max(1.0),
+            initial_residual_norm: initial,
+            final_residual_norm,
+            residual_reduction: if initial > 0.0 {
+                final_residual_norm / initial
+            } else {
+                0.0
+            },
+            condition_estimate: self.condition_estimate(),
+        }
+    }
 }
 
 pub fn solve_spd_pcg_with_info<F>(
@@ -320,6 +420,10 @@ where
                 iterations: 0,
                 converged: true,
                 relative_residual_norm: 0.0,
+                initial_residual_norm: 0.0,
+                final_residual_norm: 0.0,
+                residual_reduction: 0.0,
+                condition_estimate: None,
             },
         ));
     }
@@ -327,6 +431,7 @@ where
     let tol = rel_tol.max(1e-12) * rhs_norm.max(1.0);
     let mut x = Array1::<f64>::zeros(p);
     let mut r = rhs.clone();
+    let mut diagnostics = PcgDiagnostics::new(rhs_norm);
 
     // Precompute reciprocal preconditioner once. Each PCG iteration applies
     // M^{-1} via a single elementwise multiply (z = inv_m * r), avoiding the
@@ -380,14 +485,11 @@ where
         }
         let r_norm = r.dot(&r).sqrt();
         if r_norm.is_finite() && r_norm <= tol {
-            return x.iter().all(|v| v.is_finite()).then_some((
-                x,
-                PcgSolveInfo {
-                    iterations: iter + 1,
-                    converged: true,
-                    relative_residual_norm: r_norm / rhs_norm.max(1.0),
-                },
-            ));
+            diagnostics.push_iteration(alpha, None, r_norm);
+            return x
+                .iter()
+                .all(|v| v.is_finite())
+                .then_some((x, diagnostics.info(iter + 1, true, rhs_norm, r_norm)));
         }
         Zip::from(&mut z)
             .and(&r)
@@ -403,6 +505,7 @@ where
         if !beta.is_finite() {
             return None;
         }
+        diagnostics.push_iteration(alpha, Some(beta), r_norm);
         // p <- z + beta * p (fused, SIMD-friendly via ndarray::Zip; parallel
         // over coefficient dimension at biobank-scale p).
         Zip::from(&mut p_dir).and(&z).par_for_each(|pi, &zi| {
@@ -457,6 +560,10 @@ where
                 iterations: 0,
                 converged: true,
                 relative_residual_norm: 0.0,
+                initial_residual_norm: 0.0,
+                final_residual_norm: 0.0,
+                residual_reduction: 0.0,
+                condition_estimate: None,
             },
         ));
     }
@@ -464,6 +571,7 @@ where
     let tol = rel_tol.max(1e-12) * rhs_norm.max(1.0);
     let mut x = Array1::<f64>::zeros(p);
     let mut r = rhs.clone();
+    let mut diagnostics = PcgDiagnostics::new(rhs_norm);
 
     let mut inv_m = Array1::<f64>::zeros(p);
     Zip::from(&mut inv_m)
@@ -515,14 +623,11 @@ where
         }
         let r_norm = r.dot(&r).sqrt();
         if r_norm.is_finite() && r_norm <= tol {
-            return x.iter().all(|v| v.is_finite()).then_some((
-                x,
-                PcgSolveInfo {
-                    iterations: iter + 1,
-                    converged: true,
-                    relative_residual_norm: r_norm / rhs_norm.max(1.0),
-                },
-            ));
+            diagnostics.push_iteration(alpha, None, r_norm);
+            return x
+                .iter()
+                .all(|v| v.is_finite())
+                .then_some((x, diagnostics.info(iter + 1, true, rhs_norm, r_norm)));
         }
         Zip::from(&mut z)
             .and(&r)
@@ -538,6 +643,7 @@ where
         if !beta.is_finite() {
             return None;
         }
+        diagnostics.push_iteration(alpha, Some(beta), r_norm);
         Zip::from(&mut p_dir).and(&z).par_for_each(|pi, &zi| {
             *pi = zi + beta * *pi;
         });
@@ -718,6 +824,52 @@ mod tests {
         assert_eq!(owned.len(), writeinto.len());
         for (a, b) in owned.iter().zip(writeinto.iter()) {
             assert!((a - b).abs() < 1e-10, "owned={a} writeinto={b}");
+        }
+    }
+
+    #[test]
+    fn matrix_free_qp_beta_matches_dense_reference_with_diagnostics() {
+        // Small synthetic stand-in for the FLEX marginal-slope joint system:
+        // a coupled SPD Hessian plus a penalty/ridge Jacobi preconditioner. The
+        // matrix-free solve must return the same beta as the dense reference,
+        // while surfacing bounded iteration/residual diagnostics for cycle-0
+        // triage.
+        let h = array![
+            [12.0, 2.0, 0.5, 0.0],
+            [2.0, 9.0, 1.25, 0.25],
+            [0.5, 1.25, 7.0, 1.5],
+            [0.0, 0.25, 1.5, 5.0],
+        ];
+        let rhs = array![1.0, -0.5, 2.0, 0.75];
+        let precond = h.diag().to_owned();
+        let factor = super::StableSolver::new("synthetic dense reference")
+            .factorize(&h)
+            .expect("dense SPD reference");
+        let mut dense = rhs.clone();
+        let mut dense_view = crate::faer_ndarray::array1_to_col_matmut(&mut dense);
+        factor.solve_in_place(dense_view.as_mut());
+        let (pcg, info) = solve_spd_pcg_with_info_into(
+            |v, out| {
+                let prod = h.dot(v);
+                out.assign(&prod);
+            },
+            &rhs,
+            &precond,
+            1e-12,
+            4 * rhs.len(),
+        )
+        .expect("matrix-free pcg");
+
+        assert!(info.converged);
+        assert!(info.iterations <= 4 * rhs.len());
+        assert!(info.final_residual_norm < info.initial_residual_norm);
+        assert!(info.residual_reduction < 1e-10);
+        assert!(info.condition_estimate.is_some());
+        for (reference, actual) in dense.iter().zip(pcg.iter()) {
+            assert!(
+                (reference - actual).abs() < 1e-10,
+                "dense={reference} pcg={actual}"
+            );
         }
     }
 

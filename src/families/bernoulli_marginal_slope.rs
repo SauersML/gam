@@ -36,6 +36,7 @@ use crate::smooth::{
 use crate::types::{InverseLink, LinkFunction, WigglePenaltyConfig};
 use ndarray::{Array1, Array2, ArrayView2, s};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -156,6 +157,7 @@ pub struct BernoulliMarginalSlopeFitResult {
     pub baseline_marginal: f64,
     pub baseline_logslope: f64,
     pub z_normalization: LatentZNormalization,
+    pub latent_measure: LatentMeasureKind,
     pub score_warp_runtime: Option<DeviationRuntime>,
     pub link_dev_runtime: Option<DeviationRuntime>,
     /// Learned or fixed Gaussian-shift frailty SD.  `None` = no frailty.
@@ -176,10 +178,99 @@ pub enum LatentZNormalizationMode {
     Frozen { mean: f64, sd: f64 },
 }
 
+pub const DEFAULT_EMPIRICAL_LATENT_GRID_SIZE: usize = 101;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LatentMeasureSpec {
+    StandardNormal,
+    GlobalEmpirical { grid_size: usize },
+}
+
+impl LatentMeasureSpec {
+    pub fn global_empirical_default() -> Self {
+        Self::GlobalEmpirical {
+            grid_size: DEFAULT_EMPIRICAL_LATENT_GRID_SIZE,
+        }
+    }
+}
+
+impl Default for LatentMeasureSpec {
+    fn default() -> Self {
+        Self::StandardNormal
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum LatentMeasureKind {
+    StandardNormal,
+    GlobalEmpirical { nodes: Vec<f64>, weights: Vec<f64> },
+}
+
+impl Default for LatentMeasureKind {
+    fn default() -> Self {
+        Self::StandardNormal
+    }
+}
+
+impl LatentMeasureKind {
+    pub fn validate(&self, context: &str) -> Result<(), String> {
+        match self {
+            Self::StandardNormal => Ok(()),
+            Self::GlobalEmpirical { nodes, weights } => {
+                if nodes.len() != weights.len() {
+                    return Err(format!(
+                        "{context} empirical latent measure node/weight length mismatch: nodes={}, weights={}",
+                        nodes.len(),
+                        weights.len()
+                    ));
+                }
+                if nodes.len() < 2 {
+                    return Err(format!(
+                        "{context} empirical latent measure requires at least two nodes"
+                    ));
+                }
+                let mut total = 0.0;
+                for (idx, (&node, &weight)) in nodes.iter().zip(weights.iter()).enumerate() {
+                    if !node.is_finite() {
+                        return Err(format!(
+                            "{context} empirical latent measure node {idx} is non-finite ({node})"
+                        ));
+                    }
+                    if !(weight.is_finite() && weight > 0.0) {
+                        return Err(format!(
+                            "{context} empirical latent measure weight {idx} must be finite and positive, got {weight}"
+                        ));
+                    }
+                    total += weight;
+                }
+                if !(total.is_finite() && (total - 1.0).abs() <= 1e-8) {
+                    return Err(format!(
+                        "{context} empirical latent measure weights must sum to 1, got {total}"
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn empirical_grid(&self) -> Option<(&[f64], &[f64])> {
+        match self {
+            Self::StandardNormal => None,
+            Self::GlobalEmpirical { nodes, weights } => Some((nodes.as_slice(), weights.as_slice())),
+        }
+    }
+
+    fn is_empirical(&self) -> bool {
+        matches!(self, Self::GlobalEmpirical { .. })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LatentZPolicy {
     pub check_mode: LatentZCheckMode,
     pub normalization: LatentZNormalizationMode,
+    pub latent_measure: LatentMeasureSpec,
     pub mean_tol_multiplier: f64,
     pub sd_tol_multiplier: f64,
     pub max_abs_skew: f64,
@@ -203,6 +294,7 @@ impl LatentZPolicy {
         Self {
             check_mode: LatentZCheckMode::WarnOnly,
             normalization: LatentZNormalizationMode::Frozen { mean: 0.0, sd: 1.0 },
+            latent_measure: LatentMeasureSpec::StandardNormal,
             mean_tol_multiplier: 4.0,
             sd_tol_multiplier: 4.0,
             max_abs_skew: 4.0,
@@ -214,10 +306,18 @@ impl LatentZPolicy {
         Self {
             check_mode: LatentZCheckMode::WarnOnly,
             normalization: LatentZNormalizationMode::FitWeighted,
+            latent_measure: LatentMeasureSpec::StandardNormal,
             mean_tol_multiplier: 8.0,
             sd_tol_multiplier: 8.0,
             max_abs_skew: 4.0,
             max_abs_excess_kurtosis: 20.0,
+        }
+    }
+
+    pub fn empirical_fit_weighted() -> Self {
+        Self {
+            latent_measure: LatentMeasureSpec::global_empirical_default(),
+            ..Self::exploratory_fit_weighted()
         }
     }
 }
@@ -249,11 +349,94 @@ impl LatentZNormalization {
     }
 }
 
+fn build_latent_measure(
+    z: &Array1<f64>,
+    weights: &Array1<f64>,
+    spec: LatentMeasureSpec,
+) -> Result<LatentMeasureKind, String> {
+    match spec {
+        LatentMeasureSpec::StandardNormal => Ok(LatentMeasureKind::StandardNormal),
+        LatentMeasureSpec::GlobalEmpirical { grid_size } => {
+            build_global_empirical_latent_measure(z, weights, grid_size)
+        }
+    }
+}
+
+fn build_global_empirical_latent_measure(
+    z: &Array1<f64>,
+    weights: &Array1<f64>,
+    grid_size: usize,
+) -> Result<LatentMeasureKind, String> {
+    if grid_size < 3 {
+        return Err(format!(
+            "empirical latent measure grid_size must be at least 3, got {grid_size}"
+        ));
+    }
+    if z.len() != weights.len() {
+        return Err(format!(
+            "empirical latent measure length mismatch: z={}, weights={}",
+            z.len(),
+            weights.len()
+        ));
+    }
+    let mut pairs = Vec::<(f64, f64)>::with_capacity(z.len());
+    for (idx, (&zi, &wi)) in z.iter().zip(weights.iter()).enumerate() {
+        if !zi.is_finite() {
+            return Err(format!(
+                "empirical latent measure z value at row {idx} is non-finite ({zi})"
+            ));
+        }
+        if !wi.is_finite() || wi < 0.0 {
+            return Err(format!(
+                "empirical latent measure weight at row {idx} must be finite and non-negative, got {wi}"
+            ));
+        }
+        if wi > 0.0 {
+            pairs.push((zi, wi));
+        }
+    }
+    if pairs.len() < 2 {
+        return Err(
+            "empirical latent measure requires at least two positive-weight rows".to_string(),
+        );
+    }
+    pairs.sort_by(|left, right| {
+        left.0
+            .partial_cmp(&right.0)
+            .expect("validated empirical latent z values are finite")
+    });
+    let total_weight = pairs.iter().map(|(_, weight)| *weight).sum::<f64>();
+    if !(total_weight.is_finite() && total_weight > 0.0) {
+        return Err(
+            "empirical latent measure requires positive finite total weight".to_string(),
+        );
+    }
+
+    let m = grid_size.min(pairs.len());
+    let mut nodes = Vec::with_capacity(m);
+    let mut cursor = 0usize;
+    let mut cumulative = pairs[0].1;
+    for j in 0..m {
+        let target = ((j as f64) + 0.5) * total_weight / (m as f64);
+        while cursor + 1 < pairs.len() && cumulative < target {
+            cursor += 1;
+            cumulative += pairs[cursor].1;
+        }
+        nodes.push(pairs[cursor].0);
+    }
+    let equal_weight = 1.0 / (m as f64);
+    let weights = vec![equal_weight; m];
+    let measure = LatentMeasureKind::GlobalEmpirical { nodes, weights };
+    measure.validate("empirical latent measure")?;
+    Ok(measure)
+}
+
 #[derive(Clone)]
 struct BernoulliMarginalSlopeFamily {
     y: Arc<Array1<f64>>,
     weights: Arc<Array1<f64>>,
     z: Arc<Array1<f64>>,
+    latent_measure: LatentMeasureKind,
     gaussian_frailty_sd: Option<f64>,
     base_link: InverseLink,
     marginal_design: DesignMatrix,
@@ -7646,10 +7829,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         true
     }
 
-    fn inner_joint_workspace_gradient_available(
-        &self,
-        _specs: &[ParameterBlockSpec],
-    ) -> bool {
+    fn inner_joint_workspace_gradient_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
         true
     }
 

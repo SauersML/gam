@@ -5,7 +5,7 @@
 //! Each entry `partitions(mask)` is the list of all set-partitions of the bits
 //! of `mask`, with each partition represented as a `Vec<usize>` of disjoint
 //! sub-masks whose bitwise OR equals `mask`. The total memory footprint is
-//! bounded by the Bell numbers up to `B(MAX_DIRS) = 52` for `MAX_DIRS=5`, so
+//! bounded by the Bell numbers up to `B(MAX_DIRS) = 203` for `MAX_DIRS=6`, so
 //! the cache is tiny and computed lazily on first use.
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,7 +14,7 @@ pub static COMPOSE_UNARY_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static MUL_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static ROW_NEGLOG_CALLS: AtomicU64 = AtomicU64::new(0);
 
-const MAX_DIRS: usize = 5;
+const MAX_DIRS: usize = 6;
 const TABLE_LEN: usize = 1usize << MAX_DIRS;
 
 static CACHE: OnceLock<Vec<Vec<Vec<usize>>>> = OnceLock::new();
@@ -43,7 +43,7 @@ fn build_partitions(mask: usize) -> Vec<Vec<usize>> {
 
 /// Returns the precomputed list of set-partitions for `mask`.
 ///
-/// Supports masks in `0..=(1 << MAX_DIRS) - 1` (i.e. up to `RowKernel<5>`
+/// Supports masks in `0..=(1 << MAX_DIRS) - 1` (i.e. up to six-direction
 /// jet machinery). Panics if `mask` is out of range.
 pub fn partitions(mask: usize) -> &'static [Vec<usize>] {
     let table = CACHE.get_or_init(|| (0..TABLE_LEN).map(build_partitions).collect());
