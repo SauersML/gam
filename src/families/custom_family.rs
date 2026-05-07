@@ -1187,17 +1187,32 @@ pub trait CustomFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Array2<f64>>, String> {
-        // Outer-side gate — see `outer_default_trustworthy_for_joint_hessian`
-        // for the architectural rationale.  When the gate trips, we refuse
-        // the call entirely instead of letting either of the block-diagonal
-        // defaults (`exact_newton_joint_hessian` / `_from_working_sets`) leak
-        // into outer REML trace algebra.
-        if !self.outer_default_trustworthy_for_joint_hessian(specs) {
-            return Ok(None);
-        }
-        match self.exact_newton_joint_hessian(block_states)? {
-            Some(hessian) => Ok(Some(hessian)),
-            None => exact_newton_joint_hessian_from_working_sets(self, block_states, specs),
+        // Multi-axis dispatch over the joint Hessian source:
+        //
+        // * Single-block, or family declared `likelihood_blocks_uncoupled` —
+        //   the working-sets block-diagonal IS exact (no cross-block coupling
+        //   exists), so it's a valid fallback when the family override
+        //   returns None.
+        //
+        // * Multi-block coupled with `has_explicit_joint_hessian = true` —
+        //   the family override IS the only trusted joint Hessian.  If it
+        //   returns None (e.g. dense form too large for memory at biobank
+        //   scale), propagate None.  Substituting the working-sets
+        //   block-diagonal would silently drop the cross-block
+        //   ∂²L/∂β_a∂β_b curvature the family is the only source of —
+        //   exactly the corruption this gate exists to prevent.
+        //
+        // * Multi-block coupled, no explicit override — refuse entirely so
+        //   the multi-block error surfaces upstream.
+        if specs.len() <= 1 || self.likelihood_blocks_uncoupled() {
+            match self.exact_newton_joint_hessian(block_states)? {
+                Some(hessian) => Ok(Some(hessian)),
+                None => exact_newton_joint_hessian_from_working_sets(self, block_states, specs),
+            }
+        } else if self.has_explicit_joint_hessian() {
+            self.exact_newton_joint_hessian(block_states)
+        } else {
+            Ok(None)
         }
     }
 
@@ -1347,23 +1362,27 @@ pub trait CustomFamily {
         specs: &[ParameterBlockSpec],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        // Same outer-side gate as `exact_newton_joint_hessian_with_specs`.
-        // The default `exact_newton_joint_hessian_directional_derivative` and
-        // `_from_working_sets` both build a block-diagonal `D_β H[u]`; for
-        // coupled multi-block families that drops the cross-block
-        // `∂²L_ab/∂β_a∂β_b · u_b` rows that drive the outer mode-response
-        // correction.  Refuse the default entirely unless trusted.
-        if !self.outer_default_trustworthy_for_joint_hessian(specs) {
-            return Ok(None);
-        }
-        match self.exact_newton_joint_hessian_directional_derivative(block_states, d_beta_flat)? {
-            Some(hessian) => Ok(Some(hessian)),
-            None => exact_newton_joint_hessian_directional_derivative_from_working_sets(
-                self,
-                block_states,
-                specs,
-                d_beta_flat,
-            ),
+        // Same trust dispatch as `exact_newton_joint_hessian_with_specs` —
+        // the default `_directional_derivative` and `_from_working_sets`
+        // both build a block-diagonal `D_β H[u]`, which silently drops the
+        // cross-block `∂²L_ab/∂β_a∂β_b · u_b` rows that drive the outer
+        // mode-response correction for coupled families.
+        if specs.len() <= 1 || self.likelihood_blocks_uncoupled() {
+            match self
+                .exact_newton_joint_hessian_directional_derivative(block_states, d_beta_flat)?
+            {
+                Some(dh) => Ok(Some(dh)),
+                None => exact_newton_joint_hessian_directional_derivative_from_working_sets(
+                    self,
+                    block_states,
+                    specs,
+                    d_beta_flat,
+                ),
+            }
+        } else if self.has_explicit_joint_hessian() {
+            self.exact_newton_joint_hessian_directional_derivative(block_states, d_beta_flat)
+        } else {
+            Ok(None)
         }
     }
 
