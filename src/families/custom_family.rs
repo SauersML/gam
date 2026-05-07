@@ -942,16 +942,12 @@ pub trait CustomFamily {
         d_beta_u_flat: &Array1<f64>,
         d_betav_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if !self.exact_newton_joint_hessian_beta_dependent() {
-            let total = block_states
-                .iter()
-                .map(|state| state.beta.len())
-                .sum::<usize>();
-            validate_flat_direction_length(d_beta_u_flat, total, "joint exact-newton d2H u")?;
-            validate_flat_direction_length(d_betav_flat, total, "joint exact-newton d2H v")?;
-            return Ok(Some(Array2::zeros((total, total))));
-        }
-        Ok(None)
+        exact_newton_joint_hessiansecond_directional_derivative_from_blocks(
+            self,
+            block_states,
+            d_beta_u_flat,
+            d_betav_flat,
+        )
     }
 
     /// Optional per-evaluation workspace for exact joint Hessian operators and
@@ -6184,6 +6180,66 @@ fn exact_newton_joint_hessian_directional_derivative_from_blocks<F: CustomFamily
         if local.nrows() != p_block || local.ncols() != p_block {
             return Err(format!(
                 "exact_newton_joint_hessian_directional_derivative default: block {block_idx} dH shape {}x{} != expected {p_block}x{p_block}",
+                local.nrows(),
+                local.ncols()
+            ));
+        }
+        joint.slice_mut(s![start..end, start..end]).assign(&local);
+        start = end;
+    }
+    Ok(Some(joint))
+}
+
+/// Block-diagonal aggregator for the joint second directional derivative.
+///
+/// Mirrors `exact_newton_joint_hessian_directional_derivative_from_blocks`:
+/// for a beta-independent joint Hessian the answer is identically zero;
+/// otherwise we ask each block for `D²H_b[u_b, v_b]` via
+/// `exact_newton_hessian_second_directional_derivative` and place those
+/// per-block contributions on the joint diagonal.
+///
+/// The previous default returned `Some(zeros)` for beta-independent and
+/// `None` (no aggregation at all) for beta-dependent families, silently
+/// dropping the per-block `d²H` overrides that families like
+/// `OneBlockQuarticExactFamily` provide for the outer Hessian's drift
+/// contribution.  Aggregating here mirrors the first-derivative path so
+/// outer REML receives the curvature term whenever the per-block
+/// `exact_newton_hessian_second_directional_derivative` is implemented.
+fn exact_newton_joint_hessiansecond_directional_derivative_from_blocks<F: CustomFamily + ?Sized>(
+    family: &F,
+    block_states: &[ParameterBlockState],
+    d_beta_u_flat: &Array1<f64>,
+    d_betav_flat: &Array1<f64>,
+) -> Result<Option<Array2<f64>>, String> {
+    let total = block_states
+        .iter()
+        .map(|state| state.beta.len())
+        .sum::<usize>();
+    validate_flat_direction_length(d_beta_u_flat, total, "joint exact-newton d2H u")?;
+    validate_flat_direction_length(d_betav_flat, total, "joint exact-newton d2H v")?;
+    if !family.exact_newton_joint_hessian_beta_dependent() {
+        return Ok(Some(Array2::zeros((total, total))));
+    }
+
+    let mut joint = Array2::<f64>::zeros((total, total));
+    let mut start = 0usize;
+    for (block_idx, state) in block_states.iter().enumerate() {
+        let p_block = state.beta.len();
+        let end = start + p_block;
+        let u_block = d_beta_u_flat.slice(s![start..end]).to_owned();
+        let v_block = d_betav_flat.slice(s![start..end]).to_owned();
+        let Some(local) = family.exact_newton_hessian_second_directional_derivative(
+            block_states,
+            block_idx,
+            &u_block,
+            &v_block,
+        )?
+        else {
+            return Ok(None);
+        };
+        if local.nrows() != p_block || local.ncols() != p_block {
+            return Err(format!(
+                "exact_newton_joint_hessiansecond_directional_derivative default: block {block_idx} d2H shape {}x{} != expected {p_block}x{p_block}",
                 local.nrows(),
                 local.ncols()
             ));
@@ -14502,6 +14558,14 @@ mod tests {
     }
 
     impl CustomFamily for OneBlockQuarticExactFamily {
+        fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+            // h(β) = 1 + curvature·β² genuinely depends on β; the default
+            // (false for RidgedQuadraticReml) would short-circuit the joint
+            // d²H aggregator to zeros and drop the per-block override below
+            // before it ever reaches the outer Hessian's drift contribution.
+            true
+        }
+
         fn evaluate(
             &self,
             block_states: &[ParameterBlockState],
