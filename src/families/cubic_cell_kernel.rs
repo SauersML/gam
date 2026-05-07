@@ -143,8 +143,6 @@ pub struct CellMomentStateRef<'a> {
 #[derive(Clone, Debug, Default)]
 pub struct CellMomentScratch {
     moments: Vec<f64>,
-    affine_moments: Vec<f64>,
-    current_full: Vec<f64>,
 }
 
 impl CellMomentScratch {
@@ -155,8 +153,6 @@ impl CellMomentScratch {
     pub fn with_capacity(max_degree: usize) -> Self {
         Self {
             moments: Vec::with_capacity(max_degree + 1),
-            affine_moments: Vec::with_capacity(max_degree + 1),
-            current_full: Vec::with_capacity(MAX_AFFINE_ANCHOR_DEGREE + 1),
         }
     }
 
@@ -169,30 +165,6 @@ impl CellMomentScratch {
         self.moments.resize(len, 0.0);
         self.moments.fill(0.0);
         &mut self.moments
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    fn prepare_affine(&mut self, len: usize) -> &mut [f64] {
-        #[cfg(test)]
-        if self.affine_moments.capacity() < len {
-            CELL_MOMENT_TEST_REALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        self.affine_moments.resize(len, 0.0);
-        self.affine_moments.fill(0.0);
-        &mut self.affine_moments
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    fn prepare_current_full(&mut self, len: usize) -> &mut [f64] {
-        #[cfg(test)]
-        if self.current_full.capacity() < len {
-            CELL_MOMENT_TEST_REALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        self.current_full.resize(len, 0.0);
-        self.current_full.fill(0.0);
-        &mut self.current_full
     }
 }
 
@@ -422,104 +394,6 @@ pub fn reduce_sextic_moments(
         moments[n + 5] = numer / lead;
     }
     Ok(moments)
-}
-
-#[allow(dead_code)]
-fn reduce_quartic_moments_into(
-    cell: DenestedCubicCell,
-    base_m0_m2: [f64; 3],
-    max_degree: usize,
-    out: &mut [f64],
-) -> Result<(), String> {
-    debug_assert_eq!(out.len(), max_degree + 1);
-    if max_degree <= 2 {
-        out.copy_from_slice(&base_m0_m2[..=max_degree]);
-        return Ok(());
-    }
-    let d = quartic_qprime_coefficients(cell.c0, cell.c1, cell.c2);
-    let lead = d[3];
-    if !lead.is_finite() || lead.abs() <= 1e-18 {
-        return Err(format!(
-            "quartic moment reduction requires nonzero leading coefficient, got {lead:.3e}"
-        ));
-    }
-    out.fill(0.0);
-    out[0] = base_m0_m2[0];
-    out[1] = base_m0_m2[1];
-    out[2] = base_m0_m2[2];
-    for n in 0..=(max_degree - 3) {
-        let b_n = moment_boundary_term(cell, n);
-        let mut numer = if n == 0 { 0.0 } else { (n as f64) * out[n - 1] };
-        for j in 0..=2 {
-            numer -= d[j] * out[n + j];
-        }
-        numer -= b_n;
-        out[n + 3] = numer / lead;
-    }
-    Ok(())
-}
-
-/// Scratch-backed variant of [`reduce_sextic_moments`].
-///
-/// Mirrors the same degenerate-branch fallbacks: when the sextic leading
-/// coefficient or normalized cubic-coefficient `c3` collapses, we rebuild
-/// using the appropriate lower-branch evaluator and copy into `out`.
-#[allow(dead_code)]
-fn reduce_sextic_moments_into(
-    cell: DenestedCubicCell,
-    base_m0_m4: [f64; 5],
-    max_degree: usize,
-    out: &mut [f64],
-) -> Result<(), String> {
-    debug_assert_eq!(out.len(), max_degree + 1);
-    if max_degree <= 4 {
-        out.copy_from_slice(&base_m0_m4[..=max_degree]);
-        return Ok(());
-    }
-    let d = sextic_qprime_coefficients(cell.c0, cell.c1, cell.c2, cell.c3);
-    let lead = d[5];
-    if !lead.is_finite() {
-        return Err(format!(
-            "sextic moment reduction encountered non-finite leading coefficient: {lead:.3e}"
-        ));
-    }
-    if let Some(lower_branch) = degenerate_sextic_branch(cell, lead)? {
-        let lowered = match lower_branch {
-            ExactCellBranch::Quartic => evaluate_non_affine_cell_state(
-                DenestedCubicCell { c3: 0.0, ..cell },
-                ExactCellBranch::Quartic,
-                max_degree,
-            )?,
-            ExactCellBranch::Affine => evaluate_affine_cell_state(
-                DenestedCubicCell {
-                    left: cell.left,
-                    right: cell.right,
-                    c0: cell.c0,
-                    c1: cell.c1,
-                    c2: 0.0,
-                    c3: 0.0,
-                },
-                max_degree,
-            )?,
-            ExactCellBranch::Sextic => unreachable!("sextic cannot be a lowered branch"),
-        };
-        out.copy_from_slice(&lowered.moments);
-        return Ok(());
-    }
-    out.fill(0.0);
-    for (idx, value) in base_m0_m4.into_iter().enumerate() {
-        out[idx] = value;
-    }
-    for n in 0..=(max_degree - 5) {
-        let b_n = moment_boundary_term(cell, n);
-        let mut numer = if n == 0 { 0.0 } else { (n as f64) * out[n - 1] };
-        for j in 0..=4 {
-            numer -= d[j] * out[n + j];
-        }
-        numer -= b_n;
-        out[n + 5] = numer / lead;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
