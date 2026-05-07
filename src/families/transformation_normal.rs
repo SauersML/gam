@@ -12782,17 +12782,23 @@ mod tests {
         let rho_dim = spec.initial_log_lambdas.len();
         let psi_dim = derivative_blocks[0].len();
         let k_outer = rho_dim + psi_dim;
+        // `use_outer_hessian_operator_path` is purely a cost-based crossover
+        // over `(n_obs, p_dim, k_outer)`; commit 7f7705c removed the
+        // callback-kernel short-circuit that previously let CTN trip the
+        // operator path on its analytic HVP alone.  Per the current
+        // function docstring, family-supplied directional θθ operators
+        // route via `HessianDerivativeProvider::family_outer_hessian_operator`
+        // and short-circuit this predicate at the call site.  The
+        // meaningful invariant for this test is therefore the dispatcher
+        // verdict below — `custom_family_outer_derivatives` must still
+        // return `Analytic / Analytic` for both gradient and Hessian.
+        // We retain the threshold-tuple sanity check on the predicate so
+        // a future regression that broke the cost crossover (e.g. flipped
+        // a `>=` to `>`) would still be caught here.
         assert!(
             crate::solver::estimate::reml::unified::use_outer_hessian_operator_path(
                 crate::solver::estimate::reml::unified::MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD,
                 crate::solver::estimate::reml::unified::MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N,
-                k_outer,
-            )
-        );
-        assert!(
-            crate::solver::estimate::reml::unified::use_outer_hessian_operator_path(
-                crate::solver::estimate::reml::unified::MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD,
-                spec.design.ncols(),
                 k_outer,
             )
         );
