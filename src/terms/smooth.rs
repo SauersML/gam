@@ -4342,19 +4342,60 @@ fn smooth_intrinsic_parametric_feature_cols(
     linear_terms: &[LinearTermSpec],
     term: &SmoothTermSpec,
 ) -> Vec<usize> {
+    // Returns the data columns that should appear in the smooth's parametric
+    // constraint block `C = [1, …]`, alongside which the smooth is then
+    // ORTHOGONALIZED via `apply_smooth_transform_to_design`.  Every column
+    // returned here is therefore a direction that gets projected OUT of the
+    // smooth's basis — leaving only the nonlinear residual structure.
+    // "Owns" in the comments below means "claims for that projection," not
+    // "keeps in the smooth's column span."
+    //
     // Ownership rule for spatial polynomial directions:
-    // explicit linear terms own only their matching axes. A standalone TPS term
-    // owns its centered polynomial nullspace, matching the usual thin-plate
-    // spline model surface; projecting it out leaves small-k univariate TPS
-    // terms with only nonlinear residual columns.
+    //
+    // 1. Explicit linear terms claim their matching axes — and only those
+    //    axes.  When some (but not all) axes of a multi-axis smooth are
+    //    covered by linear terms, only the covered axes are projected out;
+    //    the smooth retains its remaining polynomial directions in its own
+    //    span (those are not in the parametric block, so the orthogonality
+    //    constraint does not remove them).
+    //
+    // 2. With NO linear-term overlap, a spatial smooth that requested
+    //    `OrthogonalToParametric` claims its full centered polynomial
+    //    nullspace for projection, matching the standard thin-plate /
+    //    Matern model surface where small-k smooths carry only nonlinear
+    //    residual columns.  When `double_penalty` is active the nullspace
+    //    is already regularized inside the smooth, so it is NOT projected
+    //    out — it stays in the smooth's span.
     let feature_cols = smooth_term_feature_cols(term);
-    let mut owned = Vec::new();
-    for linear in linear_terms {
-        if feature_cols.contains(&linear.feature_col) && !owned.contains(&linear.feature_col) {
-            owned.push(linear.feature_col);
+    let has_overlap = linear_terms
+        .iter()
+        .any(|linear| feature_cols.contains(&linear.feature_col));
+    if has_overlap {
+        let mut owned = Vec::new();
+        for linear in linear_terms {
+            if feature_cols.contains(&linear.feature_col) && !owned.contains(&linear.feature_col) {
+                owned.push(linear.feature_col);
+            }
         }
+        return owned;
     }
-    owned
+    if !matches!(
+        spatial_identifiability_policy(term),
+        Some(SpatialIdentifiability::OrthogonalToParametric)
+    ) {
+        return Vec::new();
+    }
+    let double_penalty = match &term.basis {
+        SmoothBasisSpec::ThinPlate { spec, .. } => spec.double_penalty,
+        SmoothBasisSpec::Matern { spec, .. } => spec.double_penalty,
+        SmoothBasisSpec::Duchon { .. } => false,
+        _ => false,
+    };
+    if double_penalty {
+        Vec::new()
+    } else {
+        feature_cols
+    }
 }
 
 fn apply_global_smooth_identifiability(

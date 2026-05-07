@@ -8842,6 +8842,10 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         self.assemble_joint_hessian_from_quantities(&q, block_states)
     }
 
+    fn has_explicit_joint_hessian(&self) -> bool {
+        true
+    }
+
     fn exact_newton_outer_curvature(
         &self,
         block_states: &[ParameterBlockState],
