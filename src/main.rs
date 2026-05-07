@@ -343,8 +343,12 @@ struct FitArgs {
     /// B-spline degree for the time margin of the log-sigma tensor product.
     #[arg(long = "sigma-time-degree", default_value_t = 3)]
     sigma_time_degree: usize,
-    /// Enable MM-based spatial adaptive regularization for compatible smooth terms.
-    #[arg(long = "adaptive-regularization", action = ArgAction::Set, default_value_t = true)]
+    /// Enable MM-based spatial adaptive regularization (Charbonnier majorizer)
+    /// for compatible smooth terms. Off by default — pass
+    /// `--adaptive-regularization true` to opt in. Only consulted by the bare
+    /// `gam fit` (standard GAM) path; the marginal-slope and
+    /// transformation-normal paths do not use this flag.
+    #[arg(long = "adaptive-regularization", action = ArgAction::Set, default_value_t = false)]
     adaptive_regularization: bool,
     /// Enable per-axis anisotropic spatial optimization for all eligible
     /// spatial terms (Matérn and Duchon). Hybrid Duchon jointly optimizes a
