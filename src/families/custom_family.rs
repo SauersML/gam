@@ -567,6 +567,23 @@ pub trait CustomFamily {
         self.evaluate(block_states).map(|e| e.log_likelihood)
     }
 
+    /// Options-aware log-likelihood evaluation for line search.
+    ///
+    /// Default forwards to [`log_likelihood_only`] and ignores `_options`.
+    /// Families that consult `options.outer_score_subsample` (or other
+    /// per-call options that affect the LL value) must override this so the
+    /// joint-Newton line search and the post-accept gradient reload agree
+    /// on which row subset is being evaluated. The biobank FLEX bernoulli-
+    /// marginal-slope path overrides it because the cheap LL fallback
+    /// otherwise diverges from the workspace path that DID thread options.
+    fn log_likelihood_only_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        _options: &BlockwiseFitOptions,
+    ) -> Result<f64, String> {
+        self.log_likelihood_only(block_states)
+    }
+
     /// Selects the outer objective semantics for exact-Newton families.
     ///
     /// `RidgedQuadraticReml` is the explicit ridged surrogate REML surface:
@@ -7939,7 +7956,7 @@ fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'sta
         }
     }
     family
-        .log_likelihood_only(states)
+        .log_likelihood_only_with_options(states, options)
         .map(|log_likelihood| (log_likelihood, None))
 }
 
@@ -8500,6 +8517,17 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     states[b].beta.assign(&projected);
                 }
                 refresh_all_block_etas(family, specs, &mut states)?;
+                // NB: prefer_workspace MUST stay true on the FLEX marg-slope
+                // biobank path. The workspace LL and the cheap
+                // log_likelihood_only_with_options LL do NOT agree numerically
+                // for FLEX (verified empirically: switching to cheap LL caused
+                // every line-search attempt to reject because trialobjective
+                // had a different constant offset than lastobjective).
+                // The cheap-LL path is correct only when the family's two LL
+                // computation paths produce bit-equivalent values; for FLEX
+                // bernoulli marginal-slope they differ in row-iteration scale
+                // / aggregation. A future fix wiring cheap-LL safely should
+                // verify equivalence first (see codex cloud LS task 1).
                 let trial_ll = match joint_line_search_log_likelihood(
                     family,
                     specs,
