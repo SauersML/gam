@@ -22,13 +22,17 @@
       "include_sigma": false
     },
     {
-      "name": "rust_gam_jointpc_matern60",
+      "name": "rust_margslope_aniso_duchon16d_rigid",
       "dataset": "disease",
       "backend": "rust_gam",
       "family": "binomial",
-      "spatial_basis": "matern",
-      "centers": 60,
-      "include_sigma": false
+      "spatial_basis": "duchon",
+      "centers": 24,
+      "include_sigma": false,
+      "marginal_slope": true,
+      "scale_dimensions": true,
+      "z_column": "pgs_ctn_z",
+      "max_centers": 32
     },
     {
       "name": "rust_gamlss_jointpc_duchon60",

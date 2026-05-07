@@ -7646,6 +7646,13 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         true
     }
 
+    fn inner_joint_workspace_gradient_available(
+        &self,
+        _specs: &[ParameterBlockSpec],
+    ) -> bool {
+        true
+    }
+
     fn inner_joint_workspace_log_likelihood_available(
         &self,
         _specs: &[ParameterBlockSpec],
