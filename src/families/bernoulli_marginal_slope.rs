@@ -536,6 +536,12 @@ struct BernoulliMarginalSlopeFamily {
     /// runs pick up the caller's analytic-operator preference instead of an
     /// inline default.
     policy: crate::resource::ResourcePolicy,
+    /// Fit-lifetime byte-limited LRU for de-nested cubic cell moments. The key
+    /// is the exact bit pattern of `(c0, c1, c2, c3, left, right)`, so reuse
+    /// across PIRLS cycles is safe only for byte-identical cells while LRU
+    /// eviction never changes numerical results.
+    cell_moment_lru: Arc<exact_kernel::CellMomentLruCache>,
+    cell_moment_cache_stats: Arc<exact_kernel::CellMomentCacheStats>,
     /// Per-row warm-start cache for the scalar intercept root-finder
     /// (`solve_row_intercept_base`). The intercept `a` is solved per row at
     /// every inner PIRLS iteration; without a warm start, each call burns
@@ -2409,6 +2415,20 @@ fn add_weighted_chunk_gradient(
     *target += &crate::faer_ndarray::fast_atv(chunk, weights);
 }
 
+fn new_cell_moment_lru_cache(
+    policy: &crate::resource::ResourcePolicy,
+) -> Arc<exact_kernel::CellMomentLruCache> {
+    let budget = std::env::var("GAM_BERNOULLI_MARGSLOPE_CELL_LRU_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(policy.max_single_materialization_bytes);
+    Arc::new(exact_kernel::CellMomentLruCache::new(budget))
+}
+
+fn new_cell_moment_cache_stats() -> Arc<exact_kernel::CellMomentCacheStats> {
+    Arc::new(exact_kernel::CellMomentCacheStats::default())
+}
+
 fn add_weighted_chunk_gram(chunk: &Array2<f64>, weights: &Array1<f64>, target: &mut Array2<f64>) {
     *target += &crate::faer_ndarray::fast_xt_diag_x(chunk, weights);
 }
@@ -3551,6 +3571,20 @@ impl BernoulliMarginalSlopeFamily {
         )
     }
 
+    #[inline]
+    fn evaluate_cell_moments_lru(
+        &self,
+        cell: exact_kernel::DenestedCubicCell,
+        max_degree: usize,
+    ) -> Result<exact_kernel::CellMomentState, String> {
+        exact_kernel::evaluate_cell_moments_cached(
+            cell,
+            max_degree,
+            &self.cell_moment_lru,
+            Some(&self.cell_moment_cache_stats),
+        )
+    }
+
     /// Newton-step evaluator for the inner-PIRLS row-intercept root solver.
     ///
     /// Returns `(f, f', 0.0)`: the third slot — `F''(a)` — is reported as
@@ -3587,7 +3621,7 @@ impl BernoulliMarginalSlopeFamily {
             // `dot(dc_da, moments)` first-derivative computation
             // (`dc_da` is a length-4 coefficient vector ⇒ degree 3, plus one
             // slot of safety).
-            let state = exact_kernel::evaluate_cell_moments(cell, 4)?;
+            let state = self.evaluate_cell_moments_lru(cell, 4)?;
             f += state.value;
             let (dc_da_raw, _) = exact_kernel::denested_cell_coefficient_partials(
                 partition_cell.score_span,
@@ -4083,7 +4117,7 @@ impl BernoulliMarginalSlopeFamily {
                 cells
                     .into_iter()
                     .map(|partition_cell| {
-                        exact_kernel::evaluate_cell_moments(partition_cell.cell, 9).map(
+                        self.evaluate_cell_moments_lru(partition_cell.cell, 9).map(
                             |state_degree9| CachedDenestedCellMoments {
                                 partition_cell,
                                 state_degree9,
@@ -4132,6 +4166,7 @@ impl BernoulliMarginalSlopeFamily {
         }
         self.preseed_intercept_warm_starts(block_states)?;
         let stats = BernoulliInterceptSolveStats::default();
+        let cell_cache_before = self.cell_moment_cache_stats.snapshot();
         let row_contexts: Result<Vec<_>, String> = (0..n)
             .into_par_iter()
             .map(|row| self.build_row_exact_context_with_stats(row, block_states, Some(&stats)))
@@ -4158,6 +4193,20 @@ impl BernoulliMarginalSlopeFamily {
                 stats.seed_residual_le_1e8.load(Ordering::Relaxed),
                 stats.seed_residual_le_abs_tol.load(Ordering::Relaxed),
                 stats.seed_residual_gt_abs_tol.load(Ordering::Relaxed),
+            );
+        }
+        if flex_active {
+            let (cell_hits, cell_misses, cell_hit_rate) = self
+                .cell_moment_cache_stats
+                .hit_rate_delta(cell_cache_before);
+            log::info!(
+                "[BMS cell-moment LRU] cycle hits={} misses={} hit_rate={:.1}% entries={} resident_mib={:.1}/{:.1}",
+                cell_hits,
+                cell_misses,
+                100.0 * cell_hit_rate,
+                self.cell_moment_lru.len(),
+                self.cell_moment_lru.resident_bytes() as f64 / (1024.0 * 1024.0),
+                self.cell_moment_lru.max_bytes() as f64 / (1024.0 * 1024.0),
             );
         }
         if log_exact_work(n) {
@@ -4617,7 +4666,7 @@ impl BernoulliMarginalSlopeFamily {
                 .into_iter()
                 .map(|partition_cell| {
                     let degree = if need_hessian { 9 } else { 3 };
-                    exact::evaluate_cell_moments(partition_cell.cell, degree)
+                    self.evaluate_cell_moments_lru(partition_cell.cell, degree)
                         .map(|state| (partition_cell, std::borrow::Cow::Owned(state)))
                 })
                 .collect::<Result<Vec<_>, String>>()?
@@ -5001,7 +5050,7 @@ impl BernoulliMarginalSlopeFamily {
             let cell = partition_cell.cell;
             let z_mid = exact::interval_probe_point(cell.left, cell.right)?;
             let u_mid = a + b * z_mid;
-            let state = exact::evaluate_cell_moments(cell, 15)?;
+            let state = self.evaluate_cell_moments_lru(cell, 15)?;
 
             let (dc_da_raw, dc_db_raw) = exact::denested_cell_coefficient_partials(
                 partition_cell.score_span,
@@ -5538,7 +5587,7 @@ impl BernoulliMarginalSlopeFamily {
             let cell = partition_cell.cell;
             let z_mid = exact::interval_probe_point(cell.left, cell.right)?;
             let u_mid = a + b * z_mid;
-            let state = exact::evaluate_cell_moments(cell, 21)?;
+            let state = self.evaluate_cell_moments_lru(cell, 21)?;
 
             let (dc_da_raw, dc_db_raw) = exact::denested_cell_coefficient_partials(
                 partition_cell.score_span,
@@ -9458,6 +9507,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
     };
 
     let intercept_warm_starts = new_intercept_warm_start_cache(y.len());
+    let cell_moment_lru = new_cell_moment_lru_cache(policy);
+    let cell_moment_cache_stats = new_cell_moment_cache_stats();
     let make_family = |marginal_design: &TermCollectionDesign,
                        logslope_design: &TermCollectionDesign,
                        sigma: Option<f64>|
@@ -9474,6 +9525,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
             score_warp: score_warp_runtime.clone(),
             link_dev: link_dev_runtime.clone(),
             policy: policy.clone(),
+            cell_moment_lru: Arc::clone(&cell_moment_lru),
+            cell_moment_cache_stats: Arc::clone(&cell_moment_cache_stats),
             intercept_warm_starts: Some(Arc::clone(&intercept_warm_starts)),
         }
     };
@@ -9806,6 +9859,10 @@ mod tests {
             score_warp: Some(score_prepared.runtime.clone()),
             link_dev: Some(link_prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: cache,
         };
         let marginal_eta = Array1::from_iter((0..n).map(|i| 0.15 * ((i as f64) * 0.001).sin()));
@@ -9881,6 +9938,10 @@ mod tests {
             score_warp: None,
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let block_states = vec![
@@ -10034,6 +10095,10 @@ mod tests {
             score_warp: None,
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         }
     }
@@ -10715,6 +10780,10 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let block_states = vec![
@@ -10832,6 +10901,10 @@ mod tests {
             score_warp: Some(score_prepared.runtime.clone()),
             link_dev: Some(link_prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: Some(new_intercept_warm_start_cache(n)),
         };
         let marginal_eta = 0.35;
@@ -10909,6 +10982,10 @@ mod tests {
             score_warp: Some(score_prepared.runtime.clone()),
             link_dev: Some(link_prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let block_states = vec![
@@ -10977,6 +11054,10 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let block_states = vec![
@@ -11033,6 +11114,10 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let current = Array1::<f64>::zeros(score_dim);
@@ -11865,6 +11950,10 @@ mod tests {
                 score_warp: None,
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                cell_moment_lru: new_cell_moment_lru_cache(
+                    &crate::resource::ResourcePolicy::default_library(),
+                ),
+                cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
             };
 
@@ -12031,6 +12120,10 @@ mod tests {
                 score_warp: Some(score_prepared.runtime),
                 link_dev: None,
                 policy: crate::resource::ResourcePolicy::default_library(),
+                cell_moment_lru: new_cell_moment_lru_cache(
+                    &crate::resource::ResourcePolicy::default_library(),
+                ),
+                cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
             };
         let specs = vec![
@@ -12190,6 +12283,10 @@ mod tests {
             score_warp: None,
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let specs = vec![
@@ -12246,6 +12343,10 @@ mod tests {
             score_warp: None,
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let states_at = |q: f64, g: f64| {
@@ -12379,6 +12480,10 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
 
@@ -12479,6 +12584,10 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
 
@@ -12574,6 +12683,10 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let block_states = vec![
@@ -12712,6 +12825,10 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let block_states = vec![
@@ -12819,6 +12936,10 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
 
@@ -12946,6 +13067,10 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
 
@@ -13077,6 +13202,10 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                cell_moment_lru: new_cell_moment_lru_cache(
+                    &crate::resource::ResourcePolicy::default_library(),
+                ),
+                cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
             };
         let block_states = vec![
@@ -13227,6 +13356,10 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                cell_moment_lru: new_cell_moment_lru_cache(
+                    &crate::resource::ResourcePolicy::default_library(),
+                ),
+                cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
             };
         let block_states = vec![
@@ -13330,6 +13463,10 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let cache = family
@@ -13410,6 +13547,10 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let cache = family
@@ -13488,6 +13629,10 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                cell_moment_lru: new_cell_moment_lru_cache(
+                    &crate::resource::ResourcePolicy::default_library(),
+                ),
+                cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
             };
         let block_states = vec![
@@ -13573,6 +13718,10 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                cell_moment_lru: new_cell_moment_lru_cache(
+                    &crate::resource::ResourcePolicy::default_library(),
+                ),
+                cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
             };
         let block_states = vec![
@@ -13680,6 +13829,10 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                cell_moment_lru: new_cell_moment_lru_cache(
+                    &crate::resource::ResourcePolicy::default_library(),
+                ),
+                cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
             };
         let block_states = vec![
@@ -13806,6 +13959,10 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                cell_moment_lru: new_cell_moment_lru_cache(
+                    &crate::resource::ResourcePolicy::default_library(),
+                ),
+                cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
             };
         let block_states = vec![
@@ -13955,6 +14112,10 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let cache = family
@@ -14055,6 +14216,10 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let cache = family
@@ -14155,6 +14320,10 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let cache = family
@@ -14266,6 +14435,10 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let cache = family
@@ -14375,6 +14548,10 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                cell_moment_lru: new_cell_moment_lru_cache(
+                    &crate::resource::ResourcePolicy::default_library(),
+                ),
+                cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
             };
         let block_states = vec![
@@ -14501,6 +14678,10 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                cell_moment_lru: new_cell_moment_lru_cache(
+                    &crate::resource::ResourcePolicy::default_library(),
+                ),
+                cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
             };
         let block_states = vec![
@@ -14614,6 +14795,10 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                cell_moment_lru: new_cell_moment_lru_cache(
+                    &crate::resource::ResourcePolicy::default_library(),
+                ),
+                cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
             };
         let block_states = vec![
@@ -14725,6 +14910,10 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                cell_moment_lru: new_cell_moment_lru_cache(
+                    &crate::resource::ResourcePolicy::default_library(),
+                ),
+                cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
             };
         let block_states = vec![
@@ -14860,6 +15049,10 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let cache = family
@@ -14969,6 +15162,10 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let cache = family
@@ -15076,6 +15273,10 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                cell_moment_lru: new_cell_moment_lru_cache(
+                    &crate::resource::ResourcePolicy::default_library(),
+                ),
+                cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
             };
         let block_states = vec![
@@ -15199,6 +15400,10 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let slices = block_slices(&family);
@@ -15282,6 +15487,10 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let slices = block_slices(&family);
@@ -15365,6 +15574,10 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let slices = block_slices(&family);
@@ -15453,6 +15666,10 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let slices = block_slices(&family);
@@ -15541,6 +15758,10 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let slices = block_slices(&family);
@@ -15618,6 +15839,10 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let slices = block_slices(&family);
@@ -15695,6 +15920,10 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let slices = block_slices(&family);
@@ -15759,6 +15988,10 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let slices = block_slices(&family);
@@ -15813,6 +16046,10 @@ mod tests {
                 score_warp: None,
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                cell_moment_lru: new_cell_moment_lru_cache(
+                    &crate::resource::ResourcePolicy::default_library(),
+                ),
+                cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
             };
         let beta_w = Array1::from_iter(
@@ -15923,6 +16160,10 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: None,
                 policy: crate::resource::ResourcePolicy::default_library(),
+                cell_moment_lru: new_cell_moment_lru_cache(
+                    &crate::resource::ResourcePolicy::default_library(),
+                ),
+                cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
             };
         let beta_h = Array1::from_iter(
@@ -16042,6 +16283,10 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                cell_moment_lru: new_cell_moment_lru_cache(
+                    &crate::resource::ResourcePolicy::default_library(),
+                ),
+                cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
             };
         let beta_h = Array1::from_iter(
@@ -16186,6 +16431,10 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                cell_moment_lru: new_cell_moment_lru_cache(
+                    &crate::resource::ResourcePolicy::default_library(),
+                ),
+                cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
             };
         let beta_h = Array1::from_iter(
@@ -16317,6 +16566,10 @@ mod tests {
             score_warp: Some(score_prepared.runtime.clone()),
             link_dev: Some(link_prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let beta_m = array![0.18, -0.07];
@@ -16527,6 +16780,10 @@ mod tests {
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
                 policy: crate::resource::ResourcePolicy::default_library(),
+                cell_moment_lru: new_cell_moment_lru_cache(
+                    &crate::resource::ResourcePolicy::default_library(),
+                ),
+                cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
             };
         let block_states = vec![
@@ -16596,6 +16853,10 @@ mod tests {
                 score_warp: None,
                 link_dev: None,
                 policy: crate::resource::ResourcePolicy::default_library(),
+                cell_moment_lru: new_cell_moment_lru_cache(
+                    &crate::resource::ResourcePolicy::default_library(),
+                ),
+                cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
             };
         let family = make_family(sigma);
@@ -16688,6 +16949,10 @@ mod tests {
             score_warp: None,
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         }
     }
@@ -17296,6 +17561,10 @@ mod tests {
             score_warp: Some(score_prepared.runtime.clone()),
             link_dev: Some(link_prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let beta_m = array![0.12, -0.04];
