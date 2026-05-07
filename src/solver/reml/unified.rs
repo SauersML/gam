@@ -4928,7 +4928,7 @@ pub fn reml_laml_evaluate(
         let scale_prefers_operator = prefer_outer_hessian_operator(n_obs, p_dim, k_outer);
         let has_subspace_trace = solution.penalty_subspace_trace.is_some();
         let use_operator = hessian_kernel.is_some()
-            && use_outer_hessian_operator_path(n_obs, p_dim, k_outer, callback_operator_kernel);
+            && use_outer_hessian_operator_path(n_obs, p_dim, k_outer);
         // Reason mnemonic: which clause carried the routing.  Ordered so
         // the most specific reason wins; "kernel_absent" wins over
         // everything else because that disables the operator path
@@ -5064,22 +5064,19 @@ pub(crate) fn prefer_outer_hessian_operator(n: usize, p: usize, k: usize) -> boo
 }
 
 /// Selects the matrix-free outer-Hessian representation once a Hessian HVP
-/// kernel is available.
+/// kernel is available. Decision is purely cost-driven via the `(n, p, K)`
+/// crossover: the operator and dense paths produce identical math, so they
+/// only differ in assembly cost.
 ///
-/// Callback kernels are explicit family-supplied directional operators, so they
-/// select the operator path independently of the generic `(n, p, K)` crossover.
-/// A penalty-subspace trace, when present, is handled inside
-/// `build_outer_hessian_operator` / `UnifiedOuterHessianOperator::matvec`
-/// through the projected `trace_operator` / `trace_projected_logdet` paths,
-/// so it no longer forces the dense fallback — the matvec is bit-equivalent
-/// to `compute_outer_hessian` under subspace.
-pub(crate) fn use_outer_hessian_operator_path(
-    n: usize,
-    p: usize,
-    k: usize,
-    callback_operator_kernel: bool,
-) -> bool {
-    callback_operator_kernel || prefer_outer_hessian_operator(n, p, k)
+/// Real fast HVP capability (a family-supplied directional θθ operator) is
+/// routed separately through `HessianDerivativeProvider::family_outer_hessian_operator`,
+/// which short-circuits this function entirely at the call site. Whether a
+/// `Callback` kernel is present is therefore irrelevant here — Callback exposes
+/// the same per-coordinate `dh`/`d²h` work the dense path would do, just
+/// repackaged behind the operator interface, so it must not trip the operator
+/// path on tiny problems where dense assembly is cheaper.
+pub(crate) fn use_outer_hessian_operator_path(n: usize, p: usize, k: usize) -> bool {
+    prefer_outer_hessian_operator(n, p, k)
 }
 
 fn is_hessian_unavailable(error: &str) -> bool {
