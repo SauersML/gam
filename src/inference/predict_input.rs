@@ -13,6 +13,7 @@ use crate::families::survival_predict::{
 };
 use crate::families::transformation_normal::{
     TRANSFORMATION_MONOTONICITY_EPS, TRANSFORMATION_NORMAL_H_ABS_MAX,
+    transformation_normal_pit_score,
 };
 use crate::inference::model::{FittedModel, PredictModelClass};
 use crate::matrix::DesignMatrix;

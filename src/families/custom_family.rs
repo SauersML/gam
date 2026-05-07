@@ -7845,9 +7845,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         cached_active_sets = seed.active_sets.clone();
         refresh_all_block_etas(family, specs, &mut states)?;
     }
-    let mut cached_eval: Option<FamilyEvaluation> = None;
-    let mut cached_joint_gradient: Option<Array1<f64>> = None;
-    let mut cached_joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>> = None;
     let load_joint_gradient = |states: &[ParameterBlockState]| -> Result<
         (
             f64,
@@ -7885,17 +7882,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         let gradient = exact_newton_joint_gradient_from_eval(&eval, specs)?;
         Ok((log_likelihood, gradient, Some(eval), workspace))
     };
-    let mut current_log_likelihood = if use_joint_newton {
+    let (
+        mut current_log_likelihood,
+        mut cached_eval,
+        mut cached_joint_gradient,
+        mut cached_joint_workspace,
+    ) = if use_joint_newton {
         let (log_likelihood, gradient, eval, workspace) = load_joint_gradient(&states)?;
-        cached_joint_gradient = gradient;
-        cached_eval = eval;
-        cached_joint_workspace = workspace;
-        log_likelihood
+        (log_likelihood, eval, gradient, workspace)
     } else {
         let eval = family.evaluate(&states)?;
         let log_likelihood = eval.log_likelihood;
-        cached_eval = Some(eval);
-        log_likelihood
+        (log_likelihood, Some(eval), None, None)
     };
     let mut current_penalty =
         total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
@@ -13723,6 +13721,62 @@ mod tests {
         // Below every threshold: dense path.
         assert!(!use_joint_matrix_free_path(8, 100));
         assert!(!use_joint_matrix_free_path(64, 1000));
+    }
+
+    struct CountingHessianWorkspace {
+        dense_calls: Arc<AtomicUsize>,
+        matvec_calls: Arc<AtomicUsize>,
+    }
+
+    impl ExactNewtonJointHessianWorkspace for CountingHessianWorkspace {
+        fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+            self.dense_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(Array2::eye(2)))
+        }
+
+        fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
+            self.matvec_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(v.clone()))
+        }
+
+        fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
+            Ok(Some(Array1::ones(2)))
+        }
+
+        fn directional_derivative(&self, _: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn require_operator_source_skips_dense_and_zero_matvec_probes() {
+        let dense_calls = Arc::new(AtomicUsize::new(0));
+        let matvec_calls = Arc::new(AtomicUsize::new(0));
+        let workspace: Arc<dyn ExactNewtonJointHessianWorkspace> =
+            Arc::new(CountingHessianWorkspace {
+                dense_calls: Arc::clone(&dense_calls),
+                matvec_calls: Arc::clone(&matvec_calls),
+            });
+
+        let source = exact_newton_joint_hessian_source_from_workspace(
+            &workspace,
+            2,
+            "counting workspace",
+            JointHessianSourcePreference::RequireOperator,
+        )
+        .expect("operator source should build")
+        .expect("operator source should be present");
+
+        assert_eq!(dense_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(matvec_calls.load(Ordering::Relaxed), 0);
+        match source {
+            JointHessianSource::Operator { apply, .. } => {
+                let out = apply(&Array1::from_vec(vec![1.0, 2.0])).expect("operator matvec");
+                assert_eq!(out, Array1::from_vec(vec![1.0, 2.0]));
+            }
+            JointHessianSource::Dense(_) => panic!("RequireOperator returned dense source"),
+        }
+        assert_eq!(matvec_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -7967,6 +7967,8 @@ impl TransformationNormalPsiHessianOperator {
             row_quantities: TransformationNormalRowQuantityCache {
                 beta: Arc::new(beta),
                 gamma: row_gamma,
+                h_lower: Arc::new(Array1::zeros(row_h.len())),
+                h_upper: Arc::new(Array1::zeros(row_h.len())),
                 h: row_h,
                 h_prime: row_h_prime,
                 endpoint_q,
@@ -12785,7 +12787,6 @@ mod tests {
                 crate::solver::estimate::reml::unified::MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD,
                 crate::solver::estimate::reml::unified::MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N,
                 k_outer,
-                true,
             )
         );
         assert!(
@@ -12793,7 +12794,6 @@ mod tests {
                 crate::solver::estimate::reml::unified::MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD,
                 spec.design.ncols(),
                 k_outer,
-                true,
             )
         );
 
@@ -14645,6 +14645,8 @@ impl ExactNewtonJointPsiWorkspace for TransformationNormalPsiWorkspace {
             gamma: Arc::clone(&entry.row_gamma),
             h: Arc::clone(&entry.row_h),
             h_prime: Arc::clone(&entry.row_h_prime),
+            h_lower: Arc::new(Array1::zeros(entry.row_h.len())),
+            h_upper: Arc::new(Array1::zeros(entry.row_h.len())),
             endpoint_q: Arc::clone(&entry.endpoint_q),
             log_likelihood: 0.0,
         };
@@ -14964,8 +14966,7 @@ pub fn fit_transformation_normal(
         let blocks = vec![family.block_spec()];
         let fit = fit_custom_family(&family, &blocks, &options)
             .map_err(|e| format!("transformation fit failed: {e}"))?;
-        let (fit, score_calibration) =
-            calibrate_transformation_scores(&family, fit, covariate_data, &cov_spec_resolved)?;
+        let (fit, score_calibration) = calibrate_transformation_scores(&family, fit)?;
 
         return Ok(TransformationNormalFitResult {
             family,
@@ -15311,12 +15312,8 @@ pub fn fit_transformation_normal(
     )?;
 
     let mut fit = solved.fit;
-    let (calibrated_fit, score_calibration) = calibrate_transformation_scores(
-        &fit.family,
-        fit.fit.clone(),
-        covariate_data,
-        &fit.covariate_spec_resolved,
-    )?;
+    let (calibrated_fit, score_calibration) =
+        calibrate_transformation_scores(&fit.family, fit.fit.clone())?;
     fit.fit = calibrated_fit;
     fit.score_calibration = score_calibration;
     Ok(fit)
