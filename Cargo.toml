@@ -81,6 +81,10 @@ harness = false
 name = "bvn_biobank_shape"
 harness = false
 
+[[bench]]
+name = "margslope_flex_biobank_hv"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
