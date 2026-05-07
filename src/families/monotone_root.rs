@@ -39,6 +39,31 @@ pub fn solve_monotone_root(
     Ok((solution.root, solution.abs_deriv, solution.residual))
 }
 
+/// Like [`solve_monotone_root`] but accepts an optional analytic bracket
+/// `[a_lo, a_hi]` known to straddle the root. When supplied, Phase 1 of the
+/// solver skips its expanding-step search and uses the analytic bracket
+/// directly.
+pub fn solve_monotone_root_with_bracket(
+    eval: impl Fn(f64) -> Result<(f64, f64, f64), String>,
+    a_init: f64,
+    label: &str,
+    convergence_tol: f64,
+    max_bracket_iters: usize,
+    max_refine_iters: usize,
+    analytic_bracket: Option<(f64, f64)>,
+) -> Result<(f64, f64, f64), String> {
+    let solution = solve_monotone_root_detailed_with_bracket(
+        eval,
+        a_init,
+        label,
+        convergence_tol,
+        max_bracket_iters,
+        max_refine_iters,
+        analytic_bracket,
+    )?;
+    Ok((solution.root, solution.abs_deriv, solution.residual))
+}
+
 pub fn solve_monotone_root_detailed(
     eval: impl Fn(f64) -> Result<(f64, f64, f64), String>,
     a_init: f64,
@@ -46,6 +71,26 @@ pub fn solve_monotone_root_detailed(
     convergence_tol: f64,
     max_bracket_iters: usize,
     max_refine_iters: usize,
+) -> Result<MonotoneRootSolution, String> {
+    solve_monotone_root_detailed_with_bracket(
+        eval,
+        a_init,
+        label,
+        convergence_tol,
+        max_bracket_iters,
+        max_refine_iters,
+        None,
+    )
+}
+
+pub fn solve_monotone_root_detailed_with_bracket(
+    eval: impl Fn(f64) -> Result<(f64, f64, f64), String>,
+    a_init: f64,
+    label: &str,
+    convergence_tol: f64,
+    max_bracket_iters: usize,
+    max_refine_iters: usize,
+    analytic_bracket: Option<(f64, f64)>,
 ) -> Result<MonotoneRootSolution, String> {
     let (f_init, f_deriv_init, _) = eval(a_init)?;
 
@@ -72,57 +117,75 @@ pub fn solve_monotone_root_detailed(
     }
 
     // --- Phase 1: bracket the root -------------------------------------------
-    //
-    // We need a point on the opposite side of zero from f_init.
-    // The correct search direction depends on both the sign of f_init and
-    // the monotonicity of F:
-    //
-    //   F increasing, f < 0 → root is to the right  (+)
-    //   F increasing, f > 0 → root is to the left   (−)
-    //   F decreasing, f < 0 → root is to the left   (−)
-    //   F decreasing, f > 0 → root is to the right  (+)
-    //
-    // Compactly:  step_sign = −sign(f · F')
-    let step_sign: f64 = if f_init * f_deriv_init < 0.0 {
-        1.0
-    } else {
-        -1.0
-    };
-
-    let f_init_negative = f_init < 0.0;
-    let mut same_side = a_init; // last point with same sign as f_init
-    let mut step_mag = (0.25 * (1.0 + a_init.abs())).max(1.0);
-    let mut found_other: Option<(f64, f64)> = None;
-
-    for _ in 0..max_bracket_iters {
-        let probe = same_side + step_mag * step_sign;
-        let (f_probe, _, _) = eval(probe)?;
-        let crossed = if f_init_negative {
-            f_probe >= 0.0
+    let (mut neg_pt, mut pos_pt) = if let Some((lo, hi)) = analytic_bracket {
+        if !lo.is_finite() || !hi.is_finite() || lo == hi {
+            return Err(format!(
+                "{label}: invalid analytic bracket [{lo:.6}, {hi:.6}]"
+            ));
+        }
+        let (f_lo, _, _) = eval(lo)?;
+        let (f_hi, _, _) = eval(hi)?;
+        if f_lo <= 0.0 && f_hi >= 0.0 {
+            (lo, hi)
+        } else if f_hi <= 0.0 && f_lo >= 0.0 {
+            (hi, lo)
         } else {
-            f_probe <= 0.0
-        };
-        if crossed {
-            found_other = Some((probe, f_probe));
-            break;
+            return Err(format!(
+                "{label}: analytic bracket does not straddle root (f_lo={f_lo:.3e}, f_hi={f_hi:.3e})"
+            ));
         }
-        same_side = probe;
-        step_mag *= 2.0;
-        if step_mag > 1e6 {
-            break;
-        }
-    }
-
-    let Some((other, _)) = found_other else {
-        return Err(format!(
-            "{label}: failed to bracket root (searched {step_sign:+.0} from a={a_init:.6})"
-        ));
-    };
-
-    let (mut neg_pt, mut pos_pt) = if f_init_negative {
-        (same_side, other)
     } else {
-        (other, same_side)
+        // We need a point on the opposite side of zero from f_init.
+        // The correct search direction depends on both the sign of f_init and
+        // the monotonicity of F:
+        //
+        //   F increasing, f < 0 → root is to the right  (+)
+        //   F increasing, f > 0 → root is to the left   (−)
+        //   F decreasing, f < 0 → root is to the left   (−)
+        //   F decreasing, f > 0 → root is to the right  (+)
+        //
+        // Compactly:  step_sign = −sign(f · F')
+        let step_sign: f64 = if f_init * f_deriv_init < 0.0 {
+            1.0
+        } else {
+            -1.0
+        };
+
+        let f_init_negative = f_init < 0.0;
+        let mut same_side = a_init; // last point with same sign as f_init
+        let mut step_mag = (0.25 * (1.0 + a_init.abs())).max(1.0);
+        let mut found_other: Option<(f64, f64)> = None;
+
+        for _ in 0..max_bracket_iters {
+            let probe = same_side + step_mag * step_sign;
+            let (f_probe, _, _) = eval(probe)?;
+            let crossed = if f_init_negative {
+                f_probe >= 0.0
+            } else {
+                f_probe <= 0.0
+            };
+            if crossed {
+                found_other = Some((probe, f_probe));
+                break;
+            }
+            same_side = probe;
+            step_mag *= 2.0;
+            if step_mag > 1e6 {
+                break;
+            }
+        }
+
+        let Some((other, _)) = found_other else {
+            return Err(format!(
+                "{label}: failed to bracket root (searched {step_sign:+.0} from a={a_init:.6})"
+            ));
+        };
+
+        if f_init_negative {
+            (same_side, other)
+        } else {
+            (other, same_side)
+        }
     };
 
     // --- Phase 2: hybrid bisection / Newton refinement -----------------------

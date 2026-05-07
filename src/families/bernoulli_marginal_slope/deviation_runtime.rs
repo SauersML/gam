@@ -753,6 +753,61 @@ impl DeviationRuntime {
         self.right_boundary_value_row.dot(beta)
     }
 
+    /// Conservative L1 sup-norm bound for the deviation value basis.
+    ///
+    /// For every evaluation point `x`, this returns a finite `K` such that
+    /// `|B(x)·β| <= K * ||β||_∞`.  Each basis column is a cubic on each
+    /// finite span and constant in the two tails, so the supremum is attained
+    /// at a span endpoint, an interior root of the derivative, or a tail
+    /// value.  Summing per-column suprema gives a conservative row-wise L1
+    /// bound that is independent of `x`.
+    #[allow(dead_code)] // staged for the zero-deviation fast-path bound; wired in by a follow-up agent
+    pub(crate) fn value_basis_l1_sup_norm(&self) -> f64 {
+        let mut total = 0.0;
+        for basis_idx in 0..self.basis_dim {
+            let mut col_sup = self.span_c0[[0, basis_idx]]
+                .abs()
+                .max(self.right_boundary_value_row[basis_idx].abs());
+            for span_idx in 0..self.span_count() {
+                let left = self.endpoint_points[span_idx];
+                let right = self.endpoint_points[span_idx + 1];
+                let width = right - left;
+                if !width.is_finite() || width <= 0.0 {
+                    continue;
+                }
+                let c0 = self.span_c0[[span_idx, basis_idx]];
+                let c1 = self.span_c1[[span_idx, basis_idx]];
+                let c2 = self.span_c2[[span_idx, basis_idx]];
+                let c3 = self.span_c3[[span_idx, basis_idx]];
+                let eval_abs = |t: f64| (c0 + c1 * t + c2 * t * t + c3 * t * t * t).abs();
+                col_sup = col_sup.max(eval_abs(0.0)).max(eval_abs(width));
+                let a = 3.0 * c3;
+                let b = 2.0 * c2;
+                let c = c1;
+                if a.abs() <= f64::EPSILON {
+                    if b.abs() > f64::EPSILON {
+                        let t = -c / b;
+                        if t > 0.0 && t < width {
+                            col_sup = col_sup.max(eval_abs(t));
+                        }
+                    }
+                } else {
+                    let disc = b * b - 4.0 * a * c;
+                    if disc >= 0.0 {
+                        let sqrt_disc = disc.sqrt();
+                        for t in [(-b - sqrt_disc) / (2.0 * a), (-b + sqrt_disc) / (2.0 * a)] {
+                            if t > 0.0 && t < width {
+                                col_sup = col_sup.max(eval_abs(t));
+                            }
+                        }
+                    }
+                }
+            }
+            total += col_sup;
+        }
+        total
+    }
+
     // ── monotonicity enforcement ──
 
     fn support_interval(&self) -> Result<(f64, f64), String> {
