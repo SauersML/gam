@@ -3924,22 +3924,46 @@ where
             };
         let mut used_fisher_fallback_this_iter = false;
         let curvature_start = std::time::Instant::now();
-        let mut state = match model.update_with_curvature(&beta, preferred_curvature) {
-            Ok(state) => state,
-            Err(_) if preferred_curvature == HessianCurvatureKind::Observed => {
-                used_fisher_fallback_this_iter = true;
-                consecutive_fisher_fallbacks += 1;
-                if consecutive_fisher_fallbacks > 2 && !force_fisher_for_rest {
-                    log::info!(
-                        "[PIRLS] force_fisher_for_rest engaged at iter={} (consecutive_fisher_fallbacks={}) reason=iter_start",
-                        iter,
-                        consecutive_fisher_fallbacks,
-                    );
-                    force_fisher_for_rest = true;
+        // The previous iter's LM accept path computed `accepted_state` via
+        // `update_candidate(candidate_beta, state.hessian_curvature)` and
+        // stored it as `final_state`. The new iter starts at exactly that
+        // candidate_beta (line `beta = candidate_beta` in the accept branch),
+        // and the working model's `last_*` buffers (eta, mu, weights, ...)
+        // are already populated at this beta. Rebuilding the curvature here
+        // would reproduce identical numbers at the cost of a full sweep
+        // (XᵀWX assembly + PD ridge + gradient) — measured 23 s / iter on
+        // the biobank duchon60 lane (n=320 K, p_eff=42), where it doubled
+        // wall-clock per iter on top of the candidate eval that already paid
+        // the same cost. Reuse `final_state` when the cached curvature kind
+        // matches what this iter requests; otherwise (e.g. force_fisher_for_rest
+        // just engaged, flipping preferred from Observed → Fisher) fall
+        // through to the rebuild path. Iter 1 always rebuilds because no
+        // prior accept has populated `final_state`.
+        let cache_curvature_kind = final_state.as_ref().map(|s| s.hessian_curvature);
+        let cached_state_matches =
+            iter > 1 && cache_curvature_kind == Some(preferred_curvature);
+        let mut state = if cached_state_matches {
+            final_state
+                .take()
+                .expect("cached_state_matches implies final_state.is_some()")
+        } else {
+            match model.update_with_curvature(&beta, preferred_curvature) {
+                Ok(state) => state,
+                Err(_) if preferred_curvature == HessianCurvatureKind::Observed => {
+                    used_fisher_fallback_this_iter = true;
+                    consecutive_fisher_fallbacks += 1;
+                    if consecutive_fisher_fallbacks > 2 && !force_fisher_for_rest {
+                        log::info!(
+                            "[PIRLS] force_fisher_for_rest engaged at iter={} (consecutive_fisher_fallbacks={}) reason=iter_start",
+                            iter,
+                            consecutive_fisher_fallbacks,
+                        );
+                        force_fisher_for_rest = true;
+                    }
+                    model.update_with_curvature(&beta, HessianCurvatureKind::Fisher)?
                 }
-                model.update_with_curvature(&beta, HessianCurvatureKind::Fisher)?
+                Err(err) => return Err(err),
             }
-            Err(err) => return Err(err),
         };
         let mut curvature_total = curvature_start.elapsed();
         // Log the ACTUAL curvature used, not the preferred one. When
@@ -3951,10 +3975,11 @@ where
         // diagnostic (commit 971e67ad), masking observed-Hessian PD
         // failures at biobank scale.
         log::info!(
-            "[STAGE] PIRLS update_with_curvature iter={} curvature={:?} elapsed={:.3}s",
+            "[STAGE] PIRLS update_with_curvature iter={} curvature={:?} elapsed={:.3}s source={}",
             iter,
             state.hessian_curvature,
             curvature_total.as_secs_f64(),
+            if cached_state_matches { "reused_prev_accept" } else { "rebuilt" },
         );
         // Per-iter LM-loop accumulators. Surface where the inner Newton
         // spends time when the LM has to halve repeatedly: solve-direction
