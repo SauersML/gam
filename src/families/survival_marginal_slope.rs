@@ -3716,7 +3716,7 @@ impl SurvivalMarginalSlopeFamily {
         };
         let probit_scale = self.probit_frailty_scale();
         let a_init = q * rigid_observed_scale(slope, probit_scale) / probit_scale;
-        let (a, _, _) = super::monotone_root::solve_monotone_root(
+        let solution = super::monotone_root::solve_monotone_root_detailed(
             &eval,
             a_init,
             "survival intercept",
@@ -3724,6 +3724,7 @@ impl SurvivalMarginalSlopeFamily {
             64,
             64,
         )?;
+        let a = solution.root;
         let (residual, final_deriv, _) = eval(a)?;
         let abs_deriv = final_deriv.abs();
         if !abs_deriv.is_finite() || abs_deriv == 0.0 {

@@ -4640,6 +4640,63 @@ mod tests {
     }
 
     #[test]
+    fn cell_moment_scratch_reuses_buffers_under_margslope_like_pressure() {
+        let cells = [
+            DenestedCubicCell {
+                left: -1.2,
+                right: -0.35,
+                c0: 0.18,
+                c1: 0.72,
+                c2: -0.045,
+                c3: 0.018,
+            },
+            DenestedCubicCell {
+                left: -0.35,
+                right: 0.48,
+                c0: -0.08,
+                c1: 0.91,
+                c2: 0.038,
+                c3: -0.014,
+            },
+            DenestedCubicCell {
+                left: 0.48,
+                right: 1.4,
+                c0: 0.11,
+                c1: 0.83,
+                c2: 0.022,
+                c3: 0.012,
+            },
+        ];
+        let mut scratch = CellMomentScratch::with_capacity(MAX_AFFINE_ANCHOR_DEGREE);
+        for cell in cells {
+            let baseline = evaluate_cell_moments(cell, 9).expect("baseline moments");
+            let scratch_state =
+                evaluate_cell_moments_with_scratch(cell, 9, &mut scratch).expect("scratch moments");
+            assert_eq!(baseline.branch, scratch_state.branch);
+            assert!((baseline.value - scratch_state.value).abs() <= 1e-10);
+            assert_eq!(baseline.moments.len(), scratch_state.moments.len());
+            for (lhs, rhs) in baseline.moments.iter().zip(scratch_state.moments.iter()) {
+                assert!((lhs - rhs).abs() <= 1e-10, "{lhs} vs {rhs}");
+            }
+        }
+
+        reset_cell_moment_test_reallocs();
+        let mut checksum = 0.0;
+        for i in 0..5_000 {
+            let cell = cells[i % cells.len()];
+            let state = evaluate_cell_moments_with_scratch(cell, 9, &mut scratch)
+                .expect("scratch moments under repeated pressure");
+            checksum += state.value + state.moments[0] * 1e-12;
+        }
+        assert!(checksum.is_finite());
+        assert_eq!(
+            cell_moment_test_reallocs(),
+            0,
+            "scratch-backed inner cell-moment calls should not grow Vec buffers"
+        );
+    }
+
+    #[test]
     fn evaluate_cell_moments_matches_numeric_integrals() {
         let cell = DenestedCubicCell {
             left: -0.9,
