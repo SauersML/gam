@@ -4165,27 +4165,6 @@ const IFT_WARM_START_DRHO_EPS: f64 = 1e-12;
 /// drops the adaptive cap-margin signal.
 pub(crate) const IFT_RESIDUAL_NO_SIGNAL_BITS: u64 = 0x7ff8_0000_0000_0000;
 
-/// Free-function form of the IFT warm-start predictor. Operates purely on
-/// the cache + canonical penalties + new ρ, so it is testable without
-/// instantiating a full `RemlState`.
-///
-/// Math (see field doc on `RemlState::ift_warm_start_cache`):
-/// `β_predict(ρ_new) = β_cur − Σ_k Δρ_k · H_pen^{-1} · (e^{ρ_cur_k} S_k β_cur)`
-/// where Δρ = ρ_new − ρ_cur and H_pen, β are taken at the cached solve.
-///
-/// Basis handling: S_k and β_cur live in the ORIGINAL basis (the cache
-/// stashes β_original). H_pen, however, is cached in the TRANSFORMED basis
-/// (it comes from `PirlsResult.penalized_hessian_transformed`). When the
-/// PIRLS solve was run in original-sparse-native mode (`frame_was_original`),
-/// `qs = I` and we solve directly. Otherwise we round-trip through qs:
-/// `qs · H_tfd · qs^T · u = v` ⟹ `u = qs · (H_tfd \ (qs^T · v))`. qs is
-/// orthogonal by construction (`stable_reparameterizationwith_invariant`
-/// builds it from orthogonal eigenvector matrices), so qs^{-1} = qs^T.
-/// Test-only thin wrapper: factorize H_pen inline and call the inner
-/// predictor. Production callers use `RemlState::predict_warm_start_beta_ift`,
-/// which routes through `predict_warm_start_beta_ift_with_factor` so the
-/// dense Cholesky is cached across successive predict calls. The
-/// `dead_code` allow keeps the inline-factorize path callable from the
 /// Adaptive clamp for the `initial_lm_lambda` warm-start hint passed
 /// from `execute_pirls_if_needed` into PIRLS. Selects one of three
 /// principled regimes based on the previous PIRLS solve's halving
