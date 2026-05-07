@@ -1270,18 +1270,21 @@ impl BernoulliMarginalSlopePredictor {
             }
         }
 
+        // Same adaptive tolerance the acceptance check below uses; passing
+        // a tighter `convergence_tol` would just iterate past what we accept.
+        let target = marginal.mu;
+        let abs_tol = 1e-8_f64.max(1e-4 * target.abs());
+
         let (root, _, f_best) = crate::families::monotone_root::solve_monotone_root(
             eval,
             intercept,
             "saved bernoulli intercept",
-            1e-10,
+            abs_tol,
             64,
             48,
         )
         .map_err(EstimationError::InvalidInput)?;
 
-        let target = marginal.mu;
-        let abs_tol = 1e-8_f64.max(1e-4 * target.abs());
         if f_best.abs() > abs_tol {
             return Err(EstimationError::InvalidInput(format!(
                 "saved bernoulli marginal-slope intercept solve failed: residual={f_best:.3e} at a={root:.6}, target mu={target:.6}"

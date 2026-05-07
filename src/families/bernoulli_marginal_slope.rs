@@ -3071,11 +3071,24 @@ impl BernoulliMarginalSlopeFamily {
         });
         let a_init = cached_a.unwrap_or(a_closed_form);
 
+        // Adaptive acceptance tolerance: for extreme slopes the intercept
+        // equation becomes numerically flat and tight absolute precision is
+        // not achievable. We accept any bracketed solution at this level, so
+        // pass the same tolerance to the root solver — driving it tighter
+        // than `abs_tol` is wasted cell-moment work, since at biobank scale
+        // (n=320k, FLEX active with linkwiggle + score-warp) the solver is
+        // called once per row per Hessian build and the per-row cell-moment
+        // kernel dominates wall time. With this tolerance the closed-form /
+        // affine warm start short-circuits at `monotone_root.rs:26` for the
+        // common case, instead of forcing 30+ refinement iters down to 1e-10.
+        let target = marginal.mu;
+        let abs_tol = 1e-8_f64.max(1e-4 * target.abs());
+
         let mut solve_result = super::monotone_root::solve_monotone_root(
             eval,
             a_init,
             "bernoulli intercept",
-            1e-10,
+            abs_tol,
             64,
             48,
         );
@@ -3090,19 +3103,13 @@ impl BernoulliMarginalSlopeFamily {
                 eval,
                 a_closed_form,
                 "bernoulli intercept",
-                1e-10,
+                abs_tol,
                 64,
                 48,
             );
         }
         let (a, abs_deriv, f_best) = solve_result?;
 
-        // Adaptive tolerance: for extreme slopes the intercept equation
-        // becomes numerically flat and tight absolute precision is not
-        // achievable.  Accept the best bracketed solution when the
-        // relative residual is small.
-        let target = marginal.mu;
-        let abs_tol = 1e-8_f64.max(1e-4 * target.abs());
         if f_best.abs() > abs_tol {
             return Err(format!(
                 "bernoulli marginal-slope intercept solve failed: \
