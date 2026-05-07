@@ -11959,7 +11959,11 @@ mod tests {
             ],
             Array1::zeros(0),
             1.0,
-            None,
+            // Minimal beta_covariance to satisfy the saved-model invariant
+            // (`needs_covariance` for nonlinear families): the test exercises
+            // latent-z normalization replay, not covariance accuracy, so the
+            // identity is fine.
+            Some(Array2::eye(2)),
             None,
             None,
             SavedFitSummary {
@@ -13177,6 +13181,10 @@ mod tests {
         payload.formula_logslope = Some("ls ~ 1".to_string());
         payload.z_column = Some("z".to_string());
         payload.latent_z_normalization = Some(SavedLatentZNormalization { mean: 0.0, sd: 1.0 });
+        // Marginal-slope saved-model invariant requires `latent_measure` to be
+        // populated; the standard-normal default matches the test's frozen
+        // latent-z policy.
+        payload.latent_measure = Some(LatentMeasureKind::StandardNormal);
         payload.logslope_baseline = Some(0.0);
         payload.link = Some("probit".to_string());
         let model = SavedModel::from_payload(payload);
@@ -13348,6 +13356,10 @@ mod tests {
         payload.formula_logslope = Some("1".to_string());
         payload.z_column = Some("z".to_string());
         payload.latent_z_normalization = Some(SavedLatentZNormalization { mean: 1.0, sd: 2.0 });
+        // Marginal-slope saved-model invariant requires `latent_measure`; this
+        // test exercises latent-z normalization replay, so a standard-normal
+        // measure (the frozen default) is correct.
+        payload.latent_measure = Some(LatentMeasureKind::StandardNormal);
         payload.logslope_baseline = Some(0.0);
         payload.link = Some("probit".to_string());
         let model = SavedModel::from_payload(payload);
