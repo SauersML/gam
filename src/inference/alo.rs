@@ -97,17 +97,6 @@ fn multiblock_col_offsets(block_designs: &[Array2<f64>]) -> Vec<usize> {
     offsets
 }
 
-#[allow(dead_code)]
-#[inline]
-fn multiblock_alo_chunk_size(p_tot: usize, n_blocks: usize, n_obs: usize) -> usize {
-    if p_tot == 0 || n_blocks == 0 || n_obs == 0 {
-        return 1;
-    }
-    let bytes_per_obs = (p_tot * n_blocks * std::mem::size_of::<f64>()).max(1);
-    let budget_obs = (MULTIBLOCK_ALO_MEMORY_BUDGET_BYTES / bytes_per_obs).max(1);
-    budget_obs.min(n_obs)
-}
-
 #[inline]
 fn multiblock_alo_parallel_leverage_chunk_size(
     p_tot: usize,
