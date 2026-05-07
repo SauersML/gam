@@ -881,15 +881,32 @@ impl DenseDesignMatrix {
     }
 
     pub fn try_to_dense_arc(&self, context: &str) -> Result<Arc<Array2<f64>>, String> {
+        self.try_to_dense_arc_with_policy(context, &ResourcePolicy::default_library())
+    }
+
+    /// Policy-aware variant of [`Self::try_to_dense_arc`].
+    ///
+    /// Uses the supplied policy's `max_single_materialization_bytes` cap when
+    /// deciding whether to densify a lazy operator-backed design.  The default
+    /// `try_to_dense_arc` always uses `ResourcePolicy::default_library()` (the
+    /// conservative 256 MiB cap suitable for ad-hoc dense conversions); cache
+    /// layers that have their own larger cap (e.g.
+    /// `CoefficientTransformOperator::MATERIALIZE_MAX_BYTES`) can call this
+    /// method to consume the inner under their own threshold without forcing
+    /// the conservative default on every consumer.
+    pub fn try_to_dense_arc_with_policy(
+        &self,
+        context: &str,
+        policy: &ResourcePolicy,
+    ) -> Result<Arc<Array2<f64>>, String> {
         match self {
             Self::Materialized(matrix) => Ok(Arc::clone(matrix)),
             Self::Lazy(op) => {
-                let policy = ResourcePolicy::default_library();
                 panic_or_error_if_biobank_mode_and_to_dense_called_with_policy(
                     context,
                     op.nrows(),
                     op.ncols(),
-                    &policy,
+                    policy,
                 )?;
                 dense_operator_to_dense_by_chunks(op.as_ref())
                     .map(Arc::new)
@@ -3326,8 +3343,15 @@ impl CoefficientTransformOperator {
     }
 
     /// Get-or-build the materialized X · T dense block. Returns `None` when
-    /// the block would exceed `MATERIALIZE_MAX_BYTES`; in that case callers
-    /// fall back to per-chunk evaluation.
+    /// either the X·T product exceeds the operator's local cap *or* when the
+    /// inner design refuses dense materialization under the cache-local
+    /// policy (the cache owns the densified block's lifetime, so it gates
+    /// the inner densification on the same `MATERIALIZE_MAX_BYTES` budget
+    /// rather than falling back to the conservative library default).  In
+    /// either case callers fall back to per-chunk evaluation; the cache is
+    /// best-effort optimization, not a hard requirement, so a refusal must
+    /// never panic — the streaming `row_chunk_into` / `apply` paths still
+    /// work.
     fn materialized_combined(&self) -> Option<&Array2<f64>> {
         self.materialized
             .get_or_init(|| {
@@ -3337,8 +3361,17 @@ impl CoefficientTransformOperator {
                     .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()));
                 match bytes {
                     Some(b) if b <= Self::MATERIALIZE_MAX_BYTES => {
-                        let x = self.inner.to_dense();
-                        Some(Arc::new(fast_ab(&x, &self.transform)))
+                        let cache_policy = ResourcePolicy {
+                            max_single_materialization_bytes: Self::MATERIALIZE_MAX_BYTES,
+                            ..ResourcePolicy::default_library()
+                        };
+                        self.inner
+                            .try_to_dense_arc_with_policy(
+                                "CoefficientTransformOperator materialization",
+                                &cache_policy,
+                            )
+                            .ok()
+                            .map(|x| Arc::new(fast_ab(x.as_ref(), &self.transform)))
                     }
                     _ => None,
                 }

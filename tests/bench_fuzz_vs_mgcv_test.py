@@ -44,7 +44,7 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
         self.assertEqual(cmd[-1], "y ~ s(x0, type=ps, knots=8, double_penalty=true) + s(x1, type=ps, knots=8, double_penalty=true)")
 
     def test_duchon_noise_terms_stay_rhs_only(self) -> None:
-        sc = _scenario(basis_type="duchon", knots=10, double_penalty=False, duchon_order=1, duchon_power=2)
+        sc = _scenario(basis_type="duchon", knots=10, double_penalty=False, duchon_order=0, duchon_power=2)
 
         noise_terms = _FUZZ.rust_noise_terms(["x0", "x1", "x2"], sc)
 
@@ -52,7 +52,7 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
         # scale-free Duchon with mgcv bs='ds' (mgcv has no hybrid-mode analog).
         self.assertEqual(
             noise_terms,
-            "duchon(x0, x1, centers=5, order=1, power=2)",
+            "duchon(x0, x1, centers=5, order=0, power=2)",
         )
         self.assertNotIn("~", noise_terms)
 

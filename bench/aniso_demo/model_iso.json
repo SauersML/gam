@@ -2,7 +2,7 @@
   "model_type": "transformation-normal",
   "payload": {
     "version": 4,
-    "formula": "pgs_raw ~ duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)",
+    "formula": "pgs_raw ~ duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=0, power=8, length_scale=1)",
     "model_kind": "transformation-normal",
     "family_state": {
       "family_kind": "transformation-normal",
@@ -1425,7 +1425,7 @@
       "random_effect_terms": [],
       "smooth_terms": [
         {
-          "name": "duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=1, power=8, length_scale=1)",
+          "name": "duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=12, order=0, power=8, length_scale=1)",
           "basis": {
             "Duchon": {
               "feature_cols": [
