@@ -279,7 +279,7 @@ class RunSuiteMappingTests(unittest.TestCase):
             cfg["knots"],
             ", double_penalty=true",
         )
-        self.assertIn("order=1", term)
+        self.assertIn("order=0", term)
         self.assertIn("power=8", term)
         self.assertIn("length_scale=1.0", term)
         self.assertNotIn("double_penalty", term)

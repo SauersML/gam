@@ -1056,6 +1056,13 @@ pub trait CustomFamily {
         false
     }
 
+    fn inner_joint_workspace_log_likelihood_available(
+        &self,
+        _specs: &[ParameterBlockSpec],
+    ) -> bool {
+        false
+    }
+
     /// True only when the family has a real profiled outer Hessian-vector
     /// product over θ = (ρ, ψ), without enumerating all θ_i θ_j pairs.
     fn outer_hyper_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
@@ -4353,6 +4360,10 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
         Ok(None)
     }
 
+    fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
+        Ok(None)
+    }
+
     fn joint_gradient_evaluation(
         &self,
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
@@ -6392,6 +6403,25 @@ fn exact_newton_joint_hessian_source_from_workspace(
         ));
     }
 
+    if matches!(preference, JointHessianSourcePreference::PreferDense) {
+        let zero = Array1::<f64>::zeros(total);
+        let Some(zero_image) = workspace.hessian_matvec(&zero)? else {
+            return Ok(None);
+        };
+        if zero_image.len() != total {
+            return Err(format!(
+                "{context}: operator matvec length mismatch: got {}, expected {}",
+                zero_image.len(),
+                total
+            ));
+        }
+        if zero_image.iter().any(|value| !value.is_finite()) {
+            return Err(format!(
+                "{context}: operator matvec returned non-finite values"
+            ));
+        }
+    }
+
     let workspace_apply = Arc::clone(workspace);
     let workspace_apply_into = Arc::clone(workspace);
     let context_apply: Arc<str> = Arc::from(context);
@@ -7761,6 +7791,73 @@ impl BlockEtaCheckpoint {
     }
 }
 
+fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    states: &[ParameterBlockState],
+    prefer_workspace: bool,
+) -> Result<(f64, Option<Arc<dyn ExactNewtonJointHessianWorkspace>>), String> {
+    if prefer_workspace
+        && family.inner_joint_workspace_log_likelihood_available(specs)
+        && let Some(workspace) =
+            family.exact_newton_joint_hessian_workspace_with_options(states, specs, options)?
+    {
+        if let Some(log_likelihood) = workspace.joint_log_likelihood_evaluation()? {
+            return Ok((log_likelihood, Some(workspace)));
+        }
+    }
+    family
+        .log_likelihood_only(states)
+        .map(|log_likelihood| (log_likelihood, None))
+}
+
+type JointGradientLoad = (
+    f64,
+    Option<Array1<f64>>,
+    Option<FamilyEvaluation>,
+    Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+);
+
+fn load_joint_gradient_evaluation<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    states: &[ParameterBlockState],
+    prefer_workspace: bool,
+    preferred_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+) -> Result<JointGradientLoad, String> {
+    let workspace = match preferred_workspace {
+        Some(workspace) => Some(workspace),
+        None if prefer_workspace => {
+            family.exact_newton_joint_hessian_workspace_with_options(states, specs, options)?
+        }
+        None => None,
+    };
+    if let Some(workspace_ref) = workspace.as_ref()
+        && let Some(joint_eval) = workspace_ref.joint_gradient_evaluation()?
+    {
+        return Ok((
+            joint_eval.log_likelihood,
+            Some(joint_eval.gradient),
+            None,
+            Some(Arc::clone(workspace_ref)),
+        ));
+    }
+    if let Some(joint_eval) = family.exact_newton_joint_gradient_evaluation(states, specs)? {
+        return Ok((
+            joint_eval.log_likelihood,
+            Some(joint_eval.gradient),
+            None,
+            workspace,
+        ));
+    }
+    let eval = family.evaluate(states)?;
+    let log_likelihood = eval.log_likelihood;
+    let gradient = exact_newton_joint_gradient_from_eval(&eval, specs)?;
+    Ok((log_likelihood, gradient, Some(eval), workspace))
+}
+
 fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -7845,50 +7942,20 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         cached_active_sets = seed.active_sets.clone();
         refresh_all_block_etas(family, specs, &mut states)?;
     }
-    let load_joint_gradient = |states: &[ParameterBlockState]| -> Result<
-        (
-            f64,
-            Option<Array1<f64>>,
-            Option<FamilyEvaluation>,
-            Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
-        ),
-        String,
-    > {
-        let workspace = if matrix_free_joint_workspace {
-            family.exact_newton_joint_hessian_workspace_with_options(states, specs, options)?
-        } else {
-            None
-        };
-        if let Some(workspace_ref) = workspace.as_ref()
-            && let Some(joint_eval) = workspace_ref.joint_gradient_evaluation()?
-        {
-            return Ok((
-                joint_eval.log_likelihood,
-                Some(joint_eval.gradient),
-                None,
-                Some(Arc::clone(workspace_ref)),
-            ));
-        }
-        if let Some(joint_eval) = family.exact_newton_joint_gradient_evaluation(states, specs)? {
-            return Ok((
-                joint_eval.log_likelihood,
-                Some(joint_eval.gradient),
-                None,
-                workspace,
-            ));
-        }
-        let eval = family.evaluate(states)?;
-        let log_likelihood = eval.log_likelihood;
-        let gradient = exact_newton_joint_gradient_from_eval(&eval, specs)?;
-        Ok((log_likelihood, gradient, Some(eval), workspace))
-    };
     let (
         mut current_log_likelihood,
         mut cached_eval,
         mut cached_joint_gradient,
         mut cached_joint_workspace,
     ) = if use_joint_newton {
-        let (log_likelihood, gradient, eval, workspace) = load_joint_gradient(&states)?;
+        let (log_likelihood, gradient, eval, workspace) = load_joint_gradient_evaluation(
+            family,
+            specs,
+            options,
+            &states,
+            matrix_free_joint_workspace,
+            None,
+        )?;
         (log_likelihood, eval, gradient, workspace)
     } else {
         let eval = family.evaluate(&states)?;
@@ -8088,6 +8155,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     joint_mode_diagonal_ridge,
                 );
                 let rhs = &grad_joint - &penalty_beta;
+                let pcg_started = std::time::Instant::now();
                 let mut delta = if use_joint_matrix_free_path(total_p, total_joint_n) {
                     let preconditioner_diag = match &joint_hessian_source {
                         JointHessianSource::Dense(h_joint) => joint_penalty_preconditioner_diag(
@@ -8169,6 +8237,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 } else {
                     None
                 };
+                if use_joint_matrix_free_path(total_p, total_joint_n) {
+                    log::info!(
+                        "[PIRLS/joint-PCG] cycle {:>3} | n={} p={} solved={} elapsed={:.3}s",
+                        cycle,
+                        total_joint_n,
+                        total_p,
+                        delta.is_some(),
+                        pcg_started.elapsed().as_secs_f64()
+                    );
+                }
                 if delta.is_none() {
                     let mut lhs = match materialize_joint_hessian_source(
                         &joint_hessian_source,
@@ -8218,6 +8296,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let old_beta: Vec<Array1<f64>> = states.iter().map(|s| s.beta.clone()).collect();
             let old_objective = lastobjective;
             let mut accepted = false;
+            let mut accepted_joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>> =
+                None;
             let mut barrier_ceiling = 1.0_f64;
             for (block_idx, (start, end)) in ranges.iter().copied().enumerate() {
                 let block_delta = delta.slice(s![start..end]).to_owned();
@@ -8246,8 +8326,17 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     states[b].beta.assign(&projected);
                 }
                 refresh_all_block_etas(family, specs, &mut states)?;
-                let trial_ll = match family.log_likelihood_only(&states) {
-                    Ok(value) => value,
+                let trial_ll = match joint_line_search_log_likelihood(
+                    family,
+                    specs,
+                    options,
+                    &states,
+                    matrix_free_joint_workspace,
+                ) {
+                    Ok((value, workspace)) => {
+                        accepted_joint_workspace = workspace;
+                        value
+                    }
                     Err(_) => {
                         for (b, old) in old_beta.iter().enumerate() {
                             states[b].beta.assign(old);
@@ -8268,6 +8357,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     accepted = true;
                     break;
                 }
+                accepted_joint_workspace = None;
             }
             if !accepted {
                 // Restore original betas
@@ -8278,7 +8368,15 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 break; // Fall back to blockwise
             }
 
-            let (log_likelihood, gradient, eval, workspace) = load_joint_gradient(&states)?;
+            let (log_likelihood, gradient, eval, workspace) =
+                load_joint_gradient_evaluation(
+                    family,
+                    specs,
+                    options,
+                    &states,
+                    matrix_free_joint_workspace,
+                    accepted_joint_workspace.take(),
+                )?;
             current_log_likelihood = log_likelihood;
             cached_joint_gradient = gradient;
             cached_eval = eval;

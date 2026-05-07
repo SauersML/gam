@@ -3922,9 +3922,10 @@ impl SurvivalMarginalSlopeFamily {
         coeff_aau[primary.g] = dc_daab;
         coeff_abu[primary.g] = dc_dabb;
         coeff_bbu[primary.g] = dc_dbbb;
-        coeff_aaau[primary.g] = dc_daab;
-        coeff_aabu[primary.g] = dc_dabb;
-        coeff_abbu[primary.g] = dc_dbbb;
+        coeff_aaau[primary.g] = [0.0; 4];
+        coeff_aabu[primary.g] = [0.0; 4];
+        coeff_abbu[primary.g] = [0.0; 4];
+        coeff_bbbu[primary.g] = [0.0; 4];
 
         if let (Some(h_range), Some(runtime)) = (primary.h.as_ref(), self.score_warp.as_ref()) {
             for local_idx in 0..h_range.len() {
@@ -6198,9 +6199,10 @@ impl SurvivalMarginalSlopeFamily {
         g_aau_fixed[primary.g] = obs.dc_daab;
         g_abu_fixed[primary.g] = obs.dc_dabb;
         g_bbu_fixed[primary.g] = obs.dc_dbbb;
-        g_aaau_fixed[primary.g] = obs.dc_daab;
-        g_aabu_fixed[primary.g] = obs.dc_dabb;
-        g_abbu_fixed[primary.g] = obs.dc_dbbb;
+        g_aaau_fixed[primary.g] = [0.0; 4];
+        g_aabu_fixed[primary.g] = [0.0; 4];
+        g_abbu_fixed[primary.g] = [0.0; 4];
+        g_bbbu_fixed[primary.g] = [0.0; 4];
 
         tau[primary.g] = eval_coeff4_at(&obs.dc_dab, z_obs);
         tau_a[primary.g] = eval_coeff4_at(&obs.dc_daab, z_obs);
@@ -7318,9 +7320,10 @@ impl SurvivalMarginalSlopeFamily {
         g_aau_fixed[primary.g] = obs.dc_daab;
         g_abu_fixed[primary.g] = obs.dc_dabb;
         g_bbu_fixed[primary.g] = obs.dc_dbbb;
-        g_aaau_fixed[primary.g] = obs.dc_daab;
-        g_aabu_fixed[primary.g] = obs.dc_dabb;
-        g_abbu_fixed[primary.g] = obs.dc_dbbb;
+        g_aaau_fixed[primary.g] = [0.0; 4];
+        g_aabu_fixed[primary.g] = [0.0; 4];
+        g_abbu_fixed[primary.g] = [0.0; 4];
+        g_bbbu_fixed[primary.g] = [0.0; 4];
 
         if let (Some(h_range), Some(runtime)) = (primary.h.as_ref(), self.score_warp.as_ref()) {
             for local_idx in 0..h_range.len() {
@@ -14535,6 +14538,45 @@ mod tests {
                 eta: Array1::from_elem(n, g),
             },
         ]
+    }
+
+    #[test]
+    fn survival_primary_g_fourth_cell_partials_are_zero() {
+        let family = make_closed_form_test_family(1);
+        let primary = flex_primary_slices(&family);
+        let score_span = exact_kernel::LocalSpanCubic {
+            left: -1.0,
+            right: 1.0,
+            c0: 0.2,
+            c1: -0.1,
+            c2: 0.05,
+            c3: -0.02,
+        };
+        let link_span = exact_kernel::LocalSpanCubic {
+            left: -0.5,
+            right: 0.5,
+            c0: 0.1,
+            c1: 0.3,
+            c2: -0.2,
+            c3: 0.4,
+        };
+        let fixed = family
+            .denested_cell_primary_fixed_partials(
+                &primary, 0.2, 0.7, score_span, link_span, 0.0, 0.0,
+            )
+            .expect("primary fixed partials");
+        let (_, dc_daab, dc_dabb, dc_dbbb) = exact_kernel::denested_cell_third_partials(link_span);
+
+        assert_eq!(fixed.coeff_aau[primary.g], dc_daab);
+        assert_eq!(fixed.coeff_abu[primary.g], dc_dabb);
+        assert_eq!(fixed.coeff_bbu[primary.g], dc_dbbb);
+        assert!(dc_daab.iter().any(|value| *value != 0.0));
+        assert!(dc_dabb.iter().any(|value| *value != 0.0));
+        assert!(dc_dbbb.iter().any(|value| *value != 0.0));
+        assert_eq!(fixed.coeff_aaau[primary.g], [0.0; 4]);
+        assert_eq!(fixed.coeff_aabu[primary.g], [0.0; 4]);
+        assert_eq!(fixed.coeff_abbu[primary.g], [0.0; 4]);
+        assert_eq!(fixed.coeff_bbbu[primary.g], [0.0; 4]);
     }
 
     #[test]

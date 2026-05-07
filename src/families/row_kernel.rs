@@ -17,7 +17,7 @@
 //! All assembly — gradient, matvec, diagonal, dense Hessian, directional
 //! derivatives — is then generic over any `RowKernel<K>`.
 
-use crate::custom_family::ExactNewtonJointHessianWorkspace;
+use crate::custom_family::{ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace};
 use crate::solver::estimate::reml::unified::HyperOperator;
 use ndarray::{Array1, Array2};
 use rayon::prelude::*;
@@ -472,6 +472,19 @@ impl<const K: usize, T: RowKernel<K>> RowKernelHessianWorkspace<K, T> {
 impl<const K: usize, T: RowKernel<K> + 'static> ExactNewtonJointHessianWorkspace
     for RowKernelHessianWorkspace<K, T>
 {
+    fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
+        Ok(Some(row_kernel_log_likelihood(&self.cache)))
+    }
+
+    fn joint_gradient_evaluation(
+        &self,
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        Ok(Some(ExactNewtonJointGradientEvaluation {
+            log_likelihood: row_kernel_log_likelihood(&self.cache),
+            gradient: -row_kernel_gradient(&*self.kern, &self.cache),
+        }))
+    }
+
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
         // The cached row-kernel state already encodes everything needed to
         // accumulate the dense joint Hessian in one row pass via

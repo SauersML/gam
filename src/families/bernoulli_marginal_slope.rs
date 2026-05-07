@@ -38,7 +38,7 @@ use ndarray::{Array1, Array2, ArrayView2, s};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::cell::RefCell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 mod deviation_runtime;
 pub(crate) mod exact_kernel;
@@ -348,11 +348,26 @@ pub(crate) fn bernoulli_marginal_link_map(
     eta: f64,
 ) -> Result<BernoulliMarginalLinkMap, String> {
     require_probit_marginal_slope_link(base_link, "bernoulli marginal-slope")?;
-    let phi_eta = normal_pdf(eta);
-    let mu = clamp_bernoulli_link_probability(normal_cdf(eta));
+    let raw_mu = normal_cdf(eta);
+    let mu = clamp_bernoulli_link_probability(raw_mu);
     let q = standard_normal_quantile(mu).map_err(|e| {
         format!("bernoulli marginal-slope probit target inversion failed at mu={mu}: {e}")
     })?;
+    if raw_mu <= BERNOULLI_LINK_PROBABILITY_EPS || raw_mu >= 1.0 - BERNOULLI_LINK_PROBABILITY_EPS {
+        return Ok(BernoulliMarginalLinkMap {
+            mu,
+            mu1: 0.0,
+            mu2: 0.0,
+            mu3: 0.0,
+            mu4: 0.0,
+            q,
+            q1: 0.0,
+            q2: 0.0,
+            q3: 0.0,
+            q4: 0.0,
+        });
+    }
+    let phi_eta = normal_pdf(eta);
     let phi_q = normal_pdf(q);
     if !phi_q.is_finite() || phi_q <= 0.0 {
         return Err(format!(
@@ -1196,8 +1211,8 @@ fn rigid_transformed_gradient(
     kernel: &RigidProbitKernel,
 ) -> [f64; 2] {
     [
-        -kernel.u1 * kernel.eta_q * marginal.q1,
-        -kernel.u1 * kernel.eta_g,
+        kernel.u1 * kernel.eta_q * marginal.q1,
+        kernel.u1 * kernel.eta_g,
     ]
 }
 
@@ -1207,9 +1222,10 @@ fn rigid_transformed_hessian(
     kernel: &RigidProbitKernel,
 ) -> [[f64; 2]; 2] {
     let h_q = kernel.primary_hessian(marginal.q);
+    let grad_q = kernel.u1 * kernel.eta_q;
     [
         [
-            h_q[0][0] * marginal.q1 * marginal.q1 + (-kernel.u1 * kernel.eta_q) * marginal.q2,
+            h_q[0][0] * marginal.q1 * marginal.q1 + grad_q * marginal.q2,
             h_q[0][1] * marginal.q1,
         ],
         [h_q[1][0] * marginal.q1, h_q[1][1]],
@@ -1234,7 +1250,7 @@ fn rigid_transformed_third_contracted(
     d_g: f64,
 ) -> [[f64; 2]; 2] {
     let h_q = kernel.primary_hessian(marginal.q);
-    let grad_q = -kernel.u1 * kernel.eta_q;
+    let grad_q = kernel.u1 * kernel.eta_q;
     let (f_qqq, f_qqg, f_qgg, f_ggg) = rigid_internal_third_components(marginal, kernel);
     let f_etaetaeta = f_qqq * marginal.q1.powi(3)
         + 3.0 * h_q[0][0] * marginal.q1 * marginal.q2
@@ -1263,7 +1279,7 @@ fn rigid_transformed_fourth_contracted(
     v_g: f64,
 ) -> [[f64; 2]; 2] {
     let h_q = kernel.primary_hessian(marginal.q);
-    let grad_q = -kernel.u1 * kernel.eta_q;
+    let grad_q = kernel.u1 * kernel.eta_q;
     let (f_qqq, f_qqg, f_qgg, _) = rigid_internal_third_components(marginal, kernel);
     let qq = kernel.fourth_contracted(marginal.q, 1.0, 0.0, 1.0, 0.0);
     let qg = kernel.fourth_contracted(marginal.q, 1.0, 0.0, 0.0, 1.0);
@@ -2217,6 +2233,7 @@ struct BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
     family: BernoulliMarginalSlopeFamily,
     block_states: Vec<ParameterBlockState>,
     cache: BernoulliMarginalSlopeExactEvalCache,
+    matvec_calls: AtomicUsize,
     /// Outer-only joint-Hessian directional-derivative options. The
     /// `outer_score_subsample` field is the row mask threaded through the
     /// `_with_options` directional-derivative helpers so the cached joint
@@ -5585,6 +5602,63 @@ impl BernoulliMarginalSlopeFamily {
         Ok(dense)
     }
 
+    fn log_likelihood_from_exact_cache(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+    ) -> Result<f64, String> {
+        if !self.effective_flex_active(block_states)? {
+            return self
+                .log_likelihood_only_with_options(block_states, &BlockwiseFitOptions::default());
+        }
+        let n = self.y.len();
+        let started = std::time::Instant::now();
+        if log_exact_work(n) {
+            log::info!(
+                "[BMS exact-loglik] eval start n={} p={} source=cache",
+                n,
+                cache.slices.total
+            );
+        }
+        let beta_h = self.score_beta(block_states)?;
+        let beta_w = self.link_beta(block_states)?;
+        let total: Result<f64, String> = (0..n)
+            .into_par_iter()
+            .try_fold(
+                || 0.0,
+                |mut log_likelihood, row| -> Result<_, String> {
+                    let row_ctx = Self::row_ctx(cache, row);
+                    let slope = block_states[1].eta[row];
+                    let obs = self.observed_denested_cell_partials(
+                        row,
+                        row_ctx.intercept,
+                        slope,
+                        beta_h,
+                        beta_w,
+                    )?;
+                    let s_i = eval_coeff4_at(&obs.coeff, self.z[row]);
+                    let signed = (2.0 * self.y[row] - 1.0) * s_i;
+                    let (log_cdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
+                    log_likelihood += self.weights[row] * log_cdf;
+                    Ok(log_likelihood)
+                },
+            )
+            .try_reduce(
+                || 0.0,
+                |left, right| -> Result<_, String> { Ok(left + right) },
+            );
+        let log_likelihood = total?;
+        if log_exact_work(n) {
+            log::info!(
+                "[BMS exact-loglik] eval done n={} p={} source=cache elapsed={:.3}s",
+                n,
+                cache.slices.total,
+                started.elapsed().as_secs_f64()
+            );
+        }
+        Ok(log_likelihood)
+    }
+
     fn exact_newton_joint_gradient_evaluation_from_cache(
         &self,
         block_states: &[ParameterBlockState],
@@ -7572,6 +7646,13 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         true
     }
 
+    fn inner_joint_workspace_log_likelihood_available(
+        &self,
+        _specs: &[ParameterBlockSpec],
+    ) -> bool {
+        true
+    }
+
     fn exact_newton_joint_hessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
@@ -7808,6 +7889,7 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
             family,
             block_states,
             cache,
+            matvec_calls: AtomicUsize::new(0),
             options,
         })
     }
@@ -7823,6 +7905,12 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             .map(Some)
     }
 
+    fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
+        self.family
+            .log_likelihood_from_exact_cache(&self.block_states, &self.cache)
+            .map(Some)
+    }
+
     fn joint_gradient_evaluation(
         &self,
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
@@ -7835,13 +7923,26 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
         // Hv-action against the full coefficient Hessian is consumed by inner
         // PCG / inner-Newton paths (not outer-only score), so the row mask
         // does not apply here — keep full-data semantics.
-        self.family
+        let call = self.matvec_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        let started = std::time::Instant::now();
+        let result = self
+            .family
             .exact_newton_joint_hessian_matvec_from_cache(
                 beta_flat,
                 &self.block_states,
                 &self.cache,
             )
-            .map(Some)
+            .map(Some);
+        if log_exact_work(self.family.y.len()) && (call <= 3 || call.is_power_of_two()) {
+            log::info!(
+                "[BMS Hessian-Hv] call={} n={} p={} elapsed={:.3}s",
+                call,
+                self.family.y.len(),
+                self.cache.slices.total,
+                started.elapsed().as_secs_f64()
+            );
+        }
+        result
     }
 
     fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
@@ -8661,6 +8762,65 @@ mod tests {
             link_dev: None,
             latent_z_policy: LatentZPolicy::default(),
         }
+    }
+
+    #[test]
+    fn bernoulli_marginal_link_map_zeroes_derivatives_on_clamped_tails() {
+        let link = bernoulli_marginal_slope_probit_link();
+        let lower = bernoulli_marginal_link_map(&link, -8.0).expect("lower tail map");
+        let upper = bernoulli_marginal_link_map(&link, 8.0).expect("upper tail map");
+        let lower_q = standard_normal_quantile(BERNOULLI_LINK_PROBABILITY_EPS).unwrap();
+        let upper_q = standard_normal_quantile(1.0 - BERNOULLI_LINK_PROBABILITY_EPS).unwrap();
+
+        assert_eq!(lower.mu, BERNOULLI_LINK_PROBABILITY_EPS);
+        assert_eq!(upper.mu, 1.0 - BERNOULLI_LINK_PROBABILITY_EPS);
+        assert!((lower.q - lower_q).abs() < 1e-12);
+        assert!((upper.q - upper_q).abs() < 1e-12);
+        assert_eq!([lower.mu1, lower.mu2, lower.mu3, lower.mu4], [0.0; 4]);
+        assert_eq!([upper.mu1, upper.mu2, upper.mu3, upper.mu4], [0.0; 4]);
+        assert_eq!([lower.q1, lower.q2, lower.q3, lower.q4], [0.0; 4]);
+        assert_eq!([upper.q1, upper.q2, upper.q3, upper.q4], [0.0; 4]);
+    }
+
+    #[test]
+    fn rigid_transformed_gradient_matches_negative_log_likelihood_derivative() {
+        let link = bernoulli_marginal_slope_probit_link();
+        let eta = 0.25;
+        let g = -0.15;
+        let z = 0.7;
+        let y = 1.0;
+        let weight = 1.3;
+        let probit_scale = 1.0;
+        let objective = |eta_value: f64, g_value: f64| {
+            let marginal = bernoulli_marginal_link_map(&link, eta_value).unwrap();
+            let kernel =
+                RigidProbitKernel::new(marginal.q, g_value, z, y, weight, probit_scale).unwrap();
+            -weight * kernel.logcdf
+        };
+        let marginal = bernoulli_marginal_link_map(&link, eta).expect("marginal map");
+        let kernel =
+            RigidProbitKernel::new(marginal.q, g, z, y, weight, probit_scale).expect("kernel");
+        let grad = rigid_transformed_gradient(marginal, &kernel);
+        let step = 1e-6;
+        let finite_eta = (objective(eta + step, g) - objective(eta - step, g)) / (2.0 * step);
+        let finite_g = (objective(eta, g + step) - objective(eta, g - step)) / (2.0 * step);
+
+        assert!(
+            (grad[0] - finite_eta).abs() < 1e-7,
+            "eta gradient {} != finite difference {}",
+            grad[0],
+            finite_eta
+        );
+        assert!(
+            (grad[1] - finite_g).abs() < 1e-7,
+            "g gradient {} != finite difference {}",
+            grad[1],
+            finite_g
+        );
+        assert!(
+            grad[0] < 0.0,
+            "y=1 probit nll should decrease as eta increases"
+        );
     }
 
     fn pair_distance(lhs: (f64, f64), rhs: (f64, f64)) -> f64 {

@@ -144,7 +144,7 @@ TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS = 4
 # preflight uses a conservative cap so the modelled grid size does not
 # under-report. Bumping this up is safe (only loosens the preflight check).
 CTN_RESPONSE_INTERNAL_KNOTS_CAP = 32
-BIOBANK_DUCHON16D_ORDER = 1
+BIOBANK_DUCHON16D_ORDER = 0
 BIOBANK_DUCHON16D_POWER = 8
 BIOBANK_DUCHON16D_LENGTH_SCALE = 1.0
 PGS_RAW_COLUMN = "pgs_raw"
@@ -719,9 +719,10 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
     #
     # Previously: pick N=5000 rows uniformly at random, fit CTN on those,
     # predict z on the full 320k train + 80k test. The Duchon basis we use
-    # for the conditional-CDF surface has a polynomial nullspace (order=1
-    # in 16D ⇒ 17-dim linear nullspace), which extrapolates *linearly* and
-    # without bound outside the basis-support region. With 320k rows the
+    # for the conditional-CDF surface has a polynomial nullspace (order=0
+    # in 16D ⇒ 1-dim constant nullspace), which is well-behaved at infinity
+    # but the radial basis functions themselves still don't have well-defined
+    # extrapolation outside the basis-support region. With 320k rows the
     # most extreme PC values sit at the 1/320,000 ≈ 3e-6 quantile; with a
     # 5000-row uniform subsample they're at the 1/5,000 ≈ 2e-4 quantile —
     # **64× further into the tail** in the full data than in any uniform
