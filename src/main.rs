@@ -9321,13 +9321,13 @@ mod tests {
         Dense, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, KnotSource,
         MaternBasisSpec, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec, create_basis,
     };
+    use gam::bernoulli_marginal_slope::LatentMeasureKind;
     use gam::estimate::{
         FitGeometry, FitInference, FittedBlock, FittedLinkState, UnifiedFitResultParts,
     };
     use gam::gamlss::{
         buildwiggle_block_input_from_knots, monotone_wiggle_basis_with_derivative_order,
     };
-    use gam::bernoulli_marginal_slope::LatentMeasureKind;
     use gam::inference::data::{
         EncodedDataset as Dataset, UnseenCategoryPolicy, encode_recordswith_schema,
     };
