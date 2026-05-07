@@ -15763,6 +15763,49 @@ mod tests {
     }
 
     #[test]
+    fn auto_latent_measure_uses_empirical_grid_for_bad_normal_diagnostics() {
+        let z = array![0.0, 0.0, 0.0, 0.0, 10.0, -10.0];
+        let weights = Array1::from_elem(6, 1.0);
+        let policy = LatentZPolicy {
+            check_mode: LatentZCheckMode::Off,
+            normalization: LatentZNormalizationMode::None,
+            latent_measure: LatentMeasureSpec::Auto { grid_size: 5 },
+            ..LatentZPolicy::default()
+        };
+        let measure = build_latent_measure(&z, &weights, &policy).expect("auto latent measure");
+        match measure {
+            LatentMeasureKind::GlobalEmpirical { nodes, weights } => {
+                assert_eq!(nodes.len(), 5);
+                assert_eq!(weights.len(), 5);
+                assert!((weights.iter().sum::<f64>() - 1.0).abs() <= 1e-12);
+            }
+            LatentMeasureKind::StandardNormal => {
+                panic!("bad normal diagnostics must select empirical latent measure")
+            }
+        }
+    }
+
+    #[test]
+    fn empirical_intercept_calibrates_marginal_probability() {
+        let nodes = vec![-2.0, -0.25, 0.5, 3.0];
+        let weights = vec![0.2, 0.3, 0.1, 0.4];
+        let target_q = -0.35;
+        let target_mu = normal_cdf(target_q);
+        let slope = 0.8;
+        let scale = 0.9;
+        let intercept = empirical_intercept_from_marginal(
+            target_mu, target_q, slope, scale, &nodes, &weights, None,
+        )
+        .expect("empirical intercept");
+        let calibrated = nodes
+            .iter()
+            .zip(weights.iter())
+            .map(|(&node, &weight)| weight * normal_cdf(intercept + scale * slope * node))
+            .sum::<f64>();
+        assert!((calibrated - target_mu).abs() <= 1e-10);
+    }
+
+    #[test]
     fn flexible_family_exposes_exact_newton_workspaces() {
         let z = array![-0.8, 0.2, 1.1];
         let y = array![0.0, 1.0, 1.0];
