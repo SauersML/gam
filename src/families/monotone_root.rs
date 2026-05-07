@@ -12,6 +12,14 @@
 /// The monotone direction (increasing vs decreasing) is inferred from the
 /// sign of F'(a) at the initial point, so the same code handles both the
 /// Bernoulli case (F increasing) and the survival case (F decreasing).
+#[derive(Clone, Copy, Debug)]
+pub struct MonotoneRootSolution {
+    pub root: f64,
+    pub abs_deriv: f64,
+    pub residual: f64,
+    pub refine_iters: usize,
+}
+
 pub fn solve_monotone_root(
     eval: impl Fn(f64) -> Result<(f64, f64, f64), String>,
     a_init: f64,
@@ -20,6 +28,25 @@ pub fn solve_monotone_root(
     max_bracket_iters: usize,
     max_refine_iters: usize,
 ) -> Result<(f64, f64, f64), String> {
+    let solution = solve_monotone_root_detailed(
+        eval,
+        a_init,
+        label,
+        convergence_tol,
+        max_bracket_iters,
+        max_refine_iters,
+    )?;
+    Ok((solution.root, solution.abs_deriv, solution.residual))
+}
+
+pub fn solve_monotone_root_detailed(
+    eval: impl Fn(f64) -> Result<(f64, f64, f64), String>,
+    a_init: f64,
+    label: &str,
+    convergence_tol: f64,
+    max_bracket_iters: usize,
+    max_refine_iters: usize,
+) -> Result<MonotoneRootSolution, String> {
     let (f_init, f_deriv_init, _) = eval(a_init)?;
 
     // Exact root — rare but handle correctly.
@@ -30,7 +57,12 @@ pub fn solve_monotone_root(
                 "{label}: zero or non-finite derivative at exact root a={a_init:.6}"
             ));
         }
-        return Ok((a_init, abs_d, f_init));
+        return Ok(MonotoneRootSolution {
+            root: a_init,
+            abs_deriv: abs_d,
+            residual: f_init,
+            refine_iters: 0,
+        });
     }
 
     if !f_deriv_init.is_finite() || f_deriv_init == 0.0 {
@@ -115,7 +147,9 @@ pub fn solve_monotone_root(
         }
     }
 
+    let mut refine_iters = 0usize;
     for _ in 0..max_refine_iters {
+        refine_iters += 1;
         let (lo, hi) = if neg_pt <= pos_pt {
             (neg_pt, pos_pt)
         } else {
@@ -210,7 +244,12 @@ pub fn solve_monotone_root(
         ));
     }
 
-    Ok((best_a, best_abs_deriv, best_f))
+    Ok(MonotoneRootSolution {
+        root: best_a,
+        abs_deriv: best_abs_deriv,
+        residual: best_f,
+        refine_iters,
+    })
 }
 
 #[cfg(test)]
