@@ -3177,11 +3177,30 @@ impl BernoulliMarginalSlopeFamily {
         let slices = block_slices(self);
         let primary = primary_slices(&slices);
         let n = self.y.len();
+        let flex_active = self.effective_flex_active(block_states)?;
+        let started = std::time::Instant::now();
+        if log_exact_work(n) {
+            log::info!(
+                "[BMS exact-cache] build start n={} p={} flex={}",
+                n,
+                slices.total,
+                flex_active
+            );
+        }
         let row_contexts: Result<Vec<_>, String> = (0..n)
             .into_par_iter()
             .map(|row| self.build_row_exact_context(row, block_states))
             .collect();
         let row_contexts = row_contexts?;
+        if log_exact_work(n) {
+            log::info!(
+                "[BMS exact-cache] build done n={} p={} flex={} elapsed={:.3}s",
+                n,
+                slices.total,
+                flex_active,
+                started.elapsed().as_secs_f64()
+            );
+        }
         Ok(BernoulliMarginalSlopeExactEvalCache {
             slices,
             primary,
