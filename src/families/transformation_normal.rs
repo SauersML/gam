@@ -42,12 +42,14 @@ use crate::families::custom_family::{
 use crate::families::gamlss::{
     initializewiggle_knots_from_seed, solve_penalizedweighted_projection,
 };
-use crate::inference::model::TransformationScoreCalibration;
+use crate::inference::model::{
+    TRANSFORMATION_SCORE_PIT_CLIP_EPS, TransformationScoreCalibration,
+};
 use crate::matrix::{
     DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator, SymmetricMatrix,
 };
 use crate::pirls::LinearInequalityConstraints;
-use crate::probability::{log1mexp_positive, normal_logcdf};
+use crate::probability::{log1mexp_positive, normal_logcdf, standard_normal_quantile};
 use crate::resource::{MatrixMaterializationError, ResourcePolicy};
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
@@ -246,6 +248,8 @@ struct TransformationNormalRowQuantityCache {
     gamma: Arc<Array2<f64>>,
     h: Arc<Array1<f64>>,
     h_prime: Arc<Array1<f64>>,
+    h_lower: Arc<Array1<f64>>,
+    h_upper: Arc<Array1<f64>>,
     endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
     log_likelihood: f64,
 }
@@ -373,6 +377,55 @@ fn log_normal_cdf_diff(upper: f64, lower: f64) -> Result<f64, String> {
         ));
     }
     Ok(log_z)
+}
+
+pub(crate) fn transformation_normal_pit_score(
+    h: f64,
+    lower: f64,
+    upper: f64,
+    clip_eps: f64,
+) -> Result<f64, String> {
+    if !(clip_eps.is_finite() && clip_eps > 0.0 && clip_eps < 0.5) {
+        return Err(format!(
+            "transformation-normal PIT requires clip_eps in (0, 0.5), got {clip_eps}"
+        ));
+    }
+    if !(h.is_finite() && lower.is_finite() && upper.is_finite()) {
+        return Err(format!(
+            "transformation-normal PIT requires finite h/lower/upper, got h={h}, lower={lower}, upper={upper}"
+        ));
+    }
+    if upper <= lower {
+        return Err(format!(
+            "transformation-normal PIT endpoint order violated: lower={lower:.6e}, upper={upper:.6e}"
+        ));
+    }
+
+    let scale = h.abs().max(lower.abs()).max(upper.abs()).max(1.0);
+    let endpoint_tol = 64.0 * f64::EPSILON * scale;
+    if h < lower - endpoint_tol || h > upper + endpoint_tol {
+        return Err(format!(
+            "transformation-normal PIT score is outside fitted finite support: h={h:.6e}, lower={lower:.6e}, upper={upper:.6e}"
+        ));
+    }
+    let h_inside = h.clamp(lower, upper);
+    let u = if h_inside <= lower {
+        0.0
+    } else if h_inside >= upper {
+        1.0
+    } else {
+        let log_num = log_normal_cdf_diff(h_inside, lower)?;
+        let log_den = log_normal_cdf_diff(upper, lower)?;
+        let ratio = (log_num - log_den).exp();
+        if !(ratio.is_finite() && ratio >= -1.0e-12 && ratio <= 1.0 + 1.0e-12) {
+            return Err(format!(
+                "transformation-normal PIT probability is not representable: h={h:.6e}, lower={lower:.6e}, upper={upper:.6e}, ratio={ratio}"
+            ));
+        }
+        ratio.clamp(0.0, 1.0)
+    };
+    standard_normal_quantile(u.clamp(clip_eps, 1.0 - clip_eps))
+        .map_err(|err| format!("transformation-normal PIT quantile failed: {err}"))
 }
 
 fn signed_normal_pdf_ratio(
@@ -1174,6 +1227,8 @@ impl TransformationNormalFamily {
             gamma: Arc::new(gamma),
             h: Arc::new(h),
             h_prime: Arc::new(h_prime),
+            h_lower: Arc::new(h_lower),
+            h_upper: Arc::new(h_upper),
             endpoint_q: Arc::new(derived.endpoint_q),
             log_likelihood: derived.log_likelihood,
         };
@@ -10441,152 +10496,9 @@ fn estimate_default_warm_start(
     Ok(TransformationWarmStart { location, scale })
 }
 
-fn transformation_calibration_feature_cols(spec: &TermCollectionSpec) -> Vec<usize> {
-    let mut cols = Vec::new();
-    for linear in &spec.linear_terms {
-        cols.push(linear.feature_col);
-    }
-    for smooth in &spec.smooth_terms {
-        match &smooth.basis {
-            crate::smooth::SmoothBasisSpec::BSpline1D { feature_col, .. } => {
-                cols.push(*feature_col);
-            }
-            crate::smooth::SmoothBasisSpec::ThinPlate { feature_cols, .. }
-            | crate::smooth::SmoothBasisSpec::Matern { feature_cols, .. }
-            | crate::smooth::SmoothBasisSpec::Duchon { feature_cols, .. }
-            | crate::smooth::SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
-                cols.extend(feature_cols.iter().copied());
-            }
-        }
-    }
-    cols.sort_unstable();
-    cols.dedup();
-    cols
-}
-
-fn build_transformation_score_calibration_design(
-    data: ArrayView2<'_, f64>,
-    weights: &Array1<f64>,
-    feature_cols: &[usize],
-    feature_center: Option<&[f64]>,
-    feature_scale: Option<&[f64]>,
-    rbf_centers: Option<&[Vec<f64>]>,
-    rbf_bandwidth: Option<f64>,
-) -> Result<(Array2<f64>, Vec<f64>, Vec<f64>, Vec<Vec<f64>>, f64), String> {
-    let n = data.nrows();
-    let d = feature_cols.len();
-    let weight_sum = weights.iter().copied().sum::<f64>();
-    if !(weight_sum.is_finite() && weight_sum > 0.0) {
-        return Err(
-            "transformation score calibration requires positive finite weights".to_string(),
-        );
-    }
-    let mut center = vec![0.0; d];
-    let mut scale = vec![1.0; d];
-    if let (Some(saved_center), Some(saved_scale)) = (feature_center, feature_scale) {
-        if saved_center.len() != d || saved_scale.len() != d {
-            return Err(format!(
-                "transformation score calibration feature normalization mismatch: center={}, scale={}, d={d}",
-                saved_center.len(),
-                saved_scale.len()
-            ));
-        }
-        center.copy_from_slice(saved_center);
-        scale.copy_from_slice(saved_scale);
-    } else {
-        for (j, &col) in feature_cols.iter().enumerate() {
-            if col >= data.ncols() {
-                return Err(format!(
-                    "transformation score calibration feature column {col} out of range for {} columns",
-                    data.ncols()
-                ));
-            }
-            center[j] = (0..n).map(|i| weights[i] * data[[i, col]]).sum::<f64>() / weight_sum;
-            let var = (0..n)
-                .map(|i| {
-                    let r = data[[i, col]] - center[j];
-                    weights[i] * r * r
-                })
-                .sum::<f64>()
-                / weight_sum;
-            scale[j] = var.sqrt().max(1.0e-12);
-        }
-    }
-
-    let mut z = Array2::<f64>::zeros((n, d));
-    for (j, &col) in feature_cols.iter().enumerate() {
-        if col >= data.ncols() {
-            return Err(format!(
-                "transformation score calibration feature column {col} out of range for {} columns",
-                data.ncols()
-            ));
-        }
-        for i in 0..n {
-            z[[i, j]] = (data[[i, col]] - center[j]) / scale[j];
-        }
-    }
-
-    let centers = if let Some(saved) = rbf_centers {
-        saved.to_vec()
-    } else if d == 0 {
-        Vec::new()
-    } else {
-        let k = n.min(32).max(1);
-        (0..k)
-            .map(|m| {
-                let row = if k == 1 { 0 } else { m * (n - 1) / (k - 1) };
-                z.row(row).to_vec()
-            })
-            .collect::<Vec<_>>()
-    };
-    for center_row in &centers {
-        if center_row.len() != d {
-            return Err(format!(
-                "transformation score calibration RBF center width {} != feature width {d}",
-                center_row.len()
-            ));
-        }
-    }
-    let bandwidth = rbf_bandwidth.unwrap_or_else(|| (d as f64).sqrt().max(1.0));
-    if !(bandwidth.is_finite() && bandwidth > 0.0) {
-        return Err(format!(
-            "transformation score calibration requires positive finite RBF bandwidth, got {bandwidth}"
-        ));
-    }
-
-    let p_poly = 1 + d + d * (d + 1) / 2;
-    let p = p_poly + centers.len();
-    let mut design = Array2::<f64>::zeros((n, p));
-    for i in 0..n {
-        design[[i, 0]] = 1.0;
-        for j in 0..d {
-            design[[i, 1 + j]] = z[[i, j]];
-        }
-        let mut col = 1 + d;
-        for a in 0..d {
-            for b in a..d {
-                design[[i, col]] = z[[i, a]] * z[[i, b]];
-                col += 1;
-            }
-        }
-        for (m, center_row) in centers.iter().enumerate() {
-            let dist2 = (0..d)
-                .map(|j| {
-                    let r = z[[i, j]] - center_row[j];
-                    r * r
-                })
-                .sum::<f64>();
-            design[[i, p_poly + m]] = (-0.5 * dist2 / (bandwidth * bandwidth)).exp();
-        }
-    }
-    Ok((design, center, scale, centers, bandwidth))
-}
-
 fn calibrate_transformation_scores(
     family: &TransformationNormalFamily,
     mut fit: UnifiedFitResult,
-    calibration_data: ArrayView2<'_, f64>,
-    covariate_spec: &TermCollectionSpec,
 ) -> Result<(UnifiedFitResult, TransformationScoreCalibration), String> {
     let Some(block_state) = fit.block_states.first() else {
         return Err("transformation score calibration requires one fitted block".to_string());
