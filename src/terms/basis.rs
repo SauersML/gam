@@ -2470,23 +2470,34 @@ fn design_gram_matrix(design: &DesignMatrix) -> Result<Array2<f64>, BasisError> 
 
 fn positive_spectral_whitener_from_gram(gram: &Array2<f64>) -> Result<Array2<f64>, BasisError> {
     let (eigenvalues, eigenvectors) = gram.eigh(Side::Lower).map_err(BasisError::LinalgError)?;
+    let n = gram.nrows();
     let max_eval = eigenvalues.iter().copied().fold(0.0_f64, f64::max);
-    let tol = default_rrqr_rank_alpha()
-        * f64::EPSILON
-        * (gram.nrows().max(gram.ncols()).max(1) as f64)
-        * max_eval.max(1.0);
-    let keep = eigenvalues.iter().filter(|&&ev| ev > tol).count();
-    if keep == 0 {
-        return Err(BasisError::ConstraintNullspaceNotFound);
+    // Tikhonov ridge for the inverse-square-root: tiny / non-positive
+    // eigenvalues get `1/sqrt(λ + ε)` instead of being dropped, so the
+    // returned whitener is always full-rank `n × n`. This matters for the
+    // downstream `orthogonality_transform_from_cross_and_gram` path: with
+    // the previous "drop eigenvalues below `α·ε·n·max_eval` and shrink to
+    // (n × keep)" rule, a Gram matrix with smooth singular-value decay
+    // (e.g. a high-dim radial basis like Duchon at small length_scale on a
+    // stratified subsample) collapsed `keep` to a tiny number, then
+    // `cross_whitened` ended up with `nrows < constraint_dim` and the
+    // rrqr nullspace step raised `ConstraintNullspaceNotFound` even though
+    // the constraint itself is perfectly well-defined.
+    //
+    // The ridge is `α·ε·n·max(max_eval, 1)`, identical in scale to the old
+    // drop tolerance, so well-conditioned grams produce numerically the
+    // same whitener (each kept direction gets `1/sqrt(λ_i)` to within
+    // `O(ε)`); only the previously-dropped tail directions change, and
+    // there they receive a bounded `1/sqrt(ridge)` instead of being
+    // discarded.
+    let ridge =
+        (default_rrqr_rank_alpha() * f64::EPSILON * (n.max(1) as f64) * max_eval.max(1.0))
+            .max(f64::EPSILON);
+    let mut inv_sqrt = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        inv_sqrt[[i, i]] = 1.0 / (eigenvalues[i].max(0.0) + ridge).sqrt();
     }
-
-    let eig_start = eigenvalues.len() - keep;
-    let kept_vectors = eigenvectors.slice(s![.., eig_start..]).to_owned();
-    let mut inv_sqrt = Array2::<f64>::zeros((keep, keep));
-    for (out_i, eig_i) in (eig_start..eigenvalues.len()).enumerate() {
-        inv_sqrt[[out_i, out_i]] = 1.0 / eigenvalues[eig_i].max(tol).sqrt();
-    }
-    Ok(fast_ab(&kept_vectors, &inv_sqrt))
+    Ok(fast_ab(&eigenvectors, &inv_sqrt))
 }
 
 fn stabilized_orthogonality_transform_from_gram(
