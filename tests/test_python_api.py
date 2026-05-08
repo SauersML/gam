@@ -2,6 +2,7 @@ from __future__ import annotations
 import typing
 
 import pathlib
+import time
 
 import pytest
 
@@ -27,6 +28,35 @@ def training_rows() -> list[dict[str, float]]:
         {"y": 5.0, "x": 4.0},
         {"y": 6.0, "x": 5.0},
     ]
+
+
+def _make_weibull_survival(seed: int = 123, n: int = 3000) -> pd.DataFrame:
+    """Well-conditioned Weibull survival frame for marginal-slope regression tests."""
+    rng = np.random.default_rng(seed)
+    bmi = rng.normal(27.0, 4.5, n)
+    hba1c = rng.normal(5.8, 0.7, n)
+    age = rng.normal(0.0, 1.0, n)
+    entry = rng.uniform(40.0, 65.0, n)
+
+    bmi_z = (bmi - bmi.mean()) / bmi.std(ddof=0)
+    hba1c_z = (hba1c - hba1c.mean()) / hba1c.std(ddof=0)
+    log_scale = np.log(18.0) - 0.18 * bmi_z - 0.22 * hba1c_z - 0.10 * age
+    shape = 1.45
+    event_gap = np.exp(log_scale) * rng.weibull(shape, n)
+    censor_gap = rng.uniform(6.0, 32.0, n)
+    exit_time = entry + np.minimum(event_gap, censor_gap)
+    event = (event_gap <= censor_gap).astype(float)
+
+    return pd.DataFrame(
+        {
+            "entry": entry,
+            "exit": exit_time,
+            "event": event,
+            "bmi": bmi,
+            "hba1c": hba1c,
+            "age": age,
+        }
+    )
 
 
 def prediction_rows() -> list[dict[str, float]]:
@@ -458,6 +488,29 @@ def test_bernoulli_marginal_slope_roundtrip_tracks_calibrated_score(
     prob_rank = pd.Series(probs).rank().to_numpy()
     rho = float(np.corrcoef(pgs_rank, prob_rank)[0, 1])
     assert rho > 0.3, f"spearman(pgs_ctn_z, p) = {rho:.3f} not monotone enough"
+
+
+def test_survival_marginal_slope_weibull_n3000_returns_under_60s() -> None:
+    """Regression for the n=3000 marginal-slope survival FFI hang."""
+    _require_extension()
+    df = _make_weibull_survival(n=3000)
+
+    started = time.monotonic()
+    model = gamfit.fit(
+        df,
+        "Surv(entry, exit, event) ~ smooth(bmi) + smooth(hba1c)",
+        survival_likelihood="marginal-slope",
+        z_column="age",
+        logslope_formula="smooth(bmi) + smooth(hba1c)",
+    )
+    elapsed = time.monotonic() - started
+    assert elapsed < 60.0, f"survival marginal-slope fit took {elapsed:.1f}s"
+
+    pred = model.predict(df.iloc[:8].copy())
+    survival = np.asarray(pred.survival, dtype=float)
+    assert survival.shape[0] == 8
+    assert np.all(np.isfinite(survival))
+    assert np.all((survival > 0.0) & (survival < 1.0))
 
 
 def test_survival_prediction_dense_surfaces_smoke() -> None:

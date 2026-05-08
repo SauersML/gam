@@ -195,6 +195,9 @@ fn fit_table(
     formula: String,
     config_json: Option<String>,
 ) -> PyResult<Py<PyBytes>> {
+    // PyO3 0.28 names the old `allow_threads` API `detach`: the closure
+    // runs without the GIL, so Python signal handling (KeyboardInterrupt,
+    // SIGALRM handlers, etc.) can run while the Rust solver is in progress.
     let model_bytes = py
         .detach(move || fit_table_impl(headers, rows, formula, config_json.as_deref()))
         .map_err(py_value_error)?;
@@ -258,6 +261,10 @@ fn report_html(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
 #[pymodule(name = "_rust", gil_used = false)]
 fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::init_parallelism();
+    // Install the same stderr logger used by the CLI so long-running Rust
+    // solver phases (including survival marginal-slope joint-Newton cycles)
+    // are visible from Python without requiring a separate shell.
+    gam::visualizer::init_logging();
     module.add("__doc__", "PyO3 boundary for the gam Rust engine.")?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
