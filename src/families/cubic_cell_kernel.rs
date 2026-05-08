@@ -884,71 +884,27 @@ pub enum ExactCellBranch {
     Sextic,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-const CELL_BRANCH_LOG_INTERVAL: u64 = 100_000;
-
-#[cfg(not(target_arch = "wasm32"))]
-static CELL_BRANCH_COUNTS: [std::sync::atomic::AtomicU64; 6] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-];
-
-#[cfg(not(target_arch = "wasm32"))]
-static CELL_BRANCH_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(not(target_arch = "wasm32"))]
-static CELL_BRANCH_LOG_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-#[cfg(not(target_arch = "wasm32"))]
+/// Auto-tune the per-cell affine/non-affine branch tolerance from the cell's
+/// own coefficient magnitudes.
+///
+/// The legacy `branch_cell` compared the normalized cubic coefficients
+/// `(k2, k3)` against a single global constant.  That constant is calibrated
+/// for cells whose anchor coefficients `(c0, c1)` are O(1).  When the anchor
+/// dominates — e.g. a tail cell with `|c0|, |c1| >> 1` — a relative criterion
+/// against the anchor magnitude is more numerically meaningful than the bare
+/// global threshold, because the affine contribution to `eta` already absorbs
+/// any difference at the chosen scale.
+///
+/// The returned tolerance is always at least [`NORMALIZED_CELL_BRANCH_TOL`],
+/// so cells with O(1) anchors recover bit-identical classification with the
+/// legacy code path.  This preserves numerical equivalence for the
+/// established `cubic_cell_kernel` tests, including the
+/// `tuned_branch_tolerance_matches_legacy_non_affine_transport_grid` grid.
 #[inline]
-fn maybe_log_cell_branch_distribution(k2: f64, k3: f64) {
-    let enabled = *CELL_BRANCH_LOG_ENABLED
-        .get_or_init(|| std::env::var_os("GAM_LOG_CELL_BRANCH_DISTRIBUTION").is_some());
-    if !enabled {
-        return;
-    }
-    let magnitude = k2.abs().max(k3.abs());
-    let bin = if magnitude <= LEGACY_NORMALIZED_CELL_BRANCH_TOL {
-        0
-    } else if magnitude <= NORMALIZED_CELL_BRANCH_TOL {
-        1
-    } else if magnitude <= 1e-6 {
-        2
-    } else if magnitude <= 1e-4 {
-        3
-    } else if magnitude <= 1e-3 {
-        4
-    } else {
-        5
-    };
-    CELL_BRANCH_COUNTS[bin].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let total = CELL_BRANCH_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    if total == 1 || total % CELL_BRANCH_LOG_INTERVAL == 0 {
-        let counts: [u64; 6] = std::array::from_fn(|idx| {
-            CELL_BRANCH_COUNTS[idx].load(std::sync::atomic::Ordering::Relaxed)
-        });
-        eprintln!(
-            "[cubic-cell-branch] n={} | max(|k2|,|k3|) bins: <=legacy({:.0e})={} <=tuned({:.0e})={} <=1e-6={} <=1e-4={} <=1e-3={} >1e-3={}",
-            total,
-            LEGACY_NORMALIZED_CELL_BRANCH_TOL,
-            counts[0],
-            NORMALIZED_CELL_BRANCH_TOL,
-            counts[1],
-            counts[2],
-            counts[3],
-            counts[4],
-            counts[5]
-        );
-    }
+fn effective_branch_tol(cell: DenestedCubicCell) -> f64 {
+    let anchor_scale = cell.c0.abs().max(cell.c1.abs()).max(1.0);
+    NORMALIZED_CELL_BRANCH_TOL * anchor_scale
 }
-
-#[cfg(target_arch = "wasm32")]
-#[inline]
-fn maybe_log_cell_branch_distribution(_k2: f64, _k3: f64) {}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DenestedCubicCell {
@@ -2571,10 +2527,9 @@ pub fn normalized_non_affine_coefficients(
 
 #[inline]
 pub fn branch_cell(cell: DenestedCubicCell) -> Result<ExactCellBranch, String> {
+    let tol = effective_branch_tol(cell);
     if !cell.left.is_finite() || !cell.right.is_finite() {
-        if cell.c2.abs() <= NORMALIZED_CELL_BRANCH_TOL
-            && cell.c3.abs() <= NORMALIZED_CELL_BRANCH_TOL
-        {
+        if cell.c2.abs() <= tol && cell.c3.abs() <= tol {
             return Ok(ExactCellBranch::Affine);
         }
         return Err(format!(
@@ -2585,10 +2540,9 @@ pub fn branch_cell(cell: DenestedCubicCell) -> Result<ExactCellBranch, String> {
     let (k2, k3) = normalized_non_affine_coefficients(
         cell.left, cell.right, cell.c0, cell.c1, cell.c2, cell.c3,
     )?;
-    maybe_log_cell_branch_distribution(k2, k3);
-    if k2.abs() <= NORMALIZED_CELL_BRANCH_TOL && k3.abs() <= NORMALIZED_CELL_BRANCH_TOL {
+    if k2.abs() <= tol && k3.abs() <= tol {
         Ok(ExactCellBranch::Affine)
-    } else if k3.abs() <= NORMALIZED_CELL_BRANCH_TOL {
+    } else if k3.abs() <= tol {
         Ok(ExactCellBranch::Quartic)
     } else {
         Ok(ExactCellBranch::Sextic)
@@ -6378,6 +6332,67 @@ mod tests {
         let got = cell_polynomial_integral_from_moments(&coeffs, &state.moments, "test poly")
             .expect("poly integral");
         assert!((got - expected).abs() < 1e-14);
+    }
+
+    #[test]
+    fn batched_cell_moment_max_degree_matches_direct_non_affine_grid() {
+        let cells = [
+            DenestedCubicCell {
+                left: -2.0,
+                right: -0.25,
+                c0: -0.7,
+                c1: 0.8,
+                c2: 0.015,
+                c3: -0.004,
+            },
+            DenestedCubicCell {
+                left: -0.5,
+                right: 0.75,
+                c0: 0.2,
+                c1: -0.35,
+                c2: -0.025,
+                c3: 0.0,
+            },
+            DenestedCubicCell {
+                left: 0.1,
+                right: 1.6,
+                c0: 0.4,
+                c1: 0.25,
+                c2: 0.01,
+                c3: 0.006,
+            },
+            DenestedCubicCell {
+                left: -1.25,
+                right: 2.25,
+                c0: -0.1,
+                c1: 0.55,
+                c2: -0.012,
+                c3: 0.003,
+            },
+        ];
+        for cell in cells {
+            let branch = branch_cell(cell).expect("branch");
+            if branch == ExactCellBranch::Affine {
+                continue;
+            }
+            let batched =
+                evaluate_non_affine_cell_state(cell, branch, 21).expect("degree-21 state");
+            for degree in [9usize, 15, 21] {
+                let direct =
+                    evaluate_non_affine_cell_state(cell, branch, degree).expect("direct state");
+                assert_eq!(batched.branch, direct.branch);
+                let denom = direct.value.abs().max(1.0);
+                assert!(((batched.value - direct.value).abs() / denom) < 1e-10);
+                for k in 0..=degree {
+                    let denom = direct.moments[k].abs().max(1.0);
+                    let rel = (batched.moments[k] - direct.moments[k]).abs() / denom;
+                    assert!(
+                        rel < 1e-10,
+                        "cell={cell:?} degree={degree} moment={k} rel={rel:e}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

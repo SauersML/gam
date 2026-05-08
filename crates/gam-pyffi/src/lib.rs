@@ -174,6 +174,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
         vec![
             "standard",
             "transformation-normal",
+            "survival",
             "bernoulli-marginal-slope",
             "survival-marginal-slope",
             "survival-location-scale",
