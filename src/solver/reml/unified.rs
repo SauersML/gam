@@ -2268,6 +2268,7 @@ impl HyperOperator for ImplicitHyperOperator {
     /// the biobank-shape margslope-aniso-duchon16d shard each per-axis trace
     /// drops from ~30 s to a single chunked-GEMM cost.
     fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
+        let entry_t = std::time::Instant::now();
         debug_assert_eq!(factor.nrows(), self.p);
         let rank = factor.ncols();
         let n_obs = self.w_diag.len();
@@ -2277,6 +2278,7 @@ impl HyperOperator for ImplicitHyperOperator {
 
         // Once: unproject F to raw knot space → (n_knots × rank).
         let u_knot = self.implicit_deriv.unproject_matrix(&factor.view());
+        let t_unproject = entry_t.elapsed().as_secs_f64();
 
         // Match the chunk sizing `xt_logdet_kernel_x_diagonal` uses so the
         // live block stays in L2/L3 across realistic biobank shapes.
@@ -2289,11 +2291,16 @@ impl HyperOperator for ImplicitHyperOperator {
         let c_opt = self.c_x_psi_beta.as_ref().map(|arc| arc.as_ref());
         let mut design_total = 0.0_f64;
         let mut correction_total = 0.0_f64;
+        let mut t_xchunk = 0.0;
+        let mut t_kdchunk = 0.0;
+        let mut t_dxf_gemm = 0.0;
+        let mut t_inner = 0.0;
         let mut start = 0usize;
         while start < n_obs {
             let end = (start + chunk_rows).min(n_obs);
             let chunk_n = end - start;
 
+            let t0 = std::time::Instant::now();
             // Shared-X chunk: XF_chunk = X_chunk · F.
             let rows = self
                 .x_design
@@ -2304,17 +2311,23 @@ impl HyperOperator for ImplicitHyperOperator {
                     )
                 });
             let xf_chunk = crate::faer_ndarray::fast_ab(&rows, factor);
+            t_xchunk += t0.elapsed().as_secs_f64();
 
-            // Raw kernel scalars for axis d on this chunk, then a single
-            // (chunk × n_knots) · (n_knots × rank) GEMM gives DXF_chunk.
+            let t1 = std::time::Instant::now();
+            // Raw kernel scalars for axis d on this chunk.
             let kd_chunk = self
                 .implicit_deriv
                 .row_chunk_first_raw(self.axis, start..end)
                 .expect(
                     "radial scalar evaluation failed during implicit hyper forward_mul_matrix",
                 );
-            let dxf_chunk = crate::faer_ndarray::fast_ab(&kd_chunk, &u_knot);
+            t_kdchunk += t1.elapsed().as_secs_f64();
 
+            let t2 = std::time::Instant::now();
+            let dxf_chunk = crate::faer_ndarray::fast_ab(&kd_chunk, &u_knot);
+            t_dxf_gemm += t2.elapsed().as_secs_f64();
+
+            let t3 = std::time::Instant::now();
             // Fused inner-product accumulation.
             for i_local in 0..chunk_n {
                 let i = start + i_local;
@@ -2332,12 +2345,30 @@ impl HyperOperator for ImplicitHyperOperator {
                     }
                 }
             }
+            t_inner += t3.elapsed().as_secs_f64();
             start = end;
         }
 
+        let t_pen0 = std::time::Instant::now();
         // Penalty trace: tr(F^T S_psi F) via dense BLAS3.
         let s_f = self.s_psi.dot(factor);
         let penalty: f64 = factor.iter().zip(s_f.iter()).map(|(&f, &s)| f * s).sum();
+        let t_pen = t_pen0.elapsed().as_secs_f64();
+
+        log::info!(
+            "[PERF] trace_projected_factor axis={} n={} p={} rank={} unproj={:.3}s xchunk={:.3}s kdchunk={:.3}s dxf={:.3}s inner={:.3}s pen={:.3}s total={:.3}s",
+            self.axis,
+            n_obs,
+            self.p,
+            rank,
+            t_unproject,
+            t_xchunk,
+            t_kdchunk,
+            t_dxf_gemm,
+            t_inner,
+            t_pen,
+            entry_t.elapsed().as_secs_f64(),
+        );
 
         2.0 * design_total + correction_total + penalty
     }
