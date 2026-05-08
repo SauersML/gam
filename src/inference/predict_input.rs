@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 
-use ndarray::Array1;
+use ndarray::{Array1, Array2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::basis::{
     BasisOptions, Dense, KnotSource, create_basis, create_ispline_derivative_dense,
 };
 use crate::estimate::{BlockRole, PredictInput};
+use crate::families::bernoulli_marginal_slope::LatentMeasureKind;
 use crate::families::scale_design::{build_scale_deviation_operator, scale_transform_from_payload};
 use crate::families::survival_predict::{
     fit_result_from_saved_model_for_prediction, resolve_termspec_for_prediction,
@@ -19,6 +20,63 @@ use crate::inference::model::{FittedModel, PredictModelClass};
 use crate::matrix::DesignMatrix;
 use crate::smooth::build_term_collection_design;
 use crate::term_builder::resolve_role_col;
+
+fn build_marginal_slope_local_auxiliary_matrix(
+    model: &FittedModel,
+    data: ndarray::ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+) -> Result<Option<Array2<f64>>, String> {
+    let Some(LatentMeasureKind::LocalEmpirical {
+        feature_cols,
+        input_scales,
+        ..
+    }) = model.latent_measure.as_ref()
+    else {
+        return Ok(None);
+    };
+    let n = data.nrows();
+    let d = feature_cols.len();
+    let mut out = Array2::<f64>::zeros((n, d));
+    let training_headers = model.training_headers.as_ref();
+    for (local_col, &fit_col) in feature_cols.iter().enumerate() {
+        let prediction_col = training_headers
+            .and_then(|headers| headers.get(fit_col))
+            .and_then(|name| col_map.get(name))
+            .copied()
+            .unwrap_or(fit_col);
+        if prediction_col >= data.ncols() {
+            return Err(format!(
+                "local empirical marginal-slope prediction feature column {fit_col} is out of bounds for {} columns",
+                data.ncols()
+            ));
+        }
+        out.column_mut(local_col)
+            .assign(&data.column(prediction_col));
+    }
+    if let Some(scales) = input_scales.as_ref() {
+        if scales.len() != d {
+            return Err(format!(
+                "local empirical marginal-slope prediction input scale dimension mismatch: scales={}, features={d}",
+                scales.len()
+            ));
+        }
+        for (col, &scale) in scales.iter().enumerate() {
+            if !(scale.is_finite() && scale > 0.0) {
+                return Err(format!(
+                    "local empirical marginal-slope prediction input scale {col} must be finite and positive, got {scale}"
+                ));
+            }
+            out.column_mut(col).mapv_inplace(|value| value / scale);
+        }
+    }
+    if out.iter().any(|value| !value.is_finite()) {
+        return Err(
+            "local empirical marginal-slope prediction conditioning values must be finite"
+                .to_string(),
+        );
+    }
+    Ok(Some(out))
+}
 
 /// Build a `PredictInput` for model types backed directly by `PredictableModel`.
 ///
@@ -137,18 +195,15 @@ pub fn build_predict_input_for_model(
             )?;
             let design_logslope = build_term_collection_design(design_input, &spec_logslope)
                 .map_err(|e| format!("failed to build logslope prediction design: {e}"))?;
-            // build_marginal_slope_local_auxiliary_matrix is referenced by an
-            // in-flight concurrent integration (LocalEmpirical conditioning
-            // columns); until that lands, fall back to no auxiliary matrix
-            // so the rest of the predict-input plumbing still compiles.
-            let _ = (model, design_input, col_map);
+            let auxiliary_matrix =
+                build_marginal_slope_local_auxiliary_matrix(model, design_input, col_map)?;
             Ok(PredictInput {
                 design: design.design.clone(),
                 offset: offset.clone(),
                 design_noise: Some(design_logslope.design.clone()),
                 offset_noise: Some(offset_noise.clone()),
                 auxiliary_scalar: Some(z),
-                auxiliary_matrix: None,
+                auxiliary_matrix,
             })
         }
         PredictModelClass::Survival => Err(
