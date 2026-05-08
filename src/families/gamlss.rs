@@ -12287,8 +12287,8 @@ struct BinomialLocationScaleExactNewtonJointPsiWorkspace {
     family: BinomialLocationScaleFamily,
     block_states: Vec<ParameterBlockState>,
     derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
-    x_t: Array2<f64>,
-    x_ls: Array2<f64>,
+    x_t: Arc<Array2<f64>>,
+    x_ls: Arc<Array2<f64>>,
     psi_directions: ExactNewtonJointPsiDirectCache<BinomialLocationScaleJointPsiDirection>,
 }
 
@@ -12305,8 +12305,8 @@ impl BinomialLocationScaleExactNewtonJointPsiWorkspace {
                     .to_string(),
             );
         };
-        let x_t = x_t.into_owned();
-        let x_ls = x_ls.into_owned();
+        let x_t = shared_dense_arc(x_t.as_ref());
+        let x_ls = shared_dense_arc(x_ls.as_ref());
         let psi_dim = derivative_blocks.iter().map(Vec::len).sum();
         Ok(Self {
             family,
@@ -12327,8 +12327,8 @@ impl BinomialLocationScaleExactNewtonJointPsiWorkspace {
                 &self.block_states,
                 &self.derivative_blocks,
                 psi_index,
-                &self.x_t,
-                &self.x_ls,
+                self.x_t.as_ref(),
+                self.x_ls.as_ref(),
                 &self.family.policy,
             )
         })
@@ -12354,8 +12354,8 @@ impl ExactNewtonJointPsiWorkspace for BinomialLocationScaleExactNewtonJointPsiWo
                     &self.derivative_blocks,
                     dir_i.as_ref(),
                     dir_j.as_ref(),
-                    &self.x_t,
-                    &self.x_ls,
+                    self.x_t.as_ref(),
+                    self.x_ls.as_ref(),
                 )?,
         ))
     }
@@ -12375,8 +12375,8 @@ impl ExactNewtonJointPsiWorkspace for BinomialLocationScaleExactNewtonJointPsiWo
                         &self.block_states,
                         dir.as_ref(),
                         d_beta_flat,
-                        &self.x_t,
-                        &self.x_ls,
+                        self.x_t.as_ref(),
+                        self.x_ls.as_ref(),
                     )?,
             ),
         ))
@@ -12405,8 +12405,8 @@ struct BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace {
     family: BinomialLocationScaleWiggleFamily,
     block_states: Vec<ParameterBlockState>,
     derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
-    x_t: Array2<f64>,
-    x_ls: Array2<f64>,
+    x_t: Arc<Array2<f64>>,
+    x_ls: Arc<Array2<f64>>,
     psi_directions: ExactNewtonJointPsiDirectCache<BinomialLocationScaleWiggleJointPsiDirection>,
 }
 
@@ -12423,8 +12423,8 @@ impl BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace {
                     .to_string(),
             );
         };
-        let x_t = x_t.into_owned();
-        let x_ls = x_ls.into_owned();
+        let x_t = shared_dense_arc(x_t.as_ref());
+        let x_ls = shared_dense_arc(x_ls.as_ref());
         let psi_dim = derivative_blocks.iter().map(Vec::len).sum();
         Ok(Self {
             family,
@@ -12445,8 +12445,8 @@ impl BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace {
                 &self.block_states,
                 &self.derivative_blocks,
                 psi_index,
-                &self.x_t,
-                &self.x_ls,
+                self.x_t.as_ref(),
+                self.x_ls.as_ref(),
                 &self.family.policy,
             )
         })
@@ -12472,8 +12472,8 @@ impl ExactNewtonJointPsiWorkspace for BinomialLocationScaleWiggleExactNewtonJoin
                     &self.derivative_blocks,
                     dir_i.as_ref(),
                     dir_j.as_ref(),
-                    &self.x_t,
-                    &self.x_ls,
+                    self.x_t.as_ref(),
+                    self.x_ls.as_ref(),
                 )?,
         ))
     }
@@ -12493,8 +12493,8 @@ impl ExactNewtonJointPsiWorkspace for BinomialLocationScaleWiggleExactNewtonJoin
                         &self.block_states,
                         dir.as_ref(),
                         d_beta_flat,
-                        &self.x_t,
-                        &self.x_ls,
+                        self.x_t.as_ref(),
+                        self.x_ls.as_ref(),
                     )?,
             ),
         ))
@@ -23241,7 +23241,10 @@ mod tests {
             &specs,
             &BlockwiseFitOptions::default(),
         );
-        assert_eq!(hessian, crate::solver::outer_strategy::DeclaredHessianForm::Either);
+        assert_eq!(
+            hessian,
+            crate::solver::outer_strategy::DeclaredHessianForm::Either
+        );
     }
 
     #[test]

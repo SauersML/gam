@@ -2306,9 +2306,7 @@ impl HyperOperator for ImplicitHyperOperator {
                 .x_design
                 .try_row_chunk(start..end)
                 .unwrap_or_else(|err| {
-                    panic!(
-                        "ImplicitHyperOperator::trace_projected_factor row chunk failed: {err}"
-                    )
+                    panic!("ImplicitHyperOperator::trace_projected_factor row chunk failed: {err}")
                 });
             let xf_chunk = crate::faer_ndarray::fast_ab(&rows, factor);
             t_xchunk += t0.elapsed().as_secs_f64();
@@ -2318,9 +2316,7 @@ impl HyperOperator for ImplicitHyperOperator {
             let kd_chunk = self
                 .implicit_deriv
                 .row_chunk_first_raw(self.axis, start..end)
-                .expect(
-                    "radial scalar evaluation failed during implicit hyper forward_mul_matrix",
-                );
+                .expect("radial scalar evaluation failed during implicit hyper forward_mul_matrix");
             t_kdchunk += t1.elapsed().as_secs_f64();
 
             let t2 = std::time::Instant::now();
@@ -4707,12 +4703,32 @@ pub fn reml_laml_evaluate(
         None
     };
     let rho_corrections: Vec<Option<DriftDerivResult>> = if effective_deriv.has_corrections() {
-        rho_v_ks
+        let rho_vs = rho_v_ks
             .as_ref()
-            .expect("rho mode responses required for Hessian corrections")
-            .par_iter()
-            .map(|v_k| effective_deriv.hessian_derivative_correction_result(v_k))
-            .collect::<Result<Vec<_>, _>>()?
+            .expect("rho mode responses required for Hessian corrections");
+        let correction_work = solution
+            .n_observations
+            .saturating_mul(hop.dim())
+            .saturating_mul(k.max(1));
+        let parallel_corrections = correction_work <= 64_000_000;
+        if parallel_corrections {
+            rho_vs
+                .par_iter()
+                .map(|v_k| effective_deriv.hessian_derivative_correction_result(v_k))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            log::info!(
+                "[STAGE] reml_laml rho_corrections mode=serial k={} n={} dim={} work={}",
+                k,
+                solution.n_observations,
+                hop.dim(),
+                correction_work
+            );
+            rho_vs
+                .iter()
+                .map(|v_k| effective_deriv.hessian_derivative_correction_result(v_k))
+                .collect::<Result<Vec<_>, _>>()?
+        }
     } else {
         (0..k).map(|_| None).collect()
     };
@@ -12938,6 +12954,20 @@ mod tests {
             (analytic - 0.5 * full_space_trace).abs() > 0.5,
             "projected rho trace should exclude the null-space leakage term"
         );
+    }
+
+    #[test]
+    fn test_rho_corrections_serial_large_work_case_stays_finite() {
+        let rho = 0.0;
+        let mut solution = build_projected_rho_gradient_solution(rho);
+        solution.n_observations = 40_000_000;
+
+        let result = reml_laml_evaluate(&solution, &[rho], EvalMode::ValueAndGradient, None)
+            .expect("serial rho correction evaluation");
+        assert!(result.cost.is_finite());
+        let gradient = result.gradient.expect("gradient");
+        assert_eq!(gradient.len(), 1);
+        assert!(gradient[0].is_finite());
     }
 
     /// Helper: build an InnerSolution for a Gaussian model at a given rho.

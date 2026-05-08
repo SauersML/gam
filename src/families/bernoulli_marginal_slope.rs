@@ -2334,15 +2334,20 @@ fn contract_third_full(t: &[[[f64; 2]; 2]; 2], d_eta: f64, d_g: f64) -> [[f64; 2
     ]
 }
 
-#[inline]
-fn rigid_transformed_fourth_contracted(
+/// Closed-form rigid fourth-derivative tensor — uncontracted in primary
+/// space `(η, g)`. Indexed `T[a][b][c][d]` with each index ∈ {0=η, 1=g};
+/// fully symmetric in all four indices, so only five distinct values appear:
+/// `T_ηηηη`, `T_ηηηg`, `T_ηηgg`, `T_ηggg`, `T_gggg`.
+///
+/// Same structural role as [`rigid_transformed_third_full`] one order up:
+/// the 5 axis-invariant components are computed once per row, and every
+/// (u, v) ψ-axis pair then folds them into a 2×2 matrix via the cheap
+/// [`contract_fourth_full`]. The previous design re-derived all five
+/// components per (row, axis-pair), or O(rank²) per row.
+fn rigid_transformed_fourth_full(
     marginal: BernoulliMarginalLinkMap,
     kernel: &RigidProbitKernel,
-    u_eta: f64,
-    u_g: f64,
-    v_eta: f64,
-    v_g: f64,
-) -> [[f64; 2]; 2] {
+) -> [[[[f64; 2]; 2]; 2]; 2] {
     let h_q = kernel.primary_hessian(marginal.q);
     let grad_q = kernel.u1 * kernel.eta_q;
     let (f_qqq, f_qqg, f_qgg, _) = rigid_internal_third_components(marginal, kernel);
@@ -2364,16 +2369,67 @@ fn rigid_transformed_fourth_contracted(
         + h_q[0][1] * marginal.q3;
     let f_eta2g2 = f_qqgg * marginal.q1 * marginal.q1 + f_qgg * marginal.q2;
     let f_etag3 = f_qggg * marginal.q1;
-    [
-        [
-            f_eta4 * u_eta * v_eta + f_eta3g * (u_eta * v_g + u_g * v_eta) + f_eta2g2 * u_g * v_g,
-            f_eta3g * u_eta * v_eta + f_eta2g2 * (u_eta * v_g + u_g * v_eta) + f_etag3 * u_g * v_g,
-        ],
-        [
-            f_eta3g * u_eta * v_eta + f_eta2g2 * (u_eta * v_g + u_g * v_eta) + f_etag3 * u_g * v_g,
-            f_eta2g2 * u_eta * v_eta + f_etag3 * (u_eta * v_g + u_g * v_eta) + f_gggg * u_g * v_g,
-        ],
-    ]
+    fourth_full_from_symmetric_components(f_eta4, f_eta3g, f_eta2g2, f_etag3, f_gggg)
+}
+
+/// Pack the five independent components of a fully-symmetric 4-tensor on a
+/// 2-dim primary space into the dense `[[[[f64; 2]; 2]; 2]; 2]` form.
+/// Index ordering: `T[a][b][c][d]` = ∂⁴f/∂p_a ∂p_b ∂p_c ∂p_d, symmetric in
+/// all four indices, so each of the 16 entries is fixed by the multi-set
+/// `{#η, #g}` of its index pattern.
+#[inline]
+fn fourth_full_from_symmetric_components(
+    t_qqqq: f64,
+    t_qqqg: f64,
+    t_qqgg: f64,
+    t_qggg: f64,
+    t_gggg: f64,
+) -> [[[[f64; 2]; 2]; 2]; 2] {
+    let mut t = [[[[0.0; 2]; 2]; 2]; 2];
+    for a in 0..2 {
+        for b in 0..2 {
+            for c in 0..2 {
+                for d in 0..2 {
+                    let g_count = a + b + c + d; // count of `g` indices, 0..=4
+                    t[a][b][c][d] = match g_count {
+                        0 => t_qqqq,
+                        1 => t_qqqg,
+                        2 => t_qqgg,
+                        3 => t_qggg,
+                        4 => t_gggg,
+                        _ => unreachable!(),
+                    };
+                }
+            }
+        }
+    }
+    t
+}
+
+/// Contract a symmetric 4-tensor on its last two indices with two
+/// primary-space directions `u = (u_eta, u_g)` and `v = (v_eta, v_g)`,
+/// producing the symmetric 2×2 matrix the outer-Hessian pipeline expects:
+///   `M[a][b] = Σ_{c,d} T[a][b][c][d] · u[c] · v[d]`.
+#[inline]
+fn contract_fourth_full(
+    t: &[[[[f64; 2]; 2]; 2]; 2],
+    u_eta: f64,
+    u_g: f64,
+    v_eta: f64,
+    v_g: f64,
+) -> [[f64; 2]; 2] {
+    let mut out = [[0.0; 2]; 2];
+    for a in 0..2 {
+        for b in 0..2 {
+            let mut sum = 0.0;
+            sum += t[a][b][0][0] * u_eta * v_eta;
+            sum += t[a][b][0][1] * u_eta * v_g;
+            sum += t[a][b][1][0] * u_g * v_eta;
+            sum += t[a][b][1][1] * u_g * v_g;
+            out[a][b] = sum;
+        }
+    }
+    out
 }
 
 pub(crate) fn unary_derivatives_sqrt(x: f64) -> [f64; 5] {
@@ -3246,6 +3302,15 @@ struct BernoulliMarginalSlopeExactEvalCache {
     /// expensive build runs exactly once across all concurrent threads;
     /// failure is sticky and propagated identically to every caller.
     rigid_third_full: OnceLock<Result<Vec<[[[f64; 2]; 2]; 2]>, String>>,
+
+    /// Per-row uncontracted fourth-derivative tensor in the rigid path —
+    /// the second-order analogue of `rigid_third_full`. The outer-Hessian
+    /// build at biobank shape evaluates `rigid_row_fourth_contracted` for
+    /// every (ψ-axis-i, ψ-axis-j) pair: `(rank² + rank)/2 ≈ 528` pairs at
+    /// rank=32. Per-row, the five distinct components are axis-invariant,
+    /// so caching them lets every pair contraction be a 16-multiply 2×2
+    /// bilinear instead of a fresh 8-direction empirical jet.
+    rigid_fourth_full: OnceLock<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
 }
 
 // ── RowKernel<2> implementation (rigid path only) ────────────────────
@@ -3262,6 +3327,13 @@ struct BernoulliRigidRowKernel {
     /// once per (row, ψ-axis) pair. Per-axis `row_third_contracted` becomes
     /// a 2×2 bilinear contraction against the cached tensor.
     third_full_cache: OnceLock<Vec<[[[f64; 2]; 2]; 2]>>,
+    /// Per-row uncontracted fourth-derivative tensor — the outer-Hessian
+    /// analogue of `third_full_cache`. The second-directional-derivative
+    /// operator's trace path touches every row × (u, v) pair; with this
+    /// cache the heavy 8-direction empirical jet (or closed-form 5-component
+    /// build) runs at most once per row, leaving each pair with a cheap
+    /// [`contract_fourth_full`] bilinear.
+    fourth_full_cache: OnceLock<Vec<[[[[f64; 2]; 2]; 2]; 2]>>,
 }
 
 impl BernoulliRigidRowKernel {
@@ -3272,6 +3344,7 @@ impl BernoulliRigidRowKernel {
             block_states,
             slices,
             third_full_cache: OnceLock::new(),
+            fourth_full_cache: OnceLock::new(),
         }
     }
 
@@ -3298,6 +3371,34 @@ impl BernoulliRigidRowKernel {
                     .collect::<Result<Vec<_>, String>>()
                     .expect(
                         "BernoulliRigidRowKernel third-full cache build failed; \
+                         per-row jet should not error at the converged β snapshot",
+                    )
+            })
+            .as_slice()
+    }
+
+    /// Lazy-build the per-row uncontracted fourth-derivative tensor cache —
+    /// outer-Hessian analogue of [`third_full_cache`]. Same `OnceLock`
+    /// semantics: first caller runs one parallel row pass, every other
+    /// thread blocks on the lock and reads the same vector. Used by
+    /// `row_fourth_contracted` so each (u, v) ψ-axis pair finishes in a
+    /// 16-multiply [`contract_fourth_full`] bilinear instead of triggering
+    /// a fresh empirical-grid 8-direction jet.
+    fn fourth_full_cache(&self) -> &[[[[[f64; 2]; 2]; 2]; 2]] {
+        self.fourth_full_cache
+            .get_or_init(|| {
+                (0..self.family.y.len())
+                    .into_par_iter()
+                    .map(|row| {
+                        let marginal_eta = self.block_states[0].eta[row];
+                        let marginal = self.family.marginal_link_map(marginal_eta)?;
+                        let slope = self.block_states[1].eta[row];
+                        self.family
+                            .rigid_row_fourth_full(row, marginal_eta, marginal, slope)
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+                    .expect(
+                        "BernoulliRigidRowKernel fourth-full cache build failed; \
                          per-row jet should not error at the converged β snapshot",
                     )
             })
@@ -3429,10 +3530,11 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
     /// `row_third_contracted` calls inside the parallel ext-idx sweep then
     /// hit a populated `OnceLock` and skip straight to a 2×2 contraction.
     fn warm_up_directional_caches(&self) -> Result<(), String> {
-        // Touch the cache so the parallel build runs here (not later, nested
-        // inside the outer ext-idx par_iter where the lock-holder thread
-        // would have to do the row pass alone).
+        // Touch both caches so their parallel builds run here, not later
+        // (nested inside the outer ext-idx par_iter where the lock-holder
+        // thread would have to do each row pass alone).
         let _ = self.third_full_cache();
+        let _ = self.fourth_full_cache();
         Ok(())
     }
 
@@ -3442,19 +3544,14 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         dir_u: &[f64; 2],
         dir_v: &[f64; 2],
     ) -> Result<[[f64; 2]; 2], String> {
-        let marginal_eta = self.block_states[0].eta[row];
-        let marginal = self.family.marginal_link_map(marginal_eta)?;
-        let g = self.block_states[1].eta[row];
-        self.family.rigid_row_fourth_contracted(
-            row,
-            marginal_eta,
-            marginal,
-            g,
+        let cache = self.fourth_full_cache();
+        Ok(contract_fourth_full(
+            &cache[row],
             dir_u[0],
             dir_u[1],
             dir_v[0],
             dir_v[1],
-        )
+        ))
     }
 }
 
@@ -4065,6 +4162,34 @@ impl BernoulliMarginalSlopeFamily {
         Ok(&table[row])
     }
 
+    /// Look up the per-row rigid uncontracted fourth-derivative tensor.
+    /// Same lazy-build pattern as `rigid_third_full_cached`, but serves the
+    /// outer-Hessian per-pair pullback path: at rank=32 ψ-axes the sweep
+    /// touches `(rank² + rank)/2 = 528` (u, v) pairs, all reading the same
+    /// per-row tensor. With this cache the empirical-grid 8-direction jet
+    /// (or the closed-form 5-component build) runs at most once per row,
+    /// then 528 cheap [`contract_fourth_full`] bilinears finish the work.
+    fn rigid_fourth_full_cached<'a>(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &'a BernoulliMarginalSlopeExactEvalCache,
+        row: usize,
+    ) -> Result<&'a [[[[f64; 2]; 2]; 2]; 2], String> {
+        let stored = cache.rigid_fourth_full.get_or_init(|| {
+            (0..self.y.len())
+                .into_par_iter()
+                .map(|r| {
+                    let marginal_eta = block_states[0].eta[r];
+                    let marginal = self.marginal_link_map(marginal_eta)?;
+                    let slope = block_states[1].eta[r];
+                    self.rigid_row_fourth_full(r, marginal_eta, marginal, slope)
+                })
+                .collect::<Result<Vec<_>, String>>()
+        });
+        let table = stored.as_ref().map_err(|err| err.clone())?;
+        Ok(&table[row])
+    }
+
     /// Per-row uncontracted third-derivative tensor in the rigid path.
     ///
     /// Empirical-grid rows pay the heavy `empirical_rigid_neglog_jet` once
@@ -4126,17 +4251,27 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
-    fn rigid_row_fourth_contracted(
+    /// Per-row uncontracted fourth-derivative tensor in the rigid path.
+    ///
+    /// Closed-form path drops straight out of [`rigid_transformed_fourth_full`]
+    /// with five primary-space components computed from the
+    /// `rigid_internal_third_components` quantities and the link's higher
+    /// derivatives — all axis-invariant, so the previous design that re-ran
+    /// these for every (u, v) ψ-axis pair was paying `O(rank²)` redundancy.
+    ///
+    /// Empirical-grid path widens [`empirical_rigid_neglog_jet`] to eight
+    /// identity directions (`[e_q, e_g] × 4`), giving a 256-coefficient jet
+    /// from which the five distinct symmetric components `T_qqqq, T_qqqg,
+    /// T_qqgg, T_qggg, T_gggg` are read directly. The (u, v) directions are
+    /// folded in afterwards via the cheap [`contract_fourth_full`] bilinear
+    /// — at most one jet per row total, instead of `(rank²+rank)/2` per row.
+    fn rigid_row_fourth_full(
         &self,
         row: usize,
         marginal_eta: f64,
         marginal: BernoulliMarginalLinkMap,
         slope: f64,
-        u_q: f64,
-        u_g: f64,
-        v_q: f64,
-        v_g: f64,
-    ) -> Result<[[f64; 2]; 2], String> {
+    ) -> Result<[[[[f64; 2]; 2]; 2]; 2], String> {
         match self.latent_measure.empirical_grid_for_training_row(row)? {
             None => {
                 let kernel = RigidProbitKernel::new(
@@ -4147,11 +4282,14 @@ impl BernoulliMarginalSlopeFamily {
                     self.weights[row],
                     self.probit_frailty_scale(),
                 )?;
-                Ok(rigid_transformed_fourth_contracted(
-                    marginal, &kernel, u_q, u_g, v_q, v_g,
-                ))
+                Ok(rigid_transformed_fourth_full(marginal, &kernel))
             }
             Some(grid) => {
+                // Eight identity directions: positions 0, 2, 4, 6 are `e_q`,
+                // positions 1, 3, 5, 7 are `e_g`. The mask encoding for
+                // `MultiDirJet::coeff` is `Σ 2^position`, so a 4-element
+                // subset like {0, 2, 4, 6} (four `e_q`s) becomes mask
+                // 1 | 4 | 16 | 64 = 85 — the partial `∂⁴f/∂q∂q∂q∂q`.
                 let jet = self.empirical_rigid_neglog_jet(
                     row,
                     marginal_eta,
@@ -4162,16 +4300,22 @@ impl BernoulliMarginalSlopeFamily {
                         [0.0, 1.0],
                         [1.0, 0.0],
                         [0.0, 1.0],
-                        [u_q, u_g],
-                        [v_q, v_g],
+                        [1.0, 0.0],
+                        [0.0, 1.0],
+                        [1.0, 0.0],
+                        [0.0, 1.0],
                     ],
                     &grid.nodes,
                     &grid.weights,
                 )?;
-                Ok([
-                    [jet.coeff(1 | 4 | 16 | 32), jet.coeff(1 | 2 | 16 | 32)],
-                    [jet.coeff(1 | 2 | 16 | 32), jet.coeff(2 | 8 | 16 | 32)],
-                ])
+                let t_qqqq = jet.coeff(1 | 4 | 16 | 64); // {0, 2, 4, 6}: 4× e_q
+                let t_qqqg = jet.coeff(1 | 4 | 16 | 2); // {0, 2, 4, 1}: 3× e_q + 1× e_g
+                let t_qqgg = jet.coeff(1 | 4 | 2 | 8); // {0, 2, 1, 3}: 2× e_q + 2× e_g
+                let t_qggg = jet.coeff(1 | 2 | 8 | 32); // {0, 1, 3, 5}: 1× e_q + 3× e_g
+                let t_gggg = jet.coeff(2 | 8 | 32 | 128); // {1, 3, 5, 7}: 4× e_g
+                Ok(fourth_full_from_symmetric_components(
+                    t_qqqq, t_qqqg, t_qqgg, t_qggg, t_gggg,
+                ))
             }
         }
     }
@@ -5679,6 +5823,7 @@ impl BernoulliMarginalSlopeFamily {
             row_cell_moments,
             row_primary_hessians: None,
             rigid_third_full: OnceLock::new(),
+            rigid_fourth_full: OnceLock::new(),
         })
     }
 
@@ -7390,19 +7535,13 @@ impl BernoulliMarginalSlopeFamily {
         // across independent rows/chunks so Rayon workers do not nest inside
         // the high-allocation per-row cell-kernel transport below.
         if !flex_active {
-            let marginal_eta = block_states[0].eta[row];
-            let marginal = self.marginal_link_map(marginal_eta)?;
-            let g = block_states[1].eta[row];
-            let f = self.rigid_row_fourth_contracted(
-                row,
-                marginal_eta,
-                marginal,
-                g,
-                dir_u[0],
-                dir_u[1],
-                dir_v[0],
-                dir_v[1],
-            )?;
+            // Hit the per-cache uncontracted-tensor cache (lazy-built on
+            // first access) so the heavy per-row jet runs at most once per
+            // row across all `(rank²+rank)/2` ψ-axis pairs, instead of
+            // once per (row, pair). The outer-Hessian sweep is the dominant
+            // consumer of this method.
+            let t = self.rigid_fourth_full_cached(block_states, cache, row)?;
+            let f = contract_fourth_full(t, dir_u[0], dir_u[1], dir_v[0], dir_v[1]);
             let mut out = Array2::<f64>::zeros((2, 2));
             out[[0, 0]] = f[0][0];
             out[[0, 1]] = f[0][1];
@@ -10099,9 +10238,6 @@ impl BernoulliMarginalSlopeFamily {
             let mut block_acc = row_iter
                 .into_par_iter()
                 .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
-                    let marginal_eta = block_states[0].eta[row];
-                    let marginal = self.marginal_link_map(marginal_eta)?;
-                    let g = block_states[1].eta[row];
                     let uq = self
                         .marginal_design
                         .dot_row_view(row, d_beta_u_flat.slice(s![slices.marginal.clone()]));
@@ -10114,16 +10250,8 @@ impl BernoulliMarginalSlopeFamily {
                     let vg = self
                         .logslope_design
                         .dot_row_view(row, d_beta_v_flat.slice(s![slices.logslope.clone()]));
-                    let f = self.rigid_row_fourth_contracted(
-                        row,
-                        marginal_eta,
-                        marginal,
-                        g,
-                        uq,
-                        ug,
-                        vq,
-                        vg,
-                    )?;
+                    let t = self.rigid_fourth_full_cached(block_states, cache, row)?;
+                    let f = contract_fourth_full(t, uq, ug, vq, vg);
                     let f_arr = Array2::from_shape_fn((2, 2), |(a, b)| f[a][b]);
                     acc.add_pullback(self, row, slices, primary, &f_arr);
                     Ok(acc)
@@ -10192,9 +10320,6 @@ impl BernoulliMarginalSlopeFamily {
             let mut block_acc = row_iter
                 .into_par_iter()
                 .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
-                    let marginal_eta = block_states[0].eta[row];
-                    let marginal = self.marginal_link_map(marginal_eta)?;
-                    let g = block_states[1].eta[row];
                     let uq = self
                         .marginal_design
                         .dot_row_view(row, d_beta_u_flat.slice(s![slices.marginal.clone()]));
@@ -10207,16 +10332,8 @@ impl BernoulliMarginalSlopeFamily {
                     let vg = self
                         .logslope_design
                         .dot_row_view(row, d_beta_v_flat.slice(s![slices.logslope.clone()]));
-                    let f = self.rigid_row_fourth_contracted(
-                        row,
-                        marginal_eta,
-                        marginal,
-                        g,
-                        uq,
-                        ug,
-                        vq,
-                        vg,
-                    )?;
+                    let t = self.rigid_fourth_full_cached(block_states, cache, row)?;
+                    let f = contract_fourth_full(t, uq, ug, vq, vg);
                     let f_arr = Array2::from_shape_fn((2, 2), |(a, b)| f[a][b]);
                     acc.add_pullback(self, row, slices, primary, &f_arr);
                     Ok(acc)
@@ -11191,6 +11308,11 @@ impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
         // workspace's `first_order_terms` measurement.
         if !family.effective_flex_active(&block_states)? {
             let _ = family.rigid_third_full_cached(&block_states, &cache, 0)?;
+            // Outer-Hessian path consumes per-row fourth-tensor over every
+            // (ψ-axis-i, ψ-axis-j) pair — prime here too so the 528-pair
+            // sweep reads a populated cache instead of triggering the
+            // 8-direction empirical jet on its first per-pair call.
+            let _ = family.rigid_fourth_full_cached(&block_states, &cache, 0)?;
         }
         Ok(Self {
             family,
@@ -20161,6 +20283,7 @@ mod tests {
             row_cell_moments: None,
             row_primary_hessians: None,
             rigid_third_full: OnceLock::new(),
+            rigid_fourth_full: OnceLock::new(),
         };
         let direction =
             Array1::from_iter((0..cached.slices.total).map(|idx| 0.02 * ((idx % 5) as f64 - 2.0)));
@@ -20208,6 +20331,7 @@ mod tests {
             row_cell_moments: None,
             row_primary_hessians: None,
             rigid_third_full: OnceLock::new(),
+            rigid_fourth_full: OnceLock::new(),
         };
         let directions: Vec<_> = (0..4)
             .map(|rep| {
@@ -20329,7 +20453,10 @@ mod tests {
             gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-        assert_eq!(hessian, crate::solver::outer_strategy::DeclaredHessianForm::Either);
+        assert_eq!(
+            hessian,
+            crate::solver::outer_strategy::DeclaredHessianForm::Either
+        );
     }
 
     #[test]
