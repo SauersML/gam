@@ -3513,16 +3513,19 @@ impl BernoulliMarginalSlopeFamily {
             let beta_h = beta_h
                 .ok_or_else(|| "empirical flex score-warp primary range without beta".to_string())?;
             let mut h_jet = MultiDirJet::zero(n_dirs);
-            for local_idx in 0..h_range.len() {
-                let basis_value = runtime.basis_cubic_at(local_idx, z)?.evaluate(z);
-                let beta_jet = Self::primary_component_jet(
-                    n_dirs,
-                    beta_h[local_idx],
-                    directions,
-                    h_range.start + local_idx,
-                )?;
-                h_jet = h_jet.add(&beta_jet.scale(basis_value));
-            }
+            Self::for_each_deviation_basis_cubic_at(
+                runtime,
+                h_range,
+                z,
+                "empirical flex score-warp",
+                |local_idx, idx, basis_span| {
+                    let basis_value = basis_span.evaluate(z);
+                    let beta_jet =
+                        Self::primary_component_jet(n_dirs, beta_h[local_idx], directions, idx)?;
+                    h_jet = h_jet.add(&beta_jet.scale(basis_value));
+                    Ok(())
+                },
+            )?;
             inside = inside.add(&b_jet.mul(&h_jet));
         }
 
@@ -3537,19 +3540,22 @@ impl BernoulliMarginalSlopeFamily {
             let beta_w = beta_w
                 .ok_or_else(|| "empirical flex link-deviation primary range without beta".to_string())?;
             let u0 = u_jet.coeff(0);
-            for local_idx in 0..w_range.len() {
-                let basis = runtime.basis_cubic_at(local_idx, u0)?;
-                let beta_jet = Self::primary_component_jet(
-                    n_dirs,
-                    beta_w[local_idx],
-                    directions,
-                    w_range.start + local_idx,
-                )?;
-                let basis_value = Self::local_cubic_value_jet(basis, &u_jet);
-                let basis_derivative = Self::local_cubic_first_derivative_jet(basis, &u_jet);
-                w_jet = w_jet.add(&beta_jet.mul(&basis_value));
-                w_prime_jet = w_prime_jet.add(&beta_jet.mul(&basis_derivative));
-            }
+            Self::for_each_deviation_basis_cubic_at(
+                runtime,
+                w_range,
+                u0,
+                "empirical flex link-deviation",
+                |local_idx, idx, basis_span| {
+                    let beta_jet =
+                        Self::primary_component_jet(n_dirs, beta_w[local_idx], directions, idx)?;
+                    let basis_value = Self::local_cubic_value_jet(basis_span, &u_jet);
+                    let basis_derivative =
+                        Self::local_cubic_first_derivative_jet(basis_span, &u_jet);
+                    w_jet = w_jet.add(&beta_jet.mul(&basis_value));
+                    w_prime_jet = w_prime_jet.add(&beta_jet.mul(&basis_derivative));
+                    Ok(())
+                },
+            )?;
         }
 
         let scale = self.probit_frailty_scale();

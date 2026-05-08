@@ -137,51 +137,8 @@ pub fn build_predict_input_for_model(
             )?;
             let design_logslope = build_term_collection_design(design_input, &spec_logslope)
                 .map_err(|e| format!("failed to build logslope prediction design: {e}"))?;
-            let auxiliary_matrix = match model.payload().latent_measure.as_ref() {
-                Some(crate::families::bernoulli_marginal_slope::LatentMeasureKind::LocalEmpirical {
-                    feature_cols,
-                    input_scales,
-                    ..
-                }) => {
-                    let mut conditioning = Array2::<f64>::zeros((n, feature_cols.len()));
-                    for (local_col, &feature_col) in feature_cols.iter().enumerate() {
-                        if feature_col >= design_input.ncols() {
-                            return Err(format!(
-                                "local empirical latent prediction feature column {feature_col} is out of bounds for {} columns",
-                                design_input.ncols()
-                            ));
-                        }
-                        conditioning
-                            .column_mut(local_col)
-                            .assign(&design_input.column(feature_col));
-                    }
-                    if let Some(scales) = input_scales.as_ref() {
-                        if scales.len() != feature_cols.len() {
-                            return Err(format!(
-                                "local empirical latent prediction input scale dimension mismatch: scales={}, features={}",
-                                scales.len(),
-                                feature_cols.len()
-                            ));
-                        }
-                        for (col, &scale) in scales.iter().enumerate() {
-                            if !(scale.is_finite() && scale > 0.0) {
-                                return Err(format!(
-                                    "local empirical latent prediction input scale {col} must be finite and positive, got {scale}"
-                                ));
-                            }
-                            conditioning.column_mut(col).mapv_inplace(|value| value / scale);
-                        }
-                    }
-                    if conditioning.iter().any(|value| !value.is_finite()) {
-                        return Err(
-                            "local empirical latent prediction conditioning values must be finite"
-                                .to_string(),
-                        );
-                    }
-                    Some(conditioning)
-                }
-                _ => None,
-            };
+            let auxiliary_matrix =
+                build_marginal_slope_local_auxiliary_matrix(model, design_input, col_map)?;
             Ok(PredictInput {
                 design: design.design.clone(),
                 offset: offset.clone(),
