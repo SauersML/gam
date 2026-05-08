@@ -2512,25 +2512,35 @@ fn stabilized_orthogonality_transform_from_gram(
     Ok(fast_ab(transform, &whitening))
 }
 
-fn whitening_transform_from_gram(gram: &Array2<f64>) -> Result<Array2<f64>, BasisError> {
-    positive_spectral_whitener_from_gram(gram)
-}
-
 fn orthogonality_transform_from_cross_and_gram(
     constraint_cross: &Array2<f64>,
     gram: &Array2<f64>,
 ) -> Result<Array2<f64>, BasisError> {
-    let whitening = whitening_transform_from_gram(gram)?;
-    let cross_whitened = fast_atb(&whitening, constraint_cross);
-    let (transform_whitened, rank) =
-        rrqr_nullspace_basis(&cross_whitened, default_rrqr_rank_alpha())
-            .map_err(BasisError::LinalgError)?;
-    if rank >= cross_whitened.nrows() || transform_whitened.ncols() == 0 {
+    // Compute null(M^T) directly on M = B^T W C (k × q) via column-pivoted QR.
+    // Working in the original k-dim coefficient space rather than first
+    // whitening by B^T B avoids a fundamental failure mode: when B is heavily
+    // collinear, `positive_spectral_whitener_from_gram` truncates the design
+    // column-space to a `keep`-dim subspace, and if `keep <= q` the subsequent
+    // nullspace search has no room — even though dim null(M^T) = k - rank(M)
+    // ≥ k - q is always positive when k > q. The constraint nullspace is a
+    // property of M alone; conditioning of the design only matters for the
+    // downstream stabilization of B*K_raw.
+    let k = constraint_cross.nrows();
+    if k == 0 {
+        return Err(BasisError::InsufficientColumnsForConstraint { found: 0 });
+    }
+    let (transform_raw, rank) = rrqr_nullspace_basis(constraint_cross, default_rrqr_rank_alpha())
+        .map_err(BasisError::LinalgError)?;
+    if rank >= k || transform_raw.ncols() == 0 {
         return Err(BasisError::ConstraintNullspaceNotFound);
     }
 
-    let transform = fast_ab(&whitening, &transform_whitened);
-    stabilized_orthogonality_transform_from_gram(gram, &transform)
+    // Make the constrained design B*K_raw orthonormal under the W-inner product.
+    // If the constrained Gram K_raw^T G K_raw is rank-deficient (because some
+    // directions in null(M^T) collapse under B), the spectral whitener drops
+    // them — that is the right behavior: a degenerate column never contributes
+    // to B's column space and shouldn't appear in the reparameterized basis.
+    stabilized_orthogonality_transform_from_gram(gram, &transform_raw)
 }
 
 pub(crate) fn orthogonality_transform_for_design(
@@ -23930,6 +23940,40 @@ mod tests {
         // Transform should reduce dimension by 2 (removing constant and linear)
         assert_eq!(z.ncols(), k - 2, "Z should have k-2 columns");
         assert_eq!(z.nrows(), k, "Z should have k rows");
+    }
+
+    #[test]
+    fn test_orthogonality_transform_handles_heavily_collinear_design() {
+        // A heavily collinear design (Gram eigenvalues spanning many orders
+        // of magnitude) must still admit a constraint nullspace whenever
+        // k > q. The earlier implementation pre-whitened the design Gram and
+        // searched the nullspace inside the truncated `keep`-dim subspace,
+        // which failed when `keep <= q` even though dim null(M^T) = k - rank(M)
+        // is non-trivial in the full coefficient space.
+        let n = 200usize;
+        let k = 24usize;
+        let mut basis = Array2::<f64>::zeros((n, k));
+        for i in 0..n {
+            let xi = (i as f64) / (n as f64 - 1.0);
+            for j in 0..k {
+                let pert = 1e-8 * ((j as f64) - (k as f64) * 0.5) * (xi - 0.5);
+                basis[[i, j]] = xi + pert;
+            }
+        }
+        let c = Array2::<f64>::ones((n, 1));
+        let (constrained, z) = applyweighted_orthogonality_constraint(basis.view(), c.view(), None)
+            .expect(
+                "constraint nullspace must exist when k > q, regardless of design conditioning",
+            );
+
+        let cross = constrained.t().dot(&c);
+        let max_violation = cross.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        assert!(
+            max_violation < 1e-6,
+            "orthogonality violation in constrained design: {max_violation:.3e}"
+        );
+        assert!(z.ncols() > 0, "transform should have at least one column");
+        assert_eq!(z.nrows(), k, "transform must have k rows");
     }
 
     #[test]
