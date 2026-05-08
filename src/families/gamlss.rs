@@ -3279,7 +3279,9 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     };
 
     use crate::estimate::EstimationError;
-    use crate::solver::outer_strategy::{Derivative, OuterEval, OuterEvalOrder};
+    use crate::solver::outer_strategy::{
+        DeclaredHessianForm, Derivative, OuterEval, OuterEvalOrder,
+    };
 
     // Exact first-order AND second-order [rho, psi] calculus is available
     // for all inverse links via the shared jet formulas plus the generic
@@ -3299,9 +3301,9 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     let problem = crate::solver::outer_strategy::OuterProblem::new(theta_dim)
         .with_gradient(Derivative::Analytic)
         .with_hessian(if analytic_outer_hessian_available {
-            Derivative::Analytic
+            DeclaredHessianForm::Either
         } else {
-            Derivative::Unavailable
+            DeclaredHessianForm::Unavailable
         })
         .with_psi_dim(theta_dim - rho_dim)
         .with_tolerance(options.outer_tol)
