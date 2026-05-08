@@ -4469,6 +4469,23 @@ pub struct ExactNewtonJointPsiSecondOrderTerms {
 }
 
 pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
+    /// Pre-build any per-row jet caches the workspace will hand to the
+    /// outer-eval directional-derivative path. Called once when the
+    /// `compute_dh` / `compute_d2h` closures are wired up at top-level
+    /// rayon, *before* the outer ext-coordinate `par_iter` enters. The
+    /// alternative — letting the cache materialise lazily on first call
+    /// from inside the outer `par_iter` — collapses the build's own
+    /// `par_iter` to a single worker (the seven other workers are parked
+    /// on the cache's `OnceLock`). Default impl is a no-op for workspaces
+    /// with no per-row jet cache.
+    ///
+    /// Deliberately not called from PIRLS-side workspaces (which never
+    /// invoke `directional_derivative_operator` and would pay the prime
+    /// cost without ever consuming the cache).
+    fn warm_up_outer_caches(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
         Ok(None)
     }
@@ -6719,6 +6736,15 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
         specs,
         options,
     )?;
+    // Outer-eval entry: prime any per-row jet caches the workspace will hand
+    // to the directional-derivative path. Runs at top-level rayon (we are
+    // outside the ext-coord `par_iter` here), so the cache build's own
+    // `par_iter` enjoys full thread-pool parallelism. PIRLS-side workspace
+    // construction skips this priming because PIRLS never invokes
+    // `directional_derivative_operator`.
+    if let Some(workspace) = hessian_workspace.as_ref() {
+        workspace.warm_up_outer_caches()?;
+    }
     if let Some(curvature) = family.exact_newton_outer_curvature(block_states)? {
         let h_joint_unpen = JointHessianSource::Dense(symmetrized_square_matrix(
             curvature.hessian,

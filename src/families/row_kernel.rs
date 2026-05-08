@@ -601,13 +601,13 @@ impl<const K: usize, T: RowKernel<K>> RowKernelHessianWorkspace<K, T> {
     pub fn new(kern: T) -> Result<Self, String> {
         let kern = Arc::new(kern);
         let cache = build_row_kernel_cache(&*kern)?;
-        // Prime any per-row jet caches the kernel keeps for higher-order
-        // derivatives at top-level rayon — the alternative is for the cache
-        // to be built lazily on first access from inside the outer ext-idx
-        // `par_iter`, where seven of eight workers are parked on the cache
-        // `OnceLock` and the build collapses to a single worker. See the
-        // trait method's docs for the full rationale.
-        kern.warm_up_directional_caches()?;
+        // Higher-order jet caches (third/fourth contracted) are NOT primed
+        // here. PIRLS reuses this same workspace constructor for plain
+        // gradient/Hessian evaluations and never touches `row_third_contracted`,
+        // so priming at construction would burn ~3 s × n / scale on every
+        // PIRLS cycle for a cache the gradient path never reads. Outer-eval
+        // entry points instead call `warm_up_outer_caches` on the workspace
+        // trait once, at top-level rayon, before the ext-coord `par_iter`.
         Ok(Self { kern, cache })
     }
 }
@@ -615,6 +615,16 @@ impl<const K: usize, T: RowKernel<K>> RowKernelHessianWorkspace<K, T> {
 impl<const K: usize, T: RowKernel<K> + 'static> ExactNewtonJointHessianWorkspace
     for RowKernelHessianWorkspace<K, T>
 {
+    fn warm_up_outer_caches(&self) -> Result<(), String> {
+        // Forward to the kernel: any per-row third/fourth-contracted jet
+        // cache it keeps gets primed here, at the top-level rayon site
+        // where the outer-eval `compute_dh`/`compute_d2h` closures are
+        // wired up. Called exactly once per outer iter, far outside the
+        // ext-coord `par_iter`, so the cache build's `par_iter` enjoys
+        // full 8-core parallelism instead of a single lock-holder worker.
+        self.kern.warm_up_directional_caches()
+    }
+
     fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
         Ok(Some(row_kernel_log_likelihood(&self.cache)))
     }
