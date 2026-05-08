@@ -704,6 +704,62 @@ impl DeviationRuntime {
         self.basis_span_cubic(span_idx, basis_idx)
     }
 
+    pub fn for_each_basis_cubic_at<F>(&self, value: f64, mut visit: F) -> Result<(), String>
+    where
+        F: FnMut(usize, exact_kernel::LocalSpanCubic) -> Result<(), String>,
+    {
+        let (left_ep, right_ep) = self.support_interval()?;
+        if value < left_ep {
+            for basis_idx in 0..self.basis_dim {
+                visit(
+                    basis_idx,
+                    exact_kernel::LocalSpanCubic {
+                        left: left_ep,
+                        right: left_ep + 1.0,
+                        c0: self.span_c0[[0, basis_idx]],
+                        c1: 0.0,
+                        c2: 0.0,
+                        c3: 0.0,
+                    },
+                )?;
+            }
+            return Ok(());
+        }
+        if value > right_ep {
+            for basis_idx in 0..self.basis_dim {
+                visit(
+                    basis_idx,
+                    exact_kernel::LocalSpanCubic {
+                        left: right_ep,
+                        right: right_ep + 1.0,
+                        c0: self.right_boundary_value_row[basis_idx],
+                        c1: 0.0,
+                        c2: 0.0,
+                        c3: 0.0,
+                    },
+                )?;
+            }
+            return Ok(());
+        }
+
+        let span_idx = self.left_biased_span_index_for(value)?;
+        let (left, right) = self.span_interval(span_idx)?;
+        for basis_idx in 0..self.basis_dim {
+            visit(
+                basis_idx,
+                exact_kernel::LocalSpanCubic {
+                    left,
+                    right,
+                    c0: self.span_c0[[span_idx, basis_idx]],
+                    c1: self.span_c1[[span_idx, basis_idx]],
+                    c2: self.span_c2[[span_idx, basis_idx]],
+                    c3: self.span_c3[[span_idx, basis_idx]],
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     /// Return the correct composite `LocalSpanCubic` for any evaluation
     /// point. Strictly outside the knot support, returns a constant cubic
     /// (c1=c2=c3=0) at the saturated tail value. Interior breakpoints use the

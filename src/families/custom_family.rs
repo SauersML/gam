@@ -8082,103 +8082,6 @@ fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'sta
         .map(|log_likelihood| (log_likelihood, None))
 }
 
-/// When set to `true`, the joint-Newton line search evaluates the first
-/// `joint_line_search_speculative_attempts(...)` backtracking steps in
-/// parallel via rayon and accepts the first one that meets the Armijo-style
-/// non-increase check.  Currently disabled because the surrounding
-/// line-search loop is in flux (trust-region acceptance + subsample
-/// screening). Flip to `true` once the call site is unified and a parity
-/// test confirms identical betas vs. the sequential schedule.
-#[allow(dead_code)]
-const SPECULATIVE_LINE_SEARCH_ENABLED: bool = false;
-
-#[allow(dead_code)]
-struct JointLineSearchTrial {
-    bt: usize,
-    objective: f64,
-    penalty: f64,
-    states: Vec<ParameterBlockState>,
-    workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
-}
-
-#[allow(dead_code)]
-#[inline]
-fn joint_backtracking_alpha(bt: usize, barrier_ceiling: f64) -> f64 {
-    (0.5f64.powi(bt as i32)).min(barrier_ceiling)
-}
-
-#[allow(dead_code)]
-fn joint_line_search_speculative_attempts(max_attempts: usize) -> usize {
-    const SPECULATIVE_HARD_CAP: usize = 3;
-    let thread_cap = (rayon::current_num_threads().max(1) / 2).max(1);
-    thread_cap
-        .clamp(1, SPECULATIVE_HARD_CAP)
-        .min(max_attempts.max(1))
-}
-
-#[allow(dead_code)]
-fn choose_joint_line_search_acceptance(
-    trials: &[Result<JointLineSearchTrial, String>],
-    lastobjective: f64,
-) -> Option<usize> {
-    trials.iter().position(|trial| {
-        trial
-            .as_ref()
-            .map(|trial| trial.objective.is_finite() && trial.objective <= lastobjective + 1e-10)
-            .unwrap_or(false)
-    })
-}
-
-#[allow(dead_code)]
-struct JointLineSearchEvalContext<'a> {
-    specs: &'a [ParameterBlockSpec],
-    options: &'a BlockwiseFitOptions,
-    base_states: &'a [ParameterBlockState],
-    old_beta: &'a [Array1<f64>],
-    delta: &'a Array1<f64>,
-    ranges: &'a [(usize, usize)],
-    s_lambdas: &'a [Array2<f64>],
-    ridge: f64,
-    ridge_policy: RidgePolicy,
-    prefer_workspace: bool,
-}
-
-#[allow(dead_code)]
-fn evaluate_joint_line_search_trial<F: CustomFamily + Clone + Send + Sync + 'static>(
-    family: &F,
-    ctx: &JointLineSearchEvalContext<'_>,
-    bt: usize,
-    barrier_ceiling: f64,
-) -> Result<JointLineSearchTrial, String> {
-    let alpha = joint_backtracking_alpha(bt, barrier_ceiling);
-    let mut trial_states = ctx.base_states.to_vec();
-    for b in 0..ctx.specs.len() {
-        let (start, end) = ctx.ranges[b];
-        let mut trial_beta = ctx.old_beta[b].clone();
-        trial_beta.scaled_add(alpha, &ctx.delta.slice(ndarray::s![start..end]));
-        let projected =
-            family.post_update_block_beta(&trial_states, b, &ctx.specs[b], trial_beta)?;
-        trial_states[b].beta.assign(&projected);
-    }
-    refresh_all_block_etas(family, ctx.specs, &mut trial_states)?;
-    let (trial_ll, workspace) = joint_line_search_log_likelihood(
-        family,
-        ctx.specs,
-        ctx.options,
-        &trial_states,
-        ctx.prefer_workspace,
-    )?;
-    let penalty =
-        total_quadratic_penalty(&trial_states, ctx.s_lambdas, ctx.ridge, ctx.ridge_policy);
-    Ok(JointLineSearchTrial {
-        bt,
-        objective: -trial_ll + penalty,
-        penalty,
-        states: trial_states,
-        workspace,
-    })
-}
-
 fn joint_line_search_screening_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     options: &BlockwiseFitOptions,
@@ -9077,6 +8980,31 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     current_log_likelihood = cached_eval.log_likelihood;
     lastobjective = -current_log_likelihood + current_penalty;
 
+    // Divergence-detection state for the blockwise loop.
+    //
+    // Some family parameterizations (e.g. BernoulliMarginalSlopeFamily with
+    // linkwiggle + scorewarp) carry a near-null direction in the joint
+    // Hessian when the link-deviation basis's empirical anchor — fixed at
+    // the rigid-pilot η₀ when the basis is constructed — drifts during
+    // PIRLS as the location/spatial blocks update η₀. The Newton step
+    // becomes dominated by that null direction and is clamped at
+    // MAX_NEWTON_STEP every cycle while β grows linearly along it; the
+    // log-likelihood stays frozen, only the penalty changes (slowly).
+    // Without an early-exit the loop runs to inner_max_cycles producing
+    // the same -loglik over and over, which at biobank scale (each cycle
+    // ~0.5s) burns ~50s per ρ-cost call and stacks up to a 2400s timeout.
+    //
+    // Detect the pattern and bail with `converged = false` so the cost
+    // call returns Err / +∞, BFGS κ-optim backs off the divergent ρ
+    // region, and the outer loop progresses instead of grinding.
+    let mut prev_log_likelihood_for_divergence_check = cached_eval.log_likelihood;
+    let mut consecutive_frozen_loglik_cycles: usize = 0;
+    // Mirrors the `MAX_NEWTON_STEP` const used by the inner ExactNewton
+    // path lower in this function. Hoisted here so the divergence check
+    // does not need to reach into a nested scope.
+    const NEWTON_STEP_CAP_FOR_DIVERGENCE: f64 = 20.0;
+    const DIVERGENCE_FROZEN_LOGLIK_CYCLES: usize = 8;
+
     let is_dynamic = family.block_geometry_is_dynamic();
     for cycle in 0..inner_max_cycles {
         // Fires at the top of each blockwise coordinate cycle so we can count
@@ -9383,6 +9311,44 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             beta_inf,
             exact_joint_stationarity_ok,
         );
+
+        // Divergence early-exit. See the rationale block at the top of
+        // this loop. We treat "log-likelihood unchanged + Newton step
+        // pinned at the trust-region cap" as a near-null direction
+        // signature and break out unconverged once it persists for
+        // DIVERGENCE_FROZEN_LOGLIK_CYCLES consecutive iterations. Tracking
+        // log-likelihood (not objective) is essential: when the null mode
+        // dominates, only the penalty drifts cycle-to-cycle, so
+        // `objective_change` stays above tol while -loglik is genuinely
+        // frozen.
+        let loglik_change_for_divergence_check =
+            (cached_eval.log_likelihood - prev_log_likelihood_for_divergence_check).abs();
+        let loglik_frozen_tol_for_divergence_check =
+            inner_tol * (1.0 + cached_eval.log_likelihood.abs());
+        let step_clamped_for_divergence_check =
+            max_proposed_beta_step >= 0.95 * NEWTON_STEP_CAP_FOR_DIVERGENCE;
+        if loglik_change_for_divergence_check <= loglik_frozen_tol_for_divergence_check
+            && step_clamped_for_divergence_check
+        {
+            consecutive_frozen_loglik_cycles += 1;
+        } else {
+            consecutive_frozen_loglik_cycles = 0;
+        }
+        prev_log_likelihood_for_divergence_check = cached_eval.log_likelihood;
+        if consecutive_frozen_loglik_cycles >= DIVERGENCE_FROZEN_LOGLIK_CYCLES {
+            log::warn!(
+                "[PIRLS/blockwise convergence] divergence early-exit at cycle {} | -loglik={:.6e} frozen for {} consecutive cycles | max_proposed_step={:.3e} (clamped at cap {}) | step_tol={:.3e}; near-null Hessian direction detected — returning unconverged so the outer optimizer backs off this region instead of running to inner_max_cycles.",
+                cycle,
+                -cached_eval.log_likelihood,
+                consecutive_frozen_loglik_cycles,
+                max_proposed_beta_step,
+                NEWTON_STEP_CAP_FOR_DIVERGENCE,
+                step_tol,
+            );
+            converged = false;
+            break;
+        }
+
         if max_accepted_beta_step <= step_tol && objective_change <= objective_tol {
             if exact_joint_stationarity_ok || max_proposed_beta_step <= step_tol {
                 converged = true;
