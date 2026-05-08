@@ -18,7 +18,7 @@ use crate::solver::estimate::reml::unified::BarrierConfig;
 use ::opt::{
     Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, FirstOrderObjective, FirstOrderSample,
     FixedPoint, FixedPointError, FixedPointObjective, FixedPointSample, FixedPointStatus,
-    MaxIterations, ObjectiveEvalError, SecondOrderObjective, SecondOrderSample, Solution,
+    MaxIterations, ObjectiveEvalError, Profile, SecondOrderObjective, SecondOrderSample, Solution,
     Tolerance, ZerothOrderObjective,
 };
 use ndarray::{Array1, Array2, ArrayView2};
@@ -1773,12 +1773,36 @@ struct OuterFirstOrderBridge<'a> {
     /// cap conservatively LARGER than the truly-needed value, never
     /// smaller.
     last_g_norm: Option<f64>,
+    /// Seed evaluation cache. The seed loop already pays for one full
+    /// `eval_with_order` to validate the seed point and pick a route;
+    /// `opt::Bfgs` would otherwise immediately redo the same work on its
+    /// first call. Held until `opt` queries a point that does not match
+    /// the seed (i.e. the optimizer has stepped), then dropped.
+    initial_eval: Option<(Array1<f64>, OuterEval)>,
+}
+
+impl OuterFirstOrderBridge<'_> {
+    /// Returns `Some(cached eval)` when `x` matches the cached seed point;
+    /// otherwise drops the cache (the optimizer has moved) and returns `None`.
+    fn take_cached_at(&mut self, x: &Array1<f64>) -> Option<OuterEval> {
+        let hit = matches!(&self.initial_eval, Some((cx, _)) if approx_same_point(x, cx));
+        if hit {
+            self.initial_eval.as_ref().map(|(_, eval)| eval.clone())
+        } else {
+            self.initial_eval = None;
+            None
+        }
+    }
 }
 
 impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
     fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
         self.layout
             .validate_point_len(x, "outer eval_cost failed")?;
+        if let Some(eval) = self.take_cached_at(x) {
+            log::debug!("[OUTER cache] eval_cost served from precomputed seed eval");
+            return finite_cost_or_error("outer eval_cost failed", eval.cost);
+        }
         let cost = self
             .obj
             .eval_cost(x)
@@ -1790,6 +1814,30 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
 impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
+        // Cache hit: the seed loop already produced (cost, gradient) at
+        // this point. Serve it without re-running the outer objective.
+        // Initial-grad bookkeeping mirrors the live path so the inner-cap
+        // schedule sees a consistent view across the cached and
+        // recomputed branches.
+        if let Some(eval) = self.take_cached_at(x) {
+            let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if self.g_norm_initial.is_none() && g_norm.is_finite() && g_norm > 0.0 {
+                self.g_norm_initial = Some(g_norm);
+            }
+            if g_norm.is_finite() {
+                self.last_g_norm = Some(g_norm);
+            }
+            self.iter_count = self.iter_count.saturating_add(1);
+            log::info!(
+                "[OUTER cache] eval_grad served from precomputed seed eval cost={:.6e} |g|={:.3e}",
+                eval.cost,
+                g_norm,
+            );
+            return Ok(FirstOrderSample {
+                value: eval.cost,
+                gradient: eval.gradient,
+            });
+        }
         // Drive the outer-aware inner-PIRLS cap based on the iter count,
         // BEFORE invoking the inner solve. Cap stays fixed within a single
         // outer iter (line-search probes go through `eval_cost`, which
@@ -2364,12 +2412,38 @@ struct OuterSecondOrderBridge<'a> {
     /// the staleness rationale: monotone-decreasing g_norm means the cap
     /// is conservatively LARGER than truly needed, never smaller.
     last_g_norm: Option<f64>,
+    /// Seed evaluation cache. The seed loop already paid for one full
+    /// `ValueGradientHessian` evaluation to validate the seed and pick a
+    /// route; `opt::Arc` would otherwise immediately redo the same work
+    /// on its first call. Held until any query at a different point
+    /// arrives, then dropped.
+    initial_eval: Option<(Array1<f64>, OuterEval)>,
+}
+
+impl OuterSecondOrderBridge<'_> {
+    /// See `OuterFirstOrderBridge::take_cached_at`. The second-order
+    /// bridge clones the full `OuterEval` (cost + grad + Hessian) so any
+    /// of `eval_cost`, `eval_grad`, or `eval_hessian` at the seed point
+    /// can hit; only when the optimizer steps is the cache dropped.
+    fn take_cached_at(&mut self, x: &Array1<f64>) -> Option<OuterEval> {
+        let hit = matches!(&self.initial_eval, Some((cx, _)) if approx_same_point(x, cx));
+        if hit {
+            self.initial_eval.as_ref().map(|(_, eval)| eval.clone())
+        } else {
+            self.initial_eval = None;
+            None
+        }
+    }
 }
 
 impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
         self.layout
             .validate_point_len(x, "outer eval_cost failed")?;
+        if let Some(eval) = self.take_cached_at(x) {
+            log::debug!("[OUTER cache] eval_cost served from precomputed seed eval (ARC bridge)");
+            return finite_cost_or_error("outer eval_cost failed", eval.cost);
+        }
         let cost = self
             .obj
             .eval_cost(x)
@@ -2381,6 +2455,25 @@ impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
 impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
+        if let Some(eval) = self.take_cached_at(x) {
+            let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if self.g_norm_initial.is_none() && g_norm.is_finite() && g_norm > 0.0 {
+                self.g_norm_initial = Some(g_norm);
+            }
+            if g_norm.is_finite() {
+                self.last_g_norm = Some(g_norm);
+            }
+            self.eval_count += 1;
+            log::info!(
+                "[OUTER cache] eval_grad served from precomputed seed eval (ARC bridge) cost={:.6e} |g|={:.3e}",
+                eval.cost,
+                g_norm,
+            );
+            return Ok(FirstOrderSample {
+                value: eval.cost,
+                gradient: eval.gradient,
+            });
+        }
         if let Some(feedback) = self.outer_inner_cap.as_ref() {
             // The ARC bridge increments `eval_count` in BOTH `eval_grad` and
             // `eval_hessian`. ARC calls both per outer iter, so `eval_count
@@ -2467,6 +2560,31 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
 impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_hessian(&mut self, x: &Array1<f64>) -> Result<SecondOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
+        if let Some(eval) = self.take_cached_at(x) {
+            let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if self.g_norm_initial.is_none() && g_norm.is_finite() && g_norm > 0.0 {
+                self.g_norm_initial = Some(g_norm);
+            }
+            if g_norm.is_finite() {
+                self.last_g_norm = Some(g_norm);
+            }
+            self.eval_count += 1;
+            log::info!(
+                "[OUTER cache] eval_hessian served from precomputed seed eval (ARC bridge) cost={:.6e} |g|={:.3e}",
+                eval.cost,
+                g_norm,
+            );
+            let hessian = build_bridge_hessian_for_source(
+                self.hessian_source,
+                eval.hessian,
+                self.materialize_operator_max_dim,
+            )?;
+            return Ok(SecondOrderSample {
+                value: eval.cost,
+                gradient: eval.gradient,
+                hessian,
+            });
+        }
         if let Some(feedback) = self.outer_inner_cap.as_ref() {
             let arc_iter = self.eval_count / 2;
             let g_ratio = match (self.last_g_norm, self.g_norm_initial) {
@@ -2538,37 +2656,89 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
             cost = eval.cost,
             gnorm = g_norm,
         );
-        let hessian = match self.hessian_source {
-            HessianSource::Analytic => match eval.hessian {
-                HessianResult::Analytic(h) => Some(h),
-                HessianResult::Operator(ref op)
-                    if op.materialization_capability().is_available()
-                        && op.dim() <= self.materialize_operator_max_dim =>
-                {
-                    // Work-model-approved exact operator materialization:
-                    // batched/explicit backends can avoid one full pass per
-                    // basis column while still feeding dense ARC an analytic
-                    // K×K matrix.
-                    Some(
-                        op.materialize_dense()
-                            .map_err(|message| ObjectiveEvalError::Fatal {
-                                message: format!(
-                                    "outer Hessian operator materialization failed: {message}"
-                                ),
-                            })?,
-                    )
-                }
-                HessianResult::Operator(_) | HessianResult::Unavailable => None,
-            },
-            HessianSource::BfgsApprox
-            | HessianSource::EfsFixedPoint
-            | HessianSource::HybridEfsFixedPoint => None,
-        };
+        let hessian = build_bridge_hessian_for_source(
+            self.hessian_source,
+            eval.hessian,
+            self.materialize_operator_max_dim,
+        )?;
         Ok(SecondOrderSample {
             value: eval.cost,
             gradient: eval.gradient,
             hessian,
         })
+    }
+}
+
+/// Translate an `OuterEval`'s Hessian into the `Option<Array2<f64>>`
+/// shape expected by `opt::SecondOrderSample`, enforcing the contract
+/// implied by the planner's `HessianSource`.
+///
+/// For `HessianSource::Analytic` (the exact second-order route) a missing
+/// or non-materializable Hessian is FATAL: returning `None` here would
+/// invite `opt::SecondOrderCache::finite_difference_hessian` to silently
+/// estimate the Hessian by finite-differencing the gradient, which (a)
+/// throws away the analytic structure the route was selected for, and
+/// (b) costs O(K) full outer evaluations per ARC iteration — at biobank
+/// scale, hours of work per silently-mis-routed step. The right
+/// behavior on a planner/runtime mismatch is to surface it loudly so
+/// the seed loop can either retry, demote the plan, or fail the seed.
+///
+/// Operator Hessians that *are* cheaply materializable (the operator's
+/// `materialization_capability` reports `Explicit` / `BatchedHvp` and the
+/// dimension is below `materialize_operator_max_dim`) are converted to
+/// dense in-place so dense ARC can run an exact factorization. Operator
+/// Hessians that are NOT cheaply materializable should never arrive
+/// here: the seed loop routes those to `run_operator_trust_region`
+/// before constructing the bridge. Reaching this branch on the analytic
+/// route means the runtime contradicted the seed-time decision, which
+/// is the same kind of mismatch we treat as fatal.
+///
+/// For `HessianSource::BfgsApprox`, `EfsFixedPoint`, and
+/// `HybridEfsFixedPoint` we deliberately return `None`: those routes do
+/// not consume an analytic Hessian and feed the Hessian into a
+/// quasi-Newton/fixed-point update instead. (Today these `HessianSource`
+/// variants don't actually drive `opt`'s second-order solvers, but the
+/// match preserves the original behavior in case a future routing
+/// reuses this bridge.)
+fn build_bridge_hessian_for_source(
+    source: HessianSource,
+    hessian: HessianResult,
+    materialize_operator_max_dim: usize,
+) -> Result<Option<Array2<f64>>, ObjectiveEvalError> {
+    match source {
+        HessianSource::Analytic => match hessian {
+            HessianResult::Analytic(h) => Ok(Some(h)),
+            HessianResult::Operator(op)
+                if op.materialization_capability().is_available()
+                    && op.dim() <= materialize_operator_max_dim =>
+            {
+                op.materialize_dense()
+                    .map(Some)
+                    .map_err(|message| ObjectiveEvalError::Fatal {
+                        message: format!(
+                            "outer Hessian operator materialization failed: {message}"
+                        ),
+                    })
+            }
+            HessianResult::Operator(op) => Err(ObjectiveEvalError::Fatal {
+                message: format!(
+                    "outer plan declared HessianSource::Analytic but the runtime returned a \
+                     non-materializable Hessian operator (dim={}, materialization={:?}); \
+                     finite-difference Hessian estimation is not permitted on the analytic route",
+                    op.dim(),
+                    op.materialization_capability(),
+                ),
+            }),
+            HessianResult::Unavailable => Err(ObjectiveEvalError::Fatal {
+                message: "outer plan declared HessianSource::Analytic but the runtime returned \
+                          HessianResult::Unavailable; finite-difference Hessian estimation is \
+                          not permitted on the analytic route"
+                    .to_string(),
+            }),
+        },
+        HessianSource::BfgsApprox
+        | HessianSource::EfsFixedPoint
+        | HessianSource::HybridEfsFixedPoint => Ok(None),
     }
 }
 
@@ -3867,6 +4037,28 @@ fn outer_scaled_tolerance(base_tol: f64, seed_cost: f64) -> f64 {
     base_tol * (1.0 + seed_cost.abs())
 }
 
+/// Component-wise approximate equality used by the bridge's seed-eval cache.
+///
+/// `gam` precomputes the seed's value/grad/Hessian *before* handing the
+/// objective to `opt::Bfgs` / `opt::Arc`, but `opt`'s first call still
+/// evaluates that same point. When the bridge sees a query within tight
+/// tolerance of the cached point we serve from the cached `OuterEval`
+/// instead of re-running a full outer evaluation (which at biobank scale
+/// includes a full inner P-IRLS solve). The tolerance is intentionally
+/// tight: bound projection by `opt` may shift the seed by a few ULPs, but
+/// any genuine optimizer step exceeds it by orders of magnitude.
+#[inline]
+fn approx_same_point(a: &Array1<f64>, b: &Array1<f64>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).all(|(x, y)| {
+        let diff = (x - y).abs();
+        let scale = 1.0_f64.max(x.abs()).max(y.abs());
+        diff <= 1e-12 * scale
+    })
+}
+
 fn run_operator_trust_region(
     obj: &mut dyn OuterObjective,
     seed: &Array1<f64>,
@@ -4917,6 +5109,22 @@ fn run_outer_with_plan(
                     )
                 } else {
                     let hessian_source = the_plan.hessian_source;
+                    let (lo, hi) = &bounds_template;
+                    let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
+                        .expect("outer rho bounds must be valid");
+                    let scaled_tol = outer_scaled_tolerance(config.tolerance, seed_eval.cost);
+                    let tol = Tolerance::new(scaled_tol).expect("outer tolerance must be valid");
+                    let max_iter =
+                        MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
+
+                    // Hand the precomputed seed eval to the bridge so
+                    // ARC's first call is served from cache instead of
+                    // re-running the full outer objective. The clone
+                    // here costs one Array1 (gradient) and one Array2
+                    // (analytic Hessian, when present); both are
+                    // negligible against the saved outer eval at
+                    // biobank scale.
+                    let initial_eval = Some((seed.clone(), seed_eval.clone()));
                     let objective = OuterSecondOrderBridge {
                         obj,
                         layout,
@@ -4926,20 +5134,27 @@ fn run_outer_with_plan(
                         outer_inner_cap: config.outer_inner_cap.clone(),
                         g_norm_initial: None,
                         last_g_norm: None,
+                        initial_eval,
                     };
-
-                    let (lo, hi) = &bounds_template;
-                    let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
-                        .expect("outer rho bounds must be valid");
-                    let scaled_tol = outer_scaled_tolerance(config.tolerance, seed_eval.cost);
-                    let tol = Tolerance::new(scaled_tol).expect("outer tolerance must be valid");
-                    let max_iter =
-                        MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
 
                     let mut optimizer = ArcOptimizer::new(seed.clone(), objective)
                         .with_bounds(bounds)
                         .with_tolerance(tol)
                         .with_max_iterations(max_iter);
+                    // Phase 1.3: on the exact-Hessian ARC route we
+                    // forbid `opt`'s internal AutoBfgs demotion. Robust
+                    // mode would silently switch to a quasi-Newton
+                    // approximation if an ARC step rejected hard,
+                    // throwing away the analytic Hessian geometry the
+                    // route was selected for. `Profile::Deterministic`
+                    // sets `FallbackPolicy::Never` (and tightens
+                    // `eta_accept` / history caps); ARC retries within
+                    // the same geometry on rejection. v0.3.0 will add a
+                    // dedicated `with_fallback_policy` knob so we can
+                    // disable fallback without touching `eta_accept`.
+                    if matches!(hessian_source, HessianSource::Analytic) {
+                        optimizer = optimizer.with_profile(Profile::Deterministic);
+                    }
                     match optimizer.run() {
                         Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
                         Err(ArcError::MaxIterationsReached { last_solution, .. }) => {
@@ -5013,6 +5228,12 @@ fn run_outer_with_plan(
                 let tol = Tolerance::new(scaled_tol).expect("outer tolerance must be valid");
                 let max_iter =
                     MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
+                // Hand the precomputed (cost, gradient) seed eval to
+                // the bridge so BFGS's first call is served from cache.
+                // Inner P-IRLS solves dominate outer cost at biobank
+                // scale; skipping one re-eval at the seed is one of the
+                // cheapest wins available.
+                let initial_eval = Some((seed.clone(), seed_eval.clone()));
                 let objective = OuterFirstOrderBridge {
                     obj,
                     layout,
@@ -5020,6 +5241,7 @@ fn run_outer_with_plan(
                     iter_count: 0,
                     g_norm_initial: None,
                     last_g_norm: None,
+                    initial_eval,
                 };
                 let mut optimizer = Bfgs::new(seed.clone(), objective)
                     .with_bounds(bounds)
@@ -6369,6 +6591,7 @@ mod tests {
             outer_inner_cap: None,
             g_norm_initial: None,
             last_g_norm: None,
+            initial_eval: None,
         };
         let grad_sample =
             FirstOrderObjective::eval_grad(&mut bridge, &array![1.0]).expect("grad eval");
@@ -6388,6 +6611,217 @@ mod tests {
                 ],
             "second-order bridge should split first-order and second-order requests, saw {seen_orders:?}"
         );
+    }
+
+    /// Phase 1.1 — On `HessianSource::Analytic` the bridge MUST surface a
+    /// fatal error rather than producing `SecondOrderSample { hessian: None }`
+    /// when the runtime returns `HessianResult::Unavailable`. A `None` here
+    /// would let `opt::SecondOrderCache::finite_difference_hessian` silently
+    /// estimate the Hessian by finite-differencing the gradient — at biobank
+    /// scale, hours of work per silently-mis-routed step. The seed loop
+    /// should retry, demote, or fail loudly instead.
+    #[test]
+    fn analytic_route_unavailable_hessian_is_fatal() {
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic);
+        let mut obj = problem.build_objective_with_eval_order(
+            (),
+            |_: &mut (), theta: &Array1<f64>| Ok(theta[0] * theta[0]),
+            |_: &mut (), _: &Array1<f64>| {
+                Err(EstimationError::InvalidInput(
+                    "legacy eager eval should not run".to_string(),
+                ))
+            },
+            move |_: &mut (), theta: &Array1<f64>, _order: OuterEvalOrder| {
+                Ok(OuterEval {
+                    cost: theta[0] * theta[0],
+                    gradient: array![2.0 * theta[0]],
+                    hessian: HessianResult::Unavailable,
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let mut bridge = OuterSecondOrderBridge {
+            obj: &mut obj,
+            layout: OuterThetaLayout::new(1, 0),
+            hessian_source: HessianSource::Analytic,
+            materialize_operator_max_dim: OUTER_HVP_MATERIALIZE_MAX_DIM,
+            eval_count: 0,
+            outer_inner_cap: None,
+            g_norm_initial: None,
+            last_g_norm: None,
+            initial_eval: None,
+        };
+        let err = SecondOrderObjective::eval_hessian(&mut bridge, &array![1.0])
+            .expect_err("Analytic route must reject Unavailable Hessian, not pass None to opt");
+        match err {
+            ObjectiveEvalError::Fatal { message } => {
+                assert!(
+                    message.contains("HessianSource::Analytic")
+                        && message.contains("Unavailable"),
+                    "fatal message should explain the analytic-route mismatch, saw: {message}"
+                );
+            }
+            ObjectiveEvalError::Recoverable { message } => panic!(
+                "Analytic-route Hessian violations must be Fatal (FD estimation is forbidden); \
+                 got Recoverable: {message}"
+            ),
+        }
+    }
+
+    /// Phase 1.2 — When the bridge holds a precomputed seed evaluation
+    /// and `opt` queries that exact same point, no second
+    /// `eval_with_order` call is dispatched to the underlying objective.
+    /// At biobank scale the saved evaluation is a full inner P-IRLS
+    /// solve, so this is one of the highest-value low-risk wins.
+    #[test]
+    fn second_order_bridge_serves_seed_from_cache() {
+        let seen_orders = Arc::new(Mutex::new(Vec::new()));
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic);
+        let mut obj = problem.build_objective_with_eval_order(
+            (),
+            |_: &mut (), theta: &Array1<f64>| Ok(theta[0] * theta[0]),
+            |_: &mut (), _: &Array1<f64>| {
+                Err(EstimationError::InvalidInput(
+                    "legacy eager eval should not run".to_string(),
+                ))
+            },
+            {
+                let seen_orders = Arc::clone(&seen_orders);
+                move |_: &mut (), theta: &Array1<f64>, order: OuterEvalOrder| {
+                    seen_orders.lock().unwrap().push(order);
+                    Ok(OuterEval {
+                        cost: theta[0] * theta[0],
+                        gradient: array![2.0 * theta[0]],
+                        hessian: HessianResult::Analytic(array![[2.0]]),
+                    })
+                }
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let seed = array![1.0];
+        let cached_eval = OuterEval {
+            cost: 1.0,
+            gradient: array![2.0],
+            hessian: HessianResult::Analytic(array![[2.0]]),
+        };
+        let mut bridge = OuterSecondOrderBridge {
+            obj: &mut obj,
+            layout: OuterThetaLayout::new(1, 0),
+            hessian_source: HessianSource::Analytic,
+            materialize_operator_max_dim: OUTER_HVP_MATERIALIZE_MAX_DIM,
+            eval_count: 0,
+            outer_inner_cap: None,
+            g_norm_initial: None,
+            last_g_norm: None,
+            initial_eval: Some((seed.clone(), cached_eval)),
+        };
+
+        // All three of cost / grad / Hessian at the seed point should
+        // be served from cache; the underlying objective must not see
+        // any eval_with_order call.
+        let cost = ZerothOrderObjective::eval_cost(&mut bridge, &seed).expect("cost from cache");
+        assert_eq!(cost, 1.0);
+        let grad = FirstOrderObjective::eval_grad(&mut bridge, &seed).expect("grad from cache");
+        assert_eq!(grad.value, 1.0);
+        assert_eq!(grad.gradient, array![2.0]);
+        let hess =
+            SecondOrderObjective::eval_hessian(&mut bridge, &seed).expect("hess from cache");
+        assert_eq!(hess.value, 1.0);
+        assert_eq!(hess.gradient, array![2.0]);
+        assert_eq!(hess.hessian, Some(array![[2.0]]));
+
+        assert!(
+            seen_orders.lock().unwrap().is_empty(),
+            "seed-cache hit must avoid invoking the underlying eval_with_order; \
+             saw {:?}",
+            seen_orders.lock().unwrap()
+        );
+
+        // Step away from the seed: cache is dropped, the live path runs.
+        let stepped = array![2.5];
+        let _ = SecondOrderObjective::eval_hessian(&mut bridge, &stepped).expect("live eval");
+        let observed = seen_orders.lock().unwrap().clone();
+        assert_eq!(
+            observed,
+            vec![OuterEvalOrder::ValueGradientHessian],
+            "stepped query must invoke the live path exactly once"
+        );
+
+        // Returning to the seed after stepping must NOT re-hit the
+        // dropped cache; the live path runs again.
+        let _ = SecondOrderObjective::eval_hessian(&mut bridge, &seed).expect("live eval");
+        let observed = seen_orders.lock().unwrap().clone();
+        assert_eq!(
+            observed.len(),
+            2,
+            "cache invalidates on first non-matching query and is not resurrected"
+        );
+    }
+
+    /// Phase 1.2 (first-order bridge counterpart). BFGS's first call at
+    /// the seed must be served from cache, and the bridge must invalidate
+    /// on the first non-matching query.
+    #[test]
+    fn first_order_bridge_serves_seed_from_cache() {
+        let seen_orders = Arc::new(Mutex::new(Vec::new()));
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Unavailable);
+        let mut obj = problem.build_objective_with_eval_order(
+            (),
+            |_: &mut (), theta: &Array1<f64>| Ok(theta[0] * theta[0]),
+            |_: &mut (), _: &Array1<f64>| {
+                Err(EstimationError::InvalidInput(
+                    "legacy eager eval should not run".to_string(),
+                ))
+            },
+            {
+                let seen_orders = Arc::clone(&seen_orders);
+                move |_: &mut (), theta: &Array1<f64>, order: OuterEvalOrder| {
+                    seen_orders.lock().unwrap().push(order);
+                    Ok(OuterEval {
+                        cost: theta[0] * theta[0],
+                        gradient: array![2.0 * theta[0]],
+                        hessian: HessianResult::Unavailable,
+                    })
+                }
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let seed = array![1.0];
+        let cached_eval = OuterEval {
+            cost: 1.0,
+            gradient: array![2.0],
+            hessian: HessianResult::Unavailable,
+        };
+        let mut bridge = OuterFirstOrderBridge {
+            obj: &mut obj,
+            layout: OuterThetaLayout::new(1, 0),
+            outer_inner_cap: None,
+            iter_count: 0,
+            g_norm_initial: None,
+            last_g_norm: None,
+            initial_eval: Some((seed.clone(), cached_eval)),
+        };
+
+        let grad = FirstOrderObjective::eval_grad(&mut bridge, &seed).expect("grad from cache");
+        assert_eq!(grad.value, 1.0);
+        assert_eq!(grad.gradient, array![2.0]);
+        assert!(
+            seen_orders.lock().unwrap().is_empty(),
+            "first-order seed-cache hit must skip eval_with_order"
+        );
+
+        // Stepping invalidates and runs the live path.
+        let _ = FirstOrderObjective::eval_grad(&mut bridge, &array![2.5]).expect("live eval");
+        assert_eq!(seen_orders.lock().unwrap().len(), 1);
     }
 
     #[test]
