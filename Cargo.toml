@@ -125,6 +125,10 @@ name = "joint_line_search_speculative"
 path = "bench/cargo_benches/joint_line_search_speculative.rs"
 harness = false
 
+[[bench]]
+name = "cell_moment_dedup_biobank_shape"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
