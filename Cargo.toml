@@ -93,6 +93,10 @@ harness = false
 name = "cell_moment_lru_biobank_shape"
 harness = false
 
+[[bench]]
+name = "branch_cell_biobank_hv"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
