@@ -3563,10 +3563,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(MultiDirJet::linear(n_dirs, base, &first))
     }
 
-    fn local_cubic_value_jet(
-        cubic: exact_kernel::LocalSpanCubic,
-        x: &MultiDirJet,
-    ) -> MultiDirJet {
+    fn local_cubic_value_jet(cubic: exact_kernel::LocalSpanCubic, x: &MultiDirJet) -> MultiDirJet {
         let n_dirs = x.coeffs.len().trailing_zeros() as usize;
         let t = x.add(&MultiDirJet::constant(n_dirs, -cubic.left));
         let t2 = t.mul(&t);
@@ -3603,12 +3600,12 @@ impl BernoulliMarginalSlopeFamily {
         let mut inside = a_jet.add(&b_jet.scale(z));
 
         if let Some(h_range) = primary.h.as_ref() {
-            let runtime = self
-                .score_warp
-                .as_ref()
-                .ok_or_else(|| "empirical flex score-warp primary range without runtime".to_string())?;
-            let beta_h = beta_h
-                .ok_or_else(|| "empirical flex score-warp primary range without beta".to_string())?;
+            let runtime = self.score_warp.as_ref().ok_or_else(|| {
+                "empirical flex score-warp primary range without runtime".to_string()
+            })?;
+            let beta_h = beta_h.ok_or_else(|| {
+                "empirical flex score-warp primary range without beta".to_string()
+            })?;
             let mut h_jet = MultiDirJet::zero(n_dirs);
             Self::for_each_deviation_basis_cubic_at(
                 runtime,
@@ -3630,12 +3627,12 @@ impl BernoulliMarginalSlopeFamily {
         let mut w_jet = MultiDirJet::zero(n_dirs);
         let mut w_prime_jet = MultiDirJet::zero(n_dirs);
         if let Some(w_range) = primary.w.as_ref() {
-            let runtime = self
-                .link_dev
-                .as_ref()
-                .ok_or_else(|| "empirical flex link-deviation primary range without runtime".to_string())?;
-            let beta_w = beta_w
-                .ok_or_else(|| "empirical flex link-deviation primary range without beta".to_string())?;
+            let runtime = self.link_dev.as_ref().ok_or_else(|| {
+                "empirical flex link-deviation primary range without runtime".to_string()
+            })?;
+            let beta_w = beta_w.ok_or_else(|| {
+                "empirical flex link-deviation primary range without beta".to_string()
+            })?;
             let u0 = u_jet.coeff(0);
             Self::for_each_deviation_basis_cubic_at(
                 runtime,
@@ -3717,9 +3714,7 @@ impl BernoulliMarginalSlopeFamily {
             }
         }
         if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
-            return Err(
-                "non-finite empirical flexible row context in jet contraction".to_string(),
-            );
+            return Err("non-finite empirical flexible row context in jet contraction".to_string());
         }
 
         let marginal = self.marginal_link_map(q)?;
@@ -3800,9 +3795,21 @@ impl BernoulliMarginalSlopeFamily {
         let mut out = Array2::<f64>::zeros((r, r));
         for u in 0..r {
             for v in u..r {
-                let directions = vec![basis_dirs[u].clone(), basis_dirs[v].clone(), dir_owned.clone()];
+                let directions = vec![
+                    basis_dirs[u].clone(),
+                    basis_dirs[v].clone(),
+                    dir_owned.clone(),
+                ];
                 let jet = self.empirical_flex_neglog_jet(
-                    row, primary, q, b, beta_h, beta_w, row_ctx, &directions, grid,
+                    row,
+                    primary,
+                    q,
+                    b,
+                    beta_h,
+                    beta_w,
+                    row_ctx,
+                    &directions,
+                    grid,
                 )?;
                 let val = jet.coeff(1 | 2 | 4);
                 out[[u, v]] = val;
@@ -3851,7 +3858,15 @@ impl BernoulliMarginalSlopeFamily {
                     dir_v_owned.clone(),
                 ];
                 let jet = self.empirical_flex_neglog_jet(
-                    row, primary, q, b, beta_h, beta_w, row_ctx, &directions, grid,
+                    row,
+                    primary,
+                    q,
+                    b,
+                    beta_h,
+                    beta_w,
+                    row_ctx,
+                    &directions,
+                    grid,
                 )?;
                 let val = jet.coeff(1 | 2 | 4 | 8);
                 out[[p, q_idx]] = val;
