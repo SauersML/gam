@@ -982,6 +982,106 @@ pub struct DenestedPartitionCell {
 
 impl DenestedPartitionCell {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+struct TailCellMomentCacheKey {
+    c0_bits: u64,
+    c1_bits: u64,
+    endpoint_bits: u64,
+    side: i8,
+    max_degree: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TailCellMomentCacheStats {
+    pub hits: usize,
+    pub misses: usize,
+    pub entries: usize,
+}
+
+impl TailCellMomentCacheStats {
+    #[inline]
+    pub fn requests(self) -> usize {
+        self.hits + self.misses
+    }
+
+    #[inline]
+    pub fn hit_rate(self) -> f64 {
+        let requests = self.requests();
+        if requests == 0 {
+            0.0
+        } else {
+            self.hits as f64 / requests as f64
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct TailCellMomentCache {
+    moments: std::collections::HashMap<TailCellMomentCacheKey, CellMomentState>,
+    hits: usize,
+    misses: usize,
+}
+
+static TAIL_CELL_MOMENT_CACHE: std::sync::OnceLock<std::sync::Mutex<TailCellMomentCache>> =
+    std::sync::OnceLock::new();
+static TAIL_CELL_MOMENT_CACHE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+fn tail_cell_moment_cache() -> &'static std::sync::Mutex<TailCellMomentCache> {
+    TAIL_CELL_MOMENT_CACHE.get_or_init(|| std::sync::Mutex::new(TailCellMomentCache::default()))
+}
+
+#[inline]
+fn tail_cell_cache_key(
+    cell: DenestedCubicCell,
+    max_degree: usize,
+) -> Option<TailCellMomentCacheKey> {
+    if cell.c2.abs() > NORMALIZED_CELL_BRANCH_TOL || cell.c3.abs() > NORMALIZED_CELL_BRANCH_TOL {
+        return None;
+    }
+    match (!cell.left.is_finite(), !cell.right.is_finite()) {
+        (true, false) if cell.right.is_finite() => Some(TailCellMomentCacheKey {
+            c0_bits: cell.c0.to_bits(),
+            c1_bits: cell.c1.to_bits(),
+            endpoint_bits: cell.right.to_bits(),
+            side: -1,
+            max_degree,
+        }),
+        (false, true) if cell.left.is_finite() => Some(TailCellMomentCacheKey {
+            c0_bits: cell.c0.to_bits(),
+            c1_bits: cell.c1.to_bits(),
+            endpoint_bits: cell.left.to_bits(),
+            side: 1,
+            max_degree,
+        }),
+        _ => None,
+    }
+}
+
+pub fn set_tail_cell_moment_cache_enabled(enabled: bool) {
+    TAIL_CELL_MOMENT_CACHE_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn reset_tail_cell_moment_cache() {
+    let mut cache = tail_cell_moment_cache()
+        .lock()
+        .expect("tail cell moment cache mutex poisoned");
+    cache.moments.clear();
+    cache.hits = 0;
+    cache.misses = 0;
+}
+
+pub fn tail_cell_moment_cache_stats() -> TailCellMomentCacheStats {
+    let cache = tail_cell_moment_cache()
+        .lock()
+        .expect("tail cell moment cache mutex poisoned");
+    TailCellMomentCacheStats {
+        hits: cache.hits,
+        misses: cache.misses,
+        entries: cache.moments.len(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq)]
 pub struct CellFingerprint {
     c0: u64,
@@ -3264,6 +3364,38 @@ pub fn evaluate_cell_moments(
     cell: DenestedCubicCell,
     max_degree: usize,
 ) -> Result<CellMomentState, String> {
+    if TAIL_CELL_MOMENT_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+        && let Some(key) = tail_cell_cache_key(cell, max_degree)
+    {
+        let mut cache = tail_cell_moment_cache()
+            .lock()
+            .expect("tail cell moment cache mutex poisoned");
+        if let Some(state) = cache.moments.get(&key).cloned() {
+            cache.hits += 1;
+            return Ok(state);
+        }
+        cache.misses += 1;
+        drop(cache);
+
+        let state = evaluate_cell_moments_uncached(cell, max_degree)?;
+
+        let mut cache = tail_cell_moment_cache()
+            .lock()
+            .expect("tail cell moment cache mutex poisoned");
+        let state = cache.moments.entry(key).or_insert_with(|| state.clone());
+        return Ok(state.clone());
+    }
+    evaluate_cell_moments_uncached(cell, max_degree)
+}
+
+/// Evaluate cell moments without consulting the global affine-tail memo.
+///
+/// This is retained for regression tests and before/after microbenchmarks;
+/// production callers should use [`evaluate_cell_moments`].
+pub fn evaluate_cell_moments_uncached(
+    cell: DenestedCubicCell,
+    max_degree: usize,
+) -> Result<CellMomentState, String> {
     let left_inf = !cell.left.is_finite();
     let right_inf = !cell.right.is_finite();
     if left_inf || right_inf {
@@ -3372,6 +3504,88 @@ pub fn evaluate_cell_moments_with_scratch<'a>(
 mod tests {
     use super::*;
     use crate::probability::normal_pdf;
+
+    fn assert_close_rel(label: &str, actual: f64, expected: f64, tol: f64) {
+        let denom = expected.abs().max(1.0);
+        let rel = (actual - expected).abs() / denom;
+        assert!(
+            rel <= tol,
+            "{label}: actual={actual:.17e} expected={expected:.17e} rel={rel:.3e} tol={tol:.3e}"
+        );
+    }
+
+    #[test]
+    fn affine_tail_cell_memo_matches_uncached_grid_and_records_hits() {
+        reset_tail_cell_moment_cache();
+        let c0s = [-2.0, -0.25, 0.0, 1.5];
+        let c1s = [-1.2, -0.05, 0.0, 0.8];
+        let endpoints = [-4.0, -1.0, 0.0, 2.5, 6.0];
+        let degrees = [0_usize, 4, 9, 16, 24];
+
+        for &c0 in &c0s {
+            for &c1 in &c1s {
+                for &endpoint in &endpoints {
+                    for &max_degree in &degrees {
+                        for &(left, right) in
+                            &[(f64::NEG_INFINITY, endpoint), (endpoint, f64::INFINITY)]
+                        {
+                            let cell = DenestedCubicCell {
+                                left,
+                                right,
+                                c0,
+                                c1,
+                                c2: 0.0,
+                                c3: 0.0,
+                            };
+                            let expected = evaluate_cell_moments_uncached(cell, max_degree)
+                                .expect("uncached affine tail moments");
+                            let actual = evaluate_cell_moments(cell, max_degree)
+                                .expect("cached affine tail moments miss");
+                            let repeat = evaluate_cell_moments(cell, max_degree)
+                                .expect("cached affine tail moments hit");
+                            assert_eq!(actual.branch, expected.branch);
+                            assert_eq!(repeat.branch, expected.branch);
+                            assert_close_rel(
+                                "tail value miss",
+                                actual.value,
+                                expected.value,
+                                1e-14,
+                            );
+                            assert_close_rel("tail value hit", repeat.value, expected.value, 1e-14);
+                            assert_eq!(actual.moments.len(), expected.moments.len());
+                            assert_eq!(repeat.moments.len(), expected.moments.len());
+                            for (idx, ((a, r), e)) in actual
+                                .moments
+                                .iter()
+                                .zip(repeat.moments.iter())
+                                .zip(expected.moments.iter())
+                                .enumerate()
+                            {
+                                assert_close_rel(
+                                    &format!("tail moment miss[{idx}]"),
+                                    *a,
+                                    *e,
+                                    1e-14,
+                                );
+                                assert_close_rel(&format!("tail moment hit[{idx}]"), *r, *e, 1e-14);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let stats = tail_cell_moment_cache_stats();
+        assert_eq!(stats.misses, stats.entries);
+        assert!(
+            stats.hits >= stats.misses,
+            "expected repeat hits: {stats:?}"
+        );
+        assert!(
+            stats.hit_rate() >= 0.5,
+            "unexpected low hit rate: {stats:?}"
+        );
+    }
 
     fn reference_bivariate_normal_cdf_20(h: f64, k: f64, rho: f64) -> f64 {
         if h == f64::NEG_INFINITY || k == f64::NEG_INFINITY {
