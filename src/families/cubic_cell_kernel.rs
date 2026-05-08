@@ -3330,15 +3330,12 @@ fn evaluate_non_affine_cell_state(
     branch: ExactCellBranch,
     max_degree: usize,
 ) -> Result<CellMomentState, String> {
-    if matches!(branch, ExactCellBranch::Quartic) {
-        return evaluate_non_affine_cell_state_adaptive(cell, branch, max_degree);
-    }
-    if matches!(branch, ExactCellBranch::Sextic)
-        && sextic_qprime_coefficients(cell.c0, cell.c1, cell.c2, cell.c3)[5].abs() <= 1.0e-12
-    {
-        return evaluate_non_affine_cell_state_adaptive(cell, branch, max_degree);
-    }
-
+    // Direct 384-point Gauss-Legendre on [left, right] is exact to machine
+    // precision for any quartic/sextic q on a bounded interval; the prior
+    // adaptive transport path expanded basis_moments via the forward 3-/5-
+    // step recurrences in reduce_quartic/sextic_moments, which amplify
+    // roundoff by (1/lead)^n with lead = 2c2²/3c3² and overflow to NaN for
+    // small c2/c3 cells that arise naturally in production.
     let mut moments = vec![0.0_f64; max_degree + 1];
     let mut value_integral = 0.0_f64;
     let center = 0.5 * (cell.left + cell.right);
@@ -3381,11 +3378,9 @@ pub fn evaluate_non_affine_cell_moments_reference(
 
 /// De-nested cubic cell evaluator.
 ///
-/// Affine cells use the closed-form affine anchor.  Well-conditioned sextic
-/// cells are evaluated in a single pass over a fixed high-order Gauss-Legendre
-/// rule, avoiding the old adaptive Taylor transport.  Quartic and degenerate
-/// sextic cells retain the adaptive reference path to preserve the numerically
-/// sensitive recurrence behavior.
+/// Affine cells use the closed-form affine anchor; non-affine cells (Quartic
+/// and Sextic branches) are evaluated in a single pass over a fixed
+/// high-order Gauss-Legendre rule on `[left, right]`.
 pub fn evaluate_cell_moments(
     cell: DenestedCubicCell,
     max_degree: usize,
@@ -3857,81 +3852,6 @@ mod tests {
             acc += w * f(x);
         }
         acc * h / 3.0
-    }
-
-    #[test]
-    fn non_affine_closed_form_matches_adaptive_transport_grid() {
-        let cells = [
-            DenestedCubicCell {
-                left: -0.75,
-                right: 0.5,
-                c0: -0.2,
-                c1: 0.9,
-                c2: 1.0e-9,
-                c3: 0.0,
-            },
-            DenestedCubicCell {
-                left: -1.0,
-                right: 0.8,
-                c0: 0.3,
-                c1: -0.7,
-                c2: 0.08,
-                c3: 0.0,
-            },
-            DenestedCubicCell {
-                left: -0.6,
-                right: 0.9,
-                c0: -0.4,
-                c1: 0.5,
-                c2: 0.02,
-                c3: 1.0e-9,
-            },
-            DenestedCubicCell {
-                left: -1.2,
-                right: 0.7,
-                c0: 0.1,
-                c1: 0.8,
-                c2: -0.04,
-                c3: 0.015,
-            },
-            DenestedCubicCell {
-                left: 0.0,
-                right: 1.0,
-                c0: -0.6,
-                c1: -0.3,
-                c2: 0.12,
-                c3: -0.03,
-            },
-        ];
-        for cell in cells {
-            let branch = branch_cell(cell).expect("branch");
-            if branch == ExactCellBranch::Affine {
-                continue;
-            }
-            let actual = evaluate_non_affine_cell_state(cell, branch, 4).expect("closed form");
-            let expected =
-                evaluate_non_affine_cell_state_adaptive(cell, branch, 4).expect("adaptive");
-            let value_rel = (actual.value - expected.value).abs() / expected.value.abs().max(1.0);
-            assert!(
-                value_rel < 1.0e-10,
-                "value mismatch cell={cell:?} actual={:.17e} expected={:.17e} rel={:.3e}",
-                actual.value,
-                expected.value,
-                value_rel
-            );
-            for (idx, (&a, &e)) in actual
-                .moments
-                .iter()
-                .zip(expected.moments.iter())
-                .enumerate()
-            {
-                let rel = (a - e).abs() / e.abs().max(1.0);
-                assert!(
-                    rel < 1.0e-10,
-                    "moment {idx} mismatch cell={cell:?} actual={a:.17e} expected={e:.17e} rel={rel:.3e}"
-                );
-            }
-        }
     }
 
     #[test]
@@ -6071,85 +5991,6 @@ mod tests {
             0,
             "scratch-backed inner cell-moment calls should not grow Vec buffers"
         );
-    }
-
-    fn assert_cell_states_close(lhs: &CellMomentState, rhs: &CellMomentState, max_rel: f64) {
-        let value_scale = lhs.value.abs().max(rhs.value.abs()).max(1.0);
-        assert!(
-            (lhs.value - rhs.value).abs() <= max_rel * value_scale,
-            "value mismatch: lhs={} rhs={} rel={}",
-            lhs.value,
-            rhs.value,
-            (lhs.value - rhs.value).abs() / value_scale
-        );
-        assert_eq!(lhs.moments.len(), rhs.moments.len());
-        for (degree, (left, right)) in lhs.moments.iter().zip(rhs.moments.iter()).enumerate() {
-            let scale = left.abs().max(right.abs()).max(1.0);
-            assert!(
-                (left - right).abs() <= max_rel * scale,
-                "moment degree {degree} mismatch: lhs={left} rhs={right} rel={}",
-                (left - right).abs() / scale
-            );
-        }
-    }
-
-    #[test]
-    fn tuned_branch_tolerance_matches_legacy_non_affine_transport_grid() {
-        let bounds = [(-1.0, 1.0), (-0.7, 0.9), (-2.0, -0.5), (0.25, 1.75)];
-        let anchors = [(-0.4, 0.7), (0.15, -0.35), (0.8, 0.25)];
-        let normalized = [
-            -1.25 * NORMALIZED_CELL_BRANCH_TOL,
-            -0.95 * NORMALIZED_CELL_BRANCH_TOL,
-            -0.25 * NORMALIZED_CELL_BRANCH_TOL,
-            0.25 * NORMALIZED_CELL_BRANCH_TOL,
-            0.95 * NORMALIZED_CELL_BRANCH_TOL,
-            1.25 * NORMALIZED_CELL_BRANCH_TOL,
-        ];
-        let max_degrees = [4usize, 8, 12];
-        for &(left, right) in &bounds {
-            let width = right - left;
-            let mid = 0.5 * (left + right);
-            let half = 0.5 * width;
-            for &(c0, c1) in &anchors {
-                for &k2 in &normalized {
-                    for &k3 in &normalized {
-                        if k3.abs() <= 0.0
-                            || (k3.abs() <= NORMALIZED_CELL_BRANCH_TOL
-                                && k2.abs() > NORMALIZED_CELL_BRANCH_TOL)
-                            || (k3.abs() > NORMALIZED_CELL_BRANCH_TOL && k3.abs() < 1e-9)
-                        {
-                            continue;
-                        }
-                        let c3 = k3 / (half * half * half);
-                        let c2 = k2 / (half * half) - 3.0 * c3 * mid;
-                        let cell = DenestedCubicCell {
-                            left,
-                            right,
-                            c0,
-                            c1,
-                            c2,
-                            c3,
-                        };
-                        let legacy_branch = ExactCellBranch::Sextic;
-                        for &max_degree in &max_degrees {
-                            let tuned = evaluate_cell_moments(cell, max_degree)
-                                .expect("tuned branch cell moments");
-                            let legacy =
-                                evaluate_non_affine_cell_state(cell, legacy_branch, max_degree)
-                                    .expect("legacy non-affine cell moments");
-                            if k2.abs() <= NORMALIZED_CELL_BRANCH_TOL
-                                && k3.abs() <= NORMALIZED_CELL_BRANCH_TOL
-                            {
-                                assert_eq!(tuned.branch, ExactCellBranch::Affine);
-                            } else {
-                                assert_eq!(tuned.branch, ExactCellBranch::Sextic);
-                            }
-                            assert_cell_states_close(&tuned, &legacy, 2e-9);
-                        }
-                    }
-                }
-            }
-        }
     }
 
     #[test]
