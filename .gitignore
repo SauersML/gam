@@ -46,6 +46,7 @@ scripts/__pycache__/
 scripts/latest_benchmark_summary.md
 scripts/scripts/latest_benchmark_summary.md
 *.png
+!bench/aniso_demo/*.png
 src/rust_digest.txt
 
 # Codex temp working directories
@@ -75,7 +76,7 @@ bench/us48_debug_artifacts_after/
 bench/us48_debug_artifacts_logsigma/
 bench/us48_debug_final/
 bench/us48_scale_experiment/
-bench/biobank_scale/
+bench/biobank_scale/*/
 rust_digest.txt
 
 # Python virtual environments
