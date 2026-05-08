@@ -15501,6 +15501,76 @@ pub fn create_duchon_spline_basiswithworkspace(
     })
 }
 
+/// Multiplicative amplification factor that lifts an underflowing Duchon
+/// kernel back into a representable range. Probes max|K_CC| (the kernel at
+/// every center pair) and returns `1/max` when the kernel collapses to the
+/// double-precision noise floor; otherwise returns `1.0`.
+///
+/// **Why**: in high d with a small length scale the spectral normalization
+/// `c = κ^{d/2-n} / ((2π)^{d/2}·2^{n-1}·Γ(n))` of the Matérn block is `~1e-14`,
+/// driving every `K(r) = c · r^ν · K_ν(κr)` to `~1e-16`. Downstream
+/// `B^T B` is then at `~1e-32` — below `eps²` — and the spectral whitener
+/// truncates everything as noise, even though the basis is mathematically
+/// well-defined.
+///
+/// Rescaling the basis by α = 1/max|K_CC| produces the same predictions
+/// (β rescales by α, REML's λ adapts). Since the probe is computed from
+/// `centers + kernel parameters` which are stored verbatim in
+/// `BasisMetadata::Duchon`, prediction recomputes an identical α — so
+/// fit-time and predict-time bases share a single coefficient frame.
+fn duchon_kernel_amplification(
+    centers: ArrayView2<'_, f64>,
+    length_scale: Option<f64>,
+    p_order: usize,
+    s_order: usize,
+    d: usize,
+    aniso_log_scales: Option<&[f64]>,
+    coeffs: Option<&DuchonPartialFractionCoeffs>,
+    pure_poly_coeff: Option<&PolyharmonicBlockCoeff>,
+) -> f64 {
+    let k = centers.nrows();
+    if k == 0 {
+        return 1.0;
+    }
+    let axis_scales = aniso_log_scales.map(aniso_axis_scales);
+    let mut max_abs = 0.0_f64;
+    for i in 0..k {
+        for j in i..k {
+            let r = if let Some(scales) = axis_scales.as_deref() {
+                aniso_distance_rows_with_scales(centers, i, centers, j, scales)
+            } else {
+                euclidean_distance_rows(centers, i, centers, j)
+            };
+            let val = if let Some(ppc) = pure_poly_coeff {
+                ppc.eval(r)
+            } else {
+                match duchon_matern_kernel_general_from_distance(
+                    r,
+                    length_scale,
+                    p_order,
+                    s_order,
+                    d,
+                    coeffs,
+                ) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                }
+            };
+            if val.abs() > max_abs {
+                max_abs = val.abs();
+            }
+        }
+    }
+    // Only amplify when the kernel has underflowed. The 1e-10 threshold is
+    // well above any meaningful smoothing-relevant kernel scale yet far from
+    // 1.0, so well-conditioned kernels pass through unchanged (α = 1).
+    if max_abs > 0.0 && max_abs < 1e-10 {
+        1.0 / max_abs
+    } else {
+        1.0
+    }
+}
+
 fn build_duchon_basis_designwithworkspace(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
@@ -15604,6 +15674,16 @@ fn build_duchon_basis_designwithworkspace(
     };
 
     let axis_scales = aniso_log_scales.map(aniso_axis_scales);
+    let kernel_amp = duchon_kernel_amplification(
+        centers,
+        length_scale,
+        p_order,
+        s_order,
+        d,
+        aniso_log_scales,
+        coeffs.as_ref(),
+        pure_poly_coeff.as_ref(),
+    );
     let mut basis = Array2::<f64>::zeros((n, total_cols));
     // Process rows in chunks to amortize thread-local allocation across many rows.
     // Use larger chunks (1024) for better cache utilization at biobank scale.
@@ -15623,7 +15703,7 @@ fn build_duchon_basis_designwithworkspace(
                     } else {
                         euclidean_distance_rows(data, i, centers, j)
                     };
-                    kernel_row[j] = if let Some(ref ppc) = pure_poly_coeff {
+                    let raw = if let Some(ref ppc) = pure_poly_coeff {
                         // Pure Duchon: use precomputed coefficient, skip gamma calls.
                         ppc.eval(r)
                     } else {
@@ -15636,6 +15716,7 @@ fn build_duchon_basis_designwithworkspace(
                             coeffs.as_ref(),
                         )?
                     };
+                    kernel_row[j] = raw * kernel_amp;
                 }
                 // Write basis row = kernel_row^T × Z using scatter-accumulate
                 // pattern: for each knot j with nonzero kernel, add its
@@ -15741,6 +15822,16 @@ pub fn build_duchon_basiswithworkspace(
             None
         };
         let poly_block = polynomial_block_from_order(data, effective_nullspace_order);
+        let kernel_amp = duchon_kernel_amplification(
+            centers.view(),
+            length_scale,
+            p_order,
+            s_order,
+            d,
+            aniso.as_deref(),
+            coeffs.as_ref(),
+            pure_poly_coeff.as_ref(),
+        );
         let base_design = if let Some(eta) = aniso.as_ref() {
             let metric_weights = eta.iter().map(|&v| (2.0 * v).exp()).collect::<Vec<_>>();
             let coeffs = coeffs.clone();
@@ -15751,7 +15842,7 @@ pub fn build_duchon_basiswithworkspace(
                     q += metric_weights[axis] * delta * delta;
                 }
                 let r = q.sqrt();
-                if let Some(ppc) = pure_poly_coeff {
+                let raw = if let Some(ppc) = pure_poly_coeff {
                     ppc.eval(r)
                 } else {
                     duchon_matern_kernel_general_from_distance(
@@ -15763,7 +15854,8 @@ pub fn build_duchon_basiswithworkspace(
                         coeffs.as_ref(),
                     )
                     .expect("validated Duchon inputs should not fail")
-                }
+                };
+                raw * kernel_amp
             };
             let base_op = ChunkedKernelDesignOperator::new(
                 shared_data.clone(),
@@ -15778,7 +15870,7 @@ pub fn build_duchon_basiswithworkspace(
             let coeffs = coeffs.clone();
             let kernel = move |data_row: &[f64], center_row: &[f64]| -> f64 {
                 let r = stable_euclidean_norm((0..d).map(|axis| data_row[axis] - center_row[axis]));
-                if let Some(ppc) = pure_poly_coeff {
+                let raw = if let Some(ppc) = pure_poly_coeff {
                     ppc.eval(r)
                 } else {
                     duchon_matern_kernel_general_from_distance(
@@ -15790,7 +15882,8 @@ pub fn build_duchon_basiswithworkspace(
                         coeffs.as_ref(),
                     )
                     .expect("validated Duchon inputs should not fail")
-                }
+                };
+                raw * kernel_amp
             };
             let base_op = ChunkedKernelDesignOperator::new(
                 shared_data,
