@@ -378,6 +378,79 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
         Array1::from_vec(out)
     }
 
+    /// Override: compute `tr(Fᵀ B F)` in a single row pass that amortises the
+    /// (very expensive) `row_third_contracted` jet across all rank columns
+    /// of `F`.
+    ///
+    /// **Why this matters:** the default trait route is `mul_mat` (per-column
+    /// `mul_vec` over `rank` columns of `F`), and each `mul_vec` fires its own
+    /// `into_par_iter` over the n rows that recomputes
+    /// `T_r = row_third_contracted(row, J_r · self.direction)` per row. The
+    /// `T_r` matrix only depends on `self.direction` — which is fixed for the
+    /// operator — so the rank-many recomputations are pure waste. On the
+    /// biobank-shape margslope-aniso-duchon16d shard the
+    /// `BernoulliRigidRowKernel::row_third_contracted` jet (composed of
+    /// `MultiDirJet::compose_unary` + malloc-heavy `empirical_rigid_neglog_jet`)
+    /// dominates the per-axis trace at ~30 s, with `rank≈p≈95` so the redundancy
+    /// factor lands near the observed ~95×.
+    ///
+    /// Algebra: the operator action is
+    /// ```text
+    ///   B v = Σ_r Jᵣᵀ (Tᵣ · Jᵣ v),     Tᵣ = row_third_contracted(r, Jᵣ·direction)
+    /// ```
+    /// so for `F ∈ ℝ^{p × rank}`,
+    /// ```text
+    ///   tr(Fᵀ B F) = Σ_r Σ_k (Jᵣ F[:, k])ᵀ Tᵣ (Jᵣ F[:, k]).
+    /// ```
+    /// `Jᵣ · direction` and `Tᵣ` are computed once per row; the inner k-loop
+    /// is `rank` cheap K×K bilinear forms (K=2 or 4 in practice — fully
+    /// unrolled by the compiler).
+    fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
+        debug_assert_eq!(factor.nrows(), self.p);
+        let rank = factor.ncols();
+        let n_rows = self.kern.n_rows();
+        if rank == 0 || n_rows == 0 {
+            return 0.0;
+        }
+
+        // `jacobian_action(row, &[f64])` wants a contiguous slice, but
+        // `factor.column(k)` from a row-major `Array2` is strided. One
+        // standard-layout copy of `Fᵀ` (rank × p, row-major) gives every
+        // column-of-F as a contiguous row of `f_t`, so the inner loop's
+        // `n_rows · rank` jacobian applies all run on flat slices.
+        let f_t: Array2<f64> = factor.t().as_standard_layout().into_owned();
+        let direction = self.direction.as_slice();
+
+        (0..n_rows)
+            .into_par_iter()
+            .map(|row| -> f64 {
+                let dir_k = self.kern.jacobian_action(row, direction);
+                let third = self.kern.row_third_contracted(row, &dir_k).expect(
+                    "row-kernel third contraction should succeed for validated directions",
+                );
+                let mut row_total = 0.0_f64;
+                for k_col in 0..rank {
+                    let f_slice = f_t
+                        .row(k_col)
+                        .to_slice()
+                        .expect("standard-layout row must be contiguous");
+                    let vec_k = self.kern.jacobian_action(row, f_slice);
+                    // (Tᵣ vec_k)ᵀ vec_k — K is a const-generic small integer.
+                    let mut quad = 0.0_f64;
+                    for a in 0..K {
+                        let mut t_dot = 0.0_f64;
+                        for b in 0..K {
+                            t_dot += third[a][b] * vec_k[b];
+                        }
+                        quad += vec_k[a] * t_dot;
+                    }
+                    row_total += quad;
+                }
+                row_total
+            })
+            .sum()
+    }
+
     fn to_dense(&self) -> Array2<f64> {
         row_kernel_directional_derivative(&*self.kern, &self.direction)
             .expect("row-kernel directional derivative dense materialization should succeed")
@@ -439,6 +512,56 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
                 },
             );
         Array1::from_vec(out)
+    }
+
+    /// Override: same shape as the first-derivative operator's
+    /// `trace_projected_factor` — amortise the `row_fourth_contracted` jet
+    /// across all rank columns of `F`. See that override for the full rationale;
+    /// the only change is the per-row matrix:
+    /// ```text
+    ///   Tᵣ = row_fourth_contracted(r, Jᵣ·direction_u, Jᵣ·direction_v)
+    /// ```
+    /// computed once per row instead of `rank` times.
+    fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
+        debug_assert_eq!(factor.nrows(), self.p);
+        let rank = factor.ncols();
+        let n_rows = self.kern.n_rows();
+        if rank == 0 || n_rows == 0 {
+            return 0.0;
+        }
+
+        let f_t: Array2<f64> = factor.t().as_standard_layout().into_owned();
+        let direction_u = self.direction_u.as_slice();
+        let direction_v = self.direction_v.as_slice();
+
+        (0..n_rows)
+            .into_par_iter()
+            .map(|row| -> f64 {
+                let dir_u = self.kern.jacobian_action(row, direction_u);
+                let dir_v = self.kern.jacobian_action(row, direction_v);
+                let fourth = self.kern.row_fourth_contracted(row, &dir_u, &dir_v).expect(
+                    "row-kernel fourth contraction should succeed for validated directions",
+                );
+                let mut row_total = 0.0_f64;
+                for k_col in 0..rank {
+                    let f_slice = f_t
+                        .row(k_col)
+                        .to_slice()
+                        .expect("standard-layout row must be contiguous");
+                    let vec_k = self.kern.jacobian_action(row, f_slice);
+                    let mut quad = 0.0_f64;
+                    for a in 0..K {
+                        let mut t_dot = 0.0_f64;
+                        for b in 0..K {
+                            t_dot += fourth[a][b] * vec_k[b];
+                        }
+                        quad += vec_k[a] * t_dot;
+                    }
+                    row_total += quad;
+                }
+                row_total
+            })
+            .sum()
     }
 
     fn to_dense(&self) -> Array2<f64> {
