@@ -12781,7 +12781,7 @@ mod tests {
             gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-        assert_eq!(hessian, crate::solver::outer_strategy::Derivative::Analytic);
+        assert_eq!(hessian, crate::solver::outer_strategy::DeclaredHessianForm::Either);
 
         let rho_dim = spec.initial_log_lambdas.len();
         let psi_dim = derivative_blocks[0].len();
@@ -12847,7 +12847,7 @@ mod tests {
             gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-        assert_eq!(hessian, crate::solver::outer_strategy::Derivative::Analytic);
+        assert_eq!(hessian, crate::solver::outer_strategy::DeclaredHessianForm::Either);
     }
 
     #[test]
@@ -15098,11 +15098,7 @@ pub fn fit_transformation_normal(
     let probe_blocks = vec![probe_block];
     let (_, cap_hessian) = custom_family_outer_derivatives(&probe_family, &probe_blocks, &options);
     let analytic_gradient = analytic_psi_available;
-    let analytic_hessian_supported = analytic_gradient
-        && matches!(
-            cap_hessian,
-            crate::solver::outer_strategy::Derivative::Analytic
-        );
+    let analytic_hessian_supported = analytic_gradient && cap_hessian.is_analytic();
     let analytic_hessian = false;
     if analytic_hessian_supported {
         log::info!(
