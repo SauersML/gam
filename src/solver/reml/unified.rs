@@ -2268,17 +2268,107 @@ impl HyperOperator for ImplicitHyperOperator {
     /// the biobank-shape margslope-aniso-duchon16d shard each per-axis trace
     /// drops from ~30 s to a single chunked-GEMM cost.
     fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
-        let entry_t = std::time::Instant::now();
         debug_assert_eq!(factor.nrows(), self.p);
-        let rank = factor.ncols();
         let n_obs = self.w_diag.len();
+        let rank = factor.ncols();
         if rank == 0 || n_obs == 0 {
             return 0.0;
         }
+        let xf = self.compute_xf(factor);
+        self.trace_projected_factor_with_xf(factor, xf.view())
+    }
+
+    /// Cached variant — *the* hot-path optimisation for biobank-shape outer
+    /// gradient/Hessian sweeps. Every ψ-axis built atop the same `x_design`
+    /// (e.g. all 32 ψ-axes of a marginal-slope model, or the same axis hit
+    /// from `g_factor` and `w_factor` traces) shares one chunked
+    /// `X · F` design GEMM per `(x_design, factor)` pair via
+    /// [`ProjectedFactorCache`]. With 32 axes per outer-gradient sweep and
+    /// O(rank) more cross-axis traces inside the outer-Hessian build, the
+    /// cache turns 32× redundant `O(n · p · rank)` GEMMs into a single one
+    /// per outer iter. At biobank shape (`n = 320 K`, `p = rank = 95`) that
+    /// is the difference between minutes and seconds of design-GEMM work.
+    fn trace_projected_factor_cached(
+        &self,
+        factor: &Array2<f64>,
+        cache: &ProjectedFactorCache,
+    ) -> f64 {
+        debug_assert_eq!(factor.nrows(), self.p);
+        let n_obs = self.w_diag.len();
+        let rank = factor.ncols();
+        if rank == 0 || n_obs == 0 {
+            return 0.0;
+        }
+        let xf = self.cached_xf(factor, cache);
+        self.trace_projected_factor_with_xf(factor, xf.view())
+    }
+}
+
+impl ImplicitHyperOperator {
+    /// Chunked `X · F` via faer SIMD-parallel GEMM. The chunk-row sizing
+    /// targets ~8 MiB live blocks so the (chunk_n × p) row slice and
+    /// (chunk_n × rank) result both stay in L2/L3 across realistic biobank
+    /// shapes; the kernel mirrors `xt_logdet_kernel_x_diagonal`'s sizing
+    /// rule. Caller wraps this in [`Self::cached_xf`] when invariance
+    /// across ψ-axes lets one matrix serve every axis at this `(x_design,
+    /// factor)` pair.
+    fn compute_xf(&self, factor: &Array2<f64>) -> Array2<f64> {
+        let n_obs = self.w_diag.len();
+        let rank = factor.ncols();
+        let mut xf = Array2::<f64>::zeros((n_obs, rank));
+        const TARGET_BYTES: usize = 8 * 1024 * 1024;
+        let chunk_rows = (TARGET_BYTES / ((self.p + rank).max(1) * 8))
+            .max(512)
+            .min(n_obs);
+        let mut start = 0usize;
+        while start < n_obs {
+            let end = (start + chunk_rows).min(n_obs);
+            let rows = self
+                .x_design
+                .try_row_chunk(start..end)
+                .unwrap_or_else(|err| {
+                    panic!("ImplicitHyperOperator::compute_xf row chunk failed: {err}")
+                });
+            let block = crate::faer_ndarray::fast_ab(&rows, factor);
+            xf.slice_mut(ndarray::s![start..end, ..]).assign(&block);
+            start = end;
+        }
+        xf
+    }
+
+    /// Look up `X · F` from the [`ProjectedFactorCache`] (compute-on-miss).
+    /// Cache key combines the shared `x_design` Arc pointer and the
+    /// factor's value fingerprint, so two `ImplicitHyperOperator` instances
+    /// built atop the same `x_design` (e.g. axis-0 and axis-1 of a 32-axis
+    /// ψ-block) consult the same cache slot and hit after the first
+    /// computes.
+    fn cached_xf(
+        &self,
+        factor: &Array2<f64>,
+        cache: &ProjectedFactorCache,
+    ) -> Arc<Array2<f64>> {
+        let design_id = Arc::as_ptr(&self.x_design) as usize;
+        let key = ProjectedFactorKey::from_factor_view(design_id, factor.view());
+        cache.get_or_insert_with(key, || self.compute_xf(factor))
+    }
+
+    /// Evaluate `tr(Fᵀ B_d F)` given a precomputed `X · F`. Pulls every
+    /// per-axis-redundant `X · F` out of the inner loop so the cache (or
+    /// caller-supplied matrix) covers every ψ-axis at once. The remaining
+    /// per-axis work is the row-kernel build (`row_chunk_first_raw`),
+    /// the `K_d · U_knot` GEMM, the fused `⟨W ⊙ DXF, XF⟩` inner products,
+    /// and the small dense penalty contraction.
+    fn trace_projected_factor_with_xf(
+        &self,
+        factor: &Array2<f64>,
+        xf: ArrayView2<'_, f64>,
+    ) -> f64 {
+        let rank = factor.ncols();
+        let n_obs = self.w_diag.len();
+        debug_assert_eq!(xf.dim(), (n_obs, rank));
 
         // Once: unproject F to raw knot space → (n_knots × rank).
         let u_knot = self.implicit_deriv.unproject_matrix(&factor.view());
-        let t_unproject = entry_t.elapsed().as_secs_f64();
 
         // Match the chunk sizing `xt_logdet_kernel_x_diagonal` uses so the
         // live block stays in L2/L3 across realistic biobank shapes.
@@ -2291,39 +2381,24 @@ impl HyperOperator for ImplicitHyperOperator {
         let c_opt = self.c_x_psi_beta.as_ref().map(|arc| arc.as_ref());
         let mut design_total = 0.0_f64;
         let mut correction_total = 0.0_f64;
-        let mut t_xchunk = 0.0;
-        let mut t_kdchunk = 0.0;
-        let mut t_dxf_gemm = 0.0;
-        let mut t_inner = 0.0;
         let mut start = 0usize;
         while start < n_obs {
             let end = (start + chunk_rows).min(n_obs);
             let chunk_n = end - start;
 
-            let t0 = std::time::Instant::now();
-            // Shared-X chunk: XF_chunk = X_chunk · F.
-            let rows = self
-                .x_design
-                .try_row_chunk(start..end)
-                .unwrap_or_else(|err| {
-                    panic!("ImplicitHyperOperator::trace_projected_factor row chunk failed: {err}")
-                });
-            let xf_chunk = crate::faer_ndarray::fast_ab(&rows, factor);
-            t_xchunk += t0.elapsed().as_secs_f64();
+            // Cached-or-precomputed X·F slice for this chunk.
+            let xf_chunk = xf.slice(ndarray::s![start..end, ..]);
 
-            let t1 = std::time::Instant::now();
-            // Raw kernel scalars for axis d on this chunk.
+            // Raw kernel scalars for axis d on this chunk, then a single
+            // (chunk × n_knots) · (n_knots × rank) GEMM gives DXF_chunk.
             let kd_chunk = self
                 .implicit_deriv
                 .row_chunk_first_raw(self.axis, start..end)
-                .expect("radial scalar evaluation failed during implicit hyper forward_mul_matrix");
-            t_kdchunk += t1.elapsed().as_secs_f64();
-
-            let t2 = std::time::Instant::now();
+                .expect(
+                    "radial scalar evaluation failed during implicit hyper forward_mul_matrix",
+                );
             let dxf_chunk = crate::faer_ndarray::fast_ab(&kd_chunk, &u_knot);
-            t_dxf_gemm += t2.elapsed().as_secs_f64();
 
-            let t3 = std::time::Instant::now();
             // Fused inner-product accumulation.
             for i_local in 0..chunk_n {
                 let i = start + i_local;
@@ -2341,50 +2416,16 @@ impl HyperOperator for ImplicitHyperOperator {
                     }
                 }
             }
-            t_inner += t3.elapsed().as_secs_f64();
             start = end;
         }
 
-        let t_pen0 = std::time::Instant::now();
         // Penalty trace: tr(F^T S_psi F) via dense BLAS3.
         let s_f = self.s_psi.dot(factor);
         let penalty: f64 = factor.iter().zip(s_f.iter()).map(|(&f, &s)| f * s).sum();
-        let t_pen = t_pen0.elapsed().as_secs_f64();
-
-        log::info!(
-            "[PERF] trace_projected_factor axis={} n={} p={} rank={} unproj={:.3}s xchunk={:.3}s kdchunk={:.3}s dxf={:.3}s inner={:.3}s pen={:.3}s total={:.3}s",
-            self.axis,
-            n_obs,
-            self.p,
-            rank,
-            t_unproject,
-            t_xchunk,
-            t_kdchunk,
-            t_dxf_gemm,
-            t_inner,
-            t_pen,
-            entry_t.elapsed().as_secs_f64(),
-        );
 
         2.0 * design_total + correction_total + penalty
     }
 
-    /// Cached variant: the cost is dominated by the single chunked X·F
-    /// GEMM, which is keyed on the operator's shared `x_design` and the
-    /// caller-provided `factor`. The default impl would discard the
-    /// cache; we forward to `trace_projected_factor` rather than redoing
-    /// rank matvecs through the cache key, since the shared-X path
-    /// already amortizes the dominant work.
-    fn trace_projected_factor_cached(
-        &self,
-        factor: &Array2<f64>,
-        _cache: &ProjectedFactorCache,
-    ) -> f64 {
-        self.trace_projected_factor(factor)
-    }
-}
-
-impl ImplicitHyperOperator {
     fn accumulate_c_correction_xt_into(
         &self,
         x_col: ArrayView1<'_, f64>,
