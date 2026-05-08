@@ -67,46 +67,57 @@ path = "src/main.rs"
 
 [[bench]]
 name = "closed_form_pair_block"
+path = "bench/cargo_benches/closed_form_pair_block.rs"
 harness = false
 
 [[bench]]
 name = "closed_form_criterion"
+path = "bench/cargo_benches/closed_form_criterion.rs"
 harness = false
 
 [[bench]]
 name = "spatial_basis_construction"
+path = "bench/cargo_benches/spatial_basis_construction.rs"
 harness = false
 
 [[bench]]
 name = "bvn_biobank_shape"
+path = "bench/cargo_benches/bvn_biobank_shape.rs"
 harness = false
 
 [[bench]]
 name = "margslope_flex_biobank_hv"
+path = "bench/cargo_benches/margslope_flex_biobank_hv.rs"
 harness = false
 
 [[bench]]
 name = "non_affine_cell_hv_shape"
+path = "bench/cargo_benches/non_affine_cell_hv_shape.rs"
 harness = false
 
 [[bench]]
 name = "cell_moment_lru_biobank_shape"
+path = "bench/cargo_benches/cell_moment_lru_biobank_shape.rs"
 harness = false
 
 [[bench]]
 name = "branch_cell_biobank_hv"
+path = "bench/cargo_benches/branch_cell_biobank_hv.rs"
 harness = false
 
 [[bench]]
 name = "trust_region_line_search"
+path = "bench/cargo_benches/trust_region_line_search.rs"
 harness = false
 
 [[bench]]
 name = "line_search_subsample_screen"
+path = "bench/cargo_benches/line_search_subsample_screen.rs"
 harness = false
 
 [[bench]]
 name = "joint_line_search_speculative"
+path = "bench/cargo_benches/joint_line_search_speculative.rs"
 harness = false
 
 [profile.release]
