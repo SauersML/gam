@@ -1,5 +1,24 @@
 name: Publish to PyPI
 
+# Build wheels per (os, arch) as artifacts, then upload them in one final
+# job using twine. Why split build from upload?
+#
+# `maturin-action@v1`'s `command: publish` injects `--release` into the
+# maturin invocation, but newer maturin's `publish` subcommand rejects it
+# (it's always release). Every wheel job was failing at that line, but
+# `continue-on-error: true` swallowed the error so only the sdist made it
+# to PyPI — leaving downstream consumers (`uv sync` / `pip install`) to
+# fall back to the source build path. That's the "Building gamfit==0.1.17"
+# 5× in parallel symptom.
+#
+# `command: build` does NOT trigger the `--release` injection, so the
+# wheels actually get built. We then upload them all via `twine upload`
+# in the `release` job — same pattern the existing sdist path uses, and
+# the standard PyO3 wheel-distribution recipe.
+#
+# `continue-on-error: true` is removed everywhere: real failures need to
+# fail loudly so the wheel slot doesn't silently disappear.
+
 on:
   push:
     tags:
@@ -23,19 +42,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-      - name: Publish Linux wheels
+      - name: Build Linux wheels
         uses: PyO3/maturin-action@v1
-        continue-on-error: true
-        env:
-          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         with:
-          command: publish
+          command: build
           target: ${{ matrix.platform.target }}
           args: >-
+            --release
             --strip
-            --skip-existing
+            --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
           manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.platform.target }}
+          path: dist/*.whl
+          if-no-files-found: error
 
   musllinux:
     runs-on: ubuntu-22.04
@@ -48,19 +70,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-      - name: Publish musllinux wheels
+      - name: Build musllinux wheels
         uses: PyO3/maturin-action@v1
-        continue-on-error: true
-        env:
-          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         with:
-          command: publish
+          command: build
           target: ${{ matrix.target }}
           args: >-
+            --release
             --strip
-            --skip-existing
+            --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
           manylinux: musllinux_1_2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-musllinux-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
 
   macos:
     runs-on: ${{ matrix.platform.runner }}
@@ -75,18 +100,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-      - name: Publish macOS wheels
+      - name: Build macOS wheels
         uses: PyO3/maturin-action@v1
-        continue-on-error: true
-        env:
-          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         with:
-          command: publish
+          command: build
           target: ${{ matrix.platform.target }}
           args: >-
+            --release
             --strip
-            --skip-existing
+            --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.platform.target }}
+          path: dist/*.whl
+          if-no-files-found: error
 
   windows:
     runs-on: windows-latest
@@ -100,18 +128,21 @@ jobs:
         with:
           python-version: '3.x'
           architecture: ${{ matrix.target }}
-      - name: Publish Windows wheels
+      - name: Build Windows wheels
         uses: PyO3/maturin-action@v1
-        continue-on-error: true
-        env:
-          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         with:
-          command: publish
+          command: build
           target: ${{ matrix.target }}
           args: >-
+            --release
             --strip
-            --skip-existing
+            --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
 
   sdist:
     runs-on: ubuntu-22.04
@@ -125,10 +156,36 @@ jobs:
         with:
           command: sdist
           args: --out dist --manifest-path crates/gam-pyffi/Cargo.toml
-      - name: Publish sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Upload to PyPI
+    needs:
+      - linux
+      - musllinux
+      - macos
+      - windows
+      - sdist
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Download all wheel + sdist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Show what will be uploaded
+        run: ls -la dist
+      - name: Upload to PyPI via twine
         env:
-          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         run: |
           python -m pip install --upgrade twine
-          python -m twine upload --skip-existing --non-interactive \
-            -u __token__ -p "$MATURIN_PYPI_TOKEN" dist/*.tar.gz
+          python -m twine upload --skip-existing --non-interactive dist/*
