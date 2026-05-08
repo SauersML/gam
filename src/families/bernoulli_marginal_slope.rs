@@ -3423,6 +3423,19 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         Ok(contract_third_full(&cache[row], dir[0], dir[1]))
     }
 
+    /// Force-build the per-row uncontracted third-derivative tensor cache
+    /// at top-level rayon. Called by [`RowKernelHessianWorkspace::new`]
+    /// before any outer `par_iter` enters; subsequent
+    /// `row_third_contracted` calls inside the parallel ext-idx sweep then
+    /// hit a populated `OnceLock` and skip straight to a 2×2 contraction.
+    fn warm_up_directional_caches(&self) -> Result<(), String> {
+        // Touch the cache so the parallel build runs here (not later, nested
+        // inside the outer ext-idx par_iter where the lock-holder thread
+        // would have to do the row pass alone).
+        let _ = self.third_full_cache();
+        Ok(())
+    }
+
     fn row_fourth_contracted(
         &self,
         row: usize,
@@ -11169,6 +11182,16 @@ impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
         options: BlockwiseFitOptions,
     ) -> Result<Self, String> {
         let cache = family.build_exact_eval_cache(&block_states)?;
+        // Prime the per-row uncontracted third-derivative tensor at workspace
+        // construction (rigid path only). The build runs at top-level rayon
+        // here, so the parallel row pass uses all cores. If we instead let
+        // it run lazily inside `build_psi_hyper_coords` axis calls, those
+        // calls are themselves at top level — so leaving lazy would also be
+        // parallel — but priming here lifts the first-axis cost out of the
+        // workspace's `first_order_terms` measurement.
+        if !family.effective_flex_active(&block_states)? {
+            let _ = family.rigid_third_full_cached(&block_states, &cache, 0)?;
+        }
         Ok(Self {
             family,
             block_states,
