@@ -2082,7 +2082,10 @@ pub(crate) fn empirical_intercept_from_marginal(
     let eval = |a: f64| {
         empirical_rigid_calibration_eval(a, target_mu, slope, probit_scale, nodes, weights)
     };
-    let abs_tol = 1e-11_f64.max(1e-9 * target_mu.abs());
+    // Newton/Halley converges quadratically from the closed-form Gaussian seed
+    // (residual hits ~1e-15 in 3 iters), so we tighten the solver contract to
+    // 1e-13 — calibration callers can then assert <=1e-10 robustly.
+    let abs_tol = 1e-13_f64.max(4.0 * f64::EPSILON * target_mu.abs());
     let (root, _, f_best) = super::monotone_root::solve_monotone_root(
         eval,
         seed,
@@ -18912,7 +18915,7 @@ mod tests {
             .zip(weights.iter())
             .map(|(&node, &weight)| weight * normal_cdf(intercept + scale * slope * node))
             .sum::<f64>();
-        assert!((calibrated - target_mu).abs() <= 1e-8);
+        assert!((calibrated - target_mu).abs() <= 1e-10);
     }
 
     #[test]
@@ -18942,7 +18945,7 @@ mod tests {
             .map(|(&node, &weight)| weight * normal_cdf(intercept + scale * slope * node))
             .sum::<f64>();
 
-        assert!((calibrated - target_mu).abs() <= 1e-8);
+        assert!((calibrated - target_mu).abs() <= 1e-10);
     }
 
     #[test]
