@@ -399,12 +399,26 @@ pub(crate) fn transformation_normal_pit_score(
         ));
     }
 
-    let scale = h.abs().max(lower.abs()).max(upper.abs()).max(1.0);
-    let endpoint_tol = 64.0 * f64::EPSILON * scale;
-    if h < lower - endpoint_tol || h > upper + endpoint_tol {
-        return Err(format!(
-            "transformation-normal PIT score is outside fitted finite support: h={h:.6e}, lower={lower:.6e}, upper={upper:.6e}"
-        ));
+    // Extrapolation outside `[lower, upper]` is *not* a malformed input —
+    // a test sample whose response sits at-or-beyond the training response
+    // support will produce a finite `h` slightly below `lower` (or slightly
+    // above `upper`) by exactly the amount the kernel reconstructs the
+    // boundary. The PIT mapping is still well-defined: `u → 0` when
+    // `h ≤ lower`, `u → 1` when `h ≥ upper`, and the `clip_eps` clamp on
+    // the standard-normal quantile call at the end of this function turns
+    // both into the extreme-quantile finite values that downstream
+    // calibration code expects. Refusing here was surfacing routine
+    // boundary roundoff at biobank shape (`p_resp` coefficients × O(1)
+    // basis evaluations introduce ~`p_resp·ε·scale` noise — 64·ε·scale
+    // is below that floor) as a hard prediction failure.
+    //
+    // A debug-level log preserves visibility for genuinely far-out
+    // inputs without aborting the prediction. Non-finite `h` is already
+    // rejected above at the `is_finite()` guard.
+    if h < lower || h > upper {
+        log::debug!(
+            "transformation-normal PIT extrapolation: h={h:.6e}, lower={lower:.6e}, upper={upper:.6e} — clamping to support and continuing"
+        );
     }
     let h_inside = h.clamp(lower, upper);
     let u = if h_inside <= lower {
@@ -11597,9 +11611,29 @@ mod tests {
             .expect("positive-tail PIT score");
         assert!(positive_tail.is_finite());
 
-        let err = transformation_normal_pit_score(2.1, -2.0, 2.0, 1.0e-12)
-            .expect_err("PIT outside support should fail");
-        assert!(err.contains("outside fitted finite support"));
+        // Extrapolation past the upper endpoint is *not* an error: the PIT
+        // mapping clamps `h` to `[lower, upper]` so `u → 1`, and the
+        // `clip_eps` clamp on the standard-normal quantile call yields the
+        // upper-tail extreme finite value (`≈ Φ⁻¹(1 - clip_eps)`). At
+        // biobank shape, an honest test sample at-or-just-beyond the
+        // training response support routinely lands here from boundary
+        // roundoff alone, so failing closed would ship a hard prediction
+        // error on every CTN bootstrap pass.
+        let above_upper = transformation_normal_pit_score(2.1, -2.0, 2.0, 1.0e-12)
+            .expect("extrapolation above upper endpoint should clamp, not error");
+        assert!(above_upper.is_finite());
+        assert!(above_upper > 0.0, "h>upper must produce upper-tail PIT");
+        let below_lower = transformation_normal_pit_score(-2.1, -2.0, 2.0, 1.0e-12)
+            .expect("extrapolation below lower endpoint should clamp, not error");
+        assert!(below_lower.is_finite());
+        assert!(below_lower < 0.0, "h<lower must produce lower-tail PIT");
+
+        // Genuinely-malformed input (NaN h) must still be rejected by the
+        // early `is_finite()` guard — the soft-clamp is for legitimate
+        // numerical extrapolation, not for non-finite values.
+        let nan_err = transformation_normal_pit_score(f64::NAN, -2.0, 2.0, 1.0e-12)
+            .expect_err("NaN h must still be rejected");
+        assert!(nan_err.contains("finite"));
     }
 
     #[test]
