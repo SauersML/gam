@@ -9927,6 +9927,10 @@ mod tests {
             score_warp: Some(score_prepared.runtime.clone()),
             link_dev: Some(link_prepared.runtime.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
         };
         let marginal_beta = array![0.05, 0.08];
