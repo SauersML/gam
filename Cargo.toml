@@ -1,6 +1,6 @@
 [package]
 name = "gam"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.93"
 autobins = false
@@ -47,7 +47,7 @@ indicatif = "0.18.4"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
-opt = "0.5.0"
+opt = "0.5.1"
 log = "0.4.29"
 csv = "1.4.0"
 faer = "0.24.0"

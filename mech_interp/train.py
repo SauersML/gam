@@ -121,6 +121,13 @@ def harvest_activations(
     model.eval()
     windows = make_lm_batches(tokens, seq_len=seq_len, stride=seq_len)  # non-overlapping
     n_total = windows.shape[0] * seq_len
+    # Sub-sample windows uniformly across the corpus so harvested positions
+    # span the full profile time (otherwise we only see the prefix).
+    n_windows_needed = max(1, max_acts // seq_len)
+    if windows.shape[0] > n_windows_needed:
+        idx = torch.linspace(0, windows.shape[0] - 1, n_windows_needed).long()
+        windows = windows[idx]
+        print(f"[harvest] subsampled windows: {windows.shape[0]} (uniformly spaced)")
     print(f"[harvest] total positions available: {n_total}, capping at {max_acts}")
     acts_buf: list[np.ndarray] = []
     tok_buf: list[np.ndarray] = []
@@ -128,6 +135,12 @@ def harvest_activations(
     win_buf: list[np.ndarray] = []
     collected = 0
     n_wins = windows.shape[0]
+    # Original-window indices for each retained window (used for token-offset lookup downstream).
+    n_full = (tokens.size - seq_len - 1) // seq_len + 1
+    if n_wins < n_full:
+        win_orig_idx = np.linspace(0, n_full - 1, n_wins, dtype=np.int64)
+    else:
+        win_orig_idx = np.arange(n_wins, dtype=np.int64)
     for i in range(0, n_wins, batch_size):
         batch = windows[i : i + batch_size].to(device)
         inp = batch[:, :-1]
@@ -140,7 +153,7 @@ def harvest_activations(
         B, T, D = a.shape
         a = a.reshape(B * T, D)
         t = t.reshape(B * T)
-        win_idx = np.repeat(np.arange(i, i + B), T).astype(np.int32)
+        win_idx = np.repeat(win_orig_idx[i : i + B], T).astype(np.int32)
         pos_idx = np.tile(np.arange(T), B).astype(np.int32)
         acts_buf.append(a)
         tok_buf.append(t)

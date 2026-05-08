@@ -193,6 +193,31 @@ pub trait OuterHessianOperator: Send + Sync {
     fn dim(&self) -> usize;
     fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String>;
 
+    /// Write `out <- H * v` into a caller-supplied buffer. Default
+    /// impl wraps `matvec` and copies; backends override for a true
+    /// zero-alloc inner-CG path. The matrix-free trust-region adapter
+    /// (`OuterToOptHessianOperator`) calls this on every CG step
+    /// inside `opt::MatrixFreeTrustRegion`, so an override compounds:
+    /// over a 50-outer-iter × 30-CG-iter solve at n=200 the default
+    /// path allocates 1500 transient `Array1<f64>` of size 200 that
+    /// the override eliminates.
+    fn apply_into(
+        &self,
+        v: &Array1<f64>,
+        out: &mut Array1<f64>,
+    ) -> Result<(), String> {
+        let result = self.matvec(v)?;
+        if result.len() != out.len() {
+            return Err(format!(
+                "outer Hessian operator matvec produced length {} but expected {}",
+                result.len(),
+                out.len()
+            ));
+        }
+        out.assign(&result);
+        Ok(())
+    }
+
     /// Whether probing all basis columns is cheap enough for dense ARC.
     ///
     /// The default is deliberately conservative. For operator-backed Duchon,
@@ -2694,23 +2719,14 @@ impl HessianOperator for OuterToOptHessianOperator {
     }
 
     fn apply_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<(), ObjectiveEvalError> {
-        let result = self
-            .0
-            .matvec(v)
+        // Forward to gam's `OuterHessianOperator::apply_into` (default
+        // impl wraps `matvec`; backends with a native into-buffer
+        // kernel override for true zero-alloc CG iterations).
+        self.0
+            .apply_into(v, out)
             .map_err(|message| ObjectiveEvalError::Fatal {
-                message: format!("outer Hessian operator matvec failed: {message}"),
-            })?;
-        if result.len() != out.len() {
-            return Err(ObjectiveEvalError::Fatal {
-                message: format!(
-                    "outer Hessian operator matvec produced length {} but expected {}",
-                    result.len(),
-                    out.len()
-                ),
-            });
-        }
-        out.assign(&result);
-        Ok(())
+                message: format!("outer Hessian operator apply_into failed: {message}"),
+            })
     }
 
     fn apply_mat(&self, x: ArrayView2<'_, f64>) -> Result<Array2<f64>, ObjectiveEvalError> {
