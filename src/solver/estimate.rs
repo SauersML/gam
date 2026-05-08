@@ -1910,6 +1910,7 @@ where
             .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
             .with_outer_inner_cap(InnerProgressFeedback {
                 cap: Arc::clone(&reml_state.outer_inner_cap),
+                accepted_iter: Arc::new(AtomicUsize::new(0)),
                 last_iters: Arc::clone(&reml_state.last_inner_iters),
                 last_converged: Arc::clone(&reml_state.last_inner_converged),
                 ift_residual: Arc::clone(&reml_state.last_ift_prediction_residual),
@@ -2094,6 +2095,7 @@ where
             .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
             .with_outer_inner_cap(InnerProgressFeedback {
                 cap: Arc::clone(&reml_state.outer_inner_cap),
+                accepted_iter: Arc::new(AtomicUsize::new(0)),
                 last_iters: Arc::clone(&reml_state.last_inner_iters),
                 last_converged: Arc::clone(&reml_state.last_inner_converged),
                 ift_residual: Arc::clone(&reml_state.last_ift_prediction_residual),

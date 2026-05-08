@@ -2231,6 +2231,115 @@ impl HyperOperator for ImplicitHyperOperator {
     fn as_implicit(&self) -> Option<&ImplicitHyperOperator> {
         Some(self)
     }
+
+    /// Compute `tr(F^T B F)` directly via shared-X chunked BLAS3 GEMM,
+    /// bypassing the `rank`-many separate matvecs the default impl would
+    /// run through the lazy / operator-backed design.
+    ///
+    /// **Why this matters:** the default trait impl is
+    ///   `let bf = self.mul_mat(F); (F ⊙ bf).sum()`
+    /// which calls `mul_vec_into` per column of `F` (rank columns). On a
+    /// lazy Duchon / Matérn / CTN design each `mul_vec_into` triggers a
+    /// full `O(n · p · kernel_eval)` row-streamed matvec — and with rank ≈ p
+    /// at biobank shape (16D-Duchon-aniso 32 ψ-axes, p ≈ 95, n = 320 K)
+    /// the per-axis trace landed at ~30 s. With 32 axes per outer Hessian
+    /// eval and ~5 outer iters that's the ~1 hr biobank timeout.
+    ///
+    /// The shared-X reformulation:
+    /// ```text
+    ///   B_d = D_d^T W X + X^T W D_d  + X^T diag(c) X  + S_psi
+    ///   F^T B_d F = (D_d F)^T W (X F) + (X F)^T W (D_d F)
+    ///             + (X F)^T diag(c) (X F) + F^T S_psi F
+    ///   tr(F^T B_d F) = 2 · ⟨W ⊙ DXF, XF⟩ + ⟨c ⊙ XF, XF⟩ + tr(F^T S_psi F)
+    /// ```
+    /// `XF = X · F` is computed **once** via a row-chunked faer GEMM
+    /// (the same SIMD-parallel kernel `xt_logdet_kernel_x_diagonal` uses),
+    /// `DXF = (∂X/∂ψ_d) · F` per-column via `forward_mul` (the implicit
+    /// derivative has no batched API), and the penalty trace is a tiny
+    /// `(p × p) × (p × rank)` BLAS3 contract. End-to-end this is one big
+    /// chunked matmul plus rank lightweight derivative applies — the
+    /// expensive lazy-design row-streaming pays its setup once instead
+    /// of `rank` times.
+    fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
+        debug_assert_eq!(factor.nrows(), self.p);
+        let rank = factor.ncols();
+        let n_obs = self.w_diag.len();
+        if rank == 0 || n_obs == 0 {
+            return 0.0;
+        }
+
+        // 1. Chunked X · F via faer SIMD-parallel GEMM. Match the chunk
+        //    sizing rule `xt_logdet_kernel_x_diagonal` uses so the live
+        //    block stays in L2/L3 across realistic biobank shapes.
+        let xf = {
+            let mut xf = Array2::<f64>::zeros((n_obs, rank));
+            const TARGET_BYTES: usize = 8 * 1024 * 1024;
+            let chunk_rows =
+                (TARGET_BYTES / ((self.p + rank).max(1) * 8)).max(512).min(n_obs);
+            let mut start = 0usize;
+            while start < n_obs {
+                let end = (start + chunk_rows).min(n_obs);
+                let rows = self
+                    .x_design
+                    .try_row_chunk(start..end)
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "ImplicitHyperOperator::trace_projected_factor row chunk failed: {err}"
+                        )
+                    });
+                let block = crate::faer_ndarray::fast_ab(&rows, factor);
+                xf.slice_mut(ndarray::s![start..end, ..]).assign(&block);
+                start = end;
+            }
+            xf
+        };
+
+        // 2. Per-column derivative apply + diagonal trace assembly.
+        let w = self.w_diag.as_ref();
+        let c_opt = self.c_x_psi_beta.as_ref().map(|arc| arc.as_ref());
+        let mut design_total = 0.0_f64;
+        let mut correction_total = 0.0_f64;
+        for k in 0..rank {
+            let f_col = factor.column(k).to_owned();
+            let dxf = self
+                .implicit_deriv
+                .forward_mul(self.axis, &f_col.view())
+                .expect("radial scalar evaluation failed during implicit hyper forward_mul");
+            let xf_col = xf.column(k);
+            for i in 0..n_obs {
+                design_total += dxf[i] * w[i] * xf_col[i];
+            }
+            if let Some(c) = c_opt {
+                for i in 0..n_obs {
+                    correction_total += c[i] * xf_col[i] * xf_col[i];
+                }
+            }
+        }
+
+        // 3. Penalty trace: tr(F^T S_psi F) via dense BLAS3.
+        let s_f = self.s_psi.dot(factor);
+        let penalty: f64 = factor
+            .iter()
+            .zip(s_f.iter())
+            .map(|(&f, &s)| f * s)
+            .sum();
+
+        2.0 * design_total + correction_total + penalty
+    }
+
+    /// Cached variant: the cost is dominated by the single chunked X·F
+    /// GEMM, which is keyed on the operator's shared `x_design` and the
+    /// caller-provided `factor`. The default impl would discard the
+    /// cache; we forward to `trace_projected_factor` rather than redoing
+    /// rank matvecs through the cache key, since the shared-X path
+    /// already amortizes the dominant work.
+    fn trace_projected_factor_cached(
+        &self,
+        factor: &Array2<f64>,
+        _cache: &ProjectedFactorCache,
+    ) -> f64 {
+        self.trace_projected_factor(factor)
+    }
 }
 
 impl ImplicitHyperOperator {
