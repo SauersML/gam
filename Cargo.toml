@@ -30,7 +30,7 @@ indicatif = "0.18.4"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
-opt = "0.2.2"
+opt = "0.3.0"
 log = "0.4.29"
 csv = "1.4.0"
 faer = "0.24.0"
@@ -132,6 +132,16 @@ harness = false
 [[bench]]
 name = "bms_hv_row_skip"
 harness = false
+
+# TEMPORARY: while opt 0.3.0 has not yet landed on crates.io (the
+# `crate-opt-0.3.0` tag triggered a publish workflow that failed with
+# 403 Forbidden — the CRATES_IO_TOKEN/CARGO_REGISTRY_TOKEN GitHub
+# secret on SauersML/opt is stale and needs rotating). Build against
+# the local opt source so this branch compiles end-to-end. Remove
+# this `[patch.crates-io]` block once `cargo search opt` reports
+# 0.3.0 (or higher) on crates.io.
+[patch.crates-io]
+opt = { path = "/Users/user/opt/opt" }
 
 [profile.release]
 lto = "thin"
