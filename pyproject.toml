@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "gamfit"
 version = "0.1.17"
 description = "Formula-first generalized additive models with a high-performance Rust core"
-readme = "python/README.md"
+readme = "README_PYPI.md"
 requires-python = ">=3.10"
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
@@ -89,19 +89,17 @@ all = [
 [tool.maturin]
 manifest-path = "crates/gam-pyffi/Cargo.toml"
 module-name = "gamfit._rust"
-python-source = "python"
 
 [tool.mypy]
 python_version = "3.10"
 strict = true
-mypy_path = "python"
-files = ["python", "tests", "scripts", "bench"]
+files = ["gamfit", "tests", "scripts", "bench"]
 exclude = [
   "^bench/\\.venv/",
 ]
 
 [tool.vulture]
-paths = ["python", "tests", "scripts", "bench"]
+paths = ["gamfit", "tests", "scripts", "bench"]
 exclude = ["bench/.venv/"]
 ignore_names = [
   "_repr_html_",

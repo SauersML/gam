@@ -86,8 +86,8 @@ rust_digest.txt
 .pytest_cache/
 .maturin/
 dist/
-python/gamfit/_rust.abi3.so
-python/gamfit/*.dSYM/
+gamfit/_rust.abi3.so
+gamfit/*.dSYM/
 
 # Lean/Lake build artifacts
 .lake/
