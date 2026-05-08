@@ -8281,6 +8281,19 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 0.0
             };
 
+        // Divergence-detection state for the joint-Newton path. Mirrors
+        // the blockwise sibling later in this function: a near-null
+        // direction in the joint Hessian (e.g. BernoulliMarginalSlope's
+        // linkwiggle empirical anchor drifting from fit-time η₀) makes
+        // Newton clamp at MAX_JOINT_STEP every cycle while -loglik stays
+        // frozen and β grows linearly along the null mode. Without an
+        // early-exit the loop runs to inner_max_cycles producing
+        // identical -loglik values, burning ~50s per ρ-cost call at
+        // biobank scale and stacking up to a 2400s timeout.
+        let mut prev_log_likelihood_for_joint_divergence_check = current_log_likelihood;
+        let mut consecutive_joint_frozen_loglik_cycles: usize = 0;
+        const JOINT_DIVERGENCE_FROZEN_LOGLIK_CYCLES: usize = 8;
+
         let mut joint_trust_radius = 1.0_f64;
         for cycle in 0..inner_max_cycles {
             // Fires at the top of each inner joint-Newton cycle so CI logs can
@@ -8933,6 +8946,41 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 objective_tol,
                 beta_inf,
             );
+
+            // Divergence early-exit. See the rationale block above the
+            // loop. We track current_log_likelihood (not the smoothed
+            // `objective_change`) because under a near-null mode the
+            // penalty drifts cycle-to-cycle even when the data fit is
+            // genuinely stagnant — `objective_change` would mask the
+            // divergence whereas a frozen log-likelihood is unambiguous.
+            let loglik_change_for_joint_divergence_check = (current_log_likelihood
+                - prev_log_likelihood_for_joint_divergence_check)
+                .abs();
+            let loglik_frozen_tol_for_joint_divergence_check =
+                inner_tol * (1.0 + current_log_likelihood.abs());
+            let step_clamped_for_joint_divergence_check = step_inf >= 0.95 * MAX_JOINT_STEP;
+            if loglik_change_for_joint_divergence_check
+                <= loglik_frozen_tol_for_joint_divergence_check
+                && step_clamped_for_joint_divergence_check
+            {
+                consecutive_joint_frozen_loglik_cycles += 1;
+            } else {
+                consecutive_joint_frozen_loglik_cycles = 0;
+            }
+            prev_log_likelihood_for_joint_divergence_check = current_log_likelihood;
+            if consecutive_joint_frozen_loglik_cycles >= JOINT_DIVERGENCE_FROZEN_LOGLIK_CYCLES {
+                log::warn!(
+                    "[PIRLS/joint-Newton convergence] divergence early-exit at cycle {} | -loglik={:.6e} frozen for {} consecutive cycles | step_inf={:.3e} (clamped at cap {}) | step_tol={:.3e}; near-null Hessian direction detected — returning unconverged so the outer optimizer backs off this region instead of running to inner_max_cycles.",
+                    cycle,
+                    -current_log_likelihood,
+                    consecutive_joint_frozen_loglik_cycles,
+                    step_inf,
+                    MAX_JOINT_STEP,
+                    step_tol,
+                );
+                converged = false;
+                break;
+            }
 
             if residual <= residual_tol && step_inf <= step_tol {
                 converged = true;
