@@ -18,8 +18,10 @@
 //! derivatives — is then generic over any `RowKernel<K>`.
 
 use crate::custom_family::{ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace};
-use crate::solver::estimate::reml::unified::HyperOperator;
-use ndarray::{Array1, Array2};
+use crate::solver::estimate::reml::unified::{
+    HyperOperator, ProjectedFactorCache, ProjectedFactorKey,
+};
+use ndarray::{Array1, Array2, ArrayView2};
 use rayon::prelude::*;
 use std::sync::Arc;
 
@@ -425,13 +427,98 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
         if rank == 0 || n_rows == 0 {
             return 0.0;
         }
+        let jf = self.compute_jf(factor);
+        self.trace_projected_factor_with_jf(factor, jf.view())
+    }
 
-        // `jacobian_action(row, &[f64])` wants a contiguous slice, but
-        // `factor.column(k)` from a row-major `Array2` is strided. One
-        // standard-layout copy of `Fᵀ` (rank × p, row-major) gives every
-        // column-of-F as a contiguous row of `f_t`, so the inner loop's
-        // `n_rows · rank` jacobian applies all run on flat slices.
+    /// Cached variant — biobank-scale hot path. Within one outer iter
+    /// `factor = g_factor` (or `w_factor`) is fixed and ~2000 trace calls
+    /// against operators sharing the same kernel `Arc` recompute the same
+    /// `n × rank` projection `J · F` redundantly. Caching keyed on
+    /// `(Arc::as_ptr(kern), factor)` collapses all of those to a single
+    /// row-streamed `J · F` build per outer iter; with `p_block = 24` at
+    /// biobank shape this is ~24× per trace, turning the ~30 min trace
+    /// pile into ~1.5 min.
+    fn trace_projected_factor_cached(
+        &self,
+        factor: &Array2<f64>,
+        cache: &ProjectedFactorCache,
+    ) -> f64 {
+        debug_assert_eq!(factor.nrows(), self.p);
+        let rank = factor.ncols();
+        let n_rows = self.kern.n_rows();
+        if rank == 0 || n_rows == 0 {
+            return 0.0;
+        }
+        let jf = self.cached_jf(factor, cache);
+        self.trace_projected_factor_with_jf(factor, jf.view())
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        row_kernel_directional_derivative(&*self.kern, &self.direction)
+            .expect("row-kernel directional derivative dense materialization should succeed")
+    }
+
+    fn is_implicit(&self) -> bool {
+        true
+    }
+}
+
+impl<const K: usize, T: RowKernel<K>> RowKernelDirectionalDerivativeOperator<K, T> {
+    /// Build the jacobian-projected factor `J · F`: an `(n, K * rank)`
+    /// row-major matrix with `jf[r, k * rank + col] = (J_r · F[:, col])[k]`.
+    ///
+    /// The same per-row `jacobian_action(row, F[:, col])` calls the trace
+    /// inner loop already performs — just stored in row-major (n × K·rank)
+    /// layout so a single matrix covers every (row, col) pair.
+    fn compute_jf(&self, factor: &Array2<f64>) -> Array2<f64> {
+        let n_rows = self.kern.n_rows();
+        let rank = factor.ncols();
+        let stride = K * rank;
+        let mut jf = Array2::<f64>::zeros((n_rows, stride));
+        if n_rows == 0 || rank == 0 {
+            return jf;
+        }
+        // Standard-layout `F^T` (rank × p) so each column of F is a contiguous
+        // row of `f_t`, suitable for the slice-taking `jacobian_action`.
         let f_t: Array2<f64> = factor.t().as_standard_layout().into_owned();
+        jf.as_slice_mut()
+            .expect("row-major JF matrix must be contiguous")
+            .par_chunks_mut(stride)
+            .enumerate()
+            .for_each(|(row, jf_row)| {
+                for k_col in 0..rank {
+                    let f_slice = f_t
+                        .row(k_col)
+                        .to_slice()
+                        .expect("standard-layout row must be contiguous");
+                    let vec_k = self.kern.jacobian_action(row, f_slice);
+                    for k in 0..K {
+                        jf_row[k * rank + k_col] = vec_k[k];
+                    }
+                }
+            });
+        jf
+    }
+
+    /// Look up `J · F` from the cache (compute-on-miss). Identity is the
+    /// kernel `Arc` pointer (every `directional_derivative_operator` built
+    /// from the same workspace shares one `Arc<T>` and thus consults the
+    /// same cache slot per `factor`) plus the factor's value fingerprint.
+    fn cached_jf(&self, factor: &Array2<f64>, cache: &ProjectedFactorCache) -> Arc<Array2<f64>> {
+        let design_id = Arc::as_ptr(&self.kern) as *const () as usize;
+        let key = ProjectedFactorKey::from_factor_view(design_id, factor.view());
+        cache.get_or_insert_with(key, || self.compute_jf(factor))
+    }
+
+    /// Evaluate `tr(F^T B F)` given a precomputed `J · F`. Identical inner
+    /// math to `trace_projected_factor`, but the per-(row, col)
+    /// `jacobian_action(row, F[:, col])` is replaced by a strided read out
+    /// of `jf`.
+    fn trace_projected_factor_with_jf(&self, factor: &Array2<f64>, jf: ArrayView2<'_, f64>) -> f64 {
+        let rank = factor.ncols();
+        let n_rows = self.kern.n_rows();
+        debug_assert_eq!(jf.dim(), (n_rows, K * rank));
         let direction = self.direction.as_slice();
 
         (0..n_rows)
@@ -442,14 +529,17 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
                     .kern
                     .row_third_contracted(row, &dir_k)
                     .expect("row-kernel third contraction should succeed for validated directions");
+                let jf_row = jf.row(row);
+                let jf_slice = jf_row
+                    .to_slice()
+                    .expect("J·F is built standard-layout (row-major)");
                 let mut row_total = 0.0_f64;
                 for k_col in 0..rank {
-                    let f_slice = f_t
-                        .row(k_col)
-                        .to_slice()
-                        .expect("standard-layout row must be contiguous");
-                    let vec_k = self.kern.jacobian_action(row, f_slice);
-                    // (Tᵣ vec_k)ᵀ vec_k — K is a const-generic small integer.
+                    let mut vec_k = [0.0_f64; K];
+                    for k in 0..K {
+                        vec_k[k] = jf_slice[k * rank + k_col];
+                    }
+                    // (T_r vec_k)^T vec_k — K is a const-generic small int.
                     let mut quad = 0.0_f64;
                     for a in 0..K {
                         let mut t_dot = 0.0_f64;
@@ -463,15 +553,6 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
                 row_total
             })
             .sum()
-    }
-
-    fn to_dense(&self) -> Array2<f64> {
-        row_kernel_directional_derivative(&*self.kern, &self.direction)
-            .expect("row-kernel directional derivative dense materialization should succeed")
-    }
-
-    fn is_implicit(&self) -> bool {
-        true
     }
 }
 
@@ -543,8 +624,78 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
         if rank == 0 || n_rows == 0 {
             return 0.0;
         }
+        let jf = self.compute_jf(factor);
+        self.trace_projected_factor_with_jf(factor, jf.view())
+    }
 
+    /// Cached variant — see `RowKernelDirectionalDerivativeOperator::
+    /// trace_projected_factor_cached` for the rationale. Same `J · F`
+    /// projection, same per-(kernel, factor) cache key.
+    fn trace_projected_factor_cached(
+        &self,
+        factor: &Array2<f64>,
+        cache: &ProjectedFactorCache,
+    ) -> f64 {
+        debug_assert_eq!(factor.nrows(), self.p);
+        let rank = factor.ncols();
+        let n_rows = self.kern.n_rows();
+        if rank == 0 || n_rows == 0 {
+            return 0.0;
+        }
+        let jf = self.cached_jf(factor, cache);
+        self.trace_projected_factor_with_jf(factor, jf.view())
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        row_kernel_second_directional_derivative(&*self.kern, &self.direction_u, &self.direction_v)
+            .expect("row-kernel second directional derivative dense materialization should succeed")
+    }
+
+    fn is_implicit(&self) -> bool {
+        true
+    }
+}
+
+impl<const K: usize, T: RowKernel<K>> RowKernelSecondDirectionalDerivativeOperator<K, T> {
+    /// See `RowKernelDirectionalDerivativeOperator::compute_jf`.
+    fn compute_jf(&self, factor: &Array2<f64>) -> Array2<f64> {
+        let n_rows = self.kern.n_rows();
+        let rank = factor.ncols();
+        let stride = K * rank;
+        let mut jf = Array2::<f64>::zeros((n_rows, stride));
+        if n_rows == 0 || rank == 0 {
+            return jf;
+        }
         let f_t: Array2<f64> = factor.t().as_standard_layout().into_owned();
+        jf.as_slice_mut()
+            .expect("row-major JF matrix must be contiguous")
+            .par_chunks_mut(stride)
+            .enumerate()
+            .for_each(|(row, jf_row)| {
+                for k_col in 0..rank {
+                    let f_slice = f_t
+                        .row(k_col)
+                        .to_slice()
+                        .expect("standard-layout row must be contiguous");
+                    let vec_k = self.kern.jacobian_action(row, f_slice);
+                    for k in 0..K {
+                        jf_row[k * rank + k_col] = vec_k[k];
+                    }
+                }
+            });
+        jf
+    }
+
+    fn cached_jf(&self, factor: &Array2<f64>, cache: &ProjectedFactorCache) -> Arc<Array2<f64>> {
+        let design_id = Arc::as_ptr(&self.kern) as *const () as usize;
+        let key = ProjectedFactorKey::from_factor_view(design_id, factor.view());
+        cache.get_or_insert_with(key, || self.compute_jf(factor))
+    }
+
+    fn trace_projected_factor_with_jf(&self, factor: &Array2<f64>, jf: ArrayView2<'_, f64>) -> f64 {
+        let rank = factor.ncols();
+        let n_rows = self.kern.n_rows();
+        debug_assert_eq!(jf.dim(), (n_rows, K * rank));
         let direction_u = self.direction_u.as_slice();
         let direction_v = self.direction_v.as_slice();
 
@@ -556,13 +707,16 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
                 let fourth = self.kern.row_fourth_contracted(row, &dir_u, &dir_v).expect(
                     "row-kernel fourth contraction should succeed for validated directions",
                 );
+                let jf_row = jf.row(row);
+                let jf_slice = jf_row
+                    .to_slice()
+                    .expect("J·F is built standard-layout (row-major)");
                 let mut row_total = 0.0_f64;
                 for k_col in 0..rank {
-                    let f_slice = f_t
-                        .row(k_col)
-                        .to_slice()
-                        .expect("standard-layout row must be contiguous");
-                    let vec_k = self.kern.jacobian_action(row, f_slice);
+                    let mut vec_k = [0.0_f64; K];
+                    for k in 0..K {
+                        vec_k[k] = jf_slice[k * rank + k_col];
+                    }
                     let mut quad = 0.0_f64;
                     for a in 0..K {
                         let mut t_dot = 0.0_f64;
@@ -576,15 +730,6 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
                 row_total
             })
             .sum()
-    }
-
-    fn to_dense(&self) -> Array2<f64> {
-        row_kernel_second_directional_derivative(&*self.kern, &self.direction_u, &self.direction_v)
-            .expect("row-kernel second directional derivative dense materialization should succeed")
-    }
-
-    fn is_implicit(&self) -> bool {
-        true
     }
 }
 
