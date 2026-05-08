@@ -101,11 +101,6 @@ path = "bench/cargo_benches/cell_moment_lru_biobank_shape.rs"
 harness = false
 
 [[bench]]
-name = "branch_cell_biobank_hv"
-path = "bench/cargo_benches/branch_cell_biobank_hv.rs"
-harness = false
-
-[[bench]]
 name = "tail_cell_memo_biobank_shape"
 path = "bench/cargo_benches/tail_cell_memo_biobank_shape.rs"
 harness = false
