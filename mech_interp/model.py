@@ -121,13 +121,19 @@ class SAEConfig:
     dict_size: int
     k: int = 16
     dead_feature_threshold_steps: int = 200  # steps without firing => "dead"
+    aux_k: int = 64       # # of "next-best dead" features to revive each step
+    aux_alpha: float = 0.0625  # auxiliary loss weight
 
 
 class TopKSAE(nn.Module):
     """y_hat = b_dec + W_dec @ topk_k(W_enc @ (x - b_dec) + b_enc)
 
-    Training loss: ||x - y_hat||^2 (no L1; sparsity enforced by TopK).
-    Tracks per-feature firing recency for diagnostics.
+    Main training loss: ||x - y_hat||^2 (sparsity enforced by TopK).
+    AuxK auxiliary loss (Anthropic 2024 §A.2): once a feature has been "dead"
+    for N steps, it can win the auxiliary topk-among-deads competition and
+    contribute to reconstructing the *residual* (x - y_hat). This drives the
+    decoder direction of dead features toward useful directions and revives
+    them. Without it ~80% of features die on small / repetitive corpora.
     """
 
     def __init__(self, cfg: SAEConfig):
@@ -166,8 +172,35 @@ class TopKSAE(nn.Module):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         sparse, top_idx = self.encode_topk(x)
         recon = sparse @ self.W_dec.T + self.b_dec
-        # Recon loss (per-element MSE summed over feature dim, mean over batch).
-        loss = ((recon - x) ** 2).sum(dim=-1).mean()
+        # Main recon loss (MSE summed over features, mean over batch).
+        main_loss = ((recon - x) ** 2).sum(dim=-1).mean()
+
+        # AuxK: among DEAD features, pick the topk_aux that would reconstruct
+        # the current residual best, scale them, decode, MSE-loss the result
+        # against the residual. This pulls dead features toward directions
+        # that the main code can't already explain.
+        if self.cfg.aux_alpha > 0 and self.cfg.aux_k > 0:
+            dead = self.dead_features()
+            if dead.numel() >= self.cfg.aux_k:
+                with torch.no_grad():
+                    dead_mask = torch.zeros(self.cfg.dict_size, dtype=torch.bool, device=x.device)
+                    dead_mask[dead] = True
+                # pre-topk encoder activations
+                z = (x - self.b_dec) @ self.W_enc.T + self.b_enc
+                z = F.relu(z)
+                z = z.masked_fill(~dead_mask[None, :], 0.0)
+                k_aux = min(self.cfg.aux_k, int(dead_mask.sum().item()))
+                top_aux_vals, top_aux_idx = z.topk(k_aux, dim=-1)
+                aux_sparse = torch.zeros_like(z)
+                aux_sparse.scatter_(-1, top_aux_idx, top_aux_vals)
+                aux_recon = aux_sparse @ self.W_dec.T  # no b_dec — we model the residual
+                residual = (x - recon).detach()
+                aux_loss = ((aux_recon - residual) ** 2).sum(dim=-1).mean()
+                loss = main_loss + self.cfg.aux_alpha * aux_loss
+            else:
+                loss = main_loss
+        else:
+            loss = main_loss
         return recon, sparse, loss
 
     def update_firing_stats(self, top_idx: torch.Tensor):
