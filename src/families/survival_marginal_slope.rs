@@ -13612,6 +13612,16 @@ fn joint_setup(
 
 fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
     let n = spec.age_entry.len();
+    log::info!(
+        "[survival-marginal-slope] fit start n={} marginal_terms={} logslope_terms={}",
+        n,
+        spec.marginalspec.linear_terms.len()
+            + spec.marginalspec.random_effect_terms.len()
+            + spec.marginalspec.smooth_terms.len(),
+        spec.logslopespec.linear_terms.len()
+            + spec.logslopespec.random_effect_terms.len()
+            + spec.logslopespec.smooth_terms.len(),
+    );
     if spec.age_exit.len() != n
         || spec.event_target.len() != n
         || spec.weights.len() != n
@@ -13922,6 +13932,7 @@ pub fn fit_survival_marginal_slope_terms(
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<SurvivalMarginalSlopeFitResult, String> {
+    let fit_started = std::time::Instant::now();
     let mut spec = spec;
     validate_spec(&spec)?;
     if spec.base_link != InverseLink::Standard(LinkFunction::Probit) {
@@ -13948,6 +13959,7 @@ pub fn fit_survival_marginal_slope_terms(
         }
     };
     let probit_scale = probit_frailty_scale(initial_sigma);
+    let baseline_started = std::time::Instant::now();
     let baseline_slope = pooled_survival_baseline(
         &spec.event_target,
         &spec.weights,
@@ -13956,6 +13968,11 @@ pub fn fit_survival_marginal_slope_terms(
         &spec.time_block.offset_exit,
         &spec.time_block.derivative_offset_exit,
         probit_scale,
+    );
+    log::info!(
+        "[survival-marginal-slope] baseline seed slope={:.6e} elapsed={:.3}s",
+        baseline_slope,
+        baseline_started.elapsed().as_secs_f64(),
     );
 
     let (mut joint_designs, mut joint_specs) = build_term_collection_designs_and_freeze_joint(
@@ -14154,6 +14171,14 @@ pub fn fit_survival_marginal_slope_terms(
 
     // ── Pilot fit: rigid (zero-penalty) to seed coefficients ────────────
     {
+        let pilot_started = std::time::Instant::now();
+        log::info!(
+            "[survival-marginal-slope/pilot] start n={} time_p={} marginal_p={} logslope_p={}",
+            n,
+            design_exit.ncols(),
+            marginal_design.design.ncols(),
+            logslope_design.design.ncols(),
+        );
         let rigid_rho = Array1::<f64>::zeros(
             time_penalties_len
                 + marginal_design.penalties.len()
@@ -14167,27 +14192,46 @@ pub fn fit_survival_marginal_slope_terms(
         );
         let rigid_blocks = build_blocks(&rigid_rho, &marginal_design, &logslope_design)?;
         let rigid_family = make_family(&marginal_design, &logslope_design, initial_sigma);
-        if let Ok(rigid_fit) = inner_fit(&rigid_family, &rigid_blocks, options) {
-            let mut hints_mut = hints.borrow_mut();
-            if let Some(block) = rigid_fit.block_states.get(0) {
-                hints_mut.time_beta = Some(block.beta.clone());
-            }
-            if let Some(block) = rigid_fit.block_states.get(1) {
-                hints_mut.marginal_beta = Some(block.beta.clone());
-            }
-            if let Some(block) = rigid_fit.block_states.get(2) {
-                hints_mut.logslope_beta = Some(block.beta.clone());
-            }
-            if score_warp_prepared.is_some() {
-                if let Some(block) = rigid_fit.block_states.get(3) {
-                    hints_mut.score_warp_beta = Some(block.beta.clone());
+        let mut pilot_options = options.clone();
+        // The pilot is only a warm start. Avoid production covariance assembly
+        // and cap inner cycles so a bad seed cannot silently consume minutes
+        // before the real outer optimizer starts.
+        pilot_options.compute_covariance = false;
+        pilot_options.inner_max_cycles = pilot_options.inner_max_cycles.min(12);
+        match inner_fit(&rigid_family, &rigid_blocks, &pilot_options) {
+            Ok(rigid_fit) => {
+                let mut hints_mut = hints.borrow_mut();
+                if let Some(block) = rigid_fit.block_states.get(0) {
+                    hints_mut.time_beta = Some(block.beta.clone());
                 }
-            }
-            if link_dev_prepared.is_some() {
-                let link_idx = if score_warp_prepared.is_some() { 4 } else { 3 };
-                if let Some(block) = rigid_fit.block_states.get(link_idx) {
-                    hints_mut.link_dev_beta = Some(block.beta.clone());
+                if let Some(block) = rigid_fit.block_states.get(1) {
+                    hints_mut.marginal_beta = Some(block.beta.clone());
                 }
+                if let Some(block) = rigid_fit.block_states.get(2) {
+                    hints_mut.logslope_beta = Some(block.beta.clone());
+                }
+                if score_warp_prepared.is_some() {
+                    if let Some(block) = rigid_fit.block_states.get(3) {
+                        hints_mut.score_warp_beta = Some(block.beta.clone());
+                    }
+                }
+                if link_dev_prepared.is_some() {
+                    let link_idx = if score_warp_prepared.is_some() { 4 } else { 3 };
+                    if let Some(block) = rigid_fit.block_states.get(link_idx) {
+                        hints_mut.link_dev_beta = Some(block.beta.clone());
+                    }
+                }
+                log::info!(
+                    "[survival-marginal-slope/pilot] end status=ok elapsed={:.3}s",
+                    pilot_started.elapsed().as_secs_f64(),
+                );
+            }
+            Err(err) => {
+                log::warn!(
+                    "[survival-marginal-slope/pilot] end status=ignored-error elapsed={:.3}s error={}",
+                    pilot_started.elapsed().as_secs_f64(),
+                    err,
+                );
             }
         }
     }
@@ -14206,6 +14250,12 @@ pub fn fit_survival_marginal_slope_terms(
         );
     }
 
+    let derivative_probe_started = std::time::Instant::now();
+    log::info!(
+        "[survival-marginal-slope] initial derivative probe start rho_dim={} log_kappa_dim={}",
+        setup.rho_dim(),
+        setup.log_kappa_dim(),
+    );
     let initial_rho = setup.theta0().slice(s![..setup.rho_dim()]).to_owned();
     let initial_blocks = build_blocks(&initial_rho, &marginal_design, &logslope_design)?;
     let initial_family = make_family(&marginal_design, &logslope_design, initial_sigma);
@@ -14226,6 +14276,12 @@ pub fn fit_survival_marginal_slope_terms(
             joint_hessian,
             crate::solver::outer_strategy::Derivative::Analytic
         );
+    log::info!(
+        "[survival-marginal-slope] initial derivative probe end gradient_analytic={} hessian_analytic={} elapsed={:.3}s",
+        analytic_joint_gradient_available,
+        analytic_joint_hessian_available,
+        derivative_probe_started.elapsed().as_secs_f64(),
+    );
     let kappa_options_ref: &SpatialLengthScaleOptimizationOptions = kappa_options;
     let derivative_block_cache = RefCell::new(
         None::<(
@@ -14305,6 +14361,13 @@ pub fn fit_survival_marginal_slope_terms(
         Ok(derivative_blocks)
     };
 
+    log::info!(
+        "[survival-marginal-slope/outer] solve start rho_dim={} log_kappa_dim={} aux_dim={}",
+        setup.rho_dim(),
+        setup.log_kappa_dim(),
+        setup.auxiliary_dim(),
+    );
+
     // Survival marginal-slope is a multi-block family with β-dependent
     // joint Hessian (hazard multipliers depend on current β); the
     // Wood-Fasiolo PSD invariant that justifies EFS fails here, so
@@ -14320,6 +14383,11 @@ pub fn fit_survival_marginal_slope_terms(
         analytic_joint_hessian_available,
         true,
         |theta, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+            let eval_started = std::time::Instant::now();
+            log::info!(
+                "[survival-marginal-slope/outer-inner-fit] start theta_dim={}",
+                theta.len(),
+            );
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
             let sigma = sigma_from_theta(theta);
@@ -14347,10 +14415,20 @@ pub fn fit_survival_marginal_slope_terms(
                     hints_mut.link_dev_beta = Some(block.beta.clone());
                 }
             }
+            log::info!(
+                "[survival-marginal-slope/outer-inner-fit] end elapsed={:.3}s",
+                eval_started.elapsed().as_secs_f64(),
+            );
             Ok(fit)
         },
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], eval_mode| {
             use crate::solver::estimate::reml::unified::EvalMode;
+            let eval_started = std::time::Instant::now();
+            log::info!(
+                "[survival-marginal-slope/outer-eval] start mode={:?} theta_dim={}",
+                eval_mode,
+                theta.len(),
+            );
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
             let sigma = sigma_from_theta(theta);
@@ -14376,6 +14454,12 @@ pub fn fit_survival_marginal_slope_terms(
                 effective_mode,
             )?;
             exact_warm_start.replace(Some(eval.warm_start));
+            log::info!(
+                "[survival-marginal-slope/outer-eval] end objective={:.6e} mode={:?} elapsed={:.3}s",
+                eval.objective,
+                eval_mode,
+                eval_started.elapsed().as_secs_f64(),
+            );
             if matches!(eval_mode, EvalMode::ValueGradientHessian)
                 && analytic_joint_hessian_available
                 && !eval.outer_hessian.is_analytic()
@@ -14388,6 +14472,11 @@ pub fn fit_survival_marginal_slope_terms(
             Ok((eval.objective, eval.gradient, eval.outer_hessian))
         },
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+            let eval_started = std::time::Instant::now();
+            log::info!(
+                "[survival-marginal-slope/outer-efs] start theta_dim={}",
+                theta.len(),
+            );
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
             let sigma = sigma_from_theta(theta);
@@ -14403,9 +14492,17 @@ pub fn fit_survival_marginal_slope_terms(
                 exact_warm_start.borrow().as_ref(),
             )?;
             exact_warm_start.replace(Some(eval.warm_start));
+            log::info!(
+                "[survival-marginal-slope/outer-efs] end elapsed={:.3}s",
+                eval_started.elapsed().as_secs_f64(),
+            );
             Ok(eval.efs_eval)
         },
     )?;
+    log::info!(
+        "[survival-marginal-slope/outer] solve end elapsed={:.3}s",
+        fit_started.elapsed().as_secs_f64(),
+    );
 
     let (baseline_offset_residuals, baseline_offset_curvatures) = {
         let final_family =
