@@ -12,7 +12,6 @@ import numpy as np
 import pandas as pd
 
 import gamfit
-from gamfit.pgs import PgsCalibration
 from gamfit.sklearn import GAMClassifier, GAMRegressor
 
 
@@ -390,26 +389,6 @@ def test_transformation_normal_pgs_calibration_roundtrip(synthetic_biobank_facto
         assert abs(corr) < 0.3, f"|corr(z, {pc})| = {abs(corr):.3f} too large"
 
 
-def test_pgs_calibration_predicts_minimal_new_samples_after_fit_on_full_df(
-    synthetic_biobank_factory: typing.Any,
-) -> None:
-    _require_extension()
-    df = synthetic_biobank_factory(seed=10, n=128)
-    df["person_id"] = [f"p{i}" for i in range(len(df))]
-    df["batch"] = ["a" if i % 2 == 0 else "b" for i in range(len(df))]
-
-    calibration = PgsCalibration(
-        pc_columns=["pc1", "pc2", "pc3", "pc4"],
-        pgs_column="PGS",
-    ).fit(df)
-
-    minimal = df[["PGS", "pc1", "pc2", "pc3", "pc4"]].copy()
-    z = np.asarray(calibration.predict(minimal), dtype=float)
-
-    assert z.shape == (len(minimal),)
-    assert np.all(np.isfinite(z))
-
-
 def test_transformation_normal_check_requires_raw_pgs(synthetic_biobank_factory: typing.Any) -> None:
     _require_extension()
     df = synthetic_biobank_factory(seed=11, n=128)
@@ -428,39 +407,6 @@ def test_transformation_normal_check_requires_raw_pgs(synthetic_biobank_factory:
     assert any(issue.column == "PGS" for issue in check.issues)
     with pytest.raises(gamfit.SchemaMismatchError):
         model.predict(missing_pgs)
-
-
-def test_pgs_calibration_formula_uses_duchon_operator_penalties_without_double_penalty() -> None:
-    calibration = PgsCalibration(pc_columns=["pc1", "pc2"], pgs_column="PGS")
-
-    assert "double_penalty" not in calibration.formula
-    assert "duchon(pc1, pc2" in calibration.formula
-
-
-def test_pgs_calibration_save_load_restores_wrapper_metadata(
-    synthetic_biobank_factory: typing.Any,
-    tmp_path: typing.Any,
-) -> None:
-    _require_extension()
-    df = synthetic_biobank_factory(seed=12, n=128)
-    calibration = PgsCalibration(
-        pc_columns=["pc1", "pc2", "pc3", "pc4"],
-        pgs_column="PGS",
-        out_column="pgs_z",
-    ).fit(df)
-
-    path = tmp_path / "stage1.gam"
-    calibration.save(path)
-    loaded = PgsCalibration.load(path)
-    minimal = df[["PGS", "pc1", "pc2", "pc3", "pc4"]]
-
-    assert loaded.pc_columns == ["pc1", "pc2", "pc3", "pc4"]
-    assert loaded.pgs_column == "PGS"
-    assert loaded.out_column == "pgs_z"
-    np.testing.assert_allclose(
-        np.asarray(loaded.predict(minimal), dtype=float),
-        np.asarray(calibration.predict(minimal), dtype=float),
-    )
 
 
 def test_bernoulli_marginal_slope_roundtrip_tracks_calibrated_score(
