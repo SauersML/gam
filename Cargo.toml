@@ -101,6 +101,14 @@ harness = false
 name = "trust_region_line_search"
 harness = false
 
+[[bench]]
+name = "line_search_subsample_screen"
+harness = false
+
+[[bench]]
+name = "joint_line_search_speculative"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
