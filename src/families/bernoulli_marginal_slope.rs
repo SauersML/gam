@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 mod deviation_runtime;
 pub(crate) mod exact_kernel;
@@ -2269,12 +2269,20 @@ fn rigid_internal_third_components(
 }
 
 #[inline]
-fn rigid_transformed_third_contracted(
+/// Closed-form rigid third-derivative tensor — uncontracted in primary space
+/// `(η, g)`. Indexed `T[a][b][c]` with a/b/c ∈ {0=η, 1=g}; the tensor is
+/// fully symmetric in its three indices, so only four distinct values appear:
+/// `T_ηηη`, `T_ηηg`, `T_ηgg`, `T_ggg`.
+///
+/// This is the axis-invariant building block: a single per-row evaluation
+/// produces a tensor that every ψ-axis then contracts cheaply via
+/// [`contract_third_full`]. The previous design recomputed the
+/// already-contracted matrix per axis, paying the heavy primary-derivative
+/// machinery `n_axes` times per row.
+fn rigid_transformed_third_full(
     marginal: BernoulliMarginalLinkMap,
     kernel: &RigidProbitKernel,
-    d_eta: f64,
-    d_g: f64,
-) -> [[f64; 2]; 2] {
+) -> [[[f64; 2]; 2]; 2] {
     let h_q = kernel.primary_hessian(marginal.q);
     let grad_q = kernel.u1 * kernel.eta_q;
     let (f_qqq, f_qqg, f_qgg, f_ggg) = rigid_internal_third_components(marginal, kernel);
@@ -2283,14 +2291,45 @@ fn rigid_transformed_third_contracted(
         + grad_q * marginal.q3;
     let f_etaetag = f_qqg * marginal.q1 * marginal.q1 + h_q[0][1] * marginal.q2;
     let f_etagg = f_qgg * marginal.q1;
+    third_full_from_symmetric_components(f_etaetaeta, f_etaetag, f_etagg, f_ggg)
+}
+
+/// Pack the four independent components of a fully-symmetric 3-tensor on
+/// a 2-dim primary space into the dense `[[[f64; 2]; 2]; 2]` representation
+/// callers slice. Index ordering follows `T[a][b][c]` = ∂³f/∂p_a ∂p_b ∂p_c.
+#[inline]
+fn third_full_from_symmetric_components(
+    t_qqq: f64,
+    t_qqg: f64,
+    t_qgg: f64,
+    t_ggg: f64,
+) -> [[[f64; 2]; 2]; 2] {
+    let mut t = [[[0.0; 2]; 2]; 2];
+    t[0][0][0] = t_qqq;
+    t[0][0][1] = t_qqg;
+    t[0][1][0] = t_qqg;
+    t[1][0][0] = t_qqg;
+    t[0][1][1] = t_qgg;
+    t[1][0][1] = t_qgg;
+    t[1][1][0] = t_qgg;
+    t[1][1][1] = t_ggg;
+    t
+}
+
+/// Contract a symmetric 3-tensor on its third index with a primary-space
+/// direction `d = (d_eta, d_g)`, producing the symmetric 2×2 contracted
+/// matrix the outer-derivative pipeline consumes:
+///   `M[a][b] = Σ_c T[a][b][c] · d[c]`.
+#[inline]
+fn contract_third_full(t: &[[[f64; 2]; 2]; 2], d_eta: f64, d_g: f64) -> [[f64; 2]; 2] {
     [
         [
-            f_etaetaeta * d_eta + f_etaetag * d_g,
-            f_etaetag * d_eta + f_etagg * d_g,
+            t[0][0][0] * d_eta + t[0][0][1] * d_g,
+            t[0][1][0] * d_eta + t[0][1][1] * d_g,
         ],
         [
-            f_etaetag * d_eta + f_etagg * d_g,
-            f_etagg * d_eta + f_ggg * d_g,
+            t[1][0][0] * d_eta + t[1][0][1] * d_g,
+            t[1][1][0] * d_eta + t[1][1][1] * d_g,
         ],
     ]
 }
@@ -3194,6 +3233,19 @@ struct BernoulliMarginalSlopeExactEvalCache {
     /// `None` whenever the flex path is inactive (rigid kernel) or the
     /// caller did not opt in to materialization.
     row_primary_hessians: Option<Array2<f64>>,
+    /// Per-row uncontracted third-derivative tensor in the rigid path,
+    /// lazily built on first access. The `build_psi_hyper_coords` row pass
+    /// hits `rigid_row_third_contracted` once per (row, ψ-axis) — 32× per
+    /// row at biobank shape — but the per-row jet is axis-invariant. This
+    /// cache lets the heavy `empirical_rigid_neglog_jet` (or its closed-form
+    /// equivalent) run at most once per row per cache lifetime; per-axis
+    /// callers reduce to a 2×2 [`contract_third_full`].
+    ///
+    /// Stored as `Result` because the build is fallible (per-row jet may
+    /// surface a non-finite value). Wrapping in `OnceLock` ensures the
+    /// expensive build runs exactly once across all concurrent threads;
+    /// failure is sticky and propagated identically to every caller.
+    rigid_third_full: OnceLock<Result<Vec<[[[f64; 2]; 2]; 2]>, String>>,
 }
 
 // ── RowKernel<2> implementation (rigid path only) ────────────────────
@@ -3202,6 +3254,14 @@ struct BernoulliRigidRowKernel {
     family: BernoulliMarginalSlopeFamily,
     block_states: Vec<ParameterBlockState>,
     slices: BlockSlices,
+    /// Per-row uncontracted third-derivative tensor, lazily populated in a
+    /// single parallel pass on first access. Every ψ-axis directional
+    /// derivative operator that consults this kernel shares this cache via
+    /// its `Arc`; the heavy empirical-grid jet (`empirical_rigid_neglog_jet`)
+    /// runs at most once per row across the full ext-dim sweep, instead of
+    /// once per (row, ψ-axis) pair. Per-axis `row_third_contracted` becomes
+    /// a 2×2 bilinear contraction against the cached tensor.
+    third_full_cache: OnceLock<Vec<[[[f64; 2]; 2]; 2]>>,
 }
 
 impl BernoulliRigidRowKernel {
@@ -3211,7 +3271,37 @@ impl BernoulliRigidRowKernel {
             family,
             block_states,
             slices,
+            third_full_cache: OnceLock::new(),
         }
+    }
+
+    /// Lazy-build the per-row uncontracted third-derivative tensor cache. The
+    /// first caller pays one parallel row pass that materialises the full
+    /// `[[[f64; 2]; 2]; 2]` tensor for every observation; subsequent callers
+    /// (every other ψ-axis operator that shares this kernel via `Arc`) get
+    /// an `O(1)` lookup. A failed jet evaluation here means the underlying
+    /// likelihood is non-finite at the converged β snapshot — propagate via
+    /// panic, mirroring how every other kernel-level numerical contract in
+    /// this module surfaces post-PIRLS invariant violations.
+    fn third_full_cache(&self) -> &[[[[f64; 2]; 2]; 2]] {
+        self.third_full_cache
+            .get_or_init(|| {
+                (0..self.family.y.len())
+                    .into_par_iter()
+                    .map(|row| {
+                        let marginal_eta = self.block_states[0].eta[row];
+                        let marginal = self.family.marginal_link_map(marginal_eta)?;
+                        let slope = self.block_states[1].eta[row];
+                        self.family
+                            .rigid_row_third_full(row, marginal_eta, marginal, slope)
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+                    .expect(
+                        "BernoulliRigidRowKernel third-full cache build failed; \
+                         per-row jet should not error at the converged β snapshot",
+                    )
+            })
+            .as_slice()
     }
 }
 
@@ -3329,11 +3419,8 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
     }
 
     fn row_third_contracted(&self, row: usize, dir: &[f64; 2]) -> Result<[[f64; 2]; 2], String> {
-        let marginal_eta = self.block_states[0].eta[row];
-        let marginal = self.family.marginal_link_map(marginal_eta)?;
-        let g = self.block_states[1].eta[row];
-        self.family
-            .rigid_row_third_contracted(row, marginal_eta, marginal, g, dir[0], dir[1])
+        let cache = self.third_full_cache();
+        Ok(contract_third_full(&cache[row], dir[0], dir[1]))
     }
 
     fn row_fourth_contracted(
@@ -3930,6 +4017,57 @@ impl BernoulliMarginalSlopeFamily {
         dir_q: f64,
         dir_g: f64,
     ) -> Result<[[f64; 2]; 2], String> {
+        let full = self.rigid_row_third_full(row, marginal_eta, marginal, slope)?;
+        Ok(contract_third_full(&full, dir_q, dir_g))
+    }
+
+    /// Look up the per-row rigid uncontracted third-derivative tensor from
+    /// the cache, populating it lazily on first access via one parallel
+    /// row pass. Used by `row_primary_third_contracted_recompute` so the
+    /// build-psi-hyper-coords sweep over 32 ψ-axes pays the heavy empirical
+    /// jet at most once per row.
+    ///
+    /// The first caller into `get_or_init` runs the parallel build *once*;
+    /// every other thread blocks on the `OnceLock` and observes the same
+    /// stored result. A failed build is captured in the `Err` arm of the
+    /// stored `Result` and propagates identically on every subsequent call.
+    fn rigid_third_full_cached<'a>(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &'a BernoulliMarginalSlopeExactEvalCache,
+        row: usize,
+    ) -> Result<&'a [[[f64; 2]; 2]; 2], String> {
+        let stored = cache.rigid_third_full.get_or_init(|| {
+            (0..self.y.len())
+                .into_par_iter()
+                .map(|r| {
+                    let marginal_eta = block_states[0].eta[r];
+                    let marginal = self.marginal_link_map(marginal_eta)?;
+                    let slope = block_states[1].eta[r];
+                    self.rigid_row_third_full(r, marginal_eta, marginal, slope)
+                })
+                .collect::<Result<Vec<_>, String>>()
+        });
+        let table = stored.as_ref().map_err(|err| err.clone())?;
+        Ok(&table[row])
+    }
+
+    /// Per-row uncontracted third-derivative tensor in the rigid path.
+    ///
+    /// Empirical-grid rows pay the heavy `empirical_rigid_neglog_jet` once
+    /// (with six identity directions: three `e_q` plus three `e_g`, giving
+    /// a 64-coefficient jet from which the four distinct symmetric components
+    /// `T_qqq`, `T_qqg`, `T_qgg`, `T_ggg` are read directly). The `rank`-many
+    /// ψ-axis directions are then folded in with a cheap 2×2 bilinear
+    /// `[contract_third_full]` per call, replacing the previous
+    /// `rank` separate 5-direction jets per row.
+    fn rigid_row_third_full(
+        &self,
+        row: usize,
+        marginal_eta: f64,
+        marginal: BernoulliMarginalLinkMap,
+        slope: f64,
+    ) -> Result<[[[f64; 2]; 2]; 2], String> {
         match self.latent_measure.empirical_grid_for_training_row(row)? {
             None => {
                 let kernel = RigidProbitKernel::new(
@@ -3940,11 +4078,14 @@ impl BernoulliMarginalSlopeFamily {
                     self.weights[row],
                     self.probit_frailty_scale(),
                 )?;
-                Ok(rigid_transformed_third_contracted(
-                    marginal, &kernel, dir_q, dir_g,
-                ))
+                Ok(rigid_transformed_third_full(marginal, &kernel))
             }
             Some(grid) => {
+                // Six identity directions: positions 0, 2, 4 are `e_q`,
+                // positions 1, 3, 5 are `e_g`. The mask encoding for
+                // `MultiDirJet::coeff` is `Σ 2^position`, so a 3-element
+                // subset like {0, 2, 4} (three `e_q`s) becomes mask
+                // 1 | 4 | 16 = 21 = 0b010101 — the partial `∂³f/∂q∂q∂q`.
                 let jet = self.empirical_rigid_neglog_jet(
                     row,
                     marginal_eta,
@@ -3955,15 +4096,19 @@ impl BernoulliMarginalSlopeFamily {
                         [0.0, 1.0],
                         [1.0, 0.0],
                         [0.0, 1.0],
-                        [dir_q, dir_g],
+                        [1.0, 0.0],
+                        [0.0, 1.0],
                     ],
                     &grid.nodes,
                     &grid.weights,
                 )?;
-                Ok([
-                    [jet.coeff(1 | 4 | 16), jet.coeff(1 | 2 | 16)],
-                    [jet.coeff(1 | 2 | 16), jet.coeff(2 | 8 | 16)],
-                ])
+                let t_qqq = jet.coeff(1 | 4 | 16); // {0, 2, 4}: e_q × e_q × e_q
+                let t_qqg = jet.coeff(1 | 4 | 2); // {0, 2, 1}: e_q × e_q × e_g
+                let t_qgg = jet.coeff(1 | 2 | 8); // {0, 1, 3}: e_q × e_g × e_g
+                let t_ggg = jet.coeff(2 | 8 | 32); // {1, 3, 5}: e_g × e_g × e_g
+                Ok(third_full_from_symmetric_components(
+                    t_qqq, t_qqg, t_qgg, t_ggg,
+                ))
             }
         }
     }
@@ -5520,6 +5665,7 @@ impl BernoulliMarginalSlopeFamily {
             row_contexts,
             row_cell_moments,
             row_primary_hessians: None,
+            rigid_third_full: OnceLock::new(),
         })
     }
 
@@ -6678,16 +6824,19 @@ impl BernoulliMarginalSlopeFamily {
         dir: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
         if !self.effective_flex_active(block_states)? {
-            let marginal_eta = block_states[0].eta[row];
-            let marginal = self.marginal_link_map(marginal_eta)?;
-            let g = block_states[1].eta[row];
-            let t =
-                self.rigid_row_third_contracted(row, marginal_eta, marginal, g, dir[0], dir[1])?;
+            // Hit the per-cache uncontracted-tensor cache if it has already
+            // been populated (typically by the first ψ-axis call in the
+            // sweep, which forces the build). Direct lookup is `O(1)`; the
+            // 32 ψ-axis sweep that consumes this method then pays the heavy
+            // empirical-grid jet exactly once per row instead of once per
+            // (row, axis) pair.
+            let t = self.rigid_third_full_cached(block_states, cache, row)?;
+            let m = contract_third_full(t, dir[0], dir[1]);
             let mut out = Array2::<f64>::zeros((2, 2));
-            out[[0, 0]] = t[0][0];
-            out[[0, 1]] = t[0][1];
-            out[[1, 0]] = t[1][0];
-            out[[1, 1]] = t[1][1];
+            out[[0, 0]] = m[0][0];
+            out[[0, 1]] = m[0][1];
+            out[[1, 0]] = m[1][0];
+            out[[1, 1]] = m[1][1];
             return Ok(out);
         }
         if dir.iter().all(|value| value.abs() <= 0.0) {
@@ -9016,6 +9165,16 @@ impl BernoulliMarginalSlopeFamily {
             psi_label,
             &self.policy,
         )?;
+
+        // Eager-prime the per-row uncontracted third-derivative cache *before*
+        // entering the per-axis row `par_iter` so the build's own `par_iter`
+        // does not nest inside an active rayon job. Subsequent ψ-axis sweeps
+        // hit the cache via O(1) lookups in `rigid_third_full_cached`. Skipped
+        // on the FLEX path because that branch routes through the flex jet
+        // machinery, which has its own row-cell-moments cache.
+        if !self.effective_flex_active(block_states)? {
+            let _ = self.rigid_third_full_cached(block_states, cache, 0)?;
+        }
 
         // Block-local accumulator path: avoids O(n p^2) dense Hessian
         let row_iter = outer_row_indices(options, n).to_vec();
@@ -19978,6 +20137,7 @@ mod tests {
             row_contexts: cached.row_contexts.clone(),
             row_cell_moments: None,
             row_primary_hessians: None,
+            rigid_third_full: OnceLock::new(),
         };
         let direction =
             Array1::from_iter((0..cached.slices.total).map(|idx| 0.02 * ((idx % 5) as f64 - 2.0)));
@@ -20024,6 +20184,7 @@ mod tests {
             row_contexts: cached.row_contexts.clone(),
             row_cell_moments: None,
             row_primary_hessians: None,
+            rigid_third_full: OnceLock::new(),
         };
         let directions: Vec<_> = (0..4)
             .map(|rep| {
