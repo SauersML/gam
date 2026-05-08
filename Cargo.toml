@@ -97,6 +97,10 @@ harness = false
 name = "branch_cell_biobank_hv"
 harness = false
 
+[[bench]]
+name = "trust_region_line_search"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

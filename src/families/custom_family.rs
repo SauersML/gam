@@ -7939,6 +7939,85 @@ impl BlockEtaCheckpoint {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct JointTrustRegionUpdate {
+    rho: f64,
+    radius: f64,
+    accepted: bool,
+}
+
+fn update_joint_trust_region_radius(
+    old_radius: f64,
+    step_norm: f64,
+    actual_reduction: f64,
+    predicted_reduction: f64,
+) -> JointTrustRegionUpdate {
+    let rho = if predicted_reduction > 0.0 && predicted_reduction.is_finite() {
+        actual_reduction / predicted_reduction
+    } else {
+        f64::NEG_INFINITY
+    };
+    let accepted = rho.is_finite() && rho > 0.0 && actual_reduction > 0.0;
+    let mut radius = old_radius;
+    if !accepted || rho < 0.25 {
+        radius *= 0.25;
+    } else if rho > 0.75 && step_norm >= 0.99 * old_radius {
+        radius *= 2.0;
+    }
+    if !radius.is_finite() || radius <= 0.0 {
+        radius = 1.0e-12;
+    }
+    JointTrustRegionUpdate {
+        rho,
+        radius: radius.clamp(1.0e-12, 1.0e6),
+        accepted,
+    }
+}
+
+fn joint_trust_region_step_norm(delta: &Array1<f64>) -> f64 {
+    delta.iter().map(|v| v * v).sum::<f64>().sqrt()
+}
+
+fn truncate_joint_step_to_radius(delta: &mut Array1<f64>, radius: f64) -> f64 {
+    let norm = joint_trust_region_step_norm(delta);
+    if norm.is_finite() && norm > radius && radius > 0.0 {
+        delta.mapv_inplace(|v| v * (radius / norm));
+        radius
+    } else {
+        norm
+    }
+}
+
+fn apply_joint_penalized_hessian_into(
+    source: &JointHessianSource,
+    ranges: &[(usize, usize)],
+    s_lambdas: &[Array2<f64>],
+    diagonal_ridge: f64,
+    vector: &Array1<f64>,
+    out: &mut Array1<f64>,
+) -> Result<(), String> {
+    match source {
+        JointHessianSource::Dense(h_joint) => {
+            crate::faer_ndarray::fast_av_view_into(h_joint, vector, out.view_mut());
+        }
+        JointHessianSource::Operator { apply_into, .. } => {
+            apply_into(vector, out)?;
+        }
+    }
+    let mut penalty = Array1::<f64>::zeros(vector.len());
+    apply_joint_block_penalty_into(ranges, s_lambdas, vector, diagonal_ridge, &mut penalty);
+    *out += &penalty;
+    Ok(())
+}
+
+fn joint_quadratic_predicted_reduction(
+    rhs: &Array1<f64>,
+    hpen_delta: &Array1<f64>,
+    delta: &Array1<f64>,
+) -> f64 {
+    rhs.dot(delta) - 0.5 * delta.dot(hpen_delta)
+}
+
 fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -8153,6 +8232,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 0.0
             };
 
+        let mut joint_trust_radius = 1.0_f64;
         for cycle in 0..inner_max_cycles {
             // Fires at the top of each inner joint-Newton cycle so CI logs can
             // distinguish "inner spin" (thousands of these) from "outer-assembly
@@ -8468,7 +8548,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let line_search_started = std::time::Instant::now();
             let mut delta = &candidate_beta - &beta_joint;
 
-            // Trust region: cap step size
+            // Trust-region globalization for the joint Newton proposal.  The
+            // previous implementation used up to eight backtracking likelihood
+            // evaluations (each can build the exact joint workspace at biobank
+            // scale).  Here the step is truncated before evaluation and the
+            // single trial objective is accepted only when the actual decrease
+            // is positive relative to the local quadratic model.
             let mut step_inf = delta.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
             const MAX_JOINT_STEP: f64 = 20.0;
             if step_inf > MAX_JOINT_STEP {
@@ -8476,11 +8561,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 step_inf = MAX_JOINT_STEP;
             }
 
-            // A small Newton proposal is not enough for exact outer calculus:
-            // we still need the joint residual check after evaluating the
-            // candidate state, because ||delta|| can be small while the joint
-            // KKT residual is still above tolerance.
-            // Line search: try full step, then halve
             let old_beta: Vec<Array1<f64>> = states.iter().map(|s| s.beta.clone()).collect();
             let old_objective = lastobjective;
             let mut accepted = false;
@@ -8503,15 +8583,52 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 refresh_all_block_etas(family, specs, &mut states)?;
                 break;
             }
-            for bt in 0i32..8 {
-                line_search_attempts = (bt + 1) as usize;
+            if barrier_ceiling < 1.0 {
+                delta.mapv_inplace(|v| v * barrier_ceiling);
+                step_inf *= barrier_ceiling;
+            }
+
+            let penalty_beta = apply_joint_block_penalty(
+                &ranges,
+                &s_lambdas,
+                &beta_joint,
+                joint_mode_diagonal_ridge,
+            );
+            let rhs = &grad_joint - &penalty_beta;
+
+            // One trust-region trial plus one emergency shrunken retry.  The
+            // retry preserves the objective-decrease guarantee when the initial
+            // radius is still too optimistic, without returning to the old
+            // unbounded halving loop that dominated cycle-0 wall time.
+            for trust_attempt in 0..2 {
+                line_search_attempts = trust_attempt + 1;
                 accepted_joint_workspace = None;
-                let alpha = (0.5f64.powi(bt)).min(barrier_ceiling);
+                let mut trial_delta = delta.clone();
+                let step_norm = truncate_joint_step_to_radius(&mut trial_delta, joint_trust_radius);
+                let mut hpen_delta = Array1::<f64>::zeros(total_p);
+                if apply_joint_penalized_hessian_into(
+                    &joint_hessian_source,
+                    &ranges,
+                    &s_lambdas,
+                    trace_diagonal_ridge,
+                    &trial_delta,
+                    &mut hpen_delta,
+                )
+                .is_err()
+                {
+                    break;
+                }
+                let predicted_reduction =
+                    joint_quadratic_predicted_reduction(&rhs, &hpen_delta, &trial_delta);
+                if !predicted_reduction.is_finite() || predicted_reduction <= 0.0 {
+                    joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
+                    continue;
+                }
+
                 for b in 0..specs.len() {
                     let (start, end) = ranges[b];
                     let mut trial_beta = old_beta[b].clone();
-                    trial_beta.scaled_add(alpha, &delta.slice(ndarray::s![start..end]));
-                    // Project to feasible region (e.g. monotonicity for deviation blocks).
+                    trial_beta += &trial_delta.slice(ndarray::s![start..end]);
                     let projected =
                         family.post_update_block_beta(&states, b, &specs[b], trial_beta)?;
                     states[b].beta.assign(&projected);
@@ -8544,13 +8661,39 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             states[b].beta.assign(old);
                         }
                         refresh_all_block_etas(family, specs, &mut states)?;
+                        joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
                         continue;
                     }
                 };
                 let trial_penalty =
                     total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
                 let trialobjective = -trial_ll + trial_penalty;
-                if trialobjective.is_finite() && trialobjective <= lastobjective + 1e-10 {
+                let actual_reduction = old_objective - trialobjective;
+                let trust_update = update_joint_trust_region_radius(
+                    joint_trust_radius,
+                    step_norm,
+                    actual_reduction,
+                    predicted_reduction,
+                );
+                let old_radius = joint_trust_radius;
+                joint_trust_radius = trust_update.radius;
+                log::info!(
+                    "[PIRLS/joint-Newton/trust-region] cycle={} attempt={} accepted={} rho={:.3e} actual_reduction={:.3e} predicted_reduction={:.3e} radius={:.3e}->{:.3e} step_norm={:.3e} step_inf={:.3e}",
+                    cycle,
+                    line_search_attempts,
+                    trust_update.accepted,
+                    trust_update.rho,
+                    actual_reduction,
+                    predicted_reduction,
+                    old_radius,
+                    joint_trust_radius,
+                    step_norm,
+                    step_inf,
+                );
+                if trialobjective.is_finite()
+                    && trust_update.accepted
+                    && trialobjective <= old_objective + 1e-10
+                {
                     current_penalty = trial_penalty;
                     if let Some(joint_active_set) = joint_active_set.as_ref() {
                         cached_active_sets =
@@ -8559,6 +8702,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     accepted = true;
                     break;
                 }
+                for (b, old) in old_beta.iter().enumerate() {
+                    states[b].beta.assign(old);
+                }
+                refresh_all_block_etas(family, specs, &mut states)?;
             }
             let line_search_elapsed = line_search_started.elapsed();
             if !accepted {
@@ -18423,5 +18570,52 @@ mod tests {
             cross_chunk,
             cross_full.slice(ndarray::s![rows, ..]).to_owned()
         );
+    }
+
+    #[test]
+    fn joint_trust_region_radius_update_accept_reject_logic() {
+        let accepted = update_joint_trust_region_radius(1.0, 1.0, 2.0, 2.0);
+        assert!(accepted.accepted);
+        assert!((accepted.rho - 1.0).abs() < 1.0e-12);
+        assert!((accepted.radius - 2.0).abs() < 1.0e-12);
+
+        let rejected = update_joint_trust_region_radius(1.0, 0.5, -0.1, 2.0);
+        assert!(!rejected.accepted);
+        assert!(rejected.rho < 0.0);
+        assert!((rejected.radius - 0.25).abs() < 1.0e-12);
+
+        let poor = update_joint_trust_region_radius(1.0, 0.5, 0.1, 1.0);
+        assert!(poor.accepted);
+        assert!((poor.rho - 0.1).abs() < 1.0e-12);
+        assert!((poor.radius - 0.25).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn joint_trust_region_rosenbrock_like_quadratic_is_armijo_safe() {
+        // Local Rosenbrock-at-the-valley quadratic in variables (x, y):
+        // f ≈ 0.5 * [dx, dy]' H [dx, dy], H = [[802, -400], [-400, 200]].
+        // Add a tiny ridge to make the test SPD and use a gradient whose full
+        // Newton step crosses the radius, exercising truncation before the
+        // objective is evaluated.
+        let h = array![[802.0, -400.0], [-400.0, 200.1]];
+        let unconstrained = array![1.0, 1.0];
+        let gradient = -h.dot(&unconstrained);
+        let rhs = -&gradient;
+        let mut step = unconstrained.clone();
+        let step_norm = truncate_joint_step_to_radius(&mut step, 0.25);
+        assert!(step_norm <= 0.25 + 1.0e-12);
+        assert!(joint_trust_region_step_norm(&unconstrained) > 0.25);
+
+        let h_step = h.dot(&step);
+        let predicted = joint_quadratic_predicted_reduction(&rhs, &h_step, &step);
+        let old_objective = 0.0;
+        let trial_objective = gradient.dot(&step) + 0.5 * step.dot(&h_step);
+        let actual = old_objective - trial_objective;
+        assert!(predicted > 0.0);
+        assert!((predicted - actual).abs() < 1.0e-10);
+
+        let update = update_joint_trust_region_radius(0.25, step_norm, actual, predicted);
+        assert!(update.accepted);
+        assert!(trial_objective < old_objective);
     }
 }
