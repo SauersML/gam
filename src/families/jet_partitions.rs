@@ -4,9 +4,11 @@
 //!
 //! Each entry `partitions(mask)` is the list of all set-partitions of the bits
 //! of `mask`, with each partition represented as a `Vec<usize>` of disjoint
-//! sub-masks whose bitwise OR equals `mask`. The total memory footprint is
-//! bounded by the Bell numbers up to `B(MAX_DIRS) = 203` for `MAX_DIRS=6`, so
-//! the cache is tiny and computed lazily on first use.
+//! sub-masks whose bitwise OR equals `mask`. Total memory is bounded by the
+//! Bell numbers up to `B(MAX_DIRS) = 4140` for `MAX_DIRS=8`. The 8-direction
+//! cap covers the bernoulli marginal-slope rigid path's full uncontracted
+//! fourth-tensor jet (`[e_q, e_g, e_q, e_g, e_q, e_g, e_q, e_g]`); no caller
+//! currently needs more directions. Cache is computed lazily on first use.
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -14,7 +16,7 @@ pub static COMPOSE_UNARY_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static MUL_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static ROW_NEGLOG_CALLS: AtomicU64 = AtomicU64::new(0);
 
-const MAX_DIRS: usize = 6;
+const MAX_DIRS: usize = 8;
 const TABLE_LEN: usize = 1usize << MAX_DIRS;
 
 static CACHE: OnceLock<Vec<Vec<Vec<usize>>>> = OnceLock::new();
