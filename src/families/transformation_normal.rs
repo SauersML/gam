@@ -12781,7 +12781,10 @@ mod tests {
             gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-        assert_eq!(hessian, crate::solver::outer_strategy::DeclaredHessianForm::Either);
+        assert_eq!(
+            hessian,
+            crate::solver::outer_strategy::DeclaredHessianForm::Either
+        );
 
         let rho_dim = spec.initial_log_lambdas.len();
         let psi_dim = derivative_blocks[0].len();
@@ -12847,7 +12850,10 @@ mod tests {
             gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-        assert_eq!(hessian, crate::solver::outer_strategy::DeclaredHessianForm::Either);
+        assert_eq!(
+            hessian,
+            crate::solver::outer_strategy::DeclaredHessianForm::Either
+        );
     }
 
     #[test]

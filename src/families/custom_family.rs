@@ -13937,9 +13937,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     // based on the presence of a wiggle block.
 
     use crate::estimate::EstimationError;
-    use crate::solver::outer_strategy::{
-        FallbackPolicy, OuterEval, OuterEvalOrder, OuterProblem,
-    };
+    use crate::solver::outer_strategy::{FallbackPolicy, OuterEval, OuterEvalOrder, OuterProblem};
 
     // Mutable bookkeeping for the outer optimization loop. These fields were
     // previously behind Mutex because the old optimizer bridge used `Fn`
@@ -15083,7 +15081,10 @@ mod tests {
             gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-        assert_eq!(hessian, crate::solver::outer_strategy::DeclaredHessianForm::Either);
+        assert_eq!(
+            hessian,
+            crate::solver::outer_strategy::DeclaredHessianForm::Either
+        );
     }
 
     #[test]
@@ -15130,7 +15131,10 @@ mod tests {
             gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-        assert_eq!(hessian, crate::solver::outer_strategy::DeclaredHessianForm::Either);
+        assert_eq!(
+            hessian,
+            crate::solver::outer_strategy::DeclaredHessianForm::Either
+        );
     }
 
     #[derive(Clone)]
@@ -15311,7 +15315,10 @@ mod tests {
             gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-        assert_eq!(hessian, crate::solver::outer_strategy::DeclaredHessianForm::Either);
+        assert_eq!(
+            hessian,
+            crate::solver::outer_strategy::DeclaredHessianForm::Either
+        );
     }
 
     #[test]
