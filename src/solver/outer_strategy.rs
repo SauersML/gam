@@ -6659,8 +6659,7 @@ mod tests {
         match err {
             ObjectiveEvalError::Fatal { message } => {
                 assert!(
-                    message.contains("HessianSource::Analytic")
-                        && message.contains("Unavailable"),
+                    message.contains("HessianSource::Analytic") && message.contains("Unavailable"),
                     "fatal message should explain the analytic-route mismatch, saw: {message}"
                 );
             }
@@ -6730,8 +6729,7 @@ mod tests {
         let grad = FirstOrderObjective::eval_grad(&mut bridge, &seed).expect("grad from cache");
         assert_eq!(grad.value, 1.0);
         assert_eq!(grad.gradient, array![2.0]);
-        let hess =
-            SecondOrderObjective::eval_hessian(&mut bridge, &seed).expect("hess from cache");
+        let hess = SecondOrderObjective::eval_hessian(&mut bridge, &seed).expect("hess from cache");
         assert_eq!(hess.value, 1.0);
         assert_eq!(hess.gradient, array![2.0]);
         assert_eq!(hess.hessian, Some(array![[2.0]]));
