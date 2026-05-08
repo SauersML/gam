@@ -4506,20 +4506,7 @@ fn apply_global_smooth_identifiability(
         if let Some(c_ref) = c_local.as_ref() {
             let rel =
                 orthogonality_relative_residual_for_design(&design_constrained, c_ref.view())?;
-            // Tolerance widened from 1e-8 to 1e-6 to accommodate the
-            // Tikhonov-ridged spectral whitener at
-            // `terms/basis.rs:positive_spectral_whitener_from_gram`. For
-            // heavily collinear designs (e.g. high-dim Duchon over a
-            // stratified subsample) the whitener's condition number is
-            // bounded by `sqrt(λ_max / (λ_min + ε))` which approaches
-            // `sqrt(1/ε) ≈ 1e7`, and floating-point multiplication of
-            // `whitening · Z'` then carries an unavoidable O(ε · 1e7) ≈
-            // 1e-9 absolute error per entry, with frame-norm residuals
-            // landing around 1e-7 to 1e-8. The math is still exact in
-            // exact arithmetic — the residual is purely the rounding
-            // floor — and 1e-6 is well within the working precision the
-            // downstream constraint-aware Hessian/PIRLS paths assume.
-            let tol = 1e-6;
+            let tol = 1e-8;
             if rel > tol {
                 return Err(BasisError::InvalidInput(format!(
                     "smooth orthogonality residual too large for term '{}': {:.3e} > {:.1e}",
