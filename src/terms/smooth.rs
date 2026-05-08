@@ -6458,7 +6458,9 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         ..BlockwiseFitOptions::default()
     };
 
-    use crate::solver::outer_strategy::{Derivative, HessianResult, OuterEval, OuterProblem};
+    use crate::solver::outer_strategy::{
+        DeclaredHessianForm, Derivative, HessianResult, OuterEval, OuterProblem,
+    };
 
     struct SpatialAdaptiveOuterState {
         warm_cache: Option<CustomFamilyWarmStart>,
@@ -6539,9 +6541,9 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     let problem = OuterProblem::new(n_theta)
         .with_gradient(Derivative::Analytic)
         .with_hessian(if analytic_outer_hessian_available {
-            Derivative::Analytic
+            DeclaredHessianForm::Either
         } else {
-            Derivative::Unavailable
+            DeclaredHessianForm::Unavailable
         })
         .with_fallback_policy(crate::solver::outer_strategy::FallbackPolicy::Disabled)
         .with_psi_dim(n_theta.saturating_sub(rho_dim))
@@ -10994,7 +10996,9 @@ fn try_exact_joint_spatial_aniso_optimization(
     // Use bounds and design metadata for validation.
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
-    use crate::solver::outer_strategy::{Derivative, OuterEval, OuterEvalOrder};
+    use crate::solver::outer_strategy::{
+        DeclaredHessianForm, Derivative, OuterEval, OuterEvalOrder,
+    };
 
     let theta_dim = theta0.len();
     let psi_dim = theta_dim - rho_dim;
@@ -11190,9 +11194,9 @@ fn try_exact_joint_spatial_aniso_optimization(
         theta_dim,
         Derivative::Analytic,
         if analytic_outer_hessian_available {
-            Derivative::Analytic
+            DeclaredHessianForm::Either
         } else {
-            Derivative::Unavailable
+            DeclaredHessianForm::Unavailable
         },
         prefer_gradient_only,
         // Single-block spatial path: penalty-like rho + spatial psi.
@@ -11290,7 +11294,9 @@ fn try_exact_joint_spatial_isotropic_optimization(
 ) -> Result<Array1<f64>, EstimationError> {
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
-    use crate::solver::outer_strategy::{Derivative, OuterEval, OuterEvalOrder};
+    use crate::solver::outer_strategy::{
+        DeclaredHessianForm, Derivative, OuterEval, OuterEvalOrder,
+    };
 
     let theta_dim = theta0.len();
     let kappa_dim = theta_dim - rho_dim;
@@ -11482,9 +11488,9 @@ fn try_exact_joint_spatial_isotropic_optimization(
         theta_dim,
         Derivative::Analytic,
         if analytic_outer_hessian_available {
-            Derivative::Analytic
+            DeclaredHessianForm::Either
         } else {
-            Derivative::Unavailable
+            DeclaredHessianForm::Unavailable
         },
         prefer_gradient_only,
         // Single-block spatial path: penalty-like rho + spatial psi.
@@ -12885,7 +12891,7 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     auxiliary_dim: usize,
     n_params: usize,
     gradient: crate::solver::outer_strategy::Derivative,
-    hessian: crate::solver::outer_strategy::Derivative,
+    hessian: crate::solver::outer_strategy::DeclaredHessianForm,
     prefer_gradient_only: bool,
     disable_fixed_point: bool,
     risk_profile: crate::seeding::SeedRiskProfile,
@@ -13088,7 +13094,9 @@ where
         (theta_norm, log_kappa_norm)
     };
 
-    use crate::solver::outer_strategy::{Derivative, OuterEval, OuterEvalOrder};
+    use crate::solver::outer_strategy::{
+        DeclaredHessianForm, Derivative, OuterEval, OuterEvalOrder,
+    };
 
     let problem = exact_joint_multistart_outer_problem(
         &theta0,
@@ -13103,9 +13111,9 @@ where
             Derivative::Unavailable
         },
         if analytic_outer_hessian_available {
-            Derivative::Analytic
+            DeclaredHessianForm::Either
         } else {
-            Derivative::Unavailable
+            DeclaredHessianForm::Unavailable
         },
         prefer_gradient_only,
         disable_fixed_point,

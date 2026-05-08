@@ -360,6 +360,44 @@ impl super::unified::HyperOperator for FirthAugmentedSingleHyperOperator {
     fn is_implicit(&self) -> bool {
         self.base.is_implicit()
     }
+
+    /// Bypass the default per-column trace path so the inner
+    /// [`super::unified::ImplicitHyperOperator`]'s shared-X chunked
+    /// GEMM trace fires through this Firth wrapper instead of being
+    /// undone by the wrapper's per-column `mul_vec` (which would reload
+    /// the lazy design `rank` times).
+    ///
+    /// Linearity: `B_total = B_base − B_firth` (see `mul_vec` above), so
+    /// `tr(F^T B_total F) = tr(F^T B_base F) − tr(F^T B_firth F)`. The
+    /// Firth term is computed in one batched `hphi_tau_partial_apply`
+    /// call against the full (p × rank) factor — same number of rank
+    /// columns the per-column path would touch, but as one BLAS3
+    /// contraction with no operator dispatch overhead per column.
+    fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
+        debug_assert_eq!(factor.nrows(), self.p);
+        let base_trace = self.base.trace_projected_factor(factor);
+        let firth_out = self.firth_op.hphi_tau_partial_apply(
+            &self.x_tau_dense,
+            &self.tau_kernel,
+            factor,
+        );
+        let firth_trace: f64 = factor
+            .iter()
+            .zip(firth_out.iter())
+            .map(|(&f, &fo)| f * fo)
+            .sum();
+        base_trace - firth_trace
+    }
+
+    fn trace_projected_factor_cached(
+        &self,
+        factor: &Array2<f64>,
+        _cache: &super::unified::ProjectedFactorCache,
+    ) -> f64 {
+        // Forward: the wrapper's compute is the base op's GEMM trace plus
+        // a single batched Firth correction; both already amortize work.
+        self.trace_projected_factor(factor)
+    }
 }
 
 /// Augments a pair `HyperOperator` with the fixed-β Firth (Jeffreys) pair
