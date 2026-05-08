@@ -122,6 +122,7 @@ harness = false
 
 [[bench]]
 name = "cell_moment_dedup_biobank_shape"
+path = "bench/cargo_benches/cell_moment_dedup_biobank_shape.rs"
 harness = false
 
 [[bench]]
@@ -131,13 +132,8 @@ harness = false
 
 [[bench]]
 name = "bms_hv_row_skip"
+path = "bench/cargo_benches/bms_hv_row_skip.rs"
 harness = false
-
-# TEMPORARY: opt 0.5.0 publish in flight at SauersML/opt; while
-# crates.io has not yet indexed it, build against the local opt
-# source. Remove once `cargo search opt` reports 0.5.0+.
-[patch.crates-io]
-opt = { path = "/Users/user/opt/opt" }
 
 [profile.release]
 lto = "thin"
