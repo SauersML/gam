@@ -1616,25 +1616,6 @@ pub fn auto_spatial_center_strategy(num_centers: usize, d: usize) -> CenterStrat
     CenterStrategy::Auto(Box::new(default_spatial_center_strategy(num_centers, d)))
 }
 
-const THIN_PLATE_TPRS_CANDIDATE_CAP: usize = 256;
-
-fn thin_plate_candidate_center_count(
-    n_rows: usize,
-    requested_centers: usize,
-    poly_cols: usize,
-) -> usize {
-    let nonlinear_cols = requested_centers.saturating_sub(poly_cols);
-    if nonlinear_cols == 0 || n_rows <= requested_centers {
-        return requested_centers.min(n_rows);
-    }
-    requested_centers
-        .saturating_mul(4)
-        .max(poly_cols + nonlinear_cols.saturating_mul(4))
-        .max(requested_centers)
-        .min(THIN_PLATE_TPRS_CANDIDATE_CAP)
-        .min(n_rows)
-}
-
 pub fn center_strategy_is_auto(strategy: &CenterStrategy) -> bool {
     matches!(strategy, CenterStrategy::Auto(_))
 }
@@ -1706,10 +1687,11 @@ pub struct ThinPlateBasisSpec {
     pub double_penalty: bool,
     #[serde(default)]
     pub identifiability: SpatialIdentifiability,
-    /// Frozen Wood-TPRS radial reparameterization. When `Some`, the dense builder
-    /// reuses this `(k-M) × (k-M)` matrix instead of recomputing it from the
-    /// eigendecomposition of the constrained kernel penalty. Used at predict-time
-    /// to guarantee identical reparameterization to fit-time.
+    /// Frozen Wood-TPRS radial reparameterization. When `Some`, the builder
+    /// reuses this `(raw_radial_cols) × (kept_radial_cols)` matrix instead of
+    /// recomputing it from the constrained kernel penalty eigensystem. The
+    /// rectangular case is the truncated regression-spline path; carrying it
+    /// into prediction guarantees identical radial modes to fit-time.
     #[serde(default)]
     pub radial_reparam: Option<Array2<f64>>,
 }
