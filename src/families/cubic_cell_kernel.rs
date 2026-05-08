@@ -59,7 +59,18 @@ impl LocalSpanCubic {
 }
 
 pub const ANCHORED_DEVIATION_KERNEL: &str = "DenestedCubicTransport";
+/// Default normalized non-affine branch tolerance used by [`branch_cell`].
+///
+/// Keep this cutoff explicit and hill-climbable: the biobank-shape cycle-0
+/// sweep evaluated `{1e-12, 1e-10, 1e-8, 1e-6, 1e-4, 1e-3}` against the
+/// legacy transport path.  The more aggressive candidates require an
+/// end-to-end beta acceptance run before promotion; the default therefore
+/// remains the legacy `1e-10` value to preserve bit-for-bit model behavior.
 pub const NORMALIZED_CELL_BRANCH_TOL: f64 = 1e-10;
+
+/// Previous fixed-by-hand branch tolerance retained for regression tests that
+/// compare the tuned fast path to the old transport path on borderline cells.
+pub const LEGACY_NORMALIZED_CELL_BRANCH_TOL: f64 = 1e-10;
 const INV_TWO_PI: f64 = 1.0 / std::f64::consts::TAU;
 #[allow(dead_code)]
 const RECIP_FACTORIALS_0_TO_10: [f64; 11] = [
@@ -872,6 +883,72 @@ pub enum ExactCellBranch {
     Quartic,
     Sextic,
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+const CELL_BRANCH_LOG_INTERVAL: u64 = 100_000;
+
+#[cfg(not(target_arch = "wasm32"))]
+static CELL_BRANCH_COUNTS: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+#[cfg(not(target_arch = "wasm32"))]
+static CELL_BRANCH_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(not(target_arch = "wasm32"))]
+static CELL_BRANCH_LOG_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn maybe_log_cell_branch_distribution(k2: f64, k3: f64) {
+    let enabled = *CELL_BRANCH_LOG_ENABLED
+        .get_or_init(|| std::env::var_os("GAM_LOG_CELL_BRANCH_DISTRIBUTION").is_some());
+    if !enabled {
+        return;
+    }
+    let magnitude = k2.abs().max(k3.abs());
+    let bin = if magnitude <= LEGACY_NORMALIZED_CELL_BRANCH_TOL {
+        0
+    } else if magnitude <= NORMALIZED_CELL_BRANCH_TOL {
+        1
+    } else if magnitude <= 1e-6 {
+        2
+    } else if magnitude <= 1e-4 {
+        3
+    } else if magnitude <= 1e-3 {
+        4
+    } else {
+        5
+    };
+    CELL_BRANCH_COUNTS[bin].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let total = CELL_BRANCH_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if total == 1 || total % CELL_BRANCH_LOG_INTERVAL == 0 {
+        let counts: [u64; 6] = std::array::from_fn(|idx| {
+            CELL_BRANCH_COUNTS[idx].load(std::sync::atomic::Ordering::Relaxed)
+        });
+        eprintln!(
+            "[cubic-cell-branch] n={} | max(|k2|,|k3|) bins: <=legacy({:.0e})={} <=tuned({:.0e})={} <=1e-6={} <=1e-4={} <=1e-3={} >1e-3={}",
+            total,
+            LEGACY_NORMALIZED_CELL_BRANCH_TOL,
+            counts[0],
+            NORMALIZED_CELL_BRANCH_TOL,
+            counts[1],
+            counts[2],
+            counts[3],
+            counts[4],
+            counts[5]
+        );
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline]
+fn maybe_log_cell_branch_distribution(_k2: f64, _k3: f64) {}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DenestedCubicCell {
@@ -2316,6 +2393,7 @@ pub fn branch_cell(cell: DenestedCubicCell) -> Result<ExactCellBranch, String> {
     let (k2, k3) = normalized_non_affine_coefficients(
         cell.left, cell.right, cell.c0, cell.c1, cell.c2, cell.c3,
     )?;
+    maybe_log_cell_branch_distribution(k2, k3);
     if k2.abs() <= NORMALIZED_CELL_BRANCH_TOL && k3.abs() <= NORMALIZED_CELL_BRANCH_TOL {
         Ok(ExactCellBranch::Affine)
     } else if k3.abs() <= NORMALIZED_CELL_BRANCH_TOL {
@@ -3159,6 +3237,23 @@ fn evaluate_non_affine_cell_state(
         moments,
     })
 }
+
+/// Reference evaluator that bypasses [`branch_cell`] for finite non-affine
+/// cells and runs the transport path directly.
+///
+/// This is intentionally hidden from normal docs: it exists for regression
+/// tests and Criterion workloads that need a before/after comparison against
+/// the pre-fast-path non-affine transport cost on the exact same cells.
+#[doc(hidden)]
+pub fn evaluate_non_affine_cell_moments_reference(
+    cell: DenestedCubicCell,
+    branch: ExactCellBranch,
+    max_degree: usize,
+) -> Result<CellMomentState, String> {
+    evaluate_non_affine_cell_state(cell, branch, max_degree)
+}
+
+
 /// De-nested cubic cell evaluator.
 ///
 /// Affine cells use the closed-form affine anchor.  Well-conditioned sextic
@@ -5680,6 +5775,85 @@ mod tests {
             0,
             "scratch-backed inner cell-moment calls should not grow Vec buffers"
         );
+    }
+
+    fn assert_cell_states_close(lhs: &CellMomentState, rhs: &CellMomentState, max_rel: f64) {
+        let value_scale = lhs.value.abs().max(rhs.value.abs()).max(1.0);
+        assert!(
+            (lhs.value - rhs.value).abs() <= max_rel * value_scale,
+            "value mismatch: lhs={} rhs={} rel={}",
+            lhs.value,
+            rhs.value,
+            (lhs.value - rhs.value).abs() / value_scale
+        );
+        assert_eq!(lhs.moments.len(), rhs.moments.len());
+        for (degree, (left, right)) in lhs.moments.iter().zip(rhs.moments.iter()).enumerate() {
+            let scale = left.abs().max(right.abs()).max(1.0);
+            assert!(
+                (left - right).abs() <= max_rel * scale,
+                "moment degree {degree} mismatch: lhs={left} rhs={right} rel={}",
+                (left - right).abs() / scale
+            );
+        }
+    }
+
+    #[test]
+    fn tuned_branch_tolerance_matches_legacy_non_affine_transport_grid() {
+        let bounds = [(-1.0, 1.0), (-0.7, 0.9), (-2.0, -0.5), (0.25, 1.75)];
+        let anchors = [(-0.4, 0.7), (0.15, -0.35), (0.8, 0.25)];
+        let normalized = [
+            -1.25 * NORMALIZED_CELL_BRANCH_TOL,
+            -0.95 * NORMALIZED_CELL_BRANCH_TOL,
+            -0.25 * NORMALIZED_CELL_BRANCH_TOL,
+            0.25 * NORMALIZED_CELL_BRANCH_TOL,
+            0.95 * NORMALIZED_CELL_BRANCH_TOL,
+            1.25 * NORMALIZED_CELL_BRANCH_TOL,
+        ];
+        let max_degrees = [4usize, 8, 12];
+        for &(left, right) in &bounds {
+            let width = right - left;
+            let mid = 0.5 * (left + right);
+            let half = 0.5 * width;
+            for &(c0, c1) in &anchors {
+                for &k2 in &normalized {
+                    for &k3 in &normalized {
+                        if k3.abs() <= 0.0
+                            || (k3.abs() <= NORMALIZED_CELL_BRANCH_TOL
+                                && k2.abs() > NORMALIZED_CELL_BRANCH_TOL)
+                            || (k3.abs() > NORMALIZED_CELL_BRANCH_TOL && k3.abs() < 1e-9)
+                        {
+                            continue;
+                        }
+                        let c3 = k3 / (half * half * half);
+                        let c2 = k2 / (half * half) - 3.0 * c3 * mid;
+                        let cell = DenestedCubicCell {
+                            left,
+                            right,
+                            c0,
+                            c1,
+                            c2,
+                            c3,
+                        };
+                        let legacy_branch = ExactCellBranch::Sextic;
+                        for &max_degree in &max_degrees {
+                            let tuned = evaluate_cell_moments(cell, max_degree)
+                                .expect("tuned branch cell moments");
+                            let legacy =
+                                evaluate_non_affine_cell_state(cell, legacy_branch, max_degree)
+                                    .expect("legacy non-affine cell moments");
+                            if k2.abs() <= NORMALIZED_CELL_BRANCH_TOL
+                                && k3.abs() <= NORMALIZED_CELL_BRANCH_TOL
+                            {
+                                assert_eq!(tuned.branch, ExactCellBranch::Affine);
+                            } else {
+                                assert_eq!(tuned.branch, ExactCellBranch::Sextic);
+                            }
+                            assert_cell_states_close(&tuned, &legacy, 2e-9);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
