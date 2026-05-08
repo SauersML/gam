@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from gam._tables import normalize_table, restore_output_table
+from gamfit._tables import normalize_table, restore_output_table
 
 
 def test_normalize_table_rejects_zero_row_mapping() -> None:

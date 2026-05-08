@@ -5,15 +5,15 @@ import pathlib
 
 import pytest
 
-pytest.importorskip("gam._rust")
+pytest.importorskip("gamfit._rust")
 
 import matplotlib
 import numpy as np
 import pandas as pd
 
-import gam
-from gam.pgs import PgsCalibration
-from gam.sklearn import GAMClassifier, GAMRegressor
+import gamfit
+from gamfit.pgs import PgsCalibration
+from gamfit.sklearn import GAMClassifier, GAMRegressor
 
 
 matplotlib.use("Agg")
@@ -47,9 +47,9 @@ def prediction_frame() -> pd.DataFrame:
 
 
 def test_build_info_reports_real_extension() -> None:
-    info = gam.build_info()
+    info = gamfit.build_info()
     assert info["available"] is True
-    assert info["module"] == "gam._rust"
+    assert info["module"] == "gamfit._rust"
     assert "fit" in info["capabilities"]
     assert "validate_formula" in info["capabilities"]
     assert info["supported_model_classes"] == [
@@ -66,7 +66,7 @@ def test_build_info_reports_real_extension() -> None:
 
 
 def test_validate_formula_reports_model_metadata() -> None:
-    validation = gam.validate_formula(training_rows(), "y ~ x")
+    validation = gamfit.validate_formula(training_rows(), "y ~ x")
 
     assert validation["formula"] == "y ~ x"
     assert validation["model_class"] == "standard"
@@ -76,7 +76,7 @@ def test_validate_formula_reports_model_metadata() -> None:
 
 
 def test_fit_predict_summary_check_report_and_roundtrip(tmp_path: pathlib.Path) -> None:
-    model = gam.fit(training_rows(), "y ~ x")
+    model = gamfit.fit(training_rows(), "y ~ x")
     summary = model.summary()
 
     assert model.formula == "y ~ x"
@@ -144,13 +144,13 @@ def test_fit_predict_summary_check_report_and_roundtrip(tmp_path: pathlib.Path) 
     assert model.report(report_path) == str(report_path)
     assert report_path.exists()
 
-    loaded = gam.load(model_path)
+    loaded = gamfit.load(model_path)
     reloaded_prediction = loaded.predict(prediction_rows())
     assert reloaded_prediction["mean"] == predicted["mean"]
 
 
 def test_pandas_diagnostics_and_plotting() -> None:
-    model = gam.fit(training_frame(), "y ~ x")
+    model = gamfit.fit(training_frame(), "y ~ x")
 
     predicted = model.predict(prediction_frame())
     assert isinstance(predicted, pd.DataFrame)
@@ -209,7 +209,7 @@ def test_numpy_inputs_and_outputs() -> None:
     assert pred.shape == (2,)
     np.testing.assert_allclose(pred, [2.5, 3.5], atol=1e-3)
 
-    model = gam.fit({"x0": x_train[:, 0].tolist(), "y": y_train.tolist()}, "y ~ x0")
+    model = gamfit.fit({"x0": x_train[:, 0].tolist(), "y": y_train.tolist()}, "y ~ x0")
     raw = model.predict(x_test, return_type="numpy")
     assert raw.shape == (2, 2)
     # The numpy-return contract is column-ordered (eta, mean). Identity link
@@ -286,10 +286,10 @@ def test_sklearn_classifier_roundtrip() -> None:
 
 
 def test_predict_rejects_schema_mismatch() -> None:
-    model = gam.fit(training_rows(), "y ~ x")
+    model = gamfit.fit(training_rows(), "y ~ x")
 
     # 1) Wrong column name (no required feature present).
-    with pytest.raises(gam.SchemaMismatchError) as exc_info:
+    with pytest.raises(gamfit.SchemaMismatchError) as exc_info:
         model.predict([{"z": 1.0}])
     assert "x" in str(exc_info.value), (
         f"schema-mismatch error must name the missing column; got: {exc_info.value}"
@@ -297,7 +297,7 @@ def test_predict_rejects_schema_mismatch() -> None:
 
     # 2) Required column missing in a row that has *other* columns. The
     # presence of unrelated keys must not silently mask the missing feature.
-    with pytest.raises(gam.SchemaMismatchError):
+    with pytest.raises(gamfit.SchemaMismatchError):
         model.predict([{"y": 0.0, "irrelevant": 7.0}])
 
     # 3) An empty row list. The runtime is allowed to either reject it
@@ -305,7 +305,7 @@ def test_predict_rejects_schema_mismatch() -> None:
     # no input would be silently inventing rows.
     try:
         empty_pred = model.predict([])
-    except (ValueError, gam.SchemaMismatchError, RuntimeError):
+    except (ValueError, gamfit.SchemaMismatchError, RuntimeError):
         pass  # explicit rejection is fine
     else:
         if isinstance(empty_pred, dict):
@@ -321,7 +321,7 @@ def test_predict_rejects_schema_mismatch() -> None:
 
 
 def test_predict_can_passthrough_id_column() -> None:
-    model = gam.fit(training_rows(), "y ~ x")
+    model = gamfit.fit(training_rows(), "y ~ x")
 
     pred = model.predict(
         [
@@ -342,14 +342,14 @@ def test_predict_can_passthrough_id_column() -> None:
 # These tests exercise the PGS-facing Python surface: Stage 1 conditional
 # Gaussianization of the PGS on the PC manifold, Stage 2a Bernoulli
 # marginal-slope on the calibrated score, and survival prediction surfaces.
-# They go through the Python binding (``gam.fit`` / ``model.predict``), not
+# They go through the Python binding (``gamfit.fit`` / ``model.predict``), not
 # the CLI — the CLI contract is covered separately by
 # ``tests/integration_pit_pipeline.py``.
 # ---------------------------------------------------------------------------
 
 
 def _require_extension() -> None:
-    if not gam.build_info().get("available"):
+    if not gamfit.build_info().get("available"):
         pytest.skip("rust extension not built")
 
 
@@ -371,7 +371,7 @@ def test_transformation_normal_pgs_calibration_roundtrip(synthetic_biobank_facto
     _require_extension()
     df = synthetic_biobank_factory(seed=0, n=128)
 
-    model = gam.fit(
+    model = gamfit.fit(
         df,
         f"PGS ~ {_pc_duchon()}",
         transformation_normal=True,
@@ -414,7 +414,7 @@ def test_transformation_normal_check_requires_raw_pgs(synthetic_biobank_factory:
     _require_extension()
     df = synthetic_biobank_factory(seed=11, n=128)
 
-    model = gam.fit(
+    model = gamfit.fit(
         df,
         f"PGS ~ {_pc_duchon()}",
         transformation_normal=True,
@@ -426,7 +426,7 @@ def test_transformation_normal_check_requires_raw_pgs(synthetic_biobank_factory:
 
     assert not check.ok
     assert any(issue.column == "PGS" for issue in check.issues)
-    with pytest.raises(gam.SchemaMismatchError):
+    with pytest.raises(gamfit.SchemaMismatchError):
         model.predict(missing_pgs)
 
 
@@ -476,7 +476,7 @@ def test_bernoulli_marginal_slope_roundtrip_tracks_calibrated_score(
     _require_extension()
     df = synthetic_biobank_factory(seed=1, n=128)
 
-    calib = gam.fit(
+    calib = gamfit.fit(
         df,
         f"PGS ~ {_pc_duchon()}",
         transformation_normal=True,
@@ -484,7 +484,7 @@ def test_bernoulli_marginal_slope_roundtrip_tracks_calibrated_score(
     )
     df["pgs_ctn_z"] = np.asarray(calib.predict(df), dtype=float)
 
-    model = gam.fit(
+    model = gamfit.fit(
         df,
         "disease ~ z",
         family="bernoulli-marginal-slope",
@@ -496,7 +496,7 @@ def test_bernoulli_marginal_slope_roundtrip_tracks_calibrated_score(
 
     path = tmp_path / "bernoulli_ms.gam"
     model.save(path)
-    loaded = gam.load(path)
+    loaded = gamfit.load(path)
     assert getattr(loaded, "is_marginal_slope", False) is True
 
     pred = loaded.predict(df, return_type="dict")
@@ -531,7 +531,7 @@ def test_survival_prediction_dense_surfaces_smoke() -> None:
         ],
         dtype=float,
     )
-    pred = gam.SurvivalPrediction(
+    pred = gamfit.SurvivalPrediction(
         model_class="survival marginal-slope",
         parameters=np.zeros((2, 1), dtype=float),
         parameter_names=("eta",),
@@ -588,7 +588,7 @@ def test_survival_prediction_dense_surfaces_smoke() -> None:
 
 
 def test_survival_prediction_write_csv_preserves_ids(tmp_path: pathlib.Path) -> None:
-    pred = gam.SurvivalPrediction(
+    pred = gamfit.SurvivalPrediction(
         model_class="survival",
         parameters=np.array([[np.log(0.10)], [np.log(0.20)]], dtype=float),
         parameter_names=("log_hazard",),
@@ -618,7 +618,7 @@ def test_survival_prediction_write_csv_preserves_ids(tmp_path: pathlib.Path) -> 
 
 
 def test_survival_prediction_large_curves_require_chunks(tmp_path: pathlib.Path) -> None:
-    pred = gam.SurvivalPrediction(
+    pred = gamfit.SurvivalPrediction(
         model_class="survival marginal-slope",
         parameters=np.zeros((1_001, 1), dtype=float),
         parameter_names=("eta",),
