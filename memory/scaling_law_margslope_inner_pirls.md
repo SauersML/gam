@@ -22,7 +22,7 @@ Validation status in this container after the per-cycle denested-cell moment cac
 | command | n | elapsed | notes |
 | --- | ---: | ---: | --- |
 | `cargo test --test margslope_flex_biobank_repro --no-run` | n/a | 38.17 s | compiled the ignored repro test successfully in dev/test profile |
-| `GAM_MARGSLOPE_REPRO_N=100 cargo test --test margslope_flex_biobank_repro -- --ignored --nocapture margslope_flex_biobank_repro` | 100 | >60 s in dev/test profile | debug build is not representative and was stopped after the harness warning |
+| `cargo test --release --test margslope_flex_biobank_repro -- --ignored --nocapture margslope_flex_biobank_repro_cycle0` | `DEFAULT_REPRO_N` (hard-coded) | release-only | row count and wall bound are now hard-coded constants in `tests/test_support/margslope_flex_equivalence.rs`; debug builds are not representative |
 
 Release benchmark timing should be collected with the manual command above on a machine with an already-built release test binary. The test intentionally remains ignored so normal CI does not pay this cost.
 
