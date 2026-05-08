@@ -11610,7 +11610,12 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 exact_warm_start.borrow().as_ref(),
                 effective_mode,
             )?;
-            exact_warm_start.replace(Some(eval.warm_start));
+            exact_warm_start.replace(Some(eval.warm_start.clone()));
+            if !eval.inner_converged {
+                return Err(
+                    "exact bernoulli marginal-slope inner solve did not converge".to_string(),
+                );
+            }
             if matches!(eval_mode, EvalMode::ValueGradientHessian)
                 && analytic_joint_hessian_available
                 && !eval.outer_hessian.is_analytic()
@@ -11637,7 +11642,12 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
             )?;
-            exact_warm_start.replace(Some(eval.warm_start));
+            exact_warm_start.replace(Some(eval.warm_start.clone()));
+            if !eval.inner_converged {
+                return Err(
+                    "exact bernoulli marginal-slope EFS inner solve did not converge".to_string(),
+                );
+            }
             Ok(eval.efs_eval)
         },
     )?;

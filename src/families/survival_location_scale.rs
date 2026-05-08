@@ -10572,7 +10572,12 @@ pub(crate) fn fit_survival_location_scale_terms(
                 effective_mode,
             )
             .map_err(|e| e.to_string())?;
-            exact_warm_start.replace(Some(eval.warm_start));
+            exact_warm_start.replace(Some(eval.warm_start.clone()));
+            if !eval.inner_converged {
+                return Err(
+                    "survival location-scale exact joint inner solve did not converge".to_string(),
+                );
+            }
             Ok((eval.objective, eval.gradient, eval.outer_hessian))
         },
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
@@ -10612,7 +10617,13 @@ pub(crate) fn fit_survival_location_scale_terms(
                 exact_warm_start.borrow().as_ref(),
             )
             .map_err(|e| e.to_string())?;
-            exact_warm_start.replace(Some(eval.warm_start));
+            exact_warm_start.replace(Some(eval.warm_start.clone()));
+            if !eval.inner_converged {
+                return Err(
+                    "survival location-scale exact joint EFS inner solve did not converge"
+                        .to_string(),
+                );
+            }
             Ok(eval.efs_eval)
         },
     )?;

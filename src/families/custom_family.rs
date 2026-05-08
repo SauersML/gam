@@ -10689,6 +10689,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily + Clone + Send + Sync 
     .map_err(String::from)
 }
 
+#[cfg(test)]
 fn outerobjectivegradienthessian<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -13979,6 +13980,13 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
                 EvalMode::ValueAndGradient
             },
         ) {
+            Ok(eval) if !eval.inner_converged => {
+                outer.warm_cache = Some(eval.warm_start.clone());
+                outer.last_error = Some("custom-family inner solve did not converge".to_string());
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "custom-family inner solve did not converge".to_string(),
+                ));
+            }
             Ok(eval)
                 if eval.objective.is_finite()
                     && eval.gradient.iter().all(|v| v.is_finite())
@@ -14028,7 +14036,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
             // exact-Hessian families, forcing every inner solve to start from
             // scratch (5-10 Newton steps instead of 1-2 with warm start).
             let warm_ref = screened_outer_warm_start(outer.warm_cache.as_ref(), rho);
-            match outerobjectivegradienthessian(
+            match outerobjectivegradienthessian_internal(
                 family,
                 specs,
                 &outer_options,
@@ -14037,10 +14045,21 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
                 warm_ref,
                 EvalMode::ValueOnly,
             ) {
-                Ok((cost, _, _, warm)) => {
-                    outer.warm_cache = Some(warm);
+                Ok(eval) if eval.inner_converged && eval.objective.is_finite() => {
+                    outer.warm_cache = Some(eval.warm_start);
                     outer.last_error = None;
-                    Ok(cost)
+                    Ok(eval.objective)
+                }
+                Ok(eval) => {
+                    outer.warm_cache = Some(eval.warm_start);
+                    outer.last_error = Some(
+                        "custom-family value-only inner solve did not converge or objective was non-finite"
+                            .to_string(),
+                    );
+                    Err(EstimationError::RemlOptimizationFailed(
+                        "custom-family value-only inner solve did not converge or objective was non-finite"
+                            .to_string(),
+                    ))
                 }
                 Err(e) => {
                     outer.last_error = Some(e.clone());
@@ -14075,10 +14094,18 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
                 rho,
                 warm_ref,
             ) {
-                Ok((eval, warm, _inner_converged)) => {
+                Ok((eval, warm, true)) => {
                     outer.warm_cache = Some(warm);
                     outer.last_error = None;
                     Ok(eval)
+                }
+                Ok((_eval, warm, false)) => {
+                    outer.warm_cache = Some(warm);
+                    outer.last_error =
+                        Some("custom-family EFS inner solve did not converge".to_string());
+                    Err(EstimationError::RemlOptimizationFailed(
+                        "custom-family EFS inner solve did not converge".to_string(),
+                    ))
                 }
                 Err(e) => {
                     outer.last_error = Some(e.clone());
@@ -14190,6 +14217,12 @@ pub(crate) fn fit_custom_family_fixed_log_lambdas<
         options,
         warm_start.map(|warm| &warm.inner),
     )?;
+    if !inner.converged {
+        return Err(CustomFamilyError::Optimization(format!(
+            "fixed-log-lambda inner solve did not converge after {} cycles",
+            inner.cycles
+        )));
+    }
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     let covariance_conditional =
         compute_joint_covariance_required(family, specs, &inner.block_states, &per_block, options)?;
@@ -14692,6 +14725,21 @@ mod tests {
         assert_eq!(retained.rho, rho_far);
         assert_eq!(retained.block_beta[0], array![0.2, 0.1]);
         assert_eq!(retained.active_sets[0], Some(vec![1]));
+    }
+
+    #[test]
+    fn public_warm_start_compatibility_uses_rho_screen() {
+        let warm = CustomFamilyWarmStart {
+            inner: ConstrainedWarmStart {
+                rho: array![0.0, -0.5],
+                block_beta: vec![array![1.0, -1.0]],
+                active_sets: vec![None],
+            },
+        };
+
+        assert!(warm.compatible_with_rho(&array![0.75, -0.5]));
+        assert!(!warm.compatible_with_rho(&array![1.75, -0.5]));
+        assert!(!warm.compatible_with_rho(&array![0.0]));
     }
 
     #[test]
