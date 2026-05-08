@@ -19,8 +19,10 @@ use ::opt::{
     Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds,
     FallbackPolicy as OptFallbackPolicy, FirstOrderObjective, FirstOrderSample, FixedPoint,
     FixedPointError, FixedPointObjective, FixedPointSample, FixedPointStatus,
-    HessianFallbackPolicy, MaxIterations, ObjectiveEvalError, SecondOrderObjective,
-    SecondOrderSample, Solution, Tolerance, ZerothOrderObjective,
+    HessianFallbackPolicy, HessianMaterialization, HessianOperator, HessianValue,
+    MatrixFreeTrustRegion, MatrixFreeTrustRegionError, MaxIterations, ObjectiveEvalError,
+    OperatorObjective, OperatorSample, SecondOrderObjective, SecondOrderSample, Solution,
+    Tolerance, ZerothOrderObjective,
 };
 use ndarray::{Array1, Array2, ArrayView2};
 use std::sync::Arc;
@@ -370,45 +372,6 @@ pub(crate) const OUTER_HVP_MATERIALIZE_MAX_DIM: usize = 64;
 /// the Steihaug-Toint CG inner solve. A high count at biobank scale is the
 /// quantitative signal that the matrix-free Hv kernel — not ARC's outer
 /// loop — is the bottleneck.
-struct HvApplyCounter<'a> {
-    inner: &'a dyn OuterHessianOperator,
-    count: std::sync::atomic::AtomicU64,
-}
-
-impl<'a> HvApplyCounter<'a> {
-    fn new(inner: &'a dyn OuterHessianOperator) -> Self {
-        Self {
-            inner,
-            count: std::sync::atomic::AtomicU64::new(0),
-        }
-    }
-
-    fn count(&self) -> u64 {
-        self.count.load(std::sync::atomic::Ordering::Relaxed)
-    }
-}
-
-impl<'a> OuterHessianOperator for HvApplyCounter<'a> {
-    fn dim(&self) -> usize {
-        self.inner.dim()
-    }
-
-    fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
-        self.count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inner.matvec(v)
-    }
-
-    fn mul_mat(&self, factor: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-        self.count
-            .fetch_add(factor.ncols() as u64, std::sync::atomic::Ordering::Relaxed);
-        self.inner.mul_mat(factor)
-    }
-
-    fn materialization_capability(&self) -> OuterHessianMaterialization {
-        self.inner.materialization_capability()
-    }
-}
 
 /// Whether an analytic derivative is available for a given order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2583,6 +2546,243 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
 /// variants don't actually drive `opt`'s second-order solvers, but the
 /// match preserves the original behavior in case a future routing
 /// reuses this bridge.)
+// =====================================================================
+// opt 0.4 matrix-free TR adapter (Phase 6)
+// =====================================================================
+//
+// `OuterToOptHessianOperator` wraps gam's `OuterHessianOperator` so it
+// can be passed to `opt::MatrixFreeTrustRegion` via
+// `opt::HessianValue::Operator`. The two traits have nearly identical
+// surfaces — the adapter is just shape/error translation:
+//
+//   gam::OuterHessianOperator              opt::HessianOperator
+//     dim()                       <-->       dim()
+//     matvec(v) -> Array1         <-->       apply_into(v, &mut out)
+//     mul_mat(X) -> Array2        <-->       apply_mat(X)
+//     materialization_capability  <-->       materialization
+//     materialize_dense           <-->       materialize_dense
+//
+// gam errors are `String`; opt errors are `ObjectiveEvalError`. We
+// promote everything to `ObjectiveEvalError::Fatal` because operator
+// failures inside a solver step are not generally recoverable —
+// shrinking the trust radius would not fix a dimension mismatch.
+//
+// `OuterOperatorBridge` is the bridge that implements
+// `opt::OperatorObjective` for `gam`'s outer objective — parallel to
+// `OuterSecondOrderBridge` but produces `OperatorSample` whose
+// Hessian is `HessianValue::Operator(_)` (or `Dense(_)` when the
+// operator declares an exact materialization route).
+
+struct OuterToOptHessianOperator(Arc<dyn OuterHessianOperator>);
+
+impl HessianOperator for OuterToOptHessianOperator {
+    fn dim(&self) -> usize {
+        self.0.dim()
+    }
+
+    fn apply_into(
+        &self,
+        v: &Array1<f64>,
+        out: &mut Array1<f64>,
+    ) -> Result<(), ObjectiveEvalError> {
+        let result = self.0.matvec(v).map_err(|message| ObjectiveEvalError::Fatal {
+            message: format!("outer Hessian operator matvec failed: {message}"),
+        })?;
+        if result.len() != out.len() {
+            return Err(ObjectiveEvalError::Fatal {
+                message: format!(
+                    "outer Hessian operator matvec produced length {} but expected {}",
+                    result.len(),
+                    out.len()
+                ),
+            });
+        }
+        out.assign(&result);
+        Ok(())
+    }
+
+    fn apply_mat(
+        &self,
+        x: ArrayView2<'_, f64>,
+    ) -> Result<Array2<f64>, ObjectiveEvalError> {
+        self.0.mul_mat(x).map_err(|message| ObjectiveEvalError::Fatal {
+            message: format!("outer Hessian operator mul_mat failed: {message}"),
+        })
+    }
+
+    fn materialization(&self) -> HessianMaterialization {
+        match self.0.materialization_capability() {
+            OuterHessianMaterialization::Unavailable => HessianMaterialization::Unavailable,
+            OuterHessianMaterialization::RepeatedHvp => HessianMaterialization::RepeatedHvp,
+            OuterHessianMaterialization::BatchedHvp => HessianMaterialization::BatchedHvp,
+            OuterHessianMaterialization::Explicit => HessianMaterialization::Explicit,
+        }
+    }
+
+    fn materialize_dense(&self) -> Result<Array2<f64>, ObjectiveEvalError> {
+        self.0
+            .materialize_dense()
+            .map_err(|message| ObjectiveEvalError::Fatal {
+                message: format!("outer Hessian operator materialization failed: {message}"),
+            })
+    }
+}
+
+/// Translate a gam `HessianResult` into an `opt::HessianValue` for
+/// consumption by `MatrixFreeTrustRegion`. `Analytic` becomes
+/// `Dense`; `Operator` is wrapped in the adapter; `Unavailable` is
+/// preserved (the solver's `HessianFallbackPolicy` decides what
+/// happens then).
+fn hessian_result_to_value(hessian: HessianResult) -> HessianValue {
+    match hessian {
+        HessianResult::Analytic(h) => HessianValue::Dense(h),
+        HessianResult::Operator(op) => HessianValue::Operator(Arc::new(
+            OuterToOptHessianOperator(op),
+        )),
+        HessianResult::Unavailable => HessianValue::Unavailable,
+    }
+}
+
+/// Bridge that exposes gam's outer objective as an
+/// `opt::OperatorObjective`. Used on the matrix-free trust-region
+/// route; the dense-Hessian / first-order routes still use
+/// `OuterSecondOrderBridge` / `OuterFirstOrderBridge`.
+struct OuterOperatorBridge<'a> {
+    obj: &'a mut dyn OuterObjective,
+    layout: OuterThetaLayout,
+    /// Inner-PIRLS cap atomic, mirroring the BFGS / ARC bridges.
+    outer_inner_cap: Option<InnerProgressFeedback>,
+    /// Counts gradient/Hessian evaluations for the inner-cap schedule
+    /// and progress logs.
+    eval_count: usize,
+    /// First observed `‖g‖`. Used by the inner-cap schedule's
+    /// gradient-ratio gate.
+    g_norm_initial: Option<f64>,
+    /// `‖g‖` from the most recent eval.
+    last_g_norm: Option<f64>,
+}
+
+impl ZerothOrderObjective for OuterOperatorBridge<'_> {
+    fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+        self.layout
+            .validate_point_len(x, "outer eval_cost failed")?;
+        let cost = self
+            .obj
+            .eval_cost(x)
+            .map_err(|err| into_objective_error("outer eval_cost failed", err))?;
+        finite_cost_or_error("outer eval_cost failed", cost)
+    }
+}
+
+impl FirstOrderObjective for OuterOperatorBridge<'_> {
+    fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
+        self.layout.validate_point_len(x, "outer eval failed")?;
+        let eval = self
+            .obj
+            .eval_with_order(x, OuterEvalOrder::ValueAndGradient)
+            .map_err(|err| into_objective_error("outer eval failed", err))?;
+        let eval = finite_outer_first_order_eval_or_error(
+            "outer eval failed",
+            self.layout,
+            eval,
+        )?;
+        let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if self.g_norm_initial.is_none() && g_norm.is_finite() && g_norm > 0.0 {
+            self.g_norm_initial = Some(g_norm);
+        }
+        if g_norm.is_finite() {
+            self.last_g_norm = Some(g_norm);
+        }
+        Ok(FirstOrderSample {
+            value: eval.cost,
+            gradient: eval.gradient,
+        })
+    }
+}
+
+impl OperatorObjective for OuterOperatorBridge<'_> {
+    fn eval_value_grad_op(
+        &mut self,
+        x: &Array1<f64>,
+    ) -> Result<OperatorSample, ObjectiveEvalError> {
+        self.layout.validate_point_len(x, "outer eval failed")?;
+        // Drive the outer-aware inner-PIRLS cap, mirroring
+        // OuterSecondOrderBridge::eval_grad / eval_hessian. Each
+        // accepted outer iter calls eval_value_grad_op exactly once
+        // (the matrix-free TR's inner CG uses HVPs, not full
+        // evaluations), so we increment per call without the /2 the
+        // ARC bridge needs.
+        if let Some(feedback) = self.outer_inner_cap.as_ref() {
+            let g_ratio = match (self.last_g_norm, self.g_norm_initial) {
+                (Some(g), Some(g0)) if g0 > 0.0 => Some(g / g0),
+                _ => None,
+            };
+            let snapshot = feedback.snapshot();
+            let cap = first_order_inner_cap_schedule(self.eval_count, g_ratio, snapshot);
+            let _prev = feedback.cap.swap(cap, Ordering::Relaxed);
+        }
+        let stage_start = std::time::Instant::now();
+        log::info!(
+            "[STAGE] outer eval start order=ValueGradientHessian dim={} (operator bridge)",
+            x.len(),
+        );
+        let eval = self
+            .obj
+            .eval_with_order(x, OuterEvalOrder::ValueGradientHessian)
+            .map_err(|err| into_objective_error("outer eval failed", err))?;
+        let eval = finite_outer_eval_or_error("outer eval failed", self.layout, eval)?;
+        self.eval_count += 1;
+        let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if self.g_norm_initial.is_none() && g_norm.is_finite() && g_norm > 0.0 {
+            self.g_norm_initial = Some(g_norm);
+        }
+        if g_norm.is_finite() {
+            self.last_g_norm = Some(g_norm);
+        }
+        log::info!(
+            "[STAGE] outer eval end elapsed={:.3}s cost={:.6e} |g|={:.3e} (operator bridge)",
+            stage_start.elapsed().as_secs_f64(),
+            eval.cost,
+            g_norm,
+        );
+        Ok(OperatorSample {
+            value: eval.cost,
+            gradient: eval.gradient,
+            hessian: hessian_result_to_value(eval.hessian),
+        })
+    }
+}
+
+// Helpers preserved across the Phase 6 rewrite. Both were previously
+// shared with `run_operator_trust_region` (now deleted in favor of
+// `opt::MatrixFreeTrustRegion`), but they remain in use by the dense
+// ARC and BFGS arms of the seed loop.
+
+#[inline]
+fn project_to_bounds(
+    x: &Array1<f64>,
+    bounds: Option<&(Array1<f64>, Array1<f64>)>,
+) -> Array1<f64> {
+    match bounds {
+        Some((lower, upper)) => {
+            let mut out = x.clone();
+            for idx in 0..out.len() {
+                out[idx] = out[idx].clamp(lower[idx], upper[idx]);
+            }
+            out
+        }
+        None => x.clone(),
+    }
+}
+
+/// Scale the absolute gradient-norm tolerance by `1 + |seed_cost|`. The
+/// tolerance opt's solvers consume is absolute; gam scales it so the
+/// REML score's natural magnitude does not bias convergence.
+#[inline]
+fn outer_scaled_tolerance(base_tol: f64, seed_cost: f64) -> f64 {
+    base_tol * (1.0 + seed_cost.abs())
+}
+
 fn build_bridge_hessian_for_source(
     source: HessianSource,
     hessian: HessianResult,
@@ -3483,11 +3683,6 @@ pub struct OuterResult {
     pub operator_stop_reason: Option<OperatorTrustRegionStopReason>,
 }
 
-const OPERATOR_TRUST_RADIUS_INIT: f64 = 1.0;
-const OPERATOR_TRUST_RADIUS_MAX: f64 = 1.0e6;
-const OPERATOR_ETA_ACCEPT: f64 = 1.0e-4;
-const OPERATOR_TRUST_RADIUS_REJECT_FLOOR: f64 = 1.0e-9;
-const OPERATOR_DENSE_REUSE_MAX_DIM: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperatorTrustRegionStopReason {
@@ -3501,1121 +3696,6 @@ pub enum OperatorTrustRegionStopReason {
     RoutingMismatch,
 }
 
-struct BorrowedDenseOuterHessian<'a> {
-    matrix: &'a Array2<f64>,
-}
-
-impl OuterHessianOperator for BorrowedDenseOuterHessian<'_> {
-    fn dim(&self) -> usize {
-        self.matrix.nrows()
-    }
-
-    fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
-        if v.len() != self.matrix.ncols() {
-            return Err(format!(
-                "dense outer Hessian matvec length mismatch: got {}, expected {}",
-                v.len(),
-                self.matrix.ncols()
-            ));
-        }
-        Ok(self.matrix.dot(v))
-    }
-
-    fn mul_mat(&self, factor: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-        if factor.nrows() != self.matrix.ncols() {
-            return Err(format!(
-                "dense outer Hessian factor row count mismatch: got {}, expected {}",
-                factor.nrows(),
-                self.matrix.ncols()
-            ));
-        }
-        Ok(self.matrix.dot(&factor))
-    }
-
-    fn is_cheap_to_materialize(&self) -> bool {
-        true
-    }
-}
-
-/// Pick the post-rejection trust radius. If the cubic model just
-/// predicted a decrease >1e6 × |cost| (i.e. the local function is wildly
-/// non-quadratic at the proposed step), and a Newton-step-scale derived
-/// radius is materially smaller than the post-halving default, snap to
-/// the derived radius — this avoids 20+ wasted halvings when an accepted
-/// step lands in a steep-gradient basin mid-loop. Otherwise return the
-/// caller's `default_radius` (standard ARC geometric backoff).
-///
-/// `pred_dec` is the cubic model's predicted decrease at the rejected step,
-/// `default_radius` is what plain halving would set (typically
-/// `trust_radius * 0.5`), and `derived_radius` is the
-/// `|cost|/‖g‖`-derived target.
-#[inline]
-fn snap_recovery_radius_on_rejection(
-    cost: f64,
-    pred_dec: f64,
-    derived_radius: f64,
-    default_radius: f64,
-) -> f64 {
-    let cost_scale = cost.abs().max(1.0);
-    let mismatch_ratio = if pred_dec.is_finite() && pred_dec > 0.0 {
-        pred_dec / cost_scale
-    } else {
-        0.0
-    };
-    if mismatch_ratio > 1e6 && derived_radius < default_radius * 0.5 {
-        derived_radius
-    } else {
-        default_radius
-    }
-}
-
-/// Newton-step-scale initial trust radius derivation for the operator
-/// trust-region solver.
-///
-/// Given the seed cost and projected-gradient norm, return a trust radius
-/// such that the linearised first-order decrease `|g|·radius` is comparable
-/// to `|cost|`. This lands the first cubic-model probe near the right local
-/// geometry instead of forcing the optimizer to halve a thousand-fold-too-
-/// big default.
-///
-/// The result is clamped to `[OPERATOR_TRUST_RADIUS_REJECT_FLOOR · 10,
-/// OPERATOR_TRUST_RADIUS_INIT]`:
-/// - lower bound keeps us strictly above the reject-floor (so the first
-///   iter actually attempts a step rather than terminating immediately),
-/// - upper bound preserves the previous default when `‖g‖` is small (the
-///   typical, well-conditioned case): we never start more aggressively
-///   than `OPERATOR_TRUST_RADIUS_INIT`.
-///
-/// Non-finite or zero `g_norm` → fall back to `OPERATOR_TRUST_RADIUS_INIT`.
-#[inline]
-fn derive_initial_trust_radius_from_seed(cost: f64, g_norm: f64) -> f64 {
-    let cost_scale = cost.abs().max(1.0);
-    if g_norm.is_finite() && g_norm > 0.0 {
-        (cost_scale / g_norm).clamp(
-            OPERATOR_TRUST_RADIUS_REJECT_FLOOR * 10.0,
-            OPERATOR_TRUST_RADIUS_INIT,
-        )
-    } else {
-        OPERATOR_TRUST_RADIUS_INIT
-    }
-}
-
-fn project_to_bounds(x: &Array1<f64>, bounds: Option<&(Array1<f64>, Array1<f64>)>) -> Array1<f64> {
-    match bounds {
-        Some((lower, upper)) => {
-            let mut out = x.clone();
-            for idx in 0..out.len() {
-                out[idx] = out[idx].clamp(lower[idx], upper[idx]);
-            }
-            out
-        }
-        None => x.clone(),
-    }
-}
-
-fn projected_gradient(
-    x: &Array1<f64>,
-    gradient: &Array1<f64>,
-    bounds: Option<&(Array1<f64>, Array1<f64>)>,
-) -> Array1<f64> {
-    let mut out = gradient.clone();
-    if let Some((lower, upper)) = bounds {
-        for idx in 0..out.len() {
-            let at_lower = x[idx] <= lower[idx] + 1e-10;
-            let at_upper = x[idx] >= upper[idx] - 1e-10;
-            if (at_lower && gradient[idx] > 0.0) || (at_upper && gradient[idx] < 0.0) {
-                out[idx] = 0.0;
-            }
-        }
-    }
-    out
-}
-
-fn active_mask(
-    x: &Array1<f64>,
-    gradient: &Array1<f64>,
-    bounds: Option<&(Array1<f64>, Array1<f64>)>,
-) -> Vec<bool> {
-    match bounds {
-        Some((lower, upper)) => (0..x.len())
-            .map(|idx| {
-                let at_lower = x[idx] <= lower[idx] + 1e-10;
-                let at_upper = x[idx] >= upper[idx] - 1e-10;
-                (at_lower && gradient[idx] > 0.0) || (at_upper && gradient[idx] < 0.0)
-            })
-            .collect(),
-        None => vec![false; x.len()],
-    }
-}
-
-fn masked_matvec(
-    op: &dyn OuterHessianOperator,
-    vector: &Array1<f64>,
-    active: &[bool],
-) -> Result<Array1<f64>, String> {
-    let mut masked = vector.clone();
-    for idx in 0..masked.len() {
-        if active[idx] {
-            masked[idx] = 0.0;
-        }
-    }
-    let mut out = op.matvec(&masked)?;
-    if out.len() != masked.len() {
-        return Err(format!(
-            "outer Hessian operator matvec length mismatch: got {}, expected {}",
-            out.len(),
-            masked.len()
-        ));
-    }
-    for idx in 0..out.len() {
-        if active[idx] {
-            out[idx] = 0.0;
-        }
-    }
-    Ok(out)
-}
-
-fn predicted_decrease_from_operator(
-    op: &dyn OuterHessianOperator,
-    gradient: &Array1<f64>,
-    step: &Array1<f64>,
-    active: &[bool],
-) -> Result<f64, String> {
-    let hs = if active.iter().copied().any(|flag| flag) {
-        masked_matvec(op, step, active)?
-    } else {
-        op.matvec(step)?
-    };
-    Ok(-(gradient.dot(step) + 0.5 * step.dot(&hs)))
-}
-
-fn steihaug_toint_step_operator(
-    op: &dyn OuterHessianOperator,
-    gradient: &Array1<f64>,
-    trust_radius: f64,
-    active: &[bool],
-) -> Result<Option<(Array1<f64>, f64)>, String> {
-    let n = gradient.len();
-    let g_norm = gradient.dot(gradient).sqrt();
-    if !g_norm.is_finite() || g_norm <= 0.0 {
-        return Ok(None);
-    }
-
-    let mut p = Array1::<f64>::zeros(n);
-    let mut r = gradient.clone();
-    for idx in 0..n {
-        if active[idx] {
-            r[idx] = 0.0;
-        }
-    }
-    let mut d = r.mapv(|value| -value);
-    let mut rtr = r.dot(&r);
-    if !rtr.is_finite() || rtr <= 0.0 {
-        return Ok(None);
-    }
-
-    let cg_tol = (1e-6 * g_norm).max(1e-12);
-    let max_iter = (2 * n).max(10);
-
-    for _ in 0..max_iter {
-        let bd = if active.iter().copied().any(|flag| flag) {
-            masked_matvec(op, &d, active)?
-        } else {
-            op.matvec(&d)?
-        };
-        let d_bd = d.dot(&bd);
-        if !d_bd.is_finite() || d_bd <= 1e-14 * d.dot(&d).max(1.0) {
-            let d_norm_sq = d.dot(&d);
-            if d_norm_sq <= 0.0 {
-                return Ok(None);
-            }
-            let p_dot_d = p.dot(&d);
-            let p_norm_sq = p.dot(&p);
-            let disc = p_dot_d * p_dot_d - d_norm_sq * (p_norm_sq - trust_radius * trust_radius);
-            if disc < 0.0 {
-                return Ok(None);
-            }
-            let tau = (-p_dot_d + disc.sqrt()) / d_norm_sq;
-            let mut boundary = p.clone();
-            boundary.scaled_add(tau, &d);
-            let pred = predicted_decrease_from_operator(op, gradient, &boundary, active)?;
-            return Ok((pred.is_finite() && pred > 0.0).then_some((boundary, pred)));
-        }
-
-        let alpha = rtr / d_bd;
-        if !alpha.is_finite() || alpha <= 0.0 {
-            return Ok(None);
-        }
-
-        let mut p_next = p.clone();
-        p_next.scaled_add(alpha, &d);
-        let p_next_norm = p_next.dot(&p_next).sqrt();
-        if p_next_norm >= trust_radius {
-            let d_norm_sq = d.dot(&d);
-            if d_norm_sq <= 0.0 {
-                return Ok(None);
-            }
-            let p_dot_d = p.dot(&d);
-            let p_norm_sq = p.dot(&p);
-            let disc = p_dot_d * p_dot_d - d_norm_sq * (p_norm_sq - trust_radius * trust_radius);
-            if disc < 0.0 {
-                return Ok(None);
-            }
-            let tau = (-p_dot_d + disc.sqrt()) / d_norm_sq;
-            let mut boundary = p.clone();
-            boundary.scaled_add(tau, &d);
-            let pred = predicted_decrease_from_operator(op, gradient, &boundary, active)?;
-            return Ok((pred.is_finite() && pred > 0.0).then_some((boundary, pred)));
-        }
-
-        r.scaled_add(alpha, &bd);
-        for idx in 0..n {
-            if active[idx] {
-                r[idx] = 0.0;
-            }
-        }
-        let rtr_next = r.dot(&r);
-        if !rtr_next.is_finite() {
-            return Ok(None);
-        }
-
-        p = p_next;
-        if rtr_next.sqrt() <= cg_tol {
-            let pred = predicted_decrease_from_operator(op, gradient, &p, active)?;
-            return Ok((pred.is_finite() && pred > 0.0).then_some((p, pred)));
-        }
-
-        let beta = rtr_next / rtr.max(1e-32);
-        if !beta.is_finite() || beta < 0.0 {
-            return Ok(None);
-        }
-        d *= beta;
-        d -= &r;
-        for idx in 0..n {
-            if active[idx] {
-                d[idx] = 0.0;
-            }
-        }
-        rtr = rtr_next;
-    }
-
-    let pred = predicted_decrease_from_operator(op, gradient, &p, active)?;
-    Ok((pred.is_finite() && pred > 0.0).then_some((p, pred)))
-}
-
-/// Bound-pinned axis mask used by the corner-clamp escape.
-///
-/// An axis is "pinned" iff `x[i]` is at either bound, measured with a
-/// per-axis tolerance `1e-12 · max(upper - lower, 1)`. This is a strictly
-/// geometric test — distinct from `active_mask` which additionally
-/// inspects the gradient direction. We need the geometric test for the
-/// active-set escape because the corner-clamp pathology can wedge axes
-/// that aren't strictly "active" in the KKT sense (gradient may flip sign
-/// after the inner-PIRLS update changes the local Hessian).
-fn pinned_axes_mask(x: &Array1<f64>, bounds: Option<&(Array1<f64>, Array1<f64>)>) -> Vec<bool> {
-    match bounds {
-        Some((lower, upper)) => (0..x.len())
-            .map(|idx| {
-                let span = (upper[idx] - lower[idx]).abs().max(1.0);
-                let tol = 1e-12 * span;
-                (x[idx] - lower[idx]).abs() <= tol || (upper[idx] - x[idx]).abs() <= tol
-            })
-            .collect(),
-        None => vec![false; x.len()],
-    }
-}
-
-/// Mask of axes whose unconstrained trial step was clipped by
-/// `project_to_bounds`. These are the axes responsible for the
-/// corner-clamp pathology: as the trust radius shrinks, they keep getting
-/// clipped to the same bound, so `x_trial` (and therefore `act_dec`) is
-/// constant across consecutive halvings.
-fn clipped_axes_mask(x_raw: &Array1<f64>, x_projected: &Array1<f64>) -> Vec<bool> {
-    debug_assert_eq!(x_raw.len(), x_projected.len());
-    (0..x_raw.len())
-        .map(|idx| (x_raw[idx] - x_projected[idx]).abs() > 0.0)
-        .collect()
-}
-
-/// Build the union of the existing KKT-style active mask and the
-/// geometric pinned-axes mask, used as the active set for the
-/// corner-clamp escape step.
-fn union_active_with_pinned(base_active: &[bool], pinned: &[bool]) -> Vec<bool> {
-    debug_assert_eq!(base_active.len(), pinned.len());
-    base_active
-        .iter()
-        .zip(pinned.iter())
-        .map(|(a, p)| *a || *p)
-        .collect()
-}
-
-/// Reduced-space ("active-set") trust-region escape from a corner clamp.
-///
-/// When the unconstrained Steihaug-Toint step is being repeatedly clipped
-/// by `project_to_bounds`, halving the trust radius produces bit-identical
-/// `act_dec` because all the clipped axes still hit the same bound and
-/// the unclipped axes contribute negligibly. This helper forces the
-/// clipped (and any pinned) axes to take a zero step, then re-solves the
-/// trust-region subproblem on the unpinned subspace using the existing
-/// Steihaug-Toint solver with an extended active mask.
-///
-/// Returns `None` when:
-/// - all axes are pinned (genuine corner — no feasible descent direction);
-/// - the reduced-space CG fails to find a step;
-/// - the resulting step has zero norm.
-///
-/// On success, the returned step has zero entries at every pinned axis
-/// and obeys the trust-region radius in the reduced subspace. Caller is
-/// responsible for evaluating it and applying the standard accept/reject
-/// ratio test.
-fn compute_active_set_step(
-    op: &dyn OuterHessianOperator,
-    g_proj: &Array1<f64>,
-    base_active: &[bool],
-    pinned_or_clipped: &[bool],
-    trust_radius: f64,
-) -> Result<Option<(Array1<f64>, f64, Vec<bool>)>, String> {
-    let extended = union_active_with_pinned(base_active, pinned_or_clipped);
-    if extended.iter().all(|flag| *flag) {
-        return Ok(None);
-    }
-    // If `extended` is identical to `base_active`, the Steihaug-Toint
-    // solver has already been called with this mask in the main loop and
-    // returned the step that triggered the corner clamp. Re-running it
-    // would loop. Caller should fall back to halving in that case.
-    if extended
-        .iter()
-        .zip(base_active.iter())
-        .all(|(e, b)| *e == *b)
-    {
-        return Ok(None);
-    }
-    match steihaug_toint_step_operator(op, g_proj, trust_radius, &extended)? {
-        Some((step, pred)) => {
-            let s_norm = step.dot(&step).sqrt();
-            if !s_norm.is_finite() || s_norm <= 1e-16 {
-                Ok(None)
-            } else {
-                Ok(Some((step, pred, extended)))
-            }
-        }
-        None => Ok(None),
-    }
-}
-
-/// Scale-invariant tolerance for the outer REML/LAML optimizer.
-///
-/// V_LAML(ρ) is dominated by an O(n) likelihood term at biobank scale, so
-/// its gradient ∇V scales the same way. An absolute test ‖∇V‖ < τ becomes
-/// systematically too tight at large n. Multiplying τ by `1 + |V(ρ)|` makes
-/// the certificate invariant under uniform `V → c·V`; the additive 1 is a
-/// unit floor for trivial-cost problems. This is the standard textbook
-/// scaling (mgcv's `magic` REML driver applies the same rescaling to its
-/// score tolerance).
-///
-/// Used to scale the absolute gradient-norm tolerance passed to argmin's
-/// BFGS / ARC / Trust-Region solvers, which only support an absolute test.
-#[inline]
-fn outer_scaled_tolerance(base_tol: f64, seed_cost: f64) -> f64 {
-    base_tol * (1.0 + seed_cost.abs())
-}
-
-fn run_operator_trust_region(
-    obj: &mut dyn OuterObjective,
-    seed: &Array1<f64>,
-    layout: OuterThetaLayout,
-    bounds: Option<&(Array1<f64>, Array1<f64>)>,
-    tolerance: f64,
-    max_iter: usize,
-    initial_eval: OuterEval,
-    plan: OuterPlan,
-    initial_trust_radius: Option<f64>,
-) -> Result<OuterResult, EstimationError> {
-    let mut x_k = project_to_bounds(seed, bounds);
-    let mut eval_k = initial_eval;
-    // If the caller didn't supply an initial trust radius, derive a Newton-
-    // step-scale default from the seed gradient. The previous unconditional
-    // `OPERATOR_TRUST_RADIUS_INIT = 1.0` produced 20-30 rejected halving
-    // iterations on problems where ‖g‖ ≫ |cost| at the seed (e.g. CTN exact-
-    // joint with warm-start β at biobank scale, where ‖g‖ ≈ 3·10¹⁷ vs
-    // |cost| ≈ 1·10¹⁰): the cubic model predicts a 3·10⁴⁹ decrease, the
-    // actual function is wildly non-quadratic at full step, the step is
-    // rejected and the radius halved. Halving a thousand-fold-too-big radius
-    // until it fits the local geometry costs ~10s per iter on biobank-scale
-    // CTN evaluation — about 4 minutes per CTN preprocessing call. The
-    // derivation is factored out into `derive_initial_trust_radius_from_seed`
-    // so it can be unit-tested without a full optimizer harness.
-    let g_seed_for_init = projected_gradient(&x_k, &eval_k.gradient, bounds);
-    let g_norm_for_init = g_seed_for_init.dot(&g_seed_for_init).sqrt();
-    let derived_initial_radius =
-        derive_initial_trust_radius_from_seed(eval_k.cost, g_norm_for_init);
-    let mut trust_radius = initial_trust_radius
-        .filter(|radius| radius.is_finite() && *radius > 0.0)
-        .unwrap_or(derived_initial_radius)
-        .clamp(
-            OPERATOR_TRUST_RADIUS_REJECT_FLOOR,
-            OPERATOR_TRUST_RADIUS_MAX,
-        );
-    if initial_trust_radius.is_none() && derived_initial_radius < OPERATOR_TRUST_RADIUS_INIT {
-        log::info!(
-            "[ARC-timing] iter=0 derived initial trust_radius={:.3e} from \
-             |cost|={:.3e} / ‖g‖={:.3e} (default {:.3e} would have wasted halving iters)",
-            trust_radius,
-            eval_k.cost.abs(),
-            eval_k.gradient.dot(&eval_k.gradient).sqrt(),
-            OPERATOR_TRUST_RADIUS_INIT,
-        );
-    }
-    let mut dense_model: Option<Array2<f64>> = None;
-    let mut materialize_dense_after_rejection = false;
-    // Cliff diagnostics: at biobank scale the cubic-model step direction can
-    // point straight into a bound, so projection clamps the trial point to
-    // the same corner of the box on every halving. Across many rejected
-    // iters at the same x_k (eval_k unchanged on rejection), the unclamped
-    // axes scale with trust_radius and contribute negligibly to the trial
-    // cost as r → 0; the trial value asymptotes to the cost AT THE CORNER.
-    // Result: act_dec is bit-for-bit constant across consecutive rejections,
-    // even though pred_dec is shrinking like r². This is the
-    // `act_dec=-46.65 EXACTLY` pattern observed in CTN ARC at biobank
-    // scale. Detect it: track how many consecutive rejections produce
-    // (relative-)identical act_dec.
-    let mut last_rejection_act_dec: Option<f64> = None;
-    let mut consecutive_corner_clamps: usize = 0;
-    const CORNER_CLAMP_REPORT_THRESHOLD: usize = 4;
-    let mut corner_clamp_reported_for_run: bool = false;
-
-    for iter in 0..max_iter {
-        let iter_start = std::time::Instant::now();
-        let g_proj = projected_gradient(&x_k, &eval_k.gradient, bounds);
-        let g_norm = g_proj.dot(&g_proj).sqrt();
-        // Scale-invariant outer KKT certificate via `outer_scaled_tolerance`,
-        // recomputed each iteration with the iteration-current cost so the
-        // scale tracks the descent. Same form as the BFGS / ARC paths and
-        // the inner-PIRLS fix; see the helper's doc comment for derivation.
-        let scaled_tol = outer_scaled_tolerance(tolerance, eval_k.cost);
-        if g_norm.is_finite() && g_norm <= scaled_tol {
-            log::info!(
-                "[ARC-timing] iter={iter} converged cost={:.6e} grad_norm={:.3e} \
-                 trust_radius={:.3e} tol={:.3e}",
-                eval_k.cost,
-                g_norm,
-                trust_radius,
-                scaled_tol,
-            );
-            return Ok(OuterResult {
-                rho: x_k,
-                final_value: eval_k.cost,
-                iterations: iter,
-                final_grad_norm: g_norm,
-                final_gradient: Some(eval_k.gradient),
-                final_hessian: None,
-                converged: true,
-                plan_used: plan,
-                operator_trust_radius: Some(trust_radius),
-                operator_stop_reason: Some(OperatorTrustRegionStopReason::Converged),
-            });
-        }
-        if trust_radius <= OPERATOR_TRUST_RADIUS_REJECT_FLOOR {
-            log::info!(
-                "[ARC-timing] iter={iter} status=reject_floor cost={:.6e} grad_norm={:.3e} \
-                 trust_radius={:.3e}",
-                eval_k.cost,
-                g_norm,
-                trust_radius,
-            );
-            return Ok(OuterResult {
-                rho: x_k,
-                final_value: eval_k.cost,
-                iterations: iter,
-                final_grad_norm: g_norm,
-                final_gradient: Some(eval_k.gradient),
-                final_hessian: None,
-                converged: false,
-                plan_used: plan,
-                operator_trust_radius: Some(trust_radius),
-                operator_stop_reason: Some(OperatorTrustRegionStopReason::RejectFloor),
-            });
-        }
-
-        let HessianResult::Operator(op_arc) = &eval_k.hessian else {
-            // Graceful fallback: a family that returned an operator Hessian
-            // at the seed but a different shape (Analytic/Unavailable)
-            // mid-iteration is a planner-vs-family disagreement, not a fatal
-            // error. The current x_k has a valid cost + gradient — return
-            // it as the best-effort result with a `RoutingMismatch` stop
-            // reason so the caller can decide whether to retry under a
-            // different solver. Previously this branch panicked the whole
-            // REML fit (observed at k≥32, n=50k in the
-            // standard_gam_p_scaling_law probe).
-            //
-            // ROOT CAUSE: the planner at `:4168` decides routing by
-            // inspecting `seed_eval.hessian` at the first eval. It assumes
-            // all subsequent eval_k.hessian will also be Operator, but
-            // `HessianResult` is an enum (Operator | Analytic | Unavailable)
-            // and nothing forces per-call consistency. Families return
-            // whatever's most efficient for the current ρ. The clean fix
-            // is to extend the `CustomFamily` / outer-eval contract with
-            // a `declared_hessian_shape()` const method and route on that,
-            // not on the runtime eval. Tracked as part of task #28
-            // (matrix-free outer Hessian) — once the operator form is
-            // universally available the disagreement disappears.
-            let observed_shape = match &eval_k.hessian {
-                HessianResult::Operator(_) => "Operator", // (unreachable here)
-                HessianResult::Analytic(_) => "Analytic(dense)",
-                HessianResult::Unavailable => "Unavailable",
-            };
-            log::warn!(
-                "[ARC] iter={iter}: family returned non-operator Hessian mid-flight \
-                 (planner expected Operator throughout, got {observed_shape}); \
-                 returning best-effort x_k cost={:.6e} grad_norm={:.3e}. \
-                 Routing decision was made on seed_eval.hessian shape; family \
-                 should declare a consistent shape via its capability surface.",
-                eval_k.cost,
-                g_norm
-            );
-            return Ok(OuterResult {
-                rho: x_k,
-                final_value: eval_k.cost,
-                iterations: iter,
-                final_grad_norm: g_norm,
-                final_gradient: Some(eval_k.gradient),
-                final_hessian: None,
-                converged: false,
-                plan_used: plan,
-                operator_trust_radius: Some(trust_radius),
-                operator_stop_reason: Some(OperatorTrustRegionStopReason::RoutingMismatch),
-            });
-        };
-        if materialize_dense_after_rejection
-            && dense_model.is_none()
-            && op_arc.dim() <= OPERATOR_DENSE_REUSE_MAX_DIM
-            && op_arc.materialization_capability().is_available()
-        {
-            let materialize_start = std::time::Instant::now();
-            match op_arc.materialize_dense() {
-                Ok(dense) => {
-                    if !dense.iter().all(|value| value.is_finite()) {
-                        log::debug!(
-                            "[ARC-timing] iter={iter} dense outer Hessian reuse skipped: \
-                             materialization produced non-finite entries"
-                        );
-                    } else {
-                        log::info!(
-                            "[ARC-timing] iter={iter} status=dense_model_ready dim={} bytes={} \
-                             elapsed={:.3}s",
-                            dense.nrows(),
-                            dense.len() * std::mem::size_of::<f64>(),
-                            materialize_start.elapsed().as_secs_f64(),
-                        );
-                        dense_model = Some(dense);
-                    }
-                }
-                Err(message) => {
-                    log::debug!(
-                        "[ARC-timing] iter={iter} dense outer Hessian reuse skipped: {message}"
-                    );
-                }
-            }
-            materialize_dense_after_rejection = false;
-        }
-        let counter = HvApplyCounter::new(op_arc.as_ref());
-        let dense_borrowed;
-        let step_op: &dyn OuterHessianOperator = if let Some(dense) = dense_model.as_ref() {
-            dense_borrowed = BorrowedDenseOuterHessian { matrix: dense };
-            &dense_borrowed
-        } else {
-            &counter
-        };
-        let active = active_mask(&x_k, &eval_k.gradient, bounds);
-        let cg_result = steihaug_toint_step_operator(step_op, &g_proj, trust_radius, &active)
-            .map_err(EstimationError::RemlOptimizationFailed)?;
-        let Some((trial_step, pred_dec_free)) = cg_result else {
-            let elapsed = iter_start.elapsed().as_secs_f64();
-            log::info!(
-                "[ARC-timing] iter={iter} status=cg_no_step cost={:.6e} grad_norm={:.3e} \
-                 trust_radius={:.3e} hv_applies={} elapsed={:.3}s",
-                eval_k.cost,
-                g_norm,
-                trust_radius,
-                counter.count(),
-                elapsed,
-            );
-            trust_radius = (trust_radius * 0.5).max(1e-12);
-            continue;
-        };
-
-        let x_trial_raw = &x_k + &trial_step;
-        let x_trial = project_to_bounds(&x_trial_raw, bounds);
-        let s_trial = &x_trial - &x_k;
-        let s_norm = s_trial.dot(&s_trial).sqrt();
-        if !s_norm.is_finite() || s_norm <= 1e-16 {
-            let elapsed = iter_start.elapsed().as_secs_f64();
-            log::info!(
-                "[ARC-timing] iter={iter} status=zero_step cost={:.6e} grad_norm={:.3e} \
-                 trust_radius={:.3e} hv_applies={} elapsed={:.3}s",
-                eval_k.cost,
-                g_norm,
-                trust_radius,
-                counter.count(),
-                elapsed,
-            );
-            trust_radius = (trust_radius * 0.5).max(1e-12);
-            continue;
-        }
-
-        let pred_dec = if (&s_trial - &trial_step)
-            .dot(&(&s_trial - &trial_step))
-            .sqrt()
-            > 1e-8 * (1.0 + trial_step.dot(&trial_step).sqrt())
-        {
-            predicted_decrease_from_operator(step_op, &g_proj, &s_trial, &active)
-                .map_err(EstimationError::RemlOptimizationFailed)?
-        } else {
-            pred_dec_free
-        };
-        if !pred_dec.is_finite() || pred_dec <= 0.0 {
-            let elapsed = iter_start.elapsed().as_secs_f64();
-            log::info!(
-                "[ARC-timing] iter={iter} status=bad_pred_dec cost={:.6e} grad_norm={:.3e} \
-                 trust_radius={:.3e} hv_applies={} elapsed={:.3}s",
-                eval_k.cost,
-                g_norm,
-                trust_radius,
-                counter.count(),
-                elapsed,
-            );
-            trust_radius = (trust_radius * 0.5).max(1e-12);
-            continue;
-        }
-
-        let trial_cost = match obj.eval_cost(&x_trial) {
-            Ok(cost) => match finite_cost_or_error("outer operator trial cost failed", cost) {
-                Ok(cost) => cost,
-                Err(ObjectiveEvalError::Recoverable { message }) => {
-                    let elapsed = iter_start.elapsed().as_secs_f64();
-                    log::info!(
-                        "[ARC-timing] iter={iter} status=infeasible_trial cost={:.6e} \
-                         grad_norm={:.3e} pred_dec={:.3e} trust_radius={:.3e}->{:.3e} \
-                         hv_applies={} elapsed={:.3}s reason={}",
-                        eval_k.cost,
-                        g_norm,
-                        pred_dec,
-                        trust_radius,
-                        (trust_radius * 0.25).max(1e-12),
-                        counter.count(),
-                        elapsed,
-                        message,
-                    );
-                    trust_radius = (trust_radius * 0.25).max(1e-12);
-                    continue;
-                }
-                Err(ObjectiveEvalError::Fatal { message }) => {
-                    return Err(EstimationError::RemlOptimizationFailed(message));
-                }
-            },
-            Err(err) => {
-                let elapsed = iter_start.elapsed().as_secs_f64();
-                log::info!(
-                    "[ARC-timing] iter={iter} status=eval_error cost={:.6e} grad_norm={:.3e} \
-                     pred_dec={:.3e} trust_radius={:.3e}->{:.3e} hv_applies={} \
-                     elapsed={:.3}s reason={}",
-                    eval_k.cost,
-                    g_norm,
-                    pred_dec,
-                    trust_radius,
-                    (trust_radius * 0.25).max(1e-12),
-                    counter.count(),
-                    elapsed,
-                    err,
-                );
-                trust_radius = (trust_radius * 0.25).max(1e-12);
-                continue;
-            }
-        };
-        let act_dec = eval_k.cost - trial_cost;
-        let rho = act_dec / pred_dec;
-        let accepted_by_ratio = rho > OPERATOR_ETA_ACCEPT;
-        let accepted = accepted_by_ratio;
-        let new_trust_radius = if rho > 0.75 && s_norm > 0.99 * trust_radius {
-            (trust_radius * 2.0).min(OPERATOR_TRUST_RADIUS_MAX)
-        } else if rho < 0.25 {
-            (trust_radius * 0.5).max(1e-12)
-        } else {
-            trust_radius
-        };
-        let hv_applies = counter.count();
-        if accepted {
-            let trust_radius_before_trial_eval = trust_radius;
-            let eval_trial = match obj
-                .eval_with_order(&x_trial, OuterEvalOrder::ValueGradientHessian)
-            {
-                Ok(eval) => {
-                    match finite_outer_eval_or_error("outer operator eval failed", layout, eval) {
-                        Ok(eval) => eval,
-                        Err(ObjectiveEvalError::Recoverable { message }) => {
-                            let elapsed = iter_start.elapsed().as_secs_f64();
-                            let rejected_trust_radius = (new_trust_radius * 0.25).max(1e-12);
-                            log::info!(
-                                "[ARC-timing] iter={iter} status=accepted_eval_error \
-                                     cost={:.6e}->{:.6e} grad_norm={:.3e} rho={:.3} \
-                                     pred_dec={:.3e} act_dec={:.3e} \
-                                     trust_radius={:.3e}->{:.3e} hv_applies={} elapsed={:.3}s \
-                                     reason={}",
-                                eval_k.cost,
-                                trial_cost,
-                                g_norm,
-                                rho,
-                                pred_dec,
-                                act_dec,
-                                trust_radius_before_trial_eval,
-                                rejected_trust_radius,
-                                hv_applies,
-                                elapsed,
-                                message,
-                            );
-                            trust_radius = rejected_trust_radius;
-                            continue;
-                        }
-                        Err(ObjectiveEvalError::Fatal { message }) => {
-                            return Err(EstimationError::RemlOptimizationFailed(message));
-                        }
-                    }
-                }
-                Err(err) => {
-                    let elapsed = iter_start.elapsed().as_secs_f64();
-                    let rejected_trust_radius = (new_trust_radius * 0.25).max(1e-12);
-                    log::info!(
-                        "[ARC-timing] iter={iter} status=accepted_eval_error \
-                             cost={:.6e}->{:.6e} grad_norm={:.3e} rho={:.3} \
-                             pred_dec={:.3e} act_dec={:.3e} \
-                             trust_radius={:.3e}->{:.3e} hv_applies={} elapsed={:.3}s \
-                             reason={}",
-                        eval_k.cost,
-                        trial_cost,
-                        g_norm,
-                        rho,
-                        pred_dec,
-                        act_dec,
-                        trust_radius_before_trial_eval,
-                        rejected_trust_radius,
-                        hv_applies,
-                        elapsed,
-                        err,
-                    );
-                    trust_radius = rejected_trust_radius;
-                    continue;
-                }
-            };
-            let elapsed = iter_start.elapsed().as_secs_f64();
-            log::info!(
-                "[ARC-timing] iter={iter} status=accepted cost={:.6e}->{:.6e} \
-                 grad_norm={:.3e} rho={:.3} pred_dec={:.3e} act_dec={:.3e} \
-                 trust_radius={:.3e}->{:.3e} hv_applies={} elapsed={:.3}s",
-                eval_k.cost,
-                trial_cost,
-                g_norm,
-                rho,
-                pred_dec,
-                act_dec,
-                trust_radius_before_trial_eval,
-                new_trust_radius,
-                hv_applies,
-                elapsed,
-            );
-            trust_radius = new_trust_radius;
-            x_k = x_trial;
-            eval_k = eval_trial;
-            dense_model = None;
-            materialize_dense_after_rejection = false;
-            // Accepting any step exits the corner-clamp regime: x_k moved,
-            // so the next rejection's trial cost is no longer comparable to
-            // the prior corner's cost. Reset the cliff tracker.
-            last_rejection_act_dec = None;
-            consecutive_corner_clamps = 0;
-        } else {
-            // Smart snap on egregious rejection. When the cubic model
-            // predicts a decrease many orders of magnitude larger than
-            // the current cost (i.e., the local geometry is wildly
-            // different from the seed-iter-0 geometry — typically because
-            // an accepted earlier step landed in a steep-gradient basin),
-            // geometric halving from the current radius can cost dozens
-            // of rejected iterations. Same |cost|/‖g‖ Newton-step heuristic
-            // we use at iter=0: snap directly to a radius whose linearised
-            // first-order decrease is comparable to |cost|. Only fires
-            // when the mismatch is extreme (>1e6) so well-behaved
-            // rejections continue to use ARC's standard halving.
-            let derived_recovery_radius =
-                derive_initial_trust_radius_from_seed(eval_k.cost, g_norm);
-            let snapped_radius = snap_recovery_radius_on_rejection(
-                eval_k.cost,
-                pred_dec,
-                derived_recovery_radius,
-                new_trust_radius,
-            );
-            let elapsed = iter_start.elapsed().as_secs_f64();
-            log::info!(
-                "[ARC-timing] iter={iter} status=rejected cost={:.6e}->{:.6e} \
-                 grad_norm={:.3e} rho={:.3} pred_dec={:.3e} act_dec={:.3e} \
-                 trust_radius={:.3e}->{:.3e} hv_applies={} elapsed={:.3}s",
-                eval_k.cost,
-                eval_k.cost,
-                g_norm,
-                rho,
-                pred_dec,
-                act_dec,
-                trust_radius,
-                snapped_radius,
-                hv_applies,
-                elapsed,
-            );
-            if snapped_radius < new_trust_radius {
-                let cost_scale_for_log = eval_k.cost.abs().max(1.0);
-                let mismatch_ratio_for_log = if pred_dec.is_finite() && pred_dec > 0.0 {
-                    pred_dec / cost_scale_for_log
-                } else {
-                    0.0
-                };
-                log::info!(
-                    "[ARC-timing] iter={iter} snap_recovery: pred_dec/|cost|={:.3e} >> 1; \
-                     snapped trust_radius {:.3e} -> {:.3e} (skipping ~{} halvings)",
-                    mismatch_ratio_for_log,
-                    new_trust_radius,
-                    snapped_radius,
-                    (new_trust_radius / snapped_radius).log2().ceil() as i64,
-                );
-            }
-            // Cliff / corner-clamp diagnostic. If consecutive rejections
-            // produce act_dec values that are equal to within float noise
-            // *relative to the cost scale*, the trial point is asymptoting
-            // to a constant point as trust_radius shrinks — almost certainly
-            // because the unconstrained step direction points across one or
-            // more bounds and projection is clamping to the same corner of
-            // the box every time. Surface this once per run so it shows up
-            // in CI logs without spamming.
-            let mut corner_clamp_just_detected = false;
-            if act_dec.is_finite() {
-                let cost_floor = eval_k.cost.abs().max(1.0);
-                let near_equal = match last_rejection_act_dec {
-                    Some(prev) => {
-                        let scale = prev.abs().max(act_dec.abs()).max(cost_floor) * 1e-9;
-                        (act_dec - prev).abs() <= scale
-                    }
-                    None => false,
-                };
-                if near_equal {
-                    consecutive_corner_clamps += 1;
-                    if consecutive_corner_clamps >= CORNER_CLAMP_REPORT_THRESHOLD {
-                        corner_clamp_just_detected = true;
-                    }
-                    if !corner_clamp_reported_for_run
-                        && consecutive_corner_clamps >= CORNER_CLAMP_REPORT_THRESHOLD
-                    {
-                        log::warn!(
-                            "[ARC-timing] iter={iter} corner_clamp_detected: act_dec={:.6e} \
-                             stable across {} consecutive rejected halvings (trust_radius now \
-                             {:.3e}); the unconstrained cubic-model step direction is crossing \
-                             one or more box bounds, projection clamps the trial point to a \
-                             constant corner regardless of step magnitude, so cost(trial) is \
-                             constant and act_dec stops carrying useful information. \
-                             Attempting active-set escape (reduced-subspace step).",
-                            act_dec,
-                            consecutive_corner_clamps + 1,
-                            snapped_radius,
-                        );
-                        corner_clamp_reported_for_run = true;
-                    }
-                } else {
-                    consecutive_corner_clamps = 0;
-                }
-                last_rejection_act_dec = Some(act_dec);
-            }
-
-            // Active-set escape. When the corner-clamp condition fires,
-            // build an extended active mask containing every axis that
-            // (a) was already KKT-active, plus (b) was clipped during
-            // `project_to_bounds(x_k + trial_step)`, plus (c) sits at a
-            // bound to within `1e-12 · span` numerically. Force those
-            // axes to take a zero step and re-solve the trust-region
-            // subproblem on the unpinned subspace. If the resulting step
-            // produces a valid descent (rho > OPERATOR_ETA_ACCEPT), accept
-            // it and continue from the new x_k. Otherwise fall through to
-            // the standard halving path.
-            if corner_clamp_just_detected {
-                let clipped = clipped_axes_mask(&x_trial_raw, &x_trial);
-                let pinned = pinned_axes_mask(&x_k, bounds);
-                let extra_active: Vec<bool> = clipped
-                    .iter()
-                    .zip(pinned.iter())
-                    .map(|(c, p)| *c || *p)
-                    .collect();
-                match compute_active_set_step(
-                    step_op,
-                    &g_proj,
-                    &active,
-                    &extra_active,
-                    snapped_radius.max(trust_radius),
-                ) {
-                    Ok(Some((reduced_step, reduced_pred, extended_active))) => {
-                        let x_trial_red_raw = &x_k + &reduced_step;
-                        let x_trial_red = project_to_bounds(&x_trial_red_raw, bounds);
-                        let s_red = &x_trial_red - &x_k;
-                        let s_red_norm = s_red.dot(&s_red).sqrt();
-                        if s_red_norm.is_finite() && s_red_norm > 1e-16 {
-                            let red_pred = if (&s_red - &reduced_step)
-                                .dot(&(&s_red - &reduced_step))
-                                .sqrt()
-                                > 1e-8 * (1.0 + reduced_step.dot(&reduced_step).sqrt())
-                            {
-                                predicted_decrease_from_operator(
-                                    step_op,
-                                    &g_proj,
-                                    &s_red,
-                                    &extended_active,
-                                )
-                                .unwrap_or(reduced_pred)
-                            } else {
-                                reduced_pred
-                            };
-                            if red_pred.is_finite() && red_pred > 0.0 {
-                                let red_trial_cost = obj.eval_cost(&x_trial_red);
-                                if let Ok(red_trial_cost) = red_trial_cost {
-                                    if red_trial_cost.is_finite() {
-                                        let red_act_dec = eval_k.cost - red_trial_cost;
-                                        let red_rho = red_act_dec / red_pred;
-                                        if red_rho > OPERATOR_ETA_ACCEPT {
-                                            // Accept the active-set step.
-                                            match obj.eval_with_order(
-                                                &x_trial_red,
-                                                OuterEvalOrder::ValueGradientHessian,
-                                            ) {
-                                                Ok(eval_red) => {
-                                                    if let Ok(eval_red) = finite_outer_eval_or_error(
-                                                        "outer operator active-set eval failed",
-                                                        layout,
-                                                        eval_red,
-                                                    ) {
-                                                        log::warn!(
-                                                            "[ARC-timing] iter={iter} \
-                                                             active_set_escape_accepted: \
-                                                             cost={:.6e}->{:.6e} red_rho={:.3} \
-                                                             red_pred={:.3e} red_act_dec={:.3e} \
-                                                             axes_pinned={}/{} \
-                                                             trust_radius={:.3e}",
-                                                            eval_k.cost,
-                                                            red_trial_cost,
-                                                            red_rho,
-                                                            red_pred,
-                                                            red_act_dec,
-                                                            extended_active
-                                                                .iter()
-                                                                .filter(|f| **f)
-                                                                .count(),
-                                                            extended_active.len(),
-                                                            snapped_radius,
-                                                        );
-                                                        x_k = x_trial_red;
-                                                        eval_k = eval_red;
-                                                        // Reset corner-clamp tracker; we're
-                                                        // now at a new x_k, so prior act_decs
-                                                        // are no longer comparable.
-                                                        last_rejection_act_dec = None;
-                                                        consecutive_corner_clamps = 0;
-                                                        corner_clamp_reported_for_run = false;
-                                                        // Keep trust radius at the snap target
-                                                        // — we don't want to reset to seed
-                                                        // scale and replay long halvings.
-                                                        trust_radius = snapped_radius.max(
-                                                            OPERATOR_TRUST_RADIUS_REJECT_FLOOR
-                                                                * 10.0,
-                                                        );
-                                                        dense_model = None;
-                                                        materialize_dense_after_rejection = false;
-                                                        continue;
-                                                    }
-                                                }
-                                                Err(_) => {
-                                                    // Eval failed; fall through to halving.
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        // Either all axes pinned (true corner) or extended
-                        // mask matches base — nothing new to try, fall
-                        // through to halving with a higher floor.
-                    }
-                    Err(_) => {
-                        // Operator matvec error; fall through.
-                    }
-                }
-                // Active-set escape failed or didn't apply. Force the
-                // trust radius floor up so the global optimizer can
-                // terminate cleanly rather than spinning into the
-                // reject floor with no useful progress.
-                trust_radius = snapped_radius.max(OPERATOR_TRUST_RADIUS_REJECT_FLOOR * 10.0);
-                let final_grad = projected_gradient(&x_k, &eval_k.gradient, bounds);
-                let final_grad_norm = final_grad.dot(&final_grad).sqrt();
-                log::warn!(
-                    "[ARC-timing] iter={iter} active_set_escape_unavailable: \
-                     terminating at corner with trust_radius={:.3e} \
-                     grad_norm={:.3e}",
-                    trust_radius,
-                    final_grad_norm,
-                );
-                return Ok(OuterResult {
-                    rho: x_k,
-                    final_value: eval_k.cost,
-                    iterations: iter + 1,
-                    final_grad_norm,
-                    final_gradient: Some(eval_k.gradient),
-                    final_hessian: None,
-                    converged: false,
-                    plan_used: plan,
-                    operator_trust_radius: Some(trust_radius),
-                    operator_stop_reason: Some(OperatorTrustRegionStopReason::RejectFloor),
-                });
-            }
-            trust_radius = snapped_radius;
-            if trust_radius <= OPERATOR_TRUST_RADIUS_REJECT_FLOOR {
-                let final_grad = projected_gradient(&x_k, &eval_k.gradient, bounds);
-                let final_grad_norm = final_grad.dot(&final_grad).sqrt();
-                return Ok(OuterResult {
-                    rho: x_k,
-                    final_value: eval_k.cost,
-                    iterations: iter + 1,
-                    final_grad_norm,
-                    final_gradient: Some(eval_k.gradient),
-                    final_hessian: None,
-                    converged: false,
-                    plan_used: plan,
-                    operator_trust_radius: Some(trust_radius),
-                    operator_stop_reason: Some(OperatorTrustRegionStopReason::RejectFloor),
-                });
-            } else if dense_model.is_none() {
-                materialize_dense_after_rejection = true;
-            }
-        }
-    }
-
-    let final_grad = projected_gradient(&x_k, &eval_k.gradient, bounds);
-    let final_grad_norm = final_grad.dot(&final_grad).sqrt();
-    Ok(OuterResult {
-        rho: x_k,
-        final_value: eval_k.cost,
-        iterations: max_iter,
-        final_grad_norm,
-        final_gradient: Some(eval_k.gradient),
-        final_hessian: None,
-        converged: false,
-        plan_used: plan,
-        operator_trust_radius: Some(trust_radius),
-        operator_stop_reason: Some(OperatorTrustRegionStopReason::IterationBudget),
-    })
-}
 
 /// Run the outer smoothing-parameter optimization.
 ///
@@ -4955,19 +4035,132 @@ fn run_outer_with_plan(
                 if matches!(seed_eval.hessian, HessianResult::Operator(_)) {
                     log::debug!(
                         "[OUTER] {context}: analytic Hessian provided as Hv operator; \
-                         routing to internal trust-region CG"
+                         routing to opt::MatrixFreeTrustRegion (Steihaug-Toint CG)"
                     );
-                    run_operator_trust_region(
+                    let (lo, hi) = &bounds_template;
+                    let bounds_obj = Bounds::new(lo.clone(), hi.clone(), 1e-6)
+                        .expect("outer rho bounds must be valid");
+                    let scaled_tol =
+                        outer_scaled_tolerance(config.tolerance, seed_eval.cost);
+                    let tol = Tolerance::new(scaled_tol)
+                        .expect("outer tolerance must be valid");
+                    let max_iter = MaxIterations::new(config.max_iter)
+                        .expect("outer max_iter must be valid");
+
+                    // Translate the seed_eval into an opt::OperatorSample
+                    // so the matrix-free TR solver can serve its first
+                    // call from cache without redoing the full outer
+                    // eval. The Hessian translation goes through the
+                    // gam->opt operator adapter when the seed Hessian is
+                    // an Hv operator; Analytic seeds become Dense.
+                    let initial_op_sample = OperatorSample {
+                        value: seed_eval.cost,
+                        gradient: seed_eval.gradient.clone(),
+                        hessian: hessian_result_to_value(seed_eval.hessian.clone()),
+                    };
+
+                    let bridge_obj = OuterOperatorBridge {
                         obj,
-                        &seed,
                         layout,
-                        Some(&bounds_template),
-                        config.tolerance,
-                        config.max_iter,
-                        seed_eval,
-                        *the_plan,
-                        config.operator_initial_trust_radius,
-                    )
+                        outer_inner_cap: config.outer_inner_cap.clone(),
+                        eval_count: 0,
+                        g_norm_initial: None,
+                        last_g_norm: None,
+                    };
+
+                    let mut solver = MatrixFreeTrustRegion::new(seed.clone(), bridge_obj)
+                        .with_bounds(bounds_obj)
+                        .with_tolerance(tol)
+                        .with_max_iterations(max_iter)
+                        .with_initial_sample(seed.clone(), initial_op_sample)
+                        // The matrix-free route is exclusively for
+                        // exact analytic Hessians; an `Unavailable`
+                        // here is a routing/contract violation.
+                        .with_hessian_fallback_policy(HessianFallbackPolicy::Error);
+                    if let Some(r) = config.operator_initial_trust_radius {
+                        solver = solver.with_initial_trust_radius(r);
+                    }
+
+                    let mf_start = std::time::Instant::now();
+                    let outcome = solver.run();
+                    let mf_elapsed = mf_start.elapsed().as_secs_f64();
+                    match &outcome {
+                        Ok(sol) => log::info!(
+                            "[OUTER summary] matrix-free TR converged in {} iters \
+                             elapsed={:.3}s final_value={:.6e}",
+                            sol.iterations,
+                            mf_elapsed,
+                            sol.final_value
+                        ),
+                        Err(MatrixFreeTrustRegionError::MaxIterationsReached {
+                            last_solution,
+                        }) => log::info!(
+                            "[OUTER summary] matrix-free TR hit max_iter in {} iters \
+                             elapsed={:.3}s final_value={:.6e}",
+                            last_solution.iterations,
+                            mf_elapsed,
+                            last_solution.final_value
+                        ),
+                        Err(MatrixFreeTrustRegionError::TrustRegionRejectFloor {
+                            last_solution,
+                        }) => log::info!(
+                            "[OUTER summary] matrix-free TR shrank below reject floor \
+                             at iter {} elapsed={:.3}s final_value={:.6e}",
+                            last_solution.iterations,
+                            mf_elapsed,
+                            last_solution.final_value
+                        ),
+                        Err(e) => log::info!(
+                            "[OUTER summary] matrix-free TR failed elapsed={:.3}s err={:?}",
+                            mf_elapsed,
+                            e
+                        ),
+                    }
+                    // Translate the matrix-free TR outcome into an
+                    // `OuterResult`, preserving the `operator_stop_reason`
+                    // wiring the gam-side retry orchestrator depends on
+                    // (see `run_outer_with_plan`'s retry loop). The
+                    // `operator_trust_radius` warm-start hook is set to
+                    // `None` for now: opt 0.4's
+                    // `OptimizationDiagnostics.final_trust_radius` is
+                    // not yet populated, so we cannot recover the final
+                    // radius. A follow-up opt minor will thread it.
+                    match outcome {
+                        Ok(sol) => {
+                            let mut result =
+                                solution_into_outer_result(sol, true, *the_plan);
+                            result.operator_stop_reason =
+                                Some(OperatorTrustRegionStopReason::Converged);
+                            Ok(result)
+                        }
+                        Err(MatrixFreeTrustRegionError::MaxIterationsReached {
+                            last_solution,
+                        }) => {
+                            let mut result = solution_into_outer_result(
+                                *last_solution,
+                                false,
+                                *the_plan,
+                            );
+                            result.operator_stop_reason =
+                                Some(OperatorTrustRegionStopReason::IterationBudget);
+                            Ok(result)
+                        }
+                        Err(MatrixFreeTrustRegionError::TrustRegionRejectFloor {
+                            last_solution,
+                        }) => {
+                            let mut result = solution_into_outer_result(
+                                *last_solution,
+                                false,
+                                *the_plan,
+                            );
+                            result.operator_stop_reason =
+                                Some(OperatorTrustRegionStopReason::RejectFloor);
+                            Ok(result)
+                        }
+                        Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
+                            "matrix-free TR solver failed: {e:?}"
+                        ))),
+                    }
                 } else {
                     let hessian_source = the_plan.hessian_source;
                     let (lo, hi) = &bounds_template;

@@ -30,7 +30,7 @@ indicatif = "0.18.4"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
-opt = "0.3.0"
+opt = "0.4.0"
 log = "0.4.29"
 csv = "1.4.0"
 faer = "0.24.0"
@@ -132,6 +132,13 @@ harness = false
 [[bench]]
 name = "bms_hv_row_skip"
 harness = false
+
+# TEMPORARY: opt 0.4.0 publish queued at SauersML/opt; while crates.io
+# has not yet indexed it, build against the local opt source. Remove
+# this `[patch.crates-io]` block once `cargo search opt` reports
+# 0.4.0 (or higher).
+[patch.crates-io]
+opt = { path = "/Users/user/opt/opt" }
 
 [profile.release]
 lto = "thin"
