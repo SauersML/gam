@@ -11969,6 +11969,11 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             specs,
             options,
         )?;
+        // Outer-eval entry: prime per-row jet caches before the ext-coord
+        // par_iter — see `warm_up_outer_caches` doc.
+        if let Some(workspace) = hessian_workspace.as_ref() {
+            workspace.warm_up_outer_caches()?;
+        }
         let (
             h_joint_unpen,
             rho_curvature_scale,
@@ -12870,6 +12875,11 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         specs,
         options,
     )?;
+    // Outer-eval entry: prime per-row jet caches before the ext-coord
+    // par_iter — see `warm_up_outer_caches` doc.
+    if let Some(workspace) = hessian_workspace.as_ref() {
+        workspace.warm_up_outer_caches()?;
+    }
     let (
         h_joint_unpen,
         rho_curvature_scale,
