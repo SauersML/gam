@@ -2490,9 +2490,8 @@ fn positive_spectral_whitener_from_gram(gram: &Array2<f64>) -> Result<Array2<f64
     // `O(ε)`); only the previously-dropped tail directions change, and
     // there they receive a bounded `1/sqrt(ridge)` instead of being
     // discarded.
-    let ridge =
-        (default_rrqr_rank_alpha() * f64::EPSILON * (n.max(1) as f64) * max_eval.max(1.0))
-            .max(f64::EPSILON);
+    let ridge = (default_rrqr_rank_alpha() * f64::EPSILON * (n.max(1) as f64) * max_eval.max(1.0))
+        .max(f64::EPSILON);
     let mut inv_sqrt = Array2::<f64>::zeros((n, n));
     for i in 0..n {
         inv_sqrt[[i, i]] = 1.0 / (eigenvalues[i].max(0.0) + ridge).sqrt();

@@ -3253,7 +3253,6 @@ pub fn evaluate_non_affine_cell_moments_reference(
     evaluate_non_affine_cell_state(cell, branch, max_degree)
 }
 
-
 /// De-nested cubic cell evaluator.
 ///
 /// Affine cells use the closed-form affine anchor.  Well-conditioned sextic
