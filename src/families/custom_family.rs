@@ -9046,7 +9046,15 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 break;
             }
 
-            if residual <= residual_tol && step_inf <= step_tol {
+            // In semi-definite or nearly flat directions, the linearized
+            // Newton system can keep proposing a large movement even after
+            // the accepted iterate satisfies the projected KKT residual.
+            // Treat stationarity plus a flat objective as convergence; the
+            // proposed step length is only decisive when the objective is
+            // still changing.
+            if residual <= residual_tol
+                && (accepted_step_inf <= step_tol || objective_change <= objective_tol)
+            {
                 converged = true;
                 break;
             }

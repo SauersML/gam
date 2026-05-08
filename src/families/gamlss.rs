@@ -23709,16 +23709,24 @@ mod tests {
             .build_blocks(&rho, &mean_design, &noise_design, None, None)
             .expect("build blocks");
         let family = builder.build_family(&mean_design, &noise_design);
-        let fit = fit_custom_family(
-            &family,
-            &blocks,
-            &BlockwiseFitOptions {
-                use_remlobjective: true,
-                outer_max_iter: 1,
-                ..BlockwiseFitOptions::default()
-            },
-        )
-        .expect("fit wiggle family for joint psi hooks");
+        let mut block_states = Vec::<ParameterBlockState>::with_capacity(blocks.len());
+        for (block_idx, spec) in blocks.iter().enumerate() {
+            let mut beta = spec
+                .initial_beta
+                .clone()
+                .unwrap_or_else(|| Array1::zeros(spec.design.ncols()));
+            if block_idx == BinomialLocationScaleWiggleFamily::BLOCK_WIGGLE {
+                beta.fill(0.04);
+            }
+            let (design, offset) = family
+                .block_geometry(&block_states, spec)
+                .expect("hook fixture block geometry");
+            let eta = design.matrixvectormultiply(&beta) + &offset;
+            block_states.push(ParameterBlockState { beta, eta });
+        }
+        family
+            .evaluate(&block_states)
+            .expect("hook fixture state should evaluate");
         let derivative_blocks = builder
             .build_psiderivative_blocks(
                 data.view(),
@@ -23729,12 +23737,12 @@ mod tests {
             )
             .expect("psi derivative blocks");
         let psi_terms = family
-            .exact_newton_joint_psi_terms(&fit.block_states, &blocks, &derivative_blocks, 0)
+            .exact_newton_joint_psi_terms(&block_states, &blocks, &derivative_blocks, 0)
             .expect("joint psi terms call")
             .expect("wiggle family should return joint psi terms");
         let psi2_terms = family
             .exact_newton_joint_psisecond_order_terms(
-                &fit.block_states,
+                &block_states,
                 &blocks,
                 &derivative_blocks,
                 0,
@@ -23742,11 +23750,7 @@ mod tests {
             )
             .expect("joint psi second-order call")
             .expect("wiggle family should return joint psi second-order terms");
-        let total = fit
-            .block_states
-            .iter()
-            .map(|state| state.beta.len())
-            .sum::<usize>();
+        let total = block_states.iter().map(|state| state.beta.len()).sum::<usize>();
         assert_eq!(psi_terms.score_psi.len(), total);
         if psi_terms.hessian_psi_operator.is_some() {
             assert_eq!(psi_terms.hessian_psi.dim(), (0, 0));
@@ -23762,7 +23766,7 @@ mod tests {
 
         let mut d_beta_flat = Array1::<f64>::zeros(total);
         let mut at = 0usize;
-        for state in &fit.block_states {
+        for state in &block_states {
             let end = at + state.beta.len();
             d_beta_flat
                 .slice_mut(s![at..end])
@@ -23771,7 +23775,7 @@ mod tests {
         }
         let mixed = family
             .exact_newton_joint_psihessian_directional_derivative(
-                &fit.block_states,
+                &block_states,
                 &blocks,
                 &derivative_blocks,
                 0,
