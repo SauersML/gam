@@ -8664,6 +8664,24 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 step_inf *= barrier_ceiling;
             }
 
+            // Pure Newton must take a full step on the first cycle of an
+            // exact quadratic problem (i.e. converge in one cycle when the
+            // model is exact). The trust-region globalization above must not
+            // truncate the very first proposal merely because the hard-coded
+            // initial radius (1.0) is smaller than the natural Newton-step
+            // 2-norm. Bumping the radius up to the post-barrier Newton-step
+            // norm on cycle 0 preserves quadratic convergence on
+            // well-conditioned problems while leaving the standard adaptive
+            // shrink/expand for subsequent cycles. The MAX_JOINT_STEP cap on
+            // |delta|_inf above remains the actual safeguard against runaway
+            // proposals.
+            if cycle == 0 {
+                let initial_step_norm = joint_trust_region_step_norm(&delta);
+                if initial_step_norm.is_finite() && initial_step_norm > joint_trust_radius {
+                    joint_trust_radius = initial_step_norm;
+                }
+            }
+
             let penalty_beta = apply_joint_block_penalty(
                 &ranges,
                 &s_lambdas,
