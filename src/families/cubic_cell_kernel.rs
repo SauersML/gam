@@ -3310,6 +3310,62 @@ mod tests {
     }
 
     #[test]
+    fn non_affine_cell_state_reference_grid_matches_public_moments() {
+        let c0s = [-0.4, 0.0, 0.35];
+        let c1s = [-0.8, 0.25, 1.1];
+        let c2s = [-0.12, 0.08];
+        let c3s = [-0.04, 0.03];
+        let intervals = [(-1.25, -0.2), (-0.5, 0.75), (0.1, 1.4)];
+        let degrees = [3usize, 6, 9, 12];
+
+        for &c0 in &c0s {
+            for &c1 in &c1s {
+                for &c2 in &c2s {
+                    for &c3 in &c3s {
+                        for &(left, right) in &intervals {
+                            let cell = DenestedCubicCell {
+                                left,
+                                right,
+                                c0,
+                                c1,
+                                c2,
+                                c3,
+                            };
+                            let branch = branch_cell(cell).expect("branch");
+                            assert_ne!(branch, ExactCellBranch::Affine);
+                            for &degree in &degrees {
+                                let direct = evaluate_non_affine_cell_state(cell, branch, degree)
+                                    .expect("direct non-affine state");
+                                let public = evaluate_cell_moments(cell, degree)
+                                    .expect("public non-affine state");
+                                assert_eq!(direct.branch, public.branch);
+                                let value_scale =
+                                    direct.value.abs().max(public.value.abs()).max(1.0);
+                                assert!(
+                                    (direct.value - public.value).abs() / value_scale <= 1.0e-15,
+                                    "value mismatch for {cell:?}, degree {degree}: direct={:.17e}, public={:.17e}",
+                                    direct.value,
+                                    public.value
+                                );
+                                assert_eq!(direct.moments.len(), public.moments.len());
+                                for (idx, (&a, &b)) in
+                                    direct.moments.iter().zip(public.moments.iter()).enumerate()
+                                {
+                                    let scale = a.abs().max(b.abs()).max(1.0);
+                                    assert!(
+                                        (a - b).abs() / scale <= 1.0e-15,
+                                        "moment {idx} mismatch for {cell:?}, degree {degree}: direct={a:.17e}, public={b:.17e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn bivariate_normal_cdf_matches_reference_grid_to_1e_minus_10() {
         let hs = [-8.0, -5.0, -3.0, -1.5, -0.5, 0.0, 0.25, 1.0, 2.5, 5.0, 8.0];
         let ks = [-8.0, -4.0, -2.0, -0.75, 0.0, 0.4, 1.25, 3.0, 6.0, 8.0];
