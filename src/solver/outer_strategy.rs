@@ -20,9 +20,9 @@ use ::opt::{
     FallbackPolicy as OptFallbackPolicy, FirstOrderObjective, FirstOrderSample, FixedPoint,
     FixedPointError, FixedPointObjective, FixedPointSample, FixedPointStatus,
     HessianFallbackPolicy, HessianMaterialization, HessianOperator, HessianValue,
-    MatrixFreeTrustRegion, MatrixFreeTrustRegionError, MaxIterations, ObjectiveEvalError,
-    OperatorObjective, OperatorSample, SecondOrderObjective, SecondOrderSample, Solution,
-    Tolerance, ZerothOrderObjective,
+    MatrixFreeTrustRegion, MaxIterations, ObjectiveEvalError, OperatorObjective, OperatorSample,
+    OptimizationStatus, SecondOrderObjective, SecondOrderSample, Solution, Tolerance,
+    ZerothOrderObjective,
 };
 use ndarray::{Array1, Array2, ArrayView2};
 use std::sync::Arc;
@@ -4082,84 +4082,73 @@ fn run_outer_with_plan(
                     }
 
                     let mf_start = std::time::Instant::now();
-                    let outcome = solver.run();
+                    let report = solver.run_report();
                     let mf_elapsed = mf_start.elapsed().as_secs_f64();
-                    match &outcome {
-                        Ok(sol) => log::info!(
-                            "[OUTER summary] matrix-free TR converged in {} iters \
-                             elapsed={:.3}s final_value={:.6e}",
-                            sol.iterations,
-                            mf_elapsed,
-                            sol.final_value
-                        ),
-                        Err(MatrixFreeTrustRegionError::MaxIterationsReached {
-                            last_solution,
-                        }) => log::info!(
-                            "[OUTER summary] matrix-free TR hit max_iter in {} iters \
-                             elapsed={:.3}s final_value={:.6e}",
-                            last_solution.iterations,
-                            mf_elapsed,
-                            last_solution.final_value
-                        ),
-                        Err(MatrixFreeTrustRegionError::TrustRegionRejectFloor {
-                            last_solution,
-                        }) => log::info!(
-                            "[OUTER summary] matrix-free TR shrank below reject floor \
-                             at iter {} elapsed={:.3}s final_value={:.6e}",
-                            last_solution.iterations,
-                            mf_elapsed,
-                            last_solution.final_value
-                        ),
-                        Err(e) => log::info!(
-                            "[OUTER summary] matrix-free TR failed elapsed={:.3}s err={:?}",
-                            mf_elapsed,
-                            e
-                        ),
-                    }
-                    // Translate the matrix-free TR outcome into an
-                    // `OuterResult`, preserving the `operator_stop_reason`
-                    // wiring the gam-side retry orchestrator depends on
-                    // (see `run_outer_with_plan`'s retry loop). The
-                    // `operator_trust_radius` warm-start hook is set to
-                    // `None` for now: opt 0.4's
-                    // `OptimizationDiagnostics.final_trust_radius` is
-                    // not yet populated, so we cannot recover the final
-                    // radius. A follow-up opt minor will thread it.
-                    match outcome {
-                        Ok(sol) => {
-                            let mut result =
-                                solution_into_outer_result(sol, true, *the_plan);
+                    let final_radius = report.diagnostics.final_trust_radius;
+                    log::info!(
+                        "[OUTER summary] matrix-free TR finished status={:?} in {} iters \
+                         elapsed={:.3}s final_value={:.6e} final_trust_radius={}",
+                        report.status,
+                        report.solution.iterations,
+                        mf_elapsed,
+                        report.solution.final_value,
+                        match final_radius {
+                            Some(r) => format!("{:.3e}", r),
+                            None => "n/a".to_string(),
+                        },
+                    );
+                    // Translate the structured report into an `OuterResult`.
+                    // `operator_stop_reason` wiring (read by the gam-side
+                    // retry orchestrator in `run_outer_with_plan`) maps
+                    // directly from `OptimizationStatus`. opt 0.4.1
+                    // populates `final_trust_radius` so the
+                    // `operator_trust_radius` warm-start hook now works
+                    // for matrix-free retries: the budget-bumped retry
+                    // resumes from the geometry the previous attempt
+                    // already learned instead of redoing the trust-radius
+                    // adaptation from the configured initial radius.
+                    match report.status {
+                        OptimizationStatus::Converged => {
+                            let mut result = solution_into_outer_result(
+                                report.solution,
+                                true,
+                                *the_plan,
+                            );
                             result.operator_stop_reason =
                                 Some(OperatorTrustRegionStopReason::Converged);
+                            result.operator_trust_radius = final_radius;
                             Ok(result)
                         }
-                        Err(MatrixFreeTrustRegionError::MaxIterationsReached {
-                            last_solution,
-                        }) => {
+                        OptimizationStatus::MaxIterations => {
                             let mut result = solution_into_outer_result(
-                                *last_solution,
+                                report.solution,
                                 false,
                                 *the_plan,
                             );
                             result.operator_stop_reason =
                                 Some(OperatorTrustRegionStopReason::IterationBudget);
+                            result.operator_trust_radius = final_radius;
                             Ok(result)
                         }
-                        Err(MatrixFreeTrustRegionError::TrustRegionRejectFloor {
-                            last_solution,
-                        }) => {
+                        OptimizationStatus::TrustRegionRejectFloor => {
                             let mut result = solution_into_outer_result(
-                                *last_solution,
+                                report.solution,
                                 false,
                                 *the_plan,
                             );
                             result.operator_stop_reason =
                                 Some(OperatorTrustRegionStopReason::RejectFloor);
+                            result.operator_trust_radius = final_radius;
                             Ok(result)
                         }
-                        Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
-                            "matrix-free TR solver failed: {e:?}"
-                        ))),
+                        OptimizationStatus::ObjectiveFailed
+                        | OptimizationStatus::NumericalFailure
+                        | OptimizationStatus::LineSearchFailed => {
+                            Err(EstimationError::RemlOptimizationFailed(format!(
+                                "matrix-free TR solver failed with status={:?}",
+                                report.status
+                            )))
+                        }
                     }
                 } else {
                     let hessian_source = the_plan.hessian_source;
