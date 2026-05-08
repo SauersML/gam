@@ -444,6 +444,26 @@ impl DeclaredHessianForm {
     }
 }
 
+/// Bridge for the partial migration from the legacy `Derivative`-only
+/// declaration to the richer [`DeclaredHessianForm`] used by the
+/// outer-optimizer planner. Family call sites that still produce
+/// `Derivative` (the simple available/unavailable bit) lift through
+/// this `From` impl without each rewriting its capability probe:
+/// `Analytic` defaults to `Either` so the seed loop inspects the
+/// realized seed eval and locks the route at runtime, mirroring the
+/// historical seed-eval-branch behavior; `Unavailable` projects to
+/// `Unavailable`. New call sites that already know whether the
+/// Hessian is materialized as `Dense` or comes through an `Operator`
+/// can construct the richer variant directly.
+impl From<Derivative> for DeclaredHessianForm {
+    fn from(d: Derivative) -> Self {
+        match d {
+            Derivative::Analytic => DeclaredHessianForm::Either,
+            Derivative::Unavailable => DeclaredHessianForm::Unavailable,
+        }
+    }
+}
+
 /// Declares what a specific model path can provide to the outer optimizer.
 ///
 /// Each call site that optimizes smoothing parameters constructs one of these
@@ -5543,7 +5563,7 @@ mod tests {
 
     fn cap_for_routing(
         gradient: Derivative,
-        hessian: Derivative,
+        hessian: DeclaredHessianForm,
         n_params: usize,
     ) -> OuterCapability {
         OuterCapability {
@@ -5564,7 +5584,7 @@ mod tests {
         // aggregate `k·n·p²` cost-driven downgrade. Post-#1 the planner has
         // no scale-driven downgrade, so `(Analytic, Analytic)` must stay on
         // ARC + Analytic regardless of the problem dimensions.
-        let cap = cap_for_routing(Derivative::Analytic, Derivative::Analytic, 6);
+        let cap = cap_for_routing(Derivative::Analytic, DeclaredHessianForm::Either, 6);
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Arc);
         assert_eq!(p.hessian_source, HessianSource::Analytic);
@@ -5574,7 +5594,7 @@ mod tests {
     fn routing_analytic_analytic_stays_arc_at_dense_work_scale() {
         // n=3·10⁵, p=300 used to trigger the per-inner-solve `n·p²` downgrade
         // (`2.7·10¹⁰ ≫ 5·10⁹`). Post-#1, no work-hint API exists; ARC stays.
-        let cap = cap_for_routing(Derivative::Analytic, Derivative::Analytic, 3);
+        let cap = cap_for_routing(Derivative::Analytic, DeclaredHessianForm::Either, 3);
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Arc);
         assert_eq!(p.hessian_source, HessianSource::Analytic);
@@ -5584,7 +5604,7 @@ mod tests {
     fn routing_unavailable_hessian_routes_to_bfgs() {
         // Spec section 12: when the family cannot provide a second derivative
         // (matrix-free or otherwise), BFGS is the correct route.
-        let cap = cap_for_routing(Derivative::Analytic, Derivative::Unavailable, 8);
+        let cap = cap_for_routing(Derivative::Analytic, DeclaredHessianForm::Unavailable, 8);
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
         assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
@@ -5596,7 +5616,7 @@ mod tests {
         // quasi-Newton route. Auxiliary gradient-only optimizers are separate
         // solver classes; this flag is ignored for Analytic+Analytic primary
         // capabilities.
-        let mut cap = cap_for_routing(Derivative::Analytic, Derivative::Analytic, 6);
+        let mut cap = cap_for_routing(Derivative::Analytic, DeclaredHessianForm::Either, 6);
         cap.prefer_gradient_only = true;
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Arc);
@@ -5667,7 +5687,7 @@ mod tests {
         // Post-#5/#12, GAMLSS advertises matrix-free directional operators
         // for the joint Hessian; the OuterProblem build site must declare
         // both derivatives Analytic so ARC + Analytic stays in effect.
-        let cap = cap_for_routing(Derivative::Analytic, Derivative::Analytic, 4);
+        let cap = cap_for_routing(Derivative::Analytic, DeclaredHessianForm::Either, 4);
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Arc);
         assert_eq!(p.hessian_source, HessianSource::Analytic);
@@ -5677,7 +5697,7 @@ mod tests {
     fn routing_matern_iso_kappa_stays_on_arc_when_both_derivs_analytic() {
         // Post-#7, Matern/TPS spatial κ/τ derivative drifts ship as
         // HyperOperators; planner contract: (Analytic, Analytic) → ARC.
-        let cap = cap_for_routing(Derivative::Analytic, Derivative::Analytic, 5);
+        let cap = cap_for_routing(Derivative::Analytic, DeclaredHessianForm::Either, 5);
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Arc);
         assert_eq!(p.hessian_source, HessianSource::Analytic);
@@ -5709,7 +5729,7 @@ mod tests {
         // Bernoulli/survival marginal-slope: the planner contract is the
         // same — (Analytic, Analytic) → ARC + Analytic. Runtime selects
         // operator HVPs via `use_joint_matrix_free_path`.
-        let cap = cap_for_routing(Derivative::Analytic, Derivative::Analytic, 3);
+        let cap = cap_for_routing(Derivative::Analytic, DeclaredHessianForm::Either, 3);
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Arc);
         assert_eq!(p.hessian_source, HessianSource::Analytic);
@@ -5843,7 +5863,7 @@ mod tests {
         let attempts = automatic_fallback_attempts(&cap);
         assert!(!attempts.is_empty(), "EFS failure must have a fallback");
         assert_eq!(attempts[0].gradient, Derivative::Analytic);
-        assert_eq!(attempts[0].hessian, Derivative::Unavailable);
+        assert_eq!(attempts[0].hessian, DeclaredHessianForm::Unavailable);
         assert!(attempts[0].disable_fixed_point);
         assert_eq!(plan(&attempts[0]).solver, Solver::Bfgs);
 

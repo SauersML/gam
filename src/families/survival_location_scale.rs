@@ -11085,7 +11085,7 @@ mod tests {
         );
         assert_eq!(
             hessian,
-            crate::solver::outer_strategy::Derivative::Analytic,
+            crate::solver::outer_strategy::DeclaredHessianForm::Either,
             "large survival location-scale fits must not be demoted to BFGS when the explicit HVP operator covers the dimensions"
         );
     }

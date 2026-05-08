@@ -3367,6 +3367,28 @@ impl ImplicitDesignPsiDerivative {
         }
     }
 
+    /// Batched `unproject` for a (p_out × rank) coefficient matrix.
+    /// Returns (n_knots × rank) via two BLAS3 matmuls — the same algebra as
+    /// `unproject`, but amortized across all rank columns of `u`. Used by
+    /// `forward_mul_matrix` so per-axis trace evaluations can be a single
+    /// chunked GEMM rather than rank-many `forward_mul` calls.
+    pub fn unproject_matrix(&self, u: &ArrayView2<f64>) -> Array2<f64> {
+        debug_assert_eq!(u.nrows(), self.p_out());
+        // Step 1: undo full identifiability transform → (p_after_pad, rank).
+        let after_full = match &self.full_ident_transform {
+            Some(zf) => fast_ab(zf, u),
+            None => u.to_owned(),
+        };
+        // Step 2: drop polynomial padding rows → (p_constrained, rank).
+        let p_constrained = self.p_constrained();
+        let smooth_part = after_full.slice(s![..p_constrained, ..]);
+        // Step 3: undo kernel constraint Z → (n_knots, rank).
+        match &self.ident_transform {
+            Some(z) => fast_ab(z, &smooth_part),
+            None => smooth_part.to_owned(),
+        }
+    }
+
     /// Compute (∂X/∂ψ_d)^T v for a given axis d and vector v of length n.
     ///
     /// Returns a vector of length p_out (total basis dimension after all transforms).
@@ -4227,6 +4249,23 @@ impl ImplicitDesignPsiDerivative {
     where
         G: Fn(f64, f64, f64, &[f64], usize) -> f64,
     {
+        let raw = self.row_chunk_with_kernel_raw(rows, deriv_fn)?;
+        Ok(self.project_matrix_rows(raw))
+    }
+
+    /// Like `row_chunk_with_kernel` but returns the raw (chunk × n_knots)
+    /// kernel scalars without the identifiability/padding projection. Used
+    /// by `forward_mul_matrix`, which does the projection on the rank side
+    /// instead (`unproject_matrix(F)`) so the (n × p_out) projected
+    /// derivative is never materialized for biobank-scale row counts.
+    fn row_chunk_with_kernel_raw<G>(
+        &self,
+        rows: std::ops::Range<usize>,
+        deriv_fn: G,
+    ) -> Result<Array2<f64>, BasisError>
+    where
+        G: Fn(f64, f64, f64, &[f64], usize) -> f64,
+    {
         let mut raw = Array2::<f64>::zeros((rows.end - rows.start, self.n_knots));
         if let Some(st) = self.streaming.as_ref() {
             let mut sb = vec![0.0; self.n_axes];
@@ -4251,7 +4290,7 @@ impl ImplicitDesignPsiDerivative {
                 }
             }
         }
-        Ok(self.project_matrix_rows(raw))
+        Ok(raw)
     }
 
     pub fn row_chunk_first(
@@ -4277,6 +4316,44 @@ impl ImplicitDesignPsiDerivative {
             });
         }
         self.row_chunk_with_kernel(rows, |phi, q, _, sb, idx| {
+            let s = if sb.is_empty() {
+                self.axis_components[[idx, axis]]
+            } else {
+                sb[axis]
+            };
+            q * s + c * phi
+        })
+    }
+
+    /// Raw (chunk × n_knots) first-order kernel scalars for axis d, without
+    /// the identifiability/padding projection. Pairs with `unproject_matrix`
+    /// in `forward_mul_matrix`: the kernel scalars stay in raw knot space
+    /// while the rank side (F) is unprojected to knot space, so the per-chunk
+    /// GEMM is (chunk × n_knots) · (n_knots × rank) rather than (chunk × p_out)
+    /// · (p_out × rank). Saves both flops and a (chunk × p_out) intermediate.
+    pub fn row_chunk_first_raw(
+        &self,
+        axis: usize,
+        rows: std::ops::Range<usize>,
+    ) -> Result<Array2<f64>, BasisError> {
+        assert!(axis < self.n_axes());
+        let c = self.psi_scale_share;
+        if self.axis_combinations.is_some() {
+            let combo = self.transformed_axis_combination(axis);
+            let combo_sum = Self::transformed_combo_sum(combo);
+            return self.row_chunk_with_kernel_raw(rows, |phi, q, _, sb, idx| {
+                let s_combo = if sb.is_empty() {
+                    self.transformed_combo_axis_value_materialized(idx, combo)
+                } else {
+                    combo
+                        .iter()
+                        .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
+                        .sum()
+                };
+                Self::transformed_first_kernel_value(phi, q, s_combo, combo_sum, c)
+            });
+        }
+        self.row_chunk_with_kernel_raw(rows, |phi, q, _, sb, idx| {
             let s = if sb.is_empty() {
                 self.axis_components[[idx, axis]]
             } else {

@@ -16161,7 +16161,7 @@ mod tests {
     fn spatial_aniso_joint_large_psi_dim_keeps_second_order_route() {
         let cap = crate::solver::outer_strategy::OuterCapability {
             gradient: crate::solver::outer_strategy::Derivative::Analytic,
-            hessian: crate::solver::outer_strategy::Derivative::Analytic,
+            hessian: crate::solver::outer_strategy::DeclaredHessianForm::Either,
             n_params: 40,
             psi_dim: 31,
             fixed_point_available: true,

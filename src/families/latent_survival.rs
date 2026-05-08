@@ -3758,7 +3758,7 @@ mod tests {
     #[test]
     fn latent_family_planner_keeps_outer_hessian_at_large_n() {
         use crate::families::custom_family::custom_family_outer_derivatives;
-        use crate::solver::outer_strategy::Derivative;
+        use crate::solver::outer_strategy::{DeclaredHessianForm, Derivative};
 
         let options = BlockwiseFitOptions::default();
         let large_n = 50_001;
@@ -3769,14 +3769,14 @@ mod tests {
         let (surv_grad, surv_hess) =
             custom_family_outer_derivatives(&survival, &survival_specs, &options);
         assert_eq!(surv_grad, Derivative::Analytic);
-        assert_eq!(surv_hess, Derivative::Analytic);
+        assert_eq!(surv_hess, DeclaredHessianForm::Either);
 
         let binary = fixed_sigma_binary_test_family();
         let binary_specs = latent_test_specs(large_n, &[("time", 2), ("mean", 2)]);
         let (bin_grad, bin_hess) =
             custom_family_outer_derivatives(&binary, &binary_specs, &options);
         assert_eq!(bin_grad, Derivative::Analytic);
-        assert_eq!(bin_hess, Derivative::Analytic);
+        assert_eq!(bin_hess, DeclaredHessianForm::Either);
     }
 
     #[test]

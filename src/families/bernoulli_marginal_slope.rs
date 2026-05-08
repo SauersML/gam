@@ -11445,11 +11445,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // `HyperOperator`s and cached exact-Hessian workspaces, so ARC/trust-region
     // can consume exact HVPs without falling back to BFGS merely because the
     // realized problem is large.
-    let analytic_joint_hessian_available = analytic_joint_derivatives_available
-        && matches!(
-            joint_hessian,
-            crate::solver::outer_strategy::Derivative::Analytic
-        );
+    let analytic_joint_hessian_available =
+        analytic_joint_derivatives_available && joint_hessian.is_analytic();
     let kappa_options_ref: &SpatialLengthScaleOptimizationOptions = kappa_options;
     let sigma_from_theta = |theta: &Array1<f64>| -> Option<f64> {
         if sigma_learnable {
@@ -20148,7 +20145,7 @@ mod tests {
             gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-        assert_eq!(hessian, crate::solver::outer_strategy::Derivative::Analytic);
+        assert_eq!(hessian, crate::solver::outer_strategy::DeclaredHessianForm::Either);
     }
 
     #[test]

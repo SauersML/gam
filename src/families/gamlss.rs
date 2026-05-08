@@ -20566,7 +20566,7 @@ mod tests {
         );
         assert_eq!(
             hessian,
-            crate::solver::outer_strategy::Derivative::Analytic,
+            crate::solver::outer_strategy::DeclaredHessianForm::Either,
             "large-n GAMLSS location-scale fits must advertise exact second-order curvature instead of triggering the historical BFGS downgrade"
         );
 
@@ -23262,7 +23262,7 @@ mod tests {
             &specs,
             &BlockwiseFitOptions::default(),
         );
-        assert_eq!(hessian, crate::solver::outer_strategy::Derivative::Analytic);
+        assert_eq!(hessian, crate::solver::outer_strategy::DeclaredHessianForm::Either);
     }
 
     #[test]

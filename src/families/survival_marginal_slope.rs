@@ -14271,11 +14271,8 @@ pub fn fit_survival_marginal_slope_terms(
     // overrides below). Keep analytic curvature advertised at biobank scale;
     // the unified REML/LAML planner chooses the matrix-free outer-HVP route for
     // large `(n, p, K)` shapes instead of falling back to first-order BFGS.
-    let analytic_joint_hessian_available = analytic_joint_derivatives_available
-        && matches!(
-            joint_hessian,
-            crate::solver::outer_strategy::Derivative::Analytic
-        );
+    let analytic_joint_hessian_available =
+        analytic_joint_derivatives_available && joint_hessian.is_analytic();
     log::info!(
         "[survival-marginal-slope] initial derivative probe end gradient_analytic={} hessian_analytic={} elapsed={:.3}s",
         analytic_joint_gradient_available,
@@ -15359,7 +15356,7 @@ mod tests {
             gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-        assert_eq!(hessian, crate::solver::outer_strategy::Derivative::Analytic);
+        assert_eq!(hessian, crate::solver::outer_strategy::DeclaredHessianForm::Either);
     }
 
     #[test]

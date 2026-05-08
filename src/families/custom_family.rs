@@ -13902,7 +13902,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
 
     use crate::estimate::EstimationError;
     use crate::solver::outer_strategy::{
-        DeclaredHessianForm, Derivative, FallbackPolicy, OuterEval, OuterEvalOrder, OuterProblem,
+        FallbackPolicy, OuterEval, OuterEvalOrder, OuterProblem,
     };
 
     // Mutable bookkeeping for the outer optimization loop. These fields were
@@ -13951,7 +13951,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     };
     let problem = OuterProblem::new(n_rho)
         .with_gradient(cap_gradient)
-        .with_hessian(hessian)
+        .with_hessian(hessian.into())
         .with_disable_fixed_point(multi_block_beta_dependent)
         .with_fallback_policy(fallback_policy)
         .with_tolerance(options.outer_tol)
@@ -14860,7 +14860,7 @@ mod tests {
         );
         assert_eq!(
             hessian,
-            crate::solver::outer_strategy::Derivative::Unavailable
+            crate::solver::outer_strategy::DeclaredHessianForm::Unavailable
         );
     }
 
@@ -15047,7 +15047,7 @@ mod tests {
             gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-        assert_eq!(hessian, crate::solver::outer_strategy::Derivative::Analytic);
+        assert_eq!(hessian, crate::solver::outer_strategy::DeclaredHessianForm::Either);
     }
 
     #[test]
@@ -15094,7 +15094,7 @@ mod tests {
             gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-        assert_eq!(hessian, crate::solver::outer_strategy::Derivative::Analytic);
+        assert_eq!(hessian, crate::solver::outer_strategy::DeclaredHessianForm::Either);
     }
 
     #[derive(Clone)]
@@ -15275,7 +15275,7 @@ mod tests {
             gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-        assert_eq!(hessian, crate::solver::outer_strategy::Derivative::Analytic);
+        assert_eq!(hessian, crate::solver::outer_strategy::DeclaredHessianForm::Either);
     }
 
     #[test]
