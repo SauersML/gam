@@ -14453,7 +14453,12 @@ pub fn fit_survival_marginal_slope_terms(
                 exact_warm_start.borrow().as_ref(),
                 effective_mode,
             )?;
-            exact_warm_start.replace(Some(eval.warm_start));
+            exact_warm_start.replace(Some(eval.warm_start.clone()));
+            if !eval.inner_converged {
+                return Err(
+                    "exact survival marginal-slope inner solve did not converge".to_string()
+                );
+            }
             log::info!(
                 "[survival-marginal-slope/outer-eval] end objective={:.6e} mode={:?} elapsed={:.3}s",
                 eval.objective,
@@ -14491,7 +14496,12 @@ pub fn fit_survival_marginal_slope_terms(
                 derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
             )?;
-            exact_warm_start.replace(Some(eval.warm_start));
+            exact_warm_start.replace(Some(eval.warm_start.clone()));
+            if !eval.inner_converged {
+                return Err(
+                    "exact survival marginal-slope EFS inner solve did not converge".to_string(),
+                );
+            }
             log::info!(
                 "[survival-marginal-slope/outer-efs] end elapsed={:.3}s",
                 eval_started.elapsed().as_secs_f64(),

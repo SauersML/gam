@@ -1992,6 +1992,11 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         eval_mode,
                     )?;
                     *hyper_warm_start_cell.borrow_mut() = Some(eval.warm_start.clone());
+                    if !eval.inner_converged {
+                        return Err(
+                            "exact two-block spatial inner solve did not converge".to_string(),
+                        );
+                    }
                     if matches!(eval_mode, EvalMode::ValueGradientHessian)
                         && !eval.outer_hessian.is_analytic()
                     {
@@ -2045,6 +2050,11 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         warm_start.as_ref(),
                     )?;
                     *hyper_warm_start_cell.borrow_mut() = Some(eval.warm_start.clone());
+                    if !eval.inner_converged {
+                        return Err(
+                            "exact two-block spatial EFS inner solve did not converge".to_string(),
+                        );
+                    }
                     Ok(eval.efs_eval)
                 },
             )
@@ -3334,6 +3344,12 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             && analytic_outer_hessian_available;
         let (eval, _, _) = build_eval(theta, state.warm_cache.as_ref(), need_hessian)
             .map_err(EstimationError::InvalidInput)?;
+        if !eval.inner_converged {
+            state.warm_cache = Some(eval.warm_start);
+            return Err(EstimationError::InvalidInput(
+                "binomial mean-wiggle exact spatial inner solve did not converge".to_string(),
+            ));
+        }
         let hessian_result = eval.outer_hessian.clone();
         state.last_eval = Some((
             theta.clone(),
@@ -3364,6 +3380,13 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             }
             let (eval, _, _) = build_eval(theta, state.warm_cache.as_ref(), false)
                 .map_err(EstimationError::InvalidInput)?;
+            if !eval.inner_converged {
+                state.warm_cache = Some(eval.warm_start);
+                return Err(EstimationError::InvalidInput(
+                    "binomial mean-wiggle exact spatial cost inner solve did not converge"
+                        .to_string(),
+                ));
+            }
             state.warm_cache = Some(eval.warm_start);
             Ok(eval.objective)
         },
@@ -3388,6 +3411,13 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         Some(|state: &mut MeanWiggleOuterState, theta: &Array1<f64>| {
             let eval = build_efs(theta, state.warm_cache.as_ref())
                 .map_err(EstimationError::InvalidInput)?;
+            if !eval.inner_converged {
+                state.warm_cache = Some(eval.warm_start);
+                return Err(EstimationError::InvalidInput(
+                    "binomial mean-wiggle exact spatial EFS inner solve did not converge"
+                        .to_string(),
+                ));
+            }
             state.warm_cache = Some(eval.warm_start);
             Ok(eval.efs_eval)
         }),

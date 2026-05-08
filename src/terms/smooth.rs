@@ -6612,6 +6612,12 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         .map_err(|e| {
             EstimationError::RemlOptimizationFailed(format!("spatial adaptive eval failed: {e}"))
         })?;
+        if !result.inner_converged {
+            st.warm_cache = Some(result.warm_start.clone());
+            return Err(EstimationError::RemlOptimizationFailed(
+                "exact spatial adaptive inner solve did not converge".to_string(),
+            ));
+        }
         if !result.objective.is_finite() || result.gradient.iter().any(|v| !v.is_finite()) {
             return Err(EstimationError::RemlOptimizationFailed(
                 "exact spatial adaptive objective returned non-finite values".to_string(),
@@ -6682,6 +6688,12 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                     "spatial adaptive cost eval failed: {e}"
                 ))
             })?;
+            if !result.inner_converged {
+                st.warm_cache = Some(result.warm_start);
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "exact spatial adaptive cost inner solve did not converge".to_string(),
+                ));
+            }
             st.warm_cache = Some(result.warm_start);
             Ok(result.objective)
         },
@@ -6723,6 +6735,12 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                     "spatial adaptive EFS eval failed: {e}"
                 ))
             })?;
+            if !result.inner_converged {
+                st.warm_cache = Some(result.warm_start);
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "exact spatial adaptive EFS inner solve did not converge".to_string(),
+                ));
+            }
             st.warm_cache = Some(result.warm_start);
             Ok(result.efs_eval)
         }),
