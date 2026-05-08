@@ -15386,7 +15386,8 @@ struct BinomialLocationScaleHessianWorkspace {
     coeff_ll: Array1<f64>,
     direction_eta_cache: Mutex<HashMap<BinomialDirectionKey, Arc<BinomialDirectionEta>>>,
     first_coeff_cache: Mutex<HashMap<BinomialDirectionKey, Arc<BinomialRowCoeffTriple>>>,
-    second_coeff_cache: Mutex<HashMap<BinomialDirectionPairKey, Arc<BinomialRowCoeffTriple>>>,
+    // No `second_coeff_cache` deliberately: see `second_coefficients` for why
+    // the per-pair cache was a memory-only loss at biobank shape.
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -15400,12 +15401,6 @@ impl BinomialDirectionKey {
             bits: v.iter().map(|value| value.to_bits()).collect(),
         }
     }
-}
-
-#[derive(Clone, Eq, Hash, PartialEq)]
-struct BinomialDirectionPairKey {
-    left: BinomialDirectionKey,
-    right: BinomialDirectionKey,
 }
 
 struct BinomialDirectionEta {
@@ -15449,7 +15444,6 @@ impl BinomialLocationScaleHessianWorkspace {
             coeff_ll,
             direction_eta_cache: Mutex::new(HashMap::new()),
             first_coeff_cache: Mutex::new(HashMap::new()),
-            second_coeff_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -15524,22 +15518,18 @@ impl BinomialLocationScaleHessianWorkspace {
             .clone()
     }
 
+    /// No caching here, deliberately: at biobank shape (n=320k, K=14 outer
+    /// coords) the K² ≈ 196 unique direction-pairs are queried exactly once
+    /// per outer Hessian eval, and each cached entry stored 3·n f64s
+    /// = ~7.7 MB → ~1.5 GB peak per eval with zero practical hit-rate.
+    /// Across outer evals the directions shift with ρ/ψ so cross-eval hits
+    /// are nil. Computing on demand is O(n) — under 10 ms at this scale,
+    /// dwarfed by the (n × p²) trace work that consumes the result.
     fn second_coefficients(
         &self,
-        _key: BinomialDirectionPairKey,
         eta_u: &BinomialDirectionEta,
         eta_v: &BinomialDirectionEta,
     ) -> Result<Arc<BinomialRowCoeffTriple>, String> {
-        // No caching: at biobank shape (n=320k, K=14 outer coords) the K² ≈ 196
-        // unique direction-pairs are queried exactly once per outer Hessian eval,
-        // and each entry stored 3·n f64s = ~7.7 MB → ~1.5 GB peak per eval with
-        // zero practical hit-rate. Across outer evals the directions shift with
-        // ρ/ψ so cross-eval hits are nil. Computing on demand is O(n) — under
-        // 10 ms at this scale, dwarfed by the (n × p²) trace work that consumes
-        // the result. The (now unused) `_key` parameter and the `second_coeff_cache`
-        // field are retained for API compatibility with sibling families /
-        // future smaller-scale variants where the cache could pay back; the
-        // mutex stays empty here so concurrent calls share no contended state.
         let (tt, tl, ll) = binomial_location_scalesecond_directional_coefficients(
             &self.family.y,
             &self.family.weights,
@@ -15698,14 +15688,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
         let key_v = BinomialDirectionKey::from_array(d_beta_v);
         let eta_u = self.direction_eta(&key_u, d_beta_u, pt, total);
         let eta_v = self.direction_eta(&key_v, d_beta_v, pt, total);
-        let coeffs = self.second_coefficients(
-            BinomialDirectionPairKey {
-                left: key_u,
-                right: key_v,
-            },
-            &eta_u,
-            &eta_v,
-        )?;
+        let coeffs = self.second_coefficients(&eta_u, &eta_v)?;
         Ok(Some(Arc::new(make_two_block_design_row_coeff_operator(
             self.x_t.clone(),
             self.x_ls.clone(),
