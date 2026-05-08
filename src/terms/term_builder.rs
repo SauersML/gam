@@ -339,13 +339,9 @@ pub fn build_smooth_basis(
             .map_err(|e| e.to_string())?;
             let centers = parse_countwith_basis_alias(options, "centers", plan.centers)?;
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
-                CenterStrategy::FarthestPoint {
-                    num_centers: centers,
-                }
+                spatial_center_strategy_for_dimension(centers, cols.len())
             } else {
-                CenterStrategy::Auto(Box::new(CenterStrategy::FarthestPoint {
-                    num_centers: centers,
-                }))
+                auto_spatial_center_strategy(centers, cols.len())
             };
             Ok(SmoothBasisSpec::ThinPlate {
                 feature_cols: cols.to_vec(),
