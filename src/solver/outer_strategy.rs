@@ -16,13 +16,12 @@
 use crate::estimate::EstimationError;
 use crate::solver::estimate::reml::unified::BarrierConfig;
 use ::opt::{
-    Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds,
-    FallbackPolicy as OptFallbackPolicy, FirstOrderObjective, FirstOrderSample, FixedPoint,
-    FixedPointError, FixedPointObjective, FixedPointSample, FixedPointStatus, GradientTolerance,
-    HessianFallbackPolicy, HessianMaterialization, HessianOperator, HessianValue,
-    MatrixFreeTrustRegion, MaxIterations, ObjectiveEvalError, OperatorObjective, OperatorSample,
-    OptimizationStatus, SecondOrderObjective, SecondOrderSample, Solution,
-    Tolerance, ZerothOrderObjective,
+    Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, FallbackPolicy as OptFallbackPolicy,
+    FirstOrderObjective, FirstOrderSample, FixedPoint, FixedPointError, FixedPointObjective,
+    FixedPointSample, FixedPointStatus, GradientTolerance, HessianFallbackPolicy,
+    HessianMaterialization, HessianOperator, HessianValue, MatrixFreeTrustRegion, MaxIterations,
+    ObjectiveEvalError, OperatorObjective, OperatorSample, OptimizationStatus, OptimizerObserver,
+    SecondOrderObjective, SecondOrderSample, Solution, StepInfo, Tolerance, ZerothOrderObjective,
 };
 use ndarray::{Array1, Array2, ArrayView2};
 use std::sync::Arc;
@@ -2604,9 +2603,7 @@ struct OuterAcceptObserver {
 
 impl OptimizerObserver for OuterAcceptObserver {
     fn on_step_accepted(&mut self, _info: &StepInfo) {
-        self.feedback
-            .accepted_iter
-            .fetch_add(1, Ordering::Relaxed);
+        self.feedback.accepted_iter.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -2617,14 +2614,13 @@ impl HessianOperator for OuterToOptHessianOperator {
         self.0.dim()
     }
 
-    fn apply_into(
-        &self,
-        v: &Array1<f64>,
-        out: &mut Array1<f64>,
-    ) -> Result<(), ObjectiveEvalError> {
-        let result = self.0.matvec(v).map_err(|message| ObjectiveEvalError::Fatal {
-            message: format!("outer Hessian operator matvec failed: {message}"),
-        })?;
+    fn apply_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<(), ObjectiveEvalError> {
+        let result = self
+            .0
+            .matvec(v)
+            .map_err(|message| ObjectiveEvalError::Fatal {
+                message: format!("outer Hessian operator matvec failed: {message}"),
+            })?;
         if result.len() != out.len() {
             return Err(ObjectiveEvalError::Fatal {
                 message: format!(
@@ -2638,13 +2634,12 @@ impl HessianOperator for OuterToOptHessianOperator {
         Ok(())
     }
 
-    fn apply_mat(
-        &self,
-        x: ArrayView2<'_, f64>,
-    ) -> Result<Array2<f64>, ObjectiveEvalError> {
-        self.0.mul_mat(x).map_err(|message| ObjectiveEvalError::Fatal {
-            message: format!("outer Hessian operator mul_mat failed: {message}"),
-        })
+    fn apply_mat(&self, x: ArrayView2<'_, f64>) -> Result<Array2<f64>, ObjectiveEvalError> {
+        self.0
+            .mul_mat(x)
+            .map_err(|message| ObjectiveEvalError::Fatal {
+                message: format!("outer Hessian operator mul_mat failed: {message}"),
+            })
     }
 
     fn materialization(&self) -> HessianMaterialization {
@@ -2673,9 +2668,9 @@ impl HessianOperator for OuterToOptHessianOperator {
 fn hessian_result_to_value(hessian: HessianResult) -> HessianValue {
     match hessian {
         HessianResult::Analytic(h) => HessianValue::Dense(h),
-        HessianResult::Operator(op) => HessianValue::Operator(Arc::new(
-            OuterToOptHessianOperator(op),
-        )),
+        HessianResult::Operator(op) => {
+            HessianValue::Operator(Arc::new(OuterToOptHessianOperator(op)))
+        }
         HessianResult::Unavailable => HessianValue::Unavailable,
     }
 }
@@ -2718,11 +2713,7 @@ impl FirstOrderObjective for OuterOperatorBridge<'_> {
             .obj
             .eval_with_order(x, OuterEvalOrder::ValueAndGradient)
             .map_err(|err| into_objective_error("outer eval failed", err))?;
-        let eval = finite_outer_first_order_eval_or_error(
-            "outer eval failed",
-            self.layout,
-            eval,
-        )?;
+        let eval = finite_outer_first_order_eval_or_error("outer eval failed", self.layout, eval)?;
         let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
         if self.g_norm_initial.is_none() && g_norm.is_finite() && g_norm > 0.0 {
             self.g_norm_initial = Some(g_norm);
@@ -2796,10 +2787,7 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
 // ARC and BFGS arms of the seed loop.
 
 #[inline]
-fn project_to_bounds(
-    x: &Array1<f64>,
-    bounds: Option<&(Array1<f64>, Array1<f64>)>,
-) -> Array1<f64> {
+fn project_to_bounds(x: &Array1<f64>, bounds: Option<&(Array1<f64>, Array1<f64>)>) -> Array1<f64> {
     match bounds {
         Some((lower, upper)) => {
             let mut out = x.clone();
@@ -3712,7 +3700,6 @@ pub struct OuterResult {
     pub operator_stop_reason: Option<OperatorTrustRegionStopReason>,
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperatorTrustRegionStopReason {
     Converged,
@@ -3724,7 +3711,6 @@ pub enum OperatorTrustRegionStopReason {
     /// (e.g. BFGS gradient-only) instead of trusting the partial result.
     RoutingMismatch,
 }
-
 
 /// Run the outer smoothing-parameter optimization.
 ///
@@ -4075,8 +4061,8 @@ fn run_outer_with_plan(
                     // norm. Replaces the previous gam-side
                     // precomputed `outer_scaled_tolerance` hack.
                     let grad_tol = GradientTolerance::relative_to_cost(config.tolerance);
-                    let max_iter = MaxIterations::new(config.max_iter)
-                        .expect("outer max_iter must be valid");
+                    let max_iter =
+                        MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
 
                     // Translate the seed_eval into an opt::OperatorSample
                     // so the matrix-free TR solver can serve its first
@@ -4108,6 +4094,11 @@ fn run_outer_with_plan(
                         // exact analytic Hessians; an `Unavailable`
                         // here is a routing/contract violation.
                         .with_hessian_fallback_policy(HessianFallbackPolicy::Error);
+                    if let Some(feedback) = config.outer_inner_cap.as_ref() {
+                        solver = solver.with_observer(OuterAcceptObserver {
+                            feedback: feedback.clone(),
+                        });
+                    }
                     if let Some(r) = config.operator_initial_trust_radius {
                         solver = solver.with_initial_trust_radius(r);
                     }
@@ -4140,33 +4131,24 @@ fn run_outer_with_plan(
                     // adaptation from the configured initial radius.
                     match report.status {
                         OptimizationStatus::Converged => {
-                            let mut result = solution_into_outer_result(
-                                report.solution,
-                                true,
-                                *the_plan,
-                            );
+                            let mut result =
+                                solution_into_outer_result(report.solution, true, *the_plan);
                             result.operator_stop_reason =
                                 Some(OperatorTrustRegionStopReason::Converged);
                             result.operator_trust_radius = final_radius;
                             Ok(result)
                         }
                         OptimizationStatus::MaxIterations => {
-                            let mut result = solution_into_outer_result(
-                                report.solution,
-                                false,
-                                *the_plan,
-                            );
+                            let mut result =
+                                solution_into_outer_result(report.solution, false, *the_plan);
                             result.operator_stop_reason =
                                 Some(OperatorTrustRegionStopReason::IterationBudget);
                             result.operator_trust_radius = final_radius;
                             Ok(result)
                         }
                         OptimizationStatus::TrustRegionRejectFloor => {
-                            let mut result = solution_into_outer_result(
-                                report.solution,
-                                false,
-                                *the_plan,
-                            );
+                            let mut result =
+                                solution_into_outer_result(report.solution, false, *the_plan);
                             result.operator_stop_reason =
                                 Some(OperatorTrustRegionStopReason::RejectFloor);
                             result.operator_trust_radius = final_radius;
@@ -4229,6 +4211,11 @@ fn run_outer_with_plan(
                         .with_gradient_tolerance(grad_tol)
                         .with_max_iterations(max_iter)
                         .with_initial_sample(seed.clone(), initial_sample);
+                    if let Some(feedback) = config.outer_inner_cap.as_ref() {
+                        optimizer = optimizer.with_observer(OuterAcceptObserver {
+                            feedback: feedback.clone(),
+                        });
+                    }
                     // On the exact-Hessian ARC route, forbid both (a)
                     // finite-difference Hessian estimation if the
                     // objective ever returns
@@ -4343,6 +4330,11 @@ fn run_outer_with_plan(
                     .with_gradient_tolerance(grad_tol)
                     .with_max_iterations(max_iter)
                     .with_initial_sample(seed.clone(), initial_sample);
+                if let Some(feedback) = config.outer_inner_cap.as_ref() {
+                    optimizer = optimizer.with_observer(OuterAcceptObserver {
+                        feedback: feedback.clone(),
+                    });
+                }
                 let bfgs_start = std::time::Instant::now();
                 let outcome = optimizer.run();
                 let bfgs_elapsed = bfgs_start.elapsed().as_secs_f64();
@@ -4719,51 +4711,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    /// Smart initial trust radius: when ‖g‖ ≫ |cost| (the CTN warm-start
-    /// pathology where ‖g‖ ≈ 3·10¹⁷ vs |cost| ≈ 1·10¹⁰), the derived
-    /// radius is `|cost|/‖g‖` clamped to the floor. The previous
-    /// unconditional default of 1.0 wasted ~25 halving iters on this
-    #[test]
-    fn outer_scaled_tolerance_matches_textbook_form() {
-        // Trivial-cost case: scale factor is 1, so test reduces to absolute.
-        let trivial = outer_scaled_tolerance(1e-6, 0.0);
-        assert!((trivial - 1e-6).abs() < 1e-18);
-
-        // Small cost case: 1 + |V| = 1.5, still close to absolute.
-        let small = outer_scaled_tolerance(1e-6, 0.5);
-        assert!((small - 1.5e-6).abs() < 1e-18);
-
-        // Biobank-scale cost: V_LAML ≈ -1.6e5 for binomial logit at
-        // n=320 000. The relative test ‖∇V‖/|V| ≤ τ becomes
-        // ‖∇V‖ ≤ 1e-6 · (1 + 1.6e5) ≈ 0.16, vs the absolute 1e-6
-        // that would never fire at biobank scale.
-        let biobank = outer_scaled_tolerance(1e-6, -1.6e5);
-        let expected = 1e-6 * (1.0 + 1.6e5);
-        assert!((biobank - expected).abs() < 1e-12);
-        assert!(
-            biobank > 0.1,
-            "biobank tolerance must be substantially larger than the absolute 1e-6: got {biobank:.6e}"
-        );
-    }
-
-    /// Scale invariance: under uniform `V → c·V` the relative test
-    /// ‖∇V‖ ≤ τ · (1 + |V|) is invariant in the limit |V| ≫ 1. At
-    /// biobank scale this is exact within rounding.
-    #[test]
-    fn outer_scaled_tolerance_is_scale_invariant_at_large_cost() {
-        let base_tol = 1e-7;
-        let v_base: f64 = 1.0e6;
-        let v_scaled: f64 = v_base * 1000.0;
-
-        // Scale ratio must be the same for both magnitudes.
-        let ratio_base = outer_scaled_tolerance(base_tol, v_base) / (1.0 + v_base);
-        let ratio_scaled = outer_scaled_tolerance(base_tol, v_scaled) / (1.0 + v_scaled);
-        assert!(
-            (ratio_base - ratio_scaled).abs() < 1e-15,
-            "scale ratio must be invariant: base={ratio_base:.3e}  scaled={ratio_scaled:.3e}"
-        );
-    }
-
+    // The two `outer_scaled_tolerance_*` tests that lived here have
+    // been removed: the helper is gone in favor of opt 0.5.0's
+    // `GradientTolerance::relative_to_cost(τ)`. Equivalent threshold
+    // coverage now lives upstream as
+    // `opt::tests::gradient_tolerance_relative_to_cost_matches_textbook_form`.
 
     struct FailingSeedMaterializationOperator {
         dim: usize,

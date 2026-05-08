@@ -2274,8 +2274,9 @@ impl HyperOperator for ImplicitHyperOperator {
         let xf = {
             let mut xf = Array2::<f64>::zeros((n_obs, rank));
             const TARGET_BYTES: usize = 8 * 1024 * 1024;
-            let chunk_rows =
-                (TARGET_BYTES / ((self.p + rank).max(1) * 8)).max(512).min(n_obs);
+            let chunk_rows = (TARGET_BYTES / ((self.p + rank).max(1) * 8))
+                .max(512)
+                .min(n_obs);
             let mut start = 0usize;
             while start < n_obs {
                 let end = (start + chunk_rows).min(n_obs);
@@ -2318,11 +2319,7 @@ impl HyperOperator for ImplicitHyperOperator {
 
         // 3. Penalty trace: tr(F^T S_psi F) via dense BLAS3.
         let s_f = self.s_psi.dot(factor);
-        let penalty: f64 = factor
-            .iter()
-            .zip(s_f.iter())
-            .map(|(&f, &s)| f * s)
-            .sum();
+        let penalty: f64 = factor.iter().zip(s_f.iter()).map(|(&f, &s)| f * s).sum();
 
         2.0 * design_total + correction_total + penalty
     }
