@@ -2654,6 +2654,61 @@ struct BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
     options: BlockwiseFitOptions,
 }
 
+const BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS: usize = 10_000;
+
+fn bernoulli_margslope_line_search_ll_with_early_exit<F>(
+    rows: &[usize],
+    scale: f64,
+    threshold: f64,
+    row_ll: F,
+) -> Result<f64, String>
+where
+    F: Fn(usize) -> Result<f64, String> + Sync,
+{
+    if !threshold.is_finite() {
+        return Err(format!(
+            "bernoulli marginal-slope early-exit threshold must be finite, got {threshold}"
+        ));
+    }
+    if !(scale.is_finite() && scale > 0.0) {
+        return Err(format!(
+            "bernoulli marginal-slope early-exit scale must be positive and finite, got {scale}"
+        ));
+    }
+    let mut total_ll = 0.0;
+    for chunk in rows.chunks(BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS) {
+        let chunk_ll: f64 = chunk
+            .into_par_iter()
+            .try_fold(
+                || 0.0,
+                |mut acc, &row| -> Result<_, String> {
+                    acc += row_ll(row)?;
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || 0.0,
+                |left, right| -> Result<_, String> { Ok(left + right) },
+            )?;
+        total_ll += chunk_ll;
+        // Every Bernoulli marginal-slope row contribution is <= 0 because it is
+        // weight_i * log(CDF(.)) with nonnegative weights. Therefore the
+        // remaining rows can only keep the final log-likelihood the same or
+        // decrease it, making `-scale * total_ll` a valid lower bound on the
+        // final negative log-likelihood. If that lower bound is already above
+        // the caller's acceptability ceiling, the line-search trial is
+        // provably rejected and the full row sweep is unnecessary.
+        if -scale * total_ll > threshold {
+            return Err(format!(
+                "bernoulli marginal-slope line-search rejected early: partial_nll={} threshold={}",
+                -scale * total_ll,
+                threshold
+            ));
+        }
+    }
+    Ok(total_ll * scale)
+}
+
 impl BernoulliMarginalSlopeFamily {
     #[inline]
     fn probit_frailty_scale(&self) -> f64 {
@@ -2922,16 +2977,23 @@ impl BernoulliMarginalSlopeFamily {
             // keeps the algebraic Gaussian identity; empirical measure solves
             // the calibrated intercept against its quadrature grid.
             let b = &block_states[1].eta;
+            let row_ll = |i: usize| -> Result<f64, String> {
+                let marginal_eta = block_states[0].eta[i];
+                let marginal = self.marginal_link_map(marginal_eta)?;
+                let (neglog, _, _) = self.rigid_row_kernel_eval(i, marginal_eta, marginal, b[i])?;
+                Ok(-neglog)
+            };
+            if let Some(threshold) = options.early_exit_threshold {
+                return bernoulli_margslope_line_search_ll_with_early_exit(
+                    &row_iter, scale, threshold, row_ll,
+                );
+            }
             let total: Result<f64, String> = row_iter
                 .into_par_iter()
                 .try_fold(
                     || 0.0,
                     |mut ll, i| -> Result<_, String> {
-                        let marginal_eta = block_states[0].eta[i];
-                        let marginal = self.marginal_link_map(marginal_eta)?;
-                        let (neglog, _, _) =
-                            self.rigid_row_kernel_eval(i, marginal_eta, marginal, b[i])?;
-                        ll -= neglog;
+                        ll += row_ll(i)?;
                         Ok(ll)
                     },
                 )
@@ -2943,28 +3005,36 @@ impl BernoulliMarginalSlopeFamily {
         }
         let beta_h = self.score_beta(block_states)?;
         let beta_w = self.link_beta(block_states)?;
+        let row_ll = |row: usize| -> Result<f64, String> {
+            let intercept = self
+                .solve_row_intercept_base(
+                    row,
+                    block_states[0].eta[row],
+                    block_states[1].eta[row],
+                    beta_h,
+                    beta_w,
+                    None,
+                )?
+                .0;
+            let slope = block_states[1].eta[row];
+            let obs =
+                self.observed_denested_cell_partials(row, intercept, slope, beta_h, beta_w)?;
+            let s_i = eval_coeff4_at(&obs.coeff, self.z[row]);
+            let signed = (2.0 * self.y[row] - 1.0) * s_i;
+            let (log_cdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
+            Ok(self.weights[row] * log_cdf)
+        };
+        if let Some(threshold) = options.early_exit_threshold {
+            return bernoulli_margslope_line_search_ll_with_early_exit(
+                &row_iter, scale, threshold, row_ll,
+            );
+        }
         let total: Result<f64, String> = row_iter
             .into_par_iter()
             .try_fold(
                 || 0.0,
                 |mut ll, row| -> Result<_, String> {
-                    let intercept = self
-                        .solve_row_intercept_base(
-                            row,
-                            block_states[0].eta[row],
-                            block_states[1].eta[row],
-                            beta_h,
-                            beta_w,
-                            None,
-                        )?
-                        .0;
-                    let slope = block_states[1].eta[row];
-                    let obs = self
-                        .observed_denested_cell_partials(row, intercept, slope, beta_h, beta_w)?;
-                    let s_i = eval_coeff4_at(&obs.coeff, self.z[row]);
-                    let signed = (2.0 * self.y[row] - 1.0) * s_i;
-                    let (log_cdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
-                    ll += self.weights[row] * log_cdf;
+                    ll += row_ll(row)?;
                     Ok(ll)
                 },
             )
@@ -8662,6 +8732,10 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         Self::log_likelihood_only_with_options(self, block_states, options)
     }
 
+    fn supports_log_likelihood_early_exit(&self) -> bool {
+        true
+    }
+
     fn max_feasible_step_size(
         &self,
         block_states: &[ParameterBlockState],
@@ -10142,6 +10216,93 @@ mod tests {
             assert!((warm_a.intercept - cold_ctx.intercept).abs() < 1e-9);
             assert!((warm_b.intercept - cold_ctx.intercept).abs() < 1e-9);
         }
+    }
+
+    #[test]
+    fn bernoulli_margslope_flex_ll_early_exit_is_exact_or_provably_rejected() {
+        let n = 24_000usize;
+        let z = Array1::from_iter((0..n).map(|i| {
+            let t = (i as f64 + 0.5) / n as f64;
+            (10.0 * t).sin() + 0.2 * (29.0 * t).cos()
+        }));
+        let y = Array1::from_iter((0..n).map(|i| if (i * 17 + 3) % 7 >= 4 { 1.0 } else { 0.0 }));
+        let weights = Array1::ones(n);
+        let cfg = DeviationBlockConfig {
+            num_internal_knots: 4,
+            ..DeviationBlockConfig::default()
+        };
+        let score_prepared = build_score_warp_deviation_block_from_seed(&z, &cfg)
+            .expect("score-warp deviation block");
+        let q_seed = Array1::from_iter(z.iter().map(|zi| 0.1 + 0.2 * zi));
+        let link_seed = padded_deviation_seed(&q_seed, 1.0, 0.5);
+        let link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
+            &link_seed, &q_seed, &weights, &cfg,
+        )
+        .expect("link-wiggle deviation block");
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(y),
+            weights: Arc::new(weights),
+            z: Arc::new(z),
+            latent_measure: LatentMeasureKind::StandardNormal,
+            gaussian_frailty_sd: None,
+            base_link: bernoulli_marginal_slope_probit_link(),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::ones((n, 1)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::ones((n, 1)),
+            )),
+            score_warp: Some(score_prepared.runtime.clone()),
+            link_dev: Some(link_prepared.runtime.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: new_cell_moment_lru_cache(
+                &crate::resource::ResourcePolicy::default_library(),
+            ),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
+            intercept_warm_starts: None,
+        };
+        let states = vec![
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: Array1::from_iter((0..n).map(|i| 0.08 * ((i as f64) * 0.002).sin())),
+            },
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: Array1::from_iter((0..n).map(|i| 0.30 + 0.03 * ((i as f64) * 0.003).cos())),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(score_prepared.block.design.ncols()),
+                eta: Array1::zeros(n),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(link_prepared.block.design.ncols()),
+                eta: Array1::zeros(n),
+            },
+        ];
+
+        let exact = family
+            .log_likelihood_only_with_options(&states, &BlockwiseFitOptions::default())
+            .expect("exact full FLEX ll");
+        let mut permissive = BlockwiseFitOptions::default();
+        permissive.early_exit_threshold = Some((-exact) + 1.0);
+        let accepted = family
+            .log_likelihood_only_with_options(&states, &permissive)
+            .expect("permissive threshold should compute full FLEX ll");
+        let rel = ((accepted - exact) / exact.abs().max(1.0)).abs();
+        assert!(
+            rel < 1e-10,
+            "accepted early-exit-enabled FLEX LL {accepted} differs from exact {exact} by rel {rel}"
+        );
+
+        let mut rejecting = BlockwiseFitOptions::default();
+        rejecting.early_exit_threshold = Some(1e-6);
+        let err = family
+            .log_likelihood_only_with_options(&states, &rejecting)
+            .expect_err("tight threshold should reject before the full FLEX row sweep");
+        assert!(
+            err.contains("line-search rejected early"),
+            "unexpected early-exit error: {err}"
+        );
     }
 
     #[test]
@@ -17818,6 +17979,52 @@ mod tests {
             },
         ];
         (family, states)
+    }
+
+    #[test]
+    fn bernoulli_flex_paired_subsample_ll_delta_sign_matches_full_ll() {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+
+        let (family, old_states) = make_flex_hvp_cache_test_family(96);
+        let mut trial_states = old_states.clone();
+        trial_states[0].beta[0] += 0.015;
+        trial_states[0].eta += 0.015;
+        trial_states[1].beta[1] -= 0.01;
+        let logslope_col =
+            Array1::from_iter((0..96).map(|i| 0.3 - 0.6 * ((i * 23 + 11) % 96) as f64 / 96.0));
+        trial_states[1].eta.scaled_add(-0.01, &logslope_col);
+
+        let full_old = family
+            .log_likelihood_only(&old_states)
+            .expect("full old ll");
+        let full_trial = family
+            .log_likelihood_only(&trial_states)
+            .expect("full trial ll");
+
+        let mut opts = BlockwiseFitOptions::default();
+        opts.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            (0..96).step_by(2).collect(),
+            96,
+            0x5EED5EED,
+        )));
+        let sub_old = family
+            .log_likelihood_only_with_options(&old_states, &opts)
+            .expect("subsample old ll");
+        let sub_trial = family
+            .log_likelihood_only_with_options(&trial_states, &opts)
+            .expect("subsample trial ll");
+
+        let full_delta = full_trial - full_old;
+        let sub_delta = sub_trial - sub_old;
+        assert!(
+            full_delta.abs() > 1e-8,
+            "synthetic beta-pair should produce a non-degenerate full-LL delta: {full_delta}"
+        );
+        assert_eq!(
+            full_delta.is_sign_positive(),
+            sub_delta.is_sign_positive(),
+            "paired subsample LL delta sign ({sub_delta}) should match full LL delta sign ({full_delta})"
+        );
     }
 
     #[test]
