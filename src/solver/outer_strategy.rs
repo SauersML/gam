@@ -413,7 +413,7 @@ pub enum Derivative {
 ///   declaration and the seed loop branched on `seed_eval.hessian`.
 /// - `Unavailable`: no analytic Hessian. The planner picks BFGS / EFS
 ///   per the gradient declaration and the rest of the capability.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DeclaredHessianForm {
     Dense,
     Operator {
@@ -571,7 +571,11 @@ impl OuterThetaLayout {
 #[derive(Clone, Debug)]
 pub struct OuterCapability {
     pub gradient: Derivative,
-    pub hessian: Derivative,
+    /// Declared shape of the analytic Hessian (or its absence). Replaces
+    /// the binary `Derivative` so the planner can route between dense
+    /// ARC and matrix-free trust-region *before* seed evaluation. See
+    /// [`DeclaredHessianForm`].
+    pub hessian: DeclaredHessianForm,
     /// Number of smoothing (+ any auxiliary hyper-) parameters being optimized.
     pub n_params: usize,
     /// Number of ψ (design-moving) coordinates among the extended
@@ -667,9 +671,10 @@ impl OuterCapability {
     }
 
     fn declared_hessian_for_planning(&self) -> Derivative {
-        match self.hessian {
-            Derivative::Analytic => Derivative::Analytic,
-            Derivative::Unavailable => Derivative::Unavailable,
+        if self.hessian.is_analytic() {
+            Derivative::Analytic
+        } else {
+            Derivative::Unavailable
         }
     }
 }
@@ -3420,7 +3425,7 @@ impl Default for OuterConfig {
 pub struct OuterProblem {
     n_params: usize,
     gradient: Derivative,
-    hessian: Derivative,
+    hessian: DeclaredHessianForm,
     prefer_gradient_only: bool,
     disable_fixed_point: bool,
     psi_dim: usize,
@@ -3444,7 +3449,7 @@ impl OuterProblem {
         Self {
             n_params,
             gradient: Derivative::Unavailable,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             prefer_gradient_only: false,
             disable_fixed_point: false,
             psi_dim: 0,
@@ -3468,8 +3473,8 @@ impl OuterProblem {
         self.gradient = d;
         self
     }
-    pub fn with_hessian(mut self, d: Derivative) -> Self {
-        self.hessian = d;
+    pub fn with_hessian(mut self, form: DeclaredHessianForm) -> Self {
+        self.hessian = form;
         self
     }
     pub fn with_prefer_gradient_only(mut self, prefer_gradient_only: bool) -> Self {
@@ -4856,7 +4861,7 @@ mod tests {
     fn plan_analytic_hessian_selects_arc() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Analytic,
+            hessian: DeclaredHessianForm::Either,
             n_params: 3,
             psi_dim: 0,
             fixed_point_available: false,
@@ -4873,7 +4878,7 @@ mod tests {
     fn plan_prefer_gradient_only_does_not_hide_analytic_hessian() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Analytic,
+            hessian: DeclaredHessianForm::Either,
             n_params: 3,
             psi_dim: 1,
             fixed_point_available: true,
@@ -4890,7 +4895,7 @@ mod tests {
     fn plan_survival_baseline_exact_hessian_selects_arc() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Analytic,
+            hessian: DeclaredHessianForm::Either,
             n_params: 3,
             psi_dim: 0,
             fixed_point_available: false,
@@ -4907,7 +4912,7 @@ mod tests {
     fn plan_no_hessian_few_params_selects_bfgs() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             n_params: 3,
             psi_dim: 0,
             fixed_point_available: false,
@@ -4924,7 +4929,7 @@ mod tests {
     fn plan_no_hessian_many_params_selects_bfgs() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             n_params: 12,
             psi_dim: 0,
             fixed_point_available: false,
@@ -4941,7 +4946,7 @@ mod tests {
     fn plan_boundary_8_params_uses_bfgs() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             n_params: SMALL_OUTER_BFGS_MAX_PARAMS,
             psi_dim: 0,
             fixed_point_available: false,
@@ -4958,7 +4963,7 @@ mod tests {
     fn plan_boundary_9_params_uses_bfgs() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             n_params: SMALL_OUTER_BFGS_MAX_PARAMS + 1,
             psi_dim: 0,
             fixed_point_available: false,
@@ -4975,7 +4980,7 @@ mod tests {
     fn plan_efs_selected_for_penalty_like_many_params() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             n_params: 15,
             psi_dim: 0,
             fixed_point_available: true,
@@ -4992,7 +4997,7 @@ mod tests {
     fn plan_penalty_like_without_fixed_point_stays_bfgs() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             n_params: 15,
             psi_dim: 0,
             fixed_point_available: false,
@@ -5009,7 +5014,7 @@ mod tests {
     fn plan_efs_not_selected_few_params_even_if_penalty_like() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             n_params: 5,
             psi_dim: 0,
             fixed_point_available: true,
@@ -5026,7 +5031,7 @@ mod tests {
     fn plan_efs_not_selected_with_analytic_hessian() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Analytic,
+            hessian: DeclaredHessianForm::Either,
             n_params: 20,
             psi_dim: 0,
             fixed_point_available: true,
@@ -5045,7 +5050,7 @@ mod tests {
         // need the gradient at all.
         let cap = OuterCapability {
             gradient: Derivative::Unavailable,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             n_params: 20,
             psi_dim: 0,
             fixed_point_available: true,
@@ -5070,7 +5075,7 @@ mod tests {
         };
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             n_params: 15,
             psi_dim: 0,
             fixed_point_available: true,
@@ -5095,7 +5100,7 @@ mod tests {
         };
         let cap = OuterCapability {
             gradient: Derivative::Unavailable,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             n_params: 20,
             psi_dim: 0,
             fixed_point_available: true,
@@ -5146,7 +5151,7 @@ mod tests {
     fn zero_params_selects_arc() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Analytic,
+            hessian: DeclaredHessianForm::Either,
             n_params: 0,
             psi_dim: 0,
             fixed_point_available: false,
@@ -5175,7 +5180,7 @@ mod tests {
             state: 42_i32,
             cap: OuterCapability {
                 gradient: Derivative::Analytic,
-                hessian: Derivative::Unavailable,
+                hessian: DeclaredHessianForm::Unavailable,
                 n_params: 1,
                 psi_dim: 0,
                 fixed_point_available: false,
@@ -5208,7 +5213,7 @@ mod tests {
     fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             n_params: 12,
             psi_dim: 1,
             fixed_point_available: true,
@@ -5282,7 +5287,7 @@ mod tests {
         let seen_orders = Arc::new(Mutex::new(Vec::new()));
         let problem = OuterProblem::new(1)
             .with_gradient(Derivative::Analytic)
-            .with_hessian(Derivative::Unavailable)
+            .with_hessian(DeclaredHessianForm::Unavailable)
             .with_initial_rho(array![1.0])
             .with_max_iter(1);
         let mut obj = problem.build_objective_with_eval_order(
@@ -5329,7 +5334,7 @@ mod tests {
         let seen_orders = Arc::new(Mutex::new(Vec::new()));
         let problem = OuterProblem::new(1)
             .with_gradient(Derivative::Analytic)
-            .with_hessian(Derivative::Analytic);
+            .with_hessian(DeclaredHessianForm::Either);
         let mut obj = problem.build_objective_with_eval_order(
             (),
             |_: &mut (), theta: &Array1<f64>| Ok(theta[0] * theta[0]),
@@ -5398,7 +5403,7 @@ mod tests {
     fn analytic_route_unavailable_hessian_is_fatal() {
         let problem = OuterProblem::new(1)
             .with_gradient(Derivative::Analytic)
-            .with_hessian(Derivative::Analytic);
+            .with_hessian(DeclaredHessianForm::Either);
         let mut obj = problem.build_objective_with_eval_order(
             (),
             |_: &mut (), theta: &Array1<f64>| Ok(theta[0] * theta[0]),
@@ -5467,7 +5472,7 @@ mod tests {
         // instead of falling back to BFGS.
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             n_params: 15,
             psi_dim: 1,
             fixed_point_available: true,
@@ -5484,7 +5489,7 @@ mod tests {
     fn plan_psi_without_fixed_point_stays_bfgs() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             n_params: 15,
             psi_dim: 1,
             fixed_point_available: false,
@@ -5503,7 +5508,7 @@ mod tests {
         // gradient is computed internally by the unified evaluator.
         let cap = OuterCapability {
             gradient: Derivative::Unavailable,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             n_params: 15,
             psi_dim: 1,
             fixed_point_available: true,
@@ -5686,7 +5691,7 @@ mod tests {
         // ARC instead of selecting HybridEFS.
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Analytic,
+            hessian: DeclaredHessianForm::Either,
             n_params: 37,
             psi_dim: 31,
             fixed_point_available: true,
@@ -5714,7 +5719,7 @@ mod tests {
     fn plan_hybrid_efs_not_selected_few_params() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             n_params: 5,
             psi_dim: 1,
             fixed_point_available: true,
@@ -5736,7 +5741,7 @@ mod tests {
         // evaluator advertises second-order capability.
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Analytic,
+            hessian: DeclaredHessianForm::Either,
             n_params: 64,
             psi_dim: 16,
             fixed_point_available: true,
@@ -5755,7 +5760,7 @@ mod tests {
         // even with ψ coordinates.
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Analytic,
+            hessian: DeclaredHessianForm::Either,
             n_params: 20,
             psi_dim: 1,
             fixed_point_available: true,
@@ -5773,7 +5778,7 @@ mod tests {
         // even if has_psi_coords is false.
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             n_params: 15,
             psi_dim: 0,
             fixed_point_available: true,
@@ -5799,7 +5804,7 @@ mod tests {
         // sees the genuine analytic-Hessian non-convergence verbatim.
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Analytic,
+            hessian: DeclaredHessianForm::Either,
             n_params: 12,
             psi_dim: 0,
             fixed_point_available: false,
@@ -5825,7 +5830,7 @@ mod tests {
         // guarding against.
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             n_params: 15,
             psi_dim: 0,
             fixed_point_available: true,
@@ -5852,7 +5857,7 @@ mod tests {
     fn automatic_fallbacks_from_hybrid_efs_prefer_analytic_bfgs_over_fd() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             n_params: 15,
             psi_dim: 2,
             fixed_point_available: true,
@@ -5882,7 +5887,7 @@ mod tests {
         // `.with_disable_fixed_point(true)`.
         let trapped_cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             n_params: 9,
             psi_dim: 6,
             fixed_point_available: true,
@@ -5947,7 +5952,7 @@ mod tests {
         let efs_calls = Arc::new(AtomicUsize::new(0));
         let problem = OuterProblem::new(9)
             .with_gradient(Derivative::Analytic)
-            .with_hessian(Derivative::Unavailable)
+            .with_hessian(DeclaredHessianForm::Unavailable)
             .with_psi_dim(6)
             .with_fallback_policy(FallbackPolicy::Disabled)
             .with_initial_rho(Array1::zeros(9))
@@ -5991,7 +5996,7 @@ mod tests {
         for (psi_dim, expected_solver) in [(0, Solver::Efs), (2, Solver::HybridEfs)] {
             let cap = OuterCapability {
                 gradient: Derivative::Unavailable,
-                hessian: Derivative::Unavailable,
+                hessian: DeclaredHessianForm::Unavailable,
                 n_params: 15,
                 psi_dim,
                 fixed_point_available: true,
@@ -6019,7 +6024,7 @@ mod tests {
         // ARC budget-bump retry ladder owns recovery.
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Analytic,
+            hessian: DeclaredHessianForm::Either,
             n_params: 15,
             psi_dim: 0,
             fixed_point_available: true,
@@ -6041,7 +6046,7 @@ mod tests {
     fn plan_disable_fixed_point_forces_bfgs_even_when_efs_eligible() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             n_params: 15,
             psi_dim: 0,
             fixed_point_available: true,
@@ -6062,7 +6067,7 @@ mod tests {
         // disabled in production.
         let problem = OuterProblem::new(2)
             .with_gradient(Derivative::Analytic)
-            .with_hessian(Derivative::Unavailable)
+            .with_hessian(DeclaredHessianForm::Unavailable)
             .with_initial_rho(Array1::zeros(2))
             .with_max_iter(1);
         let mut obj = problem.build_objective(
@@ -6091,7 +6096,7 @@ mod tests {
     fn run_bfgs_ignores_malformed_hessian_payload() {
         let problem = OuterProblem::new(1)
             .with_gradient(Derivative::Analytic)
-            .with_hessian(Derivative::Unavailable)
+            .with_hessian(DeclaredHessianForm::Unavailable)
             .with_initial_rho(array![0.0])
             .with_max_iter(1);
         let mut obj = problem.build_objective(
@@ -6155,7 +6160,7 @@ mod tests {
         seed_config.seed_budget = 1;
         let problem = OuterProblem::new(1)
             .with_gradient(Derivative::Analytic)
-            .with_hessian(Derivative::Unavailable)
+            .with_hessian(DeclaredHessianForm::Unavailable)
             .with_seed_config(seed_config)
             .with_initial_rho(initial_seed)
             .with_max_iter(1);
@@ -6197,7 +6202,7 @@ mod tests {
         seed_config.seed_budget = 1;
         let problem = OuterProblem::new(1)
             .with_gradient(Derivative::Analytic)
-            .with_hessian(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Either)
             .with_seed_config(seed_config)
             .with_initial_rho(array![0.0])
             .with_max_iter(1);
@@ -6235,7 +6240,7 @@ mod tests {
         seed_config.seed_budget = 1;
         let problem = OuterProblem::new(1)
             .with_gradient(Derivative::Analytic)
-            .with_hessian(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Either)
             .with_seed_config(seed_config)
             .with_initial_rho(array![0.0])
             .with_max_iter(1);
@@ -6287,7 +6292,7 @@ mod tests {
         seed_config.seed_budget = 1;
         let problem = OuterProblem::new(1)
             .with_gradient(Derivative::Analytic)
-            .with_hessian(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Either)
             .with_seed_config(seed_config)
             .with_initial_rho(array![5.0])
             .with_max_iter(1);
@@ -6396,7 +6401,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let problem = OuterProblem::new(1)
             .with_gradient(Derivative::Analytic)
-            .with_hessian(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Either)
             .with_seed_config(seed_config)
             .with_max_iter(1);
         let mut obj = problem.build_objective(
@@ -6450,7 +6455,7 @@ mod tests {
         let started = Arc::new(Mutex::new(Vec::new()));
         let problem = OuterProblem::new(1)
             .with_gradient(Derivative::Analytic)
-            .with_hessian(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Either)
             .with_seed_config(seed_config)
             .with_screening_cap(Arc::clone(&screening_cap))
             .with_initial_rho(initial_seed.clone())
@@ -6521,7 +6526,7 @@ mod tests {
         let max_cap_seen = Arc::new(AtomicUsize::new(0));
         let problem = OuterProblem::new(1)
             .with_gradient(Derivative::Analytic)
-            .with_hessian(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Either)
             .with_seed_config(seed_config)
             .with_screening_cap(Arc::clone(&screening_cap))
             .with_initial_rho(initial_seed.clone())
@@ -6591,7 +6596,7 @@ mod tests {
         let screening_calls = Arc::new(AtomicUsize::new(0));
         let problem = OuterProblem::new(15)
             .with_gradient(Derivative::Unavailable)
-            .with_hessian(Derivative::Unavailable)
+            .with_hessian(DeclaredHessianForm::Unavailable)
             .with_seed_config(seed_config)
             .with_max_iter(1);
         let mut obj = problem.build_objective(
@@ -6644,7 +6649,7 @@ mod tests {
         seed_config.seed_budget = 1;
         let problem = OuterProblem::new(15)
             .with_gradient(Derivative::Analytic)
-            .with_hessian(Derivative::Unavailable)
+            .with_hessian(DeclaredHessianForm::Unavailable)
             .with_seed_config(seed_config)
             .with_initial_rho(invalid_seed)
             .with_max_iter(1);
@@ -6686,7 +6691,7 @@ mod tests {
         let efs_calls = Arc::new(AtomicUsize::new(0));
         let problem = OuterProblem::new(12)
             .with_gradient(Derivative::Analytic)
-            .with_hessian(Derivative::Unavailable)
+            .with_hessian(DeclaredHessianForm::Unavailable)
             .with_seed_config(seed_config)
             .with_initial_rho(Array1::zeros(12))
             .with_max_iter(5);
@@ -6727,7 +6732,7 @@ mod tests {
     fn run_rejects_invalid_theta_layout() {
         let problem = OuterProblem::new(1)
             .with_gradient(Derivative::Analytic)
-            .with_hessian(Derivative::Unavailable)
+            .with_hessian(DeclaredHessianForm::Unavailable)
             .with_psi_dim(2)
             .with_initial_rho(Array1::zeros(1))
             .with_max_iter(1);
@@ -6807,7 +6812,7 @@ mod tests {
     fn aux_cap_unavailable(n_params: usize) -> OuterCapability {
         OuterCapability {
             gradient: Derivative::Unavailable,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             n_params,
             psi_dim: 0,
             fixed_point_available: false,
@@ -6841,7 +6846,7 @@ mod tests {
         // routed to direct search when a derivative-based solver exists.
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Analytic,
+            hessian: DeclaredHessianForm::Either,
             n_params: 3,
             psi_dim: 0,
             fixed_point_available: false,
@@ -6860,7 +6865,7 @@ mod tests {
         // search whenever it applies.
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
             n_params: 12,
             psi_dim: 0,
             fixed_point_available: true,
@@ -6879,7 +6884,7 @@ mod tests {
         // method; its dispatch is orthogonal to the fallback ladder.
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Analytic,
+            hessian: DeclaredHessianForm::Either,
             n_params: 5,
             psi_dim: 0,
             fixed_point_available: false,

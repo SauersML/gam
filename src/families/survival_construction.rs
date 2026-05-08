@@ -550,7 +550,7 @@ where
     F: FnMut(&SurvivalBaselineConfig) -> Result<(f64, Array1<f64>, Array2<f64>), String>,
 {
     use crate::solver::outer_strategy::{
-        Derivative, HessianResult, OuterEval, OuterProblem, SolverClass,
+        DeclaredHessianForm, Derivative, HessianResult, OuterEval, OuterProblem, SolverClass,
     };
     let Some(seed) = survival_baseline_theta_from_config(initial)? else {
         return Ok(initial.clone());
@@ -561,7 +561,7 @@ where
     let upper = seed.mapv(|v| v + 6.0);
     let problem = OuterProblem::new(dim)
         .with_gradient(Derivative::Analytic)
-        .with_hessian(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Either)
         .with_solver_class(SolverClass::Primary)
         .with_tolerance(1e-4)
         .with_max_iter(240)
