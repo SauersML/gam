@@ -872,7 +872,6 @@ fn effective_branch_tol(cell: DenestedCubicCell) -> f64 {
     NORMALIZED_CELL_BRANCH_TOL * anchor_scale
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DenestedCubicCell {
     pub left: f64,
@@ -2897,7 +2896,6 @@ pub fn evaluate_affine_cell_state_with_scratch<'a>(
         moments: out,
     })
 }
-
 
 fn evaluate_non_affine_cell_state(
     cell: DenestedCubicCell,
