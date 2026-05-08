@@ -16975,7 +16975,15 @@ mod tests {
     #[test]
     fn outer_lamlhessian_joint_exact_binomial_location_scale_matchesfd() {
         let n = 10usize;
-        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]);
+        // Asymmetric y (6 ones / 4 zeros). A balanced 5/5 vector forces
+        // β̂_threshold = 0 by probit-link symmetry, which makes the joint
+        // observed Hessian block-diagonal in (threshold, log_sigma) at the
+        // inner mode. The outer LAML Hessian off-diagonals are then ~1e-11,
+        // below the central-FD noise floor (≈ pirls_tol / h) at h=1e-5, so
+        // FD-vs-analytic agreement cannot be enforced. Asymmetric y gives
+        // β̂_threshold ≠ 0, coupling the (β_0, β_1) blocks through the
+        // observed-information weights and making all four entries validatable.
+        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0]);
         let weights = Array1::from_elem(n, 1.0);
         let thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
