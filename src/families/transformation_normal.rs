@@ -14820,6 +14820,26 @@ struct TransformationExactGeometryCache {
     derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
 }
 
+#[derive(Clone)]
+struct TransformationExactWarmStart {
+    theta: Array1<f64>,
+    warm_start: CustomFamilyWarmStart,
+}
+
+impl TransformationExactWarmStart {
+    fn is_compatible_with(&self, theta: &Array1<f64>, rho: &Array1<f64>) -> bool {
+        const MAX_THETA_DISTANCE: f64 = 1.5;
+
+        self.theta.len() == theta.len()
+            && self
+                .theta
+                .iter()
+                .zip(theta.iter())
+                .all(|(&a, &b)| (a - b).abs() <= MAX_THETA_DISTANCE)
+            && self.warm_start.compatible_with_rho(rho)
+    }
+}
+
 impl TransformationExactGeometryCache {
     fn update_initial_log_lambdas(&mut self, log_lambdas: &Array1<f64>) -> Result<(), String> {
         let spec = self
@@ -15081,7 +15101,7 @@ pub fn fit_transformation_normal(
     }
 
     // Shared mutable state for warm-starting across optimizer iterations.
-    let exact_warm_start: RefCell<Option<CustomFamilyWarmStart>> = RefCell::new(None);
+    let exact_warm_start: RefCell<Option<TransformationExactWarmStart>> = RefCell::new(None);
 
     let joint_setup =
         ExactJointHyperSetup::new(rho0, rho_lower, rho_upper, kappa0, kappa_lower, kappa_upper);
@@ -15169,12 +15189,21 @@ pub fn fit_transformation_normal(
         Ok(())
     };
 
-    let compatible_warm_start = |rho: &Array1<f64>| -> Option<CustomFamilyWarmStart> {
+    let compatible_warm_start =
+        |theta: &Array1<f64>, rho: &Array1<f64>| -> Option<CustomFamilyWarmStart> {
+            exact_warm_start
+                .borrow()
+                .as_ref()
+                .filter(|warm| warm.is_compatible_with(theta, rho))
+                .map(|warm| warm.warm_start.clone())
+        };
+    let store_warm_start = |theta: &Array1<f64>, warm_start: CustomFamilyWarmStart| {
         exact_warm_start
-            .borrow()
-            .as_ref()
-            .filter(|warm| warm.compatible_with_rho(rho))
-            .cloned()
+            .borrow_mut()
+            .replace(TransformationExactWarmStart {
+                theta: theta.clone(),
+                warm_start,
+            });
     };
 
     log::info!(
@@ -15206,7 +15235,7 @@ pub fn fit_transformation_normal(
                 .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             geometry.update_initial_log_lambdas(&rho)?;
-            let warm_start = compatible_warm_start(&rho);
+            let warm_start = compatible_warm_start(theta, &rho);
             let fit = fit_custom_family_fixed_log_lambdas(
                 &geometry.family,
                 &geometry.blocks,
@@ -15260,7 +15289,7 @@ pub fn fit_transformation_normal(
                 .as_mut()
                 .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
-            let warm_start = compatible_warm_start(&rho);
+            let warm_start = compatible_warm_start(theta, &rho);
 
             let eval = evaluate_custom_family_joint_hyper(
                 &geometry.family,
@@ -15283,7 +15312,13 @@ pub fn fit_transformation_normal(
             }
 
             if eval.objective.is_finite() && eval.gradient.iter().all(|value| value.is_finite()) {
-                *exact_warm_start.borrow_mut() = Some(eval.warm_start.clone());
+                store_warm_start(theta, eval.warm_start.clone());
+            }
+
+            if !eval.inner_converged {
+                return Err(format!(
+                    "transformation exact joint inner solve did not converge for eval_mode={eval_mode:?}; cached warm start for retry"
+                ));
             }
 
             Ok((eval.objective, eval.gradient, eval.outer_hessian))
@@ -15295,7 +15330,7 @@ pub fn fit_transformation_normal(
                 .as_mut()
                 .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
-            let warm_start = compatible_warm_start(&rho);
+            let warm_start = compatible_warm_start(theta, &rho);
             let eval = evaluate_custom_family_joint_hyper_efs(
                 &geometry.family,
                 &geometry.blocks,
@@ -15305,7 +15340,13 @@ pub fn fit_transformation_normal(
                 warm_start.as_ref(),
             )
             .map_err(|e| format!("transformation exact_efs_fn: {e}"))?;
-            *exact_warm_start.borrow_mut() = Some(eval.warm_start.clone());
+            store_warm_start(theta, eval.warm_start.clone());
+            if !eval.inner_converged {
+                return Err(
+                    "transformation exact joint EFS inner solve did not converge; cached warm start for retry"
+                        .to_string(),
+                );
+            }
             Ok(eval.efs_eval)
         },
     )?;
