@@ -89,7 +89,6 @@ preds = est.predict([{"x": 1.5}, {"x": 2.5}])
 | `gamfit.explain_error(exc)` | Convert a `gamfit` exception into a human-readable hint. |
 | `gamfit.Model` | Fitted-model handle: `predict`, `summary`, `check`, `diagnose`, `plot`, `report`, `save`. |
 | `gamfit.sklearn.GAMRegressor` / `GAMClassifier` | scikit-learn-compatible estimators. |
-| `gamfit.pgs` | Polygenic-score helpers. |
 
 See the [project documentation](https://github.com/SauersML/gam) for the
 full guide, the formula DSL reference, and the CLI.
