@@ -1875,7 +1875,7 @@ where
         ));
     } else if mixture_dim == 0 && sas_dim == 0 {
         use crate::solver::outer_strategy::{
-            Derivative, InnerProgressFeedback, OuterEvalOrder, OuterProblem,
+            DeclaredHessianForm, Derivative, InnerProgressFeedback, OuterEvalOrder, OuterProblem,
         };
 
         let analytic_outer_hessian_available = reml_state.analytic_outer_hessian_enabled();
@@ -1897,9 +1897,9 @@ where
         let problem = OuterProblem::new(k)
             .with_gradient(Derivative::Analytic)
             .with_hessian(if analytic_outer_hessian_available {
-                Derivative::Analytic
+                DeclaredHessianForm::Either
             } else {
-                Derivative::Unavailable
+                DeclaredHessianForm::Unavailable
             })
             .with_barrier(self::reml::unified::BarrierConfig::from_constraints(
                 fit_linear_constraints.as_ref(),
