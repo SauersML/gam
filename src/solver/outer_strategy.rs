@@ -201,11 +201,7 @@ pub trait OuterHessianOperator: Send + Sync {
     /// over a 50-outer-iter × 30-CG-iter solve at n=200 the default
     /// path allocates 1500 transient `Array1<f64>` of size 200 that
     /// the override eliminates.
-    fn apply_into(
-        &self,
-        v: &Array1<f64>,
-        out: &mut Array1<f64>,
-    ) -> Result<(), String> {
+    fn apply_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<(), String> {
         let result = self.matvec(v)?;
         if result.len() != out.len() {
             return Err(format!(

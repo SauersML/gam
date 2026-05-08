@@ -438,9 +438,10 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
             .into_par_iter()
             .map(|row| -> f64 {
                 let dir_k = self.kern.jacobian_action(row, direction);
-                let third = self.kern.row_third_contracted(row, &dir_k).expect(
-                    "row-kernel third contraction should succeed for validated directions",
-                );
+                let third = self
+                    .kern
+                    .row_third_contracted(row, &dir_k)
+                    .expect("row-kernel third contraction should succeed for validated directions");
                 let mut row_total = 0.0_f64;
                 for k_col in 0..rank {
                     let f_slice = f_t
