@@ -2079,12 +2079,13 @@ where
         let mut reml_seed_config_mix = reml_seed_config.clone();
         reml_seed_config_mix.num_auxiliary_trailing = aux_dim_outer;
         use crate::solver::outer_strategy::{
-            Derivative, HessianResult, InnerProgressFeedback, OuterEval, OuterProblem,
+            DeclaredHessianForm, Derivative, HessianResult, InnerProgressFeedback, OuterEval,
+            OuterProblem,
         };
         let initial_link_kind = cfg.link_kind.clone();
         let problem = OuterProblem::new(theta_dim)
             .with_gradient(Derivative::Analytic)
-            .with_hessian(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Either)
             .with_psi_dim(mixture_dim + sas_dim)
             .with_barrier(self::reml::unified::BarrierConfig::from_constraints(
                 fit_linear_constraints.as_ref(),
