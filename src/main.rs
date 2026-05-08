@@ -10930,6 +10930,7 @@ mod tests {
             design_noise: None,
             offset_noise: None,
             auxiliary_scalar: None,
+            auxiliary_matrix: None,
         };
         let out = predictor
             .predict_posterior_mean(&input, &fit, Some(0.95))

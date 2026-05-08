@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use ndarray::Array1;
+use ndarray::{Array1, Array2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::basis::{
@@ -84,6 +84,7 @@ pub fn build_predict_input_for_model(
                 design_noise: None,
                 offset_noise: None,
                 auxiliary_scalar: None,
+                auxiliary_matrix: None,
             })
         }
         PredictModelClass::GaussianLocationScale | PredictModelClass::BinomialLocationScale => {
@@ -118,6 +119,7 @@ pub fn build_predict_input_for_model(
                 design_noise: Some(prepared_noise_design),
                 offset_noise: Some(offset_noise.clone()),
                 auxiliary_scalar: None,
+                auxiliary_matrix: None,
             })
         }
         PredictModelClass::BernoulliMarginalSlope => {
@@ -135,12 +137,58 @@ pub fn build_predict_input_for_model(
             )?;
             let design_logslope = build_term_collection_design(design_input, &spec_logslope)
                 .map_err(|e| format!("failed to build logslope prediction design: {e}"))?;
+            let auxiliary_matrix = match model.payload().latent_measure.as_ref() {
+                Some(crate::families::bernoulli_marginal_slope::LatentMeasureKind::LocalEmpirical {
+                    feature_cols,
+                    input_scales,
+                    ..
+                }) => {
+                    let mut conditioning = Array2::<f64>::zeros((n, feature_cols.len()));
+                    for (local_col, &feature_col) in feature_cols.iter().enumerate() {
+                        if feature_col >= design_input.ncols() {
+                            return Err(format!(
+                                "local empirical latent prediction feature column {feature_col} is out of bounds for {} columns",
+                                design_input.ncols()
+                            ));
+                        }
+                        conditioning
+                            .column_mut(local_col)
+                            .assign(&design_input.column(feature_col));
+                    }
+                    if let Some(scales) = input_scales.as_ref() {
+                        if scales.len() != feature_cols.len() {
+                            return Err(format!(
+                                "local empirical latent prediction input scale dimension mismatch: scales={}, features={}",
+                                scales.len(),
+                                feature_cols.len()
+                            ));
+                        }
+                        for (col, &scale) in scales.iter().enumerate() {
+                            if !(scale.is_finite() && scale > 0.0) {
+                                return Err(format!(
+                                    "local empirical latent prediction input scale {col} must be finite and positive, got {scale}"
+                                ));
+                            }
+                            conditioning.column_mut(col).mapv_inplace(|value| value / scale);
+                        }
+                    }
+                    if conditioning.iter().any(|value| !value.is_finite()) {
+                        return Err(
+                            "local empirical latent prediction conditioning values must be finite"
+                                .to_string(),
+                        );
+                    }
+                    Some(conditioning)
+                }
+                _ => None,
+            };
             Ok(PredictInput {
                 design: design.design.clone(),
                 offset: offset.clone(),
                 design_noise: Some(design_logslope.design.clone()),
                 offset_noise: Some(offset_noise.clone()),
                 auxiliary_scalar: Some(z),
+                auxiliary_matrix,
             })
         }
         PredictModelClass::Survival => Err(
@@ -367,6 +415,7 @@ pub fn build_predict_input_for_model(
                 design_noise: None,
                 offset_noise: None,
                 auxiliary_scalar: None,
+                auxiliary_matrix: None,
             })
         }
     }

@@ -29,17 +29,18 @@ use crate::probability::{
     normal_cdf, normal_pdf, signed_probit_logcdf_and_mills_ratio, standard_normal_quantile,
 };
 use crate::smooth::{
-    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
-    TermCollectionDesign, TermCollectionSpec, build_term_collection_designs_and_freeze_joint,
-    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
+    ExactJointHyperSetup, SmoothBasisSpec, SpatialLengthScaleOptimizationOptions,
+    SpatialLogKappaCoords, TermCollectionDesign, TermCollectionSpec,
+    build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
+    spatial_length_scale_term_indices,
 };
 use crate::types::{InverseLink, LinkFunction, WigglePenaltyConfig};
 use ndarray::{Array1, Array2, ArrayView2, s};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 mod deviation_runtime;
 pub(crate) mod exact_kernel;
@@ -178,7 +179,13 @@ pub enum LatentZNormalizationMode {
     Frozen { mean: f64, sd: f64 },
 }
 
-pub const DEFAULT_EMPIRICAL_LATENT_GRID_SIZE: usize = 101;
+pub const DEFAULT_EMPIRICAL_LATENT_GRID_SIZE: usize = 65;
+const DEFAULT_LOCAL_EMPIRICAL_LATENT_TOP_K: usize = 4;
+const DEFAULT_LOCAL_EMPIRICAL_LATENT_BANDWIDTH: f64 = 1.0;
+const AUTO_Z_NORMAL_SKEW_TOL: f64 = 0.10;
+const AUTO_Z_NORMAL_KURT_TOL: f64 = 0.25;
+const AUTO_Z_NORMAL_KS_TOL: f64 = 0.025;
+const AUTO_Z_NORMAL_MAX_ABS: f64 = 8.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LatentMeasureSpec {
@@ -208,10 +215,30 @@ impl Default for LatentMeasureSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EmpiricalZGrid {
+    pub nodes: Vec<f64>,
+    pub weights: Vec<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum LatentMeasureKind {
     StandardNormal,
-    GlobalEmpirical { nodes: Vec<f64>, weights: Vec<f64> },
+    GlobalEmpirical {
+        nodes: Vec<f64>,
+        weights: Vec<f64>,
+    },
+    LocalEmpirical {
+        feature_cols: Vec<usize>,
+        #[serde(default)]
+        input_scales: Option<Vec<f64>>,
+        centers: Vec<Vec<f64>>,
+        grids: Vec<EmpiricalZGrid>,
+        top_k: usize,
+        bandwidth: f64,
+        #[serde(skip)]
+        train_row_mixtures: Arc<Vec<Vec<(usize, f64)>>>,
+    },
 }
 
 impl Default for LatentMeasureKind {
@@ -225,54 +252,189 @@ impl LatentMeasureKind {
         match self {
             Self::StandardNormal => Ok(()),
             Self::GlobalEmpirical { nodes, weights } => {
-                if nodes.len() != weights.len() {
+                validate_empirical_z_grid(nodes, weights, context)
+            }
+            Self::LocalEmpirical {
+                feature_cols,
+                input_scales,
+                centers,
+                grids,
+                top_k,
+                bandwidth,
+                ..
+            } => {
+                if feature_cols.is_empty() {
                     return Err(format!(
-                        "{context} empirical latent measure node/weight length mismatch: nodes={}, weights={}",
-                        nodes.len(),
-                        weights.len()
+                        "{context} local empirical latent measure needs feature columns"
                     ));
                 }
-                if nodes.len() < 2 {
+                if centers.is_empty() {
                     return Err(format!(
-                        "{context} empirical latent measure requires at least two nodes"
+                        "{context} local empirical latent measure needs centers"
                     ));
                 }
-                let mut total = 0.0;
-                for (idx, (&node, &weight)) in nodes.iter().zip(weights.iter()).enumerate() {
-                    if !node.is_finite() {
+                if centers.len() != grids.len() {
+                    return Err(format!(
+                        "{context} local empirical latent measure center/grid length mismatch: centers={}, grids={}",
+                        centers.len(),
+                        grids.len()
+                    ));
+                }
+                if *top_k == 0 || *top_k > centers.len() {
+                    return Err(format!(
+                        "{context} local empirical latent measure top_k must be in 1..={}, got {top_k}",
+                        centers.len()
+                    ));
+                }
+                if !(*bandwidth).is_finite() || *bandwidth <= 0.0 {
+                    return Err(format!(
+                        "{context} local empirical latent measure bandwidth must be finite and positive, got {bandwidth}"
+                    ));
+                }
+                if let Some(scales) = input_scales.as_ref() {
+                    if scales.len() != feature_cols.len() {
                         return Err(format!(
-                            "{context} empirical latent measure node {idx} is non-finite ({node})"
+                            "{context} local empirical latent measure input scale dimension mismatch: scales={}, features={}",
+                            scales.len(),
+                            feature_cols.len()
                         ));
                     }
-                    if !(weight.is_finite() && weight > 0.0) {
+                    for (scale_idx, scale) in scales.iter().enumerate() {
+                        if !(scale.is_finite() && *scale > 0.0) {
+                            return Err(format!(
+                                "{context} local empirical latent measure input scale {scale_idx} must be finite and positive, got {scale}"
+                            ));
+                        }
+                    }
+                }
+                for (center_idx, center) in centers.iter().enumerate() {
+                    if center.len() != feature_cols.len() {
                         return Err(format!(
-                            "{context} empirical latent measure weight {idx} must be finite and positive, got {weight}"
+                            "{context} local empirical latent center {center_idx} dimension mismatch: got {}, expected {}",
+                            center.len(),
+                            feature_cols.len()
                         ));
                     }
-                    total += weight;
+                    if center.iter().any(|value| !value.is_finite()) {
+                        return Err(format!(
+                            "{context} local empirical latent center {center_idx} has non-finite coordinates"
+                        ));
+                    }
                 }
-                if !(total.is_finite() && (total - 1.0).abs() <= 1e-8) {
-                    return Err(format!(
-                        "{context} empirical latent measure weights must sum to 1, got {total}"
-                    ));
+                for (grid_idx, grid) in grids.iter().enumerate() {
+                    validate_empirical_z_grid(
+                        &grid.nodes,
+                        &grid.weights,
+                        &format!("{context} local empirical grid {grid_idx}"),
+                    )?;
                 }
                 Ok(())
             }
         }
     }
 
-    fn empirical_grid(&self) -> Option<(&[f64], &[f64])> {
+    fn is_empirical(&self) -> bool {
+        matches!(
+            self,
+            Self::GlobalEmpirical { .. } | Self::LocalEmpirical { .. }
+        )
+    }
+
+    fn empirical_grid_for_training_row(
+        &self,
+        row: usize,
+    ) -> Result<Option<EmpiricalZGrid>, String> {
         match self {
-            Self::StandardNormal => None,
-            Self::GlobalEmpirical { nodes, weights } => {
-                Some((nodes.as_slice(), weights.as_slice()))
+            Self::StandardNormal => Ok(None),
+            Self::GlobalEmpirical { nodes, weights } => Ok(Some(EmpiricalZGrid {
+                nodes: nodes.clone(),
+                weights: weights.clone(),
+            })),
+            Self::LocalEmpirical {
+                grids,
+                train_row_mixtures,
+                ..
+            } => {
+                let mixture = train_row_mixtures.get(row).ok_or_else(|| {
+                    format!(
+                        "local empirical latent measure is missing training mixture for row {row}"
+                    )
+                })?;
+                Ok(Some(combine_empirical_grids(grids, mixture)?))
             }
         }
     }
+}
 
-    fn is_empirical(&self) -> bool {
-        matches!(self, Self::GlobalEmpirical { .. })
+fn validate_empirical_z_grid(nodes: &[f64], weights: &[f64], context: &str) -> Result<(), String> {
+    if nodes.len() != weights.len() {
+        return Err(format!(
+            "{context} empirical latent measure node/weight length mismatch: nodes={}, weights={}",
+            nodes.len(),
+            weights.len()
+        ));
     }
+    if nodes.len() < 2 {
+        return Err(format!(
+            "{context} empirical latent measure requires at least two nodes"
+        ));
+    }
+    let mut total = 0.0;
+    for (idx, (&node, &weight)) in nodes.iter().zip(weights.iter()).enumerate() {
+        if !node.is_finite() {
+            return Err(format!(
+                "{context} empirical latent measure node {idx} is non-finite ({node})"
+            ));
+        }
+        if !(weight.is_finite() && weight > 0.0) {
+            return Err(format!(
+                "{context} empirical latent measure weight {idx} must be finite and positive, got {weight}"
+            ));
+        }
+        total += weight;
+    }
+    if !(total.is_finite() && (total - 1.0).abs() <= 1e-8) {
+        return Err(format!(
+            "{context} empirical latent measure weights must sum to 1, got {total}"
+        ));
+    }
+    Ok(())
+}
+
+fn combine_empirical_grids(
+    grids: &[EmpiricalZGrid],
+    mixture: &[(usize, f64)],
+) -> Result<EmpiricalZGrid, String> {
+    if mixture.is_empty() {
+        return Err("local empirical latent measure row mixture is empty".to_string());
+    }
+    let mut nodes = Vec::new();
+    let mut weights = Vec::new();
+    for &(grid_idx, grid_weight) in mixture {
+        if !grid_weight.is_finite() || grid_weight <= 0.0 {
+            return Err(format!(
+                "local empirical latent mixture weight must be finite and positive, got {grid_weight}"
+            ));
+        }
+        let grid = grids.get(grid_idx).ok_or_else(|| {
+            format!("local empirical latent mixture references missing grid {grid_idx}")
+        })?;
+        for (&node, &weight) in grid.nodes.iter().zip(grid.weights.iter()) {
+            nodes.push(node);
+            weights.push(grid_weight * weight);
+        }
+    }
+    let total = weights.iter().copied().sum::<f64>();
+    if !(total.is_finite() && total > 0.0) {
+        return Err(
+            "local empirical latent combined grid has non-positive total weight".to_string(),
+        );
+    }
+    for weight in &mut weights {
+        *weight /= total;
+    }
+    validate_empirical_z_grid(&nodes, &weights, "local empirical latent combined grid")?;
+    Ok(EmpiricalZGrid { nodes, weights })
 }
 
 #[derive(Clone, Debug)]
@@ -358,16 +520,35 @@ impl LatentZNormalization {
     }
 }
 
-fn build_latent_measure(
+fn build_latent_measure_with_geometry(
     z: &Array1<f64>,
     weights: &Array1<f64>,
     policy: &LatentZPolicy,
+    data: Option<ArrayView2<'_, f64>>,
+    specs: &[&TermCollectionSpec],
 ) -> Result<LatentMeasureKind, String> {
     match policy.latent_measure {
         LatentMeasureSpec::Auto { grid_size } => {
             if latent_z_is_standard_normal_enough(z, weights, policy)? {
                 Ok(LatentMeasureKind::StandardNormal)
+            } else if let (Some(data), Some(geometry)) =
+                (data, best_latent_score_law_geometry(specs))
+            {
+                log::warn!(
+                    "latent z is not close to standard normal; using local empirical latent-z calibration internally"
+                );
+                build_local_empirical_latent_measure(
+                    z,
+                    weights,
+                    data,
+                    &geometry,
+                    grid_size,
+                    DEFAULT_LOCAL_EMPIRICAL_LATENT_TOP_K,
+                )
             } else {
+                log::warn!(
+                    "latent z is not close to standard normal; using global empirical latent-z calibration internally"
+                );
                 build_global_empirical_latent_measure(z, weights, grid_size)
             }
         }
@@ -443,12 +624,23 @@ fn latent_z_is_standard_normal_enough(
         - 3.0;
     let mean_tol = policy.mean_tol_multiplier / effective_n.sqrt();
     let sd_tol = policy.sd_tol_multiplier / (2.0 * (effective_n - 1.0).max(1.0)).sqrt();
+    let ks_to_normal = weighted_ks_to_standard_normal(z, weights, weight_sum)?;
+    let tail_mass_4 = weighted_tail_mass(z, weights, weight_sum, 4.0);
+    let tail_mass_6 = weighted_tail_mass(z, weights, weight_sum, 6.0);
+    let max_abs_z = z.iter().fold(0.0_f64, |acc, &zi| acc.max(zi.abs()));
+    let normal_tail_4 = 2.0 * (1.0 - normal_cdf(4.0));
+    let normal_tail_6 = 2.0 * (1.0 - normal_cdf(6.0));
     Ok(mean.abs() <= mean_tol
         && (sd - 1.0).abs() <= sd_tol
         && skew.is_finite()
-        && skew.abs() <= policy.max_abs_skew
+        && skew.abs() <= policy.max_abs_skew.min(AUTO_Z_NORMAL_SKEW_TOL)
         && excess_kurtosis.is_finite()
-        && excess_kurtosis.abs() <= policy.max_abs_excess_kurtosis)
+        && excess_kurtosis.abs() <= policy.max_abs_excess_kurtosis.min(AUTO_Z_NORMAL_KURT_TOL)
+        && ks_to_normal.is_finite()
+        && ks_to_normal <= AUTO_Z_NORMAL_KS_TOL
+        && tail_mass_4 <= 2.0 * normal_tail_4 + 1e-5
+        && tail_mass_6 <= 2.0 * normal_tail_6 + 1e-8
+        && max_abs_z < AUTO_Z_NORMAL_MAX_ABS)
 }
 
 fn build_global_empirical_latent_measure(
@@ -456,6 +648,68 @@ fn build_global_empirical_latent_measure(
     weights: &Array1<f64>,
     grid_size: usize,
 ) -> Result<LatentMeasureKind, String> {
+    let grid = build_empirical_z_grid(z, weights, grid_size, "empirical latent measure")?;
+    let measure = LatentMeasureKind::GlobalEmpirical {
+        nodes: grid.nodes,
+        weights: grid.weights,
+    };
+    measure.validate("empirical latent measure")?;
+    Ok(measure)
+}
+
+fn weighted_ks_to_standard_normal(
+    z: &Array1<f64>,
+    weights: &Array1<f64>,
+    total_weight: f64,
+) -> Result<f64, String> {
+    let mut pairs = Vec::<(f64, f64)>::with_capacity(z.len());
+    for (&zi, &wi) in z.iter().zip(weights.iter()) {
+        if !zi.is_finite() || !wi.is_finite() || wi < 0.0 {
+            return Err(
+                "latent-measure KS diagnostic requires finite z and non-negative finite weights"
+                    .to_string(),
+            );
+        }
+        if wi > 0.0 {
+            pairs.push((zi, wi));
+        }
+    }
+    pairs.sort_by(|left, right| {
+        left.0
+            .partial_cmp(&right.0)
+            .expect("validated latent z values are finite")
+    });
+    let mut prev = 0.0;
+    let mut ks = 0.0_f64;
+    for (zi, wi) in pairs {
+        let cdf = normal_cdf(zi);
+        let next = prev + wi / total_weight;
+        ks = ks.max((cdf - prev).abs()).max((cdf - next).abs());
+        prev = next;
+    }
+    Ok(ks)
+}
+
+fn weighted_tail_mass(
+    z: &Array1<f64>,
+    weights: &Array1<f64>,
+    total_weight: f64,
+    cutoff: f64,
+) -> f64 {
+    z.iter()
+        .zip(weights.iter())
+        .filter(|&(&zi, _)| zi.abs() > cutoff)
+        .map(|(_, &wi)| wi)
+        .sum::<f64>()
+        / total_weight
+}
+
+fn build_empirical_z_grid(
+    z: &Array1<f64>,
+    weights: &Array1<f64>,
+    grid_size: usize,
+    context: &str,
+) -> Result<EmpiricalZGrid, String> {
     if grid_size < 3 {
         return Err(format!(
             "empirical latent measure grid_size must be at least 3, got {grid_size}"
@@ -463,7 +717,7 @@ fn build_global_empirical_latent_measure(
     }
     if z.len() != weights.len() {
         return Err(format!(
-            "empirical latent measure length mismatch: z={}, weights={}",
+            "{context} length mismatch: z={}, weights={}",
             z.len(),
             weights.len()
         ));
@@ -472,12 +726,12 @@ fn build_global_empirical_latent_measure(
     for (idx, (&zi, &wi)) in z.iter().zip(weights.iter()).enumerate() {
         if !zi.is_finite() {
             return Err(format!(
-                "empirical latent measure z value at row {idx} is non-finite ({zi})"
+                "{context} z value at row {idx} is non-finite ({zi})"
             ));
         }
         if !wi.is_finite() || wi < 0.0 {
             return Err(format!(
-                "empirical latent measure weight at row {idx} must be finite and non-negative, got {wi}"
+                "{context} weight at row {idx} must be finite and non-negative, got {wi}"
             ));
         }
         if wi > 0.0 {
@@ -485,9 +739,9 @@ fn build_global_empirical_latent_measure(
         }
     }
     if pairs.len() < 2 {
-        return Err(
-            "empirical latent measure requires at least two positive-weight rows".to_string(),
-        );
+        return Err(format!(
+            "{context} requires at least two positive-weight rows"
+        ));
     }
     pairs.sort_by(|left, right| {
         left.0
@@ -496,25 +750,298 @@ fn build_global_empirical_latent_measure(
     });
     let total_weight = pairs.iter().map(|(_, weight)| *weight).sum::<f64>();
     if !(total_weight.is_finite() && total_weight > 0.0) {
-        return Err("empirical latent measure requires positive finite total weight".to_string());
+        return Err(format!("{context} requires positive finite total weight"));
     }
 
     let m = grid_size.min(pairs.len());
     let mut nodes = Vec::with_capacity(m);
+    let mut out_weights = Vec::with_capacity(m);
+    let bin_weight_target = total_weight / (m as f64);
     let mut cursor = 0usize;
-    let mut cumulative = pairs[0].1;
-    for j in 0..m {
-        let target = ((j as f64) + 0.5) * total_weight / (m as f64);
-        while cursor + 1 < pairs.len() && cumulative < target {
-            cursor += 1;
-            cumulative += pairs[cursor].1;
+    let mut remaining = pairs[0].1;
+    for _ in 0..m {
+        let mut need = bin_weight_target;
+        let mut bin_weight = 0.0;
+        let mut bin_sum = 0.0;
+        while need > 1e-14 * bin_weight_target && cursor < pairs.len() {
+            let take = remaining.min(need);
+            bin_sum += take * pairs[cursor].0;
+            bin_weight += take;
+            need -= take;
+            remaining -= take;
+            if remaining <= 1e-14 * pairs[cursor].1 {
+                cursor += 1;
+                if cursor < pairs.len() {
+                    remaining = pairs[cursor].1;
+                }
+            }
         }
-        nodes.push(pairs[cursor].0);
+        if bin_weight > 0.0 {
+            nodes.push(bin_sum / bin_weight);
+            out_weights.push(bin_weight / total_weight);
+        }
     }
-    let equal_weight = 1.0 / (m as f64);
-    let weights = vec![equal_weight; m];
-    let measure = LatentMeasureKind::GlobalEmpirical { nodes, weights };
-    measure.validate("empirical latent measure")?;
+    if nodes.len() < 2 {
+        return Err(format!(
+            "{context} compression produced fewer than two nodes"
+        ));
+    }
+    recenter_rescale_empirical_grid(&mut nodes, &out_weights);
+    let total = out_weights.iter().sum::<f64>();
+    if total.is_finite() && total > 0.0 {
+        for weight in &mut out_weights {
+            *weight /= total;
+        }
+    }
+    validate_empirical_z_grid(&nodes, &out_weights, context)?;
+    Ok(EmpiricalZGrid {
+        nodes,
+        weights: out_weights,
+    })
+}
+
+fn recenter_rescale_empirical_grid(nodes: &mut [f64], weights: &[f64]) {
+    let total = weights.iter().sum::<f64>();
+    if !(total.is_finite() && total > 0.0) {
+        return;
+    }
+    let mean = nodes
+        .iter()
+        .zip(weights.iter())
+        .map(|(&node, &weight)| weight * node)
+        .sum::<f64>()
+        / total;
+    let var = nodes
+        .iter()
+        .zip(weights.iter())
+        .map(|(&node, &weight)| weight * (node - mean).powi(2))
+        .sum::<f64>()
+        / total;
+    let sd = var.sqrt();
+    if sd.is_finite() && sd > 1e-12 {
+        for node in nodes {
+            *node = (*node - mean) / sd;
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LatentScoreLawGeometry {
+    feature_cols: Vec<usize>,
+    centers: Array2<f64>,
+    input_scales: Option<Vec<f64>>,
+    bandwidth: f64,
+}
+
+fn best_latent_score_law_geometry(specs: &[&TermCollectionSpec]) -> Option<LatentScoreLawGeometry> {
+    let mut best: Option<LatentScoreLawGeometry> = None;
+    for spec in specs {
+        for term in &spec.smooth_terms {
+            let SmoothBasisSpec::Duchon {
+                feature_cols,
+                spec,
+                input_scales,
+            } = &term.basis
+            else {
+                continue;
+            };
+            if feature_cols.len() < 2 {
+                continue;
+            }
+            let crate::basis::CenterStrategy::UserProvided(centers) = &spec.center_strategy else {
+                continue;
+            };
+            if centers.nrows() < 2 || centers.ncols() != feature_cols.len() {
+                continue;
+            }
+            let bandwidth = spec
+                .length_scale
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .unwrap_or(DEFAULT_LOCAL_EMPIRICAL_LATENT_BANDWIDTH);
+            let candidate = LatentScoreLawGeometry {
+                feature_cols: feature_cols.clone(),
+                centers: centers.clone(),
+                input_scales: input_scales.clone(),
+                bandwidth,
+            };
+            if best
+                .as_ref()
+                .is_none_or(|current| candidate.feature_cols.len() > current.feature_cols.len())
+            {
+                best = Some(candidate);
+            }
+        }
+    }
+    best
+}
+
+fn conditioning_matrix_from_geometry(
+    data: ArrayView2<'_, f64>,
+    geometry: &LatentScoreLawGeometry,
+) -> Result<Array2<f64>, String> {
+    let n = data.nrows();
+    let d = geometry.feature_cols.len();
+    let mut out = Array2::<f64>::zeros((n, d));
+    for (local_col, &feature_col) in geometry.feature_cols.iter().enumerate() {
+        if feature_col >= data.ncols() {
+            return Err(format!(
+                "local empirical latent measure feature column {feature_col} is out of bounds for {} columns",
+                data.ncols()
+            ));
+        }
+        out.column_mut(local_col).assign(&data.column(feature_col));
+    }
+    if let Some(scales) = geometry.input_scales.as_ref() {
+        if scales.len() != d {
+            return Err(format!(
+                "local empirical latent measure input scale dimension mismatch: scales={}, features={d}",
+                scales.len()
+            ));
+        }
+        for (col, &scale) in scales.iter().enumerate() {
+            if !(scale.is_finite() && scale > 0.0) {
+                return Err(format!(
+                    "local empirical latent measure input scale {col} must be finite and positive, got {scale}"
+                ));
+            }
+            out.column_mut(col).mapv_inplace(|value| value / scale);
+        }
+    }
+    if out.iter().any(|value| !value.is_finite()) {
+        return Err(
+            "local empirical latent measure conditioning values must be finite".to_string(),
+        );
+    }
+    Ok(out)
+}
+
+fn local_empirical_mixture_for_point(
+    point: &[f64],
+    centers: &[Vec<f64>],
+    top_k: usize,
+    bandwidth: f64,
+) -> Result<Vec<(usize, f64)>, String> {
+    if centers.is_empty() {
+        return Err("local empirical latent measure has no centers".to_string());
+    }
+    if top_k == 0 {
+        return Err("local empirical latent measure top_k must be positive".to_string());
+    }
+    if !(bandwidth.is_finite() && bandwidth > 0.0) {
+        return Err(format!(
+            "local empirical latent measure bandwidth must be finite and positive, got {bandwidth}"
+        ));
+    }
+    let bw2 = bandwidth * bandwidth;
+    let mut distances = Vec::<(usize, f64)>::with_capacity(centers.len());
+    for (idx, center) in centers.iter().enumerate() {
+        if center.len() != point.len() {
+            return Err(format!(
+                "local empirical latent center {idx} dimension mismatch: center={}, point={}",
+                center.len(),
+                point.len()
+            ));
+        }
+        let d2 = center
+            .iter()
+            .zip(point.iter())
+            .map(|(&c, &x)| {
+                let delta = x - c;
+                delta * delta
+            })
+            .sum::<f64>();
+        distances.push((idx, d2));
+    }
+    distances.sort_by(|left, right| {
+        left.1
+            .partial_cmp(&right.1)
+            .expect("validated local empirical distances are finite")
+    });
+    let k = top_k.min(distances.len());
+    let mut mixture = Vec::with_capacity(k);
+    let mut total = 0.0;
+    for &(idx, d2) in distances.iter().take(k) {
+        let weight = (-0.5 * d2 / bw2).exp().max(1e-300);
+        mixture.push((idx, weight));
+        total += weight;
+    }
+    if !(total.is_finite() && total > 0.0) {
+        return Err("local empirical latent mixture has non-positive total weight".to_string());
+    }
+    for (_, weight) in &mut mixture {
+        *weight /= total;
+    }
+    Ok(mixture)
+}
+
+fn build_local_empirical_latent_measure(
+    z: &Array1<f64>,
+    weights: &Array1<f64>,
+    data: ArrayView2<'_, f64>,
+    geometry: &LatentScoreLawGeometry,
+    grid_size: usize,
+    top_k: usize,
+) -> Result<LatentMeasureKind, String> {
+    let conditioning = conditioning_matrix_from_geometry(data, geometry)?;
+    if conditioning.nrows() != z.len() {
+        return Err(format!(
+            "local empirical latent measure row mismatch: conditioning={}, z={}",
+            conditioning.nrows(),
+            z.len()
+        ));
+    }
+    let centers = geometry
+        .centers
+        .outer_iter()
+        .map(|row| row.to_vec())
+        .collect::<Vec<_>>();
+    let top_k = top_k.min(centers.len()).max(1);
+    let mut grids = Vec::with_capacity(centers.len());
+    for center in &centers {
+        let local_weights = Array1::from_iter((0..conditioning.nrows()).map(|row| {
+            let d2 = conditioning
+                .row(row)
+                .iter()
+                .zip(center.iter())
+                .map(|(&x, &c)| {
+                    let delta = x - c;
+                    delta * delta
+                })
+                .sum::<f64>();
+            weights[row] * (-0.5 * d2 / (geometry.bandwidth * geometry.bandwidth)).exp()
+        }));
+        grids.push(build_empirical_z_grid(
+            z,
+            &local_weights,
+            grid_size,
+            "local empirical latent measure",
+        )?);
+    }
+    let train_row_mixtures = Arc::new(
+        conditioning
+            .outer_iter()
+            .map(|row| {
+                local_empirical_mixture_for_point(
+                    row.as_slice().ok_or_else(|| {
+                        "local empirical conditioning row is not contiguous".to_string()
+                    })?,
+                    &centers,
+                    top_k,
+                    geometry.bandwidth,
+                )
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+    );
+    let measure = LatentMeasureKind::LocalEmpirical {
+        feature_cols: geometry.feature_cols.clone(),
+        input_scales: geometry.input_scales.clone(),
+        centers,
+        grids,
+        top_k,
+        bandwidth: geometry.bandwidth,
+        train_row_mixtures,
+    };
+    measure.validate("local empirical latent measure")?;
     Ok(measure)
 }
 
@@ -557,11 +1084,81 @@ struct BernoulliMarginalSlopeFamily {
     /// `BernoulliMarginalSlopeFamily` directly without running the full fit
     /// pipeline; production paths go through `make_family` which initialises
     /// the cache to length-`n` NaN.
-    intercept_warm_starts: Option<Arc<Vec<AtomicU64>>>,
+    intercept_warm_starts: Option<Arc<BernoulliInterceptWarmStartCache>>,
 }
 
-fn new_intercept_warm_start_cache(n: usize) -> Arc<Vec<AtomicU64>> {
-    Arc::new((0..n).map(|_| AtomicU64::new(f64::NAN.to_bits())).collect())
+#[derive(Clone)]
+struct BernoulliInterceptPredictorWarmStart {
+    intercept: f64,
+    primary_point: Vec<f64>,
+    intercept_primary_deriv: Vec<f64>,
+}
+
+struct BernoulliInterceptWarmStartCache {
+    intercepts: Vec<AtomicU64>,
+    predictors: Vec<Mutex<Option<BernoulliInterceptPredictorWarmStart>>>,
+}
+
+impl std::ops::Deref for BernoulliInterceptWarmStartCache {
+    type Target = [AtomicU64];
+
+    fn deref(&self) -> &Self::Target {
+        &self.intercepts
+    }
+}
+
+impl BernoulliInterceptWarmStartCache {
+    fn predictor_seed(&self, row: usize, current_point: &[f64]) -> Option<f64> {
+        let warm = self.predictors.get(row)?.lock().ok()?.as_ref().cloned()?;
+        if warm.primary_point.len() != current_point.len()
+            || warm.intercept_primary_deriv.len() != current_point.len()
+            || !warm.intercept.is_finite()
+        {
+            return None;
+        }
+        let correction = warm
+            .intercept_primary_deriv
+            .iter()
+            .zip(current_point.iter().zip(warm.primary_point.iter()))
+            .map(|(a_u, (new, old))| a_u * (new - old))
+            .sum::<f64>();
+        let seed = warm.intercept + correction;
+        seed.is_finite().then_some(seed)
+    }
+
+    fn store_predictor(
+        &self,
+        row: usize,
+        intercept: f64,
+        primary_point: Vec<f64>,
+        intercept_primary_deriv: Vec<f64>,
+    ) {
+        if !intercept.is_finite()
+            || primary_point.iter().any(|value| !value.is_finite())
+            || intercept_primary_deriv
+                .iter()
+                .any(|value| !value.is_finite())
+        {
+            return;
+        }
+        let Some(slot) = self.predictors.get(row) else {
+            return;
+        };
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(BernoulliInterceptPredictorWarmStart {
+                intercept,
+                primary_point,
+                intercept_primary_deriv,
+            });
+        }
+    }
+}
+
+fn new_intercept_warm_start_cache(n: usize) -> Arc<BernoulliInterceptWarmStartCache> {
+    Arc::new(BernoulliInterceptWarmStartCache {
+        intercepts: (0..n).map(|_| AtomicU64::new(f64::NAN.to_bits())).collect(),
+        predictors: (0..n).map(|_| Mutex::new(None)).collect(),
+    })
 }
 
 #[derive(Clone, Default)]
@@ -581,6 +1178,21 @@ pub(crate) fn build_score_warp_deviation_block_from_seed(
         seed,
         cfg,
         DeviationAnchorKind::StandardNormal,
+    )
+}
+
+pub(crate) fn build_score_warp_deviation_block_from_seed_empirical_anchor(
+    seed: &Array1<f64>,
+    weights: &Array1<f64>,
+    cfg: &DeviationBlockConfig,
+) -> Result<DeviationPrepared, String> {
+    build_deviation_block_from_knots_and_design_seed_with_anchor(
+        seed,
+        seed,
+        cfg,
+        DeviationAnchorKind::EmpiricalDesign {
+            anchor_weights: weights,
+        },
     )
 }
 
@@ -1016,7 +1628,7 @@ pub(crate) fn standardize_latent_z_with_policy(
     }
     if skew.abs() > 0.75 || kurt.abs() > 2.0 {
         log::warn!(
-            "{context}: z has skewness={skew:.3} and excess kurtosis={kurt:.3}; the calibrated marginal-slope model assumes latent Gaussian scores"
+            "{context}: z has skewness={skew:.3} and excess kurtosis={kurt:.3}; latent-measure auto-selection will use empirical calibration unless stricter diagnostics pass"
         );
     }
     Ok((z_std, normalization))
@@ -1889,8 +2501,32 @@ impl BernoulliBlockHessianAccumulator {
 
         // h/w cross-blocks -> dense_correction
         if let Some(ref mut dc) = self.dense_correction {
-            family.add_pullback_primary_hessian_hw_only(dc, row, slices, primary, h);
+            family.add_pullback_primary_hessian_hw_only(dc, row, slices, primary, h.view());
         }
+    }
+
+    fn add_weighted_design_grams(
+        &mut self,
+        family: &BernoulliMarginalSlopeFamily,
+        rows: std::ops::Range<usize>,
+        w_mm: &Array1<f64>,
+        w_mg: &Array1<f64>,
+        w_gg: &Array1<f64>,
+    ) -> Result<(), String> {
+        let x = family
+            .marginal_design
+            .try_row_chunk(rows.clone())
+            .map_err(|e| format!("bernoulli marginal_design try_row_chunk: {e}"))?;
+        let g = family
+            .logslope_design
+            .try_row_chunk(rows)
+            .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?;
+        self.h_mm += &crate::faer_ndarray::fast_xt_diag_x(&x, w_mm);
+        if w_mg.iter().any(|value| *value != 0.0) {
+            self.h_mg += &crate::faer_ndarray::fast_xt_diag_y(&x, w_mg, &g);
+        }
+        self.h_gg += &crate::faer_ndarray::fast_xt_diag_x(&g, w_gg);
+        Ok(())
     }
 
     /// Add a rank-1 update from psi_row (in the psi block) crossed with the
@@ -2418,10 +3054,7 @@ fn add_weighted_chunk_gradient(
 fn new_cell_moment_lru_cache(
     policy: &crate::resource::ResourcePolicy,
 ) -> Arc<exact_kernel::CellMomentLruCache> {
-    let budget = std::env::var("GAM_BERNOULLI_MARGSLOPE_CELL_LRU_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(policy.max_single_materialization_bytes);
+    let budget = policy.max_single_materialization_bytes;
     Arc::new(exact_kernel::CellMomentLruCache::new(budget))
 }
 
@@ -2819,7 +3452,7 @@ impl BernoulliMarginalSlopeFamily {
         marginal: BernoulliMarginalLinkMap,
         slope: f64,
     ) -> Result<(f64, [f64; 2], [[f64; 2]; 2]), String> {
-        match self.latent_measure.empirical_grid() {
+        match self.latent_measure.empirical_grid_for_training_row(row)? {
             None => {
                 let kernel = RigidProbitKernel::new(
                     marginal.q,
@@ -2835,15 +3468,15 @@ impl BernoulliMarginalSlopeFamily {
                     rigid_transformed_hessian(marginal, &kernel),
                 ))
             }
-            Some((nodes, measure_weights)) => {
+            Some(grid) => {
                 let jet = self.empirical_rigid_neglog_jet(
                     row,
                     marginal_eta,
                     marginal,
                     slope,
                     &[[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]],
-                    nodes,
-                    measure_weights,
+                    &grid.nodes,
+                    &grid.weights,
                 )?;
                 Ok((
                     jet.coeff(0),
@@ -2866,7 +3499,7 @@ impl BernoulliMarginalSlopeFamily {
         dir_q: f64,
         dir_g: f64,
     ) -> Result<[[f64; 2]; 2], String> {
-        match self.latent_measure.empirical_grid() {
+        match self.latent_measure.empirical_grid_for_training_row(row)? {
             None => {
                 let kernel = RigidProbitKernel::new(
                     marginal.q,
@@ -2880,7 +3513,7 @@ impl BernoulliMarginalSlopeFamily {
                     marginal, &kernel, dir_q, dir_g,
                 ))
             }
-            Some((nodes, measure_weights)) => {
+            Some(grid) => {
                 let jet = self.empirical_rigid_neglog_jet(
                     row,
                     marginal_eta,
@@ -2893,8 +3526,8 @@ impl BernoulliMarginalSlopeFamily {
                         [0.0, 1.0],
                         [dir_q, dir_g],
                     ],
-                    nodes,
-                    measure_weights,
+                    &grid.nodes,
+                    &grid.weights,
                 )?;
                 Ok([
                     [jet.coeff(1 | 4 | 16), jet.coeff(1 | 2 | 16)],
@@ -2915,7 +3548,7 @@ impl BernoulliMarginalSlopeFamily {
         v_q: f64,
         v_g: f64,
     ) -> Result<[[f64; 2]; 2], String> {
-        match self.latent_measure.empirical_grid() {
+        match self.latent_measure.empirical_grid_for_training_row(row)? {
             None => {
                 let kernel = RigidProbitKernel::new(
                     marginal.q,
@@ -2929,7 +3562,7 @@ impl BernoulliMarginalSlopeFamily {
                     marginal, &kernel, u_q, u_g, v_q, v_g,
                 ))
             }
-            Some((nodes, measure_weights)) => {
+            Some(grid) => {
                 let jet = self.empirical_rigid_neglog_jet(
                     row,
                     marginal_eta,
@@ -2943,8 +3576,8 @@ impl BernoulliMarginalSlopeFamily {
                         [u_q, u_g],
                         [v_q, v_g],
                     ],
-                    nodes,
-                    measure_weights,
+                    &grid.nodes,
+                    &grid.weights,
                 )?;
                 Ok([
                     [jet.coeff(1 | 4 | 16 | 32), jet.coeff(1 | 2 | 16 | 32)],
@@ -3705,6 +4338,61 @@ impl BernoulliMarginalSlopeFamily {
         Ok((f, f_a, 0.0))
     }
 
+    fn evaluate_empirical_grid_calibration_newton(
+        &self,
+        a: f64,
+        marginal_eta: f64,
+        slope: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        grid: &EmpiricalZGrid,
+    ) -> Result<(f64, f64, f64), String> {
+        let marginal = self.marginal_link_map(marginal_eta)?;
+        let mut f = -marginal.mu;
+        let mut f_a = 0.0;
+        let mut f_aa = 0.0;
+        for (&node, &weight) in grid.nodes.iter().zip(grid.weights.iter()) {
+            let obs = self.observed_denested_cell_partials_at_z(node, a, slope, beta_h, beta_w)?;
+            let eta = eval_coeff4_at(&obs.coeff, node);
+            let eta_a = eval_coeff4_at(&obs.dc_da, node);
+            let eta_aa = eval_coeff4_at(&obs.dc_daa, node);
+            let pdf = normal_pdf(eta);
+            f += weight * normal_cdf(eta);
+            f_a += weight * pdf * eta_a;
+            f_aa += weight * pdf * (eta_aa - eta * eta_a * eta_a);
+        }
+        if !(f.is_finite() && f_a.is_finite() && f_a > 0.0 && f_aa.is_finite()) {
+            return Err(format!(
+                "empirical latent denested calibration produced invalid root state: f={f}, f_a={f_a}, f_aa={f_aa}"
+            ));
+        }
+        Ok((f, f_a, f_aa))
+    }
+
+    fn evaluate_calibration_newton(
+        &self,
+        row: usize,
+        a: f64,
+        marginal_eta: f64,
+        slope: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+    ) -> Result<(f64, f64, f64), String> {
+        match self.latent_measure.empirical_grid_for_training_row(row)? {
+            None => {
+                self.evaluate_denested_calibration_newton(a, marginal_eta, slope, beta_h, beta_w)
+            }
+            Some(grid) => self.evaluate_empirical_grid_calibration_newton(
+                a,
+                marginal_eta,
+                slope,
+                beta_h,
+                beta_w,
+                &grid,
+            ),
+        }
+    }
+
     fn flex_active(&self) -> bool {
         self.score_warp.is_some() || self.link_dev.is_some()
     }
@@ -3903,6 +4591,27 @@ impl BernoulliInterceptSolveStats {
 }
 
 impl BernoulliMarginalSlopeFamily {
+    fn intercept_primary_point(
+        q: f64,
+        b: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+    ) -> Vec<f64> {
+        let mut point = Vec::with_capacity(
+            2 + beta_h.map(|beta| beta.len()).unwrap_or(0)
+                + beta_w.map(|beta| beta.len()).unwrap_or(0),
+        );
+        point.push(q);
+        point.push(b);
+        if let Some(beta) = beta_h {
+            point.extend(beta.iter().copied());
+        }
+        if let Some(beta) = beta_w {
+            point.extend(beta.iter().copied());
+        }
+        point
+    }
+
     #[inline]
     fn cache_row_intercept(&self, row: usize, a: f64) {
         if let Some(cache) = self.intercept_warm_starts.as_ref()
@@ -3910,6 +4619,26 @@ impl BernoulliMarginalSlopeFamily {
         {
             slot.store(a.to_bits(), Ordering::Relaxed);
         }
+    }
+
+    fn cache_row_intercept_predictor(
+        &self,
+        row: usize,
+        a: f64,
+        q: f64,
+        b: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        a_u: &Array1<f64>,
+    ) {
+        let Some(cache) = self.intercept_warm_starts.as_ref() else {
+            return;
+        };
+        let primary_point = Self::intercept_primary_point(q, b, beta_h, beta_w);
+        if primary_point.len() != a_u.len() {
+            return;
+        }
+        cache.store_predictor(row, a, primary_point, a_u.iter().copied().collect());
     }
 
     #[inline]
@@ -3966,7 +4695,8 @@ impl BernoulliMarginalSlopeFamily {
         let beta_h_linf = Self::beta_linf(beta_h);
         let beta_w_linf = Self::beta_linf(beta_w);
         let exact_zero_deviation = beta_h_linf == 0.0 && beta_w_linf == 0.0;
-        if exact_zero_deviation {
+        let standard_normal_law = matches!(self.latent_measure, LatentMeasureKind::StandardNormal);
+        if exact_zero_deviation && standard_normal_law {
             self.cache_row_intercept(row, rigid_a);
             return Ok((rigid_a, rigid_abs_deriv, true));
         }
@@ -3974,7 +4704,8 @@ impl BernoulliMarginalSlopeFamily {
         let near_zero_bound =
             self.near_zero_deviation_residual_bound(slope, beta_h_linf, beta_w_linf);
         let beta_linf_max = beta_h_linf.max(beta_w_linf);
-        if near_zero_bound <= abs_tol && beta_linf_max <= f64::EPSILON.sqrt() {
+        if standard_normal_law && near_zero_bound <= abs_tol && beta_linf_max <= f64::EPSILON.sqrt()
+        {
             // Numerical guardrail for the conservative perturbation bound: the
             // exact-zero path above avoids all cell machinery, while this
             // near-zero path spends one evaluator call to guarantee that every
@@ -3983,7 +4714,8 @@ impl BernoulliMarginalSlopeFamily {
             // derivative probes out of this value-only acceptance path;
             // mathematically nonzero deviations still fall through unless they
             // are too small to carry stable derivative information.
-            let (f_rigid, _, _) = self.evaluate_denested_calibration_newton(
+            let (f_rigid, _, _) = self.evaluate_calibration_newton(
+                row,
                 rigid_a,
                 marginal_eta,
                 slope,
@@ -4002,7 +4734,7 @@ impl BernoulliMarginalSlopeFamily {
         // cell-moment work in favour of degree-4 moments. See the comment
         // on `evaluate_denested_calibration_newton`.
         let eval = |a: f64| -> Result<(f64, f64, f64), String> {
-            self.evaluate_denested_calibration_newton(a, marginal_eta, slope, beta_h, beta_w)
+            self.evaluate_calibration_newton(row, a, marginal_eta, slope, beta_h, beta_w)
         };
 
         // Closed-form fallback initial guess: rigid probit in pre-scale
@@ -4019,11 +4751,17 @@ impl BernoulliMarginalSlopeFamily {
         // root-solver steps of the new one. If the cache slot is NaN
         // (uninitialised) or non-finite (stale), fall back to the closed-
         // form seed.
+        let current_primary_point =
+            Self::intercept_primary_point(marginal_eta, slope, beta_h, beta_w);
+        let predictor_a = self
+            .intercept_warm_starts
+            .as_ref()
+            .and_then(|cache| cache.predictor_seed(row, &current_primary_point));
         let cached_a = self.intercept_warm_starts.as_ref().and_then(|cache| {
             let value = f64::from_bits(cache.get(row)?.load(Ordering::Relaxed));
             value.is_finite().then_some(value)
         });
-        let a_init = cached_a.unwrap_or(a_closed_form);
+        let a_init = predictor_a.or(cached_a).unwrap_or(a_closed_form);
 
         // Note: an explicit `eval(a_closed_form)` short-circuit at this point
         // would be redundant. On cold cycle-0 `cached_a` is None, so `a_init`
@@ -4077,7 +4815,7 @@ impl BernoulliMarginalSlopeFamily {
             }
             if let Some((a, abs_deriv, _)) = accepted {
                 if let Some(stats) = stats {
-                    if cached_a.is_some() {
+                    if predictor_a.is_some() || cached_a.is_some() {
                         stats.cached_short_circuit.fetch_add(1, Ordering::Relaxed);
                     } else {
                         stats
@@ -4104,7 +4842,7 @@ impl BernoulliMarginalSlopeFamily {
         // the current root (e.g., after a large β step) that the bracketing
         // search exhausts; the closed-form seed always sits in the correct
         // basin.
-        if cached_a.is_some() && solve_result.is_err() {
+        if (predictor_a.is_some() || cached_a.is_some()) && solve_result.is_err() {
             solve_result = super::monotone_root::solve_monotone_root_detailed(
                 &eval,
                 a_closed_form,
@@ -4161,16 +4899,16 @@ impl BernoulliMarginalSlopeFamily {
         let (intercept, m_a, intercept_fast_path) = if self.effective_flex_active(block_states)? {
             self.solve_row_intercept_base(row, marginal_eta, slope, beta_h, beta_w, stats)?
         } else {
-            let intercept = match self.latent_measure.empirical_grid() {
+            let intercept = match self.latent_measure.empirical_grid_for_training_row(row)? {
                 None => {
                     rigid_intercept_from_marginal(marginal.q, slope, self.probit_frailty_scale())
                 }
-                Some((nodes, measure_weights)) => self.empirical_rigid_intercept_for_row(
+                Some(grid) => self.empirical_rigid_intercept_for_row(
                     row,
                     marginal,
                     slope,
-                    nodes,
-                    measure_weights,
+                    &grid.nodes,
+                    &grid.weights,
                 )?,
             };
             (intercept, f64::NAN, false)
@@ -4181,7 +4919,9 @@ impl BernoulliMarginalSlopeFamily {
         // `bivariate_normal_cdf` on identical inputs. This matters for the
         // FLEX path (linkwiggle + score-warp), where each per-row Hessian
         // build runs the cell-moment kernel once per cell per closure call.
-        let degree9_cells = if self.effective_flex_active(block_states)? {
+        let degree9_cells = if self.effective_flex_active(block_states)?
+            && matches!(self.latent_measure, LatentMeasureKind::StandardNormal)
+        {
             let cells = self.denested_partition_cells(intercept, slope, beta_h, beta_w)?;
             Some(
                 cells
@@ -4235,6 +4975,9 @@ impl BernoulliMarginalSlopeFamily {
             );
         }
         self.preseed_intercept_warm_starts(block_states)?;
+        if flex_active {
+            exact_kernel::reset_tail_cell_moment_cache();
+        }
         let stats = BernoulliInterceptSolveStats::default();
         let cell_cache_before = self.cell_moment_cache_stats.snapshot();
         let row_contexts: Result<Vec<_>, String> = (0..n)
@@ -4277,6 +5020,14 @@ impl BernoulliMarginalSlopeFamily {
                 self.cell_moment_lru.len(),
                 self.cell_moment_lru.resident_bytes() as f64 / (1024.0 * 1024.0),
                 self.cell_moment_lru.max_bytes() as f64 / (1024.0 * 1024.0),
+            );
+            let tail_stats = exact_kernel::tail_cell_moment_cache_stats();
+            log::info!(
+                "[BMS exact-cache] affine tail-cell memo: hits={} misses={} entries={} hit_rate={:.3}%",
+                tail_stats.hits,
+                tail_stats.misses,
+                tail_stats.entries,
+                100.0 * tail_stats.hit_rate(),
             );
         }
         if log_exact_work(n) {
@@ -4709,153 +5460,265 @@ impl BernoulliMarginalSlopeFamily {
         let mut coeff_au = vec![[0.0; 4]; r];
         let mut coeff_bu = vec![[0.0; 4]; r];
 
-        // Reuse the cached degree-9 cell moments from the row context when
-        // present (FLEX path; cache is built once per row in
-        // `build_row_exact_context` after the intercept converges). Only
-        // re-evaluate if the cache is missing or `need_hessian=false` (where
-        // the kernel can use cheaper degree-3 work). The cache is keyed by
-        // (intercept, slope, beta_h, beta_w) — those are fixed for the
-        // duration of one Hessian/gradient/diagonal/matvec pass.
-        let owned_cells;
-        let cached_cells: Vec<(
-            exact::DenestedPartitionCell,
-            std::borrow::Cow<'_, exact::CellMomentState>,
-        )> = if need_hessian && let Some(cached) = row_ctx.degree9_cells.as_ref() {
-            cached
+        if let Some(empirical_grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
+            for (&node, &weight) in empirical_grid
+                .nodes
                 .iter()
-                .map(|entry| {
-                    (
-                        entry.partition_cell,
-                        std::borrow::Cow::Borrowed(&entry.state_degree9),
-                    )
-                })
-                .collect()
-        } else {
-            owned_cells = self.denested_partition_cells(a, b, beta_h, beta_w)?;
-            owned_cells
-                .into_iter()
-                .map(|partition_cell| {
-                    let degree = if need_hessian { 9 } else { 3 };
-                    self.evaluate_cell_moments_lru(partition_cell.cell, degree)
-                        .map(|state| (partition_cell, std::borrow::Cow::Owned(state)))
-                })
-                .collect::<Result<Vec<_>, String>>()?
-        };
-        for (partition_cell, state) in cached_cells {
-            let cell = partition_cell.cell;
-            let z_mid = exact::interval_probe_point(cell.left, cell.right)?;
-            let u_mid = a + b * z_mid;
-            let state: &exact::CellMomentState = &state;
-            let (dc_da_raw, dc_db_raw) = exact::denested_cell_coefficient_partials(
-                partition_cell.score_span,
-                partition_cell.link_span,
-                a,
-                b,
-            );
-            let dc_da = scale_coeff4(dc_da_raw, scale);
-            let dc_db = scale_coeff4(dc_db_raw, scale);
+                .zip(empirical_grid.weights.iter())
+            {
+                coeff_u.fill([0.0; 4]);
+                coeff_au.fill([0.0; 4]);
+                coeff_bu.fill([0.0; 4]);
 
-            coeff_u[1] = dc_db;
-            coeff_au[1] = [0.0; 4];
-            coeff_bu[1] = [0.0; 4];
-            if need_hessian {
-                let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) = exact::denested_cell_second_partials(
+                let obs = self.observed_denested_cell_partials_at_z(node, a, b, beta_h, beta_w)?;
+                let eta = eval_coeff4_at(&obs.coeff, node);
+                let eta_a = eval_coeff4_at(&obs.dc_da, node);
+                let eta_aa = eval_coeff4_at(&obs.dc_daa, node);
+                let phi = normal_pdf(eta);
+                if need_hessian {
+                    f_aa += weight * phi * (eta_aa - eta * eta_a * eta_a);
+                }
+
+                coeff_u[1] = obs.dc_db;
+                if need_hessian {
+                    coeff_au[1] = obs.dc_dab;
+                    coeff_bu[1] = obs.dc_dbb;
+                }
+
+                if let (Some(h_range), Some(runtime)) = (h_range, score_runtime) {
+                    for local_idx in 0..h_range.len() {
+                        let basis_span = runtime.basis_cubic_at(local_idx, node)?;
+                        let idx = h_range.start + local_idx;
+                        coeff_u[idx] = scale_coeff4(
+                            exact::score_basis_cell_coefficients(basis_span, b),
+                            scale,
+                        );
+                        if need_hessian {
+                            coeff_bu[idx] = scale_coeff4(
+                                exact::score_basis_cell_coefficients(basis_span, 1.0),
+                                scale,
+                            );
+                        }
+                    }
+                }
+
+                if let (Some(w_range), Some(runtime)) = (w_range, link_runtime) {
+                    let u_node = a + b * node;
+                    for local_idx in 0..w_range.len() {
+                        let basis_span = runtime.basis_cubic_at(local_idx, u_node)?;
+                        let idx = w_range.start + local_idx;
+                        coeff_u[idx] = scale_coeff4(
+                            exact::link_basis_cell_coefficients(basis_span, a, b),
+                            scale,
+                        );
+                        if need_hessian {
+                            let (dc_aw_raw, dc_bw_raw) =
+                                exact::link_basis_cell_coefficient_partials(basis_span, a, b);
+                            coeff_au[idx] = scale_coeff4(dc_aw_raw, scale);
+                            coeff_bu[idx] = scale_coeff4(dc_bw_raw, scale);
+                        }
+                    }
+                }
+
+                let eta_u = (0..r)
+                    .map(|idx| eval_coeff4_at(&coeff_u[idx], node))
+                    .collect::<Vec<_>>();
+                for u in 1..r {
+                    f_u[u] += weight * phi * eta_u[u];
+                    if need_hessian {
+                        let eta_au = eval_coeff4_at(&coeff_au[u], node);
+                        f_au[u] += weight * phi * (eta_au - eta * eta_a * eta_u[u]);
+                    }
+                }
+
+                if need_hessian {
+                    let coeff_jet = SparsePrimaryCoeffJetView::new(
+                        1,
+                        h_range,
+                        w_range,
+                        &coeff_u,
+                        &coeff_au,
+                        &coeff_bu,
+                        &zero_family,
+                        &zero_family,
+                        &zero_family,
+                        &zero_family,
+                        &zero_family,
+                        &zero_family,
+                        &zero_family,
+                    );
+                    for u in 1..r {
+                        for v in u..r {
+                            let second_coeff = coeff_jet.pair_from_b_family(
+                                coeff_jet.b_first,
+                                u,
+                                v,
+                                COEFF_SUPPORT_BHW,
+                            );
+                            let eta_uv = eval_coeff4_at(&second_coeff, node);
+                            let val = weight * phi * (eta_uv - eta * eta_u[u] * eta_u[v]);
+                            f_uv[[u, v]] += val;
+                            if u != v {
+                                f_uv[[v, u]] += val;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Reuse the cached degree-9 cell moments from the row context when
+            // present (FLEX path; cache is built once per row in
+            // `build_row_exact_context` after the intercept converges). Only
+            // re-evaluate if the cache is missing or `need_hessian=false` (where
+            // the kernel can use cheaper degree-3 work). The cache is keyed by
+            // (intercept, slope, beta_h, beta_w) — those are fixed for the
+            // duration of one Hessian/gradient/diagonal/matvec pass.
+            let owned_cells;
+            let cached_cells: Vec<(
+                exact::DenestedPartitionCell,
+                std::borrow::Cow<'_, exact::CellMomentState>,
+            )> = if need_hessian && let Some(cached) = row_ctx.degree9_cells.as_ref() {
+                cached
+                    .iter()
+                    .map(|entry| {
+                        (
+                            entry.partition_cell,
+                            std::borrow::Cow::Borrowed(&entry.state_degree9),
+                        )
+                    })
+                    .collect()
+            } else {
+                owned_cells = self.denested_partition_cells(a, b, beta_h, beta_w)?;
+                owned_cells
+                    .into_iter()
+                    .map(|partition_cell| {
+                        let degree = if need_hessian { 9 } else { 3 };
+                        self.evaluate_cell_moments_lru(partition_cell.cell, degree)
+                            .map(|state| (partition_cell, std::borrow::Cow::Owned(state)))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?
+            };
+            for (partition_cell, state) in cached_cells {
+                let cell = partition_cell.cell;
+                let z_mid = exact::interval_probe_point(cell.left, cell.right)?;
+                let u_mid = a + b * z_mid;
+                let state: &exact::CellMomentState = &state;
+                let (dc_da_raw, dc_db_raw) = exact::denested_cell_coefficient_partials(
                     partition_cell.score_span,
                     partition_cell.link_span,
                     a,
                     b,
                 );
-                let dc_daa = scale_coeff4(dc_daa_raw, scale);
-                let dc_dab = scale_coeff4(dc_dab_raw, scale);
-                let dc_dbb = scale_coeff4(dc_dbb_raw, scale);
-                f_aa += exact::cell_second_derivative_from_moments(
-                    cell,
-                    &dc_da,
-                    &dc_da,
-                    &dc_daa,
-                    &state.moments,
-                )?;
-                coeff_au[1] = dc_dab;
-                coeff_bu[1] = dc_dbb;
-            }
+                let dc_da = scale_coeff4(dc_da_raw, scale);
+                let dc_db = scale_coeff4(dc_db_raw, scale);
 
-            if let (Some(h_range), Some(runtime)) = (h_range, score_runtime) {
-                for local_idx in 0..h_range.len() {
-                    let basis_span = runtime.basis_cubic_at(local_idx, z_mid)?;
-                    let idx = h_range.start + local_idx;
-                    coeff_u[idx] =
-                        scale_coeff4(exact::score_basis_cell_coefficients(basis_span, b), scale);
-                    if need_hessian {
-                        coeff_bu[idx] = scale_coeff4(
-                            exact::score_basis_cell_coefficients(basis_span, 1.0),
-                            scale,
-                        );
-                    }
-                }
-            }
-
-            if let (Some(w_range), Some(runtime)) = (w_range, link_runtime) {
-                for local_idx in 0..w_range.len() {
-                    let basis_span = runtime.basis_cubic_at(local_idx, u_mid)?;
-                    let idx = w_range.start + local_idx;
-                    coeff_u[idx] =
-                        scale_coeff4(exact::link_basis_cell_coefficients(basis_span, a, b), scale);
-                    if need_hessian {
-                        let (dc_aw_raw, dc_bw_raw) =
-                            exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                        coeff_au[idx] = scale_coeff4(dc_aw_raw, scale);
-                        coeff_bu[idx] = scale_coeff4(dc_bw_raw, scale);
-                    }
-                }
-            }
-
-            for u in 1..r {
-                f_u[u] += exact::cell_first_derivative_from_moments(&coeff_u[u], &state.moments)?;
+                coeff_u[1] = dc_db;
+                coeff_au[1] = [0.0; 4];
+                coeff_bu[1] = [0.0; 4];
                 if need_hessian {
-                    f_au[u] += exact::cell_second_derivative_from_moments(
+                    let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) = exact::denested_cell_second_partials(
+                        partition_cell.score_span,
+                        partition_cell.link_span,
+                        a,
+                        b,
+                    );
+                    let dc_daa = scale_coeff4(dc_daa_raw, scale);
+                    let dc_dab = scale_coeff4(dc_dab_raw, scale);
+                    let dc_dbb = scale_coeff4(dc_dbb_raw, scale);
+                    f_aa += exact::cell_second_derivative_from_moments(
                         cell,
                         &dc_da,
-                        &coeff_u[u],
-                        &coeff_au[u],
+                        &dc_da,
+                        &dc_daa,
                         &state.moments,
                     )?;
+                    coeff_au[1] = dc_dab;
+                    coeff_bu[1] = dc_dbb;
                 }
-            }
 
-            if need_hessian {
-                let coeff_jet = SparsePrimaryCoeffJetView::new(
-                    1,
-                    h_range,
-                    w_range,
-                    &coeff_u,
-                    &coeff_au,
-                    &coeff_bu,
-                    &zero_family,
-                    &zero_family,
-                    &zero_family,
-                    &zero_family,
-                    &zero_family,
-                    &zero_family,
-                    &zero_family,
-                );
-                for u in 1..r {
-                    for v in u..r {
-                        let second_coeff = coeff_jet.pair_from_b_family(
-                            coeff_jet.b_first,
-                            u,
-                            v,
-                            COEFF_SUPPORT_BHW,
+                if let (Some(h_range), Some(runtime)) = (h_range, score_runtime) {
+                    for local_idx in 0..h_range.len() {
+                        let basis_span = runtime.basis_cubic_at(local_idx, z_mid)?;
+                        let idx = h_range.start + local_idx;
+                        coeff_u[idx] = scale_coeff4(
+                            exact::score_basis_cell_coefficients(basis_span, b),
+                            scale,
                         );
-                        let val = exact::cell_second_derivative_from_moments(
+                        if need_hessian {
+                            coeff_bu[idx] = scale_coeff4(
+                                exact::score_basis_cell_coefficients(basis_span, 1.0),
+                                scale,
+                            );
+                        }
+                    }
+                }
+
+                if let (Some(w_range), Some(runtime)) = (w_range, link_runtime) {
+                    for local_idx in 0..w_range.len() {
+                        let basis_span = runtime.basis_cubic_at(local_idx, u_mid)?;
+                        let idx = w_range.start + local_idx;
+                        coeff_u[idx] = scale_coeff4(
+                            exact::link_basis_cell_coefficients(basis_span, a, b),
+                            scale,
+                        );
+                        if need_hessian {
+                            let (dc_aw_raw, dc_bw_raw) =
+                                exact::link_basis_cell_coefficient_partials(basis_span, a, b);
+                            coeff_au[idx] = scale_coeff4(dc_aw_raw, scale);
+                            coeff_bu[idx] = scale_coeff4(dc_bw_raw, scale);
+                        }
+                    }
+                }
+
+                for u in 1..r {
+                    f_u[u] +=
+                        exact::cell_first_derivative_from_moments(&coeff_u[u], &state.moments)?;
+                    if need_hessian {
+                        f_au[u] += exact::cell_second_derivative_from_moments(
                             cell,
-                            &coeff_jet.first[u],
-                            &coeff_jet.first[v],
-                            &second_coeff,
+                            &dc_da,
+                            &coeff_u[u],
+                            &coeff_au[u],
                             &state.moments,
                         )?;
-                        f_uv[[u, v]] += val;
-                        if u != v {
-                            f_uv[[v, u]] += val;
+                    }
+                }
+
+                if need_hessian {
+                    let coeff_jet = SparsePrimaryCoeffJetView::new(
+                        1,
+                        h_range,
+                        w_range,
+                        &coeff_u,
+                        &coeff_au,
+                        &coeff_bu,
+                        &zero_family,
+                        &zero_family,
+                        &zero_family,
+                        &zero_family,
+                        &zero_family,
+                        &zero_family,
+                        &zero_family,
+                    );
+                    for u in 1..r {
+                        for v in u..r {
+                            let second_coeff = coeff_jet.pair_from_b_family(
+                                coeff_jet.b_first,
+                                u,
+                                v,
+                                COEFF_SUPPORT_BHW,
+                            );
+                            let val = exact::cell_second_derivative_from_moments(
+                                cell,
+                                &coeff_jet.first[u],
+                                &coeff_jet.first[v],
+                                &second_coeff,
+                                &state.moments,
+                            )?;
+                            f_uv[[u, v]] += val;
+                            if u != v {
+                                f_uv[[v, u]] += val;
+                            }
                         }
                     }
                 }
@@ -4871,6 +5734,7 @@ impl BernoulliMarginalSlopeFamily {
         for u in 0..r {
             a_u[u] = -f_u[u] * inv_ma;
         }
+        self.cache_row_intercept_predictor(row, a, q, b, beta_h, beta_w, a_u);
         let a_uv = &mut scratch.a_uv;
         if need_hessian {
             for u in 0..r {
@@ -5036,6 +5900,26 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<ObservedDenestedCellPartials, String> {
         shared_observed_denested_cell_partials(
             self.z[row],
+            a,
+            b,
+            self.score_warp.as_ref(),
+            beta_h,
+            self.link_dev.as_ref(),
+            beta_w,
+            self.probit_frailty_scale(),
+        )
+    }
+
+    fn observed_denested_cell_partials_at_z(
+        &self,
+        z_value: f64,
+        a: f64,
+        b: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+    ) -> Result<ObservedDenestedCellPartials, String> {
+        shared_observed_denested_cell_partials(
+            z_value,
             a,
             b,
             self.score_warp.as_ref(),
@@ -6570,7 +7454,7 @@ impl BernoulliMarginalSlopeFamily {
         row: usize,
         slices: &BlockSlices,
         primary: &PrimarySlices,
-        primary_hessian: &Array2<f64>,
+        primary_hessian: ArrayView2<'_, f64>,
     ) {
         let h = primary_hessian;
         if let (Some(primary_h), Some(block_h)) = (primary.h.as_ref(), slices.h.as_ref()) {
@@ -6714,19 +7598,37 @@ impl BernoulliMarginalSlopeFamily {
                 |mut acc, chunk_idx| -> Result<_, String> {
                     let start = chunk_idx * ROW_CHUNK_SIZE;
                     let end = (start + ROW_CHUNK_SIZE).min(n);
+                    let chunk_len = end - start;
+                    let mut w_mm = Array1::<f64>::zeros(chunk_len);
+                    let mut w_mg = Array1::<f64>::zeros(chunk_len);
+                    let mut w_gg = Array1::<f64>::zeros(chunk_len);
                     let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
-                    for row in start..end {
-                        let row_ctx = Self::row_ctx(cache, row);
-                        self.compute_row_analytic_flex_into(
-                            row,
-                            block_states,
-                            primary,
-                            row_ctx,
-                            true,
-                            &mut scratch,
-                        )?;
-                        acc.add_pullback(self, row, slices, primary, &scratch.hess);
+                    for (local, row) in (start..end).enumerate() {
+                        let hess_view =
+                            if let Some(cached) = Self::cached_row_primary_hessian(cache, row) {
+                                cached
+                            } else {
+                                let row_ctx = Self::row_ctx(cache, row);
+                                self.compute_row_analytic_flex_into(
+                                    row,
+                                    block_states,
+                                    primary,
+                                    row_ctx,
+                                    true,
+                                    &mut scratch,
+                                )?;
+                                scratch.hess.view()
+                            };
+                        w_mm[local] = hess_view[[0, 0]];
+                        w_mg[local] = hess_view[[0, 1]];
+                        w_gg[local] = hess_view[[1, 1]];
+                        if let Some(ref mut dc) = acc.dense_correction {
+                            self.add_pullback_primary_hessian_hw_only(
+                                dc, row, slices, primary, hess_view,
+                            );
+                        }
                     }
+                    acc.add_weighted_design_grams(self, start..end, &w_mm, &w_mg, &w_gg)?;
                     Ok(acc)
                 },
             )
@@ -9478,24 +10380,11 @@ pub fn fit_bernoulli_marginal_slope_terms(
         &spec.latent_z_policy,
     )?;
     spec.z = z_standardized;
-    let latent_measure = build_latent_measure(&spec.z, &spec.weights, &spec.latent_z_policy)?;
     let pilot_baseline = pooled_probit_baseline(&spec.y, &spec.z, &spec.weights)?;
     let sigma_learnable = matches!(
         &spec.frailty,
         FrailtySpec::GaussianShift { sigma_fixed: None }
     );
-    if latent_measure.is_empirical() && sigma_learnable {
-        return Err(
-            "empirical latent-measure marginal-slope calibration requires fixed GaussianShift sigma; learnable sigma derivatives must be fit under the standard-normal latent measure"
-                .to_string(),
-        );
-    }
-    if latent_measure.is_empirical() && (spec.score_warp.is_some() || spec.link_dev.is_some()) {
-        return Err(
-            "empirical latent-measure marginal-slope calibration currently requires rigid probit mode; score-warp/link-deviation models must use a CTN-PIT standard-normal latent measure"
-                .to_string(),
-        );
-    }
     let initial_sigma = match &spec.frailty {
         FrailtySpec::GaussianShift {
             sigma_fixed: Some(s),
@@ -9524,6 +10413,19 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let logslope_design = joint_designs.remove(0);
     let marginalspec_boot = joint_specs.remove(0);
     let logslopespec_boot = joint_specs.remove(0);
+    let latent_measure = build_latent_measure_with_geometry(
+        &spec.z,
+        &spec.weights,
+        &spec.latent_z_policy,
+        Some(data_view),
+        &[&marginalspec_boot, &logslopespec_boot],
+    )?;
+    if latent_measure.is_empirical() && sigma_learnable {
+        return Err(
+            "empirical latent-measure marginal-slope calibration requires fixed GaussianShift sigma; learnable sigma derivatives must be fit under the standard-normal latent measure"
+                .to_string(),
+        );
+    }
 
     let y = Arc::new(spec.y.clone());
     let weights = Arc::new(spec.weights.clone());
@@ -9532,7 +10434,17 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let score_warp_prepared = spec
         .score_warp
         .as_ref()
-        .map(|cfg| build_score_warp_deviation_block_from_seed(&spec.z, cfg))
+        .map(|cfg| {
+            if matches!(latent_measure, LatentMeasureKind::StandardNormal) {
+                build_score_warp_deviation_block_from_seed(&spec.z, cfg)
+            } else {
+                build_score_warp_deviation_block_from_seed_empirical_anchor(
+                    &spec.z,
+                    &spec.weights,
+                    cfg,
+                )
+            }
+        })
         .transpose()?;
     // Build the link-deviation block if requested.  The seed only determines
     // knot placement for the deviation basis, so we use the closed-form
@@ -10141,28 +11053,29 @@ mod tests {
         .expect("link-wiggle deviation block");
 
         let cache = new_intercept_warm_start_cache(n);
-        let make_family = |cache: Option<Arc<Vec<AtomicU64>>>| BernoulliMarginalSlopeFamily {
-            y: Arc::new(y.clone()),
-            weights: Arc::new(weights.clone()),
-            z: Arc::new(z.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::ones((n, 1)),
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::ones((n, 1)),
-            )),
-            score_warp: Some(score_prepared.runtime.clone()),
-            link_dev: Some(link_prepared.runtime.clone()),
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: cache,
-        };
+        let make_family =
+            |cache: Option<Arc<BernoulliInterceptWarmStartCache>>| BernoulliMarginalSlopeFamily {
+                y: Arc::new(y.clone()),
+                weights: Arc::new(weights.clone()),
+                z: Arc::new(z.clone()),
+                latent_measure: LatentMeasureKind::StandardNormal,
+                gaussian_frailty_sd: None,
+                base_link: bernoulli_marginal_slope_probit_link(),
+                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    Array2::ones((n, 1)),
+                )),
+                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    Array2::ones((n, 1)),
+                )),
+                score_warp: Some(score_prepared.runtime.clone()),
+                link_dev: Some(link_prepared.runtime.clone()),
+                policy: crate::resource::ResourcePolicy::default_library(),
+                cell_moment_lru: new_cell_moment_lru_cache(
+                    &crate::resource::ResourcePolicy::default_library(),
+                ),
+                cell_moment_cache_stats: new_cell_moment_cache_stats(),
+                intercept_warm_starts: cache,
+            };
         let marginal_eta = Array1::from_iter((0..n).map(|i| 0.15 * ((i as f64) * 0.001).sin()));
         let slope_eta = Array1::from_iter((0..n).map(|i| 0.35 + 0.02 * ((i as f64) * 0.003).cos()));
         let states = vec![
@@ -17093,7 +18006,8 @@ mod tests {
             latent_measure: LatentMeasureSpec::Auto { grid_size: 5 },
             ..LatentZPolicy::default()
         };
-        let measure = build_latent_measure(&z, &weights, &policy).expect("auto latent measure");
+        let measure = build_latent_measure_with_geometry(&z, &weights, &policy, None, &[])
+            .expect("auto latent measure");
         match measure {
             LatentMeasureKind::GlobalEmpirical { nodes, weights } => {
                 assert_eq!(nodes.len(), 5);
@@ -17102,6 +18016,9 @@ mod tests {
             }
             LatentMeasureKind::StandardNormal => {
                 panic!("bad normal diagnostics must select empirical latent measure")
+            }
+            LatentMeasureKind::LocalEmpirical { .. } => {
+                panic!("auto latent measure without geometry must select global empirical")
             }
         }
     }
@@ -17124,6 +18041,128 @@ mod tests {
             .map(|(&node, &weight)| weight * normal_cdf(intercept + scale * slope * node))
             .sum::<f64>();
         assert!((calibrated - target_mu).abs() <= 1e-10);
+    }
+
+    #[test]
+    fn skewed_rigid_empirical_grid_calibrates_marginal_probability() {
+        let z = array![-1.15, -1.05, -0.95, -0.8, -0.65, -0.45, 0.1, 0.9, 2.4, 4.7];
+        let weights = array![1.0, 1.0, 1.0, 0.9, 0.9, 0.8, 0.5, 0.35, 0.2, 0.1];
+        let grid = build_empirical_z_grid(&z, &weights, 7, "test skewed grid").expect("grid");
+        let target_q = 0.25;
+        let target_mu = normal_cdf(target_q);
+        let slope = 1.35;
+        let scale = 0.82;
+
+        let intercept = empirical_intercept_from_marginal(
+            target_mu,
+            target_q,
+            slope,
+            scale,
+            &grid.nodes,
+            &grid.weights,
+            None,
+        )
+        .expect("empirical intercept");
+        let calibrated = grid
+            .nodes
+            .iter()
+            .zip(grid.weights.iter())
+            .map(|(&node, &weight)| weight * normal_cdf(intercept + scale * slope * node))
+            .sum::<f64>();
+
+        assert!((calibrated - target_mu).abs() <= 1e-10);
+    }
+
+    #[test]
+    fn gaussian_rigid_intercept_miscalibrates_skewed_empirical_law() {
+        let nodes = vec![-0.95, -0.7, -0.45, -0.2, 0.4, 1.3, 3.1];
+        let weights = vec![0.28, 0.22, 0.17, 0.13, 0.1, 0.07, 0.03];
+        let target_q = -0.15;
+        let target_mu = normal_cdf(target_q);
+        let slope = 1.4;
+        let scale = 0.9;
+
+        let gaussian_intercept = rigid_intercept_from_marginal(target_q, slope, scale);
+        let gaussian_mu = nodes
+            .iter()
+            .zip(weights.iter())
+            .map(|(&node, &weight)| weight * normal_cdf(gaussian_intercept + scale * slope * node))
+            .sum::<f64>();
+        assert!(
+            (gaussian_mu - target_mu).abs() > 1e-3,
+            "skewed empirical law should not be calibrated by Gaussian identity"
+        );
+
+        let empirical_intercept = empirical_intercept_from_marginal(
+            target_mu, target_q, slope, scale, &nodes, &weights, None,
+        )
+        .expect("empirical intercept");
+        let empirical_mu = nodes
+            .iter()
+            .zip(weights.iter())
+            .map(|(&node, &weight)| weight * normal_cdf(empirical_intercept + scale * slope * node))
+            .sum::<f64>();
+        assert!((empirical_mu - target_mu).abs() <= 1e-10);
+    }
+
+    #[test]
+    fn auto_latent_measure_preserves_standard_normal_fast_path() {
+        let n = 2001usize;
+        let z = Array1::from_iter((0..n).map(|idx| {
+            let p = (idx as f64 + 0.5) / n as f64;
+            standard_normal_quantile(p).expect("normal quantile")
+        }));
+        let weights = Array1::ones(n);
+        let policy = LatentZPolicy {
+            latent_measure: LatentMeasureSpec::Auto { grid_size: 17 },
+            ..LatentZPolicy::default()
+        };
+        let measure =
+            build_latent_measure_with_geometry(&z, &weights, &policy, None, &[]).expect("measure");
+
+        assert!(matches!(measure, LatentMeasureKind::StandardNormal));
+        let slope = 0.7;
+        let scale = 0.85;
+        let target_q = 0.4;
+        assert_eq!(
+            rigid_intercept_from_marginal(target_q, slope, scale),
+            target_q * (1.0 + (scale * slope).powi(2)).sqrt()
+        );
+    }
+
+    #[test]
+    fn score_warp_empirical_anchor_zeroes_empirical_intercept_and_slope_components() {
+        let z = array![-1.4, -0.9, -0.35, 0.1, 0.55, 1.2, 2.8];
+        let weights = array![1.0, 0.8, 1.2, 0.7, 0.9, 0.6, 0.25];
+        let prepared = build_score_warp_deviation_block_from_seed_empirical_anchor(
+            &z,
+            &weights,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("empirical score warp");
+        let design = prepared.runtime.design(&z).expect("score warp design");
+        let beta = Array1::from_iter((0..design.ncols()).map(|idx| 0.1 * (idx as f64 + 1.0)));
+        let h = design.dot(&beta);
+        let total_weight = weights.sum();
+        let empirical_mean = h
+            .iter()
+            .zip(weights.iter())
+            .map(|(&value, &weight)| weight * value)
+            .sum::<f64>()
+            / total_weight;
+        let empirical_slope = h
+            .iter()
+            .zip(z.iter())
+            .zip(weights.iter())
+            .map(|((&value, &z_value), &weight)| weight * z_value * value)
+            .sum::<f64>()
+            / total_weight;
+
+        assert!(empirical_mean.abs() <= 1e-10);
+        assert!(empirical_slope.abs() <= 1e-10);
     }
 
     #[test]

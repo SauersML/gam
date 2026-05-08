@@ -1,9 +1,11 @@
 use crate::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
 use crate::families::bernoulli_marginal_slope::{
-    LatentMeasureKind, bernoulli_marginal_link_map, empirical_intercept_from_marginal,
+    EmpiricalZGrid, LatentMeasureKind, bernoulli_marginal_link_map,
+    empirical_intercept_from_marginal,
 };
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
+    ObservedDenestedCellPartials, eval_coeff4_at,
     probit_frailty_scale as marginal_slope_probit_frailty_scale, scale_coeff4,
 };
 use crate::families::strategy::{FamilyStrategy, strategy_for_family, strategy_from_fit};
@@ -459,6 +461,8 @@ pub struct PredictInput {
     pub offset_noise: Option<Array1<f64>>,
     /// Optional auxiliary scalar covariate used by specialized predictors.
     pub auxiliary_scalar: Option<Array1<f64>>,
+    /// Optional auxiliary matrix used by specialized predictors.
+    pub auxiliary_matrix: Option<Array2<f64>>,
 }
 
 fn slice_predict_input(
@@ -486,7 +490,11 @@ fn slice_predict_input(
         auxiliary_scalar: input
             .auxiliary_scalar
             .as_ref()
-            .map(|values| values.slice(ndarray::s![rows]).to_owned()),
+            .map(|values| values.slice(ndarray::s![rows.clone()]).to_owned()),
+        auxiliary_matrix: input
+            .auxiliary_matrix
+            .as_ref()
+            .map(|values| values.slice(ndarray::s![rows, ..]).to_owned()),
     })
 }
 
@@ -947,6 +955,177 @@ impl BernoulliMarginalSlopePredictor {
         Ok((intercept, a_marginal_eta, a_slope))
     }
 
+    fn local_empirical_mixture_for_point(
+        point: &[f64],
+        centers: &[Vec<f64>],
+        top_k: usize,
+        bandwidth: f64,
+    ) -> Result<Vec<(usize, f64)>, EstimationError> {
+        if centers.is_empty() {
+            return Err(EstimationError::InvalidInput(
+                "local empirical latent prediction has no centers".to_string(),
+            ));
+        }
+        if top_k == 0 {
+            return Err(EstimationError::InvalidInput(
+                "local empirical latent prediction top_k must be positive".to_string(),
+            ));
+        }
+        if !(bandwidth.is_finite() && bandwidth > 0.0) {
+            return Err(EstimationError::InvalidInput(format!(
+                "local empirical latent prediction bandwidth must be finite and positive, got {bandwidth}"
+            )));
+        }
+        let bw2 = bandwidth * bandwidth;
+        let mut distances = Vec::<(usize, f64)>::with_capacity(centers.len());
+        for (idx, center) in centers.iter().enumerate() {
+            if center.len() != point.len() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "local empirical latent prediction center {idx} dimension mismatch: center={}, point={}",
+                    center.len(),
+                    point.len()
+                )));
+            }
+            let d2 = center
+                .iter()
+                .zip(point.iter())
+                .map(|(&c, &x)| {
+                    let delta = x - c;
+                    delta * delta
+                })
+                .sum::<f64>();
+            if !d2.is_finite() {
+                return Err(EstimationError::InvalidInput(
+                    "local empirical latent prediction distance is non-finite".to_string(),
+                ));
+            }
+            distances.push((idx, d2));
+        }
+        distances.sort_by(|left, right| {
+            left.1
+                .partial_cmp(&right.1)
+                .expect("validated local empirical distances are finite")
+        });
+        let k = top_k.min(distances.len());
+        let mut mixture = Vec::with_capacity(k);
+        let mut total = 0.0;
+        for &(idx, d2) in distances.iter().take(k) {
+            let weight = (-0.5 * d2 / bw2).exp().max(1e-300);
+            mixture.push((idx, weight));
+            total += weight;
+        }
+        if !(total.is_finite() && total > 0.0) {
+            return Err(EstimationError::InvalidInput(
+                "local empirical latent prediction mixture has non-positive total weight"
+                    .to_string(),
+            ));
+        }
+        for (_, weight) in &mut mixture {
+            *weight /= total;
+        }
+        Ok(mixture)
+    }
+
+    fn combine_empirical_grids(
+        grids: &[EmpiricalZGrid],
+        mixture: &[(usize, f64)],
+    ) -> Result<EmpiricalZGrid, EstimationError> {
+        let total_len = mixture
+            .iter()
+            .map(|&(idx, _)| grids.get(idx).map_or(0, |grid| grid.nodes.len()))
+            .sum::<usize>();
+        let mut nodes = Vec::with_capacity(total_len);
+        let mut weights = Vec::with_capacity(total_len);
+        let mut total_weight = 0.0;
+        for &(grid_idx, grid_weight) in mixture {
+            if !(grid_weight.is_finite() && grid_weight >= 0.0) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "local empirical latent prediction mixture weight must be finite and non-negative, got {grid_weight}"
+                )));
+            }
+            let grid = grids.get(grid_idx).ok_or_else(|| {
+                EstimationError::InvalidInput(format!(
+                    "local empirical latent prediction grid index {grid_idx} is out of bounds for {} grids",
+                    grids.len()
+                ))
+            })?;
+            if grid.nodes.len() != grid.weights.len() || grid.nodes.is_empty() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "local empirical latent prediction grid {grid_idx} is invalid: nodes={}, weights={}",
+                    grid.nodes.len(),
+                    grid.weights.len()
+                )));
+            }
+            for (&node, &weight) in grid.nodes.iter().zip(grid.weights.iter()) {
+                let combined_weight = grid_weight * weight;
+                if !(node.is_finite() && combined_weight.is_finite() && combined_weight >= 0.0) {
+                    return Err(EstimationError::InvalidInput(
+                        "local empirical latent prediction grid contains invalid node/weight"
+                            .to_string(),
+                    ));
+                }
+                nodes.push(node);
+                weights.push(combined_weight);
+                total_weight += combined_weight;
+            }
+        }
+        if !(total_weight.is_finite() && total_weight > 0.0) {
+            return Err(EstimationError::InvalidInput(
+                "local empirical latent prediction combined grid has non-positive total weight"
+                    .to_string(),
+            ));
+        }
+        for weight in &mut weights {
+            *weight /= total_weight;
+        }
+        Ok(EmpiricalZGrid { nodes, weights })
+    }
+
+    fn empirical_grid_for_prediction_row(
+        &self,
+        input: &PredictInput,
+        row: usize,
+    ) -> Result<Option<EmpiricalZGrid>, EstimationError> {
+        match &self.latent_measure {
+            LatentMeasureKind::StandardNormal => Ok(None),
+            LatentMeasureKind::GlobalEmpirical { nodes, weights } => Ok(Some(EmpiricalZGrid {
+                nodes: nodes.clone(),
+                weights: weights.clone(),
+            })),
+            LatentMeasureKind::LocalEmpirical {
+                centers,
+                grids,
+                top_k,
+                bandwidth,
+                ..
+            } => {
+                let conditioning = input.auxiliary_matrix.as_ref().ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "bernoulli marginal-slope local empirical prediction requires auxiliary conditioning matrix"
+                            .to_string(),
+                    )
+                })?;
+                if row >= conditioning.nrows() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "local empirical latent prediction row {row} is out of bounds for {} conditioning rows",
+                        conditioning.nrows()
+                    )));
+                }
+                let expected_dim = centers.first().map_or(0, Vec::len);
+                if conditioning.ncols() != expected_dim {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "local empirical latent prediction conditioning dimension mismatch: got {}, expected {expected_dim}",
+                        conditioning.ncols()
+                    )));
+                }
+                let point = conditioning.row(row).to_vec();
+                let mixture =
+                    Self::local_empirical_mixture_for_point(&point, centers, *top_k, *bandwidth)?;
+                Self::combine_empirical_grids(grids, &mixture).map(Some)
+            }
+        }
+    }
+
     fn transform_internal_eta_to_base_scale(
         &self,
         internal_eta: Array1<f64>,
@@ -1102,6 +1281,129 @@ impl BernoulliMarginalSlopePredictor {
         Ok((f, f_a, f_aa))
     }
 
+    fn observed_denested_cell_partials_at_z(
+        &self,
+        z_value: f64,
+        a: f64,
+        b: f64,
+        beta_score_warp: Option<&Array1<f64>>,
+        beta_link_dev: Option<&Array1<f64>>,
+    ) -> Result<ObservedDenestedCellPartials, EstimationError> {
+        use crate::families::bernoulli_marginal_slope::exact_kernel as exact;
+
+        let zero_span = exact::LocalSpanCubic {
+            left: 0.0,
+            right: 1.0,
+            c0: 0.0,
+            c1: 0.0,
+            c2: 0.0,
+            c3: 0.0,
+        };
+        let u_value = a + b * z_value;
+        let score_span = if let (Some(runtime), Some(beta)) =
+            (self.score_warp_runtime.as_ref(), beta_score_warp)
+        {
+            runtime
+                .local_cubic_at(beta, z_value)
+                .map_err(EstimationError::InvalidInput)?
+        } else {
+            zero_span
+        };
+        let link_span = if let (Some(runtime), Some(beta)) =
+            (self.link_deviation_runtime.as_ref(), beta_link_dev)
+        {
+            runtime
+                .local_cubic_at(beta, u_value)
+                .map_err(EstimationError::InvalidInput)?
+        } else {
+            zero_span
+        };
+        let scale = self.probit_frailty_scale();
+        let coeff = scale_coeff4(
+            exact::denested_cell_coefficients(score_span, link_span, a, b),
+            scale,
+        );
+        let (dc_da_raw, dc_db_raw) =
+            exact::denested_cell_coefficient_partials(score_span, link_span, a, b);
+        let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) =
+            exact::denested_cell_second_partials(score_span, link_span, a, b);
+        let (dc_daaa, dc_daab, dc_dabb, dc_dbbb) = exact::denested_cell_third_partials(link_span);
+        Ok(ObservedDenestedCellPartials {
+            coeff,
+            dc_da: scale_coeff4(dc_da_raw, scale),
+            dc_db: scale_coeff4(dc_db_raw, scale),
+            dc_daa: scale_coeff4(dc_daa_raw, scale),
+            dc_dab: scale_coeff4(dc_dab_raw, scale),
+            dc_dbb: scale_coeff4(dc_dbb_raw, scale),
+            dc_daaa: scale_coeff4(dc_daaa, scale),
+            dc_daab: scale_coeff4(dc_daab, scale),
+            dc_dabb: scale_coeff4(dc_dabb, scale),
+            dc_dbbb: scale_coeff4(dc_dbbb, scale),
+        })
+    }
+
+    fn evaluate_empirical_denested_calibration(
+        &self,
+        a: f64,
+        marginal_eta: f64,
+        slope: f64,
+        beta_score_warp: Option<&Array1<f64>>,
+        beta_link_dev: Option<&Array1<f64>>,
+        grid: &EmpiricalZGrid,
+    ) -> Result<(f64, f64, f64), EstimationError> {
+        let marginal = bernoulli_marginal_link_map(&self.base_link, marginal_eta)
+            .map_err(EstimationError::InvalidInput)?;
+        let mut f = -marginal.mu;
+        let mut f_a = 0.0;
+        let mut f_aa = 0.0;
+        for (&node, &weight) in grid.nodes.iter().zip(grid.weights.iter()) {
+            let obs = self.observed_denested_cell_partials_at_z(
+                node,
+                a,
+                slope,
+                beta_score_warp,
+                beta_link_dev,
+            )?;
+            let eta = eval_coeff4_at(&obs.coeff, node);
+            let eta_a = eval_coeff4_at(&obs.dc_da, node);
+            let eta_aa = eval_coeff4_at(&obs.dc_daa, node);
+            let pdf = normal_pdf(eta);
+            f += weight * normal_cdf(eta);
+            f_a += weight * pdf * eta_a;
+            f_aa += weight * pdf * (eta_aa - eta * eta_a * eta_a);
+        }
+        Ok((f, f_a, f_aa))
+    }
+
+    fn evaluate_prediction_calibration(
+        &self,
+        a: f64,
+        marginal_eta: f64,
+        slope: f64,
+        beta_score_warp: Option<&Array1<f64>>,
+        beta_link_dev: Option<&Array1<f64>>,
+        empirical_grid: Option<&EmpiricalZGrid>,
+    ) -> Result<(f64, f64, f64), EstimationError> {
+        if let Some(grid) = empirical_grid {
+            self.evaluate_empirical_denested_calibration(
+                a,
+                marginal_eta,
+                slope,
+                beta_score_warp,
+                beta_link_dev,
+                grid,
+            )
+        } else {
+            self.evaluate_denested_calibration(
+                a,
+                marginal_eta,
+                slope,
+                beta_score_warp,
+                beta_link_dev,
+            )
+        }
+    }
+
     pub fn from_unified(
         unified: &UnifiedFitResult,
         z_column: String,
@@ -1161,14 +1463,6 @@ impl BernoulliMarginalSlopePredictor {
             .map_err(|e| {
                 format!("bernoulli marginal-slope predictor latent measure is invalid: {e}")
             })?;
-        if matches!(latent_measure, LatentMeasureKind::GlobalEmpirical { .. })
-            && (score_warp_runtime.is_some() || link_deviation_runtime.is_some())
-        {
-            return Err(
-                "bernoulli marginal-slope empirical latent-measure prediction requires rigid probit mode; saved flexible models must use a standard-normal CTN-PIT latent measure"
-                    .to_string(),
-            );
-        }
         let blocks = &unified.blocks;
         let expected_blocks = 2
             + usize::from(score_warp_runtime.is_some())
@@ -1294,17 +1588,19 @@ impl BernoulliMarginalSlopePredictor {
         slope: f64,
         link_dev_beta: Option<&Array1<f64>>,
         score_warp_beta: Option<&Array1<f64>>,
+        empirical_grid: Option<&EmpiricalZGrid>,
         warm_start_buf: &mut Array1<f64>,
     ) -> Result<f64, EstimationError> {
         let marginal = bernoulli_marginal_link_map(&self.base_link, marginal_eta)
             .map_err(EstimationError::InvalidInput)?;
         let eval = |a: f64| -> Result<(f64, f64, f64), String> {
-            self.evaluate_denested_calibration(
+            self.evaluate_prediction_calibration(
                 a,
                 marginal_eta,
                 slope,
                 score_warp_beta,
                 link_dev_beta,
+                empirical_grid,
             )
             .map_err(|err| err.to_string())
         };
@@ -1465,6 +1761,32 @@ impl BernoulliMarginalSlopePredictor {
                     }
                     (final_eta, marginal_scales, logslope_scales)
                 }
+                LatentMeasureKind::LocalEmpirical { .. } => {
+                    let mut final_eta = Array1::<f64>::zeros(n);
+                    let mut marginal_scales = Array1::<f64>::zeros(n);
+                    let mut logslope_scales = Array1::<f64>::zeros(n);
+                    for i in 0..n {
+                        let grid = self
+                            .empirical_grid_for_prediction_row(input, i)?
+                            .ok_or_else(|| {
+                                EstimationError::InvalidInput(
+                                    "local empirical latent prediction did not produce a row grid"
+                                        .to_string(),
+                                )
+                            })?;
+                        let (intercept, a_marginal, a_slope) = self
+                            .empirical_rigid_intercept_and_gradient(
+                                marginal_eta[i],
+                                logslope_eta[i],
+                                &grid.nodes,
+                                &grid.weights,
+                            )?;
+                        final_eta[i] = intercept + scale * logslope_eta[i] * z[i];
+                        marginal_scales[i] = a_marginal;
+                        logslope_scales[i] = a_slope + scale * z[i];
+                    }
+                    (final_eta, marginal_scales, logslope_scales)
+                }
             };
 
             if !need_gradient {
@@ -1554,11 +1876,13 @@ impl BernoulliMarginalSlopePredictor {
                     let i = start + local_row;
                     let slope = logslope_eta[i];
                     let q = marginal_eta[i];
+                    let empirical_grid = self.empirical_grid_for_prediction_row(input, i)?;
                     intercepts[local_row] = self.solve_intercept_scalar(
                         q,
                         slope,
                         link_dev_beta_owned.as_ref(),
                         score_warp_beta_owned.as_ref(),
+                        empirical_grid.as_ref(),
                         &mut warm_start_buf,
                     )?;
 
@@ -1567,94 +1891,139 @@ impl BernoulliMarginalSlopePredictor {
                     }
 
                     let intercept = intercepts[local_row];
-                    let (_, m_a_raw, _) = self.evaluate_denested_calibration(
+                    let (_, m_a_raw, _) = self.evaluate_prediction_calibration(
                         intercept,
                         q,
                         slope,
                         score_warp_beta_owned.as_ref(),
                         link_dev_beta_owned.as_ref(),
+                        empirical_grid.as_ref(),
                     )?;
                     let m_a = m_a_raw.max(1e-12);
                     a_q.as_mut().unwrap()[local_row] = marginal_map[i].mu1 / m_a;
-                    let cells = self.denested_partition_cells(
-                        intercept,
-                        slope,
-                        score_warp_beta_owned.as_ref(),
-                        link_dev_beta_owned.as_ref(),
-                    )?;
                     let mut f_b = 0.0;
                     let mut f_h_row = vec![0.0; score_warp_dim];
                     let mut f_w_row = vec![0.0; link_dev_dim];
-                    for partition_cell in cells {
-                        let cell = partition_cell.cell;
-                        let state =
-                            crate::families::bernoulli_marginal_slope::exact_kernel::evaluate_cell_moments(
-                                cell, 9,
-                            )
-                            .map_err(EstimationError::InvalidInput)?;
-                        let (_, dc_db_raw) = crate::families::bernoulli_marginal_slope::exact_kernel::denested_cell_coefficient_partials(
-                            partition_cell.score_span,
-                            partition_cell.link_span,
-                            intercept,
-                            slope,
-                        );
-                        // `denested_partition_cells` scales the cell itself for
-                        // Gaussian frailty, so every coefficient partial of
-                        // F(a, theta) must carry the same probit scale as F_a.
-                        let dc_db = scale_coeff4(dc_db_raw, scale);
-                        f_b += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
-                            &dc_db,
-                            &state.moments,
-                        )
-                        .map_err(EstimationError::InvalidInput)?;
+                    if let Some(grid) = empirical_grid.as_ref() {
+                        for (&node, &weight) in grid.nodes.iter().zip(grid.weights.iter()) {
+                            let obs = self.observed_denested_cell_partials_at_z(
+                                node,
+                                intercept,
+                                slope,
+                                score_warp_beta_owned.as_ref(),
+                                link_dev_beta_owned.as_ref(),
+                            )?;
+                            let eta = eval_coeff4_at(&obs.coeff, node);
+                            let pdf = normal_pdf(eta);
+                            f_b += weight * pdf * eval_coeff4_at(&obs.dc_db, node);
 
-                        let mid = 0.5 * (cell.left + cell.right);
-                        if let (Some(a_h), Some(runtime)) =
-                            (a_h.as_mut(), self.score_warp_runtime.as_ref())
-                        {
-                            for j in 0..score_warp_dim {
-                                let basis_span = runtime
-                                    .basis_cubic_at(j, mid)
-                                    .map_err(EstimationError::InvalidInput)?;
-                                let coeffs = crate::families::bernoulli_marginal_slope::exact_kernel::score_basis_cell_coefficients(
-                                    basis_span, slope,
-                                );
-                                let coeffs = scale_coeff4(coeffs, scale);
-                                f_h_row[j] += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
-                                    &coeffs,
-                                    &state.moments,
-                                )
-                                .map_err(EstimationError::InvalidInput)?;
+                            if let Some(runtime) = self.score_warp_runtime.as_ref() {
+                                for j in 0..score_warp_dim {
+                                    let basis_span = runtime
+                                        .basis_cubic_at(j, node)
+                                        .map_err(EstimationError::InvalidInput)?;
+                                    let coeffs = crate::families::bernoulli_marginal_slope::exact_kernel::score_basis_cell_coefficients(
+                                        basis_span,
+                                        slope,
+                                    );
+                                    let coeffs = scale_coeff4(coeffs, scale);
+                                    f_h_row[j] += weight * pdf * eval_coeff4_at(&coeffs, node);
+                                }
                             }
-                            let factor = -1.0 / m_a;
-                            for j in 0..score_warp_dim {
-                                a_h[[local_row, j]] = factor * f_h_row[j];
+
+                            if let Some(runtime) = self.link_deviation_runtime.as_ref() {
+                                for j in 0..link_dev_dim {
+                                    let basis_span = runtime
+                                        .basis_cubic_at(j, intercept + slope * node)
+                                        .map_err(EstimationError::InvalidInput)?;
+                                    let coeffs = crate::families::bernoulli_marginal_slope::exact_kernel::link_basis_cell_coefficients(
+                                        basis_span,
+                                        intercept,
+                                        slope,
+                                    );
+                                    let coeffs = scale_coeff4(coeffs, scale);
+                                    f_w_row[j] += weight * pdf * eval_coeff4_at(&coeffs, node);
+                                }
                             }
                         }
-
-                        if let (Some(a_w), Some(runtime)) =
-                            (a_w.as_mut(), self.link_deviation_runtime.as_ref())
-                        {
-                            for j in 0..link_dev_dim {
-                                let basis_span = runtime
-                                    .basis_cubic_at(j, intercept + slope * mid)
-                                    .map_err(EstimationError::InvalidInput)?;
-                                let coeffs = crate::families::bernoulli_marginal_slope::exact_kernel::link_basis_cell_coefficients(
-                                    basis_span,
-                                    intercept,
-                                    slope,
-                                );
-                                let coeffs = scale_coeff4(coeffs, scale);
-                                f_w_row[j] += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
-                                    &coeffs,
-                                    &state.moments,
+                    } else {
+                        let cells = self.denested_partition_cells(
+                            intercept,
+                            slope,
+                            score_warp_beta_owned.as_ref(),
+                            link_dev_beta_owned.as_ref(),
+                        )?;
+                        for partition_cell in cells {
+                            let cell = partition_cell.cell;
+                            let state =
+                                crate::families::bernoulli_marginal_slope::exact_kernel::evaluate_cell_moments(
+                                    cell, 9,
                                 )
                                 .map_err(EstimationError::InvalidInput)?;
+                            let (_, dc_db_raw) = crate::families::bernoulli_marginal_slope::exact_kernel::denested_cell_coefficient_partials(
+                                partition_cell.score_span,
+                                partition_cell.link_span,
+                                intercept,
+                                slope,
+                            );
+                            // `denested_partition_cells` scales the cell itself for
+                            // Gaussian frailty, so every coefficient partial of
+                            // F(a, theta) must carry the same probit scale as F_a.
+                            let dc_db = scale_coeff4(dc_db_raw, scale);
+                            f_b += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
+                                &dc_db,
+                                &state.moments,
+                            )
+                            .map_err(EstimationError::InvalidInput)?;
+
+                            let mid = 0.5 * (cell.left + cell.right);
+                            if let Some(runtime) = self.score_warp_runtime.as_ref() {
+                                for j in 0..score_warp_dim {
+                                    let basis_span = runtime
+                                        .basis_cubic_at(j, mid)
+                                        .map_err(EstimationError::InvalidInput)?;
+                                    let coeffs = crate::families::bernoulli_marginal_slope::exact_kernel::score_basis_cell_coefficients(
+                                        basis_span, slope,
+                                    );
+                                    let coeffs = scale_coeff4(coeffs, scale);
+                                    f_h_row[j] += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
+                                        &coeffs,
+                                        &state.moments,
+                                    )
+                                    .map_err(EstimationError::InvalidInput)?;
+                                }
                             }
-                            let factor = -1.0 / m_a;
-                            for j in 0..link_dev_dim {
-                                a_w[[local_row, j]] = factor * f_w_row[j];
+
+                            if let Some(runtime) = self.link_deviation_runtime.as_ref() {
+                                for j in 0..link_dev_dim {
+                                    let basis_span = runtime
+                                        .basis_cubic_at(j, intercept + slope * mid)
+                                        .map_err(EstimationError::InvalidInput)?;
+                                    let coeffs = crate::families::bernoulli_marginal_slope::exact_kernel::link_basis_cell_coefficients(
+                                        basis_span,
+                                        intercept,
+                                        slope,
+                                    );
+                                    let coeffs = scale_coeff4(coeffs, scale);
+                                    f_w_row[j] += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
+                                        &coeffs,
+                                        &state.moments,
+                                    )
+                                    .map_err(EstimationError::InvalidInput)?;
+                                }
                             }
+                        }
+                    }
+                    if let Some(a_h) = a_h.as_mut() {
+                        let factor = -1.0 / m_a;
+                        for j in 0..score_warp_dim {
+                            a_h[[local_row, j]] = factor * f_h_row[j];
+                        }
+                    }
+                    if let Some(a_w) = a_w.as_mut() {
+                        let factor = -1.0 / m_a;
+                        for j in 0..link_dev_dim {
+                            a_w[[local_row, j]] = factor * f_w_row[j];
                         }
                     }
                     a_b.as_mut().unwrap()[local_row] = -f_b / m_a;
@@ -1949,12 +2318,40 @@ impl BernoulliMarginalSlopePredictor {
         // Rigid path mirrors `final_eta_and_gradient_from_theta` lines 1342-1383:
         //   eta = c·q + s·b·z,  ∂eta/∂q = c.
         if !flex_active {
-            // Vectorize: sb = scale·logslope, c = sqrt(1 + sb²),
-            // eta = c·marginal_eta + sb·z, ∂eta/∂q = c.
-            let sb = logslope_eta.mapv(|x| scale * x);
-            let deta_dq = sb.mapv(|s| (1.0 + s * s).sqrt());
-            let eta = &deta_dq * marginal_eta + &sb * z;
-            return Ok((eta, deta_dq));
+            match &self.latent_measure {
+                LatentMeasureKind::StandardNormal => {
+                    // Vectorize: sb = scale·logslope, c = sqrt(1 + sb²),
+                    // eta = c·marginal_eta + sb·z, ∂eta/∂q = c.
+                    let sb = logslope_eta.mapv(|x| scale * x);
+                    let deta_dq = sb.mapv(|s| (1.0 + s * s).sqrt());
+                    let eta = &deta_dq * marginal_eta + &sb * z;
+                    return Ok((eta, deta_dq));
+                }
+                _ => {
+                    let mut eta = Array1::<f64>::zeros(n);
+                    let mut deta_dq = Array1::<f64>::zeros(n);
+                    for i in 0..n {
+                        let grid = self
+                            .empirical_grid_for_prediction_row(input, i)?
+                            .ok_or_else(|| {
+                                EstimationError::InvalidInput(
+                                    "empirical latent prediction did not produce a row grid"
+                                        .to_string(),
+                                )
+                            })?;
+                        let (intercept, a_marginal, _) = self
+                            .empirical_rigid_intercept_and_gradient(
+                                marginal_eta[i],
+                                logslope_eta[i],
+                                &grid.nodes,
+                                &grid.weights,
+                            )?;
+                        eta[i] = intercept + scale * logslope_eta[i] * z[i];
+                        deta_dq[i] = a_marginal;
+                    }
+                    return Ok((eta, deta_dq));
+                }
+            }
         }
 
         // Flex path: solve the per-row intercept, then evaluate
@@ -1980,19 +2377,22 @@ impl BernoulliMarginalSlopePredictor {
                 |warm_start_buf, i| {
                     let q = marginal_eta[i];
                     let slope = logslope_eta[i];
+                    let empirical_grid = self.empirical_grid_for_prediction_row(input, i)?;
                     let intercept = self.solve_intercept_scalar(
                         q,
                         slope,
                         self.beta_link_dev.as_ref(),
                         self.beta_score_warp.as_ref(),
+                        empirical_grid.as_ref(),
                         warm_start_buf,
                     )?;
-                    let (_, m_a_raw, _) = self.evaluate_denested_calibration(
+                    let (_, m_a_raw, _) = self.evaluate_prediction_calibration(
                         intercept,
                         q,
                         slope,
                         self.beta_score_warp.as_ref(),
                         self.beta_link_dev.as_ref(),
+                        empirical_grid.as_ref(),
                     )?;
                     let m_a = m_a_raw.max(1e-12);
                     Ok((intercept, marginal_map[i].mu1 / m_a))
@@ -4832,6 +5232,7 @@ mod tests {
             design_noise: Some(DesignMatrix::from(array![[1.0], [1.0]])),
             offset_noise: Some(array![0.0, -0.1]),
             auxiliary_scalar: Some(array![-0.3, 1.2]),
+            auxiliary_matrix: None,
         };
 
         let (eta, grad) = predictor
@@ -4853,6 +5254,75 @@ mod tests {
             let grad = grad.as_ref().expect("gradient should be returned");
             assert!((grad[[i, 0]] - expected_d_marginal).abs() <= 1e-12);
             assert!((grad[[i, 1]] - expected_d_logslope).abs() <= 1e-12);
+        }
+    }
+
+    #[test]
+    fn bernoulli_marginal_slope_predictor_uses_local_empirical_latent_law() {
+        let grids = vec![
+            EmpiricalZGrid {
+                nodes: vec![-1.2, -0.2, 0.7],
+                weights: vec![0.45, 0.35, 0.20],
+            },
+            EmpiricalZGrid {
+                nodes: vec![-0.4, 0.6, 2.4],
+                weights: vec![0.20, 0.35, 0.45],
+            },
+        ];
+        let predictor = BernoulliMarginalSlopePredictor {
+            beta_marginal: array![0.2],
+            beta_logslope: array![0.9],
+            beta_score_warp: None,
+            beta_link_dev: None,
+            base_link: InverseLink::Standard(crate::types::LinkFunction::Probit),
+            z_column: "z".to_string(),
+            latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
+            latent_measure: LatentMeasureKind::LocalEmpirical {
+                feature_cols: vec![0],
+                input_scales: None,
+                centers: vec![vec![-1.0], vec![1.0]],
+                grids: grids.clone(),
+                top_k: 1,
+                bandwidth: 0.25,
+                train_row_mixtures: std::sync::Arc::new(Vec::new()),
+            },
+            baseline_marginal: 0.0,
+            baseline_logslope: 0.0,
+            covariance: None,
+            score_warp_runtime: None,
+            link_deviation_runtime: None,
+            gaussian_frailty_sd: None,
+        };
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0], [1.0]]),
+            offset: array![0.0, 0.0],
+            design_noise: Some(DesignMatrix::from(array![[1.0], [1.0]])),
+            offset_noise: Some(array![0.0, 0.0]),
+            auxiliary_scalar: Some(array![0.0, 0.0]),
+            auxiliary_matrix: Some(array![[-1.0], [1.0]]),
+        };
+
+        let (eta, _) = predictor
+            .final_eta_and_gradient_from_theta(&input, &predictor.theta(), true)
+            .expect("local empirical prediction");
+        let (chain_eta, deta_dq) = predictor
+            .predict_eta_and_q_chain(&input)
+            .expect("local empirical q chain");
+
+        for (row, grid) in grids.iter().enumerate() {
+            let expected_intercept = empirical_intercept_from_marginal(
+                normal_cdf(0.2),
+                0.2,
+                0.9,
+                1.0,
+                &grid.nodes,
+                &grid.weights,
+                None,
+            )
+            .expect("expected empirical intercept");
+            assert!((eta[row] - expected_intercept).abs() <= 1e-10);
+            assert!((chain_eta[row] - eta[row]).abs() <= 1e-12);
+            assert!(deta_dq[row].is_finite() && deta_dq[row] > 0.0);
         }
     }
 
@@ -4881,6 +5351,7 @@ mod tests {
             design_noise: Some(DesignMatrix::from(array![[1.0], [1.0]])),
             offset_noise: Some(array![0.0, -0.1]),
             auxiliary_scalar: Some(array![-0.3, 1.2]),
+            auxiliary_matrix: None,
         };
 
         let err = predictor
@@ -5043,6 +5514,7 @@ mod tests {
             design_noise: Some(DesignMatrix::from(array![[1.0], [1.0]])),
             offset_noise: Some(array![(3.0f64).ln(), (5.0f64).ln()]),
             auxiliary_scalar: None,
+            auxiliary_matrix: None,
         };
 
         let sigma = predictor
@@ -5079,6 +5551,7 @@ mod tests {
             design_noise: Some(DesignMatrix::from(array![[1.0]])),
             offset_noise: None,
             auxiliary_scalar: None,
+            auxiliary_matrix: None,
         };
 
         let out = predictor
@@ -5101,6 +5574,7 @@ mod tests {
             design_noise: Some(DesignMatrix::from(array![[1.0]])),
             offset_noise: Some(array![0.0]),
             auxiliary_scalar: None,
+            auxiliary_matrix: None,
         };
 
         let out = predictor
@@ -5124,6 +5598,7 @@ mod tests {
             design_noise: Some(DesignMatrix::from(array![[1.0]])),
             offset_noise: Some(array![0.0]),
             auxiliary_scalar: None,
+            auxiliary_matrix: None,
         };
 
         let out = predictor
@@ -5154,6 +5629,7 @@ mod tests {
             design_noise: Some(DesignMatrix::from(array![[1.0]])),
             offset_noise: Some(array![0.0]),
             auxiliary_scalar: None,
+            auxiliary_matrix: None,
         };
 
         let point = predictor
@@ -5180,6 +5656,7 @@ mod tests {
             design_noise: Some(DesignMatrix::from(array![[1.0]])),
             offset_noise: Some(array![-1000.0]),
             auxiliary_scalar: None,
+            auxiliary_matrix: None,
         };
 
         let point = predictor
