@@ -4648,16 +4648,33 @@ pub struct CustomFamilyWarmStart {
     inner: ConstrainedWarmStart,
 }
 
+impl CustomFamilyWarmStart {
+    pub(crate) fn compatible_with_rho(&self, rho: &Array1<f64>) -> bool {
+        screened_outer_warm_start(Some(&self.inner), rho).is_some()
+    }
+}
+
 pub struct CustomFamilyJointHyperResult {
     pub objective: f64,
     pub gradient: Array1<f64>,
     pub outer_hessian: crate::solver::outer_strategy::HessianResult,
     pub warm_start: CustomFamilyWarmStart,
+    /// `false` when the inner blockwise/Newton solve hit its divergence
+    /// early-exit or its max-cycle cap. Envelope-theorem outer gradients
+    /// and analytic outer Hessians are valid only at a stationary β̂ —
+    /// callers that consume `gradient`/`outer_hessian` MUST gate on this
+    /// flag and treat non-converged evaluations as inexact (e.g. let ARC
+    /// back off the trust region) rather than feeding pathological
+    /// derivatives into the outer optimizer.
+    pub inner_converged: bool,
 }
 
 pub struct CustomFamilyJointHyperEfsResult {
     pub efs_eval: crate::solver::outer_strategy::EfsEval,
     pub warm_start: CustomFamilyWarmStart,
+    /// See [`CustomFamilyJointHyperResult::inner_converged`]. EFS gradients
+    /// also assume a stationary inner solve.
+    pub inner_converged: bool,
 }
 
 struct OuterObjectiveEvalResult {
@@ -4665,6 +4682,7 @@ struct OuterObjectiveEvalResult {
     gradient: Array1<f64>,
     outer_hessian: crate::solver::outer_strategy::HessianResult,
     warm_start: ConstrainedWarmStart,
+    inner_converged: bool,
 }
 
 fn outer_eval_result_to_joint_hyper_result(
@@ -4677,6 +4695,7 @@ fn outer_eval_result_to_joint_hyper_result(
         warm_start: CustomFamilyWarmStart {
             inner: result.warm_start,
         },
+        inner_converged: result.inner_converged,
     }
 }
 
@@ -4734,10 +4753,12 @@ fn custom_family_batched_outer_hessian_operator<F: CustomFamily>(
 fn outer_efs_result_to_joint_hyper_efs_result(
     efs_eval: crate::solver::outer_strategy::EfsEval,
     warm_start: ConstrainedWarmStart,
+    inner_converged: bool,
 ) -> CustomFamilyJointHyperEfsResult {
     CustomFamilyJointHyperEfsResult {
         efs_eval,
         warm_start: CustomFamilyWarmStart { inner: warm_start },
+        inner_converged,
     }
 }
 
@@ -10486,6 +10507,7 @@ fn joint_outer_evaluate(
         gradient: grad,
         outer_hessian,
         warm_start: warm,
+        inner_converged: inner.converged,
     })
 }
 
@@ -10727,7 +10749,14 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
     penalty_counts: &[usize],
     rho: &Array1<f64>,
     warm_start: Option<&ConstrainedWarmStart>,
-) -> Result<(crate::solver::outer_strategy::EfsEval, ConstrainedWarmStart), String> {
+) -> Result<
+    (
+        crate::solver::outer_strategy::EfsEval,
+        ConstrainedWarmStart,
+        bool,
+    ),
+    String,
+> {
     let include_logdet_h = include_exact_newton_logdet_h(family, options);
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
     let strict_spd = use_exact_newton_strict_spd(family);
@@ -11075,7 +11104,7 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
         active_sets: inner.active_sets.clone(),
     };
 
-    Ok((efs_eval, warm))
+    Ok((efs_eval, warm, inner.converged))
 }
 
 fn normalize_outer_eval_error_detail(error: &str) -> &str {
@@ -12297,6 +12326,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         gradient,
                         outer_hessian: crate::solver::outer_strategy::HessianResult::Unavailable,
                         warm_start: value_only.warm_start,
+                        inner_converged: inner.converged,
                     });
                 }
             }
@@ -12707,7 +12737,14 @@ fn evaluate_custom_family_joint_hyper_efs_internal<
     rho_current: &Array1<f64>,
     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
     warm_start: Option<&ConstrainedWarmStart>,
-) -> Result<(crate::solver::outer_strategy::EfsEval, ConstrainedWarmStart), CustomFamilyError> {
+) -> Result<
+    (
+        crate::solver::outer_strategy::EfsEval,
+        ConstrainedWarmStart,
+        bool,
+    ),
+    CustomFamilyError,
+> {
     evaluate_custom_family_joint_hyper_efs_internal_shared(
         family,
         specs,
@@ -12729,7 +12766,14 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
     rho_current: &Array1<f64>,
     derivative_blocks: SharedDerivativeBlocks,
     warm_start: Option<&ConstrainedWarmStart>,
-) -> Result<(crate::solver::outer_strategy::EfsEval, ConstrainedWarmStart), CustomFamilyError> {
+) -> Result<
+    (
+        crate::solver::outer_strategy::EfsEval,
+        ConstrainedWarmStart,
+        bool,
+    ),
+    CustomFamilyError,
+> {
     if derivative_blocks.len() != specs.len() {
         return Err(format!(
             "joint hyper derivative block count mismatch: got {}, expected {}",
@@ -13022,7 +13066,7 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         active_sets: inner.active_sets.clone(),
     };
 
-    Ok((efs_eval, warm))
+    Ok((efs_eval, warm, inner.converged))
 }
 
 /// Evaluate the joint custom-family hyper-surface in fixed-point form for the
@@ -13044,7 +13088,7 @@ pub fn evaluate_custom_family_joint_hyper_efs<F: CustomFamily + Clone + Send + S
         )
         .into());
     }
-    let (efs_eval, warm_start) = if derivative_blocks.iter().all(Vec::is_empty) {
+    let (efs_eval, warm_start, inner_converged) = if derivative_blocks.iter().all(Vec::is_empty) {
         outerobjectiveefs(
             family,
             specs,
@@ -13066,7 +13110,9 @@ pub fn evaluate_custom_family_joint_hyper_efs<F: CustomFamily + Clone + Send + S
         )?
     };
     Ok(outer_efs_result_to_joint_hyper_efs_result(
-        efs_eval, warm_start,
+        efs_eval,
+        warm_start,
+        inner_converged,
     ))
 }
 
@@ -13089,7 +13135,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_shared<
         )
         .into());
     }
-    let (efs_eval, warm_start) = if derivative_blocks.iter().all(Vec::is_empty) {
+    let (efs_eval, warm_start, inner_converged) = if derivative_blocks.iter().all(Vec::is_empty) {
         outerobjectiveefs(
             family,
             specs,
@@ -13111,7 +13157,9 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_shared<
         )?
     };
     Ok(outer_efs_result_to_joint_hyper_efs_result(
-        efs_eval, warm_start,
+        efs_eval,
+        warm_start,
+        inner_converged,
     ))
 }
 
@@ -14027,7 +14075,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
                 rho,
                 warm_ref,
             ) {
-                Ok((eval, warm)) => {
+                Ok((eval, warm, _inner_converged)) => {
                     outer.warm_cache = Some(warm);
                     outer.last_error = None;
                     Ok(eval)

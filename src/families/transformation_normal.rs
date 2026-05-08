@@ -31,7 +31,7 @@ use crate::basis::{
 use crate::faer_ndarray::{fast_ab, fast_ab_into, fast_atb};
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
-    CustomFamilyPsiDerivativeOperator, ExactNewtonJointGradientEvaluation,
+    CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
     ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
     ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, FamilyEvaluation,
     MaterializablePsiDerivativeOperator, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
@@ -14821,17 +14821,6 @@ struct TransformationExactGeometryCache {
 }
 
 impl TransformationExactGeometryCache {
-    fn update_initial_beta(&mut self, beta_hint: Option<&Array1<f64>>) {
-        let Some(spec) = self.blocks.first_mut() else {
-            return;
-        };
-        if let Some(hint) = beta_hint
-            && hint.len() == spec.design.ncols()
-        {
-            spec.initial_beta = Some(hint.clone());
-        }
-    }
-
     fn update_initial_log_lambdas(&mut self, log_lambdas: &Array1<f64>) -> Result<(), String> {
         let spec = self
             .blocks
@@ -15055,11 +15044,17 @@ pub fn fit_transformation_normal(
     let probe_blocks = vec![probe_block];
     let (_, cap_hessian) = custom_family_outer_derivatives(&probe_family, &probe_blocks, &options);
     let analytic_gradient = analytic_psi_available;
-    let analytic_hessian = analytic_gradient
+    let analytic_hessian_supported = analytic_gradient
         && matches!(
             cap_hessian,
             crate::solver::outer_strategy::Derivative::Analytic
         );
+    let analytic_hessian = false;
+    if analytic_hessian_supported {
+        log::info!(
+            "[transformation-normal] CTN exact joint analytic outer Hessian is available but disabled for spatial kappa optimization; using analytic-gradient outer solves to avoid callback logdet trace work"
+        );
+    }
 
     let (rho0_min, rho0_max) = if rho0.is_empty() {
         (0.0, 0.0)
@@ -15086,7 +15081,7 @@ pub fn fit_transformation_normal(
     }
 
     // Shared mutable state for warm-starting across optimizer iterations.
-    let beta_hint: RefCell<Option<Array1<f64>>> = RefCell::new(None);
+    let exact_warm_start: RefCell<Option<CustomFamilyWarmStart>> = RefCell::new(None);
 
     let joint_setup =
         ExactJointHyperSetup::new(rho0, rho_lower, rho_upper, kappa0, kappa_lower, kappa_upper);
@@ -15174,6 +15169,14 @@ pub fn fit_transformation_normal(
         Ok(())
     };
 
+    let compatible_warm_start = |rho: &Array1<f64>| -> Option<CustomFamilyWarmStart> {
+        exact_warm_start
+            .borrow()
+            .as_ref()
+            .filter(|warm| warm.compatible_with_rho(rho))
+            .cloned()
+    };
+
     log::info!(
         "[transformation-normal] entering exact joint outer optimization \
          (analytic_gradient={}, analytic_hessian={})",
@@ -15190,10 +15193,9 @@ pub fn fit_transformation_normal(
         analytic_gradient,
         analytic_hessian,
         // Transformation-normal has β-dependent H (through 1/h'²), so the
-        // EFS Wood-Fasiolo PSD invariant fails — disable fixed-point so the
-        // planner cannot pick EFS / Hybrid-EFS. CTN supplies SCOP ψ-axis
-        // second-order curvature through matrix-free HVPs; ARC consumes the
-        // exact analytic Hessian operator.
+        // EFS Wood-Fasiolo PSD invariant fails. Keep fixed-point disabled,
+        // but do not expose CTN's analytic Hessian to ARC: its callback
+        // trace route applies full-rank logdet operators at biobank shape.
         true,
         // fit_fn
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
@@ -15204,12 +15206,12 @@ pub fn fit_transformation_normal(
                 .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             geometry.update_initial_log_lambdas(&rho)?;
-            geometry.update_initial_beta(beta_hint.borrow().as_ref());
+            let warm_start = compatible_warm_start(&rho);
             let fit = fit_custom_family_fixed_log_lambdas(
                 &geometry.family,
                 &geometry.blocks,
                 &options,
-                None,
+                warm_start.as_ref(),
                 0,
                 0.0,
                 true,
@@ -15242,10 +15244,6 @@ pub fn fit_transformation_normal(
                     max_abs_cov
                 );
             }
-            // Update warm start hints.
-            if let Some(block) = fit.block_states.first() {
-                *beta_hint.borrow_mut() = Some(block.beta.clone());
-            }
             Ok(TransformationNormalFitResult {
                 family: geometry.family.clone(),
                 fit,
@@ -15256,14 +15254,13 @@ pub fn fit_transformation_normal(
         },
         // exact_fn
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], eval_mode| {
-            use crate::solver::estimate::reml::unified::EvalMode;
             ensure_exact_geometry(&specs[0], &designs[0])?;
             let mut cache_ref = exact_geometry_cache.borrow_mut();
             let geometry = cache_ref
                 .as_mut()
                 .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
-            geometry.update_initial_beta(beta_hint.borrow().as_ref());
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
+            let warm_start = compatible_warm_start(&rho);
 
             let eval = evaluate_custom_family_joint_hyper(
                 &geometry.family,
@@ -15271,7 +15268,7 @@ pub fn fit_transformation_normal(
                 &options,
                 &rho,
                 &geometry.derivative_blocks,
-                None,
+                warm_start.as_ref(),
                 eval_mode,
             )
             .map_err(|e| format!("transformation exact_fn: {e}"))?;
@@ -15285,13 +15282,8 @@ pub fn fit_transformation_normal(
                 );
             }
 
-            if matches!(eval_mode, EvalMode::ValueGradientHessian)
-                && !eval.outer_hessian.is_analytic()
-            {
-                return Err(
-                    "transformation exact joint objective did not return an outer Hessian"
-                        .to_string(),
-                );
+            if eval.objective.is_finite() && eval.gradient.iter().all(|value| value.is_finite()) {
+                *exact_warm_start.borrow_mut() = Some(eval.warm_start.clone());
             }
 
             Ok((eval.objective, eval.gradient, eval.outer_hessian))
@@ -15302,17 +15294,18 @@ pub fn fit_transformation_normal(
             let geometry = cache_ref
                 .as_mut()
                 .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
-            geometry.update_initial_beta(beta_hint.borrow().as_ref());
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
+            let warm_start = compatible_warm_start(&rho);
             let eval = evaluate_custom_family_joint_hyper_efs(
                 &geometry.family,
                 &geometry.blocks,
                 &options,
                 &rho,
                 &geometry.derivative_blocks,
-                None,
+                warm_start.as_ref(),
             )
             .map_err(|e| format!("transformation exact_efs_fn: {e}"))?;
+            *exact_warm_start.borrow_mut() = Some(eval.warm_start.clone());
             Ok(eval.efs_eval)
         },
     )?;
