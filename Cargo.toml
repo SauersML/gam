@@ -7,6 +7,23 @@ autobins = false
 default-run = "gam"
 description = "Generalized penalized likelihood engine"
 license = "AGPL-3.0-or-later"
+# Limit the published `.crate` to source + bench harnesses + license + readme.
+# Without this, `bench/biobank_scale/` (>1 GB of benchmark data) and the
+# `.lake/` lean toolchain cache are bundled into the package and crates.io
+# rejects the upload at the 10 MiB limit. Patterns are gitignore-style;
+# leading `/` anchors to crate root.
+include = [
+    "/src/**/*.rs",
+    "/src/**/*.lean",
+    "/src/**/*.pest",
+    "/bench/cargo_benches/**/*.rs",
+    "/build.rs",
+    "/Cargo.toml",
+    "/rust-toolchain.toml",
+    "/rustfmt.toml",
+    "/README.md",
+    "/LICENSE",
+]
 
 [package.metadata.cargo-machete]
 ignored = ["grep", "walkdir"]
