@@ -32,7 +32,6 @@ jobs:
           command: publish
           target: ${{ matrix.platform.target }}
           args: >-
-            --release
             --strip
             --skip-existing
             --manifest-path crates/gam-pyffi/Cargo.toml
@@ -58,7 +57,6 @@ jobs:
           command: publish
           target: ${{ matrix.target }}
           args: >-
-            --release
             --strip
             --skip-existing
             --manifest-path crates/gam-pyffi/Cargo.toml
@@ -86,7 +84,6 @@ jobs:
           command: publish
           target: ${{ matrix.platform.target }}
           args: >-
-            --release
             --strip
             --skip-existing
             --manifest-path crates/gam-pyffi/Cargo.toml
@@ -112,7 +109,6 @@ jobs:
           command: publish
           target: ${{ matrix.target }}
           args: >-
-            --release
             --strip
             --skip-existing
             --manifest-path crates/gam-pyffi/Cargo.toml
