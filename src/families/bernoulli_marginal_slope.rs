@@ -8691,11 +8691,16 @@ impl BernoulliMarginalSlopeFamily {
                             if let Some(row_hess) = Self::cached_row_primary_hessian(cache, row) {
                                 row_hess.dot(&row_dir)
                             } else {
-                                self.compute_row_analytic_flex_into(
+                                let row_moments = cache
+                                    .row_cell_moments
+                                    .as_ref()
+                                    .and_then(|bundle| bundle.row(row, 9));
+                                self.compute_row_analytic_flex_into_with_moments(
                                     row,
                                     block_states,
                                     primary,
                                     row_ctx,
+                                    row_moments,
                                     true,
                                     &mut scratch,
                                 )?;
@@ -8763,11 +8768,16 @@ impl BernoulliMarginalSlopeFamily {
             let row_action = if let Some(row_hess) = Self::cached_row_primary_hessian(cache, row) {
                 row_hess.dot(&row_dir)
             } else {
-                self.compute_row_analytic_flex_into(
+                let row_moments = cache
+                    .row_cell_moments
+                    .as_ref()
+                    .and_then(|bundle| bundle.row(row, 9));
+                self.compute_row_analytic_flex_into_with_moments(
                     row,
                     block_states,
                     primary,
                     row_ctx,
+                    row_moments,
                     true,
                     &mut scratch,
                 )?;
@@ -8843,11 +8853,16 @@ impl BernoulliMarginalSlopeFamily {
                         // scratch Hessian on the fly.
                         let cached_hess = Self::cached_row_primary_hessian(cache, row);
                         if cached_hess.is_none() {
-                            self.compute_row_analytic_flex_into(
+                            let row_moments = cache
+                                .row_cell_moments
+                                .as_ref()
+                                .and_then(|bundle| bundle.row(row, 9));
+                            self.compute_row_analytic_flex_into_with_moments(
                                 row,
                                 block_states,
                                 primary,
                                 row_ctx,
+                                row_moments,
                                 true,
                                 &mut scratch,
                             )?;
@@ -10078,11 +10093,16 @@ impl BernoulliMarginalSlopeFamily {
                     let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
                     for row in start..end {
                         let row_ctx = Self::row_ctx(cache, row);
-                        let row_neglog = self.compute_row_analytic_flex_into(
+                        let row_moments = cache
+                            .row_cell_moments
+                            .as_ref()
+                            .and_then(|bundle| bundle.row(row, 9));
+                        let row_neglog = self.compute_row_analytic_flex_into_with_moments(
                             row,
                             block_states,
                             &primary,
                             row_ctx,
+                            row_moments,
                             true,
                             &mut scratch,
                         )?;
@@ -19931,6 +19951,7 @@ mod tests {
             slices: cached.slices.clone(),
             primary: cached.primary.clone(),
             row_contexts: cached.row_contexts.clone(),
+            row_cell_moments: None,
             row_primary_hessians: None,
         };
         let direction =
@@ -19976,6 +19997,7 @@ mod tests {
             slices: cached.slices.clone(),
             primary: cached.primary.clone(),
             row_contexts: cached.row_contexts.clone(),
+            row_cell_moments: None,
             row_primary_hessians: None,
         };
         let directions: Vec<_> = (0..4)
