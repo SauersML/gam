@@ -8953,9 +8953,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // penalty drifts cycle-to-cycle even when the data fit is
             // genuinely stagnant — `objective_change` would mask the
             // divergence whereas a frozen log-likelihood is unambiguous.
-            let loglik_change_for_joint_divergence_check = (current_log_likelihood
-                - prev_log_likelihood_for_joint_divergence_check)
-                .abs();
+            let loglik_change_for_joint_divergence_check =
+                (current_log_likelihood - prev_log_likelihood_for_joint_divergence_check).abs();
             let loglik_frozen_tol_for_joint_divergence_check =
                 inner_tol * (1.0 + current_log_likelihood.abs());
             let step_clamped_for_joint_divergence_check = step_inf >= 0.95 * MAX_JOINT_STEP;
