@@ -41,17 +41,17 @@ The binary is at `./target/release/gam`. Add it to your `PATH` or use the full p
 The repo now includes a mixed Rust/Python package built around PyO3 and maturin.
 
 ```bash
-python3 -m venv .venv
+uv venv
 source .venv/bin/activate
-python -m pip install maturin
+uv pip install maturin
 maturin develop --manifest-path crates/gam-pyffi/Cargo.toml
-python3 -c "import gam; print(gam.build_info())"
+python -c "import gamfit; print(gamfit.build_info())"
 ```
 
 Formula-first usage:
 
 ```python
-import gam
+import gamfit
 
 train = [
     {"y": 1.0, "x": 0.0},
@@ -59,12 +59,12 @@ train = [
     {"y": 3.0, "x": 2.0},
 ]
 
-model = gam.fit(train, "y ~ x")
+model = gamfit.fit(train, "y ~ x")
 pred = model.predict([{"x": 1.5}, {"x": 2.5}], interval=0.95)
 summary = model.summary()
 check = model.check([{"x": 1.5}])
 diagnostics = model.diagnose(train)
-gam.validate_formula(train, "y ~ x")
+gamfit.validate_formula(train, "y ~ x")
 model.plot(train, kind="prediction")
 html = model.report()
 model.save("linear.gam")
@@ -73,14 +73,14 @@ model.save("linear.gam")
 scikit-learn usage:
 
 ```python
-from gam.sklearn import GAMRegressor
+from gamfit.sklearn import GAMRegressor
 
 est = GAMRegressor(formula="y ~ x")
 est.fit(train)
 pred = est.predict([{"x": 1.5}, {"x": 2.5}])
 ```
 
-The native extension is `gam._rust`, while the public Python API lives under `python/gam`.
+The native extension is `gamfit._rust`, while the public Python API lives under `python/gamfit/`.
 
 ## Quick start
 
