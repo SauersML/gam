@@ -638,6 +638,7 @@ fn evaluate_marginal_slope_row(
         ))),
         offset_noise: Some(Array1::from_elem(1, ctx.noise_offset[row_index])),
         auxiliary_scalar: Some(Array1::from_elem(1, ctx.z_raw[row_index])),
+        auxiliary_matrix: None,
     };
 
     // Exact IFT pull-back: the predictor returns both `eta` and the analytic
@@ -1575,6 +1576,7 @@ pub fn build_saved_survival_marginal_slope_predictor(
         design_noise: Some(logslope_design.clone()),
         offset_noise: Some(noise_offset.clone()),
         auxiliary_scalar: Some(z.clone()),
+        auxiliary_matrix: None,
     };
 
     Ok((predictor, pred_input, predictor_fit))

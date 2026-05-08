@@ -14,7 +14,7 @@
 //! `inner_max_cycles=1`, matching the local ignored repro test.
 
 #[allow(dead_code)]
-#[path = "../tests/test_support/margslope_flex_equivalence.rs"]
+#[path = "../../tests/test_support/margslope_flex_equivalence.rs"]
 mod margslope_flex_equivalence;
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};

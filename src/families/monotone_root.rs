@@ -116,6 +116,56 @@ pub fn solve_monotone_root_detailed_with_bracket(
         ));
     }
 
+    // With a good warm start, the root is often within one or two Newton
+    // corrections. Try that local basin before spending evaluations on a
+    // global bracket; fall back to the bracketed solver unchanged if the
+    // probe is not decisive.
+    let mut a = a_init;
+    let mut f = f_init;
+    let mut fp = f_deriv_init;
+    for probe_iter in 0..2 {
+        if f.abs() <= convergence_tol {
+            let abs_d = fp.abs();
+            if !abs_d.is_finite() || abs_d == 0.0 {
+                break;
+            }
+            return Ok(MonotoneRootSolution {
+                root: a,
+                abs_deriv: abs_d,
+                residual: f,
+                refine_iters: probe_iter,
+            });
+        }
+
+        if !fp.is_finite() || fp.abs() <= 1e-30 {
+            break;
+        }
+
+        let step = -f / fp;
+        if !step.is_finite() || step.abs() > 8.0 * (1.0 + a.abs()) {
+            break;
+        }
+
+        let cand = a + step;
+        let (f_cand, fp_cand, _) = eval(cand)?;
+        if f_cand.abs() <= convergence_tol {
+            let abs_d = fp_cand.abs();
+            if !abs_d.is_finite() || abs_d == 0.0 {
+                break;
+            }
+            return Ok(MonotoneRootSolution {
+                root: cand,
+                abs_deriv: abs_d,
+                residual: f_cand,
+                refine_iters: probe_iter + 1,
+            });
+        }
+
+        a = cand;
+        f = f_cand;
+        fp = fp_cand;
+    }
+
     // --- Phase 1: bracket the root -------------------------------------------
     let (mut neg_pt, mut pos_pt) = if let Some((lo, hi)) = analytic_bracket {
         if !lo.is_finite() || !hi.is_finite() || lo == hi {

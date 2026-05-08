@@ -1734,6 +1734,14 @@ pub struct BlockwiseFitOptions {
     /// Shared cap engaged during seed screening so cost-only evaluations can
     /// stop inner iterations early without affecting the full solve.
     pub screening_max_inner_iterations: Option<Arc<AtomicUsize>>,
+    /// If true, the joint-Newton line search may reuse an exact-Newton
+    /// workspace to read trial log-likelihood values. This preserves the
+    /// legacy path for A/B regression tests, but defaults to false because
+    /// rejected backtracking attempts discard that workspace and can dominate
+    /// FLEX marginal-slope fits — the cheap scalar log-likelihood is
+    /// sufficient for the accept/reject decision; the full state is built
+    /// only after a step is accepted.
+    pub line_search_prefer_workspace: bool,
     /// Optional line-search objective ceiling for lazy log-likelihood-only
     /// evaluations. Families whose per-row log-likelihood contributions are
     /// non-positive may stop once the partial negative log-likelihood is already
@@ -1769,6 +1777,7 @@ impl Default for BlockwiseFitOptions {
             use_outer_hessian: true,
             compute_covariance: false,
             screening_max_inner_iterations: None,
+            line_search_prefer_workspace: false,
             early_exit_threshold: None,
             outer_score_subsample: None,
         }
@@ -7635,6 +7644,17 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
     block_log_lambdas: &[Array1<f64>],
     options: &BlockwiseFitOptions,
 ) -> Result<(f64, f64), String> {
+    blockwise_logdet_terms_with_workspace(family, specs, states, block_log_lambdas, options, None)
+}
+
+fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    states: &mut [ParameterBlockState],
+    block_log_lambdas: &[Array1<f64>],
+    options: &BlockwiseFitOptions,
+    preferred_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+) -> Result<(f64, f64), String> {
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
     let strict_spd = use_exact_newton_strict_spd(family);
     let allow_semidefinite = strict_spd && family.exact_newton_allows_semidefinitehessian();
@@ -7766,24 +7786,30 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
         let logdet_h_total = logdet_h_scaled + curvature.hessian_logdet_correction;
         return Ok((logdet_h_total, penalty_logdet_s_total));
     }
-    let exact_joint_source =
-        if !strict_spd && use_joint_matrix_free_path(total, joint_observation_count(states)) {
-            family
-                .exact_newton_joint_hessian_workspace_with_options(states, specs, options)?
-                .as_ref()
-                .map(|workspace| {
-                    exact_newton_joint_hessian_source_from_workspace(
-                        workspace,
-                        total,
-                        "joint exact-newton operator mismatch in logdet terms",
-                        JointHessianSourcePreference::PreferDense,
-                    )
-                })
-                .transpose()?
-                .flatten()
-        } else {
-            None
-        };
+    let exact_joint_source = if let Some(workspace) = preferred_workspace.as_ref() {
+        exact_newton_joint_hessian_source_from_workspace(
+            workspace,
+            total,
+            "joint exact-newton operator mismatch in logdet terms",
+            JointHessianSourcePreference::PreferDense,
+        )?
+    } else if !strict_spd && use_joint_matrix_free_path(total, joint_observation_count(states)) {
+        family
+            .exact_newton_joint_hessian_workspace_with_options(states, specs, options)?
+            .as_ref()
+            .map(|workspace| {
+                exact_newton_joint_hessian_source_from_workspace(
+                    workspace,
+                    total,
+                    "joint exact-newton operator mismatch in logdet terms",
+                    JointHessianSourcePreference::PreferDense,
+                )
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
     if let Some(source) = exact_joint_source {
         // Exact determinant of H + S_λ for operator-backed coefficient Hessians.
         //
@@ -8225,28 +8251,19 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     refresh_all_block_etas(family, specs, &mut states)?;
     let total_joint_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
     let total_joint_n = joint_observation_count(&states);
-    // Track workspace-source availability separately so we only route
-    // single-block families to the joint-Newton path when the matrix-free
-    // operator is actually wired. Single-block families with only the dense
-    // `exact_newton_joint_hessian` would pay a full `Θ(n p²)` Gram build per
-    // joint-Newton cycle, which is strictly worse than the blockwise dense
-    // Cholesky path — keep them on blockwise.
     let matrix_free_joint_requested = use_joint_matrix_free_path(total_joint_p, total_joint_n);
-    let (has_joint_exacthessian, has_workspace_source) =
-        if matrix_free_joint_requested && family.inner_coefficient_hessian_hvp_available(specs) {
-            (true, true)
-        } else {
-            (family.exact_newton_joint_hessian(&states)?.is_some(), false)
-        };
+    let has_workspace_source = family.inner_coefficient_hessian_hvp_available(specs);
+    let has_joint_exacthessian = if has_workspace_source {
+        true
+    } else {
+        family.exact_newton_joint_hessian(&states)?.is_some()
+    };
     // Multi-block families have always taken the joint path when an exact
-    // joint Hessian is available. Single-block families now also take it when
-    // the matrix-free workspace is wired — the joint loop then runs entirely
-    // operator-form (PCG on the workspace operator + log-likelihood-only line
-    // search + gradient-only refresh through
-    // `exact_newton_joint_gradient_evaluation`) and never builds the dense
-    // per-block Hessian inside the inner solve.
+    // joint Hessian is available. Single-block families also take it when a
+    // coefficient-Hessian workspace is wired; dense vs. operator form is a
+    // later representation choice, not a cache-construction gate.
     let use_joint_newton = has_joint_exacthessian && (specs.len() >= 2 || has_workspace_source);
-    let matrix_free_joint_workspace = matrix_free_joint_requested && has_workspace_source;
+    let joint_workspace_requested = use_joint_newton && has_workspace_source;
     let inner_tol = options.inner_tol;
     let inner_max_cycles = options.inner_max_cycles;
     let inner_max_cycles = capped_inner_max_cycles(options, inner_max_cycles);
@@ -8309,7 +8326,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             specs,
             options,
             &states,
-            matrix_free_joint_workspace,
+            joint_workspace_requested,
             None,
         )?;
         (log_likelihood, eval, gradient, workspace)
@@ -8394,12 +8411,17 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let joint_constraints =
                 assemble_joint_linear_constraints(&block_constraints, &ranges, total_p)?;
             // Get joint Hessian and block gradients from the current evaluation.
-            let joint_hessian_source = if use_joint_matrix_free_path(total_p, total_joint_n) {
+            let joint_hessian_source = if joint_workspace_requested {
                 let workspace = match cached_joint_workspace.take() {
                     Some(workspace) => Some(workspace),
                     None => family.exact_newton_joint_hessian_workspace_with_options(
                         &states, specs, options,
                     )?,
+                };
+                let preference = if matrix_free_joint_requested {
+                    JointHessianSourcePreference::RequireOperator
+                } else {
+                    JointHessianSourcePreference::PreferDense
                 };
                 workspace
                     .as_ref()
@@ -8408,7 +8430,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             workspace,
                             total_p,
                             "joint Newton inner exact-newton operator mismatch",
-                            JointHessianSourcePreference::RequireOperator,
+                            preference,
                         )
                     })
                     .transpose()?
@@ -8451,7 +8473,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 
             let trace_diagonal_ridge = joint_mode_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE;
 
-            let solve_joint_constraints_dense = !use_joint_matrix_free_path(total_p, total_joint_n);
+            let solve_joint_constraints_dense = !matrix_free_joint_requested;
             let (candidate_beta, joint_active_set) = if solve_joint_constraints_dense
                 && let Some(constraints) = joint_constraints.as_ref()
             {
@@ -8526,7 +8548,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 );
                 let rhs = &grad_joint - &penalty_beta;
                 let pcg_started = std::time::Instant::now();
-                let mut delta = if use_joint_matrix_free_path(total_p, total_joint_n) {
+                let mut delta = if matrix_free_joint_requested {
                     let preconditioner_diag = match &joint_hessian_source {
                         JointHessianSource::Dense(h_joint) => joint_penalty_preconditioner_diag(
                             &h_joint.diag().to_owned(),
@@ -8627,7 +8649,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 } else {
                     None
                 };
-                if use_joint_matrix_free_path(total_p, total_joint_n) {
+                if matrix_free_joint_requested {
                     log::info!(
                         "[PIRLS/joint-PCG] cycle {:>3} | n={} p={} solved={} elapsed={:.3}s",
                         cycle,
@@ -8693,7 +8715,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let old_beta: Vec<Array1<f64>> = states.iter().map(|s| s.beta.clone()).collect();
             let old_objective = lastobjective;
             let use_subsample_line_search =
-                matrix_free_joint_workspace && options.outer_score_subsample.is_some();
+                joint_workspace_requested && options.outer_score_subsample.is_some();
             let old_screening_objective = if use_subsample_line_search {
                 let old_screening_ll =
                     joint_line_search_screening_log_likelihood(family, options, &states)?;
@@ -8820,13 +8842,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     };
                     -full_trial_ll + trial_penalty
                 } else {
-                    // NB: prefer_workspace MUST stay true on the FLEX marg-slope
-                    // biobank path when no subsample is configured. The
-                    // workspace LL and the cheap log_likelihood_only_with_options
-                    // LL do NOT agree numerically for FLEX (verified
-                    // empirically: switching to cheap LL caused every
-                    // line-search attempt to reject because trialobjective had
-                    // a different constant offset than lastobjective).
+                    // Cheap-LL line-search path: rejected backtracking attempts
+                    // discard the exact-Newton workspace they build, so by
+                    // default we evaluate just the scalar log-likelihood for
+                    // the accept/reject decision and only build the full
+                    // workspace once the step is accepted (via the gradient
+                    // reload below). The workspace path is preserved behind
+                    // `options.line_search_prefer_workspace` for A/B regression
+                    // checks against the legacy numerics.
                     let mut line_search_options = options.clone();
                     line_search_options.early_exit_threshold = Some(old_objective + 1e-10);
                     let trial_ll = match joint_line_search_log_likelihood(
@@ -8834,7 +8857,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         specs,
                         &line_search_options,
                         &states,
-                        matrix_free_joint_workspace,
+                        joint_workspace_requested && options.line_search_prefer_workspace,
                     ) {
                         Ok((value, workspace)) => {
                             accepted_joint_workspace = workspace;
@@ -8914,7 +8937,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 specs,
                 options,
                 &states,
-                matrix_free_joint_workspace,
+                joint_workspace_requested,
                 accepted_joint_workspace.take(),
             )?;
             let grad_reload_elapsed = grad_reload_started.elapsed();
@@ -9024,8 +9047,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         if converged {
             let penalty_value =
                 total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
-            let (block_logdet_h, block_logdet_s) =
-                blockwise_logdet_terms(family, specs, &mut states, block_log_lambdas, options)?;
+            let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
+                family,
+                specs,
+                &mut states,
+                block_log_lambdas,
+                options,
+                cached_joint_workspace.clone(),
+            )?;
             return Ok(BlockwiseInnerResult {
                 block_states: states,
                 active_sets: normalize_active_sets(cached_active_sets),
@@ -15986,6 +16015,7 @@ mod tests {
             compute_covariance: false,
             use_outer_hessian: false,
             screening_max_inner_iterations: None,
+            line_search_prefer_workspace: false,
             early_exit_threshold: None,
             outer_score_subsample: None,
         };
@@ -16027,6 +16057,7 @@ mod tests {
             compute_covariance: false,
             use_outer_hessian: false,
             screening_max_inner_iterations: None,
+            line_search_prefer_workspace: false,
             early_exit_threshold: None,
             outer_score_subsample: None,
         };
@@ -16071,6 +16102,7 @@ mod tests {
             compute_covariance: false,
             use_outer_hessian: false,
             screening_max_inner_iterations: None,
+            line_search_prefer_workspace: false,
             early_exit_threshold: None,
             outer_score_subsample: None,
         };
