@@ -68,11 +68,7 @@ pub const ANCHORED_DEVIATION_KERNEL: &str = "DenestedCubicTransport";
 /// remains the legacy `1e-10` value to preserve bit-for-bit model behavior.
 pub const NORMALIZED_CELL_BRANCH_TOL: f64 = 1e-10;
 
-/// Previous fixed-by-hand branch tolerance retained for regression tests that
-/// compare the tuned fast path to the old transport path on borderline cells.
-pub const LEGACY_NORMALIZED_CELL_BRANCH_TOL: f64 = 1e-10;
 const INV_TWO_PI: f64 = 1.0 / std::f64::consts::TAU;
-#[allow(dead_code)]
 const RECIP_FACTORIALS_0_TO_10: [f64; 11] = [
     1.0,
     1.0,
@@ -86,7 +82,6 @@ const RECIP_FACTORIALS_0_TO_10: [f64; 11] = [
     1.0 / 362880.0,
     1.0 / 3628800.0,
 ];
-#[allow(dead_code)]
 const RECIP_POW2_0_TO_10: [f64; 11] = [
     1.0,
     0.5,
@@ -100,7 +95,6 @@ const RECIP_POW2_0_TO_10: [f64; 11] = [
     0.001953125,
     0.0009765625,
 ];
-#[allow(dead_code)]
 const ALTERNATING_SIGNS_0_TO_10: [f64; 11] =
     [1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0];
 
@@ -905,6 +899,7 @@ fn effective_branch_tol(cell: DenestedCubicCell) -> f64 {
     let anchor_scale = cell.c0.abs().max(cell.c1.abs()).max(1.0);
     NORMALIZED_CELL_BRANCH_TOL * anchor_scale
 }
+
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DenestedCubicCell {
@@ -2926,7 +2921,6 @@ pub fn evaluate_affine_cell_state_with_scratch<'a>(
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 struct TransportCellState {
     lambda: f64,
     cell: DenestedCubicCell,
@@ -2935,21 +2929,16 @@ struct TransportCellState {
     basis_moments: [f64; MAX_TRANSPORT_BASIS_LEN],
 }
 
-#[allow(dead_code)]
 const TRANSPORT_ORDER: usize = 10;
-#[allow(dead_code)]
 const MAX_TRANSPORT_POLY_LEN: usize = 6 * TRANSPORT_ORDER + 1;
-#[allow(dead_code)]
 const MAX_TRANSPORT_SERIES_LEN: usize = TRANSPORT_ORDER + 1;
 // Upper bound on max_degree passed to `affine_anchor_moment_vector`.
 // Public callers use 24; the transport step's required-degree budget is
 // `4 + 6 * TRANSPORT_ORDER = 64`, which dominates.
-#[allow(dead_code)]
 const MAX_AFFINE_ANCHOR_DEGREE: usize = 4 + 6 * TRANSPORT_ORDER;
 const MAX_TRANSPORT_BASIS_LEN: usize = 5;
 
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)]
 struct FixedPoly {
     len: usize,
     coeffs: [f64; MAX_TRANSPORT_POLY_LEN],
@@ -2969,7 +2958,6 @@ impl FixedPoly {
 }
 
 #[inline]
-#[allow(dead_code)]
 fn recip_factorial(n: usize) -> f64 {
     if let Some(&value) = RECIP_FACTORIALS_0_TO_10.get(n) {
         value
@@ -2979,7 +2967,6 @@ fn recip_factorial(n: usize) -> f64 {
 }
 
 #[inline]
-#[allow(dead_code)]
 fn recip_pow2(n: usize) -> f64 {
     if let Some(&value) = RECIP_POW2_0_TO_10.get(n) {
         value
@@ -2989,7 +2976,6 @@ fn recip_pow2(n: usize) -> f64 {
 }
 
 #[inline]
-#[allow(dead_code)]
 fn alternating_sign(n: usize) -> f64 {
     if let Some(&value) = ALTERNATING_SIGNS_0_TO_10.get(n) {
         value
@@ -3000,7 +2986,6 @@ fn alternating_sign(n: usize) -> f64 {
     }
 }
 
-#[allow(dead_code)]
 fn poly_mul_fixed(lhs: &FixedPoly, rhs: &FixedPoly, out: &mut FixedPoly) {
     out.len = lhs.len + rhs.len - 1;
     out.coeffs[..out.len].fill(0.0);
@@ -3013,7 +2998,6 @@ fn poly_mul_fixed(lhs: &FixedPoly, rhs: &FixedPoly, out: &mut FixedPoly) {
 }
 
 #[inline]
-#[allow(dead_code)]
 fn add_scaled_poly_product(target: &mut [f64], lhs: &[f64], rhs: &[f64], scale: f64) {
     for (i, &lv) in lhs.iter().enumerate() {
         for (j, &rv) in rhs.iter().enumerate() {
@@ -3022,7 +3006,6 @@ fn add_scaled_poly_product(target: &mut [f64], lhs: &[f64], rhs: &[f64], scale: 
     }
 }
 
-#[allow(dead_code)]
 fn build_transport_series_polynomials(
     current: DenestedCubicCell,
     delta_c2: f64,
@@ -3094,7 +3077,6 @@ fn build_transport_series_polynomials(
     coeffs
 }
 
-#[allow(dead_code)]
 fn non_affine_required_degree(branch: ExactCellBranch, order: usize) -> usize {
     let basis_max = match branch {
         ExactCellBranch::Quartic => 2,
@@ -3143,7 +3125,6 @@ fn reduced_moments_from_basis(
     }
 }
 
-#[allow(dead_code)]
 fn evaluate_non_affine_transport_step(
     state: &TransportCellState,
     target_branch: ExactCellBranch,
@@ -3263,7 +3244,6 @@ fn evaluate_non_affine_transport_step(
     }))
 }
 
-#[allow(dead_code)]
 fn evaluate_non_affine_cell_state_adaptive(
     cell: DenestedCubicCell,
     branch: ExactCellBranch,
