@@ -89,6 +89,19 @@ pub trait RowKernel<const K: usize>: Send + Sync {
         dir_u: &[f64; K],
         dir_v: &[f64; K],
     ) -> Result<[[f64; K]; K], String>;
+
+    /// Optional warm-up hook: triggers any per-row caches the kernel keeps for
+    /// `row_third_contracted` / `row_fourth_contracted`. Called by
+    /// [`RowKernelHessianWorkspace::new`] **before** the outer ext-coordinate
+    /// `par_iter` enters, so the cache build runs at top-level rayon and
+    /// fans out across all worker threads. If the build instead runs nested
+    /// inside the outer `par_iter` (which holds 8 of 8 workers), the
+    /// cache builder's own `par_iter` collapses to a single worker — the
+    /// other seven threads are parked on the cache `OnceLock`. Default impl
+    /// is a no-op for kernels with no per-row jet cache to prime.
+    fn warm_up_directional_caches(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 // ── Cache ────────────────────────────────────────────────────────────
@@ -588,6 +601,13 @@ impl<const K: usize, T: RowKernel<K>> RowKernelHessianWorkspace<K, T> {
     pub fn new(kern: T) -> Result<Self, String> {
         let kern = Arc::new(kern);
         let cache = build_row_kernel_cache(&*kern)?;
+        // Prime any per-row jet caches the kernel keeps for higher-order
+        // derivatives at top-level rayon — the alternative is for the cache
+        // to be built lazily on first access from inside the outer ext-idx
+        // `par_iter`, where seven of eight workers are parked on the cache
+        // `OnceLock` and the build collapses to a single worker. See the
+        // trait method's docs for the full rationale.
+        kern.warm_up_directional_caches()?;
         Ok(Self { kern, cache })
     }
 }
