@@ -376,11 +376,9 @@ impl super::unified::HyperOperator for FirthAugmentedSingleHyperOperator {
     fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
         debug_assert_eq!(factor.nrows(), self.p);
         let base_trace = self.base.trace_projected_factor(factor);
-        let firth_out = self.firth_op.hphi_tau_partial_apply(
-            &self.x_tau_dense,
-            &self.tau_kernel,
-            factor,
-        );
+        let firth_out =
+            self.firth_op
+                .hphi_tau_partial_apply(&self.x_tau_dense, &self.tau_kernel, factor);
         let firth_trace: f64 = factor
             .iter()
             .zip(firth_out.iter())
