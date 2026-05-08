@@ -15526,19 +15526,20 @@ impl BinomialLocationScaleHessianWorkspace {
 
     fn second_coefficients(
         &self,
-        key: BinomialDirectionPairKey,
+        _key: BinomialDirectionPairKey,
         eta_u: &BinomialDirectionEta,
         eta_v: &BinomialDirectionEta,
     ) -> Result<Arc<BinomialRowCoeffTriple>, String> {
-        if let Some(value) = self
-            .second_coeff_cache
-            .lock()
-            .expect("binomial second coefficient cache lock poisoned")
-            .get(&key)
-            .cloned()
-        {
-            return Ok(value);
-        }
+        // No caching: at biobank shape (n=320k, K=14 outer coords) the K² ≈ 196
+        // unique direction-pairs are queried exactly once per outer Hessian eval,
+        // and each entry stored 3·n f64s = ~7.7 MB → ~1.5 GB peak per eval with
+        // zero practical hit-rate. Across outer evals the directions shift with
+        // ρ/ψ so cross-eval hits are nil. Computing on demand is O(n) — under
+        // 10 ms at this scale, dwarfed by the (n × p²) trace work that consumes
+        // the result. The (now unused) `_key` parameter and the `second_coeff_cache`
+        // field are retained for API compatibility with sibling families /
+        // future smaller-scale variants where the cache could pay back; the
+        // mutex stays empty here so concurrent calls share no contended state.
         let (tt, tl, ll) = binomial_location_scalesecond_directional_coefficients(
             &self.family.y,
             &self.family.weights,
@@ -15549,16 +15550,11 @@ impl BinomialLocationScaleHessianWorkspace {
             &eta_v.ls,
             &self.family.link_kind,
         )?;
-        let value = Arc::new(BinomialRowCoeffTriple {
+        Ok(Arc::new(BinomialRowCoeffTriple {
             tt: Arc::new(tt),
             tl: Arc::new(tl),
             ll: Arc::new(ll),
-        });
-        let mut cache = self
-            .second_coeff_cache
-            .lock()
-            .expect("binomial second coefficient cache lock poisoned");
-        Ok(cache.entry(key).or_insert_with(|| value.clone()).clone())
+        }))
     }
 }
 
