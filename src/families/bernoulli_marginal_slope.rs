@@ -2935,42 +2935,6 @@ impl HyperOperator for BernoulliBlockHessianOperator {
         out
     }
 
-    /// Block-aware `tr(Fᵀ B F)` that bypasses the trait default's per-column
-    /// `mul_mat` loop. The operator's algebra is
-    ///   `B v = ⊕[h_mm v_m + h_mg v_g, h_mgᵀ v_m + h_gg v_g] + dc · v`,
-    /// so for a `(p_total × rank)` factor `F` the trace decomposes into four
-    /// dense BLAS3 contractions over the two row/column blocks plus the
-    /// (optional) full-`p_total` dense correction. This replaces 95 sequential
-    /// `mul_vec` calls with at most five GEMMs per trace — and `build_outer_-
-    /// hessian_operator` runs ~528 of these traces per outer iter, so the
-    /// per-call cost reduction multiplies through every ψ-axis pair.
-    fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
-        debug_assert_eq!(factor.nrows(), self.total);
-        let f_m = factor.slice(s![self.marginal.clone(), ..]);
-        let f_g = factor.slice(s![self.logslope.clone(), ..]);
-
-        // Diagonal blocks: tr(F_mᵀ h_mm F_m), tr(F_gᵀ h_gg F_g).
-        let h_mm_fm = self.h_mm.dot(&f_m);
-        let mm_term: f64 = f_m.iter().zip(h_mm_fm.iter()).map(|(&f, &x)| f * x).sum();
-        let h_gg_fg = self.h_gg.dot(&f_g);
-        let gg_term: f64 = f_g.iter().zip(h_gg_fg.iter()).map(|(&f, &x)| f * x).sum();
-
-        // Off-diagonal blocks: 2 · tr(F_mᵀ h_mg F_g) (h_mg appears once on
-        // each side of the symmetric block, so the total contribution is
-        // twice the inner product of `F_m` with `h_mg · F_g`).
-        let h_mg_fg = self.h_mg.dot(&f_g);
-        let mg_term: f64 = f_m.iter().zip(h_mg_fg.iter()).map(|(&f, &x)| f * x).sum();
-
-        let mut total = mm_term + gg_term + 2.0 * mg_term;
-
-        // Optional dense correction over the full p_total × p_total block.
-        if let Some(ref dc) = self.dense_correction {
-            let dc_f = dc.dot(factor);
-            total += factor.iter().zip(dc_f.iter()).map(|(&f, &x)| f * x).sum::<f64>();
-        }
-        total
-    }
-
     fn is_implicit(&self) -> bool {
         false
     }
