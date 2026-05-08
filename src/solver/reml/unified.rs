@@ -2342,11 +2342,7 @@ impl ImplicitHyperOperator {
     /// built atop the same `x_design` (e.g. axis-0 and axis-1 of a 32-axis
     /// ψ-block) consult the same cache slot and hit after the first
     /// computes.
-    fn cached_xf(
-        &self,
-        factor: &Array2<f64>,
-        cache: &ProjectedFactorCache,
-    ) -> Arc<Array2<f64>> {
+    fn cached_xf(&self, factor: &Array2<f64>, cache: &ProjectedFactorCache) -> Arc<Array2<f64>> {
         let design_id = Arc::as_ptr(&self.x_design) as usize;
         let key = ProjectedFactorKey::from_factor_view(design_id, factor.view());
         cache.get_or_insert_with(key, || self.compute_xf(factor))
@@ -2358,11 +2354,7 @@ impl ImplicitHyperOperator {
     /// per-axis work is the row-kernel build (`row_chunk_first_raw`),
     /// the `K_d · U_knot` GEMM, the fused `⟨W ⊙ DXF, XF⟩` inner products,
     /// and the small dense penalty contraction.
-    fn trace_projected_factor_with_xf(
-        &self,
-        factor: &Array2<f64>,
-        xf: ArrayView2<'_, f64>,
-    ) -> f64 {
+    fn trace_projected_factor_with_xf(&self, factor: &Array2<f64>, xf: ArrayView2<'_, f64>) -> f64 {
         let rank = factor.ncols();
         let n_obs = self.w_diag.len();
         debug_assert_eq!(xf.dim(), (n_obs, rank));
@@ -2394,9 +2386,7 @@ impl ImplicitHyperOperator {
             let kd_chunk = self
                 .implicit_deriv
                 .row_chunk_first_raw(self.axis, start..end)
-                .expect(
-                    "radial scalar evaluation failed during implicit hyper forward_mul_matrix",
-                );
+                .expect("radial scalar evaluation failed during implicit hyper forward_mul_matrix");
             let dxf_chunk = crate::faer_ndarray::fast_ab(&kd_chunk, &u_knot);
 
             // Fused inner-product accumulation.
