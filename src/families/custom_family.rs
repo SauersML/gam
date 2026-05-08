@@ -573,15 +573,23 @@ pub trait CustomFamily {
     /// Families that consult `options.outer_score_subsample` (or other
     /// per-call options that affect the LL value) must override this so the
     /// joint-Newton line search and the post-accept gradient reload agree
-    /// on which row subset is being evaluated. The biobank FLEX bernoulli-
-    /// marginal-slope path overrides it because the cheap LL fallback
-    /// otherwise diverges from the workspace path that DID thread options.
+    /// on which row subset is being evaluated. Biobank-scale outer-only
+    /// callers (including the joint-Newton line-search screening path) can
+    /// override this to evaluate a deterministic paired Horvitz-Thompson
+    /// estimate without constructing a full exact-Newton workspace.
     fn log_likelihood_only_with_options(
         &self,
         block_states: &[ParameterBlockState],
         _options: &BlockwiseFitOptions,
     ) -> Result<f64, String> {
         self.log_likelihood_only(block_states)
+    }
+
+    /// Whether `log_likelihood_only_with_options` can use
+    /// `BlockwiseFitOptions::early_exit_threshold` to reject line-search trials
+    /// without computing the full log-likelihood.
+    fn supports_log_likelihood_early_exit(&self) -> bool {
+        false
     }
 
     /// Selects the outer objective semantics for exact-Newton families.
@@ -1726,6 +1734,13 @@ pub struct BlockwiseFitOptions {
     /// Shared cap engaged during seed screening so cost-only evaluations can
     /// stop inner iterations early without affecting the full solve.
     pub screening_max_inner_iterations: Option<Arc<AtomicUsize>>,
+    /// Optional line-search objective ceiling for lazy log-likelihood-only
+    /// evaluations. Families whose per-row log-likelihood contributions are
+    /// non-positive may stop once the partial negative log-likelihood is already
+    /// above this ceiling, because the unvisited rows cannot improve the trial
+    /// objective enough to be accepted. Default `None` preserves exact full-sum
+    /// behavior and is the only mode used outside backtracking rejection tests.
+    pub early_exit_threshold: Option<f64>,
     /// Optional stratified row subsample used by outer-only score/gradient
     /// passes. When `Some(s)`, outer score/gradient hot loops should iterate
     /// only over `s.mask` and rescale per-row contributions by
@@ -1754,6 +1769,7 @@ impl Default for BlockwiseFitOptions {
             use_outer_hessian: true,
             compute_covariance: false,
             screening_max_inner_iterations: None,
+            early_exit_threshold: None,
             outer_score_subsample: None,
         }
     }
@@ -8025,7 +8041,8 @@ fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'sta
     states: &[ParameterBlockState],
     prefer_workspace: bool,
 ) -> Result<(f64, Option<Arc<dyn ExactNewtonJointHessianWorkspace>>), String> {
-    if prefer_workspace
+    if (!family.supports_log_likelihood_early_exit() || options.early_exit_threshold.is_none())
+        && prefer_workspace
         && family.inner_joint_workspace_log_likelihood_available(specs)
         && let Some(workspace) =
             family.exact_newton_joint_hessian_workspace_with_options(states, specs, options)?
@@ -8037,6 +8054,118 @@ fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'sta
     family
         .log_likelihood_only_with_options(states, options)
         .map(|log_likelihood| (log_likelihood, None))
+}
+
+/// When set to `true`, the joint-Newton line search evaluates the first
+/// `joint_line_search_speculative_attempts(...)` backtracking steps in
+/// parallel via rayon and accepts the first one that meets the Armijo-style
+/// non-increase check.  Currently disabled because the surrounding
+/// line-search loop is in flux (trust-region acceptance + subsample
+/// screening). Flip to `true` once the call site is unified and a parity
+/// test confirms identical betas vs. the sequential schedule.
+#[allow(dead_code)]
+const SPECULATIVE_LINE_SEARCH_ENABLED: bool = false;
+
+#[allow(dead_code)]
+struct JointLineSearchTrial {
+    bt: usize,
+    objective: f64,
+    penalty: f64,
+    states: Vec<ParameterBlockState>,
+    workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+}
+
+#[allow(dead_code)]
+#[inline]
+fn joint_backtracking_alpha(bt: usize, barrier_ceiling: f64) -> f64 {
+    (0.5f64.powi(bt as i32)).min(barrier_ceiling)
+}
+
+#[allow(dead_code)]
+fn joint_line_search_speculative_attempts(max_attempts: usize) -> usize {
+    const SPECULATIVE_HARD_CAP: usize = 3;
+    let thread_cap = (rayon::current_num_threads().max(1) / 2).max(1);
+    thread_cap
+        .clamp(1, SPECULATIVE_HARD_CAP)
+        .min(max_attempts.max(1))
+}
+
+#[allow(dead_code)]
+fn choose_joint_line_search_acceptance(
+    trials: &[Result<JointLineSearchTrial, String>],
+    lastobjective: f64,
+) -> Option<usize> {
+    trials.iter().position(|trial| {
+        trial
+            .as_ref()
+            .map(|trial| trial.objective.is_finite() && trial.objective <= lastobjective + 1e-10)
+            .unwrap_or(false)
+    })
+}
+
+#[allow(dead_code)]
+struct JointLineSearchEvalContext<'a> {
+    specs: &'a [ParameterBlockSpec],
+    options: &'a BlockwiseFitOptions,
+    base_states: &'a [ParameterBlockState],
+    old_beta: &'a [Array1<f64>],
+    delta: &'a Array1<f64>,
+    ranges: &'a [(usize, usize)],
+    s_lambdas: &'a [Array2<f64>],
+    ridge: f64,
+    ridge_policy: RidgePolicy,
+    prefer_workspace: bool,
+}
+
+#[allow(dead_code)]
+fn evaluate_joint_line_search_trial<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    ctx: &JointLineSearchEvalContext<'_>,
+    bt: usize,
+    barrier_ceiling: f64,
+) -> Result<JointLineSearchTrial, String> {
+    let alpha = joint_backtracking_alpha(bt, barrier_ceiling);
+    let mut trial_states = ctx.base_states.to_vec();
+    for b in 0..ctx.specs.len() {
+        let (start, end) = ctx.ranges[b];
+        let mut trial_beta = ctx.old_beta[b].clone();
+        trial_beta.scaled_add(alpha, &ctx.delta.slice(ndarray::s![start..end]));
+        let projected =
+            family.post_update_block_beta(&trial_states, b, &ctx.specs[b], trial_beta)?;
+        trial_states[b].beta.assign(&projected);
+    }
+    refresh_all_block_etas(family, ctx.specs, &mut trial_states)?;
+    let (trial_ll, workspace) = joint_line_search_log_likelihood(
+        family,
+        ctx.specs,
+        ctx.options,
+        &trial_states,
+        ctx.prefer_workspace,
+    )?;
+    let penalty =
+        total_quadratic_penalty(&trial_states, ctx.s_lambdas, ctx.ridge, ctx.ridge_policy);
+    Ok(JointLineSearchTrial {
+        bt,
+        objective: -trial_ll + penalty,
+        penalty,
+        states: trial_states,
+        workspace,
+    })
+}
+
+fn joint_line_search_screening_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    options: &BlockwiseFitOptions,
+    states: &[ParameterBlockState],
+) -> Result<f64, String> {
+    family.log_likelihood_only_with_options(states, options)
+}
+
+fn joint_line_search_full_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    states: &[ParameterBlockState],
+) -> Result<f64, String> {
+    family.log_likelihood_only_with_options(states, &BlockwiseFitOptions::default())
 }
 
 type JointGradientLoad = (
@@ -8563,6 +8692,15 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 
             let old_beta: Vec<Array1<f64>> = states.iter().map(|s| s.beta.clone()).collect();
             let old_objective = lastobjective;
+            let use_subsample_line_search =
+                matrix_free_joint_workspace && options.outer_score_subsample.is_some();
+            let old_screening_objective = if use_subsample_line_search {
+                let old_screening_ll =
+                    joint_line_search_screening_log_likelihood(family, options, &states)?;
+                Some(-old_screening_ll + current_penalty)
+            } else {
+                None
+            };
             let mut accepted = false;
             let mut accepted_joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>> =
                 None;
@@ -8634,29 +8772,28 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     states[b].beta.assign(&projected);
                 }
                 refresh_all_block_etas(family, specs, &mut states)?;
-                // NB: prefer_workspace MUST stay true on the FLEX marg-slope
-                // biobank path. The workspace LL and the cheap
-                // log_likelihood_only_with_options LL do NOT agree numerically
-                // for FLEX (verified empirically: switching to cheap LL caused
-                // every line-search attempt to reject because trialobjective
-                // had a different constant offset than lastobjective).
-                // The cheap-LL path is correct only when the family's two LL
-                // computation paths produce bit-equivalent values; for FLEX
-                // bernoulli marginal-slope they differ in row-iteration scale
-                // / aggregation. A future fix wiring cheap-LL safely should
-                // verify equivalence first (see codex cloud LS task 1).
-                let trial_ll = match joint_line_search_log_likelihood(
-                    family,
-                    specs,
-                    options,
-                    &states,
-                    matrix_free_joint_workspace,
-                ) {
-                    Ok((value, workspace)) => {
-                        accepted_joint_workspace = workspace;
-                        value
-                    }
-                    Err(_) => {
+                let trial_penalty =
+                    total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
+                let trialobjective = if let Some(old_screening_objective) = old_screening_objective
+                {
+                    accepted_joint_workspace = None;
+                    let trial_screening_ll = match joint_line_search_screening_log_likelihood(
+                        family, options, &states,
+                    ) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            for (b, old) in old_beta.iter().enumerate() {
+                                states[b].beta.assign(old);
+                            }
+                            refresh_all_block_etas(family, specs, &mut states)?;
+                            joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
+                            continue;
+                        }
+                    };
+                    let screening_objective = -trial_screening_ll + trial_penalty;
+                    if !screening_objective.is_finite()
+                        || screening_objective > old_screening_objective + 1e-10
+                    {
                         for (b, old) in old_beta.iter().enumerate() {
                             states[b].beta.assign(old);
                         }
@@ -8664,10 +8801,56 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
                         continue;
                     }
+
+                    // Safety net: the paired subsample only screens the
+                    // backtracking attempts. Before accepting and moving on to
+                    // the full gradient reload, re-anchor the Armijo / trust-
+                    // region decision on the exact full-data objective once.
+                    let full_trial_ll = match joint_line_search_full_log_likelihood(family, &states)
+                    {
+                        Ok(value) => value,
+                        Err(_) => {
+                            for (b, old) in old_beta.iter().enumerate() {
+                                states[b].beta.assign(old);
+                            }
+                            refresh_all_block_etas(family, specs, &mut states)?;
+                            joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
+                            continue;
+                        }
+                    };
+                    -full_trial_ll + trial_penalty
+                } else {
+                    // NB: prefer_workspace MUST stay true on the FLEX marg-slope
+                    // biobank path when no subsample is configured. The
+                    // workspace LL and the cheap log_likelihood_only_with_options
+                    // LL do NOT agree numerically for FLEX (verified
+                    // empirically: switching to cheap LL caused every
+                    // line-search attempt to reject because trialobjective had
+                    // a different constant offset than lastobjective).
+                    let mut line_search_options = options.clone();
+                    line_search_options.early_exit_threshold = Some(old_objective + 1e-10);
+                    let trial_ll = match joint_line_search_log_likelihood(
+                        family,
+                        specs,
+                        &line_search_options,
+                        &states,
+                        matrix_free_joint_workspace,
+                    ) {
+                        Ok((value, workspace)) => {
+                            accepted_joint_workspace = workspace;
+                            value
+                        }
+                        Err(_) => {
+                            for (b, old) in old_beta.iter().enumerate() {
+                                states[b].beta.assign(old);
+                            }
+                            refresh_all_block_etas(family, specs, &mut states)?;
+                            joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
+                            continue;
+                        }
+                    };
+                    -trial_ll + trial_penalty
                 };
-                let trial_penalty =
-                    total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
-                let trialobjective = -trial_ll + trial_penalty;
                 let actual_reduction = old_objective - trialobjective;
                 let trust_update = update_joint_trust_region_radius(
                     joint_trust_radius,
@@ -15803,6 +15986,7 @@ mod tests {
             compute_covariance: false,
             use_outer_hessian: false,
             screening_max_inner_iterations: None,
+            early_exit_threshold: None,
             outer_score_subsample: None,
         };
 
@@ -15843,6 +16027,7 @@ mod tests {
             compute_covariance: false,
             use_outer_hessian: false,
             screening_max_inner_iterations: None,
+            early_exit_threshold: None,
             outer_score_subsample: None,
         };
         let per_block_log_lambdas = vec![array![10.0_f64.ln()]];
@@ -15886,6 +16071,7 @@ mod tests {
             compute_covariance: false,
             use_outer_hessian: false,
             screening_max_inner_iterations: None,
+            early_exit_threshold: None,
             outer_score_subsample: None,
         };
         let inner = inner_blockwise_fit(&family, &[spec], &[Array1::zeros(0)], &options, None)

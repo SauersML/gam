@@ -13036,7 +13036,19 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
-        self.log_likelihood_only_with_options(block_states, &BlockwiseFitOptions::default())
+        SurvivalMarginalSlopeFamily::log_likelihood_only_with_options(
+            self,
+            block_states,
+            &BlockwiseFitOptions::default(),
+        )
+    }
+
+    fn log_likelihood_only_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        options: &BlockwiseFitOptions,
+    ) -> Result<f64, String> {
+        SurvivalMarginalSlopeFamily::log_likelihood_only_with_options(self, block_states, options)
     }
 
     fn has_explicit_joint_hessian(&self) -> bool {
