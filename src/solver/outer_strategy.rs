@@ -390,6 +390,60 @@ pub enum Derivative {
     Unavailable,
 }
 
+/// Capability-time declaration of what shape the outer Hessian takes.
+/// Replaces the binary `Derivative` for the Hessian field on
+/// [`OuterCapability`]: callers that know the shape upfront declare
+/// it here, and the planner routes between dense ARC and matrix-free
+/// trust-region *before* seed evaluation rather than dynamically
+/// branching on `seed_eval.hessian` at runtime.
+///
+/// Variants:
+/// - `Dense`: the family always returns `HessianResult::Analytic(_)`.
+///   The planner picks dense ARC; matrix-free TR is never engaged.
+/// - `Operator { materialization, estimated_materialization_cost }`:
+///   the family always returns `HessianResult::Operator(_)`. The
+///   planner picks matrix-free TR unless `materialization` advertises
+///   `Explicit`/`BatchedHvp` cheaply enough that materializing once
+///   per outer iter (opt 0.4.2 `with_materialize_when_cheap`) wins.
+///   `estimated_materialization_cost` is reserved for a future cost
+///   model; today it is purely informational.
+/// - `Either`: the family may return either shape; the runner inspects
+///   the seed eval and locks the route then. This is the historical
+///   default for code paths where `Derivative::Analytic` made the
+///   declaration and the seed loop branched on `seed_eval.hessian`.
+/// - `Unavailable`: no analytic Hessian. The planner picks BFGS / EFS
+///   per the gradient declaration and the rest of the capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeclaredHessianForm {
+    Dense,
+    Operator {
+        materialization: OuterHessianMaterialization,
+        estimated_materialization_cost: Option<f64>,
+    },
+    Either,
+    Unavailable,
+}
+
+impl DeclaredHessianForm {
+    /// Coarse "is an analytic Hessian declared?" projection. `true`
+    /// for `Dense` / `Operator` / `Either`; `false` for `Unavailable`.
+    /// Used by `plan` to keep the existing `Derivative`-based match
+    /// arms while richer routing decisions consult the form directly.
+    pub fn is_analytic(self) -> bool {
+        !matches!(self, DeclaredHessianForm::Unavailable)
+    }
+
+    /// True when the declaration commits to a matrix-free path.
+    pub fn is_operator_only(self) -> bool {
+        matches!(self, DeclaredHessianForm::Operator { .. })
+    }
+
+    /// True when the declaration commits to a dense path.
+    pub fn is_dense_only(self) -> bool {
+        matches!(self, DeclaredHessianForm::Dense)
+    }
+}
+
 /// Declares what a specific model path can provide to the outer optimizer.
 ///
 /// Each call site that optimizes smoothing parameters constructs one of these
