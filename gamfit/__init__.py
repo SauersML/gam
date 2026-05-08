@@ -19,7 +19,6 @@ See https://github.com/SauersML/gam for the full guide.
 
 from importlib import metadata as _metadata
 
-from . import pgs
 from ._api import build_info, explain_error, fit, load, loads, validate_formula
 from ._binding import RustExtensionUnavailableError
 from ._diagnostics import Diagnostics
@@ -53,6 +52,5 @@ __all__ = [
     "fit",
     "load",
     "loads",
-    "pgs",
     "validate_formula",
 ]
