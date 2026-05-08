@@ -72,12 +72,11 @@ struct PyFitConfig {
 
     firth: Option<bool>,
 
-    // Frailty (only consumed by survival families today). When provided as a
-    // string, accepts: "hazard-multiplier", "hazard-multiplier:learnable",
-    // "gaussian-shift:<sigma>". For richer frailty configs, use the CLI.
-    frailty: Option<String>,
-    frailty_sigma: Option<f64>,
-    frailty_loading: Option<f64>,
+    // Frailty (only consumed by survival families today). Mirrors the CLI
+    // names: --frailty-kind, --frailty-sd, --hazard-loading.
+    frailty_kind: Option<String>,
+    frailty_sd: Option<f64>,
+    hazard_loading: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -428,6 +427,19 @@ fn fit_table_impl(
                 ls_result,
             )?
         }
+        FitRequest::SurvivalTransformation(rp_request) => {
+            let fit_result = fit_model(FitRequest::SurvivalTransformation(rp_request))?;
+            let rp_result = match fit_result {
+                FitResult::SurvivalTransformation(result) => result,
+                _ => {
+                    return Err(
+                        "python binding expected the survival transformation workflow to return a survival transformation fit result"
+                            .to_string(),
+                    );
+                }
+            };
+            build_survival_transformation_ffi_payload(formula, &dataset, &fit_config, rp_result)?
+        }
         FitRequest::LatentSurvival(lat_request) => {
             let frailty = lat_request.frailty.clone();
             let fit_result = fit_model(FitRequest::LatentSurvival(lat_request))?;
@@ -728,37 +740,65 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
     if let Some(flag) = py_config.firth {
         fit_config.firth = flag;
     }
-    if let Some(kind) = py_config.frailty {
+    if let Some(kind) = py_config.frailty_kind {
         let trimmed = kind.trim().to_ascii_lowercase();
-        let sigma = py_config.frailty_sigma;
-        let loading_kind = py_config.frailty_loading.map(|raw| raw).unwrap_or(0.0);
-        let hazard_loading = if loading_kind > 0.5 {
-            gam::families::lognormal_kernel::HazardLoading::LoadedVsUnloaded
-        } else {
-            gam::families::lognormal_kernel::HazardLoading::Full
-        };
+        let sigma = py_config.frailty_sd;
+        if let Some(value) = sigma
+            && (!value.is_finite() || value < 0.0)
+        {
+            return Err(format!("frailty_sd must be finite and >= 0, got {value}"));
+        }
+        let hazard_loading = py_config
+            .hazard_loading
+            .as_ref()
+            .map(|raw| raw.trim().to_ascii_lowercase());
         let frailty = match trimmed.as_str() {
-            "none" | "" => gam::families::lognormal_kernel::FrailtySpec::None,
-            "hazard-multiplier" => gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
-                sigma_fixed: sigma,
-                loading: hazard_loading,
-            },
-            "hazard-multiplier:learnable" => {
+            "none" | "" => {
+                if sigma.is_some() || hazard_loading.is_some() {
+                    return Err(
+                        "frailty_kind='none' does not accept frailty_sd or hazard_loading"
+                            .to_string(),
+                    );
+                }
+                gam::families::lognormal_kernel::FrailtySpec::None
+            }
+            "hazard-multiplier" => {
+                let loading = match hazard_loading.as_deref() {
+                    Some("full") | None => gam::families::lognormal_kernel::HazardLoading::Full,
+                    Some("loaded-vs-unloaded") => {
+                        gam::families::lognormal_kernel::HazardLoading::LoadedVsUnloaded
+                    }
+                    Some(other) => {
+                        return Err(format!(
+                            "unknown hazard_loading '{other}'; supported: 'full', 'loaded-vs-unloaded'"
+                        ));
+                    }
+                };
                 gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
-                    sigma_fixed: None,
-                    loading: hazard_loading,
+                    sigma_fixed: sigma,
+                    loading,
                 }
             }
             "gaussian-shift" => {
+                if hazard_loading.is_some() {
+                    return Err(
+                        "hazard_loading is valid only with frailty_kind='hazard-multiplier'"
+                            .to_string(),
+                    );
+                }
                 gam::families::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed: sigma }
             }
             other => {
                 return Err(format!(
-                    "unknown frailty kind '{other}'; supported: 'none', 'hazard-multiplier', 'hazard-multiplier:learnable', 'gaussian-shift'"
+                    "unknown frailty_kind '{other}'; supported: 'none', 'hazard-multiplier', 'gaussian-shift'"
                 ));
             }
         };
         fit_config.frailty = Some(frailty);
+    } else if py_config.frailty_sd.is_some() || py_config.hazard_loading.is_some() {
+        return Err(
+            "frailty_kind is required when frailty_sd or hazard_loading is provided".to_string(),
+        );
     }
     Ok(fit_config)
 }
@@ -777,6 +817,12 @@ fn request_metadata(request: &FitRequest<'_>) -> (&'static str, &'static str, bo
         FitRequest::SurvivalLocationScale(_) => {
             ("Survival location-scale", "survival location-scale", true)
         }
+        FitRequest::SurvivalTransformation(request) => match request.spec.likelihood_mode {
+            gam::families::survival_construction::SurvivalLikelihoodMode::Weibull => {
+                ("Survival Weibull", "survival", true)
+            }
+            _ => ("Survival", "survival", true),
+        },
         FitRequest::BernoulliMarginalSlope(_) => {
             ("Bernoulli marginal-slope", "bernoulli marginal-slope", true)
         }
@@ -1280,6 +1326,82 @@ fn build_survival_marginal_slope_ffi_payload(
         .map(saved_anchored_deviation_runtime);
     payload.offset_column = fit_config.offset_column.clone();
     payload.noise_offset_column = fit_config.noise_offset_column.clone();
+    Ok(payload)
+}
+
+fn build_survival_transformation_ffi_payload(
+    formula: String,
+    dataset: &EncodedDataset,
+    fit_config: &FitConfig,
+    rp_result: gam::SurvivalTransformationFitResult,
+) -> Result<FittedModelPayload, String> {
+    use gam::families::survival_construction::{
+        survival_baseline_targetname, survival_likelihood_modename,
+    };
+    use ndarray::s;
+
+    let parsed = parse_formula(&formula)
+        .map_err(|err| format!("failed to re-parse survival transformation formula: {err}"))?;
+    let (entryname, exitname, eventname) = parse_surv_response(&parsed.response)?
+        .ok_or_else(|| "survival transformation FFI requires Surv(...) response".to_string())?;
+    let likelihood_label = survival_likelihood_modename(rp_result.likelihood_mode).to_string();
+
+    let mut payload = FittedModelPayload::new(
+        MODEL_VERSION,
+        formula,
+        ModelKind::Survival,
+        FittedFamily::Survival {
+            likelihood: LikelihoodFamily::RoystonParmar,
+            survival_likelihood: Some(likelihood_label.clone()),
+            survival_distribution: None,
+            frailty: gam::families::lognormal_kernel::FrailtySpec::None,
+        },
+        "royston-parmar".to_string(),
+    );
+    payload.unified = Some(rp_result.fit.clone());
+    payload.fit_result = Some(rp_result.fit.clone());
+    payload.data_schema = Some(dataset.schema.clone());
+    payload.survival_entry = Some(entryname);
+    payload.survival_exit = Some(exitname);
+    payload.survival_event = Some(eventname);
+    payload.survivalspec = Some("net".to_string());
+    payload.survival_baseline_target =
+        Some(survival_baseline_targetname(rp_result.baseline_cfg.target).to_string());
+    payload.survival_baseline_scale = rp_result.baseline_cfg.scale;
+    payload.survival_baseline_shape = rp_result.baseline_cfg.shape;
+    payload.survival_baseline_rate = rp_result.baseline_cfg.rate;
+    payload.survival_baseline_makeham = rp_result.baseline_cfg.makeham;
+    payload.survival_time_basis = Some(rp_result.time_basisname);
+    payload.survival_time_degree = rp_result.time_degree;
+    payload.survival_time_knots = rp_result.time_knots;
+    payload.survival_time_keep_cols = rp_result.time_keep_cols;
+    payload.survival_time_smooth_lambda = rp_result.time_smooth_lambda;
+    payload.survival_time_anchor = Some(rp_result.time_anchor);
+    payload.survivalridge_lambda = Some(fit_config.ridge_lambda);
+    payload.survival_likelihood = Some(likelihood_label);
+    if let Some(timewiggle) = rp_result.baseline_timewiggle.as_ref() {
+        payload.baseline_timewiggle_degree = Some(timewiggle.degree);
+        payload.baseline_timewiggle_knots = Some(timewiggle.knots.to_vec());
+        payload.baseline_timewiggle_penalty_orders = parsed
+            .timewiggle
+            .as_ref()
+            .map(|cfg| cfg.penalty_orders.clone());
+        payload.baseline_timewiggle_double_penalty =
+            parsed.timewiggle.as_ref().map(|cfg| cfg.double_penalty);
+        let beta = &rp_result.fit.beta;
+        let start = rp_result.time_base_ncols;
+        let end = start + timewiggle.ncols;
+        if beta.len() < end {
+            return Err(format!(
+                "survival transformation timewiggle beta mismatch: beta has {}, needs {end}",
+                beta.len()
+            ));
+        }
+        payload.beta_baseline_timewiggle = Some(beta.slice(s![start..end]).to_vec());
+    }
+    payload.training_headers = Some(dataset.headers.clone());
+    payload.resolved_termspec = Some(rp_result.resolvedspec);
+    payload.offset_column = fit_config.offset_column.clone();
     Ok(payload)
 }
 

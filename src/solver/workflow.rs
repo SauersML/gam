@@ -37,7 +37,8 @@ use crate::families::transformation_normal::{
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::smooth::{
     AdaptiveRegularizationDiagnostics, SpatialLengthScaleOptimizationOptions, TermCollectionDesign,
-    TermCollectionSpec, fit_term_collectionwith_spatial_length_scale_optimization,
+    TermCollectionSpec, build_term_collection_design,
+    fit_term_collectionwith_spatial_length_scale_optimization,
 };
 use crate::types::{
     InverseLink, LatentCLogLogState, LikelihoodFamily, LinkFunction, MixtureLinkSpec, SasLinkSpec,
@@ -95,6 +96,28 @@ pub struct SurvivalLocationScaleFitRequest<'a> {
     pub wiggle: Option<LinkWiggleConfig>,
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
     pub optimize_inverse_link: bool,
+}
+
+pub struct SurvivalTransformationFitRequest<'a> {
+    pub data: ArrayView2<'a, f64>,
+    pub spec: SurvivalTransformationTermSpec,
+}
+
+#[derive(Clone)]
+pub struct SurvivalTransformationTermSpec {
+    pub age_entry: Array1<f64>,
+    pub age_exit: Array1<f64>,
+    pub event_target: Array1<u8>,
+    pub weights: Array1<f64>,
+    pub covariate_spec: TermCollectionSpec,
+    pub covariate_offset: Array1<f64>,
+    pub baseline_cfg: crate::families::survival_construction::SurvivalBaselineConfig,
+    pub likelihood_mode: crate::families::survival_construction::SurvivalLikelihoodMode,
+    pub time_anchor: f64,
+    pub time_build: crate::families::survival_construction::SurvivalTimeBuildOutput,
+    pub timewiggle: Option<LinkWiggleFormulaSpec>,
+    pub weibull_seed: Option<(f64, f64)>,
+    pub ridge_lambda: f64,
 }
 
 pub(crate) fn survival_inverse_link_has_free_parameters(link: &InverseLink) -> bool {
@@ -173,6 +196,7 @@ pub enum FitRequest<'a> {
     GaussianLocationScale(GaussianLocationScaleFitRequest<'a>),
     BinomialLocationScale(BinomialLocationScaleFitRequest<'a>),
     SurvivalLocationScale(SurvivalLocationScaleFitRequest<'a>),
+    SurvivalTransformation(SurvivalTransformationFitRequest<'a>),
     BernoulliMarginalSlope(BernoulliMarginalSlopeFitRequest<'a>),
     SurvivalMarginalSlope(SurvivalMarginalSlopeFitRequest<'a>),
     LatentSurvival(LatentSurvivalFitRequest<'a>),
@@ -195,6 +219,22 @@ pub struct SurvivalLocationScaleFitResult {
     pub inverse_link: InverseLink,
     pub wiggle_knots: Option<Array1<f64>>,
     pub wiggle_degree: Option<usize>,
+}
+
+pub struct SurvivalTransformationFitResult {
+    pub fit: UnifiedFitResult,
+    pub resolvedspec: TermCollectionSpec,
+    pub covariate_design: TermCollectionDesign,
+    pub baseline_cfg: crate::families::survival_construction::SurvivalBaselineConfig,
+    pub likelihood_mode: crate::families::survival_construction::SurvivalLikelihoodMode,
+    pub time_anchor: f64,
+    pub time_basisname: String,
+    pub time_base_ncols: usize,
+    pub time_degree: Option<usize>,
+    pub time_knots: Option<Vec<f64>>,
+    pub time_keep_cols: Option<Vec<usize>>,
+    pub time_smooth_lambda: Option<f64>,
+    pub baseline_timewiggle: Option<TimeWiggleBlockInput>,
 }
 
 struct SurvivalLocationScaleProfile {
@@ -224,6 +264,7 @@ pub enum FitResult {
     GaussianLocationScale(GaussianLocationScaleFitResult),
     BinomialLocationScale(BinomialLocationScaleFitResult),
     SurvivalLocationScale(SurvivalLocationScaleFitResult),
+    SurvivalTransformation(SurvivalTransformationFitResult),
     BernoulliMarginalSlope(BernoulliMarginalSlopeFitResult),
     SurvivalMarginalSlope(SurvivalMarginalSlopeFitResult),
     LatentSurvival(LatentSurvivalTermFitResult),
@@ -495,6 +536,313 @@ fn fit_binomial_location_scale_model(
             beta_link_wiggle: None,
         })
     }
+}
+
+fn survival_working_reml_score(state: &crate::pirls::WorkingState) -> f64 {
+    0.5 * (state.deviance + state.penalty_term)
+}
+
+fn fitted_weibull_baseline_from_linear_time_beta(
+    beta: &Array1<f64>,
+) -> Option<crate::families::survival_construction::SurvivalBaselineConfig> {
+    if beta.len() < 2 {
+        return None;
+    }
+    let shape = beta[1];
+    if !shape.is_finite() || shape <= 0.0 {
+        return None;
+    }
+    let scale = (-beta[0] / shape).exp();
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    Some(crate::families::survival_construction::SurvivalBaselineConfig {
+        target: SurvivalBaselineTarget::Weibull,
+        scale: Some(scale),
+        shape: Some(shape),
+        rate: None,
+        makeham: None,
+    })
+}
+
+fn survival_unified_fit_result(
+    beta: Array1<f64>,
+    lambdas: Array1<f64>,
+    summary: &crate::pirls::WorkingModelPirlsResult,
+    state: &crate::pirls::WorkingState,
+) -> Result<UnifiedFitResult, String> {
+    let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
+    let reml_score = survival_working_reml_score(state);
+    crate::estimate::validate_all_finite("survival fit beta", beta.iter().copied())?;
+    crate::estimate::validate_all_finite("survival fit lambdas", lambdas.iter().copied())?;
+    crate::estimate::ensure_finite_scalar("survival fit log_likelihood", state.log_likelihood)?;
+    crate::estimate::ensure_finite_scalar("survival fit deviance", state.deviance)?;
+    crate::estimate::ensure_finite_scalar("survival fit penalty", state.penalty_term)?;
+    crate::estimate::ensure_finite_scalar("survival fit reml_score", reml_score)?;
+    crate::estimate::ensure_finite_scalar(
+        "survival fit gradient_norm",
+        summary.lastgradient_norm,
+    )?;
+    crate::estimate::ensure_finite_scalar("survival fit max_abs_eta", summary.max_abs_eta)?;
+
+    UnifiedFitResult::try_from_parts(crate::estimate::UnifiedFitResultParts {
+        blocks: vec![crate::estimate::FittedBlock {
+            beta: beta.clone(),
+            role: crate::estimate::BlockRole::Mean,
+            edf: 0.0,
+            lambdas: lambdas.clone(),
+        }],
+        log_lambdas,
+        lambdas,
+        likelihood_family: Some(LikelihoodFamily::RoystonParmar),
+        likelihood_scale: crate::types::LikelihoodScaleMetadata::Unspecified,
+        log_likelihood_normalization: crate::types::LogLikelihoodNormalization::UserProvided,
+        log_likelihood: state.log_likelihood,
+        deviance: state.deviance,
+        reml_score,
+        stable_penalty_term: state.penalty_term,
+        penalized_objective: reml_score,
+        outer_iterations: summary.iterations,
+        outer_converged: true,
+        outer_gradient_norm: summary.lastgradient_norm,
+        standard_deviation: 1.0,
+        covariance_conditional: None,
+        covariance_corrected: None,
+        inference: None,
+        fitted_link: FittedLinkState::Standard(None),
+        geometry: None,
+        block_states: Vec::new(),
+        pirls_status: summary.status,
+        max_abs_eta: summary.max_abs_eta,
+        constraint_kkt: None,
+        artifacts: crate::estimate::FitArtifacts {
+            pirls: None,
+            ..Default::default()
+        },
+        inner_cycles: 0,
+    })
+    .map_err(|err| err.to_string())
+}
+
+fn fit_survival_transformation_model(
+    request: SurvivalTransformationFitRequest<'_>,
+) -> Result<SurvivalTransformationFitResult, String> {
+    use crate::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
+
+    let SurvivalTransformationFitRequest { data, spec } = request;
+    let mut baseline_cfg = spec.baseline_cfg.clone();
+    let covariate_design = build_term_collection_design(data, &spec.covariate_spec)
+        .map_err(|err| err.to_string())?;
+    let resolvedspec =
+        crate::smooth::freeze_term_collection_from_design(&spec.covariate_spec, &covariate_design)
+            .map_err(|err| err.to_string())?;
+    let dense_cov_design = covariate_design.design.to_dense();
+    let p_cov = dense_cov_design.ncols();
+    let event_competing = Array1::<u8>::zeros(spec.event_target.len());
+    let exact_derivative_guard = survival_derivative_guard_for_likelihood(spec.likelihood_mode);
+
+    let build_working_model = |candidate: &crate::families::survival_construction::SurvivalBaselineConfig| {
+        let prepared = prepare_workflow_survival_time_stack(
+            &spec.age_entry,
+            &spec.age_exit,
+            candidate,
+            spec.likelihood_mode,
+            None,
+            spec.time_anchor,
+            exact_derivative_guard,
+            &spec.time_build,
+            spec.timewiggle.as_ref(),
+            None,
+        )?;
+        let mut eta_offset_entry = prepared.eta_offset_entry.clone();
+        let mut eta_offset_exit = prepared.eta_offset_exit.clone();
+        eta_offset_entry += &spec.covariate_offset;
+        eta_offset_exit += &spec.covariate_offset;
+        let p_time_total = prepared.time_design_exit.ncols();
+        let p = p_time_total + p_cov;
+        let mut penalty_blocks = Vec::<PenaltyBlock>::new();
+        for (idx, penalty) in prepared.time_penalties.iter().enumerate() {
+            if penalty.nrows() == p_time_total && penalty.ncols() == p_time_total {
+                penalty_blocks.push(PenaltyBlock {
+                    matrix: penalty.clone(),
+                    lambda: spec.time_build.smooth_lambda.unwrap_or(1e-2),
+                    range: 0..p_time_total,
+                    nullspace_dim: prepared.time_nullspace_dims.get(idx).copied().unwrap_or(0),
+                });
+            }
+        }
+        let ridge_range_start = if spec.likelihood_mode == SurvivalLikelihoodMode::Weibull
+            && spec.time_build.basisname == "linear"
+            && spec.timewiggle.is_none()
+        {
+            1
+        } else {
+            0
+        };
+        if spec.ridge_lambda > 0.0 && p > ridge_range_start {
+            let dim = p - ridge_range_start;
+            let mut ridge = Array2::<f64>::zeros((dim, dim));
+            for d in 0..dim {
+                ridge[[d, d]] = 1.0;
+            }
+            penalty_blocks.push(PenaltyBlock {
+                matrix: ridge,
+                lambda: spec.ridge_lambda,
+                range: ridge_range_start..p,
+                nullspace_dim: 0,
+            });
+        }
+        let dense_time_entry = prepared.time_design_entry.to_dense();
+        let dense_time_exit = prepared.time_design_exit.to_dense();
+        let dense_time_derivative = prepared.time_design_derivative.to_dense();
+        let mut model = crate::families::royston_parmar::working_model_from_time_covariateshared(
+            PenaltyBlocks::new(penalty_blocks.clone()),
+            MonotonicityPenalty { tolerance: 0.0 },
+            SurvivalSpec::Net,
+            crate::families::royston_parmar::RoystonParmarSharedTimeCovariateInputs {
+                age_entry: spec.age_entry.view(),
+                age_exit: spec.age_exit.view(),
+                event_target: spec.event_target.view(),
+                event_competing: event_competing.view(),
+                weights: spec.weights.view(),
+                time_entry: dense_time_entry.view(),
+                time_exit: dense_time_exit.view(),
+                time_derivative: dense_time_derivative.view(),
+                covariates: dense_cov_design.view(),
+                monotonicity_constraint_rows: None,
+                monotonicity_constraint_offsets: None,
+                eta_offset_entry: Some(eta_offset_entry.view()),
+                eta_offset_exit: Some(eta_offset_exit.view()),
+                derivative_offset_exit: Some(prepared.derivative_offset_exit.view()),
+            },
+        )
+        .map_err(|err| format!("failed to construct survival model: {err}"))?;
+        if spec.likelihood_mode != SurvivalLikelihoodMode::Weibull {
+            model
+                .set_structural_monotonicity(true, p_time_total)
+                .map_err(|err| format!("failed to enable structural monotonicity: {err}"))?;
+        }
+        let mut beta0 = Array1::<f64>::zeros(p);
+        if spec.likelihood_mode == SurvivalLikelihoodMode::Weibull && spec.timewiggle.is_none() {
+            let (scale, shape) = spec
+                .weibull_seed
+                .ok_or_else(|| "weibull survival fit missing scale/shape seed".to_string())?;
+            if p_time_total < 2 {
+                return Err(format!(
+                    "weibull built-in time basis has {p_time_total} columns but needs 2 to seed scale/shape"
+                ));
+            }
+            beta0[0] = -shape * scale.ln();
+            beta0[1] = shape;
+        }
+        let structural_lower_bounds =
+            if spec.likelihood_mode != SurvivalLikelihoodMode::Weibull && p_time_total > 0 {
+                let mut lb = Array1::from_elem(p, f64::NEG_INFINITY);
+                for j in 0..p_time_total {
+                    lb[j] = 0.0;
+                    beta0[j] = 1e-4;
+                }
+                Some(lb)
+            } else {
+                None
+            };
+        Ok::<_, String>((prepared, penalty_blocks, beta0, structural_lower_bounds, model))
+    };
+
+    if baseline_cfg.target != SurvivalBaselineTarget::Linear {
+        baseline_cfg = optimize_survival_baseline_config(
+            &baseline_cfg,
+            "workflow survival transformation baseline",
+            |candidate| {
+                let (_, _, beta0, structural_lower_bounds, mut model) =
+                    build_working_model(candidate)?;
+                let opts = crate::pirls::WorkingModelPirlsOptions {
+                    max_iterations: 400,
+                    convergence_tolerance: 1e-6,
+                    max_step_halving: 40,
+                    min_step_size: 1e-12,
+                    firth_bias_reduction: false,
+                    coefficient_lower_bounds: structural_lower_bounds,
+                    linear_constraints: None,
+                    initial_lm_lambda: None,
+                };
+                let summary = crate::pirls::runworking_model_pirls(
+                    &mut model,
+                    crate::types::Coefficients::new(beta0),
+                    &opts,
+                    |_| {},
+                )
+                .map_err(|err| format!("survival PIRLS failed: {err}"))?;
+                let beta = summary.beta.as_ref().to_owned();
+                let state = model.update_state(&beta).map_err(|err| {
+                    format!("failed to evaluate survival baseline candidate: {err}")
+                })?;
+                Ok(survival_working_reml_score(&state))
+            },
+        )?;
+    }
+
+    let (prepared, penalty_blocks, beta0, structural_lower_bounds, mut model) =
+        build_working_model(&baseline_cfg)?;
+    let opts = crate::pirls::WorkingModelPirlsOptions {
+        max_iterations: 400,
+        convergence_tolerance: 1e-6,
+        max_step_halving: 40,
+        min_step_size: 1e-12,
+        firth_bias_reduction: false,
+        coefficient_lower_bounds: structural_lower_bounds,
+        linear_constraints: None,
+        initial_lm_lambda: None,
+    };
+    let summary = crate::pirls::runworking_model_pirls(
+        &mut model,
+        crate::types::Coefficients::new(beta0),
+        &opts,
+        |_| {},
+    )
+    .map_err(|err| format!("survival PIRLS failed: {err}"))?;
+    match summary.status {
+        crate::pirls::PirlsStatus::Converged
+        | crate::pirls::PirlsStatus::StalledAtValidMinimum => {}
+        ref other => {
+            return Err(format!(
+                "survival PIRLS did not converge: status={other:?}, grad_norm={:.3e}, iterations={}, deviance={:.6e}",
+                summary.lastgradient_norm, summary.iterations, summary.state.deviance
+            ));
+        }
+    }
+    let beta = summary.beta.as_ref().to_owned();
+    let state = model
+        .update_state(&beta)
+        .map_err(|err| format!("failed to evaluate survival optimum: {err}"))?;
+    let lambdas = Array1::from_iter(penalty_blocks.iter().map(|block| block.lambda));
+    let fitted_baseline_cfg =
+        if spec.likelihood_mode == SurvivalLikelihoodMode::Weibull && spec.timewiggle.is_none() {
+            let time_beta = beta.slice(s![..spec.time_build.x_exit_time.ncols()]).to_owned();
+            fitted_weibull_baseline_from_linear_time_beta(&time_beta).ok_or_else(|| {
+                "failed to recover fitted Weibull scale/shape from the linear time coefficients"
+                    .to_string()
+            })?
+        } else {
+            baseline_cfg
+        };
+    let fit = survival_unified_fit_result(beta, lambdas, &summary, &state)?;
+
+    Ok(SurvivalTransformationFitResult {
+        fit,
+        resolvedspec,
+        covariate_design,
+        baseline_cfg: fitted_baseline_cfg,
+        likelihood_mode: spec.likelihood_mode,
+        time_anchor: spec.time_anchor,
+        time_basisname: spec.time_build.basisname.clone(),
+        time_base_ncols: spec.time_build.x_exit_time.ncols(),
+        time_degree: spec.time_build.degree,
+        time_knots: spec.time_build.knots.clone(),
+        time_keep_cols: spec.time_build.keep_cols.clone(),
+        time_smooth_lambda: spec.time_build.smooth_lambda,
+        baseline_timewiggle: prepared.timewiggle_block,
+    })
 }
 
 fn fit_survival_location_scale_model(
@@ -856,6 +1204,9 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
         FitRequest::SurvivalLocationScale(request) => {
             fit_survival_location_scale_model(request).map(FitResult::SurvivalLocationScale)
         }
+        FitRequest::SurvivalTransformation(request) => {
+            fit_survival_transformation_model(request).map(FitResult::SurvivalTransformation)
+        }
         FitRequest::BernoulliMarginalSlope(request) => {
             fit_bernoulli_marginal_slope_model(request).map(FitResult::BernoulliMarginalSlope)
         }
@@ -890,7 +1241,8 @@ use crate::families::survival_construction::{
     normalize_survival_time_pair, optimize_survival_baseline_config,
     optimize_survival_baseline_config_with_gradient, parse_survival_distribution,
     parse_survival_likelihood_mode, parse_survival_time_basis_config,
-    require_structural_survival_time_basis, resolve_survival_time_anchor_value,
+    positive_survival_time_seed, require_structural_survival_time_basis,
+    resolve_survival_time_anchor_value,
     resolved_survival_time_basis_config_from_build, survival_derivative_guard_for_likelihood,
 };
 use crate::families::survival_location_scale::{
@@ -1632,18 +1984,39 @@ fn materialize_survival<'a>(
     }
 
     let survival_mode = parse_survival_likelihood_mode(&config.survival_likelihood)?;
-    if matches!(
-        survival_mode,
-        SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull
-    ) {
+    if parsed.linkwiggle.is_some()
+        && !matches!(
+            survival_mode,
+            SurvivalLikelihoodMode::LocationScale | SurvivalLikelihoodMode::MarginalSlope
+        )
+    {
         return Err(format!(
-            "survival likelihood '{}' is not yet supported through the unified API; \
-             use 'location-scale', 'marginal-slope', 'latent', or 'latent-binary'. For transformation/weibull, use FitRequest directly.",
+            "linkwiggle(...) is not defined for survival_likelihood='{}'",
             config.survival_likelihood
         ));
     }
+    if parsed.linkspec.is_some()
+        && matches!(
+            survival_mode,
+            SurvivalLikelihoodMode::Transformation
+                | SurvivalLikelihoodMode::Weibull
+                | SurvivalLikelihoodMode::Latent
+                | SurvivalLikelihoodMode::LatentBinary
+        )
+    {
+        return Err(format!(
+            "link(...) is not implemented for survival_likelihood='{}'",
+            config.survival_likelihood
+        ));
+    }
+    let effective_timewiggle = parsed.timewiggle.clone();
+    let baseline_target_raw = match survival_mode {
+        SurvivalLikelihoodMode::Weibull if effective_timewiggle.is_some() => "weibull",
+        SurvivalLikelihoodMode::Weibull => "linear",
+        _ => &config.baseline_target,
+    };
     let baseline_cfg = initial_survival_baseline_config_for_fit(
-        &config.baseline_target,
+        baseline_target_raw,
         config.baseline_scale,
         config.baseline_shape,
         config.baseline_rate,
@@ -1660,11 +2033,12 @@ fn materialize_survival<'a>(
                 .to_string(),
         );
     }
-    let effective_timewiggle = parsed.timewiggle.clone();
     let time_cfg = if effective_timewiggle.is_some() {
         // Match the CLI path: the parametric baseline plus timewiggle supplies
         // the time structure, so the base time basis is disabled.
         SurvivalTimeBasisConfig::None
+    } else if survival_mode == SurvivalLikelihoodMode::Weibull {
+        SurvivalTimeBasisConfig::Linear
     } else {
         parse_survival_time_basis_config(
             &config.time_basis,
@@ -1780,6 +2154,8 @@ fn materialize_survival<'a>(
             config.scale_dimensions,
             &policy,
         )?
+    } else if survival_mode == SurvivalLikelihoodMode::LocationScale {
+        termspec.clone()
     } else {
         TermCollectionSpec {
             linear_terms: vec![],
@@ -1906,6 +2282,13 @@ fn materialize_survival<'a>(
         None
     };
     match survival_mode {
+        SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull
+            if config.frailty.is_some() =>
+        {
+            return Err(
+                "frailty is not supported for transformation/weibull survival models".to_string(),
+            );
+        }
         SurvivalLikelihoodMode::LocationScale if config.frailty.is_some() => {
             return Err(
                 "config.frailty is not implemented for survival-likelihood=location-scale"
@@ -2038,7 +2421,7 @@ fn materialize_survival<'a>(
                     latent_z_policy: Default::default(),
                 },
                 options: BlockwiseFitOptions {
-                    compute_covariance: true,
+                    compute_covariance: false,
                     ..Default::default()
                 },
                 kappa_options: SpatialLengthScaleOptimizationOptions::default(),
@@ -2163,7 +2546,12 @@ fn materialize_survival<'a>(
             })
         };
 
-    let baseline_cfg = if baseline_cfg.target != SurvivalBaselineTarget::Linear
+    let baseline_cfg = if matches!(
+        survival_mode,
+        SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull
+    ) {
+        baseline_cfg
+    } else if baseline_cfg.target != SurvivalBaselineTarget::Linear
         && survival_mode == SurvivalLikelihoodMode::MarginalSlope
     {
         optimize_survival_baseline_config_with_gradient(
@@ -2234,6 +2622,49 @@ fn materialize_survival<'a>(
     };
 
     let request = match survival_mode {
+        SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
+            if config.noise_offset_column.is_some() {
+                return Err(
+                    "noise_offset_column is supported only for survival location-scale or marginal-slope"
+                        .to_string(),
+                );
+            }
+            let weibull_seed = if survival_mode == SurvivalLikelihoodMode::Weibull
+                && effective_timewiggle.is_none()
+            {
+                let scale = config
+                    .baseline_scale
+                    .unwrap_or_else(|| positive_survival_time_seed(&age_exit));
+                let shape = config.baseline_shape.unwrap_or(1.0);
+                if !scale.is_finite() || scale <= 0.0 || !shape.is_finite() || shape <= 0.0 {
+                    return Err(
+                        "weibull survival fit requires finite positive baseline_scale and baseline_shape"
+                            .to_string(),
+                    );
+                }
+                Some((scale, shape))
+            } else {
+                None
+            };
+            FitRequest::SurvivalTransformation(SurvivalTransformationFitRequest {
+                data: data.values.view(),
+                spec: SurvivalTransformationTermSpec {
+                    age_entry: age_entry.clone(),
+                    age_exit: age_exit.clone(),
+                    event_target: event.mapv(|value| if value >= 0.5 { 1 } else { 0 }),
+                    weights: weights.clone(),
+                    covariate_spec: termspec.clone(),
+                    covariate_offset: threshold_offset.clone(),
+                    baseline_cfg,
+                    likelihood_mode: survival_mode,
+                    time_anchor,
+                    time_build: time_build.clone(),
+                    timewiggle: effective_timewiggle.clone(),
+                    weibull_seed,
+                    ridge_lambda: config.ridge_lambda,
+                },
+            })
+        }
         SurvivalLikelihoodMode::LocationScale => {
             FitRequest::SurvivalLocationScale(build_location_scale_request(&baseline_cfg)?)
         }
@@ -2245,9 +2676,6 @@ fn materialize_survival<'a>(
         }
         SurvivalLikelihoodMode::LatentBinary => {
             FitRequest::LatentBinary(build_latent_binary_request(&baseline_cfg)?)
-        }
-        SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
-            unreachable!()
         }
     };
 

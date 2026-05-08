@@ -46,6 +46,27 @@ use std::sync::{Arc, Mutex};
 mod deviation_runtime;
 pub(crate) mod exact_kernel;
 pub use deviation_runtime::DeviationRuntime;
+
+/// Importance-weighted relative threshold for the matrix-free Bernoulli
+/// marginal-slope FLEX Hessian row-skip gate. A row is skipped from the
+/// per-row primary-Hessian build when its conservative likelihood-side
+/// curvature envelope (`row_hessian_importance_bound`) falls below
+/// `BMS_HV_ROW_SKIP_TAU * mean(envelope)` across all rows at the current β
+/// snapshot.
+///
+/// `0.0` disables the gate and preserves the exact legacy row set. The
+/// non-zero value here is chosen to be deeply conservative: at biobank
+/// scale (n ≈ 1e5–5e5 rows) the worst-case aggregate row-Hessian error is
+/// `n · BMS_HV_ROW_SKIP_TAU · mean ≈ 5e-9 · mean`, well below the
+/// inner-Newton convergence tolerance and the adjacent row-intercept
+/// solver tolerance pattern `1e-8.max(1e-4 · |target|)`. Skipped rows
+/// are typically degenerate (`λ ≈ 0`, i.e. the margin is far inside the
+/// linear regime where the probit log-likelihood Hessian contribution is
+/// numerically zero). There is intentionally no env var, no CLI flag,
+/// and no public API surface for tuning this — it is an internal
+/// implementation detail of the FLEX matrix-free Hv path.
+const BMS_HV_ROW_SKIP_TAU: f64 = 1e-14;
+
 #[derive(Clone, Debug)]
 pub struct DeviationBlockConfig {
     pub degree: usize,
@@ -2821,10 +2842,75 @@ impl HyperOperator for BernoulliBlockHessianOperator {
     }
 }
 
+// Per-row cell-moment dedup switch. In production this is always `true`; the
+// `cfg(test)` knob lets the regression test in this file flip it off and
+// assert numerical equivalence to the un-deduped path. There is no env var,
+// no CLI flag, and no public API surface — the dedup is purely an internal
+// optimization within `build_row_exact_context_with_stats`.
+#[cfg(not(test))]
+#[inline]
+fn cell_moment_per_row_dedup_enabled() -> bool {
+    true
+}
+
+#[cfg(test)]
+fn cell_moment_per_row_dedup_enabled() -> bool {
+    CELL_MOMENT_PER_ROW_DEDUP_ENABLED.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+static CELL_MOMENT_PER_ROW_DEDUP_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+#[cfg(test)]
+pub(crate) fn set_cell_moment_per_row_dedup_enabled(enabled: bool) {
+    CELL_MOMENT_PER_ROW_DEDUP_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
 #[derive(Clone)]
 struct CachedDenestedCellMoments {
     partition_cell: exact_kernel::DenestedPartitionCell,
-    state_degree9: exact_kernel::CellMomentState,
+    /// Cell-moment state evaluated at this row's converged intercept for the
+    /// current PIRLS/Newton cycle. Stored at whatever `max_degree` the cache
+    /// was built with (degree 9 for the per-row lazy fallback; up to degree
+    /// 21 for the pre-built `RowCellMomentsBundle`).
+    state: exact_kernel::CellMomentState,
+}
+
+/// Pre-built per-row cell moments for the current β snapshot. Built once at
+/// the top of the joint-Newton cycle (after row intercepts are solved) and
+/// reused by every gradient/Hessian/Hv/diagonal/derivative-tensor pass at the
+/// same β.
+#[derive(Clone)]
+struct RowCellMomentsBundle {
+    max_degree: usize,
+    rows: Vec<Vec<CachedDenestedCellMoments>>,
+}
+
+impl RowCellMomentsBundle {
+    #[inline]
+    fn row(&self, row: usize, required_degree: usize) -> Option<&[CachedDenestedCellMoments]> {
+        debug_assert!(
+            self.max_degree >= required_degree,
+            "row cell moments bundle max_degree={} required_degree={}",
+            self.max_degree,
+            required_degree
+        );
+        (self.max_degree >= required_degree)
+            .then(|| self.rows.get(row).map(Vec::as_slice))
+            .flatten()
+    }
+
+    fn estimated_resident_bytes(n_rows: usize, n_cells: usize, max_degree: usize) -> usize {
+        let row_vecs = n_rows.saturating_mul(std::mem::size_of::<Vec<CachedDenestedCellMoments>>());
+        let cell_records = n_cells.saturating_mul(std::mem::size_of::<CachedDenestedCellMoments>());
+        let moment_payload = n_cells
+            .saturating_mul(max_degree.saturating_add(1))
+            .saturating_mul(std::mem::size_of::<f64>());
+        row_vecs
+            .saturating_add(cell_records)
+            .saturating_add(moment_payload)
+    }
 }
 
 #[derive(Clone)]
@@ -2832,11 +2918,11 @@ struct BernoulliMarginalSlopeRowExactContext {
     intercept: f64,
     m_a: f64,
     intercept_fast_path: bool,
-    /// Degree-9 cell moments at the converged row intercept for the current
-    /// PIRLS/Newton cycle. They are independent of the Hessian-vector
-    /// direction and can be reused by gradient, diagonal, and matvec passes
-    /// instead of re-evaluating `evaluate_cell_moments` /
-    /// `bivariate_normal_cdf` for the same row and cycle.
+    /// Degree-9 per-row cell moments at the converged row intercept. The
+    /// top-of-cycle [`RowCellMomentsBundle`] is preferred when present (and
+    /// is built at degree 21 so it can serve degree-9, degree-15 *and*
+    /// degree-21 consumers); this field remains the per-row lazy fallback
+    /// for callers without a bundle (e.g. legacy direct call sites).
     degree9_cells: Option<Vec<CachedDenestedCellMoments>>,
 }
 
@@ -3089,6 +3175,14 @@ struct BernoulliMarginalSlopeExactEvalCache {
     primary: PrimarySlices,
     /// Pre-solved row contexts (intercept, M_a, observed score-warp value).
     row_contexts: Vec<BernoulliMarginalSlopeRowExactContext>,
+    /// Batched per-row denested cell moments for the current β snapshot.
+    /// Built once at exact-cache construction (after row intercepts converge)
+    /// and consumed by row gradient/Hessian/Hv/diagonal/derivative-tensor
+    /// paths via `RowCellMomentsBundle::row(row, required_degree)`. May be
+    /// `None` when the FLEX path is inactive, when an empirical latent grid
+    /// drives the row kernel through a non-cell path, or when the estimated
+    /// resident bytes would exceed the active resource policy budget.
+    row_cell_moments: Option<RowCellMomentsBundle>,
     /// Flexible-path per-β per-row primary Hessians (`r×r` blocks flattened
     /// row-major into one wide `Array2`).  The matrix-free inner Newton/CG
     /// loop contracts the same primary Hessian against many trial directions
@@ -5274,21 +5368,26 @@ impl BernoulliMarginalSlopeFamily {
             // skips redundant work. The dedup is purely intra-row, so it is
             // orthogonal to the per-family LRU (which is keyed across rows)
             // and the affine tail-cell memo (a separate mechanism).
+            let dedup_enabled = cell_moment_per_row_dedup_enabled();
             let mut dedup: HashMap<exact_kernel::CellFingerprint, exact_kernel::CellMomentState> =
                 HashMap::new();
             let mut out: Vec<CachedDenestedCellMoments> = Vec::with_capacity(cells.len());
             for partition_cell in cells.into_iter() {
-                let key = exact_kernel::CellFingerprint::new(partition_cell.cell);
-                let state_degree9 = if let Some(existing) = dedup.get(&key) {
-                    existing.clone()
+                let state: exact_kernel::CellMomentState = if dedup_enabled {
+                    let key = exact_kernel::CellFingerprint::new(partition_cell.cell);
+                    if let Some(existing) = dedup.get(&key) {
+                        existing.clone()
+                    } else {
+                        let computed = self.evaluate_cell_moments_lru(partition_cell.cell, 9)?;
+                        dedup.insert(key, computed.clone());
+                        computed
+                    }
                 } else {
-                    let computed = self.evaluate_cell_moments_lru(partition_cell.cell, 9)?;
-                    dedup.insert(key, computed.clone());
-                    computed
+                    self.evaluate_cell_moments_lru(partition_cell.cell, 9)?
                 };
                 out.push(CachedDenestedCellMoments {
                     partition_cell,
-                    state_degree9,
+                    state,
                 });
             }
             Some(out)
@@ -5395,12 +5494,176 @@ impl BernoulliMarginalSlopeFamily {
                 started.elapsed().as_secs_f64()
             );
         }
+        let row_cell_moments =
+            self.build_row_cell_moments_bundle(block_states, &row_contexts, 21)?;
         Ok(BernoulliMarginalSlopeExactEvalCache {
             slices,
             primary,
             row_contexts,
+            row_cell_moments,
             row_primary_hessians: None,
         })
+    }
+
+    /// Build a top-of-cycle [`RowCellMomentsBundle`] at the given
+    /// `max_degree`. Returns `None` when the FLEX path is inactive, when an
+    /// empirical latent grid is in effect (the row kernel takes a non-cell
+    /// path), or when the estimated resident bytes exceed the active
+    /// resource-policy budget. Numerical equivalence with the legacy per-row
+    /// path is unconditional: callers always fall back to
+    /// `degree9_cells`/on-demand cell evaluation when the bundle is absent.
+    fn build_row_cell_moments_bundle(
+        &self,
+        block_states: &[ParameterBlockState],
+        row_contexts: &[BernoulliMarginalSlopeRowExactContext],
+        max_degree: usize,
+    ) -> Result<Option<RowCellMomentsBundle>, String> {
+        if !self.effective_flex_active(block_states)? {
+            return Ok(None);
+        }
+        // Empirical-grid rows take a non-cell code path inside
+        // `compute_row_analytic_flex_from_parts_into`, so the bundle would
+        // never be consulted. Skip the build to avoid wasted work.
+        if !matches!(self.latent_measure, LatentMeasureKind::StandardNormal) {
+            return Ok(None);
+        }
+        let n = self.y.len();
+        let beta_h = self.score_beta(block_states)?;
+        let beta_w = self.link_beta(block_states)?;
+        let partitions: Vec<Vec<exact_kernel::DenestedPartitionCell>> = (0..n)
+            .into_par_iter()
+            .map(|row| {
+                self.denested_partition_cells(
+                    row_contexts[row].intercept,
+                    block_states[1].eta[row],
+                    beta_h,
+                    beta_w,
+                )
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let n_cells = partitions.iter().map(Vec::len).sum::<usize>();
+        let estimated_bytes =
+            RowCellMomentsBundle::estimated_resident_bytes(n, n_cells, max_degree);
+        let limit_bytes = self.policy.max_operator_cache_bytes;
+        if estimated_bytes > limit_bytes {
+            log::warn!(
+                "[BMS row-cell-moments] skip precompute n={} cells={} degree={} estimated_bytes={} limit_bytes={}",
+                n,
+                n_cells,
+                max_degree,
+                estimated_bytes,
+                limit_bytes
+            );
+            return Ok(None);
+        }
+        let started = std::time::Instant::now();
+        let rows = partitions
+            .into_par_iter()
+            .map(|cells| {
+                cells
+                    .into_iter()
+                    .map(|partition_cell| {
+                        // Use the per-family LRU here too so the bundle build
+                        // benefits from cross-row cell-moment reuse and keeps
+                        // the LRU's hit-rate accounting consistent.
+                        self.evaluate_cell_moments_lru(partition_cell.cell, max_degree)
+                            .map(|state| CachedDenestedCellMoments {
+                                partition_cell,
+                                state,
+                            })
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if log_exact_work(n) {
+            log::info!(
+                "[BMS row-cell-moments] precomputed n={} cells={} degree={} estimated_bytes={} elapsed={:.3}s",
+                n,
+                n_cells,
+                max_degree,
+                estimated_bytes,
+                started.elapsed().as_secs_f64()
+            );
+        }
+        Ok(Some(RowCellMomentsBundle { max_degree, rows }))
+    }
+
+    /// Conservative likelihood-side envelope on a single row's contribution
+    /// to the per-row primary Hessian at the current β snapshot. Used by
+    /// [`hessian_skip_mask_from_row_bounds`] to gate rows whose curvature
+    /// contribution is provably below `BMS_HV_ROW_SKIP_TAU * mean(envelope)`.
+    ///
+    /// The envelope combines the direct observed-margin curvature
+    /// (`|w| · |λ| · |signed_margin + λ|`) with the implicit-intercept
+    /// curvature (`|w| · |λ|`) scaled by the marginal-link slope/curvature
+    /// and intercept sensitivity (`1 / |m_a|`). The moment side is bounded
+    /// by a unit ceiling because the gate is relative to the row mean.
+    fn row_hessian_importance_bound(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        row_ctx: &BernoulliMarginalSlopeRowExactContext,
+    ) -> Result<f64, String> {
+        let q = block_states[0].eta[row];
+        let b = block_states[1].eta[row];
+        let beta_h = self.score_beta(block_states)?;
+        let beta_w = self.link_beta(block_states)?;
+        let z_obs = self.z[row];
+        let eta_val = eval_coeff4_at(
+            &self
+                .observed_denested_cell_partials(row, row_ctx.intercept, b, beta_h, beta_w)?
+                .coeff,
+            z_obs,
+        );
+        let marginal = self.marginal_link_map(q)?;
+        let s_y = 2.0 * self.y[row] - 1.0;
+        let signed_margin = s_y * eta_val;
+        let (_, lambda) = signed_probit_logcdf_and_mills_ratio(signed_margin);
+        let d1_abs = self.weights[row].abs() * lambda.abs();
+        let d2 = self.weights[row].abs() * lambda.abs() * (signed_margin + lambda).abs();
+        // `m_a` is the marginal-intercept sensitivity at the converged row
+        // intercept. Degenerate rows have `m_a` near machine epsilon, in
+        // which case `1 / m_a` is huge and the envelope grows accordingly,
+        // i.e. they are NOT skipped. Non-finite or zero `m_a` collapses the
+        // envelope to +∞, which `hessian_skip_mask_from_row_bounds` then
+        // rejects via its finite-mean check (so the gate degrades to a
+        // no-op rather than silently skipping rows we cannot bound).
+        let m_a_recip = if row_ctx.m_a.is_finite() && row_ctx.m_a.abs() > 0.0 {
+            row_ctx.m_a.abs().recip()
+        } else {
+            f64::INFINITY
+        };
+        Ok((d1_abs + d2) * (1.0 + marginal.mu1.abs() + marginal.mu2.abs() + m_a_recip))
+    }
+
+    /// Compute the importance-weighted skip mask for the per-row primary
+    /// Hessian build at the current β snapshot. Returns `None` (i.e. no
+    /// rows skipped) when the gate is disabled (`tau == 0`), the FLEX
+    /// path is inactive, or the per-row envelope mean is non-finite or
+    /// non-positive.
+    fn hessian_skip_mask_from_row_bounds(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        tau: f64,
+    ) -> Result<Option<Vec<bool>>, String> {
+        if tau <= 0.0 || !self.effective_flex_active(block_states)? {
+            return Ok(None);
+        }
+        let n = self.y.len();
+        let bounds: Result<Vec<_>, String> = (0..n)
+            .into_par_iter()
+            .map(|row| {
+                self.row_hessian_importance_bound(row, block_states, Self::row_ctx(cache, row))
+            })
+            .collect();
+        let bounds = bounds?;
+        let mean = bounds.iter().copied().sum::<f64>() / n.max(1) as f64;
+        if !mean.is_finite() || mean <= 0.0 {
+            return Ok(None);
+        }
+        let threshold = tau * mean;
+        Ok(Some(bounds.into_iter().map(|b| b < threshold).collect()))
     }
 
     fn build_row_primary_hessian_cache(
@@ -5414,16 +5677,39 @@ impl BernoulliMarginalSlopeFamily {
         let n = self.y.len();
         let primary = &cache.primary;
         let r = primary.total;
+        let tau = BMS_HV_ROW_SKIP_TAU;
+        let skip_mask = self.hessian_skip_mask_from_row_bounds(block_states, cache, tau)?;
+        let skipped = skip_mask
+            .as_ref()
+            .map(|mask| mask.iter().filter(|&&skip| skip).count())
+            .unwrap_or(0);
+        if tau > 0.0 {
+            log::info!(
+                "[BMS Hessian-Hv row-skip] tau={:.3e} skipped={}/{} ({:.3}%)",
+                tau,
+                skipped,
+                n,
+                100.0 * skipped as f64 / n.max(1) as f64
+            );
+        }
         let rows: Result<Vec<_>, String> = (0..n)
             .into_par_iter()
             .map(|row| {
+                if skip_mask.as_ref().is_some_and(|mask| mask[row]) {
+                    return Ok(vec![0.0; r * r]);
+                }
                 let row_ctx = Self::row_ctx(cache, row);
                 let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(r);
-                self.compute_row_analytic_flex_into(
+                let row_moments = cache
+                    .row_cell_moments
+                    .as_ref()
+                    .and_then(|bundle| bundle.row(row, 9));
+                self.compute_row_analytic_flex_into_with_moments(
                     row,
                     block_states,
                     primary,
                     row_ctx,
+                    row_moments,
                     true,
                     &mut scratch,
                 )?;
@@ -5761,6 +6047,27 @@ impl BernoulliMarginalSlopeFamily {
         need_hessian: bool,
         scratch: &mut BernoulliMarginalSlopeFlexRowScratch,
     ) -> Result<f64, String> {
+        self.compute_row_analytic_flex_into_with_moments(
+            row,
+            block_states,
+            primary,
+            row_ctx,
+            None,
+            need_hessian,
+            scratch,
+        )
+    }
+
+    fn compute_row_analytic_flex_into_with_moments(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        primary: &PrimarySlices,
+        row_ctx: &BernoulliMarginalSlopeRowExactContext,
+        row_cell_moments: Option<&[CachedDenestedCellMoments]>,
+        need_hessian: bool,
+        scratch: &mut BernoulliMarginalSlopeFlexRowScratch,
+    ) -> Result<f64, String> {
         let q = block_states[0].eta[row];
         let b = block_states[1].eta[row];
         let beta_h = self.score_beta(block_states)?;
@@ -5773,6 +6080,7 @@ impl BernoulliMarginalSlopeFamily {
             beta_h,
             beta_w,
             row_ctx,
+            row_cell_moments,
             need_hessian,
             scratch,
         )
@@ -5787,6 +6095,7 @@ impl BernoulliMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
         row_ctx: &BernoulliMarginalSlopeRowExactContext,
+        row_cell_moments: Option<&[CachedDenestedCellMoments]>,
         need_hessian: bool,
         scratch: &mut BernoulliMarginalSlopeFlexRowScratch,
     ) -> Result<f64, String> {
@@ -5943,13 +6252,27 @@ impl BernoulliMarginalSlopeFamily {
             let cached_cells: Vec<(
                 exact::DenestedPartitionCell,
                 std::borrow::Cow<'_, exact::CellMomentState>,
-            )> = if need_hessian && let Some(cached) = row_ctx.degree9_cells.as_ref() {
+            )> = if let Some(cached) = row_cell_moments {
+                debug_assert!(
+                    !cached.is_empty(),
+                    "row cell moments bundle was selected but row {row} has no cells"
+                );
                 cached
                     .iter()
                     .map(|entry| {
                         (
                             entry.partition_cell,
-                            std::borrow::Cow::Borrowed(&entry.state_degree9),
+                            std::borrow::Cow::Borrowed(&entry.state),
+                        )
+                    })
+                    .collect()
+            } else if need_hessian && let Some(cached) = row_ctx.degree9_cells.as_ref() {
+                cached
+                    .iter()
+                    .map(|entry| {
+                        (
+                            entry.partition_cell,
+                            std::borrow::Cow::Borrowed(&entry.state),
                         )
                     })
                     .collect()
@@ -8060,11 +8383,16 @@ impl BernoulliMarginalSlopeFamily {
                                 cached
                             } else {
                                 let row_ctx = Self::row_ctx(cache, row);
-                                self.compute_row_analytic_flex_into(
+                                let row_moments = cache
+                                    .row_cell_moments
+                                    .as_ref()
+                                    .and_then(|bundle| bundle.row(row, 9));
+                                self.compute_row_analytic_flex_into_with_moments(
                                     row,
                                     block_states,
                                     primary,
                                     row_ctx,
+                                    row_moments,
                                     true,
                                     &mut scratch,
                                 )?;
@@ -8199,11 +8527,16 @@ impl BernoulliMarginalSlopeFamily {
                 let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
                 for row in start..end {
                     let row_ctx = Self::row_ctx(cache, row);
-                    let neglog = self.compute_row_analytic_flex_into(
+                    let row_moments = cache
+                        .row_cell_moments
+                        .as_ref()
+                        .and_then(|bundle| bundle.row(row, 3));
+                    let neglog = self.compute_row_analytic_flex_into_with_moments(
                         row,
                         block_states,
                         primary,
                         row_ctx,
+                        row_moments,
                         false,
                         &mut scratch,
                     )?;
