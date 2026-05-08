@@ -13,13 +13,11 @@ Run the 50K-row cycle-0 reproducer:
 cargo test --release --test margslope_flex_biobank_repro -- --ignored --nocapture margslope_flex_biobank_repro_cycle0
 ```
 
-Useful environment knobs:
-
-- `GAM_MARGSLOPE_REPRO_N` (default `50000`) changes synthetic row count.
-- `GAM_MARGSLOPE_REPRO_BOUND_SECS` (default `300`) controls the loose wall-time assertion.
-- `GAM_MARGSLOPE_REPRO_PERSISTENT=1` adds a second run capped at five inner cycles.
-- Profile with `samply`, `cargo flamegraph`, or macOS `sample`; `--nocapture`
-  preserves the solver's per-cycle phase logs.
+Profile with `samply`, `cargo flamegraph`, or macOS `sample`; `--nocapture`
+preserves the solver's per-cycle phase logs. The fixture is hard-coded to
+`DEFAULT_REPRO_N = 50000` and the wall-time bound to `DEFAULT_WALL_BOUND`;
+edit `tests/test_support/margslope_flex_equivalence.rs` if a different
+shape is needed (no env-var knobs).
 
 The synthetic fixture uses binomial/probit bernoulli marginal-slope, 16 PC
 columns, a Duchon smooth for the PCs, an age smooth, score-warp FLEX, and
@@ -36,13 +34,9 @@ synthetic problem:
 cargo test --release --test margslope_flex_biobank_repro -- --ignored --nocapture margslope_flex_beta_equivalence_smoke
 ```
 
-Useful environment knobs:
-
-- `GAM_MARGSLOPE_EQUIV_N` (default `2000`) changes smoke row count.
-- `GAM_MARGSLOPE_EQUIV_INNER_CYCLES` (default `1`) changes the cycle cap.
-- `GAM_MARGSLOPE_EQUIV_REL_TOL` (default `1e-10`) controls the relative beta tolerance.
-
-The helper lives in `tests/test_support/margslope_flex_equivalence.rs` and emits
+The smoke is hard-coded to `DEFAULT_SMOKE_N`, `inner_cycles=1`, and
+`rel_tol=1e-10`; edit the test if a different shape is needed (no
+env-var knobs). The helper lives in `tests/test_support/margslope_flex_equivalence.rs` and emits
 a clear PASS/FAIL message.  On failure it reports beta length, maximum absolute
 and relative differences, and the worst-disagreeing beta index with both values.
 Future optimization tasks should reuse this helper before claiming model
