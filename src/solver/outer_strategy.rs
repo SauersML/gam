@@ -18,11 +18,11 @@ use crate::solver::estimate::reml::unified::BarrierConfig;
 use ::opt::{
     Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds,
     FallbackPolicy as OptFallbackPolicy, FirstOrderObjective, FirstOrderSample, FixedPoint,
-    FixedPointError, FixedPointObjective, FixedPointSample, FixedPointStatus,
+    FixedPointError, FixedPointObjective, FixedPointSample, FixedPointStatus, GradientTolerance,
     HessianFallbackPolicy, HessianMaterialization, HessianOperator, HessianValue,
     MatrixFreeTrustRegion, MaxIterations, ObjectiveEvalError, OperatorObjective, OperatorSample,
-    OptimizationStatus, SecondOrderObjective, SecondOrderSample, Solution, Tolerance,
-    ZerothOrderObjective,
+    OptimizationStatus, SecondOrderObjective, SecondOrderSample, Solution,
+    Tolerance, ZerothOrderObjective,
 };
 use ndarray::{Array1, Array2, ArrayView2};
 use std::sync::Arc;
@@ -48,6 +48,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[derive(Clone, Debug)]
 pub struct InnerProgressFeedback {
     pub cap: Arc<AtomicUsize>,
+    /// Count of accepted outer steps observed via the
+    /// `OuterAcceptObserver` plugged into `opt`'s solver. Replaces
+    /// the bridge-side `eval_count / 2` heuristic on routes that
+    /// see trial-and-rejection probing (ARC dense, matrix-free TR):
+    /// rejection iters used to inflate the schedule's iter index,
+    /// lifting the cap too early. With this counter, the schedule
+    /// sees the true accepted-step count and the cap relaxes only
+    /// when real progress has been made.
+    pub accepted_iter: Arc<AtomicUsize>,
     pub last_iters: Arc<AtomicUsize>,
     pub last_converged: Arc<AtomicBool>,
     /// Bit-packed `f64` residual `‖β_converged − β_predicted‖ /
@@ -1998,6 +2007,7 @@ mod outer_inner_cap_schedule_tests {
         let make_feedback =
             |iters: usize, converged: bool, residual_bits: u64| InnerProgressFeedback {
                 cap: Arc::new(AtomicUsize::new(0)),
+                accepted_iter: Arc::new(AtomicUsize::new(0)),
                 last_iters: Arc::new(AtomicUsize::new(iters)),
                 last_converged: Arc::new(AtomicBool::new(converged)),
                 ift_residual: Arc::new(AtomicU64::new(residual_bits)),
@@ -2351,7 +2361,11 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
             // / 2` is the correct iter index for the schedule. Without this
             // divisor the schedule would lift to full inner-cap at ARC iter
             // 3 instead of iter 6.
-            let arc_iter = self.eval_count / 2;
+            // Use the observer-fed accepted-iter counter (opt 0.5.0
+            // OptimizerObserver) instead of `eval_count / 2`; the
+            // observer increments only on rho-accepted steps, so the
+            // schedule no longer relaxes the cap on rejected trials.
+            let arc_iter = feedback.accepted_iter.load(Ordering::Relaxed);
             let g_ratio = match (self.last_g_norm, self.g_norm_initial) {
                 (Some(g), Some(g0)) if g0 > 0.0 => Some(g / g0),
                 _ => None,
@@ -2432,7 +2446,11 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_hessian(&mut self, x: &Array1<f64>) -> Result<SecondOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
         if let Some(feedback) = self.outer_inner_cap.as_ref() {
-            let arc_iter = self.eval_count / 2;
+            // Use the observer-fed accepted-iter counter (opt 0.5.0
+            // OptimizerObserver) instead of `eval_count / 2`; the
+            // observer increments only on rho-accepted steps, so the
+            // schedule no longer relaxes the cap on rejected trials.
+            let arc_iter = feedback.accepted_iter.load(Ordering::Relaxed);
             let g_ratio = match (self.last_g_norm, self.g_norm_initial) {
                 (Some(g), Some(g0)) if g0 > 0.0 => Some(g / g0),
                 _ => None,
@@ -2572,6 +2590,25 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
 // `OuterSecondOrderBridge` but produces `OperatorSample` whose
 // Hessian is `HessianValue::Operator(_)` (or `Dense(_)` when the
 // operator declares an exact materialization route).
+
+/// `opt::OptimizerObserver` that increments
+/// `InnerProgressFeedback.accepted_iter` on every accepted outer
+/// step. Replaces the bridge-side `eval_count / 2` heuristic on
+/// routes that see trial-and-rejection probing (ARC dense,
+/// matrix-free TR). The bridge's inner-cap schedule reads
+/// `accepted_iter` from the feedback channel instead of inferring
+/// it from raw eval counts.
+struct OuterAcceptObserver {
+    feedback: InnerProgressFeedback,
+}
+
+impl OptimizerObserver for OuterAcceptObserver {
+    fn on_step_accepted(&mut self, _info: &StepInfo) {
+        self.feedback
+            .accepted_iter
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 struct OuterToOptHessianOperator(Arc<dyn OuterHessianOperator>);
 
@@ -2773,14 +2810,6 @@ fn project_to_bounds(
         }
         None => x.clone(),
     }
-}
-
-/// Scale the absolute gradient-norm tolerance by `1 + |seed_cost|`. The
-/// tolerance opt's solvers consume is absolute; gam scales it so the
-/// REML score's natural magnitude does not bias convergence.
-#[inline]
-fn outer_scaled_tolerance(base_tol: f64, seed_cost: f64) -> f64 {
-    base_tol * (1.0 + seed_cost.abs())
 }
 
 fn build_bridge_hessian_for_source(
@@ -4040,10 +4069,12 @@ fn run_outer_with_plan(
                     let (lo, hi) = &bounds_template;
                     let bounds_obj = Bounds::new(lo.clone(), hi.clone(), 1e-6)
                         .expect("outer rho bounds must be valid");
-                    let scaled_tol =
-                        outer_scaled_tolerance(config.tolerance, seed_eval.cost);
-                    let tol = Tolerance::new(scaled_tol)
-                        .expect("outer tolerance must be valid");
+                    // Scale-aware tolerance via opt 0.5.0:
+                    // `relative_to_cost(τ)` = `τ * (1 + |f|)` resolved
+                    // at run time from the seed cost and initial grad
+                    // norm. Replaces the previous gam-side
+                    // precomputed `outer_scaled_tolerance` hack.
+                    let grad_tol = GradientTolerance::relative_to_cost(config.tolerance);
                     let max_iter = MaxIterations::new(config.max_iter)
                         .expect("outer max_iter must be valid");
 
@@ -4070,7 +4101,7 @@ fn run_outer_with_plan(
 
                     let mut solver = MatrixFreeTrustRegion::new(seed.clone(), bridge_obj)
                         .with_bounds(bounds_obj)
-                        .with_tolerance(tol)
+                        .with_gradient_tolerance(grad_tol)
                         .with_max_iterations(max_iter)
                         .with_initial_sample(seed.clone(), initial_op_sample)
                         // The matrix-free route is exclusively for
@@ -4155,8 +4186,7 @@ fn run_outer_with_plan(
                     let (lo, hi) = &bounds_template;
                     let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
                         .expect("outer rho bounds must be valid");
-                    let scaled_tol = outer_scaled_tolerance(config.tolerance, seed_eval.cost);
-                    let tol = Tolerance::new(scaled_tol).expect("outer tolerance must be valid");
+                    let grad_tol = GradientTolerance::relative_to_cost(config.tolerance);
                     let max_iter =
                         MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
 
@@ -4196,7 +4226,7 @@ fn run_outer_with_plan(
 
                     let mut optimizer = ArcOptimizer::new(seed.clone(), objective)
                         .with_bounds(bounds)
-                        .with_tolerance(tol)
+                        .with_gradient_tolerance(grad_tol)
                         .with_max_iterations(max_iter)
                         .with_initial_sample(seed.clone(), initial_sample);
                     // On the exact-Hessian ARC route, forbid both (a)
@@ -4285,8 +4315,7 @@ fn run_outer_with_plan(
                 let (lo, hi) = &bounds_template;
                 let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
                     .expect("outer rho bounds must be valid");
-                let scaled_tol = outer_scaled_tolerance(config.tolerance, seed_eval.cost);
-                let tol = Tolerance::new(scaled_tol).expect("outer tolerance must be valid");
+                let grad_tol = GradientTolerance::relative_to_cost(config.tolerance);
                 let max_iter =
                     MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
                 let objective = OuterFirstOrderBridge {
@@ -4311,7 +4340,7 @@ fn run_outer_with_plan(
                 };
                 let mut optimizer = Bfgs::new(seed.clone(), objective)
                     .with_bounds(bounds)
-                    .with_tolerance(tol)
+                    .with_gradient_tolerance(grad_tol)
                     .with_max_iterations(max_iter)
                     .with_initial_sample(seed.clone(), initial_sample);
                 let bfgs_start = std::time::Instant::now();
