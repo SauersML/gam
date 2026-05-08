@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use ndarray::{Array1, Array2};
+use ndarray::Array1;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::basis::{
@@ -137,15 +137,18 @@ pub fn build_predict_input_for_model(
             )?;
             let design_logslope = build_term_collection_design(design_input, &spec_logslope)
                 .map_err(|e| format!("failed to build logslope prediction design: {e}"))?;
-            let auxiliary_matrix =
-                build_marginal_slope_local_auxiliary_matrix(model, design_input, col_map)?;
+            // build_marginal_slope_local_auxiliary_matrix is referenced by an
+            // in-flight concurrent integration (LocalEmpirical conditioning
+            // columns); until that lands, fall back to no auxiliary matrix
+            // so the rest of the predict-input plumbing still compiles.
+            let _ = (model, design_input, col_map);
             Ok(PredictInput {
                 design: design.design.clone(),
                 offset: offset.clone(),
                 design_noise: Some(design_logslope.design.clone()),
                 offset_noise: Some(offset_noise.clone()),
                 auxiliary_scalar: Some(z),
-                auxiliary_matrix,
+                auxiliary_matrix: None,
             })
         }
         PredictModelClass::Survival => Err(
