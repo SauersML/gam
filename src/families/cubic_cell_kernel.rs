@@ -3607,6 +3607,63 @@ mod tests {
     }
 
     #[test]
+    fn non_affine_cell_state_grid_matches_public_cell_moments_reference() {
+        let cells = [
+            DenestedCubicCell {
+                left: -1.25,
+                right: -0.2,
+                c0: -0.35,
+                c1: 0.85,
+                c2: 0.04,
+                c3: -0.015,
+            },
+            DenestedCubicCell {
+                left: -0.2,
+                right: 0.55,
+                c0: 0.12,
+                c1: -0.65,
+                c2: -0.025,
+                c3: 0.02,
+            },
+            DenestedCubicCell {
+                left: 0.55,
+                right: 1.6,
+                c0: 0.42,
+                c1: 0.35,
+                c2: 0.018,
+                c3: 0.012,
+            },
+        ];
+        for cell in cells {
+            let branch = branch_cell(cell).expect("branch");
+            assert_ne!(branch, ExactCellBranch::Affine);
+            for max_degree in [0usize, 2, 4, 9, 16] {
+                let direct = evaluate_non_affine_cell_state(cell, branch, max_degree)
+                    .expect("direct non-affine transport");
+                let public = evaluate_cell_moments(cell, max_degree).expect("public evaluator");
+                assert_eq!(direct.branch, public.branch);
+                assert_eq!(direct.moments.len(), public.moments.len());
+                let value_scale = direct.value.abs().max(public.value.abs()).max(1.0);
+                assert!(
+                    (direct.value - public.value).abs() <= 1e-10 * value_scale,
+                    "value mismatch for {cell:?} degree {max_degree}: direct={} public={}",
+                    direct.value,
+                    public.value
+                );
+                for (degree, (lhs, rhs)) in
+                    direct.moments.iter().zip(public.moments.iter()).enumerate()
+                {
+                    let scale = lhs.abs().max(rhs.abs()).max(1.0);
+                    assert!(
+                        (lhs - rhs).abs() <= 1e-10 * scale,
+                        "moment {degree} mismatch for {cell:?} degree {max_degree}: {lhs} vs {rhs}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn affine_tail_cell_memo_matches_uncached_grid_and_records_hits() {
         reset_tail_cell_moment_cache();
         let c0s = [-2.0, -0.25, 0.0, 1.5];

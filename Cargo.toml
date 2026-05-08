@@ -129,6 +129,15 @@ harness = false
 name = "cell_moment_dedup_biobank_shape"
 harness = false
 
+[[bench]]
+name = "row_cell_moments_biobank_shape"
+path = "bench/cargo_benches/row_cell_moments_biobank_shape.rs"
+harness = false
+
+[[bench]]
+name = "bms_hv_row_skip"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

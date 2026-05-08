@@ -30,6 +30,9 @@ def _build_fit_payload(
     z_column: str | None,
     link: str | None,
     logslope_formula: str | None,
+    frailty_kind: str | None,
+    frailty_sd: float | None,
+    hazard_loading: str | None,
     scale_dimensions: bool | None,
     firth: bool | None,
     config: dict[str, Any] | None,
@@ -50,6 +53,9 @@ def _build_fit_payload(
         "z_column": z_column,
         "link": link,
         "logslope_formula": logslope_formula,
+        "frailty_kind": frailty_kind,
+        "frailty_sd": frailty_sd,
+        "hazard_loading": hazard_loading,
         "scale_dimensions": scale_dimensions,
         "firth": firth,
     }
@@ -79,6 +85,9 @@ def fit(
     z_column: str | None = None,
     link: str | None = None,
     logslope_formula: str | None = None,
+    frailty_kind: str | None = None,
+    frailty_sd: float | None = None,
+    hazard_loading: str | None = None,
     scale_dimensions: bool | None = None,
     firth: bool | None = None,
     config: dict[str, Any] | None = None,
@@ -129,6 +138,17 @@ def fit(
     logslope_formula:
         Secondary formula for the logslope / score-warp submodel. Corresponds to
         ``--logslope-formula``.
+    frailty_kind:
+        Frailty family for frailty-aware survival models. One of
+        ``"gaussian-shift"`` or ``"hazard-multiplier"``. Corresponds to
+        ``--frailty-kind``.
+    frailty_sd:
+        Fixed frailty standard deviation. Omit to let latent hazard-multiplier
+        models learn it. Corresponds to ``--frailty-sd``.
+    hazard_loading:
+        Hazard loading for ``frailty_kind="hazard-multiplier"``. One of
+        ``"full"`` or ``"loaded-vs-unloaded"``. Corresponds to
+        ``--hazard-loading``.
     scale_dimensions:
         When ``True``, enables learned per-axis anisotropic length scales on
         spatial smooths (e.g. multi-dim Duchon / Matern / TPS). Per-axis
@@ -160,6 +180,9 @@ def fit(
         z_column=z_column,
         link=link,
         logslope_formula=logslope_formula,
+        frailty_kind=frailty_kind,
+        frailty_sd=frailty_sd,
+        hazard_loading=hazard_loading,
         scale_dimensions=scale_dimensions,
         firth=firth,
         config=config,
@@ -203,6 +226,9 @@ def validate_formula(
     z_column: str | None = None,
     link: str | None = None,
     logslope_formula: str | None = None,
+    frailty_kind: str | None = None,
+    frailty_sd: float | None = None,
+    hazard_loading: str | None = None,
     scale_dimensions: bool | None = None,
     firth: bool | None = None,
     config: dict[str, Any] | None = None,
@@ -227,6 +253,9 @@ def validate_formula(
         z_column=z_column,
         link=link,
         logslope_formula=logslope_formula,
+        frailty_kind=frailty_kind,
+        frailty_sd=frailty_sd,
+        hazard_loading=hazard_loading,
         scale_dimensions=scale_dimensions,
         firth=firth,
         config=config,
