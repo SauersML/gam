@@ -394,14 +394,6 @@ impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {
 /// Duchon, or survival passes.
 pub(crate) const OUTER_HVP_MATERIALIZE_MAX_DIM: usize = 64;
 
-/// Hv-apply counter wrapping an `OuterHessianOperator`.
-///
-/// Used by `run_operator_trust_region` so the per-iteration log line can
-/// report exactly how many matrix-free Hv applications were spent inside
-/// the Steihaug-Toint CG inner solve. A high count at biobank scale is the
-/// quantitative signal that the matrix-free Hv kernel — not ARC's outer
-/// loop — is the bottleneck.
-
 /// Whether an analytic derivative is available for a given order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Derivative {
@@ -2632,37 +2624,6 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
     }
 }
 
-/// Translate an `OuterEval`'s Hessian into the `Option<Array2<f64>>`
-/// shape expected by `opt::SecondOrderSample`, enforcing the contract
-/// implied by the planner's `HessianSource`.
-///
-/// For `HessianSource::Analytic` (the exact second-order route) a missing
-/// or non-materializable Hessian is FATAL: returning `None` here would
-/// invite `opt::SecondOrderCache::finite_difference_hessian` to silently
-/// estimate the Hessian by finite-differencing the gradient, which (a)
-/// throws away the analytic structure the route was selected for, and
-/// (b) costs O(K) full outer evaluations per ARC iteration — at biobank
-/// scale, hours of work per silently-mis-routed step. The right
-/// behavior on a planner/runtime mismatch is to surface it loudly so
-/// the seed loop can either retry, demote the plan, or fail the seed.
-///
-/// Operator Hessians that *are* cheaply materializable (the operator's
-/// `materialization_capability` reports `Explicit` / `BatchedHvp` and the
-/// dimension is below `materialize_operator_max_dim`) are converted to
-/// dense in-place so dense ARC can run an exact factorization. Operator
-/// Hessians that are NOT cheaply materializable should never arrive
-/// here: the seed loop routes those to `run_operator_trust_region`
-/// before constructing the bridge. Reaching this branch on the analytic
-/// route means the runtime contradicted the seed-time decision, which
-/// is the same kind of mismatch we treat as fatal.
-///
-/// For `HessianSource::BfgsApprox`, `EfsFixedPoint`, and
-/// `HybridEfsFixedPoint` we deliberately return `None`: those routes do
-/// not consume an analytic Hessian and feed the Hessian into a
-/// quasi-Newton/fixed-point update instead. (Today these `HessianSource`
-/// variants don't actually drive `opt`'s second-order solvers, but the
-/// match preserves the original behavior in case a future routing
-/// reuses this bridge.)
 // =====================================================================
 // opt 0.4 matrix-free TR adapter (Phase 6)
 // =====================================================================
@@ -2891,6 +2852,37 @@ fn project_to_bounds(x: &Array1<f64>, bounds: Option<&(Array1<f64>, Array1<f64>)
     }
 }
 
+/// Translate an `OuterEval`'s Hessian into the `Option<Array2<f64>>`
+/// shape expected by `opt::SecondOrderSample`, enforcing the contract
+/// implied by the planner's `HessianSource`.
+///
+/// For `HessianSource::Analytic` (the exact second-order route) a missing
+/// or non-materializable Hessian is FATAL: returning `None` here would
+/// invite `opt::SecondOrderCache::finite_difference_hessian` to silently
+/// estimate the Hessian by finite-differencing the gradient, which (a)
+/// throws away the analytic structure the route was selected for, and
+/// (b) costs O(K) full outer evaluations per ARC iteration — at biobank
+/// scale, hours of work per silently-mis-routed step. The right
+/// behavior on a planner/runtime mismatch is to surface it loudly so
+/// the seed loop can either retry, demote the plan, or fail the seed.
+///
+/// Operator Hessians that *are* cheaply materializable (the operator's
+/// `materialization_capability` reports `Explicit` / `BatchedHvp` and the
+/// dimension is below `materialize_operator_max_dim`) are converted to
+/// dense in-place so dense ARC can run an exact factorization. Operator
+/// Hessians that are NOT cheaply materializable should never arrive
+/// here: the seed loop routes those to `run_operator_trust_region`
+/// before constructing the bridge. Reaching this branch on the analytic
+/// route means the runtime contradicted the seed-time decision, which
+/// is the same kind of mismatch we treat as fatal.
+///
+/// For `HessianSource::BfgsApprox`, `EfsFixedPoint`, and
+/// `HybridEfsFixedPoint` we deliberately return `None`: those routes do
+/// not consume an analytic Hessian and feed the Hessian into a
+/// quasi-Newton/fixed-point update instead. (Today these `HessianSource`
+/// variants don't actually drive `opt`'s second-order solvers, but the
+/// match preserves the original behavior in case a future routing
+/// reuses this bridge.)
 fn build_bridge_hessian_for_source(
     source: HessianSource,
     hessian: HessianResult,
