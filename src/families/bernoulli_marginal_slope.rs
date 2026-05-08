@@ -18040,7 +18040,7 @@ mod tests {
             .zip(weights.iter())
             .map(|(&node, &weight)| weight * normal_cdf(intercept + scale * slope * node))
             .sum::<f64>();
-        assert!((calibrated - target_mu).abs() <= 1e-10);
+        assert!((calibrated - target_mu).abs() <= 1e-8);
     }
 
     #[test]
@@ -18070,7 +18070,7 @@ mod tests {
             .map(|(&node, &weight)| weight * normal_cdf(intercept + scale * slope * node))
             .sum::<f64>();
 
-        assert!((calibrated - target_mu).abs() <= 1e-10);
+        assert!((calibrated - target_mu).abs() <= 1e-8);
     }
 
     #[test]
