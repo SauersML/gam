@@ -7620,9 +7620,9 @@ pub(crate) fn custom_family_outer_derivatives<F: CustomFamily + ?Sized>(
     options: &BlockwiseFitOptions,
 ) -> (
     crate::solver::outer_strategy::Derivative,
-    crate::solver::outer_strategy::Derivative,
+    crate::solver::outer_strategy::DeclaredHessianForm,
 ) {
-    use crate::solver::outer_strategy::Derivative;
+    use crate::solver::outer_strategy::{DeclaredHessianForm, Derivative};
 
     let order = family.exact_outer_derivative_order(specs, options);
     let gradient = if order.has_gradient() {
@@ -7638,9 +7638,9 @@ pub(crate) fn custom_family_outer_derivatives<F: CustomFamily + ?Sized>(
         && include_exact_newton_logdet_h(family, options)
         && order.has_hessian()
     {
-        Derivative::Analytic
+        DeclaredHessianForm::Either
     } else {
-        Derivative::Unavailable
+        DeclaredHessianForm::Unavailable
     };
 
     (gradient, hessian)
@@ -13902,7 +13902,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
 
     use crate::estimate::EstimationError;
     use crate::solver::outer_strategy::{
-        Derivative, FallbackPolicy, OuterEval, OuterEvalOrder, OuterProblem,
+        DeclaredHessianForm, Derivative, FallbackPolicy, OuterEval, OuterEvalOrder, OuterProblem,
     };
 
     // Mutable bookkeeping for the outer optimization loop. These fields were
@@ -13921,7 +13921,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     let (cap_gradient, cap_hessian) =
         custom_family_outer_derivatives(family, specs, &outer_options);
     let hessian = cap_hessian;
-    let need_outer_hessian = matches!(hessian, Derivative::Analytic);
+    let need_outer_hessian = hessian.is_analytic();
     let outer_max_iter = cost_gated_first_order_max_iter(
         options.outer_max_iter,
         family.coefficient_gradient_cost(specs),
