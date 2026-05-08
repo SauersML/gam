@@ -973,6 +973,98 @@ impl DenestedCubicCell {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct CellMomentFingerprint {
+    pub hash: u64,
+    bins: [u64; 6],
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct CellMomentCacheKey {
+    pub fingerprint: CellMomentFingerprint,
+    pub max_degree: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CellMomentDedupStats {
+    pub lookups: u64,
+    pub hits: u64,
+    pub misses: u64,
+}
+
+impl CellMomentDedupStats {
+    #[inline]
+    pub fn hit_rate(self) -> f64 {
+        if self.lookups == 0 {
+            0.0
+        } else {
+            self.hits as f64 / self.lookups as f64
+        }
+    }
+}
+
+pub const DEFAULT_CELL_MOMENT_DEDUP_EPSILON: f64 = 0.0;
+
+#[inline]
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+#[inline]
+fn mix_fingerprint_words(words: &[u64]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &word in words {
+        h ^= splitmix64(word);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+#[inline]
+fn quantized_cell_word(x: f64, epsilon: f64) -> u64 {
+    if epsilon == 0.0 || !epsilon.is_finite() || epsilon < 0.0 || !x.is_finite() {
+        return x.to_bits();
+    }
+    (x / epsilon).round().to_bits()
+}
+
+/// Returns a deterministic geometric fingerprint for a de-nested cubic cell.
+///
+/// With `epsilon == 0.0`, each coordinate is represented by its exact IEEE-754
+/// bit pattern, so equal fingerprints imply bit-equal `(left, right, c0, c1,
+/// c2, c3)` tuples.  With `epsilon > 0`, finite coordinates are binned to the
+/// nearest multiple of `epsilon`; callers should treat this as an approximate
+/// cache key and validate the resulting model error for their data.
+pub fn cell_moment_fingerprint(cell: DenestedCubicCell, epsilon: f64) -> CellMomentFingerprint {
+    let bins = [
+        quantized_cell_word(cell.left, epsilon),
+        quantized_cell_word(cell.right, epsilon),
+        quantized_cell_word(cell.c0, epsilon),
+        quantized_cell_word(cell.c1, epsilon),
+        quantized_cell_word(cell.c2, epsilon),
+        quantized_cell_word(cell.c3, epsilon),
+    ];
+    CellMomentFingerprint {
+        hash: mix_fingerprint_words(&bins),
+        bins,
+    }
+}
+
+#[inline]
+pub fn cell_moment_cache_key(
+    cell: DenestedCubicCell,
+    max_degree: usize,
+    epsilon: f64,
+) -> CellMomentCacheKey {
+    CellMomentCacheKey {
+        fingerprint: cell_moment_fingerprint(cell, epsilon),
+        max_degree,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DenestedPartitionCell {
     pub cell: DenestedCubicCell,
@@ -6304,5 +6396,89 @@ mod tests {
         let (hits, misses) = stats.snapshot();
         assert!(hits > 0, "expected warm LRU hits");
         assert!(misses > 0, "expected cold LRU misses");
+    }
+
+    #[test]
+    fn cell_moment_fingerprint_exact_cache_matches_current_evaluator() {
+        let cells = [
+            DenestedCubicCell {
+                left: -1.75,
+                right: -0.25,
+                c0: 0.15,
+                c1: -0.35,
+                c2: 0.08,
+                c3: -0.015,
+            },
+            DenestedCubicCell {
+                left: -0.5,
+                right: 0.8,
+                c0: -0.2,
+                c1: 0.45,
+                c2: -0.12,
+                c3: 0.025,
+            },
+            DenestedCubicCell {
+                left: 0.1,
+                right: 1.6,
+                c0: 0.05,
+                c1: 0.2,
+                c2: 0.03,
+                c3: 0.004,
+            },
+        ];
+        let mut cache = std::collections::HashMap::new();
+        for max_degree in [0usize, 3, 4, 9, 16] {
+            for cell in cells {
+                let baseline = evaluate_cell_moments(cell, max_degree).expect("baseline moments");
+                let key = cell_moment_cache_key(cell, max_degree, 0.0);
+                let cached = cache.entry(key).or_insert_with(|| {
+                    evaluate_cell_moments(cell, max_degree).expect("cached moments")
+                });
+                assert_eq!(baseline.branch, cached.branch);
+                assert_eq!(baseline.value.to_bits(), cached.value.to_bits());
+                assert_eq!(baseline.moments.len(), cached.moments.len());
+                for (lhs, rhs) in baseline.moments.iter().zip(cached.moments.iter()) {
+                    assert_eq!(lhs.to_bits(), rhs.to_bits());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fuzzy_cell_moment_fingerprint_error_scales_with_epsilon() {
+        for epsilon in [1e-8, 1e-6] {
+            let base = DenestedCubicCell {
+                left: -1.25,
+                right: 1.1,
+                c0: 0.1,
+                c1: -0.25,
+                c2: 0.04,
+                c3: -0.006,
+            };
+            let perturbed = DenestedCubicCell {
+                left: base.left + 0.001 * epsilon,
+                right: base.right - 0.001 * epsilon,
+                c0: base.c0 + 0.001 * epsilon,
+                c1: base.c1 - 0.001 * epsilon,
+                c2: base.c2 + 0.001 * epsilon,
+                c3: base.c3 - 0.001 * epsilon,
+            };
+            assert_eq!(
+                cell_moment_cache_key(base, 9, epsilon),
+                cell_moment_cache_key(perturbed, 9, epsilon)
+            );
+            let lhs = evaluate_cell_moments(base, 9).expect("base moments");
+            let rhs = evaluate_cell_moments(perturbed, 9).expect("perturbed moments");
+            let max_rel = lhs
+                .moments
+                .iter()
+                .zip(rhs.moments.iter())
+                .map(|(a, b)| (a - b).abs() / a.abs().max(b.abs()).max(1.0))
+                .fold(0.0_f64, f64::max);
+            assert!(
+                max_rel <= 10.0 * epsilon,
+                "epsilon={epsilon:.1e} max_rel={max_rel:.3e}"
+            );
+        }
     }
 }
