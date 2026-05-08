@@ -80,7 +80,7 @@ est.fit(train)
 pred = est.predict([{"x": 1.5}, {"x": 2.5}])
 ```
 
-The native extension is `gamfit._rust`, while the public Python API lives under `python/gamfit/`.
+The native extension is `gamfit._rust`, while the public Python API lives under `gamfit/`.
 
 ## Quick start
 
