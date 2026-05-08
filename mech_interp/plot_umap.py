@@ -93,35 +93,46 @@ def main(out_dir: Path):
     acts = torch.from_numpy(blob["acts"])
     ctx_toks = blob["ctx_toks"]
 
-    # Per-feature TopK activations (only features that win TopK count as "fired")
+    # Per-feature TopK activations — batched to avoid memory blowups on large dicts.
+    print("computing TopK activations (batched)...")
+    z_chunks = []
+    bs = 4096
     with torch.no_grad():
-        sparse, _ = sae.encode_topk(acts)
-        z = sparse.cpu().numpy()  # (N, dict_size), zeros except at TopK positions
-        # Also keep the pre-topk for activation magnitude.
+        for i in range(0, acts.shape[0], bs):
+            chunk = acts[i : i + bs]
+            sparse, _ = sae.encode_topk(chunk)
+            z_chunks.append(sparse.cpu().numpy())
+    z = np.concatenate(z_chunks, axis=0)
+    print(f"  z shape: {z.shape}")
 
     max_act = z.max(axis=0)
     frac_fire = (z > 0).mean(axis=0)
     alive = max_act > 1e-6
     print(f"alive (ever fired in TopK): {alive.sum()}/{len(max_act)}")
 
-    # For each feature, find its dominant token
-    # mean activation per token id
-    n_vocab = max(ctx_toks) + 1
-    print(f"computing per-feature dominant tokens (n_vocab={n_vocab})...")
-    # vectorized: for each feature, sum z[:, f] grouped by ctx_toks
+    # For each feature, find its dominant token (vectorized via sparse matmul on alive only).
+    n_vocab = int(ctx_toks.max()) + 1
+    print(f"computing per-feature dominant tokens (n_vocab={n_vocab}, alive={int(alive.sum())})...")
+    ctx64 = ctx_toks.astype(np.int64)
+    N = z.shape[0]
+    # S: (n_vocab, N) sparse one-hot of token id per sample.
+    # token_act_sum_alive = S @ z_alive  -> (n_vocab, n_alive), no n_vocab×dict_size blowup.
+    from scipy.sparse import csr_matrix
+    S = csr_matrix(
+        (np.ones(N, dtype=np.float32), (ctx64, np.arange(N))),
+        shape=(n_vocab, N),
+    )
+    z_alive_full = z[:, alive].astype(np.float32, copy=False)
+    tok_act_alive = np.asarray(S @ z_alive_full)  # (n_vocab, n_alive)
+
     feat_top_token = np.zeros(z.shape[1], dtype=np.int64)
-    feat_dwell_aff = np.zeros(z.shape[1], dtype=np.float32)  # dwell weighting
-    for f in np.where(alive)[0]:
-        col = z[:, f]
-        if col.max() < 1e-6:
-            continue
-        # tokens weighted by activation
-        # use bincount with weights
-        sums = np.bincount(ctx_toks.astype(np.int64), weights=col, minlength=n_vocab)
-        feat_top_token[f] = int(np.argmax(sums))
-        # dwell affinity: fraction of total activation on dwell tokens
-        dwell_mask = (np.arange(n_vocab) >= DWELL_BASE) & (np.arange(n_vocab) < DWELL_BASE + N_DWELL)
-        feat_dwell_aff[f] = sums[dwell_mask].sum() / max(sums.sum(), 1e-9)
+    feat_top_token[alive] = tok_act_alive.argmax(axis=0)
+
+    dwell_mask = np.zeros(n_vocab, dtype=bool)
+    dwell_mask[DWELL_BASE : DWELL_BASE + N_DWELL] = True
+    total_alive = tok_act_alive.sum(axis=0) + 1e-9
+    feat_dwell_aff = np.zeros(z.shape[1], dtype=np.float32)
+    feat_dwell_aff[alive] = (tok_act_alive[dwell_mask].sum(axis=0) / total_alive).astype(np.float32)
 
     # Decoder directions, alive only
     W_dec = sae.W_dec.detach().cpu().numpy().T  # (dict_size, d_model)
