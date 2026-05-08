@@ -77,7 +77,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true')
     environment:
       name: pypi
-      url: https://pypi.org/p/gam
+      url: https://pypi.org/p/gamfit
     permissions:
       id-token: write
     steps:

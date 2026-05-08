@@ -7,9 +7,9 @@ sampling uses NUTS.
 
 Quick start::
 
-    import gam
+    import gamfit
 
-    model = gam.fit(train, "y ~ s(x)")
+    model = gamfit.fit(train, "y ~ s(x)")
     pred = model.predict(test, interval=0.95)
     print(model.summary())
     model.save("model.gam")
@@ -30,7 +30,7 @@ from ._summary import Summary
 from ._validation import FormulaValidation
 
 try:
-    __version__ = _metadata.version("gam")
+    __version__ = _metadata.version("gamfit")
 except _metadata.PackageNotFoundError:
     __version__ = "0.0.0+unknown"
 

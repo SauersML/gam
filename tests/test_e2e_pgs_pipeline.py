@@ -24,20 +24,20 @@ import math
 
 import pytest
 
-pytest.importorskip("gam._rust")
+pytest.importorskip("gamfit._rust")
 
 import numpy as np
 import pandas as pd
 
-import gam
-from gam.pgs import PgsCalibration
+import gamfit
+from gamfit.pgs import PgsCalibration
 
 
 PC_COLUMNS = ["pc1", "pc2", "pc3", "pc4"]
 
 
 def _require_extension() -> None:
-    if not gam.build_info().get("available"):
+    if not gamfit.build_info().get("available"):
         pytest.skip("rust extension not built")
 
 
@@ -147,7 +147,7 @@ def test_e2e_stage1_then_stage2a_binary_holdout_auc(
     df = synthetic_biobank_factory(seed=21, n=256)
     train, test = _split_train_test(df)
 
-    calib = gam.fit(
+    calib = gamfit.fit(
         train,
         f"PGS ~ {_pc_duchon()}",
         transformation_normal=True,
@@ -156,7 +156,7 @@ def test_e2e_stage1_then_stage2a_binary_holdout_auc(
     train["pgs_ctn_z"] = np.asarray(calib.predict(train), dtype=float)
     test["pgs_ctn_z"] = np.asarray(calib.predict(test), dtype=float)
 
-    model = gam.fit(
+    model = gamfit.fit(
         train,
         "disease ~ z",
         family="bernoulli-marginal-slope",
@@ -193,7 +193,7 @@ def test_e2e_stage1_calibrated_pgs_survival_holdout_cindex(
     df = synthetic_biobank_factory(seed=22, n=256)
     train, test = _split_train_test(df)
 
-    calib = gam.fit(
+    calib = gamfit.fit(
         train,
         f"PGS ~ {_pc_duchon()}",
         transformation_normal=True,
@@ -249,7 +249,7 @@ def test_e2e_pipeline_save_and_reload_predicts_identically(
     )
     test["pgs_ctn_z"] = z_inmem
 
-    model = gam.fit(
+    model = gamfit.fit(
         train,
         "disease ~ z",
         family="bernoulli-marginal-slope",
@@ -261,7 +261,7 @@ def test_e2e_pipeline_save_and_reload_predicts_identically(
 
     model_path = tmp_path / "stage2a.gam"
     model.save(model_path)
-    reloaded_model = gam.load(model_path)
+    reloaded_model = gamfit.load(model_path)
 
     probs_inmem = np.asarray(
         model.predict(test, return_type="dict")["mean"], dtype=float

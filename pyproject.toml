@@ -3,16 +3,17 @@ requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"
 
 [project]
-name = "gam"
+name = "gamfit"
 version = "0.1.15"
 description = "Formula-first generalized additive models with a high-performance Rust core"
 readme = "python/README.md"
 requires-python = ">=3.10"
-license = "Apache-2.0"
+license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
 authors = [{ name = "SauersML" }]
 keywords = [
   "gam",
+  "gamfit",
   "generalized-additive-models",
   "regression",
   "smoothing-splines",
@@ -87,7 +88,7 @@ all = [
 
 [tool.maturin]
 manifest-path = "crates/gam-pyffi/Cargo.toml"
-module-name = "gam._rust"
+module-name = "gamfit._rust"
 python-source = "python"
 
 [tool.mypy]

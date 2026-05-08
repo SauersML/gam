@@ -12,10 +12,10 @@ class RustExtensionUnavailableError(ImportError):
 @lru_cache(maxsize=1)
 def rust_module() -> ModuleType:
     try:
-        return importlib.import_module("gam._rust")
+        return importlib.import_module("gamfit._rust")
     except ImportError as exc:  # pragma: no cover - import environment specific
         raise RustExtensionUnavailableError(
-            "gam._rust is not available. Build or install the package with maturin first."
+            "gamfit._rust is not available. Build or install the package with maturin first."
         ) from exc
 
 
@@ -25,12 +25,12 @@ def extension_status() -> dict[str, object]:
     except RustExtensionUnavailableError as exc:
         return {
             "available": False,
-            "module": "gam._rust",
+            "module": "gamfit._rust",
             "reason": str(exc),
         }
     build_info = module.build_info()
     return {
         "available": True,
-        "module": "gam._rust",
+        "module": "gamfit._rust",
         **dict(build_info),
     }

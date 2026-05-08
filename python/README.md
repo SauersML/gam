@@ -1,13 +1,13 @@
-# gam
+# gamfit
 
-[![PyPI](https://img.shields.io/pypi/v/gam.svg)](https://pypi.org/project/gam/)
-[![Python](https://img.shields.io/pypi/pyversions/gam.svg)](https://pypi.org/project/gam/)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/SauersML/gam/blob/main/LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/gamfit.svg)](https://pypi.org/project/gamfit/)
+[![Python](https://img.shields.io/pypi/pyversions/gamfit.svg)](https://pypi.org/project/gamfit/)
+[![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](https://github.com/SauersML/gam/blob/main/LICENSE)
 
 A formula-first generalized additive model library for Python, backed by a
 high-performance Rust engine.
 
-`gam` fits Gaussian, binomial, Poisson, and Gamma GLMs with smooth terms,
+`gamfit` fits Gaussian, binomial, Poisson, and Gamma GLMs with smooth terms,
 random effects, location-scale extensions, survival likelihoods, and
 flexible/learnable links. Smoothing parameters are selected by REML or LAML.
 Posterior sampling uses NUTS.
@@ -15,7 +15,13 @@ Posterior sampling uses NUTS.
 ## Install
 
 ```bash
-pip install gam
+uv add gamfit
+```
+
+Or with a managed Python (one-off, no project required):
+
+```bash
+uv pip install gamfit
 ```
 
 Wheels are published for Linux (x86_64, aarch64), macOS (x86_64, Apple
@@ -24,7 +30,7 @@ silicon), and Windows. No Rust toolchain required.
 ## Quick start
 
 ```python
-import gam
+import gamfit
 
 train = [
     {"y": 1.2, "x": 0.0},
@@ -33,7 +39,7 @@ train = [
     {"y": 4.5, "x": 3.0},
 ]
 
-model = gam.fit(train, "y ~ s(x)")
+model = gamfit.fit(train, "y ~ s(x)")
 predictions = model.predict([{"x": 1.5}, {"x": 2.5}], interval=0.95)
 print(model.summary())
 model.save("model.gam")
@@ -65,7 +71,7 @@ without conversion.
 ## scikit-learn integration
 
 ```python
-from gam.sklearn import GAMRegressor
+from gamfit.sklearn import GAMRegressor
 
 est = GAMRegressor(formula="y ~ s(x)")
 est.fit(train)
@@ -76,14 +82,14 @@ preds = est.predict([{"x": 1.5}, {"x": 2.5}])
 
 | Symbol | Purpose |
 | --- | --- |
-| `gam.fit(data, formula, **kwargs)` | Fit a model from a dataset and a Wilkinson-style formula. |
-| `gam.load(path)` / `gam.loads(bytes)` | Reload a saved model. |
-| `gam.validate_formula(data, formula, ...)` | Type-check a formula against a dataset without fitting. |
-| `gam.build_info()` | Native-extension build metadata. |
-| `gam.explain_error(exc)` | Convert a `gam` exception into a human-readable hint. |
-| `gam.Model` | Fitted-model handle: `predict`, `summary`, `check`, `diagnose`, `plot`, `report`, `save`. |
-| `gam.sklearn.GAMRegressor` / `GAMClassifier` | scikit-learn-compatible estimators. |
-| `gam.pgs` | Polygenic-score helpers. |
+| `gamfit.fit(data, formula, **kwargs)` | Fit a model from a dataset and a Wilkinson-style formula. |
+| `gamfit.load(path)` / `gamfit.loads(bytes)` | Reload a saved model. |
+| `gamfit.validate_formula(data, formula, ...)` | Type-check a formula against a dataset without fitting. |
+| `gamfit.build_info()` | Native-extension build metadata. |
+| `gamfit.explain_error(exc)` | Convert a `gamfit` exception into a human-readable hint. |
+| `gamfit.Model` | Fitted-model handle: `predict`, `summary`, `check`, `diagnose`, `plot`, `report`, `save`. |
+| `gamfit.sklearn.GAMRegressor` / `GAMClassifier` | scikit-learn-compatible estimators. |
+| `gamfit.pgs` | Polygenic-score helpers. |
 
 See the [project documentation](https://github.com/SauersML/gam) for the
 full guide, the formula DSL reference, and the CLI.
@@ -91,12 +97,14 @@ full guide, the formula DSL reference, and the CLI.
 ## Optional extras
 
 ```bash
-pip install "gam[pandas]"    # pandas + pyarrow input/output
-pip install "gam[plot]"      # matplotlib-based plotting
-pip install "gam[sklearn]"   # scikit-learn integration
-pip install "gam[all]"       # everything
+uv add "gamfit[pandas]"     # pandas + pyarrow input/output
+uv add "gamfit[plot]"       # matplotlib-based plotting
+uv add "gamfit[sklearn]"    # scikit-learn integration
+uv add "gamfit[all]"        # everything
 ```
 
 ## License
 
-Apache-2.0. See [LICENSE](https://github.com/SauersML/gam/blob/main/LICENSE).
+AGPL-3.0-or-later. See [LICENSE](https://github.com/SauersML/gam/blob/main/LICENSE).
+A commercial license is available for closed-source or SaaS use — see
+[COMMERCIAL.md](https://github.com/SauersML/gam/blob/main/COMMERCIAL.md).
