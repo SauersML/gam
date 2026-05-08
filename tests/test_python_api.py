@@ -54,6 +54,7 @@ def test_build_info_reports_real_extension() -> None:
     assert info["supported_model_classes"] == [
         "standard",
         "transformation-normal",
+        "survival",
         "bernoulli-marginal-slope",
         "survival-marginal-slope",
         "survival-location-scale",

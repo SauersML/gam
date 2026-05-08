@@ -224,7 +224,6 @@ pub struct SurvivalLocationScaleFitResult {
 pub struct SurvivalTransformationFitResult {
     pub fit: UnifiedFitResult,
     pub resolvedspec: TermCollectionSpec,
-    pub covariate_design: TermCollectionDesign,
     pub baseline_cfg: crate::families::survival_construction::SurvivalBaselineConfig,
     pub likelihood_mode: crate::families::survival_construction::SurvivalLikelihoodMode,
     pub time_anchor: f64,
@@ -831,7 +830,6 @@ fn fit_survival_transformation_model(
     Ok(SurvivalTransformationFitResult {
         fit,
         resolvedspec,
-        covariate_design,
         baseline_cfg: fitted_baseline_cfg,
         likelihood_mode: spec.likelihood_mode,
         time_anchor: spec.time_anchor,
