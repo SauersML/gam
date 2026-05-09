@@ -52,6 +52,12 @@ pub struct SurvivalPredictRequest<'a> {
     /// If `None`, every row is evaluated at its own `age_exit`. If
     /// `Some(grid)`, every row is evaluated at every time in the grid.
     pub time_grid: Option<&'a [f64]>,
+    /// When true, the result also carries delta-method standard errors
+    /// for the survival surface (response scale) and the linear
+    /// predictor.  Currently honored for `LocationScale` only; other
+    /// likelihood modes return `Err` rather than silently dropping
+    /// the request.
+    pub with_uncertainty: bool,
 }
 
 /// Result of [`predict_survival`].
@@ -62,6 +68,14 @@ pub struct SurvivalPredictResult {
     pub cumulative_hazard: Array2<f64>,
     pub linear_predictor: Array1<f64>,
     pub likelihood_mode: SurvivalLikelihoodMode,
+    /// Per-cell delta-method SE on the survival surface.  Same shape as
+    /// `survival`.  Populated only when the request set
+    /// `with_uncertainty = true` and the model class supports it.
+    pub survival_se: Option<Array2<f64>>,
+    /// Per-row delta-method SE on the linear predictor at the row's own
+    /// exit time.  Length `n`.  Populated under the same conditions as
+    /// `survival_se`.
+    pub eta_se: Option<Array1<f64>>,
 }
 
 /// Run the survival prediction pipeline.
@@ -78,6 +92,7 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
         primary_offset,
         noise_offset,
         time_grid,
+        with_uncertainty,
     } = req;
 
     let entryname = model
@@ -159,7 +174,15 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
             col_map,
             data,
             time_grid,
+            with_uncertainty,
         );
+    }
+    if with_uncertainty {
+        return Err(format!(
+            "predict_survival: with_uncertainty is currently supported only for the \
+             location-scale likelihood mode; got {}",
+            survival_likelihood_modename(saved_likelihood_mode)
+        ));
     }
 
     // Ambient time basis: built once with (age_entry, age_exit) so that
@@ -385,6 +408,8 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
         cumulative_hazard,
         linear_predictor,
         likelihood_mode: saved_likelihood_mode,
+        survival_se: None,
+        eta_se: None,
     })
 }
 
@@ -735,12 +760,14 @@ fn predict_survival_location_scale_batch(
     col_map: &HashMap<String, usize>,
     data: ArrayView2<'_, f64>,
     time_grid: Option<&[f64]>,
+    with_uncertainty: bool,
 ) -> Result<SurvivalPredictResult, String> {
     use crate::families::scale_design::build_scale_deviation_operator;
     use crate::families::survival_construction::evaluate_survival_time_basis_row;
     use crate::families::survival_location_scale::{
         SurvivalLocationScalePredictInput, predict_survival_location_scale,
         predict_survival_location_scale_from_linear_components,
+        predict_survival_location_scalewith_uncertainty,
     };
     use crate::matrix::DesignMatrix;
 
@@ -937,33 +964,68 @@ fn predict_survival_location_scale_batch(
             Array1::from_shape_fn(total_rows, |k| values[k / eval_width])
         }
     };
-    let pred = if per_row_eval {
-        let pred_input = SurvivalLocationScalePredictInput {
-            x_time_exit,
-            eta_time_offset_exit: eta_offset_exit,
-            time_wiggle_knots,
-            time_wiggle_degree,
-            time_wiggle_ncols,
-            x_threshold: threshold_matrix,
-            eta_threshold_offset: primary_offset.clone(),
-            x_log_sigma: prepared_sigma_design,
-            eta_log_sigma_offset: noise_offset.clone(),
-            x_link_wiggle: None,
-            link_wiggle_knots,
-            link_wiggle_degree,
-            inverse_link: saved_inverse_link.clone(),
-        };
-        predict_survival_location_scale(&pred_input, &saved_fit)
+    // Build the SurvivalLocationScalePredictInput once, with replicated /
+    // expanded designs and offsets, regardless of `per_row_eval`.  This
+    // unifies the mean-only and uncertainty paths and lets the
+    // uncertainty branch reuse the same input.
+    let pred_input = SurvivalLocationScalePredictInput {
+        x_time_exit,
+        eta_time_offset_exit: eta_offset_exit.clone(),
+        time_wiggle_knots: time_wiggle_knots.clone(),
+        time_wiggle_degree,
+        time_wiggle_ncols,
+        x_threshold: threshold_matrix,
+        eta_threshold_offset: expand_vector(primary_offset),
+        x_log_sigma: prepared_sigma_design,
+        eta_log_sigma_offset: expand_vector(noise_offset),
+        x_link_wiggle: None,
+        link_wiggle_knots: link_wiggle_knots.clone(),
+        link_wiggle_degree,
+        inverse_link: saved_inverse_link.clone(),
+    };
+
+    // Mean / SE computation.  The uncertainty path also computes the
+    // survival mean and eta, so we use whichever output we have.
+    let (eta_full, survival_prob_full, response_se_full, eta_se_full): (
+        Array1<f64>,
+        Array1<f64>,
+        Option<Array1<f64>>,
+        Option<Array1<f64>>,
+    ) = if with_uncertainty {
+        let cov = saved_fit.beta_covariance().ok_or_else(|| {
+            "survival location-scale uncertainty: saved fit is missing the \
+             posterior covariance; refit with the current CLI / library to \
+             populate beta_covariance".to_string()
+        })?;
+        let unc = predict_survival_location_scalewith_uncertainty(
+            &pred_input,
+            &saved_fit,
+            cov,
+            false,
+            true,
+        )
+        .map_err(|err| format!("survival location-scale uncertainty predict failed: {err}"))?;
+        let response_se = unc.response_standard_error.ok_or_else(|| {
+            "survival location-scale uncertainty: response_standard_error \
+             missing despite include_response_sd=true"
+                .to_string()
+        })?;
+        (unc.eta, unc.survival_prob, Some(response_se), Some(unc.eta_standard_error))
+    } else if per_row_eval {
+        let pred = predict_survival_location_scale(&pred_input, &saved_fit)
+            .map_err(|err| format!("survival location-scale predict failed: {err}"))?;
+        (pred.eta, pred.survival_prob, None, None)
     } else {
         let beta_threshold = saved_fit.beta_threshold();
         let beta_log_sigma = saved_fit.beta_log_sigma();
         let eta_t_subject =
             cov_design.design.matrixvectormultiply(&beta_threshold) + primary_offset;
-        let eta_ls_subject = prepared_sigma_design.matrixvectormultiply(&beta_log_sigma)
+        let eta_ls_subject = prepared_sigma_design_view(&pred_input)
+            .matrixvectormultiply(&beta_log_sigma)
             + &expand_vector(noise_offset);
         let eta_t = expand_vector(&eta_t_subject);
-        predict_survival_location_scale_from_linear_components(
-            &x_time_exit,
+        let pred = predict_survival_location_scale_from_linear_components(
+            &pred_input.x_time_exit,
             &eta_offset_exit,
             time_wiggle_knots.as_ref(),
             time_wiggle_degree,
@@ -975,8 +1037,9 @@ fn predict_survival_location_scale_batch(
             &saved_inverse_link,
             &saved_fit,
         )
-    }
-    .map_err(|err| format!("survival location-scale predict failed: {err}"))?;
+        .map_err(|err| format!("survival location-scale predict failed: {err}"))?;
+        (pred.eta, pred.survival_prob, None, None)
+    };
 
     let mut survival = Array2::<f64>::zeros((n, t_cols));
     let mut cumulative_hazard = Array2::<f64>::zeros((n, t_cols));
@@ -985,21 +1048,37 @@ fn predict_survival_location_scale_batch(
         .and(&mut cumulative_hazard)
         .par_for_each(|(i, j), s, ch| {
             let k = if per_row_eval { i } else { i * eval_width + j };
-            let surv = pred.survival_prob[k].clamp(1e-300, 1.0);
+            let surv = survival_prob_full[k].clamp(1e-300, 1.0);
             *s = surv;
             *ch = -surv.ln();
         });
 
     let linear_predictor = if per_row_eval {
-        pred.eta
+        eta_full.clone()
     } else {
-        Array1::from_shape_fn(n, |i| pred.eta[i * eval_width + t_cols])
+        Array1::from_shape_fn(n, |i| eta_full[i * eval_width + t_cols])
     };
     let times = if per_row_eval {
         age_exit.to_vec()
     } else {
         eval_times
     };
+
+    let survival_se = response_se_full.as_ref().map(|response_se| {
+        let mut out = Array2::<f64>::zeros((n, t_cols));
+        ndarray::Zip::indexed(&mut out).par_for_each(|(i, j), slot| {
+            let k = if per_row_eval { i } else { i * eval_width + j };
+            *slot = response_se[k].max(0.0);
+        });
+        out
+    });
+    let eta_se_per_row = eta_se_full.as_ref().map(|eta_se| {
+        if per_row_eval {
+            eta_se.clone()
+        } else {
+            Array1::from_shape_fn(n, |i| eta_se[i * eval_width + t_cols])
+        }
+    });
 
     Ok(SurvivalPredictResult {
         times,
@@ -1008,7 +1087,18 @@ fn predict_survival_location_scale_batch(
         cumulative_hazard,
         linear_predictor,
         likelihood_mode: saved_likelihood_mode,
+        survival_se,
+        eta_se: eta_se_per_row,
     })
+}
+
+/// Helper: borrow the prepared sigma design back from the pred_input
+/// without consuming it.  Used so the mean-only fast path can reuse the
+/// log-sigma design without an extra clone.
+fn prepared_sigma_design_view(
+    input: &crate::families::survival_location_scale::SurvivalLocationScalePredictInput,
+) -> &crate::matrix::DesignMatrix {
+    &input.x_log_sigma
 }
 
 // ---------------------------------------------------------------------------

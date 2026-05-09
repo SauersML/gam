@@ -84,6 +84,13 @@ struct PyFitConfig {
 struct PyPredictOptions {
     interval: Option<f64>,
     time_grid: Option<Vec<f64>>,
+    /// Request delta-method standard errors on the survival surface
+    /// (and the linear predictor at each row's exit time).  Honored
+    /// only by the survival prediction path.  When set, the resulting
+    /// payload carries `survival_se` (per-cell SE) and `eta_se` (per-row
+    /// SE at the exit time).
+    #[serde(default)]
+    with_uncertainty: bool,
 }
 
 #[derive(Serialize)]
@@ -134,6 +141,16 @@ struct SurvivalPredictionPayload {
     cumulative_hazard: Vec<Vec<f64>>,
     linear_predictor: Vec<f64>,
     columns: BTreeMap<String, Vec<f64>>,
+    /// Delta-method standard errors on the survival surface, when the
+    /// caller requested `with_uncertainty=true`.  Same shape as
+    /// `survival`.  `None` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    survival_se: Option<Vec<Vec<f64>>>,
+    /// Delta-method SE on the linear predictor at each row's own exit
+    /// time, when uncertainty was requested.  Length equals
+    /// `linear_predictor.len()`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eta_se: Option<Vec<f64>>,
 }
 
 #[derive(Serialize)]
@@ -2013,6 +2030,7 @@ fn predict_table_survival(
         primary_offset: &primary_offset,
         noise_offset: &noise_offset,
         time_grid: time_grid_slice,
+        with_uncertainty: options.with_uncertainty,
     };
     let result = predict_survival(request)?;
 
@@ -2035,6 +2053,18 @@ fn predict_table_survival(
         survival_rows.push(srow);
         cumulative_rows.push(crow);
     }
+    let survival_se_rows = result.survival_se.as_ref().map(|se| {
+        let mut rows: Vec<Vec<f64>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut row = Vec::with_capacity(t);
+            for j in 0..t {
+                row.push(se[[i, j]]);
+            }
+            rows.push(row);
+        }
+        rows
+    });
+    let eta_se_vec = result.eta_se.as_ref().map(|v| v.to_vec());
 
     // Always populate a columns block for the backward-compatible
     // Python path. `mean` tracks the per-row survival at exit time
@@ -2076,6 +2106,8 @@ fn predict_table_survival(
         cumulative_hazard: cumulative_rows,
         linear_predictor: result.linear_predictor.to_vec(),
         columns,
+        survival_se: survival_se_rows,
+        eta_se: eta_se_vec,
     };
     serde_json::to_string(&survival_payload)
         .map_err(|err| format!("failed to serialize survival prediction payload: {err}"))
