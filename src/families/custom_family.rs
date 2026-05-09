@@ -9327,6 +9327,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     // region, and the outer loop progresses instead of grinding.
     let mut prev_log_likelihood_for_divergence_check = cached_eval.log_likelihood;
     let mut consecutive_frozen_loglik_cycles: usize = 0;
+    // Coordinate descent visits each block in turn, so `max_proposed_step`
+    // (the per-cycle max across blocks) only fires the cap on cycles where
+    // the divergent block is the active one. On a near-null direction this
+    // produces an alternation pattern (e.g. cap, cap, small, cap, small,
+    // cap, …) and a strict "consecutive cycles where step is clamped"
+    // requirement resets the counter every time another block's smaller
+    // step dominates the per-cycle maximum. The frozen-loglik signal,
+    // however, is a property of the joint state — it stays true across
+    // every cycle of the alternation. Track frozen-loglik consecutively
+    // and require that `step_clamped` was observed AT LEAST ONCE inside
+    // the frozen run (rather than EVERY cycle).
+    let mut clamped_step_in_frozen_run: bool = false;
     // Mirrors the `MAX_NEWTON_STEP` const used by the inner ExactNewton
     // path lower in this function. Hoisted here so the divergence check
     // does not need to reach into a nested scope.
@@ -9666,17 +9678,21 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             inner_tol * (1.0 + cached_eval.log_likelihood.abs());
         let step_clamped_for_divergence_check =
             max_proposed_beta_step >= 0.95 * NEWTON_STEP_CAP_FOR_DIVERGENCE;
-        if loglik_change_for_divergence_check <= loglik_frozen_tol_for_divergence_check
-            && step_clamped_for_divergence_check
-        {
+        if loglik_change_for_divergence_check <= loglik_frozen_tol_for_divergence_check {
             consecutive_frozen_loglik_cycles += 1;
+            if step_clamped_for_divergence_check {
+                clamped_step_in_frozen_run = true;
+            }
         } else {
             consecutive_frozen_loglik_cycles = 0;
+            clamped_step_in_frozen_run = false;
         }
         prev_log_likelihood_for_divergence_check = cached_eval.log_likelihood;
-        if consecutive_frozen_loglik_cycles >= DIVERGENCE_FROZEN_LOGLIK_CYCLES {
+        if consecutive_frozen_loglik_cycles >= DIVERGENCE_FROZEN_LOGLIK_CYCLES
+            && clamped_step_in_frozen_run
+        {
             log::warn!(
-                "[PIRLS/blockwise convergence] divergence early-exit at cycle {} | -loglik={:.6e} frozen for {} consecutive cycles | max_proposed_step={:.3e} (clamped at cap {}) | step_tol={:.3e}; near-null Hessian direction detected — returning unconverged so the outer optimizer backs off this region instead of running to inner_max_cycles.",
+                "[PIRLS/blockwise convergence] divergence early-exit at cycle {} | -loglik={:.6e} frozen for {} consecutive cycles | max_proposed_step={:.3e} (clamped-at-cap {} observed in frozen run) | step_tol={:.3e}; near-null Hessian direction detected — returning unconverged so the outer optimizer backs off this region instead of running to inner_max_cycles.",
                 cycle,
                 -cached_eval.log_likelihood,
                 consecutive_frozen_loglik_cycles,
