@@ -1,5 +1,6 @@
 use crate::probability::normal_cdf;
 use crate::resource::{ByteLruCache, ResidentBytes};
+use smallvec::{SmallVec, smallvec};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1173,12 +1174,15 @@ impl CachedCellMoments {
 
 impl ResidentBytes for CachedCellMoments {
     fn resident_bytes(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(
+        let spilled_bytes = if self.state.moments.spilled() {
             self.state
                 .moments
                 .capacity()
-                .saturating_mul(std::mem::size_of::<f64>()),
-        )
+                .saturating_mul(std::mem::size_of::<f64>())
+        } else {
+            0
+        };
+        std::mem::size_of::<Self>().saturating_add(spilled_bytes)
     }
 }
 
@@ -1219,11 +1223,21 @@ impl CellMomentCacheStats {
 
 pub type CellMomentLruCache = ByteLruCache<CellFingerprint, CachedCellMoments>;
 
+pub const CELL_MOMENT_INLINE_CAPACITY: usize = 10;
+
+pub type CellMomentVec = SmallVec<[f64; CELL_MOMENT_INLINE_CAPACITY]>;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CellMomentState {
     pub branch: ExactCellBranch,
     pub value: f64,
-    pub moments: Vec<f64>,
+    pub moments: CellMomentVec,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CellDerivativeMomentState {
+    pub branch: ExactCellBranch,
+    pub moments: CellMomentVec,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1454,7 +1468,7 @@ pub fn reduce_sextic_moments(
                 ExactCellBranch::Quartic,
                 max_degree,
             )
-            .map(|state| state.moments);
+            .map(|state| state.moments.into_vec());
         }
         return evaluate_affine_cell_state(
             DenestedCubicCell {
@@ -1467,7 +1481,7 @@ pub fn reduce_sextic_moments(
             },
             max_degree,
         )
-        .map(|state| state.moments);
+        .map(|state| state.moments.into_vec());
     }
     let mut moments = vec![0.0; max_degree + 1];
     for (idx, value) in base_m0_m4.into_iter().enumerate() {
@@ -2881,7 +2895,20 @@ pub fn evaluate_affine_cell_state(
     Ok(CellMomentState {
         branch: ExactCellBranch::Affine,
         value,
-        moments,
+        moments: moments.into(),
+    })
+}
+
+fn evaluate_affine_cell_derivative_state(
+    cell: DenestedCubicCell,
+    max_degree: usize,
+) -> Result<CellDerivativeMomentState, String> {
+    let alpha = cell.c0;
+    let beta = cell.c1;
+    let moments = affine_anchor_moment_vector(alpha, beta, cell.left, cell.right, max_degree);
+    Ok(CellDerivativeMomentState {
+        branch: ExactCellBranch::Affine,
+        moments: moments.into(),
     })
 }
 
@@ -2913,7 +2940,7 @@ fn evaluate_non_affine_cell_state(
     // step recurrences in reduce_quartic/sextic_moments, which amplify
     // roundoff by (1/lead)^n with lead = 2c2²/3c3² and overflow to NaN for
     // small c2/c3 cells that arise naturally in production.
-    let mut moments = vec![0.0_f64; max_degree + 1];
+    let mut moments: CellMomentVec = smallvec![0.0_f64; max_degree + 1];
     let mut value_integral = 0.0_f64;
     let center = 0.5 * (cell.left + cell.right);
     let half_width = 0.5 * (cell.right - cell.left);
@@ -2936,6 +2963,29 @@ fn evaluate_non_affine_cell_state(
         value: value_integral * half_width / (std::f64::consts::TAU).sqrt(),
         moments,
     })
+}
+
+fn evaluate_non_affine_cell_derivative_state(
+    cell: DenestedCubicCell,
+    branch: ExactCellBranch,
+    max_degree: usize,
+) -> Result<CellDerivativeMomentState, String> {
+    let mut moments: CellMomentVec = smallvec![0.0_f64; max_degree + 1];
+    let center = 0.5 * (cell.left + cell.right);
+    let half_width = 0.5 * (cell.right - cell.left);
+    for (&node, &weight) in GL_NODES.iter().zip(GL_WEIGHTS.iter()) {
+        let z = center + half_width * node;
+        let moment_weight = weight * (-cell.q(z)).exp();
+        let mut z_pow = 1.0_f64;
+        for moment in &mut moments {
+            *moment = moment_weight.mul_add(z_pow, *moment);
+            z_pow *= z;
+        }
+    }
+    for moment in &mut moments {
+        *moment *= half_width;
+    }
+    Ok(CellDerivativeMomentState { branch, moments })
 }
 
 /// De-nested cubic cell evaluator.
@@ -3031,6 +3081,67 @@ pub fn evaluate_cell_moments_uncached(
         }
     }
     evaluate_non_affine_cell_state(cell, branch, max_degree)
+}
+
+/// Evaluate only the moment vector needed by derivative contractions.
+///
+/// This deliberately does not compute the cell probability value
+/// `∫ φ(z) Φ(η(z)) dz`. Derivative contractions consume
+/// `∫ z^k exp(-q(z)) dz` moments only, so keeping the value out of the return
+/// type prevents this cheaper evaluator from satisfying value-bearing calls.
+pub fn evaluate_cell_derivative_moments_uncached(
+    cell: DenestedCubicCell,
+    max_degree: usize,
+) -> Result<CellDerivativeMomentState, String> {
+    let left_inf = !cell.left.is_finite();
+    let right_inf = !cell.right.is_finite();
+    if left_inf || right_inf {
+        if cell.c2.abs() > NORMALIZED_CELL_BRANCH_TOL || cell.c3.abs() > NORMALIZED_CELL_BRANCH_TOL
+        {
+            return Err(format!(
+                "semi-infinite cell [{}, {}] must be affine (c2=c3=0), got c2={:.3e}, c3={:.3e}",
+                cell.left, cell.right, cell.c2, cell.c3
+            ));
+        }
+        return evaluate_affine_cell_derivative_state(cell, max_degree);
+    }
+    if cell.right <= cell.left {
+        return Err(format!(
+            "finite cell must have left < right, got [{}, {}]",
+            cell.left, cell.right
+        ));
+    }
+    let branch = branch_cell(cell)?;
+    if branch == ExactCellBranch::Affine {
+        return evaluate_affine_cell_derivative_state(cell, max_degree);
+    }
+    if branch == ExactCellBranch::Sextic {
+        let lead = sextic_qprime_coefficients(cell.c0, cell.c1, cell.c2, cell.c3)[5];
+        if !lead.is_finite() {
+            return Err(format!(
+                "sextic cell evaluation encountered non-finite leading coefficient: {lead:.3e}"
+            ));
+        }
+        if let Some(lower_branch) = degenerate_sextic_branch(cell, lead)? {
+            return match lower_branch {
+                ExactCellBranch::Quartic => evaluate_non_affine_cell_derivative_state(
+                    DenestedCubicCell { c3: 0.0, ..cell },
+                    ExactCellBranch::Quartic,
+                    max_degree,
+                ),
+                ExactCellBranch::Affine => evaluate_affine_cell_derivative_state(
+                    DenestedCubicCell {
+                        c2: 0.0,
+                        c3: 0.0,
+                        ..cell
+                    },
+                    max_degree,
+                ),
+                ExactCellBranch::Sextic => unreachable!("sextic cannot be a lowered branch"),
+            };
+        }
+    }
+    evaluate_non_affine_cell_derivative_state(cell, branch, max_degree)
 }
 
 /// Evaluate a de-nested cubic cell through a fit-lifetime byte-limited LRU cache.
@@ -5773,6 +5884,48 @@ mod tests {
                         rel < 1e-10,
                         "cell={cell:?} degree={degree} moment={k} rel={rel:e}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn derivative_moment_evaluator_matches_value_evaluator_moments() {
+        let cells = [
+            DenestedCubicCell {
+                left: -2.0,
+                right: -0.4,
+                c0: 0.15,
+                c1: -0.8,
+                c2: 0.0,
+                c3: 0.0,
+            },
+            DenestedCubicCell {
+                left: -0.75,
+                right: 1.4,
+                c0: -0.25,
+                c1: 0.6,
+                c2: 0.12,
+                c3: 0.0,
+            },
+            DenestedCubicCell {
+                left: -1.1,
+                right: 0.9,
+                c0: 0.35,
+                c1: -0.3,
+                c2: 0.05,
+                c3: -0.015,
+            },
+        ];
+        for cell in cells {
+            for degree in [4usize, 9, 15, 21] {
+                let full = evaluate_cell_moments_uncached(cell, degree).expect("full moments");
+                let derivative = evaluate_cell_derivative_moments_uncached(cell, degree)
+                    .expect("derivative moments");
+                assert_eq!(full.branch, derivative.branch);
+                assert_eq!(full.moments.len(), derivative.moments.len());
+                for k in 0..full.moments.len() {
+                    assert_eq!(full.moments[k].to_bits(), derivative.moments[k].to_bits());
                 }
             }
         }
