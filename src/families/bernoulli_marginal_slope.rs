@@ -4277,9 +4277,9 @@ impl BernoulliMarginalSlopeFamily {
     /// Outer-aware variant of `log_likelihood_only`. When
     /// `options.outer_score_subsample` is `None` this iterates over all rows
     /// and returns a value identical (bit-for-bit) to the legacy full-data
-    /// implementation. When it is `Some`, only the masked rows contribute and
-    /// the row-summed component is rescaled by `weight_scale = n_full / |mask|`
-    /// (Horvitz-Thompson). This is the row-iter swap that lets outer-only
+    /// implementation. When it is `Some`, only the sampled rows contribute,
+    /// with their Horvitz-Thompson inverse-inclusion weights taken from
+    /// `OuterScoreSubsample::rows`. This is the row-iter swap that lets outer-only
     /// score/gradient passes scale to biobank `n` without distorting the
     /// full-data inner-PIRLS or covariance code paths.
     pub(crate) fn log_likelihood_only_with_options(
@@ -4669,9 +4669,9 @@ impl BernoulliMarginalSlopeFamily {
     /// Outer-aware variant of `sigma_exact_joint_psi_terms`. When
     /// `options.outer_score_subsample` is `None`, iterates all rows and is
     /// bit-for-bit equivalent to the legacy implementation. When `Some`, only
-    /// the masked rows contribute and every row-summed component (objective
-    /// scalar, score vector, Hessian operator blocks) is rescaled by
-    /// `weight_scale = n_full / |mask|` (Horvitz-Thompson).
+    /// the sampled rows contribute and every row-summed component (objective
+    /// scalar, score vector, Hessian operator blocks) is accumulated with the
+    /// row's Horvitz-Thompson inverse-inclusion weight.
     pub(crate) fn sigma_exact_joint_psi_terms_with_options(
         &self,
         block_states: &[ParameterBlockState],
@@ -4747,7 +4747,7 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     /// Outer-aware variant of `sigma_exact_joint_psisecond_order_terms`. See
-    /// `sigma_exact_joint_psi_terms_with_options` for the row-iter / rescaling
+    /// `sigma_exact_joint_psi_terms_with_options` for the row-iter / weighting
     /// contract.
     pub(crate) fn sigma_exact_joint_psisecond_order_terms_with_options(
         &self,
@@ -4821,8 +4821,8 @@ impl BernoulliMarginalSlopeFamily {
 
     /// Outer-aware variant of `sigma_exact_joint_psihessian_directional_derivative`.
     /// See `sigma_exact_joint_psi_terms_with_options` for the row-iter /
-    /// rescaling contract — the returned dense Hessian-derivative matrix is
-    /// rescaled element-wise by `weight_scale` when a subsample is active.
+    /// weighting contract — the returned dense Hessian-derivative matrix is
+    /// accumulated with per-row inverse-inclusion weights when a subsample is active.
     pub(crate) fn sigma_exact_joint_psihessian_directional_derivative_with_options(
         &self,
         block_states: &[ParameterBlockState],
@@ -9437,9 +9437,9 @@ impl BernoulliMarginalSlopeFamily {
     /// Outer-aware variant of `exact_newton_joint_psi_terms_from_cache`. When
     /// `options.outer_score_subsample` is `None`, iterates all rows and is
     /// bit-for-bit equivalent to the legacy implementation. When `Some`, only
-    /// the masked rows contribute and every row-summed component (objective
-    /// scalar, score vector, Hessian operator blocks) is rescaled by
-    /// `weight_scale = n_full / |mask|` (Horvitz-Thompson).
+    /// the sampled rows contribute and every row-summed component (objective
+    /// scalar, score vector, Hessian operator blocks) is accumulated with the
+    /// row's Horvitz-Thompson inverse-inclusion weight.
     pub(crate) fn exact_newton_joint_psi_terms_from_cache_with_options(
         &self,
         block_states: &[ParameterBlockState],
@@ -9607,7 +9607,7 @@ impl BernoulliMarginalSlopeFamily {
 
     /// Outer-aware variant of `exact_newton_joint_psisecond_order_terms_from_cache`.
     /// See `exact_newton_joint_psi_terms_from_cache_with_options` for the
-    /// row-iter / rescaling contract.
+    /// row-iter / weighting contract.
     pub(crate) fn exact_newton_joint_psisecond_order_terms_from_cache_with_options(
         &self,
         block_states: &[ParameterBlockState],
@@ -9926,11 +9926,11 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     /// Outer-aware variant of `exact_newton_joint_psihessian_directional_derivative_from_cache`.
-    /// When `options.outer_score_subsample` is `Some`, only the masked rows
-    /// are visited and the accumulated dense Hessian-action matrix is rescaled
-    /// by the Horvitz-Thompson `weight_scale`. See
+    /// When `options.outer_score_subsample` is `Some`, only the sampled rows
+    /// are visited and the accumulated dense Hessian-action matrix uses
+    /// per-row Horvitz-Thompson inverse-inclusion weights. See
     /// `exact_newton_joint_psi_terms_from_cache_with_options` for the
-    /// row-iter / rescaling contract.
+    /// row-iter / weighting contract.
     pub(crate) fn exact_newton_joint_psihessian_directional_derivative_from_cache_with_options(
         &self,
         block_states: &[ParameterBlockState],
@@ -10061,11 +10061,11 @@ impl BernoulliMarginalSlopeFamily {
     /// workspace always threads its own `BlockwiseFitOptions`), so the legacy
     /// non-`_with_options` shim is omitted.
     /// When `options.outer_score_subsample` is `Some`, only the masked rows
-    /// are visited and the accumulated block Hessian operator is rescaled by
-    /// the Horvitz-Thompson `weight_scale` before being wrapped in the
+    /// are visited and the accumulated block Hessian operator uses per-row
+    /// Horvitz-Thompson inverse-inclusion weights before being wrapped in the
     /// `HyperOperator`. See
     /// `exact_newton_joint_psi_terms_from_cache_with_options` for the
-    /// row-iter / rescaling contract.
+    /// row-iter / weighting contract.
     pub(crate) fn exact_newton_joint_psihessian_directional_derivative_operator_from_cache_with_options(
         &self,
         block_states: &[ParameterBlockState],
@@ -10210,7 +10210,7 @@ impl BernoulliMarginalSlopeFamily {
     /// Outer-aware variant of `exact_newton_joint_hessian_directional_derivative_from_cache`.
     /// When `options.outer_score_subsample` is `Some`, only the masked rows
     /// are visited and the accumulated dense Hessian directional-derivative
-    /// matrix is rescaled by the Horvitz-Thompson `weight_scale` before
+    /// matrix uses per-row Horvitz-Thompson inverse-inclusion weights before
     /// densification.
     pub(crate) fn exact_newton_joint_hessian_directional_derivative_from_cache_with_options(
         &self,
@@ -10306,8 +10306,8 @@ impl BernoulliMarginalSlopeFamily {
     /// derivative. The default-options shim is omitted because the
     /// `BernoulliMarginalSlopeExactNewtonJointHessianWorkspace` always threads
     /// its own `BlockwiseFitOptions`. When `options.outer_score_subsample` is `Some`, only the
-    /// masked rows are visited and the accumulator is rescaled by the
-    /// Horvitz-Thompson `weight_scale` before being wrapped in the operator.
+    /// sampled rows are visited and the accumulator uses per-row
+    /// Horvitz-Thompson inverse-inclusion weights before being wrapped in the operator.
     pub(crate) fn exact_newton_joint_hessian_directional_derivative_operator_from_cache_with_options(
         &self,
         block_states: &[ParameterBlockState],
@@ -10573,7 +10573,7 @@ impl BernoulliMarginalSlopeFamily {
     /// `exact_newton_joint_hessiansecond_directional_derivative_from_cache`.
     /// When `options.outer_score_subsample` is `Some`, only the masked rows
     /// are visited and the accumulated dense second-directional Hessian
-    /// matrix is rescaled by the Horvitz-Thompson `weight_scale`.
+    /// matrix uses per-row Horvitz-Thompson inverse-inclusion weights.
     pub(crate) fn exact_newton_joint_hessiansecond_directional_derivative_from_cache_with_options(
         &self,
         block_states: &[ParameterBlockState],
@@ -10658,8 +10658,8 @@ impl BernoulliMarginalSlopeFamily {
     /// derivative. The default-options shim is omitted because the
     /// `BernoulliMarginalSlopeExactNewtonJointHessianWorkspace` always threads
     /// its own `BlockwiseFitOptions`. When `options.outer_score_subsample` is `Some`, only the
-    /// masked rows are visited and the accumulator is rescaled by the
-    /// Horvitz-Thompson `weight_scale` before being wrapped in the operator.
+    /// sampled rows are visited and the accumulator uses per-row
+    /// Horvitz-Thompson inverse-inclusion weights before being wrapped in the operator.
     pub(crate) fn exact_newton_joint_hessiansecond_directional_derivative_operator_from_cache_with_options(
         &self,
         block_states: &[ParameterBlockState],

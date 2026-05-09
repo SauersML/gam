@@ -235,8 +235,8 @@ pub(crate) fn boundary_hit_indices(
 /// **Invariant:** caller must have already established the matrix is
 /// positive definite. For indefinite matrices λ_min may be negative or
 /// zero and the ratio max/min becomes meaningless (it can be negative or
-/// infinite even when the matrix is well-scaled). Use
-/// [`indefinite_safe_condition_number`] when the spectrum sign is unknown.
+/// infinite even when the matrix is well-scaled). When the spectrum sign is
+/// unknown, inspect inertia directly via [`symmetric_extremes`].
 pub(crate) fn symmetric_spectrum_condition_number(matrix: &Array2<f64>) -> f64 {
     matrix
         .eigh(Side::Lower)
@@ -251,31 +251,6 @@ pub(crate) fn symmetric_spectrum_condition_number(matrix: &Array2<f64>) -> f64 {
             max / min.max(1e-12)
         })
         .unwrap_or(f64::NAN)
-}
-
-/// Indefinite-safe variant: returns `Err(min_eigenvalue)` when the matrix
-/// is not numerically positive definite. The error payload exposes
-/// `λ_min` so the caller can route into a stabilization-ledger
-/// `bump_with_matrix` call with an inertia-target rule rather than
-/// silently consuming a misleading "condition number" value.
-pub(crate) fn indefinite_safe_condition_number(matrix: &Array2<f64>) -> Result<f64, f64> {
-    let (evals, _) = matrix.eigh(Side::Lower).map_err(|_| f64::NAN)?;
-    let mut min = f64::INFINITY;
-    let mut max = f64::NEG_INFINITY;
-    for &v in evals.iter() {
-        if v < min {
-            min = v;
-        }
-        if v > max {
-            max = v;
-        }
-    }
-    let pd_floor = max.abs().max(1.0) * 1e-14;
-    if min <= pd_floor {
-        Err(min)
-    } else {
-        Ok(max / min)
-    }
 }
 
 /// Estimate min/max eigenvalues of a symmetric matrix via a short

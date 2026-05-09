@@ -28,7 +28,7 @@ use crate::basis::{
     BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
     create_ispline_derivative_dense,
 };
-use crate::faer_ndarray::{fast_ab, fast_ab_into, fast_atb};
+use crate::faer_ndarray::{fast_ab, fast_atb};
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
@@ -105,14 +105,6 @@ const LARGE_SAMPLE_TRANSFORMATION_TENSOR_WIDTH: usize = 320;
 /// E[log |Z|] for Z ~ N(0, 1), used to put local log-absolute residual
 /// projections on the standard-normal scale.
 const STANDARD_NORMAL_MEAN_LOG_ABS: f64 = -0.635_181_422_730_739_1;
-/// Relative tolerance for response-grid deduplication and zero-width-gap
-/// skipping. Used by both the fit-time grid builder
-/// (`transformation_monotonicity_response_grid`) and the predict-time
-/// derivative-grid builder. Kept in sync so the two grids generate the
-/// same point set on identical inputs (otherwise predict could hit a
-/// distinct grid point that the fit-time barrier never bounded).
-pub const TRANSFORMATION_GRID_RELATIVE_TOL: f64 = 1.0e-12;
-
 /// Strict-feasibility margin for `h' > 0` on the monotonicity grid. Used
 /// both by the fit-time fraction-to-boundary line search (so accepted β
 /// keeps `h'(grid) ≥ EPS`) and by the predict-time monotonicity check
@@ -129,12 +121,6 @@ pub const TRANSFORMATION_MONOTONICITY_EPS: f64 = 1.0e-8;
 /// land outside practically observable normal quantiles before the line search
 /// moves them back into the likelihood's high-density region.
 pub const TRANSFORMATION_NORMAL_H_ABS_MAX: f64 = 1.0e6;
-/// Maximum number of response quantiles drawn into the monotonicity grid.
-/// Shared between fit and predict so the grid construction is identical.
-pub const TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES: usize = 129;
-/// Number of equal subdivisions inserted between consecutive grid points
-/// (knots + quantiles). Shared between fit and predict.
-pub const TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS: usize = 4;
 /// Number of dense-spectral factor columns processed per exact ψψ HVP row pass.
 /// At biobank CTN dimensions p≈800, this keeps the per-worker accumulator well
 /// under 1 MiB while reducing repeated SCOP row-invariant work by 32× relative
@@ -186,16 +172,6 @@ pub struct TransformationNormalFamily {
     x_val_kron: KroneckerDesign,
     /// Derivative design operator: keeps the tensor factors separate.
     x_deriv_kron: KroneckerDesign,
-    /// Derivative design operator on the monotonicity grid: the virtual row
-    /// space is the Cartesian product of all training covariate rows with a
-    /// bounded response grid (knots, support quantiles, interval guard points,
-    /// tail guards). Stored as the `KroneckerDesign::Kronecker` variant —
-    /// the (n_grid × p_resp) response-direction factor and the unmodified
-    /// covariate design are kept separate, so the n_cov*n_grid × p_total
-    /// row-replicated form is never materialized. Only `forward_mul` is
-    /// invoked downstream (interior-point fraction-to-boundary line search).
-    x_deriv_grid_kron: KroneckerDesign,
-
     // --- Response-direction basis (fixed, does not depend on κ) ---
     /// Response value basis: n × p_resp. Columns: [1, I_1(y), ..., I_k(y)].
     response_val_basis: Array2<f64>,
@@ -760,25 +736,9 @@ impl TransformationNormalFamily {
         // ----- 2. Row-wise Kronecker product (operator form) -----
         let x_val_kron = KroneckerDesign::new_khatri_rao(&resp_val, covariate_design.clone())?;
         let x_deriv_kron = KroneckerDesign::new_khatri_rao(&resp_deriv, covariate_design.clone())?;
-        let x_deriv_grid_kron = build_monotonicity_derivative_grid_kron(
-            response,
-            &resp_knots,
-            config.response_degree,
-            &resp_transform,
-            &covariate_design,
-        )?;
         let p_total = p_resp * p_cov;
         debug_assert_eq!(x_val_kron.ncols(), p_total);
         debug_assert_eq!(x_deriv_kron.ncols(), p_total);
-        debug_assert_eq!(x_deriv_grid_kron.ncols(), p_total);
-        // Hard invariant (release+debug): the monotonicity grid design must
-        // remain the Kronecker variant. Switching it to the row-wise KhatriRao
-        // variant re-introduces the n_cov*n_grid row replication and OOMs at
-        // biobank scale. Cost is one match per family construction.
-        assert!(
-            matches!(x_deriv_grid_kron, KroneckerDesign::Kronecker { .. }),
-            "x_deriv_grid_kron must be the Kronecker variant — KhatriRao re-introduces O(n_cov*n_grid*p_total) row-replicated materialization",
-        );
 
         // ----- 3. Warm start -----
         let initial_beta = compute_warm_start(
@@ -823,7 +783,6 @@ impl TransformationNormalFamily {
         Ok(Self {
             x_val_kron,
             x_deriv_kron,
-            x_deriv_grid_kron,
             response_val_basis: resp_val,
             response_lower_basis,
             response_upper_basis,
@@ -943,19 +902,6 @@ impl TransformationNormalFamily {
         debug_assert_eq!(x_val_kron.ncols(), p_total);
         debug_assert_eq!(x_deriv_kron.ncols(), p_total);
 
-        let x_deriv_grid_kron = build_monotonicity_derivative_grid_kron(
-            response,
-            &response_knots,
-            response_degree,
-            &response_transform,
-            &covariate_design,
-        )?;
-        debug_assert_eq!(x_deriv_grid_kron.ncols(), p_total);
-        // Hard invariant — see TransformationNormalFamily::new for rationale.
-        assert!(
-            matches!(x_deriv_grid_kron, KroneckerDesign::Kronecker { .. }),
-            "x_deriv_grid_kron must be the Kronecker variant — KhatriRao re-introduces O(n_cov*n_grid*p_total) row-replicated materialization",
-        );
         let initial_beta = compute_warm_start(
             response,
             weights,
@@ -997,7 +943,6 @@ impl TransformationNormalFamily {
         Ok(Self {
             x_val_kron,
             x_deriv_kron,
-            x_deriv_grid_kron,
             response_val_basis,
             response_lower_basis,
             response_upper_basis,
@@ -9071,52 +9016,6 @@ fn build_response_basis(
     Ok((resp_val, resp_deriv, resp_penalties, knots, transform))
 }
 
-/// Evaluate the SCOP derivative response basis `[0, M_k(y)]` at `values`.
-///
-/// `transform` is the SCOP-CTN coef-transform; under the I-spline response
-/// basis it is the identity (size p_shape × p_shape), but it is still applied
-/// to handle the (atypical) case of a non-identity caller-provided transform
-/// without requiring the call sites to be aware of it. The output has shape
-/// `values.len() × (1 + transform.ncols())`.
-fn evaluate_response_derivative_basis(
-    values: &Array1<f64>,
-    knots: &Array1<f64>,
-    degree: usize,
-    transform: &Array2<f64>,
-) -> Result<Array2<f64>, String> {
-    for (i, &value) in values.iter().enumerate() {
-        if !value.is_finite() {
-            return Err(format!(
-                "response monotonicity grid value {i} is not finite: {value}"
-            ));
-        }
-    }
-    if knots.is_empty() {
-        return Err("response derivative grid needs knots".to_string());
-    }
-    if degree < 1 {
-        return Err(format!(
-            "response degree must be >= 1 for I-spline derivative, got {degree}"
-        ));
-    }
-
-    // M_k(y) = I'_k(y) at the grid points.
-    let raw_m = create_ispline_derivative_dense(values.view(), knots, degree, 1)
-        .map_err(|e| e.to_string())?;
-
-    if raw_m.ncols() != transform.nrows() {
-        return Err(format!(
-            "response derivative transform shape mismatch: M_k cols={} transform rows={}",
-            raw_m.ncols(),
-            transform.nrows()
-        ));
-    }
-    let shape_deriv = fast_ab(&raw_m, transform);
-    let mut out = Array2::<f64>::zeros((values.len(), shape_deriv.ncols() + 1));
-    out.slice_mut(s![.., 1..]).assign(&shape_deriv);
-    Ok(out)
-}
-
 fn response_endpoint_value_bases(transform: &Array2<f64>) -> (Array1<f64>, Array1<f64>) {
     let mut lower = Array1::<f64>::zeros(transform.ncols() + 1);
     let mut upper = Array1::<f64>::zeros(transform.ncols() + 1);
@@ -9147,216 +9046,6 @@ fn response_floor_offsets(
         TRANSFORMATION_MONOTONICITY_EPS * (lower_y - response_median),
         TRANSFORMATION_MONOTONICITY_EPS * (upper_y - response_median),
     )
-}
-
-fn transformation_monotonicity_response_grid(
-    response: &Array1<f64>,
-    knots: &Array1<f64>,
-) -> Result<Array1<f64>, String> {
-    if response.is_empty() {
-        return Err(
-            "cannot build transformation monotonicity grid with no response values".to_string(),
-        );
-    }
-    let mut min_y = f64::INFINITY;
-    let mut max_y = f64::NEG_INFINITY;
-    let mut values = Vec::with_capacity(
-        TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES
-            + knots.len() * (TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS + 1)
-            + 4,
-    );
-    for (i, &value) in response.iter().enumerate() {
-        if !value.is_finite() {
-            return Err(format!("response[{i}] is not finite: {value}"));
-        }
-        min_y = min_y.min(value);
-        max_y = max_y.max(value);
-    }
-    let mut sorted_response = response.to_vec();
-    sorted_response.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    if sorted_response.len() == 1 {
-        values.push(sorted_response[0]);
-    } else {
-        let quantiles = sorted_response
-            .len()
-            .min(TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES);
-        for q in 0..quantiles {
-            let idx = if quantiles == 1 {
-                0
-            } else {
-                q * (sorted_response.len() - 1) / (quantiles - 1)
-            };
-            values.push(sorted_response[idx]);
-        }
-    }
-    for &knot in knots.iter() {
-        if knot.is_finite() {
-            values.push(knot);
-            min_y = min_y.min(knot);
-            max_y = max_y.max(knot);
-        }
-    }
-    let span = (max_y - min_y).abs().max(1.0);
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let base_values = values.clone();
-    for window in base_values.windows(2) {
-        let left = window[0];
-        let right = window[1];
-        let width = right - left;
-        if width <= TRANSFORMATION_GRID_RELATIVE_TOL * span {
-            continue;
-        }
-        for sidx in 1..TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS {
-            let frac = sidx as f64 / TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS as f64;
-            values.push(left + frac * width);
-        }
-    }
-    // No tail guard. The B-spline derivative basis clamps `x` to the basis
-    // support `[t_d, t_{p_basis}]`, so any check at `min_y - guard`
-    // evaluates the same `B_k'` as the boundary point — already covered by
-    // the existing knot/quantile entries. The historical 25% extension was
-    // a no-op redundant scan that nonetheless drove the perception that
-    // CTN was extrapolating outside the basis. Removing it makes the fit
-    // and predict checks operate on the same support.
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    values.dedup_by(|a, b| (*a - *b).abs() <= TRANSFORMATION_GRID_RELATIVE_TOL * span);
-    Ok(Array1::from_vec(values))
-}
-
-fn build_monotonicity_derivative_grid_kron(
-    response: &Array1<f64>,
-    knots: &Array1<f64>,
-    degree: usize,
-    transform: &Array2<f64>,
-    covariate_design: &DesignMatrix,
-) -> Result<KroneckerDesign, String> {
-    let response_grid = transformation_monotonicity_response_grid(response, knots)?;
-    let response_deriv_grid_raw =
-        evaluate_response_derivative_basis(&response_grid, knots, degree, transform)?;
-    let keep_rows: Vec<usize> = (0..response_deriv_grid_raw.nrows())
-        .filter(|&i| {
-            response_deriv_grid_raw
-                .row(i)
-                .slice(s![1..])
-                .iter()
-                .any(|&v| v > 0.0)
-        })
-        .collect();
-    if keep_rows.is_empty() {
-        return Err("SCOP monotonicity grid has no positive derivative rows".to_string());
-    }
-    let mut response_deriv_grid =
-        Array2::<f64>::zeros((keep_rows.len(), response_deriv_grid_raw.ncols()));
-    for (out_i, &src_i) in keep_rows.iter().enumerate() {
-        response_deriv_grid
-            .row_mut(out_i)
-            .assign(&response_deriv_grid_raw.row(src_i));
-    }
-    // SCOP monotonicity is coefficient-side: `h'(y,x)=Σ_k M_k(y)γ_k(x)^2`.
-    // The old affine-deviation loose-bound rows encoded linear B-spline
-    // derivative identities and are invalid for squared I-spline shape
-    // components. The M-spline grid rows are therefore the entire response-side
-    // constraint set here; covariate axis-extreme rows below keep the same
-    // train/predict covariate support contract.
-    // Augment the covariate side with `2 · p_cov` axis-extreme rows so the
-    // loose-bound certificate `β₁(x) + δ_k(x) ≥ ε` holds at every corner of
-    // the axis-aligned box `[col_min_j, col_max_j]^{p_cov}` reached after
-    // `axis_clip_to_training_ranges` on the predict path. Each axis-extreme
-    // row is the training-mean covariate vector with column j replaced by
-    // the training column min (then max) of that column. Rows of the
-    // training design are unchanged; the augmented matrix simply has
-    // `2 · p_cov` extra rows appended after the original n. The resulting
-    // covariate side lives in the same (already-standardized) space the
-    // training design was built in — we read training stats directly out
-    // of `covariate_design` and emit values in that same coordinate
-    // system, so no extra transform is applied.
-    let augmented_covariate_design = augment_covariate_design_with_axis_extremes(covariate_design)?;
-    // Build the operator factored: the small (n_grid × p_resp) response-side
-    // factor and the augmented covariate design. The implied virtual row
-    // space is (n_cov + 2·p_cov) × n_grid — never materialized.
-    KroneckerDesign::new_kronecker(response_deriv_grid, augmented_covariate_design)
-}
-
-/// Append `2 · p_cov` axis-extreme rows to a covariate design.
-///
-/// Each axis-extreme row is the training-mean covariate vector with column
-/// `j` replaced by the training column min (rows 0..p_cov) or training
-/// column max (rows p_cov..2·p_cov). These rows act as additional
-/// monotonicity feasibility constraints in the loose-bound row set so the
-/// certificate `β₁(x) + δ_k(x) ≥ ε` holds at the corners of the
-/// axis-aligned predict-time box, not only at training rows.
-///
-/// Sparse designs are materialized through `try_to_dense_by_chunks` so the
-/// per-column min / mean / max can be read; for biobank-scale dense CTN
-/// (the common case) this is a single dense pass.
-fn augment_covariate_design_with_axis_extremes(
-    covariate_design: &DesignMatrix,
-) -> Result<DesignMatrix, String> {
-    let n_train = covariate_design.nrows();
-    let p_cov = covariate_design.ncols();
-    if n_train == 0 || p_cov == 0 {
-        return Ok(covariate_design.clone());
-    }
-    // Per-column training mean / min / max via chunked row scan, so giant
-    // sparse designs never densify in one shot.
-    let mut col_sum = Array1::<f64>::zeros(p_cov);
-    let mut col_min = Array1::<f64>::from_elem(p_cov, f64::INFINITY);
-    let mut col_max = Array1::<f64>::from_elem(p_cov, f64::NEG_INFINITY);
-    let chunk_rows = 4096usize.min(n_train.max(1));
-    for start in (0..n_train).step_by(chunk_rows) {
-        let end = (start + chunk_rows).min(n_train);
-        let chunk = covariate_design.try_row_chunk(start..end).map_err(|e| {
-            format!(
-                "monotonicity grid axis-extreme augmentation: failed to read row chunk \
-                 [{start},{end}): {e}"
-            )
-        })?;
-        for j in 0..p_cov {
-            let col = chunk.column(j);
-            let mut sum = 0.0;
-            let mut lo = col_min[j];
-            let mut hi = col_max[j];
-            for &v in col.iter() {
-                sum += v;
-                if v < lo {
-                    lo = v;
-                }
-                if v > hi {
-                    hi = v;
-                }
-            }
-            col_sum[j] += sum;
-            col_min[j] = lo;
-            col_max[j] = hi;
-        }
-    }
-    let inv_n = 1.0 / n_train as f64;
-    let col_mean = col_sum.mapv(|s| s * inv_n);
-
-    // Build the augmented dense matrix: original rows on top, axis-extreme
-    // rows on the bottom. The original rows are streamed back in chunks to
-    // avoid a redundant n × p_cov peak.
-    let extra_rows = 2 * p_cov;
-    let mut augmented = Array2::<f64>::zeros((n_train + extra_rows, p_cov));
-    for start in (0..n_train).step_by(chunk_rows) {
-        let end = (start + chunk_rows).min(n_train);
-        let chunk = covariate_design.try_row_chunk(start..end).map_err(|e| {
-            format!(
-                "monotonicity grid axis-extreme augmentation: failed to copy row chunk \
-                 [{start},{end}): {e}"
-            )
-        })?;
-        augmented.slice_mut(s![start..end, ..]).assign(&chunk);
-    }
-    for j in 0..p_cov {
-        let mut row_min = augmented.row_mut(n_train + j);
-        row_min.assign(&col_mean);
-        row_min[j] = col_min[j];
-        let mut row_max = augmented.row_mut(n_train + p_cov + j);
-        row_max.assign(&col_mean);
-        row_max[j] = col_max[j];
-    }
-    Ok(DesignMatrix::from(augmented))
 }
 
 fn effective_response_num_internal_knots(
@@ -9448,68 +9137,10 @@ fn assert_no_rowwise_kronecker_materialization(n: usize, p_resp: usize, p_cov: u
 // Kronecker-aware operator for biobank-scale tensor products
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
-#[derive(Clone, Debug)]
-struct KroneckerActiveSetCache {
-    active_pairs: Vec<(usize, usize)>,
-    min_inactive_margin: f64,
-    max_response_norm: Option<f64>,
-    max_covariate_norm: Option<f64>,
-    c_version: u64,
-    cached_for_version: u64,
-    c_fingerprint: [f64; 3],
-    n: usize,
-    n_grid: usize,
-    p_resp: usize,
-    slack: f64,
-    dh_eps: f64,
-}
-
-#[cfg(test)]
-impl KroneckerActiveSetCache {
-    fn new() -> Self {
-        Self {
-            active_pairs: Vec::new(),
-            min_inactive_margin: f64::INFINITY,
-            max_response_norm: None,
-            max_covariate_norm: None,
-            c_version: 0,
-            cached_for_version: u64::MAX,
-            c_fingerprint: [f64::NAN; 3],
-            n: 0,
-            n_grid: 0,
-            p_resp: 0,
-            slack: f64::NAN,
-            dh_eps: f64::NAN,
-        }
-    }
-
-    fn fingerprint_of(c: ndarray::ArrayView2<'_, f64>) -> [f64; 3] {
-        let n = c.nrows();
-        let p = c.ncols();
-        if n == 0 || p == 0 {
-            return [0.0; 3];
-        }
-        let mid_i = n / 2;
-        let mid_j = p / 2;
-        [c[[0, 0]], c[[mid_i, mid_j]], c[[n - 1, p - 1]]]
-    }
-}
-
-/// Discriminated union over two factored representations of a Kronecker-shaped
-/// design. Both variants compute `forward_mul` and `transpose_mul` from the
-/// natural factor pair without ever materializing the full matrix.
-///
-/// `KhatriRao` is the row-wise Kronecker (face-splitting / Khatri–Rao) product
-/// `A ⊙ B`: both factors share `n` rows, and each output row is the elementwise
-/// Kronecker of the corresponding factor rows. Used for designs whose virtual
-/// rows already correspond one-to-one with covariate rows (value and
-/// derivative designs at observation points).
-///
-/// `Kronecker` is the full tensor product. The virtual row space is the
-/// Cartesian product `n_cov × n_grid`; the two factors do not share a row
-/// count and are never replicated. Used for the monotonicity grid, where each
-/// covariate row is paired with every response grid point.
+/// Row-wise Kronecker (face-splitting / Khatri-Rao) design operator for
+/// transformation-normal value and derivative rows. It computes `forward_mul`
+/// and `transpose_mul` from the natural factor pair without ever materializing
+/// the full matrix.
 #[derive(Clone)]
 enum KroneckerDesign {
     /// Row-wise Khatri–Rao product `A ⊙ B`.
@@ -9531,103 +9162,6 @@ enum KroneckerDesign {
         left: Array2<f64>,   // n × p_a
         right: DesignMatrix, // n × p_b
     },
-    /// Full Kronecker product `R ⊗ C` with covariate-major row flattening.
-    ///
-    /// The virtual row space is the Cartesian product `n_cov × n_grid` with row
-    /// index `i*n_grid + g` (covariate-major); columns use the same response-
-    /// major ordering `a*p_cov + b` as `KhatriRao`. Defined elementwise:
-    /// ```text
-    ///     X[(i, g), (a, b)]  =  R[g, a] · C[i, b]
-    /// ```
-    /// where `R = response_grid` (n_grid × p_resp) and `C = covariate`
-    /// (n_cov × p_cov).
-    ///
-    /// Forward identity (used by `forward_mul`):
-    /// ```text
-    ///     (X β)[i*n_grid + g]
-    ///       = Σ_{a,b} R[g,a] · C[i,b] · β_mat[a,b]
-    ///       = Σ_a R[g,a] · (C · β_matᵀ)[i, a]
-    ///       = ((C · β_matᵀ) · Rᵀ)[i, g]
-    /// ```
-    /// with `β_mat[a, b] = β[a*p_cov + b]` (row-major reshape into
-    /// `p_resp × p_cov`).
-    ///
-    /// Transpose identity (used by `transpose_mul`):
-    /// ```text
-    ///     (Xᵀ v)[(a, b)]
-    ///       = Σ_{i,g} v[i*n_grid+g] · R[g,a] · C[i,b]
-    ///       = Σ_i C[i,b] · (V · R)[i, a]            with V[i,g] = v[i*n_grid+g]
-    ///       = (Cᵀ · (V · R)[:, a])[b]
-    /// ```
-    ///
-    /// In exact arithmetic these identities are a strict reassociation of the
-    /// materialized `Σ_{a,b}` sum; in IEEE-754 the factored and replicated
-    /// forms agree to within the BLAS-accumulation rounding floor (~1e-15).
-    /// Storage: `O(n_grid · p_resp + storage(C))` instead of the row-replicated
-    /// `O(n_cov · n_grid · (p_resp + p_cov))`.
-    Kronecker {
-        /// (n_grid × p_resp) — small response-direction derivative basis on
-        /// the monotonicity grid. Independent of covariate rows.
-        response_grid: Array2<f64>,
-        /// (n_cov × p_cov) — original covariate design, never replicated.
-        covariate: DesignMatrix,
-    },
-}
-
-fn scop_quadratic_boundary_root(
-    response_row: ArrayView1<'_, f64>,
-    gamma_row: ArrayView1<'_, f64>,
-    dgamma_row: ArrayView1<'_, f64>,
-    slack: f64,
-    dh_eps: f64,
-) -> f64 {
-    let p_resp = response_row.len();
-    debug_assert_eq!(gamma_row.len(), p_resp);
-    debug_assert_eq!(dgamma_row.len(), p_resp);
-
-    let mut a = 0.0;
-    let mut b = response_row[0] * dgamma_row[0];
-    let mut c = response_row[0] * gamma_row[0] - slack;
-    for k in 1..p_resp {
-        let r = response_row[k];
-        let g = gamma_row[k];
-        let d = dgamma_row[k];
-        a += r * d * d;
-        b += 2.0 * r * g * d;
-        c += r * g * g;
-    }
-    if !(c.is_finite() && a.is_finite() && b.is_finite()) {
-        return 0.0;
-    }
-    if c <= 0.0 {
-        return 0.0;
-    }
-    if a.abs() <= dh_eps {
-        if b < -dh_eps {
-            let root = -c / b;
-            return if root.is_finite() && root > 0.0 {
-                root
-            } else {
-                f64::INFINITY
-            };
-        }
-        return f64::INFINITY;
-    }
-    let disc = b.mul_add(b, -4.0 * a * c);
-    if disc < 0.0 || !disc.is_finite() {
-        return f64::INFINITY;
-    }
-    let sqrt_disc = disc.sqrt();
-    let r1 = (-b - sqrt_disc) / (2.0 * a);
-    let r2 = (-b + sqrt_disc) / (2.0 * a);
-    let mut best = f64::INFINITY;
-    if r1.is_finite() && r1 > 0.0 {
-        best = best.min(r1);
-    }
-    if r2.is_finite() && r2 > 0.0 {
-        best = best.min(r2);
-    }
-    best
 }
 
 impl KroneckerDesign {
@@ -9646,39 +9180,15 @@ impl KroneckerDesign {
         })
     }
 
-    /// Construct the outer-factored variant used by the monotonicity grid: the
-    /// virtual row space is the Cartesian product `n_cov × n_grid`, and the
-    /// two factors never need to share a row count.
-    fn new_kronecker(response_grid: Array2<f64>, covariate: DesignMatrix) -> Result<Self, String> {
-        if response_grid.ncols() == 0 {
-            return Err("Kronecker response_grid has zero columns".to_string());
-        }
-        if covariate.ncols() == 0 {
-            return Err("Kronecker covariate has zero columns".to_string());
-        }
-        Ok(KroneckerDesign::Kronecker {
-            response_grid,
-            covariate,
-        })
-    }
-
     fn nrows(&self) -> usize {
         match self {
             KroneckerDesign::KhatriRao { left, .. } => left.nrows(),
-            KroneckerDesign::Kronecker {
-                response_grid,
-                covariate,
-            } => covariate.nrows() * response_grid.nrows(),
         }
     }
 
     fn ncols(&self) -> usize {
         match self {
             KroneckerDesign::KhatriRao { left, right } => left.ncols() * right.ncols(),
-            KroneckerDesign::Kronecker {
-                response_grid,
-                covariate,
-            } => response_grid.ncols() * covariate.ncols(),
         }
     }
 
@@ -9715,35 +9225,6 @@ impl KroneckerDesign {
                         .par_for_each(|r, &c, &l| *r += l * c);
                 }
                 result
-            }
-            KroneckerDesign::Kronecker {
-                response_grid,
-                covariate,
-            } => {
-                let n_cov = covariate.nrows();
-                let n_grid = response_grid.nrows();
-                let p_resp = response_grid.ncols();
-                let p_cov = covariate.ncols();
-                debug_assert_eq!(beta.len(), p_resp * p_cov);
-                let beta_mat = beta.view().into_shape_with_order((p_resp, p_cov)).unwrap();
-                // inner[i, a] = covariate.apply(beta_mat[a, :])[i] — shape (n_cov × p_resp).
-                let mut inner = Array2::<f64>::zeros((n_cov, p_resp));
-                for a in 0..p_resp {
-                    let cov_part = covariate.apply(&beta_mat.row(a).to_owned());
-                    inner.column_mut(a).assign(&cov_part);
-                }
-                // result_2d = inner · response_grid^T  →  (n_cov × n_grid),
-                // written directly into the row-major buffer that the returned
-                // Array1 will own. Default Array2 layout is row-major C-order,
-                // so flattening yields result[i*n_grid + g] = result_2d[i, g] —
-                // exactly the covariate-major virtual-row layout.
-                // response_grid.t() is a zero-copy transposed view; faer accepts
-                // any positive-strided layout, so no temporary copy is made.
-                let mut result_2d = Array2::<f64>::zeros((n_cov, n_grid));
-                fast_ab_into(&inner, &response_grid.t(), &mut result_2d);
-                result_2d
-                    .into_shape_with_order((n_cov * n_grid,))
-                    .expect("row-major Array2 flattens to Array1 of length n_cov*n_grid")
             }
         }
     }
@@ -9804,543 +9285,7 @@ impl KroneckerDesign {
                     });
                 result
             }
-            KroneckerDesign::Kronecker {
-                response_grid,
-                covariate,
-            } => {
-                let n_cov = covariate.nrows();
-                let n_grid = response_grid.nrows();
-                let p_resp = response_grid.ncols();
-                let p_cov = covariate.ncols();
-                debug_assert_eq!(beta.len(), p_resp * p_cov);
-                let beta_mat = beta.view().into_shape_with_order((p_resp, p_cov)).unwrap();
-                // gamma[i, k] = γ_k(x_i) — covariate-side per response component.
-                let mut gamma = Array2::<f64>::zeros((n_cov, p_resp));
-                for k in 0..p_resp {
-                    let cov_part = covariate.apply(&beta_mat.row(k).to_owned());
-                    gamma.column_mut(k).assign(&cov_part);
-                }
-                // features[i,0] = γ_0(x_i); features[i,k>=1] = γ_k(x_i)².
-                let mut features = gamma;
-                for mut row in features.rows_mut() {
-                    for k in 1..p_resp {
-                        row[k] *= row[k];
-                    }
-                }
-                // result_2d[i, g] = response_grid[g,0]γ_0(x_i)
-                //               + Σ_{k>=1} response_grid[g,k]γ_k(x_i)².
-                let mut result_2d = Array2::<f64>::zeros((n_cov, n_grid));
-                fast_ab_into(&features, &response_grid.t(), &mut result_2d);
-                result_2d
-                    .into_shape_with_order((n_cov * n_grid,))
-                    .expect("row-major Array2 flattens to Array1 of length n_cov*n_grid")
-            }
         }
-    }
-
-    fn scop_affine_squared_min_step_to_boundary(
-        &self,
-        beta: &Array1<f64>,
-        delta: &Array1<f64>,
-        slack: f64,
-        dh_eps: f64,
-    ) -> f64 {
-        match self {
-            KroneckerDesign::KhatriRao { left, right } => {
-                let p_resp = left.ncols();
-                let p_cov = right.ncols();
-                let n = left.nrows();
-                debug_assert_eq!(beta.len(), p_resp * p_cov);
-                debug_assert_eq!(delta.len(), p_resp * p_cov);
-                let beta_mat = beta.view().into_shape_with_order((p_resp, p_cov)).unwrap();
-                let delta_mat = delta.view().into_shape_with_order((p_resp, p_cov)).unwrap();
-                let mut gamma = Array2::<f64>::zeros((n, p_resp));
-                let mut dgamma = Array2::<f64>::zeros((n, p_resp));
-                for k in 0..p_resp {
-                    gamma
-                        .column_mut(k)
-                        .assign(&right.apply(&beta_mat.row(k).to_owned()));
-                    dgamma
-                        .column_mut(k)
-                        .assign(&right.apply(&delta_mat.row(k).to_owned()));
-                }
-                use rayon::prelude::*;
-                (0..n)
-                    .into_par_iter()
-                    .map(|i| {
-                        scop_quadratic_boundary_root(
-                            left.row(i),
-                            gamma.row(i),
-                            dgamma.row(i),
-                            slack,
-                            dh_eps,
-                        )
-                    })
-                    .reduce(|| f64::INFINITY, f64::min)
-            }
-            KroneckerDesign::Kronecker {
-                response_grid,
-                covariate,
-            } => {
-                let n_cov = covariate.nrows();
-                let n_grid = response_grid.nrows();
-                let p_resp = response_grid.ncols();
-                let p_cov = covariate.ncols();
-                debug_assert_eq!(beta.len(), p_resp * p_cov);
-                debug_assert_eq!(delta.len(), p_resp * p_cov);
-                let beta_mat = beta.view().into_shape_with_order((p_resp, p_cov)).unwrap();
-                let delta_mat = delta.view().into_shape_with_order((p_resp, p_cov)).unwrap();
-                let mut gamma = Array2::<f64>::zeros((n_cov, p_resp));
-                let mut dgamma = Array2::<f64>::zeros((n_cov, p_resp));
-                for k in 0..p_resp {
-                    gamma
-                        .column_mut(k)
-                        .assign(&covariate.apply(&beta_mat.row(k).to_owned()));
-                    dgamma
-                        .column_mut(k)
-                        .assign(&covariate.apply(&delta_mat.row(k).to_owned()));
-                }
-                use rayon::prelude::*;
-                (0..n_cov)
-                    .into_par_iter()
-                    .map(|i| {
-                        let g_row = gamma.row(i);
-                        let dg_row = dgamma.row(i);
-                        let mut best = f64::INFINITY;
-                        for grid_idx in 0..n_grid {
-                            let root = scop_quadratic_boundary_root(
-                                response_grid.row(grid_idx),
-                                g_row,
-                                dg_row,
-                                slack,
-                                dh_eps,
-                            );
-                            best = best.min(root);
-                        }
-                        best
-                    })
-                    .reduce(|| f64::INFINITY, f64::min)
-            }
-        }
-    }
-
-    /// Streaming fraction-to-boundary reduction.
-    ///
-    /// Returns the smallest positive α for which there exists a virtual row
-    /// `r` with `(self · δ)[r] < -dh_eps` and
-    /// `(self · β)[r] + α · (self · δ)[r] = slack`, i.e.
-    ///
-    /// ```text
-    ///     α = ((self · β)[r] - slack) / (-(self · δ)[r])
-    /// ```
-    ///
-    /// minimized over all such `r`. Returns `f64::INFINITY` if no row violates
-    /// the descent threshold.
-    ///
-    /// For the `Kronecker` variant the reduction streams over the
-    /// `n_cov × n_grid` virtual rows from the factored representation: only an
-    /// `n_cov × p_resp` projection (`C = X · β_matᵀ`, `D = X · δ_matᵀ`) and a
-    /// per-thread `chunk_rows × n_grid` scratch buffer are held in memory, so
-    /// the dense `n_cov · n_grid · 8 B` forward image is never materialized.
-    ///
-    /// The reduction is `f64::min`, which is associative for non-NaN inputs,
-    /// so the parallel and serial reductions are bit-equivalent.
-    #[cfg(test)]
-    fn min_step_to_boundary(
-        &self,
-        beta: &Array1<f64>,
-        delta: &Array1<f64>,
-        slack: f64,
-        dh_eps: f64,
-    ) -> f64 {
-        match self {
-            KroneckerDesign::KhatriRao { .. } => {
-                let h = self.forward_mul(beta);
-                let dh = self.forward_mul(delta);
-                use rayon::prelude::*;
-                h.as_slice()
-                    .unwrap()
-                    .par_iter()
-                    .zip(dh.as_slice().unwrap().par_iter())
-                    .map(|(&hi, &dval)| {
-                        if dval < -dh_eps {
-                            (hi - slack) / (-dval)
-                        } else {
-                            f64::INFINITY
-                        }
-                    })
-                    .reduce(|| f64::INFINITY, f64::min)
-            }
-            KroneckerDesign::Kronecker {
-                response_grid,
-                covariate,
-            } => {
-                let n = covariate.nrows();
-                let p_resp = response_grid.ncols();
-                let p_cov = covariate.ncols();
-                debug_assert_eq!(beta.len(), p_resp * p_cov);
-                debug_assert_eq!(delta.len(), p_resp * p_cov);
-                let beta_mat = beta.view().into_shape_with_order((p_resp, p_cov)).unwrap();
-                let delta_mat = delta.view().into_shape_with_order((p_resp, p_cov)).unwrap();
-                // Project β and δ through the covariate operator once. Each
-                // takes p_resp `apply` calls — identical cost to a single
-                // `forward_mul`. Together: `n × p_resp` doubles ≈ 60 MiB at
-                // biobank scale, vs the `2 · n × n_grid ≈ 3 GiB` the prior
-                // pair of `forward_mul` outputs held simultaneously.
-                let mut c = Array2::<f64>::zeros((n, p_resp));
-                let mut d = Array2::<f64>::zeros((n, p_resp));
-                for a in 0..p_resp {
-                    let beta_row = beta_mat.row(a).to_owned();
-                    let delta_row = delta_mat.row(a).to_owned();
-                    c.column_mut(a).assign(&covariate.apply(&beta_row));
-                    d.column_mut(a).assign(&covariate.apply(&delta_row));
-                }
-                let mut cache = KroneckerActiveSetCache::new();
-                Self::scan_kronecker_boundary_and_refresh_cache(
-                    response_grid,
-                    c.view(),
-                    d.view(),
-                    slack,
-                    dh_eps,
-                    n,
-                    response_grid.nrows(),
-                    p_resp,
-                    &mut cache,
-                )
-            }
-        }
-    }
-
-    /// Project a `(p_resp × p_cov)` row-major coefficient vector through the
-    /// covariate factor of the `Kronecker` variant. Returns the
-    /// `(n_cov × p_resp)` matrix `X · β_matᵀ`.
-    ///
-    /// Used by the cached `min_step_to_boundary` path: callers pass the
-    /// freshly-projected `C` and `D` so the projection cost is paid once per
-    /// fresh `β` / `δ` rather than once per outer iteration. Returns `None`
-    /// for the `KhatriRao` variant since that branch streams over `n`
-    /// observation rows directly and benefits no caching.
-    #[cfg(test)]
-    fn project_kronecker_factor(&self, beta: &Array1<f64>) -> Option<Array2<f64>> {
-        match self {
-            KroneckerDesign::KhatriRao { .. } => None,
-            KroneckerDesign::Kronecker {
-                response_grid,
-                covariate,
-            } => {
-                let n = covariate.nrows();
-                let p_resp = response_grid.ncols();
-                let p_cov = covariate.ncols();
-                debug_assert_eq!(beta.len(), p_resp * p_cov);
-                let beta_mat = beta.view().into_shape_with_order((p_resp, p_cov)).unwrap();
-                let mut out = Array2::<f64>::zeros((n, p_resp));
-                for a in 0..p_resp {
-                    let row_a = beta_mat.row(a).to_owned();
-                    out.column_mut(a).assign(&covariate.apply(&row_a));
-                }
-                Some(out)
-            }
-        }
-    }
-
-    /// Maximum row L2-norm of the response-grid factor (`max_g ||r_g||₂`).
-    ///
-    /// Returns `None` for the `KhatriRao` variant — it has no separate response
-    /// factor to summarize.
-    #[cfg(test)]
-    fn max_response_norm(&self) -> Option<f64> {
-        match self {
-            KroneckerDesign::KhatriRao { .. } => None,
-            KroneckerDesign::Kronecker { response_grid, .. } => {
-                let mut m = 0.0_f64;
-                for g in 0..response_grid.nrows() {
-                    let row = response_grid.row(g);
-                    let s2: f64 = row.iter().map(|v| v * v).sum();
-                    m = m.max(s2.sqrt());
-                }
-                Some(m)
-            }
-        }
-    }
-
-    /// Maximum row L2-norm of the covariate factor (`max_i ||X_cov[i,:]||₂`).
-    ///
-    /// Streamed via `try_row_chunk` so sparse / operator-backed covariates
-    /// stay chunkable. Returns `None` for the `KhatriRao` variant.
-    #[cfg(test)]
-    fn max_covariate_norm(&self) -> Option<f64> {
-        match self {
-            KroneckerDesign::KhatriRao { .. } => None,
-            KroneckerDesign::Kronecker { covariate, .. } => {
-                let n = covariate.nrows();
-                if n == 0 {
-                    return Some(0.0);
-                }
-                let p = covariate.ncols();
-                if let Some(dense) = covariate.as_dense_ref() {
-                    use rayon::prelude::*;
-                    let m = dense
-                        .axis_iter(ndarray::Axis(0))
-                        .into_par_iter()
-                        .map(|row| {
-                            let s2: f64 = row.iter().map(|v| v * v).sum();
-                            s2.sqrt()
-                        })
-                        .reduce(|| 0.0_f64, f64::max);
-                    return Some(m);
-                }
-                let chunk_rows =
-                    crate::resource::rows_for_target_bytes(8 * 1024 * 1024, p.max(1)).max(1);
-                let mut m = 0.0_f64;
-                let mut start = 0usize;
-                while start < n {
-                    let end = (start + chunk_rows).min(n);
-                    let chunk = covariate
-                        .try_row_chunk(start..end)
-                        .expect("covariate.try_row_chunk for max-row-norm precompute");
-                    for i in 0..(end - start) {
-                        let row = chunk.row(i);
-                        let s2: f64 = row.iter().map(|v| v * v).sum();
-                        m = m.max(s2.sqrt());
-                    }
-                    start = end;
-                }
-                Some(m)
-            }
-        }
-    }
-
-    /// Cached `min_step_to_boundary` for the `Kronecker` variant with an
-    /// active-set certificate fast path.
-    ///
-    /// Bit-equivalent to `min_step_to_boundary(β, δ, slack, dh_eps)` whenever
-    /// the certificate accepts; otherwise refreshes the certificate by running
-    /// a full grid scan and returns the same `α` the un-cached path would.
-    /// Math (proof of correctness):
-    ///   For each `(i, g)`: `h_{i,g} = r_g · c_i^T`, `d_{i,g} = r_g · d_i^T`.
-    ///   Lipschitz bound `|d_{i,g}| ≤ ||r_g||₂ · ||ΔB||_F · ||X_cov[i,:]||₂`.
-    ///   Let `L = max_g ||r_g||₂ · max_i ||X_cov[i,:]||₂ · ||ΔB||_F`.
-    ///   `α_A` = min over active `(i,g)` with `d_{i,g}<-dh_eps` of
-    ///     `(h_{i,g} - slack)/(-d_{i,g})`. If `m_inactive - α_A · L > slack`
-    ///   then no inactive constraint can bind before `α_A`, so `α_A` is exact.
-    #[cfg(test)]
-    fn min_step_to_boundary_with_active_set(
-        &self,
-        c: ndarray::ArrayView2<'_, f64>,
-        d: ndarray::ArrayView2<'_, f64>,
-        delta: &Array1<f64>,
-        slack: f64,
-        dh_eps: f64,
-        cache: &mut KroneckerActiveSetCache,
-    ) -> f64 {
-        let response_grid = match self {
-            KroneckerDesign::KhatriRao { .. } => panic!(
-                "min_step_to_boundary_with_active_set is only defined for the \
-                 Kronecker variant; KhatriRao callers should use the un-cached \
-                 streaming path"
-            ),
-            KroneckerDesign::Kronecker { response_grid, .. } => response_grid,
-        };
-        let n = c.nrows();
-        let n_grid = response_grid.nrows();
-        let p_resp = response_grid.ncols();
-        debug_assert_eq!(c.ncols(), p_resp);
-        debug_assert_eq!(d.nrows(), n);
-        debug_assert_eq!(d.ncols(), p_resp);
-
-        // ||ΔB||_F: from the row-major (p_resp × p_cov) reshape of `delta`.
-        let p_cov = delta.len() / p_resp.max(1);
-        debug_assert_eq!(delta.len(), p_resp * p_cov);
-        let delta_fro: f64 = delta.iter().map(|v| v * v).sum::<f64>().sqrt();
-
-        // Initialize / refresh the row-norm caches if missing.
-        if cache.max_response_norm.is_none() {
-            cache.max_response_norm = self.max_response_norm();
-        }
-        if cache.max_covariate_norm.is_none() {
-            cache.max_covariate_norm = self.max_covariate_norm();
-        }
-        let max_response = cache.max_response_norm.unwrap_or(f64::INFINITY);
-        let max_covariate = cache.max_covariate_norm.unwrap_or(f64::INFINITY);
-        let lipschitz = max_response * max_covariate * delta_fro;
-
-        // If the cache is stale (β changed), or its dimensions disagree with
-        // the current projection shape, refresh by a full grid scan. We
-        // fingerprint `c` by three corner samples — when the caller has
-        // accepted a Newton step, β (and therefore `c`) changes and at least
-        // one of those samples will differ.
-        let fp = KroneckerActiveSetCache::fingerprint_of(c);
-        let cache_fresh = cache.cached_for_version == cache.c_version
-            && cache.n == n
-            && cache.n_grid == n_grid
-            && cache.p_resp == p_resp
-            && (cache.slack - slack).abs() <= f64::EPSILON
-            && (cache.dh_eps - dh_eps).abs() <= f64::EPSILON
-            && cache.c_fingerprint == fp;
-
-        if cache_fresh {
-            // Active-set fast path: scan only the cached active set with the
-            // fresh `d` projection. Compute α_A.
-            let mut alpha_active = f64::INFINITY;
-            for &(i, g) in &cache.active_pairs {
-                let r_g = response_grid.row(g);
-                let mut hv = 0.0_f64;
-                let mut dv = 0.0_f64;
-                for a in 0..p_resp {
-                    hv += r_g[a] * c[[i, a]];
-                    dv += r_g[a] * d[[i, a]];
-                }
-                if dv < -dh_eps {
-                    let hit = (hv - slack) / (-dv);
-                    if hit < alpha_active {
-                        alpha_active = hit;
-                    }
-                }
-            }
-            // Certificate: m_inactive - α_A · L > slack ⇒ no inactive pair can
-            // bind at any α ≤ α_A.  The cached `min_inactive_margin = min
-            // (h_{i,g} - slack)` over (i,g) ∉ A was already netted of `slack`
-            // in `refresh_active_set_cache`, so the strict-feasibility test
-            // collapses to `m_inactive > α_A · L`.
-            //
-            // When `α_active = +∞` (no active pair binds along `d`), the
-            // Lipschitz bound `|d_{i,g}| ≤ L` gives a LOWER bound on inactive
-            // hit points (they bind at α ≥ m_inactive / L) but NOT an upper
-            // bound on the minimum.  So the certificate cannot prove
-            // bit-equivalence with the full-grid scan in that regime — we
-            // must fall through to the full scan to find the true minimum.
-            // Substituting `α_for_bound = 1.0` to certify within a downstream
-            // `min(1.0, ·)` cap is unprincipled because (a) it changes this
-            // function's stated contract from "exact min α" to "exact min α
-            // within α ≤ 1.0", and (b) the assertion in
-            // `ctn_active_set_certificate_matches_full_grid_when_bound_passes`
-            // will catch any drift.
-            if alpha_active.is_finite() && cache.min_inactive_margin > alpha_active * lipschitz {
-                log::info!(
-                    "[STAGE] CTN monotonicity certificate hit |A|={} m_inactive={:.3e} \
-                     α_A·L={:.3e} → α={:.3e} (skipped n·n_grid={} pair scan)",
-                    cache.active_pairs.len(),
-                    cache.min_inactive_margin,
-                    alpha_active * lipschitz,
-                    alpha_active,
-                    n * n_grid,
-                );
-                return alpha_active;
-            }
-        }
-
-        // Cache stale or certificate failed: refresh the active set in the
-        // same full-grid scan that computes the exact boundary step.
-        log::info!(
-            "[STAGE] CTN monotonicity certificate miss (cache_fresh={}) → full grid scan \
-             over {} (i,g) pairs",
-            cache_fresh,
-            n * n_grid,
-        );
-        Self::scan_kronecker_boundary_and_refresh_cache(
-            response_grid,
-            c,
-            d,
-            slack,
-            dh_eps,
-            n,
-            n_grid,
-            p_resp,
-            cache,
-        )
-    }
-
-    /// Scan the full `n_cov × n_grid` virtual rows, recompute the active-set
-    /// cache from the current `c` projection, and return the exact boundary
-    /// step for the current `d` projection.
-    ///
-    /// Both cached and uncached Kronecker line searches use this one streaming
-    /// reducer, so the full-grid scan has a single implementation.
-    ///
-    /// `active_pairs` collects (i, g) with `h_{i,g} - slack ≤ τ`; the
-    /// `min_inactive_margin` is the smallest `h_{i,g} - slack` over inactive
-    /// pairs (= the tightest non-active constraint).
-    #[cfg(test)]
-    fn scan_kronecker_boundary_and_refresh_cache(
-        response_grid: &Array2<f64>,
-        c: ndarray::ArrayView2<'_, f64>,
-        d: ndarray::ArrayView2<'_, f64>,
-        slack: f64,
-        dh_eps: f64,
-        n: usize,
-        n_grid: usize,
-        p_resp: usize,
-        cache: &mut KroneckerActiveSetCache,
-    ) -> f64 {
-        debug_assert_eq!(d.nrows(), n);
-        debug_assert_eq!(d.ncols(), p_resp);
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        // Compute H = c · response_gridᵀ and dH = d · response_gridᵀ in
-        // chunked passes; classify rows and reduce the boundary step.
-        const CHUNK_ROWS: usize = 1024;
-        // Active-set tolerance: small relative-to-slack with an additive
-        // floor. The certificate is valid for any τ ≥ 0; this scale keeps
-        // the active set typically ≤ 0.1% of pairs at biobank scale.
-        let scale = c.iter().fold(0.0_f64, |a, &v| a.max(v.abs())).max(1.0);
-        let tau = (slack.abs() * 1e-3 + 1e-12).max(dh_eps * scale);
-
-        let r_t = response_grid.t();
-        let n_chunks = n.div_ceil(CHUNK_ROWS);
-        let (active_pairs, min_inactive, alpha_full): (Vec<(usize, usize)>, f64, f64) = (0
-            ..n_chunks)
-            .into_par_iter()
-            .map(|chunk_idx: usize| {
-                let start = chunk_idx * CHUNK_ROWS;
-                let end = (start + CHUNK_ROWS).min(n);
-                let m = end - start;
-                let c_chunk = c.slice(s![start..end, ..]);
-                let d_chunk = d.slice(s![start..end, ..]);
-                let mut h_chunk = Array2::<f64>::zeros((m, n_grid));
-                let mut dh_chunk = Array2::<f64>::zeros((m, n_grid));
-                fast_ab_into(&c_chunk, &r_t, &mut h_chunk);
-                fast_ab_into(&d_chunk, &r_t, &mut dh_chunk);
-                let mut local_active: Vec<(usize, usize)> = Vec::new();
-                let mut local_min = f64::INFINITY;
-                let mut local_alpha = f64::INFINITY;
-                for i_local in 0..m {
-                    let i = start + i_local;
-                    for g in 0..n_grid {
-                        let h = h_chunk[[i_local, g]];
-                        let dval = dh_chunk[[i_local, g]];
-                        if dval < -dh_eps {
-                            let hit = (h - slack) / (-dval);
-                            if hit < local_alpha {
-                                local_alpha = hit;
-                            }
-                        }
-                        let margin = h - slack;
-                        if margin <= tau {
-                            local_active.push((i, g));
-                        } else if margin < local_min {
-                            local_min = margin;
-                        }
-                    }
-                }
-                (local_active, local_min, local_alpha)
-            })
-            .reduce(
-                || (Vec::new(), f64::INFINITY, f64::INFINITY),
-                |(mut a, am, aa), (b, bm, ba)| {
-                    a.extend(b);
-                    (a, am.min(bm), aa.min(ba))
-                },
-            );
-
-        cache.active_pairs = active_pairs;
-        cache.min_inactive_margin = min_inactive;
-        cache.n = n;
-        cache.n_grid = n_grid;
-        cache.p_resp = p_resp;
-        cache.slack = slack;
-        cache.dh_eps = dh_eps;
-        cache.c_fingerprint = KroneckerActiveSetCache::fingerprint_of(c);
-        cache.cached_for_version = cache.c_version;
-        alpha_full
     }
 
     /// Compute `self^T · v` where v is an n-vector.
@@ -10374,31 +9319,6 @@ impl KroneckerDesign {
                 }
                 out
             }
-            KroneckerDesign::Kronecker {
-                response_grid,
-                covariate,
-            } => {
-                let n_cov = covariate.nrows();
-                let n_grid = response_grid.nrows();
-                let p_resp = response_grid.ncols();
-                let p_cov = covariate.ncols();
-                debug_assert_eq!(v.len(), n_cov * n_grid);
-                // v reshaped as V (n_cov × n_grid) row-major view — matches the
-                // covariate-major flattening v[i*n_grid + g] = V[i, g]. Faer
-                // accepts the zero-copy view, so V is never duplicated.
-                let v_mat = v.view().into_shape_with_order((n_cov, n_grid)).unwrap();
-                // tmp = V · response_grid  →  (n_cov × p_resp).
-                let mut tmp = Array2::<f64>::zeros((n_cov, p_resp));
-                fast_ab_into(&v_mat, response_grid, &mut tmp);
-                // For each a, out[a*p_cov..(a+1)*p_cov] = covariate^T · tmp[:, a].
-                let mut out = Array1::<f64>::zeros(p_resp * p_cov);
-                for a in 0..p_resp {
-                    let col_a = tmp.column(a).to_owned();
-                    let block = covariate.apply_transpose(&col_a);
-                    out.slice_mut(s![a * p_cov..(a + 1) * p_cov]).assign(&block);
-                }
-                out
-            }
         }
     }
 
@@ -10419,17 +9339,6 @@ impl KroneckerDesign {
         other: &KroneckerDesign,
         policy: &ResourcePolicy,
     ) -> Result<Array2<f64>, String> {
-        if matches!(self, KroneckerDesign::Kronecker { .. })
-            || matches!(other, KroneckerDesign::Kronecker { .. })
-        {
-            return Err(
-                "KroneckerDesign::weighted_cross_with is not supported for the Kronecker \
-                 monotonicity-grid variant: the virtual row space (n_cov × n_grid) does not \
-                 align with weights of the underlying observations, and no caller in the \
-                 transformation-normal family computes a weighted Gram on this design."
-                    .to_string(),
-            );
-        }
         match (self, other) {
             (
                 KroneckerDesign::KhatriRao { left: a, right: b },
@@ -10476,7 +9385,6 @@ impl KroneckerDesign {
                 }
                 Ok(out)
             }
-            _ => unreachable!("Kronecker cross-with case is rejected by the early return above"),
         }
     }
 }
@@ -10542,14 +9450,6 @@ impl DenseDesignOperator for KroneckerDesign {
                 let right_chunk = right.try_row_chunk(rows)?;
                 out.assign(&rowwise_kronecker(&left_chunk, &right_chunk));
             }
-            KroneckerDesign::Kronecker { .. } => {
-                panic!(
-                    "KroneckerDesign::row_chunk_into is not supported on the Kronecker \
-                     monotonicity-grid design: it would materialize the n_cov*n_grid × p_total \
-                     row-replicated form (the very allocation this variant exists to avoid). \
-                     Use forward_mul / transpose_mul instead."
-                );
-            }
         }
         Ok(())
     }
@@ -10561,16 +9461,6 @@ impl DenseDesignOperator for KroneckerDesign {
                     left.nrows(),
                     left.ncols(),
                     right.ncols(),
-                );
-            }
-            KroneckerDesign::Kronecker {
-                response_grid,
-                covariate,
-            } => {
-                assert_no_rowwise_kronecker_materialization(
-                    covariate.nrows() * response_grid.nrows(),
-                    response_grid.ncols(),
-                    covariate.ncols(),
                 );
             }
         }
@@ -12030,68 +10920,33 @@ mod tests {
     }
 
     #[test]
-    fn max_feasible_step_size_uses_cached_kronecker_reduction() {
-        // End-to-end equivalence check for the production line-search caller.
-        // `max_feasible_step_size` projects β and δ through the covariate
-        // factor once and routes the monotonicity-grid reduction through
-        // `min_step_to_boundary_with_active_set`; this test confirms the
-        // wired path matches the un-cached baseline exactly on a small CTN
-        // configuration (toy family with a `Kronecker` grid design).
+    fn max_feasible_step_size_is_unconstrained_for_scop_derivative() {
         let psi = array![0.15, -0.10];
         let (family, _, state, _) = toy_family_and_derivatives(&psi);
-        // Sanity: the toy fixture really uses the Kronecker grid variant the
-        // cached path was built for; if anything ever rewires this design to
-        // KhatriRao the production caller must keep working via fallback, so
-        // the assertion documents the precondition rather than gating it.
-        assert!(
-            matches!(family.x_deriv_grid_kron, KroneckerDesign::Kronecker { .. }),
-            "toy family must keep the Kronecker grid variant for cached-path coverage"
-        );
-        // δ direction with a negative leading derivative contribution. The
-        // structural ε floor means the production guard binds only if the
-        // learned derivative part would drift below −ε.
         let p_total = state.beta.len();
         let mut delta = toy_probe_vector(p_total, 0xDE17A);
         delta[0] = -0.30;
 
-        // Production path (cached internally).
         let block_states = vec![state.clone()];
         let alpha_prod = family
             .max_feasible_step_size(&block_states, 0, &delta)
             .expect("toy max_feasible_step_size returns Ok");
+        assert_eq!(alpha_prod, None);
 
-        // Hand-rolled un-cached baseline that mirrors the pre-wiring
-        // implementation: both designs use `min_step_to_boundary` directly,
-        // with no projection caching. If the cached and un-cached reductions
-        // ever diverge (e.g. a chunk-size change), this test fails before the
-        // production line search silently picks up the regression.
-        let beta = &block_states[0].beta;
-        let alpha_obs_uncached = family.x_deriv_kron.min_step_to_boundary(
-            beta,
-            &delta,
-            -TRANSFORMATION_MONOTONICITY_EPS,
-            1e-14,
+        let bad_delta = Array1::<f64>::zeros(p_total + 1);
+        assert!(
+            family
+                .max_feasible_step_size(&block_states, 0, &bad_delta)
+                .is_err(),
+            "dimension mismatches should still be rejected before line search"
         );
-        let alpha_grid_uncached = family.x_deriv_grid_kron.min_step_to_boundary(
-            beta,
-            &delta,
-            -TRANSFORMATION_MONOTONICITY_EPS,
-            1e-14,
-        );
-        let alpha_max_uncached = 1.0_f64.min(alpha_obs_uncached).min(alpha_grid_uncached);
-        let tau = 0.995;
-        let alpha_safe_uncached = tau * alpha_max_uncached;
-        let expected = if alpha_safe_uncached < 1.0 {
-            Some(alpha_safe_uncached)
-        } else {
-            None
-        };
+    }
 
-        assert_eq!(
-            alpha_prod, expected,
-            "wired max_feasible_step_size must match the un-cached baseline bit-for-bit \
-             (cached α = {alpha_prod:?}, un-cached α = {expected:?})"
-        );
+    #[test]
+    fn ctn_joint_newton_uses_ctn_specific_step_cap() {
+        let psi = array![0.15, -0.10];
+        let (family, _, _, spec) = toy_family_and_derivatives(&psi);
+        assert_eq!(family.joint_newton_max_step_inf(&[spec]), 100.0);
     }
 
     #[test]
@@ -13672,368 +12527,6 @@ mod tests {
                 gradient_eval.gradient[i],
             );
         }
-    }
-
-    #[test]
-    fn kronecker_variant_matches_materialized_form() {
-        // Tiny inputs: n_cov=4 covariate rows, n_grid=3 monotonicity-grid points,
-        // p_resp=2 response-direction columns, p_cov=2 covariate columns.
-        let response_grid = array![[1.0, 0.5], [0.7, -0.1], [-0.3, 0.9]];
-        let cov = array![[0.20, 1.10], [-0.40, 0.80], [0.55, -0.25], [0.10, 0.65]];
-        let n_cov = cov.nrows();
-        let n_grid = response_grid.nrows();
-        let p_resp = response_grid.ncols();
-        let p_cov = cov.ncols();
-        let p_total = p_resp * p_cov;
-        let n_virtual = n_cov * n_grid;
-
-        let design = KroneckerDesign::new_kronecker(
-            response_grid.clone(),
-            DesignMatrix::Dense(DenseDesignMatrix::from(cov.clone())),
-        )
-        .expect("Kronecker variant construction");
-        assert_eq!(design.nrows(), n_virtual);
-        assert_eq!(design.ncols(), p_total);
-
-        // Materialize the reference: virtual row (i, g) has design row equal
-        // to response_grid[g, :] ⊗ cov[i, :] (response-major flattening).
-        let mut reference = Array2::<f64>::zeros((n_virtual, p_total));
-        for i in 0..n_cov {
-            for g in 0..n_grid {
-                let row = i * n_grid + g;
-                for a in 0..p_resp {
-                    for b in 0..p_cov {
-                        reference[[row, a * p_cov + b]] = response_grid[[g, a]] * cov[[i, b]];
-                    }
-                }
-            }
-        }
-
-        // forward_mul: choose a deterministic non-trivial beta and compare.
-        let beta = Array1::from_vec((0..p_total).map(|k| 0.3 + 0.17 * k as f64).collect());
-        let got_forward = design.forward_mul(&beta);
-        let expected_forward = reference.dot(&beta);
-        assert_eq!(got_forward.len(), n_virtual);
-        for i in 0..n_virtual {
-            assert!(
-                (got_forward[i] - expected_forward[i]).abs() < 1e-12,
-                "forward_mul mismatch at row {i}: got={}, expected={}",
-                got_forward[i],
-                expected_forward[i]
-            );
-        }
-
-        // transpose_mul: virtual-row vector v, compare against reference^T · v.
-        let v = Array1::from_vec((0..n_virtual).map(|k| -0.25 + 0.31 * k as f64).collect());
-        let got_transpose = design.transpose_mul(&v);
-        let expected_transpose = reference.t().dot(&v);
-        assert_eq!(got_transpose.len(), p_total);
-        for k in 0..p_total {
-            assert!(
-                (got_transpose[k] - expected_transpose[k]).abs() < 1e-12,
-                "transpose_mul mismatch at col {k}: got={}, expected={}",
-                got_transpose[k],
-                expected_transpose[k]
-            );
-        }
-    }
-
-    /// Sweep over a representative cross-section of (n_cov, n_grid, p_resp,
-    /// p_cov) shapes — including degenerate p_resp=1 / p_cov=1 cases and
-    /// asymmetric n_cov / n_grid ratios — to confirm the factored Kronecker
-    /// identities hold across the parameter space, not just at one point. All
-    /// inputs are deterministic (a Numerical-Recipes LCG over a fixed seed)
-    /// so the test is reproducible without an RNG dependency.
-    #[test]
-    fn kronecker_variant_matches_materialized_form_across_shapes() {
-        fn lcg_sequence(seed: u64, len: usize) -> Vec<f64> {
-            let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut out = Vec::with_capacity(len);
-            for _ in 0..len {
-                state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                let u = (state >> 11) as f64 / (1u64 << 53) as f64;
-                out.push(2.0 * u - 1.0);
-            }
-            out
-        }
-        fn make_array2(seed: u64, rows: usize, cols: usize) -> Array2<f64> {
-            Array2::from_shape_vec((rows, cols), lcg_sequence(seed, rows * cols))
-                .expect("dimensions match")
-        }
-        fn make_array1(seed: u64, len: usize) -> Array1<f64> {
-            Array1::from_vec(lcg_sequence(seed, len))
-        }
-
-        // Shapes: (n_cov, n_grid, p_resp, p_cov). Includes the structural edge
-        // cases p_resp=1 and p_cov=1 (the elementwise definition collapses to
-        // an outer product), n_cov=1 and n_grid=1, an asymmetric grid-heavy
-        // case, and a moderate generic shape.
-        let shapes: &[(usize, usize, usize, usize)] = &[
-            (1, 5, 3, 4),
-            (5, 1, 3, 4),
-            (5, 7, 1, 4),
-            (5, 7, 3, 1),
-            (3, 11, 2, 5),
-            (10, 4, 4, 3),
-            (8, 13, 2, 4),
-            (4, 4, 4, 4),
-        ];
-
-        for (idx, &(n_cov, n_grid, p_resp, p_cov)) in shapes.iter().enumerate() {
-            let seed = 0xA17B_C0DE_u64.wrapping_add(idx as u64);
-            let response_grid = make_array2(seed ^ 0x1, n_grid, p_resp);
-            let cov = make_array2(seed ^ 0x2, n_cov, p_cov);
-            let beta = make_array1(seed ^ 0x3, p_resp * p_cov);
-            let v = make_array1(seed ^ 0x4, n_cov * n_grid);
-
-            let design = KroneckerDesign::new_kronecker(
-                response_grid.clone(),
-                DesignMatrix::Dense(DenseDesignMatrix::from(cov.clone())),
-            )
-            .expect("Kronecker variant construction");
-
-            // Materialize the reference matrix from the elementwise definition
-            // X[(i, g), (a, b)] = R[g, a] · C[i, b] with row-flatten covariate-
-            // major and column-flatten response-major.
-            let p_total = p_resp * p_cov;
-            let n_virtual = n_cov * n_grid;
-            let mut reference = Array2::<f64>::zeros((n_virtual, p_total));
-            for i in 0..n_cov {
-                for g in 0..n_grid {
-                    let row = i * n_grid + g;
-                    for a in 0..p_resp {
-                        for b in 0..p_cov {
-                            reference[[row, a * p_cov + b]] = response_grid[[g, a]] * cov[[i, b]];
-                        }
-                    }
-                }
-            }
-
-            // forward_mul: factored vs. materialized.
-            let got_forward = design.forward_mul(&beta);
-            let expected_forward = reference.dot(&beta);
-            for k in 0..n_virtual {
-                let diff = (got_forward[k] - expected_forward[k]).abs();
-                assert!(
-                    diff < 1e-12,
-                    "shape {:?} #{idx}: forward_mul mismatch at virtual row {k} (diff={diff:e})",
-                    (n_cov, n_grid, p_resp, p_cov),
-                );
-            }
-
-            // transpose_mul: factored vs. materialized.
-            let got_transpose = design.transpose_mul(&v);
-            let expected_transpose = reference.t().dot(&v);
-            for k in 0..p_total {
-                let diff = (got_transpose[k] - expected_transpose[k]).abs();
-                assert!(
-                    diff < 1e-12,
-                    "shape {:?} #{idx}: transpose_mul mismatch at col {k} (diff={diff:e})",
-                    (n_cov, n_grid, p_resp, p_cov),
-                );
-            }
-
-            // Adjoint identity: ⟨v, X β⟩ = ⟨Xᵀ v, β⟩. If both forms match the
-            // same reference this is implied, but checking it directly catches
-            // a class of off-by-one transpose bugs that would happen to flip
-            // both forms consistently.
-            let lhs: f64 = v.iter().zip(got_forward.iter()).map(|(a, b)| a * b).sum();
-            let rhs: f64 = got_transpose
-                .iter()
-                .zip(beta.iter())
-                .map(|(a, b)| a * b)
-                .sum();
-            assert!(
-                (lhs - rhs).abs() < 1e-10,
-                "shape {:?} #{idx}: adjoint identity ⟨v, Xβ⟩ ≠ ⟨Xᵀv, β⟩ (lhs={lhs}, rhs={rhs})",
-                (n_cov, n_grid, p_resp, p_cov),
-            );
-        }
-    }
-
-    /// When most virtual rows are far from the slack boundary the active-set
-    /// certificate accepts and the cached fast path must produce the same
-    /// `α` the full-grid scan would. Bit-equivalence is the contract — any
-    /// drift is a correctness bug, not a numerical-precision issue, since
-    /// both paths reduce identical sums by the associative `f64::min`.
-    #[test]
-    fn ctn_active_set_certificate_matches_full_grid_when_bound_passes() {
-        // n=64, p_resp=8, p_cov=4, n_grid=16. Build smooth, well-separated
-        // factors so most (i, g) pairs have generous feasibility margin.
-        let n = 64usize;
-        let p_resp = 8usize;
-        let p_cov = 4usize;
-        let n_grid = 16usize;
-        let mut covariate = Array2::<f64>::zeros((n, p_cov));
-        for i in 0..n {
-            let t = i as f64 / (n as f64 - 1.0);
-            covariate[[i, 0]] = 1.0;
-            covariate[[i, 1]] = 0.20 + 0.05 * t;
-            covariate[[i, 2]] = -0.10 + 0.04 * (t * t - 0.5);
-            covariate[[i, 3]] = 0.08 * (t - 0.5);
-        }
-        let mut response_grid = Array2::<f64>::zeros((n_grid, p_resp));
-        for g in 0..n_grid {
-            let s = g as f64 / (n_grid as f64 - 1.0);
-            response_grid[[g, 0]] = 1.0;
-            for a in 1..p_resp {
-                response_grid[[g, a]] = 0.05 * (a as f64) * (s - 0.5);
-            }
-        }
-        let design = KroneckerDesign::new_kronecker(
-            response_grid.clone(),
-            DesignMatrix::Dense(DenseDesignMatrix::from(covariate)),
-        )
-        .expect("Kronecker design");
-
-        // β has dominant value on the (a=0, b=0) entry so h ≈ 1.0 on every
-        // virtual row, well above slack. δ has small negative leading entry
-        // to push some virtual rows toward the boundary, but |Δ| stays small
-        // enough that L · α_A is comfortably below m_inactive.
-        let mut beta = Array1::<f64>::zeros(p_resp * p_cov);
-        beta[0] = 1.0;
-        let mut delta = Array1::<f64>::zeros(p_resp * p_cov);
-        delta[0] = -1.0e-2;
-
-        let slack = 1e-3;
-        let dh_eps = 1e-14;
-
-        // Reference: full-grid reduction via the un-cached entry point.
-        let alpha_full = design.min_step_to_boundary(&beta, &delta, slack, dh_eps);
-
-        let c = design
-            .project_kronecker_factor(&beta)
-            .expect("Kronecker variant projects β");
-        let d = design
-            .project_kronecker_factor(&delta)
-            .expect("Kronecker variant projects δ");
-        let mut cache = KroneckerActiveSetCache::new();
-        // First call refreshes the cache (cache.cached_for_version != c_version
-        // ⇒ cache miss); the answer matches full-grid by construction.
-        let alpha_first = design.min_step_to_boundary_with_active_set(
-            c.view(),
-            d.view(),
-            &delta,
-            slack,
-            dh_eps,
-            &mut cache,
-        );
-        assert_eq!(
-            alpha_first, alpha_full,
-            "first active-set call must full-scan and match the un-cached path"
-        );
-        // Cache must now be marked fresh and hold a finite inactive bound.
-        assert_eq!(cache.cached_for_version, cache.c_version);
-        assert!(
-            cache.min_inactive_margin.is_finite(),
-            "fixture must produce at least one inactive pair so m_inactive is finite"
-        );
-        // Second call: same β-projection ⇒ certificate path. Must be exactly
-        // bit-equal to the full-grid reduction.
-        let alpha_certified = design.min_step_to_boundary_with_active_set(
-            c.view(),
-            d.view(),
-            &delta,
-            slack,
-            dh_eps,
-            &mut cache,
-        );
-        assert_eq!(
-            alpha_certified, alpha_full,
-            "active-set certificate fast path must be bit-equivalent to the full-grid scan"
-        );
-    }
-
-    /// When the certificate's Lipschitz bound is too loose to certify (an
-    /// inactive pair is near-binding), the implementation must fall back to a
-    /// full grid scan and return the correct `α`. We refresh the cache, then
-    /// shrink `m_inactive` to drive the certificate into its fail branch and
-    /// confirm the fallback recovers the exact full-grid answer.
-    #[test]
-    fn ctn_active_set_falls_back_to_full_grid_when_bound_fails() {
-        // p_resp=2, p_cov=1, n=3, n_grid=2 ⇒ 6 virtual pairs. Response grid
-        // r_g = e_a (axis-aligned) so h_{i,g} = c[i, g] and d_{i,g} = d[i, g];
-        // diagonal indexing makes the fixture readable.
-        let n = 3usize;
-        let p_resp = 2usize;
-        let response_grid = array![[1.0, 0.0], [0.0, 1.0]];
-        let mut cov_arr = Array2::<f64>::zeros((n, 1));
-        cov_arr[[0, 0]] = 1.0;
-        cov_arr[[1, 0]] = 1.0;
-        cov_arr[[2, 0]] = 1.0;
-        let design = KroneckerDesign::new_kronecker(
-            response_grid.clone(),
-            DesignMatrix::Dense(DenseDesignMatrix::from(cov_arr)),
-        )
-        .expect("Kronecker design");
-
-        // c shape (n × p_resp). Pair (0, 0) is the binder (h = slack + 1e-12)
-        // with strongly negative d so α_A is tiny and finite. Pair (1, 1) is
-        // the near-inactive: h_{1,1} = slack + 1e-3 — sits just outside τ but
-        // small enough that the conservative L bound can exceed m_inactive.
-        // Remaining pairs sit far above slack.
-        let slack = 1e-3;
-        let dh_eps = 1e-14;
-        let mut c = Array2::<f64>::zeros((n, p_resp));
-        c[[0, 0]] = slack + 1e-12;
-        c[[0, 1]] = 5.0;
-        c[[1, 0]] = 5.0;
-        c[[1, 1]] = slack + 1e-3;
-        c[[2, 0]] = 5.0;
-        c[[2, 1]] = 5.0;
-        // Only the binder has nonzero d, so the full-grid α equals (h-slack)/(-d).
-        let mut d = Array2::<f64>::zeros((n, p_resp));
-        d[[0, 0]] = -1.0;
-        let delta = Array1::<f64>::from(vec![1.0, 0.0]);
-        let alpha_ref = (c[[0, 0]] - slack) / (-d[[0, 0]]);
-
-        let mut cache = KroneckerActiveSetCache::new();
-        // First call: cache miss ⇒ full-grid scan, populates cache.
-        let alpha_first = design.min_step_to_boundary_with_active_set(
-            c.view(),
-            d.view(),
-            &delta,
-            slack,
-            dh_eps,
-            &mut cache,
-        );
-        assert_eq!(alpha_first, alpha_ref);
-        // The near-inactive pair (1,1) has h - slack = 1e-3, well outside τ
-        // (≈1e-6) but the smallest among inactive pairs, so it drives
-        // cache.min_inactive_margin to ~1e-3.
-        assert!(
-            cache.min_inactive_margin <= 1e-3 + 1e-12,
-            "near-inactive pair must drive m_inactive ≤ 1e-3, got {}",
-            cache.min_inactive_margin
-        );
-        // For this fixture max ||r_g|| = 1, max ||c_i|| = 1, ‖ΔB‖_F = 1 ⇒
-        // L = 1. With α_A = 1e-12 the certificate margin (1e-3) trivially
-        // exceeds α_A · L, so it would actually accept here. Drive the
-        // fail-bound branch by mutating m_inactive directly — this mirrors
-        // the production case where ‖ΔB‖_F is large enough that L overshoots
-        // the truth and the conservative bound is too tight.
-        cache.min_inactive_margin = 0.0;
-        let alpha_after = design.min_step_to_boundary_with_active_set(
-            c.view(),
-            d.view(),
-            &delta,
-            slack,
-            dh_eps,
-            &mut cache,
-        );
-        // Bound-failure branch must fall back to a full grid scan and return
-        // the correct α. The full scan also refreshes the cache, restoring
-        // `min_inactive_margin` to its true value.
-        assert_eq!(
-            alpha_after, alpha_ref,
-            "fallback path must return the full-grid α when the certificate bound fails"
-        );
-        assert!(
-            cache.min_inactive_margin > 0.0,
-            "fallback must rerun the refresh and restore m_inactive"
-        );
     }
 
     /// Pairwise oracle for Phase-2 outer-HVP cross-checking.
