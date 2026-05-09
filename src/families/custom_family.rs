@@ -6851,22 +6851,15 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
             hessian_logdet_correction: curvature.hessian_logdet_correction,
         }));
     }
-    let exact_joint_source =
-        if use_joint_matrix_free_path(total, joint_observation_count(block_states)) {
-            hessian_workspace
-                .as_ref()
-                .map(|workspace| {
-                    exact_newton_joint_hessian_source_from_workspace(
-                        workspace,
-                        total,
-                        "joint exact-newton operator mismatch in outer gradient",
-                    )
-                })
-                .transpose()?
-                .flatten()
-        } else {
-            None
-        };
+    let exact_joint_source = if let Some(workspace) = hessian_workspace.as_ref() {
+        exact_newton_joint_hessian_source_from_workspace(
+            workspace,
+            total,
+            "joint exact-newton operator mismatch in outer gradient",
+        )?
+    } else {
+        None
+    };
     let exact_joint_source = match exact_joint_source {
         Some(source) => Some(source),
         None => exact_newton_joint_hessian_symmetrized(
@@ -8208,8 +8201,7 @@ fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'sta
     states: &[ParameterBlockState],
     prefer_workspace: bool,
 ) -> Result<(f64, Option<Arc<dyn ExactNewtonJointHessianWorkspace>>), String> {
-    if (!family.supports_log_likelihood_early_exit() || options.early_exit_threshold.is_none())
-        && prefer_workspace
+    if prefer_workspace
         && family.inner_joint_workspace_log_likelihood_available(specs)
         && let Some(workspace) =
             family.exact_newton_joint_hessian_workspace_with_options(states, specs, options)?
@@ -8933,12 +8925,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // checks against the legacy numerics.
                 let line_search_options =
                     coefficient_line_search_options(options, old_objective + 1e-10);
+                let prefer_trial_workspace = joint_workspace_requested
+                    && options.line_search_prefer_workspace
+                    && trust_attempt == 0
+                    && step_inf < 0.95 * MAX_JOINT_STEP;
                 let trial_ll = match joint_line_search_log_likelihood(
                     family,
                     specs,
                     &line_search_options,
                     &states,
-                    joint_workspace_requested && options.line_search_prefer_workspace,
+                    prefer_trial_workspace,
                 ) {
                     Ok((value, workspace)) => {
                         accepted_joint_workspace = workspace;
@@ -9173,8 +9169,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // KKT convergence: small residual plus EITHER a small
             // Newton step (tight quadratic-rate convergence, lets β
             // polish to machine precision) OR confirmed stagnation
-            // (`accepted_step_inf <= step_tol` AND `objective_change
-            // <= objective_tol`, the rank-deficient null-mode case).
+            // (`accepted_step_inf` within a tiny tolerance cushion AND
+            // `objective_change <= objective_tol`, the rank-deficient
+            // null-mode case).
             // The conjunction in the second branch matters: a single
             // small `objective_change` on a quadratic-rate cycle is
             // normal Newton progress, not stagnation, and treating it
@@ -9182,15 +9179,17 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // O(residual_tol) away from the optimum — visible as a
             // sign mismatch against finite-differenced outer LAML
             // gradients in the autodiff cross-checks.
+            const ACCEPTED_STEP_TOL_CUSHION: f64 = 2.0;
+            let accepted_step_tol = ACCEPTED_STEP_TOL_CUSHION * step_tol;
             if residual <= residual_tol
                 && (step_inf <= step_tol
-                    || (accepted_step_inf <= step_tol
+                    || (accepted_step_inf <= accepted_step_tol
                         && objective_change <= objective_tol))
             {
                 converged = true;
                 break;
             }
-            if accepted_step_inf <= step_tol && objective_change <= objective_tol {
+            if accepted_step_inf <= accepted_step_tol && objective_change <= objective_tol {
                 if residual <= residual_tol {
                     converged = true;
                 }
@@ -12184,21 +12183,12 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 true,
             )
         } else {
-            let h_joint_unpen = if use_joint_matrix_free_path(
-                total,
-                joint_observation_count(synced_joint_states.as_ref()),
-            ) {
-                hessian_workspace
-                    .as_ref()
-                    .map(|workspace| {
-                        exact_newton_joint_hessian_source_from_workspace(
-                            workspace,
-                            total,
-                            "joint exact-newton operator mismatch in joint hyper evaluator",
-                        )
-                    })
-                    .transpose()?
-                    .flatten()
+            let h_joint_unpen = if let Some(workspace) = hessian_workspace.as_ref() {
+                exact_newton_joint_hessian_source_from_workspace(
+                    workspace,
+                    total,
+                    "joint exact-newton operator mismatch in joint hyper evaluator",
+                )?
             } else {
                 None
             };
@@ -13098,21 +13088,12 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
             true,
         )
     } else {
-        let h_joint_unpen = if use_joint_matrix_free_path(
-            total,
-            joint_observation_count(synced_joint_states.as_ref()),
-        ) {
-            hessian_workspace
-                .as_ref()
-                .map(|workspace| {
-                    exact_newton_joint_hessian_source_from_workspace(
-                        workspace,
-                        total,
-                        "joint exact-newton operator mismatch in joint hyper EFS evaluator",
-                    )
-                })
-                .transpose()?
-                .flatten()
+        let h_joint_unpen = if let Some(workspace) = hessian_workspace.as_ref() {
+            exact_newton_joint_hessian_source_from_workspace(
+                workspace,
+                total,
+                "joint exact-newton operator mismatch in joint hyper EFS evaluator",
+            )?
         } else {
             None
         };
