@@ -1190,6 +1190,11 @@ pub struct CellMomentCacheStats {
 
 impl CellMomentCacheStats {
     #[inline]
+    pub fn record_miss(&self) {
+        self.misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
     pub fn snapshot(&self) -> (u64, u64) {
         (
             self.hits.load(Ordering::Relaxed),

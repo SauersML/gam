@@ -140,6 +140,15 @@ pub const TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS: usize = 4;
 /// under 1 MiB while reducing repeated SCOP row-invariant work by 32× relative
 /// to one-column HVP dispatch.
 const SCOP_PSI_PSI_HVP_TILE_COLS: usize = 32;
+/// Exact dense SCOP coefficient Hessian cache limit for the inner `H·v` path.
+///
+/// The biobank CTN calibration fit has many rows but a moderate coefficient
+/// dimension (for example n=20k, p=264). In that regime repeated PCG products
+/// against the same Hessian should pay the row-streaming chain rule once, then
+/// serve subsequent products as dense BLAS matvecs. Keep the cache restricted to
+/// genuinely moderate p so wide CTN fits remain row-streamed.
+const SCOP_HESSIAN_HVP_DENSE_CACHE_MAX_DIM: usize = 384;
+const SCOP_HESSIAN_HVP_DENSE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 fn beta_bits_match(cached: &Array1<f64>, candidate: &Array1<f64>) -> bool {
     cached.len() == candidate.len()
@@ -1268,10 +1277,11 @@ impl TransformationNormalFamily {
                 beta.len()
             ));
         }
-        let beta_mat = beta
-            .view()
-            .into_shape_with_order((p_resp, p_cov))
-            .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
+        if !row_quantities.matches_beta(beta) {
+            return Err(
+                "SCOP gradient/Hessian received row quantities for a different beta".to_string(),
+            );
+        }
         let cov = self
             .covariate_dense_arc()
             .map_err(|e| format!("SCOP gradient requires cached covariate design: {e}"))?;
@@ -1279,6 +1289,16 @@ impl TransformationNormalFamily {
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
         let endpoint_q = row_quantities.endpoint_q.as_ref();
+        let gamma_rows = row_quantities.gamma.as_ref();
+        if gamma_rows.nrows() != n || gamma_rows.ncols() != p_resp {
+            return Err(format!(
+                "SCOP gradient/Hessian gamma cache shape mismatch: got {}x{}, expected {}x{}",
+                gamma_rows.nrows(),
+                gamma_rows.ncols(),
+                n,
+                p_resp
+            ));
+        }
         let response_val_basis = &self.response_val_basis;
         let response_deriv_basis = &self.response_deriv_basis;
         let response_lower_basis = &self.response_lower_basis;
@@ -1323,7 +1343,6 @@ impl TransformationNormalFamily {
             .into_par_iter()
             .map(|(start, end)| {
                 let mut acc = ScopAccum::new(p_total);
-                let mut gamma = vec![0.0; p_resp];
                 let mut dh_factor = vec![0.0; p_resp];
                 let mut dhp_factor = vec![0.0; p_resp];
                 let mut second_diag = vec![0.0; p_resp];
@@ -1334,15 +1353,12 @@ impl TransformationNormalFamily {
                     let cov_row = cov.row(i);
                     let rv = response_val_basis.row(i);
                     let rd = response_deriv_basis.row(i);
+                    let gamma = gamma_rows.row(i);
                     let wi = weights[i];
                     let hi = h[i];
                     let hp = h_prime[i];
                     let inv_hp = 1.0 / hp;
                     let inv_hp_sq = inv_hp * inv_hp;
-
-                    for k in 0..p_resp {
-                        gamma[k] = beta_mat.row(k).dot(&cov_row);
-                    }
 
                     let q = endpoint_q[i];
                     lower_factor[0] = response_lower_basis[0];
@@ -1439,18 +1455,26 @@ impl TransformationNormalFamily {
                 beta.len()
             ));
         }
-        let beta_mat = beta
-            .view()
-            .into_shape_with_order((p_resp, p_cov))
-            .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
+        if !row_quantities.matches_beta(beta) {
+            return Err("SCOP gradient received row quantities for a different beta".to_string());
+        }
         let cov = self
             .covariate_dense_arc()
             .map_err(|e| format!("SCOP gradient requires cached covariate design: {e}"))?;
         let weights = self.weights.as_ref();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
+        let gamma_rows = row_quantities.gamma.as_ref();
+        if gamma_rows.nrows() != n || gamma_rows.ncols() != p_resp {
+            return Err(format!(
+                "SCOP gradient gamma cache shape mismatch: got {}x{}, expected {}x{}",
+                gamma_rows.nrows(),
+                gamma_rows.ncols(),
+                n,
+                p_resp
+            ));
+        }
         let mut gradient = Array1::<f64>::zeros(p_total);
-        let mut gamma = vec![0.0; p_resp];
         let mut lower_factor = vec![0.0; p_resp];
         let mut upper_factor = vec![0.0; p_resp];
 
@@ -1458,13 +1482,10 @@ impl TransformationNormalFamily {
             let cov_row = cov.row(i);
             let rv = self.response_val_basis.row(i);
             let rd = self.response_deriv_basis.row(i);
+            let gamma = gamma_rows.row(i);
             let wi = weights[i];
             let hi = h[i];
             let inv_hp = 1.0 / h_prime[i];
-
-            for k in 0..p_resp {
-                gamma[k] = beta_mat.row(k).dot(&cov_row);
-            }
 
             let q = row_quantities.endpoint_q[i];
             lower_factor[0] = self.response_lower_basis[0];
@@ -1957,59 +1978,60 @@ impl TransformationNormalFamily {
         Ok(0.5 * (&out + &out.t()))
     }
 
-    fn scop_hessian_matvec(
+    fn scop_hessian_matvec_into(
         &self,
         beta: &Array1<f64>,
         row_quantities: &TransformationNormalRowQuantityCache,
         probe: &Array1<f64>,
-    ) -> Result<Array1<f64>, String> {
-        let mut probes = Array2::<f64>::zeros((probe.len(), 1));
-        probes.column_mut(0).assign(probe);
-        let out = self.scop_hessian_matmat(beta, row_quantities, &probes)?;
-        Ok(out.column(0).to_owned())
-    }
-
-    fn scop_hessian_matmat(
-        &self,
-        beta: &Array1<f64>,
-        row_quantities: &TransformationNormalRowQuantityCache,
-        probes: &Array2<f64>,
-    ) -> Result<Array2<f64>, String> {
+        out: &mut Array1<f64>,
+    ) -> Result<(), String> {
         let stage_start = std::time::Instant::now();
         let n = self.response_val_basis.nrows();
         let p_resp = self.response_val_basis.ncols();
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
-        let n_probe = probes.ncols();
-        if beta.len() != p_total || probes.nrows() != p_total {
+        if beta.len() != p_total || probe.len() != p_total || out.len() != p_total {
             return Err(format!(
-                "SCOP Hessian matmat length mismatch: beta={}, probes rows={}, expected={p_total}",
+                "SCOP Hessian matvec length mismatch: beta={}, probe={}, out={}, expected={p_total}",
                 beta.len(),
-                probes.nrows()
+                probe.len(),
+                out.len()
             ));
         }
-        let beta_mat = beta
+        if !row_quantities.matches_beta(beta) {
+            return Err(
+                "SCOP Hessian matvec received row quantities for a different beta".to_string(),
+            );
+        }
+        let probe_mat = probe
             .view()
             .into_shape_with_order((p_resp, p_cov))
-            .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
+            .map_err(|e| format!("SCOP probe reshape failed: {e}"))?;
         let cov = self
             .covariate_dense_arc()
-            .map_err(|e| format!("SCOP Hessian matmat requires cached covariate design: {e}"))?;
+            .map_err(|e| format!("SCOP Hessian matvec requires cached covariate design: {e}"))?;
         let weights = self.weights.as_ref();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
-        let mut out = Array2::<f64>::zeros((p_total, n_probe));
-        let mut gamma = vec![0.0; p_resp];
-        let mut probe_gamma = vec![0.0; p_resp * n_probe];
-        let mut h_probe = vec![0.0; n_probe];
-        let mut hp_probe = vec![0.0; n_probe];
-        let mut lower_probe = vec![0.0; n_probe];
-        let mut upper_probe = vec![0.0; n_probe];
+        let gamma_rows = row_quantities.gamma.as_ref();
+        if gamma_rows.nrows() != n || gamma_rows.ncols() != p_resp {
+            return Err(format!(
+                "SCOP Hessian matvec gamma cache shape mismatch: got {}x{}, expected {}x{}",
+                gamma_rows.nrows(),
+                gamma_rows.ncols(),
+                n,
+                p_resp
+            ));
+        }
+
+        out.fill(0.0);
+        let mut probe_gamma = vec![0.0; p_resp];
 
         for i in 0..n {
             let cov_row = cov.row(i);
             let rv = self.response_val_basis.row(i);
             let rd = self.response_deriv_basis.row(i);
+            let gamma = gamma_rows.row(i);
             let wi = weights[i];
             let hi = h[i];
             let hp = h_prime[i];
@@ -2017,39 +2039,24 @@ impl TransformationNormalFamily {
             let inv_hp_sq = inv_hp * inv_hp;
 
             for k in 0..p_resp {
-                gamma[k] = beta_mat.row(k).dot(&cov_row);
-                let row_offset = k * p_cov;
-                let probe_offset = k * n_probe;
-                for j in 0..n_probe {
-                    let mut value = 0.0;
-                    for c in 0..p_cov {
-                        value += probes[[row_offset + c, j]] * cov_row[c];
-                    }
-                    probe_gamma[probe_offset + j] = value;
-                }
+                probe_gamma[k] = probe_mat.row(k).dot(&cov_row);
             }
 
-            for j in 0..n_probe {
-                h_probe[j] = rv[0] * probe_gamma[j];
-                hp_probe[j] = rd[0] * probe_gamma[j];
-                lower_probe[j] = self.response_lower_basis[0] * probe_gamma[j];
-                upper_probe[j] = self.response_upper_basis[0] * probe_gamma[j];
-            }
+            let mut h_probe = rv[0] * probe_gamma[0];
+            let mut hp_probe = rd[0] * probe_gamma[0];
+            let mut lower_probe = self.response_lower_basis[0] * probe_gamma[0];
+            let mut upper_probe = self.response_upper_basis[0] * probe_gamma[0];
             for k in 1..p_resp {
-                let probe_offset = k * n_probe;
+                let pg = probe_gamma[k];
                 let gamma_k = gamma[k];
-                for j in 0..n_probe {
-                    let pg = probe_gamma[probe_offset + j];
-                    h_probe[j] += 2.0 * rv[k] * gamma_k * pg;
-                    hp_probe[j] += 2.0 * rd[k] * gamma_k * pg;
-                    lower_probe[j] += 2.0 * self.response_lower_basis[k] * gamma_k * pg;
-                    upper_probe[j] += 2.0 * self.response_upper_basis[k] * gamma_k * pg;
-                }
+                h_probe += 2.0 * rv[k] * gamma_k * pg;
+                hp_probe += 2.0 * rd[k] * gamma_k * pg;
+                lower_probe += 2.0 * self.response_lower_basis[k] * gamma_k * pg;
+                upper_probe += 2.0 * self.response_upper_basis[k] * gamma_k * pg;
             }
             let q = row_quantities.endpoint_q[i];
 
             for k in 0..p_resp {
-                let probe_offset = k * n_probe;
                 let h_factor = if k == 0 {
                     rv[0]
                 } else {
@@ -2070,49 +2077,45 @@ impl TransformationNormalFamily {
                 } else {
                     2.0 * self.response_upper_basis[k] * gamma[k]
                 };
-                for j in 0..n_probe {
-                    let pg = probe_gamma[probe_offset + j];
-                    let second_probe = if k == 0 {
-                        0.0
-                    } else {
-                        2.0 * (hi * rv[k] - rd[k] * inv_hp) * pg
-                    };
-                    let lower_factor_probe = if k == 0 {
-                        0.0
-                    } else {
-                        2.0 * self.response_lower_basis[k] * pg
-                    };
-                    let upper_factor_probe = if k == 0 {
-                        0.0
-                    } else {
-                        2.0 * self.response_upper_basis[k] * pg
-                    };
-                    let normalizer_probe = q.first[0] * upper_factor_probe
-                        + q.first[1] * lower_factor_probe
-                        + (q.second[0][0] * upper_factor + q.second[1][0] * lower_factor)
-                            * upper_probe[j]
-                        + (q.second[0][1] * upper_factor + q.second[1][1] * lower_factor)
-                            * lower_probe[j];
-                    let scalar = wi
-                        * (h_factor * h_probe[j]
-                            + hp_factor * hp_probe[j] * inv_hp_sq
-                            + second_probe
-                            + normalizer_probe);
-                    for c in 0..p_cov {
-                        out[[k * p_cov + c, j]] += scalar * cov_row[c];
-                    }
+                let pg = probe_gamma[k];
+                let second_probe = if k == 0 {
+                    0.0
+                } else {
+                    2.0 * (hi * rv[k] - rd[k] * inv_hp) * pg
+                };
+                let lower_factor_probe = if k == 0 {
+                    0.0
+                } else {
+                    2.0 * self.response_lower_basis[k] * pg
+                };
+                let upper_factor_probe = if k == 0 {
+                    0.0
+                } else {
+                    2.0 * self.response_upper_basis[k] * pg
+                };
+                let normalizer_probe = q.first[0] * upper_factor_probe
+                    + q.first[1] * lower_factor_probe
+                    + (q.second[0][0] * upper_factor + q.second[1][0] * lower_factor) * upper_probe
+                    + (q.second[0][1] * upper_factor + q.second[1][1] * lower_factor) * lower_probe;
+                let scalar = wi
+                    * (h_factor * h_probe
+                        + hp_factor * hp_probe * inv_hp_sq
+                        + second_probe
+                        + normalizer_probe);
+                let row_offset = k * p_cov;
+                for c in 0..p_cov {
+                    out[row_offset + c] += scalar * cov_row[c];
                 }
             }
         }
 
         log::info!(
-            "[STAGE] CTN scop_hessian_matmat n={} p={} k={} elapsed={:.3}s",
+            "[STAGE] CTN scop_hessian_matvec n={} p={} elapsed={:.3}s",
             n,
             p_total,
-            n_probe,
             stage_start.elapsed().as_secs_f64(),
         );
-        Ok(out)
+        Ok(())
     }
 
     fn scop_hessian_directional_matvec(
@@ -2672,30 +2675,38 @@ impl TransformationNormalFamily {
                 beta.len()
             ));
         }
-        let beta_mat = beta
-            .view()
-            .into_shape_with_order((p_resp, p_cov))
-            .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
+        if !row_quantities.matches_beta(beta) {
+            return Err(
+                "SCOP Hessian diagonal received row quantities for a different beta".to_string(),
+            );
+        }
         let cov = self
             .covariate_dense_arc()
             .map_err(|e| format!("SCOP Hessian diagonal requires cached covariate design: {e}"))?;
         let weights = self.weights.as_ref();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
+        let gamma_rows = row_quantities.gamma.as_ref();
+        if gamma_rows.nrows() != n || gamma_rows.ncols() != p_resp {
+            return Err(format!(
+                "SCOP Hessian diagonal gamma cache shape mismatch: got {}x{}, expected {}x{}",
+                gamma_rows.nrows(),
+                gamma_rows.ncols(),
+                n,
+                p_resp
+            ));
+        }
         let mut diag = Array1::<f64>::zeros(p_total);
         for i in 0..n {
             let cov_row = cov.row(i);
             let rv = self.response_val_basis.row(i);
             let rd = self.response_deriv_basis.row(i);
+            let gamma = gamma_rows.row(i);
             let wi = weights[i];
             let hi = h[i];
             let hp = h_prime[i];
             let inv_hp = 1.0 / hp;
             let inv_hp_sq = inv_hp * inv_hp;
-            let mut gamma = vec![0.0; p_resp];
-            for k in 0..p_resp {
-                gamma[k] = beta_mat.row(k).dot(&cov_row);
-            }
             let q = row_quantities.endpoint_q[i];
             for k in 0..p_resp {
                 let h_factor = if k == 0 {
@@ -7647,6 +7658,7 @@ struct TransformationNormalJointHessianWorkspace {
     family: Arc<TransformationNormalFamily>,
     beta: Array1<f64>,
     row_quantities: TransformationNormalRowQuantityCache,
+    dense_hessian_cache: OnceLock<Array2<f64>>,
 }
 
 impl TransformationNormalJointHessianWorkspace {
@@ -7659,11 +7671,54 @@ impl TransformationNormalJointHessianWorkspace {
             family,
             beta,
             row_quantities,
+            dense_hessian_cache: OnceLock::new(),
         })
     }
 
     fn p_total(&self) -> usize {
         self.family.x_val_kron.ncols()
+    }
+
+    fn dense_hessian_cache_enabled(&self) -> bool {
+        let p_total = self.p_total();
+        if p_total > SCOP_HESSIAN_HVP_DENSE_CACHE_MAX_DIM {
+            return false;
+        }
+        p_total
+            .checked_mul(p_total)
+            .and_then(|entries| entries.checked_mul(std::mem::size_of::<f64>()))
+            .is_some_and(|bytes| bytes <= SCOP_HESSIAN_HVP_DENSE_CACHE_MAX_BYTES)
+    }
+
+    fn dense_hessian(&self) -> Result<&Array2<f64>, String> {
+        if let Some(hessian) = self.dense_hessian_cache.get() {
+            return Ok(hessian);
+        }
+        let dense_start = std::time::Instant::now();
+        let (_, hessian) = self
+            .family
+            .scop_gradient_and_negative_hessian(&self.beta, &self.row_quantities)?;
+        if hessian.nrows() != self.p_total() || hessian.ncols() != self.p_total() {
+            return Err(format!(
+                "CTN dense Hessian cache shape mismatch: got {}x{}, expected {}x{}",
+                hessian.nrows(),
+                hessian.ncols(),
+                self.p_total(),
+                self.p_total()
+            ));
+        }
+        if hessian.iter().any(|value| !value.is_finite()) {
+            return Err("CTN dense Hessian cache produced non-finite values".to_string());
+        }
+        let _ = self.dense_hessian_cache.set(hessian);
+        log::info!(
+            "[STAGE] CTN dense Hessian cache build p={} elapsed={:.3}s",
+            self.p_total(),
+            dense_start.elapsed().as_secs_f64(),
+        );
+        self.dense_hessian_cache
+            .get()
+            .ok_or_else(|| "CTN dense Hessian cache was not initialized".to_string())
     }
 
     fn apply_hessian(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
@@ -7674,12 +7729,34 @@ impl TransformationNormalJointHessianWorkspace {
                 self.p_total()
             ));
         }
+        let mut out = Array1::<f64>::zeros(self.p_total());
+        self.apply_hessian_into(v, &mut out)?;
+        Ok(out)
+    }
+
+    fn apply_hessian_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<(), String> {
+        if v.len() != self.p_total() || out.len() != self.p_total() {
+            return Err(format!(
+                "CTN joint Hessian matvec_into dimension mismatch: v={} out={} p_total={}",
+                v.len(),
+                out.len(),
+                self.p_total()
+            ));
+        }
+        if self.dense_hessian_cache_enabled() {
+            let hessian = self.dense_hessian()?;
+            crate::faer_ndarray::fast_av_view_into(hessian, v, out.view_mut());
+            return Ok(());
+        }
         self.family
-            .scop_hessian_matvec(&self.beta, &self.row_quantities, v)
+            .scop_hessian_matvec_into(&self.beta, &self.row_quantities, v, out)
     }
 
     /// Exact diagonal of the unpenalized joint Hessian.
     fn compute_diagonal(&self) -> Result<Array1<f64>, String> {
+        if self.dense_hessian_cache_enabled() {
+            return Ok(self.dense_hessian()?.diag().to_owned());
+        }
         self.family
             .scop_hessian_diagonal(&self.beta, &self.row_quantities)
     }
@@ -7687,14 +7764,16 @@ impl TransformationNormalJointHessianWorkspace {
 
 impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorkspace {
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
-        let (_, hessian) = self
-            .family
-            .scop_gradient_and_negative_hessian(&self.beta, &self.row_quantities)?;
-        Ok(Some(hessian))
+        Ok(Some(self.dense_hessian()?.clone()))
     }
 
     fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         Ok(Some(self.apply_hessian(v)?))
+    }
+
+    fn hessian_matvec_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<bool, String> {
+        self.apply_hessian_into(v, out)?;
+        Ok(true)
     }
 
     fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
@@ -12619,30 +12698,6 @@ mod tests {
             }
         }
 
-        let matmat_probes = vec![toy_probe_vector(p, 104), toy_probe_vector(p, 105)];
-        let mut probe_mat = Array2::<f64>::zeros((p, matmat_probes.len()));
-        for (j, w) in matmat_probes.iter().enumerate() {
-            probe_mat.column_mut(j).assign(w);
-        }
-        let row_quantities = family.row_quantities(&state.beta).expect("row quantities");
-        let want_mat = dense.dot(&probe_mat);
-        let got_mat = family
-            .scop_hessian_matmat(&state.beta, &row_quantities, &probe_mat)
-            .expect("batched Hessian matmat");
-        for i in 0..p {
-            for j in 0..matmat_probes.len() {
-                let tol = 1e-12 * want_mat[[i, j]].abs().max(1.0) + 1e-12;
-                assert!(
-                    (want_mat[[i, j]] - got_mat[[i, j]]).abs() <= tol,
-                    "H matmat[{}, {}] mismatch: dense={:.6e}, op={:.6e}",
-                    i,
-                    j,
-                    want_mat[[i, j]],
-                    got_mat[[i, j]]
-                );
-            }
-        }
-
         // Diagonal must agree element-wise (matrix-free pre-square path vs. dense gram).
         let diag_op = workspace
             .hessian_diagonal()
@@ -12682,6 +12737,58 @@ mod tests {
                     got[i]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn ctn_joint_hessian_workspace_matvec_into_primes_dense_cache() {
+        let psi = array![0.15, -0.10];
+        let (family, _, state, _) = toy_family_and_derivatives(&psi);
+        let p = state.beta.len();
+        let row_quantities = family.row_quantities(&state.beta).expect("row quantities");
+        let workspace = TransformationNormalJointHessianWorkspace::new(
+            Arc::new(family.clone()),
+            state.beta.clone(),
+            row_quantities,
+        )
+        .expect("workspace build");
+        assert!(workspace.dense_hessian_cache_enabled());
+        assert!(workspace.dense_hessian_cache.get().is_none());
+
+        let dense = family
+            .exact_newton_joint_hessian(std::slice::from_ref(&state))
+            .expect("dense joint Hessian build")
+            .expect("dense joint Hessian present");
+        let v = toy_probe_vector(p, 12_345);
+        let want = dense.dot(&v);
+        let mut got = Array1::<f64>::zeros(p);
+        workspace
+            .apply_hessian_into(&v, &mut got)
+            .expect("workspace matvec_into");
+        assert!(workspace.dense_hessian_cache.get().is_some());
+        for i in 0..p {
+            let tol = 1e-12 * want[i].abs().max(1.0) + 1e-12;
+            assert!(
+                (want[i] - got[i]).abs() <= tol,
+                "cached matvec_into mismatch at {i}: dense={:.6e}, workspace={:.6e}",
+                want[i],
+                got[i]
+            );
+        }
+
+        let v2 = toy_probe_vector(p, 12_346);
+        let want2 = dense.dot(&v2);
+        workspace
+            .apply_hessian_into(&v2, &mut got)
+            .expect("second workspace matvec_into");
+        for i in 0..p {
+            let tol = 1e-12 * want2[i].abs().max(1.0) + 1e-12;
+            assert!(
+                (want2[i] - got[i]).abs() <= tol,
+                "second cached matvec_into mismatch at {i}: dense={:.6e}, workspace={:.6e}",
+                want2[i],
+                got[i]
+            );
         }
     }
 

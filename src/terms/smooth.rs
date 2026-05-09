@@ -9710,7 +9710,7 @@ fn apply_pilot_spatial_psi_reseed(
         .apply_tospec(spec, spatial_terms)
 }
 
-fn apply_spatial_anisotropy_pilot_initializer(
+pub(crate) fn apply_spatial_anisotropy_pilot_initializer(
     data: ArrayView2<'_, f64>,
     spec: &mut TermCollectionSpec,
     spatial_terms: &[usize],
