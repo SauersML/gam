@@ -20,7 +20,7 @@ from ._tables import (
 
 DEFAULT_SURVIVAL_PEOPLE_CHUNK = 50_000
 DEFAULT_SURVIVAL_TIME_GRID_CHUNK = 64
-MAX_DENSE_SURVIVAL_CURVE_CELLS = 1_000_000
+DENSE_SURVIVAL_AUTO_CHUNK_CELLS = 1_000_000
 
 _SURVIVAL_MODEL_CLASSES = frozenset(
     {
@@ -111,52 +111,72 @@ class SurvivalPrediction:
             params = params.reshape(-1, 1)
         return params
 
-    def _check_dense_size(self, n_rows: int, n_times: int) -> None:
+    def _should_auto_chunk_dense(self, n_rows: int, n_times: int) -> bool:
         cells = int(n_rows) * int(n_times)
-        if cells > MAX_DENSE_SURVIVAL_CURVE_CELLS:
-            raise ValueError(
-                "dense survival curves are limited to diagnostic subsets "
-                f"({MAX_DENSE_SURVIVAL_CURVE_CELLS} cells); requested "
-                f"{n_rows} rows x {n_times} times. Use survival_at_chunks(), "
-                "hazard_at_chunks(), or write_survival_at_csv()."
-            )
+        return cells > DENSE_SURVIVAL_AUTO_CHUNK_CELLS
+
+    def _collect_chunks(self, chunks: Any, *, n_rows: int, n_times: int) -> Any:
+        import numpy as np
+
+        dense = np.empty((n_rows, n_times), dtype=float)
+        for row_slice, time_slice, block in chunks:
+            dense[row_slice, time_slice] = block
+        return dense
+
+    def _prediction_row_count(self) -> int:
+        for kind in ("hazard", "cumulative_hazard", "survival"):
+            _grid, surface = self._ffi_surface(kind)
+            if surface is not None:
+                return int(surface.shape[0])
+        return int(self._parameters_array().shape[0])
+
+    def _hazard_from_cumulative(
+        self,
+        times_arr: Any,
+        cumulative: Any,
+        *,
+        previous_cumulative: Any | None = None,
+        previous_time: float = 0.0,
+    ) -> Any:
+        import numpy as np
+
+        if previous_cumulative is None:
+            previous_cumulative = np.zeros((cumulative.shape[0], 1), dtype=float)
+        grid = np.concatenate([[float(previous_time)], times_arr])
+        widths = np.diff(grid)
+        widths = np.where(widths <= 0.0, 1.0, widths)
+        cumulative_full = np.concatenate([previous_cumulative, cumulative], axis=1)
+        return np.diff(cumulative_full, axis=1) / widths.reshape(1, -1)
 
     def hazard_at(self, times: Any) -> Any:
         """Hazard rate ``h(t)`` evaluated at each time in ``times``.
 
-        Returns an ``(n_samples, len(times))`` numpy array for diagnostic-sized
-        requests. Large production grids must use ``hazard_at_chunks``.
+        Returns an ``(n_samples, len(times))`` numpy array. Large requests are
+        evaluated in chunks internally before assembling the dense result.
         """
-        import numpy as np
-
         times_arr = self._coerce_times(times)
-        grid, hazard = self._ffi_surface("hazard")
-        if grid is not None and hazard is not None:
-            self._check_dense_size(hazard.shape[0], times_arr.size)
-            return _interpolate_rows(grid, hazard, times_arr, clip=(0.0, None))
+        hazard = self._ffi_surface_at("hazard", times_arr, clip=(0.0, None))
+        if hazard is not None:
+            return hazard
 
-        self._check_dense_size(self._parameters_array().shape[0], times_arr.size)
+        n_rows = self._prediction_row_count()
+        if self._should_auto_chunk_dense(n_rows, times_arr.size):
+            return self._collect_chunks(
+                self.hazard_at_chunks(times_arr),
+                n_rows=n_rows,
+                n_times=times_arr.size,
+            )
         cumulative = self.cumulative_hazard_at(times_arr)
-        if times_arr.size <= 1:
-            return cumulative
-        grid_full = np.concatenate([[0.0], times_arr])
-        cumulative_full = np.concatenate(
-            [np.zeros((cumulative.shape[0], 1)), cumulative], axis=1
-        )
-        diffs = np.diff(cumulative_full, axis=1)
-        widths = np.diff(grid_full)
-        widths = np.where(widths <= 0.0, 1.0, widths)
-        return diffs / widths
+        return self._hazard_from_cumulative(times_arr, cumulative)
 
     def cumulative_hazard_at(self, times: Any) -> Any:
-        """Cumulative hazard ``H(t) = -log S(t)`` for diagnostic-sized grids."""
+        """Cumulative hazard ``H(t) = -log S(t)`` at each requested time."""
         import numpy as np
 
         times_arr = self._coerce_times(times)
-        grid, cumulative = self._ffi_surface("cumulative_hazard")
-        if grid is not None and cumulative is not None:
-            self._check_dense_size(cumulative.shape[0], times_arr.size)
-            return _interpolate_rows(grid, cumulative, times_arr, clip=(0.0, None))
+        cumulative = self._ffi_surface_at("cumulative_hazard", times_arr, clip=(0.0, None))
+        if cumulative is not None:
+            return cumulative
 
         survival = self.survival_at(times)
         survival = np.clip(survival, 1e-12, 1.0)
@@ -169,22 +189,46 @@ class SurvivalPrediction:
         linearly interpolate against the returned grid. Otherwise we
         fall back to the plug-in identity ``S(t) = exp(-H(t))`` using a
         per-row piecewise-constant hazard derived from ``parameters``
-        for backward compatibility with bare-dataclass construction.
-        Dense output is intentionally bounded. Use ``survival_at_chunks`` or
-        ``write_survival_at_csv`` for biobank-scale prediction.
+        for bare-dataclass construction. Large requests are evaluated in
+        chunks internally before assembling the dense result.
         """
-        import numpy as np
-
         times_arr = self._coerce_times(times)
-        grid, surv = self._ffi_surface("survival")
-        if grid is not None and surv is not None:
-            self._check_dense_size(surv.shape[0], times_arr.size)
-            interpolated = _interpolate_rows(grid, surv, times_arr, clip=(0.0, 1.0))
-            return interpolated
+        survival = self._ffi_surface_at("survival", times_arr, clip=(0.0, 1.0))
+        if survival is not None:
+            return survival
 
         params = self._parameters_array()
-        self._check_dense_size(params.shape[0], times_arr.size)
+        if self._should_auto_chunk_dense(params.shape[0], times_arr.size):
+            return self._collect_chunks(
+                self.survival_at_chunks(times_arr),
+                n_rows=params.shape[0],
+                n_times=times_arr.size,
+            )
         return self._survival_block(params, times_arr)
+
+    def _ffi_surface_at(
+        self,
+        kind: str,
+        times_arr: Any,
+        *,
+        clip: tuple[float | None, float | None],
+    ) -> Any | None:
+        grid, surface = self._ffi_surface(kind)
+        if grid is None or surface is None:
+            return None
+        if self._should_auto_chunk_dense(surface.shape[0], times_arr.size):
+            return self._collect_chunks(
+                self._ffi_surface_at_chunks(
+                    kind,
+                    times_arr,
+                    clip=clip,
+                    people_chunk=DEFAULT_SURVIVAL_PEOPLE_CHUNK,
+                    time_grid_chunk=DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
+                ),
+                n_rows=surface.shape[0],
+                n_times=times_arr.size,
+            )
+        return _interpolate_rows(grid, surface, times_arr, clip=clip)
 
     def _ffi_surface(self, kind: str) -> tuple[Any, Any]:
         """Return ``(grid, surface)`` for the FFI-provided surface or
@@ -204,6 +248,36 @@ class SurvivalPrediction:
             return (None, None)
         return (grid, surface_arr)
 
+    def _ffi_surface_at_chunks(
+        self,
+        kind: str,
+        times_arr: Any,
+        *,
+        clip: tuple[float | None, float | None],
+        people_chunk: int,
+        time_grid_chunk: int,
+    ) -> Any | None:
+        grid, surface = self._ffi_surface(kind)
+        if grid is None or surface is None:
+            return None
+        people_chunk = _validate_survival_chunk_size(people_chunk, "people_chunk")
+        time_grid_chunk = _validate_survival_chunk_size(time_grid_chunk, "time_grid_chunk")
+
+        def chunks() -> Any:
+            for row_start in range(0, surface.shape[0], people_chunk):
+                row_stop = min(row_start + people_chunk, surface.shape[0])
+                row_surface = surface[row_start:row_stop, :]
+                for time_start in range(0, times_arr.size, time_grid_chunk):
+                    time_stop = min(time_start + time_grid_chunk, times_arr.size)
+                    time_block = times_arr[time_start:time_stop]
+                    yield (
+                        slice(row_start, row_stop),
+                        slice(time_start, time_stop),
+                        _interpolate_rows(grid, row_surface, time_block, clip=clip),
+                    )
+
+        return chunks()
+
     def survival_at_chunks(
         self,
         times: Any,
@@ -212,8 +286,19 @@ class SurvivalPrediction:
         time_grid_chunk: int = DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
     ) -> Any:
         """Yield ``(row_slice, time_slice, survival_block)`` chunks."""
-        params = self._parameters_array()
         times_arr = self._coerce_times(times)
+        ffi_chunks = self._ffi_surface_at_chunks(
+            "survival",
+            times_arr,
+            clip=(0.0, 1.0),
+            people_chunk=people_chunk,
+            time_grid_chunk=time_grid_chunk,
+        )
+        if ffi_chunks is not None:
+            yield from ffi_chunks
+            return
+
+        params = self._parameters_array()
         people_chunk = _validate_survival_chunk_size(people_chunk, "people_chunk")
         time_grid_chunk = _validate_survival_chunk_size(time_grid_chunk, "time_grid_chunk")
         for row_start in range(0, params.shape[0], people_chunk):
@@ -237,8 +322,20 @@ class SurvivalPrediction:
         """Yield ``(row_slice, time_slice, cumulative_hazard_block)`` chunks."""
         import numpy as np
 
+        times_arr = self._coerce_times(times)
+        ffi_chunks = self._ffi_surface_at_chunks(
+            "cumulative_hazard",
+            times_arr,
+            clip=(0.0, None),
+            people_chunk=people_chunk,
+            time_grid_chunk=time_grid_chunk,
+        )
+        if ffi_chunks is not None:
+            yield from ffi_chunks
+            return
+
         for row_slice, time_slice, survival in self.survival_at_chunks(
-            times,
+            times_arr,
             people_chunk=people_chunk,
             time_grid_chunk=time_grid_chunk,
         ):
@@ -252,33 +349,44 @@ class SurvivalPrediction:
         time_grid_chunk: int = DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
     ) -> Any:
         """Yield ``(row_slice, time_slice, hazard_block)`` chunks."""
-        import numpy as np
-
         times_arr = self._coerce_times(times)
-        people_chunk = _validate_survival_chunk_size(people_chunk, "people_chunk")
-        time_grid_chunk = _validate_survival_chunk_size(time_grid_chunk, "time_grid_chunk")
-        params = self._parameters_array()
-        for row_start in range(0, params.shape[0], people_chunk):
-            row_stop = min(row_start + people_chunk, params.shape[0])
-            row_params = params[row_start:row_stop, :]
-            previous_cumulative = np.zeros((row_stop - row_start, 1), dtype=float)
-            previous_time = 0.0
-            for time_start in range(0, times_arr.size, time_grid_chunk):
-                time_stop = min(time_start + time_grid_chunk, times_arr.size)
-                time_block = times_arr[time_start:time_stop]
-                survival = self._survival_block(row_params, time_block)
-                cumulative = -np.log(np.clip(survival, 1e-12, 1.0))
-                cumulative_full = np.concatenate([previous_cumulative, cumulative], axis=1)
-                grid = np.concatenate([[previous_time], time_block])
-                widths = np.diff(grid)
-                widths = np.where(widths <= 0.0, 1.0, widths)
-                yield (
-                    slice(row_start, row_stop),
-                    slice(time_start, time_stop),
-                    np.diff(cumulative_full, axis=1) / widths.reshape(1, -1),
-                )
-                previous_cumulative = cumulative[:, -1:]
-                previous_time = float(time_block[-1])
+        ffi_chunks = self._ffi_surface_at_chunks(
+            "hazard",
+            times_arr,
+            clip=(0.0, None),
+            people_chunk=people_chunk,
+            time_grid_chunk=time_grid_chunk,
+        )
+        if ffi_chunks is not None:
+            yield from ffi_chunks
+            return
+
+        previous_row_key: tuple[int | None, int | None] | None = None
+        previous_cumulative = None
+        previous_time = 0.0
+        for row_slice, time_slice, cumulative in self.cumulative_hazard_at_chunks(
+            times_arr,
+            people_chunk=people_chunk,
+            time_grid_chunk=time_grid_chunk,
+        ):
+            row_key = (row_slice.start, row_slice.stop)
+            if previous_row_key != row_key or time_slice.start == 0:
+                previous_cumulative = None
+                previous_time = 0.0
+                previous_row_key = row_key
+            time_block = times_arr[time_slice]
+            yield (
+                row_slice,
+                time_slice,
+                self._hazard_from_cumulative(
+                    time_block,
+                    cumulative,
+                    previous_cumulative=previous_cumulative,
+                    previous_time=previous_time,
+                ),
+            )
+            previous_cumulative = cumulative[:, -1:]
+            previous_time = float(time_block[-1])
 
     def write_survival_at_csv(
         self,

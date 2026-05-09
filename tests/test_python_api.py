@@ -617,7 +617,7 @@ def test_survival_prediction_write_csv_preserves_ids(tmp_path: pathlib.Path) -> 
     assert values[2] < values[0]
 
 
-def test_survival_prediction_large_curves_require_chunks(tmp_path: pathlib.Path) -> None:
+def test_survival_prediction_large_curves_auto_chunk_dense_output(tmp_path: pathlib.Path) -> None:
     pred = gamfit.SurvivalPrediction(
         model_class="survival marginal-slope",
         parameters=np.zeros((1_001, 1), dtype=float),
@@ -625,12 +625,62 @@ def test_survival_prediction_large_curves_require_chunks(tmp_path: pathlib.Path)
     )
     grid = np.linspace(0.0, 1000.0, 1000, dtype=float)
 
-    with pytest.raises(ValueError, match="dense survival curves"):
-        pred.survival_at(grid)
+    survival = np.asarray(pred.survival_at(grid), dtype=float)
+    assert survival.shape == (1_001, 1_000)
+    assert np.all(np.isfinite(survival))
+    assert survival[0, 0] == pytest.approx(1.0)
+    assert survival[0, 1] < survival[0, 0]
 
     chunks = list(pred.survival_at_chunks(grid, people_chunk=500, time_grid_chunk=128))
     assert chunks[0][2].shape == (500, 128)
     assert chunks[-1][2].shape == (1, 104)
+    assembled = np.empty_like(survival)
+    for row_slice, time_slice, block in chunks:
+        assembled[row_slice, time_slice] = block
+    np.testing.assert_allclose(assembled, survival)
+
+    source_grid = np.array([0.0, 10.0, 20.0], dtype=float)
+    row_rates = np.linspace(0.01, 0.03, 1_001, dtype=float).reshape(-1, 1)
+    ffi_survival = np.exp(-row_rates * source_grid.reshape(1, -1))
+    ffi_pred = gamfit.SurvivalPrediction(
+        model_class="survival marginal-slope",
+        parameters=row_rates,
+        parameter_names=("rate",),
+        times=source_grid,
+        hazard=np.repeat(row_rates, source_grid.size, axis=1),
+        survival=ffi_survival,
+        cumulative_hazard=row_rates * source_grid.reshape(1, -1),
+    )
+    query_grid = np.linspace(0.0, 20.0, 1_000, dtype=float)
+
+    ffi_dense = np.asarray(ffi_pred.survival_at(query_grid), dtype=float)
+    assert ffi_dense.shape == (1_001, 1_000)
+    np.testing.assert_allclose(
+        ffi_dense[-1, :],
+        np.interp(query_grid, source_grid, ffi_survival[-1, :]),
+    )
+
+    ffi_chunks = list(
+        ffi_pred.survival_at_chunks(query_grid, people_chunk=500, time_grid_chunk=128)
+    )
+    assert ffi_chunks[0][2].shape == (500, 128)
+    assert ffi_chunks[-1][2].shape == (1, 104)
+    ffi_assembled = np.empty_like(ffi_dense)
+    for row_slice, time_slice, block in ffi_chunks:
+        ffi_assembled[row_slice, time_slice] = block
+    np.testing.assert_allclose(ffi_assembled, ffi_dense)
+
+    ffi_hazard = np.asarray(ffi_pred.hazard_at(query_grid), dtype=float)
+    assert ffi_hazard.shape == (1_001, 1_000)
+    np.testing.assert_allclose(ffi_hazard[:, 0], row_rates[:, 0])
+
+    ffi_cumulative = np.asarray(ffi_pred.cumulative_hazard_at(query_grid), dtype=float)
+    assert ffi_cumulative.shape == (1_001, 1_000)
+    np.testing.assert_allclose(ffi_cumulative[-1, :], row_rates[-1, 0] * query_grid)
+
+    single_time_hazard = np.asarray(pred.hazard_at(np.array([2.0], dtype=float)), dtype=float)
+    assert single_time_hazard.shape == (1_001, 1)
+    np.testing.assert_allclose(single_time_hazard, 1.0)
 
     chunk_grid = np.array([1.0, 2.0], dtype=float)
     cumhaz_chunks = list(
