@@ -8279,56 +8279,279 @@ fn symmetric_eigen(a: &ndarray::Array2<f64>) -> (Vec<f64>, ndarray::Array2<f64>)
 //  Corrected coefficient covariance (smoothing-parameter uncertainty)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Corrected covariance of the coefficient vector, accounting for uncertainty
-/// in the smoothing/hyperparameters theta = (rho, psi).
+/// Diagnostic returned when the (free-subspace) outer Hessian is indefinite.
 ///
-/// The standard conditional covariance H^{-1} ignores uncertainty in theta.
+/// An indefinite outer Hessian at the reported optimum means one of:
+///  - the outer optimization has not converged to a stationary point,
+///  - the reported point is a saddle, not a minimum,
+///  - the active-bound set on θ is wrong (the unconstrained Hessian is
+///    being inspected on directions that the constraint set actually pins),
+///  - the objective being inspected is a surrogate / smoothed version of
+///    the true REML/LAML criterion.
+///
+/// The previous implementation silently clamped the negative eigenvalues to
+/// zero, which under-reports the uncertainty in those directions (it pretends
+/// the directions don't exist). That is not "conservative" — it is wrong.
+/// We refuse to fabricate a covariance and instead return this diagnostic.
+#[derive(Debug, Clone)]
+pub struct OuterHessianIndefinite {
+    /// Most-negative eigenvalue of the projected (free-subspace) outer Hessian.
+    pub min_eigenvalue: f64,
+    /// Indices of θ-coordinates that were detected as active on a bound.
+    pub active_constraints: Vec<usize>,
+    /// θ at the reported optimum (if available; empty otherwise).
+    pub theta: Vec<f64>,
+    /// L2 norm of the outer gradient at θ (NaN if unavailable).
+    pub gradient_norm: f64,
+    /// Frobenius norm of the outer Hessian.
+    pub hessian_norm: f64,
+    /// Suggested next action for the caller / user.
+    pub suggested_action: &'static str,
+}
+
+/// Errors that can arise while building the corrected covariance.
+#[derive(Debug, Clone)]
+pub enum CorrectedCovarianceError {
+    /// Argument shapes do not agree (with explanatory message).
+    ShapeMismatch(String),
+    /// The eigendecomposition failed numerically (with the underlying message).
+    EigendecompositionFailed(String),
+    /// The projected outer Hessian is indefinite — see diagnostic.
+    Indefinite(OuterHessianIndefinite),
+}
+
+impl core::fmt::Display for CorrectedCovarianceError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::ShapeMismatch(msg) => write!(f, "shape mismatch: {msg}"),
+            Self::EigendecompositionFailed(msg) => write!(f, "eigendecomposition failed: {msg}"),
+            Self::Indefinite(d) => write!(
+                f,
+                "outer Hessian indefinite on free subspace (min eigenvalue = {:.3e}, \
+                 ||H||_F = {:.3e}, ||g||_2 = {:.3e}, active = {:?}); {}",
+                d.min_eigenvalue,
+                d.hessian_norm,
+                d.gradient_norm,
+                d.active_constraints,
+                d.suggested_action,
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CorrectedCovarianceError {}
+
+/// Result describing the corrected covariance plus structural diagnostics.
+#[derive(Debug, Clone)]
+pub struct CorrectedCovariance {
+    /// The p×p corrected covariance V*_α.
+    pub matrix: Array2<f64>,
+    /// θ-indices that were treated as active on a bound and excluded from V_θ.
+    pub active_constraints: Vec<usize>,
+    /// θ-indices in the free subspace whose curvature was so close to zero
+    /// that they were treated as structurally rank-deficient (pseudoinverse).
+    pub rank_deficient_directions: Vec<usize>,
+}
+
+/// Suggested action text returned with `OuterHessianIndefinite`.
+const INDEFINITE_SUGGESTED_ACTION: &str = "refit with a tighter outer tolerance, verify the inspected objective is the true \
+     REML/LAML cost rather than a surrogate, and audit recent active-set transitions";
+
+/// Detect θ-coordinates that are sitting on the [-RHO_BOUND, RHO_BOUND] bound.
+///
+/// We use the same `tolerance = 1e-8` as the rest of the outer code path so the
+/// active-set view here agrees with the optimizer's view at the reported optimum.
+fn detect_active_theta_bounds(theta: Option<&[f64]>, q: usize) -> Vec<usize> {
+    let Some(theta) = theta else {
+        return Vec::new();
+    };
+    if theta.len() != q {
+        return Vec::new();
+    }
+    let bound = crate::solver::estimate::RHO_BOUND;
+    let tol = 1e-8;
+    theta
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &v)| (v.abs() >= bound - tol).then_some(i))
+        .collect()
+}
+
+/// Decide which θ-coordinates are bounded (ρ-style) vs unbounded (ψ-style).
+///
+/// We treat the LAST `ext_len` coordinates as ψ (unbounded extended
+/// hyperparameters) and the FIRST `rho_len` as ρ (bounded by ±RHO_BOUND).
+/// This matches the layout used everywhere else in this file: J_α has ρ
+/// columns first, then ext columns.
+fn active_bound_indices_for_theta(
+    theta: Option<&[f64]>,
+    rho_len: usize,
+    ext_len: usize,
+) -> Vec<usize> {
+    let q = rho_len + ext_len;
+    let mut active = detect_active_theta_bounds(theta, q);
+    // Drop ψ-coordinates: they are unbounded by construction.
+    active.retain(|&i| i < rho_len);
+    let _ = ext_len;
+    active
+}
+
+/// Inertia gate + projected-inverse on the free subspace of θ.
+///
+/// Returns `(V_θ_full, rank_deficient_free_indices)` where `V_θ_full` is q×q
+/// with rows/columns of active coordinates set to zero. If the projected
+/// Hessian is indefinite beyond tolerance, returns the diagnostic instead.
+fn projected_inverse_with_inertia_gate(
+    outer_hessian: &Array2<f64>,
+    active: &[usize],
+    theta_for_diag: Option<&[f64]>,
+    gradient_norm: f64,
+) -> Result<(Array2<f64>, Vec<usize>), CorrectedCovarianceError> {
+    let q = outer_hessian.nrows();
+    let mut is_active = vec![false; q];
+    for &i in active {
+        if i < q {
+            is_active[i] = true;
+        }
+    }
+    let free: Vec<usize> = (0..q).filter(|i| !is_active[*i]).collect();
+    let qf = free.len();
+
+    let h_norm = outer_hessian.iter().map(|v| v * v).sum::<f64>().sqrt();
+
+    let mut v_theta_full = Array2::<f64>::zeros((q, q));
+    if qf == 0 {
+        return Ok((v_theta_full, Vec::new()));
+    }
+
+    let mut h_ff = Array2::<f64>::zeros((qf, qf));
+    for (a, &ia) in free.iter().enumerate() {
+        for (b, &ib) in free.iter().enumerate() {
+            h_ff[[a, b]] = outer_hessian[[ia, ib]];
+        }
+    }
+
+    let (evals, evecs) = h_ff.eigh(faer::Side::Lower).map_err(|e| {
+        CorrectedCovarianceError::EigendecompositionFailed(format!("projected outer Hessian: {e}"))
+    })?;
+
+    let eps = f64::EPSILON;
+    let neg_tol = 8.0 * eps * (q.max(1) as f64) * h_norm.max(1.0);
+    let min_eig = evals.iter().copied().fold(f64::INFINITY, f64::min);
+    if min_eig < -neg_tol {
+        return Err(CorrectedCovarianceError::Indefinite(
+            OuterHessianIndefinite {
+                min_eigenvalue: min_eig,
+                active_constraints: active.to_vec(),
+                theta: theta_for_diag.map(|t| t.to_vec()).unwrap_or_default(),
+                gradient_norm,
+                hessian_norm: h_norm,
+                suggested_action: INDEFINITE_SUGGESTED_ACTION,
+            },
+        ));
+    }
+
+    let pos_tol = 8.0 * eps * (q.max(1) as f64) * h_norm.max(1.0);
+    let mut v_theta_ff = Array2::<f64>::zeros((qf, qf));
+    let mut rank_deficient_free: Vec<usize> = Vec::new();
+    for j in 0..qf {
+        let sigma = evals[j];
+        if sigma.abs() <= pos_tol {
+            rank_deficient_free.push(j);
+            continue;
+        }
+        let inv_sigma = 1.0 / sigma;
+        let u = evecs.column(j);
+        for a in 0..qf {
+            let ua = inv_sigma * u[a];
+            for b in a..qf {
+                let val = ua * u[b];
+                v_theta_ff[[a, b]] += val;
+                if a != b {
+                    v_theta_ff[[b, a]] += val;
+                }
+            }
+        }
+    }
+
+    for (a, &ia) in free.iter().enumerate() {
+        for (b, &ib) in free.iter().enumerate() {
+            v_theta_full[[ia, ib]] = v_theta_ff[[a, b]];
+        }
+    }
+
+    let rank_deficient_directions: Vec<usize> =
+        rank_deficient_free.into_iter().map(|j| free[j]).collect();
+
+    Ok((v_theta_full, rank_deficient_directions))
+}
+
+/// Corrected covariance of the coefficient vector, accounting for uncertainty
+/// in the smoothing/hyperparameters θ = (ρ, ψ).
+///
+/// The standard conditional covariance H^{-1} ignores uncertainty in θ.
 /// The corrected covariance adds the propagation term:
 ///
 /// ```text
-///   V*_alpha = H^{-1} + J_alpha V_theta J_alpha^T
+///   V*_α = H^{-1} + J_α V_θ J_α^T
 /// ```
 ///
 /// where:
-/// - H^{-1} is obtained via `hop.solve` on identity columns
-/// - J_alpha = [-v_1, ..., -v_k, -ext_v_1, ..., -ext_v_m] is the p x q matrix
-///   of negated mode responses (the implicit-function sensitivities d(beta)/d(theta))
-/// - V_theta = outer_hessian^{-1} is the q x q inverse outer Hessian
+/// - H^{-1} is obtained via `hop.solve` on identity columns,
+/// - J_α = [-v_1, …, -v_k, -ext_v_1, …, -ext_v_m] is the p×q matrix of
+///   negated mode responses (implicit-function sensitivities ∂β̂/∂θ),
+/// - V_θ is the inverse of the outer Hessian RESTRICTED to the free subspace
+///   of θ (coordinates that are not pinned to a bound) and inertia-gated.
 ///
-/// The mode responses v_k = H^{-1}(A_k beta) and ext_v_i = H^{-1}(g_i) are
-/// already computed in the unified evaluator gradient/Hessian loop, so this
-/// function reuses them directly.
+/// # Active-bound handling and inertia gate
 ///
-/// # Arguments
-/// - `v_ks`: mode responses for rho coordinates, v_k = H^{-1}(A_k beta)
-/// - `ext_v`: mode responses for extended (psi) coordinates, v_i = H^{-1}(g_i)
-/// - `outer_hessian`: the q x q outer Hessian (nabla^2_theta V)
-/// - `hop`: the HessianOperator providing H^{-1}
-///
-/// # Returns
-/// The full p x p corrected covariance matrix V*_alpha = H^{-1} + J V_theta J^T.
-///
-/// # Edge cases
-/// - If the outer Hessian is indefinite, eigendecomposition with positive-part
-///   projection is used for V_theta (negative eigenvalues are clamped to zero).
-/// - Returns `Err` only if the eigendecomposition itself fails.
+/// If `theta_at_optimum` is supplied, ρ-coordinates sitting on ±`RHO_BOUND`
+/// are treated as active and excluded from V_θ. The remaining free Hessian
+/// block H_FF is eigen-decomposed:
+///   - if min(σ) < -8·ε·q·‖H‖_F → return [`CorrectedCovarianceError::Indefinite`]
+///     with a diagnostic (the previous behavior of clamping negatives to zero
+///     under-reports uncertainty and is therefore refused);
+///   - if |σ| ≤ 8·ε·q·‖H‖_F → that direction is treated as structurally
+///     rank-deficient (Moore-Penrose drop) and listed in
+///     `rank_deficient_directions` for the caller to surface;
+///   - otherwise H_FF is inverted exactly via the spectral expansion.
 pub fn compute_corrected_covariance(
     v_ks: &[Array1<f64>],
     ext_v: &[Array1<f64>],
     outer_hessian: &Array2<f64>,
     hop: &dyn HessianOperator,
-) -> Result<Array2<f64>, String> {
+) -> Result<Array2<f64>, CorrectedCovarianceError> {
+    compute_corrected_covariance_with_constraints(v_ks, ext_v, outer_hessian, hop, None, f64::NAN)
+        .map(|cov| cov.matrix)
+}
+
+/// Constraint- and inertia-aware version of [`compute_corrected_covariance`].
+///
+/// Prefer this entry point when θ at the optimum and the outer-gradient norm
+/// are available — it auto-derives the active-bound set on ρ and emits the
+/// rank-deficient diagnostic alongside the matrix.
+pub fn compute_corrected_covariance_with_constraints(
+    v_ks: &[Array1<f64>],
+    ext_v: &[Array1<f64>],
+    outer_hessian: &Array2<f64>,
+    hop: &dyn HessianOperator,
+    theta_at_optimum: Option<&[f64]>,
+    gradient_norm: f64,
+) -> Result<CorrectedCovariance, CorrectedCovarianceError> {
     let p = hop.dim();
     let q = v_ks.len() + ext_v.len();
 
     if q == 0 {
-        // No hyperparameters — corrected covariance equals the conditional H^{-1}.
         let eye = Array2::eye(p);
-        return Ok(hop.solve_multi(&eye));
+        return Ok(CorrectedCovariance {
+            matrix: hop.solve_multi(&eye),
+            active_constraints: Vec::new(),
+            rank_deficient_directions: Vec::new(),
+        });
     }
 
     if outer_hessian.nrows() != q || outer_hessian.ncols() != q {
-        return Err(format!(
+        return Err(CorrectedCovarianceError::ShapeMismatch(format!(
             "compute_corrected_covariance: outer Hessian dimension ({}, {}) does not match \
              total hyperparameter count q = {} (rho: {}, ext: {})",
             outer_hessian.nrows(),
@@ -8336,10 +8559,9 @@ pub fn compute_corrected_covariance(
             q,
             v_ks.len(),
             ext_v.len(),
-        ));
+        )));
     }
 
-    // Step 1: Assemble J_alpha (p x q) with columns = -v_i.
     let mut j_alpha = Array2::zeros((p, q));
     for (col, v) in v_ks.iter().enumerate() {
         for row in 0..p {
@@ -8353,24 +8575,29 @@ pub fn compute_corrected_covariance(
         }
     }
 
-    // Step 2: Compute V_theta = outer_hessian^{-1} via eigendecomposition
-    // with positive-part projection (handles indefinite Hessians gracefully).
-    let v_theta = invert_with_positive_projection(outer_hessian)?;
+    let active = active_bound_indices_for_theta(theta_at_optimum, v_ks.len(), ext_v.len());
 
-    // Step 3: Compute the correction term J_alpha V_theta J_alpha^T.
-    // Factored as (J V_theta) J^T to reuse the intermediate (p x q).
-    let j_v_theta = j_alpha.dot(&v_theta); // p x q
-    let correction = j_v_theta.dot(&j_alpha.t()); // p x p
+    let (v_theta, rank_deficient_directions) = projected_inverse_with_inertia_gate(
+        outer_hessian,
+        &active,
+        theta_at_optimum,
+        gradient_norm,
+    )?;
 
-    // Step 4: Compute H^{-1} and add the correction.
+    let j_v_theta = j_alpha.dot(&v_theta);
+    let correction = j_v_theta.dot(&j_alpha.t());
+
     let eye = Array2::eye(p);
     let mut h_inv = hop.solve_multi(&eye);
     h_inv += &correction;
 
-    // Enforce exact symmetry (numerical noise from the matrix products).
     enforce_symmetry_inplace(&mut h_inv);
 
-    Ok(h_inv)
+    Ok(CorrectedCovariance {
+        matrix: h_inv,
+        active_constraints: active,
+        rank_deficient_directions,
+    })
 }
 
 /// Compute only the diagonal of the corrected covariance V*_alpha.
@@ -8398,11 +8625,39 @@ pub fn compute_corrected_covariance_diagonal(
     ext_v: &[Array1<f64>],
     outer_hessian: &Array2<f64>,
     hop: &dyn HessianOperator,
-) -> Result<Array1<f64>, String> {
+) -> Result<Array1<f64>, CorrectedCovarianceError> {
+    compute_corrected_covariance_diagonal_with_constraints(
+        v_ks,
+        ext_v,
+        outer_hessian,
+        hop,
+        None,
+        f64::NAN,
+    )
+    .map(|d| d.diagonal)
+}
+
+/// Diagonal of the corrected covariance plus active-set / rank-deficiency
+/// diagnostics. See [`compute_corrected_covariance_with_constraints`] for the
+/// full version (the inertia gate logic is identical).
+#[derive(Debug, Clone)]
+pub struct CorrectedCovarianceDiagonal {
+    pub diagonal: Array1<f64>,
+    pub active_constraints: Vec<usize>,
+    pub rank_deficient_directions: Vec<usize>,
+}
+
+pub fn compute_corrected_covariance_diagonal_with_constraints(
+    v_ks: &[Array1<f64>],
+    ext_v: &[Array1<f64>],
+    outer_hessian: &Array2<f64>,
+    hop: &dyn HessianOperator,
+    theta_at_optimum: Option<&[f64]>,
+    gradient_norm: f64,
+) -> Result<CorrectedCovarianceDiagonal, CorrectedCovarianceError> {
     let p = hop.dim();
     let q = v_ks.len() + ext_v.len();
 
-    // Start with diag(H^{-1}).
     let mut diag = Array1::zeros(p);
     for i in 0..p {
         let mut e_i = Array1::zeros(p);
@@ -8412,25 +8667,47 @@ pub fn compute_corrected_covariance_diagonal(
     }
 
     if q == 0 {
-        return Ok(diag);
+        return Ok(CorrectedCovarianceDiagonal {
+            diagonal: diag,
+            active_constraints: Vec::new(),
+            rank_deficient_directions: Vec::new(),
+        });
     }
 
     if outer_hessian.nrows() != q || outer_hessian.ncols() != q {
-        return Err(format!(
+        return Err(CorrectedCovarianceError::ShapeMismatch(format!(
             "compute_corrected_covariance_diagonal: outer Hessian dimension ({}, {}) \
              does not match q = {}",
             outer_hessian.nrows(),
             outer_hessian.ncols(),
             q,
-        ));
+        )));
     }
 
-    // Compute V_theta^{1/2} via positive-projected eigendecomposition.
-    // V_theta^{1/2} = U diag(sqrt(max(0, 1/sigma_i))) where sigma_i are
-    // eigenvalues of the outer Hessian.
-    let v_theta_sqrt = sqrt_inverse_with_positive_projection(outer_hessian)?;
+    let active = active_bound_indices_for_theta(theta_at_optimum, v_ks.len(), ext_v.len());
+    let (v_theta_full, rank_deficient_directions) = projected_inverse_with_inertia_gate(
+        outer_hessian,
+        &active,
+        theta_at_optimum,
+        gradient_norm,
+    )?;
 
-    // Assemble J_alpha (p x q) with columns = -v_i.
+    // Symmetric square root of V_θ via eigendecomposition (PSD by construction).
+    let (sym_evals, sym_evecs) = v_theta_full
+        .eigh(faer::Side::Lower)
+        .map_err(|e| CorrectedCovarianceError::EigendecompositionFailed(e.to_string()))?;
+    let mut v_theta_sqrt = Array2::<f64>::zeros((q, q));
+    for j in 0..q {
+        let s = sym_evals[j];
+        if s <= 0.0 {
+            continue;
+        }
+        let scale = s.sqrt();
+        for row in 0..q {
+            v_theta_sqrt[[row, j]] = sym_evecs[[row, j]] * scale;
+        }
+    }
+
     let mut j_alpha = Array2::zeros((p, q));
     for (col, v) in v_ks.iter().enumerate() {
         for row in 0..p {
@@ -8444,10 +8721,7 @@ pub fn compute_corrected_covariance_diagonal(
         }
     }
 
-    // Compute M = J_alpha V_theta^{1/2} (p x q).
-    let m = j_alpha.dot(&v_theta_sqrt); // p x q
-
-    // diag(correction) = row_norms(M)^2 = sum_j M[i,j]^2 for each i.
+    let m = j_alpha.dot(&v_theta_sqrt);
     for i in 0..p {
         let mut row_norm_sq = 0.0;
         for j in 0..m.ncols() {
@@ -8456,69 +8730,11 @@ pub fn compute_corrected_covariance_diagonal(
         diag[i] += row_norm_sq;
     }
 
-    Ok(diag)
-}
-
-/// Invert a symmetric matrix using eigendecomposition with positive-part
-/// projection: eigenvalues <= 0 are treated as infinite (their directions
-/// are omitted from the inverse, equivalent to clamping to zero).
-///
-/// This handles indefinite outer Hessians gracefully — negative curvature
-/// directions indicate that the Laplace approximation is unreliable in those
-/// directions, so we conservatively omit their contribution rather than
-/// amplifying uncertainty along negatively-curved directions.
-fn invert_with_positive_projection(mat: &Array2<f64>) -> Result<Array2<f64>, String> {
-    let n = mat.nrows();
-    let (eigenvalues, eigenvectors) = mat
-        .eigh(faer::Side::Lower)
-        .map_err(|e| format!("eigendecomposition failed in positive-projection inverse: {e}"))?;
-
-    let mut result = Array2::zeros((n, n));
-    for j in 0..n {
-        let sigma = eigenvalues[j];
-        if sigma <= 0.0 {
-            continue; // omit non-positive directions
-        }
-        let inv_sigma = 1.0 / sigma;
-        let u = eigenvectors.column(j);
-        for a in 0..n {
-            let ua = inv_sigma * u[a];
-            for b in a..n {
-                let val = ua * u[b];
-                result[[a, b]] += val;
-                if a != b {
-                    result[[b, a]] += val;
-                }
-            }
-        }
-    }
-    Ok(result)
-}
-
-/// Compute V_theta^{1/2} = U diag(sqrt(1/sigma_i^+)) for positive eigenvalues
-/// of the outer Hessian. Non-positive eigenvalues produce zero columns.
-///
-/// The result is q x q_active (where q_active <= q is the number of positive
-/// eigenvalues), but we return the full q x q matrix with zero columns for
-/// omitted directions for simplicity.
-fn sqrt_inverse_with_positive_projection(mat: &Array2<f64>) -> Result<Array2<f64>, String> {
-    let n = mat.nrows();
-    let (eigenvalues, eigenvectors) = mat
-        .eigh(faer::Side::Lower)
-        .map_err(|e| format!("eigendecomposition failed in sqrt-inverse: {e}"))?;
-
-    let mut result = Array2::zeros((n, n));
-    for j in 0..n {
-        let sigma = eigenvalues[j];
-        if sigma <= 0.0 {
-            continue;
-        }
-        let scale = (1.0 / sigma).sqrt();
-        for row in 0..n {
-            result[[row, j]] = eigenvectors[[row, j]] * scale;
-        }
-    }
-    Ok(result)
+    Ok(CorrectedCovarianceDiagonal {
+        diagonal: diag,
+        active_constraints: active,
+        rank_deficient_directions,
+    })
 }
 
 /// Enforce exact symmetry on a square matrix by averaging off-diagonal pairs.
