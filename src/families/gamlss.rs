@@ -7049,6 +7049,80 @@ impl RowCoeffOperator {
             .expect("RowCoeffOperator scratch pool poisoned")
             .push(scratch);
     }
+
+    fn projected_trace_column(
+        &self,
+        factor: &Array2<f64>,
+        col: usize,
+        u: &mut [Array1<f64>],
+    ) -> f64 {
+        for (k, ch) in self.channels.iter().enumerate() {
+            let start = self.block_offsets[ch.block];
+            let width = self.block_widths[ch.block];
+            debug_assert_eq!(ch.design.ncols(), width);
+            let f_slice = factor.slice(s![start..start + width, col]);
+            crate::faer_ndarray::fast_av_into(ch.design.as_ref(), &f_slice, &mut u[k]);
+        }
+
+        let mut trace = 0.0;
+        for pair in &self.pair_coeffs {
+            let coeff = pair
+                .coeff
+                .as_slice()
+                .expect("RowCoeffOperator pair coeff must be contiguous");
+            let u_a = u[pair.a]
+                .as_slice()
+                .expect("RowCoeffOperator projected channel must be contiguous");
+            let u_b = u[pair.b]
+                .as_slice()
+                .expect("RowCoeffOperator projected channel must be contiguous");
+            if pair.a == pair.b {
+                for i in 0..self.nrows {
+                    trace += coeff[i] * u_a[i] * u_a[i];
+                }
+            } else {
+                for i in 0..self.nrows {
+                    trace += 2.0 * coeff[i] * u_a[i] * u_b[i];
+                }
+            }
+        }
+        trace
+    }
+
+    fn projected_trace(&self, factor: &Array2<f64>) -> f64 {
+        assert_eq!(
+            factor.nrows(),
+            self.dim,
+            "row-coefficient projected trace factor row mismatch: factor rows={} but dim={}",
+            factor.nrows(),
+            self.dim
+        );
+        let rank = factor.ncols();
+        if self.nrows == 0 || rank == 0 {
+            return 0.0;
+        }
+        if rayon::current_thread_index().is_some() {
+            let mut scratch = self.acquire_scratch();
+            let mut trace = 0.0;
+            for col in 0..rank {
+                trace += self.projected_trace_column(factor, col, &mut scratch.u);
+            }
+            self.release_scratch(scratch);
+            trace
+        } else {
+            (0..rank)
+                .into_par_iter()
+                .map(|col| {
+                    let mut u: Vec<Array1<f64>> = self
+                        .channels
+                        .iter()
+                        .map(|_| Array1::<f64>::zeros(self.nrows))
+                        .collect();
+                    self.projected_trace_column(factor, col, &mut u)
+                })
+                .sum()
+        }
+    }
 }
 
 impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator {
@@ -7163,6 +7237,18 @@ impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator 
         let mut out = Array2::<f64>::zeros((self.dim, self.dim));
         self.mul_basis_columns_into(0, out.view_mut());
         out
+    }
+
+    fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
+        self.projected_trace(factor)
+    }
+
+    fn trace_projected_factor_cached(
+        &self,
+        factor: &Array2<f64>,
+        _cache: &crate::solver::estimate::reml::unified::ProjectedFactorCache,
+    ) -> f64 {
+        self.projected_trace(factor)
     }
 
     fn is_implicit(&self) -> bool {
@@ -7300,53 +7386,6 @@ impl DesignTwoBlockRowCoeffOperator {
         if n == 0 || k == 0 {
             return 0.0;
         }
-        let f_a = factor.slice(s![0..pa, ..]);
-        let f_b = factor.slice(s![pa..dim, ..]);
-        // The trait default `mul_mat` already disables rayon when called from
-        // inside an existing rayon worker (`rayon::current_thread_index()` is
-        // `Some` in that case). Mirror that gating here so this path doesn't
-        // oversubscribe the worker pool when it is invoked from inside the
-        // outer-Hessian assembly's own par_iter scope.
-        let cols: Vec<(Array1<f64>, Array1<f64>)> = if rayon::current_thread_index().is_some() {
-            (0..k)
-                .map(|col| {
-                    let f_a_col = f_a.column(col).to_owned();
-                    let f_b_col = f_b.column(col).to_owned();
-                    let u_a = self.x_a.matrixvectormultiply(&f_a_col);
-                    let u_b = self.x_b.matrixvectormultiply(&f_b_col);
-                    debug_assert_eq!(u_a.len(), n);
-                    debug_assert_eq!(u_b.len(), n);
-                    (u_a, u_b)
-                })
-                .collect()
-        } else {
-            (0..k)
-                .into_par_iter()
-                .map(|col| {
-                    let f_a_col = f_a.column(col).to_owned();
-                    let f_b_col = f_b.column(col).to_owned();
-                    let u_a = self.x_a.matrixvectormultiply(&f_a_col);
-                    let u_b = self.x_b.matrixvectormultiply(&f_b_col);
-                    debug_assert_eq!(u_a.len(), n);
-                    debug_assert_eq!(u_b.len(), n);
-                    (u_a, u_b)
-                })
-                .collect()
-        };
-        let mut aa = vec![0.0_f64; n];
-        let mut ab = vec![0.0_f64; n];
-        let mut bb = vec![0.0_f64; n];
-        for (u_a, u_b) in &cols {
-            let ua = u_a.as_slice().expect("u_a contiguous");
-            let ub = u_b.as_slice().expect("u_b contiguous");
-            for i in 0..n {
-                let a = ua[i];
-                let b = ub[i];
-                aa[i] += a * a;
-                ab[i] += a * b;
-                bb[i] += b * b;
-            }
-        }
         let c_aa = self
             .c_aa
             .as_slice()
@@ -7360,8 +7399,22 @@ impl DesignTwoBlockRowCoeffOperator {
             .as_slice()
             .expect("c_bb is constructed contiguous");
         let mut trace = 0.0;
-        for i in 0..n {
-            trace += c_aa[i] * aa[i] + 2.0 * c_ab[i] * ab[i] + c_bb[i] * bb[i];
+        let f_a = factor.slice(s![0..pa, ..]);
+        let f_b = factor.slice(s![pa..dim, ..]);
+        for col in 0..k {
+            let f_a_col = f_a.column(col).to_owned();
+            let f_b_col = f_b.column(col).to_owned();
+            let u_a = self.x_a.matrixvectormultiply(&f_a_col);
+            let u_b = self.x_b.matrixvectormultiply(&f_b_col);
+            debug_assert_eq!(u_a.len(), n);
+            debug_assert_eq!(u_b.len(), n);
+            let ua = u_a.as_slice().expect("u_a contiguous");
+            let ub = u_b.as_slice().expect("u_b contiguous");
+            for i in 0..n {
+                let a = ua[i];
+                let b = ub[i];
+                trace += c_aa[i] * a * a + 2.0 * c_ab[i] * a * b + c_bb[i] * b * b;
+            }
         }
         trace
     }
