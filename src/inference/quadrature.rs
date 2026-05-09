@@ -2300,6 +2300,9 @@ pub(crate) fn cloglog_posterior_meanwith_deriv_controlled(
     // This layered routing is the real conclusion of the math work: not one
     // magical universal formula, but one shared mathematical target with the
     // best evaluator chosen for each regime.
+    // ApproxKind: NumericalApproximation — each branch carries its own
+    // backward error bound (special-function or GHQ tail), composed so the
+    // worst-case error is the max across regimes; documented at each branch.
     if !(mu.is_finite() && sigma.is_finite()) || sigma <= CLOGLOG_SIGMA_DEGENERATE {
         return IntegratedMeanDerivative {
             // cloglog_mean_exact uses expm1 to avoid 1 − 1 cancellation for
