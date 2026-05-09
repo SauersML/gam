@@ -16,8 +16,8 @@ use crate::families::marginal_slope_shared::{
     build_denested_partition_cells as shared_denested_partition_cells, chunked_row_reduction,
     eval_coeff4_at, is_sigma_aux_index as shared_is_sigma_aux_index,
     observed_denested_cell_partials as shared_observed_denested_cell_partials, outer_row_indices,
-    outer_score_scale, probit_frailty_scale, probit_frailty_scale_multi_dir_jet,
-    psi_derivative_location, scale_coeff4,
+    outer_weighted_rows, probit_frailty_scale, probit_frailty_scale_multi_dir_jet,
+    psi_derivative_location, scale_coeff4, WeightedOuterRow,
 };
 use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
@@ -52,8 +52,7 @@ pub use deviation_runtime::DeviationRuntime;
 /// spends most of its time in third/fourth β-derivative contractions over the
 /// FLEX cell kernel; exact value/gradient evaluations keep the same likelihood,
 /// calibration, and inner Newton solve without paying that curvature bill.
-const BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT: usize =
-    crate::families::marginal_slope_shared::BIOBANK_OUTER_SUBSAMPLE_THRESHOLD;
+const BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT: usize = 50_000;
 
 #[derive(Clone, Debug)]
 pub struct DeviationBlockConfig {
@@ -2775,21 +2774,6 @@ impl BernoulliBlockHessianAccumulator {
         }
     }
 
-    /// Scale every accumulated block in place by `scale`. Used to apply the
-    /// Horvitz-Thompson rescaling when the accumulator was populated from a
-    /// stratified subsample of rows (outer-only score / Hessian passes).
-    fn scale_assign(&mut self, scale: f64) {
-        if scale == 1.0 {
-            return;
-        }
-        self.h_mm.mapv_inplace(|v| v * scale);
-        self.h_gg.mapv_inplace(|v| v * scale);
-        self.h_mg.mapv_inplace(|v| v * scale);
-        if let Some(ref mut dc) = self.dense_correction {
-            dc.mapv_inplace(|v| v * scale);
-        }
-    }
-
     fn to_dense(&self, slices: &BlockSlices) -> Array2<f64> {
         let mut out = Array2::zeros((slices.total, slices.total));
         out.slice_mut(s![slices.marginal.clone(), slices.marginal.clone()])
@@ -3563,8 +3547,7 @@ struct BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
 const BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS: usize = 10_000;
 
 fn bernoulli_margslope_line_search_ll_with_early_exit<F>(
-    rows: &[usize],
-    scale: f64,
+    weighted_rows: &[WeightedOuterRow],
     threshold: f64,
     row_ll: F,
 ) -> Result<f64, String>
@@ -3576,19 +3559,14 @@ where
             "bernoulli marginal-slope early-exit threshold must be finite, got {threshold}"
         ));
     }
-    if !(scale.is_finite() && scale > 0.0) {
-        return Err(format!(
-            "bernoulli marginal-slope early-exit scale must be positive and finite, got {scale}"
-        ));
-    }
     let mut total_ll = 0.0;
-    for chunk in rows.chunks(BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS) {
+    for chunk in weighted_rows.chunks(BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS) {
         let chunk_ll: f64 = chunk
             .into_par_iter()
             .try_fold(
                 || 0.0,
-                |mut acc, &row| -> Result<_, String> {
-                    acc += row_ll(row)?;
+                |mut acc, wr| -> Result<_, String> {
+                    acc += wr.weight * row_ll(wr.index)?;
                     Ok(acc)
                 },
             )
@@ -3598,21 +3576,19 @@ where
             )?;
         total_ll += chunk_ll;
         // Every Bernoulli marginal-slope row contribution is <= 0 because it is
-        // weight_i * log(CDF(.)) with nonnegative weights. Therefore the
-        // remaining rows can only keep the final log-likelihood the same or
-        // decrease it, making `-scale * total_ll` a valid lower bound on the
-        // final negative log-likelihood. If that lower bound is already above
-        // the caller's acceptability ceiling, the line-search trial is
-        // provably rejected and the full row sweep is unnecessary.
-        if -scale * total_ll > threshold {
+        // weight_i * log(CDF(.)) with nonnegative weights. With nonnegative HT
+        // weights w_i applied row-wise the partial sum is still monotone-down,
+        // so `-total_ll` is a valid lower bound on the final negative
+        // log-likelihood and can prove the line-search trial rejected before
+        // the full row sweep finishes.
+        if -total_ll > threshold {
             return Err(format!(
                 "bernoulli marginal-slope line-search rejected early: partial_nll={} threshold={}",
-                -scale * total_ll,
-                threshold
+                -total_ll, threshold
             ));
         }
     }
-    Ok(total_ll * scale)
+    Ok(total_ll)
 }
 
 impl BernoulliMarginalSlopeFamily {
@@ -4314,8 +4290,7 @@ impl BernoulliMarginalSlopeFamily {
         self.validate_exact_monotonicity(block_states)?;
         let flex_active = self.effective_flex_active(block_states)?;
         let n = self.y.len();
-        let row_iter = outer_row_indices(options, n).to_vec();
-        let scale = outer_score_scale(options, n);
+        let weighted_rows = outer_weighted_rows(options, n);
         if !flex_active {
             // Rigid probit under the active latent measure. Standard-normal
             // keeps the algebraic Gaussian identity; empirical measure solves
@@ -4329,15 +4304,17 @@ impl BernoulliMarginalSlopeFamily {
             };
             if let Some(threshold) = options.early_exit_threshold {
                 return bernoulli_margslope_line_search_ll_with_early_exit(
-                    &row_iter, scale, threshold, row_ll,
+                    &weighted_rows,
+                    threshold,
+                    row_ll,
                 );
             }
-            let total: Result<f64, String> = row_iter
+            let total: Result<f64, String> = weighted_rows
                 .into_par_iter()
                 .try_fold(
                     || 0.0,
-                    |mut ll, i| -> Result<_, String> {
-                        ll += row_ll(i)?;
+                    |mut ll, wr| -> Result<_, String> {
+                        ll += wr.weight * row_ll(wr.index)?;
                         Ok(ll)
                     },
                 )
@@ -4345,7 +4322,7 @@ impl BernoulliMarginalSlopeFamily {
                     || 0.0,
                     |left, right| -> Result<_, String> { Ok(left + right) },
                 );
-            return total.map(|v| v * scale);
+            return total;
         }
         let beta_h = self.score_beta(block_states)?;
         let beta_w = self.link_beta(block_states)?;
@@ -4370,15 +4347,17 @@ impl BernoulliMarginalSlopeFamily {
         };
         if let Some(threshold) = options.early_exit_threshold {
             return bernoulli_margslope_line_search_ll_with_early_exit(
-                &row_iter, scale, threshold, row_ll,
+                &weighted_rows,
+                threshold,
+                row_ll,
             );
         }
-        let total: Result<f64, String> = row_iter
+        let total: Result<f64, String> = weighted_rows
             .into_par_iter()
             .try_fold(
                 || 0.0,
-                |mut ll, row| -> Result<_, String> {
-                    ll += row_ll(row)?;
+                |mut ll, wr| -> Result<_, String> {
+                    ll += wr.weight * row_ll(wr.index)?;
                     Ok(ll)
                 },
             )
@@ -4386,7 +4365,7 @@ impl BernoulliMarginalSlopeFamily {
                 || 0.0,
                 |left, right| -> Result<_, String> { Ok(left + right) },
             );
-        total.map(|v| v * scale)
+        total
     }
 
     fn line_search_log_likelihood_workspace(
@@ -4711,9 +4690,15 @@ impl BernoulliMarginalSlopeFamily {
         let slices = block_slices(self);
         let n = self.y.len();
         let row_iter = outer_row_indices(options, n).to_vec();
-        let scale = outer_score_scale(options, n);
-        // Bit-deterministic reduction: see `chunked_row_reduction`.
-        let (mut objective_psi, mut score_psi, mut acc) = chunked_row_reduction(
+        let row_weights = crate::families::marginal_slope_shared::outer_row_weights_by_index(
+            options, n,
+        );
+        // Per-row HT weighting: each row's (obj, grad, hess) is multiplied by
+        // its inverse-inclusion weight `w_i` *before* accumulation, so the
+        // final operator is the unbiased Horvitz-Thompson estimator. A single
+        // post-sum scalar is biased under stratified subsampling because
+        // per-stratum sampling fractions differ.
+        let (objective_psi, score_psi, acc) = chunked_row_reduction(
             row_iter.as_slice(),
             || {
                 (
@@ -4723,7 +4708,14 @@ impl BernoulliMarginalSlopeFamily {
                 )
             },
             |row, acc| -> Result<(), String> {
-                let (obj, grad, hess) = self.row_sigma_primary_terms(row, block_states, false)?;
+                let (mut obj, mut grad, mut hess) =
+                    self.row_sigma_primary_terms(row, block_states, false)?;
+                let w = row_weights[row];
+                if w != 1.0 {
+                    obj *= w;
+                    grad.mapv_inplace(|v| v * w);
+                    hess.mapv_inplace(|v| v * w);
+                }
                 acc.0 += obj;
                 self.accumulate_rigid_sigma_pullback(
                     row, &slices, &grad, &hess, &mut acc.1, &mut acc.2,
@@ -4736,11 +4728,6 @@ impl BernoulliMarginalSlopeFamily {
                 total.2.add(&chunk.2);
             },
         )?;
-        if scale != 1.0 {
-            objective_psi *= scale;
-            score_psi.mapv_inplace(|v| v * scale);
-            acc.scale_assign(scale);
-        }
         Ok(Some(ExactNewtonJointPsiTerms {
             objective_psi,
             score_psi,
@@ -4779,9 +4766,10 @@ impl BernoulliMarginalSlopeFamily {
         let slices = block_slices(self);
         let n = self.y.len();
         let row_iter = outer_row_indices(options, n).to_vec();
-        let scale = outer_score_scale(options, n);
-        // Bit-deterministic reduction: see `chunked_row_reduction`.
-        let (mut objective_psi_psi, mut score_psi_psi, mut acc) = chunked_row_reduction(
+        let row_weights = crate::families::marginal_slope_shared::outer_row_weights_by_index(
+            options, n,
+        );
+        let (objective_psi_psi, score_psi_psi, acc) = chunked_row_reduction(
             row_iter.as_slice(),
             || {
                 (
@@ -4791,7 +4779,14 @@ impl BernoulliMarginalSlopeFamily {
                 )
             },
             |row, acc| -> Result<(), String> {
-                let (obj, grad, hess) = self.row_sigma_primary_terms(row, block_states, true)?;
+                let (mut obj, mut grad, mut hess) =
+                    self.row_sigma_primary_terms(row, block_states, true)?;
+                let w = row_weights[row];
+                if w != 1.0 {
+                    obj *= w;
+                    grad.mapv_inplace(|v| v * w);
+                    hess.mapv_inplace(|v| v * w);
+                }
                 acc.0 += obj;
                 self.accumulate_rigid_sigma_pullback(
                     row, &slices, &grad, &hess, &mut acc.1, &mut acc.2,
@@ -4804,11 +4799,6 @@ impl BernoulliMarginalSlopeFamily {
                 total.2.add(&chunk.2);
             },
         )?;
-        if scale != 1.0 {
-            objective_psi_psi *= scale;
-            score_psi_psi.mapv_inplace(|v| v * scale);
-            acc.scale_assign(scale);
-        }
         Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
             objective_psi_psi,
             score_psi_psi,
@@ -4859,9 +4849,10 @@ impl BernoulliMarginalSlopeFamily {
         let n = self.y.len();
         let primary = primary_slices(&slices);
         let row_iter = outer_row_indices(options, n).to_vec();
-        let outer_scale = outer_score_scale(options, n);
-        // Bit-deterministic reduction: see `chunked_row_reduction`.
-        let mut acc = chunked_row_reduction(
+        let row_weights = crate::families::marginal_slope_shared::outer_row_weights_by_index(
+            options, n,
+        );
+        let acc = chunked_row_reduction(
             row_iter.as_slice(),
             || BernoulliBlockHessianAccumulator::new(&slices),
             |row, acc| -> Result<(), String> {
@@ -4898,6 +4889,10 @@ impl BernoulliMarginalSlopeFamily {
                         hess[[b, a]] = value;
                     }
                 }
+                let w = row_weights[row];
+                if w != 1.0 {
+                    hess.mapv_inplace(|v| v * w);
+                }
                 acc.add_pullback(self, row, &slices, &primary, &hess);
                 Ok(())
             },
@@ -4905,9 +4900,6 @@ impl BernoulliMarginalSlopeFamily {
                 total.add(&chunk);
             },
         )?;
-        if outer_scale != 1.0 {
-            acc.scale_assign(outer_scale);
-        }
         Ok(Some(acc.into_operator(&slices).to_dense()))
     }
 
@@ -6082,6 +6074,22 @@ impl BernoulliMarginalSlopeFamily {
         let n = self.y.len();
         let primary = &cache.primary;
         let r = primary.total;
+        let cache_bytes = n
+            .saturating_mul(r)
+            .saturating_mul(r)
+            .saturating_mul(std::mem::size_of::<f64>());
+        if cache_bytes > self.policy.max_single_materialization_bytes {
+            if log_exact_work(n) {
+                log::info!(
+                    "[BMS row-primary-hessian-cache] stream rows n={} r={} bytes={} limit_bytes={}",
+                    n,
+                    r,
+                    cache_bytes,
+                    self.policy.max_single_materialization_bytes
+                );
+            }
+            return Ok(None);
+        }
         let mut packed = Array2::<f64>::zeros((n, r * r));
         packed
             .axis_iter_mut(Axis(0))
@@ -7075,6 +7083,25 @@ impl BernoulliMarginalSlopeFamily {
         row_ctx: &BernoulliMarginalSlopeRowExactContext,
         dir: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
+        self.row_primary_third_contracted_recompute_with_moments(
+            row,
+            block_states,
+            cache,
+            row_ctx,
+            dir,
+            None,
+        )
+    }
+
+    fn row_primary_third_contracted_recompute_with_moments(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        row_ctx: &BernoulliMarginalSlopeRowExactContext,
+        dir: &Array1<f64>,
+        row_cell_moments_override: Option<&[CachedDenestedCellMoments]>,
+    ) -> Result<Array2<f64>, String> {
         if !self.effective_flex_active(block_states)? {
             // Hit the per-cache uncontracted-tensor cache if it has already
             // been populated (typically by the first ψ-axis call in the
@@ -7136,7 +7163,9 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_uv_dir = Array2::<f64>::zeros((r, r));
 
         let owned_cells;
-        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = cache
+        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = row_cell_moments_override {
+            cached
+        } else if let Some(cached) = cache
             .row_cell_moments
             .as_ref()
             .and_then(|bundle| bundle.row(row, 15))
@@ -9465,9 +9494,8 @@ impl BernoulliMarginalSlopeFamily {
         }
 
         // Block-local accumulator path: avoids O(n p^2) dense Hessian
-        let row_iter = outer_row_indices(options, n).to_vec();
-        let outer_scale = outer_score_scale(options, n);
-        let (mut objective_psi, mut score_psi, mut block_acc) = row_iter
+        let weighted_rows = outer_weighted_rows(options, n);
+        let (objective_psi, score_psi, block_acc) = weighted_rows
             .into_par_iter()
             .try_fold(
                 || {
@@ -9477,7 +9505,9 @@ impl BernoulliMarginalSlopeFamily {
                         BernoulliBlockHessianAccumulator::new(slices),
                     )
                 },
-                |mut acc, row| -> Result<_, String> {
+                |mut acc, wr| -> Result<_, String> {
+                    let row = wr.index;
+                    let w = wr.weight;
                     let dir = self.row_primary_psi_direction_from_map(
                         row,
                         block_idx,
@@ -9486,14 +9516,15 @@ impl BernoulliMarginalSlopeFamily {
                         primary,
                     )?;
                     let row_ctx = Self::row_ctx(cache, row);
-                    let (f_pi, f_pipi) = self.compute_row_primary_gradient_hessian_reusing_cache(
-                        row,
-                        block_states,
-                        primary,
-                        row_ctx,
-                        cache,
-                    )?;
-                    let third = self.row_primary_third_contracted_recompute(
+                    let (f_pi, mut f_pipi) =
+                        self.compute_row_primary_gradient_hessian_reusing_cache(
+                            row,
+                            block_states,
+                            primary,
+                            row_ctx,
+                            cache,
+                        )?;
+                    let mut third = self.row_primary_third_contracted_recompute(
                         row,
                         block_states,
                         cache,
@@ -9501,14 +9532,20 @@ impl BernoulliMarginalSlopeFamily {
                         &dir,
                     )?;
                     let psi_row = self.block_psi_row_from_map(row, block_idx, &psi_map, slices)?;
-                    acc.0 += f_pi.dot(&dir);
+                    let mut f_pipi_dir = f_pipi.dot(&dir);
+                    if w != 1.0 {
+                        f_pipi.mapv_inplace(|v| v * w);
+                        third.mapv_inplace(|v| v * w);
+                        f_pipi_dir.mapv_inplace(|v| v * w);
+                    }
+                    acc.0 += w * f_pi.dot(&dir);
                     acc.1
                         .slice_mut(s![psi_row.range.clone()])
-                        .scaled_add(f_pi[idx_primary], &psi_row.local_vec);
-                    acc.1 +=
-                        &self.pullback_primary_vector(row, slices, primary, &f_pipi.dot(&dir))?;
+                        .scaled_add(w * f_pi[idx_primary], &psi_row.local_vec);
+                    acc.1 += &self.pullback_primary_vector(row, slices, primary, &f_pipi_dir)?;
 
                     // psi_row outer pullback(f_pipi[idx_primary,:]) + transpose
+                    // (already w-scaled above via f_pipi).
                     let right_primary = f_pipi.row(idx_primary).to_owned();
                     acc.2.add_rank1_psi_cross(
                         self,
@@ -9539,11 +9576,9 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(left)
                 },
             )?;
-        if outer_scale != 1.0 {
-            objective_psi *= outer_scale;
-            score_psi.mapv_inplace(|v| v * outer_scale);
-            block_acc.scale_assign(outer_scale);
-        }
+        // Per-row HT weighting is applied inside the fold; the final
+        // accumulator is the unbiased estimator under variable per-row
+        // weights, so no post-sum rescale is needed.
         Ok(Some(ExactNewtonJointPsiTerms {
             objective_psi,
             score_psi,
@@ -9661,9 +9696,8 @@ impl BernoulliMarginalSlopeFamily {
         };
 
         // Block-local accumulator path for second-order psi terms
-        let row_iter = outer_row_indices(options, n).to_vec();
-        let outer_scale = outer_score_scale(options, n);
-        let (mut objective_psi_psi, mut score_psi_psi, mut block_acc) = row_iter
+        let weighted_rows = outer_weighted_rows(options, n);
+        let (objective_psi_psi, score_psi_psi, block_acc) = weighted_rows
             .into_par_iter()
             .try_fold(
                 || {
@@ -9673,7 +9707,9 @@ impl BernoulliMarginalSlopeFamily {
                         BernoulliBlockHessianAccumulator::new(slices),
                     )
                 },
-                |mut acc, row| -> Result<_, String> {
+                |mut acc, wr| -> Result<_, String> {
+                    let row = wr.index;
+                    let w = wr.weight;
                     {
                         let dir_i = self.row_primary_psi_direction_from_map(
                             row,
@@ -9698,7 +9734,7 @@ impl BernoulliMarginalSlopeFamily {
                             primary,
                         )?;
                         let row_ctx = Self::row_ctx(cache, row);
-                        let (f_pi, f_pipi) = self
+                        let (mut f_pi, mut f_pipi) = self
                             .compute_row_primary_gradient_hessian_reusing_cache(
                                 row,
                                 block_states,
@@ -9706,21 +9742,21 @@ impl BernoulliMarginalSlopeFamily {
                                 row_ctx,
                                 cache,
                             )?;
-                        let third_i = self.row_primary_third_contracted_recompute(
+                        let mut third_i = self.row_primary_third_contracted_recompute(
                             row,
                             block_states,
                             cache,
                             row_ctx,
                             &dir_i,
                         )?;
-                        let third_j = self.row_primary_third_contracted_recompute(
+                        let mut third_j = self.row_primary_third_contracted_recompute(
                             row,
                             block_states,
                             cache,
                             row_ctx,
                             &dir_j,
                         )?;
-                        let fourth = self.row_primary_fourth_contracted_recompute(
+                        let mut fourth = self.row_primary_fourth_contracted_recompute(
                             row,
                             block_states,
                             cache,
@@ -9728,6 +9764,17 @@ impl BernoulliMarginalSlopeFamily {
                             &dir_i,
                             &dir_j,
                         )?;
+                        // Per-row HT weighting: scale every row contribution
+                        // (gradient, Hessian, third, fourth) by w before
+                        // accumulation. The post-sum scalar that the legacy
+                        // code path applied is biased under variable weights.
+                        if w != 1.0 {
+                            f_pi.mapv_inplace(|v| v * w);
+                            f_pipi.mapv_inplace(|v| v * w);
+                            third_i.mapv_inplace(|v| v * w);
+                            third_j.mapv_inplace(|v| v * w);
+                            fourth.mapv_inplace(|v| v * w);
+                        }
                         let br_i = self.block_psi_row_from_map(row, block_i, &psi_map_i, slices)?;
                         let br_j = self.block_psi_row_from_map(row, block_j, &psi_map_j, slices)?;
                         let br_ij = self.block_psi_second_row_from_map(
@@ -9818,13 +9865,16 @@ impl BernoulliMarginalSlopeFamily {
                         acc.2.add_pullback(self, row, slices, primary, &fourth);
 
                         // --- third_ij tensor pullback ---
-                        let third_ij = self.row_primary_third_contracted_recompute(
+                        let mut third_ij = self.row_primary_third_contracted_recompute(
                             row,
                             block_states,
                             cache,
                             row_ctx,
                             &dir_ij,
                         )?;
+                        if w != 1.0 {
+                            third_ij.mapv_inplace(|v| v * w);
+                        }
                         acc.2.add_pullback(self, row, slices, primary, &third_ij);
                     }
                     Ok(acc)
@@ -9845,11 +9895,10 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(left)
                 },
             )?;
-        if outer_scale != 1.0 {
-            objective_psi_psi *= outer_scale;
-            score_psi_psi.mapv_inplace(|v| v * outer_scale);
-            block_acc.scale_assign(outer_scale);
-        }
+        // Per-row HT weighting was applied inside the closure (every
+        // gradient / Hessian / third / fourth tensor scaled by `w` before
+        // accumulation), so the unbiased estimator is already in
+        // `block_acc` and no post-sum rescale is required.
         Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
             objective_psi_psi,
             score_psi_psi,
@@ -9926,13 +9975,14 @@ impl BernoulliMarginalSlopeFamily {
             &self.policy,
         )?;
 
-        let row_iter = outer_row_indices(options, n).to_vec();
-        let outer_scale = outer_score_scale(options, n);
-        let mut block_acc = row_iter
+        let weighted_rows = outer_weighted_rows(options, n);
+        let block_acc = weighted_rows
             .into_par_iter()
             .try_fold(
                 || BernoulliBlockHessianAccumulator::new(slices),
-                |mut acc, row| -> Result<_, String> {
+                |mut acc, wr| -> Result<_, String> {
+                    let row = wr.index;
+                    let w = wr.weight;
                     let row_dir =
                         self.row_primary_direction_from_flat(row, slices, primary, d_beta_flat)?;
                     let psi_dir = self.row_primary_psi_direction_from_map(
@@ -9951,14 +10001,14 @@ impl BernoulliMarginalSlopeFamily {
                         primary,
                     )?;
                     let row_ctx = Self::row_ctx(cache, row);
-                    let third_beta = self.row_primary_third_contracted_recompute(
+                    let mut third_beta = self.row_primary_third_contracted_recompute(
                         row,
                         block_states,
                         cache,
                         row_ctx,
                         &row_dir,
                     )?;
-                    let fourth = self.row_primary_fourth_contracted_recompute(
+                    let mut fourth = self.row_primary_fourth_contracted_recompute(
                         row,
                         block_states,
                         cache,
@@ -9966,6 +10016,10 @@ impl BernoulliMarginalSlopeFamily {
                         &row_dir,
                         &psi_dir,
                     )?;
+                    if w != 1.0 {
+                        third_beta.mapv_inplace(|v| v * w);
+                        fourth.mapv_inplace(|v| v * w);
+                    }
                     let psi_row = self.block_psi_row_from_map(row, block_idx, &psi_map, slices)?;
                     let right_primary = third_beta.row(idx_primary).to_owned();
                     acc.add_rank1_psi_cross(
@@ -9978,13 +10032,16 @@ impl BernoulliMarginalSlopeFamily {
                         &right_primary,
                     );
                     acc.add_pullback(self, row, slices, primary, &fourth);
-                    let third_action = self.row_primary_third_contracted_recompute(
+                    let mut third_action = self.row_primary_third_contracted_recompute(
                         row,
                         block_states,
                         cache,
                         row_ctx,
                         &psi_action,
                     )?;
+                    if w != 1.0 {
+                        third_action.mapv_inplace(|v| v * w);
+                    }
                     acc.add_pullback(self, row, slices, primary, &third_action);
                     Ok(acc)
                 },
@@ -9996,9 +10053,6 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(left)
                 },
             )?;
-        if outer_scale != 1.0 {
-            block_acc.scale_assign(outer_scale);
-        }
         Ok(Some(block_acc.to_dense(slices)))
     }
 
@@ -10056,13 +10110,14 @@ impl BernoulliMarginalSlopeFamily {
             &self.policy,
         )?;
 
-        let row_iter = outer_row_indices(options, n).to_vec();
-        let outer_scale = outer_score_scale(options, n);
-        let mut block_acc = row_iter
+        let weighted_rows = outer_weighted_rows(options, n);
+        let block_acc = weighted_rows
             .into_par_iter()
             .try_fold(
                 || BernoulliBlockHessianAccumulator::new(slices),
-                |mut acc, row| -> Result<_, String> {
+                |mut acc, wr| -> Result<_, String> {
+                    let row = wr.index;
+                    let w = wr.weight;
                     let row_dir =
                         self.row_primary_direction_from_flat(row, slices, primary, d_beta_flat)?;
                     let psi_dir = self.row_primary_psi_direction_from_map(
@@ -10081,14 +10136,14 @@ impl BernoulliMarginalSlopeFamily {
                         primary,
                     )?;
                     let row_ctx = Self::row_ctx(cache, row);
-                    let third_beta = self.row_primary_third_contracted_recompute(
+                    let mut third_beta = self.row_primary_third_contracted_recompute(
                         row,
                         block_states,
                         cache,
                         row_ctx,
                         &row_dir,
                     )?;
-                    let fourth = self.row_primary_fourth_contracted_recompute(
+                    let mut fourth = self.row_primary_fourth_contracted_recompute(
                         row,
                         block_states,
                         cache,
@@ -10096,6 +10151,10 @@ impl BernoulliMarginalSlopeFamily {
                         &row_dir,
                         &psi_dir,
                     )?;
+                    if w != 1.0 {
+                        third_beta.mapv_inplace(|v| v * w);
+                        fourth.mapv_inplace(|v| v * w);
+                    }
                     let psi_row = self.block_psi_row_from_map(row, block_idx, &psi_map, slices)?;
                     let right_primary = third_beta.row(idx_primary).to_owned();
                     acc.add_rank1_psi_cross(
@@ -10108,13 +10167,16 @@ impl BernoulliMarginalSlopeFamily {
                         &right_primary,
                     );
                     acc.add_pullback(self, row, slices, primary, &fourth);
-                    let third_action = self.row_primary_third_contracted_recompute(
+                    let mut third_action = self.row_primary_third_contracted_recompute(
                         row,
                         block_states,
                         cache,
                         row_ctx,
                         &psi_action,
                     )?;
+                    if w != 1.0 {
+                        third_action.mapv_inplace(|v| v * w);
+                    }
                     acc.add_pullback(self, row, slices, primary, &third_action);
                     Ok(acc)
                 },
@@ -10126,9 +10188,6 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(left)
                 },
             )?;
-        if outer_scale != 1.0 {
-            block_acc.scale_assign(outer_scale);
-        }
         Ok(Some(
             Arc::new(block_acc.into_operator(slices)) as Arc<dyn HyperOperator>
         ))
@@ -10163,16 +10222,17 @@ impl BernoulliMarginalSlopeFamily {
         let slices = &cache.slices;
         let primary = &cache.primary;
         let n = self.y.len();
-        let row_iter = outer_row_indices(options, n).to_vec();
-        let outer_scale = outer_score_scale(options, n);
+        let weighted_rows = outer_weighted_rows(options, n);
 
         // ── Rigid closed-form: 3rd-order scalar kernel ───────────────
         if !self.effective_flex_active(block_states)? {
-            let mut block_acc = row_iter
+            let block_acc = weighted_rows
                 .into_par_iter()
                 .try_fold(
                     || BernoulliBlockHessianAccumulator::new(slices),
-                    |mut acc, row| -> Result<_, String> {
+                    |mut acc, wr| -> Result<_, String> {
+                        let row = wr.index;
+                        let w = wr.weight;
                         let marginal_eta = block_states[0].eta[row];
                         let marginal = self.marginal_link_map(marginal_eta)?;
                         let g = block_states[1].eta[row];
@@ -10190,7 +10250,10 @@ impl BernoulliMarginalSlopeFamily {
                             dq,
                             dg,
                         )?;
-                        let t_arr = Array2::from_shape_fn((2, 2), |(a, b)| t[a][b]);
+                        let mut t_arr = Array2::from_shape_fn((2, 2), |(a, b)| t[a][b]);
+                        if w != 1.0 {
+                            t_arr.mapv_inplace(|v| v * w);
+                        }
                         acc.add_pullback(self, row, slices, primary, &t_arr);
                         Ok(acc)
                     },
@@ -10202,27 +10265,29 @@ impl BernoulliMarginalSlopeFamily {
                         Ok(left)
                     },
                 )?;
-            if outer_scale != 1.0 {
-                block_acc.scale_assign(outer_scale);
-            }
             return Ok(Some(block_acc.to_dense(slices)));
         }
 
-        let mut block_acc = row_iter
+        let block_acc = weighted_rows
             .into_par_iter()
             .try_fold(
                 || BernoulliBlockHessianAccumulator::new(slices),
-                |mut acc, row| -> Result<_, String> {
+                |mut acc, wr| -> Result<_, String> {
+                    let row = wr.index;
+                    let w = wr.weight;
                     let row_dir =
                         self.row_primary_direction_from_flat(row, slices, primary, d_beta_flat)?;
                     let row_ctx = Self::row_ctx(cache, row);
-                    let third = self.row_primary_third_contracted_recompute(
+                    let mut third = self.row_primary_third_contracted_recompute(
                         row,
                         block_states,
                         cache,
                         row_ctx,
                         &row_dir,
                     )?;
+                    if w != 1.0 {
+                        third.mapv_inplace(|v| v * w);
+                    }
                     acc.add_pullback(self, row, slices, primary, &third);
                     Ok(acc)
                 },
@@ -10234,9 +10299,6 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(left)
                 },
             )?;
-        if outer_scale != 1.0 {
-            block_acc.scale_assign(outer_scale);
-        }
         Ok(Some(block_acc.to_dense(slices)))
     }
 
@@ -10256,15 +10318,16 @@ impl BernoulliMarginalSlopeFamily {
         let slices = &cache.slices;
         let primary = &cache.primary;
         let n = self.y.len();
-        let row_iter = outer_row_indices(options, n).to_vec();
-        let outer_scale = outer_score_scale(options, n);
+        let weighted_rows = outer_weighted_rows(options, n);
 
         if !self.effective_flex_active(block_states)? {
-            let mut block_acc = row_iter
+            let block_acc = weighted_rows
                 .into_par_iter()
                 .try_fold(
                     || BernoulliBlockHessianAccumulator::new(slices),
-                    |mut acc, row| -> Result<_, String> {
+                    |mut acc, wr| -> Result<_, String> {
+                        let row = wr.index;
+                        let w = wr.weight;
                         let marginal_eta = block_states[0].eta[row];
                         let marginal = self.marginal_link_map(marginal_eta)?;
                         let g = block_states[1].eta[row];
@@ -10282,7 +10345,10 @@ impl BernoulliMarginalSlopeFamily {
                             dq,
                             dg,
                         )?;
-                        let t_arr = Array2::from_shape_fn((2, 2), |(a, b)| t[a][b]);
+                        let mut t_arr = Array2::from_shape_fn((2, 2), |(a, b)| t[a][b]);
+                        if w != 1.0 {
+                            t_arr.mapv_inplace(|v| v * w);
+                        }
                         acc.add_pullback(self, row, slices, primary, &t_arr);
                         Ok(acc)
                     },
@@ -10294,29 +10360,31 @@ impl BernoulliMarginalSlopeFamily {
                         Ok(left)
                     },
                 )?;
-            if outer_scale != 1.0 {
-                block_acc.scale_assign(outer_scale);
-            }
             return Ok(Some(
                 Arc::new(block_acc.into_operator(slices)) as Arc<dyn HyperOperator>
             ));
         }
 
-        let mut block_acc = row_iter
+        let block_acc = weighted_rows
             .into_par_iter()
             .try_fold(
                 || BernoulliBlockHessianAccumulator::new(slices),
-                |mut acc, row| -> Result<_, String> {
+                |mut acc, wr| -> Result<_, String> {
+                    let row = wr.index;
+                    let w = wr.weight;
                     let row_dir =
                         self.row_primary_direction_from_flat(row, slices, primary, d_beta_flat)?;
                     let row_ctx = Self::row_ctx(cache, row);
-                    let third = self.row_primary_third_contracted_recompute(
+                    let mut third = self.row_primary_third_contracted_recompute(
                         row,
                         block_states,
                         cache,
                         row_ctx,
                         &row_dir,
                     )?;
+                    if w != 1.0 {
+                        third.mapv_inplace(|v| v * w);
+                    }
                     acc.add_pullback(self, row, slices, primary, &third);
                     Ok(acc)
                 },
@@ -10328,9 +10396,6 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(left)
                 },
             )?;
-        if outer_scale != 1.0 {
-            block_acc.scale_assign(outer_scale);
-        }
         Ok(Some(
             Arc::new(block_acc.into_operator(slices)) as Arc<dyn HyperOperator>
         ))
@@ -10349,8 +10414,7 @@ impl BernoulliMarginalSlopeFamily {
         let slices = &cache.slices;
         let primary = &cache.primary;
         let n = self.y.len();
-        let row_iter = outer_row_indices(options, n).to_vec();
-        let outer_scale = outer_score_scale(options, n);
+        let weighted_rows = outer_weighted_rows(options, n);
         let make_accs = || {
             (0..d_beta_flats.len())
                 .map(|_| BernoulliBlockHessianAccumulator::new(slices))
@@ -10358,10 +10422,14 @@ impl BernoulliMarginalSlopeFamily {
         };
         let started = std::time::Instant::now();
 
+        let n_rows = weighted_rows.len();
         let mut accs = if !self.effective_flex_active(block_states)? {
-            row_iter
+            weighted_rows
+                .clone()
                 .into_par_iter()
-                .try_fold(make_accs, |mut accs, row| -> Result<_, String> {
+                .try_fold(make_accs, |mut accs, wr| -> Result<_, String> {
+                    let row = wr.index;
+                    let w = wr.weight;
                     let marginal_eta = block_states[0].eta[row];
                     let marginal = self.marginal_link_map(marginal_eta)?;
                     let g = block_states[1].eta[row];
@@ -10380,7 +10448,10 @@ impl BernoulliMarginalSlopeFamily {
                             dq,
                             dg,
                         )?;
-                        let t_arr = Array2::from_shape_fn((2, 2), |(a, b)| t[a][b]);
+                        let mut t_arr = Array2::from_shape_fn((2, 2), |(a, b)| t[a][b]);
+                        if w != 1.0 {
+                            t_arr.mapv_inplace(|v| v * w);
+                        }
                         accs[idx].add_pullback(self, row, slices, primary, &t_arr);
                     }
                     Ok(accs)
@@ -10392,10 +10463,49 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(left)
                 })?
         } else {
-            row_iter
+            weighted_rows
                 .into_par_iter()
-                .try_fold(make_accs, |mut accs, row| -> Result<_, String> {
+                .try_fold(make_accs, |mut accs, wr| -> Result<_, String> {
+                    let row = wr.index;
+                    let w = wr.weight;
                     let row_ctx = Self::row_ctx(cache, row);
+                    let cached_row_moments = cache
+                        .row_cell_moments
+                        .as_ref()
+                        .and_then(|bundle| bundle.row(row, 15));
+                    let mut owned_row_moments: Option<Vec<CachedDenestedCellMoments>> = None;
+                    if cached_row_moments.is_none()
+                        && self
+                            .latent_measure
+                            .empirical_grid_for_training_row(row)?
+                            .is_none()
+                    {
+                        let point =
+                            self.primary_point_from_block_states(row, block_states, primary)?;
+                        let (_q, b, beta_h_owned, beta_w_owned) =
+                            self.primary_point_components(&point, primary);
+                        let beta_h = beta_h_owned.as_ref();
+                        let beta_w = beta_w_owned.as_ref();
+                        let partitions =
+                            self.denested_partition_cells(row_ctx.intercept, b, beta_h, beta_w)?;
+                        owned_row_moments = Some(
+                            partitions
+                                .into_iter()
+                                .map(|partition_cell| {
+                                    self.evaluate_cell_derivative_moments_lru(
+                                        partition_cell.cell,
+                                        15,
+                                    )
+                                    .map(|state| CachedDenestedCellMoments {
+                                        partition_cell,
+                                        state,
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, String>>()?,
+                        );
+                    }
+                    let row_moments =
+                        cached_row_moments.or_else(|| owned_row_moments.as_deref());
                     for (idx, d_beta_flat) in d_beta_flats.iter().enumerate() {
                         let row_dir = self.row_primary_direction_from_flat(
                             row,
@@ -10403,13 +10513,17 @@ impl BernoulliMarginalSlopeFamily {
                             primary,
                             d_beta_flat,
                         )?;
-                        let third = self.row_primary_third_contracted_recompute(
+                        let mut third = self.row_primary_third_contracted_recompute_with_moments(
                             row,
                             block_states,
                             cache,
                             row_ctx,
                             &row_dir,
+                            row_moments,
                         )?;
+                        if w != 1.0 {
+                            third.mapv_inplace(|v| v * w);
+                        }
                         accs[idx].add_pullback(self, row, slices, primary, &third);
                     }
                     Ok(accs)
@@ -10427,7 +10541,7 @@ impl BernoulliMarginalSlopeFamily {
             log::info!(
                 "[BMS batched dH] n={} rows={} p={} dirs={} elapsed={:.3}s",
                 n,
-                outer_row_indices(options, n).len(),
+                n_rows,
                 slices.total,
                 d_beta_flats.len(),
                 elapsed
@@ -10435,12 +10549,7 @@ impl BernoulliMarginalSlopeFamily {
         }
         Ok(accs
             .drain(..)
-            .map(|mut acc| {
-                if outer_scale != 1.0 {
-                    acc.scale_assign(outer_scale);
-                }
-                Some(Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>)
-            })
+            .map(|acc| Some(Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>))
             .collect())
     }
 
@@ -10477,14 +10586,15 @@ impl BernoulliMarginalSlopeFamily {
         let primary = &cache.primary;
         let n = self.y.len();
         let make_acc = || BernoulliBlockHessianAccumulator::new(slices);
-        let row_iter = outer_row_indices(options, n).to_vec();
-        let outer_scale = outer_score_scale(options, n);
+        let weighted_rows = outer_weighted_rows(options, n);
 
         // ── Rigid closed-form: 4th-order scalar kernel ───────────────
         if !self.effective_flex_active(block_states)? {
-            let mut block_acc = row_iter
+            let block_acc = weighted_rows
                 .into_par_iter()
-                .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
+                .try_fold(make_acc, |mut acc, wr| -> Result<_, String> {
+                    let row = wr.index;
+                    let w = wr.weight;
                     let uq = self
                         .marginal_design
                         .dot_row_view(row, d_beta_u_flat.slice(s![slices.marginal.clone()]));
@@ -10499,7 +10609,10 @@ impl BernoulliMarginalSlopeFamily {
                         .dot_row_view(row, d_beta_v_flat.slice(s![slices.logslope.clone()]));
                     let t = self.rigid_fourth_full_cached(block_states, cache, row)?;
                     let f = contract_fourth_full(t, uq, ug, vq, vg);
-                    let f_arr = Array2::from_shape_fn((2, 2), |(a, b)| f[a][b]);
+                    let mut f_arr = Array2::from_shape_fn((2, 2), |(a, b)| f[a][b]);
+                    if w != 1.0 {
+                        f_arr.mapv_inplace(|v| v * w);
+                    }
                     acc.add_pullback(self, row, slices, primary, &f_arr);
                     Ok(acc)
                 })
@@ -10507,21 +10620,20 @@ impl BernoulliMarginalSlopeFamily {
                     left.add(&right);
                     Ok(left)
                 })?;
-            if outer_scale != 1.0 {
-                block_acc.scale_assign(outer_scale);
-            }
             return Ok(Some(block_acc.to_dense(slices)));
         }
 
-        let mut block_acc = row_iter
+        let block_acc = weighted_rows
             .into_par_iter()
-            .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
+            .try_fold(make_acc, |mut acc, wr| -> Result<_, String> {
+                let row = wr.index;
+                let w = wr.weight;
                 let row_u =
                     self.row_primary_direction_from_flat(row, slices, primary, d_beta_u_flat)?;
                 let row_v =
                     self.row_primary_direction_from_flat(row, slices, primary, d_beta_v_flat)?;
                 let row_ctx = Self::row_ctx(cache, row);
-                let fourth = self.row_primary_fourth_contracted_recompute(
+                let mut fourth = self.row_primary_fourth_contracted_recompute(
                     row,
                     block_states,
                     cache,
@@ -10529,6 +10641,9 @@ impl BernoulliMarginalSlopeFamily {
                     &row_u,
                     &row_v,
                 )?;
+                if w != 1.0 {
+                    fourth.mapv_inplace(|v| v * w);
+                }
                 acc.add_pullback(self, row, slices, primary, &fourth);
                 Ok(acc)
             })
@@ -10536,9 +10651,6 @@ impl BernoulliMarginalSlopeFamily {
                 left.add(&right);
                 Ok(left)
             })?;
-        if outer_scale != 1.0 {
-            block_acc.scale_assign(outer_scale);
-        }
         Ok(Some(block_acc.to_dense(slices)))
     }
 
@@ -10560,13 +10672,14 @@ impl BernoulliMarginalSlopeFamily {
         let primary = &cache.primary;
         let n = self.y.len();
         let make_acc = || BernoulliBlockHessianAccumulator::new(slices);
-        let row_iter = outer_row_indices(options, n).to_vec();
-        let outer_scale = outer_score_scale(options, n);
+        let weighted_rows = outer_weighted_rows(options, n);
 
         if !self.effective_flex_active(block_states)? {
-            let mut block_acc = row_iter
+            let block_acc = weighted_rows
                 .into_par_iter()
-                .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
+                .try_fold(make_acc, |mut acc, wr| -> Result<_, String> {
+                    let row = wr.index;
+                    let w = wr.weight;
                     let uq = self
                         .marginal_design
                         .dot_row_view(row, d_beta_u_flat.slice(s![slices.marginal.clone()]));
@@ -10581,7 +10694,10 @@ impl BernoulliMarginalSlopeFamily {
                         .dot_row_view(row, d_beta_v_flat.slice(s![slices.logslope.clone()]));
                     let t = self.rigid_fourth_full_cached(block_states, cache, row)?;
                     let f = contract_fourth_full(t, uq, ug, vq, vg);
-                    let f_arr = Array2::from_shape_fn((2, 2), |(a, b)| f[a][b]);
+                    let mut f_arr = Array2::from_shape_fn((2, 2), |(a, b)| f[a][b]);
+                    if w != 1.0 {
+                        f_arr.mapv_inplace(|v| v * w);
+                    }
                     acc.add_pullback(self, row, slices, primary, &f_arr);
                     Ok(acc)
                 })
@@ -10589,23 +10705,22 @@ impl BernoulliMarginalSlopeFamily {
                     left.add(&right);
                     Ok(left)
                 })?;
-            if outer_scale != 1.0 {
-                block_acc.scale_assign(outer_scale);
-            }
             return Ok(Some(
                 Arc::new(block_acc.into_operator(slices)) as Arc<dyn HyperOperator>
             ));
         }
 
-        let mut block_acc = row_iter
+        let block_acc = weighted_rows
             .into_par_iter()
-            .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
+            .try_fold(make_acc, |mut acc, wr| -> Result<_, String> {
+                let row = wr.index;
+                let w = wr.weight;
                 let row_u =
                     self.row_primary_direction_from_flat(row, slices, primary, d_beta_u_flat)?;
                 let row_v =
                     self.row_primary_direction_from_flat(row, slices, primary, d_beta_v_flat)?;
                 let row_ctx = Self::row_ctx(cache, row);
-                let fourth = self.row_primary_fourth_contracted_recompute(
+                let mut fourth = self.row_primary_fourth_contracted_recompute(
                     row,
                     block_states,
                     cache,
@@ -10613,6 +10728,9 @@ impl BernoulliMarginalSlopeFamily {
                     &row_u,
                     &row_v,
                 )?;
+                if w != 1.0 {
+                    fourth.mapv_inplace(|v| v * w);
+                }
                 acc.add_pullback(self, row, slices, primary, &fourth);
                 Ok(acc)
             })
@@ -10620,9 +10738,6 @@ impl BernoulliMarginalSlopeFamily {
                 left.add(&right);
                 Ok(left)
             })?;
-        if outer_scale != 1.0 {
-            block_acc.scale_assign(outer_scale);
-        }
         Ok(Some(
             Arc::new(block_acc.into_operator(slices)) as Arc<dyn HyperOperator>
         ))
@@ -12665,57 +12780,6 @@ mod tests {
         let any_nonzero = on_rows.iter().any(|v| v.abs() > 0.0);
         assert!(any_nonzero, "row primary hessians should not be all zero");
         let _ = max_abs;
-    }
-
-    #[test]
-    #[ignore = "criterion-style local timing for the biobank-shape FLEX Hv pattern"]
-    fn bench_flex_hessian_matvec_parallel_chunks_biobank_shape() {
-        use criterion::{Criterion, black_box};
-        use std::time::Duration;
-
-        let (family, states, cache, direction) =
-            flex_hessian_matvec_fixture(4096).expect("biobank-shape FLEX Hv fixture");
-        let serial = family
-            .exact_newton_joint_hessian_matvec_from_cache_serial_reference(
-                &direction, &states, &cache,
-            )
-            .expect("serial reference Hv");
-        let parallel = family
-            .exact_newton_joint_hessian_matvec_from_cache(&direction, &states, &cache)
-            .expect("parallel chunked Hv");
-        assert_allclose_relative(&parallel, &serial, 1.0e-13);
-
-        let mut criterion = Criterion::default()
-            .sample_size(10)
-            .warm_up_time(Duration::from_millis(200))
-            .measurement_time(Duration::from_millis(500));
-        criterion.bench_function("bernoulli_margslope_flex_hv_serial_reference_4096", |b| {
-            b.iter(|| {
-                black_box(
-                    family
-                        .exact_newton_joint_hessian_matvec_from_cache_serial_reference(
-                            black_box(&direction),
-                            black_box(&states),
-                            black_box(&cache),
-                        )
-                        .expect("serial reference Hv"),
-                )
-            })
-        });
-        criterion.bench_function("bernoulli_margslope_flex_hv_parallel_chunks_4096", |b| {
-            b.iter(|| {
-                black_box(
-                    family
-                        .exact_newton_joint_hessian_matvec_from_cache(
-                            black_box(&direction),
-                            black_box(&states),
-                            black_box(&cache),
-                        )
-                        .expect("parallel chunked Hv"),
-                )
-            })
-        });
-        criterion.final_summary();
     }
 
     #[test]
@@ -21043,154 +21107,4 @@ mod tests {
         assert!(rel < 1e-12, "joint Hessian dH HT rel {}", rel);
     }
 
-    /// Scaling-law probe for the margslope sigma ψ first-order path —
-    /// the per-row hot loop the path #1 subsample-outer fix targets.
-    /// `#[ignore]`-gated; run with:
-    ///   `cargo test --release --lib -- --ignored --nocapture margslope_sigma_psi_scaling_law`
-    ///
-    /// Fits y = a · n^α to (n, wall-time) at full data and at the
-    /// auto-K subsample. Reports R², max log-residual, and verdicts at
-    /// biobank n=320k against an 80s/call budget (≈30 ψ-eval calls per
-    /// 2400s cmd budget, with ~10 BFGS outer × ~3 ψ-evals/outer).
-    #[test]
-    #[ignore]
-    fn margslope_sigma_psi_scaling_law() {
-        use crate::families::marginal_slope_shared::{OuterScoreSubsample, auto_outer_subsample_k};
-        use std::time::Instant;
-
-        let ns: Vec<usize> = vec![5_000, 10_000, 25_000, 50_000, 100_000, 200_000, 320_000];
-        let per_call_budget = 80.0_f64;
-        const REPS: usize = 3;
-
-        eprintln!("\n[MS-SCALING] header n full_s subsample_s K speedup");
-        let mut full_pts: Vec<(f64, f64)> = Vec::new();
-        let mut sub_pts: Vec<(f64, f64)> = Vec::new();
-
-        for &n in &ns {
-            let family = make_sigma_aware_test_family(n);
-            let states = rigid_block_states(&family, 0.3, 0.4);
-            let specs = vec![dummy_blockspec(1, n), dummy_blockspec(1, n)];
-
-            let opts_full = BlockwiseFitOptions::default();
-            let mut full_samples: Vec<f64> = Vec::with_capacity(REPS);
-            for _ in 0..REPS {
-                let t0 = Instant::now();
-                let _ = family
-                    .sigma_exact_joint_psi_terms_with_options(&states, &specs, &opts_full)
-                    .expect("sigma terms full")
-                    .expect("some");
-                full_samples.push(t0.elapsed().as_secs_f64());
-            }
-            full_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let t_full = full_samples[full_samples.len() / 2];
-
-            let k = auto_outer_subsample_k(n);
-            let mask: Vec<usize> = (0..n).step_by((n / k).max(1)).take(k).collect();
-            let mut opts_sub = BlockwiseFitOptions::default();
-            opts_sub.outer_score_subsample =
-                Some(Arc::new(OuterScoreSubsample::new(mask, n, 0xC0FFEE_5EED)));
-            let mut sub_samples: Vec<f64> = Vec::with_capacity(REPS);
-            for _ in 0..REPS {
-                let t0 = Instant::now();
-                let _ = family
-                    .sigma_exact_joint_psi_terms_with_options(&states, &specs, &opts_sub)
-                    .expect("sigma terms sub")
-                    .expect("some");
-                sub_samples.push(t0.elapsed().as_secs_f64());
-            }
-            sub_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let t_sub = sub_samples[sub_samples.len() / 2];
-
-            let speedup = if t_sub > 0.0 {
-                t_full / t_sub
-            } else {
-                f64::NAN
-            };
-            eprintln!(
-                "[MS-SCALING] row n={n} full_s={t_full:.5} subsample_s={t_sub:.5} K={k} speedup={speedup:.2}x"
-            );
-            full_pts.push((n as f64, t_full));
-            sub_pts.push((n as f64, t_sub));
-        }
-        eprintln!();
-        report_power_law(
-            "[MS-SCALING-FULL]",
-            &full_pts,
-            &[("n=320k", 320_000.0), ("n=1M", 1_000_000.0)],
-            per_call_budget,
-        );
-        eprintln!();
-        report_power_law(
-            "[MS-SCALING-SUBSAMPLE]",
-            &sub_pts,
-            &[("n=320k", 320_000.0), ("n=1M", 1_000_000.0)],
-            per_call_budget,
-        );
-    }
-
-    /// Honest power-law fit + R² + extrapolation verdicts. Refuses to
-    /// extrapolate when the fit is poor (R²<0.85 or any log-residual >0.5).
-    fn report_power_law(
-        tag: &str,
-        points: &[(f64, f64)],
-        extrapolate: &[(&str, f64)],
-        budget_y: f64,
-    ) {
-        if points.len() < 3 {
-            eprintln!("{tag} INSUFFICIENT DATA: {} points (need ≥3)", points.len());
-            return;
-        }
-        let logs: Vec<(f64, f64)> = points.iter().map(|(x, y)| (x.ln(), y.ln())).collect();
-        let n = logs.len() as f64;
-        let sx: f64 = logs.iter().map(|(x, _)| x).sum();
-        let sy: f64 = logs.iter().map(|(_, y)| y).sum();
-        let sxx: f64 = logs.iter().map(|(x, _)| x * x).sum();
-        let sxy: f64 = logs.iter().map(|(x, y)| x * y).sum();
-        let alpha = (n * sxy - sx * sy) / (n * sxx - sx * sx);
-        let log_a = (sy - alpha * sx) / n;
-        let a = log_a.exp();
-        let mean_y = sy / n;
-        let ss_tot: f64 = logs.iter().map(|(_, y)| (y - mean_y).powi(2)).sum();
-        let ss_res: f64 = logs
-            .iter()
-            .map(|(x, y)| {
-                let pred = log_a + alpha * x;
-                (y - pred).powi(2)
-            })
-            .sum();
-        let r2 = if ss_tot > 0.0 {
-            1.0 - ss_res / ss_tot
-        } else {
-            0.0
-        };
-        let max_abs_log_resid: f64 = logs
-            .iter()
-            .map(|(x, y)| (y - (log_a + alpha * x)).abs())
-            .fold(0.0_f64, f64::max);
-        eprintln!(
-            "{tag} fit: y ≈ {:.3e} · x^{:.3}  | R²={:.4}  max|log-resid|={:.3} (×{:.2})",
-            a,
-            alpha,
-            r2,
-            max_abs_log_resid,
-            max_abs_log_resid.exp()
-        );
-        if r2 < 0.85 || max_abs_log_resid > 0.5 {
-            eprintln!("{tag} REFUSING EXTRAPOLATION (R²<0.85 or max log-resid >0.5)");
-            return;
-        }
-        eprintln!("{tag} budget per call: {:.1}s", budget_y);
-        for (label, x_target) in extrapolate {
-            let pred = a * x_target.powf(alpha);
-            let verdict = if pred <= budget_y {
-                format!("FITS ({:.0}× headroom)", budget_y / pred)
-            } else {
-                format!("OVER by {:.1}× ({:.0}s)", pred / budget_y, pred)
-            };
-            eprintln!(
-                "{tag} extrap @ {label} (x={:.1e}): pred={:.4}s → {}",
-                x_target, pred, verdict
-            );
-        }
-    }
 }
