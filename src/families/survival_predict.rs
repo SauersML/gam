@@ -995,7 +995,8 @@ fn predict_survival_location_scale_batch(
         let cov = saved_fit.beta_covariance().ok_or_else(|| {
             "survival location-scale uncertainty: saved fit is missing the \
              posterior covariance; refit with the current CLI / library to \
-             populate beta_covariance".to_string()
+             populate beta_covariance"
+                .to_string()
         })?;
         let unc = predict_survival_location_scalewith_uncertainty(
             &pred_input,
@@ -1010,7 +1011,12 @@ fn predict_survival_location_scale_batch(
              missing despite include_response_sd=true"
                 .to_string()
         })?;
-        (unc.eta, unc.survival_prob, Some(response_se), Some(unc.eta_standard_error))
+        (
+            unc.eta,
+            unc.survival_prob,
+            Some(response_se),
+            Some(unc.eta_standard_error),
+        )
     } else if per_row_eval {
         let pred = predict_survival_location_scale(&pred_input, &saved_fit)
             .map_err(|err| format!("survival location-scale predict failed: {err}"))?;
