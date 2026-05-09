@@ -2951,7 +2951,7 @@ impl SurvivalMarginalSlopeFamily {
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
         let row_iter = outer_row_indices(options, self.n).to_vec();
-        let outer_scale = outer_score_scale(options, self.n);
+        let row_weights = outer_row_weights_by_index(options, self.n);
         // Bit-deterministic reduction: see `chunked_row_reduction`.
         let (
             mut objective_psi,
@@ -9131,7 +9131,7 @@ impl SurvivalMarginalSlopeFamily {
                 };
 
                 let q_geom_lazy;
-                let (f_pi, f_pipi) = if let Some(primary) = flex_primary.as_ref() {
+                let (mut f_pi, mut f_pipi) = if let Some(primary) = flex_primary.as_ref() {
                     let q_ref = match q_geom.as_ref() {
                         Some(q) => q,
                         None => {
@@ -9156,7 +9156,16 @@ impl SurvivalMarginalSlopeFamily {
                 };
 
                 // Third contracted derivative T_i[u^α].
-                let third = self.row_primary_third_contracted_general(row, block_states, &dir)?;
+                let w = row_weights[row];
+                if w != 1.0 {
+                    f_pi.mapv_inplace(|v| v * w);
+                    f_pipi.mapv_inplace(|v| v * w);
+                }
+
+                let mut third = self.row_primary_third_contracted_general(row, block_states, &dir)?;
+                if w != 1.0 {
+                    third.mapv_inplace(|v| v * w);
+                }
 
                 // ── Eq (45): objective_psi += f_i^T u_i^α ──
                 a.0 += f_pi.dot(&dir);
@@ -9222,16 +9231,6 @@ impl SurvivalMarginalSlopeFamily {
                 total.6.add(&chunk.6);
             },
         )?;
-
-        if outer_scale != 1.0 {
-            objective_psi *= outer_scale;
-            score_t.mapv_inplace(|v| v * outer_scale);
-            score_m.mapv_inplace(|v| v * outer_scale);
-            score_g.mapv_inplace(|v| v * outer_scale);
-            score_h.mapv_inplace(|v| v * outer_scale);
-            score_w.mapv_inplace(|v| v * outer_scale);
-            acc.scale_assign(outer_scale);
-        }
 
         // Assemble score into flat vector
         let mut score_psi = Array1::zeros(slices.total);

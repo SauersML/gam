@@ -598,7 +598,7 @@ fn build_scale_deviation_transform_impl(
     let p_noise = noise_design.ncols();
     let first_active = non_intercept_start.min(p_noise);
     let chunk_rows = scale_design_row_chunk_size(n, p_primary.max(p_noise));
-    let projection_coef = solve_scale_projection(
+    let (projection_coef, projection_ridge_alpha) = solve_scale_projection(
         primary_design,
         noise_design,
         weights,
@@ -615,6 +615,7 @@ fn build_scale_deviation_transform_impl(
             weighted_column_mean: Array1::<f64>::zeros(p_noise),
             rescale: Array1::<f64>::ones(p_noise),
             non_intercept_start,
+            projection_ridge_alpha,
         };
         let mut w_sum = 0.0;
         let mut w_resid_sum = Array1::<f64>::zeros(active_cols);
@@ -697,6 +698,7 @@ fn build_scale_deviation_transform_impl(
         weighted_column_mean,
         rescale,
         non_intercept_start,
+        projection_ridge_alpha,
     })
 }
 
