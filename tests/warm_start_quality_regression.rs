@@ -19,6 +19,7 @@
 //! Failure of either test means a bandaid (or the warm-start machinery
 //! itself) is causing inner-PIRLS to terminate at a non-KKT β —
 //! exactly the kind of quality regression the mission forbids. These
+//! ApproxKind: Exact (the assertion is a KKT residual, not a heuristic).
 //! tests run cheap (n=400, p=12) and gate every PR.
 
 use gam::construction::CanonicalPenalty;

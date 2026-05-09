@@ -1720,6 +1720,7 @@ impl Default for SpatialIdentifiability {
     fn default() -> Self {
         // "Magic" default for modular GAMs with explicit parametric block:
         // keep spatial smooth orthogonal to intercept/linear terms.
+        // ApproxKind: Exact (orthogonalization is an exact projection).
         Self::OrthogonalToParametric
     }
 }

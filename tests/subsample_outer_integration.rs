@@ -8,6 +8,7 @@
 //!   - Phase 4 (`ab9f2523`): auto-injection at workflow.rs wrappers
 //!   - Phase 5 (`24df6f51`): workspace bridge so `_with_options` activates
 //!   - Magic K (`3af67ae6`): `auto_outer_subsample_k` derives K from n
+//!     (ApproxKind: StatisticalApproximation — subsampled outer score).
 //!
 //! These tests exercise the seams BETWEEN those pieces through the
 //! public surface, catching integration gaps that unit tests within each
