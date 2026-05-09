@@ -2941,7 +2941,7 @@ struct CachedDenestedCellMoments {
     /// current PIRLS/Newton cycle. Stored at whatever `max_degree` the cache
     /// was built with (degree 9 for the per-row lazy fallback; up to degree
     /// 21 for the pre-built `RowCellMomentsBundle`).
-    state: exact_kernel::CellMomentState,
+    state: exact_kernel::CellDerivativeMomentState,
 }
 
 /// Pre-built per-row cell moments for the current β snapshot. Built once at
@@ -2977,9 +2977,14 @@ impl RowCellMomentsBundle {
         let row_vecs =
             n_rows.saturating_mul(std::mem::size_of::<Option<Vec<CachedDenestedCellMoments>>>());
         let cell_records = n_cells.saturating_mul(std::mem::size_of::<CachedDenestedCellMoments>());
-        let moment_payload = n_cells
-            .saturating_mul(max_degree.saturating_add(1))
-            .saturating_mul(std::mem::size_of::<f64>());
+        let required_moments = max_degree.saturating_add(1);
+        let moment_payload = if required_moments > exact_kernel::CELL_MOMENT_INLINE_CAPACITY {
+            n_cells
+                .saturating_mul(required_moments)
+                .saturating_mul(std::mem::size_of::<f64>())
+        } else {
+            0
+        };
         row_vecs
             .saturating_add(cell_records)
             .saturating_add(moment_payload)
@@ -4993,6 +4998,16 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
+    fn evaluate_cell_derivative_moments_lru(
+        &self,
+        cell: exact_kernel::DenestedCubicCell,
+        max_degree: usize,
+    ) -> Result<exact_kernel::CellDerivativeMomentState, String> {
+        self.cell_moment_cache_stats.record_miss();
+        exact_kernel::evaluate_cell_derivative_moments_uncached(cell, max_degree)
+    }
+
+    #[inline]
     fn for_each_deviation_basis_cubic_at<F>(
         runtime: &DeviationRuntime,
         primary_range: &std::ops::Range<usize>,
@@ -5666,21 +5681,24 @@ impl BernoulliMarginalSlopeFamily {
             // orthogonal to the per-family LRU (which is keyed across rows)
             // and the affine tail-cell memo (a separate mechanism).
             let dedup_enabled = cell_moment_per_row_dedup_enabled();
-            let mut dedup: HashMap<exact_kernel::CellFingerprint, exact_kernel::CellMomentState> =
-                HashMap::new();
+            let mut dedup: HashMap<
+                exact_kernel::CellFingerprint,
+                exact_kernel::CellDerivativeMomentState,
+            > = HashMap::new();
             let mut out: Vec<CachedDenestedCellMoments> = Vec::with_capacity(cells.len());
             for partition_cell in cells.into_iter() {
-                let state: exact_kernel::CellMomentState = if dedup_enabled {
+                let state: exact_kernel::CellDerivativeMomentState = if dedup_enabled {
                     let key = exact_kernel::CellFingerprint::new(partition_cell.cell);
                     if let Some(existing) = dedup.get(&key) {
                         existing.clone()
                     } else {
-                        let computed = self.evaluate_cell_moments_lru(partition_cell.cell, 9)?;
+                        let computed =
+                            self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 9)?;
                         dedup.insert(key, computed.clone());
                         computed
                     }
                 } else {
-                    self.evaluate_cell_moments_lru(partition_cell.cell, 9)?
+                    self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 9)?
                 };
                 out.push(CachedDenestedCellMoments {
                     partition_cell,
@@ -5897,7 +5915,10 @@ impl BernoulliMarginalSlopeFamily {
                         // Use the per-family LRU here too so the bundle build
                         // benefits from cross-row cell-moment reuse and keeps
                         // the LRU's hit-rate accounting consistent.
-                        self.evaluate_cell_moments_lru(partition_cell.cell, max_degree)
+                        self.evaluate_cell_derivative_moments_lru(
+                            partition_cell.cell,
+                            max_degree,
+                        )
                             .map(|state| CachedDenestedCellMoments {
                                 partition_cell,
                                 state,
@@ -6489,7 +6510,7 @@ impl BernoulliMarginalSlopeFamily {
             let owned_cells;
             let cached_cells: Vec<(
                 exact::DenestedPartitionCell,
-                std::borrow::Cow<'_, exact::CellMomentState>,
+                std::borrow::Cow<'_, exact::CellDerivativeMomentState>,
             )> = if let Some(cached) = row_cell_moments {
                 debug_assert!(
                     !cached.is_empty(),
@@ -6520,7 +6541,7 @@ impl BernoulliMarginalSlopeFamily {
                     .into_iter()
                     .map(|partition_cell| {
                         let degree = if need_hessian { 9 } else { 3 };
-                        self.evaluate_cell_moments_lru(partition_cell.cell, degree)
+                        self.evaluate_cell_derivative_moments_lru(partition_cell.cell, degree)
                             .map(|state| (partition_cell, std::borrow::Cow::Owned(state)))
                     })
                     .collect::<Result<Vec<_>, String>>()?
@@ -6532,7 +6553,7 @@ impl BernoulliMarginalSlopeFamily {
                 let cell = partition_cell.cell;
                 let z_mid = exact::interval_probe_point(cell.left, cell.right)?;
                 let u_mid = a + b * z_mid;
-                let state: &exact::CellMomentState = &state;
+                let state: &exact::CellDerivativeMomentState = &state;
                 let (dc_da_raw, dc_db_raw) = exact::denested_cell_coefficient_partials(
                     partition_cell.score_span,
                     partition_cell.link_span,
@@ -6969,7 +6990,7 @@ impl BernoulliMarginalSlopeFamily {
             owned_cells = partitions
                 .into_iter()
                 .map(|partition_cell| {
-                    self.evaluate_cell_moments_lru(partition_cell.cell, 15)
+                    self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 15)
                         .map(|state| CachedDenestedCellMoments {
                             partition_cell,
                             state,
@@ -7552,7 +7573,7 @@ impl BernoulliMarginalSlopeFamily {
             owned_cells = partitions
                 .into_iter()
                 .map(|partition_cell| {
-                    self.evaluate_cell_moments_lru(partition_cell.cell, 21)
+                    self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 21)
                         .map(|state| CachedDenestedCellMoments {
                             partition_cell,
                             state,
@@ -11729,11 +11750,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let intercept_warm_starts = new_intercept_warm_start_cache(y.len());
     let cell_moment_lru = new_cell_moment_lru_cache(policy);
     let cell_moment_cache_stats = new_cell_moment_cache_stats();
-    let flex_active = score_warp_prepared.is_some() || link_dev_prepared.is_some();
-    let mut fit_options = options.clone();
-    if flex_active && y.len() >= BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT {
-        fit_options.line_search_prefer_workspace = true;
-    }
     let make_family = |marginal_design: &TermCollectionDesign,
                        logslope_design: &TermCollectionDesign,
                        sigma: Option<f64>|
@@ -11772,7 +11788,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let initial_blocks = build_blocks(&initial_rho, &marginal_design, &logslope_design)?;
     let initial_family = make_family(&marginal_design, &logslope_design, initial_sigma);
     let (joint_gradient, joint_hessian) =
-        custom_family_outer_derivatives(&initial_family, &initial_blocks, &fit_options);
+        custom_family_outer_derivatives(&initial_family, &initial_blocks, options);
     let analytic_joint_gradient_available = analytic_joint_derivatives_available
         && matches!(
             joint_gradient,
@@ -11895,7 +11911,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             let sigma = sigma_from_theta(theta);
             final_sigma_cell.set(sigma);
             let family = make_family(&designs[0], &designs[1], sigma);
-            let fit = inner_fit(&family, &blocks, &fit_options)?;
+            let fit = inner_fit(&family, &blocks, options)?;
             let mut hints_mut = hints.borrow_mut();
             let mut bidx = 0usize;
             if let Some(block) = fit.block_states.get(bidx) {
@@ -11939,7 +11955,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             let eval = evaluate_custom_family_joint_hyper_shared(
                 &family,
                 &blocks,
-                &fit_options,
+                options,
                 &rho,
                 derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
@@ -11972,7 +11988,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             let eval = evaluate_custom_family_joint_hyper_efs_shared(
                 &family,
                 &blocks,
-                &fit_options,
+                options,
                 &rho,
                 derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
