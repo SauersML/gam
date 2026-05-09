@@ -559,29 +559,90 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
 /// Stratified row index subsample shared across outer-loop evaluations.
 ///
 /// `mask` is sorted, deduplicated, and never empty in practice (enforced by
-/// `build_outer_score_subsample`). `weight_scale = n_full / mask.len()` is the
-/// constant rescaling factor that outer-only passes apply per-row so that
-/// linear-in-row sums approximate full-data sums in expectation.
+/// `build_outer_score_subsample`).
+///
+/// Per-row inverse-inclusion weights `w_i = N_h / k_h` (where `h` is the row's
+/// stratum) are stored alongside the mask in `rows`. The Horvitz–Thompson
+/// estimator for any linear-in-row functional T = Σ_i f_i is
+///   T̂ = Σ_{i ∈ mask} w_i · f_i,
+/// which is unbiased even when per-stratum sampling fractions differ
+/// (the `ceil(k * N_h / n).max(1)` rule in the stratified builder makes
+/// rare strata oversample relative to the bulk, so a single global rescale
+/// `n_full / |mask|` is biased in those strata).
+///
+/// `weight_scale` is retained as a *diagnostic* (mean of `w_i` across the
+/// mask). It equals the legacy `n_full / |mask|` when all rows share a
+/// uniform weight (the common case for caller-supplied masks via
+/// [`OuterScoreSubsample::new`]); it can drift from that value under the
+/// stratified builder's rare-stratum boost. It is not the per-row scaling
+/// factor — consumers must read `rows[i].weight` for HT correctness.
 #[derive(Debug, Clone)]
 pub struct OuterScoreSubsample {
     pub mask: Arc<Vec<usize>>,
+    pub rows: Arc<Vec<WeightedOuterRow>>,
     pub n_full: usize,
     pub weight_scale: f64,
     pub seed: u64,
 }
 
 impl OuterScoreSubsample {
-    /// Wrap a precomputed mask. The caller is responsible for sortedness and
-    /// uniqueness; `build_outer_score_subsample` is the canonical builder.
+    /// Wrap a precomputed mask with the legacy uniform `n_full / m` weight
+    /// per row. The caller is responsible for sortedness and uniqueness;
+    /// `build_outer_score_subsample` is the canonical (per-stratum HT)
+    /// builder.
     pub fn new(mask: Vec<usize>, n_full: usize, seed: u64) -> Self {
         let m = mask.len();
-        let weight_scale = if m == 0 {
+        let w = if m == 0 {
             1.0
         } else {
             n_full as f64 / m as f64
         };
+        Self::with_uniform_weight(mask, n_full, seed, w)
+    }
+
+    /// Wrap a precomputed mask with an explicit uniform per-row weight.
+    /// Useful for tests that need the unrescaled (`weight = 1.0`) sum over a
+    /// custom mask, and for callers that already know the desired
+    /// rescaling factor and don't want the constructor to derive it from
+    /// `n_full / |mask|`.
+    pub fn with_uniform_weight(mask: Vec<usize>, n_full: usize, seed: u64, weight: f64) -> Self {
+        let rows: Vec<WeightedOuterRow> = mask
+            .iter()
+            .map(|&index| WeightedOuterRow {
+                index,
+                weight,
+                stratum: 0,
+            })
+            .collect();
+        let weight_scale = if rows.is_empty() { 1.0 } else { weight };
         Self {
             mask: Arc::new(mask),
+            rows: Arc::new(rows),
+            n_full,
+            weight_scale,
+            seed,
+        }
+    }
+
+    /// Wrap a vector of `(index, weight, stratum)` triples. The mask is
+    /// derived as the sorted/dedup'd index list. Used by the stratified
+    /// builder to install per-row HT weights.
+    pub fn from_weighted_rows(
+        mut rows: Vec<WeightedOuterRow>,
+        n_full: usize,
+        seed: u64,
+    ) -> Self {
+        rows.sort_by_key(|r| r.index);
+        rows.dedup_by_key(|r| r.index);
+        let mask: Vec<usize> = rows.iter().map(|r| r.index).collect();
+        let weight_scale = if rows.is_empty() {
+            1.0
+        } else {
+            rows.iter().map(|r| r.weight).sum::<f64>() / rows.len() as f64
+        };
+        Self {
+            mask: Arc::new(mask),
+            rows: Arc::new(rows),
             n_full,
             weight_scale,
             seed,
@@ -598,9 +659,15 @@ impl OuterScoreSubsample {
         self.mask.is_empty()
     }
 
-    #[inline]
+    /// True when at least two retained rows have different per-row weights.
+    /// Consumers that previously applied a single post-sum scalar must
+    /// switch to per-row weighting whenever this returns true.
     pub fn has_variable_weights(&self) -> bool {
-        false
+        let mut iter = self.rows.iter();
+        let Some(first) = iter.next() else {
+            return false;
+        };
+        iter.any(|r| (r.weight - first.weight).abs() > 0.0)
     }
 }
 
@@ -608,6 +675,9 @@ impl OuterScoreSubsample {
 pub struct WeightedOuterRow {
     pub index: usize,
     pub weight: f64,
+    /// Stratum identifier the row was drawn from. Pure diagnostic — consumers
+    /// must use `weight` for any aggregation.
+    pub stratum: u32,
 }
 
 /// Splitmix64: deterministic single-u64 expansion. Local copy so this module
@@ -631,7 +701,10 @@ fn splitmix64(state: &mut u64) -> u64 {
 /// is reproducible from `(seed, stratum_id)`.
 ///
 /// The returned mask is sorted, deduplicated, and never empty when `n > 0`.
-/// `weight_scale = n_full / mask.len()` (computed by `OuterScoreSubsample::new`).
+/// Per-row weights `w_i = N_h / k_h` (Horvitz-Thompson inverse-inclusion
+/// weights for the stratum the row came from) are assigned to
+/// `OuterScoreSubsample::rows`, and `weight_scale` is reported as the mean
+/// of those weights for diagnostics only.
 ///
 /// Panics if `z.len() != stratum_secondary.len()`.
 pub fn build_outer_score_subsample(
@@ -648,15 +721,15 @@ pub fn build_outer_score_subsample(
     );
 
     if n == 0 {
-        return OuterScoreSubsample::new(Vec::new(), 0, seed);
+        return OuterScoreSubsample::with_uniform_weight(Vec::new(), 0, seed, 1.0);
     }
 
     // If the requested subsample covers the full dataset (or more), short-
-    // circuit to the full row set. weight_scale = 1.0 and this becomes a
-    // no-op compared to the legacy full-data path.
+    // circuit to the full row set with weight 1.0 — this is a no-op
+    // relative to the legacy full-data path.
     if k >= n {
         let mask: Vec<usize> = (0..n).collect();
-        return OuterScoreSubsample::new(mask, n, seed);
+        return OuterScoreSubsample::with_uniform_weight(mask, n, seed, 1.0);
     }
 
     // Q = 100 z-deciles. Sort indices by z and split into Q ~equal chunks.
@@ -693,14 +766,19 @@ pub fn build_outer_score_subsample(
         strata[s].push(i);
     }
 
-    // For each non-empty stratum, draw ceil(k * stratum_size / n) rows.
-    let mut picked: Vec<usize> = Vec::with_capacity(k + n_strata);
+    // For each non-empty stratum, draw ceil(k * stratum_size / n) rows and
+    // tag each retained row with its HT weight w_h = N_h / k_h.
+    let mut picked: Vec<WeightedOuterRow> = Vec::with_capacity(k + n_strata);
     for (stratum_id, rows) in strata.iter().enumerate() {
         if rows.is_empty() {
             continue;
         }
         let take = ((k as u128 * rows.len() as u128 + n as u128 - 1) / n as u128) as usize;
         let take = take.max(1).min(rows.len());
+        // HT inverse-inclusion weight for this stratum: w_h = N_h / k_h.
+        // Identical for every row drawn from `stratum_id`.
+        let w_h = rows.len() as f64 / take as f64;
+        let stratum_tag = stratum_id as u32;
 
         // Deterministic key from (seed, stratum_id).
         let mut state = seed ^ (stratum_id as u64).wrapping_mul(0x9E3779B97F4A7C15);
@@ -708,7 +786,13 @@ pub fn build_outer_score_subsample(
         let _ = splitmix64(&mut state);
 
         if take == rows.len() {
-            picked.extend_from_slice(rows);
+            for &index in rows.iter() {
+                picked.push(WeightedOuterRow {
+                    index,
+                    weight: w_h,
+                    stratum: stratum_tag,
+                });
+            }
         } else {
             // Fisher-Yates partial shuffle: produce `take` distinct rows.
             let mut buf: Vec<usize> = rows.clone();
@@ -718,16 +802,20 @@ pub fn build_outer_score_subsample(
                 let j = i + (r as usize) % (m - i);
                 buf.swap(i, j);
             }
-            picked.extend_from_slice(&buf[..take]);
+            for &index in &buf[..take] {
+                picked.push(WeightedOuterRow {
+                    index,
+                    weight: w_h,
+                    stratum: stratum_tag,
+                });
+            }
         }
     }
 
-    // Sort + dedup. Strata are disjoint by construction so dedup is a no-op,
-    // but we sort regardless to satisfy the OuterScoreSubsample contract.
-    picked.sort_unstable();
-    picked.dedup();
-
-    OuterScoreSubsample::new(picked, n, seed)
+    // `from_weighted_rows` sorts + dedups by index. Strata are disjoint by
+    // construction so dedup is a no-op, but we route through the constructor
+    // so the OuterScoreSubsample contract stays in one place.
+    OuterScoreSubsample::from_weighted_rows(picked, n, seed)
 }
 
 // ---------------------------------------------------------------------------
@@ -778,64 +866,79 @@ impl OuterRowIter {
 /// Choose the row-iteration strategy for an outer-only pass. When
 /// `opts.outer_score_subsample` is `Some`, returns the subsample mask;
 /// otherwise returns the full range `0..n`.
+///
+/// Callers using this helper iterate over row indices and must additionally
+/// consult [`outer_row_weights_by_index`] (or [`outer_weighted_rows`]) for
+/// per-row HT weights — a single global rescale is biased under stratified
+/// sampling and is no longer exposed.
 pub fn outer_row_indices(
     opts: &crate::custom_family::BlockwiseFitOptions,
     n: usize,
 ) -> OuterRowIter {
     match opts.outer_score_subsample.as_ref() {
-        Some(s) if !s.has_variable_weights() => OuterRowIter::Subset {
+        Some(s) => OuterRowIter::Subset {
             mask: Arc::clone(&s.mask),
         },
-        Some(_) => OuterRowIter::All { n },
         None => OuterRowIter::All { n },
     }
 }
 
-/// Per-row rescaling factor for outer-only sums. Returns
-/// `subsample.weight_scale` when a subsample is active and `1.0` otherwise.
+/// Diagnostic: mean per-row HT weight across the subsample (or 1.0 in the
+/// no-subsample / full-data path). Equals the legacy `n_full / |mask|`
+/// global rescale when all retained rows share a uniform weight; differs
+/// from it under the stratified builder's rare-stratum boost.
+///
+/// Consumers must not use this as a per-row scaling factor when
+/// `OuterScoreSubsample::has_variable_weights()` is true — the unbiased
+/// estimator multiplies each row by `outer_row_weights_by_index(opts, n)[i]`,
+/// not by this scalar. Retained for backward-compatible tests over uniformly
+/// weighted masks (e.g. callers that build `OuterScoreSubsample::new`).
 #[inline]
 pub fn outer_score_scale(opts: &crate::custom_family::BlockwiseFitOptions, _n: usize) -> f64 {
     match opts.outer_score_subsample.as_ref() {
-        Some(s) if !s.has_variable_weights() => s.weight_scale,
-        Some(_) => 1.0,
+        Some(s) => s.weight_scale,
         None => 1.0,
     }
 }
 
+/// Per-row HT-weighted iteration: returns one `WeightedOuterRow` per
+/// retained row when a subsample is active; otherwise returns
+/// `(index, weight = 1.0, stratum = 0)` for every row in `0..n`.
 pub fn outer_weighted_rows(
     opts: &crate::custom_family::BlockwiseFitOptions,
     n: usize,
 ) -> Vec<WeightedOuterRow> {
     match opts.outer_score_subsample.as_ref() {
-        Some(s) if !s.has_variable_weights() => s
-            .mask
-            .iter()
-            .map(|&index| WeightedOuterRow {
+        Some(s) => s.rows.as_ref().clone(),
+        None => (0..n)
+            .map(|index| WeightedOuterRow {
                 index,
-                weight: s.weight_scale,
+                weight: 1.0,
+                stratum: 0,
             })
-            .collect(),
-        Some(_) | None => (0..n)
-            .map(|index| WeightedOuterRow { index, weight: 1.0 })
             .collect(),
     }
 }
 
+/// Dense-by-row HT weights of length `n`. Masked rows carry their HT
+/// weight; unmasked rows default to 1.0 so that callers who index by row
+/// regardless of subsampling still get a valid scalar (the consumer is
+/// expected to iterate only over `outer_row_indices`).
 pub fn outer_row_weights_by_index(
     opts: &crate::custom_family::BlockwiseFitOptions,
     n: usize,
 ) -> Vec<f64> {
     match opts.outer_score_subsample.as_ref() {
-        Some(s) if !s.has_variable_weights() => {
-            let mut weights = vec![0.0; n];
-            for &row in s.mask.iter() {
-                if row < n {
-                    weights[row] = s.weight_scale;
+        Some(s) => {
+            let mut weights = vec![1.0; n];
+            for r in s.rows.iter() {
+                if r.index < n {
+                    weights[r.index] = r.weight;
                 }
             }
             weights
         }
-        Some(_) | None => vec![1.0; n],
+        None => vec![1.0; n],
     }
 }
 
@@ -869,16 +972,17 @@ pub fn assert_outer_only(_opts: &crate::custom_family::BlockwiseFitOptions, _con
 /// row-reduction that the bernoulli / survival sigma-ψ paths funnel
 /// through; their per-row contributions are the dominant non-deterministic
 /// source in the marginal-slope outer-loop score / Hessian sums.
-pub(crate) fn chunked_row_reduction<Acc, Init, Process, Combine>(
-    rows: &[usize],
+pub(crate) fn chunked_row_reduction<Item, Acc, Init, Process, Combine>(
+    rows: &[Item],
     init: Init,
     process_row: Process,
     mut combine: Combine,
 ) -> Result<Acc, String>
 where
+    Item: Sync + Copy,
     Acc: Send,
     Init: Fn() -> Acc + Sync,
-    Process: Fn(usize, &mut Acc) -> Result<(), String> + Sync,
+    Process: Fn(Item, &mut Acc) -> Result<(), String> + Sync,
     Combine: FnMut(&mut Acc, Acc),
 {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -899,8 +1003,8 @@ where
             let start = chunk_idx * chunk_size;
             let end = (start + chunk_size).min(n);
             let mut acc = init();
-            for &row in &rows[start..end] {
-                process_row(row, &mut acc)?;
+            for &item in &rows[start..end] {
+                process_row(item, &mut acc)?;
             }
             Ok(acc)
         })
@@ -912,216 +1016,9 @@ where
     Ok(total)
 }
 
-// ---------------------------------------------------------------------------
-// Phase 4: biobank-scale outer-score subsample auto-injection.
-//
-// At biobank scale (n > BIOBANK_OUTER_SUBSAMPLE_THRESHOLD) the
-// marginal-slope outer optimization burns most of its time in O(n) per-row
-// score / Hessian sweeps. `inject_biobank_outer_subsample` constructs a
-// stratified subsample (100 z-deciles × distinct secondary classes) and
-// installs it on the supplied `BlockwiseFitOptions` so outer-only sweeps
-// downscale to ~K rows. Inner-PIRLS and final-covariance passes still run
-// on the full data because they don't consult `outer_score_subsample`.
-//
-// The auto-enable gate fires only when `outer_score_subsample.is_none()`
-// so any caller that already supplied a subsample (for example a test or
-// a future CLI flag) is preserved verbatim.
-// ---------------------------------------------------------------------------
-
-/// Auto-enable threshold for the biobank-scale outer-score subsample.
-pub const BIOBANK_OUTER_SUBSAMPLE_THRESHOLD: usize = 50_000;
-/// Lower bound on the auto-derived subsample size — below this the
-/// stratified estimator becomes too noisy for the outer optimizer.
-pub const BIOBANK_OUTER_SUBSAMPLE_K_MIN: usize = 4_000;
-/// Upper bound on the auto-derived subsample size — above this the
-/// per-iter savings from subsampling diminish (and memory cost grows).
-pub const BIOBANK_OUTER_SUBSAMPLE_K_MAX: usize = 40_000;
-/// Default subsample size targeted at biobank scale; mgcv::bam(discrete=TRUE)
-/// regime, ample for stable score / Hessian sums. Retained as a public
-/// reference point and as the value used by tests; the runtime gate uses
-/// [`auto_outer_subsample_k`] instead.
-pub const BIOBANK_OUTER_SUBSAMPLE_K: usize = 20_000;
-/// Deterministic seed for the auto-enabled subsample. Tests rely on this
-/// being stable across runs.
-pub const BIOBANK_OUTER_SUBSAMPLE_SEED: u64 = 0xC0FFEE_5EED;
-
-/// Auto-derive the outer-score subsample size from the data row count.
-///
-/// "Magic by default": no CLI flag, no env var. K targets ~6% of n (so
-/// subsample work is ~16x cheaper than full-data work) with a 4_000 floor
-/// for statistical adequacy. The ceiling is *adaptive* in n: it grows with
-/// sqrt(n) above the legacy 40_000 cap so biobank fits at n >> 1M aren't
-/// strangled by a fixed scalar limit.
-/// ApproxKind: StatisticalApproximation - stratified Horvitz-Thompson outer
-/// score; per-coordinate variance scales O(N_eff / K) where N_eff is bounded
-/// by the per-stratum design effect. With sqrt(n) cap growth the relative
-/// score-SE stays roughly constant rather than degrading as O(sqrt(n)).
-///
-/// At anchor points (rounded):
-/// - n = 50_000 (threshold) -> K = 4_000   (floor binds)
-/// - n = 100_000             -> K = 6_250
-/// - n = 320_000 (biobank)   -> K = 20_000  (n/16 binds)
-/// - n = 1_000_000           -> K = 62_500  (n/16 binds; was 40_000)
-/// - n = 5_000_000           -> K = 167_705 (sqrt cap binds; was 40_000)
-///
-/// `BIOBANK_OUTER_SUBSAMPLE_K_MAX` is retained as the legacy fixed-cap
-/// constant for callers that want the historical bound; the runtime uses
-/// the adaptive formula here instead.
-pub fn auto_outer_subsample_k(n: usize) -> usize {
-    if n == 0 {
-        return BIOBANK_OUTER_SUBSAMPLE_K_MIN;
-    }
-    // Adaptive ceiling: grows with sqrt(n) so the cap never falls below
-    // 40_000 but scales with effective sample size for biobank-scale jobs.
-    // 75 is the proportionality constant chosen so sqrt(1e6)*75 ~ 75_000
-    // (close to the legacy 40_000 at n=1M but ~2x larger for very-large n)
-    // and so the cap doesn't bind below ~285_000 (sqrt(285k)*75 ~ 40_000).
-    let n_f = n as f64;
-    let sqrt_cap = (n_f.sqrt() * 75.0) as usize;
-    let cap = sqrt_cap.max(BIOBANK_OUTER_SUBSAMPLE_K_MAX).min(n);
-    (n / 16).max(BIOBANK_OUTER_SUBSAMPLE_K_MIN).min(cap)
-}
-
-/// Install a stratified outer-score subsample on `opts` when `n` exceeds the
-/// biobank-scale threshold and no subsample is already configured. Returns
-/// `true` when a subsample was installed, `false` otherwise.
-///
-/// `z` is the linearized PGS axis the marginal-slope family stratifies on.
-/// `secondary` is the distinct-class indicator (binary y for bernoulli,
-/// event indicator for survival) used as the secondary stratification key.
-///
-/// This is a thin, separately-testable wrapper around
-/// [`build_outer_score_subsample`] so the wiring layer (workflow.rs) can be
-/// exercised without spinning up a full fit.
-pub fn inject_biobank_outer_subsample(
-    opts: &mut crate::custom_family::BlockwiseFitOptions,
-    z: &[f64],
-    secondary: &[u8],
-) -> bool {
-    let n = z.len();
-    if n <= BIOBANK_OUTER_SUBSAMPLE_THRESHOLD {
-        return false;
-    }
-    if opts.outer_score_subsample.is_some() {
-        return false;
-    }
-    if z.len() != secondary.len() {
-        // Defensive: mismatched lengths would panic inside the builder; bail
-        // out instead so the legacy full-data path keeps running.
-        return false;
-    }
-    let k = auto_outer_subsample_k(n);
-    let subsample = build_outer_score_subsample(z, secondary, k, BIOBANK_OUTER_SUBSAMPLE_SEED);
-    log::info!(
-        "[biobank-scale] constructed outer-score subsample: n={} k={} weight_scale={:.3} seed={:#x}",
-        n,
-        subsample.len(),
-        subsample.weight_scale,
-        BIOBANK_OUTER_SUBSAMPLE_SEED,
-    );
-    opts.outer_score_subsample = Some(Arc::new(subsample));
-    true
-}
-
-/// Convenience wrapper that converts an `Array1<f64>` event/y indicator
-/// (the canonical marginal-slope storage) into the `&[u8]` form the
-/// stratifier expects, then delegates to [`inject_biobank_outer_subsample`].
-///
-/// Exact zeros map to class `0`, non-zero finite entries map to class `1`,
-/// and NaNs map to class `2`. The explicit NaN check is required because
-/// `NaN != 0.0` evaluates true in Rust IEEE-754, so a naive `v != 0.0`
-/// would silently bucket NaNs with the event class and bias the secondary
-/// stratification. `build_outer_score_subsample` handles any u8 alphabet
-/// transparently, so the third class costs nothing when there are no NaNs.
-pub fn inject_biobank_outer_subsample_from_arrays(
-    opts: &mut crate::custom_family::BlockwiseFitOptions,
-    z: &[f64],
-    secondary_f64: &[f64],
-) -> bool {
-    if z.len() != secondary_f64.len() {
-        return false;
-    }
-    let secondary: Vec<u8> = secondary_f64
-        .iter()
-        .map(|&v| {
-            if v.is_nan() {
-                2u8
-            } else if v != 0.0 {
-                1u8
-            } else {
-                0u8
-            }
-        })
-        .collect();
-    inject_biobank_outer_subsample(opts, z, &secondary)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn auto_outer_subsample_k_anchor_points() {
-        // The anchors documented in the docstring should match the
-        // implementation. If the heuristic changes, update both.
-        // The cap is sqrt(n)*75 above the legacy K_MAX=40_000 ceiling.
-        assert_eq!(auto_outer_subsample_k(50_000), 4_000);
-        assert_eq!(auto_outer_subsample_k(100_000), 6_250);
-        assert_eq!(auto_outer_subsample_k(320_000), 20_000);
-        // n=1M: n/16 = 62_500, sqrt-cap = 75_000, so 62_500 binds.
-        assert_eq!(auto_outer_subsample_k(1_000_000), 62_500);
-    }
-
-    #[test]
-    fn auto_outer_subsample_k_floor_binds_below_threshold_x16() {
-        // Below n = K_MIN * 16 = 64_000, the n/16 term is below the floor.
-        assert_eq!(auto_outer_subsample_k(0), BIOBANK_OUTER_SUBSAMPLE_K_MIN);
-        assert_eq!(
-            auto_outer_subsample_k(60_000),
-            BIOBANK_OUTER_SUBSAMPLE_K_MIN
-        );
-        assert_eq!(
-            auto_outer_subsample_k(64_000),
-            BIOBANK_OUTER_SUBSAMPLE_K_MIN
-        );
-    }
-
-    #[test]
-    fn auto_outer_subsample_k_legacy_ceiling_binds_at_n_640k() {
-        // At n = K_MAX * 16 = 640_000, the n/16 term is exactly K_MAX and
-        // the sqrt-cap (sqrt(640k)*75 ~ 60k) sits above it, so n/16 binds.
-        assert_eq!(
-            auto_outer_subsample_k(640_000),
-            BIOBANK_OUTER_SUBSAMPLE_K_MAX
-        );
-    }
-
-    #[test]
-    fn auto_outer_subsample_k_sqrt_cap_grows_with_n() {
-        // Above n ~ 1M the sqrt-cap exceeds K_MAX so K can grow past 40_000.
-        // At n=10M, sqrt(10M)*75 ~ 237_171 < n/16 = 625_000, so the cap
-        // binds and K ~ 237k (much larger than the legacy fixed 40_000).
-        let k = auto_outer_subsample_k(10_000_000);
-        assert!(
-            k > BIOBANK_OUTER_SUBSAMPLE_K_MAX,
-            "auto K at n=10M should exceed legacy K_MAX, got {k}"
-        );
-        assert!(k <= 10_000_000 / 16, "auto K can never exceed n/16 budget");
-    }
-
-    #[test]
-    fn auto_outer_subsample_k_is_monotone_non_decreasing() {
-        // Sanity: more rows never asks for fewer subsample rows.
-        let mut prev = 0usize;
-        for n in (0..2_000_000).step_by(7919) {
-            let k = auto_outer_subsample_k(n);
-            assert!(
-                k >= prev,
-                "auto_outer_subsample_k regressed at n={n}: prev={prev} k={k}"
-            );
-            prev = k;
-        }
-    }
 
     #[test]
     fn subsample_full_n_equals_no_subsample() {
@@ -1221,110 +1118,4 @@ mod tests {
         );
     }
 
-    // ── Phase 4 wiring: biobank-scale auto-injection ───────────────────────
-
-    #[test]
-    fn inject_biobank_outer_subsample_fires_at_biobank_scale() {
-        // n=100k > 50k threshold → subsample should be installed and the
-        // mask length should be roughly K (within stratification overshoot).
-        // The runtime gate uses `auto_outer_subsample_k(n)` (≈ n/16 with a
-        // K_MIN/K_MAX clamp), not the historical `BIOBANK_OUTER_SUBSAMPLE_K`
-        // constant; at n=100k the auto-derived target is 6_250.
-        let n: usize = 100_000;
-        let z: Vec<f64> = (0..n).map(|i| (i as f64) * 1e-3).collect();
-        let secondary: Vec<u8> = (0..n).map(|i| (i % 2) as u8).collect();
-        let mut opts = crate::custom_family::BlockwiseFitOptions::default();
-        assert!(opts.outer_score_subsample.is_none());
-        let installed = inject_biobank_outer_subsample(&mut opts, &z, &secondary);
-        assert!(installed, "subsample should be installed at n={}", n);
-        let s = opts
-            .outer_score_subsample
-            .as_ref()
-            .expect("subsample present");
-        let expected_k = auto_outer_subsample_k(n);
-        // K with 200-stratum overshoot bound (2 secondary classes × 100 z-deciles).
-        assert!(
-            s.len() >= expected_k,
-            "mask len {} below auto-derived K {}",
-            s.len(),
-            expected_k
-        );
-        assert!(
-            s.len() <= expected_k + 200,
-            "mask len {} much larger than auto-derived K {} + 200",
-            s.len(),
-            expected_k
-        );
-        assert_eq!(s.n_full, n);
-        // weight_scale = n / mask.len() ≈ n / expected_k.
-        let expected_scale = (n as f64) / (s.len() as f64);
-        assert!(
-            (s.weight_scale - expected_scale).abs() < 1e-9,
-            "weight_scale {} disagrees with n/len {}",
-            s.weight_scale,
-            expected_scale
-        );
-        assert_eq!(s.seed, BIOBANK_OUTER_SUBSAMPLE_SEED);
-    }
-
-    #[test]
-    fn inject_biobank_outer_subsample_skips_below_threshold() {
-        // n=10k ≤ 50k threshold → subsample stays None.
-        let n: usize = 10_000;
-        let z: Vec<f64> = (0..n).map(|i| (i as f64) * 1e-3).collect();
-        let secondary: Vec<u8> = (0..n).map(|i| (i % 2) as u8).collect();
-        let mut opts = crate::custom_family::BlockwiseFitOptions::default();
-        let installed = inject_biobank_outer_subsample(&mut opts, &z, &secondary);
-        assert!(!installed, "subsample must not fire below threshold");
-        assert!(opts.outer_score_subsample.is_none());
-    }
-
-    #[test]
-    fn inject_biobank_outer_subsample_preserves_existing() {
-        // Pre-existing subsample must not be overwritten.
-        let n: usize = 100_000;
-        let z: Vec<f64> = (0..n).map(|i| (i as f64) * 1e-3).collect();
-        let secondary: Vec<u8> = (0..n).map(|i| (i % 2) as u8).collect();
-        let preset = build_outer_score_subsample(&z, &secondary, 1_000, 0xABCDEF);
-        let preset_seed = preset.seed;
-        let preset_len = preset.len();
-        let mut opts = crate::custom_family::BlockwiseFitOptions::default();
-        opts.outer_score_subsample = Some(Arc::new(preset));
-        let installed = inject_biobank_outer_subsample(&mut opts, &z, &secondary);
-        assert!(!installed, "existing subsample must be preserved");
-        let s = opts
-            .outer_score_subsample
-            .as_ref()
-            .expect("subsample present");
-        assert_eq!(s.seed, preset_seed);
-        assert_eq!(s.len(), preset_len);
-    }
-
-    #[test]
-    fn inject_biobank_outer_subsample_from_arrays_maps_nonzero_to_one() {
-        // f64-secondary convenience: any non-zero entry should map to 1u8.
-        let n: usize = 100_000;
-        let z: Vec<f64> = (0..n).map(|i| (i as f64) * 1e-3).collect();
-        // Mix of 0.0 and 1.0 — exercises the standard binary case.
-        let secondary_f64: Vec<f64> = (0..n).map(|i| (i % 2) as f64).collect();
-        let mut opts = crate::custom_family::BlockwiseFitOptions::default();
-        let installed = inject_biobank_outer_subsample_from_arrays(&mut opts, &z, &secondary_f64);
-        assert!(installed);
-        let s = opts
-            .outer_score_subsample
-            .as_ref()
-            .expect("subsample present");
-        // Auto-derived K, not the historical constant: gate uses auto_outer_subsample_k(n).
-        assert!(s.len() >= auto_outer_subsample_k(n));
-    }
-
-    #[test]
-    fn inject_biobank_outer_subsample_rejects_mismatched_lengths() {
-        let z: Vec<f64> = (0..100_000).map(|i| i as f64).collect();
-        let secondary: Vec<u8> = (0..50_000).map(|i| (i % 2) as u8).collect();
-        let mut opts = crate::custom_family::BlockwiseFitOptions::default();
-        let installed = inject_biobank_outer_subsample(&mut opts, &z, &secondary);
-        assert!(!installed);
-        assert!(opts.outer_score_subsample.is_none());
-    }
 }
