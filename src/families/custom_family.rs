@@ -1824,17 +1824,6 @@ struct ConstrainedWarmStart {
     rho: Array1<f64>,
     block_beta: Vec<Array1<f64>>,
     active_sets: Vec<Option<Vec<usize>>>,
-    cached_inner: Option<CachedInnerMode>,
-}
-
-#[derive(Clone)]
-struct CachedInnerMode {
-    log_likelihood: f64,
-    penalty_value: f64,
-    cycles: usize,
-    block_logdet_h: f64,
-    block_logdet_s: f64,
-    joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
 }
 
 fn screened_outer_warm_start<'a>(
@@ -1867,33 +1856,6 @@ fn warm_start_matches_block_log_lambdas(
         }
     }
     true
-}
-
-fn projected_warm_start_betas_match(
-    states: &[ParameterBlockState],
-    seed: &ConstrainedWarmStart,
-) -> bool {
-    if states.len() != seed.block_beta.len() {
-        return false;
-    }
-    states.iter().zip(seed.block_beta.iter()).all(|(state, beta)| {
-        state.beta.len() == beta.len()
-            && state.beta.iter().zip(beta.iter()).all(|(&a, &b)| {
-                let tol = 1.0e-10 * (1.0 + a.abs().max(b.abs()));
-                (a - b).abs() <= tol
-            })
-    })
-}
-
-fn cached_inner_mode_from_result(inner: &BlockwiseInnerResult) -> Option<CachedInnerMode> {
-    inner.converged.then(|| CachedInnerMode {
-        log_likelihood: inner.log_likelihood,
-        penalty_value: inner.penalty_value,
-        cycles: inner.cycles,
-        block_logdet_h: inner.block_logdet_h,
-        block_logdet_s: inner.block_logdet_s,
-        joint_workspace: inner.joint_workspace.clone(),
-    })
 }
 
 /// Helper struct mirroring the old `BlockwiseFitResultParts`.
@@ -8369,29 +8331,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         }
         cached_active_sets = seed.active_sets.clone();
         refresh_all_block_etas(family, specs, &mut states)?;
-        if warm_start_matches_block_log_lambdas(seed, block_log_lambdas)
-            && projected_warm_start_betas_match(&states, seed)
-            && let Some(cached) = seed.cached_inner.as_ref()
-        {
-            log::info!(
-                "[PIRLS/joint-Newton warm-start] reused cached same-rho inner mode | cycles={} logdet_h={:.6e} logdet_s={:.6e}",
-                cached.cycles,
-                cached.block_logdet_h,
-                cached.block_logdet_s,
-            );
-            return Ok(BlockwiseInnerResult {
-                block_states: states,
-                active_sets: normalize_active_sets(cached_active_sets),
-                log_likelihood: cached.log_likelihood,
-                penalty_value: cached.penalty_value,
-                cycles: cached.cycles,
-                converged: true,
-                block_logdet_h: cached.block_logdet_h,
-                block_logdet_s: cached.block_logdet_s,
-                s_lambdas,
-                joint_workspace: cached.joint_workspace.clone(),
-            });
-        }
     }
     let (
         mut current_log_likelihood,
@@ -8456,7 +8395,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 0.0
             };
 
-        if warm_start.is_some()
+        if let Some(seed) = warm_start
+            && warm_start_matches_block_log_lambdas(seed, block_log_lambdas)
             && let Some(gradient) = cached_joint_gradient.as_ref()
         {
             let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
@@ -8477,7 +8417,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let objective_tol = inner_tol * (1.0 + lastobjective.abs());
             if residual <= objective_tol {
                 log::info!(
-                    "[PIRLS/joint-Newton warm-start] reused KKT-converged mode | residual={:.3e} tol={:.3e} beta_inf={:.3e}",
+                    "[PIRLS/joint-Newton warm-start] reused converged same-rho mode | residual={:.3e} tol={:.3e} beta_inf={:.3e}",
                     residual,
                     objective_tol,
                     beta_inf,
@@ -8505,47 +8445,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             }
         }
 
-        // Runaway-and-stall detection state for the joint-Newton path.
-        // Three distinct signatures, all rooted in "the outer optimizer
-        // is probing a pathological ρ" — the inner solver cannot finish
-        // in any reasonable cycle budget and must hand control back
-        // rather than burning the wall-time budget:
-        //
-        //   (A) **Newton runaway in null direction** — step clamped at
-        //       MAX_JOINT_STEP every cycle, -loglik frozen, β drifts in
-        //       the null mode (e.g. BernoulliMarginalSlope's linkwiggle
-        //       empirical anchor drifting from fit-time η₀ creates a
-        //       constant component aliased with the location block's
-        //       global mean → σ_min ≈ 1e-10).
-        //
-        //   (B) **Penalty-only drift** — accepted step is small but
-        //       persistently above step_tol with objective_change > obj_tol;
-        //       -loglik frozen; only the penalty refines cycle-to-cycle.
-        //       Same root cause as (A) but the null mode manifests as
-        //       slow drift rather than cap-clamped saturation.
-        //
-        //   (C) **Unbounded mode at pathological ρ** — step at cap, full
-        //       step accepted, β grows linearly at the cap rate
-        //       (β_inf - prev_β_inf ≈ MAX_JOINT_STEP per cycle). -loglik
-        //       IS decreasing each cycle (real progress!) but the
-        //       penalty is too weak to bound β; the optimum is at
-        //       infinity for this ρ. Each PCG cycle is expensive at
-        //       biobank scale (~4 min when jacobi_diag_ratio ≈ 1e5),
-        //       so 100 cycles to budget ≫ 50 min job timeout. Loglik-
-        //       frozen detectors miss this because -loglik is moving —
-        //       the unique signature is *β-growth at cap rate*.
-        //
-        // In all three cases the outer envelope theorem is unreliable
-        // (joint stationarity isn't reached) so we return unconverged
-        // and let the outer's robust BFGS retreat from this ρ region.
+        // Divergence-detection state for the joint-Newton path. Mirrors
+        // the blockwise sibling later in this function: a near-null
+        // direction in the joint Hessian (e.g. BernoulliMarginalSlope's
+        // linkwiggle empirical anchor drifting from fit-time η₀) makes
+        // Newton clamp at MAX_JOINT_STEP every cycle while -loglik stays
+        // frozen and β grows linearly along the null mode. Without an
+        // early-exit the loop runs to inner_max_cycles producing
+        // identical -loglik values, burning ~50s per ρ-cost call at
+        // biobank scale and stacking up to a 2400s timeout.
         let mut prev_log_likelihood_for_joint_divergence_check = current_log_likelihood;
-        let mut prev_beta_inf_for_joint_divergence_check: f64 = states
-            .iter()
-            .flat_map(|s| s.beta.iter().copied())
-            .map(f64::abs)
-            .fold(0.0_f64, f64::max);
-        let mut consecutive_joint_runaway_cycles: usize = 0;
-        const JOINT_DIVERGENCE_BUDGET_CYCLES: usize = 8;
+        let mut consecutive_joint_frozen_loglik_cycles: usize = 0;
+        const JOINT_DIVERGENCE_FROZEN_LOGLIK_CYCLES: usize = 8;
 
         let mut joint_trust_radius = 1.0_f64;
         for cycle in 0..inner_max_cycles {
@@ -9197,73 +9108,49 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 beta_inf,
             );
 
-            // Runaway-and-stall early-exit. See the rationale block at
-            // the top of this branch for the three signatures (A/B/C)
-            // and why each forces an unconverged return rather than
-            // running to inner_max_cycles.
+            // Divergence early-exit. Two signatures (see blockwise sibling
+            // for full rationale): (A) Newton runaway — step pinned at the
+            // MAX_JOINT_STEP cap; (B) penalty-only drift — accepted step
+            // stuck above step_tol while objective_change > obj_tol, β
+            // drifting in S's null space with the data fit already
+            // converged. Tracking log-likelihood (not `objective_change`)
+            // is essential because under either signature only the
+            // penalty drifts and `objective_change` would mask the
+            // data-fit stagnation.
             let loglik_change_for_joint_divergence_check =
                 (current_log_likelihood - prev_log_likelihood_for_joint_divergence_check).abs();
             let loglik_frozen_tol_for_joint_divergence_check =
                 inner_tol * (1.0 + current_log_likelihood.abs());
-            let loglik_frozen_for_joint_divergence_check = loglik_change_for_joint_divergence_check
-                <= loglik_frozen_tol_for_joint_divergence_check;
             let step_clamped_for_joint_divergence_check = step_inf >= 0.95 * MAX_JOINT_STEP;
-            let accepted_step_clamped_for_joint_divergence_check =
-                accepted_step_inf >= 0.95 * MAX_JOINT_STEP;
             let penalty_only_drift_for_joint_divergence_check =
                 accepted_step_inf > step_tol && objective_change > objective_tol;
-            // β-growth at cap rate is the unique fingerprint of (C):
-            // step pegged at MAX_JOINT_STEP every cycle with the full
-            // step accepted, so β advances by ≥ ½·MAX_JOINT_STEP per
-            // cycle along the unbounded direction. The half-cap floor
-            // allows for non-axis-aligned step directions where the
-            // ‖·‖_∞ growth lags the ‖·‖_2 step length but is still
-            // dominated by the same diverging mode. Loglik is *not*
-            // required to be frozen here — that distinguishes (C)
-            // from (A).
-            let beta_growth_for_joint_divergence_check =
-                (beta_inf - prev_beta_inf_for_joint_divergence_check).max(0.0);
-            let runaway_growth_for_joint_divergence_check =
-                step_clamped_for_joint_divergence_check
-                    && accepted_step_clamped_for_joint_divergence_check
-                    && beta_growth_for_joint_divergence_check >= 0.5 * MAX_JOINT_STEP;
-            let signature_a_for_joint_divergence_check = loglik_frozen_for_joint_divergence_check
-                && step_clamped_for_joint_divergence_check;
-            let signature_b_for_joint_divergence_check = loglik_frozen_for_joint_divergence_check
-                && penalty_only_drift_for_joint_divergence_check
-                && !step_clamped_for_joint_divergence_check;
-            let signature_c_for_joint_divergence_check =
-                runaway_growth_for_joint_divergence_check;
-            if signature_a_for_joint_divergence_check
-                || signature_b_for_joint_divergence_check
-                || signature_c_for_joint_divergence_check
+            let loglik_frozen_for_joint_divergence_check = loglik_change_for_joint_divergence_check
+                <= loglik_frozen_tol_for_joint_divergence_check;
+            if loglik_frozen_for_joint_divergence_check
+                && (step_clamped_for_joint_divergence_check
+                    || penalty_only_drift_for_joint_divergence_check)
             {
-                consecutive_joint_runaway_cycles += 1;
+                consecutive_joint_frozen_loglik_cycles += 1;
             } else {
-                consecutive_joint_runaway_cycles = 0;
+                consecutive_joint_frozen_loglik_cycles = 0;
             }
             prev_log_likelihood_for_joint_divergence_check = current_log_likelihood;
-            prev_beta_inf_for_joint_divergence_check = beta_inf;
-            if consecutive_joint_runaway_cycles >= JOINT_DIVERGENCE_BUDGET_CYCLES {
-                let signature = if signature_c_for_joint_divergence_check {
-                    "(C) unbounded mode (step at cap, β growing at cap rate, -loglik decreasing but no end in sight)"
-                } else if signature_a_for_joint_divergence_check {
-                    "(A) Newton runaway (step clamped at cap, -loglik frozen)"
+            if consecutive_joint_frozen_loglik_cycles >= JOINT_DIVERGENCE_FROZEN_LOGLIK_CYCLES {
+                let signature = if step_clamped_for_joint_divergence_check {
+                    "Newton runaway (step clamped at cap)"
                 } else {
-                    "(B) penalty-only drift (small step, obj_change > obj_tol, -loglik frozen)"
+                    "penalty-only drift (small step, obj_change > obj_tol)"
                 };
                 log::warn!(
-                    "[PIRLS/joint-Newton convergence] runaway-or-stall early-exit at cycle {} after {} consecutive bad cycles | signature: {} | -loglik={:.6e} | step_inf={:.3e} (cap {}) | accepted_step_inf={:.3e} (tol={:.3e}) | beta_inf={:.3e} (Δ={:.3e}) | obj_change={:.3e} (tol={:.3e}); returning unconverged so the outer optimizer backs off this ρ region instead of running to inner_max_cycles.",
+                    "[PIRLS/joint-Newton convergence] divergence early-exit at cycle {} | -loglik={:.6e} frozen for {} consecutive cycles | signature: {} | step_inf={:.3e} (cap {}) | accepted_step_inf={:.3e} (tol={:.3e}) | obj_change={:.3e} (tol={:.3e}); near-null Hessian direction detected — returning unconverged so the outer optimizer backs off this region instead of running to inner_max_cycles.",
                     cycle,
-                    consecutive_joint_runaway_cycles,
-                    signature,
                     -current_log_likelihood,
+                    consecutive_joint_frozen_loglik_cycles,
+                    signature,
                     step_inf,
                     MAX_JOINT_STEP,
                     accepted_step_inf,
                     step_tol,
-                    beta_inf,
-                    beta_growth_for_joint_divergence_check,
                     objective_change,
                     objective_tol,
                 );
@@ -9350,51 +9237,30 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     current_log_likelihood = cached_eval.log_likelihood;
     lastobjective = -current_log_likelihood + current_penalty;
 
-    // Runaway-and-stall detection state for the blockwise loop.
+    // Divergence-detection state for the blockwise loop.
     //
-    // Three distinct signatures, all rooted in "the outer optimizer is
-    // probing a pathological ρ" — the inner solver cannot finish in any
-    // reasonable cycle budget and must hand control back rather than
-    // burning the wall-time budget. See the joint-Newton sibling near
-    // the top of this function for the full (A)/(B)/(C) rationale; in
-    // brief:
+    // Some family parameterizations (e.g. BernoulliMarginalSlopeFamily with
+    // linkwiggle + scorewarp) carry a near-null direction in the joint
+    // Hessian when the link-deviation basis's empirical anchor — fixed at
+    // the rigid-pilot η₀ when the basis is constructed — drifts during
+    // PIRLS as the location/spatial blocks update η₀. The Newton step
+    // becomes dominated by that null direction and is clamped at
+    // MAX_NEWTON_STEP every cycle while β grows linearly along it; the
+    // log-likelihood stays frozen, only the penalty changes (slowly).
+    // Without an early-exit the loop runs to inner_max_cycles producing
+    // the same -loglik over and over, which at biobank scale (each cycle
+    // ~0.5s) burns ~50s per ρ-cost call and stacks up to a 2400s timeout.
     //
-    //   (A) Newton runaway in null direction — step clamped at
-    //       MAX_NEWTON_STEP, -loglik frozen, β drifts in null mode.
-    //       Trigger family: BernoulliMarginalSlopeFamily with linkwiggle
-    //       + scorewarp (link-deviation empirical anchor fixed at the
-    //       rigid-pilot η₀ aliases with location-block global mean once
-    //       PIRLS shifts η₀).
-    //
-    //   (B) Penalty-only drift — small step persistently above
-    //       step_tol with objective_change > obj_tol; -loglik frozen.
-    //       Same root cause as (A) but null mode manifests as glacial
-    //       drift instead of cap-clamped saturation.
-    //
-    //   (C) Unbounded mode at pathological ρ — step at cap, β grows
-    //       linearly at the cap rate, -loglik IS decreasing each cycle
-    //       but the penalty is too weak to bound β so the optimum is
-    //       at infinity for this ρ. Loglik-frozen detectors miss this
-    //       because -loglik is moving — the unique fingerprint is
-    //       β-growth at cap rate.
-    //
-    // In all three cases the outer envelope theorem is unreliable
-    // (joint stationarity isn't reached), so `converged = false` is
-    // returned and the outer's robust BFGS retreats from this ρ region
-    // instead of stacking 100 cycles × per-cycle cost into a 2400s
-    // timeout.
+    // Detect the pattern and bail with `converged = false` so the cost
+    // call returns Err / +∞, BFGS κ-optim backs off the divergent ρ
+    // region, and the outer loop progresses instead of grinding.
     let mut prev_log_likelihood_for_divergence_check = cached_eval.log_likelihood;
-    let mut prev_beta_inf_for_divergence_check: f64 = states
-        .iter()
-        .flat_map(|s| s.beta.iter().copied())
-        .map(f64::abs)
-        .fold(0.0_f64, f64::max);
-    let mut consecutive_runaway_cycles: usize = 0;
+    let mut consecutive_frozen_loglik_cycles: usize = 0;
     // Mirrors the `MAX_NEWTON_STEP` const used by the inner ExactNewton
     // path lower in this function. Hoisted here so the divergence check
     // does not need to reach into a nested scope.
     const NEWTON_STEP_CAP_FOR_DIVERGENCE: f64 = 20.0;
-    const DIVERGENCE_BUDGET_CYCLES: usize = 8;
+    const DIVERGENCE_FROZEN_LOGLIK_CYCLES: usize = 8;
 
     let is_dynamic = family.block_geometry_is_dynamic();
     for cycle in 0..inner_max_cycles {
@@ -9715,68 +9581,71 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             exact_joint_stationarity_ok,
         );
 
-        // Runaway-and-stall early-exit. See the rationale block at the
-        // top of this function for the three signatures (A/B/C) and
-        // why each forces an unconverged return rather than running to
-        // inner_max_cycles.
+        // Divergence early-exit. Two distinct signatures, both rooted in a
+        // near-null direction in the joint Hessian where -loglik freezes
+        // while β drifts:
+        //
+        // (A) **Newton runaway**: step pinned at the MAX_NEWTON_STEP cap
+        //     every cycle. The original failure mode this detector caught
+        //     — happens when the linearized step's quadratic model fails
+        //     under near-null curvature, so the proposed direction shoots
+        //     out and gets clamped to the cap.
+        //
+        // (B) **Penalty-only drift**: step is small but persistently
+        //     greater than step_tol while objective_change > obj_tol —
+        //     β is moving slowly in S's null space, the data fit has
+        //     converged, only the penalty refines cycle-to-cycle. Without
+        //     this branch the loop runs to inner_max_cycles (CI evidence:
+        //     gamlss_jointpc_duchon60 hit cycle 99/100 with -loglik
+        //     frozen at 2.272279e5 across 12 consecutive cycles, step
+        //     ≈ 7.6e-3 ≫ step_tol ≈ 5.5e-5, penalty drifting from 812 →
+        //     319 — original detector missed it because step never came
+        //     near the cap of 20.0).
+        //
+        // In both cases the outer envelope theorem is unreliable (joint
+        // stationarity isn't reached), so we return unconverged so the
+        // outer optimizer's robust BFGS retreats from this ρ region
+        // rather than spinning the inner loop to the cycle budget.
+        // Tracking log-likelihood (not `objective_change`) is essential:
+        // under either signature only the penalty drifts and
+        // `objective_change` would mask the data-fit stagnation.
         let loglik_change_for_divergence_check =
             (cached_eval.log_likelihood - prev_log_likelihood_for_divergence_check).abs();
         let loglik_frozen_tol_for_divergence_check =
             inner_tol * (1.0 + cached_eval.log_likelihood.abs());
-        let loglik_frozen_for_divergence_check =
-            loglik_change_for_divergence_check <= loglik_frozen_tol_for_divergence_check;
         let step_clamped_for_divergence_check =
             max_proposed_beta_step >= 0.95 * NEWTON_STEP_CAP_FOR_DIVERGENCE;
-        let accepted_step_clamped_for_divergence_check =
-            max_accepted_beta_step >= 0.95 * NEWTON_STEP_CAP_FOR_DIVERGENCE;
+        // Penalty-drift branch: step has stalled above step_tol AND
+        // objective is still above obj_tol — the outer convergence test
+        // can never fire from here, so we'd grind to inner_max_cycles.
         let penalty_only_drift_for_divergence_check =
             max_accepted_beta_step > step_tol && objective_change > objective_tol;
-        // β-growth at cap rate is the unique fingerprint of (C):
-        // step pegged at MAX_NEWTON_STEP every cycle with the full
-        // step accepted, so β advances by ≥ ½·MAX_NEWTON_STEP per
-        // cycle along the unbounded direction. Loglik is *not* required
-        // to be frozen here — that distinguishes (C) from (A).
-        let beta_growth_for_divergence_check =
-            (beta_inf - prev_beta_inf_for_divergence_check).max(0.0);
-        let runaway_growth_for_divergence_check = step_clamped_for_divergence_check
-            && accepted_step_clamped_for_divergence_check
-            && beta_growth_for_divergence_check >= 0.5 * NEWTON_STEP_CAP_FOR_DIVERGENCE;
-        let signature_a_for_divergence_check =
-            loglik_frozen_for_divergence_check && step_clamped_for_divergence_check;
-        let signature_b_for_divergence_check = loglik_frozen_for_divergence_check
-            && penalty_only_drift_for_divergence_check
-            && !step_clamped_for_divergence_check;
-        let signature_c_for_divergence_check = runaway_growth_for_divergence_check;
-        if signature_a_for_divergence_check
-            || signature_b_for_divergence_check
-            || signature_c_for_divergence_check
+        let loglik_frozen_for_divergence_check =
+            loglik_change_for_divergence_check <= loglik_frozen_tol_for_divergence_check;
+        if loglik_frozen_for_divergence_check
+            && (step_clamped_for_divergence_check || penalty_only_drift_for_divergence_check)
         {
-            consecutive_runaway_cycles += 1;
+            consecutive_frozen_loglik_cycles += 1;
         } else {
-            consecutive_runaway_cycles = 0;
+            consecutive_frozen_loglik_cycles = 0;
         }
         prev_log_likelihood_for_divergence_check = cached_eval.log_likelihood;
-        prev_beta_inf_for_divergence_check = beta_inf;
-        if consecutive_runaway_cycles >= DIVERGENCE_BUDGET_CYCLES {
-            let signature = if signature_c_for_divergence_check {
-                "(C) unbounded mode (step at cap, β growing at cap rate, -loglik decreasing but no end in sight)"
-            } else if signature_a_for_divergence_check {
-                "(A) Newton runaway (step clamped at cap, -loglik frozen)"
+        if consecutive_frozen_loglik_cycles >= DIVERGENCE_FROZEN_LOGLIK_CYCLES {
+            let signature = if step_clamped_for_divergence_check {
+                "Newton runaway (step clamped at cap)"
             } else {
-                "(B) penalty-only drift (small step, obj_change > obj_tol, -loglik frozen)"
+                "penalty-only drift (small step, obj_change > obj_tol)"
             };
             log::warn!(
-                "[PIRLS/blockwise convergence] runaway-or-stall early-exit at cycle {} after {} consecutive bad cycles | signature: {} | -loglik={:.6e} | max_proposed_step={:.3e} (cap {}) | max_accepted_step={:.3e} (tol={:.3e}) | beta_inf={:.3e} (Δ={:.3e}) | obj_change={:.3e} (tol={:.3e}); returning unconverged so the outer optimizer backs off this ρ region instead of running to inner_max_cycles.",
+                "[PIRLS/blockwise convergence] divergence early-exit at cycle {} | -loglik={:.6e} frozen for {} consecutive cycles | signature: {} | max_proposed_step={:.3e} (cap {}) | max_accepted_step={:.3e} (tol={:.3e}) | obj_change={:.3e} (tol={:.3e}); near-null Hessian direction detected — returning unconverged so the outer optimizer backs off this region instead of running to inner_max_cycles.",
                 cycle,
-                consecutive_runaway_cycles,
-                signature,
                 -cached_eval.log_likelihood,
+                consecutive_frozen_loglik_cycles,
+                signature,
                 max_proposed_beta_step,
                 NEWTON_STEP_CAP_FOR_DIVERGENCE,
                 max_accepted_beta_step,
                 step_tol,
-                beta_inf,
-                beta_growth_for_divergence_check,
                 objective_change,
                 objective_tol,
             );
@@ -10850,7 +10719,6 @@ fn joint_outer_evaluate(
             .map(|st| st.beta.clone())
             .collect(),
         active_sets: inner.active_sets.clone(),
-        cached_inner: cached_inner_mode_from_result(inner),
     };
 
     Ok(OuterObjectiveEvalResult {
@@ -11461,7 +11329,6 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
             .map(|state| state.beta.clone())
             .collect(),
         active_sets: inner.active_sets.clone(),
-        cached_inner: cached_inner_mode_from_result(&inner),
     };
 
     Ok((efs_eval, warm, inner.converged))
@@ -13443,7 +13310,6 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
             .map(|state| state.beta.clone())
             .collect(),
         active_sets: inner.active_sets.clone(),
-        cached_inner: cached_inner_mode_from_result(&inner),
     };
 
     Ok((efs_eval, warm, inner.converged))
@@ -15122,7 +14988,6 @@ mod tests {
             rho: array![0.0, -0.5],
             block_beta: vec![array![1.0, -1.0]],
             active_sets: vec![None],
-            cached_inner: None,
         });
 
         let retained = screened_outer_warm_start(cache.as_ref(), &rho_far)
@@ -15139,7 +15004,6 @@ mod tests {
                 rho: array![0.0, -0.5],
                 block_beta: vec![array![1.0, -1.0]],
                 active_sets: vec![None],
-                cached_inner: None,
             },
         };
 
