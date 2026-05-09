@@ -80,6 +80,14 @@ class SurvivalPrediction:
         ``(n_samples, len(times))`` dense cumulative-hazard surface from the FFI.
     linear_predictor:
         ``(n_samples,)`` per-row linear predictor at each row's own exit time.
+    survival_se:
+        ``(n_samples, len(times))`` delta-method standard errors on the
+        survival surface (response scale).  ``None`` unless the prediction
+        was issued with ``with_uncertainty=True``; then populated for
+        location-scale survival models.
+    eta_se:
+        ``(n_samples,)`` delta-method SE on the linear predictor at each
+        row's own exit time, under the same conditions as ``survival_se``.
     """
 
     model_class: str
@@ -92,6 +100,8 @@ class SurvivalPrediction:
     linear_predictor: Any | None = None
     id_column: str | None = None
     row_ids: Sequence[str] | None = None
+    survival_se: Any | None = None
+    eta_se: Any | None = None
 
     def _coerce_times(self, times: Any) -> Any:
         import numpy as np
@@ -205,6 +215,20 @@ class SurvivalPrediction:
                 n_times=times_arr.size,
             )
         return self._survival_block(params, times_arr)
+
+    def survival_se_at(self, times: Any) -> Any:
+        """Delta-method standard error on ``S(t)`` at each requested time.
+
+        Returns ``None`` when the prediction was not issued with
+        ``with_uncertainty=True`` (or the model class does not yet
+        support response-scale uncertainty).  When available, the
+        returned array has shape ``(n_samples, len(times))`` and is
+        clipped to be non-negative.
+        """
+        if self.survival_se is None:
+            return None
+        times_arr = self._coerce_times(times)
+        return self._ffi_surface_at("survival_se", times_arr, clip=(0.0, None))
 
     def _ffi_surface_at(
         self,
@@ -450,6 +474,7 @@ class Model:
         interval: float | None = None,
         return_type: str | None = None,
         id_column: str | None = None,
+        with_uncertainty: bool = False,
     ) -> Any:
         """Predict from ``data``.
 
@@ -467,10 +492,18 @@ class Model:
           ``.hazard_at``, ``.survival_at``, and ``.cumulative_hazard_at``
           helpers evaluate the fitted hazard surface on a user-supplied time
           grid.
+
+        ``with_uncertainty`` (survival only): when ``True``, the returned
+        :class:`SurvivalPrediction` also carries delta-method standard
+        errors on the survival surface (``survival_se``) and the linear
+        predictor (``eta_se``).  Currently honored for the location-scale
+        survival likelihood mode.
         """
         headers, rows, table_kind = normalize_table(data)
         row_ids = _extract_row_ids(headers, rows, id_column)
         payload: dict[str, Any] = {"interval": interval}
+        if with_uncertainty:
+            payload["with_uncertainty"] = True
         # For survival models we auto-supply a default time grid built
         # from the exit/entry columns in the prediction frame so that
         # ``hazard_at`` / ``survival_at`` can interpolate at arbitrary
@@ -882,6 +915,13 @@ def _survival_prediction_from_ffi_payload(
     linear_predictor = np.asarray(
         parsed.get("linear_predictor") or [], dtype=float
     ).reshape(-1)
+    survival_se = _coerce_matrix(parsed.get("survival_se"))
+    eta_se_raw = parsed.get("eta_se")
+    eta_se = (
+        np.asarray(eta_se_raw, dtype=float).reshape(-1)
+        if eta_se_raw is not None
+        else None
+    )
     columns = parsed.get("columns") or {}
     parameter_names = tuple(columns.keys())
     if parameter_names:
@@ -901,6 +941,8 @@ def _survival_prediction_from_ffi_payload(
         linear_predictor=linear_predictor if linear_predictor.size else None,
         id_column=id_column,
         row_ids=row_ids,
+        survival_se=survival_se,
+        eta_se=eta_se if eta_se is not None and eta_se.size else None,
     )
 
 

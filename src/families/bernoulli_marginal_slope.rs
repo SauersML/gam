@@ -47,26 +47,6 @@ mod deviation_runtime;
 pub(crate) mod exact_kernel;
 pub use deviation_runtime::DeviationRuntime;
 
-/// Importance-weighted relative threshold for the matrix-free Bernoulli
-/// marginal-slope FLEX Hessian row-skip gate. A row is skipped from the
-/// per-row primary-Hessian build when its conservative likelihood-side
-/// curvature envelope (`row_hessian_importance_bound`) falls below
-/// `BMS_HV_ROW_SKIP_TAU * mean(envelope)` across all rows at the current β
-/// snapshot.
-///
-/// `0.0` disables the gate and preserves the exact legacy row set. The
-/// non-zero value here is chosen to be deeply conservative: at biobank
-/// scale (n ≈ 1e5–5e5 rows) the worst-case aggregate row-Hessian error is
-/// `n · BMS_HV_ROW_SKIP_TAU · mean ≈ 5e-9 · mean`, well below the
-/// inner-Newton convergence tolerance and the adjacent row-intercept
-/// solver tolerance pattern `1e-8.max(1e-4 · |target|)`. Skipped rows
-/// are typically degenerate (`λ ≈ 0`, i.e. the margin is far inside the
-/// linear regime where the probit log-likelihood Hessian contribution is
-/// numerically zero). There is intentionally no env var, no CLI flag,
-/// and no public API surface for tuning this — it is an internal
-/// implementation detail of the FLEX matrix-free Hv path.
-const BMS_HV_ROW_SKIP_TAU: f64 = 1e-14;
-
 /// Row count where flexible marginal-slope outer-Hessian calculus stops being
 /// a useful optimizer acceleration. Above this gate the exact profiled Hessian
 /// spends most of its time in third/fourth β-derivative contractions over the
@@ -5945,84 +5925,6 @@ impl BernoulliMarginalSlopeFamily {
         Ok(Some(RowCellMomentsBundle { max_degree, rows }))
     }
 
-    /// Conservative likelihood-side envelope on a single row's contribution
-    /// to the per-row primary Hessian at the current β snapshot. Used by
-    /// [`hessian_skip_mask_from_row_bounds`] to gate rows whose curvature
-    /// contribution is provably below `BMS_HV_ROW_SKIP_TAU * mean(envelope)`.
-    ///
-    /// The envelope combines the direct observed-margin curvature
-    /// (`|w| · |λ| · |signed_margin + λ|`) with the implicit-intercept
-    /// curvature (`|w| · |λ|`) scaled by the marginal-link slope/curvature
-    /// and intercept sensitivity (`1 / |m_a|`). The moment side is bounded
-    /// by a unit ceiling because the gate is relative to the row mean.
-    fn row_hessian_importance_bound(
-        &self,
-        row: usize,
-        block_states: &[ParameterBlockState],
-        row_ctx: &BernoulliMarginalSlopeRowExactContext,
-    ) -> Result<f64, String> {
-        let q = block_states[0].eta[row];
-        let b = block_states[1].eta[row];
-        let beta_h = self.score_beta(block_states)?;
-        let beta_w = self.link_beta(block_states)?;
-        let z_obs = self.z[row];
-        let eta_val = eval_coeff4_at(
-            &self
-                .observed_denested_cell_partials(row, row_ctx.intercept, b, beta_h, beta_w)?
-                .coeff,
-            z_obs,
-        );
-        let marginal = self.marginal_link_map(q)?;
-        let s_y = 2.0 * self.y[row] - 1.0;
-        let signed_margin = s_y * eta_val;
-        let (_, lambda) = signed_probit_logcdf_and_mills_ratio(signed_margin);
-        let d1_abs = self.weights[row].abs() * lambda.abs();
-        let d2 = self.weights[row].abs() * lambda.abs() * (signed_margin + lambda).abs();
-        // `m_a` is the marginal-intercept sensitivity at the converged row
-        // intercept. Degenerate rows have `m_a` near machine epsilon, in
-        // which case `1 / m_a` is huge and the envelope grows accordingly,
-        // i.e. they are NOT skipped. Non-finite or zero `m_a` collapses the
-        // envelope to +∞, which `hessian_skip_mask_from_row_bounds` then
-        // rejects via its finite-mean check (so the gate degrades to a
-        // no-op rather than silently skipping rows we cannot bound).
-        let m_a_recip = if row_ctx.m_a.is_finite() && row_ctx.m_a.abs() > 0.0 {
-            row_ctx.m_a.abs().recip()
-        } else {
-            f64::INFINITY
-        };
-        Ok((d1_abs + d2) * (1.0 + marginal.mu1.abs() + marginal.mu2.abs() + m_a_recip))
-    }
-
-    /// Compute the importance-weighted skip mask for the per-row primary
-    /// Hessian build at the current β snapshot. Returns `None` (i.e. no
-    /// rows skipped) when the gate is disabled (`tau == 0`), the FLEX
-    /// path is inactive, or the per-row envelope mean is non-finite or
-    /// non-positive.
-    fn hessian_skip_mask_from_row_bounds(
-        &self,
-        block_states: &[ParameterBlockState],
-        cache: &BernoulliMarginalSlopeExactEvalCache,
-        tau: f64,
-    ) -> Result<Option<Vec<bool>>, String> {
-        if tau <= 0.0 || !self.effective_flex_active(block_states)? {
-            return Ok(None);
-        }
-        let n = self.y.len();
-        let bounds: Result<Vec<_>, String> = (0..n)
-            .into_par_iter()
-            .map(|row| {
-                self.row_hessian_importance_bound(row, block_states, Self::row_ctx(cache, row))
-            })
-            .collect();
-        let bounds = bounds?;
-        let mean = bounds.iter().copied().sum::<f64>() / n.max(1) as f64;
-        if !mean.is_finite() || mean <= 0.0 {
-            return Ok(None);
-        }
-        let threshold = tau * mean;
-        Ok(Some(bounds.into_iter().map(|b| b < threshold).collect()))
-    }
-
     fn build_row_primary_hessian_cache(
         &self,
         block_states: &[ParameterBlockState],
@@ -6034,27 +5936,9 @@ impl BernoulliMarginalSlopeFamily {
         let n = self.y.len();
         let primary = &cache.primary;
         let r = primary.total;
-        let tau = BMS_HV_ROW_SKIP_TAU;
-        let skip_mask = self.hessian_skip_mask_from_row_bounds(block_states, cache, tau)?;
-        let skipped = skip_mask
-            .as_ref()
-            .map(|mask| mask.iter().filter(|&&skip| skip).count())
-            .unwrap_or(0);
-        if tau > 0.0 {
-            log::info!(
-                "[BMS Hessian-Hv row-skip] tau={:.3e} skipped={}/{} ({:.3}%)",
-                tau,
-                skipped,
-                n,
-                100.0 * skipped as f64 / n.max(1) as f64
-            );
-        }
         let rows: Result<Vec<_>, String> = (0..n)
             .into_par_iter()
             .map(|row| {
-                if skip_mask.as_ref().is_some_and(|mask| mask[row]) {
-                    return Ok(vec![0.0; r * r]);
-                }
                 let row_ctx = Self::row_ctx(cache, row);
                 let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(r);
                 let row_moments = cache
@@ -6598,13 +6482,10 @@ impl BernoulliMarginalSlopeFamily {
                 }
             }
         } else {
-            // Reuse the cached degree-9 cell moments from the row context when
-            // present (FLEX path; cache is built once per row in
-            // `build_row_exact_context` after the intercept converges). Only
-            // re-evaluate if the cache is missing or `need_hessian=false` (where
-            // the kernel can use cheaper degree-3 work). The cache is keyed by
-            // (intercept, slope, beta_h, beta_w) — those are fixed for the
-            // duration of one Hessian/gradient/diagonal/matvec pass.
+            // Reuse cached row moments whenever they cover the requested
+            // derivative order. Degree-9 moments are exact for gradient-only
+            // calls too, and avoiding a second degree-3 cell sweep preserves
+            // the same calculus with less work.
             let owned_cells;
             let cached_cells: Vec<(
                 exact::DenestedPartitionCell,
@@ -6623,7 +6504,7 @@ impl BernoulliMarginalSlopeFamily {
                         )
                     })
                     .collect()
-            } else if need_hessian && let Some(cached) = row_ctx.degree9_cells.as_ref() {
+            } else if let Some(cached) = row_ctx.degree9_cells.as_ref() {
                 cached
                     .iter()
                     .map(|entry| {
@@ -11848,6 +11729,11 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let intercept_warm_starts = new_intercept_warm_start_cache(y.len());
     let cell_moment_lru = new_cell_moment_lru_cache(policy);
     let cell_moment_cache_stats = new_cell_moment_cache_stats();
+    let flex_active = score_warp_prepared.is_some() || link_dev_prepared.is_some();
+    let mut fit_options = options.clone();
+    if flex_active && y.len() >= BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT {
+        fit_options.line_search_prefer_workspace = true;
+    }
     let make_family = |marginal_design: &TermCollectionDesign,
                        logslope_design: &TermCollectionDesign,
                        sigma: Option<f64>|
@@ -11886,7 +11772,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let initial_blocks = build_blocks(&initial_rho, &marginal_design, &logslope_design)?;
     let initial_family = make_family(&marginal_design, &logslope_design, initial_sigma);
     let (joint_gradient, joint_hessian) =
-        custom_family_outer_derivatives(&initial_family, &initial_blocks, options);
+        custom_family_outer_derivatives(&initial_family, &initial_blocks, &fit_options);
     let analytic_joint_gradient_available = analytic_joint_derivatives_available
         && matches!(
             joint_gradient,
@@ -12009,7 +11895,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             let sigma = sigma_from_theta(theta);
             final_sigma_cell.set(sigma);
             let family = make_family(&designs[0], &designs[1], sigma);
-            let fit = inner_fit(&family, &blocks, options)?;
+            let fit = inner_fit(&family, &blocks, &fit_options)?;
             let mut hints_mut = hints.borrow_mut();
             let mut bidx = 0usize;
             if let Some(block) = fit.block_states.get(bidx) {
@@ -12053,7 +11939,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             let eval = evaluate_custom_family_joint_hyper_shared(
                 &family,
                 &blocks,
-                options,
+                &fit_options,
                 &rho,
                 derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
@@ -12086,7 +11972,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             let eval = evaluate_custom_family_joint_hyper_efs_shared(
                 &family,
                 &blocks,
-                options,
+                &fit_options,
                 &rho,
                 derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
@@ -13260,82 +13146,107 @@ mod tests {
     }
 
     #[test]
-    fn score_warp_basis_is_orthogonal_to_standard_normal_location_and_scale() {
+    fn score_warp_basis_smoothness_penalty_is_full_rank() {
+        // Replaces the old data-distribution moment-anchor test. After the
+        // smoothness-null-space drop (β-independent identifiability), the
+        // integrated derivative penalty at the configured max derivative
+        // order must be full rank on the transformed basis — the
+        // {constants, linears, ...} null space is structurally absent
+        // from the parameterization. This is the property that makes
+        // joint H+S well-conditioned during PIRLS regardless of how β
+        // shifts the linear-predictor distribution.
         let seed = array![-2.0, -1.0, 0.0, 1.0, 2.0];
-        let prepared = build_score_warp_deviation_block_from_seed(
-            &seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 5,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("build standard-normal anchored score-warp");
-        let rule = crate::quadrature::compute_gauss_hermite_n(51);
-        let z = Array1::from_iter(
-            rule.nodes
-                .iter()
-                .map(|&node| std::f64::consts::SQRT_2 * node),
-        );
-        let design = prepared
+        let cfg = DeviationBlockConfig {
+            num_internal_knots: 5,
+            ..DeviationBlockConfig::default()
+        };
+        let prepared = build_score_warp_deviation_block_from_seed(&seed, &cfg)
+            .expect("build smoothness-null-space-drop score-warp");
+        let max_order = cfg
+            .penalty_orders
+            .iter()
+            .copied()
+            .max()
+            .or(Some(cfg.penalty_order))
+            .filter(|o| *o > 0)
+            .expect("test config has a positive penalty order");
+        let (penalty, nullity) = prepared
             .runtime
-            .design(&z)
-            .expect("score-warp quadrature design");
-        let inv_sqrt_pi = std::f64::consts::PI.sqrt().recip();
-        for basis_idx in 0..design.ncols() {
-            let mut mean_moment = 0.0;
-            let mut scale_moment = 0.0;
-            for row in 0..design.nrows() {
-                let weight = rule.weights[row] * inv_sqrt_pi;
-                mean_moment += weight * design[[row, basis_idx]];
-                scale_moment += weight * z[row] * design[[row, basis_idx]];
-            }
-            assert!(
-                mean_moment.abs() <= 1e-10,
-                "score-warp basis column {basis_idx} has nonzero standard-normal mean moment {mean_moment}"
-            );
-            assert!(
-                scale_moment.abs() <= 1e-10,
-                "score-warp basis column {basis_idx} has nonzero standard-normal scale moment {scale_moment}"
-            );
-        }
+            .integrated_derivative_penalty_with_nullity(max_order)
+            .expect("integrated penalty on transformed basis");
+        assert_eq!(
+            nullity, 0,
+            "smoothness-null-space-drop basis must have zero nullity at the max configured \
+             derivative order; got {nullity}"
+        );
+        // Cross-check via eigendecomposition that all eigenvalues exceed the
+        // numerical positive-eigenvalue threshold — confirms full rank
+        // beyond the rank-reporting heuristic.
+        use crate::faer_ndarray::FaerEigh;
+        let (evals, _) = penalty
+            .eigh(faer::Side::Lower)
+            .expect("eigendecomposition of transformed-basis penalty");
+        let evals_slice = evals
+            .as_slice()
+            .expect("contiguous transformed-basis penalty eigenvalues");
+        let threshold = crate::estimate::reml::unified::positive_eigenvalue_threshold(evals_slice);
+        let smallest = evals_slice.iter().copied().fold(f64::INFINITY, f64::min);
+        assert!(
+            smallest > threshold,
+            "smallest eigenvalue {smallest} of transformed-basis penalty must exceed positive \
+             threshold {threshold} — null space was not fully dropped"
+        );
     }
 
     #[test]
-    fn link_deviation_basis_is_orthogonal_to_weighted_training_index_moments() {
+    fn link_deviation_basis_smoothness_penalty_is_full_rank() {
+        // Mirror of `score_warp_basis_smoothness_penalty_is_full_rank` for
+        // the link-deviation entry point. Same property, same proof: full
+        // rank of the integrated derivative penalty on the transformed
+        // basis. The `_anchor_weights` argument is now a no-op (the
+        // construction is β-independent) but the test still passes the
+        // weights to verify the entry-point signature continues to accept
+        // them.
         let q = array![-2.0, -0.8, -0.1, 0.4, 1.3, 2.1];
         let weights = array![0.2, 1.7, 0.5, 2.3, 0.8, 1.1];
-        let prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
-            &q,
-            &q,
-            &weights,
-            &DeviationBlockConfig {
-                num_internal_knots: 5,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("build weighted empirical anchored link deviation");
-        let design = prepared
+        let cfg = DeviationBlockConfig {
+            num_internal_knots: 5,
+            ..DeviationBlockConfig::default()
+        };
+        let prepared =
+            build_link_deviation_block_from_knots_design_seed_and_weights(&q, &q, &weights, &cfg)
+                .expect("build smoothness-null-space-drop link-deviation");
+        let max_order = cfg
+            .penalty_orders
+            .iter()
+            .copied()
+            .max()
+            .or(Some(cfg.penalty_order))
+            .filter(|o| *o > 0)
+            .expect("test config has a positive penalty order");
+        let (penalty, nullity) = prepared
             .runtime
-            .design(&q)
-            .expect("link-deviation training design");
-        let total_weight: f64 = weights.iter().copied().sum();
-        for basis_idx in 0..design.ncols() {
-            let mut mean_moment = 0.0;
-            let mut scale_moment = 0.0;
-            for row in 0..design.nrows() {
-                let weight = weights[row] / total_weight;
-                mean_moment += weight * design[[row, basis_idx]];
-                scale_moment += weight * q[row] * design[[row, basis_idx]];
-            }
-            assert!(
-                mean_moment.abs() <= 1e-10,
-                "link-deviation basis column {basis_idx} has nonzero weighted mean moment {mean_moment}"
-            );
-            assert!(
-                scale_moment.abs() <= 1e-10,
-                "link-deviation basis column {basis_idx} has nonzero weighted scale moment {scale_moment}"
-            );
-        }
+            .integrated_derivative_penalty_with_nullity(max_order)
+            .expect("integrated penalty on transformed basis");
+        assert_eq!(
+            nullity, 0,
+            "smoothness-null-space-drop basis must have zero nullity at the max configured \
+             derivative order; got {nullity}"
+        );
+        use crate::faer_ndarray::FaerEigh;
+        let (evals, _) = penalty
+            .eigh(faer::Side::Lower)
+            .expect("eigendecomposition of transformed-basis penalty");
+        let evals_slice = evals
+            .as_slice()
+            .expect("contiguous transformed-basis penalty eigenvalues");
+        let threshold = crate::estimate::reml::unified::positive_eigenvalue_threshold(evals_slice);
+        let smallest = evals_slice.iter().copied().fold(f64::INFINITY, f64::min);
+        assert!(
+            smallest > threshold,
+            "smallest eigenvalue {smallest} of transformed-basis penalty must exceed positive \
+             threshold {threshold} — null space was not fully dropped"
+        );
     }
 
     #[test]
