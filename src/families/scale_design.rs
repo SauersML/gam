@@ -1,22 +1,25 @@
-use crate::faer_ndarray::{FaerArrayView, default_rrqr_rank_alpha, fast_ab};
+use crate::faer_ndarray::{FaerSvd, fast_ab};
 use crate::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator};
-use dyn_stack::{MemBuffer, MemStack};
-use faer::Unbind;
-use faer::prelude::ReborrowMut;
-use faer::{Conj, get_global_parallelism};
 use ndarray::{Array1, Array2, ArrayViewMut2, s};
 use std::ops::Range;
 use std::sync::Arc;
 
 const COLUMN_TOL: f64 = 1e-12;
 const SCALE_DESIGN_TARGET_CHUNK_BYTES: usize = 8 * 1024 * 1024;
-// Explicit replay of the sigma orthogonalization on new rows is much more
-// sensitive than fitting on the training rows: near-null QR directions can
-// yield enormous projection coefficients that reconstruct the training design
-// but catastrophically amplify modest prediction rows. Use a stronger cutoff
-// than the generic RRQR epsilon rule and add a last-resort coefficient cap.
+// Hard floor on the SVD truncation tolerance.  The primary tolerance is
+// derived per-fit from the leverage-amplification target below; this floor is
+// kept only to guard against catastrophic conditioning where the derived
+// tolerance would otherwise be sub-epsilon.
 const SCALE_PROJECTION_REPLAY_RCOND_FLOOR: f64 = 1e-8;
-const SCALE_PROJECTION_MAX_ABS_COEF: f64 = 1e6;
+// Tikhonov target: bound the worst-case prediction-row leverage amplification
+// of the replayed projection at this multiple of the typical training-row
+// norm.  A value of 100 means a unit-norm prediction row can perturb the
+// projected response by at most 100x what an average training row does, so a
+// pathological deviation only grows linearly (no step-function truncation),
+// while well-conditioned designs see a vanishing alpha and remain identical
+// to ordinary least squares.  Picking this in dimensionless leverage units
+// (rather than coefficient magnitude) is what makes the bound scale-free.
+const SCALE_PROJECTION_LEVERAGE_AMPLIFICATION: f64 = 100.0;
 
 #[derive(Clone, Debug)]
 pub struct ScaleDeviationTransform {
@@ -24,6 +27,10 @@ pub struct ScaleDeviationTransform {
     pub weighted_column_mean: Array1<f64>,
     pub rescale: Array1<f64>,
     pub non_intercept_start: usize,
+    /// Tikhonov regularization parameter actually used when fitting
+    /// `projection_coef`.  Stored so prediction-time replay is
+    /// reproducible without re-deriving alpha from heuristics.
+    pub projection_ridge_alpha: f64,
 }
 
 /// Build a [`ScaleDeviationTransform`] from saved projection metadata.
@@ -36,6 +43,7 @@ pub fn scale_transform_from_payload(
     center: &Option<Vec<f64>>,
     scale: &Option<Vec<f64>>,
     non_intercept_start: Option<usize>,
+    projection_ridge_alpha: Option<f64>,
 ) -> Result<Option<ScaleDeviationTransform>, String> {
     match (projection, center, scale, non_intercept_start) {
         (None, None, None, None) => Ok(None),
@@ -57,11 +65,21 @@ pub fn scale_transform_from_payload(
                     projection_coef[[i, j]] = value;
                 }
             }
+            // Older saved payloads (pre-Tikhonov) did not record alpha.  Treat
+            // them as alpha=0: replay then matches the original least-squares
+            // coefficients exactly, which is the previous behavior.
+            let projection_ridge_alpha = projection_ridge_alpha.unwrap_or(0.0);
+            if !projection_ridge_alpha.is_finite() || projection_ridge_alpha < 0.0 {
+                return Err(format!(
+                    "saved scale transform projection_ridge_alpha must be finite and non-negative, got {projection_ridge_alpha}"
+                ));
+            }
             Ok(Some(ScaleDeviationTransform {
                 projection_coef,
                 weighted_column_mean: Array1::from_vec(center.clone()),
                 rescale: Array1::from_vec(scale.clone()),
                 non_intercept_start,
+                projection_ridge_alpha,
             }))
         }
         _ => Err(

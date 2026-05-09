@@ -27,7 +27,7 @@ use crate::families::marginal_slope_shared::{
     build_denested_partition_cells as shared_denested_partition_cells, chunked_row_reduction,
     eval_coeff4_at, is_sigma_aux_index as shared_is_sigma_aux_index,
     observed_denested_cell_partials as shared_observed_denested_cell_partials, outer_row_indices,
-    outer_score_scale, probit_frailty_scale, probit_frailty_scale_multi_dir_jet,
+    outer_row_weights_by_index, probit_frailty_scale, probit_frailty_scale_multi_dir_jet,
     psi_derivative_location, scale_coeff4,
 };
 use crate::families::row_kernel::{
@@ -2673,16 +2673,16 @@ impl SurvivalMarginalSlopeFamily {
         options: &BlockwiseFitOptions,
     ) -> Result<f64, String> {
         let flex_active = self.effective_flex_active(block_states)?;
-        let row_iter = outer_row_indices(options, self.n).to_vec();
-        let scale = outer_score_scale(options, self.n);
+        let row_iter = outer_weighted_rows(options, self.n).to_vec();
         if flex_active {
             self.validate_exact_monotonicity(block_states)?;
             let total: Result<f64, String> = row_iter
                 .into_par_iter()
                 .try_fold(
                     || 0.0,
-                    |mut ll, i| -> Result<_, String> {
-                        ll -= self.row_neglog_flex_value(i, block_states)?;
+                    |mut ll, weighted| -> Result<_, String> {
+                        ll -= weighted.weight
+                            * self.row_neglog_flex_value(weighted.index, block_states)?;
                         Ok(ll)
                     },
                 )
@@ -2690,7 +2690,7 @@ impl SurvivalMarginalSlopeFamily {
                     || 0.0,
                     |left, right| -> Result<_, String> { Ok(left + right) },
                 );
-            return total.map(|v| v * scale);
+            return total;
         }
         // True fast path: closed-form scalar NLL, no jets, no Vecs, no gradients.
         let guard = self.derivative_guard;
@@ -2699,7 +2699,8 @@ impl SurvivalMarginalSlopeFamily {
             .into_par_iter()
             .try_fold(
                 || 0.0,
-                |mut ll, i| -> Result<_, String> {
+                |mut ll, weighted| -> Result<_, String> {
+                    let i = weighted.index;
                     let q_geom = self.row_dynamic_q_geometry(i, block_states)?;
                     let g = block_states[2].eta[i];
                     let (nll, _, _) = row_primary_closed_form(
@@ -2713,7 +2714,7 @@ impl SurvivalMarginalSlopeFamily {
                         guard,
                         probit_scale,
                     )?;
-                    ll -= nll;
+                    ll -= weighted.weight * nll;
                     Ok(ll)
                 },
             )
@@ -2721,7 +2722,7 @@ impl SurvivalMarginalSlopeFamily {
                 || 0.0,
                 |left, right| -> Result<_, String> { Ok(left + right) },
             );
-        total.map(|v| v * scale)
+        total
     }
 
     fn is_sigma_aux_index(
