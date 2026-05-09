@@ -2348,6 +2348,11 @@ fn materialize_survival<'a>(
                     config.time_smooth_lambda.ln(),
                 ))
             };
+            let initial_beta = if survival_mode == SurvivalLikelihoodMode::LocationScale {
+                None
+            } else {
+                Some(Array1::from_elem(time_p, 1e-4))
+            };
             let time_block = TimeBlockInput {
                 design_entry: prepared.time_design_entry.clone(),
                 design_exit: prepared.time_design_exit.clone(),
@@ -2359,7 +2364,7 @@ fn materialize_survival<'a>(
                 penalties: prepared.time_penalties.clone(),
                 nullspace_dims: prepared.time_nullspace_dims.clone(),
                 initial_log_lambdas: time_initial_log_lambdas,
-                initial_beta: Some(Array1::from_elem(time_p, 1e-4)),
+                initial_beta,
             };
             Ok::<_, String>((prepared, time_block))
         };
