@@ -3581,10 +3581,20 @@ fn binomial_neglog_q_derivatives_probit_closed_form(
 ) -> (f64, f64, f64) {
     // Closed-form derivatives for F_i(q) = -w_i[y log Phi(q) + (1-y) log(1-Phi(q))].
     // Uses canonical A/Amu/Amumu identities from the probit composition.
-    let (m, clamp_active) = clamped_binomial_probability(mu);
-    if clamp_active || weight == 0.0 || !q.is_finite() {
+    //
+    // Stability (Issue 5): μ is floored to [MIN_PROB, 1 - MIN_PROB] inside
+    // the 1/μ and 1/(1-μ) divisions only — the chain-rule terms phi(q),
+    // q, etc. flow through unchanged. Previously we returned (0, 0, 0) on
+    // clamp, which created a phantom flat region that the optimizer could
+    // accept as a stationary point. The Mills-ratio tail behaviour
+    // (phi(q)/Phi(-q) is bounded as q → ∞) keeps the result finite at
+    // saturation; when y is incompatible with the saturation direction
+    // the resulting derivative is genuinely large and the LM gain-ratio
+    // guard rejects the step.
+    if weight == 0.0 || !q.is_finite() {
         return (0.0, 0.0, 0.0);
     }
+    let m = mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
     let nu = 1.0 - m;
     let phi = normal_pdf(q);
     let a = (1.0 - y) / nu - y / m;
@@ -3606,10 +3616,11 @@ fn binomial_neglog_q_fourth_derivative_probit_closed_form(
     mu: f64,
 ) -> f64 {
     // Closed-form m4 for F_i(q) = -w_i[y log Phi(q) + (1-y) log(1-Phi(q))].
-    let (m, clamp_active) = clamped_binomial_probability(mu);
-    if clamp_active || weight == 0.0 || !q.is_finite() {
+    // Stability (Issue 5): see binomial_neglog_q_derivatives_probit_closed_form.
+    if weight == 0.0 || !q.is_finite() {
         return 0.0;
     }
+    let m = mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
     let nu = 1.0 - m;
     let phi = normal_pdf(q);
     let a = (1.0 - y) / nu - y / m;
