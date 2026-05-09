@@ -1784,7 +1784,7 @@ impl Default for BlockwiseFitOptions {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BlockwiseInnerResult {
     pub block_states: Vec<ParameterBlockState>,
     pub active_sets: Vec<Option<Vec<usize>>>,
@@ -1797,6 +1797,27 @@ pub struct BlockwiseInnerResult {
     /// Cached assembled penalty matrices S(ρ) = Σ_k exp(ρ_k) S_k per block.
     /// Avoids redundant re-assembly in the outer objective evaluation.
     pub s_lambdas: Vec<Array2<f64>>,
+    pub joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+}
+
+impl std::fmt::Debug for BlockwiseInnerResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockwiseInnerResult")
+            .field("block_states", &self.block_states)
+            .field("active_sets", &self.active_sets)
+            .field("log_likelihood", &self.log_likelihood)
+            .field("penalty_value", &self.penalty_value)
+            .field("cycles", &self.cycles)
+            .field("converged", &self.converged)
+            .field("block_logdet_h", &self.block_logdet_h)
+            .field("block_logdet_s", &self.block_logdet_s)
+            .field("s_lambdas", &self.s_lambdas)
+            .field(
+                "joint_workspace",
+                &self.joint_workspace.as_ref().map(|_| "<workspace>"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -1804,6 +1825,18 @@ struct ConstrainedWarmStart {
     rho: Array1<f64>,
     block_beta: Vec<Array1<f64>>,
     active_sets: Vec<Option<Vec<usize>>>,
+    cached_inner: Option<CachedInnerMode>,
+}
+
+#[derive(Clone)]
+struct CachedInnerMode {
+    log_likelihood: f64,
+    penalty_value: f64,
+    cycles: usize,
+    converged: bool,
+    block_logdet_h: f64,
+    block_logdet_s: f64,
+    joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
 }
 
 fn screened_outer_warm_start<'a>(
@@ -1811,6 +1844,40 @@ fn screened_outer_warm_start<'a>(
     rho: &Array1<f64>,
 ) -> Option<&'a ConstrainedWarmStart> {
     warm_start.filter(|seed| seed.rho.len() == rho.len())
+}
+
+fn warm_start_matches_block_log_lambdas(
+    seed: &ConstrainedWarmStart,
+    block_log_lambdas: &[Array1<f64>],
+) -> bool {
+    let expected = block_log_lambdas
+        .iter()
+        .map(|values| values.len())
+        .sum::<usize>();
+    if seed.rho.len() != expected {
+        return false;
+    }
+    let mut offset = 0usize;
+    for block in block_log_lambdas {
+        let end = offset + block.len();
+        if seed.rho.slice(s![offset..end]) != block.view() {
+            return false;
+        }
+        offset = end;
+    }
+    true
+}
+
+fn cached_inner_mode_from_result(result: &BlockwiseInnerResult) -> CachedInnerMode {
+    CachedInnerMode {
+        log_likelihood: result.log_likelihood,
+        penalty_value: result.penalty_value,
+        cycles: result.cycles,
+        converged: result.converged,
+        block_logdet_h: result.block_logdet_h,
+        block_logdet_s: result.block_logdet_s,
+        joint_workspace: result.joint_workspace.clone(),
+    }
 }
 
 /// Helper struct mirroring the old `BlockwiseFitResultParts`.
@@ -6704,6 +6771,7 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
     specs: &'a [ParameterBlockSpec],
     total: usize,
     options: &BlockwiseFitOptions,
+    preferred_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
 ) -> Result<Option<JointHessianBundle<'a>>, String> {
     // Path 1: exact Newton joint Hessian (preferred).
     let beta_flat = flatten_state_betas(block_states, specs);
@@ -6713,11 +6781,14 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
         block_states,
         &beta_flat,
     )?);
-    let hessian_workspace = family.exact_newton_joint_hessian_workspace_with_options(
-        synced.as_ref(),
-        specs,
-        options,
-    )?;
+    let hessian_workspace = match preferred_workspace {
+        Some(workspace) => Some(workspace),
+        None => family.exact_newton_joint_hessian_workspace_with_options(
+            synced.as_ref(),
+            specs,
+            options,
+        )?,
+    };
     // Outer-eval entry: prime any per-row jet caches the workspace will hand
     // to the directional-derivative path. Runs at top-level rayon (we are
     // outside the ext-coord `par_iter` here), so the cache build's own
@@ -8273,6 +8344,39 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         && seed.block_beta.len() == states.len()
         && seed.active_sets.len() == states.len()
     {
+        if warm_start_matches_block_log_lambdas(seed, block_log_lambdas)
+            && let Some(cached) = seed.cached_inner.as_ref()
+            && cached.converged
+            && seed
+                .block_beta
+                .iter()
+                .zip(&states)
+                .all(|(beta_seed, state)| beta_seed.len() == state.beta.len())
+        {
+            for (state, beta_seed) in states.iter_mut().zip(&seed.block_beta) {
+                state.beta.assign(beta_seed);
+            }
+            cached_active_sets = seed.active_sets.clone();
+            refresh_all_block_etas(family, specs, &mut states)?;
+            log::info!(
+                "[PIRLS/joint-Newton warm-start] reused cached same-rho inner mode | cycles={} logdet_h={:.6e} logdet_s={:.6e}",
+                cached.cycles,
+                cached.block_logdet_h,
+                cached.block_logdet_s,
+            );
+            return Ok(BlockwiseInnerResult {
+                block_states: states,
+                active_sets: normalize_active_sets(cached_active_sets),
+                log_likelihood: cached.log_likelihood,
+                penalty_value: cached.penalty_value,
+                cycles: cached.cycles,
+                converged: cached.converged,
+                block_logdet_h: cached.block_logdet_h,
+                block_logdet_s: cached.block_logdet_s,
+                s_lambdas,
+                joint_workspace: cached.joint_workspace.clone(),
+            });
+        }
         for (b, beta_seed) in seed.block_beta.iter().enumerate() {
             if beta_seed.len() == states[b].beta.len() {
                 let beta_projected =
@@ -8790,8 +8894,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 search_delta = descent_delta;
                             }
                             Err(_) => {
-                                joint_trust_radius =
-                                    (0.25 * joint_trust_radius).max(1.0e-12);
+                                joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
                             }
                         }
                         tried_preconditioned_descent = true;
@@ -8829,18 +8932,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     &states,
                     joint_workspace_requested && options.line_search_prefer_workspace,
                 ) {
-                        Ok((value, workspace)) => {
-                            accepted_joint_workspace = workspace;
-                            value
+                    Ok((value, workspace)) => {
+                        accepted_joint_workspace = workspace;
+                        value
+                    }
+                    Err(e) => {
+                        likelihood_rejects += 1;
+                        if first_likelihood_reject.is_none() {
+                            first_likelihood_reject = Some(e);
                         }
-                        Err(e) => {
-                            likelihood_rejects += 1;
-                            if first_likelihood_reject.is_none() {
-                                first_likelihood_reject = Some(e);
-                            }
-                            for (b, old) in old_beta.iter().enumerate() {
-                                states[b].beta.assign(old);
-                            }
+                        for (b, old) in old_beta.iter().enumerate() {
+                            states[b].beta.assign(old);
+                        }
                         refresh_all_block_etas(family, specs, &mut states)?;
                         joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
                         continue;
@@ -9085,6 +9188,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 block_logdet_h,
                 block_logdet_s,
                 s_lambdas,
+                joint_workspace: cached_joint_workspace.clone(),
             });
         }
         if cycles_done >= inner_max_cycles {
@@ -9108,6 +9212,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 block_logdet_h,
                 block_logdet_s,
                 s_lambdas,
+                joint_workspace: cached_joint_workspace.clone(),
             });
         }
         // Otherwise fall through to blockwise iteration below.
@@ -9289,16 +9394,15 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     options,
                     objective_cycle_prev - trial_penalty + 1e-10,
                 );
-                let trial_ll = match family
-                    .log_likelihood_only_with_options(&states, &line_search_options)
-                {
-                    Ok(value) => value,
-                    Err(_) => {
-                        states[b].beta.assign(&beta_old);
-                        eta_checkpoint.restore_eta(&mut states[b]);
-                        continue;
-                    }
-                };
+                let trial_ll =
+                    match family.log_likelihood_only_with_options(&states, &line_search_options) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            states[b].beta.assign(&beta_old);
+                            eta_checkpoint.restore_eta(&mut states[b]);
+                            continue;
+                        }
+                    };
                 let trialobjective = -trial_ll + trial_penalty;
                 if trialobjective.is_finite() && trialobjective <= objective_cycle_prev + 1e-10 {
                     objective_cycle_prev = trialobjective;
@@ -9743,6 +9847,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         block_logdet_h,
         block_logdet_s,
         s_lambdas,
+        joint_workspace: None,
     })
 }
 
@@ -10566,6 +10671,7 @@ fn joint_outer_evaluate(
             .map(|st| st.beta.clone())
             .collect(),
         active_sets: inner.active_sets.clone(),
+        cached_inner: Some(cached_inner_mode_from_result(inner)),
     };
 
     Ok(OuterObjectiveEvalResult {
@@ -10848,9 +10954,14 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
     let total = ranges.last().map(|(_, end)| *end).unwrap_or(0);
 
     let efs_eval = {
-        if let Some(joint_bundle) =
-            build_joint_hessian_closures(family, &inner.block_states, specs, total, options)?
-        {
+        if let Some(joint_bundle) = build_joint_hessian_closures(
+            family,
+            &inner.block_states,
+            specs,
+            total,
+            options,
+            inner.joint_workspace.clone(),
+        )? {
             let JointHessianBundle {
                 source: h_joint_unpen,
                 beta_flat,
@@ -11169,6 +11280,7 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
             .map(|state| state.beta.clone())
             .collect(),
         active_sets: inner.active_sets.clone(),
+        cached_inner: Some(cached_inner_mode_from_result(&inner)),
     };
 
     Ok((efs_eval, warm, inner.converged))
@@ -12004,11 +12116,14 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             &inner.block_states,
             &beta_flat,
         )?);
-        let hessian_workspace = family.exact_newton_joint_hessian_workspace_with_options(
-            synced_joint_states.as_ref(),
-            specs,
-            options,
-        )?;
+        let hessian_workspace = match inner.joint_workspace.clone() {
+            Some(workspace) => Some(workspace),
+            None => family.exact_newton_joint_hessian_workspace_with_options(
+                synced_joint_states.as_ref(),
+                specs,
+                options,
+            )?,
+        };
         // Outer-eval entry: prime per-row jet caches before the ext-coord
         // par_iter — see `warm_up_outer_caches` doc.
         if let Some(workspace) = hessian_workspace.as_ref() {
@@ -12303,14 +12418,17 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             &inner.block_states,
             &beta_flat_for_batch,
         )?;
-        let workspace_for_batch = family
-            .exact_newton_joint_hessian_workspace_with_options(
-                &synced_states_for_batch,
-                specs,
-                options,
-            )
-            .ok()
-            .flatten();
+        let workspace_for_batch = match inner.joint_workspace.clone() {
+            Some(workspace) => Some(workspace),
+            None => family
+                .exact_newton_joint_hessian_workspace_with_options(
+                    &synced_states_for_batch,
+                    specs,
+                    options,
+                )
+                .ok()
+                .flatten(),
+        };
         let derivative_blocks_for_batch =
             vec![Vec::<CustomFamilyBlockPsiDerivative>::new(); specs.len()];
         if let Ok(Some(batch)) = family.batched_outer_gradient_terms(
@@ -12332,6 +12450,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                     specs,
                     total,
                     options,
+                    inner.joint_workspace.clone(),
                 )? {
                     let JointHessianBundle {
                         source: h_joint_unpen,
@@ -12407,9 +12526,14 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     // Try build_joint_hessian_closures which handles both exact Newton and
     // surrogate Hessian sources, then call joint_outer_evaluate with no
     // extended coordinates.
-    if let Some(joint_bundle) =
-        build_joint_hessian_closures(family, &inner.block_states, specs, total, options)?
-    {
+    if let Some(joint_bundle) = build_joint_hessian_closures(
+        family,
+        &inner.block_states,
+        specs,
+        total,
+        options,
+        inner.joint_workspace.clone(),
+    )? {
         let JointHessianBundle {
             source: h_joint_unpen,
             beta_flat,
@@ -12451,7 +12575,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 specs,
                 derivative_blocks.as_ref(),
                 rho_current,
-                None,
+                inner.joint_workspace.clone(),
                 eval_mode,
             )?,
         )?;
@@ -12742,7 +12866,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             specs,
             derivative_blocks.as_ref(),
             rho_current,
-            None,
+            inner.joint_workspace.clone(),
             eval_mode,
         )?,
     )?;
@@ -13139,6 +13263,7 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
             .map(|state| state.beta.clone())
             .collect(),
         active_sets: inner.active_sets.clone(),
+        cached_inner: Some(cached_inner_mode_from_result(&inner)),
     };
 
     Ok((efs_eval, warm, inner.converged))
@@ -14817,6 +14942,7 @@ mod tests {
             rho: array![0.0, -0.5],
             block_beta: vec![array![1.0, -1.0]],
             active_sets: vec![None],
+            cached_inner: None,
         });
 
         let retained = screened_outer_warm_start(cache.as_ref(), &rho_far)
@@ -14833,6 +14959,7 @@ mod tests {
                 rho: array![0.0, -0.5],
                 block_beta: vec![array![1.0, -1.0]],
                 active_sets: vec![None],
+                cached_inner: None,
             },
         };
 
