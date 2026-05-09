@@ -159,6 +159,25 @@ pub fn exp_sigma_derivs_up_to_fourth(
 /// is unbounded below as σ → 0 with μ → y on any single observation; with
 /// σ ≥ b > 0 the log term is bounded by −log b, so the joint penalized MLE is
 /// finite for any finite data and the working weight 1/σ² is bounded by 1/b².
+///
+/// # Scale invariance
+///
+/// This 0.01 looks absolute but is *operationally* scale-relative: the GAMLSS
+/// fit driver in `main.rs` first computes
+/// `response_scale = sample_std(y).max(1e-6)` and rescales `y → y / response_scale`
+/// before fitting (see `gaussian_saved_fit_scale_for_role` and the
+/// `y_scaled` construction). The reported σ in response units is then
+///
+///   σ_response = (LOGB_SIGMA_FLOOR + exp(η)) · response_scale,
+///
+/// so the response-scale floor is `0.01 · sample_std(y)` — exactly 1 % of the
+/// robust spread of `y`. Under a rescaling `y → c·y` the prefit divides by `c`
+/// again, leaving the dimensionless internal floor unchanged. The single
+/// lingering breakage is the global underflow guard `response_scale.max(1e-6)`:
+/// if the user feeds responses with `sample_std(y) < 1e-6` the floor stops
+/// tracking the data scale. That is a deliberate guard against a pathological
+/// constant-y input rather than a model assumption, and 1e-6 sits well below
+/// any sensible measurement-noise floor.
 pub const LOGB_SIGMA_FLOOR: f64 = 0.01;
 
 #[inline]

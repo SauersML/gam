@@ -52,8 +52,32 @@ use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
+/// Numerical floor on μ ∈ (0, 1) used only for downstream `1/μ` and
+/// `1/(1-μ)` divisions and for `μ.ln()` / `(1-μ).ln()` in the generic
+/// composed-link binomial log-likelihood (where the logit-stable
+/// `log_expit` form is unavailable because `q` is the composed link
+/// argument, not the raw logit η). Pure numerical safety, NOT a model
+/// assumption — when the optimizer pushes μ to the floor it indicates a
+/// separated/saturated fit which is detected and surfaced upstream
+/// (`detect_logit_instability`, `Unstable` PIRLS status). For
+/// composed-link μ, derivatives `dμ/dq` etc. are NOT zeroed when the
+/// floor is hit; they carry the legitimate gradient signal of the
+/// outer link and zeroing them would create a phantom flat region that
+/// the optimizer would converge to as a stationary point.
 const MIN_PROB: f64 = 1e-10;
 const MIN_DERIV: f64 = 1e-8;
+/// Lower clamp on POSITIVE working weights `w_i = (dμ/dη)² / V(μ_i)`
+/// to keep `Xᵀ W X` numerically representable. Strictly numerical:
+/// `w` enters subsequent dense matrix products and a true zero (which
+/// happens when `dμ/dη = 0` at saturation, e.g. logistic μ → 0 with
+/// `dμ/dη = μ(1-μ)`) is harmless but a denormal `w` propagates as
+/// inf/NaN through `XᵀWX` because `w * (x_i x_j)` underflows
+/// non-uniformly. `floor_positiveweight` returns 0 for non-finite or
+/// non-positive inputs (so saturation correctly drops the row from
+/// the inner Newton system); the floor only fires for *strictly
+/// positive* tiny weights. The 1e-12 magnitude is chosen so that
+/// `1e-12 · max|x|² · n` stays comfortably above `f64::MIN_POSITIVE`
+/// at biobank scale.
 const MIN_WEIGHT: f64 = 1e-12;
 const EXACT_DENSE_BLOCK_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 const EXACT_DENSE_TOTAL_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
