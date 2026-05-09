@@ -1,12 +1,6 @@
 name: Benchmark Suite
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
   workflow_dispatch:
   schedule:
     - cron: "0 4 * * *"
@@ -137,7 +131,7 @@ jobs:
               # Nightly: run full matrix (all knot variants).
               selected = names
           else:
-              # Push/manual: run one representative knot per *_kN family.
+              # Manual: run one representative knot per *_kN family.
               k_pat = re.compile(r"^(?P<base>.+)_k(?P<k>\d+)$")
               families = {}
               selected = []
