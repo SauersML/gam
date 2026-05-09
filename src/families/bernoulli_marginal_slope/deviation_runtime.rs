@@ -1,8 +1,7 @@
 use crate::basis::create_ispline_derivative_dense;
-use crate::faer_ndarray::{FaerEigh, default_rrqr_rank_alpha, fast_ab, rrqr_nullspace_basis};
+use crate::faer_ndarray::{FaerEigh, fast_ab};
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::pirls::LinearInequalityConstraints;
-use crate::quadrature::compute_gauss_hermite_n;
 use crate::span::{breakpoints_from_knots, span_index_for_breakpoints};
 use ndarray::{Array1, Array2};
 
@@ -47,150 +46,156 @@ pub struct DeviationRuntime {
     right_boundary_value_row: Array1<f64>,
 }
 
-enum DeviationMomentAnchor<'a> {
-    StandardNormal,
-    Empirical {
-        values: &'a Array1<f64>,
-        weights: &'a Array1<f64>,
-    },
-}
-
-fn anchor_coefficient_nullspace(
+/// Build the integrated derivative penalty matrix `P` on the *raw* I-spline
+/// coefficients (before any null-space transform), where
+/// `P_{ij} = ∫ b_i^(k)(x) b_j^(k)(x) dx` integrated piecewise over the knot
+/// support. The null space of `P` is the function-space null space of the
+/// k-th-derivative penalty: polynomials of degree < k. For k = 1 this is
+/// {constants}; for k = 2 it is {constants, linears}; for k = 3 it is
+/// {constants, linears, quadratics}. Dropping these directions from the
+/// basis at construction time is what gives the link-deviation block
+/// β-independent identifiability (the location block's intercept and any
+/// unpenalized location-linear absorb constants/linears in η; β_dev contains
+/// only the wiggle).
+///
+/// Mirrors `integrated_derivative_penalty_with_nullity` but operates on the
+/// raw cubic span coefficients, so it can be evaluated *before* the basis
+/// transform `Z` is constructed (which is what we need to compute `Z`
+/// itself).
+fn raw_integrated_derivative_penalty(
     endpoint_points: &Array1<f64>,
     raw_span_c0: &Array2<f64>,
     raw_span_c1: &Array2<f64>,
     raw_span_c2: &Array2<f64>,
     raw_span_c3: &Array2<f64>,
-    raw_right_boundary_value_row: &Array1<f64>,
-    anchor: DeviationMomentAnchor<'_>,
+    derivative_order: usize,
 ) -> Result<Array2<f64>, String> {
     let raw_dim = raw_span_c0.ncols();
-    let mut c = Array2::<f64>::zeros((2, raw_dim));
-    match anchor {
-        DeviationMomentAnchor::StandardNormal => {
-            let rule = compute_gauss_hermite_n(51);
-            let inv_sqrt_pi = std::f64::consts::PI.sqrt().recip();
-            for (&node, &weight) in rule.nodes.iter().zip(rule.weights.iter()) {
-                let z = std::f64::consts::SQRT_2 * node;
-                let row = raw_design_row(
-                    z,
-                    endpoint_points,
-                    raw_span_c0,
-                    raw_span_c1,
-                    raw_span_c2,
-                    raw_span_c3,
-                    raw_right_boundary_value_row,
-                )?;
-                let w = weight * inv_sqrt_pi;
-                for j in 0..raw_dim {
-                    c[[0, j]] += w * row[j];
-                    c[[1, j]] += w * z * row[j];
-                }
-            }
+    let n_spans = endpoint_points.len().saturating_sub(1);
+    if raw_span_c1.ncols() != raw_dim
+        || raw_span_c2.ncols() != raw_dim
+        || raw_span_c3.ncols() != raw_dim
+    {
+        return Err("raw smoothness penalty: span coefficient column dimensions disagree".into());
+    }
+    let mut penalty = Array2::<f64>::zeros((raw_dim, raw_dim));
+    for span_idx in 0..n_spans {
+        let left = endpoint_points[span_idx];
+        let right = endpoint_points[span_idx + 1];
+        let width = right - left;
+        if !width.is_finite() || width <= 0.0 {
+            return Err(format!(
+                "raw smoothness penalty span {span_idx} has invalid width {width}"
+            ));
         }
-        DeviationMomentAnchor::Empirical { values, weights } => {
-            if values.is_empty() {
-                return Err(
-                    "deviation empirical moment anchor requires at least one value".to_string(),
-                );
-            }
-            if weights.len() != values.len() {
-                return Err(format!(
-                    "deviation empirical moment anchor weight length mismatch: values={}, weights={}",
-                    values.len(),
-                    weights.len()
-                ));
-            }
-            let mut total_weight = 0.0;
-            for (idx, &weight) in weights.iter().enumerate() {
-                if !weight.is_finite() || weight < 0.0 {
-                    return Err(format!(
-                        "deviation empirical moment anchor weight at row {idx} must be finite and non-negative, got {weight}"
-                    ));
-                }
-                total_weight += weight;
-            }
-            if !total_weight.is_finite() || total_weight <= 0.0 {
-                return Err(
-                    "deviation empirical moment anchor requires positive total weight".to_string(),
-                );
-            }
-            for (idx, &q) in values.iter().enumerate() {
-                if !q.is_finite() {
-                    return Err(format!(
-                        "deviation empirical moment anchor value at row {idx} is non-finite ({q})"
-                    ));
-                }
-                let row = raw_design_row(
-                    q,
-                    endpoint_points,
+        for i in 0..raw_dim {
+            let ci = raw_span_derivative_polynomial_coefficients(
+                span_idx,
+                i,
+                derivative_order,
+                raw_span_c0,
+                raw_span_c1,
+                raw_span_c2,
+                raw_span_c3,
+            );
+            for j in i..raw_dim {
+                let cj = raw_span_derivative_polynomial_coefficients(
+                    span_idx,
+                    j,
+                    derivative_order,
                     raw_span_c0,
                     raw_span_c1,
                     raw_span_c2,
                     raw_span_c3,
-                    raw_right_boundary_value_row,
-                )?;
-                let anchor_weight = weights[idx] / total_weight;
-                for j in 0..raw_dim {
-                    c[[0, j]] += anchor_weight * row[j];
-                    c[[1, j]] += anchor_weight * q * row[j];
+                );
+                let contribution = integrate_polynomial_product(&ci, &cj, width);
+                penalty[[i, j]] += contribution;
+                if i != j {
+                    penalty[[j, i]] += contribution;
                 }
             }
         }
     }
-    let (z, rank) = rrqr_nullspace_basis(&c.t(), default_rrqr_rank_alpha())
-        .map_err(|e| format!("deviation moment anchor RRQR failed: {e}"))?;
-    if rank >= raw_dim || z.ncols() == 0 {
+    Ok(penalty)
+}
+
+/// Per-span polynomial coefficients of the `derivative_order`-th derivative
+/// of raw basis function `basis_idx` on its parametric coordinate `t`. Mirrors
+/// `DeviationRuntime::span_derivative_polynomial_coefficients` but on raw
+/// coefficients so it's callable before `Z` exists.
+fn raw_span_derivative_polynomial_coefficients(
+    span_idx: usize,
+    basis_idx: usize,
+    derivative_order: usize,
+    raw_span_c0: &Array2<f64>,
+    raw_span_c1: &Array2<f64>,
+    raw_span_c2: &Array2<f64>,
+    raw_span_c3: &Array2<f64>,
+) -> Vec<f64> {
+    let c0 = raw_span_c0[[span_idx, basis_idx]];
+    let c1 = raw_span_c1[[span_idx, basis_idx]];
+    let c2 = raw_span_c2[[span_idx, basis_idx]];
+    let c3 = raw_span_c3[[span_idx, basis_idx]];
+    match derivative_order {
+        0 => vec![c0, c1, c2, c3],
+        1 => vec![c1, 2.0 * c2, 3.0 * c3],
+        2 => vec![2.0 * c2, 6.0 * c3],
+        3 => vec![6.0 * c3],
+        _ => Vec::new(),
+    }
+}
+
+/// Compute `Z` = orthonormal columns spanning the orthogonal complement of
+/// the null space of `P_raw` (the integrated derivative penalty in raw
+/// coordinates). Eigenvectors with strictly-positive eigenvalues are taken;
+/// near-zero eigenvalues correspond to functions with zero `derivative_order`-
+/// th derivative, i.e., polynomials of degree `< derivative_order` evaluated
+/// in the raw basis.
+///
+/// Returned `Z` has shape `raw_dim × (raw_dim − nullity)`. After applying it
+/// (`raw_basis · Z`), the transformed basis cannot represent any polynomial
+/// of degree < `derivative_order` — that direction is structurally absent
+/// from the parameterization. This is the β-independent identifiability
+/// constraint that replaces the data-distribution-dependent moment anchor.
+fn smoothness_nullspace_orthogonal_complement(
+    raw_penalty: &Array2<f64>,
+) -> Result<Array2<f64>, String> {
+    let n = raw_penalty.nrows();
+    if raw_penalty.ncols() != n {
+        return Err("smoothness penalty matrix must be square for null-space drop".to_string());
+    }
+    let (eigenvalues, eigenvectors) = raw_penalty
+        .eigh(faer::Side::Lower)
+        .map_err(|e| format!("raw smoothness penalty eigendecomposition failed: {e}"))?;
+    let evals = eigenvalues
+        .as_slice()
+        .ok_or_else(|| "raw smoothness penalty eigenvalues are not contiguous".to_string())?;
+    let threshold = crate::estimate::reml::unified::positive_eigenvalue_threshold(evals);
+    let kept: Vec<usize> = evals
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &v)| (v > threshold).then_some(i))
+        .collect();
+    if kept.is_empty() {
         return Err(
-            "deviation moment anchor constraints removed all columns; increase basis richness"
+            "smoothness penalty has no positive eigenvalues; basis is entirely in the penalty's \
+             null space and cannot be identified after the smoothness null-space drop"
                 .to_string(),
         );
     }
+    if kept.len() == n {
+        return Err(
+            "smoothness penalty has no null directions; nothing to drop. The link-deviation \
+             basis was expected to carry a non-trivial null space (constants/linears) for \
+             absorption by the location block — check the configured penalty derivative order"
+                .to_string(),
+        );
+    }
+    let mut z = Array2::<f64>::zeros((n, kept.len()));
+    for (col_out, &col_in) in kept.iter().enumerate() {
+        z.column_mut(col_out).assign(&eigenvectors.column(col_in));
+    }
     Ok(z)
-}
-
-fn raw_design_row(
-    value: f64,
-    endpoint_points: &Array1<f64>,
-    raw_span_c0: &Array2<f64>,
-    raw_span_c1: &Array2<f64>,
-    raw_span_c2: &Array2<f64>,
-    raw_span_c3: &Array2<f64>,
-    raw_right_boundary_value_row: &Array1<f64>,
-) -> Result<Array1<f64>, String> {
-    if !value.is_finite() {
-        return Err(format!(
-            "deviation moment anchor design value is non-finite ({value})"
-        ));
-    }
-    let raw_dim = raw_span_c0.ncols();
-    let left_ep = endpoint_points[0];
-    let right_ep = endpoint_points[endpoint_points.len() - 1];
-    if value < left_ep {
-        return Ok(raw_span_c0.row(0).to_owned());
-    }
-    if value > right_ep {
-        return Ok(raw_right_boundary_value_row.to_owned());
-    }
-    let mut span_idx = span_index_for_breakpoints(
-        endpoint_points
-            .as_slice()
-            .ok_or_else(|| "deviation moment anchor breakpoints are not contiguous".to_string())?,
-        value,
-        "deviation moment anchor span lookup",
-    )?;
-    if span_idx > 0 && value == endpoint_points[span_idx] {
-        span_idx -= 1;
-    }
-    let t = value - endpoint_points[span_idx];
-    let mut out = Array1::<f64>::zeros(raw_dim);
-    for j in 0..raw_dim {
-        out[j] = raw_span_c0[[span_idx, j]]
-            + raw_span_c1[[span_idx, j]] * t
-            + raw_span_c2[[span_idx, j]] * t * t
-            + raw_span_c3[[span_idx, j]] * t * t * t;
-    }
-    Ok(out)
 }
 
 fn build_quadratic_derivative_bernstein_constraints(
@@ -235,37 +240,32 @@ fn build_quadratic_derivative_bernstein_constraints(
 }
 
 impl DeviationRuntime {
-    pub(crate) fn try_new_standard_normal_anchor(
+    /// Construct the link-deviation runtime with a smoothness-null-space-drop
+    /// basis transform. `max_penalty_derivative_order` is the highest
+    /// derivative order of any penalty that will subsequently be applied to
+    /// this block (computed by the caller from its `DeviationBlockConfig`).
+    /// The returned basis structurally excludes polynomials of degree
+    /// `< max_penalty_derivative_order`, so the configured smoothness
+    /// penalties have no null space on the transformed basis and the
+    /// joint Hessian + penalty system is well-conditioned at every PIRLS
+    /// iteration regardless of how β shifts the linear predictor distribution.
+    ///
+    /// This replaces the previous data-distribution moment anchor (at the
+    /// rigid-pilot η₀), which gave a β-dependent identifiability constraint
+    /// that drifted out of alignment with η_current during PIRLS and produced
+    /// near-singular joint Hessians (σ_min ≈ ridge_floor).
+    pub(crate) fn try_new(
         knots: Array1<f64>,
         monotonicity_eps: f64,
+        max_penalty_derivative_order: usize,
     ) -> Result<Self, String> {
-        Self::try_new_with_anchor(
-            knots,
-            monotonicity_eps,
-            DeviationMomentAnchor::StandardNormal,
-        )
+        Self::try_new_with_smoothness_drop(knots, monotonicity_eps, max_penalty_derivative_order)
     }
 
-    pub(crate) fn try_new_weighted_empirical_anchor(
+    fn try_new_with_smoothness_drop(
         knots: Array1<f64>,
         monotonicity_eps: f64,
-        reference: &Array1<f64>,
-        weights: &Array1<f64>,
-    ) -> Result<Self, String> {
-        Self::try_new_with_anchor(
-            knots,
-            monotonicity_eps,
-            DeviationMomentAnchor::Empirical {
-                values: reference,
-                weights,
-            },
-        )
-    }
-
-    fn try_new_with_anchor(
-        knots: Array1<f64>,
-        monotonicity_eps: f64,
-        anchor: DeviationMomentAnchor<'_>,
+        max_penalty_derivative_order: usize,
     ) -> Result<Self, String> {
         if !monotonicity_eps.is_finite() || monotonicity_eps < 0.0 {
             return Err(format!(
@@ -330,15 +330,30 @@ impl DeviationRuntime {
                 })?;
         let raw_right_boundary_value_row = raw_right_boundary_values.row(0).to_owned();
 
-        let coefficient_transform = anchor_coefficient_nullspace(
+        if max_penalty_derivative_order == 0 {
+            return Err(
+                "DeviationRuntime requires max_penalty_derivative_order >= 1 so the basis can \
+                 drop the corresponding smoothness null space; an order-0 (mass) penalty alone \
+                 has no null space and would not require any drop"
+                    .to_string(),
+            );
+        }
+        if max_penalty_derivative_order > 3 {
+            return Err(format!(
+                "DeviationRuntime cubic basis supports derivative orders up to 3; got max \
+                 penalty derivative order {max_penalty_derivative_order}"
+            ));
+        }
+        let raw_smoothness_penalty = raw_integrated_derivative_penalty(
             &endpoint_points,
             &raw_span_c0,
             &raw_span_c1,
             &raw_span_c2,
             &raw_span_c3,
-            &raw_right_boundary_value_row,
-            anchor,
+            max_penalty_derivative_order,
         )?;
+        let coefficient_transform =
+            smoothness_nullspace_orthogonal_complement(&raw_smoothness_penalty)?;
         let basis_dim = coefficient_transform.ncols();
         let span_c0 = fast_ab(&raw_span_c0, &coefficient_transform);
         let span_c1 = fast_ab(&raw_span_c1, &coefficient_transform);

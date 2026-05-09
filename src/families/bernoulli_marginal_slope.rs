@@ -31,9 +31,8 @@ use crate::probability::{
 use crate::smooth::{
     ExactJointHyperSetup, SmoothBasisSpec, SpatialLengthScaleOptimizationOptions,
     SpatialLogKappaCoords, TermCollectionDesign, TermCollectionSpec,
-    apply_spatial_anisotropy_pilot_initializer,
-    build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
-    spatial_length_scale_term_indices,
+    apply_spatial_anisotropy_pilot_initializer, build_term_collection_designs_and_freeze_joint,
+    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
 use crate::types::{InverseLink, LinkFunction, WigglePenaltyConfig};
 use ndarray::{Array1, Array2, ArrayView2, s};
@@ -1204,27 +1203,19 @@ pub(crate) fn build_score_warp_deviation_block_from_seed(
     seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
-    build_deviation_block_from_knots_and_design_seed_with_anchor(
-        seed,
-        seed,
-        cfg,
-        DeviationAnchorKind::StandardNormal,
-    )
+    build_deviation_block_from_knots_and_design_seed(seed, seed, cfg)
 }
 
 pub(crate) fn build_score_warp_deviation_block_from_seed_empirical_anchor(
     seed: &Array1<f64>,
-    weights: &Array1<f64>,
+    _weights: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
-    build_deviation_block_from_knots_and_design_seed_with_anchor(
-        seed,
-        seed,
-        cfg,
-        DeviationAnchorKind::EmpiricalDesign {
-            anchor_weights: weights,
-        },
-    )
+    // The `weights` argument is retained for caller-API stability but no
+    // longer participates in basis construction: identifiability now comes
+    // from the smoothness-penalty null-space drop (β-independent), not from a
+    // data-distribution moment anchor at the rigid-pilot η₀.
+    build_deviation_block_from_knots_and_design_seed(seed, seed, cfg)
 }
 
 const BERNOULLI_LINK_PROBABILITY_EPS: f64 = 1e-12;
@@ -1333,27 +1324,20 @@ fn require_probit_marginal_slope_link(
 pub(crate) fn build_link_deviation_block_from_knots_design_seed_and_weights(
     knot_seed: &Array1<f64>,
     design_seed: &Array1<f64>,
-    anchor_weights: &Array1<f64>,
+    _anchor_weights: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
-    build_deviation_block_from_knots_and_design_seed_with_anchor(
-        knot_seed,
-        design_seed,
-        cfg,
-        DeviationAnchorKind::EmpiricalDesign { anchor_weights },
-    )
+    // The `anchor_weights` argument is retained for caller-API stability but
+    // no longer participates in basis construction (see
+    // `build_score_warp_deviation_block_from_seed_empirical_anchor` for the
+    // rationale: identifiability is now β-independent).
+    build_deviation_block_from_knots_and_design_seed(knot_seed, design_seed, cfg)
 }
 
-enum DeviationAnchorKind<'a> {
-    StandardNormal,
-    EmpiricalDesign { anchor_weights: &'a Array1<f64> },
-}
-
-fn build_deviation_block_from_knots_and_design_seed_with_anchor(
+fn build_deviation_block_from_knots_and_design_seed(
     knot_seed: &Array1<f64>,
     design_seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
-    anchor: DeviationAnchorKind<'_>,
 ) -> Result<DeviationPrepared, String> {
     if cfg.degree != 3 {
         return Err(format!(
@@ -1367,19 +1351,15 @@ fn build_deviation_block_from_knots_and_design_seed_with_anchor(
         cfg.degree,
         cfg.num_internal_knots,
     )?;
-    let runtime = match anchor {
-        DeviationAnchorKind::StandardNormal => {
-            DeviationRuntime::try_new_standard_normal_anchor(knots, cfg.monotonicity_eps)?
-        }
-        DeviationAnchorKind::EmpiricalDesign { anchor_weights } => {
-            DeviationRuntime::try_new_weighted_empirical_anchor(
-                knots,
-                cfg.monotonicity_eps,
-                design_seed,
-                anchor_weights,
-            )?
-        }
-    };
+    // The smoothness-null-space drop must remove the union of null spaces
+    // across all configured penalties, which (for nested null spaces of
+    // increasing-order derivative penalties) equals the largest order's
+    // null space. Thus we drop polynomials of degree < max_order.
+    let max_penalty_order = penalty_orders.iter().copied().max().ok_or_else(|| {
+        "deviation block requires at least one positive function-penalty derivative order"
+            .to_string()
+    })?;
+    let runtime = DeviationRuntime::try_new(knots, cfg.monotonicity_eps, max_penalty_order)?;
     let design = runtime.design(design_seed)?;
     let p = design.ncols();
     if p == 0 {
@@ -3004,7 +2984,12 @@ impl RowCellMomentsBundle {
             required_degree
         );
         (self.max_degree >= required_degree)
-            .then(|| self.rows.get(row).and_then(Option::as_ref).map(Vec::as_slice))
+            .then(|| {
+                self.rows
+                    .get(row)
+                    .and_then(Option::as_ref)
+                    .map(Vec::as_slice)
+            })
             .flatten()
     }
 
@@ -5903,7 +5888,10 @@ impl BernoulliMarginalSlopeFamily {
             })
             .collect::<Result<Vec<_>, String>>()?;
         let selected_n = partitions.len();
-        let n_cells = partitions.iter().map(|(_, cells)| cells.len()).sum::<usize>();
+        let n_cells = partitions
+            .iter()
+            .map(|(_, cells)| cells.len())
+            .sum::<usize>();
         let estimated_bytes =
             RowCellMomentsBundle::estimated_resident_bytes(n, n_cells, max_degree);
         let limit_bytes = self.policy.max_operator_cache_bytes;
@@ -10788,20 +10776,27 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         true
     }
 
-    // The link-deviation basis is empirically anchored at the rigid-pilot η₀
-    // (`build_link_deviation_block_from_knots_design_seed_and_weights` with a
-    // `q0_seed` from the closed-form rigid pooled-intercept solution). During
-    // PIRLS the location/spatial blocks shift η₀ away from that anchor, so
-    // `Σᵢ wᵢ b(η₀ᵢ)` re-acquires a small but nonzero constant component.
-    // That residual constant trades off against the global-mean direction of
-    // the location block, leaving the penalized joint Hessian near-singular
-    // along that combination (σ_min ≈ ridge_floor ≈ 1e-10). Under the default
-    // `Smooth` log|H| regularization the eigenvector for σ_min is numerically
-    // arbitrary inside the near-null space, so first-order perturbation
-    // theory leaks a spurious term into d log|H|/dρ that the analytic
-    // u^⊤(dH/dρ)u formula cannot match. `HardPseudo` excludes σ ≤ ε from
-    // BOTH log|H| and its gradient consistently, mirroring the
-    // BinomialLocationScaleWiggleFamily precedent for the same hazard.
+    // Historically the link-deviation basis used a β-dependent moment anchor
+    // (empirical at the rigid-pilot η₀); as PIRLS drifted η away from η₀,
+    // `Σᵢ wᵢ b(η_currentᵢ)` re-acquired a constant component aliased with
+    // the location intercept, collapsing σ_min(joint H+S) to ridge_floor and
+    // leaking spurious terms into d log|H|/dρ. The basis is now constructed
+    // with a β-INDEPENDENT smoothness-penalty null-space drop (see
+    // `DeviationRuntime::try_new` and
+    // `smoothness_nullspace_orthogonal_complement` in `deviation_runtime.rs`):
+    // the basis structurally cannot represent polynomials of degree
+    // `< max_penalty_derivative_order`, so the location block's intercept and
+    // any unpenalized location-linear absorb constants/linears in η at every
+    // PIRLS iteration. With `S` full-rank on the transformed basis,
+    // `σ_min(H+S) ≥ smallest positive eigenvalue of S` — orders of magnitude
+    // above ridge_floor — so the original "near-null direction" no longer
+    // appears. We retain `HardPseudo` for the exact-newton outer hessian
+    // path because numerical rounding can still leave eigenvalues that are
+    // very small (though no longer at the floor); excluding σ ≤ ε from both
+    // log|H| and its gradient consistently is harmless when there is no
+    // genuine null space and remains correct if a residual one ever
+    // re-appears (defense in depth, mirroring
+    // BinomialLocationScaleWiggleFamily).
     fn pseudo_logdet_mode(&self) -> crate::custom_family::PseudoLogdetMode {
         crate::custom_family::PseudoLogdetMode::HardPseudo
     }
@@ -11282,7 +11277,8 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
         block_states: Vec<ParameterBlockState>,
         options: BlockwiseFitOptions,
     ) -> Result<Self, String> {
-        let mut cache = family.build_exact_eval_cache_with_options(&block_states, Some(&options))?;
+        let mut cache =
+            family.build_exact_eval_cache_with_options(&block_states, Some(&options))?;
         // Materialize per-row primary Hessians at construction time. The
         // matrix-free CG / inner-Newton loops contract these against many
         // trial directions at the same β, so caching the `r×r` blocks once
@@ -14806,10 +14802,7 @@ mod tests {
 
         let mut large_rigid_family = large_flex_family.clone();
         large_rigid_family.score_warp = None;
-        let large_rigid_specs = vec![
-            dummy_blockspec(1, n_large),
-            dummy_blockspec(1, n_large),
-        ];
+        let large_rigid_specs = vec![dummy_blockspec(1, n_large), dummy_blockspec(1, n_large)];
         assert_eq!(
             large_rigid_family
                 .exact_outer_derivative_order(&large_rigid_specs, &BlockwiseFitOptions::default()),
