@@ -308,6 +308,7 @@ fn gaussian_diagonal_row_kernel(
     // H_μμ has bounded condition number — no after-the-fact floor or cap is
     // needed (the previous (1e-12, 1e24) clamp was a numerical bandaid for the
     // pure-exp link's σ→0 singularity and is structurally unnecessary here).
+    // ApproxKind: Exact — working weight analytically bounded in (0, 1/b²].
     let SigmaJet1 { sigma, d1: _ } = logb_sigma_jet1_scalar(eta_log_sigma);
     let inv_s2 = (sigma * sigma).recip();
     let residual = y - location_eta;
@@ -3869,10 +3870,11 @@ fn binomial_neglog_q_fourth_derivative_from_jet(
     d3: f64,
     d4: f64,
 ) -> f64 {
-    let (m, clamp_active) = clamped_binomial_probability(mu);
-    if clamp_active
-        || weight == 0.0
-        || !m.is_finite()
+    // Stability (Issue 5): floor μ inside divisions but allow the chain
+    // rule to propagate; non-finite inputs still short-circuit (the LM
+    // gain-ratio guard rejects non-finite candidate gradients).
+    if weight == 0.0
+        || !mu.is_finite()
         || !d1.is_finite()
         || !d2.is_finite()
         || !d3.is_finite()
@@ -3880,6 +3882,7 @@ fn binomial_neglog_q_fourth_derivative_from_jet(
     {
         return 0.0;
     }
+    let m = mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
     let one_minus = 1.0 - m;
     let ellmu = y / m - (1.0 - y) / one_minus;
     let ellmumu = -y / (m * m) - (1.0 - y) / (one_minus * one_minus);
@@ -4322,8 +4325,16 @@ fn binomial_location_scale_log_likelihood(
     if matches!(link_kind, InverseLink::Standard(LinkFunction::Probit)) {
         return weight * (y * normal_logcdf(q) + (1.0_f64 - y) * normal_logsf(q));
     }
-    let (mu_clamped, _) = clamped_binomial_probability(mu);
-    weight * (y * mu_clamped.ln() + (1.0_f64 - y) * (1.0_f64 - mu_clamped).ln())
+    // Stability (Issue 5): for non-probit links we still need a numerical
+    // floor on μ to keep mu.ln() and (1-mu).ln() finite — both -∞ at
+    // saturation. The bias is `y * ln(MIN_PROB)` ≈ y · (-23) per
+    // saturating row and is only applied when the optimizer pushes μ to
+    // the floor anyway. The proper logit-stable form `log_expit(q)` is
+    // unavailable in this generic location-scale path because q is the
+    // composed link-input, not the raw logit eta. For probit the
+    // analytic `normal_logcdf/normal_logsf` above gives full precision.
+    let mu_safe = mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
+    weight * (y * mu_safe.ln() + (1.0_f64 - y) * (1.0_f64 - mu_safe).ln())
 }
 
 fn binomial_location_scalerow(
@@ -4343,13 +4354,14 @@ fn binomial_location_scalerow(
     let mut jet = inverse_link_jet_for_inverse_link(link_kind, q)
         .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
     let raw_mu = jet.mu;
-    let (mu_clamped, clamp_active) = clamped_binomial_probability(jet.mu);
+    // Stability (Issue 5): floor μ for downstream 1/μ divisions but DO
+    // NOT zero d1/d2/d3 — those are derivatives of the inverse link
+    // (dμ/dq, ...) which are bounded for any sane link and carry the
+    // legitimate gradient signal. Zeroing them created a phantom flat
+    // region that the optimizer would converge to as a stationary point,
+    // silently misreporting separated/saturated fits as well-fit modes.
+    let (mu_clamped, _clamp_active) = clamped_binomial_probability(jet.mu);
     jet.mu = mu_clamped;
-    if clamp_active {
-        jet.d1 = 0.0;
-        jet.d2 = 0.0;
-        jet.d3 = 0.0;
-    }
     let inverse_link = inverse_linkrow(jet);
     let ll = binomial_location_scale_log_likelihood(y, weight, q, link_kind, raw_mu);
     Ok(BinomialLocationScaleRow {
@@ -10899,13 +10911,11 @@ impl BinomialMeanWiggleFamily {
     fn neglog_q_derivatives(&self, y: f64, weight: f64, q: f64) -> Result<(f64, f64, f64), String> {
         let mut jet = inverse_link_jet_for_inverse_link(&self.link_kind, q)
             .map_err(|e| format!("fixed-link wiggle inverse-link evaluation failed: {e}"))?;
-        let (mu_clamped, clamp_active) = clamped_binomial_probability(jet.mu);
+        // Stability (Issue 5): floor μ for downstream divisions only;
+        // preserve d1/d2/d3 so the chain rule reflects the true geometry.
+        // See binomial_location_scalerow for the full rationale.
+        let (mu_clamped, _clamp_active) = clamped_binomial_probability(jet.mu);
         jet.mu = mu_clamped;
-        if clamp_active {
-            jet.d1 = 0.0;
-            jet.d2 = 0.0;
-            jet.d3 = 0.0;
-        }
         Ok(binomial_neglog_q_derivatives_dispatch(
             y,
             weight,

@@ -1017,6 +1017,7 @@ pub trait CustomFamily {
         _: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
+        _: &BlockwiseFitOptions,
     ) -> Result<Option<(f64, Arc<dyn ExactNewtonJointHessianWorkspace>)>, String> {
         Ok(None)
     }
@@ -1031,6 +1032,7 @@ pub trait CustomFamily {
         &self,
         _: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
+        _: &BlockwiseFitOptions,
         _: &BlockwiseFitOptions,
     ) -> Result<Option<(f64, Option<Arc<dyn ExactNewtonJointHessianWorkspace>>)>, String> {
         Ok(None)
@@ -1796,6 +1798,15 @@ impl Default for BlockwiseFitOptions {
             outer_max_iter: 60,
             outer_tol: 1e-5,
             minweight: 1e-12,
+            // `ridge_floor` is an ExplicitPrior in the canonical
+            // stabilization ledger taxonomy (`StabilizationKind::ExplicitPrior`):
+            // its δ enters the quadratic term, the Laplace Hessian, and the
+            // penalty log-determinant — `ridge_policy` below is the live
+            // policy that confirms which terms it lands in. The default
+            // pos-part policy enables every inclusion flag, so callers
+            // wanting solver-only damping should construct a custom policy
+            // (or, preferably, a `StabilizationLedger::numerical_perturbation`)
+            // rather than reusing this field.
             ridge_floor: 1e-12,
             ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
             use_remlobjective: true,
@@ -4797,6 +4808,90 @@ struct OuterObjectiveEvalResult {
     outer_hessian: crate::solver::outer_strategy::HessianResult,
     warm_start: ConstrainedWarmStart,
     inner_converged: bool,
+}
+
+fn constrained_warm_start_from_inner(
+    rho: &Array1<f64>,
+    inner: &BlockwiseInnerResult,
+) -> ConstrainedWarmStart {
+    ConstrainedWarmStart {
+        rho: rho.clone(),
+        block_beta: inner
+            .block_states
+            .iter()
+            .map(|state| state.beta.clone())
+            .collect(),
+        active_sets: inner.active_sets.clone(),
+        cached_inner: Some(cached_inner_mode_from_result(inner)),
+    }
+}
+
+fn inner_penalized_objective(
+    inner: &BlockwiseInnerResult,
+    include_logdet_h: bool,
+    include_logdet_s: bool,
+    context: &str,
+) -> Result<f64, String> {
+    let reml_term = if include_logdet_h {
+        0.5 * inner.block_logdet_h
+    } else {
+        0.0
+    } - if include_logdet_s {
+        0.5 * inner.block_logdet_s
+    } else {
+        0.0
+    };
+    checked_penalizedobjective(
+        inner.log_likelihood,
+        inner.penalty_value,
+        reml_term,
+        context,
+    )
+}
+
+fn nonconverged_outer_eval_result(
+    inner: &BlockwiseInnerResult,
+    rho: &Array1<f64>,
+    theta_dim: usize,
+    include_logdet_h: bool,
+    include_logdet_s: bool,
+    context: &str,
+) -> Result<OuterObjectiveEvalResult, String> {
+    Ok(OuterObjectiveEvalResult {
+        objective: inner_penalized_objective(inner, include_logdet_h, include_logdet_s, context)?,
+        gradient: Array1::<f64>::zeros(theta_dim),
+        outer_hessian: crate::solver::outer_strategy::HessianResult::Unavailable,
+        warm_start: constrained_warm_start_from_inner(rho, inner),
+        inner_converged: false,
+    })
+}
+
+fn nonconverged_outer_efs_result(
+    inner: &BlockwiseInnerResult,
+    rho: &Array1<f64>,
+    theta_dim: usize,
+    include_logdet_h: bool,
+    include_logdet_s: bool,
+    context: &str,
+) -> Result<
+    (
+        crate::solver::outer_strategy::EfsEval,
+        ConstrainedWarmStart,
+        bool,
+    ),
+    String,
+> {
+    Ok((
+        crate::solver::outer_strategy::EfsEval {
+            cost: inner_penalized_objective(inner, include_logdet_h, include_logdet_s, context)?,
+            steps: vec![0.0; theta_dim],
+            beta: None,
+            psi_gradient: None,
+            psi_indices: None,
+        },
+        constrained_warm_start_from_inner(rho, inner),
+        false,
+    ))
 }
 
 fn outer_eval_result_to_joint_hyper_result(
@@ -8355,33 +8450,46 @@ fn joint_preconditioned_descent_delta(
 fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
-    options: &BlockwiseFitOptions,
+    line_search_options: &BlockwiseFitOptions,
+    workspace_options: &BlockwiseFitOptions,
     states: &[ParameterBlockState],
     prefer_workspace: bool,
 ) -> Result<(f64, Option<Arc<dyn ExactNewtonJointHessianWorkspace>>), String> {
-    if let Some((log_likelihood, workspace)) =
-        family.joint_line_search_log_likelihood_evaluation(states, specs, options)?
-    {
+    if let Some((log_likelihood, workspace)) = family.joint_line_search_log_likelihood_evaluation(
+        states,
+        specs,
+        line_search_options,
+        workspace_options,
+    )? {
         return Ok((log_likelihood, workspace));
     }
     if prefer_workspace
-        && let Some((log_likelihood, workspace)) =
-            family.joint_line_search_log_likelihood_workspace(states, specs, options)?
+        && let Some((log_likelihood, workspace)) = family
+            .joint_line_search_log_likelihood_workspace(
+                states,
+                specs,
+                line_search_options,
+                workspace_options,
+            )?
     {
         return Ok((log_likelihood, Some(workspace)));
     }
-    if (!family.supports_log_likelihood_early_exit() || options.early_exit_threshold.is_none())
+    if (!family.supports_log_likelihood_early_exit()
+        || line_search_options.early_exit_threshold.is_none())
         && prefer_workspace
         && family.inner_joint_workspace_log_likelihood_available(specs)
-        && let Some(workspace) =
-            family.exact_newton_joint_hessian_workspace_with_options(states, specs, options)?
+        && let Some(workspace) = family.exact_newton_joint_hessian_workspace_with_options(
+            states,
+            specs,
+            workspace_options,
+        )?
     {
         if let Some(log_likelihood) = workspace.joint_log_likelihood_evaluation()? {
             return Ok((log_likelihood, Some(workspace)));
         }
     }
     family
-        .log_likelihood_only_with_options(states, options)
+        .log_likelihood_only_with_options(states, line_search_options)
         .map(|log_likelihood| (log_likelihood, None))
 }
 
@@ -9144,6 +9252,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     family,
                     specs,
                     &line_search_options,
+                    options,
                     &states,
                     joint_workspace_requested || options.line_search_prefer_workspace,
                 ) {
@@ -11295,6 +11404,22 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
     let strict_spd = use_exact_newton_strict_spd(family);
     let per_block = split_log_lambdas(rho, penalty_counts)?;
     let mut inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
+    if !inner.converged {
+        log::warn!(
+            "[OUTER] custom-family EFS inner solve did not converge after {} cycle(s); \
+             skipping EFS derivative assembly for theta_dim={}",
+            inner.cycles,
+            rho.len(),
+        );
+        return nonconverged_outer_efs_result(
+            &inner,
+            rho,
+            rho.len(),
+            include_logdet_h,
+            include_logdet_s,
+            "custom-family EFS non-converged inner solve",
+        );
+    }
     let ridge = effective_solverridge(options.ridge_floor);
     let moderidge = if options.ridge_policy.include_quadratic_penalty {
         ridge
@@ -12442,6 +12567,26 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     let strict_spd = use_exact_newton_strict_spd(family);
     let per_block = split_log_lambdas(rho_current, &penalty_counts)?;
     let mut inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
+    if !inner.converged {
+        let theta_dim = rho_dim + psi_dim;
+        log::warn!(
+            "[OUTER] custom-family inner solve did not converge after {} cycle(s); \
+             skipping exact outer derivative assembly for theta_dim={} (rho_dim={}, psi_dim={})",
+            inner.cycles,
+            theta_dim,
+            rho_dim,
+            psi_dim,
+        );
+        return nonconverged_outer_eval_result(
+            &inner,
+            rho_current,
+            theta_dim,
+            include_logdet_h,
+            include_logdet_s,
+            "custom-family non-converged inner solve",
+        )
+        .map_err(CustomFamilyError::from);
+    }
     let ridge = effective_solverridge(options.ridge_floor);
     let moderidge = if options.ridge_policy.include_quadratic_penalty {
         ridge
@@ -13387,6 +13532,26 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
     let strict_spd = use_exact_newton_strict_spd(family);
     let per_block = split_log_lambdas(rho_current, penalty_counts)?;
     let mut inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
+    if !inner.converged {
+        let theta_dim = rho_dim + psi_dim;
+        log::warn!(
+            "[OUTER] custom-family joint-hyper EFS inner solve did not converge after {} cycle(s); \
+             skipping joint-hyper EFS derivative assembly for theta_dim={} (rho_dim={}, psi_dim={})",
+            inner.cycles,
+            theta_dim,
+            rho_dim,
+            psi_dim,
+        );
+        return nonconverged_outer_efs_result(
+            &inner,
+            rho_current,
+            theta_dim,
+            include_logdet_h,
+            include_logdet_s,
+            "custom-family joint-hyper EFS non-converged inner solve",
+        )
+        .map_err(CustomFamilyError::from);
+    }
     let ridge = effective_solverridge(options.ridge_floor);
     let moderidge = if options.ridge_policy.include_quadratic_penalty {
         ridge
@@ -14771,6 +14936,12 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
                      {e}.{last_error_detail}"
             )
         })?;
+    if !inner.converged {
+        return Err(CustomFamilyError::Optimization(format!(
+            "outer smoothing optimization final inner refit did not converge after {} cycles.{}",
+            inner.cycles, last_error_detail
+        )));
+    }
     refresh_all_block_etas(family, specs, &mut inner.block_states).map_err(|e| {
         format!(
             "outer smoothing optimization failed during final eta refresh: \

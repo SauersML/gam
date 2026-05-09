@@ -1257,6 +1257,15 @@ fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
     attempts
 }
 
+fn outer_gradient_tolerance(tolerance: f64) -> GradientTolerance {
+    GradientTolerance {
+        abs: tolerance,
+        rel_initial_grad: Some(tolerance),
+        rel_cost: None,
+        projected: true,
+    }
+}
+
 fn disabled_fallback_hybrid_efs_has_standalone_bfgs_primary(
     cap: &OuterCapability,
     config: &OuterConfig,
@@ -4138,12 +4147,16 @@ fn run_outer_with_plan(
                     let (lo, hi) = &bounds_template;
                     let bounds_obj = Bounds::new(lo.clone(), hi.clone(), 1e-6)
                         .expect("outer rho bounds must be valid");
-                    // Scale-aware tolerance via opt 0.5.0:
-                    // `relative_to_cost(τ)` = `τ * (1 + |f|)` resolved
-                    // at run time from the seed cost and initial grad
-                    // norm. Replaces the previous gam-side
-                    // precomputed `outer_scaled_tolerance` hack.
-                    let grad_tol = GradientTolerance::relative_to_cost(config.tolerance);
+                    // Smoothing-parameter gradients are not on the same
+                    // scale as the raw REML/LAML objective: the objective
+                    // contains an O(n) likelihood constant, while ∂/∂logλ
+                    // stationarity balances effective degrees of freedom,
+                    // traces, and penalty quadratics. Scaling the gradient
+                    // tolerance by |f| gets looser as n grows and can declare
+                    // convergence with materially nonzero outer gradients.
+                    // Use an absolute tolerance plus a relative reduction
+                    // from the seed gradient instead.
+                    let grad_tol = outer_gradient_tolerance(config.tolerance);
                     let max_iter =
                         MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
 
@@ -4264,7 +4277,7 @@ fn run_outer_with_plan(
                     let (lo, hi) = &bounds_template;
                     let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
                         .expect("outer rho bounds must be valid");
-                    let grad_tol = GradientTolerance::relative_to_cost(config.tolerance);
+                    let grad_tol = outer_gradient_tolerance(config.tolerance);
                     let max_iter =
                         MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
 
@@ -4398,7 +4411,7 @@ fn run_outer_with_plan(
                 let (lo, hi) = &bounds_template;
                 let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
                     .expect("outer rho bounds must be valid");
-                let grad_tol = GradientTolerance::relative_to_cost(config.tolerance);
+                let grad_tol = outer_gradient_tolerance(config.tolerance);
                 let max_iter =
                     MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
                 let objective = OuterFirstOrderBridge {
@@ -4807,11 +4820,13 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    // The two `outer_scaled_tolerance_*` tests that lived here have
-    // been removed: the helper is gone in favor of opt 0.5.0's
-    // `GradientTolerance::relative_to_cost(τ)`. Equivalent threshold
-    // coverage now lives upstream as
-    // `opt::tests::gradient_tolerance_relative_to_cost_matches_textbook_form`.
+    #[test]
+    fn outer_gradient_tolerance_does_not_scale_with_raw_cost() {
+        let tol = outer_gradient_tolerance(1e-5);
+        assert_eq!(tol.rel_cost, None);
+        assert_eq!(tol.rel_initial_grad, Some(1e-5));
+        assert!((tol.threshold(1.0e9, 2.0) - 2.0e-5).abs() < 1e-14);
+    }
 
     struct FailingSeedMaterializationOperator {
         dim: usize,

@@ -970,6 +970,9 @@ pub fn inverse_link_jet_for_link_function(
 
 #[inline]
 fn royston_parmar_inverse_link_jet(eta: f64) -> InverseLinkJet {
+    // ApproxKind: NumericalApproximation — exp(exp(eta)) overflows f64 for
+    // eta > ~3.7; the |eta| > 30 saturation tail returns survival ≈ 0 with
+    // d_k = 0, matching the analytic limit to within IEEE-754 underflow.
     const SURVIVAL_ETA_CLAMP: f64 = 30.0;
 
     let z = eta.clamp(-SURVIVAL_ETA_CLAMP, SURVIVAL_ETA_CLAMP);

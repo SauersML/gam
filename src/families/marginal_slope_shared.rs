@@ -597,6 +597,17 @@ impl OuterScoreSubsample {
     pub fn is_empty(&self) -> bool {
         self.mask.is_empty()
     }
+
+    #[inline]
+    pub fn has_variable_weights(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WeightedOuterRow {
+    pub index: usize,
+    pub weight: f64,
 }
 
 /// Splitmix64: deterministic single-u64 expansion. Local copy so this module
@@ -772,9 +783,10 @@ pub fn outer_row_indices(
     n: usize,
 ) -> OuterRowIter {
     match opts.outer_score_subsample.as_ref() {
-        Some(s) => OuterRowIter::Subset {
+        Some(s) if !s.has_variable_weights() => OuterRowIter::Subset {
             mask: Arc::clone(&s.mask),
         },
+        Some(_) => OuterRowIter::All { n },
         None => OuterRowIter::All { n },
     }
 }
@@ -784,8 +796,46 @@ pub fn outer_row_indices(
 #[inline]
 pub fn outer_score_scale(opts: &crate::custom_family::BlockwiseFitOptions, _n: usize) -> f64 {
     match opts.outer_score_subsample.as_ref() {
-        Some(s) => s.weight_scale,
+        Some(s) if !s.has_variable_weights() => s.weight_scale,
+        Some(_) => 1.0,
         None => 1.0,
+    }
+}
+
+pub fn outer_weighted_rows(
+    opts: &crate::custom_family::BlockwiseFitOptions,
+    n: usize,
+) -> Vec<WeightedOuterRow> {
+    match opts.outer_score_subsample.as_ref() {
+        Some(s) if !s.has_variable_weights() => s
+            .mask
+            .iter()
+            .map(|&index| WeightedOuterRow {
+                index,
+                weight: s.weight_scale,
+            })
+            .collect(),
+        Some(_) | None => (0..n)
+            .map(|index| WeightedOuterRow { index, weight: 1.0 })
+            .collect(),
+    }
+}
+
+pub fn outer_row_weights_by_index(
+    opts: &crate::custom_family::BlockwiseFitOptions,
+    n: usize,
+) -> Vec<f64> {
+    match opts.outer_score_subsample.as_ref() {
+        Some(s) if !s.has_variable_weights() => {
+            let mut weights = vec![0.0; n];
+            for &row in s.mask.iter() {
+                if row < n {
+                    weights[row] = s.weight_scale;
+                }
+            }
+            weights
+        }
+        Some(_) | None => vec![1.0; n],
     }
 }
 
@@ -897,25 +947,39 @@ pub const BIOBANK_OUTER_SUBSAMPLE_SEED: u64 = 0xC0FFEE_5EED;
 
 /// Auto-derive the outer-score subsample size from the data row count.
 ///
-/// "Magic by default": no CLI flag, no env var. The runtime picks a K that
-/// targets ≈6% of n (so subsample work is ≈16× cheaper than full-data work)
-/// with a floor of 4_000 (statistical adequacy for stratified score sums)
-/// and a ceiling of 40_000 (diminishing returns + memory).
+/// "Magic by default": no CLI flag, no env var. K targets ~6% of n (so
+/// subsample work is ~16x cheaper than full-data work) with a 4_000 floor
+/// for statistical adequacy. The ceiling is *adaptive* in n: it grows with
+/// sqrt(n) above the legacy 40_000 cap so biobank fits at n >> 1M aren't
+/// strangled by a fixed scalar limit.
+/// ApproxKind: StatisticalApproximation - stratified Horvitz-Thompson outer
+/// score; per-coordinate variance scales O(N_eff / K) where N_eff is bounded
+/// by the per-stratum design effect. With sqrt(n) cap growth the relative
+/// score-SE stays roughly constant rather than degrading as O(sqrt(n)).
 ///
-/// At the canonical anchor points:
-/// - n = 50_000 (threshold) → K = 4_000   (8% of n; floor binds)
-/// - n = 100_000             → K = 6_250
-/// - n = 320_000 (biobank)   → K = 20_000  (matches prior hardcoded default)
-/// - n = 1_000_000           → K = 40_000  (ceiling binds; ≈4% of n)
+/// At anchor points (rounded):
+/// - n = 50_000 (threshold) -> K = 4_000   (floor binds)
+/// - n = 100_000             -> K = 6_250
+/// - n = 320_000 (biobank)   -> K = 20_000  (n/16 binds)
+/// - n = 1_000_000           -> K = 62_500  (n/16 binds; was 40_000)
+/// - n = 5_000_000           -> K = 167_705 (sqrt cap binds; was 40_000)
 ///
-/// The 1/16 ratio is the sweet spot per Wood's `mgcv::bam(discrete=TRUE)`
-/// experiments — the outer-score gradient SE is dominated by the constant
-/// stratification contribution rather than the subsample variance, so K
-/// can grow sub-linearly with n without losing precision.
+/// `BIOBANK_OUTER_SUBSAMPLE_K_MAX` is retained as the legacy fixed-cap
+/// constant for callers that want the historical bound; the runtime uses
+/// the adaptive formula here instead.
 pub fn auto_outer_subsample_k(n: usize) -> usize {
-    (n / 16)
-        .max(BIOBANK_OUTER_SUBSAMPLE_K_MIN)
-        .min(BIOBANK_OUTER_SUBSAMPLE_K_MAX)
+    if n == 0 {
+        return BIOBANK_OUTER_SUBSAMPLE_K_MIN;
+    }
+    // Adaptive ceiling: grows with sqrt(n) so the cap never falls below
+    // 40_000 but scales with effective sample size for biobank-scale jobs.
+    // 75 is the proportionality constant chosen so sqrt(1e6)*75 ~ 75_000
+    // (close to the legacy 40_000 at n=1M but ~2x larger for very-large n)
+    // and so the cap doesn't bind below ~285_000 (sqrt(285k)*75 ~ 40_000).
+    let n_f = n as f64;
+    let sqrt_cap = (n_f.sqrt() * 75.0) as usize;
+    let cap = sqrt_cap.max(BIOBANK_OUTER_SUBSAMPLE_K_MAX).min(n);
+    (n / 16).max(BIOBANK_OUTER_SUBSAMPLE_K_MIN).min(cap)
 }
 
 /// Install a stratified outer-score subsample on `opts` when `n` exceeds the
@@ -963,9 +1027,12 @@ pub fn inject_biobank_outer_subsample(
 /// (the canonical marginal-slope storage) into the `&[u8]` form the
 /// stratifier expects, then delegates to [`inject_biobank_outer_subsample`].
 ///
-/// Non-zero entries map to `1u8`, exact zeros to `0u8`. NaNs are bucketed
-/// with non-zero (treated as a third class only if any are present, but
-/// `build_outer_score_subsample` handles arbitrary u8 alphabets transparently).
+/// Exact zeros map to class `0`, non-zero finite entries map to class `1`,
+/// and NaNs map to class `2`. The explicit NaN check is required because
+/// `NaN != 0.0` evaluates true in Rust IEEE-754, so a naive `v != 0.0`
+/// would silently bucket NaNs with the event class and bias the secondary
+/// stratification. `build_outer_score_subsample` handles any u8 alphabet
+/// transparently, so the third class costs nothing when there are no NaNs.
 pub fn inject_biobank_outer_subsample_from_arrays(
     opts: &mut crate::custom_family::BlockwiseFitOptions,
     z: &[f64],
@@ -976,7 +1043,15 @@ pub fn inject_biobank_outer_subsample_from_arrays(
     }
     let secondary: Vec<u8> = secondary_f64
         .iter()
-        .map(|&v| if v != 0.0 { 1u8 } else { 0u8 })
+        .map(|&v| {
+            if v.is_nan() {
+                2u8
+            } else if v != 0.0 {
+                1u8
+            } else {
+                0u8
+            }
+        })
         .collect();
     inject_biobank_outer_subsample(opts, z, &secondary)
 }
@@ -989,10 +1064,12 @@ mod tests {
     fn auto_outer_subsample_k_anchor_points() {
         // The anchors documented in the docstring should match the
         // implementation. If the heuristic changes, update both.
+        // The cap is sqrt(n)*75 above the legacy K_MAX=40_000 ceiling.
         assert_eq!(auto_outer_subsample_k(50_000), 4_000);
         assert_eq!(auto_outer_subsample_k(100_000), 6_250);
         assert_eq!(auto_outer_subsample_k(320_000), 20_000);
-        assert_eq!(auto_outer_subsample_k(1_000_000), 40_000);
+        // n=1M: n/16 = 62_500, sqrt-cap = 75_000, so 62_500 binds.
+        assert_eq!(auto_outer_subsample_k(1_000_000), 62_500);
     }
 
     #[test]
@@ -1010,16 +1087,26 @@ mod tests {
     }
 
     #[test]
-    fn auto_outer_subsample_k_ceiling_binds_above_threshold_x16() {
-        // Above n = K_MAX * 16 = 640_000, the n/16 term is above the ceiling.
+    fn auto_outer_subsample_k_legacy_ceiling_binds_at_n_640k() {
+        // At n = K_MAX * 16 = 640_000, the n/16 term is exactly K_MAX and
+        // the sqrt-cap (sqrt(640k)*75 ~ 60k) sits above it, so n/16 binds.
         assert_eq!(
             auto_outer_subsample_k(640_000),
             BIOBANK_OUTER_SUBSAMPLE_K_MAX
         );
-        assert_eq!(
-            auto_outer_subsample_k(10_000_000),
-            BIOBANK_OUTER_SUBSAMPLE_K_MAX
+    }
+
+    #[test]
+    fn auto_outer_subsample_k_sqrt_cap_grows_with_n() {
+        // Above n ~ 1M the sqrt-cap exceeds K_MAX so K can grow past 40_000.
+        // At n=10M, sqrt(10M)*75 ~ 237_171 < n/16 = 625_000, so the cap
+        // binds and K ~ 237k (much larger than the legacy fixed 40_000).
+        let k = auto_outer_subsample_k(10_000_000);
+        assert!(
+            k > BIOBANK_OUTER_SUBSAMPLE_K_MAX,
+            "auto K at n=10M should exceed legacy K_MAX, got {k}"
         );
+        assert!(k <= 10_000_000 / 16, "auto K can never exceed n/16 budget");
     }
 
     #[test]
