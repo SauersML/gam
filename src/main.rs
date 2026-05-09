@@ -949,12 +949,20 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     }
 
     progress.set_stage("fit", "building term specification");
+    // Shape-derived resource policy: at biobank-scale n we auto-select strict
+    // (analytic-operator-required) so any silent dense fallback in the
+    // term-construction layer fails fast.
+    let bare_fit_policy = gam::resource::ResourcePolicy::for_problem(
+        ds.values.nrows(),
+        0,
+        gam::resource::ProblemHints::default(),
+    );
     let mut spec = build_termspec(
         &parsed.terms,
         &ds,
         &col_map,
         &mut inference_notes,
-        &gam::resource::ResourcePolicy::default_library(),
+        &bare_fit_policy,
     )?;
     if args.scale_dimensions {
         enable_scale_dimensions(&mut spec);
