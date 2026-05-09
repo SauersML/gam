@@ -18,7 +18,7 @@ use crate::custom_family::{
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{
-    fast_atv, fast_av, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y,
+    fast_ab, fast_atv, fast_av, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y,
 };
 use crate::families::scale_design::{
     build_scale_deviation_operator, build_scale_deviation_transform_design,
@@ -30,7 +30,7 @@ use crate::families::sigma_link::{
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::matrix::SymmetricMatrix;
-use crate::matrix::{DenseDesignOperator, DesignMatrix};
+use crate::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix};
 use crate::mixture_link::{
     inverse_link_jet_for_inverse_link, inverse_link_pdffourth_derivative_for_inverse_link,
 };
@@ -48,7 +48,8 @@ use crate::types::{InverseLink, LinkFunction, RidgePolicy};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::prelude::*;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 const MIN_PROB: f64 = 1e-10;
@@ -57,6 +58,26 @@ const MIN_WEIGHT: f64 = 1e-12;
 const EXACT_DENSE_BLOCK_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 const EXACT_DENSE_TOTAL_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const GAMLSS_ROWWISE_PAR_MIN_N: usize = 4096;
+const GAMLSS_PROJECTED_TRACE_TARGET_BYTES: usize = 32 * 1024 * 1024;
+const GAMLSS_PROJECTED_TRACE_MIN_CHUNK_ROWS: usize = 64;
+const GAMLSS_PROJECTED_TRACE_MAX_CHUNK_ROWS: usize = 8192;
+
+fn gamlss_projected_trace_chunk_rows(
+    rank: usize,
+    projected_channel_count: usize,
+    gram_column_count: usize,
+) -> usize {
+    let per_row_values = rank
+        .saturating_mul(projected_channel_count.max(1))
+        .saturating_add(gram_column_count.max(1))
+        .max(1);
+    let per_row_bytes = per_row_values.saturating_mul(std::mem::size_of::<f64>());
+    let rows = GAMLSS_PROJECTED_TRACE_TARGET_BYTES / per_row_bytes.max(1);
+    rows.clamp(
+        GAMLSS_PROJECTED_TRACE_MIN_CHUNK_ROWS,
+        GAMLSS_PROJECTED_TRACE_MAX_CHUNK_ROWS,
+    )
+}
 
 fn gamlss_rowwise_map<F>(n: usize, f: F) -> Array1<f64>
 where
@@ -7050,78 +7071,105 @@ impl RowCoeffOperator {
             .push(scratch);
     }
 
-    fn projected_trace_column(
-        &self,
-        factor: &Array2<f64>,
-        col: usize,
-        u: &mut [Array1<f64>],
-    ) -> f64 {
-        for (k, ch) in self.channels.iter().enumerate() {
-            let start = self.block_offsets[ch.block];
-            let width = self.block_widths[ch.block];
-            debug_assert_eq!(ch.design.ncols(), width);
-            let f_slice = factor.slice(s![start..start + width, col]);
-            crate::faer_ndarray::fast_av_into(ch.design.as_ref(), &f_slice, &mut u[k]);
-        }
-
-        let mut trace = 0.0;
-        for pair in &self.pair_coeffs {
-            let coeff = pair
-                .coeff
-                .as_slice()
-                .expect("RowCoeffOperator pair coeff must be contiguous");
-            let u_a = u[pair.a]
-                .as_slice()
-                .expect("RowCoeffOperator projected channel must be contiguous");
-            let u_b = u[pair.b]
-                .as_slice()
-                .expect("RowCoeffOperator projected channel must be contiguous");
-            if pair.a == pair.b {
-                for i in 0..self.nrows {
-                    trace += coeff[i] * u_a[i] * u_a[i];
-                }
-            } else {
-                for i in 0..self.nrows {
-                    trace += 2.0 * coeff[i] * u_a[i] * u_b[i];
-                }
-            }
-        }
-        trace
+    fn projected_trace(&self, factor: &Array2<f64>) -> f64 {
+        let grams = self.projected_pair_gram_table(factor);
+        self.trace_from_pair_gram_table(grams.view())
     }
 
-    fn projected_trace(&self, factor: &Array2<f64>) -> f64 {
+    fn projected_pair_gram_cache_id(&self) -> usize {
+        let mut hasher = DefaultHasher::new();
+        "RowCoeffOperator::projected_pair_gram_table".hash(&mut hasher);
+        self.nrows.hash(&mut hasher);
+        self.dim.hash(&mut hasher);
+        self.block_widths.hash(&mut hasher);
+        self.block_offsets.hash(&mut hasher);
+        self.channels.len().hash(&mut hasher);
+        self.pair_coeffs.len().hash(&mut hasher);
+        for (idx, ch) in self.channels.iter().enumerate() {
+            idx.hash(&mut hasher);
+            (Arc::as_ptr(&ch.design) as usize).hash(&mut hasher);
+            ch.block.hash(&mut hasher);
+            ch.design.nrows().hash(&mut hasher);
+            ch.design.ncols().hash(&mut hasher);
+            self.block_widths[ch.block].hash(&mut hasher);
+        }
+        for (idx, pair) in self.pair_coeffs.iter().enumerate() {
+            idx.hash(&mut hasher);
+            pair.a.hash(&mut hasher);
+            pair.b.hash(&mut hasher);
+        }
+        hasher.finish() as usize
+    }
+
+    fn projected_pair_gram_table(&self, factor: &Array2<f64>) -> Array2<f64> {
         assert_eq!(
             factor.nrows(),
             self.dim,
-            "row-coefficient projected trace factor row mismatch: factor rows={} but dim={}",
+            "row-coefficient cached projected trace factor row mismatch: factor rows={} but dim={}",
             factor.nrows(),
             self.dim
         );
         let rank = factor.ncols();
-        if self.nrows == 0 || rank == 0 {
-            return 0.0;
+        let pair_count = self.pair_coeffs.len();
+        if self.nrows == 0 || rank == 0 || pair_count == 0 {
+            return Array2::<f64>::zeros((self.nrows, pair_count));
         }
-        if rayon::current_thread_index().is_some() {
-            let mut scratch = self.acquire_scratch();
-            let mut trace = 0.0;
-            for col in 0..rank {
-                trace += self.projected_trace_column(factor, col, &mut scratch.u);
+        let rows_per_chunk =
+            gamlss_projected_trace_chunk_rows(rank, self.channels.len(), pair_count)
+                .min(self.nrows.max(1));
+        let mut grams = Array2::<f64>::zeros((self.nrows, pair_count));
+        let fill_chunk = |start: usize, mut out_chunk: ndarray::ArrayViewMut2<'_, f64>| {
+            let end = (start + rows_per_chunk).min(self.nrows);
+            let rows = start..end;
+            let mut projected: Vec<Array2<f64>> = Vec::with_capacity(self.channels.len());
+            for ch in &self.channels {
+                let block_start = self.block_offsets[ch.block];
+                let width = self.block_widths[ch.block];
+                let design_chunk = ch.design.slice(s![rows.clone(), ..]);
+                let factor_block = factor.slice(s![block_start..block_start + width, ..]);
+                projected.push(fast_ab(&design_chunk, &factor_block));
             }
-            self.release_scratch(scratch);
-            trace
-        } else {
-            (0..rank)
+            for (pair_idx, pair) in self.pair_coeffs.iter().enumerate() {
+                let u_a = &projected[pair.a];
+                let u_b = &projected[pair.b];
+                for local_i in 0..u_a.nrows() {
+                    let mut value = 0.0;
+                    for col in 0..rank {
+                        value += u_a[[local_i, col]] * u_b[[local_i, col]];
+                    }
+                    out_chunk[[local_i, pair_idx]] = value;
+                }
+            }
+        };
+        if rayon::current_thread_index().is_none() && self.nrows > rows_per_chunk {
+            grams
+                .axis_chunks_iter_mut(Axis(0), rows_per_chunk)
                 .into_par_iter()
-                .map(|col| {
-                    let mut u: Vec<Array1<f64>> = self
-                        .channels
-                        .iter()
-                        .map(|_| Array1::<f64>::zeros(self.nrows))
-                        .collect();
-                    self.projected_trace_column(factor, col, &mut u)
-                })
-                .sum()
+                .enumerate()
+                .for_each(|(chunk_idx, out_chunk)| {
+                    fill_chunk(chunk_idx * rows_per_chunk, out_chunk)
+                });
+        } else {
+            for start in (0..self.nrows).step_by(rows_per_chunk) {
+                let end = (start + rows_per_chunk).min(self.nrows);
+                let out_chunk = grams.slice_mut(s![start..end, ..]);
+                fill_chunk(start, out_chunk);
+            }
         }
+        grams
+    }
+
+    fn trace_from_pair_gram_table(&self, grams: ArrayView2<'_, f64>) -> f64 {
+        debug_assert_eq!(grams.nrows(), self.nrows);
+        debug_assert_eq!(grams.ncols(), self.pair_coeffs.len());
+        let mut trace = 0.0;
+        for i in 0..self.nrows {
+            for (pair_idx, pair) in self.pair_coeffs.iter().enumerate() {
+                let multiplier = if pair.a == pair.b { 1.0 } else { 2.0 };
+                trace += multiplier * pair.coeff[i] * grams[[i, pair_idx]];
+            }
+        }
+        trace
     }
 }
 
@@ -7246,9 +7294,14 @@ impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator 
     fn trace_projected_factor_cached(
         &self,
         factor: &Array2<f64>,
-        _cache: &crate::solver::estimate::reml::unified::ProjectedFactorCache,
+        cache: &crate::solver::estimate::reml::unified::ProjectedFactorCache,
     ) -> f64 {
-        self.projected_trace(factor)
+        let key = crate::solver::estimate::reml::unified::ProjectedFactorKey::from_factor_view(
+            self.projected_pair_gram_cache_id(),
+            factor.view(),
+        );
+        let grams = cache.get_or_insert_with(key, || self.projected_pair_gram_table(factor));
+        self.trace_from_pair_gram_table(grams.view())
     }
 
     fn is_implicit(&self) -> bool {
@@ -7326,13 +7379,14 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
         // so the projected trace never needs the X^T r step that the default
         // mul_vec path computes, and the per-row coefficients fold the K
         // columns into a single weighted sum once U_a, U_b are formed.
-        self.assemble_two_block_projected_trace(factor)
+        let grams = self.projected_row_gram_triples(factor);
+        self.trace_from_row_gram_triples(grams.view())
     }
 
     fn trace_projected_factor_cached(
         &self,
         factor: &Array2<f64>,
-        _cache: &crate::solver::estimate::reml::unified::ProjectedFactorCache,
+        cache: &crate::solver::estimate::reml::unified::ProjectedFactorCache,
     ) -> f64 {
         // Validate the factor row count up front. Without this, a caller that
         // hands in a factor whose row count does not equal the joint p slips
@@ -7353,7 +7407,12 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
             self.pa,
             self.dim - self.pa,
         );
-        self.assemble_two_block_projected_trace(factor)
+        let key = crate::solver::estimate::reml::unified::ProjectedFactorKey::from_factor_view(
+            self.projected_row_gram_cache_id(),
+            factor.view(),
+        );
+        let grams = cache.get_or_insert_with(key, || self.projected_row_gram_triples(factor));
+        self.trace_from_row_gram_triples(grams.view())
     }
 
     fn is_implicit(&self) -> bool {
@@ -7362,30 +7421,98 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
 }
 
 impl DesignTwoBlockRowCoeffOperator {
-    /// Compute `trace(F^T B F)` directly from per-row contributions.
-    ///
-    /// `B = X^T C X` decomposes into two design blocks (`X_a`, `X_b`) with
-    /// per-row coefficients `(c_aa, c_ab, c_bb)`. The default
-    /// `trace_projected_factor` path forms `B F` (which requires both `X v`
-    /// and `X^T r` per column) and then takes a Frobenius inner product with
-    /// `F`. The transpose-multiply step is redundant: the column quadratic
-    /// form factors through the row-space images
-    ///   `u_a[:,k] = X_a F_a[:,k],  u_b[:,k] = X_b F_b[:,k]`
-    /// so the trace collapses to a per-row weighted sum
-    ///   trace = Σ_i (c_aa[i] · Σ_k u_a[i,k]² + 2 c_ab[i] · Σ_k u_a[i,k] u_b[i,k]
-    ///                + c_bb[i] · Σ_k u_b[i,k]²).
-    /// This costs one `X v` per design block per factor column instead of
-    /// one `X v` plus one `X^T r` per column, halving the design-matrix
-    /// flops in the projected-trace hot path.
-    fn assemble_two_block_projected_trace(&self, factor: &Array2<f64>) -> f64 {
-        debug_assert_eq!(factor.nrows(), self.dim);
-        let n = self.nrows;
-        let pa = self.pa;
-        let dim = self.dim;
-        let k = factor.ncols();
-        if n == 0 || k == 0 {
-            return 0.0;
+    fn design_cache_token(design: &DesignMatrix) -> usize {
+        match design {
+            DesignMatrix::Dense(DenseDesignMatrix::Materialized(matrix)) => {
+                Arc::as_ptr(matrix) as usize
+            }
+            DesignMatrix::Dense(DenseDesignMatrix::Lazy(op)) => {
+                Arc::as_ptr(op) as *const () as usize
+            }
+            DesignMatrix::Sparse(sparse) => sparse as *const _ as usize,
         }
+    }
+
+    fn projected_row_gram_cache_id(&self) -> usize {
+        let mut hasher = DefaultHasher::new();
+        "DesignTwoBlockRowCoeffOperator::projected_row_gram_triples".hash(&mut hasher);
+        Self::design_cache_token(&self.x_a).hash(&mut hasher);
+        Self::design_cache_token(&self.x_b).hash(&mut hasher);
+        self.nrows.hash(&mut hasher);
+        self.pa.hash(&mut hasher);
+        self.dim.hash(&mut hasher);
+        hasher.finish() as usize
+    }
+
+    fn projected_row_gram_triples(&self, factor: &Array2<f64>) -> Array2<f64> {
+        assert_eq!(
+            factor.nrows(),
+            self.dim,
+            "two-block cached projected trace factor row mismatch: factor rows={} \
+             but joint p={} (pa={}, pb={})",
+            factor.nrows(),
+            self.dim,
+            self.pa,
+            self.dim - self.pa,
+        );
+        let rank = factor.ncols();
+        let mut grams = Array2::<f64>::zeros((self.nrows, 3));
+        if self.nrows == 0 || rank == 0 {
+            return grams;
+        }
+        let rows_per_chunk = gamlss_projected_trace_chunk_rows(rank, 2, 3).min(self.nrows.max(1));
+        let f_a = factor.slice(s![0..self.pa, ..]);
+        let f_b = factor.slice(s![self.pa..self.dim, ..]);
+        let fill_chunk = |start: usize, mut out_chunk: ndarray::ArrayViewMut2<'_, f64>| {
+            let end = (start + rows_per_chunk).min(self.nrows);
+            let rows = start..end;
+            let x_a_chunk = self
+                .x_a
+                .try_row_chunk(rows.clone())
+                .expect("two-block projected trace x_a row chunk materialization failed");
+            let x_b_chunk = self
+                .x_b
+                .try_row_chunk(rows.clone())
+                .expect("two-block projected trace x_b row chunk materialization failed");
+            let u_a = fast_ab(&x_a_chunk, &f_a);
+            let u_b = fast_ab(&x_b_chunk, &f_b);
+            for local_i in 0..u_a.nrows() {
+                let mut aa = 0.0;
+                let mut ab = 0.0;
+                let mut bb = 0.0;
+                for col in 0..rank {
+                    let a = u_a[[local_i, col]];
+                    let b = u_b[[local_i, col]];
+                    aa += a * a;
+                    ab += a * b;
+                    bb += b * b;
+                }
+                out_chunk[[local_i, 0]] = aa;
+                out_chunk[[local_i, 1]] = ab;
+                out_chunk[[local_i, 2]] = bb;
+            }
+        };
+        if rayon::current_thread_index().is_none() && self.nrows > rows_per_chunk {
+            grams
+                .axis_chunks_iter_mut(Axis(0), rows_per_chunk)
+                .into_par_iter()
+                .enumerate()
+                .for_each(|(chunk_idx, out_chunk)| {
+                    fill_chunk(chunk_idx * rows_per_chunk, out_chunk)
+                });
+        } else {
+            for start in (0..self.nrows).step_by(rows_per_chunk) {
+                let end = (start + rows_per_chunk).min(self.nrows);
+                let out_chunk = grams.slice_mut(s![start..end, ..]);
+                fill_chunk(start, out_chunk);
+            }
+        }
+        grams
+    }
+
+    fn trace_from_row_gram_triples(&self, grams: ArrayView2<'_, f64>) -> f64 {
+        debug_assert_eq!(grams.nrows(), self.nrows);
+        debug_assert_eq!(grams.ncols(), 3);
         let c_aa = self
             .c_aa
             .as_slice()
@@ -7399,22 +7526,9 @@ impl DesignTwoBlockRowCoeffOperator {
             .as_slice()
             .expect("c_bb is constructed contiguous");
         let mut trace = 0.0;
-        let f_a = factor.slice(s![0..pa, ..]);
-        let f_b = factor.slice(s![pa..dim, ..]);
-        for col in 0..k {
-            let f_a_col = f_a.column(col).to_owned();
-            let f_b_col = f_b.column(col).to_owned();
-            let u_a = self.x_a.matrixvectormultiply(&f_a_col);
-            let u_b = self.x_b.matrixvectormultiply(&f_b_col);
-            debug_assert_eq!(u_a.len(), n);
-            debug_assert_eq!(u_b.len(), n);
-            let ua = u_a.as_slice().expect("u_a contiguous");
-            let ub = u_b.as_slice().expect("u_b contiguous");
-            for i in 0..n {
-                let a = ua[i];
-                let b = ub[i];
-                trace += c_aa[i] * a * a + 2.0 * c_ab[i] * a * b + c_bb[i] * b * b;
-            }
+        for i in 0..self.nrows {
+            trace +=
+                c_aa[i] * grams[[i, 0]] + 2.0 * c_ab[i] * grams[[i, 1]] + c_bb[i] * grams[[i, 2]];
         }
         trace
     }
