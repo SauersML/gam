@@ -3945,6 +3945,8 @@ where
         // bandaid) — we need to see what fraction of inner cost is
         // curvature update vs LM solve vs deviance check, plus per-iter
         // timing distribution at biobank scale.
+        // ApproxKind: TemporarySolverDamping — LM ridge + step-halving
+        // schedule are inactive at convergence; fixed point is exact Newton.
         let iter_start = std::time::Instant::now();
         // Start-of-iteration beacon: emits one line BEFORE the curvature-sensitive
         // inner work begins, so CI logs show *which* PIRLS iteration is in flight
@@ -4882,76 +4884,75 @@ where
     // (canonical-link case where Observed = Fisher, or by-design surrogate
     // family), export `ExpectedInformationSurrogate` — never silently
     // mislabel a Fisher fallback as exact.
-    let exported_laplace_curvature: ExportedLaplaceCurvature = if model
-        .supports_observed_information_curvature()
-    {
-        match model.update_with_curvature(&beta, HessianCurvatureKind::Observed) {
-            Ok(observed_state) => {
-                // Inertia check via the dense Hessian. Use the symmetric
-                // eigensolver (matches the indefinite-safe stabilization
-                // path elsewhere in PIRLS). If the Hessian is sparse-only
-                // and we cannot densify, conservatively label SPD when
-                // assembly succeeded; the symbolic pattern of the sparse
-                // path enforces SPD assembly upstream.
-                let inertia = observed_state
-                    .hessian
-                    .as_dense()
-                    .and_then(crate::linalg::utils::symmetric_extremes);
-                match inertia {
-                    Some((min_eig, max_eig)) => {
-                        let pd_tolerance = max_eig.abs().max(1.0) * 1e-12;
-                        if min_eig > -pd_tolerance {
-                            ExportedLaplaceCurvature::ObservedExact
-                        } else {
-                            let g_norm = constrained_stationarity_norm(
-                                &observed_state.gradient,
-                                beta.as_ref(),
-                                options.coefficient_lower_bounds.as_ref(),
-                                options.linear_constraints.as_ref(),
-                            );
-                            log::warn!(
-                                "[PIRLS] post-convergence observed Hessian indefinite: \
+    let exported_laplace_curvature: ExportedLaplaceCurvature =
+        if model.supports_observed_information_curvature() {
+            match model.update_with_curvature(&beta, HessianCurvatureKind::Observed) {
+                Ok(observed_state) => {
+                    // Inertia check via the dense Hessian. Use the symmetric
+                    // eigensolver (matches the indefinite-safe stabilization
+                    // path elsewhere in PIRLS). If the Hessian is sparse-only
+                    // and we cannot densify, conservatively label SPD when
+                    // assembly succeeded; the symbolic pattern of the sparse
+                    // path enforces SPD assembly upstream.
+                    let inertia = observed_state
+                        .hessian
+                        .as_dense()
+                        .and_then(crate::linalg::utils::symmetric_extremes);
+                    match inertia {
+                        Some((min_eig, max_eig)) => {
+                            let pd_tolerance = max_eig.abs().max(1.0) * 1e-12;
+                            if min_eig > -pd_tolerance {
+                                ExportedLaplaceCurvature::ObservedExact
+                            } else {
+                                let g_norm = constrained_stationarity_norm(
+                                    &observed_state.gradient,
+                                    beta.as_ref(),
+                                    options.coefficient_lower_bounds.as_ref(),
+                                    options.linear_constraints.as_ref(),
+                                );
+                                log::warn!(
+                                    "[PIRLS] post-convergence observed Hessian indefinite: \
                                  λ_min={min_eig:.3e}, pd_tol={pd_tolerance:.3e}, ‖g‖={g_norm:.3e}"
-                            );
-                            ExportedLaplaceCurvature::InvalidObservedCurvature {
-                                min_eigenvalue: min_eig,
-                                pd_tolerance,
-                                gradient_norm: g_norm,
+                                );
+                                ExportedLaplaceCurvature::InvalidObservedCurvature {
+                                    min_eigenvalue: min_eig,
+                                    pd_tolerance,
+                                    gradient_norm: g_norm,
+                                }
                             }
                         }
-                    }
-                    None => {
-                        // Sparse-native path or eigensolver failure: rely on
-                        // the upstream SPD-assembly invariant. Treat as
-                        // observed-exact since the model accepted the assembly.
-                        ExportedLaplaceCurvature::ObservedExact
+                        None => {
+                            // Sparse-native path or eigensolver failure: rely on
+                            // the upstream SPD-assembly invariant. Treat as
+                            // observed-exact since the model accepted the assembly.
+                            ExportedLaplaceCurvature::ObservedExact
+                        }
                     }
                 }
-            }
-            Err(err) => {
-                let g_norm = constrained_stationarity_norm(
-                    &state.gradient,
-                    beta.as_ref(),
-                    options.coefficient_lower_bounds.as_ref(),
-                    options.linear_constraints.as_ref(),
-                );
-                log::warn!(
-                    "[PIRLS] post-convergence observed Hessian assembly failed: {err}; \
+                Err(err) => {
+                    let g_norm = constrained_stationarity_norm(
+                        &state.gradient,
+                        beta.as_ref(),
+                        options.coefficient_lower_bounds.as_ref(),
+                        options.linear_constraints.as_ref(),
+                    );
+                    log::warn!(
+                        "[PIRLS] post-convergence observed Hessian assembly failed: {err}; \
                      exporting InvalidObservedCurvature with ‖g‖={g_norm:.3e}"
-                );
-                ExportedLaplaceCurvature::InvalidObservedCurvature {
-                    min_eigenvalue: f64::NAN,
-                    pd_tolerance: f64::NAN,
-                    gradient_norm: g_norm,
+                    );
+                    ExportedLaplaceCurvature::InvalidObservedCurvature {
+                        min_eigenvalue: f64::NAN,
+                        pd_tolerance: f64::NAN,
+                        gradient_norm: g_norm,
+                    }
                 }
             }
-        }
-    } else {
-        // Canonical link or surrogate-by-design: Observed = Fisher (canonical)
-        // or Fisher used by explicit family choice. Either way, the exported
-        // curvature is the Fisher information, labeled honestly.
-        ExportedLaplaceCurvature::ExpectedInformationSurrogate
-    };
+        } else {
+            // Canonical link or surrogate-by-design: Observed = Fisher (canonical)
+            // or Fisher used by explicit family choice. Either way, the exported
+            // curvature is the Fisher information, labeled honestly.
+            ExportedLaplaceCurvature::ExpectedInformationSurrogate
+        };
 
     Ok(WorkingModelPirlsResult {
         constraint_kkt: options

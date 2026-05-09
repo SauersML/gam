@@ -15,7 +15,7 @@
 //! stable contract the rest of the codebase keys off.
 
 use gam::types::{
-    RidgeMatrixForm, RidgePolicy, RidgePassport, StabilizationKind, StabilizationLedger,
+    RidgeMatrixForm, RidgePassport, RidgePolicy, StabilizationKind, StabilizationLedger,
     StabilizationRule,
 };
 use ndarray::Array1;
@@ -51,7 +51,9 @@ fn numerical_perturbation_excludes_every_accounting_term() {
     assert_eq!(ledger.laplace_hessian_delta(), 0.0);
     assert_eq!(ledger.penalty_logdet_delta(), 0.0);
     match ledger.kind {
-        StabilizationKind::NumericalPerturbation { backward_error_bound } => {
+        StabilizationKind::NumericalPerturbation {
+            backward_error_bound,
+        } => {
             assert_eq!(backward_error_bound, Some(1e-12));
         }
         _ => panic!("expected NumericalPerturbation"),
@@ -126,7 +128,10 @@ fn from_passport_round_trip_preserves_classification() {
         RidgePassport::scaled_identity(DELTA, RidgePolicy::explicit_stabilization_full());
     let prior_ledger = StabilizationLedger::from_passport(prior_passport);
     assert!(prior_ledger.invariants_hold());
-    assert!(matches!(prior_ledger.kind, StabilizationKind::ExplicitPrior));
+    assert!(matches!(
+        prior_ledger.kind,
+        StabilizationKind::ExplicitPrior
+    ));
     assert_eq!(prior_ledger.delta, DELTA);
 
     // A policy with every flag false: morally a numerical perturbation.

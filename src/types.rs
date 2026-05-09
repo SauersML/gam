@@ -594,6 +594,257 @@ impl RidgePassport {
         }
     }
 }
+
+// ============================================================================
+// StabilizationLedger: canonical accounting for every fixed/heuristic ridge
+// added anywhere in the solver, linear-algebra, or family code paths.
+//
+// Three semantically distinct ridge uses must NEVER be conflated:
+//   1. SolverDampingOnly      — Levenberg/trust-region damping; never enters
+//                               objective, gradient, logdet, Hessian, or any
+//                               saved/serialized model artifact.
+//   2. NumericalPerturbation  — added strictly so a linear solve is well-
+//                               posed (e.g. Cholesky of a near-singular
+//                               matrix). Carries an optional backward-error
+//                               bound. Does NOT change the objective.
+//   3. ExplicitPrior          — model-level `delta * I` (or block-diagonal)
+//                               prior. Appears in quadratic, log normalizer,
+//                               Laplace Hessian, serialization, diagnostics.
+//
+// `RidgePassport` above already encodes the inclusion-flag matrix for the
+// PIRLS Laplace ridge specifically; this ledger is the broader sibling that
+// every other call site (RidgePlanner, matrix_inverse_with_regularization,
+// LAML rho-Hessian inversion, survival stabilization, custom-family
+// `ridge_floor`) routes through, so a downstream consumer can ask
+// `ledger.included_in_quadratic()` rather than rediscovering the policy.
+// ============================================================================
+
+/// Inertia of a symmetric matrix (count of positive / zero / negative
+/// eigenvalues). Used by `bump_with_matrix` and other indefinite-aware
+/// stabilization rules to drive δ from spectral evidence rather than a
+/// condition-number heuristic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Inertia {
+    pub positive: usize,
+    pub zero: usize,
+    pub negative: usize,
+}
+
+/// Why a stabilization δ was chosen at this site.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum StabilizationRule {
+    /// δ is a hard-coded constant in the source.
+    FixedConstant,
+    /// δ chosen so the SPD floor τ is met: δ = max(0, τ - λ_min(H)).
+    InertiaTarget { spd_floor: f64 },
+    /// δ chosen via a condition-number / sqrt-ratio heuristic.
+    Heuristic,
+    /// User- or family-specified prior precision.
+    UserSpecified,
+    /// δ derived from a back-off escalation after a factorization failure.
+    BackoffEscalation { attempts: usize },
+}
+
+/// Three semantically distinct flavours a ridge δ can have.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum StabilizationKind {
+    None,
+    /// LM/TR damping. NEVER enters the objective, gradient, logdet, Hessian,
+    /// or any saved model artifact. Lives only inside the trust-region step.
+    SolverDampingOnly,
+    /// Added strictly so a linear solve succeeds. The objective/Hessian the
+    /// caller sees is unchanged; the perturbation is a property of the
+    /// solver, not the model. `backward_error_bound` is the max change to
+    /// the solution norm imputable to the perturbation, when known.
+    NumericalPerturbation {
+        backward_error_bound: Option<f64>,
+    },
+    /// Part of the model. Enters quadratic, log normalizer, Hessian,
+    /// serialization, and user-visible summaries.
+    ExplicitPrior,
+}
+
+/// Canonical record of a single stabilization δ applied at a single site.
+///
+/// Construct via the helper constructors (`solver_damping`,
+/// `numerical_perturbation`, `explicit_prior`) so the `included_in_*`
+/// invariants are guaranteed to match `kind`. Direct field construction is
+/// public for serialization round-trips only.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct StabilizationLedger {
+    pub kind: StabilizationKind,
+    pub delta: f64,
+    pub matrix_form: RidgeMatrixForm,
+    pub chosen_by: StabilizationRule,
+    pub inertia_before: Option<Inertia>,
+    pub inertia_after: Option<Inertia>,
+    /// True iff δ contributes ½ δ ‖β‖² to the objective.
+    pub included_in_quadratic: bool,
+    /// True iff δ contributes δ I to the Laplace Hessian used for
+    /// covariance / smoothing-parameter inference.
+    pub included_in_laplace_hessian: bool,
+    /// True iff δ contributes log|S + δ I| to the penalty log-determinant.
+    pub included_in_penalty_logdet: bool,
+}
+
+impl StabilizationLedger {
+    /// "No stabilization applied at this site" sentinel.
+    pub fn none() -> Self {
+        Self {
+            kind: StabilizationKind::None,
+            delta: 0.0,
+            matrix_form: RidgeMatrixForm::ScaledIdentity,
+            chosen_by: StabilizationRule::FixedConstant,
+            inertia_before: None,
+            inertia_after: None,
+            included_in_quadratic: false,
+            included_in_laplace_hessian: false,
+            included_in_penalty_logdet: false,
+        }
+    }
+
+    /// LM/TR damping. δ is invisible to the objective, gradient, and any
+    /// saved artifact. Asserting this invariant at every read site is the
+    /// whole reason the ledger exists.
+    pub fn solver_damping(delta: f64, chosen_by: StabilizationRule) -> Self {
+        Self {
+            kind: StabilizationKind::SolverDampingOnly,
+            delta,
+            matrix_form: RidgeMatrixForm::ScaledIdentity,
+            chosen_by,
+            inertia_before: None,
+            inertia_after: None,
+            included_in_quadratic: false,
+            included_in_laplace_hessian: false,
+            included_in_penalty_logdet: false,
+        }
+    }
+
+    /// Solver-only perturbation that leaves the objective unchanged. The
+    /// caller may attach a backward-error bound when one is available
+    /// (e.g. from iterative refinement / Wilkinson-style analysis).
+    pub fn numerical_perturbation(
+        delta: f64,
+        chosen_by: StabilizationRule,
+        backward_error_bound: Option<f64>,
+    ) -> Self {
+        Self {
+            kind: StabilizationKind::NumericalPerturbation {
+                backward_error_bound,
+            },
+            delta,
+            matrix_form: RidgeMatrixForm::ScaledIdentity,
+            chosen_by,
+            inertia_before: None,
+            inertia_after: None,
+            included_in_quadratic: false,
+            included_in_laplace_hessian: false,
+            included_in_penalty_logdet: false,
+        }
+    }
+
+    /// Model-level explicit prior. δ enters every accounting pass: the
+    /// quadratic penalty, the Laplace Hessian, the penalty log-determinant,
+    /// and serialization.
+    pub fn explicit_prior(delta: f64, matrix_form: RidgeMatrixForm) -> Self {
+        Self {
+            kind: StabilizationKind::ExplicitPrior,
+            delta,
+            matrix_form,
+            chosen_by: StabilizationRule::UserSpecified,
+            inertia_before: None,
+            inertia_after: None,
+            included_in_quadratic: true,
+            included_in_laplace_hessian: true,
+            included_in_penalty_logdet: true,
+        }
+    }
+
+    /// Bridge from the existing `RidgePassport` so PIRLS-side code (which
+    /// already passes a `RidgePassport` through every call) can hand a
+    /// ledger to anything that wants the new uniform view.
+    pub fn from_passport(passport: RidgePassport) -> Self {
+        let any_included = passport.policy.include_quadratic_penalty
+            || passport.policy.include_laplacehessian
+            || passport.policy.include_penalty_logdet;
+        let kind = if !any_included {
+            // A `RidgePassport` whose policy excludes every accounting term
+            // is morally a numerical perturbation: the ridge is there to
+            // make the solve work but the objective ignores it.
+            StabilizationKind::NumericalPerturbation {
+                backward_error_bound: None,
+            }
+        } else {
+            StabilizationKind::ExplicitPrior
+        };
+        Self {
+            kind,
+            delta: passport.delta,
+            matrix_form: passport.matrix_form,
+            chosen_by: StabilizationRule::FixedConstant,
+            inertia_before: None,
+            inertia_after: None,
+            included_in_quadratic: passport.policy.include_quadratic_penalty,
+            included_in_laplace_hessian: passport.policy.include_laplacehessian,
+            included_in_penalty_logdet: passport.policy.include_penalty_logdet,
+        }
+    }
+
+    /// δ value to fold into the quadratic penalty term, or 0.0 if this
+    /// ledger entry is not part of the model.
+    #[inline]
+    pub fn quadratic_delta(&self) -> f64 {
+        if self.included_in_quadratic {
+            self.delta
+        } else {
+            0.0
+        }
+    }
+
+    /// δ value to add to the Laplace Hessian, or 0.0 if not included.
+    #[inline]
+    pub fn laplace_hessian_delta(&self) -> f64 {
+        if self.included_in_laplace_hessian {
+            self.delta
+        } else {
+            0.0
+        }
+    }
+
+    /// δ value to add inside log|S + δ I|, or 0.0 if not included.
+    #[inline]
+    pub fn penalty_logdet_delta(&self) -> f64 {
+        if self.included_in_penalty_logdet {
+            self.delta
+        } else {
+            0.0
+        }
+    }
+
+    /// Invariant check: kind must be consistent with the inclusion flags.
+    /// Used by the ledger-invariants test in `tests/ridge_ledger_invariants.rs`.
+    pub fn invariants_hold(&self) -> bool {
+        match self.kind {
+            StabilizationKind::None => {
+                self.delta == 0.0
+                    && !self.included_in_quadratic
+                    && !self.included_in_laplace_hessian
+                    && !self.included_in_penalty_logdet
+            }
+            StabilizationKind::SolverDampingOnly
+            | StabilizationKind::NumericalPerturbation { .. } => {
+                !self.included_in_quadratic
+                    && !self.included_in_laplace_hessian
+                    && !self.included_in_penalty_logdet
+            }
+            StabilizationKind::ExplicitPrior => {
+                self.included_in_quadratic
+                    && self.included_in_laplace_hessian
+                    && self.included_in_penalty_logdet
+            }
+        }
+    }
+}
 #[repr(transparent)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Coefficients(pub Array1<f64>);
