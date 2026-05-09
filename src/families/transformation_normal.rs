@@ -2344,6 +2344,265 @@ impl TransformationNormalFamily {
         Ok(out)
     }
 
+    fn scop_projected_response_gram_table(
+        &self,
+        factor: ArrayView2<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        let n = self.response_val_basis.nrows();
+        let p_resp = self.response_val_basis.ncols();
+        let p_cov = self.covariate_design.ncols();
+        let p_total = p_resp * p_cov;
+        let rank = factor.ncols();
+        if factor.nrows() != p_total {
+            return Err(format!(
+                "SCOP projected response Gram factor row mismatch: factor_rows={}, expected={p_total}",
+                factor.nrows()
+            ));
+        }
+        let cov = self.covariate_dense_arc().map_err(|e| {
+            format!("SCOP projected response Gram requires cached covariate design: {e}")
+        })?;
+        let stride = p_resp * p_resp;
+        let mut grams = vec![0.0_f64; n * stride];
+
+        let fill_row = |i: usize, row_out: &mut [f64], projected: &mut [f64]| {
+            let cov_row = cov.row(i);
+            projected.fill(0.0);
+            for k in 0..p_resp {
+                let factor_row_base = k * p_cov;
+                let projected_base = k * rank;
+                for c in 0..p_cov {
+                    let x_ic = cov_row[c];
+                    if x_ic == 0.0 {
+                        continue;
+                    }
+                    let factor_row = factor_row_base + c;
+                    for col in 0..rank {
+                        projected[projected_base + col] += x_ic * factor[[factor_row, col]];
+                    }
+                }
+            }
+            for k in 0..p_resp {
+                let k_base = k * rank;
+                for l in 0..p_resp {
+                    let l_base = l * rank;
+                    let mut value = 0.0;
+                    for col in 0..rank {
+                        value += projected[k_base + col] * projected[l_base + col];
+                    }
+                    row_out[k * p_resp + l] = value;
+                }
+            }
+        };
+
+        if rayon::current_thread_index().is_some() {
+            let mut projected = vec![0.0_f64; p_resp * rank];
+            for (i, row_out) in grams.chunks_mut(stride).enumerate() {
+                fill_row(i, row_out, &mut projected);
+            }
+        } else {
+            use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+            use rayon::slice::ParallelSliceMut;
+            grams.par_chunks_mut(stride).enumerate().for_each_init(
+                || vec![0.0_f64; p_resp * rank],
+                |projected, (i, row_out)| fill_row(i, row_out, projected),
+            );
+        }
+
+        Array2::from_shape_vec((n, stride), grams)
+            .map_err(|e| format!("SCOP projected response Gram table shape failed: {e}"))
+    }
+
+    fn scop_hessian_directional_trace_from_response_grams(
+        &self,
+        beta: &Array1<f64>,
+        direction: &Array1<f64>,
+        row_quantities: &TransformationNormalRowQuantityCache,
+        row_grams: ArrayView2<'_, f64>,
+    ) -> Result<f64, String> {
+        let n = self.response_val_basis.nrows();
+        let p_resp = self.response_val_basis.ncols();
+        let p_cov = self.covariate_design.ncols();
+        let p_total = p_resp * p_cov;
+        if beta.len() != p_total || direction.len() != p_total {
+            return Err(format!(
+                "SCOP dH projected trace length mismatch: beta={}, direction={}, expected={p_total}",
+                beta.len(),
+                direction.len()
+            ));
+        }
+        if row_grams.nrows() != n || row_grams.ncols() != p_resp * p_resp {
+            return Err(format!(
+                "SCOP dH projected trace Gram shape {}x{} != expected {}x{}",
+                row_grams.nrows(),
+                row_grams.ncols(),
+                n,
+                p_resp * p_resp
+            ));
+        }
+        if !row_quantities.matches_beta(beta) {
+            return Err(
+                "SCOP dH projected trace received row quantities for a different beta".to_string(),
+            );
+        }
+        let dir_mat = direction
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP dH projected trace direction reshape failed: {e}"))?;
+        let cov = self.covariate_dense_arc().map_err(|e| {
+            format!("SCOP dH projected trace requires cached covariate design: {e}")
+        })?;
+        let weights = self.weights.as_ref();
+        let h_prime = row_quantities.h_prime.as_ref();
+        let row_gamma = row_quantities.gamma.as_ref();
+
+        struct DhTraceScratch {
+            gamma: Vec<f64>,
+            gamma_dir: Vec<f64>,
+            h_factor: Vec<f64>,
+            hp_factor: Vec<f64>,
+            h_factor_dir: Vec<f64>,
+            hp_factor_dir: Vec<f64>,
+            endpoint_factor: [Vec<f64>; 2],
+            endpoint_factor_dir: [Vec<f64>; 2],
+        }
+
+        impl DhTraceScratch {
+            fn new(p_resp: usize) -> Self {
+                Self {
+                    gamma: vec![0.0; p_resp],
+                    gamma_dir: vec![0.0; p_resp],
+                    h_factor: vec![0.0; p_resp],
+                    hp_factor: vec![0.0; p_resp],
+                    h_factor_dir: vec![0.0; p_resp],
+                    hp_factor_dir: vec![0.0; p_resp],
+                    endpoint_factor: [vec![0.0; p_resp], vec![0.0; p_resp]],
+                    endpoint_factor_dir: [vec![0.0; p_resp], vec![0.0; p_resp]],
+                }
+            }
+        }
+
+        let row_trace = |i: usize, scratch: &mut DhTraceScratch| {
+            let cov_row = cov.row(i);
+            let rv = self.response_val_basis.row(i);
+            let rd = self.response_deriv_basis.row(i);
+            let wi = weights[i];
+            let hp = h_prime[i];
+            let inv_hp = 1.0 / hp;
+            let inv_hp_sq = inv_hp * inv_hp;
+            let inv_hp_cu = inv_hp_sq * inv_hp;
+            let gamma_row = row_gamma.row(i);
+            for k in 0..p_resp {
+                scratch.gamma[k] = gamma_row[k];
+                scratch.gamma_dir[k] = dir_mat.row(k).dot(&cov_row);
+            }
+
+            let mut h_dir = rv[0] * scratch.gamma_dir[0];
+            let mut hp_dir = rd[0] * scratch.gamma_dir[0];
+            let mut endpoint_dir = [
+                self.response_upper_basis[0] * scratch.gamma_dir[0],
+                self.response_lower_basis[0] * scratch.gamma_dir[0],
+            ];
+            for k in 1..p_resp {
+                h_dir += 2.0 * rv[k] * scratch.gamma[k] * scratch.gamma_dir[k];
+                hp_dir += 2.0 * rd[k] * scratch.gamma[k] * scratch.gamma_dir[k];
+                endpoint_dir[0] +=
+                    2.0 * self.response_upper_basis[k] * scratch.gamma[k] * scratch.gamma_dir[k];
+                endpoint_dir[1] +=
+                    2.0 * self.response_lower_basis[k] * scratch.gamma[k] * scratch.gamma_dir[k];
+            }
+            let q = row_quantities.endpoint_q[i];
+
+            scratch.h_factor[0] = rv[0];
+            scratch.hp_factor[0] = rd[0];
+            scratch.h_factor_dir[0] = 0.0;
+            scratch.hp_factor_dir[0] = 0.0;
+            scratch.endpoint_factor[0][0] = self.response_upper_basis[0];
+            scratch.endpoint_factor[1][0] = self.response_lower_basis[0];
+            scratch.endpoint_factor_dir[0][0] = 0.0;
+            scratch.endpoint_factor_dir[1][0] = 0.0;
+            for k in 1..p_resp {
+                scratch.h_factor[k] = 2.0 * rv[k] * scratch.gamma[k];
+                scratch.hp_factor[k] = 2.0 * rd[k] * scratch.gamma[k];
+                scratch.h_factor_dir[k] = 2.0 * rv[k] * scratch.gamma_dir[k];
+                scratch.hp_factor_dir[k] = 2.0 * rd[k] * scratch.gamma_dir[k];
+                scratch.endpoint_factor[0][k] =
+                    2.0 * self.response_upper_basis[k] * scratch.gamma[k];
+                scratch.endpoint_factor[1][k] =
+                    2.0 * self.response_lower_basis[k] * scratch.gamma[k];
+                scratch.endpoint_factor_dir[0][k] =
+                    2.0 * self.response_upper_basis[k] * scratch.gamma_dir[k];
+                scratch.endpoint_factor_dir[1][k] =
+                    2.0 * self.response_lower_basis[k] * scratch.gamma_dir[k];
+            }
+
+            let gram_row = row_grams.row(i);
+            let mut total = 0.0;
+            for k in 0..p_resp {
+                for l in 0..p_resp {
+                    let same_shape = k == l && k > 0;
+                    let mut normalizer_block = 0.0;
+                    for a in 0..2 {
+                        let endpoint_second = if same_shape {
+                            2.0 * if a == 0 {
+                                self.response_upper_basis[k]
+                            } else {
+                                self.response_lower_basis[k]
+                            }
+                        } else {
+                            0.0
+                        };
+                        for b in 0..2 {
+                            normalizer_block += q.second[a][b] * endpoint_dir[b] * endpoint_second;
+                            normalizer_block += q.second[a][b]
+                                * (scratch.endpoint_factor_dir[a][k]
+                                    * scratch.endpoint_factor[b][l]
+                                    + scratch.endpoint_factor[a][k]
+                                        * scratch.endpoint_factor_dir[b][l]);
+                            for c_ep in 0..2 {
+                                normalizer_block += q.third[a][b][c_ep]
+                                    * endpoint_dir[c_ep]
+                                    * scratch.endpoint_factor[a][k]
+                                    * scratch.endpoint_factor[b][l];
+                            }
+                        }
+                    }
+                    let second_h = if same_shape { 2.0 * rv[k] } else { 0.0 };
+                    let second_hp = if same_shape { 2.0 * rd[k] } else { 0.0 };
+                    let q_kl = scratch.h_factor_dir[k] * scratch.h_factor[l]
+                        + scratch.h_factor[k] * scratch.h_factor_dir[l]
+                        + h_dir * second_h
+                        + (scratch.hp_factor_dir[k] * scratch.hp_factor[l]
+                            + scratch.hp_factor[k] * scratch.hp_factor_dir[l])
+                            * inv_hp_sq
+                        - 2.0 * scratch.hp_factor[k] * scratch.hp_factor[l] * hp_dir * inv_hp_cu
+                        + second_hp * hp_dir * inv_hp_sq
+                        + normalizer_block;
+                    total += q_kl * gram_row[k * p_resp + l];
+                }
+            }
+            wi * total
+        };
+
+        if rayon::current_thread_index().is_some() {
+            let mut scratch = DhTraceScratch::new(p_resp);
+            Ok((0..n).map(|i| row_trace(i, &mut scratch)).sum())
+        } else {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            Ok((0..n)
+                .into_par_iter()
+                .fold(
+                    || (DhTraceScratch::new(p_resp), 0.0),
+                    |(mut scratch, mut sum), i| {
+                        sum += row_trace(i, &mut scratch);
+                        (scratch, sum)
+                    },
+                )
+                .map(|(_, sum)| sum)
+                .sum())
+        }
+    }
+
     fn scop_hessian_second_directional_matvec(
         &self,
         beta: &Array1<f64>,
@@ -7875,6 +8134,13 @@ impl TransformationNormalDhMatrixFreeOperator {
             .scop_hessian_directional_matvec(&self.beta, &self.direction, &self.row_quantities, v)
             .expect("validated CTN dH operator inputs should not fail")
     }
+
+    fn projected_gram_cache_id(&self) -> usize {
+        let family_ptr = Arc::as_ptr(&self.family) as usize;
+        let design_dims = self.family.covariate_design.nrows()
+            ^ self.family.covariate_design.ncols().rotate_left(11);
+        family_ptr ^ design_dims.rotate_left(23)
+    }
 }
 
 impl HyperOperator for TransformationNormalDhMatrixFreeOperator {
@@ -7897,6 +8163,45 @@ impl HyperOperator for TransformationNormalDhMatrixFreeOperator {
                 factor,
             )
             .expect("validated CTN dH batched operator inputs should not fail")
+    }
+
+    fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
+        debug_assert_eq!(factor.nrows(), self.p_total());
+        let row_grams = self
+            .family
+            .scop_projected_response_gram_table(factor.view())
+            .expect("validated CTN dH projected Gram inputs should not fail");
+        self.family
+            .scop_hessian_directional_trace_from_response_grams(
+                &self.beta,
+                &self.direction,
+                &self.row_quantities,
+                row_grams.view(),
+            )
+            .expect("validated CTN dH projected trace inputs should not fail")
+    }
+
+    fn trace_projected_factor_cached(
+        &self,
+        factor: &Array2<f64>,
+        cache: &ProjectedFactorCache,
+    ) -> f64 {
+        debug_assert_eq!(factor.nrows(), self.p_total());
+        let key =
+            ProjectedFactorKey::from_factor_view(self.projected_gram_cache_id(), factor.view());
+        let row_grams = cache.get_or_insert_with(key, || {
+            self.family
+                .scop_projected_response_gram_table(factor.view())
+                .expect("validated CTN dH cached projected Gram inputs should not fail")
+        });
+        self.family
+            .scop_hessian_directional_trace_from_response_grams(
+                &self.beta,
+                &self.direction,
+                &self.row_quantities,
+                row_grams.view(),
+            )
+            .expect("validated CTN dH cached projected trace inputs should not fail")
     }
 
     fn to_dense(&self) -> Array2<f64> {
@@ -13012,6 +13317,47 @@ mod tests {
                 );
             }
         }
+        let want_trace = probe_mat
+            .iter()
+            .zip(want_mat.iter())
+            .map(|(&f, &bf)| f * bf)
+            .sum::<f64>();
+        let got_trace = dh_op.trace_projected_factor(&probe_mat);
+        let trace_tol = 1e-12 * want_trace.abs().max(1.0) + 1e-12;
+        assert!(
+            (want_trace - got_trace).abs() <= trace_tol,
+            "dH op projected trace mismatch: dense={want_trace:.6e}, op={got_trace:.6e}"
+        );
+        let cache = ProjectedFactorCache::default();
+        let cached_trace = dh_op.trace_projected_factor_cached(&probe_mat, &cache);
+        assert!(
+            (want_trace - cached_trace).abs() <= trace_tol,
+            "dH op cached projected trace mismatch: dense={want_trace:.6e}, op={cached_trace:.6e}"
+        );
+        let d_beta_2 = toy_probe_vector(p, 205);
+        let dense_dh_2 = family
+            .exact_newton_joint_hessian_directional_derivative(
+                std::slice::from_ref(&state),
+                &d_beta_2,
+            )
+            .expect("second dense dH build")
+            .expect("second dense dH present");
+        let dh_op_2 = workspace
+            .directional_derivative_operator(&d_beta_2)
+            .expect("second dH operator call")
+            .expect("second dH operator present");
+        let want_mat_2 = dense_dh_2.dot(&probe_mat);
+        let want_trace_2 = probe_mat
+            .iter()
+            .zip(want_mat_2.iter())
+            .map(|(&f, &bf)| f * bf)
+            .sum::<f64>();
+        let cached_trace_2 = dh_op_2.trace_projected_factor_cached(&probe_mat, &cache);
+        let trace_tol_2 = 1e-12 * want_trace_2.abs().max(1.0) + 1e-12;
+        assert!(
+            (want_trace_2 - cached_trace_2).abs() <= trace_tol_2,
+            "second dH op cached projected trace mismatch: dense={want_trace_2:.6e}, op={cached_trace_2:.6e}"
+        );
         for (k, w) in probes.iter().enumerate() {
             assert_eq!(w.len(), p);
             let want = dense_dh.dot(w);
