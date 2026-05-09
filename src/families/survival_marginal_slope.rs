@@ -2953,15 +2953,8 @@ impl SurvivalMarginalSlopeFamily {
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let row_weights = outer_row_weights_by_index(options, self.n);
         // Bit-deterministic reduction: see `chunked_row_reduction`.
-        let (
-            mut objective_psi,
-            mut score_t,
-            mut score_m,
-            mut score_g,
-            mut score_h,
-            mut score_w,
-            mut acc,
-        ) = chunked_row_reduction(
+        let (objective_psi, score_t, score_m, score_g, score_h, score_w, acc) =
+            chunked_row_reduction(
             row_iter.as_slice(),
             || {
                 (
@@ -3057,15 +3050,8 @@ impl SurvivalMarginalSlopeFamily {
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let row_weights = outer_row_weights_by_index(options, self.n);
         // Bit-deterministic reduction: see `chunked_row_reduction`.
-        let (
-            mut objective_psi_psi,
-            mut score_t,
-            mut score_m,
-            mut score_g,
-            mut score_h,
-            mut score_w,
-            mut acc,
-        ) = chunked_row_reduction(
+        let (objective_psi_psi, score_t, score_m, score_g, score_h, score_w, acc) =
+            chunked_row_reduction(
             row_iter.as_slice(),
             || {
                 (
