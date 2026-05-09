@@ -8835,8 +8835,7 @@ impl BernoulliMarginalSlopeFamily {
             {
                 return Err(format!(
                     "bernoulli marginal-slope line-search rejected early: partial_nll={} threshold={}",
-                    -log_likelihood,
-                    threshold
+                    -log_likelihood, threshold
                 ));
             }
         }
