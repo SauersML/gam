@@ -895,7 +895,16 @@ impl DenseDesignMatrix {
     }
 
     pub fn try_to_dense_arc(&self, context: &str) -> Result<Arc<Array2<f64>>, String> {
-        self.try_to_dense_arc_with_policy(context, &ResourcePolicy::default_library())
+        // Auto-strict from operator shape: at biobank n (or biobank p) we refuse
+        // any silent dense fallback even when no caller-supplied policy is at
+        // hand, mirroring the policy `for_problem` would have selected. Small
+        // operators still get the permissive default so non-operator bases work.
+        let policy = ResourcePolicy::for_problem(
+            self.nrows(),
+            self.ncols(),
+            crate::resource::ProblemHints::default(),
+        );
+        self.try_to_dense_arc_with_policy(context, &policy)
     }
 
     /// Policy-aware variant of [`Self::try_to_dense_arc`].
