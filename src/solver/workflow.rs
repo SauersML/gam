@@ -1123,21 +1123,10 @@ fn fit_survival_location_scale_model(
 fn fit_bernoulli_marginal_slope_model(
     request: BernoulliMarginalSlopeFitRequest<'_>,
 ) -> Result<BernoulliMarginalSlopeFitResult, String> {
-    // Phase 4: at biobank scale, auto-install a stratified outer-score
-    // subsample so outer-only score / Hessian sweeps run on ~K rows instead
-    // of ~n. Inner-PIRLS and final-covariance passes still use full data
-    // because they don't consult `outer_score_subsample`. The helper is a
-    // no-op below the biobank threshold or when a subsample is already set.
-    let mut options = request.options.clone();
-    crate::families::marginal_slope_shared::inject_biobank_outer_subsample_from_arrays(
-        &mut options,
-        request.spec.z.as_slice().expect("z is contiguous"),
-        request.spec.y.as_slice().expect("y is contiguous"),
-    );
     fit_bernoulli_marginal_slope_terms(
         request.data,
         request.spec,
-        &options,
+        &request.options,
         &request.kappa_options,
         &request.policy,
     )
@@ -1146,20 +1135,12 @@ fn fit_bernoulli_marginal_slope_model(
 fn fit_survival_marginal_slope_model(
     request: SurvivalMarginalSlopeFitRequest<'_>,
 ) -> Result<SurvivalMarginalSlopeFitResult, String> {
-    // Phase 4: see `fit_bernoulli_marginal_slope_model` above. Survival
-    // stratifies on the event indicator (`event_target`), which is the
-    // canonical {0,1} secondary class for right-censored survival.
-    let mut options = request.options.clone();
-    crate::families::marginal_slope_shared::inject_biobank_outer_subsample_from_arrays(
-        &mut options,
-        request.spec.z.as_slice().expect("z is contiguous"),
-        request
-            .spec
-            .event_target
-            .as_slice()
-            .expect("event_target is contiguous"),
-    );
-    fit_survival_marginal_slope_terms(request.data, request.spec, &options, &request.kappa_options)
+    fit_survival_marginal_slope_terms(
+        request.data,
+        request.spec,
+        &request.options,
+        &request.kappa_options,
+    )
 }
 
 fn fit_latent_survival_model(
@@ -1373,13 +1354,36 @@ impl Default for FitConfig {
 }
 
 /// Resolve the [`crate::resource::ResourcePolicy`] backing term construction
-/// for a given [`FitConfig`].  Returns the configured override when present,
-/// otherwise the default-library policy.
-fn resolved_resource_policy(config: &FitConfig) -> crate::resource::ResourcePolicy {
-    config
-        .resource_policy
-        .clone()
-        .unwrap_or_else(crate::resource::ResourcePolicy::default_library)
+/// for a given [`FitConfig`] + dataset.
+///
+/// If the caller hasn't supplied an explicit policy override, derive one from
+/// the shape of the problem via
+/// [`crate::resource::ResourcePolicy::for_problem`]. At biobank scale (n_rows
+/// >= 100k or the marginal-slope biobank path active) this returns
+/// `analytic_operator_required` so that any silent dense materialization in
+/// the term-construction layer fails fast rather than allocating tens of GiB;
+/// at small scale it falls through to the permissive default-library policy
+/// so that non-operator bases still build cleanly.
+///
+/// `p_estimate = 0` because the per-block coefficient count isn't known until
+/// the spec has been built; the n_rows and hints triggers are sufficient to
+/// flip strict mode for every shape that needs it.
+fn resolved_resource_policy(
+    config: &FitConfig,
+    data: &Dataset,
+    hints: crate::resource::ProblemHints,
+) -> crate::resource::ResourcePolicy {
+    if let Some(p) = config.resource_policy.clone() {
+        return p;
+    }
+    crate::resource::ResourcePolicy::for_problem(data.values.nrows(), 0, hints)
+}
+
+fn marginal_slope_hints(config: &FitConfig) -> crate::resource::ProblemHints {
+    crate::resource::ProblemHints {
+        marginal_slope_biobank_active: config.logslope_formula.is_some()
+            || config.z_column.is_some(),
+    }
 }
 
 /// The result of materializing a formula + config against a dataset.
@@ -1740,7 +1744,7 @@ fn materialize_standard<'a>(
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
 
-    let policy = resolved_resource_policy(config);
+    let policy = resolved_resource_policy(config, data, crate::resource::ProblemHints::default());
     let spec = build_termspec_with_geometry(
         &parsed.terms,
         data,
@@ -1900,7 +1904,15 @@ fn materialize_bernoulli_marginal_slope<'a>(
     )?;
 
     let mut inference_notes = Vec::new();
-    let policy = resolved_resource_policy(config);
+    // Bernoulli marginal-slope: structurally operator-only at biobank scale, so
+    // flip the hint regardless of n to keep dense fallbacks blocked.
+    let policy = resolved_resource_policy(
+        config,
+        data,
+        crate::resource::ProblemHints {
+            marginal_slope_biobank_active: true,
+        },
+    );
     let aliased_col_map = column_map_with_alias(col_map, "z", z_column);
     let marginalspec = build_termspec_with_geometry(
         &parsed.terms,
@@ -2088,7 +2100,17 @@ fn materialize_survival<'a>(
         );
     }
 
-    let policy = resolved_resource_policy(config);
+    let policy = resolved_resource_policy(
+        config,
+        data,
+        crate::resource::ProblemHints {
+            // Survival marginal-slope shares the operator-only invariant with
+            // the Bernoulli path; flag it as such so strict mode is selected
+            // even at small n.
+            marginal_slope_biobank_active: survival_mode
+                == SurvivalLikelihoodMode::MarginalSlope,
+        },
+    );
     let marginal_slope_aliased_col_map = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
         Some(column_map_with_alias(
             col_map,
@@ -2724,7 +2746,7 @@ fn materialize_transformation_normal<'a>(
     let y = data.values.column(y_col).to_owned();
     let mut inference_notes = Vec::new();
 
-    let policy = resolved_resource_policy(config);
+    let policy = resolved_resource_policy(config, data, marginal_slope_hints(config));
     let mut covariate_spec =
         build_termspec(&parsed.terms, data, col_map, &mut inference_notes, &policy)?;
     if config.scale_dimensions {
@@ -2772,7 +2794,7 @@ fn materialize_location_scale<'a>(
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
 
-    let policy = resolved_resource_policy(config);
+    let policy = resolved_resource_policy(config, data, crate::resource::ProblemHints::default());
     let mut meanspec = build_termspec(&parsed.terms, data, col_map, &mut inference_notes, &policy)?;
     let mut log_sigmaspec = build_termspec(
         &noise_parsed.terms,
