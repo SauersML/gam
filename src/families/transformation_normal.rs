@@ -7471,37 +7471,10 @@ impl CustomFamily for TransformationNormalFamily {
     }
 
     fn coefficient_gradient_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
-        // Honest CTN per-gradient cost. The default
-        // (`coefficient_hessian_cost / 2`) only counts the inner Newton solve
-        // and undercounts each outer evaluation, because CTN also runs a
-        // numerical-underflow guard over the derivative grid via
-        // `KronDesign::min_step_to_boundary` on every gradient/cost step.
-        // That pass walks the n_cov × n_grid virtual row space, forming
-        // chunk-local `c · Rᵀ` and `d · Rᵀ` factors, with cost
-        // `2 · n · n_grid · p_resp + 2 · n · p_resp · p_cov`. At biobank
-        // scale (n=320 000, n_grid=293, p_resp=32, p_cov=23) that is
-        // ≈ 6.5·10⁹ multiply-adds per pass — orders of magnitude above
-        // the matrix-free `Hv` cost — so leaving it out of the gradient
-        // cost reports a per-eval budget tens of times smaller than
-        // reality, and `cost_gated_first_order_max_iter` lets the BFGS
-        // loop request far more outer iterations than the global FLOP
-        // budget can pay for. That is the proximate cause of the
-        // `rust_margslope_aniso_duchon16d_linkwiggle_scorewarp_fast`
-        // and survival-marginal-slope timeouts: the CTN baseline
-        // custom-family fit runs to its full requested `outer_max_iter`
-        // because the gate never fires.
-        let inner = self.coefficient_hessian_cost(specs) / 2;
-        let n = self.response_val_basis.nrows() as u64;
-        let p_resp = self.response_val_basis.ncols() as u64;
-        let p_cov = self.covariate_design.ncols() as u64;
-        let n_grid = match &self.x_deriv_grid_kron {
-            KroneckerDesign::Kronecker { response_grid, .. } => response_grid.nrows() as u64,
-            KroneckerDesign::KhatriRao { .. } => 0,
-        };
-        let monotonicity_pass = n
-            .saturating_mul(2u64.saturating_mul(n_grid).saturating_mul(p_resp))
-            .saturating_add(n.saturating_mul(2u64.saturating_mul(p_resp).saturating_mul(p_cov)));
-        inner.saturating_add(monotonicity_pass)
+        // One row-quantity pass plus two transpose products. The SCOP derivative
+        // is structurally positive, so coefficient line searches no longer run a
+        // full derivative-grid fraction-to-boundary scan on every attempt.
+        self.coefficient_hessian_cost(specs) / 2
     }
 
     fn outer_seed_config(&self, n_params: usize) -> crate::seeding::SeedConfig {
@@ -7524,62 +7497,32 @@ impl CustomFamily for TransformationNormalFamily {
         if block_index != 0 {
             return Ok(None);
         }
-        let beta = &block_states[0].beta;
-        let scan_start = std::time::Instant::now();
-
-        // Numerical-underflow guard for the learned, beta-dependent part of
-        // the SCOP derivative. The actual derivative is
-        //
-        //   h'(y, x) = ε + q(y, x; β),    q = Σ M_r(y) γ_r(x)^2.
-        //
-        // Since ε is integrated directly into h and h', q=0 is a perfectly
-        // smooth interior point of the likelihood; treating q=ε as a hard
-        // line-search boundary makes the inner mode a constrained/KKT point
-        // while the exact outer REML Hessian assumes an unconstrained smooth
-        // mode. That mismatch is what produced enormous ARC model decreases
-        // and dozens of trust-region rejections on small CTN demos. The scan
-        // therefore only rejects catastrophic numerical drift below −ε, where
-        // even the structural floor could be cancelled.
-        //
-        // Each design owns its own streaming reduction over its virtual rows
-        // (KhatriRao: n observations; Kronecker: n_cov × n_grid pairs without
-        // materializing the dense forward image). Both return the smallest
-        // binding step ratio, or +∞ if no row binds. Composing via `f64::min`
-        // is associative for non-NaN inputs, so the final α_max is
-        // bit-equivalent to a single scan over the union of binding rows.
-        //
-        // Observation-row reduction stays on the un-cached path because the
-        // KhatriRao variant streams over `n` observation rows directly via
-        // `forward_mul`; there is no factored projection to reuse there.
-        let alpha_obs = self.x_deriv_kron.scop_affine_squared_min_step_to_boundary(
-            beta,
-            delta,
-            -TRANSFORMATION_MONOTONICITY_EPS,
-            1e-14,
-        );
-        let alpha_grid = self
-            .x_deriv_grid_kron
-            .scop_affine_squared_min_step_to_boundary(
-                beta,
-                delta,
-                -TRANSFORMATION_MONOTONICITY_EPS,
-                1e-14,
-            );
-        let alpha_max = 1.0_f64.min(alpha_obs).min(alpha_grid);
-        log::info!(
-            "[STAGE] CTN monotonicity grid scan alpha_obs={:.3e} alpha_grid={:.3e} elapsed={:.3}s",
-            alpha_obs,
-            alpha_grid,
-            scan_start.elapsed().as_secs_f64(),
-        );
-
-        let tau = 0.995;
-        let alpha_safe = tau * alpha_max;
-        if alpha_safe < 1.0 {
-            Ok(Some(alpha_safe))
-        } else {
-            Ok(None)
+        if block_states.len() != 1 {
+            return Err(format!(
+                "TransformationNormalFamily expects 1 block, got {}",
+                block_states.len()
+            ));
         }
+        if delta.len() != block_states[0].beta.len() {
+            return Err(format!(
+                "CTN line-search step length {} != beta length {}",
+                delta.len(),
+                block_states[0].beta.len()
+            ));
+        }
+        // SCOP encodes monotonicity as
+        //   h'(y, x) = epsilon + sum_k M_k(y) * gamma_k(x)^2.
+        // With nonnegative M-spline derivative basis rows, every finite beta is
+        // interior-feasible. A derivative-grid fraction-to-boundary scan is pure
+        // overhead and was the dominant CTN biobank-scale line-search cost.
+        Ok(None)
+    }
+
+    fn joint_newton_max_step_inf(&self, _specs: &[ParameterBlockSpec]) -> f64 {
+        // CTN's SCOP coefficients can legitimately travel far along shape-scale
+        // directions; the generic 20.0 cap throttles those accepted steps for
+        // dozens of exact-objective trust-region cycles at biobank scale.
+        100.0
     }
 
     fn block_linear_constraints(
@@ -15558,10 +15501,10 @@ pub fn fit_transformation_normal(
     let (_, cap_hessian) = custom_family_outer_derivatives(&probe_family, &probe_blocks, &options);
     let analytic_gradient = analytic_psi_available;
     let analytic_hessian_supported = analytic_gradient && cap_hessian.is_analytic();
-    let analytic_hessian = false;
+    let analytic_hessian = analytic_hessian_supported;
     if analytic_hessian_supported {
         log::info!(
-            "[transformation-normal] CTN exact joint analytic outer Hessian is available but disabled for spatial kappa optimization; using analytic-gradient outer solves to avoid callback logdet trace work"
+            "[transformation-normal] CTN exact joint analytic outer Hessian enabled for spatial kappa optimization"
         );
     }
 
@@ -15712,8 +15655,8 @@ pub fn fit_transformation_normal(
         analytic_hessian,
         // Transformation-normal has β-dependent H (through 1/h'²), so the
         // EFS Wood-Fasiolo PSD invariant fails. Keep fixed-point disabled,
-        // but do not expose CTN's analytic Hessian to ARC: its callback
-        // trace route applies full-rank logdet operators at biobank shape.
+        // while still exposing CTN's exact analytic Hessian to the outer trust
+        // solver when the matrix-free callback path is available.
         true,
         // fit_fn
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {

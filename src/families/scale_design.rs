@@ -415,39 +415,69 @@ fn build_weighted_primary_design(
     Ok(wx)
 }
 
-fn scale_projection_rank_tolerance(leading_diag: f64, major_dim: usize) -> f64 {
-    let leading_diag = leading_diag.max(1.0);
-    let generic =
-        default_rrqr_rank_alpha() * f64::EPSILON * (major_dim.max(1) as f64) * leading_diag;
-    let replay_safe = SCALE_PROJECTION_REPLAY_RCOND_FLOOR * leading_diag;
-    generic.max(replay_safe)
+/// Pick the Tikhonov regularization parameter alpha for the replay solve.
+///
+/// Filter factors `f_k = sigma_k / (sigma_k^2 + alpha)` are bounded above by
+/// `1 / (2 * sqrt(alpha))` (achieved at sigma_k = sqrt(alpha)).  We want the
+/// worst-case prediction-row leverage amplification — a unit-norm new row
+/// transformed by the saved coefficients — to be at most
+/// `SCALE_PROJECTION_LEVERAGE_AMPLIFICATION` times what a sigma_max-scale
+/// direction sees in the un-regularized solve.  Solving for alpha gives the
+/// dimensionless tolerance below; we add an absolute floor so even a pristine
+/// design retains a sub-epsilon ridge that prevents catastrophic cancellation.
+fn choose_scale_projection_ridge_alpha(singular: &[f64]) -> f64 {
+    if singular.is_empty() {
+        return 0.0;
+    }
+    let sigma_max = singular.iter().copied().fold(0.0_f64, f64::max);
+    if !sigma_max.is_finite() || sigma_max <= 0.0 {
+        return 0.0;
+    }
+    let derived_tol = sigma_max / SCALE_PROJECTION_LEVERAGE_AMPLIFICATION;
+    let truncation_tol = derived_tol.max(SCALE_PROJECTION_REPLAY_RCOND_FLOOR * sigma_max);
+    truncation_tol * truncation_tol
 }
 
-fn scale_projection_effective_rank(r_diag: &[f64], leading_diag: f64, major_dim: usize) -> usize {
-    let tol = scale_projection_rank_tolerance(leading_diag, major_dim);
-    r_diag.iter().take_while(|&&d| d.abs() > tol).count()
-}
-
-fn solve_scale_projection_for_rank(
+fn solve_scale_projection(
     primary_design: ScaleDesignMatrixRef<'_>,
     noise_design: ScaleDesignMatrixRef<'_>,
-    sqrtw: &Array1<f64>,
-    qr: &faer::linalg::solvers::ColPivQr<f64>,
-    r_diag: &[f64],
-    perm_fwd: &[usize],
-    rank: usize,
+    weights: &Array1<f64>,
     first_active: usize,
     chunk_rows: usize,
-) -> Result<Array2<f64>, String> {
+) -> Result<(Array2<f64>, f64), String> {
     let n = primary_design.nrows();
     let p_primary = primary_design.ncols();
     let p_noise = noise_design.ncols();
     let mut projection_coef = Array2::<f64>::zeros((p_primary, p_noise));
     let active_cols = p_noise.saturating_sub(first_active);
-    if active_cols == 0 || p_primary == 0 || rank == 0 {
-        return Ok(projection_coef);
+
+    if active_cols == 0 || p_primary == 0 {
+        return Ok((projection_coef, 0.0));
     }
-    let r = qr.thin_R();
+
+    let sqrtw = weights.mapv(f64::sqrt);
+    let wx = build_weighted_primary_design(primary_design, &sqrtw, chunk_rows)?;
+    // Thin SVD of W^{1/2} X_primary: replay reduces to V * diag(filter) * U^T
+    // applied to the weighted noise RHS.  Tikhonov filter factors are the
+    // smooth alternative to RRQR rank truncation + coefficient cap.
+    let (u_opt, singular, vt_opt) = wx
+        .svd(true, true)
+        .map_err(|e| format!("scale projection SVD failed: {e:?}"))?;
+    let (Some(u), Some(vt)) = (u_opt, vt_opt) else {
+        return Err("scale projection SVD did not return singular vectors".to_string());
+    };
+    let alpha = choose_scale_projection_ridge_alpha(singular.as_slice().unwrap_or(&[]));
+    let rank = singular.len();
+    if rank == 0 {
+        return Ok((projection_coef, alpha));
+    }
+    let mut filter = Array1::<f64>::zeros(rank);
+    for k in 0..rank {
+        let s = singular[k];
+        let denom = s * s + alpha;
+        filter[k] = if denom > 0.0 { s / denom } else { 0.0 };
+    }
+
     let chunk_cols = (SCALE_DESIGN_TARGET_CHUNK_BYTES / (n.max(1) * std::mem::size_of::<f64>()))
         .max(1)
         .min(active_cols);
@@ -467,103 +497,26 @@ fn solve_scale_projection_for_rank(
             }
         }
 
-        let mut rhs_mat = crate::faer_ndarray::array2_to_matmut(&mut rhs);
-        faer::linalg::householder::apply_block_householder_sequence_on_the_left_in_place_with_conj(
-            qr.Q_basis(),
-            qr.Q_coeff(),
-            Conj::Yes,
-            rhs_mat.rb_mut(),
-            get_global_parallelism(),
-            MemStack::new(&mut MemBuffer::new(
-                faer::linalg::householder::apply_block_householder_sequence_on_the_left_in_place_scratch::<f64>(
-                    n,
-                    qr.Q_coeff().nrows(),
-                    width,
-                ),
-            )),
-        );
-
-        let mut pivoted_solution = Array2::<f64>::zeros((rank, width));
+        // U^T (rank x n) * rhs (n x width) -> (rank x width)
+        let mut t = u.t().dot(&rhs);
+        // Apply filter rowwise: t_k *= sigma_k / (sigma_k^2 + alpha).
+        for k in 0..rank {
+            let f = filter[k];
+            for col in 0..width {
+                t[[k, col]] *= f;
+            }
+        }
+        // V (p_primary x rank) * t (rank x width) -> (p_primary x width).
+        // vt has shape (rank, p_primary), so V = vt^T.
+        let block = vt.t().dot(&t);
         for col in 0..width {
-            for i in (0..rank).rev() {
-                let mut accum = rhs[[i, col]];
-                for k in (i + 1)..rank {
-                    accum -= r[(i, k)] * pivoted_solution[[k, col]];
-                }
-                let rii = r_diag[i];
-                if rii != 0.0 {
-                    pivoted_solution[[i, col]] = accum / rii;
-                }
-            }
-        }
-        for pivoted_col in 0..rank {
-            let orig_col = perm_fwd[pivoted_col];
-            for rhs_col in 0..width {
-                projection_coef[[orig_col, first_active + chunk_start + rhs_col]] =
-                    pivoted_solution[[pivoted_col, rhs_col]];
+            for row in 0..p_primary {
+                projection_coef[[row, first_active + chunk_start + col]] = block[[row, col]];
             }
         }
     }
 
-    Ok(projection_coef)
-}
-
-fn solve_scale_projection(
-    primary_design: ScaleDesignMatrixRef<'_>,
-    noise_design: ScaleDesignMatrixRef<'_>,
-    weights: &Array1<f64>,
-    first_active: usize,
-    chunk_rows: usize,
-) -> Result<Array2<f64>, String> {
-    let n = primary_design.nrows();
-    let p_primary = primary_design.ncols();
-    let p_noise = noise_design.ncols();
-    let mut projection_coef = Array2::<f64>::zeros((p_primary, p_noise));
-    let active_cols = p_noise.saturating_sub(first_active);
-
-    if active_cols == 0 || p_primary == 0 {
-        return Ok(projection_coef);
-    }
-
-    let sqrtw = weights.mapv(f64::sqrt);
-    let wx = build_weighted_primary_design(primary_design, &sqrtw, chunk_rows)?;
-    let wx_faer = FaerArrayView::new(&wx);
-    // Keep one explicit RRQR factorization and one explicit rank policy for all
-    // projection coefficients so dense and operator-backed paths reuse the same solve.
-    let qr = wx_faer.as_ref().col_piv_qr();
-    let r = qr.thin_R();
-    let diag_len = r.nrows().min(r.ncols());
-    let r_diag = (0..diag_len).map(|i| r[(i, i)]).collect::<Vec<_>>();
-    let leading_diag = r_diag.first().copied().map(f64::abs).unwrap_or(0.0);
-    let mut rank = scale_projection_effective_rank(&r_diag, leading_diag, n.max(p_primary));
-    let (perm_fwd, _) = qr.P().arrays();
-    let perm_fwd: Vec<usize> = perm_fwd.iter().map(|idx| idx.unbound()).collect();
-    loop {
-        projection_coef = solve_scale_projection_for_rank(
-            primary_design,
-            noise_design,
-            &sqrtw,
-            &qr,
-            &r_diag,
-            &perm_fwd,
-            rank,
-            first_active,
-            chunk_rows,
-        )?;
-        let max_abs_coef = projection_coef
-            .iter()
-            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-        if !max_abs_coef.is_finite() || (max_abs_coef > SCALE_PROJECTION_MAX_ABS_COEF && rank > 0) {
-            rank -= 1;
-            if rank == 0 {
-                return Ok(Array2::<f64>::zeros((p_primary, p_noise)));
-            }
-            continue;
-        }
-        break;
-    }
-
-    Ok(projection_coef)
+    Ok((projection_coef, alpha))
 }
 
 fn apply_projection_chunk(
@@ -991,102 +944,183 @@ mod tests {
     }
 
     #[test]
-    fn scale_projection_rank_uses_replay_safe_cutoff() {
-        let leading = 4.0;
-        let diag = vec![
-            leading,
-            1e-4 * leading,
-            2.0 * SCALE_PROJECTION_REPLAY_RCOND_FLOOR * leading,
-            0.5 * SCALE_PROJECTION_REPLAY_RCOND_FLOOR * leading,
-        ];
-        let rank = scale_projection_effective_rank(&diag, leading, 18);
-        assert_eq!(
-            rank, 3,
-            "replay-safe scale projection rank should drop diagonals below the replay cutoff"
+    fn choose_scale_projection_ridge_alpha_scales_with_sigma_max() {
+        let alpha_unit = choose_scale_projection_ridge_alpha(&[1.0, 0.5, 1e-6]);
+        assert!(alpha_unit > 0.0);
+        // tolerance = sigma_max / leverage_amplification = 1/100 = 0.01,
+        // so alpha = (0.01)^2 = 1e-4.
+        assert!(
+            (alpha_unit - 1e-4).abs() < 1e-12,
+            "alpha should be 1e-4 for sigma_max=1, got {alpha_unit}"
         );
 
-        let dropped = scale_projection_effective_rank(
-            &[
-                leading,
-                1e-4 * leading,
-                0.5 * SCALE_PROJECTION_REPLAY_RCOND_FLOOR * leading,
-            ],
-            leading,
-            18,
+        let alpha_scaled = choose_scale_projection_ridge_alpha(&[100.0, 1.0]);
+        // sigma_max=100 -> tol=1.0 -> alpha=1.0.  Scales as sigma_max^2.
+        assert!(
+            (alpha_scaled - 1.0).abs() < 1e-9,
+            "alpha should be 1.0 for sigma_max=100, got {alpha_scaled}"
         );
-        assert_eq!(dropped, 2);
+
+        let alpha_floor = choose_scale_projection_ridge_alpha(&[]);
+        assert_eq!(alpha_floor, 0.0);
     }
 
     #[test]
-    fn scale_projection_drops_high_gain_replay_direction() {
-        let n = 32;
-        let eps = 2e-8;
-        let mut primary = Array2::<f64>::zeros((n, 2));
+    fn ridge_replay_continuous_under_input_sweep() {
+        // A near-collinear primary design plus a sweepable perturbation column
+        // would, under the old hard coefficient cap, jump discontinuously when
+        // the cap kicks in.  With the Tikhonov filter the replayed coefficient
+        // must be a smooth function of the input perturbation.
+        let n = 64;
+        let mut primary = Array2::<f64>::zeros((n, 3));
         let mut noise = Array2::<f64>::zeros((n, 2));
         let weights = Array1::<f64>::ones(n);
         for i in 0..n {
-            let t = i as f64;
+            let t = i as f64 / n as f64;
             primary[[i, 0]] = 1.0;
-            primary[[i, 1]] = eps * t;
+            primary[[i, 1]] = t;
+            // Near-collinear with col 1 — this is the high-gain direction.
+            primary[[i, 2]] = t + 1e-9 * (5.0 * t).sin();
             noise[[i, 0]] = 1.0;
-            noise[[i, 1]] = (0.37 * t).sin();
+            noise[[i, 1]] = (0.4 * t).cos();
         }
 
-        let chunk_rows = scale_design_row_chunk_size(n, 2);
-        let sqrtw = weights.mapv(f64::sqrt);
-        let wx = build_weighted_primary_design(
-            ScaleDesignMatrixRef::Dense(&primary),
-            &sqrtw,
-            chunk_rows,
+        // Sweep: gradually scale one noise entry; record the corresponding
+        // projected coefficient cell.  Numerical first differences should be
+        // bounded — the ridge guarantees Lipschitz continuity in the input.
+        let mut last: Option<f64> = None;
+        let mut max_step: f64 = 0.0;
+        for k in 0..50 {
+            let s = k as f64 / 49.0;
+            let mut perturbed = noise.clone();
+            for i in 0..n {
+                perturbed[[i, 1]] += s;
+            }
+            let transform = build_scale_deviation_transform(&primary, &perturbed, &weights, 1)
+                .expect("ridge transform should succeed under input sweep");
+            let val = transform.projection_coef[[2, 1]];
+            if let Some(prev) = last {
+                let step = (val - prev).abs();
+                max_step = max_step.max(step);
+            }
+            last = Some(val);
+        }
+        // Step bound: with 50 samples over a unit sweep, a smooth dependence
+        // produces uniform tiny jumps.  The old coefficient cap would emit a
+        // single huge step at the cap boundary, easily blowing 1.0 here.
+        assert!(
+            max_step < 0.5,
+            "replay coefficient sweep should be continuous, got max step {max_step}"
+        );
+    }
+
+    #[test]
+    fn ridge_replay_noise_free_is_near_identity() {
+        // When the noise design lives in the column span of the primary
+        // design and W^{1/2} X is well-conditioned, the Tikhonov ridge is
+        // tiny and the residual after subtracting the projected fit is at
+        // numerical zero.
+        let n = 128;
+        let p_primary = 4;
+        let p_noise = 3;
+        let mut primary = Array2::<f64>::zeros((n, p_primary));
+        let mut noise = Array2::<f64>::zeros((n, p_noise));
+        let weights = Array1::<f64>::ones(n);
+        for i in 0..n {
+            let t = i as f64 / n as f64;
+            primary[[i, 0]] = 1.0;
+            primary[[i, 1]] = t;
+            primary[[i, 2]] = (3.0 * t).sin();
+            primary[[i, 3]] = (2.0 * t - 0.4).powi(2);
+            noise[[i, 0]] = 1.0;
+            // Linear combinations of primary cols so the projection should
+            // recover them exactly modulo a vanishing ridge.
+            noise[[i, 1]] = 0.7 * primary[[i, 1]] - 0.3 * primary[[i, 2]];
+            noise[[i, 2]] = 0.2 * primary[[i, 3]] + 0.1 * primary[[i, 1]];
+        }
+
+        let transform = build_scale_deviation_transform(&primary, &noise, &weights, 1)
+            .expect("transform should succeed");
+        let transformed = apply_scale_deviation_transform(&primary, &noise, &transform)
+            .expect("apply should succeed");
+
+        // Pass-through column unaffected.
+        for i in 0..n {
+            assert_eq!(transformed[[i, 0]], 1.0);
+        }
+        // Active columns: residuals should be near zero up to the ridge bias.
+        // The ridge bias here is bounded by alpha / sigma_min and the design is
+        // well-conditioned, so 1e-6 is a safe envelope.
+        for j in 1..p_noise {
+            for i in 0..n {
+                assert!(
+                    transformed[[i, j]].abs() < 1e-6,
+                    "noise-free residual should be near zero at ({i},{j}), got {}",
+                    transformed[[i, j]]
+                );
+            }
+        }
+        assert!(transform.projection_ridge_alpha > 0.0);
+    }
+
+    #[test]
+    fn scale_transform_payload_round_trips_alpha() {
+        let n = 64;
+        let mut primary = Array2::<f64>::zeros((n, 3));
+        let mut noise = Array2::<f64>::zeros((n, 2));
+        let weights = Array1::<f64>::ones(n);
+        for i in 0..n {
+            let t = i as f64 / n as f64;
+            primary[[i, 0]] = 1.0;
+            primary[[i, 1]] = t;
+            primary[[i, 2]] = (4.0 * t).cos();
+            noise[[i, 0]] = 1.0;
+            noise[[i, 1]] = (2.0 * t).sin();
+        }
+        let transform = build_scale_deviation_transform(&primary, &noise, &weights, 1)
+            .expect("transform should succeed");
+
+        let projection: Vec<Vec<f64>> = transform
+            .projection_coef
+            .rows()
+            .into_iter()
+            .map(|row| row.to_vec())
+            .collect();
+        let center = transform.weighted_column_mean.to_vec();
+        let scale = transform.rescale.to_vec();
+        let restored = scale_transform_from_payload(
+            &Some(projection),
+            &Some(center),
+            &Some(scale),
+            Some(transform.non_intercept_start),
+            Some(transform.projection_ridge_alpha),
         )
-        .expect("weighted primary design should materialize");
-        let qr = FaerArrayView::new(&wx).as_ref().col_piv_qr();
-        let r = qr.thin_R();
-        let diag_len = r.nrows().min(r.ncols());
-        let r_diag = (0..diag_len).map(|i| r[(i, i)]).collect::<Vec<_>>();
-        let leading_diag = r_diag.first().copied().map(f64::abs).unwrap_or(0.0);
-        let rank = scale_projection_effective_rank(&r_diag, leading_diag, n.max(primary.ncols()));
+        .expect("payload round-trip should succeed")
+        .expect("payload should produce a transform");
         assert_eq!(
-            rank, 2,
-            "replay-safe rank floor should still keep the high-gain direction before coefficient capping"
+            restored.projection_ridge_alpha, transform.projection_ridge_alpha,
+            "alpha must round-trip exactly through payload serialization"
         );
 
-        let (perm_fwd, _) = qr.P().arrays();
-        let perm_fwd: Vec<usize> = perm_fwd.iter().map(|idx| idx.unbound()).collect();
-        let uncapped_projection = solve_scale_projection_for_rank(
-            ScaleDesignMatrixRef::Dense(&primary),
-            ScaleDesignMatrixRef::Dense(&noise),
-            &sqrtw,
-            &qr,
-            &r_diag,
-            &perm_fwd,
-            rank,
-            1,
-            chunk_rows,
+        let legacy = scale_transform_from_payload(
+            &Some(
+                transform
+                    .projection_coef
+                    .rows()
+                    .into_iter()
+                    .map(|row| row.to_vec())
+                    .collect(),
+            ),
+            &Some(transform.weighted_column_mean.to_vec()),
+            &Some(transform.rescale.to_vec()),
+            Some(transform.non_intercept_start),
+            None,
         )
-        .expect("uncapped projection solve should succeed");
-        let uncapped_max_abs = uncapped_projection
-            .iter()
-            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-        assert!(
-            uncapped_max_abs > SCALE_PROJECTION_MAX_ABS_COEF,
-            "constructed replay solve should exceed the coefficient cap before fallback, got {uncapped_max_abs}"
-        );
-
-        let capped_projection = solve_scale_projection(
-            ScaleDesignMatrixRef::Dense(&primary),
-            ScaleDesignMatrixRef::Dense(&noise),
-            &weights,
-            1,
-            chunk_rows,
-        )
-        .expect("projection solve should succeed");
-        let capped_max_abs = capped_projection
-            .iter()
-            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-        assert!(
-            capped_max_abs <= SCALE_PROJECTION_MAX_ABS_COEF,
-            "fallback should remove high-gain replay directions, got max coefficient {capped_max_abs}"
+        .expect("legacy payload (no alpha) should still load")
+        .expect("legacy payload should produce a transform");
+        assert_eq!(
+            legacy.projection_ridge_alpha, 0.0,
+            "legacy payload without alpha must default to zero for backward compatibility"
         );
     }
 }

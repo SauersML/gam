@@ -580,8 +580,25 @@ pub fn col_minmax(col: ArrayView1<'_, f64>) -> Result<(f64, f64), String> {
     }
 }
 
+/// Default knot count for an n-row design, growing the ceiling with n^(1/3).
+///
+/// Wood (2017, sec 5.5) shows the optimal smoothing-spline rank for an
+/// asymptotically smooth target grows as n^(1/(2k+1)) where k is the order
+/// of the penalty (k=2 cubic ⇒ n^(1/5)) and as n^(1/3) under a fixed-knot
+/// regression-spline regime (k → ∞ in the rank-bias trade-off). Capping the
+/// floor heuristic `floor(sqrt(n))` at 30 strangles biobank fits at n = 3e5
+/// where the underlying signal can support ~60 knots without overfitting.
+/// We retain the sqrt() floor as the starting point, raise the ceiling with
+/// n^(1/3) so it crosses 30 around n = 27_000 and reaches ~100 at n = 1e6,
+/// and keep the lower bound at 6 to guarantee enough degrees of freedom for
+/// monotone constraints.
 pub fn heuristic_knots(n: usize) -> usize {
-    ((n as f64).sqrt() as usize).clamp(6, 30)
+    let n_f = n as f64;
+    let base = n_f.sqrt() as usize;
+    let n_cbrt = n_f.cbrt();
+    // Ceiling grows with n^(1/3): 30 at n ≈ 27k, 60 at n ≈ 216k, 100 at n ≈ 1M.
+    let ceiling = (n_cbrt as usize).max(30);
+    base.clamp(6, ceiling)
 }
 
 pub fn unique_count_column(col: ArrayView1<'_, f64>) -> usize {
@@ -594,9 +611,14 @@ pub fn unique_count_column(col: ArrayView1<'_, f64>) -> usize {
     set.len().max(1)
 }
 
+/// Per-column knot count from the unique-value count, with the same n^(1/3)
+/// ceiling growth as `heuristic_knots` so per-column smooths can support more
+/// detail at biobank scale. The 4-knot floor stays put because we still need
+/// enough basis functions to fit a non-trivial smooth at all.
 pub fn heuristic_knots_for_column(col: ArrayView1<'_, f64>) -> usize {
     let unique = unique_count_column(col);
-    (unique / 4).clamp(4, 20)
+    let ceiling = ((unique as f64).cbrt() as usize).max(20);
+    (unique / 4).clamp(4, ceiling)
 }
 
 pub fn heuristic_centers(n: usize, d: usize) -> usize {

@@ -4392,14 +4392,15 @@ impl BernoulliMarginalSlopeFamily {
     fn line_search_log_likelihood_workspace(
         &self,
         block_states: &[ParameterBlockState],
-        options: &BlockwiseFitOptions,
+        line_search_options: &BlockwiseFitOptions,
+        workspace_options: &BlockwiseFitOptions,
     ) -> Result<Option<(f64, Arc<dyn ExactNewtonJointHessianWorkspace>)>, String> {
         self.validate_exact_monotonicity(block_states)?;
         self.validate_exact_block_state_shapes(block_states)?;
         if !self.effective_flex_active(block_states)? {
             return Ok(None);
         }
-        if options.outer_score_subsample.is_some() {
+        if line_search_options.outer_score_subsample.is_some() {
             return Ok(None);
         }
 
@@ -4454,7 +4455,7 @@ impl BernoulliMarginalSlopeFamily {
                 log_likelihood += row_ll;
                 row_contexts.push(row_ctx);
             }
-            if let Some(threshold) = options.early_exit_threshold
+            if let Some(threshold) = line_search_options.early_exit_threshold
                 && -log_likelihood > threshold
             {
                 return Err(format!(
@@ -4492,7 +4493,7 @@ impl BernoulliMarginalSlopeFamily {
                     rigid_third_full: OnceLock::new(),
                     rigid_fourth_full: OnceLock::new(),
                 },
-                options: options.clone(),
+                options: workspace_options.clone(),
                 log_likelihood,
                 full_workspace: OnceLock::new(),
             });
@@ -11059,16 +11060,22 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        options: &BlockwiseFitOptions,
+        line_search_options: &BlockwiseFitOptions,
+        workspace_options: &BlockwiseFitOptions,
     ) -> Result<Option<(f64, Arc<dyn ExactNewtonJointHessianWorkspace>)>, String> {
-        let Some(workspace) =
-            self.exact_newton_joint_hessian_workspace_with_options(block_states, specs, options)?
+        let Some(workspace) = self.exact_newton_joint_hessian_workspace_with_options(
+            block_states,
+            specs,
+            workspace_options,
+        )?
         else {
             return Ok(None);
         };
         let log_likelihood = match workspace.joint_log_likelihood_evaluation()? {
             Some(value) => value,
-            None => Self::log_likelihood_only_with_options(self, block_states, options)?,
+            None => {
+                Self::log_likelihood_only_with_options(self, block_states, line_search_options)?
+            }
         };
         Ok(Some((log_likelihood, workspace)))
     }
@@ -11077,10 +11084,15 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
-        options: &BlockwiseFitOptions,
+        line_search_options: &BlockwiseFitOptions,
+        workspace_options: &BlockwiseFitOptions,
     ) -> Result<Option<(f64, Option<Arc<dyn ExactNewtonJointHessianWorkspace>>)>, String> {
-        self.line_search_log_likelihood_workspace(block_states, options)
-            .map(|maybe| maybe.map(|(log_likelihood, workspace)| (log_likelihood, Some(workspace))))
+        self.line_search_log_likelihood_workspace(
+            block_states,
+            line_search_options,
+            workspace_options,
+        )
+        .map(|maybe| maybe.map(|(log_likelihood, workspace)| (log_likelihood, Some(workspace))))
     }
 
     fn max_feasible_step_size(
@@ -13151,12 +13163,9 @@ mod tests {
         // Construct an "even-only" full call by building a custom mask
         // covering the same rows but with weight_scale = 1.0.
         let mut opts_even_unscaled = BlockwiseFitOptions::default();
-        opts_even_unscaled.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
-            mask: Arc::new(even_mask),
-            n_full: m, // weight_scale = m / m = 1.0 so the call returns the raw even-row sum
-            weight_scale: 1.0,
-            seed: 0,
-        }));
+        opts_even_unscaled.outer_score_subsample = Some(Arc::new(
+            OuterScoreSubsample::with_uniform_weight(even_mask, m, 0, 1.0),
+        ));
         let raw_even_sum = family
             .log_likelihood_only_with_options(&states, &opts_even_unscaled)
             .expect("raw even-row ll sum");
@@ -13283,12 +13292,9 @@ mod tests {
             .expect("some");
 
         let mut opts_raw = BlockwiseFitOptions::default();
-        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
-            mask: Arc::new(even_mask),
-            n_full: m,
-            weight_scale: 1.0,
-            seed: 0,
-        }));
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::with_uniform_weight(
+            even_mask, m, 0, 1.0,
+        )));
         let raw = family
             .sigma_exact_joint_psi_terms_with_options(&states, &specs, &opts_raw)
             .expect("raw")
@@ -13361,12 +13367,9 @@ mod tests {
             .expect("some");
 
         let mut opts_raw = BlockwiseFitOptions::default();
-        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
-            mask: Arc::new(even_mask),
-            n_full: m,
-            weight_scale: 1.0,
-            seed: 0,
-        }));
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::with_uniform_weight(
+            even_mask, m, 0, 1.0,
+        )));
         let raw = family
             .sigma_exact_joint_psisecond_order_terms_with_options(&states, &opts_raw)
             .expect("raw")
@@ -13436,12 +13439,9 @@ mod tests {
             .expect("some");
 
         let mut opts_raw = BlockwiseFitOptions::default();
-        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
-            mask: Arc::new(even_mask),
-            n_full: m,
-            weight_scale: 1.0,
-            seed: 0,
-        }));
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::with_uniform_weight(
+            even_mask, m, 0, 1.0,
+        )));
         let raw = family
             .sigma_exact_joint_psihessian_directional_derivative_with_options(
                 &states, &dir, &opts_raw,
@@ -20217,12 +20217,9 @@ mod tests {
             .expect("some");
 
         let mut opts_raw = BlockwiseFitOptions::default();
-        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
-            mask: Arc::new(even_mask),
-            n_full: m,
-            weight_scale: 1.0,
-            seed: 0,
-        }));
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::with_uniform_weight(
+            even_mask, m, 0, 1.0,
+        )));
         let raw = family
             .exact_newton_joint_psi_terms_from_cache_with_options(
                 &states,
@@ -20324,12 +20321,9 @@ mod tests {
             .expect("some");
 
         let mut opts_raw = BlockwiseFitOptions::default();
-        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
-            mask: Arc::new(even_mask),
-            n_full: m,
-            weight_scale: 1.0,
-            seed: 0,
-        }));
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::with_uniform_weight(
+            even_mask, m, 0, 1.0,
+        )));
         let raw = family
             .exact_newton_joint_psisecond_order_terms_from_cache_with_options(
                 &states,
@@ -20436,12 +20430,9 @@ mod tests {
             .expect("some");
 
         let mut opts_raw = BlockwiseFitOptions::default();
-        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
-            mask: Arc::new(even_mask),
-            n_full: m,
-            weight_scale: 1.0,
-            seed: 0,
-        }));
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::with_uniform_weight(
+            even_mask, m, 0, 1.0,
+        )));
         let raw = family
             .exact_newton_joint_psihessian_directional_derivative_from_cache_with_options(
                 &states,
@@ -20549,12 +20540,9 @@ mod tests {
         let scaled_dense = scaled.to_dense();
 
         let mut opts_raw = BlockwiseFitOptions::default();
-        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
-            mask: Arc::new(even_mask),
-            n_full: m,
-            weight_scale: 1.0,
-            seed: 0,
-        }));
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::with_uniform_weight(
+            even_mask, m, 0, 1.0,
+        )));
         let raw = family
             .exact_newton_joint_psihessian_directional_derivative_operator_from_cache_with_options(
                 &states,
@@ -20658,10 +20646,7 @@ mod tests {
         for (idx, direction) in directions.iter().enumerate() {
             let single = family
                 .exact_newton_joint_hessian_directional_derivative_operator_from_cache_with_options(
-                    &states,
-                    direction,
-                    &cache,
-                    &opts,
+                    &states, direction, &cache, &opts,
                 )
                 .expect("single operator")
                 .expect("single operator some")
@@ -21039,12 +21024,9 @@ mod tests {
             .expect("some");
 
         let mut opts_raw = BlockwiseFitOptions::default();
-        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample {
-            mask: Arc::new(even_mask),
-            n_full: m,
-            weight_scale: 1.0,
-            seed: 0,
-        }));
+        opts_raw.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::with_uniform_weight(
+            even_mask, m, 0, 1.0,
+        )));
         let raw = family
             .exact_newton_joint_hessian_directional_derivative_from_cache_with_options(
                 &states,

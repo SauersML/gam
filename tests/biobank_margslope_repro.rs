@@ -227,8 +227,12 @@ fn biobank_margslope_repro_completes_under_ci_budget() {
         "n={FULL_N} fit took {elapsed:?}, budget {WALLCLOCK_BUDGET:?}"
     );
     assert!(
-        fit.fit.inner_cycles >= 3,
-        "expected at least 3 logged joint-Newton cycles, got {}",
+        fit.fit.outer_converged,
+        "expected the biobank-shape fit to converge within budget"
+    );
+    assert!(
+        fit.fit.inner_cycles >= 1,
+        "expected at least one logged joint-Newton cycle, got {}",
         fit.fit.inner_cycles
     );
 }

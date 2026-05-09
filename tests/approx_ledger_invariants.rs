@@ -82,7 +82,12 @@ fn unclassified_bandaid_is_caught() {
         let _ = 0;\n\
     }\n";
     let hits = scan(content);
-    assert_eq!(hits.len(), 1, "expected exactly one offender, got {:?}", hits);
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected exactly one offender, got {:?}",
+        hits
+    );
     assert_eq!(hits[0].1, "bandaid");
 }
 
@@ -109,7 +114,11 @@ fn marker_outside_comment_is_ignored() {
     let content = "fn hack_score() -> f64 { 0.0 }\n\
         let s = \"a magic value\";\n";
     let hits = scan(content);
-    assert!(hits.is_empty(), "identifiers/strings must not trigger: {:?}", hits);
+    assert!(
+        hits.is_empty(),
+        "identifiers/strings must not trigger: {:?}",
+        hits
+    );
 }
 
 #[test]
@@ -123,7 +132,12 @@ fn annotation_outside_window_does_not_rescue() {
     }
     content.push_str("// stray bandaid in here\n");
     let hits = scan(&content);
-    assert_eq!(hits.len(), 1, "expected the stray marker to be flagged: {:?}", hits);
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected the stray marker to be flagged: {:?}",
+        hits
+    );
 }
 
 #[test]
