@@ -35,7 +35,9 @@ use crate::mixture_link::{
     inverse_link_jet_for_inverse_link, inverse_link_pdffourth_derivative_for_inverse_link,
 };
 use crate::pirls::LinearInequalityConstraints;
-use crate::probability::{normal_logcdf, normal_logsf, normal_pdf, standard_normal_quantile};
+use crate::probability::{
+    normal_logcdf, normal_logsf, signed_probit_logcdf_and_mills_ratio, standard_normal_quantile,
+};
 use crate::smooth::{
     BlockwisePenalty, ExactJointHyperSetup, PenaltyBlockInfo,
     SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
@@ -3602,34 +3604,32 @@ fn binomial_neglog_q_derivatives_probit_closed_form(
     y: f64,
     weight: f64,
     q: f64,
-    mu: f64,
+    _mu: f64,
 ) -> (f64, f64, f64) {
     // Closed-form derivatives for F_i(q) = -w_i[y log Phi(q) + (1-y) log(1-Phi(q))].
-    // Uses canonical A/Amu/Amumu identities from the probit composition.
-    //
-    // Stability (Issue 5): μ is floored to [MIN_PROB, 1 - MIN_PROB] inside
-    // the 1/μ and 1/(1-μ) divisions only — the chain-rule terms phi(q),
-    // q, etc. flow through unchanged. Previously we returned (0, 0, 0) on
-    // clamp, which created a phantom flat region that the optimizer could
-    // accept as a stationary point. The Mills-ratio tail behaviour
-    // (phi(q)/Phi(-q) is bounded as q → ∞) keeps the result finite at
-    // saturation; when y is incompatible with the saturation direction
-    // the resulting derivative is genuinely large and the LM gain-ratio
-    // guard rejects the step.
+    // Uses stable Mills ratios instead of `phi / mu` divisions. In the
+    // incompatible separated tail (for example y=0, q>>0), `phi(q)` underflows
+    // to zero while `phi(q)/Phi(-q) ≈ q`; computing the ratio in log-CDF space
+    // preserves the true score/curvature signal instead of manufacturing a
+    // flat optimum.
     if weight == 0.0 || !q.is_finite() {
         return (0.0, 0.0, 0.0);
     }
-    let m = mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
-    let nu = 1.0 - m;
-    let phi = normal_pdf(q);
-    let a = (1.0 - y) / nu - y / m;
-    let amu = (1.0 - y) / (nu * nu) + y / (m * m);
-    let amumu = 2.0 * (1.0 - y) / (nu * nu * nu) - 2.0 * y / (m * m * m);
+    let (_, left) = signed_probit_logcdf_and_mills_ratio(q);
+    let (_, right) = signed_probit_logcdf_and_mills_ratio(-q);
 
-    let m1 = weight * a * phi;
-    let m2 = weight * (amu * phi * phi - q * a * phi);
-    let m3 =
-        weight * (amumu * phi * phi * phi - 3.0 * q * amu * phi * phi + (q * q - 1.0) * a * phi);
+    let left_prime = -left * (q + left);
+    let left_m2 = -left_prime;
+    let left_m3 = left + left_prime * (q + 2.0 * left);
+
+    let right_prime = right * (right - q);
+    let right_m2 = right_prime;
+    let right_m3 = right_prime * (2.0 * right - q) - right;
+
+    let y0 = 1.0 - y;
+    let m1 = weight * (y0 * right - y * left);
+    let m2 = weight * (y0 * right_m2 + y * left_m2);
+    let m3 = weight * (y0 * right_m3 + y * left_m3);
     (m1, m2, m3)
 }
 
@@ -3638,24 +3638,26 @@ fn binomial_neglog_q_fourth_derivative_probit_closed_form(
     y: f64,
     weight: f64,
     q: f64,
-    mu: f64,
+    _mu: f64,
 ) -> f64 {
     // Closed-form m4 for F_i(q) = -w_i[y log Phi(q) + (1-y) log(1-Phi(q))].
     // Stability (Issue 5): see binomial_neglog_q_derivatives_probit_closed_form.
     if weight == 0.0 || !q.is_finite() {
         return 0.0;
     }
-    let m = mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
-    let nu = 1.0 - m;
-    let phi = normal_pdf(q);
-    let a = (1.0 - y) / nu - y / m;
-    let amu = (1.0 - y) / (nu * nu) + y / (m * m);
-    let amumu = 2.0 * (1.0 - y) / (nu * nu * nu) - 2.0 * y / (m * m * m);
-    let amumumu = 6.0 * (1.0 - y) / (nu * nu * nu * nu) + 6.0 * y / (m * m * m * m);
-    weight
-        * (amumumu * phi.powi(4) - 6.0 * q * amumu * phi.powi(3)
-            + (7.0 * q * q - 4.0) * amu * phi * phi
-            - (q * q * q - 3.0 * q) * a * phi)
+    let (_, left) = signed_probit_logcdf_and_mills_ratio(q);
+    let (_, right) = signed_probit_logcdf_and_mills_ratio(-q);
+
+    let left_prime = -left * (q + left);
+    let left_m3 = left + left_prime * (q + 2.0 * left);
+    let left_m4 = 2.0 * left_prime - left_m3 * (q + 2.0 * left) + 2.0 * left_prime * left_prime;
+
+    let right_prime = right * (right - q);
+    let right_m3 = right_prime * (2.0 * right - q) - right;
+    let right_m4 = right_m3 * (2.0 * right - q) + 2.0 * right_prime * right_prime
+        - 2.0 * right_prime;
+
+    weight * ((1.0 - y) * right_m4 + y * left_m4)
 }
 
 // ---------------------------------------------------------------------------
@@ -4331,6 +4333,69 @@ fn clamped_binomial_probability(mu: f64) -> (f64, bool) {
 }
 
 #[inline]
+fn stable_softplus(x: f64) -> f64 {
+    if x > 0.0 {
+        x + (-x).exp().ln_1p()
+    } else {
+        x.exp().ln_1p()
+    }
+}
+
+#[inline]
+fn log1mexp_neg_positive(z: f64) -> f64 {
+    debug_assert!(z >= 0.0);
+    if z == 0.0 {
+        f64::NEG_INFINITY
+    } else if z <= std::f64::consts::LN_2 {
+        (-(-z).exp_m1()).ln()
+    } else {
+        (1.0 - (-z).exp()).ln()
+    }
+}
+
+#[inline]
+fn bernoulli_log_likelihood_from_probability(
+    y: f64,
+    weight: f64,
+    mu: f64,
+) -> Result<f64, String> {
+    if weight == 0.0 {
+        return Ok(0.0);
+    }
+    if !mu.is_finite() || !(0.0..=1.0).contains(&mu) {
+        return Err(format!(
+            "binomial location-scale inverse link returned invalid probability {mu}"
+        ));
+    }
+    let log_mu = if mu == 0.0 {
+        if y == 0.0 {
+            0.0
+        } else {
+            f64::NEG_INFINITY
+        }
+    } else {
+        mu.ln()
+    };
+    let log_one_minus = if mu == 1.0 {
+        if y == 1.0 {
+            0.0
+        } else {
+            f64::NEG_INFINITY
+        }
+    } else {
+        (1.0 - mu).ln()
+    };
+    let ll = weight * (y * log_mu + (1.0 - y) * log_one_minus);
+    if ll.is_finite() {
+        Ok(ll)
+    } else {
+        Err(format!(
+            "binomial location-scale log likelihood is non-finite at y={y}, mu={mu}"
+        ))
+    }
+}
+
+#[inline]
 fn binomial_location_scale_q0(eta_t: f64, sigma: f64) -> f64 {
     -eta_t / sigma
 }
@@ -4342,23 +4407,36 @@ fn binomial_location_scale_log_likelihood(
     q: f64,
     link_kind: &InverseLink,
     mu: f64,
-) -> f64 {
+) -> Result<f64, String> {
     if weight == 0.0 {
-        return 0.0;
+        return Ok(0.0);
     }
-    if matches!(link_kind, InverseLink::Standard(LinkFunction::Probit)) {
-        return weight * (y * normal_logcdf(q) + (1.0_f64 - y) * normal_logsf(q));
+    match link_kind {
+        InverseLink::Standard(LinkFunction::Probit) => Ok(weight
+            * (y * normal_logcdf(q) + (1.0_f64 - y) * normal_logsf(q))),
+        InverseLink::Standard(LinkFunction::Logit) => Ok(weight
+            * (-y * stable_softplus(-q) - (1.0_f64 - y) * stable_softplus(q))),
+        InverseLink::Standard(LinkFunction::CLogLog) => {
+            let z = q.exp();
+            let log_p = if z == 0.0 {
+                q
+            } else if z.is_infinite() {
+                0.0
+            } else {
+                log1mexp_neg_positive(z)
+            };
+            let log_survival = -z;
+            let ll = weight * (y * log_p + (1.0_f64 - y) * log_survival);
+            if ll.is_finite() {
+                Ok(ll)
+            } else {
+                Err(format!(
+                    "binomial cloglog location-scale log likelihood is non-finite at y={y}, q={q}"
+                ))
+            }
+        }
+        _ => bernoulli_log_likelihood_from_probability(y, weight, mu),
     }
-    // Stability (Issue 5): for non-probit links we still need a numerical
-    // floor on μ to keep mu.ln() and (1-mu).ln() finite — both -∞ at
-    // saturation. The bias is `y * ln(MIN_PROB)` ≈ y · (-23) per
-    // saturating row and is only applied when the optimizer pushes μ to
-    // the floor anyway. The proper logit-stable form `log_expit(q)` is
-    // unavailable in this generic location-scale path because q is the
-    // composed link-input, not the raw logit eta. For probit the
-    // analytic `normal_logcdf/normal_logsf` above gives full precision.
-    let mu_safe = mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
-    weight * (y * mu_safe.ln() + (1.0_f64 - y) * (1.0_f64 - mu_safe).ln())
 }
 
 fn binomial_location_scalerow(
@@ -4387,7 +4465,7 @@ fn binomial_location_scalerow(
     let (mu_clamped, _clamp_active) = clamped_binomial_probability(jet.mu);
     jet.mu = mu_clamped;
     let inverse_link = inverse_linkrow(jet);
-    let ll = binomial_location_scale_log_likelihood(y, weight, q, link_kind, raw_mu);
+    let ll = binomial_location_scale_log_likelihood(y, weight, q, link_kind, raw_mu)?;
     Ok(BinomialLocationScaleRow {
         sigma,
         dsigma_deta,
@@ -4426,14 +4504,14 @@ fn binomial_location_scale_ll_only(
                     return Ok(acc
                         + binomial_location_scale_log_likelihood(
                             y_slice[i], w_slice[i], q, link_kind, 0.5,
-                        ));
+                        )?);
                 }
                 let jet = inverse_link_jet_for_inverse_link(link_kind, q)
                     .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
                 Ok(acc
                     + binomial_location_scale_log_likelihood(
                         y_slice[i], w_slice[i], q, link_kind, jet.mu,
-                    ))
+                    )?)
             },
         )
         .try_reduce(|| 0.0_f64, |a, b| Ok(a + b))
@@ -11420,11 +11498,11 @@ impl CustomFamily for BinomialMeanWiggleFamily {
             let q = eta[i] + etaw[i];
             let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q)
                 .map_err(|e| format!("fixed-link wiggle inverse-link evaluation failed: {e}"))?;
-            let mu = jet.mu.clamp(1e-12, 1.0 - 1e-12);
             let yi = self.y[i];
             let wi = self.weights[i];
-            ll += wi * (yi * mu.ln() + (1.0 - yi) * (1.0 - mu).ln());
+            ll += binomial_location_scale_log_likelihood(yi, wi, q, &self.link_kind, jet.mu)?;
 
+            let mu = jet.mu.clamp(1e-12, 1.0 - 1e-12);
             let var = (mu * (1.0 - mu)).max(MIN_PROB);
             let dmu_deta = jet.d1 * dq_dq0[i];
             let dmu_dw = jet.d1;
@@ -20687,6 +20765,86 @@ mod tests {
         assert_eq!(m2, expected);
         assert_eq!(m3, expected);
         assert_eq!(m4, expected);
+    }
+
+    #[test]
+    fn probit_binomial_incompatible_tail_keeps_mills_score() {
+        let q = 40.0;
+        let (m1, m2, m3) = binomial_neglog_q_derivatives_probit_closed_form(0.0, 1.0, q, 1.0);
+        let m4 = binomial_neglog_q_fourth_derivative_probit_closed_form(0.0, 1.0, q, 1.0);
+
+        assert!(
+            m1 > 39.0 && m1 < 41.0,
+            "right-tail probit score should be Mills-ratio sized, got {m1}"
+        );
+        assert!(
+            m2 > 0.9 && m2 < 1.1,
+            "right-tail probit curvature should stay near one, got {m2}"
+        );
+        assert!(m3.is_finite(), "third derivative must stay finite, got {m3}");
+        assert!(m4.is_finite(), "fourth derivative must stay finite, got {m4}");
+    }
+
+    #[test]
+    fn binomial_location_scale_loglik_uses_tail_stable_standard_links() {
+        use crate::families::custom_family::{CustomFamily, ParameterBlockState};
+
+        let n = 2usize;
+        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            Array2::from_elem((n, 1), 1.0),
+        ));
+        let log_sigma = ParameterBlockState {
+            beta: array![0.0],
+            eta: array![0.0, 0.0],
+        };
+
+        let logit_family = BinomialLocationScaleFamily {
+            y: array![0.0, 1.0],
+            weights: Array1::ones(n),
+            link_kind: InverseLink::Standard(LinkFunction::Logit),
+            threshold_design: Some(design.clone()),
+            log_sigma_design: Some(design.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
+        };
+        let logit_states = vec![
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: array![-1000.0, 1000.0],
+            },
+            log_sigma.clone(),
+        ];
+        let logit_ll = logit_family
+            .log_likelihood_only(&logit_states)
+            .expect("logit tail likelihood");
+        assert!(
+            (logit_ll + 2000.0).abs() <= 1e-10,
+            "logit tail likelihood must use softplus natural-parameter algebra, got {logit_ll}"
+        );
+
+        let cloglog_family = BinomialLocationScaleFamily {
+            y: array![0.0, 1.0],
+            weights: Array1::ones(n),
+            link_kind: InverseLink::Standard(LinkFunction::CLogLog),
+            threshold_design: Some(design.clone()),
+            log_sigma_design: Some(design),
+            policy: crate::resource::ResourcePolicy::default_library(),
+        };
+        let cloglog_states = vec![
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: array![-20.0, 1000.0],
+            },
+            log_sigma,
+        ];
+        let cloglog_ll = cloglog_family
+            .log_likelihood_only(&cloglog_states)
+            .expect("cloglog tail likelihood");
+        let expected = -20.0_f64.exp() - 1000.0;
+        let rel = (cloglog_ll - expected).abs() / expected.abs();
+        assert!(
+            rel <= 1e-14,
+            "cloglog tail likelihood must use exp(q) survival algebra, got {cloglog_ll}, expected {expected}"
+        );
     }
 
     #[test]

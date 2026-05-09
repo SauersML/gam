@@ -1789,12 +1789,12 @@ pub struct BlockwiseFitOptions {
     pub early_exit_threshold: Option<f64>,
     /// Optional stratified row subsample used by outer-only score/gradient
     /// passes. When `Some(s)`, outer score/gradient hot loops should iterate
-    /// only over `s.mask` and rescale per-row contributions by
-    /// `s.weight_scale = n_full / mask.len()`. Inner-PIRLS and final
+    /// only over `s.rows` and multiply each contribution by that row's
+    /// Horvitz-Thompson inverse-inclusion weight. Inner-PIRLS and final
     /// covariance passes always run on the full data, so this field is
-    /// consulted only by outer-only call sites. Default `None` preserves
-    /// the legacy full-data behavior. Wrapping in `Arc` keeps `Clone` cheap
-    /// across the many places `BlockwiseFitOptions` is duplicated per-eval.
+    /// consulted only by outer-only call sites. Default `None` preserves the
+    /// full-data behavior. Wrapping in `Arc` keeps `Clone` cheap across the
+    /// many places `BlockwiseFitOptions` is duplicated per-eval.
     pub outer_score_subsample:
         Option<Arc<crate::families::marginal_slope_shared::OuterScoreSubsample>>,
 }

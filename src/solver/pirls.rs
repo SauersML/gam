@@ -62,15 +62,11 @@ const GAMMA_SHAPE_MIN: f64 = 1e-8;
 const GAMMA_SHAPE_MAX: f64 = 1e12;
 const GAMMA_SHAPE_TARGET_TOL: f64 = 1e-12;
 
-/// Absolute cap on `|η|` at any inner P-IRLS iterate.
+/// Saturation threshold for `|η|` diagnostics at inner P-IRLS iterates.
 ///
-/// A sensible guard against runaway underdetermined systems: when `p > n`
-/// with weak penalty the optimizer can wander along a likelihood ridge,
-/// sending η to extreme values where the gradient overflows. Step
-/// candidates that drive `max|η|` past this bound are rejected as LM
-/// halving triggers, and the rescue logic recognises a fit pinned
-/// against the cap with a deviance plateau as the same "saturated
-/// boundary" class as separated binomial fits.
+/// This value no longer rejects otherwise finite step candidates. Stable
+/// likelihood code owns tail arithmetic; this threshold only helps the rescue
+/// logic classify a stalled fit pinned deep in a separated/saturated tail.
 const PIRLS_ETA_ABS_CAP: f64 = 40.0;
 
 #[inline]
@@ -4295,25 +4291,16 @@ where
                     };
 
                     // Guard: reject steps that produce non-finite gradients
-                    // or extreme linear predictors.  When p > n with weak
-                    // penalty, the optimizer can wander along a likelihood
-                    // ridge, sending eta to extreme values where the gradient
-                    // overflows.  Treating these as rejected steps lets the
-                    // LM damping increase until the step is tamed.
+                    // or extreme linear predictors. Tail size alone is not a
+                    // reason to reject a candidate; only non-finite objective
+                    // or gradient arithmetic is. Saturation is diagnosed later
+                    // by `pirls_soft_acceptance`.
                     let candidate_grad_finite =
                         candidate_state.gradient.iter().all(|g| g.is_finite());
-                    let candidate_max_eta = candidate_state
-                        .eta
-                        .iter()
-                        .copied()
-                        .map(f64::abs)
-                        .fold(0.0_f64, f64::max);
-                    let eta_ok = candidate_max_eta <= PIRLS_ETA_ABS_CAP;
 
                     if screening_rho > 0.0
                         && screening_penalized.is_finite()
                         && candidate_grad_finite
-                        && eta_ok
                     {
                         let accepted_state = if options.firth_bias_reduction {
                             let firth_curv_start = std::time::Instant::now();

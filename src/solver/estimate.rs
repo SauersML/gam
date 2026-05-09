@@ -722,6 +722,17 @@ fn invert_regularized_rho_hessian(hessian_rho: &Array2<f64>) -> Option<(Array2<f
         .map(f64::abs)
         .fold(0.0_f64, f64::max)
         .max(1.0);
+    let min_eig = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
+    let neg_tol = 64.0 * f64::EPSILON * (n.max(1) as f64) * spectral_scale;
+    if min_eig < -neg_tol {
+        log::warn!(
+            "LAML rho Hessian has material negative eigenvalue {:.3e} below tolerance {:.3e}; \
+             smoothing correction covariance is invalid.",
+            min_eig,
+            neg_tol
+        );
+        return None;
+    }
     let floor = (spectral_scale * 1e-10).max(LAML_RIDGE);
     let mut inverse = Array2::<f64>::zeros((n, n));
     for i in 0..n {
@@ -852,7 +863,7 @@ fn compute_smoothing_correction(
         Some(inverse) => inverse,
         None => {
             log::warn!(
-                "Failed to invert LAML Hessian for smoothing correction after spectral repair; skipping."
+                "Failed to invert SPD LAML Hessian for smoothing correction; skipping."
             );
             return SmoothingCorrectionComputation {
                 correction: None,
@@ -862,7 +873,7 @@ fn compute_smoothing_correction(
     };
     if repaired_hessian {
         log::debug!(
-            "Projected indefinite LAML Hessian onto a positive spectrum before smoothing correction inversion."
+            "Applied near-singular rho-Hessian eigenvalue floor before smoothing correction inversion."
         );
     }
 
@@ -892,17 +903,35 @@ fn compute_smoothing_correction(
         };
     }
 
-    // Ensure positive semi-definiteness by clamping negative eigenvalues
-    // (can happen due to numerical noise)
+    // Ensure positive semi-definiteness without hiding a failed rho-space
+    // optimum. Tiny negative values are eigensolver roundoff and are snapped
+    // to zero; material negative curvature means the first-order smoothing
+    // correction is not a valid covariance contribution, so skip it loudly
+    // instead of projecting away the offending direction.
     match v_corr_orig.eigh(faer::Side::Lower) {
         Ok((eigenvalues, eigenvectors)) => {
             let min_eig = eigenvalues.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-            if min_eig < -1e-10 {
-                log::debug!(
-                    "Smoothing correction has negative eigenvalue {:.3e}; clamping to zero.",
-                    min_eig
+            let spectral_scale = eigenvalues
+                .iter()
+                .copied()
+                .map(f64::abs)
+                .fold(0.0_f64, f64::max)
+                .max(1.0);
+            let neg_tol =
+                64.0 * f64::EPSILON * (n_coeffs_orig.max(1) as f64) * spectral_scale;
+            if min_eig < -neg_tol {
+                log::warn!(
+                    "Smoothing correction has material negative eigenvalue {:.3e} \
+                     below tolerance {:.3e}; skipping correction.",
+                    min_eig,
+                    neg_tol
                 );
-                // Reconstruct with clamped eigenvalues
+                return SmoothingCorrectionComputation {
+                    correction: None,
+                    hessian_rho: Some(hessian_rho),
+                };
+            }
+            if min_eig < 0.0 {
                 let mut result = Array2::<f64>::zeros((n_coeffs_orig, n_coeffs_orig));
                 for i in 0..n_coeffs_orig {
                     let eig = eigenvalues[i].max(0.0);
