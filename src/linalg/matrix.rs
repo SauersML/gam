@@ -3384,8 +3384,19 @@ impl CoefficientTransformOperator {
                     .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()));
                 match bytes {
                     Some(b) if b <= Self::MATERIALIZE_MAX_BYTES => {
+                        // Auto-strict at biobank shape: even though the cache's
+                        // own MATERIALIZE_MAX_BYTES budget would admit this
+                        // block, refuse densification when the operator's
+                        // outer shape says we're in strict territory. Falls
+                        // through to streaming row_chunk_into / apply paths.
+                        let auto_policy = ResourcePolicy::for_problem(
+                            self.n,
+                            self.p_out,
+                            crate::resource::ProblemHints::default(),
+                        );
                         let cache_policy = ResourcePolicy {
                             max_single_materialization_bytes: Self::MATERIALIZE_MAX_BYTES,
+                            derivative_storage_mode: auto_policy.derivative_storage_mode,
                             ..ResourcePolicy::default_library()
                         };
                         self.inner

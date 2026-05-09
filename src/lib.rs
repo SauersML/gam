@@ -40,7 +40,7 @@ pub use inference::{alo, data, diagnostics, generative, hmc, predict, probabilit
 pub use linalg::{faer_ndarray, matrix, utils};
 pub use resource::{
     ByteLruCache, DerivativeStorageMode, MaterializationPolicy, MatrixMaterializationError,
-    ResidentBytes, ResourcePolicy,
+    ProblemHints, ResidentBytes, ResourcePolicy,
 };
 pub use solver::{estimate, mixture_link, pirls, seeding, visualizer};
 pub use terms::{basis, construction, hull, layout, smooth, term_builder};
