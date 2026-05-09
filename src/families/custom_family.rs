@@ -15768,7 +15768,8 @@ mod tests {
 
     #[test]
     fn default_custom_family_exact_hessian_hooks_drive_profiled_outer_hessian() {
-        let spec = default_diagonal_exact_hook_spec();
+        let mut spec = default_diagonal_exact_hook_spec();
+        spec.initial_beta = Some(Array1::zeros(2));
         let result = evaluate_custom_family_joint_hyper(
             &DefaultDiagonalExactHookFamily,
             &[spec],
@@ -15794,6 +15795,34 @@ mod tests {
             }
             _ => panic!("outer Hessian should be analytic"),
         }
+    }
+
+    #[test]
+    fn nonconverged_inner_skips_profiled_outer_hessian_assembly() {
+        let spec = default_diagonal_exact_hook_spec();
+        let result = evaluate_custom_family_joint_hyper(
+            &DefaultDiagonalExactHookFamily,
+            &[spec],
+            &BlockwiseFitOptions {
+                use_remlobjective: true,
+                use_outer_hessian: true,
+                compute_covariance: false,
+                inner_max_cycles: 1,
+                ..BlockwiseFitOptions::default()
+            },
+            &array![0.0],
+            &[vec![]],
+            None,
+            EvalMode::ValueGradientHessian,
+        )
+        .expect("non-converged inner solve should return a recoverable outer result");
+
+        assert!(!result.inner_converged);
+        assert_eq!(result.gradient.len(), 1);
+        assert!(matches!(
+            result.outer_hessian,
+            crate::solver::outer_strategy::HessianResult::Unavailable
+        ));
     }
 
     #[test]

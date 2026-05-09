@@ -1,9 +1,8 @@
 //! Integration tests for the outer-score subsample pipeline.
 //!
 //! These tests exercise the public Horvitz-Thompson semantics of the
-//! stratified outer-score subsample without depending on the higher-level
-//! biobank-scale auto-injection wrapper (which is owned and configured in
-//! the workflow layer). The invariant under test is the per-row weighting
+//! stratified outer-score subsample without any automatic workflow wiring.
+//! The invariant under test is the per-row weighting
 //! contract: `OuterScoreSubsample::rows[i].weight = N_h / k_h` for the
 //! row's stratum, and `outer_row_weights_by_index` exposes those weights
 //! to per-row score / Hessian sums.

@@ -53,7 +53,7 @@ pub enum ApproxKind {
     /// Horvitz-Thompson outer-score subsamples.
     StatisticalApproximation {
         /// Free-form description of the variance bound, e.g.
-        /// `"Var(score_K) / Var(score_n) = O(n / K) for K = auto_outer_subsample_k(n)"`.
+        /// `"Var(score_K) / Var(score_n) = O(n / K) for caller-selected K"`.
         variance_bound: &'static str,
     },
 
