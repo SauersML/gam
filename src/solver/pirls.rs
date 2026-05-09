@@ -6019,6 +6019,11 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             final_lm_lambda: 1e-6,
             // Zero-iteration synthesis: no LM gain ratio was measured.
             final_accept_rho: None,
+            // Zero-iteration synthesis assembles the Hessian with prior
+            // weights only; no observed-information re-evaluation has
+            // happened. Label honestly as a Fisher-type surrogate so
+            // outer Laplace consumers see the truth.
+            exported_laplace_curvature: ExportedLaplaceCurvature::ExpectedInformationSurrogate,
         };
 
         let (solve_c_array, solve_d_array, solve_dmu_deta, solve_d2mu_deta2, solve_d3mu_deta3) =
