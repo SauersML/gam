@@ -1009,6 +1009,18 @@ pub trait CustomFamily {
         self.exact_newton_joint_hessian_workspace(states, specs)
     }
 
+    /// Optional line-search evaluator that returns both the exact
+    /// log-likelihood and a reusable joint-Hessian workspace built during the
+    /// same row sweep.
+    fn joint_line_search_log_likelihood_workspace(
+        &self,
+        _: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+        _: &BlockwiseFitOptions,
+    ) -> Result<Option<(f64, Arc<dyn ExactNewtonJointHessianWorkspace>)>, String> {
+        Ok(None)
+    }
+
     /// Optional batched analytic-gradient hook.
     ///
     /// Returns the K per-θ_j gradient contributions ([`BatchedOuterGradientTerms`])
@@ -8201,6 +8213,12 @@ fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'sta
     states: &[ParameterBlockState],
     prefer_workspace: bool,
 ) -> Result<(f64, Option<Arc<dyn ExactNewtonJointHessianWorkspace>>), String> {
+    if prefer_workspace
+        && let Some((log_likelihood, workspace)) =
+            family.joint_line_search_log_likelihood_workspace(states, specs, options)?
+    {
+        return Ok((log_likelihood, Some(workspace)));
+    }
     if (!family.supports_log_likelihood_early_exit() || options.early_exit_threshold.is_none())
         && prefer_workspace
         && family.inner_joint_workspace_log_likelihood_available(specs)
@@ -8497,6 +8515,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let joint_constraints =
                 assemble_joint_linear_constraints(&block_constraints, &ranges, total_p)?;
             // Get joint Hessian and block gradients from the current evaluation.
+            let mut hessian_workspace_for_cycle: Option<
+                Arc<dyn ExactNewtonJointHessianWorkspace>,
+            > = None;
             let joint_hessian_source = if joint_workspace_requested {
                 let workspace = match cached_joint_workspace.take() {
                     Some(workspace) => Some(workspace),
@@ -8504,6 +8525,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         &states, specs, options,
                     )?,
                 };
+                hessian_workspace_for_cycle = workspace.clone();
                 workspace
                     .as_ref()
                     .map(|workspace| {
@@ -8831,6 +8853,41 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 joint_mode_diagonal_ridge,
             );
             let rhs = &grad_joint - &penalty_beta;
+            let beta_inf = states
+                .iter()
+                .flat_map(|s| s.beta.iter().copied())
+                .map(f64::abs)
+                .fold(0.0_f64, f64::max);
+            let step_tol = inner_tol * (1.0 + beta_inf);
+            let objective_tol = inner_tol * (1.0 + old_objective.abs());
+            let residual_tol = objective_tol;
+            let current_stationarity_residual =
+                exact_newton_joint_stationarity_inf_norm_from_gradient(
+                    &grad_joint,
+                    &states,
+                    specs,
+                    &s_lambdas,
+                    ridge,
+                    options.ridge_policy,
+                    &block_constraints,
+                )?;
+            if current_stationarity_residual <= residual_tol
+                && last_cycle_obj_change_below_tol
+                && step_inf <= step_tol
+            {
+                log::info!(
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | pre-line-search converged: step_inf={:.3e} (tol={:.3e}) | residual={:.3e} (tol={:.3e}) | previous objective change below tol",
+                    cycle,
+                    step_inf,
+                    step_tol,
+                    current_stationarity_residual,
+                    residual_tol,
+                );
+                cached_joint_workspace = hessian_workspace_for_cycle;
+                cycles_done = cycle;
+                converged = true;
+                break;
+            }
 
             // Trust-region retries preserve the objective-decrease guarantee
             // when the initial radius is too optimistic. If the Newton proposal
@@ -8916,14 +8973,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 refresh_all_block_etas(family, specs, &mut states)?;
                 let trial_penalty =
                     total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
-                // Cheap-LL line-search path: rejected backtracking attempts
-                // discard the exact-Newton workspace they build, so by default
-                // we evaluate just the scalar full-data log-likelihood for the
-                // accept/reject decision and only build the full state once the
-                // step is accepted (via the gradient reload below). The
-                // workspace path is preserved behind
-                // `options.line_search_prefer_workspace` for A/B regression
-                // checks against the legacy numerics.
+                // Families that can build a reusable workspace while computing
+                // the line-search likelihood do so here. Rejected attempts can
+                // still stop through the early-exit threshold; accepted full
+                // sweeps keep their exact row cache for the gradient reload.
                 let line_search_options =
                     coefficient_line_search_options(options, old_objective + 1e-10);
                 let trial_ll = match joint_line_search_log_likelihood(
@@ -8931,7 +8984,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     specs,
                     &line_search_options,
                     &states,
-                    joint_workspace_requested && options.line_search_prefer_workspace,
+                    joint_workspace_requested || options.line_search_prefer_workspace,
                 ) {
                     Ok((value, workspace)) => {
                         accepted_joint_workspace = workspace;
