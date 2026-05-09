@@ -8515,9 +8515,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let joint_constraints =
                 assemble_joint_linear_constraints(&block_constraints, &ranges, total_p)?;
             // Get joint Hessian and block gradients from the current evaluation.
-            let mut hessian_workspace_for_cycle: Option<
-                Arc<dyn ExactNewtonJointHessianWorkspace>,
-            > = None;
+            let mut hessian_workspace_for_cycle: Option<Arc<dyn ExactNewtonJointHessianWorkspace>> =
+                None;
             let joint_hessian_source = if joint_workspace_requested {
                 let workspace = match cached_joint_workspace.take() {
                     Some(workspace) => Some(workspace),
