@@ -4004,6 +4004,53 @@ fn xt_diag_y_dense(
     Ok(fast_xt_diag_y(left, diag, right))
 }
 
+fn xt_diag_x_design(design: &DesignMatrix, diag: &Array1<f64>) -> Result<Array2<f64>, String> {
+    if design.nrows() != diag.len() {
+        return Err(format!(
+            "xt_diag_x_design row mismatch: design has {} rows but diag has {} entries",
+            design.nrows(),
+            diag.len()
+        ));
+    }
+    design.compute_xtwx(diag)
+}
+
+fn xt_diag_y_design(
+    left: &DesignMatrix,
+    diag: &Array1<f64>,
+    right: &DesignMatrix,
+) -> Result<Array2<f64>, String> {
+    if left.nrows() != diag.len() {
+        return Err(format!(
+            "xt_diag_y_design row mismatch: left has {} rows but diag has {} entries",
+            left.nrows(),
+            diag.len()
+        ));
+    }
+    if right.nrows() != diag.len() {
+        return Err(format!(
+            "xt_diag_y_design row mismatch: right has {} rows but diag has {} entries",
+            right.nrows(),
+            diag.len()
+        ));
+    }
+    if let (Some(left_dense), Some(right_dense)) = (left.as_dense_ref(), right.as_dense_ref()) {
+        return xt_diag_y_dense(left_dense, diag, right_dense);
+    }
+
+    let mut out = Array2::<f64>::zeros((left.ncols(), right.ncols()));
+    for rows in exact_design_row_chunks(diag.len(), left.ncols() + right.ncols()) {
+        let left_chunk = left
+            .try_row_chunk(rows.clone())
+            .map_err(|e| format!("xt_diag_y_design left row chunk materialization failed: {e}"))?;
+        let right_chunk = right
+            .try_row_chunk(rows.clone())
+            .map_err(|e| format!("xt_diag_y_design right row chunk materialization failed: {e}"))?;
+        out += &fast_xt_diag_y(&left_chunk, &diag.slice(s![rows]), &right_chunk);
+    }
+    Ok(out)
+}
+
 fn mirror_upper_to_lower(target: &mut Array2<f64>) {
     for i in 0..target.nrows() {
         for j in 0..i {
@@ -12758,10 +12805,10 @@ impl BinomialLocationScaleFamily {
         block_states: &[ParameterBlockState],
         specs: Option<&[ParameterBlockSpec]>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(specs)? else {
+        let Some((x_t, x_ls)) = self.exact_joint_block_designs_owned(specs)? else {
             return Ok(None);
         };
-        self.exact_newton_joint_hessian_from_designs(block_states, &x_t, &x_ls)
+        self.exact_newton_joint_hessian_from_design_matrices(block_states, &x_t, &x_ls)
     }
 
     fn exact_newton_joint_hessian_directional_derivative_for_specs(
@@ -12944,16 +12991,16 @@ impl BinomialLocationScaleFamily {
     /// Exact diagonal-block-only Hessians (h_tt, h_ll) used by `evaluate()`
     /// to populate per-block working sets without ever materializing the
     /// dense p×p joint matrix.
-    fn exact_newton_block_diagonal_hessians_from_designs(
+    fn exact_newton_block_diagonal_hessians_from_design_matrices(
         &self,
         block_states: &[ParameterBlockState],
-        x_t: &Array2<f64>,
-        x_ls: &Array2<f64>,
+        x_t: &DesignMatrix,
+        x_ls: &DesignMatrix,
     ) -> Result<(Array2<f64>, Array2<f64>), String> {
         let (coeff_tt, _coeff_tl, coeff_ll) =
             self.exact_newton_joint_hessian_row_coefficients(block_states)?;
-        let h_tt = xt_diag_x_dense(x_t, &coeff_tt)?;
-        let h_ll = xt_diag_x_dense(x_ls, &coeff_ll)?;
+        let h_tt = xt_diag_x_design(x_t, &coeff_tt)?;
+        let h_ll = xt_diag_x_design(x_ls, &coeff_ll)?;
         Ok((h_tt, h_ll))
     }
 
@@ -13027,6 +13074,29 @@ impl BinomialLocationScaleFamily {
         let h_tt = xt_diag_x_dense(x_t, &coeff_tt)?;
         let h_tl = xt_diag_y_dense(x_t, &coeff_tl, x_ls)?;
         let h_ll = xt_diag_x_dense(x_ls, &coeff_ll)?;
+        let total = pt + pls;
+        let mut h = Array2::<f64>::zeros((total, total));
+        h.slice_mut(s![0..pt, 0..pt]).assign(&h_tt);
+        h.slice_mut(s![0..pt, pt..total]).assign(&h_tl);
+        h.slice_mut(s![pt..total, pt..total]).assign(&h_ll);
+        mirror_upper_to_lower(&mut h);
+        Ok(Some(h))
+    }
+
+    fn exact_newton_joint_hessian_from_design_matrices(
+        &self,
+        block_states: &[ParameterBlockState],
+        x_t: &DesignMatrix,
+        x_ls: &DesignMatrix,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let (coeff_tt, coeff_tl, coeff_ll) =
+            self.exact_newton_joint_hessian_row_coefficients(block_states)?;
+        let pt = x_t.ncols();
+        let pls = x_ls.ncols();
+
+        let h_tt = xt_diag_x_design(x_t, &coeff_tt)?;
+        let h_tl = xt_diag_y_design(x_t, &coeff_tl, x_ls)?;
+        let h_ll = xt_diag_x_design(x_ls, &coeff_ll)?;
         let total = pt + pls;
         let mut h = Array2::<f64>::zeros((total, total));
         h.slice_mut(s![0..pt, 0..pt]).assign(&h_tt);
@@ -14596,11 +14666,11 @@ impl CustomFamily for BinomialLocationScaleFamily {
         // matrix — the off-diagonal cross block is unused for IRLS-style block
         // working sets and would cost O(p_t * p_ls * n) to form. The diagonal
         // blocks are computed from the same row coefficients as the joint.
-        let (x_t, x_ls) = self
-            .exact_joint_dense_block_designs(None)?
-            .ok_or("BinomialLocationScaleFamily: joint block designs unavailable")?;
-        let (h_tt, h_ll) =
-            self.exact_newton_block_diagonal_hessians_from_designs(block_states, &x_t, &x_ls)?;
+        let (h_tt, h_ll) = self.exact_newton_block_diagonal_hessians_from_design_matrices(
+            block_states,
+            threshold_design,
+            log_sigma_design,
+        )?;
         Ok(FamilyEvaluation {
             log_likelihood: core.log_likelihood,
             blockworking_sets: vec![
@@ -15556,25 +15626,16 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
         //   H_ll = X_lsᵀ diag(coeff_ll) X_ls,
         // versus letting `MatrixFreeSpdOperator::materialize_dense_operator`
         // reconstruct the dense Hessian via `total` canonical-basis HVPs. At
-        // biobank scale (n≈320k, p_total≈82) the canonical-basis path takes
-        // ~568s per κ-iter while the dense build via fast_xt_diag_x/y is ~1s.
-        //
-        // If either design is operator-backed and the active resource policy
-        // refuses dense materialization (biobank-mode budget guard), we
-        // surface the error to the dispatch site, which falls through to
-        // diagonal+matvec scaffolding rather than the dense path.
+        // biobank scale, canonical-basis materialization costs p_total full
+        // Hessian-vector products. The design helpers below stream row chunks,
+        // so the only dense object retained here is the small p_total×p_total
+        // coefficient Hessian.
         let pt = self.x_t.ncols();
         let pls = self.x_ls.ncols();
         let total = pt + pls;
-        let x_t_dense = self
-            .x_t
-            .try_to_dense_arc("BinomialLocationScaleHessianWorkspace::hessian_dense x_t")?;
-        let x_ls_dense = self
-            .x_ls
-            .try_to_dense_arc("BinomialLocationScaleHessianWorkspace::hessian_dense x_ls")?;
-        let h_tt = xt_diag_x_dense(x_t_dense.as_ref(), &self.coeff_tt)?;
-        let h_tl = xt_diag_y_dense(x_t_dense.as_ref(), &self.coeff_tl, x_ls_dense.as_ref())?;
-        let h_ll = xt_diag_x_dense(x_ls_dense.as_ref(), &self.coeff_ll)?;
+        let h_tt = xt_diag_x_design(&self.x_t, &self.coeff_tt)?;
+        let h_tl = xt_diag_y_design(&self.x_t, &self.coeff_tl, &self.x_ls)?;
+        let h_ll = xt_diag_x_design(&self.x_ls, &self.coeff_ll)?;
         let mut h = Array2::<f64>::zeros((total, total));
         h.slice_mut(s![0..pt, 0..pt]).assign(&h_tt);
         h.slice_mut(s![0..pt, pt..total]).assign(&h_tl);
@@ -21110,6 +21171,22 @@ mod tests {
             .exact_newton_joint_hessian_workspace(&states, &specs)
             .expect("operator workspace build")
             .expect("operator workspace present");
+        let got_h = workspace
+            .hessian_dense()
+            .expect("operator-backed dense Hessian")
+            .expect("operator-backed dense Hessian present");
+        assert_eq!(got_h.dim(), dense_h.dim());
+        for i in 0..got_h.nrows() {
+            for j in 0..got_h.ncols() {
+                let want = dense_h[[i, j]];
+                let got = got_h[[i, j]];
+                let tol = 1e-10 * want.abs().max(1.0) + 1e-10;
+                assert!(
+                    (want - got).abs() <= tol,
+                    "lazy BLS dense Hessian mismatch at ({i}, {j}): dense={want:.6e}, op={got:.6e}"
+                );
+            }
+        }
         let v = array![0.30, -0.70, 0.50, -0.20, 0.15];
         let got_hv = workspace
             .hessian_matvec(&v)
@@ -23750,7 +23827,10 @@ mod tests {
             )
             .expect("joint psi second-order call")
             .expect("wiggle family should return joint psi second-order terms");
-        let total = block_states.iter().map(|state| state.beta.len()).sum::<usize>();
+        let total = block_states
+            .iter()
+            .map(|state| state.beta.len())
+            .sum::<usize>();
         assert_eq!(psi_terms.score_psi.len(), total);
         if psi_terms.hessian_psi_operator.is_some() {
             assert_eq!(psi_terms.hessian_psi.dim(), (0, 0));

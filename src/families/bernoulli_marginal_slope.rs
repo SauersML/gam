@@ -31,6 +31,7 @@ use crate::probability::{
 use crate::smooth::{
     ExactJointHyperSetup, SmoothBasisSpec, SpatialLengthScaleOptimizationOptions,
     SpatialLogKappaCoords, TermCollectionDesign, TermCollectionSpec,
+    apply_spatial_anisotropy_pilot_initializer,
     build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
 };
@@ -66,6 +67,14 @@ pub use deviation_runtime::DeviationRuntime;
 /// and no public API surface for tuning this — it is an internal
 /// implementation detail of the FLEX matrix-free Hv path.
 const BMS_HV_ROW_SKIP_TAU: f64 = 1e-14;
+
+/// Row count where flexible marginal-slope outer-Hessian calculus stops being
+/// a useful optimizer acceleration. Above this gate the exact profiled Hessian
+/// spends most of its time in third/fourth β-derivative contractions over the
+/// FLEX cell kernel; exact value/gradient evaluations keep the same likelihood,
+/// calibration, and inner Newton solve without paying that curvature bill.
+const BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT: usize =
+    crate::families::marginal_slope_shared::BIOBANK_OUTER_SUBSAMPLE_THRESHOLD;
 
 #[derive(Clone, Debug)]
 pub struct DeviationBlockConfig {
@@ -2982,7 +2991,7 @@ struct CachedDenestedCellMoments {
 #[derive(Clone)]
 struct RowCellMomentsBundle {
     max_degree: usize,
-    rows: Vec<Vec<CachedDenestedCellMoments>>,
+    rows: Vec<Option<Vec<CachedDenestedCellMoments>>>,
 }
 
 impl RowCellMomentsBundle {
@@ -2995,12 +3004,13 @@ impl RowCellMomentsBundle {
             required_degree
         );
         (self.max_degree >= required_degree)
-            .then(|| self.rows.get(row).map(Vec::as_slice))
+            .then(|| self.rows.get(row).and_then(Option::as_ref).map(Vec::as_slice))
             .flatten()
     }
 
     fn estimated_resident_bytes(n_rows: usize, n_cells: usize, max_degree: usize) -> usize {
-        let row_vecs = n_rows.saturating_mul(std::mem::size_of::<Vec<CachedDenestedCellMoments>>());
+        let row_vecs =
+            n_rows.saturating_mul(std::mem::size_of::<Option<Vec<CachedDenestedCellMoments>>>());
         let cell_records = n_cells.saturating_mul(std::mem::size_of::<CachedDenestedCellMoments>());
         let moment_payload = n_cells
             .saturating_mul(max_degree.saturating_add(1))
@@ -5013,12 +5023,8 @@ impl BernoulliMarginalSlopeFamily {
         cell: exact_kernel::DenestedCubicCell,
         max_degree: usize,
     ) -> Result<exact_kernel::CellMomentState, String> {
-        exact_kernel::evaluate_cell_moments_cached(
-            cell,
-            max_degree,
-            &self.cell_moment_lru,
-            Some(&self.cell_moment_cache_stats),
-        )
+        self.cell_moment_cache_stats.record_miss();
+        exact_kernel::evaluate_cell_moments_uncached(cell, max_degree)
     }
 
     #[inline]
@@ -5289,12 +5295,12 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
-    fn row_intercept_newton_is_converged(a: f64, f: f64, f_a: f64) -> bool {
+    fn row_intercept_newton_is_converged(a: f64, f: f64, f_a: f64, abs_tol: f64) -> bool {
         if !a.is_finite() || !f.is_finite() || !f_a.is_finite() || f_a == 0.0 {
             return false;
         }
         let correction = (f / f_a).abs();
-        f.abs() <= 1e-10 || correction <= 1e-10 * (1.0 + a.abs())
+        f.abs() <= abs_tol || correction <= 1e-10 * (1.0 + a.abs())
     }
 }
 
@@ -5539,30 +5545,36 @@ impl BernoulliMarginalSlopeFamily {
         // affine warm start short-circuits at `monotone_root.rs:26` for the
         // common case, instead of forcing 30+ refinement iters down to 1e-10.
 
-        // Two-step Newton probe before paying for the safeguarded bracket.
+        // Local Newton probe before paying for the safeguarded bracket.
         // Cycle-0 is cold at biobank scale, so forcing every row through the
         // bracket spends most of the wall time rebuilding identical degree-4
         // cell moments. The rigid/affine seed is exact when deviations vanish
         // and first-order accurate when they are small; probe that local
-        // Newton basin first. The convergence test (1e-10 absolute or
-        // relative correction) is strictly tighter than `abs_tol`, so any
-        // accept here is safe. Hard cases still fall through unchanged.
+        // Newton basin first. The convergence test uses the same residual
+        // contract as the safeguarded solver plus a tight relative-correction
+        // gate, so any accept here satisfies the existing final check. Hard
+        // cases still fall through unchanged.
         let probe_result = (|| -> Result<(Option<(f64, f64, f64)>, f64), String> {
-            let (f0, f_a0, _) = eval(a_init)?;
-            let seed_residual = f0;
-            if Self::row_intercept_newton_is_converged(a_init, f0, f_a0) {
-                return Ok((Some((a_init, f_a0.abs(), f0)), seed_residual));
-            }
-            if f_a0.is_finite() && f_a0 != 0.0 {
-                let a1 = a_init - f0 / f_a0;
-                if a1.is_finite() {
-                    let (f1, f_a1, _) = eval(a1)?;
-                    if Self::row_intercept_newton_is_converged(a1, f1, f_a1) {
-                        return Ok((Some((a1, f_a1.abs(), f1)), seed_residual));
-                    }
+            let mut a = a_init;
+            let mut seed_residual = None;
+            for _ in 0..6 {
+                let (f, f_a, _) = eval(a)?;
+                if seed_residual.is_none() {
+                    seed_residual = Some(f);
                 }
+                if Self::row_intercept_newton_is_converged(a, f, f_a, abs_tol) {
+                    return Ok((Some((a, f_a.abs(), f)), seed_residual.unwrap_or(f)));
+                }
+                if !(f_a.is_finite() && f_a != 0.0) {
+                    break;
+                }
+                let next_a = a - f / f_a;
+                if !next_a.is_finite() {
+                    break;
+                }
+                a = next_a;
             }
-            Ok((None, seed_residual))
+            Ok((None, seed_residual.unwrap_or(f64::INFINITY)))
         })();
 
         if let Ok((accepted, seed_residual)) = &probe_result {
@@ -5735,6 +5747,14 @@ impl BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<BernoulliMarginalSlopeExactEvalCache, String> {
+        self.build_exact_eval_cache_with_options(block_states, None)
+    }
+
+    fn build_exact_eval_cache_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        options: Option<&BlockwiseFitOptions>,
+    ) -> Result<BernoulliMarginalSlopeExactEvalCache, String> {
         self.validate_exact_block_state_shapes(block_states)?;
         let slices = block_slices(self);
         let primary = primary_slices(&slices);
@@ -5814,8 +5834,18 @@ impl BernoulliMarginalSlopeFamily {
                 started.elapsed().as_secs_f64()
             );
         }
-        let row_cell_moments =
-            self.build_row_cell_moments_bundle(block_states, &row_contexts, 21)?;
+        let row_cell_mask = options
+            .and_then(|opts| opts.outer_score_subsample.as_ref())
+            .map(|subsample| subsample.mask.as_slice());
+        let row_cell_moments = match row_cell_mask {
+            Some(mask) => {
+                self.build_row_cell_moments_bundle(block_states, &row_contexts, 21, Some(mask))?
+            }
+            None if n < BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT => {
+                self.build_row_cell_moments_bundle(block_states, &row_contexts, 21, None)?
+            }
+            None => None,
+        };
         Ok(BernoulliMarginalSlopeExactEvalCache {
             slices,
             primary,
@@ -5839,6 +5869,7 @@ impl BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         row_contexts: &[BernoulliMarginalSlopeRowExactContext],
         max_degree: usize,
+        row_mask: Option<&[usize]>,
     ) -> Result<Option<RowCellMomentsBundle>, String> {
         if !self.effective_flex_active(block_states)? {
             return Ok(None);
@@ -5852,7 +5883,14 @@ impl BernoulliMarginalSlopeFamily {
         let n = self.y.len();
         let beta_h = self.score_beta(block_states)?;
         let beta_w = self.link_beta(block_states)?;
-        let partitions: Vec<Vec<exact_kernel::DenestedPartitionCell>> = (0..n)
+        let selected_rows: Vec<usize> = match row_mask {
+            Some(mask) => mask.iter().copied().filter(|&row| row < n).collect(),
+            None => (0..n).collect(),
+        };
+        if selected_rows.is_empty() {
+            return Ok(None);
+        }
+        let partitions: Vec<(usize, Vec<exact_kernel::DenestedPartitionCell>)> = selected_rows
             .into_par_iter()
             .map(|row| {
                 self.denested_partition_cells(
@@ -5861,16 +5899,19 @@ impl BernoulliMarginalSlopeFamily {
                     beta_h,
                     beta_w,
                 )
+                .map(|cells| (row, cells))
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let n_cells = partitions.iter().map(Vec::len).sum::<usize>();
+        let selected_n = partitions.len();
+        let n_cells = partitions.iter().map(|(_, cells)| cells.len()).sum::<usize>();
         let estimated_bytes =
             RowCellMomentsBundle::estimated_resident_bytes(n, n_cells, max_degree);
         let limit_bytes = self.policy.max_operator_cache_bytes;
         if estimated_bytes > limit_bytes {
             log::warn!(
-                "[BMS row-cell-moments] skip precompute n={} cells={} degree={} estimated_bytes={} limit_bytes={}",
+                "[BMS row-cell-moments] skip precompute n={} selected_rows={} cells={} degree={} estimated_bytes={} limit_bytes={}",
                 n,
+                selected_n,
                 n_cells,
                 max_degree,
                 estimated_bytes,
@@ -5879,10 +5920,10 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(None);
         }
         let started = std::time::Instant::now();
-        let rows = partitions
+        let computed_rows = partitions
             .into_par_iter()
-            .map(|cells| {
-                cells
+            .map(|(row, cells)| {
+                let moments = cells
                     .into_iter()
                     .map(|partition_cell| {
                         // Use the per-family LRU here too so the bundle build
@@ -5894,13 +5935,19 @@ impl BernoulliMarginalSlopeFamily {
                                 state,
                             })
                     })
-                    .collect::<Result<Vec<_>, String>>()
+                    .collect::<Result<Vec<_>, String>>()?;
+                Ok((row, moments))
             })
             .collect::<Result<Vec<_>, String>>()?;
+        let mut rows = vec![None; n];
+        for (row, moments) in computed_rows {
+            rows[row] = Some(moments);
+        }
         if log_exact_work(n) {
             log::info!(
-                "[BMS row-cell-moments] precomputed n={} cells={} degree={} estimated_bytes={} elapsed={:.3}s",
+                "[BMS row-cell-moments] precomputed n={} selected_rows={} cells={} degree={} estimated_bytes={} elapsed={:.3}s",
                 n,
+                selected_n,
                 n_cells,
                 max_degree,
                 estimated_bytes,
@@ -7041,12 +7088,33 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_uv = Array2::<f64>::zeros((r, r));
         let mut f_uv_dir = Array2::<f64>::zeros((r, r));
 
-        let cells = self.denested_partition_cells(a, b, beta_h, beta_w)?;
-        for partition_cell in cells {
+        let owned_cells;
+        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = cache
+            .row_cell_moments
+            .as_ref()
+            .and_then(|bundle| bundle.row(row, 15))
+        {
+            cached
+        } else {
+            let partitions = self.denested_partition_cells(a, b, beta_h, beta_w)?;
+            owned_cells = partitions
+                .into_iter()
+                .map(|partition_cell| {
+                    self.evaluate_cell_moments_lru(partition_cell.cell, 15)
+                        .map(|state| CachedDenestedCellMoments {
+                            partition_cell,
+                            state,
+                        })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            &owned_cells
+        };
+        for entry in cells {
+            let partition_cell = entry.partition_cell;
             let cell = partition_cell.cell;
             let z_mid = exact::interval_probe_point(cell.left, cell.right)?;
             let u_mid = a + b * z_mid;
-            let state = self.evaluate_cell_moments_lru(cell, 15)?;
+            let state = &entry.state;
 
             let (dc_da_raw, dc_db_raw) = exact::denested_cell_coefficient_partials(
                 partition_cell.score_span,
@@ -7603,12 +7671,33 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_au_uv = Array1::<f64>::zeros(r);
         let mut f_uv_uv = Array2::<f64>::zeros((r, r));
 
-        let cells = self.denested_partition_cells(a, b, beta_h, beta_w)?;
-        for partition_cell in cells {
+        let owned_cells;
+        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = cache
+            .row_cell_moments
+            .as_ref()
+            .and_then(|bundle| bundle.row(row, 21))
+        {
+            cached
+        } else {
+            let partitions = self.denested_partition_cells(a, b, beta_h, beta_w)?;
+            owned_cells = partitions
+                .into_iter()
+                .map(|partition_cell| {
+                    self.evaluate_cell_moments_lru(partition_cell.cell, 21)
+                        .map(|state| CachedDenestedCellMoments {
+                            partition_cell,
+                            state,
+                        })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            &owned_cells
+        };
+        for entry in cells {
+            let partition_cell = entry.partition_cell;
             let cell = partition_cell.cell;
             let z_mid = exact::interval_probe_point(cell.left, cell.right)?;
             let u_mid = a + b * z_mid;
-            let state = self.evaluate_cell_moments_lru(cell, 21)?;
+            let state = &entry.state;
 
             let (dc_da_raw, dc_db_raw) = exact::denested_cell_coefficient_partials(
                 partition_cell.score_span,
@@ -10735,6 +10824,45 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }
     }
 
+    fn exact_outer_derivative_order(
+        &self,
+        specs: &[ParameterBlockSpec],
+        _: &BlockwiseFitOptions,
+    ) -> crate::custom_family::ExactOuterDerivativeOrder {
+        use crate::custom_family::ExactOuterDerivativeOrder;
+
+        let flex_active = self.score_warp.is_some() || self.link_dev.is_some();
+        if flex_active && self.y.len() >= BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT {
+            return ExactOuterDerivativeOrder::First;
+        }
+
+        let coefficient_work = self
+            .coefficient_hessian_cost(specs)
+            .max(self.coefficient_gradient_cost(specs));
+        if !self.outer_hyper_hessian_dense_available(specs)
+            && !self.outer_hyper_hessian_hvp_available(specs)
+        {
+            return ExactOuterDerivativeOrder::First;
+        }
+
+        crate::custom_family::exact_outer_order_with_outer_hvp(
+            specs,
+            coefficient_work,
+            self.outer_hyper_hessian_hvp_available(specs),
+        )
+    }
+
+    fn outer_seed_config(&self, n_params: usize) -> crate::seeding::SeedConfig {
+        let mut config = crate::seeding::SeedConfig::default();
+        if n_params == 0 {
+            return config;
+        }
+        config.max_seeds = 1;
+        config.seed_budget = 1;
+        config.screen_max_inner_iterations = 2;
+        config
+    }
+
     fn exact_newton_joint_psi_workspace_for_first_order_terms(&self) -> bool {
         true
     }
@@ -10748,13 +10876,9 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         Self::log_likelihood_only_with_options(self, block_states, &BlockwiseFitOptions::default())
     }
 
-    /// Options-aware override: thread the inherent options-aware path so the
-    /// joint-Newton line search agrees with the workspace path on which row
-    /// subset is in scope (the biobank FLEX path always sets an
-    /// outer_score_subsample). Without this override, the cheap fallback in
-    /// `joint_line_search_log_likelihood` evaluated on full n while the
-    /// workspace path evaluated on the subsample, producing mismatched LL
-    /// and bogus accept/reject decisions.
+    /// Options-aware override: outer hyper-derivative callers may pass a row
+    /// subsample, while coefficient inner line searches clear that option and
+    /// evaluate the exact full-data objective.
     fn log_likelihood_only_with_options(
         &self,
         block_states: &[ParameterBlockState],
@@ -11158,7 +11282,7 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
         block_states: Vec<ParameterBlockState>,
         options: BlockwiseFitOptions,
     ) -> Result<Self, String> {
-        let mut cache = family.build_exact_eval_cache(&block_states)?;
+        let mut cache = family.build_exact_eval_cache_with_options(&block_states, Some(&options))?;
         // Materialize per-row primary Hessians at construction time. The
         // matrix-free CG / inner-Newton loops contract these against many
         // trial directions at the same β, so caching the `r×r` blocks once
@@ -11298,7 +11422,7 @@ impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
         derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
         options: BlockwiseFitOptions,
     ) -> Result<Self, String> {
-        let cache = family.build_exact_eval_cache(&block_states)?;
+        let cache = family.build_exact_eval_cache_with_options(&block_states, Some(&options))?;
         // Prime the per-row uncontracted third-derivative tensor at workspace
         // construction (rigid path only). The build runs at top-level rayon
         // here, so the parallel row pass uses all cores. If we instead let
@@ -11517,6 +11641,34 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let mut spec = spec;
     let data_view = data;
     validate_spec(data_view, &spec)?;
+    let mut effective_kappa_options = kappa_options.clone();
+    let flex_spatial_scale_path = (spec.score_warp.is_some() || spec.link_dev.is_some())
+        && spec.y.len() >= BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT
+        && effective_kappa_options.enabled;
+    if flex_spatial_scale_path {
+        let marginal_terms = spatial_length_scale_term_indices(&spec.marginalspec);
+        let logslope_terms = spatial_length_scale_term_indices(&spec.logslopespec);
+        let marginal_updates = apply_spatial_anisotropy_pilot_initializer(
+            data_view,
+            &mut spec.marginalspec,
+            &marginal_terms,
+            effective_kappa_options.pilot_subsample_threshold,
+            &effective_kappa_options,
+        );
+        let logslope_updates = apply_spatial_anisotropy_pilot_initializer(
+            data_view,
+            &mut spec.logslopespec,
+            &logslope_terms,
+            effective_kappa_options.pilot_subsample_threshold,
+            &effective_kappa_options,
+        );
+        effective_kappa_options.enabled = false;
+        log::info!(
+            "[BMS spatial] n={} flex=true pilot_geometry_updates={} iterative_spatial_outer=false",
+            spec.y.len(),
+            marginal_updates + logslope_updates,
+        );
+    }
     let (z_standardized, z_normalization) = standardize_latent_z_with_policy(
         &spec.z,
         &spec.weights,
@@ -11636,7 +11788,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         marginal_design.penalties.len(),
         logslope_design.penalties.len(),
         &extra_rho0,
-        kappa_options,
+        &effective_kappa_options,
     );
     let setup = if sigma_learnable {
         setup.with_auxiliary(
@@ -11751,7 +11903,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // realized problem is large.
     let analytic_joint_hessian_available =
         analytic_joint_derivatives_available && joint_hessian.is_analytic();
-    let kappa_options_ref: &SpatialLengthScaleOptimizationOptions = kappa_options;
+    let kappa_options_ref: &SpatialLengthScaleOptimizationOptions = &effective_kappa_options;
     let sigma_from_theta = |theta: &Array1<f64>| -> Option<f64> {
         if sigma_learnable {
             Some(theta[setup.rho_dim() + setup.log_kappa_dim()].exp())
@@ -14592,7 +14744,7 @@ mod tests {
     }
 
     #[test]
-    fn flexible_family_exposes_exact_outer_derivative_path() {
+    fn flexible_family_routes_outer_derivatives_by_scale() {
         let seed = array![-1.0, 0.0, 1.0];
         let score_prepared = build_score_warp_deviation_block_from_seed(
             &seed,
@@ -14616,7 +14768,7 @@ mod tests {
                 logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
-                score_warp: Some(score_prepared.runtime),
+                score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: None,
                 policy: crate::resource::ResourcePolicy::default_library(),
                 cell_moment_lru: new_cell_moment_lru_cache(
@@ -14635,6 +14787,34 @@ mod tests {
             ExactOuterDerivativeOrder::Second
         );
         assert!(family.exact_newton_joint_psi_workspace_for_first_order_terms());
+
+        let n_large = BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT;
+        let mut large_flex_family = family.clone();
+        large_flex_family.y = Arc::new(Array1::zeros(n_large));
+        large_flex_family.weights = Arc::new(Array1::ones(n_large));
+        large_flex_family.z = Arc::new(Array1::zeros(n_large));
+        let large_flex_specs = vec![
+            dummy_blockspec(1, n_large),
+            dummy_blockspec(1, n_large),
+            dummy_blockspec(2, n_large),
+        ];
+        assert_eq!(
+            large_flex_family
+                .exact_outer_derivative_order(&large_flex_specs, &BlockwiseFitOptions::default()),
+            ExactOuterDerivativeOrder::First
+        );
+
+        let mut large_rigid_family = large_flex_family.clone();
+        large_rigid_family.score_warp = None;
+        let large_rigid_specs = vec![
+            dummy_blockspec(1, n_large),
+            dummy_blockspec(1, n_large),
+        ];
+        assert_eq!(
+            large_rigid_family
+                .exact_outer_derivative_order(&large_rigid_specs, &BlockwiseFitOptions::default()),
+            ExactOuterDerivativeOrder::Second
+        );
     }
 
     #[test]

@@ -3269,6 +3269,52 @@ fn compute_constraint_kkt_diagnostics(
     active_set::compute_constraint_kkt_diagnostics(beta, gradient, constraints)
 }
 
+/// Select which active bound-constraint to release in the primal active-set
+/// QP loop, or `None` when KKT is satisfied (no negative multiplier).
+///
+/// `use_blands` switches between two pivoting rules with the same KKT-test
+/// semantics but different anti-cycling guarantees:
+///
+/// - `false` — **worst-violation**: release the constraint with the most
+///   negative multiplier `λ_i = g_i + (H d)_i`. Greedy and fast on
+///   non-degenerate problems but can cycle when several constraints have
+///   multipliers near zero of comparable magnitude.
+/// - `true` — **Bland's rule**: release the *lowest-index* constraint with a
+///   strictly-negative multiplier (using a scale-aware deadband to ignore
+///   pure round-off). This is the textbook anti-cycling choice — combined
+///   with Bland-compatible tie-breaking on entering, it guarantees the
+///   active-set sequence visits each vertex at most once and so terminates
+///   in finitely many pivots.
+fn select_active_set_release(
+    gradient: &Array1<f64>,
+    hd: &Array1<f64>,
+    active_idx: &[usize],
+    use_blands: bool,
+) -> Option<usize> {
+    if use_blands {
+        for &i in active_idx {
+            let lambda_i = gradient[i] + hd[i];
+            let scale = gradient[i].abs().max(hd[i].abs()).max(1.0);
+            let tol = 64.0 * f64::EPSILON * scale;
+            if lambda_i < -tol {
+                return Some(i);
+            }
+        }
+        None
+    } else {
+        let mut worst = 0.0_f64;
+        let mut idx = None;
+        for &i in active_idx {
+            let lambda_i = gradient[i] + hd[i];
+            if lambda_i < worst {
+                worst = lambda_i;
+                idx = Some(i);
+            }
+        }
+        idx
+    }
+}
+
 pub(crate) fn solve_newton_directionwith_lower_bounds(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
@@ -3347,8 +3393,23 @@ pub(crate) fn solve_newton_directionwith_lower_bounds(
         }
     }
 
+    // Hybrid pivoting: worst-violation gives faster average convergence on
+    // non-degenerate problems but can cycle at degenerate vertices (multiple
+    // active constraints with multipliers near zero, ping-ponging activate/
+    // release of the same coordinate). After a worst-violation grace period
+    // we switch to Bland's lowest-index rule, which monotonically orders the
+    // active-set sequence visited and therefore terminates in finitely many
+    // additional pivots. Entering already uses Bland-compatible tie-breaking
+    // (smallest α_hit, ties broken by ascending free-index iteration order
+    // because `boundary_hit_step_fraction` requires `step < current_step_limit`
+    // strictly), so the leaving rule is the only place anti-cycling has to
+    // be enforced.
+    const BLANDS_RULE_GRACE: usize = 2;
+    let blands_threshold = BLANDS_RULE_GRACE * (p + 1);
+    let max_iters = 8 * (p + 1);
     let mut d_free = Array1::<f64>::zeros(p);
-    for _ in 0..(p + 4) {
+    for it in 0..max_iters {
+        let use_blands = it >= blands_threshold;
         let free_idx: Vec<usize> = (0..p).filter(|&i| !active[i]).collect();
         let active_idx: Vec<usize> = (0..p).filter(|&i| active[i]).collect();
         direction_out.fill(0.0);
@@ -3360,16 +3421,7 @@ pub(crate) fn solve_newton_directionwith_lower_bounds(
         }
         if free_idx.is_empty() {
             let hd = hessian.dot(direction_out);
-            let mut worstviolation = 0.0_f64;
-            let mut release_idx: Option<usize> = None;
-            for &i in &active_idx {
-                let lambda_i = gradient[i] + hd[i];
-                if lambda_i < worstviolation {
-                    worstviolation = lambda_i;
-                    release_idx = Some(i);
-                }
-            }
-            if let Some(idx) = release_idx {
+            if let Some(idx) = select_active_set_release(gradient, &hd, &active_idx, use_blands) {
                 active[idx] = false;
                 continue;
             }
@@ -3423,19 +3475,7 @@ pub(crate) fn solve_newton_directionwith_lower_bounds(
         // Dual feasibility on active constraints:
         // λ_i = g_i + (H d)_i must be >= 0 for all active lower bounds.
         let hd = hessian.dot(direction_out);
-        let mut worstviolation = 0.0_f64;
-        let mut release_idx: Option<usize> = None;
-        for i in 0..p {
-            if !active[i] {
-                continue;
-            }
-            let lambda_i = gradient[i] + hd[i];
-            if lambda_i < worstviolation {
-                worstviolation = lambda_i;
-                release_idx = Some(i);
-            }
-        }
-        if let Some(idx) = release_idx {
+        if let Some(idx) = select_active_set_release(gradient, &hd, &active_idx, use_blands) {
             active[idx] = false;
             continue;
         }
@@ -8924,9 +8964,9 @@ mod tests {
         PirlsProblem, PirlsWorkspace, bernoulli_geometry_from_jet, calculate_deviance,
         compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays,
         default_beta_guess_external, fit_model_for_fixed_rho, madsen_lm_accept_factor,
-        should_log_pirls_decision_summary, should_use_sparse_native_pirls,
-        solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
-        update_glmvectors,
+        select_active_set_release, should_log_pirls_decision_summary,
+        should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints,
+        solve_newton_directionwith_lower_bounds, update_glmvectors,
     };
     use crate::matrix::DesignMatrix;
     use crate::mixture_link::InverseLinkJet as MixtureInverseLinkJet;
@@ -9866,6 +9906,83 @@ mod tests {
         let projected = &beta + &direction;
         assert_relative_eq!(projected[0], beta[0], epsilon = 1e-14);
         assert!(active_hint.is_empty());
+    }
+
+    #[test]
+    fn select_active_set_release_worst_violation_picks_most_negative() {
+        // Multipliers λ_i = g_i + (Hd)_i across active = {0, 1, 2}:
+        //   i=0: -0.1 (mildly negative)
+        //   i=1: -0.5 (most negative)
+        //   i=2: -0.2
+        // Worst-violation must pick i=1.
+        let gradient = array![-0.1, -0.5, -0.2];
+        let hd = array![0.0, 0.0, 0.0];
+        let active_idx = vec![0, 1, 2];
+        assert_eq!(
+            select_active_set_release(&gradient, &hd, &active_idx, false),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn select_active_set_release_blands_picks_lowest_index_with_negative_multiplier() {
+        // Same setup as above. Bland's rule must pick the LOWEST index with a
+        // strictly-negative multiplier (i=0), not the most negative (i=1).
+        // This is the anti-cycling property — combined with Bland-compatible
+        // tie-breaking on entering, it monotonically orders the active-set
+        // sequence and prevents activate/release ping-pong on the same
+        // coordinate at degenerate vertices.
+        let gradient = array![-0.1, -0.5, -0.2];
+        let hd = array![0.0, 0.0, 0.0];
+        let active_idx = vec![0, 1, 2];
+        assert_eq!(
+            select_active_set_release(&gradient, &hd, &active_idx, true),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn select_active_set_release_blands_deadband_ignores_round_off() {
+        // A multiplier of magnitude 64·ε·|g| is round-off level and must NOT
+        // trigger release under Bland's rule. Otherwise pure floating-point
+        // noise would cause spurious activate/release transitions and reopen
+        // the cycling vulnerability the deadband was added to close.
+        let g = 1.0_f64;
+        let lambda_noise = -32.0 * f64::EPSILON * g; // strictly inside the deadband
+        let gradient = array![g];
+        let hd = array![lambda_noise - g]; // λ = g + hd = lambda_noise
+        let active_idx = vec![0];
+        assert_eq!(
+            select_active_set_release(&gradient, &hd, &active_idx, true),
+            None,
+            "round-off-level multiplier must not trigger Bland's release"
+        );
+
+        // ...but a multiplier just outside the deadband (128·ε·|g|) must
+        // trigger release, so the rule still detects genuine KKT violations.
+        let lambda_real = -128.0 * f64::EPSILON * g;
+        let hd = array![lambda_real - g];
+        assert_eq!(
+            select_active_set_release(&gradient, &hd, &active_idx, true),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn select_active_set_release_returns_none_when_kkt_satisfied() {
+        // All active multipliers ≥ 0 → KKT satisfied → no release, both rules
+        // signal termination by returning None.
+        let gradient = array![0.5, 1.0, 0.0];
+        let hd = array![0.0, 0.0, 0.0];
+        let active_idx = vec![0, 1, 2];
+        assert_eq!(
+            select_active_set_release(&gradient, &hd, &active_idx, false),
+            None
+        );
+        assert_eq!(
+            select_active_set_release(&gradient, &hd, &active_idx, true),
+            None
+        );
     }
 
     #[test]

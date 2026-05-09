@@ -1810,14 +1810,7 @@ fn screened_outer_warm_start<'a>(
     warm_start: Option<&'a ConstrainedWarmStart>,
     rho: &Array1<f64>,
 ) -> Option<&'a ConstrainedWarmStart> {
-    warm_start.filter(|seed| {
-        seed.rho.len() == rho.len()
-            && seed
-                .rho
-                .iter()
-                .zip(rho.iter())
-                .all(|(&a, &b)| (a - b).abs() <= 1.5)
-    })
+    warm_start.filter(|seed| seed.rho.len() == rho.len())
 }
 
 /// Helper struct mirroring the old `BlockwiseFitResultParts`.
@@ -6491,12 +6484,6 @@ enum JointHessianSource {
     },
 }
 
-#[derive(Clone, Copy)]
-enum JointHessianSourcePreference {
-    PreferDense,
-    RequireOperator,
-}
-
 const EXACT_JOINT_HESSIAN_DENSE_MAX_BYTES: usize = 512 * 1024 * 1024;
 
 fn exact_joint_hessian_dense_bytes(total: usize) -> Result<usize, String> {
@@ -6577,11 +6564,8 @@ fn exact_newton_joint_hessian_source_from_workspace(
     workspace: &Arc<dyn ExactNewtonJointHessianWorkspace>,
     total: usize,
     context: &str,
-    preference: JointHessianSourcePreference,
 ) -> Result<Option<JointHessianSource>, String> {
-    if matches!(preference, JointHessianSourcePreference::PreferDense)
-        && let Some(mut hessian) = workspace.hessian_dense()?
-    {
+    if let Some(mut hessian) = workspace.hessian_dense()? {
         if hessian.nrows() != total || hessian.ncols() != total {
             return Err(format!(
                 "{context}: dense Hessian shape mismatch: got {}x{}, expected {total}x{total}",
@@ -6614,23 +6598,21 @@ fn exact_newton_joint_hessian_source_from_workspace(
         ));
     }
 
-    if matches!(preference, JointHessianSourcePreference::PreferDense) {
-        let zero = Array1::<f64>::zeros(total);
-        let Some(zero_image) = workspace.hessian_matvec(&zero)? else {
-            return Ok(None);
-        };
-        if zero_image.len() != total {
-            return Err(format!(
-                "{context}: operator matvec length mismatch: got {}, expected {}",
-                zero_image.len(),
-                total
-            ));
-        }
-        if zero_image.iter().any(|value| !value.is_finite()) {
-            return Err(format!(
-                "{context}: operator matvec returned non-finite values"
-            ));
-        }
+    let zero = Array1::<f64>::zeros(total);
+    let Some(zero_image) = workspace.hessian_matvec(&zero)? else {
+        return Ok(None);
+    };
+    if zero_image.len() != total {
+        return Err(format!(
+            "{context}: operator matvec length mismatch: got {}, expected {}",
+            zero_image.len(),
+            total
+        ));
+    }
+    if zero_image.iter().any(|value| !value.is_finite()) {
+        return Err(format!(
+            "{context}: operator matvec returned non-finite values"
+        ));
     }
 
     let workspace_apply = Arc::clone(workspace);
@@ -6807,7 +6789,6 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
                         workspace,
                         total,
                         "joint exact-newton operator mismatch in outer gradient",
-                        JointHessianSourcePreference::PreferDense,
                     )
                 })
                 .transpose()?
@@ -7702,7 +7683,11 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
     options: &BlockwiseFitOptions,
     preferred_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
 ) -> Result<(f64, f64), String> {
+    let include_logdet_h = include_exact_newton_logdet_h(family, options);
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
+    if !include_logdet_h && !include_logdet_s {
+        return Ok((0.0, 0.0));
+    }
     let strict_spd = use_exact_newton_strict_spd(family);
     let allow_semidefinite = strict_spd && family.exact_newton_allows_semidefinitehessian();
     refresh_all_block_etas(family, specs, states)?;
@@ -7804,6 +7789,9 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
         s_lambdas.push(s_lambda);
         penalty_logdet_s_total += block_logdet;
     }
+    if !include_logdet_h {
+        return Ok((0.0, penalty_logdet_s_total));
+    }
     // Try the shared scale-aware exact curvature path first.
     if let Some(curvature) = family.exact_newton_outer_curvature(states)? {
         let mut h_joint = symmetrized_square_matrix(
@@ -7838,7 +7826,6 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
             workspace,
             total,
             "joint exact-newton operator mismatch in logdet terms",
-            JointHessianSourcePreference::PreferDense,
         )?
     } else if !strict_spd && use_joint_matrix_free_path(total, joint_observation_count(states)) {
         family
@@ -7849,7 +7836,6 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
                     workspace,
                     total,
                     "joint exact-newton operator mismatch in logdet terms",
-                    JointHessianSourcePreference::PreferDense,
                 )
             })
             .transpose()?
@@ -8107,6 +8093,43 @@ fn joint_quadratic_predicted_reduction(
     rhs.dot(delta) - 0.5 * delta.dot(hpen_delta)
 }
 
+fn joint_preconditioned_descent_delta(
+    source: &JointHessianSource,
+    ranges: &[(usize, usize)],
+    s_lambdas: &[Array2<f64>],
+    diagonal_ridge: f64,
+    rhs: &Array1<f64>,
+) -> Result<Array1<f64>, String> {
+    let base_diagonal = match source {
+        JointHessianSource::Dense(h_joint) => h_joint.diag().to_owned(),
+        JointHessianSource::Operator { diagonal, .. } => diagonal.clone(),
+    };
+    let preconditioner =
+        joint_penalty_preconditioner_diag(&base_diagonal, ranges, s_lambdas, diagonal_ridge);
+    let mut delta = rhs / &preconditioner;
+    if !delta.iter().all(|v| v.is_finite()) || rhs.dot(&delta) <= 0.0 {
+        delta.assign(rhs);
+    }
+    let directional = rhs.dot(&delta);
+    if directional.is_finite() && directional > 0.0 {
+        let mut hpen_delta = Array1::<f64>::zeros(rhs.len());
+        apply_joint_penalized_hessian_into(
+            source,
+            ranges,
+            s_lambdas,
+            diagonal_ridge,
+            &delta,
+            &mut hpen_delta,
+        )?;
+        let curvature = delta.dot(&hpen_delta);
+        if curvature.is_finite() && curvature > 0.0 {
+            let alpha = (directional / curvature).clamp(1.0e-12, 1.0);
+            delta.mapv_inplace(|v| alpha * v);
+        }
+    }
+    Ok(delta)
+}
+
 fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -8129,19 +8152,14 @@ fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'sta
         .map(|log_likelihood| (log_likelihood, None))
 }
 
-fn joint_line_search_screening_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'static>(
-    family: &F,
+fn coefficient_line_search_options(
     options: &BlockwiseFitOptions,
-    states: &[ParameterBlockState],
-) -> Result<f64, String> {
-    family.log_likelihood_only_with_options(states, options)
-}
-
-fn joint_line_search_full_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'static>(
-    family: &F,
-    states: &[ParameterBlockState],
-) -> Result<f64, String> {
-    family.log_likelihood_only_with_options(states, &BlockwiseFitOptions::default())
+    early_exit_threshold: f64,
+) -> BlockwiseFitOptions {
+    let mut line_search_options = options.clone();
+    line_search_options.outer_score_subsample = None;
+    line_search_options.early_exit_threshold = Some(early_exit_threshold);
+    line_search_options
 }
 
 type JointGradientLoad = (
@@ -8381,11 +8399,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         &states, specs, options,
                     )?,
                 };
-                let preference = if matrix_free_joint_requested {
-                    JointHessianSourcePreference::RequireOperator
-                } else {
-                    JointHessianSourcePreference::PreferDense
-                };
                 workspace
                     .as_ref()
                     .map(|workspace| {
@@ -8393,7 +8406,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             workspace,
                             total_p,
                             "joint Newton inner exact-newton operator mismatch",
-                            preference,
                         )
                     })
                     .transpose()?
@@ -8435,8 +8447,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             }
 
             let trace_diagonal_ridge = joint_mode_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE;
+            let joint_hessian_is_dense =
+                matches!(&joint_hessian_source, JointHessianSource::Dense(_));
 
-            let solve_joint_constraints_dense = !matrix_free_joint_requested;
+            let solve_joint_constraints_dense =
+                !matrix_free_joint_requested || joint_hessian_is_dense;
             let (candidate_beta, joint_active_set) = if solve_joint_constraints_dense
                 && let Some(constraints) = joint_constraints.as_ref()
             {
@@ -8511,7 +8526,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 );
                 let rhs = &grad_joint - &penalty_beta;
                 let pcg_started = std::time::Instant::now();
-                let mut delta = if matrix_free_joint_requested {
+                let pcg_requested = matrix_free_joint_requested && !joint_hessian_is_dense;
+                let mut delta = if pcg_requested {
                     let preconditioner_diag = match &joint_hessian_source {
                         JointHessianSource::Dense(h_joint) => joint_penalty_preconditioner_diag(
                             &h_joint.diag().to_owned(),
@@ -8612,7 +8628,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 } else {
                     None
                 };
-                if matrix_free_joint_requested {
+                if pcg_requested {
                     log::info!(
                         "[PIRLS/joint-PCG] cycle {:>3} | n={} p={} solved={} elapsed={:.3}s",
                         cycle,
@@ -8623,6 +8639,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     );
                 }
                 if delta.is_none() {
+                    if pcg_requested {
+                        break;
+                    }
                     let mut lhs = match materialize_joint_hessian_source(
                         &joint_hessian_source,
                         total_p,
@@ -8677,39 +8696,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 
             let old_beta: Vec<Array1<f64>> = states.iter().map(|s| s.beta.clone()).collect();
             let old_objective = lastobjective;
-            let use_subsample_line_search =
-                joint_workspace_requested && options.outer_score_subsample.is_some();
-            let old_screening_objective = if use_subsample_line_search {
-                let old_screening_ll =
-                    joint_line_search_screening_log_likelihood(family, options, &states)?;
-                Some(-old_screening_ll + current_penalty)
-            } else {
-                None
-            };
             let mut accepted = false;
             let mut accepted_joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>> =
                 None;
             let mut line_search_attempts = 0usize;
-            let mut barrier_ceiling = 1.0_f64;
-            for (block_idx, (start, end)) in ranges.iter().copied().enumerate() {
-                let block_delta = delta.slice(s![start..end]).to_owned();
-                if let Some(alpha_max) =
-                    family.max_feasible_step_size(&states, block_idx, &block_delta)?
-                {
-                    barrier_ceiling = barrier_ceiling.min(alpha_max);
-                }
-            }
-            if !barrier_ceiling.is_finite() || barrier_ceiling <= 0.0 {
-                for (b, old) in old_beta.iter().enumerate() {
-                    states[b].beta.assign(old);
-                }
-                refresh_all_block_etas(family, specs, &mut states)?;
-                break;
-            }
-            if barrier_ceiling < 1.0 {
-                delta.mapv_inplace(|v| v * barrier_ceiling);
-                step_inf *= barrier_ceiling;
-            }
 
             // Pure Newton must take a full step on the first cycle of an
             // exact quadratic problem (i.e. converge in one cycle when the
@@ -8737,15 +8727,40 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             );
             let rhs = &grad_joint - &penalty_beta;
 
-            // One trust-region trial plus one emergency shrunken retry.  The
-            // retry preserves the objective-decrease guarantee when the initial
-            // radius is still too optimistic, without returning to the old
-            // unbounded halving loop that dominated cycle-0 wall time.
-            for trust_attempt in 0..2 {
+            // Trust-region retries preserve the objective-decrease guarantee
+            // when the initial radius is too optimistic. If the Newton proposal
+            // is not a descent direction for the penalized quadratic model,
+            // switch once to a diagonally preconditioned gradient step and keep
+            // the same exact full-objective accept/reject test.
+            const JOINT_TRUST_MAX_ATTEMPTS: usize = 24;
+            let mut search_delta = delta.clone();
+            let mut tried_preconditioned_descent = false;
+            let mut model_rejects = 0usize;
+            let mut likelihood_rejects = 0usize;
+            let mut objective_rejects = 0usize;
+            let mut first_likelihood_reject: Option<String> = None;
+            for trust_attempt in 0..JOINT_TRUST_MAX_ATTEMPTS {
                 line_search_attempts = trust_attempt + 1;
                 accepted_joint_workspace = None;
-                let mut trial_delta = delta.clone();
-                let step_norm = truncate_joint_step_to_radius(&mut trial_delta, joint_trust_radius);
+                let mut trial_delta = search_delta.clone();
+                truncate_joint_step_to_radius(&mut trial_delta, joint_trust_radius);
+                let mut barrier_ceiling = 1.0_f64;
+                for (block_idx, (start, end)) in ranges.iter().copied().enumerate() {
+                    let block_delta = trial_delta.slice(s![start..end]).to_owned();
+                    if let Some(alpha_max) =
+                        family.max_feasible_step_size(&states, block_idx, &block_delta)?
+                    {
+                        barrier_ceiling = barrier_ceiling.min(alpha_max);
+                    }
+                }
+                if !barrier_ceiling.is_finite() || barrier_ceiling <= 0.0 {
+                    joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
+                    continue;
+                }
+                if barrier_ceiling < 1.0 {
+                    trial_delta.mapv_inplace(|v| v * barrier_ceiling);
+                }
+                let step_norm = joint_trust_region_step_norm(&trial_delta);
                 let mut hpen_delta = Array1::<f64>::zeros(total_p);
                 if apply_joint_penalized_hessian_into(
                     &joint_hessian_source,
@@ -8762,7 +8777,27 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 let predicted_reduction =
                     joint_quadratic_predicted_reduction(&rhs, &hpen_delta, &trial_delta);
                 if !predicted_reduction.is_finite() || predicted_reduction <= 0.0 {
-                    joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
+                    model_rejects += 1;
+                    if !tried_preconditioned_descent {
+                        match joint_preconditioned_descent_delta(
+                            &joint_hessian_source,
+                            &ranges,
+                            &s_lambdas,
+                            trace_diagonal_ridge,
+                            &rhs,
+                        ) {
+                            Ok(descent_delta) => {
+                                search_delta = descent_delta;
+                            }
+                            Err(_) => {
+                                joint_trust_radius =
+                                    (0.25 * joint_trust_radius).max(1.0e-12);
+                            }
+                        }
+                        tried_preconditioned_descent = true;
+                    } else {
+                        joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
+                    }
                     continue;
                 }
 
@@ -8777,84 +8812,41 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 refresh_all_block_etas(family, specs, &mut states)?;
                 let trial_penalty =
                     total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
-                let trialobjective = if let Some(old_screening_objective) = old_screening_objective
-                {
-                    accepted_joint_workspace = None;
-                    let trial_screening_ll = match joint_line_search_screening_log_likelihood(
-                        family, options, &states,
-                    ) {
-                        Ok(value) => value,
-                        Err(_) => {
-                            for (b, old) in old_beta.iter().enumerate() {
-                                states[b].beta.assign(old);
-                            }
-                            refresh_all_block_etas(family, specs, &mut states)?;
-                            joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
-                            continue;
-                        }
-                    };
-                    let screening_objective = -trial_screening_ll + trial_penalty;
-                    if !screening_objective.is_finite()
-                        || screening_objective > old_screening_objective + 1e-10
-                    {
-                        for (b, old) in old_beta.iter().enumerate() {
-                            states[b].beta.assign(old);
-                        }
-                        refresh_all_block_etas(family, specs, &mut states)?;
-                        joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
-                        continue;
-                    }
-
-                    // Safety net: the paired subsample only screens the
-                    // backtracking attempts. Before accepting and moving on to
-                    // the full gradient reload, re-anchor the Armijo / trust-
-                    // region decision on the exact full-data objective once.
-                    let full_trial_ll = match joint_line_search_full_log_likelihood(family, &states)
-                    {
-                        Ok(value) => value,
-                        Err(_) => {
-                            for (b, old) in old_beta.iter().enumerate() {
-                                states[b].beta.assign(old);
-                            }
-                            refresh_all_block_etas(family, specs, &mut states)?;
-                            joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
-                            continue;
-                        }
-                    };
-                    -full_trial_ll + trial_penalty
-                } else {
-                    // Cheap-LL line-search path: rejected backtracking attempts
-                    // discard the exact-Newton workspace they build, so by
-                    // default we evaluate just the scalar log-likelihood for
-                    // the accept/reject decision and only build the full
-                    // workspace once the step is accepted (via the gradient
-                    // reload below). The workspace path is preserved behind
-                    // `options.line_search_prefer_workspace` for A/B regression
-                    // checks against the legacy numerics.
-                    let mut line_search_options = options.clone();
-                    line_search_options.early_exit_threshold = Some(old_objective + 1e-10);
-                    let trial_ll = match joint_line_search_log_likelihood(
-                        family,
-                        specs,
-                        &line_search_options,
-                        &states,
-                        joint_workspace_requested && options.line_search_prefer_workspace,
-                    ) {
+                // Cheap-LL line-search path: rejected backtracking attempts
+                // discard the exact-Newton workspace they build, so by default
+                // we evaluate just the scalar full-data log-likelihood for the
+                // accept/reject decision and only build the full state once the
+                // step is accepted (via the gradient reload below). The
+                // workspace path is preserved behind
+                // `options.line_search_prefer_workspace` for A/B regression
+                // checks against the legacy numerics.
+                let line_search_options =
+                    coefficient_line_search_options(options, old_objective + 1e-10);
+                let trial_ll = match joint_line_search_log_likelihood(
+                    family,
+                    specs,
+                    &line_search_options,
+                    &states,
+                    joint_workspace_requested && options.line_search_prefer_workspace,
+                ) {
                         Ok((value, workspace)) => {
                             accepted_joint_workspace = workspace;
                             value
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            likelihood_rejects += 1;
+                            if first_likelihood_reject.is_none() {
+                                first_likelihood_reject = Some(e);
+                            }
                             for (b, old) in old_beta.iter().enumerate() {
                                 states[b].beta.assign(old);
                             }
-                            refresh_all_block_etas(family, specs, &mut states)?;
-                            joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
-                            continue;
-                        }
-                    };
-                    -trial_ll + trial_penalty
+                        refresh_all_block_etas(family, specs, &mut states)?;
+                        joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
+                        continue;
+                    }
                 };
+                let trialobjective = -trial_ll + trial_penalty;
                 let actual_reduction = old_objective - trialobjective;
                 let trust_update = update_joint_trust_region_radius(
                     joint_trust_radius,
@@ -8893,15 +8885,20 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     states[b].beta.assign(old);
                 }
                 refresh_all_block_etas(family, specs, &mut states)?;
+                objective_rejects += 1;
             }
             let line_search_elapsed = line_search_started.elapsed();
             if !accepted {
                 log::info!(
-                    "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=false hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} grad_reload=0.000s total={:.3}s",
+                    "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=false hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} reject_model={} reject_likelihood={} reject_objective={} first_likelihood_reject={} grad_reload=0.000s total={:.3}s",
                     cycle,
                     hessian_and_qp_elapsed.as_secs_f64(),
                     line_search_elapsed.as_secs_f64(),
                     line_search_attempts,
+                    model_rejects,
+                    likelihood_rejects,
+                    objective_rejects,
+                    first_likelihood_reject.as_deref().unwrap_or("none"),
                     cycle_started.elapsed().as_secs_f64(),
                 );
                 // Restore original betas
@@ -9068,6 +9065,29 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 
         // If joint Newton converged, skip the blockwise loop entirely.
         if converged {
+            let penalty_value =
+                total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
+            let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
+                family,
+                specs,
+                &mut states,
+                block_log_lambdas,
+                options,
+                cached_joint_workspace.clone(),
+            )?;
+            return Ok(BlockwiseInnerResult {
+                block_states: states,
+                active_sets: normalize_active_sets(cached_active_sets),
+                log_likelihood: current_log_likelihood,
+                penalty_value,
+                cycles: cycles_done,
+                converged,
+                block_logdet_h,
+                block_logdet_s,
+                s_lambdas,
+            });
+        }
+        if cycles_done >= inner_max_cycles {
             let penalty_value =
                 total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
             let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
@@ -9262,7 +9282,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 } else {
                     refresh_single_block_eta(family, specs, &mut states, b)?;
                 }
-                let trial_ll = match family.log_likelihood_only(&states) {
+                let trial_block_penalty =
+                    block_quadratic_penalty(&states[b].beta, s_lambda, ridge, options.ridge_policy);
+                let trial_penalty = current_penalty - old_block_penalty + trial_block_penalty;
+                let line_search_options = coefficient_line_search_options(
+                    options,
+                    objective_cycle_prev - trial_penalty + 1e-10,
+                );
+                let trial_ll = match family
+                    .log_likelihood_only_with_options(&states, &line_search_options)
+                {
                     Ok(value) => value,
                     Err(_) => {
                         states[b].beta.assign(&beta_old);
@@ -9270,9 +9299,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         continue;
                     }
                 };
-                let trial_block_penalty =
-                    block_quadratic_penalty(&states[b].beta, s_lambda, ridge, options.ridge_policy);
-                let trial_penalty = current_penalty - old_block_penalty + trial_block_penalty;
                 let trialobjective = -trial_ll + trial_penalty;
                 if trialobjective.is_finite() && trialobjective <= objective_cycle_prev + 1e-10 {
                     objective_cycle_prev = trialobjective;
@@ -9326,14 +9352,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             } else {
                                 refresh_single_block_eta(family, specs, &mut states, b)?;
                             }
-                            let trial_ll = match family.log_likelihood_only(&states) {
-                                Ok(value) => value,
-                                Err(_) => {
-                                    states[b].beta.assign(&beta_old);
-                                    eta_checkpoint.restore_eta(&mut states[b]);
-                                    continue;
-                                }
-                            };
                             let trial_block_penalty = block_quadratic_penalty(
                                 &states[b].beta,
                                 s_lambda,
@@ -9342,6 +9360,20 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             );
                             let trial_penalty =
                                 current_penalty - old_block_penalty + trial_block_penalty;
+                            let line_search_options = coefficient_line_search_options(
+                                options,
+                                objective_cycle_prev - trial_penalty + 1e-10,
+                            );
+                            let trial_ll = match family
+                                .log_likelihood_only_with_options(&states, &line_search_options)
+                            {
+                                Ok(value) => value,
+                                Err(_) => {
+                                    states[b].beta.assign(&beta_old);
+                                    eta_checkpoint.restore_eta(&mut states[b]);
+                                    continue;
+                                }
+                            };
                             let trialobjective = -trial_ll + trial_penalty;
                             if trialobjective.is_finite()
                                 && trialobjective <= objective_cycle_prev + 1e-10
@@ -12010,7 +12042,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                             workspace,
                             total,
                             "joint exact-newton operator mismatch in joint hyper evaluator",
-                            JointHessianSourcePreference::PreferDense,
                         )
                     })
                     .transpose()?
@@ -12916,7 +12947,6 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
                         workspace,
                         total,
                         "joint exact-newton operator mismatch in joint hyper EFS evaluator",
-                        JointHessianSourcePreference::PreferDense,
                     )
                 })
                 .transpose()?
@@ -13943,6 +13973,50 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     // If a particular outer step is ill-conditioned, strategy fallback handles
     // the downgrade; we do not suppress second-order capability preemptively
     // based on the presence of a wiggle block.
+    if options.inner_max_cycles <= 1 && options.outer_max_iter <= 1 {
+        log::info!(
+            "[OUTER] custom family: skipping smoothing outer solve for explicit one-cycle inner probe"
+        );
+        let per_block = split_log_lambdas(&rho0, &penalty_counts)?;
+        let mut inner = inner_blockwise_fit(family, specs, &per_block, options, None)?;
+        refresh_all_block_etas(family, specs, &mut inner.block_states)
+            .map_err(CustomFamilyError::Optimization)?;
+        let penalized_objective = checked_penalizedobjective(
+            inner.log_likelihood,
+            inner.penalty_value,
+            if include_exact_newton_logdet_h(family, options) {
+                0.5 * inner.block_logdet_h
+            } else {
+                0.0
+            } - if include_exact_newton_logdet_s(family, options) {
+                0.5 * inner.block_logdet_s
+            } else {
+                0.0
+            },
+            "custom-family explicit one-cycle inner probe",
+        )
+        .map_err(CustomFamilyError::Optimization)?;
+        let lambdas = rho0.mapv(f64::exp);
+        let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
+        return blockwise_fit_from_parts(
+            BlockwiseFitResultParts {
+                block_states: inner.block_states,
+                log_likelihood: inner.log_likelihood,
+                log_lambdas,
+                lambdas,
+                covariance_conditional: None,
+                stable_penalty_term: 2.0 * inner.penalty_value,
+                penalized_objective,
+                outer_iterations: 0,
+                outer_gradient_norm: 0.0,
+                inner_cycles: inner.cycles,
+                outer_converged: inner.converged,
+                geometry: None,
+            },
+            specs,
+        )
+        .map_err(CustomFamilyError::Optimization);
+    }
 
     use crate::estimate::EstimationError;
     use crate::solver::outer_strategy::{FallbackPolicy, OuterEval, OuterEvalOrder, OuterProblem};
@@ -14645,7 +14719,7 @@ mod tests {
     }
 
     #[test]
-    fn require_operator_source_skips_dense_and_zero_matvec_probes() {
+    fn workspace_hessian_source_prefers_dense_without_zero_matvec_probe() {
         let dense_calls = Arc::new(AtomicUsize::new(0));
         let matvec_calls = Arc::new(AtomicUsize::new(0));
         let workspace: Arc<dyn ExactNewtonJointHessianWorkspace> =
@@ -14654,25 +14728,18 @@ mod tests {
                 matvec_calls: Arc::clone(&matvec_calls),
             });
 
-        let source = exact_newton_joint_hessian_source_from_workspace(
-            &workspace,
-            2,
-            "counting workspace",
-            JointHessianSourcePreference::RequireOperator,
-        )
-        .expect("operator source should build")
-        .expect("operator source should be present");
+        let source =
+            exact_newton_joint_hessian_source_from_workspace(&workspace, 2, "counting workspace")
+                .expect("hessian source should build")
+                .expect("hessian source should be present");
 
-        assert_eq!(dense_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(dense_calls.load(Ordering::Relaxed), 1);
         assert_eq!(matvec_calls.load(Ordering::Relaxed), 0);
         match source {
-            JointHessianSource::Operator { apply, .. } => {
-                let out = apply(&Array1::from_vec(vec![1.0, 2.0])).expect("operator matvec");
-                assert_eq!(out, Array1::from_vec(vec![1.0, 2.0]));
-            }
-            JointHessianSource::Dense(_) => panic!("RequireOperator returned dense source"),
+            JointHessianSource::Dense(hessian) => assert_eq!(hessian, Array2::<f64>::eye(2)),
+            JointHessianSource::Operator { .. } => panic!("dense source was not preferred"),
         }
-        assert_eq!(matvec_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(matvec_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -14744,33 +14811,23 @@ mod tests {
     }
 
     #[test]
-    fn screened_outer_warm_start_skips_far_seed_without_dropping_latest_solution() {
+    fn screened_outer_warm_start_reuses_any_matching_rho_dimension() {
         let rho_far = array![2.25, -0.5];
-        let mut cache = Some(ConstrainedWarmStart {
+        let cache = Some(ConstrainedWarmStart {
             rho: array![0.0, -0.5],
             block_beta: vec![array![1.0, -1.0]],
             active_sets: vec![None],
         });
 
-        assert!(
-            screened_outer_warm_start(cache.as_ref(), &rho_far).is_none(),
-            "far-away warm seeds should be screened before reuse"
-        );
-
-        cache = Some(ConstrainedWarmStart {
-            rho: rho_far.clone(),
-            block_beta: vec![array![0.2, 0.1]],
-            active_sets: vec![Some(vec![1])],
-        });
         let retained = screened_outer_warm_start(cache.as_ref(), &rho_far)
-            .expect("the freshly solved point should remain reusable");
-        assert_eq!(retained.rho, rho_far);
-        assert_eq!(retained.block_beta[0], array![0.2, 0.1]);
-        assert_eq!(retained.active_sets[0], Some(vec![1]));
+            .expect("matching-dimension warm starts should remain reusable");
+        assert_eq!(retained.rho, array![0.0, -0.5]);
+        assert_eq!(retained.block_beta[0], array![1.0, -1.0]);
+        assert_eq!(retained.active_sets[0], None);
     }
 
     #[test]
-    fn public_warm_start_compatibility_uses_rho_screen() {
+    fn public_warm_start_compatibility_checks_rho_dimension() {
         let warm = CustomFamilyWarmStart {
             inner: ConstrainedWarmStart {
                 rho: array![0.0, -0.5],
@@ -14780,7 +14837,7 @@ mod tests {
         };
 
         assert!(warm.compatible_with_rho(&array![0.75, -0.5]));
-        assert!(!warm.compatible_with_rho(&array![1.75, -0.5]));
+        assert!(warm.compatible_with_rho(&array![1.75, -0.5]));
         assert!(!warm.compatible_with_rho(&array![0.0]));
     }
 
