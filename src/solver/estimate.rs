@@ -574,8 +574,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
-/// Small ridge added to the LAML Hessian before inversion, for numerical stability
-/// when smoothing parameters are weakly identified.
+/// Small ridge added to the rho-space LAML Hessian before inversion, for
+/// numerical stability when smoothing parameters are weakly identified.
+///
+/// **Stabilization semantics:** this ridge is a
+/// [`crate::types::StabilizationKind::NumericalPerturbation`] (not an
+/// `ExplicitPrior`). It enters only the inverse used to build `V_rho` for
+/// the smoothing-correction propagation step. It does NOT enter the LAML
+/// objective, its gradient, the saved coefficients, or any user-visible
+/// summary — the rho-Hessian itself is recomputed from first principles
+/// in every place that consults it. The canonical ledger record is
+/// `StabilizationLedger::numerical_perturbation(LAML_RIDGE, FixedConstant, None)`.
 const LAML_RIDGE: f64 = 1e-8;
 /// Minimum penalized deviance floor.
 pub(crate) const DP_FLOOR: f64 = 1e-12;
@@ -931,6 +940,26 @@ pub enum EstimationError {
 
     #[error("Eigendecomposition failed: {0}")]
     EigendecompositionFailed(FaerLinalgError),
+
+    #[error(
+        "Penalty spectrum check failed in '{context}': non-finite eigenvalue {value:?} at index {index}"
+    )]
+    PenaltySpectrumNonFinite {
+        context: String,
+        index: usize,
+        value: f64,
+    },
+
+    #[error(
+        "Penalty spectrum check failed in '{context}': indefinite eigenvalue {value:.3e} at index {index} (tolerance {tolerance:.3e}, scale {scale:.3e})"
+    )]
+    PenaltySpectrumIndefinite {
+        context: String,
+        index: usize,
+        value: f64,
+        tolerance: f64,
+        scale: f64,
+    },
 
     #[error("Parameter constraint violation: {0}")]
     ParameterConstraintViolation(String),
