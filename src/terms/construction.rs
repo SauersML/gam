@@ -335,96 +335,90 @@ fn trace_penalty_in_orthogonal_basis(
     trace.sum()
 }
 
-fn clamp_eigenvalues_for_stability(eigenvalues: &mut [f64], context: &str) {
-    // Upstream basis builders are expected to construct PSD penalties.
-    // This clamp is a downstream numerical cleanup step for machine-scale
-    // spectral noise, not a semantic repair for materially indefinite inputs.
-    let scale = eigenvalues
-        .iter()
-        .filter(|v| v.is_finite())
-        .fold(0.0_f64, |acc, &val| acc.max(val.abs()));
-    let tolerance = if scale.is_finite() {
-        (scale * 1e-12).max(1e-12)
-    } else {
-        1e-12
-    };
+/// Strict spectral classifier used as a final guard on penalty eigendecompositions.
+///
+/// Penalty matrices fed to the GAM solver are required to be PSD by construction.
+/// This routine snaps roundoff-zero eigenvalues to exact zero, accepts strictly
+/// positive eigenvalues, and rejects materially-indefinite or non-finite spectra
+/// with a hard error rather than silently rewriting them. The previous behaviour
+/// (mass-zeroing negative or non-finite eigenvalues) hid construction bugs and
+/// changed the optimisation objective downstream.
+///
+/// `C_EPS_P_FACTOR = 64` chooses the multiplier `c` in
+/// `tol = c * eps_machine * p * scale`: 64 absorbs the rounding accumulated in a
+/// symmetric eigendecomposition of a moderate-dimension matrix while still
+/// rejecting the 1e-12 * scale magnitudes that previously slipped through.
+fn classify_eigenvalues_strict(
+    eigenvalues: &mut [f64],
+    context: &str,
+) -> Result<(), EstimationError> {
+    const C_EPS_P_FACTOR: f64 = 64.0;
+    let p = eigenvalues.len();
 
-    for val in eigenvalues.iter_mut() {
+    let mut scale = 0.0_f64;
+    for (idx, &val) in eigenvalues.iter().enumerate() {
         if !val.is_finite() {
-            *val = 0.0;
-            continue;
+            return Err(EstimationError::PenaltySpectrumNonFinite {
+                context: context.to_string(),
+                index: idx,
+                value: val,
+            });
         }
-        if val.abs() < tolerance {
+        scale = scale.max(val.abs());
+    }
+
+    // p * eps captures the rounding floor of a symmetric eigendecomposition of a
+    // p-dimensional matrix; multiplying by `scale` lifts the floor to the actual
+    // magnitude of the spectrum. The constant `C_EPS_P_FACTOR` provides headroom
+    // for the residual rounding in subsequent matmuls.
+    let tolerance =
+        (C_EPS_P_FACTOR * f64::EPSILON * (p.max(1) as f64) * scale).max(f64::MIN_POSITIVE);
+
+    for (idx, val) in eigenvalues.iter_mut().enumerate() {
+        if val.abs() <= tolerance {
             *val = 0.0;
         } else if *val < 0.0 {
-            if val.abs() <= tolerance * 10.0 {
-                *val = 0.0;
-            } else {
-                log::warn!(
-                    "{} produced large negative eigenvalue {:.3e}; clamping for stability",
-                    context,
-                    *val
-                );
-                *val = 0.0;
-            }
+            return Err(EstimationError::PenaltySpectrumIndefinite {
+                context: context.to_string(),
+                index: idx,
+                value: *val,
+                tolerance,
+                scale,
+            });
         }
     }
+    Ok(())
 }
 
-fn robust_eighwith_policy<M, V, E, Validate, Sanitize, EigCall, DiagScale, AddRidge, MapErr>(
+fn robust_eighwith_policy<M, V, E, Validate, Sanitize, EigCall, MapErr>(
     matrix: &M,
     context: &str,
     validate_input: Validate,
     sanitize: Sanitize,
     mut eig_call: EigCall,
-    diag_scale: DiagScale,
-    mut addridge_to_diag: AddRidge,
     map_error: MapErr,
 ) -> Result<(Vec<f64>, V), EstimationError>
 where
     Validate: Fn(&M, &str) -> Result<(), EstimationError>,
     Sanitize: Fn(&M) -> M,
     EigCall: FnMut(&M) -> Result<(Vec<f64>, V), E>,
-    DiagScale: Fn(&M) -> f64,
-    AddRidge: FnMut(&mut M, f64),
-    MapErr: Fn(E) -> EstimationError,
+    MapErr: Fn(E, &str) -> EstimationError,
 {
     validate_input(matrix, context)?;
 
-    let mut candidate = sanitize(matrix);
-    let mut ridge = 0.0_f64;
-
-    for attempt in 0..4 {
-        match eig_call(&candidate) {
-            Ok((mut eigenvalues, eigenvectors)) => {
-                clamp_eigenvalues_for_stability(&mut eigenvalues, context);
-                return Ok((eigenvalues, eigenvectors));
-            }
-            Err(err) => {
-                if attempt == 3 {
-                    return Err(map_error(err));
-                }
-
-                let scale = diag_scale(&candidate);
-                let base = if scale.is_finite() {
-                    (scale * 1e-8).max(1e-10)
-                } else {
-                    1e-8
-                };
-                ridge = if ridge == 0.0 { base } else { ridge * 10.0 };
-                addridge_to_diag(&mut candidate, ridge);
-
-                log::warn!(
-                    "{} eigendecomposition failed on attempt {}. Added ridge {:.3e} before retrying.",
-                    context,
-                    attempt + 1,
-                    ridge
-                );
-            }
+    // The sanitize step only enforces exact symmetry by averaging M and M^T and
+    // zeros sub-eps noise; it never adds a diagonal ridge. Adding ridge changes
+    // the matrix being decomposed, which silently changes the optimisation
+    // objective downstream. If eigh genuinely fails on a finite symmetric input,
+    // surface the error instead of mutating the spectrum.
+    let candidate = sanitize(matrix);
+    match eig_call(&candidate) {
+        Ok((mut eigenvalues, eigenvectors)) => {
+            classify_eigenvalues_strict(&mut eigenvalues, context)?;
+            Ok((eigenvalues, eigenvectors))
         }
+        Err(err) => Err(map_error(err, context)),
     }
-
-    unreachable!("robust_eighwith_policy should return or error within 4 attempts")
 }
 
 pub(crate) fn robust_eigh_faer(
@@ -469,22 +463,9 @@ pub(crate) fn robust_eigh_faer(
             }
             Ok((eigenvalues, eigenvectors))
         },
-        |candidate| {
-            let mut scale = 0.0_f64;
-            for idx in 0..candidate.nrows() {
-                let val = candidate[(idx, idx)];
-                if val.is_finite() {
-                    scale = scale.max(val.abs());
-                }
-            }
-            scale
+        |err, _ctx| {
+            EstimationError::EigendecompositionFailed(FaerLinalgError::SelfAdjointEigen(err))
         },
-        |candidate, ridge| {
-            for idx in 0..candidate.nrows() {
-                candidate[(idx, idx)] += ridge;
-            }
-        },
-        |err| EstimationError::EigendecompositionFailed(FaerLinalgError::SelfAdjointEigen(err)),
     )
 }
 
@@ -1144,6 +1125,17 @@ pub fn canonicalize_penalty_specs(
     Ok((active, active_nullspace))
 }
 
+/// Hard cap on the dimension `p` allowed to fall back to a dense p × p
+/// eigendecomposition of the overlapping balanced penalty.
+///
+/// Beyond this cap the overlapping-penalty path errors out instead of
+/// allocating an O(p²) workspace whose eigendecomposition would dominate the
+/// solve. ResourcePolicy threading is the long-term home for this cap (the
+/// resource_serialize agent is widening ResourcePolicy coverage); until that
+/// lands, both overlapping branches share this single constant so they can't
+/// drift apart.
+pub(crate) const OVERLAPPING_PENALTY_DENSE_FALLBACK_MAX_P: usize = 4096;
+
 /// Creates a balanced penalty root from canonical penalties.
 ///
 /// When all penalties have non-overlapping col_ranges, the balanced sum is
@@ -1183,7 +1175,6 @@ pub fn create_balanced_penalty_root_from_canonical(
     }
 
     if overlapping {
-        const OVERLAPPING_PENALTY_DENSE_FALLBACK_MAX_P: usize = 4096;
         if p > OVERLAPPING_PENALTY_DENSE_FALLBACK_MAX_P {
             return Err(EstimationError::LayoutError(format!(
                 "overlapping penalty root would require dense {}x{} eigendecomposition; \
@@ -1475,6 +1466,19 @@ pub fn precompute_reparam_invariant_from_canonical(
     }
 
     if overlapping {
+        // Mirror the dense-fallback guard from
+        // `create_balanced_penalty_root_from_canonical`. Without this, biobank-
+        // scale models with overlapping penalties allocated a full
+        // p_total × p_total workspace and ran an O(p³) eigendecomposition
+        // before any solver code saw the problem size.
+        if p_total > OVERLAPPING_PENALTY_DENSE_FALLBACK_MAX_P {
+            return Err(EstimationError::LayoutError(format!(
+                "overlapping penalty reparameterization would require dense {}x{} eigendecomposition; \
+                 large-model dense fallback is disabled. Keep penalties structured or \
+                 extend the overlapping-penalty solver path",
+                p_total, p_total
+            )));
+        }
         // Fallback: global p×p eigendecomposition.
         let mut s_balanced = Mat::<f64>::zeros(p_total, p_total);
         for cp in penalties {
@@ -1871,6 +1875,16 @@ pub fn stable_reparameterizationwith_invariant(
     // high-dimensional spatial smooths). The ridge magnitude is proportional to the
     // balanced penalty's max eigenvalue (lambda-independent scale), so LAML gradients
     // w.r.t. rho remain correct: d(epsilon * I)/d(rho_k) = 0.
+    //
+    // The shrinkage ridge is a real prior contribution: it changes the quadratic
+    // form, the penalty pseudo-logdet, and downstream Hessians. It is currently
+    // surfaced through `ReparamResult::penalty_shrinkage_ridge` and consumed by
+    // PIRLS/REML via that per-call channel. The longer-term home is a
+    // `RidgePassport` with `RidgePolicy::explicit_stabilization_full` scoped to
+    // the penalized block so the same delta is reflected in serialization, the
+    // Laplace Hessian, and the prior logdet without callers having to thread an
+    // additional scalar — once the ridge-ledger plumbing covers per-block
+    // ScaledIdentity passports.
     let shrinkage_ridge = penalty_shrinkage_floor
         .filter(|&eps| eps > 0.0)
         .map(|eps| eps * invariant.max_balanced_eigenvalue)
@@ -1945,17 +1959,19 @@ pub fn stable_reparameterizationwith_invariant(
 
     // Pseudo-logdet on the structural penalized block.  The null block is split
     // out above, so there is no nullspace normalization here.  Spectrally-noisy
-    // directions (eigenvalues clamped to 0 by `clamp_eigenvalues_for_stability`
-    // because they fall below `scale * 1e-12` in the lambda-weighted sum) are
-    // floored to `eigenvalue_floor` to keep the log-det finite and consistent
-    // with the floored values used to construct `e_transformed_mat` above.
-    // This avoids spurious P-IRLS failures when the lambda dynamic range is
-    // wide (e.g. during BFGS line search probing extreme rho candidates) while
-    // still rejecting genuinely non-finite or large negative eigenvalues.
+    // directions (eigenvalues snapped to 0 by `classify_eigenvalues_strict`
+    // because they fall below the `c * eps_machine * p * scale` tolerance in
+    // the lambda-weighted sum) are floored to `eigenvalue_floor` to keep the
+    // log-det finite and consistent with the floored values used to construct
+    // `e_transformed_mat` above.  This avoids spurious P-IRLS failures when the
+    // lambda dynamic range is wide (e.g. during BFGS line search probing extreme
+    // rho candidates).  Materially negative or non-finite spectra are already
+    // rejected by the strict classifier upstream; this loop re-checks the
+    // *post-shrinkage* range eigenvalues against the same floor.
     //
     // The same floored spectrum is used in the trace formula tr(S⁺ S_k) below,
     // matching the rank structure embedded in `e_transformed_mat` and avoiding
-    // a 1/0 in the trace contraction when an eigenvalue was clamped to 0.
+    // a 1/0 in the trace contraction when an eigenvalue was floored to 0.
     let mut floored_eigs: Vec<f64> = Vec::with_capacity(range_eigs_sorted.len());
     let mut log_det_sum = KahanSum::default();
     for (idx, &ev) in range_eigs_sorted.iter().enumerate() {
@@ -2556,9 +2572,11 @@ pub fn calculate_condition_number(matrix: &Array2<f64>) -> Result<f64, FaerLinal
 mod tests {
     use super::{
         CanonicalPenalty, SubspaceLeakageMetrics, assess_subspace_leakage,
-        precompute_reparam_invariant_from_canonical, stable_reparameterizationwith_invariant,
+        classify_eigenvalues_strict, precompute_reparam_invariant_from_canonical,
+        stable_reparameterizationwith_invariant,
     };
     use crate::construction::kronecker_product;
+    use crate::estimate::EstimationError;
     use crate::linalg::faer_ndarray::FaerEigh;
     use faer::Mat;
     use ndarray::{Array2, array};
@@ -2864,5 +2882,77 @@ mod tests {
                 rel_err,
             );
         }
+    }
+
+    #[test]
+    fn classify_strict_rejects_nan_eigenvalue() {
+        let mut eigs = [1.0, f64::NAN, 0.5];
+        match classify_eigenvalues_strict(&mut eigs, "test_nan") {
+            Err(EstimationError::PenaltySpectrumNonFinite {
+                context,
+                index,
+                value,
+            }) => {
+                assert_eq!(context, "test_nan");
+                assert_eq!(index, 1);
+                assert!(value.is_nan());
+            }
+            other => panic!("expected PenaltySpectrumNonFinite, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_strict_rejects_inf_eigenvalue() {
+        let mut eigs = [1.0, 0.5, f64::INFINITY];
+        match classify_eigenvalues_strict(&mut eigs, "test_inf") {
+            Err(EstimationError::PenaltySpectrumNonFinite { index, value, .. }) => {
+                assert_eq!(index, 2);
+                assert!(value.is_infinite());
+            }
+            other => panic!("expected PenaltySpectrumNonFinite, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_strict_rejects_materially_indefinite() {
+        // -1e-2 with scale ~1.0 is well above any reasonable roundoff tolerance.
+        let mut eigs = [1.0, -1e-2, 0.5];
+        match classify_eigenvalues_strict(&mut eigs, "test_indef") {
+            Err(EstimationError::PenaltySpectrumIndefinite {
+                context,
+                index,
+                value,
+                ..
+            }) => {
+                assert_eq!(context, "test_indef");
+                assert_eq!(index, 1);
+                assert!((value + 1e-2).abs() <= 1e-15);
+            }
+            other => panic!("expected PenaltySpectrumIndefinite, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_strict_accepts_roundoff_negative() {
+        // -1e-16 * scale is well within tol = 64 * eps * p * scale.
+        let scale = 1.0_f64;
+        let roundoff = -1e-16 * scale;
+        let mut eigs = [scale, 0.5 * scale, roundoff, 0.25 * scale];
+        classify_eigenvalues_strict(&mut eigs, "test_roundoff").expect("roundoff must classify");
+        // The roundoff eigenvalue is snapped to exact zero.
+        assert_eq!(eigs[2], 0.0);
+        // Strictly positive entries must be preserved.
+        assert!(eigs[0] > 0.0 && eigs[1] > 0.0 && eigs[3] > 0.0);
+    }
+
+    #[test]
+    fn classify_strict_snaps_subtol_positive_to_zero() {
+        // Positive eigenvalues below the tolerance are also snapped to exact 0
+        // so downstream rank counts and pseudo-logdets are deterministic.
+        let scale = 10.0_f64;
+        let subtol = 1e-15 * scale;
+        let mut eigs = [scale, subtol];
+        classify_eigenvalues_strict(&mut eigs, "test_sub_pos").expect("sub-tol positive ok");
+        assert_eq!(eigs[1], 0.0);
     }
 }
