@@ -12,6 +12,22 @@ pub const SPATIAL_DISTANCE_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
 pub const SPATIAL_DISTANCE_CACHE_SINGLE_ENTRY_MAX_BYTES: usize = 256 * 1024 * 1024;
 pub const OWNED_DATA_CACHE_MAX_ENTRIES: usize = 2;
 
+/// Auto-strict triggers for [`ResourcePolicy::for_problem`].
+///
+/// Tuned for biobank-scale problems where dense materialization of any
+/// design factor would itself be tens of GiB. Below these thresholds we
+/// stay on `default_library` so small-data and ad-hoc fits keep working
+/// without operator implementations.
+pub const STRICT_POLICY_NROWS_THRESHOLD: usize = 100_000;
+pub const STRICT_POLICY_P_THRESHOLD: usize = 5_000;
+
+/// Hints that flip strict mode on regardless of n/p — used when a code path
+/// is structurally operator-only and any dense fallback would be a bug.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProblemHints {
+    pub marginal_slope_biobank_active: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DerivativeStorageMode {
     /// Production exact-math: operator-backed, no dense fallback.
