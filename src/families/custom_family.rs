@@ -8463,6 +8463,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         let mut consecutive_joint_frozen_loglik_cycles: usize = 0;
         const JOINT_DIVERGENCE_FROZEN_LOGLIK_CYCLES: usize = 8;
 
+        // Cross-cycle convergence carry-over: set at the end of every
+        // accepted cycle so the next cycle's line-search-failure path
+        // can distinguish a true KKT optimum on a rank-deficient
+        // Hessian (no meaningful trial step, even though step_inf is
+        // O(1) along the null mode) from genuine non-convergence.
+        let mut last_cycle_residual_below_tol = false;
+        let mut last_cycle_obj_change_below_tol = false;
+
         let mut joint_trust_radius = 1.0_f64;
         for cycle in 0..inner_max_cycles {
             // Fires at the top of each inner joint-Newton cycle so CI logs can
@@ -9009,6 +9017,22 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     states[b].beta.assign(old);
                 }
                 refresh_all_block_etas(family, specs, &mut states)?;
+                // If the previous cycle's bookkeeping certified KKT
+                // stationarity (residual ≤ tol and objective change ≤
+                // tol), the line-search failure here is round-off on a
+                // rank-deficient null mode rather than non-convergence:
+                // the proposed `H⁻¹ g` step stays O(1) along the null
+                // direction at the optimum, every trial moves β along
+                // it without changing the objective, and round-off
+                // flips the sign of `actual − predicted` so the
+                // sufficient-decrease check rejects every trial. The
+                // iterate ALREADY satisfies the first-order optimality
+                // conditions; we accept that as convergence rather
+                // than fail the outer "inner solve did not converge"
+                // panic on a fully resolved fit.
+                if last_cycle_residual_below_tol && last_cycle_obj_change_below_tol {
+                    converged = true;
+                }
                 break; // Fall back to blockwise
             }
 
@@ -9146,14 +9170,22 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 break;
             }
 
-            // In semi-definite or nearly flat directions, the linearized
-            // Newton system can keep proposing a large movement even after
-            // the accepted iterate satisfies the projected KKT residual.
-            // Treat stationarity plus a flat objective as convergence; the
-            // proposed step length is only decisive when the objective is
-            // still changing.
+            // KKT convergence: small residual plus EITHER a small
+            // Newton step (tight quadratic-rate convergence, lets β
+            // polish to machine precision) OR confirmed stagnation
+            // (`accepted_step_inf <= step_tol` AND `objective_change
+            // <= objective_tol`, the rank-deficient null-mode case).
+            // The conjunction in the second branch matters: a single
+            // small `objective_change` on a quadratic-rate cycle is
+            // normal Newton progress, not stagnation, and treating it
+            // alone as convergence stops the iteration with β still
+            // O(residual_tol) away from the optimum — visible as a
+            // sign mismatch against finite-differenced outer LAML
+            // gradients in the autodiff cross-checks.
             if residual <= residual_tol
-                && (accepted_step_inf <= step_tol || objective_change <= objective_tol)
+                && (step_inf <= step_tol
+                    || (accepted_step_inf <= step_tol
+                        && objective_change <= objective_tol))
             {
                 converged = true;
                 break;
@@ -9164,6 +9196,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 }
                 break;
             }
+            // Carry the KKT-stationarity signal into the next cycle so
+            // the line-search-failure path above can recognise a true
+            // KKT optimum on a rank-deficient null mode. See that path
+            // for the full rationale.
+            last_cycle_residual_below_tol = residual <= residual_tol;
+            last_cycle_obj_change_below_tol = objective_change <= objective_tol;
         }
 
         // If joint Newton converged, skip the blockwise loop entirely.
