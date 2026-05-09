@@ -132,8 +132,7 @@ fn scan_for_unclassified_handwavy(
             return;
         }
         let lines: Vec<&str> = content.lines().collect();
-        let lower_lines: Vec<String> =
-            lines.iter().map(|l| l.to_ascii_lowercase()).collect();
+        let lower_lines: Vec<String> = lines.iter().map(|l| l.to_ascii_lowercase()).collect();
         for (idx, line) in lines.iter().enumerate() {
             for marker in HANDWAVY_MARKERS {
                 let m_lower = marker.to_ascii_lowercase();
@@ -146,12 +145,7 @@ fn scan_for_unclassified_handwavy(
                 if window_has_ledger_annotation(&lines, idx) {
                     continue;
                 }
-                offenders.push((
-                    rel.to_path_buf(),
-                    idx + 1,
-                    marker,
-                    line.to_string(),
-                ));
+                offenders.push((rel.to_path_buf(), idx + 1, marker, line.to_string()));
             }
         }
     });
