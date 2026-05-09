@@ -764,6 +764,10 @@ struct PreparedSurvivalLocationScaleModel {
     family: SurvivalLocationScaleFamily,
     blockspecs: Vec<ParameterBlockSpec>,
     time_transform: TimeIdentifiabilityTransform,
+    threshold_fixed_cols: usize,
+    threshold_full_ncols: usize,
+    log_sigma_fixed_cols: usize,
+    log_sigma_full_ncols: usize,
     k_time: usize,
     k_threshold: usize,
     k_log_sigma: usize,
@@ -2948,6 +2952,201 @@ fn design_block_from_matrix(design: DesignMatrix) -> DesignBlock {
     }
 }
 
+fn design_column_tail(
+    design: &DesignMatrix,
+    first_col: usize,
+    label: &str,
+) -> Result<DesignMatrix, String> {
+    let p = design.ncols();
+    if first_col > p {
+        return Err(format!(
+            "{label}: first retained column {first_col} exceeds design width {p}"
+        ));
+    }
+    if first_col == 0 {
+        return Ok(design.clone());
+    }
+    let n = design.nrows();
+    let active_p = p - first_col;
+    if active_p == 0 {
+        return Ok(DesignMatrix::from(Array2::<f64>::zeros((n, 0))));
+    }
+
+    let chunk_rows = (8 * 1024 * 1024 / (p.max(1) * std::mem::size_of::<f64>()))
+        .max(1)
+        .min(n.max(1));
+    let mut out = Array2::<f64>::zeros((n, active_p));
+    for start in (0..n).step_by(chunk_rows) {
+        let end = (start + chunk_rows).min(n);
+        let chunk = design
+            .try_row_chunk(start..end)
+            .map_err(|e| format!("{label}: failed to materialize design rows: {e}"))?;
+        out.slice_mut(s![start..end, ..])
+            .assign(&chunk.slice(s![.., first_col..]));
+    }
+    Ok(DesignMatrix::from(out))
+}
+
+fn drop_leading_initial_beta(
+    beta: Option<Array1<f64>>,
+    fixed_cols: usize,
+    full_dim: usize,
+    label: &str,
+) -> Result<Option<Array1<f64>>, String> {
+    let Some(beta) = beta else {
+        return Ok(None);
+    };
+    if beta.len() != full_dim {
+        return Err(format!(
+            "{label}: initial_beta length mismatch before identifiability reduction: got {}, expected {full_dim}",
+            beta.len()
+        ));
+    }
+    Ok(Some(beta.slice(s![fixed_cols..]).to_owned()))
+}
+
+fn expand_leading_fixed_beta(
+    beta_active: &Array1<f64>,
+    fixed_cols: usize,
+    full_dim: usize,
+    label: &str,
+) -> Result<Array1<f64>, String> {
+    if fixed_cols > full_dim {
+        return Err(format!(
+            "{label}: fixed column count {fixed_cols} exceeds full width {full_dim}"
+        ));
+    }
+    let active_dim = full_dim - fixed_cols;
+    if beta_active.len() != active_dim {
+        return Err(format!(
+            "{label}: active beta length mismatch: got {}, expected {active_dim}",
+            beta_active.len()
+        ));
+    }
+    if fixed_cols == 0 {
+        return Ok(beta_active.clone());
+    }
+    let mut beta_full = Array1::<f64>::zeros(full_dim);
+    beta_full.slice_mut(s![fixed_cols..]).assign(beta_active);
+    Ok(beta_full)
+}
+
+fn drop_leading_penalty_columns(
+    penalties: &[PenaltyMatrix],
+    nullspace_dims: &[usize],
+    initial_log_lambdas: Array1<f64>,
+    fixed_cols: usize,
+    full_dim: usize,
+    label: &str,
+) -> Result<(Vec<PenaltyMatrix>, Vec<usize>, Array1<f64>), String> {
+    if fixed_cols > full_dim {
+        return Err(format!(
+            "{label}: fixed column count {fixed_cols} exceeds full penalty width {full_dim}"
+        ));
+    }
+    if initial_log_lambdas.len() != penalties.len() {
+        return Err(format!(
+            "{label}: initial log-lambda length {} does not match {} penalties",
+            initial_log_lambdas.len(),
+            penalties.len()
+        ));
+    }
+    if fixed_cols == 0 {
+        return Ok((
+            penalties.to_vec(),
+            nullspace_dims.to_vec(),
+            initial_log_lambdas,
+        ));
+    }
+
+    let active_dim = full_dim - fixed_cols;
+    if active_dim == 0 {
+        return Ok((Vec::new(), Vec::new(), Array1::zeros(0)));
+    }
+
+    let structural_nullspace_available = nullspace_dims.len() == penalties.len();
+    let mut structural_nullspace_exact = structural_nullspace_available;
+    let mut retained_penalties = Vec::new();
+    let mut retained_nullspace_dims = Vec::new();
+    let mut retained_log_lambdas = Vec::new();
+
+    for (idx, penalty) in penalties.iter().enumerate() {
+        if penalty.dim() != full_dim {
+            return Err(format!(
+                "{label}: penalty {idx} has dimension {}, expected {full_dim}",
+                penalty.dim()
+            ));
+        }
+
+        let reduced = match penalty {
+            PenaltyMatrix::Blockwise {
+                local,
+                col_range,
+                total_dim,
+            } => {
+                if *total_dim != full_dim {
+                    return Err(format!(
+                        "{label}: blockwise penalty {idx} total_dim {total_dim} does not match {full_dim}"
+                    ));
+                }
+                if col_range.end <= fixed_cols {
+                    None
+                } else {
+                    let active_start = col_range.start.max(fixed_cols);
+                    let active_end = col_range.end;
+                    let local_start = active_start - col_range.start;
+                    let local_end = active_end - col_range.start;
+                    if local_start != 0 || local_end != local.nrows() {
+                        structural_nullspace_exact = false;
+                    }
+                    Some(PenaltyMatrix::Blockwise {
+                        local: local
+                            .slice(s![local_start..local_end, local_start..local_end])
+                            .to_owned(),
+                        col_range: (active_start - fixed_cols)..(active_end - fixed_cols),
+                        total_dim: active_dim,
+                    })
+                }
+            }
+            PenaltyMatrix::Dense(matrix) => {
+                structural_nullspace_exact = false;
+                Some(PenaltyMatrix::Dense(
+                    matrix
+                        .slice(s![fixed_cols..full_dim, fixed_cols..full_dim])
+                        .to_owned(),
+                ))
+            }
+            PenaltyMatrix::KroneckerFactored { .. } => {
+                structural_nullspace_exact = false;
+                let dense = penalty.to_dense();
+                Some(PenaltyMatrix::Dense(
+                    dense
+                        .slice(s![fixed_cols..full_dim, fixed_cols..full_dim])
+                        .to_owned(),
+                ))
+            }
+        };
+
+        if let Some(reduced) = reduced {
+            retained_penalties.push(reduced);
+            retained_log_lambdas.push(initial_log_lambdas[idx]);
+            if structural_nullspace_available {
+                retained_nullspace_dims.push(nullspace_dims[idx]);
+            }
+        }
+    }
+
+    if !structural_nullspace_exact {
+        retained_nullspace_dims.clear();
+    }
+
+    Ok((
+        retained_penalties,
+        retained_nullspace_dims,
+        Array1::from_vec(retained_log_lambdas),
+    ))
+}
+
 /// Prepared covariate block data for the family struct.
 struct PreparedCovBlock {
     /// Exit design (used as the solver's primary).
@@ -3680,18 +3879,62 @@ fn prepare_survival_location_scale_model(
     };
 
     let threshold_prep = prepare_cov_block_kind(&spec.threshold_block)?;
+    let threshold_full_ncols = threshold_prep.design_exit.ncols();
+    let threshold_fixed_cols =
+        infer_non_intercept_start_design(&threshold_prep.design_exit, &spec.weights)?
+            .min(threshold_full_ncols);
+    let threshold_design = design_column_tail(
+        &threshold_prep.design_exit,
+        threshold_fixed_cols,
+        "survival location-scale threshold design",
+    )?;
+    let threshold_entry_design = if let Some(x_entry) = threshold_prep.design_entry.as_ref() {
+        Some(design_column_tail(
+            x_entry,
+            threshold_fixed_cols,
+            "survival location-scale threshold entry design",
+        )?)
+    } else {
+        None
+    };
+    let threshold_deriv_design =
+        if let Some(x_deriv) = threshold_prep.design_derivative_exit.as_ref() {
+            Some(design_column_tail(
+                x_deriv,
+                threshold_fixed_cols,
+                "survival location-scale threshold derivative design",
+            )?)
+        } else {
+            None
+        };
+    let threshold_initial_log_lambdas = initial_log_lambdas(
+        &threshold_prep.penalties,
+        threshold_prep.initial_log_lambdas.clone(),
+    )?;
+    let (threshold_penalties, threshold_nullspace_dims, threshold_initial_log_lambdas) =
+        drop_leading_penalty_columns(
+            &threshold_prep.penalties,
+            &threshold_prep.nullspace_dims,
+            threshold_initial_log_lambdas,
+            threshold_fixed_cols,
+            threshold_full_ncols,
+            "survival location-scale threshold penalties",
+        )?;
+    let threshold_initial_beta = drop_leading_initial_beta(
+        threshold_prep.initial_beta.clone(),
+        threshold_fixed_cols,
+        threshold_full_ncols,
+        "survival location-scale threshold",
+    )?;
     let (threshold_solver_design, threshold_solver_offset) =
-        if let Some(x_entry) = threshold_prep.design_entry.as_ref() {
-            let x_deriv = threshold_prep
-                .design_derivative_exit
-                .as_ref()
-                .ok_or_else(|| {
-                    "time-varying threshold block is missing its exit derivative design".to_string()
-                })?;
+        if let Some(x_entry) = threshold_entry_design.as_ref() {
+            let x_deriv = threshold_deriv_design.as_ref().ok_or_else(|| {
+                "time-varying threshold block is missing its exit derivative design".to_string()
+            })?;
             (
                 DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(
                     MultiChannelOperator::new(vec![
-                        threshold_prep.design_exit.clone(),
+                        threshold_design.clone(),
                         x_entry.clone(),
                         x_deriv.clone(),
                     ])?,
@@ -3703,22 +3946,16 @@ fn prepare_survival_location_scale_model(
                 ]),
             )
         } else {
-            (
-                threshold_prep.design_exit.clone(),
-                threshold_prep.offset.clone(),
-            )
+            (threshold_design.clone(), threshold_prep.offset.clone())
         };
     let thresholdspec = ParameterBlockSpec {
         name: "threshold".to_string(),
         design: threshold_solver_design,
         offset: threshold_solver_offset,
-        penalties: threshold_prep.penalties.clone(),
-        nullspace_dims: threshold_prep.nullspace_dims.clone(),
-        initial_log_lambdas: initial_log_lambdas(
-            &threshold_prep.penalties,
-            threshold_prep.initial_log_lambdas.clone(),
-        )?,
-        initial_beta: threshold_prep.initial_beta.clone(),
+        penalties: threshold_penalties.clone(),
+        nullspace_dims: threshold_nullspace_dims.clone(),
+        initial_log_lambdas: threshold_initial_log_lambdas,
+        initial_beta: threshold_initial_beta,
     };
 
     let survival_primary_design = DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(
@@ -3726,41 +3963,79 @@ fn prepare_survival_location_scale_model(
             DesignBlock::Dense(DenseDesignMatrix::from(shared_dense_arc(
                 &time_prepared.design_exit,
             ))),
-            design_block_from_matrix(threshold_prep.design_exit.clone()),
+            design_block_from_matrix(threshold_design.clone()),
         ])?,
     )));
 
     let log_sigma_prep = prepare_cov_block_kind(&spec.log_sigma_block)?;
     let non_intercept_start =
         infer_non_intercept_start_design(&log_sigma_prep.design_exit, &spec.weights)?;
+    let log_sigma_full_ncols = log_sigma_prep.design_exit.ncols();
+    let log_sigma_fixed_cols = non_intercept_start.min(log_sigma_full_ncols);
     let scale_transform = build_scale_deviation_transform_design(
         &survival_primary_design,
         &log_sigma_prep.design_exit,
         &spec.weights,
         non_intercept_start,
     )?;
-    let log_sigma_design = build_scale_deviation_operator(
+    let log_sigma_full_design = build_scale_deviation_operator(
         survival_primary_design.clone(),
         log_sigma_prep.design_exit.clone(),
         &scale_transform,
     )?;
+    let log_sigma_design = design_column_tail(
+        &log_sigma_full_design,
+        log_sigma_fixed_cols,
+        "survival location-scale log-sigma design",
+    )?;
     let log_sigma_entry_design = if let Some(x_ls_entry) = log_sigma_prep.design_entry.as_ref() {
-        Some(build_scale_deviation_operator(
+        let full_entry = build_scale_deviation_operator(
             survival_primary_design.clone(),
             x_ls_entry.clone(),
             &scale_transform,
+        )?;
+        Some(design_column_tail(
+            &full_entry,
+            log_sigma_fixed_cols,
+            "survival location-scale log-sigma entry design",
         )?)
     } else {
         None
     };
+    let log_sigma_deriv_design =
+        if let Some(ls_deriv) = log_sigma_prep.design_derivative_exit.as_ref() {
+            Some(design_column_tail(
+                ls_deriv,
+                log_sigma_fixed_cols,
+                "survival location-scale log-sigma derivative design",
+            )?)
+        } else {
+            None
+        };
+    let log_sigma_initial_log_lambdas = initial_log_lambdas(
+        &log_sigma_prep.penalties,
+        log_sigma_prep.initial_log_lambdas.clone(),
+    )?;
+    let (log_sigma_penalties, log_sigma_nullspace_dims, log_sigma_initial_log_lambdas) =
+        drop_leading_penalty_columns(
+            &log_sigma_prep.penalties,
+            &log_sigma_prep.nullspace_dims,
+            log_sigma_initial_log_lambdas,
+            log_sigma_fixed_cols,
+            log_sigma_full_ncols,
+            "survival location-scale log-sigma penalties",
+        )?;
+    let log_sigma_initial_beta = drop_leading_initial_beta(
+        log_sigma_prep.initial_beta.clone(),
+        log_sigma_fixed_cols,
+        log_sigma_full_ncols,
+        "survival location-scale log-sigma",
+    )?;
     let (log_sigma_solver_design, log_sigma_solver_offset) =
         if let Some(ref ls_entry) = log_sigma_entry_design {
-            let ls_deriv = log_sigma_prep
-                .design_derivative_exit
-                .as_ref()
-                .ok_or_else(|| {
-                    "time-varying log-sigma block is missing its exit derivative design".to_string()
-                })?;
+            let ls_deriv = log_sigma_deriv_design.as_ref().ok_or_else(|| {
+                "time-varying log-sigma block is missing its exit derivative design".to_string()
+            })?;
             (
                 DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(
                     MultiChannelOperator::new(vec![
@@ -3782,13 +4057,10 @@ fn prepare_survival_location_scale_model(
         name: "log_sigma".to_string(),
         design: log_sigma_solver_design,
         offset: log_sigma_solver_offset,
-        penalties: log_sigma_prep.penalties.clone(),
-        nullspace_dims: log_sigma_prep.nullspace_dims.clone(),
-        initial_log_lambdas: initial_log_lambdas(
-            &log_sigma_prep.penalties,
-            log_sigma_prep.initial_log_lambdas.clone(),
-        )?,
-        initial_beta: log_sigma_prep.initial_beta.clone(),
+        penalties: log_sigma_penalties.clone(),
+        nullspace_dims: log_sigma_nullspace_dims.clone(),
+        initial_log_lambdas: log_sigma_initial_log_lambdas,
+        initial_beta: log_sigma_initial_beta,
     };
     let wigglespec = if let Some(w) = spec.linkwiggle_block.as_ref() {
         Some(ParameterBlockSpec {
@@ -3835,12 +4107,12 @@ fn prepare_survival_location_scale_model(
         time_wiggle_degree: spec.timewiggle_block.as_ref().map(|w| w.degree),
         time_wiggle_ncols: protected_timewiggle_cols,
         time_coefficient_lower_bounds: time_prepared.coefficient_lower_bounds.clone(),
-        x_threshold: threshold_prep.design_exit.clone(),
-        x_threshold_entry: threshold_prep.design_entry.clone(),
-        x_threshold_deriv: threshold_prep.design_derivative_exit.clone(),
+        x_threshold: threshold_design,
+        x_threshold_entry: threshold_entry_design,
+        x_threshold_deriv: threshold_deriv_design,
         x_log_sigma: log_sigma_design,
         x_log_sigma_entry: log_sigma_entry_design,
-        x_log_sigma_deriv: log_sigma_prep.design_derivative_exit.clone(),
+        x_log_sigma_deriv: log_sigma_deriv_design,
         x_link_wiggle: wigglespec.as_ref().map(|s| s.design.clone()),
         wiggle_knots: spec.linkwiggle_block.as_ref().map(|w| w.knots.clone()),
         wiggle_degree: spec.linkwiggle_block.as_ref().map(|w| w.degree),
@@ -3856,9 +4128,13 @@ fn prepare_survival_location_scale_model(
         family,
         blockspecs,
         time_transform: time_prepared.transform,
+        threshold_fixed_cols,
+        threshold_full_ncols,
+        log_sigma_fixed_cols,
+        log_sigma_full_ncols,
         k_time: spec.time_block.penalties.len(),
-        k_threshold: threshold_prep.penalties.len(),
-        k_log_sigma: log_sigma_prep.penalties.len(),
+        k_threshold: threshold_penalties.len(),
+        k_log_sigma: log_sigma_penalties.len(),
         k_wiggle: spec
             .linkwiggle_block
             .as_ref()
@@ -3874,12 +4150,24 @@ fn finalize_survival_location_scale_fit(
         .beta
         .clone();
     let beta_time = prepared.time_transform.z.dot(&beta_time_reduced);
-    let beta_threshold = fit.block_states[SurvivalLocationScaleFamily::BLOCK_THRESHOLD]
+    let beta_threshold_active = fit.block_states[SurvivalLocationScaleFamily::BLOCK_THRESHOLD]
         .beta
         .clone();
-    let beta_log_sigma = fit.block_states[SurvivalLocationScaleFamily::BLOCK_LOG_SIGMA]
+    let beta_threshold = expand_leading_fixed_beta(
+        &beta_threshold_active,
+        prepared.threshold_fixed_cols,
+        prepared.threshold_full_ncols,
+        "survival location-scale threshold final beta",
+    )?;
+    let beta_log_sigma_active = fit.block_states[SurvivalLocationScaleFamily::BLOCK_LOG_SIGMA]
         .beta
         .clone();
+    let beta_log_sigma = expand_leading_fixed_beta(
+        &beta_log_sigma_active,
+        prepared.log_sigma_fixed_cols,
+        prepared.log_sigma_full_ncols,
+        "survival location-scale log-sigma final beta",
+    )?;
     let beta_link_wiggle = if prepared.family.x_link_wiggle.is_some() {
         Some(
             fit.block_states[SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE]
@@ -3915,15 +4203,51 @@ fn finalize_survival_location_scale_fit(
     } else {
         None
     };
-    let covariance_conditional = fit.covariance_conditional.as_ref().map(|cov_reduced| {
-        lift_conditional_covariance(
-            cov_reduced,
-            &prepared.time_transform.z,
-            beta_threshold.len(),
-            beta_log_sigma.len(),
-            beta_link_wiggle.as_ref().map_or(0, |b| b.len()),
-        )
-    });
+    let covariance_conditional = fit
+        .covariance_conditional
+        .as_ref()
+        .map(|cov_reduced| {
+            lift_conditional_covariance(
+                cov_reduced,
+                &prepared.time_transform.z,
+                beta_threshold_active.len(),
+                beta_threshold.len(),
+                prepared.threshold_fixed_cols,
+                beta_log_sigma_active.len(),
+                beta_log_sigma.len(),
+                prepared.log_sigma_fixed_cols,
+                beta_link_wiggle.as_ref().map_or(0, |b| b.len()),
+            )
+        })
+        .transpose()?;
+    let geometry = fit
+        .geometry
+        .as_ref()
+        .and_then(|geom| {
+            if prepared.threshold_fixed_cols > 0 || prepared.log_sigma_fixed_cols > 0 {
+                None
+            } else {
+                Some(
+                    lift_conditional_covariance(
+                        &geom.penalized_hessian,
+                        &prepared.time_transform.z,
+                        beta_threshold_active.len(),
+                        beta_threshold.len(),
+                        prepared.threshold_fixed_cols,
+                        beta_log_sigma_active.len(),
+                        beta_log_sigma.len(),
+                        prepared.log_sigma_fixed_cols,
+                        beta_link_wiggle.as_ref().map_or(0, |b| b.len()),
+                    )
+                    .map(|penalized_hessian| FitGeometry {
+                        penalized_hessian,
+                        working_weights: geom.working_weights.clone(),
+                        working_response: geom.working_response.clone(),
+                    }),
+                )
+            }
+        })
+        .transpose()?;
     survival_fit_from_parts(SurvivalLocationScaleFitResultParts {
         beta_time,
         beta_threshold,
@@ -3939,11 +4263,11 @@ fn finalize_survival_location_scale_fit(
         reml_score: fit.reml_score,
         stable_penalty_term: fit.stable_penalty_term,
         penalized_objective: fit.penalized_objective,
-        outer_iterations: fit.inner_cycles,
+        outer_iterations: fit.outer_iterations,
         outer_gradient_norm: fit.outer_gradient_norm,
         outer_converged: fit.outer_converged,
         covariance_conditional,
-        geometry: fit.geometry.clone(),
+        geometry,
     })
 }
 
@@ -6416,38 +6740,58 @@ fn exact_survival_response_moments(
 fn lift_conditional_covariance(
     cov_reduced: &Array2<f64>,
     z: &Array2<f64>,
-    p_threshold: usize,
-    p_log_sigma: usize,
+    p_threshold_reduced: usize,
+    p_threshold_full: usize,
+    threshold_fixed_cols: usize,
+    p_log_sigma_reduced: usize,
+    p_log_sigma_full: usize,
+    log_sigma_fixed_cols: usize,
     p_linkwiggle: usize,
-) -> Array2<f64> {
+) -> Result<Array2<f64>, String> {
     let p_time_reduced = z.ncols();
     let p_time_full = z.nrows();
-    let p_reduced = p_time_reduced + p_threshold + p_log_sigma + p_linkwiggle;
-    let p_full = p_time_full + p_threshold + p_log_sigma + p_linkwiggle;
+    if threshold_fixed_cols + p_threshold_reduced != p_threshold_full {
+        return Err(format!(
+            "survival location-scale covariance lift threshold dimensions are inconsistent: fixed={}, reduced={}, full={}",
+            threshold_fixed_cols, p_threshold_reduced, p_threshold_full
+        ));
+    }
+    if log_sigma_fixed_cols + p_log_sigma_reduced != p_log_sigma_full {
+        return Err(format!(
+            "survival location-scale covariance lift log-sigma dimensions are inconsistent: fixed={}, reduced={}, full={}",
+            log_sigma_fixed_cols, p_log_sigma_reduced, p_log_sigma_full
+        ));
+    }
+    let p_reduced = p_time_reduced + p_threshold_reduced + p_log_sigma_reduced + p_linkwiggle;
+    let p_full = p_time_full + p_threshold_full + p_log_sigma_full + p_linkwiggle;
     if cov_reduced.nrows() != p_reduced || cov_reduced.ncols() != p_reduced {
-        return cov_reduced.clone();
+        return Err(format!(
+            "survival location-scale covariance lift expected reduced matrix {p_reduced}x{p_reduced}, got {}x{}",
+            cov_reduced.nrows(),
+            cov_reduced.ncols()
+        ));
     }
 
     let mut t_map = Array2::<f64>::zeros((p_full, p_reduced));
     t_map
         .slice_mut(s![0..p_time_full, 0..p_time_reduced])
         .assign(z);
-    for j in 0..p_threshold {
-        t_map[[p_time_full + j, p_time_reduced + j]] = 1.0;
+    for j in 0..p_threshold_reduced {
+        t_map[[p_time_full + threshold_fixed_cols + j, p_time_reduced + j]] = 1.0;
     }
-    for j in 0..p_log_sigma {
+    for j in 0..p_log_sigma_reduced {
         t_map[[
-            p_time_full + p_threshold + j,
-            p_time_reduced + p_threshold + j,
+            p_time_full + p_threshold_full + log_sigma_fixed_cols + j,
+            p_time_reduced + p_threshold_reduced + j,
         ]] = 1.0;
     }
     for j in 0..p_linkwiggle {
         t_map[[
-            p_time_full + p_threshold + p_log_sigma + j,
-            p_time_reduced + p_threshold + p_log_sigma + j,
+            p_time_full + p_threshold_full + p_log_sigma_full + j,
+            p_time_reduced + p_threshold_reduced + p_log_sigma_reduced + j,
         ]] = 1.0;
     }
-    t_map.dot(cov_reduced).dot(&t_map.t())
+    Ok(t_map.dot(cov_reduced).dot(&t_map.t()))
 }
 
 impl SurvivalLocationScaleFamily {
@@ -12237,7 +12581,8 @@ mod tests {
             [0.3, 0.6, 0.8, 5.0, 1.1],
             [0.4, 0.7, 0.9, 1.1, 6.0],
         ];
-        let lifted = lift_conditional_covariance(&cov_reduced, &z, 1, 1, 1);
+        let lifted = lift_conditional_covariance(&cov_reduced, &z, 1, 1, 0, 1, 1, 0, 1)
+            .expect("covariance lift");
         assert_eq!(lifted.dim(), (6, 6));
         assert!((lifted[[5, 5]] - 6.0).abs() <= 1e-12);
         assert!((lifted[[0, 5]] - 0.4).abs() <= 1e-12);

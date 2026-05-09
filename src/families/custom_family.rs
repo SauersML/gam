@@ -1021,6 +1021,21 @@ pub trait CustomFamily {
         Ok(None)
     }
 
+    /// Optional exact line-search evaluator.
+    ///
+    /// This hook is for families where the likelihood can be scored exactly
+    /// without constructing the full reusable joint-Hessian workspace for
+    /// every rejected trial. Returning `Some((ll, workspace))` lets the caller
+    /// keep any exact row state worth reusing if the trial is accepted.
+    fn joint_line_search_log_likelihood_evaluation(
+        &self,
+        _: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+        _: &BlockwiseFitOptions,
+    ) -> Result<Option<(f64, Option<Arc<dyn ExactNewtonJointHessianWorkspace>>)>, String> {
+        Ok(None)
+    }
+
     /// Optional batched analytic-gradient hook.
     ///
     /// Returns the K per-θ_j gradient contributions ([`BatchedOuterGradientTerms`])
@@ -4618,6 +4633,16 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
         }))
     }
 
+    fn directional_derivative_operators(
+        &self,
+        d_beta_flats: &[Array1<f64>],
+    ) -> Result<Vec<Option<Arc<dyn HyperOperator>>>, String> {
+        d_beta_flats
+            .iter()
+            .map(|d_beta_flat| self.directional_derivative_operator(d_beta_flat))
+            .collect()
+    }
+
     fn second_directional_derivative(
         &self,
         _: &Array1<f64>,
@@ -5985,6 +6010,80 @@ fn total_quadratic_penalty(
     }
 }
 
+/// Locate the first non-finite entry in a Hessian and report it as a
+/// canonical "smooth-regularized logdet boundary" error. The same
+/// message is used at every site that refuses to factor or iterate on
+/// a non-finite Hessian — the logdet computation itself, and the
+/// inner-fit entry where exact-Newton block Hessians arrive from the
+/// family. A single canonical phrasing means callers and tests
+/// recognise this as one mathematical event regardless of where it
+/// was caught: a NaN entry is a contract violation against the
+/// family's analytic second derivative, full stop.
+fn smooth_regularized_logdet_hessian_finite_check(
+    matrix: &Array2<f64>,
+    block: Option<usize>,
+) -> Result<(), String> {
+    let Some((row, col, value)) = matrix
+        .indexed_iter()
+        .find_map(|((row, col), &value)| (!value.is_finite()).then_some((row, col, value)))
+    else {
+        return Ok(());
+    };
+    let block_context = match block {
+        Some(b) => format!(" for block {b}"),
+        None => String::new(),
+    };
+    Err(format!(
+        "smooth-regularized logdet Hessian contains non-finite entry at ({row}, {col}): {value}{block_context}"
+    ))
+}
+
+/// Validate that every exact-Newton block working set in a family
+/// evaluation has a finite Hessian. Returns Err on the first
+/// non-finite entry using the canonical smooth-regularized logdet
+/// boundary message, with the offending block index appended for
+/// diagnostics.
+///
+/// Exact-Newton Hessians are part of the mathematical contract: they
+/// are the family's analytic second derivative of the log-likelihood,
+/// so any non-finite entry means that derivative is invalid math.
+/// Catching it at the family-evaluation boundary lets the inner
+/// solver refuse to iterate on a poisoned Hessian, instead of
+/// silently "converging" because the gradient happens to be zero or
+/// the bad entries get hidden behind a downstream eigendecomposition
+/// fallback that the outer optimizer's flags may or may not invoke.
+fn validate_block_hessians_finite(eval: &FamilyEvaluation) -> Result<(), String> {
+    for (b, ws) in eval.blockworking_sets.iter().enumerate() {
+        let BlockWorkingSet::ExactNewton { hessian, .. } = ws else {
+            continue;
+        };
+        match hessian {
+            SymmetricMatrix::Dense(matrix) => {
+                smooth_regularized_logdet_hessian_finite_check(matrix, Some(b))?;
+            }
+            SymmetricMatrix::Sparse(matrix) => {
+                let (symbolic, values) = matrix.parts();
+                let col_ptr = symbolic.col_ptr();
+                let row_idx = symbolic.row_idx();
+                for col in 0..matrix.ncols() {
+                    let start = col_ptr[col];
+                    let end = col_ptr[col + 1];
+                    for idx in start..end {
+                        let row = row_idx[idx];
+                        let value = values[idx];
+                        if !value.is_finite() {
+                            return Err(format!(
+                                "smooth-regularized logdet Hessian contains non-finite entry at ({row}, {col}): {value} for block {b}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn stable_logdet_with_ridge_policy(
     matrix: &Array2<f64>,
     ridge_floor: f64,
@@ -6011,14 +6110,7 @@ fn stable_logdet_with_ridge_policy(
         }
         RidgeDeterminantMode::Auto => unreachable!("adaptive determinant mode must resolve"),
         RidgeDeterminantMode::PositivePart => {
-            if let Some((row, col, value)) = a
-                .indexed_iter()
-                .find_map(|((row, col), &value)| (!value.is_finite()).then_some((row, col, value)))
-            {
-                return Err(format!(
-                    "smooth-regularized logdet Hessian contains non-finite entry at ({row}, {col}): {value}"
-                ));
-            }
+            smooth_regularized_logdet_hessian_finite_check(&a, None)?;
             // Smooth-regularized logdet objective, aligned with the gradient
             // operator (`DenseSpectralOperator` in `Smooth` mode):
             //
@@ -6589,10 +6681,15 @@ struct JointHessianBundle<'a> {
     source: JointHessianSource,
     beta_flat: Array1<f64>,
     compute_dh: Box<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + 'a>,
+    compute_dh_many:
+        Option<Box<dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String> + 'a>>,
     compute_d2h:
         Box<dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String> + 'a>,
     owned_compute_dh:
         Option<Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>>,
+    owned_compute_dh_many: Option<
+        Arc<dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String> + Send + Sync>,
+    >,
     owned_compute_d2h: Option<
         Arc<
             dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>
@@ -6825,6 +6922,7 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
             1.0,
             hessian_workspace.clone(),
         ));
+        let compute_dh_many = None;
         let compute_d2h = Box::new(exact_newton_d2h_closure(
             family,
             Arc::clone(&synced),
@@ -6843,6 +6941,7 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
             1.0,
             hessian_workspace.clone(),
         );
+        let owned_compute_dh_many = None;
         let owned_compute_d2h = exact_newton_d2h_closure_owned(
             family.clone(),
             Arc::clone(&synced),
@@ -6856,8 +6955,10 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
             source: h_joint_unpen,
             beta_flat,
             compute_dh,
+            compute_dh_many,
             compute_d2h,
             owned_compute_dh: Some(owned_compute_dh),
+            owned_compute_dh_many,
             owned_compute_d2h: Some(owned_compute_d2h),
             rho_curvature_scale: curvature.rho_curvature_scale,
             hessian_logdet_correction: curvature.hessian_logdet_correction,
@@ -6893,6 +6994,7 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
             1.0,
             hessian_workspace.clone(),
         ));
+        let compute_dh_many = exact_newton_dh_many_closure(1.0, hessian_workspace.clone());
         let compute_d2h = Box::new(exact_newton_d2h_closure(
             family,
             Arc::clone(&synced),
@@ -6911,6 +7013,8 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
             1.0,
             hessian_workspace.clone(),
         );
+        let owned_compute_dh_many =
+            exact_newton_dh_many_closure_owned(1.0, hessian_workspace.clone());
         let owned_compute_d2h = exact_newton_d2h_closure_owned(
             family.clone(),
             Arc::clone(&synced),
@@ -6924,8 +7028,10 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
             source: h_joint_unpen,
             beta_flat,
             compute_dh,
+            compute_dh_many,
             compute_d2h,
             owned_compute_dh: Some(owned_compute_dh),
+            owned_compute_dh_many,
             owned_compute_d2h: Some(owned_compute_d2h),
             rho_curvature_scale: 1.0,
             hessian_logdet_correction: 0.0,
@@ -7031,8 +7137,10 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
             source: JointHessianSource::Dense(h_joint_unpen),
             beta_flat,
             compute_dh,
+            compute_dh_many: None,
             compute_d2h,
             owned_compute_dh: Some(owned_compute_dh),
+            owned_compute_dh_many: None,
             owned_compute_d2h: Some(owned_compute_d2h),
             rho_curvature_scale: 1.0,
             hessian_logdet_correction: 0.0,
@@ -7116,6 +7224,24 @@ fn exact_newton_dh_closure<'a, F: CustomFamily>(
             }
         }
     }
+}
+
+fn exact_newton_dh_many_closure<'a>(
+    scale: f64,
+    workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+) -> Option<Box<dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String> + 'a>> {
+    let workspace = workspace?;
+    Some(Box::new(move |directions: &[Array1<f64>]| {
+        workspace
+            .directional_derivative_operators(directions)?
+            .into_iter()
+            .map(|maybe_operator| {
+                Ok(maybe_operator.map(|operator| {
+                    scale_drift_deriv_result(DriftDerivResult::Operator(operator), scale)
+                }))
+            })
+            .collect()
+    }))
 }
 
 /// Build a closure computing d²H[u,v] using exact Newton derivatives on synced states.
@@ -7241,6 +7367,26 @@ fn exact_newton_dh_closure_owned<F: CustomFamily + Clone + Send + Sync + 'static
             }
         }
     })
+}
+
+fn exact_newton_dh_many_closure_owned(
+    scale: f64,
+    workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+) -> Option<
+    Arc<dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String> + Send + Sync>,
+> {
+    let workspace = workspace?;
+    Some(Arc::new(move |directions: &[Array1<f64>]| {
+        workspace
+            .directional_derivative_operators(directions)?
+            .into_iter()
+            .map(|maybe_operator| {
+                Ok(maybe_operator.map(|operator| {
+                    scale_drift_deriv_result(DriftDerivResult::Operator(operator), scale)
+                }))
+            })
+            .collect()
+    }))
 }
 
 fn exact_newton_d2h_closure_owned<F: CustomFamily + Clone + Send + Sync + 'static>(
@@ -8213,6 +8359,11 @@ fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'sta
     states: &[ParameterBlockState],
     prefer_workspace: bool,
 ) -> Result<(f64, Option<Arc<dyn ExactNewtonJointHessianWorkspace>>), String> {
+    if let Some((log_likelihood, workspace)) =
+        family.joint_line_search_log_likelihood_evaluation(states, specs, options)?
+    {
+        return Ok((log_likelihood, workspace));
+    }
     if prefer_workspace
         && let Some((log_likelihood, workspace)) =
             family.joint_line_search_log_likelihood_workspace(states, specs, options)?
@@ -8418,6 +8569,15 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         let log_likelihood = eval.log_likelihood;
         (log_likelihood, Some(eval), None, None)
     };
+    // Validate exact-Newton block Hessians at the family-evaluation
+    // boundary. A non-finite entry is a contract violation against the
+    // family's analytic second derivative; refuse to iterate before
+    // any factorization rather than letting it slip through to a
+    // downstream logdet check that may be gated off by the outer
+    // optimizer's flags.
+    if let Some(eval) = cached_eval.as_ref() {
+        validate_block_hessians_finite(eval)?;
+    }
     let mut current_penalty =
         total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
     let mut lastobjective = -current_log_likelihood + current_penalty;
@@ -9098,8 +9258,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // arrived here via convergent progress, not from a
                 // saddle traversal mid-flight.
                 let trust_region_collapsed = joint_trust_radius <= 1.0e-9;
+                // Require at least 2 successful cycles before accepting the
+                // relaxed (residual > tol) KKT signature, so we never accept
+                // a degenerate cycle-0 failure as convergence.
+                let made_progress = cycles_done >= 2;
                 if (last_cycle_residual_below_tol && last_cycle_obj_change_below_tol)
-                    || (trust_region_collapsed && last_cycle_obj_change_below_tol)
+                    || (trust_region_collapsed && last_cycle_obj_change_below_tol && made_progress)
                 {
                     converged = true;
                 }
@@ -9240,29 +9404,33 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 break;
             }
 
-            // KKT convergence: small residual plus EITHER a small
-            // Newton step (tight quadratic-rate convergence, lets β
-            // polish to machine precision) OR confirmed stagnation
-            // (`accepted_step_inf <= step_tol` AND `objective_change
-            // <= objective_tol`, the rank-deficient null-mode case).
-            // The conjunction in the second branch matters: a single
-            // small `objective_change` on a quadratic-rate cycle is
-            // normal Newton progress, not stagnation, and treating it
-            // alone as convergence stops the iteration with β still
-            // O(residual_tol) away from the optimum — visible as a
-            // sign mismatch against finite-differenced outer LAML
-            // gradients in the autodiff cross-checks.
-            if residual <= residual_tol
-                && (step_inf <= step_tol
-                    || (accepted_step_inf <= step_tol && objective_change <= objective_tol))
-            {
+            // KKT convergence: a small post-step residual is the
+            // canonical optimality certificate for the penalized
+            // objective. ‖∇L(β) − Sβ‖∞ ≤ residual_tol means the
+            // iterate is at a KKT point to numerical precision and
+            // further iteration cannot reduce it; the step magnitude
+            // is irrelevant once the residual signal has fired.
+            //
+            // Tying convergence to a small step instead would refuse
+            // to recognise quadratic-rate single-shot convergence:
+            // exact Newton on an exact quadratic produces one full
+            // step that lands at the optimum, so ‖delta‖∞ equals the
+            // initial distance ‖β* − β₀‖∞ no matter how exact the
+            // model is. Pairing a residual check with a step-size
+            // requirement structurally rejects this entirely-correct
+            // cycle-0 termination, leaving inner_max_cycles=1 callers
+            // unable to certify convergence on a problem that was
+            // solved exactly in one Newton step.
+            if residual <= residual_tol {
                 converged = true;
                 break;
             }
+            // No-progress break: a tiny accepted step paired with a
+            // tiny objective change means further iteration will not
+            // improve the iterate. Exit even if the residual has not
+            // reached its own tolerance — the rank-deficient null-mode
+            // case described in the line-search-failure path below.
             if accepted_step_inf <= step_tol && objective_change <= objective_tol {
-                if residual <= residual_tol {
-                    converged = true;
-                }
                 break;
             }
             // Carry the KKT-stationarity signal into the next cycle so
@@ -9988,6 +10156,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 /// expects the actual perturbation direction `δβ`, so we negate `v_k` before calling it.
 struct BorrowedJointDerivProvider<'a> {
     compute_dh: &'a dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+    compute_dh_many:
+        Option<&'a dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String>>,
     compute_d2h: &'a dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
     family_outer_hessian_operator:
         Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
@@ -10016,6 +10186,25 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
     ) -> Result<Option<DriftDerivResult>, String> {
         let neg_v = -v_k;
         (self.compute_dh)(&neg_v)
+    }
+
+    fn hessian_derivative_corrections_result(
+        &self,
+        v_ks: &[Array1<f64>],
+    ) -> Result<Vec<Option<DriftDerivResult>>, String> {
+        let neg_vs: Vec<Array1<f64>> = v_ks.iter().map(|v_k| -v_k).collect();
+        if let Some(compute_dh_many) = self.compute_dh_many {
+            compute_dh_many(&neg_vs)
+        } else {
+            neg_vs
+                .iter()
+                .map(|neg_v| (self.compute_dh)(neg_v))
+                .collect()
+        }
+    }
+
+    fn has_batched_hessian_derivative_corrections(&self) -> bool {
+        self.compute_dh_many.is_some()
     }
 
     fn hessian_second_derivative_correction(
@@ -10064,6 +10253,9 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
 
 struct OwnedJointDerivProvider {
     compute_dh: Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
+    compute_dh_many: Option<
+        Arc<dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String> + Send + Sync>,
+    >,
     compute_d2h: Arc<
         dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>
             + Send
@@ -10089,6 +10281,25 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
     ) -> Result<Option<DriftDerivResult>, String> {
         let neg_v = -v_k;
         (self.compute_dh)(&neg_v)
+    }
+
+    fn hessian_derivative_corrections_result(
+        &self,
+        v_ks: &[Array1<f64>],
+    ) -> Result<Vec<Option<DriftDerivResult>>, String> {
+        let neg_vs: Vec<Array1<f64>> = v_ks.iter().map(|v_k| -v_k).collect();
+        if let Some(compute_dh_many) = self.compute_dh_many.as_ref() {
+            compute_dh_many(&neg_vs)
+        } else {
+            neg_vs
+                .iter()
+                .map(|neg_v| (self.compute_dh)(neg_v))
+                .collect()
+        }
+    }
+
+    fn has_batched_hessian_derivative_corrections(&self) -> bool {
+        self.compute_dh_many.is_some()
     }
 
     fn hessian_second_derivative_correction(
@@ -10594,9 +10805,15 @@ fn joint_outer_evaluate(
     options: &BlockwiseFitOptions,
     pseudo_logdet_mode: PseudoLogdetMode,
     compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+    compute_dh_many: Option<
+        &dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String>,
+    >,
     compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
     owned_compute_dh: Option<
         Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
+    >,
+    owned_compute_dh_many: Option<
+        Arc<dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String> + Send + Sync>,
     >,
     owned_compute_d2h: Option<
         Arc<
@@ -10618,12 +10835,14 @@ fn joint_outer_evaluate(
         if let (Some(owned_dh), Some(owned_d2h)) = (owned_compute_dh, owned_compute_d2h) {
             Box::new(OwnedJointDerivProvider {
                 compute_dh: owned_dh,
+                compute_dh_many: owned_compute_dh_many,
                 compute_d2h: owned_d2h,
                 family_outer_hessian_operator: batched_outer_hessian_operator.clone(),
             })
         } else {
             Box::new(BorrowedJointDerivProvider {
                 compute_dh,
+                compute_dh_many,
                 compute_d2h,
                 family_outer_hessian_operator: batched_outer_hessian_operator.clone(),
             })
@@ -10826,9 +11045,15 @@ fn joint_outer_evaluate_efs(
     options: &BlockwiseFitOptions,
     pseudo_logdet_mode: PseudoLogdetMode,
     compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+    compute_dh_many: Option<
+        &dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String>,
+    >,
     compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
     owned_compute_dh: Option<
         Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
+    >,
+    owned_compute_dh_many: Option<
+        Arc<dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String> + Send + Sync>,
     >,
     owned_compute_d2h: Option<
         Arc<
@@ -10846,12 +11071,14 @@ fn joint_outer_evaluate_efs(
         if let (Some(owned_dh), Some(owned_d2h)) = (owned_compute_dh, owned_compute_d2h) {
             Box::new(OwnedJointDerivProvider {
                 compute_dh: owned_dh,
+                compute_dh_many: owned_compute_dh_many,
                 compute_d2h: owned_d2h,
                 family_outer_hessian_operator: None,
             })
         } else {
             Box::new(BorrowedJointDerivProvider {
                 compute_dh,
+                compute_dh_many,
                 compute_d2h,
                 family_outer_hessian_operator: None,
             })
@@ -11089,8 +11316,10 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                 source: h_joint_unpen,
                 beta_flat,
                 compute_dh,
+                compute_dh_many,
                 compute_d2h,
                 owned_compute_dh,
+                owned_compute_dh_many,
                 owned_compute_d2h,
                 rho_curvature_scale,
                 hessian_logdet_correction,
@@ -11115,8 +11344,10 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                 options,
                 family.pseudo_logdet_mode(),
                 compute_dh.as_ref(),
+                compute_dh_many.as_deref(),
                 compute_d2h.as_ref(),
                 owned_compute_dh,
+                owned_compute_dh_many,
                 owned_compute_d2h,
                 None,
             )
@@ -11387,7 +11618,9 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                 options,
                 family.pseudo_logdet_mode(),
                 &compute_dh,
+                None,
                 &compute_d2h,
+                None,
                 None,
                 None,
                 None,
@@ -12428,6 +12661,11 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             },
             hessian_workspace.clone(),
         );
+        let compute_dh_many = if use_outer_curvature_derivatives {
+            None
+        } else {
+            exact_newton_dh_many_closure(rho_curvature_scale, hessian_workspace.clone())
+        };
         let compute_d2h = exact_newton_d2h_closure(
             family,
             Arc::clone(&synced_joint_states),
@@ -12454,6 +12692,11 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             },
             hessian_workspace.clone(),
         );
+        let owned_compute_dh_many = if use_outer_curvature_derivatives {
+            None
+        } else {
+            exact_newton_dh_many_closure_owned(rho_curvature_scale, hessian_workspace.clone())
+        };
         let owned_compute_d2h = exact_newton_d2h_closure_owned(
             family.clone(),
             Arc::clone(&synced_joint_states),
@@ -12490,8 +12733,10 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             options,
             family.pseudo_logdet_mode(),
             &compute_dh,
+            compute_dh_many.as_deref(),
             &compute_d2h,
             Some(owned_compute_dh),
+            owned_compute_dh_many,
             Some(owned_compute_d2h),
             ext_bundle,
             custom_family_batched_outer_hessian_operator(
@@ -12570,8 +12815,10 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         source: h_joint_unpen,
                         beta_flat,
                         compute_dh,
+                        compute_dh_many,
                         compute_d2h,
                         owned_compute_dh: _,
+                        owned_compute_dh_many: _,
                         owned_compute_d2h: _,
                         rho_curvature_scale,
                         hessian_logdet_correction,
@@ -12598,7 +12845,9 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         options,
                         family.pseudo_logdet_mode(),
                         compute_dh.as_ref(),
+                        compute_dh_many.as_deref(),
                         compute_d2h.as_ref(),
+                        None,
                         None,
                         None,
                         None,
@@ -12652,8 +12901,10 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             source: h_joint_unpen,
             beta_flat,
             compute_dh,
+            compute_dh_many,
             compute_d2h,
             owned_compute_dh,
+            owned_compute_dh_many,
             owned_compute_d2h,
             rho_curvature_scale,
             hessian_logdet_correction,
@@ -12679,8 +12930,10 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             options,
             family.pseudo_logdet_mode(),
             compute_dh.as_ref(),
+            compute_dh_many.as_deref(),
             compute_d2h.as_ref(),
             owned_compute_dh,
+            owned_compute_dh_many,
             owned_compute_d2h,
             None, // no ext_coords when psi_dim == 0
             custom_family_batched_outer_hessian_operator(
@@ -12970,7 +13223,9 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         options,
         family.pseudo_logdet_mode(),
         &compute_dh,
+        None,
         &compute_d2h,
+        None,
         None,
         None,
         None, // no ext_coords for generic single-block fallback
@@ -13293,6 +13548,11 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         },
         hessian_workspace.clone(),
     );
+    let compute_dh_many = if use_outer_curvature_derivatives {
+        None
+    } else {
+        exact_newton_dh_many_closure(rho_curvature_scale, hessian_workspace.clone())
+    };
     let compute_d2h = exact_newton_d2h_closure(
         family,
         Arc::clone(&synced_joint_states),
@@ -13319,6 +13579,11 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         },
         hessian_workspace.clone(),
     );
+    let owned_compute_dh_many = if use_outer_curvature_derivatives {
+        None
+    } else {
+        exact_newton_dh_many_closure_owned(rho_curvature_scale, hessian_workspace.clone())
+    };
     let owned_compute_d2h = exact_newton_d2h_closure_owned(
         family.clone(),
         Arc::clone(&synced_joint_states),
@@ -13353,8 +13618,10 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         options,
         family.pseudo_logdet_mode(),
         &compute_dh,
+        compute_dh_many.as_deref(),
         &compute_d2h,
         Some(owned_compute_dh),
+        owned_compute_dh_many,
         Some(owned_compute_d2h),
         Some(ext_bundle),
     )
