@@ -1186,18 +1186,6 @@ pub(crate) fn build_score_warp_deviation_block_from_seed(
     build_deviation_block_from_knots_and_design_seed(seed, seed, cfg)
 }
 
-pub(crate) fn build_score_warp_deviation_block_from_seed_empirical_anchor(
-    seed: &Array1<f64>,
-    _weights: &Array1<f64>,
-    cfg: &DeviationBlockConfig,
-) -> Result<DeviationPrepared, String> {
-    // The `weights` argument is retained for caller-API stability but no
-    // longer participates in basis construction: identifiability now comes
-    // from the smoothness-penalty null-space drop (β-independent), not from a
-    // data-distribution moment anchor at the rigid-pilot η₀.
-    build_deviation_block_from_knots_and_design_seed(seed, seed, cfg)
-}
-
 const BERNOULLI_LINK_PROBABILITY_EPS: f64 = 1e-12;
 
 #[derive(Clone, Copy, Debug)]
@@ -1308,9 +1296,9 @@ pub(crate) fn build_link_deviation_block_from_knots_design_seed_and_weights(
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
     // The `anchor_weights` argument is retained for caller-API stability but
-    // no longer participates in basis construction (see
-    // `build_score_warp_deviation_block_from_seed_empirical_anchor` for the
-    // rationale: identifiability is now β-independent).
+    // no longer participates in basis construction: identifiability now comes
+    // from the smoothness-penalty null-space drop (β-independent), not from a
+    // data-distribution moment anchor at the rigid-pilot η₀.
     build_deviation_block_from_knots_and_design_seed(knot_seed, design_seed, cfg)
 }
 
@@ -11759,20 +11747,18 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let weights = Arc::new(spec.weights.clone());
     let z = Arc::new(spec.z.clone());
 
+    // Score-warp basis construction is β-independent (identifiability is
+    // provided by the smoothness-null-space drop on the basis transform,
+    // not by a data-distribution moment anchor at the rigid-pilot η₀), so
+    // the standard-normal and empirical latent-measure branches build the
+    // same block. There is no row-weight pilot to thread into the basis;
+    // the latent-measure split is enforced upstream via the empirical
+    // intercept solve in `build_row_exact_context_with_stats`, not in the
+    // deviation basis.
     let score_warp_prepared = spec
         .score_warp
         .as_ref()
-        .map(|cfg| {
-            if matches!(latent_measure, LatentMeasureKind::StandardNormal) {
-                build_score_warp_deviation_block_from_seed(&spec.z, cfg)
-            } else {
-                build_score_warp_deviation_block_from_seed_empirical_anchor(
-                    &spec.z,
-                    &spec.weights,
-                    cfg,
-                )
-            }
-        })
+        .map(|cfg| build_score_warp_deviation_block_from_seed(&spec.z, cfg))
         .transpose()?;
     // Build the link-deviation block if requested.  The seed only determines
     // knot placement for the deviation basis, so we use the closed-form
@@ -19563,41 +19549,6 @@ mod tests {
             rigid_intercept_from_marginal(target_q, slope, scale),
             target_q * (1.0 + (scale * slope).powi(2)).sqrt()
         );
-    }
-
-    #[test]
-    fn score_warp_empirical_anchor_zeroes_empirical_intercept_and_slope_components() {
-        let z = array![-1.4, -0.9, -0.35, 0.1, 0.55, 1.2, 2.8];
-        let weights = array![1.0, 0.8, 1.2, 0.7, 0.9, 0.6, 0.25];
-        let prepared = build_score_warp_deviation_block_from_seed_empirical_anchor(
-            &z,
-            &weights,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("empirical score warp");
-        let design = prepared.runtime.design(&z).expect("score warp design");
-        let beta = Array1::from_iter((0..design.ncols()).map(|idx| 0.1 * (idx as f64 + 1.0)));
-        let h = design.dot(&beta);
-        let total_weight = weights.sum();
-        let empirical_mean = h
-            .iter()
-            .zip(weights.iter())
-            .map(|(&value, &weight)| weight * value)
-            .sum::<f64>()
-            / total_weight;
-        let empirical_slope = h
-            .iter()
-            .zip(z.iter())
-            .zip(weights.iter())
-            .map(|((&value, &z_value), &weight)| weight * z_value * value)
-            .sum::<f64>()
-            / total_weight;
-
-        assert!(empirical_mean.abs() <= 1e-10);
-        assert!(empirical_slope.abs() <= 1e-10);
     }
 
     #[test]
