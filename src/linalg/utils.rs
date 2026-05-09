@@ -29,6 +29,18 @@ impl KahanSum {
     }
 }
 
+/// Compute `matrix^{-1}` with a stabilization ridge added solely to make
+/// the Cholesky factorization succeed.
+///
+/// **Stabilization semantics:** the ridge applied here is a
+/// [`StabilizationKind::NumericalPerturbation`](crate::types::StabilizationKind)
+/// — it does NOT change the model, the objective, the gradient, or
+/// anything serialized. The returned matrix is treated by callers as
+/// `(matrix)^{-1}`, not `(matrix + δ I)^{-1}`. Callers that genuinely
+/// need a model-level prior must build that prior into `matrix` *before*
+/// calling this function and pass through a `RidgePassport` /
+/// `StabilizationLedger::explicit_prior` so the same δ is also accounted
+/// for in objective, logdet, and saved state.
 pub(crate) fn matrix_inversewith_regularization(
     matrix: &Array2<f64>,
     label: &str,
@@ -217,6 +229,14 @@ pub(crate) fn boundary_hit_indices(
     (at_lower, at_upper)
 }
 
+/// SPD-only spectrum condition number: λ_max / λ_min on the principal
+/// (positive-eigenvalue) spectrum.
+///
+/// **Invariant:** caller must have already established the matrix is
+/// positive definite. For indefinite matrices λ_min may be negative or
+/// zero and the ratio max/min becomes meaningless (it can be negative or
+/// infinite even when the matrix is well-scaled). Use
+/// [`indefinite_safe_condition_number`] when the spectrum sign is unknown.
 pub(crate) fn symmetric_spectrum_condition_number(matrix: &Array2<f64>) -> f64 {
     matrix
         .eigh(Side::Lower)
@@ -231,6 +251,53 @@ pub(crate) fn symmetric_spectrum_condition_number(matrix: &Array2<f64>) -> f64 {
             max / min.max(1e-12)
         })
         .unwrap_or(f64::NAN)
+}
+
+/// Indefinite-safe variant: returns `Err(min_eigenvalue)` when the matrix
+/// is not numerically positive definite. The error payload exposes
+/// `λ_min` so the caller can route into a stabilization-ledger
+/// `bump_with_matrix` call with an inertia-target rule rather than
+/// silently consuming a misleading "condition number" value.
+pub(crate) fn indefinite_safe_condition_number(matrix: &Array2<f64>) -> Result<f64, f64> {
+    let (evals, _) = matrix.eigh(Side::Lower).map_err(|_| f64::NAN)?;
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for &v in evals.iter() {
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
+    }
+    let pd_floor = max.abs().max(1.0) * 1e-14;
+    if min <= pd_floor {
+        Err(min)
+    } else {
+        Ok(max / min)
+    }
+}
+
+/// Estimate min/max eigenvalues of a symmetric matrix via a short
+/// `eigh` call. Used by the inertia-aware stabilization rule below.
+/// Returns `None` if the eigensolver fails.
+pub(crate) fn symmetric_extremes(matrix: &Array2<f64>) -> Option<(f64, f64)> {
+    let (evals, _) = matrix.eigh(Side::Lower).ok()?;
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for &v in evals.iter() {
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
+    }
+    if min.is_finite() && max.is_finite() {
+        Some((min, max))
+    } else {
+        None
+    }
 }
 
 /// Enforce exact symmetry on a square matrix by averaging off-diagonal pairs.
@@ -434,15 +501,38 @@ where
     let mut diagnostics = PcgDiagnostics::new(rhs_norm);
 
     // Precompute reciprocal preconditioner once. Each PCG iteration applies
-    // M^{-1} via a single elementwise multiply (z = inv_m * r), avoiding the
-    // per-element `.abs().max(1e-12)` and division on every iteration. The
-    // floor mirrors the previous guard against zero/negative diagonals.
+    // M^{-1} via a single elementwise multiply (z = inv_m * r).
+    //
+    // SPD-PCG requires a strictly positive preconditioner (M ≻ 0). A
+    // non-positive diagonal entry is a contract violation by the caller —
+    // either the matrix is not actually SPD, or it has a structural zero.
+    // Silently `abs()`-ing the value (the historical behavior) hides this
+    // and produces a "solution" that does not minimize the SPD energy.
+    // Instead, fall through to `None` so the caller routes to a
+    // direct-factorization or indefinite Krylov path. We still tolerate
+    // very small positive values via a 1e-12 floor for numerical noise.
     let mut inv_m = Array1::<f64>::zeros(p);
-    Zip::from(&mut inv_m)
-        .and(preconditioner_diag)
-        .par_for_each(|inv, &m| {
-            *inv = 1.0 / m.abs().max(1e-12);
-        });
+    let mut bad_diag = false;
+    for (slot, &m) in inv_m.iter_mut().zip(preconditioner_diag.iter()) {
+        if !m.is_finite() || m < 0.0 {
+            // Negative or non-finite preconditioner diagonal violates the
+            // SPD-PCG contract (M ≻ 0). Hard error rather than silent
+            // `abs()`: caller should route to a direct factorization or
+            // indefinite Krylov path. Exactly-zero entries are treated as
+            // numerical noise and floored to 1e-12.
+            bad_diag = true;
+            break;
+        }
+        *slot = 1.0 / m.max(1e-12);
+    }
+    if bad_diag {
+        log::warn!(
+            "SPD PCG rejected: preconditioner diagonal contained a negative or \
+             non-finite entry; caller should route to a direct factorization \
+             or indefinite Krylov path."
+        );
+        return None;
+    }
 
     let mut z = Array1::<f64>::zeros(p);
     Zip::from(&mut z)
@@ -676,6 +766,7 @@ pub(crate) struct RidgePlanner {
     ridge: f64,
     attempts: usize,
     scale: f64,
+    ledger: crate::types::StabilizationLedger,
 }
 
 impl RidgePlanner {
@@ -685,16 +776,36 @@ impl RidgePlanner {
         // Most Hessians factorize on the first attempt. Avoid an eager exact
         // condition-number decomposition here and only pay for spectral
         // diagnostics after an actual factorization failure.
+        //
+        // RidgePlanner is *strictly* a numerical-perturbation device: the
+        // perturbation is applied so a Cholesky factorization succeeds for
+        // an inverse / linear solve, and the matrix the caller hands back
+        // to the rest of the system is the unperturbed one. The ledger
+        // entry below is the canonical record of that semantic.
+        let ledger = crate::types::StabilizationLedger::numerical_perturbation(
+            min_step,
+            crate::types::StabilizationRule::FixedConstant,
+            None,
+        );
         Self {
             cond_estimate: None,
             ridge: min_step,
             attempts: 0,
             scale,
+            ledger,
         }
     }
 
     pub(crate) fn ridge(&self) -> f64 {
         self.ridge
+    }
+
+    /// Canonical accounting record for the ridge currently planned/applied.
+    /// Always `NumericalPerturbation`-kind: the planner exists to make a
+    /// linear solve succeed, never to change the model.
+    #[allow(dead_code)] // exposed for downstream telemetry/tests
+    pub(crate) fn ledger(&self) -> crate::types::StabilizationLedger {
+        self.ledger
     }
 
     #[inline]
@@ -714,44 +825,76 @@ impl RidgePlanner {
         let min_step = self.scale * 1e-10;
         let base = self.ridge.max(min_step);
 
-        // Estimate conditioning at the current ridge level.
-        let cond_now = self.estimate_conditionwithridge(matrix, base);
-        self.cond_estimate = cond_now;
-
-        self.ridge = if let Some(cond) = cond_now {
-            let ratio = cond / HESSIAN_CONDITION_TARGET;
-            // Primary update from condition feedback.
-            // sqrt-ratio avoids wild overshoot while still scaling with severity.
-            let mut multiplier = if ratio > 1.0 {
-                ratio.sqrt().clamp(1.5, 10.0)
-            } else {
-                // Factorization failed despite "acceptable" condition number.
-                // This usually indicates indefiniteness/numerical fragility, so
-                // use a stronger fallback than ×2, increasing with attempts.
-                (2.0 + self.attempts as f64).clamp(3.0, 10.0)
-            };
-
-            let mut proposal = base * multiplier;
-            // Verify whether the proposal actually improves condition enough.
-            // If not, escalate once more before returning.
-            if let Some(cond_next) = self.estimate_conditionwithridge(matrix, proposal)
-                && cond_next > cond * 0.9
-                && ratio > 1.0
-            {
-                multiplier = (multiplier * 1.8).clamp(2.0, 10.0);
-                proposal = base * multiplier;
-            }
-            proposal.max(min_step)
-        } else if self.ridge <= 0.0 {
-            min_step
+        // Primary rule: inertia-target. Estimate λ_min(H) on the unperturbed
+        // matrix; pick δ so that λ_min(H + δ I) ≥ τ for an SPD floor τ tied
+        // to the matrix scale. This is a defensible "make it positive
+        // definite by exactly the amount needed" rule, in contrast with
+        // condition-number sqrt heuristics that happen to land in the same
+        // ballpark only by coincidence.
+        let spd_floor = self.scale * 1e-8;
+        let mut chose_via_inertia = false;
+        let mut next_ridge = if let Some((lam_min, _lam_max)) = symmetric_extremes(matrix) {
+            chose_via_inertia = true;
+            // δ = max(min_step, τ - λ_min). Multiply by a small safety
+            // factor (1.5×) on the deficit so a single eigensolver round-off
+            // does not leave us a hair below τ on the first retry.
+            let deficit = (spd_floor - lam_min).max(0.0);
+            let proposal = (1.5 * deficit).max(base * 1.5).max(min_step);
+            // Cap escalation per attempt so we don't shoot past what's
+            // needed when λ_min is wildly negative; the surrounding loop
+            // will re-bump up to MAX_FACTORIZATION_ATTEMPTS times.
+            proposal.min(base * 10.0)
         } else {
-            // Condition estimate unavailable: geometric fallback.
-            (base * 10.0).max(min_step)
+            f64::NAN
         };
 
-        if !self.ridge.is_finite() || self.ridge <= 0.0 {
-            self.ridge = self.scale;
+        // Fallback rule: condition-number heuristic. Used only when the
+        // eigensolver itself failed (rare, usually means a non-finite
+        // matrix or extreme scaling).
+        if !next_ridge.is_finite() {
+            let cond_now = self.estimate_conditionwithridge(matrix, base);
+            self.cond_estimate = cond_now;
+            next_ridge = if let Some(cond) = cond_now {
+                let ratio = cond / HESSIAN_CONDITION_TARGET;
+                let mut multiplier = if ratio > 1.0 {
+                    ratio.sqrt().clamp(1.5, 10.0)
+                } else {
+                    (2.0 + self.attempts as f64).clamp(3.0, 10.0)
+                };
+                let mut proposal = base * multiplier;
+                if let Some(cond_next) = self.estimate_conditionwithridge(matrix, proposal)
+                    && cond_next > cond * 0.9
+                    && ratio > 1.0
+                {
+                    multiplier = (multiplier * 1.8).clamp(2.0, 10.0);
+                    proposal = base * multiplier;
+                }
+                proposal.max(min_step)
+            } else if self.ridge <= 0.0 {
+                min_step
+            } else {
+                (base * 10.0).max(min_step)
+            };
         }
+
+        if !next_ridge.is_finite() || next_ridge <= 0.0 {
+            next_ridge = self.scale;
+        }
+
+        self.ridge = next_ridge;
+        // Reflect the new escalation state in the ledger so any downstream
+        // consumer (telemetry, debug logging) sees a consistent record.
+        self.ledger = crate::types::StabilizationLedger::numerical_perturbation(
+            self.ridge,
+            if chose_via_inertia {
+                crate::types::StabilizationRule::InertiaTarget { spd_floor }
+            } else {
+                crate::types::StabilizationRule::BackoffEscalation {
+                    attempts: self.attempts,
+                }
+            },
+            None,
+        );
     }
 
     pub(crate) fn attempts(&self) -> usize {

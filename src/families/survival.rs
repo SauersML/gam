@@ -1273,6 +1273,17 @@ impl WorkingModelSurvival {
         totalgrad += &penaltygrad;
 
         self.penalties.addhessian_inplace(&mut h);
+        // SURVIVAL_STABILIZATION_RIDGE is an `ExplicitPrior`-kind
+        // stabilization in the canonical ledger taxonomy
+        // (`crate::types::StabilizationKind::ExplicitPrior`): δ enters the
+        // gradient (`grad += δ β`), the Hessian (`H += δ I`), the scalar
+        // penalty term added to the objective (`0.5 δ ‖β‖²`), and is
+        // serialized through `WorkingState::ridge_used` so downstream
+        // covariance and survival_ridge_lambda accounting remain
+        // consistent. The canonical ledger record is
+        //   StabilizationLedger::explicit_prior(δ, RidgeMatrixForm::ScaledIdentity)
+        // chosen_by = FixedConstant. Coordinated with main.rs
+        // `survival_ridge_lambda` field.
         const SURVIVAL_STABILIZATION_RIDGE: f64 = 1e-8;
         let ridge_used = SURVIVAL_STABILIZATION_RIDGE;
         for d in 0..p {
