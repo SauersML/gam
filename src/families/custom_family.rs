@@ -1009,6 +1009,22 @@ pub trait CustomFamily {
         self.exact_newton_joint_hessian_workspace(states, specs)
     }
 
+    /// Optional line-search evaluator that can return the exact workspace
+    /// corresponding to a full accepted-trial log-likelihood sweep.
+    ///
+    /// Implementations must preserve the same accept/reject semantics as
+    /// [`Self::log_likelihood_only_with_options`], including any certified
+    /// early-exit rejection. Returning a workspace is only valid when the full
+    /// log-likelihood was evaluated at the same coefficient state.
+    fn joint_line_search_log_likelihood_workspace(
+        &self,
+        _states: &[ParameterBlockState],
+        _specs: &[ParameterBlockSpec],
+        _options: &BlockwiseFitOptions,
+    ) -> Result<Option<(f64, Arc<dyn ExactNewtonJointHessianWorkspace>)>, String> {
+        Ok(None)
+    }
+
     /// Optional batched analytic-gradient hook.
     ///
     /// Returns the K per-θ_j gradient contributions ([`BatchedOuterGradientTerms`])
@@ -8201,6 +8217,11 @@ fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'sta
     states: &[ParameterBlockState],
     prefer_workspace: bool,
 ) -> Result<(f64, Option<Arc<dyn ExactNewtonJointHessianWorkspace>>), String> {
+    if let Some((log_likelihood, workspace)) =
+        family.joint_line_search_log_likelihood_workspace(states, specs, options)?
+    {
+        return Ok((log_likelihood, Some(workspace)));
+    }
     if (!family.supports_log_likelihood_early_exit() || options.early_exit_threshold.is_none())
         && prefer_workspace
         && family.inner_joint_workspace_log_likelihood_available(specs)
@@ -9165,19 +9186,26 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 
             // KKT convergence: small residual plus EITHER a small
             // Newton step (tight quadratic-rate convergence, lets β
-            // polish to machine precision) OR confirmed stagnation
+            // polish to machine precision), confirmed stagnation
             // (`accepted_step_inf <= step_tol` AND `objective_change
-            // <= objective_tol`, the rank-deficient null-mode case).
-            // The conjunction in the second branch matters: a single
-            // small `objective_change` on a quadratic-rate cycle is
-            // normal Newton progress, not stagnation, and treating it
-            // alone as convergence stops the iteration with β still
-            // O(residual_tol) away from the optimum — visible as a
-            // sign mismatch against finite-differenced outer LAML
-            // gradients in the autodiff cross-checks.
+            // <= objective_tol`, the rank-deficient null-mode case),
+            // OR a stricter stationarity certificate where both the
+            // residual and objective change are an additional factor of
+            // `inner_tol` below their scale-aware tolerances. The last
+            // branch is deliberately stricter than the public tolerance:
+            // it handles machine-precision null directions where β can
+            // still move by about `step_tol` but the KKT residual and
+            // objective are already over-polished. Using objective
+            // stagnation alone is not sufficient; the residual guard is
+            // what preserves first-order correctness.
+            let superconverged_residual_tol = inner_tol * residual_tol;
+            let superconverged_objective_tol = inner_tol * objective_tol;
+            let superconverged_stationarity = residual <= superconverged_residual_tol
+                && objective_change <= superconverged_objective_tol;
             if residual <= residual_tol
                 && (step_inf <= step_tol
-                    || (accepted_step_inf <= step_tol && objective_change <= objective_tol))
+                    || (accepted_step_inf <= step_tol && objective_change <= objective_tol)
+                    || superconverged_stationarity)
             {
                 converged = true;
                 break;
