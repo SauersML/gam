@@ -8635,11 +8635,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         const JOINT_DIVERGENCE_FROZEN_LOGLIK_CYCLES: usize = 8;
 
         // Cross-cycle convergence carry-over: set at the end of every
-        // accepted cycle so the next cycle's line-search-failure path
-        // can distinguish a true KKT optimum on a rank-deficient
-        // Hessian (no meaningful trial step, even though step_inf is
-        // O(1) along the null mode) from genuine non-convergence.
-        let mut last_cycle_residual_below_tol = false;
+        // accepted cycle so the next cycle can distinguish a true KKT
+        // optimum on a rank-deficient null mode (objective stuck
+        // because every direction is along the null space) from
+        // genuine non-convergence. The residual signal does not need
+        // a carry-over — `residual <= residual_tol` is the canonical
+        // KKT certificate and the end-of-cycle test consumes it
+        // directly when it fires.
         let mut last_cycle_obj_change_below_tol = false;
 
         let mut joint_trust_radius = 1.0_f64;
@@ -9245,11 +9247,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // residual cannot drop below ~λ_min · radius regardless
                 // of how close β is to KKT stationarity. The failure
                 // mode is the same — TR shrinks to its 1e-12 floor
-                // without finding ANY descent step — but the original
-                // condition refuses to recognize it.
+                // without finding ANY descent step — but the residual
+                // certificate alone refuses to recognize it.
                 //
                 // Treat "TR shrunk to its floor + previous cycle's
-                // objective change below tol" as the same KKT-on-null
+                // objective change below tol" as a KKT-on-null
                 // signature: total TR collapse (no scale of step
                 // produces a strictly negative actual_reduction) is
                 // itself the certificate that no descent direction
@@ -9257,14 +9259,19 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // change in the previous accepted cycle confirms we
                 // arrived here via convergent progress, not from a
                 // saddle traversal mid-flight.
+                //
+                // We do not need a separate "previous cycle had small
+                // residual" branch: the end-of-cycle test breaks with
+                // converged=true the moment a cycle leaves residual
+                // below tol, so the only way to reach this line-search
+                // failure with the previous cycle's KKT signal already
+                // active is via the trust-region-collapse path below.
                 let trust_region_collapsed = joint_trust_radius <= 1.0e-9;
                 // Require at least 2 successful cycles before accepting the
                 // relaxed (residual > tol) KKT signature, so we never accept
                 // a degenerate cycle-0 failure as convergence.
                 let made_progress = cycles_done >= 2;
-                if (last_cycle_residual_below_tol && last_cycle_obj_change_below_tol)
-                    || (trust_region_collapsed && last_cycle_obj_change_below_tol && made_progress)
-                {
+                if trust_region_collapsed && last_cycle_obj_change_below_tol && made_progress {
                     converged = true;
                 }
                 break; // Fall back to blockwise
@@ -9433,11 +9440,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             if accepted_step_inf <= step_tol && objective_change <= objective_tol {
                 break;
             }
-            // Carry the KKT-stationarity signal into the next cycle so
-            // the line-search-failure path above can recognise a true
-            // KKT optimum on a rank-deficient null mode. See that path
-            // for the full rationale.
-            last_cycle_residual_below_tol = residual <= residual_tol;
+            // Carry the objective-stagnation signal into the next
+            // cycle so the line-search-failure path above can pair it
+            // with trust-region collapse to certify a KKT optimum on a
+            // rank-deficient null mode. The residual signal does not
+            // need a carry-over: by the time we reach this assignment
+            // the end-of-cycle test has already confirmed residual is
+            // above its tolerance, so a "previous cycle had small
+            // residual" branch in the failure path could never fire.
             last_cycle_obj_change_below_tol = objective_change <= objective_tol;
         }
 
