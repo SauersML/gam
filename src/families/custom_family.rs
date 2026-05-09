@@ -16981,8 +16981,17 @@ mod tests {
             specs,
             penalty_counts,
             rho,
-            options,
+            options: base_options,
         } = binomial_location_scale_wiggle_outer_fixture();
+        // FD/analytic noise floor below is `EPS·|cost|/h`, valid only when PIRLS
+        // converges to f64 precision; HardPseudo + σ_min~1e-10 amplifies the
+        // default 1e-6 inner residual into ~1e-7 cost slack that lifts both
+        // estimators above the machine-precision floor.
+        let options = BlockwiseFitOptions {
+            inner_tol: 1e-12,
+            inner_max_cycles: 500,
+            ..base_options
+        };
 
         let (f0, g0, _) =
             outerobjective_andgradient(&family, &specs, &options, &penalty_counts, &rho, None)
