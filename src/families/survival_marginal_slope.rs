@@ -1516,30 +1516,6 @@ impl BlockHessianAccumulator {
         self.h_hw += &other.h_hw;
     }
 
-    /// Scale every accumulated block in place by `scale`. Used to apply the
-    /// Horvitz-Thompson rescaling when the accumulator was populated from a
-    /// stratified subsample of rows (outer-only score / Hessian passes).
-    fn scale_assign(&mut self, scale: f64) {
-        if scale == 1.0 {
-            return;
-        }
-        self.h_tt.mapv_inplace(|v| v * scale);
-        self.h_mm.mapv_inplace(|v| v * scale);
-        self.h_gg.mapv_inplace(|v| v * scale);
-        self.h_hh.mapv_inplace(|v| v * scale);
-        self.h_ww.mapv_inplace(|v| v * scale);
-        self.h_tm.mapv_inplace(|v| v * scale);
-        self.h_tg.mapv_inplace(|v| v * scale);
-        self.h_th.mapv_inplace(|v| v * scale);
-        self.h_tw.mapv_inplace(|v| v * scale);
-        self.h_mg.mapv_inplace(|v| v * scale);
-        self.h_mh.mapv_inplace(|v| v * scale);
-        self.h_mw.mapv_inplace(|v| v * scale);
-        self.h_gh.mapv_inplace(|v| v * scale);
-        self.h_gw.mapv_inplace(|v| v * scale);
-        self.h_hw.mapv_inplace(|v| v * scale);
-    }
-
     fn diagonal(&self, slices: &BlockSlices) -> Array1<f64> {
         let mut out = Array1::zeros(slices.total);
         out.slice_mut(s![slices.time.clone()])
@@ -2663,8 +2639,8 @@ impl SurvivalMarginalSlopeFamily {
     /// Outer-aware variant of `log_likelihood_only`. When
     /// `options.outer_score_subsample` is `None` this iterates over all rows
     /// and matches the legacy full-data implementation. When it is `Some`,
-    /// only the masked rows contribute and the row-summed total is rescaled
-    /// by `weight_scale = n_full / |mask|` (Horvitz-Thompson). Lets outer-only
+    /// only the sampled rows contribute, with their Horvitz-Thompson
+    /// inverse-inclusion weights taken from `OuterScoreSubsample::rows`. Lets outer-only
     /// score/gradient passes scale to biobank `n` without distorting the
     /// full-data inner-PIRLS or covariance code paths.
     pub(crate) fn log_likelihood_only_with_options(
@@ -2929,9 +2905,9 @@ impl SurvivalMarginalSlopeFamily {
     /// Outer-aware variant of `sigma_exact_joint_psi_terms`. When
     /// `options.outer_score_subsample` is `None`, iterates all rows and is
     /// bit-for-bit equivalent to the legacy implementation. When `Some`, only
-    /// the masked rows contribute and every row-summed component (objective
-    /// scalar, per-block score vectors, Hessian operator blocks) is rescaled
-    /// by `weight_scale = n_full / |mask|` (Horvitz-Thompson).
+    /// the sampled rows contribute and every row-summed component (objective
+    /// scalar, per-block score vectors, Hessian operator blocks) is accumulated
+    /// with the row's Horvitz-Thompson inverse-inclusion weight.
     pub(crate) fn sigma_exact_joint_psi_terms_with_options(
         &self,
         block_states: &[ParameterBlockState],
@@ -3031,7 +3007,7 @@ impl SurvivalMarginalSlopeFamily {
     }
 
     /// Outer-aware variant of `sigma_exact_joint_psisecond_order_terms`. See
-    /// `sigma_exact_joint_psi_terms_with_options` for the row-iter / rescaling
+    /// `sigma_exact_joint_psi_terms_with_options` for the row-iter / weighting
     /// contract.
     pub(crate) fn sigma_exact_joint_psisecond_order_terms_with_options(
         &self,
@@ -3131,8 +3107,8 @@ impl SurvivalMarginalSlopeFamily {
 
     /// Outer-aware variant of `sigma_exact_joint_psihessian_directional_derivative`.
     /// See `sigma_exact_joint_psi_terms_with_options` for the row-iter /
-    /// rescaling contract — the returned dense Hessian-derivative matrix is
-    /// rescaled element-wise by `weight_scale` when a subsample is active.
+    /// weighting contract — the returned dense Hessian-derivative matrix is
+    /// accumulated with per-row inverse-inclusion weights when a subsample is active.
     pub(crate) fn sigma_exact_joint_psihessian_directional_derivative_with_options(
         &self,
         block_states: &[ParameterBlockState],
@@ -8991,9 +8967,9 @@ impl SurvivalMarginalSlopeFamily {
     /// Outer-aware variant of `psi_terms_inner`. When
     /// `options.outer_score_subsample` is `None`, iterates all rows and is
     /// bit-for-bit equivalent to the legacy implementation. When `Some`, only
-    /// the masked rows contribute and every row-summed component (objective
-    /// scalar, per-block score vectors, Hessian operator blocks) is rescaled
-    /// by `weight_scale = n_full / |mask|` (Horvitz-Thompson).
+    /// the sampled rows contribute and every row-summed component (objective
+    /// scalar, per-block score vectors, Hessian operator blocks) is accumulated
+    /// with the row's Horvitz-Thompson inverse-inclusion weight.
     pub(crate) fn psi_terms_inner_with_options(
         &self,
         block_states: &[ParameterBlockState],
@@ -9262,7 +9238,7 @@ impl SurvivalMarginalSlopeFamily {
     }
 
     /// Outer-aware variant of `psi_second_order_terms_inner`. See
-    /// `psi_terms_inner_with_options` for the row-iter / rescaling contract.
+    /// `psi_terms_inner_with_options` for the row-iter / weighting contract.
     pub(crate) fn psi_second_order_terms_inner_with_options(
         &self,
         block_states: &[ParameterBlockState],
@@ -9736,8 +9712,8 @@ impl SurvivalMarginalSlopeFamily {
     /// Outer-aware variant of `psi_hessian_directional_derivative` that
     /// returns the dense block Hessian directional derivative. When
     /// `options.outer_score_subsample` is `Some`, only the masked rows are
-    /// visited and the accumulator is rescaled by the Horvitz-Thompson
-    /// `weight_scale` before being densified.
+    /// visited and the accumulator uses per-row Horvitz-Thompson
+    /// inverse-inclusion weights before being densified.
     pub(crate) fn psi_hessian_directional_derivative_with_options(
         &self,
         block_states: &[ParameterBlockState],
@@ -9936,8 +9912,8 @@ impl SurvivalMarginalSlopeFamily {
 
     /// Outer-aware operator builder for the per-ψ Hessian directional
     /// derivative. When `options.outer_score_subsample` is `Some`, only the
-    /// masked rows are visited and the accumulator is rescaled by the
-    /// Horvitz-Thompson `weight_scale` before being wrapped in the
+    /// sampled rows are visited and the accumulator uses per-row
+    /// Horvitz-Thompson inverse-inclusion weights before being wrapped in the
     /// `HyperOperator`.
     pub(crate) fn psi_hessian_directional_derivative_operator_with_options(
         &self,
@@ -10193,8 +10169,8 @@ impl SurvivalMarginalSlopeFamily {
     /// directional derivative. The default-options shim is omitted because
     /// the `SurvivalMarginalSlopeExactNewtonJointHessianWorkspace` always
     /// threads its own `BlockwiseFitOptions`. When `options.outer_score_subsample` is
-    /// `Some`, only the masked rows are visited and the accumulator is
-    /// rescaled by the Horvitz-Thompson `weight_scale` before being wrapped
+    /// `Some`, only the sampled rows are visited and the accumulator uses
+    /// per-row Horvitz-Thompson inverse-inclusion weights before being wrapped
     /// in the `HyperOperator`.
     pub(crate) fn exact_newton_joint_hessian_directional_derivative_operator_flex_no_wiggle_with_options(
         &self,
@@ -10257,8 +10233,8 @@ impl SurvivalMarginalSlopeFamily {
     /// second directional derivative. The default-options shim is omitted
     /// because the `SurvivalMarginalSlopeExactNewtonJointHessianWorkspace`
     /// always threads its own `BlockwiseFitOptions`. When `options.outer_score_subsample` is
-    /// `Some`, only the masked rows are visited and the accumulator is
-    /// rescaled by the Horvitz-Thompson `weight_scale` before being wrapped
+    /// `Some`, only the sampled rows are visited and the accumulator uses
+    /// per-row Horvitz-Thompson inverse-inclusion weights before being wrapped
     /// in the `HyperOperator`.
     pub(crate) fn exact_newton_joint_hessiansecond_directional_derivative_operator_flex_no_wiggle_with_options(
         &self,

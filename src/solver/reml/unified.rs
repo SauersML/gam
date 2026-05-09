@@ -8309,6 +8309,12 @@ pub struct OuterHessianIndefinite {
     pub suggested_action: &'static str,
 }
 
+impl OuterHessianIndefinite {
+    fn theta_dimension(&self) -> usize {
+        self.theta.len()
+    }
+}
+
 /// Errors that can arise while building the corrected covariance.
 #[derive(Debug, Clone)]
 pub enum CorrectedCovarianceError {
@@ -8328,11 +8334,12 @@ impl core::fmt::Display for CorrectedCovarianceError {
             Self::Indefinite(d) => write!(
                 f,
                 "outer Hessian indefinite on free subspace (min eigenvalue = {:.3e}, \
-                 ||H||_F = {:.3e}, ||g||_2 = {:.3e}, active = {:?}); {}",
+                 ||H||_F = {:.3e}, ||g||_2 = {:.3e}, active = {:?}, theta = {:?}); {}",
                 d.min_eigenvalue,
                 d.hessian_norm,
                 d.gradient_norm,
                 d.active_constraints,
+                d.theta,
                 d.suggested_action,
             ),
         }
@@ -8351,6 +8358,12 @@ pub struct CorrectedCovariance {
     /// θ-indices in the free subspace whose curvature was so close to zero
     /// that they were treated as structurally rank-deficient (pseudoinverse).
     pub rank_deficient_directions: Vec<usize>,
+}
+
+impl CorrectedCovariance {
+    fn has_structural_diagnostics(&self) -> bool {
+        !self.active_constraints.is_empty() || !self.rank_deficient_directions.is_empty()
+    }
 }
 
 /// Suggested action text returned with `OuterHessianIndefinite`.
@@ -8439,16 +8452,16 @@ fn projected_inverse_with_inertia_gate(
     let neg_tol = 8.0 * eps * (q.max(1) as f64) * h_norm.max(1.0);
     let min_eig = evals.iter().copied().fold(f64::INFINITY, f64::min);
     if min_eig < -neg_tol {
-        return Err(CorrectedCovarianceError::Indefinite(
-            OuterHessianIndefinite {
-                min_eigenvalue: min_eig,
-                active_constraints: active.to_vec(),
-                theta: theta_for_diag.map(|t| t.to_vec()).unwrap_or_default(),
-                gradient_norm,
-                hessian_norm: h_norm,
-                suggested_action: INDEFINITE_SUGGESTED_ACTION,
-            },
-        ));
+        let diagnostic = OuterHessianIndefinite {
+            min_eigenvalue: min_eig,
+            active_constraints: active.to_vec(),
+            theta: theta_for_diag.map(|t| t.to_vec()).unwrap_or_default(),
+            gradient_norm,
+            hessian_norm: h_norm,
+            suggested_action: INDEFINITE_SUGGESTED_ACTION,
+        };
+        let _theta_dimension = diagnostic.theta_dimension();
+        return Err(CorrectedCovarianceError::Indefinite(diagnostic));
     }
 
     let pos_tol = 8.0 * eps * (q.max(1) as f64) * h_norm.max(1.0);
@@ -8522,7 +8535,16 @@ pub fn compute_corrected_covariance(
     hop: &dyn HessianOperator,
 ) -> Result<Array2<f64>, CorrectedCovarianceError> {
     compute_corrected_covariance_with_constraints(v_ks, ext_v, outer_hessian, hop, None, f64::NAN)
-        .map(|cov| cov.matrix)
+        .map(|cov| {
+            if cov.has_structural_diagnostics() {
+                log::debug!(
+                    "corrected covariance diagnostics: active_constraints={:?} rank_deficient_directions={:?}",
+                    cov.active_constraints,
+                    cov.rank_deficient_directions
+                );
+            }
+            cov.matrix
+        })
 }
 
 /// Constraint- and inertia-aware version of [`compute_corrected_covariance`].
@@ -8634,7 +8656,16 @@ pub fn compute_corrected_covariance_diagonal(
         None,
         f64::NAN,
     )
-    .map(|d| d.diagonal)
+    .map(|d| {
+        if d.has_structural_diagnostics() {
+            log::debug!(
+                "corrected covariance diagonal diagnostics: active_constraints={:?} rank_deficient_directions={:?}",
+                d.active_constraints,
+                d.rank_deficient_directions
+            );
+        }
+        d.diagonal
+    })
 }
 
 /// Diagonal of the corrected covariance plus active-set / rank-deficiency
@@ -8645,6 +8676,12 @@ pub struct CorrectedCovarianceDiagonal {
     pub diagonal: Array1<f64>,
     pub active_constraints: Vec<usize>,
     pub rank_deficient_directions: Vec<usize>,
+}
+
+impl CorrectedCovarianceDiagonal {
+    fn has_structural_diagnostics(&self) -> bool {
+        !self.active_constraints.is_empty() || !self.rank_deficient_directions.is_empty()
+    }
 }
 
 pub fn compute_corrected_covariance_diagonal_with_constraints(

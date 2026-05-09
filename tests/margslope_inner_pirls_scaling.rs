@@ -1,11 +1,9 @@
 //! Scaling-law probe for the bernoulli marginal-slope INNER PIRLS Newton
 //! solve at biobank shape.
 //!
-//! The companion outer-score probe (`tests/standard_gam_scaling.rs` and the
-//! in-module `bernoulli_marginal_slope::tests::margslope_sigma_psi_scaling_law`)
-//! already established that the OUTER ψ first-order eval is ~0.6 s/call at
-//! n=320k — only ~8% of the 2400 s cmd budget. The hypothesis under test
-//! here is that the dominant cost lives inside the inner PIRLS Newton solve
+//! The outer-score probes established that the OUTER ψ first-order eval is
+//! small relative to the full command budget. The hypothesis under test here
+//! is that the dominant cost lives inside the inner PIRLS Newton solve
 //! (i.e. per-row sextic-kernel evaluation × inner-Newton iterations × outer
 //! BFGS iterations), and that the path #3 inner-iter schedule cap is
 //! actually doing the work it claims.
