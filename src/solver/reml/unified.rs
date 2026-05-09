@@ -14343,4 +14343,95 @@ mod tests {
             pseudoinverse_times_vec(&g, v.as_slice().expect("contiguous test vector"), 1e-8);
         assert!((result[0] - 2.0).abs() < 1e-12);
     }
+
+    /// Indefinite outer Hessian (no active bounds, no rank deficiency) must
+    /// surface as `CorrectedCovarianceError::Indefinite` — never as a
+    /// covariance with the negative directions silently clamped to zero.
+    #[test]
+    fn corrected_covariance_indefinite_returns_diagnostic() {
+        // 2×2 outer Hessian with one positive and one clearly negative
+        // eigenvalue ⇒ the projected (=full, since no active bounds) inertia
+        // gate must reject. Using diag(2, -1) on a small p=2 base.
+        let outer = ndarray::arr2(&[[2.0_f64, 0.0], [0.0, -1.0]]);
+
+        // Build a SPD base H = I_2 so DenseSpectralOperator works trivially.
+        let base = Array2::<f64>::eye(2);
+        let hop = DenseSpectralOperator::from_symmetric(&base)
+            .expect("DenseSpectralOperator from identity should succeed");
+
+        // Two ρ-coords with arbitrary mode responses (their values don't
+        // affect the inertia gate; the gate fires before any J·V_θ·Jᵀ work).
+        let v0 = Array1::from_vec(vec![0.1, 0.2]);
+        let v1 = Array1::from_vec(vec![0.3, 0.4]);
+
+        // No theta supplied ⇒ active set is empty ⇒ projected Hessian = full
+        // outer Hessian, which is indefinite ⇒ Err(Indefinite).
+        let res = compute_corrected_covariance_with_constraints(
+            &[v0.clone(), v1.clone()],
+            &[],
+            &outer,
+            &hop,
+            None,
+            f64::NAN,
+        );
+        match res {
+            Err(CorrectedCovarianceError::Indefinite(diag)) => {
+                assert!(
+                    diag.min_eigenvalue < -0.5,
+                    "min eigenvalue should be ~-1, got {}",
+                    diag.min_eigenvalue,
+                );
+                assert!(
+                    diag.active_constraints.is_empty(),
+                    "no theta supplied ⇒ no active constraints",
+                );
+                assert!(
+                    !diag.suggested_action.is_empty(),
+                    "diagnostic must include a suggested-action message",
+                );
+            }
+            Err(other) => panic!("expected Indefinite diagnostic, got error: {:?}", other),
+            Ok(cov) => panic!(
+                "indefinite outer Hessian must NOT yield a covariance; got matrix shape {:?}",
+                cov.matrix.shape(),
+            ),
+        }
+
+        // Also check the legacy entry point preserves the same behaviour.
+        let res_legacy = compute_corrected_covariance(&[v0, v1], &[], &outer, &hop);
+        assert!(
+            matches!(res_legacy, Err(CorrectedCovarianceError::Indefinite(_))),
+            "legacy entry point must also surface Indefinite, got: {:?}",
+            res_legacy.map(|m| m.shape().to_vec()),
+        );
+    }
+
+    /// When the indefinite direction is precisely the bound-active θ, the
+    /// projected-Hessian inertia gate sees a SPD matrix and we return a
+    /// covariance (with the active coordinate listed in `active_constraints`).
+    #[test]
+    fn corrected_covariance_indefinite_with_active_bound_succeeds() {
+        // Outer Hessian: positive on coord 0, negative on coord 1.
+        let outer = ndarray::arr2(&[[3.0_f64, 0.0], [0.0, -2.0]]);
+        let base = Array2::<f64>::eye(2);
+        let hop = DenseSpectralOperator::from_symmetric(&base).expect("hop");
+
+        let v0 = Array1::from_vec(vec![0.5, 0.0]);
+        let v1 = Array1::from_vec(vec![0.0, 0.5]);
+
+        // θ pinned at +RHO_BOUND on coord 1 (the negative-curvature direction).
+        // After projecting away coord 1, the free Hessian is [[3]] — SPD.
+        let theta = vec![0.0_f64, crate::solver::estimate::RHO_BOUND];
+        let res = compute_corrected_covariance_with_constraints(
+            &[v0, v1],
+            &[],
+            &outer,
+            &hop,
+            Some(&theta),
+            0.0,
+        )
+        .expect("free-subspace SPD ⇒ covariance returned");
+        assert_eq!(res.active_constraints, vec![1]);
+        assert!(res.matrix.iter().all(|v| v.is_finite()));
+    }
 }
