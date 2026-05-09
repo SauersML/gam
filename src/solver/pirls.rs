@@ -4832,7 +4832,7 @@ where
         status,
     );
 
-    let state = final_state.ok_or(EstimationError::PirlsDidNotConverge {
+    let mut state = final_state.ok_or(EstimationError::PirlsDidNotConverge {
         max_iterations: options.max_iterations,
         last_change: lastgradient_norm,
     })?;
@@ -4910,11 +4910,11 @@ where
                         .hessian
                         .as_dense()
                         .and_then(crate::linalg::utils::symmetric_extremes);
-                    match inertia {
+                    let (label, accept_observed) = match inertia {
                         Some((min_eig, max_eig)) => {
                             let pd_tolerance = max_eig.abs().max(1.0) * 1e-12;
                             if min_eig > -pd_tolerance {
-                                ExportedLaplaceCurvature::ObservedExact
+                                (ExportedLaplaceCurvature::ObservedExact, true)
                             } else {
                                 let g_norm = constrained_stationarity_norm(
                                     &observed_state.gradient,
@@ -4926,20 +4926,41 @@ where
                                     "[PIRLS] post-convergence observed Hessian indefinite: \
                                  λ_min={min_eig:.3e}, pd_tol={pd_tolerance:.3e}, ‖g‖={g_norm:.3e}"
                                 );
-                                ExportedLaplaceCurvature::InvalidObservedCurvature {
-                                    min_eigenvalue: min_eig,
-                                    pd_tolerance,
-                                    gradient_norm: g_norm,
-                                }
+                                (
+                                    ExportedLaplaceCurvature::InvalidObservedCurvature {
+                                        min_eigenvalue: min_eig,
+                                        pd_tolerance,
+                                        gradient_norm: g_norm,
+                                    },
+                                    // Indefinite observed Hessian: we still
+                                    // promote it into `state` so the exported
+                                    // Hessian matches the diagnostic label —
+                                    // the caller is told loudly via
+                                    // InvalidObservedCurvature that downstream
+                                    // log|H| is not trustworthy.
+                                    true,
+                                )
                             }
                         }
                         None => {
                             // Sparse-native path or eigensolver failure: rely on
                             // the upstream SPD-assembly invariant. Treat as
                             // observed-exact since the model accepted the assembly.
-                            ExportedLaplaceCurvature::ObservedExact
+                            (ExportedLaplaceCurvature::ObservedExact, true)
                         }
+                    };
+                    // WHY: promote the observed_state into the exported `state`
+                    // when the post-convergence Observed assembly succeeded.
+                    // Without this swap, when the inner LM loop ended on
+                    // Fisher (force_fisher_for_rest engaged or mid-iter
+                    // gain-rejection fallback fired), the exported
+                    // `penalized_hessian_transformed` would still carry Fisher
+                    // weights even though `exported_laplace_curvature` claims
+                    // ObservedExact. The label and the matrix must agree.
+                    if accept_observed {
+                        state = observed_state;
                     }
+                    label
                 }
                 Err(err) => {
                     let g_norm = constrained_stationarity_norm(
@@ -5124,10 +5145,16 @@ pub struct PirlsResult {
     /// Firth diagnostics in the converged PIRLS state.
     pub firth: FirthDiagnostics,
 
-    // The final diagonal weights defining the Hessian surface at convergence.
-    // For canonical links this matches Fisher weights. For non-canonical links
-    // this may be the clamped observed-information curvature used on the PIRLS
-    // left-hand side.
+    // Diagonal weights defining the Hessian surface returned to outer REML/LAML.
+    //
+    // For canonical links Fisher = Observed identically. For non-canonical links,
+    // PIRLS always recomputes observed weights at the accepted β̂ in a
+    // post-convergence finalization step (see "Post-convergence Laplace curvature
+    // finalization"), so `finalweights` carries the *observed-information* diagonal
+    // whenever the model supports it — even if the inner LM loop ended on Fisher
+    // due to a fallback. Exact label of what these represent is in
+    // `exported_laplace_curvature`; do not infer the kind from `hessian_curvature`
+    // (which records what the inner loop's last accepted step happened to use).
     pub finalweights: Array1<f64>,
     // Additional PIRLS state captured at the accepted step to support
     // cost/gradient consistency in the outer optimization
@@ -11263,6 +11290,153 @@ mod root_cause_tests {
             rel < 1e-9,
             "implicit-PCG vs dense-Cholesky Newton direction relative diff {} exceeds 1e-9",
             rel
+        );
+    }
+
+    // ─── Issue 4: ExportedLaplaceCurvature labelling regressions ─────────────
+    //
+    // The inner LM step search may accept Fisher curvature when observed went
+    // non-SPD or produced a bad gain ratio mid-iteration. The exported Laplace
+    // curvature on `WorkingModelPirlsResult` (and downstream `PirlsResult`) is
+    // re-evaluated at the accepted β̂ in a post-convergence finalization step
+    // and must reflect the *actual* Hessian status — never silently mislabel a
+    // Fisher fallback as exact, and never silently substitute Fisher when the
+    // Observed Hessian is indefinite.
+
+    /// Inner-loop accepts a step under Fisher (it's the only curvature this
+    /// model offers during the inner loop), but in post-convergence
+    /// finalization we explicitly recompute the Observed Hessian. Result:
+    /// the exported label flips from whatever the inner loop used to
+    /// `ObservedExact` (when SPD) — Fisher → Observed substitution is
+    /// detected by the inertia gate, not silently accepted.
+    #[derive(Default)]
+    struct InnerFisherButObservedSpdAtMode {
+        observed_post_calls: usize,
+    }
+
+    impl WorkingModel for InnerFisherButObservedSpdAtMode {
+        fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
+            self.update_with_curvature(beta, HessianCurvatureKind::Fisher)
+        }
+
+        fn update_with_curvature(
+            &mut self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> Result<WorkingState, EstimationError> {
+            if curvature == HessianCurvatureKind::Observed {
+                self.observed_post_calls += 1;
+            }
+            // SPD scalar Hessian; identical for either curvature here, mirrors
+            // the canonical-link case where Observed = Fisher numerically but
+            // labels still need to be honest.
+            Ok(scalar_working_state(beta, curvature, 0.0, 0.0))
+        }
+
+        fn update_candidate(
+            &mut self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> Result<WorkingState, EstimationError> {
+            Ok(scalar_working_state(beta, curvature, 0.0, 0.0))
+        }
+
+        fn supports_observed_information_curvature(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn exported_laplace_observed_exact_when_post_finalization_spd() {
+        let mut model = InnerFisherButObservedSpdAtMode::default();
+        let options = WorkingModelPirlsOptions {
+            max_iterations: 2,
+            convergence_tolerance: 1e-8,
+            max_step_halving: 3,
+            min_step_size: 0.0,
+            firth_bias_reduction: false,
+            coefficient_lower_bounds: None,
+            linear_constraints: None,
+            initial_lm_lambda: None,
+        };
+        let summary = runworking_model_pirls(
+            &mut model,
+            Coefficients::new(array![0.0]),
+            &options,
+            |_| {},
+        )
+        .expect("converged scalar model should produce a result");
+        assert!(
+            matches!(
+                summary.exported_laplace_curvature,
+                ExportedLaplaceCurvature::ObservedExact
+            ),
+            "post-convergence Observed-SPD must export ObservedExact, got {:?}",
+            summary.exported_laplace_curvature
+        );
+        assert!(
+            model.observed_post_calls >= 1,
+            "post-convergence finalization must call update_with_curvature(Observed) \
+             at least once to assert SPD inertia"
+        );
+    }
+
+    /// Model that does NOT support observed information (e.g. canonical-link
+    /// or surrogate-by-design family). Exported curvature must be
+    /// `ExpectedInformationSurrogate`, not silently relabeled `ObservedExact`.
+    #[derive(Default)]
+    struct CanonicalSurrogateModel;
+
+    impl WorkingModel for CanonicalSurrogateModel {
+        fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
+            self.update_with_curvature(beta, HessianCurvatureKind::Fisher)
+        }
+        fn update_with_curvature(
+            &mut self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> Result<WorkingState, EstimationError> {
+            Ok(scalar_working_state(beta, curvature, 0.0, 0.0))
+        }
+        fn update_candidate(
+            &mut self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> Result<WorkingState, EstimationError> {
+            Ok(scalar_working_state(beta, curvature, 0.0, 0.0))
+        }
+        // Default `supports_observed_information_curvature() -> false`.
+    }
+
+    #[test]
+    fn exported_laplace_surrogate_when_observed_unsupported() {
+        let mut model = CanonicalSurrogateModel;
+        let options = WorkingModelPirlsOptions {
+            max_iterations: 2,
+            convergence_tolerance: 1e-8,
+            max_step_halving: 3,
+            min_step_size: 0.0,
+            firth_bias_reduction: false,
+            coefficient_lower_bounds: None,
+            linear_constraints: None,
+            initial_lm_lambda: None,
+        };
+        let summary = runworking_model_pirls(
+            &mut model,
+            Coefficients::new(array![0.0]),
+            &options,
+            |_| {},
+        )
+        .expect("canonical surrogate model should converge");
+        assert!(
+            matches!(
+                summary.exported_laplace_curvature,
+                ExportedLaplaceCurvature::ExpectedInformationSurrogate
+            ),
+            "model that doesn't support observed information must export \
+             ExpectedInformationSurrogate (no silent ObservedExact relabel), \
+             got {:?}",
+            summary.exported_laplace_curvature
         );
     }
 }
