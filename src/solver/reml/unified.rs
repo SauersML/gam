@@ -480,6 +480,22 @@ pub trait HessianDerivativeProvider: Send + Sync {
             .map(DriftDerivResult::Dense))
     }
 
+    /// Batched first-order correction hook for families whose
+    /// `D_beta H[u_k]` operators share row-local state across all smoothing
+    /// coordinates. The default preserves the single-direction semantics.
+    fn hessian_derivative_corrections_result(
+        &self,
+        v_ks: &[Array1<f64>],
+    ) -> Result<Vec<Option<DriftDerivResult>>, String> {
+        v_ks.iter()
+            .map(|v_k| self.hessian_derivative_correction_result(v_k))
+            .collect()
+    }
+
+    fn has_batched_hessian_derivative_corrections(&self) -> bool {
+        false
+    }
+
     /// Compute the second-order correction to H_{k,l} for the outer Hessian.
     ///
     /// Returns `None` if not needed or not implemented.
@@ -4741,8 +4757,24 @@ pub fn reml_laml_evaluate(
             .n_observations
             .saturating_mul(hop.dim())
             .saturating_mul(k.max(1));
-        let parallel_corrections = correction_work <= 64_000_000;
-        if parallel_corrections {
+        // Small coefficient systems produce bounded-size correction operators;
+        // keep their independent row contractions parallel even at large n.
+        let correction_parallel_work_limit = if hop.dim() <= 512 {
+            1_000_000_000
+        } else {
+            64_000_000
+        };
+        let parallel_corrections = correction_work <= correction_parallel_work_limit;
+        if effective_deriv.has_batched_hessian_derivative_corrections() {
+            log::info!(
+                "[STAGE] reml_laml rho_corrections mode=batched k={} n={} dim={} work={}",
+                k,
+                solution.n_observations,
+                hop.dim(),
+                correction_work
+            );
+            effective_deriv.hessian_derivative_corrections_result(rho_vs)?
+        } else if parallel_corrections {
             rho_vs
                 .par_iter()
                 .map(|v_k| effective_deriv.hessian_derivative_correction_result(v_k))
@@ -4917,7 +4949,6 @@ pub fn reml_laml_evaluate(
                 )
                 .trace_logdet(hop)
             };
-
             (
                 idx,
                 outer_gradient_entry(
