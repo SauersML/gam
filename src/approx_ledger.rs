@@ -109,8 +109,7 @@ mod tests {
 
     #[test]
     fn ledger_site_carries_kind() {
-        const S: LedgerSite =
-            LedgerSite::new("test_site", ApproxKind::TemporarySolverDamping);
+        const S: LedgerSite = LedgerSite::new("test_site", ApproxKind::TemporarySolverDamping);
         assert_eq!(S.site, "test_site");
         assert!(matches!(S.kind, ApproxKind::TemporarySolverDamping));
     }
