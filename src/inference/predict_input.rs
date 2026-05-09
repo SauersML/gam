@@ -160,6 +160,7 @@ pub fn build_predict_input_for_model(
                 &model.noise_center,
                 &model.noise_scale,
                 model.noise_non_intercept_start,
+                model.noise_projection_ridge_alpha,
             )?;
             let prepared_noise_design = if let Some(transform) = noise_transform.as_ref() {
                 build_scale_deviation_operator(

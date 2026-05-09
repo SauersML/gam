@@ -3021,6 +3021,7 @@ fn run_predict_survival(
             &model.survival_noise_center,
             &model.survival_noise_scale,
             model.survival_noise_non_intercept_start,
+            model.survival_noise_projection_ridge_alpha,
         )?;
         let x_time_exit_dense = time_build
             .x_exit_time
@@ -4386,6 +4387,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_noise_scale = Some(survival_noise_transform.rescale.to_vec());
             payload.survival_noise_non_intercept_start =
                 Some(survival_noise_transform.non_intercept_start);
+            payload.survival_noise_projection_ridge_alpha =
+                Some(survival_noise_transform.projection_ridge_alpha);
             payload.survival_distribution = Some(fitted_inverse_link.saved_string());
             set_training_feature_metadata_from_dataset(&mut payload, &ds);
             payload.resolved_termspec = Some(
@@ -5840,7 +5843,21 @@ fn run_sample_survival(
             }
         }
     }
-    let ridge_lambda = model.survivalridge_lambda.unwrap_or(1e-4);
+    // Saved-model schema strictly enforces version match in
+    // FittedModelPayload::validate_payload_version(); by the time we get here
+    // the payload is at the current MODEL_PAYLOAD_VERSION, so a missing
+    // survivalridge_lambda is a corrupt file rather than a legacy migration.
+    // Refuse to silently pick a default — the previous fallback (1e-4)
+    // disagreed with the fit-time CLI default (1e-6) by 100x, which silently
+    // changed survival posteriors across save/load. Every fresh fit now
+    // writes Some(...) at every survival payload assembly site.
+    let ridge_lambda = model.survivalridge_lambda.ok_or_else(|| {
+        "saved survival model is missing survivalridge_lambda; refusing to \
+         pick a load-time default (the historical 1e-4 fallback silently \
+         disagreed with the current 1e-6 fit-time CLI default). Refit on the \
+         current CLI."
+            .to_string()
+    })?;
     let ridge_range_start =
         if time_build.basisname == "linear" && !baseline_timewiggle_is_present(model) {
             1
@@ -6896,6 +6913,7 @@ fn build_location_scale_saved_model(
         payload.noise_center = Some(transform.weighted_column_mean.to_vec());
         payload.noise_scale = Some(transform.rescale.to_vec());
         payload.noise_non_intercept_start = Some(transform.non_intercept_start);
+        payload.noise_projection_ridge_alpha = Some(transform.projection_ridge_alpha);
     }
     payload.set_training_feature_metadata(training_headers, training_feature_ranges);
     payload.resolved_termspec = Some(resolved_termspec);

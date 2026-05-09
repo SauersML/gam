@@ -724,6 +724,17 @@ pub enum HessianCurvatureKind {
     Observed,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ExportedLaplaceCurvature {
+    ObservedExact,
+    ExpectedInformationSurrogate,
+    InvalidObservedCurvature {
+        min_eigenvalue: f64,
+        pd_tolerance: f64,
+        gradient_norm: f64,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkingState {
     pub eta: LinearPredictor,
@@ -1153,6 +1164,7 @@ pub struct WorkingModelPirlsResult {
     /// when no state was ever computed (paths that synthesize a result
     /// without iterating, e.g. zero-iteration warm-only paths).
     pub min_penalized_deviance: f64,
+    pub exported_laplace_curvature: ExportedLaplaceCurvature,
 }
 
 // Fixed stabilization ridge for PIRLS/PLS. `penalty_term` carries this as
@@ -5157,6 +5169,7 @@ pub struct PirlsResult {
     pub last_deviance_change: f64,
     pub last_step_halving: usize,
     pub hessian_curvature: HessianCurvatureKind,
+    pub exported_laplace_curvature: ExportedLaplaceCurvature,
     /// Levenberg-Marquardt damping coefficient at the converged inner
     /// iter. Cached by the REML runtime so the next PIRLS call in the
     /// same outer optimization can seed `λ_LM` to this value instead
