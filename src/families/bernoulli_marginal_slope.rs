@@ -5034,10 +5034,19 @@ impl BernoulliMarginalSlopeFamily {
     ///
     /// Returns `(f, f', 0.0)`: the third slot — `F''(a)` — is reported as
     /// zero, which makes [`monotone_root::solve_monotone_root`]'s safeguarded
-    /// Halley step reduce to a Newton step. A measured degree-9 `F''(a)` path
-    /// did not reduce calibration evaluations on the biobank FLEX repro, and
-    /// it made each value-bearing cell evaluation slower; degree 4 is the
-    /// correct cost/accuracy point for this solver.
+    /// Halley step reduce to a Newton step (the Halley denominator
+    /// `2·F'² − F·F''` collapses to `2·F'²`, so the step
+    /// `mid − 2·F·F'/(2·F'²) = mid − F/F'` is exactly Newton's). Newton
+    /// converges roughly twice as slowly near the root as a true Halley
+    /// iteration, but each iteration is far cheaper because we compute cell
+    /// moments only to **degree 4** instead of degree 9. At `max_degree ≤ 4`,
+    /// `cubic_cell_kernel::reduce_sextic_moments` (cubic_cell_kernel.rs:298)
+    /// takes its fast path — slicing the affine-anchor base moments and
+    /// skipping the entire sextic recurrence + boundary-term loop — and
+    /// `affine_anchor_moment_vector` (O(max_degree²)) drops by ~4×.
+    ///
+    /// Used at every PIRLS iteration on every row, so even modest per-call
+    /// wins compound into the dominant inner-PIRLS speed-up at biobank scale.
     fn evaluate_denested_calibration_newton(
         &self,
         a: f64,
@@ -5053,6 +5062,10 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_a = 0.0;
         for partition_cell in cells {
             let cell = partition_cell.cell;
+            // Degree 4 covers both the cell integral `value` and the
+            // `dot(dc_da, moments)` first-derivative computation
+            // (`dc_da` is a length-4 coefficient vector ⇒ degree 3, plus one
+            // slot of safety).
             let state = self.evaluate_cell_moments_lru(cell, 4)?;
             f += state.value;
             let (dc_da_raw, _) = exact_kernel::denested_cell_coefficient_partials(
@@ -5459,8 +5472,9 @@ impl BernoulliMarginalSlopeFamily {
 
         // Use the Newton-only calibration evaluator: `solve_monotone_root`
         // safely degrades its Halley step to Newton when `F''(a) = 0`, and
-        // dropping the second derivative lets us skip order-9 value-bearing
-        // cell moments in favour of degree-4 moments.
+        // dropping the second derivative lets us skip the order-9
+        // cell-moment work in favour of degree-4 moments. See the comment
+        // on `evaluate_denested_calibration_newton`.
         let eval = |a: f64| -> Result<(f64, f64, f64), String> {
             self.evaluate_calibration_newton(row, a, marginal_eta, slope, beta_h, beta_w)
         };
@@ -5513,8 +5527,8 @@ impl BernoulliMarginalSlopeFamily {
 
         // Local Newton probe before paying for the safeguarded bracket.
         // Cycle-0 is cold at biobank scale, so forcing every row through the
-        // bracket spends most of the wall time rebuilding identical cell
-        // value integrals. The rigid/affine seed is exact when deviations vanish
+        // bracket spends most of the wall time rebuilding identical degree-4
+        // cell moments. The rigid/affine seed is exact when deviations vanish
         // and first-order accurate when they are small; probe that local
         // Newton basin first. The convergence test uses the same residual
         // contract as the safeguarded solver plus a tight relative-correction
@@ -5759,7 +5773,7 @@ impl BernoulliMarginalSlopeFamily {
             n
         );
         if flex_active {
-            log::info!(
+            log::debug!(
                 "bernoulli marginal-slope intercept seed short-circuit: cached={}, closed_form={}, full_solver={}, max_full_solver_iters={}, seed_residual_bins={{<=1e-12:{}, <=1e-10:{}, <=1e-8:{}, <=abs_tol:{}, >abs_tol:{}}}",
                 stats.cached_short_circuit.load(Ordering::Relaxed),
                 stats.closed_form_short_circuit.load(Ordering::Relaxed),
@@ -5824,145 +5838,6 @@ impl BernoulliMarginalSlopeFamily {
             rigid_third_full: OnceLock::new(),
             rigid_fourth_full: OnceLock::new(),
         })
-    }
-
-    fn line_search_log_likelihood_workspace(
-        &self,
-        block_states: &[ParameterBlockState],
-        options: &BlockwiseFitOptions,
-    ) -> Result<Option<(f64, Arc<dyn ExactNewtonJointHessianWorkspace>)>, String> {
-        self.validate_exact_block_state_shapes(block_states)?;
-        if !self.effective_flex_active(block_states)? {
-            return Ok(None);
-        }
-        let n = self.y.len();
-        let rows = outer_row_indices(options, n).to_vec();
-        if rows.len() != n || rows.iter().copied().ne(0..n) {
-            return Ok(None);
-        }
-        let scale = outer_score_scale(options, n);
-        if scale != 1.0 {
-            return Ok(None);
-        }
-        self.validate_exact_monotonicity(block_states)?;
-
-        let slices = block_slices(self);
-        let primary = primary_slices(&slices);
-        let started = std::time::Instant::now();
-        if log_exact_work(n) {
-            log::info!(
-                "[BMS exact-cache] build start n={} p={} flex=true purpose=line-search",
-                n,
-                slices.total
-            );
-        }
-        self.preseed_intercept_warm_starts(block_states)?;
-        exact_kernel::reset_tail_cell_moment_cache();
-        let stats = BernoulliInterceptSolveStats::default();
-        let cell_cache_before = self.cell_moment_cache_stats.snapshot();
-        let beta_h = self.score_beta(block_states)?;
-        let beta_w = self.link_beta(block_states)?;
-        let threshold = options.early_exit_threshold;
-        let mut row_contexts: Vec<Option<BernoulliMarginalSlopeRowExactContext>> =
-            (0..n).map(|_| None).collect();
-        let mut total_ll = 0.0;
-
-        for chunk in rows.chunks(BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS) {
-            let chunk_entries = chunk
-                .into_par_iter()
-                .map(|&row| -> Result<_, String> {
-                    let ctx =
-                        self.build_row_exact_context_with_stats(row, block_states, Some(&stats))?;
-                    let slope = block_states[1].eta[row];
-                    let obs = self.observed_denested_cell_partials(
-                        row,
-                        ctx.intercept,
-                        slope,
-                        beta_h,
-                        beta_w,
-                    )?;
-                    let s_i = eval_coeff4_at(&obs.coeff, self.z[row]);
-                    let signed = (2.0 * self.y[row] - 1.0) * s_i;
-                    let (log_cdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
-                    Ok((row, ctx, self.weights[row] * log_cdf))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            for (row, ctx, row_ll) in chunk_entries {
-                row_contexts[row] = Some(ctx);
-                total_ll += row_ll;
-            }
-            if let Some(threshold) = threshold
-                && -total_ll > threshold
-            {
-                return Err(format!(
-                    "bernoulli marginal-slope line-search rejected early: partial_nll={} threshold={}",
-                    -total_ll, threshold
-                ));
-            }
-        }
-
-        let row_contexts = row_contexts
-            .into_iter()
-            .enumerate()
-            .map(|(row, ctx)| {
-                ctx.ok_or_else(|| format!("line-search exact cache missing row context {row}"))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let fast_path_rows = row_contexts
-            .iter()
-            .filter(|ctx| ctx.intercept_fast_path)
-            .count();
-        log::debug!(
-            "[BMS exact-cache] row-intercept zero-deviation fast path rows={}/{}",
-            fast_path_rows,
-            n
-        );
-        let (cell_hits, cell_misses, cell_hit_rate) = self
-            .cell_moment_cache_stats
-            .hit_rate_delta(cell_cache_before);
-        if log_exact_work(n) {
-            log::info!(
-                "[BMS cell-moment LRU] cycle hits={} misses={} hit_rate={:.1}% entries={} resident_mib={:.1}/{:.1}",
-                cell_hits,
-                cell_misses,
-                100.0 * cell_hit_rate,
-                self.cell_moment_lru.len(),
-                self.cell_moment_lru.resident_bytes() as f64 / (1024.0 * 1024.0),
-                self.cell_moment_lru.max_bytes() as f64 / (1024.0 * 1024.0),
-            );
-            let tail_stats = exact_kernel::tail_cell_moment_cache_stats();
-            log::info!(
-                "[BMS exact-cache] affine tail-cell memo: hits={} misses={} entries={} hit_rate={:.3}%",
-                tail_stats.hits,
-                tail_stats.misses,
-                tail_stats.entries,
-                100.0 * tail_stats.hit_rate(),
-            );
-            log::info!(
-                "[BMS exact-cache] build done n={} p={} flex=true purpose=line-search elapsed={:.3}s",
-                n,
-                slices.total,
-                started.elapsed().as_secs_f64()
-            );
-        }
-        let cache = BernoulliMarginalSlopeExactEvalCache {
-            slices,
-            primary,
-            row_contexts,
-            row_cell_moments: None,
-            row_primary_hessians: None,
-            rigid_third_full: OnceLock::new(),
-            rigid_fourth_full: OnceLock::new(),
-        };
-        let workspace: Arc<dyn ExactNewtonJointHessianWorkspace> =
-            Arc::new(BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
-                family: self.clone(),
-                block_states: block_states.to_vec(),
-                cache,
-                matvec_calls: AtomicUsize::new(0),
-                options: options.clone(),
-            });
-        Ok(Some((total_ll, workspace)))
     }
 
     /// Build a top-of-cycle [`RowCellMomentsBundle`] at the given
