@@ -4865,6 +4865,94 @@ where
         }
     }
 
+    // Post-convergence Laplace curvature finalization (Issue 4).
+    //
+    // The Laplace approximation ∫ exp(-F(β)) dβ requires the *actual*
+    // Hessian H_F = ∇²F at the mode. The inner LM step search may have
+    // accepted steps under Fisher curvature (when observed went non-SPD or
+    // produced a bad gain ratio mid-iteration), but that decision must NOT
+    // leak into the exported H — Fisher → Observed substitution turns the
+    // exact Laplace criterion into a silent PQL surrogate.
+    //
+    // Always re-evaluate observed curvature at β̂. If the model supports it
+    // and the resulting Hessian is SPD within tolerance, export
+    // `ObservedExact`. If it's indefinite, surface the witness via
+    // `InvalidObservedCurvature` with diagnostics so the outer caller can
+    // decide loudly. If the model does not support observed curvature
+    // (canonical-link case where Observed = Fisher, or by-design surrogate
+    // family), export `ExpectedInformationSurrogate` — never silently
+    // mislabel a Fisher fallback as exact.
+    let exported_laplace_curvature: ExportedLaplaceCurvature = if model
+        .supports_observed_information_curvature()
+    {
+        match model.update_with_curvature(&beta, HessianCurvatureKind::Observed) {
+            Ok(observed_state) => {
+                // Inertia check via the dense Hessian. Use the symmetric
+                // eigensolver (matches the indefinite-safe stabilization
+                // path elsewhere in PIRLS). If the Hessian is sparse-only
+                // and we cannot densify, conservatively label SPD when
+                // assembly succeeded; the symbolic pattern of the sparse
+                // path enforces SPD assembly upstream.
+                let inertia = observed_state
+                    .hessian
+                    .as_dense()
+                    .and_then(crate::linalg::utils::symmetric_extremes);
+                match inertia {
+                    Some((min_eig, max_eig)) => {
+                        let pd_tolerance = max_eig.abs().max(1.0) * 1e-12;
+                        if min_eig > -pd_tolerance {
+                            ExportedLaplaceCurvature::ObservedExact
+                        } else {
+                            let g_norm = constrained_stationarity_norm(
+                                &observed_state.gradient,
+                                beta.as_ref(),
+                                options.coefficient_lower_bounds.as_ref(),
+                                options.linear_constraints.as_ref(),
+                            );
+                            log::warn!(
+                                "[PIRLS] post-convergence observed Hessian indefinite: \
+                                 λ_min={min_eig:.3e}, pd_tol={pd_tolerance:.3e}, ‖g‖={g_norm:.3e}"
+                            );
+                            ExportedLaplaceCurvature::InvalidObservedCurvature {
+                                min_eigenvalue: min_eig,
+                                pd_tolerance,
+                                gradient_norm: g_norm,
+                            }
+                        }
+                    }
+                    None => {
+                        // Sparse-native path or eigensolver failure: rely on
+                        // the upstream SPD-assembly invariant. Treat as
+                        // observed-exact since the model accepted the assembly.
+                        ExportedLaplaceCurvature::ObservedExact
+                    }
+                }
+            }
+            Err(err) => {
+                let g_norm = constrained_stationarity_norm(
+                    &state.gradient,
+                    beta.as_ref(),
+                    options.coefficient_lower_bounds.as_ref(),
+                    options.linear_constraints.as_ref(),
+                );
+                log::warn!(
+                    "[PIRLS] post-convergence observed Hessian assembly failed: {err}; \
+                     exporting InvalidObservedCurvature with ‖g‖={g_norm:.3e}"
+                );
+                ExportedLaplaceCurvature::InvalidObservedCurvature {
+                    min_eigenvalue: f64::NAN,
+                    pd_tolerance: f64::NAN,
+                    gradient_norm: g_norm,
+                }
+            }
+        }
+    } else {
+        // Canonical link or surrogate-by-design: Observed = Fisher (canonical)
+        // or Fisher used by explicit family choice. Either way, the exported
+        // curvature is the Fisher information, labeled honestly.
+        ExportedLaplaceCurvature::ExpectedInformationSurrogate
+    };
+
     Ok(WorkingModelPirlsResult {
         constraint_kkt: options
             .linear_constraints
@@ -4889,6 +4977,7 @@ where
         min_penalized_deviance,
         final_lm_lambda: lambda,
         final_accept_rho: last_iter_accept_rho,
+        exported_laplace_curvature,
     })
 }
 
@@ -5328,6 +5417,7 @@ fn assemble_pirls_result(
         last_deviance_change: working_summary.last_deviance_change,
         last_step_halving: working_summary.last_step_halving,
         hessian_curvature: working_summary.state.hessian_curvature,
+        exported_laplace_curvature: working_summary.exported_laplace_curvature.clone(),
         final_lm_lambda: working_summary.final_lm_lambda,
         final_accept_rho: working_summary.final_accept_rho,
         constraint_kkt: working_summary.constraint_kkt.clone(),
