@@ -187,6 +187,11 @@ pub struct FittedModelPayload {
     pub noise_scale: Option<Vec<f64>>,
     #[serde(default)]
     pub noise_non_intercept_start: Option<usize>,
+    /// Tikhonov ridge alpha used by `solve_scale_projection` when fitting
+    /// `noise_projection`.  Persisted so prediction-time replay is identical
+    /// to fit-time projection.  `None` for legacy payloads (interpreted as 0).
+    #[serde(default)]
+    pub noise_projection_ridge_alpha: Option<f64>,
     #[serde(default)]
     pub gaussian_response_scale: Option<f64>,
     #[serde(default)]
@@ -269,6 +274,11 @@ pub struct FittedModelPayload {
     pub survival_noise_scale: Option<Vec<f64>>,
     #[serde(default)]
     pub survival_noise_non_intercept_start: Option<usize>,
+    /// Survival analog of `noise_projection_ridge_alpha`: the Tikhonov ridge
+    /// used when fitting the survival log-sigma projection.  See doc comment
+    /// on `noise_projection_ridge_alpha`.
+    #[serde(default)]
+    pub survival_noise_projection_ridge_alpha: Option<f64>,
     #[serde(default)]
     pub survival_distribution: Option<String>,
     #[serde(default)]
@@ -348,6 +358,7 @@ impl FittedModelPayload {
             noise_center: None,
             noise_scale: None,
             noise_non_intercept_start: None,
+            noise_projection_ridge_alpha: None,
             gaussian_response_scale: None,
             linkwiggle_knots: None,
             linkwiggle_degree: None,
@@ -389,6 +400,7 @@ impl FittedModelPayload {
             survival_noise_center: None,
             survival_noise_scale: None,
             survival_noise_non_intercept_start: None,
+            survival_noise_projection_ridge_alpha: None,
             survival_distribution: None,
             training_headers: None,
             training_feature_ranges: None,
@@ -2488,6 +2500,14 @@ impl FittedModel {
         if let Some(v) = self.noise_scale.as_ref() {
             validate_all_finite("noise_scale", v.iter().copied())?;
         }
+        if let Some(v) = self.noise_projection_ridge_alpha {
+            ensure_finite_scalar("noise_projection_ridge_alpha", v)?;
+            if v < 0.0 {
+                return Err(format!(
+                    "noise_projection_ridge_alpha must be non-negative, got {v}"
+                ));
+            }
+        }
         if let Some(v) = self.gaussian_response_scale {
             ensure_finite_scalar("gaussian_response_scale", v)?;
         }
@@ -2517,6 +2537,14 @@ impl FittedModel {
         }
         if let Some(v) = self.survival_noise_center.as_ref() {
             validate_all_finite("survival_noise_center", v.iter().copied())?;
+        }
+        if let Some(v) = self.survival_noise_projection_ridge_alpha {
+            ensure_finite_scalar("survival_noise_projection_ridge_alpha", v)?;
+            if v < 0.0 {
+                return Err(format!(
+                    "survival_noise_projection_ridge_alpha must be non-negative, got {v}"
+                ));
+            }
         }
         if let Some(v) = self.survival_noise_scale.as_ref() {
             validate_all_finite("survival_noise_scale", v.iter().copied())?;

@@ -104,6 +104,30 @@ impl ResourcePolicy {
         }
     }
 
+    /// Auto-derive the resource policy from the shape of the problem rather
+    /// than from an explicit CLI flag. The library refuses to silently
+    /// densify operator-backed designs once the problem is large enough that
+    /// a hidden dense fallback would blow real-world memory budgets, but
+    /// keeps the permissive default for ordinary small-data fits so that
+    /// non-operator bases still work out of the box.
+    ///
+    /// Strict mode (`AnalyticOperatorRequired`) is selected when ANY of:
+    ///   * `n_rows >= STRICT_POLICY_NROWS_THRESHOLD` (biobank scale by row count)
+    ///   * `p_estimate >= STRICT_POLICY_P_THRESHOLD` (biobank scale by coefficient count)
+    ///   * `hints.marginal_slope_biobank_active` (the GAMLSS marginal-slope
+    ///     biobank path is in play; the corresponding operators MUST stay
+    ///     matrix-free regardless of n)
+    pub fn for_problem(n_rows: usize, p_estimate: usize, hints: ProblemHints) -> Self {
+        let strict = n_rows >= STRICT_POLICY_NROWS_THRESHOLD
+            || p_estimate >= STRICT_POLICY_P_THRESHOLD
+            || hints.marginal_slope_biobank_active;
+        if strict {
+            Self::analytic_operator_required()
+        } else {
+            Self::default_library()
+        }
+    }
+
     /// Permissive mode for small-data usage and tests.
     pub fn permissive_small_data() -> Self {
         Self {

@@ -846,6 +846,15 @@ pub trait CustomFamily {
         Ok(None)
     }
 
+    /// Family-specific infinity-norm cap for exact joint-Newton coefficient steps.
+    ///
+    /// The solver still applies the trust-region accept/reject test against the
+    /// exact penalized objective. This cap only prevents a single ill-conditioned
+    /// Newton proposal from dominating the trust-region model before that test.
+    fn joint_newton_max_step_inf(&self, _specs: &[ParameterBlockSpec]) -> f64 {
+        20.0
+    }
+
     /// Optional linear inequality constraints for a block update:
     /// `A * beta_block >= b`.
     fn block_linear_constraints(
@@ -8729,11 +8738,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 0.0
             };
 
+        let max_joint_step = family.joint_newton_max_step_inf(specs);
+        if !max_joint_step.is_finite() || max_joint_step <= 0.0 {
+            return Err(format!(
+                "joint Newton max step cap must be finite and positive, got {max_joint_step}"
+            ));
+        }
+
         // Divergence-detection state for the joint-Newton path. Mirrors
         // the blockwise sibling later in this function: a near-null
         // direction in the joint Hessian (e.g. BernoulliMarginalSlope's
         // linkwiggle empirical anchor drifting from fit-time η₀) makes
-        // Newton clamp at MAX_JOINT_STEP every cycle while -loglik stays
+        // Newton clamp at the family step cap every cycle while -loglik stays
         // frozen and β grows linearly along the null mode. Without an
         // early-exit the loop runs to inner_max_cycles producing
         // identical -loglik values, burning ~50s per ρ-cost call at
@@ -9084,10 +9100,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // single trial objective is accepted only when the actual decrease
             // is positive relative to the local quadratic model.
             let mut step_inf = delta.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
-            const MAX_JOINT_STEP: f64 = 20.0;
-            if step_inf > MAX_JOINT_STEP {
-                delta.mapv_inplace(|v| v * (MAX_JOINT_STEP / step_inf));
-                step_inf = MAX_JOINT_STEP;
+            if step_inf > max_joint_step {
+                delta.mapv_inplace(|v| v * (max_joint_step / step_inf));
+                step_inf = max_joint_step;
             }
 
             let old_beta: Vec<Array1<f64>> = states.iter().map(|s| s.beta.clone()).collect();
@@ -9105,7 +9120,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // 2-norm. Bumping the radius up to the post-barrier Newton-step
             // norm on cycle 0 preserves quadratic convergence on
             // well-conditioned problems while leaving the standard adaptive
-            // shrink/expand for subsequent cycles. The MAX_JOINT_STEP cap on
+            // shrink/expand for subsequent cycles. The family infinity-norm cap on
             // |delta|_inf above remains the actual safeguard against runaway
             // proposals.
             if cycle == 0 {
@@ -9496,7 +9511,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 (current_log_likelihood - prev_log_likelihood_for_joint_divergence_check).abs();
             let loglik_frozen_tol_for_joint_divergence_check =
                 inner_tol * (1.0 + current_log_likelihood.abs());
-            let step_clamped_for_joint_divergence_check = step_inf >= 0.95 * MAX_JOINT_STEP;
+            let step_clamped_for_joint_divergence_check = step_inf >= 0.95 * max_joint_step;
             if loglik_change_for_joint_divergence_check
                 <= loglik_frozen_tol_for_joint_divergence_check
                 && step_clamped_for_joint_divergence_check
@@ -9513,7 +9528,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     -current_log_likelihood,
                     consecutive_joint_frozen_loglik_cycles,
                     step_inf,
-                    MAX_JOINT_STEP,
+                    max_joint_step,
                     step_tol,
                 );
                 converged = false;

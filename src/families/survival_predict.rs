@@ -893,6 +893,7 @@ fn predict_survival_location_scale_batch(
         &model.survival_noise_center,
         &model.survival_noise_scale,
         model.survival_noise_non_intercept_start,
+        model.survival_noise_projection_ridge_alpha,
     )?;
 
     let x_time_exit_dense = time_build

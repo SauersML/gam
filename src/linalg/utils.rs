@@ -663,11 +663,17 @@ where
     let mut r = rhs.clone();
     let mut diagnostics = PcgDiagnostics::new(rhs_norm);
 
+    if preconditioner_diag
+        .iter()
+        .any(|&m| !m.is_finite() || m <= 0.0)
+    {
+        return None;
+    }
     let mut inv_m = Array1::<f64>::zeros(p);
     Zip::from(&mut inv_m)
         .and(preconditioner_diag)
         .par_for_each(|inv, &m| {
-            *inv = 1.0 / m.abs().max(1e-12);
+            *inv = 1.0 / m.max(1e-12);
         });
 
     let mut z = Array1::<f64>::zeros(p);
