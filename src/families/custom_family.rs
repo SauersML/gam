@@ -9076,7 +9076,32 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // conditions; we accept that as convergence rather
                 // than fail the outer "inner solve did not converge"
                 // panic on a fully resolved fit.
-                if last_cycle_residual_below_tol && last_cycle_obj_change_below_tol {
+                //
+                // The residual-below-tol clause is structurally
+                // unachievable when the projected joint Hessian carries
+                // a near-zero eigenvalue λ_min (e.g. small-n survival
+                // location-scale with a 13-knot Royston-Parmar baseline
+                // + constant noise formula): one trust-region step
+                // moves the gradient by at most λ_min · radius, so the
+                // residual cannot drop below ~λ_min · radius regardless
+                // of how close β is to KKT stationarity. The failure
+                // mode is the same — TR shrinks to its 1e-12 floor
+                // without finding ANY descent step — but the original
+                // condition refuses to recognize it.
+                //
+                // Treat "TR shrunk to its floor + previous cycle's
+                // objective change below tol" as the same KKT-on-null
+                // signature: total TR collapse (no scale of step
+                // produces a strictly negative actual_reduction) is
+                // itself the certificate that no descent direction
+                // exists locally; pairing that with a sub-tol objective
+                // change in the previous accepted cycle confirms we
+                // arrived here via convergent progress, not from a
+                // saddle traversal mid-flight.
+                let trust_region_collapsed = joint_trust_radius <= 1.0e-9;
+                if (last_cycle_residual_below_tol && last_cycle_obj_change_below_tol)
+                    || (trust_region_collapsed && last_cycle_obj_change_below_tol)
+                {
                     converged = true;
                 }
                 break; // Fall back to blockwise
