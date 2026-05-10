@@ -8378,6 +8378,9 @@ fn update_joint_trust_region_radius(
     let mut radius = old_radius;
     if !accepted || rho < 0.25 {
         radius *= 0.25;
+        if !accepted && step_norm.is_finite() && step_norm > 0.0 {
+            radius = radius.min(0.5 * step_norm);
+        }
     } else if rho > 0.75 && step_norm >= 0.99 * old_radius {
         radius *= 2.0;
     }
@@ -19877,6 +19880,14 @@ mod tests {
         assert!(!rejected.accepted);
         assert!(rejected.rho < 0.0);
         assert!((rejected.radius - 0.25).abs() < 1.0e-12);
+
+        let rejected_inside_radius = update_joint_trust_region_radius(1.0, 1.0e-3, -0.1, 2.0);
+        assert!(!rejected_inside_radius.accepted);
+        assert!(
+            rejected_inside_radius.radius < 1.0e-3,
+            "a rejected in-radius step must be outside the next trust region"
+        );
+        assert!((rejected_inside_radius.radius - 5.0e-4).abs() < 1.0e-12);
 
         let poor = update_joint_trust_region_radius(1.0, 0.5, 0.1, 1.0);
         assert!(poor.accepted);
