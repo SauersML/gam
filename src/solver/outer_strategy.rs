@@ -19,9 +19,10 @@ use ::opt::{
     Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, FallbackPolicy as OptFallbackPolicy,
     FirstOrderObjective, FirstOrderSample, FixedPoint, FixedPointError, FixedPointObjective,
     FixedPointSample, FixedPointStatus, GradientTolerance, HessianFallbackPolicy,
-    HessianMaterialization, HessianOperator, HessianValue, MatrixFreeTrustRegion, MaxIterations,
-    ObjectiveEvalError, OperatorObjective, OperatorSample, OptimizationStatus, OptimizerObserver,
-    SecondOrderObjective, SecondOrderSample, Solution, StepInfo, Tolerance, ZerothOrderObjective,
+    HessianMaterialization, HessianOperator, HessianValue, InitialMetric, MatrixFreeTrustRegion,
+    MaxIterations, ObjectiveEvalError, OperatorObjective, OperatorSample, OptimizationStatus,
+    OptimizerObserver, SecondOrderObjective, SecondOrderSample, Solution, StepInfo, Tolerance,
+    ZerothOrderObjective,
 };
 use ndarray::{Array1, Array2, ArrayView2};
 use std::sync::Arc;
@@ -393,6 +394,7 @@ impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {
 /// sufficient: a 50-column operator can still mean 50 full row-streaming CTN,
 /// Duchon, or survival passes.
 pub(crate) const OUTER_HVP_MATERIALIZE_MAX_DIM: usize = 64;
+const BFGS_LINE_SEARCH_REJECT_COST: f64 = 1.0e300;
 
 /// Whether an analytic derivative is available for a given order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1846,12 +1848,33 @@ struct OuterFirstOrderBridge<'a> {
     /// cap conservatively LARGER than the truly-needed value, never
     /// smaller.
     last_g_norm: Option<f64>,
+    /// Local line-search trust budget for first-order BFGS routes. When set,
+    /// cost-only probes whose infinity-norm displacement from the most recent
+    /// accepted gradient point exceeds this cap are rejected with a large
+    /// finite cost before invoking the expensive inner solve.
+    line_search_step_cap: Option<f64>,
+    last_gradient_point: Option<Array1<f64>>,
 }
 
 impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
     fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
         self.layout
             .validate_point_len(x, "outer eval_cost failed")?;
+        if let (Some(cap), Some(anchor)) = (self.line_search_step_cap, &self.last_gradient_point) {
+            let step_inf = x
+                .iter()
+                .zip(anchor.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            if step_inf > cap {
+                log::info!(
+                    "[OUTER/BFGS] rejecting cost probe before inner solve: step_inf={:.3e} cap={:.3e}",
+                    step_inf,
+                    cap,
+                );
+                return Ok(BFGS_LINE_SEARCH_REJECT_COST);
+            }
+        }
         let cost = self
             .obj
             .eval_cost(x)
@@ -1927,6 +1950,7 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         if g_norm.is_finite() {
             self.last_g_norm = Some(g_norm);
         }
+        self.last_gradient_point = Some(x.clone());
         log::info!(
             "[STAGE] outer eval end order=ValueAndGradient elapsed={:.3}s cost={:.6e} |g|={:.3e} (first-order bridge, iter={})",
             stage_start.elapsed().as_secs_f64(),
@@ -3423,6 +3447,7 @@ struct OuterConfig {
     outer_inner_cap: Option<InnerProgressFeedback>,
     solver_class: SolverClass,
     operator_initial_trust_radius: Option<f64>,
+    bfgs_step_cap: Option<f64>,
 }
 
 impl Default for OuterConfig {
@@ -3440,6 +3465,7 @@ impl Default for OuterConfig {
             outer_inner_cap: None,
             solver_class: SolverClass::Primary,
             operator_initial_trust_radius: None,
+            bfgs_step_cap: None,
         }
     }
 }
@@ -3475,6 +3501,7 @@ pub struct OuterProblem {
     outer_inner_cap: Option<InnerProgressFeedback>,
     solver_class: SolverClass,
     operator_initial_trust_radius: Option<f64>,
+    bfgs_step_cap: Option<f64>,
 }
 
 impl OuterProblem {
@@ -3499,6 +3526,7 @@ impl OuterProblem {
             outer_inner_cap: None,
             solver_class: SolverClass::Primary,
             operator_initial_trust_radius: None,
+            bfgs_step_cap: None,
         }
     }
 
@@ -3599,6 +3627,15 @@ impl OuterProblem {
         self
     }
 
+    /// Cap the infinity-norm displacement of BFGS cost-only line-search probes
+    /// from the most recent accepted gradient point. Also scales the initial
+    /// inverse metric so the first trial direction respects the same local
+    /// budget coordinate-wise.
+    pub fn with_bfgs_step_cap(mut self, cap: Option<f64>) -> Self {
+        self.bfgs_step_cap = cap.filter(|v| v.is_finite() && *v > 0.0);
+        self
+    }
+
     /// Override the fallback policy. Default is [`FallbackPolicy::Automatic`].
     ///
     /// Set [`FallbackPolicy::Disabled`] when the caller requires the primary
@@ -3641,6 +3678,7 @@ impl OuterProblem {
             outer_inner_cap: self.outer_inner_cap.clone(),
             solver_class: self.solver_class,
             operator_initial_trust_radius: self.operator_initial_trust_radius,
+            bfgs_step_cap: self.bfgs_step_cap,
         }
     }
 
@@ -4421,6 +4459,8 @@ fn run_outer_with_plan(
                     iter_count: 0,
                     g_norm_initial: None,
                     last_g_norm: None,
+                    line_search_step_cap: config.bfgs_step_cap,
+                    last_gradient_point: None,
                 };
                 // Hand the precomputed (cost, gradient) seed eval to
                 // `opt::Bfgs` so its first internal `eval_grad` call is
@@ -4439,6 +4479,26 @@ fn run_outer_with_plan(
                     .with_gradient_tolerance(grad_tol)
                     .with_max_iterations(max_iter)
                     .with_initial_sample(seed.clone(), initial_sample);
+                if let Some(step_cap) = config.bfgs_step_cap {
+                    let metric_diag = seed_eval.gradient.mapv(|g| {
+                        let g_abs = g.abs();
+                        if g_abs > step_cap {
+                            (step_cap / g_abs).max(1.0e-12)
+                        } else {
+                            1.0
+                        }
+                    });
+                    if metric_diag.iter().any(|&v| v < 1.0) {
+                        let min_scale = metric_diag.iter().copied().fold(f64::INFINITY, f64::min);
+                        log::info!(
+                            "[OUTER/BFGS] initial inverse metric capped by first-trial step budget: step_cap={:.3e} min_diag_scale={:.3e}",
+                            step_cap,
+                            min_scale,
+                        );
+                        optimizer =
+                            optimizer.with_initial_metric(InitialMetric::Diagonal(metric_diag));
+                    }
+                }
                 if let Some(feedback) = config.outer_inner_cap.as_ref() {
                     optimizer = optimizer.with_observer(OuterAcceptObserver {
                         feedback: feedback.clone(),
@@ -5379,6 +5439,65 @@ mod tests {
                 .all(|order| *order == OuterEvalOrder::ValueAndGradient),
             "BFGS should request only value+gradient, saw {seen_orders:?}"
         );
+    }
+
+    #[test]
+    fn first_order_bridge_rejects_oversized_bfgs_cost_probe_before_objective() {
+        let cost_calls = Arc::new(AtomicUsize::new(0));
+        let eval_calls = Arc::new(AtomicUsize::new(0));
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Unavailable);
+        let mut obj = problem.build_objective(
+            (),
+            {
+                let cost_calls = Arc::clone(&cost_calls);
+                move |_: &mut (), theta: &Array1<f64>| {
+                    cost_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(theta[0] * theta[0])
+                }
+            },
+            {
+                let eval_calls = Arc::clone(&eval_calls);
+                move |_: &mut (), theta: &Array1<f64>| {
+                    eval_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(OuterEval {
+                        cost: theta[0] * theta[0],
+                        gradient: array![2.0 * theta[0]],
+                        hessian: HessianResult::Unavailable,
+                    })
+                }
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let mut bridge = OuterFirstOrderBridge {
+            obj: &mut obj,
+            layout: OuterThetaLayout::new(1, 0),
+            outer_inner_cap: None,
+            iter_count: 0,
+            g_norm_initial: None,
+            last_g_norm: None,
+            line_search_step_cap: Some(0.5),
+            last_gradient_point: None,
+        };
+
+        FirstOrderObjective::eval_grad(&mut bridge, &array![0.0])
+            .expect("seed gradient eval should establish the line-search anchor");
+        let rejected = ZerothOrderObjective::eval_cost(&mut bridge, &array![0.51])
+            .expect("oversized probe should be represented as a finite reject cost");
+        assert!(rejected > 1.0e250);
+        assert_eq!(
+            cost_calls.load(Ordering::Relaxed),
+            0,
+            "oversized BFGS probe must not run the expensive inner objective"
+        );
+
+        let accepted = ZerothOrderObjective::eval_cost(&mut bridge, &array![0.5])
+            .expect("probe at the trust budget should call the objective");
+        assert_eq!(accepted, 0.25);
+        assert_eq!(cost_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(eval_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

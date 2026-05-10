@@ -862,9 +862,7 @@ fn compute_smoothing_correction(
     let (v_rho, repaired_hessian) = match invert_regularized_rho_hessian(&hessian_rho) {
         Some(inverse) => inverse,
         None => {
-            log::warn!(
-                "Failed to invert SPD LAML Hessian for smoothing correction; skipping."
-            );
+            log::warn!("Failed to invert SPD LAML Hessian for smoothing correction; skipping.");
             return SmoothingCorrectionComputation {
                 correction: None,
                 hessian_rho: Some(hessian_rho),
@@ -917,8 +915,7 @@ fn compute_smoothing_correction(
                 .map(f64::abs)
                 .fold(0.0_f64, f64::max)
                 .max(1.0);
-            let neg_tol =
-                64.0 * f64::EPSILON * (n_coeffs_orig.max(1) as f64) * spectral_scale;
+            let neg_tol = 64.0 * f64::EPSILON * (n_coeffs_orig.max(1) as f64) * spectral_scale;
             if min_eig < -neg_tol {
                 log::warn!(
                     "Smoothing correction has material negative eigenvalue {:.3e} \

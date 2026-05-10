@@ -8788,19 +8788,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         const ADAPTIVE_CAP_GROWTH_FACTOR: f64 = 2.0;
         const ADAPTIVE_CAP_CEILING: f64 = 1.0e4;
 
-        // Divergence-detection state for the joint-Newton path. Mirrors
-        // the blockwise sibling later in this function: a near-null
-        // direction in the joint Hessian (e.g. BernoulliMarginalSlope's
-        // linkwiggle empirical anchor drifting from fit-time η₀) makes
-        // Newton clamp at the family step cap every cycle while -loglik stays
-        // frozen and β grows linearly along the null mode. Without an
-        // early-exit the loop runs to inner_max_cycles producing
-        // identical -loglik values, burning ~50s per ρ-cost call at
-        // biobank scale and stacking up to a 2400s timeout.
-        let mut prev_log_likelihood_for_joint_divergence_check = current_log_likelihood;
-        let mut consecutive_joint_frozen_loglik_cycles: usize = 0;
-        const JOINT_DIVERGENCE_FROZEN_LOGLIK_CYCLES: usize = 8;
-
         // Cross-cycle convergence carry-over: set at the end of every
         // accepted cycle so the next cycle can distinguish a true KKT
         // optimum on a rank-deficient null mode (objective stuck
@@ -9578,40 +9565,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 beta_inf,
             );
 
-            // Divergence early-exit. See the rationale block above the
-            // loop. We track current_log_likelihood (not the smoothed
-            // `objective_change`) because under a near-null mode the
-            // penalty drifts cycle-to-cycle even when the data fit is
-            // genuinely stagnant — `objective_change` would mask the
-            // divergence whereas a frozen log-likelihood is unambiguous.
-            let loglik_change_for_joint_divergence_check =
-                (current_log_likelihood - prev_log_likelihood_for_joint_divergence_check).abs();
-            let loglik_frozen_tol_for_joint_divergence_check =
-                inner_tol * (1.0 + current_log_likelihood.abs());
-            let step_clamped_for_joint_divergence_check = step_inf >= 0.95 * max_joint_step;
-            if loglik_change_for_joint_divergence_check
-                <= loglik_frozen_tol_for_joint_divergence_check
-                && step_clamped_for_joint_divergence_check
-            {
-                consecutive_joint_frozen_loglik_cycles += 1;
-            } else {
-                consecutive_joint_frozen_loglik_cycles = 0;
-            }
-            prev_log_likelihood_for_joint_divergence_check = current_log_likelihood;
-            if consecutive_joint_frozen_loglik_cycles >= JOINT_DIVERGENCE_FROZEN_LOGLIK_CYCLES {
-                log::warn!(
-                    "[PIRLS/joint-Newton convergence] divergence early-exit at cycle {} | -loglik={:.6e} frozen for {} consecutive cycles | step_inf={:.3e} (clamped at cap {}) | step_tol={:.3e}; near-null Hessian direction detected — returning unconverged so the outer optimizer backs off this region instead of running to inner_max_cycles.",
-                    cycle,
-                    -current_log_likelihood,
-                    consecutive_joint_frozen_loglik_cycles,
-                    step_inf,
-                    max_joint_step,
-                    step_tol,
-                );
-                converged = false;
-                break;
-            }
-
             // KKT convergence: a small post-step residual is the
             // canonical optimality certificate for the penalized
             // objective. ‖∇L(β) − Sβ‖∞ ≤ residual_tol means the
@@ -9733,6 +9686,25 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     // Detect the pattern and bail with `converged = false` so the cost
     // call returns Err / +∞, BFGS κ-optim backs off the divergent ρ
     // region, and the outer loop progresses instead of grinding.
+
+    // Adaptive per-block step cap. Mirrors the joint-Newton sibling
+    // (`max_joint_step`) for the same root cause: a fixed
+    // `MAX_NEWTON_STEP` chosen for typical |β|=O(1) problems binds every
+    // cycle when the optimum sits at |β|=O(10²)–O(10³) along a
+    // near-linear ridge, forcing 50–100 inner cycles to traverse a
+    // valley each block could otherwise leap in one shot. Track
+    // per-block: any block whose line search keeps accepting α=1 with
+    // the proposal at its cap has empirically certified the cap is too
+    // tight. Grow that block's cap geometrically; shrink it back if the
+    // line search starts cutting α hard or fails outright. Floor at the
+    // family-safe initial value so we never undercut the family's own
+    // first-cycle safety budget.
+    const BLOCK_NEWTON_STEP_INITIAL: f64 = 20.0;
+    const BLOCK_NEWTON_STEP_CEILING: f64 = 1.0e4;
+    const BLOCK_CAP_GROWTH_THRESHOLD: usize = 3;
+    let mut block_max_step: Vec<f64> = vec![BLOCK_NEWTON_STEP_INITIAL; specs.len()];
+    let mut block_consecutive_full_clamped: Vec<usize> = vec![0; specs.len()];
+
     let mut prev_log_likelihood_for_divergence_check = cached_eval.log_likelihood;
     let mut consecutive_frozen_loglik_cycles: usize = 0;
     // Coordinate descent visits each block in turn, so `max_proposed_step`
@@ -9833,16 +9805,22 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // Trust region: cap the infinity-norm of the Newton step to
             // prevent eta from jumping into regions where exp() overflows.
             // The cap is generous enough to never slow normal convergence
-            // (a coefficient change of 20 means exp(eta) changes by ~5e8)
-            // but prevents catastrophic jumps to eta > 700.
-            const MAX_NEWTON_STEP: f64 = 20.0;
+            // on typical-scale problems (a coefficient change of 20 means
+            // exp(eta) changes by ~5e8) but prevents catastrophic jumps
+            // to eta > 700. The cap is per-block adaptive — see the
+            // declaration of `block_max_step` outside the cycle loop.
+            // Falls back to the family-safe initial floor whenever the
+            // line search rejects or has to cut α hard.
+            const MAX_NEWTON_STEP: f64 = BLOCK_NEWTON_STEP_INITIAL;
+            let block_cap = block_max_step[b];
             let step_inf = raw_delta
                 .iter()
                 .copied()
                 .map(f64::abs)
                 .fold(0.0_f64, f64::max);
-            let delta = if step_inf > MAX_NEWTON_STEP {
-                &raw_delta * (MAX_NEWTON_STEP / step_inf)
+            let raw_step_inf = step_inf;
+            let delta = if step_inf > block_cap {
+                &raw_delta * (block_cap / step_inf)
             } else {
                 raw_delta
             };
@@ -9873,6 +9851,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .unwrap_or(1.0);
             // Reuse trial_beta_buf to avoid allocation per backtracking trial.
             let mut trial_beta_buf = beta_old.clone();
+            let mut accepted_bt: usize = usize::MAX;
             for bt in 0..8 {
                 let alpha = (0.5f64.powi(bt)).min(barrier_ceiling);
                 trial_beta_buf.assign(&beta_old);
@@ -9911,7 +9890,28 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     objective_cycle_prev = trialobjective;
                     current_penalty = trial_penalty;
                     accepted = true;
+                    accepted_bt = bt as usize;
                     break;
+                }
+            }
+            // Adaptive cap update: the line search just told us how
+            // trustworthy this block's quadratic model was. α=1
+            // accepted with the proposal at the cap → cap is binding,
+            // grow it after the threshold of consecutive corroborating
+            // cycles (mirrors joint-Newton's `consecutive_high_rho_clamped_cycles`).
+            // Anything weaker (α<1, line-search rejection) shrinks the
+            // cap toward the family-safe initial value.
+            let was_clamped = raw_step_inf >= 0.95 * block_cap;
+            if accepted && accepted_bt == 0 && was_clamped {
+                block_consecutive_full_clamped[b] += 1;
+                if block_consecutive_full_clamped[b] >= BLOCK_CAP_GROWTH_THRESHOLD {
+                    block_max_step[b] = (block_max_step[b] * 2.0).min(BLOCK_NEWTON_STEP_CEILING);
+                    block_consecutive_full_clamped[b] = 0;
+                }
+            } else {
+                block_consecutive_full_clamped[b] = 0;
+                if !accepted || accepted_bt >= 3 {
+                    block_max_step[b] = (block_max_step[b] * 0.5).max(BLOCK_NEWTON_STEP_INITIAL);
                 }
             }
             if !accepted {
