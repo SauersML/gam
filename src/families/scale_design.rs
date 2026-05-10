@@ -6,20 +6,22 @@ use std::sync::Arc;
 
 const COLUMN_TOL: f64 = 1e-12;
 const SCALE_DESIGN_TARGET_CHUNK_BYTES: usize = 8 * 1024 * 1024;
-// Hard floor on the SVD truncation tolerance.  The primary tolerance is
-// derived per-fit from the leverage-amplification target below; this floor is
-// kept only to guard against catastrophic conditioning where the derived
-// tolerance would otherwise be sub-epsilon.
+// Numerical conditioning floor for the SVD truncation tolerance: we drop any
+// singular direction below `RCOND_FLOOR * sigma_max`, which is the standard
+// machine-precision boundary for considering a direction resolvable. Above
+// this floor, the replay solve is unbiased least squares (no Tikhonov
+// damping), so noise in the primary span is recovered exactly. This is the
+// primary safety net.
 const SCALE_PROJECTION_REPLAY_RCOND_FLOOR: f64 = 1e-8;
-// Tikhonov target: bound the worst-case prediction-row leverage amplification
-// of the replayed projection at this multiple of the typical training-row
-// norm.  A value of 100 means a unit-norm prediction row can perturb the
-// projected response by at most 100x what an average training row does, so a
-// pathological deviation only grows linearly (no step-function truncation),
-// while well-conditioned designs see a vanishing alpha and remain identical
-// to ordinary least squares.  Picking this in dimensionless leverage units
-// (rather than coefficient magnitude) is what makes the bound scale-free.
-const SCALE_PROJECTION_LEVERAGE_AMPLIFICATION: f64 = 100.0;
+// Optional tighter cap on coefficient amplification, used only when the
+// design is so well-conditioned that even the worst retained direction would
+// not amplify a unit prediction row beyond this multiple. For natural smooth
+// bases (cond ≈ 100–1000) this cap is dominated by the rcond floor and has no
+// effect; it kicks in only for nearly-orthogonal designs where one could
+// otherwise tighten the cutoff without losing real signal. Setting this much
+// smaller than `1 / RCOND_FLOOR` would discard real signal from moderately
+// conditioned bases and is intentionally avoided.
+const SCALE_PROJECTION_LEVERAGE_AMPLIFICATION: f64 = 1.0e8;
 
 #[derive(Clone, Debug)]
 pub struct ScaleDeviationTransform {
@@ -471,11 +473,24 @@ fn solve_scale_projection(
     if rank == 0 {
         return Ok((projection_coef, alpha));
     }
+    // Truncated SVD with leverage-bound cutoff: directions resolved well
+    // enough to keep coefficient amplification under
+    // SCALE_PROJECTION_LEVERAGE_AMPLIFICATION are inverted exactly (no
+    // Tikhonov bias on the dominant components), and weaker directions are
+    // dropped. The primary design is fixed across any single replay, so no
+    // threshold-crossings occur within a call: the projection is a linear
+    // function of the noise RHS, which is the continuity property the audit
+    // asked for. The discarded singular value floor sqrt(alpha) doubles as
+    // the recovered-coefficient leverage cap.
+    let cutoff = alpha.sqrt();
     let mut filter = Array1::<f64>::zeros(rank);
     for k in 0..rank {
         let s = singular[k];
-        let denom = s * s + alpha;
-        filter[k] = if denom > 0.0 { s / denom } else { 0.0 };
+        filter[k] = if s > cutoff && s > 0.0 {
+            1.0 / s
+        } else {
+            0.0
+        };
     }
 
     let chunk_cols = (SCALE_DESIGN_TARGET_CHUNK_BYTES / (n.max(1) * std::mem::size_of::<f64>()))
@@ -945,20 +960,28 @@ mod tests {
 
     #[test]
     fn choose_scale_projection_ridge_alpha_scales_with_sigma_max() {
+        // Truncation tolerance is `RCOND_FLOOR * sigma_max` whenever the
+        // leverage cap is looser (which it always is for the default 1e8
+        // value), so alpha = (RCOND_FLOOR * sigma_max)^2.
         let alpha_unit = choose_scale_projection_ridge_alpha(&[1.0, 0.5, 1e-6]);
+        let expected_unit = SCALE_PROJECTION_REPLAY_RCOND_FLOOR.powi(2);
         assert!(alpha_unit > 0.0);
-        // tolerance = sigma_max / leverage_amplification = 1/100 = 0.01,
-        // so alpha = (0.01)^2 = 1e-4.
         assert!(
-            (alpha_unit - 1e-4).abs() < 1e-12,
-            "alpha should be 1e-4 for sigma_max=1, got {alpha_unit}"
+            (alpha_unit - expected_unit).abs() < 1e-24,
+            "alpha should be {expected_unit:e} for sigma_max=1, got {alpha_unit}"
         );
 
         let alpha_scaled = choose_scale_projection_ridge_alpha(&[100.0, 1.0]);
-        // sigma_max=100 -> tol=1.0 -> alpha=1.0.  Scales as sigma_max^2.
+        let expected_scaled = (SCALE_PROJECTION_REPLAY_RCOND_FLOOR * 100.0).powi(2);
         assert!(
-            (alpha_scaled - 1.0).abs() < 1e-9,
-            "alpha should be 1.0 for sigma_max=100, got {alpha_scaled}"
+            (alpha_scaled - expected_scaled).abs() < 1e-18,
+            "alpha should be {expected_scaled:e} for sigma_max=100, got {alpha_scaled}"
+        );
+        // Scales as sigma_max^2.
+        assert!(
+            (alpha_scaled / alpha_unit - 1.0e4).abs() < 1e-6,
+            "alpha should scale as sigma_max^2; got ratio {}",
+            alpha_scaled / alpha_unit
         );
 
         let alpha_floor = choose_scale_projection_ridge_alpha(&[]);

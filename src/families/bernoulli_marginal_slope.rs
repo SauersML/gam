@@ -1,5 +1,6 @@
 use crate::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyWarmStart,
+    BatchedOuterGradientTerms, BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
+    CustomFamilyWarmStart,
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
     FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, build_block_spatial_psi_derivatives,
@@ -7,7 +8,7 @@ use crate::custom_family::{
     evaluate_custom_family_joint_hyper_shared, fit_custom_family,
 };
 use crate::estimate::UnifiedFitResult;
-use crate::estimate::reml::unified::HyperOperator;
+use crate::estimate::reml::unified::{DenseSpectralOperator, HessianOperator, HyperOperator};
 use crate::families::gamlss::{ParameterBlockInput, initialize_monotone_wiggle_knots_from_seed};
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
@@ -36,7 +37,9 @@ use crate::smooth::{
 };
 use crate::types::{InverseLink, LinkFunction, WigglePenaltyConfig};
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
-use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+use rayon::iter::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -11147,6 +11150,178 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         true
     }
 
+    fn batched_outer_gradient_terms(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        rho: &Array1<f64>,
+        options: &BlockwiseFitOptions,
+        hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+    ) -> Result<Option<BatchedOuterGradientTerms>, String> {
+        let psi_dim: usize = derivative_blocks.iter().map(Vec::len).sum();
+        if psi_dim != 0 {
+            return Ok(None);
+        }
+        if block_states.len() != specs.len() {
+            return Ok(None);
+        }
+        let ranges = Self::block_ranges_from_specs(specs);
+        let total = ranges.last().map(|(_, end)| *end).unwrap_or(0);
+        if total == 0 {
+            return Ok(Some(BatchedOuterGradientTerms {
+                objective_theta: Array1::zeros(0),
+                trace_h_inv_hdot: Array1::zeros(0),
+                trace_s_pinv_sdot: Array1::zeros(0),
+            }));
+        }
+        if rho.len() != specs.iter().map(|spec| spec.penalties.len()).sum::<usize>() {
+            return Ok(None);
+        }
+        if total >= 512 {
+            return Ok(None);
+        }
+
+        let beta = Self::flatten_block_state_betas_for_specs(block_states, specs)?;
+        let mut h = if let Some(workspace) = hessian_workspace.as_ref() {
+            workspace.hessian_dense()?.ok_or_else(|| {
+                "bernoulli marginal-slope batched gradient requires dense exact joint Hessian below p=512"
+                    .to_string()
+            })?
+        } else {
+            self.exact_newton_joint_hessian(block_states)?.ok_or_else(|| {
+                "bernoulli marginal-slope batched gradient could not build dense exact joint Hessian"
+                    .to_string()
+            })?
+        };
+        if h.nrows() != total || h.ncols() != total {
+            return Err(format!(
+                "bernoulli marginal-slope batched gradient Hessian shape {}x{} != {total}x{total}",
+                h.nrows(),
+                h.ncols()
+            ));
+        }
+
+        let ridge = options.ridge_floor.max(1e-15);
+        let trace_diagonal_ridge = if options.ridge_policy.include_quadratic_penalty
+            || options.ridge_policy.include_penalty_logdet
+        {
+            ridge
+        } else {
+            0.0
+        };
+        let mut objective_theta = Array1::<f64>::zeros(rho.len());
+        let mut trace_s_pinv_sdot = Array1::<f64>::zeros(rho.len());
+        let mut penalty_cursor = 0usize;
+        let mut per_block_rho: Vec<Array1<f64>> = Vec::with_capacity(specs.len());
+        let mut penalties_dense: Vec<Vec<Array2<f64>>> = Vec::with_capacity(specs.len());
+        for (block_idx, spec) in specs.iter().enumerate() {
+            let count = spec.penalties.len();
+            let block_rho = rho.slice(s![penalty_cursor..penalty_cursor + count]).to_owned();
+            let lambdas = block_rho.mapv(f64::exp);
+            per_block_rho.push(block_rho);
+            let (start, end) = ranges[block_idx];
+            let beta_block = beta.slice(s![start..end]);
+            let mut s_lambda = Array2::<f64>::zeros((end - start, end - start));
+            let mut block_penalties = Vec::with_capacity(count);
+            for (local_idx, penalty) in spec.penalties.iter().enumerate() {
+                let dense = penalty.to_dense();
+                let lambda = lambdas[local_idx];
+                let s_beta = dense.dot(&beta_block);
+                objective_theta[penalty_cursor + local_idx] = 0.5 * lambda * beta_block.dot(&s_beta);
+                s_lambda.scaled_add(lambda, &dense);
+                block_penalties.push(dense);
+            }
+            h.slice_mut(s![start..end, start..end])
+                .scaled_add(1.0, &s_lambda);
+            penalties_dense.push(block_penalties);
+            penalty_cursor += count;
+        }
+        if trace_diagonal_ridge != 0.0 {
+            for diag in 0..total {
+                h[[diag, diag]] += trace_diagonal_ridge;
+            }
+        }
+
+        let penalty_logdet_ridge = if options.ridge_policy.include_penalty_logdet {
+            ridge
+        } else {
+            0.0
+        };
+        let per_block_penalty_refs: Vec<&[Array2<f64>]> =
+            penalties_dense.iter().map(Vec::as_slice).collect();
+        let per_block_nullspace_dims: Vec<&[usize]> =
+            specs.iter().map(|spec| spec.nullspace_dims.as_slice()).collect();
+        let penalty_logdet = crate::estimate::reml::unified::compute_block_penalty_logdet_derivs(
+            &per_block_rho,
+            &per_block_penalty_refs,
+            &per_block_nullspace_dims,
+            penalty_logdet_ridge,
+        )?;
+        trace_s_pinv_sdot.assign(&penalty_logdet.first);
+
+        let spectral =
+            DenseSpectralOperator::from_symmetric_with_mode(&h, self.pseudo_logdet_mode())?;
+        let factor = spectral.logdet_gradient_factor();
+        let mut trace_h_inv_hdot = Array1::<f64>::zeros(rho.len());
+        let mut directions = Array2::<f64>::zeros((total, rho.len()));
+        penalty_cursor = 0;
+        for (block_idx, spec) in specs.iter().enumerate() {
+            let (start, end) = ranges[block_idx];
+            let beta_block = beta.slice(s![start..end]);
+            for (local_idx, _penalty) in spec.penalties.iter().enumerate() {
+                let idx = penalty_cursor + local_idx;
+                let lambda = rho[idx].exp();
+                let dense = &penalties_dense[block_idx][local_idx];
+                trace_h_inv_hdot[idx] +=
+                    spectral.trace_logdet_block_local(dense, lambda, start, end);
+                let curvature_rhs = dense.dot(&beta_block).mapv(|value| lambda * value);
+                let mut rhs = Array1::<f64>::zeros(total);
+                rhs.slice_mut(s![start..end]).assign(&curvature_rhs);
+                let v = spectral.solve(&rhs);
+                directions.column_mut(idx).assign(&(-&v));
+            }
+            penalty_cursor += spec.penalties.len();
+        }
+
+        let owned_cache = self.build_exact_eval_cache_with_options(block_states, Some(options))?;
+        let cache_ref = &owned_cache;
+        let started = std::time::Instant::now();
+        let correction_traces = if options.outer_score_subsample.is_some() {
+            let weighted_rows = outer_weighted_rows(options, self.y.len());
+            self.batched_rho_correction_logdet_traces_for_rows(
+                block_states,
+                cache_ref,
+                factor,
+                &directions,
+                &weighted_rows,
+            )?
+        } else {
+            self.batched_rho_correction_logdet_traces_full_rows(
+                block_states,
+                cache_ref,
+                factor,
+                &directions,
+            )?
+        };
+        trace_h_inv_hdot += &correction_traces;
+        if log_exact_work(self.y.len()) {
+            log::info!(
+                "[BMS batched outer-gradient] n={} p={} rho={} trace_elapsed={:.3}s",
+                self.y.len(),
+                total,
+                rho.len(),
+                started.elapsed().as_secs_f64()
+            );
+        }
+
+        Ok(Some(BatchedOuterGradientTerms {
+            objective_theta,
+            trace_h_inv_hdot,
+            trace_s_pinv_sdot,
+        }))
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         self.validate_exact_monotonicity(block_states)?;
         self.evaluate_blockwise_exact_newton(block_states)
@@ -11863,6 +12038,379 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeLineSearchWorksp
     ) -> Result<Option<Array2<f64>>, String> {
         self.materialized()?
             .second_directional_derivative(d_beta_u_flat, d_beta_v_flat)
+    }
+}
+
+impl BernoulliMarginalSlopeFamily {
+    fn block_ranges_from_specs(specs: &[ParameterBlockSpec]) -> Vec<(usize, usize)> {
+        let mut cursor = 0usize;
+        specs
+            .iter()
+            .map(|spec| {
+                let start = cursor;
+                cursor += spec.design.ncols();
+                (start, cursor)
+            })
+            .collect()
+    }
+
+    fn flatten_block_state_betas_for_specs(
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Array1<f64>, String> {
+        if block_states.len() != specs.len() {
+            return Err(format!(
+                "bernoulli marginal-slope batched gradient state/spec mismatch: states={}, specs={}",
+                block_states.len(),
+                specs.len()
+            ));
+        }
+        let total = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+        let mut beta = Array1::<f64>::zeros(total);
+        let mut cursor = 0usize;
+        for (idx, (state, spec)) in block_states.iter().zip(specs.iter()).enumerate() {
+            let width = spec.design.ncols();
+            if state.beta.len() != width {
+                return Err(format!(
+                    "bernoulli marginal-slope batched gradient block {idx} beta length {} != spec width {}",
+                    state.beta.len(),
+                    width
+                ));
+            }
+            beta.slice_mut(s![cursor..cursor + width])
+                .assign(&state.beta);
+            cursor += width;
+        }
+        Ok(beta)
+    }
+
+    fn row_factor_primary_projection(
+        &self,
+        row: usize,
+        slices: &BlockSlices,
+        primary: &PrimarySlices,
+        factor: &Array2<f64>,
+        out: &mut [f64],
+    ) -> Result<(), String> {
+        let rank = factor.ncols();
+        if out.len() != primary.total * rank {
+            return Err(format!(
+                "primary projection scratch length {} != {}",
+                out.len(),
+                primary.total * rank
+            ));
+        }
+        out.fill(0.0);
+        for col in 0..rank {
+            out[primary.q * rank + col] = self
+                .marginal_design
+                .dot_row_view(row, factor.slice(s![slices.marginal.clone(), col]));
+            out[primary.logslope * rank + col] = self
+                .logslope_design
+                .dot_row_view(row, factor.slice(s![slices.logslope.clone(), col]));
+        }
+        if let (Some(block_range), Some(primary_range)) = (slices.h.as_ref(), primary.h.as_ref()) {
+            for (local, block_idx) in block_range.clone().enumerate() {
+                let primary_idx = primary_range.start + local;
+                for col in 0..rank {
+                    out[primary_idx * rank + col] = factor[[block_idx, col]];
+                }
+            }
+        }
+        if let (Some(block_range), Some(primary_range)) = (slices.w.as_ref(), primary.w.as_ref()) {
+            for (local, block_idx) in block_range.clone().enumerate() {
+                let primary_idx = primary_range.start + local;
+                for col in 0..rank {
+                    out[primary_idx * rank + col] = factor[[block_idx, col]];
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn row_primary_gram_from_projection(primary_total: usize, rank: usize, projection: &[f64]) -> Vec<f64> {
+        let mut gram = vec![0.0; primary_total * primary_total];
+        for a in 0..primary_total {
+            for b in 0..=a {
+                let mut sum = 0.0;
+                let a_base = a * rank;
+                let b_base = b * rank;
+                for col in 0..rank {
+                    sum += projection[a_base + col] * projection[b_base + col];
+                }
+                gram[a * primary_total + b] = sum;
+                gram[b * primary_total + a] = sum;
+            }
+        }
+        gram
+    }
+
+    fn row_primary_trace_contract(third: &Array2<f64>, gram: &[f64]) -> f64 {
+        let r = third.nrows();
+        debug_assert_eq!(third.ncols(), r);
+        debug_assert_eq!(gram.len(), r * r);
+        let mut total = 0.0;
+        for a in 0..r {
+            for b in 0..r {
+                total += third[[a, b]] * gram[a * r + b];
+            }
+        }
+        total
+    }
+
+    fn build_owned_row_cell_moments_for_third(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        primary: &PrimarySlices,
+        row_ctx: &BernoulliMarginalSlopeRowExactContext,
+    ) -> Result<Option<Vec<CachedDenestedCellMoments>>, String> {
+        if self
+            .latent_measure
+            .empirical_grid_for_training_row(row)?
+            .is_some()
+        {
+            return Ok(None);
+        }
+        let point = self.primary_point_from_block_states(row, block_states, primary)?;
+        let (_q, b, beta_h_owned, beta_w_owned) =
+            self.primary_point_components(&point, primary);
+        let beta_h = beta_h_owned.as_ref();
+        let beta_w = beta_w_owned.as_ref();
+        let partitions = self.denested_partition_cells(row_ctx.intercept, b, beta_h, beta_w)?;
+        let moments = partitions
+            .into_iter()
+            .map(|partition_cell| {
+                self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 15)
+                    .map(|state| CachedDenestedCellMoments {
+                        partition_cell,
+                        state,
+                    })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Some(moments))
+    }
+
+    fn batched_rho_correction_logdet_traces_for_rows(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        factor: &Array2<f64>,
+        directions: &Array2<f64>,
+        weighted_rows: &[WeightedOuterRow],
+    ) -> Result<Array1<f64>, String> {
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        let rank = factor.ncols();
+        let n_dirs = directions.ncols();
+        if factor.nrows() != slices.total || directions.nrows() != slices.total {
+            return Err(format!(
+                "bernoulli marginal-slope batched trace shape mismatch: factor={}x{}, directions={}x{}, p={}",
+                factor.nrows(),
+                factor.ncols(),
+                directions.nrows(),
+                directions.ncols(),
+                slices.total
+            ));
+        }
+        let traces = weighted_rows
+            .par_iter()
+            .try_fold(
+                || vec![0.0; n_dirs],
+                |mut acc, wr| -> Result<_, String> {
+                    let row = wr.index;
+                    let row_ctx = Self::row_ctx(cache, row);
+                    let cached_row_moments = cache
+                        .row_cell_moments
+                        .as_ref()
+                        .and_then(|bundle| bundle.row(row, 15));
+                    let owned_row_moments = if cached_row_moments.is_none()
+                        && self.effective_flex_active(block_states)?
+                    {
+                        self.build_owned_row_cell_moments_for_third(
+                            row,
+                            block_states,
+                            primary,
+                            row_ctx,
+                        )?
+                    } else {
+                        None
+                    };
+                    let row_moments =
+                        cached_row_moments.or_else(|| owned_row_moments.as_deref());
+                    let mut projection = vec![0.0; primary.total * rank];
+                    self.row_factor_primary_projection(row, slices, primary, factor, &mut projection)?;
+                    let gram = Self::row_primary_gram_from_projection(primary.total, rank, &projection);
+                    for dir_idx in 0..n_dirs {
+                        let d_beta = directions.column(dir_idx).to_owned();
+                        let row_dir =
+                            self.row_primary_direction_from_flat(row, slices, primary, &d_beta)?;
+                        let third = self.row_primary_third_contracted_recompute_with_moments(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            &row_dir,
+                            row_moments,
+                        )?;
+                        acc[dir_idx] +=
+                            wr.weight * Self::row_primary_trace_contract(&third, &gram);
+                    }
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || vec![0.0; n_dirs],
+                |mut left, right| -> Result<_, String> {
+                    for (l, r) in left.iter_mut().zip(right.iter()) {
+                        *l += *r;
+                    }
+                    Ok(left)
+                },
+            )?;
+        Ok(Array1::from_vec(traces))
+    }
+
+    fn batched_rho_correction_logdet_traces_full_rows(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        factor: &Array2<f64>,
+        directions: &Array2<f64>,
+    ) -> Result<Array1<f64>, String> {
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        let n = self.y.len();
+        let rank = factor.ncols();
+        let n_dirs = directions.ncols();
+        if n == 0 || rank == 0 || n_dirs == 0 {
+            return Ok(Array1::zeros(n_dirs));
+        }
+        let rows_per_chunk = {
+            const TARGET_BYTES: usize = 8 * 1024 * 1024;
+            let panels = 4usize;
+            let width = rank + n_dirs;
+            (TARGET_BYTES / (panels * width.max(1) * 8))
+                .max(512)
+                .min(n)
+        };
+        let factor_m = factor.slice(s![slices.marginal.clone(), ..]);
+        let factor_g = factor.slice(s![slices.logslope.clone(), ..]);
+        let dir_m = directions.slice(s![slices.marginal.clone(), ..]);
+        let dir_g = directions.slice(s![slices.logslope.clone(), ..]);
+        let n_chunks = n.div_ceil(rows_per_chunk);
+        let traces = (0..n_chunks)
+            .into_par_iter()
+            .map(|chunk_idx| -> Result<Vec<f64>, String> {
+                let start = chunk_idx * rows_per_chunk;
+                let end = (start + rows_per_chunk).min(n);
+                let rows = start..end;
+                let x_chunk = self
+                    .marginal_design
+                    .try_row_chunk(rows.clone())
+                    .map_err(|err| format!("marginal trace row chunk failed: {err}"))?;
+                let g_chunk = self
+                    .logslope_design
+                    .try_row_chunk(rows.clone())
+                    .map_err(|err| format!("logslope trace row chunk failed: {err}"))?;
+                let proj_m = crate::faer_ndarray::fast_ab(&x_chunk, &factor_m);
+                let proj_g = crate::faer_ndarray::fast_ab(&g_chunk, &factor_g);
+                let dir_proj_m = crate::faer_ndarray::fast_ab(&x_chunk, &dir_m);
+                let dir_proj_g = crate::faer_ndarray::fast_ab(&g_chunk, &dir_g);
+                let mut acc = vec![0.0; n_dirs];
+                let mut projection = vec![0.0; primary.total * rank];
+                let mut row_dir = Array1::<f64>::zeros(primary.total);
+                for local in 0..(end - start) {
+                    let row = start + local;
+                    projection.fill(0.0);
+                    for col in 0..rank {
+                        projection[primary.q * rank + col] = proj_m[[local, col]];
+                        projection[primary.logslope * rank + col] = proj_g[[local, col]];
+                    }
+                    if let (Some(block_range), Some(primary_range)) =
+                        (slices.h.as_ref(), primary.h.as_ref())
+                    {
+                        for (offset, block_idx) in block_range.clone().enumerate() {
+                            let primary_idx = primary_range.start + offset;
+                            for col in 0..rank {
+                                projection[primary_idx * rank + col] = factor[[block_idx, col]];
+                            }
+                        }
+                    }
+                    if let (Some(block_range), Some(primary_range)) =
+                        (slices.w.as_ref(), primary.w.as_ref())
+                    {
+                        for (offset, block_idx) in block_range.clone().enumerate() {
+                            let primary_idx = primary_range.start + offset;
+                            for col in 0..rank {
+                                projection[primary_idx * rank + col] = factor[[block_idx, col]];
+                            }
+                        }
+                    }
+                    let gram =
+                        Self::row_primary_gram_from_projection(primary.total, rank, &projection);
+                    let row_ctx = Self::row_ctx(cache, row);
+                    let cached_row_moments = cache
+                        .row_cell_moments
+                        .as_ref()
+                        .and_then(|bundle| bundle.row(row, 15));
+                    let owned_row_moments = if cached_row_moments.is_none()
+                        && self.effective_flex_active(block_states)?
+                    {
+                        self.build_owned_row_cell_moments_for_third(
+                            row,
+                            block_states,
+                            primary,
+                            row_ctx,
+                        )?
+                    } else {
+                        None
+                    };
+                    let row_moments =
+                        cached_row_moments.or_else(|| owned_row_moments.as_deref());
+                    for dir_idx in 0..n_dirs {
+                        row_dir.fill(0.0);
+                        row_dir[primary.q] = dir_proj_m[[local, dir_idx]];
+                        row_dir[primary.logslope] = dir_proj_g[[local, dir_idx]];
+                        if let (Some(block_range), Some(primary_range)) =
+                            (slices.h.as_ref(), primary.h.as_ref())
+                        {
+                            for (offset, block_idx) in block_range.clone().enumerate() {
+                                row_dir[primary_range.start + offset] =
+                                    directions[[block_idx, dir_idx]];
+                            }
+                        }
+                        if let (Some(block_range), Some(primary_range)) =
+                            (slices.w.as_ref(), primary.w.as_ref())
+                        {
+                            for (offset, block_idx) in block_range.clone().enumerate() {
+                                row_dir[primary_range.start + offset] =
+                                    directions[[block_idx, dir_idx]];
+                            }
+                        }
+                        let third = self.row_primary_third_contracted_recompute_with_moments(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            &row_dir,
+                            row_moments,
+                        )?;
+                        acc[dir_idx] += Self::row_primary_trace_contract(&third, &gram);
+                    }
+                }
+                Ok(acc)
+            })
+            .try_reduce(
+                || vec![0.0; n_dirs],
+                |mut left, right| -> Result<_, String> {
+                    for (l, r) in left.iter_mut().zip(right.iter()) {
+                        *l += *r;
+                    }
+                    Ok(left)
+                },
+            )?;
+        Ok(Array1::from_vec(traces))
     }
 }
 

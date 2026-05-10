@@ -42,9 +42,9 @@ pub fn erfcx_nonnegative(x: f64) -> f64 {
         let inv = 1.0 / x;
         let inv2 = inv * inv;
         let poly = 1.0
-            + 0.5 * inv2
+            - 0.5 * inv2
             + 0.75 * inv2 * inv2
-            + 1.875 * inv2 * inv2 * inv2
+            - 1.875 * inv2 * inv2 * inv2
             + 6.5625 * inv2 * inv2 * inv2 * inv2;
         inv * poly / std::f64::consts::PI.sqrt()
     }
