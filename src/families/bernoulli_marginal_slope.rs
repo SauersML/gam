@@ -16124,7 +16124,7 @@ mod tests {
             &z,
             &q0_seed,
             &link_seed,
-            &cfg,
+            &link_cfg,
         )
         .expect("cross-block reparameterisation should succeed for non-degenerate overlap");
         let p_link_after = link_prepared.runtime.basis_dim();
