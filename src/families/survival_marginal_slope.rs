@@ -534,6 +534,76 @@ struct SurvivalMarginalSlopeDynamicRow {
     d2qd1_marginal_marginal: Array2<f64>,
 }
 
+impl SurvivalMarginalSlopeDynamicRow {
+    /// Construct a zero-sized workspace. Sizes are filled in lazily by
+    /// [`reset`] on the first call to [`row_dynamic_q_geometry_into`].
+    fn empty_workspace() -> Self {
+        Self {
+            q0: 0.0,
+            q1: 0.0,
+            qd1: 0.0,
+            dq0_time: Array1::zeros(0),
+            dq1_time: Array1::zeros(0),
+            dqd1_time: Array1::zeros(0),
+            dq0_marginal: Array1::zeros(0),
+            dq1_marginal: Array1::zeros(0),
+            dqd1_marginal: Array1::zeros(0),
+            d2q0_time_time: Array2::zeros((0, 0)),
+            d2q1_time_time: Array2::zeros((0, 0)),
+            d2qd1_time_time: Array2::zeros((0, 0)),
+            d2q0_time_marginal: Array2::zeros((0, 0)),
+            d2q1_time_marginal: Array2::zeros((0, 0)),
+            d2qd1_time_marginal: Array2::zeros((0, 0)),
+            d2q0_marginal_marginal: Array2::zeros((0, 0)),
+            d2q1_marginal_marginal: Array2::zeros((0, 0)),
+            d2qd1_marginal_marginal: Array2::zeros((0, 0)),
+        }
+    }
+
+    /// Resize buffers to `(p_time, p_marginal)` and zero them in place.
+    /// Reallocates only when the existing buffer shape differs from the
+    /// requested shape; otherwise reuses the existing storage with
+    /// `fill(0.0)` to keep the per-row allocator pressure flat.
+    fn reset(&mut self, p_time: usize, p_marginal: usize) {
+        self.q0 = 0.0;
+        self.q1 = 0.0;
+        self.qd1 = 0.0;
+        reset_array1(&mut self.dq0_time, p_time);
+        reset_array1(&mut self.dq1_time, p_time);
+        reset_array1(&mut self.dqd1_time, p_time);
+        reset_array1(&mut self.dq0_marginal, p_marginal);
+        reset_array1(&mut self.dq1_marginal, p_marginal);
+        reset_array1(&mut self.dqd1_marginal, p_marginal);
+        reset_array2(&mut self.d2q0_time_time, p_time, p_time);
+        reset_array2(&mut self.d2q1_time_time, p_time, p_time);
+        reset_array2(&mut self.d2qd1_time_time, p_time, p_time);
+        reset_array2(&mut self.d2q0_time_marginal, p_time, p_marginal);
+        reset_array2(&mut self.d2q1_time_marginal, p_time, p_marginal);
+        reset_array2(&mut self.d2qd1_time_marginal, p_time, p_marginal);
+        reset_array2(&mut self.d2q0_marginal_marginal, p_marginal, p_marginal);
+        reset_array2(&mut self.d2q1_marginal_marginal, p_marginal, p_marginal);
+        reset_array2(&mut self.d2qd1_marginal_marginal, p_marginal, p_marginal);
+    }
+}
+
+#[inline]
+fn reset_array1(arr: &mut Array1<f64>, len: usize) {
+    if arr.len() == len {
+        arr.fill(0.0);
+    } else {
+        *arr = Array1::zeros(len);
+    }
+}
+
+#[inline]
+fn reset_array2(arr: &mut Array2<f64>, rows: usize, cols: usize) {
+    if arr.shape() == [rows, cols] {
+        arr.fill(0.0);
+    } else {
+        *arr = Array2::zeros((rows, cols));
+    }
+}
+
 struct TimewiggleMarginalPsiRowLift {
     dir: Array1<f64>,
     u_q0_time: Array1<f64>,
@@ -590,43 +660,65 @@ fn unit_primary_direction_ref(idx: usize) -> &'static Array1<f64> {
     &unit_primary_direction_table()[idx]
 }
 
+#[inline]
 fn poly_mul(lhs: &[f64], rhs: &[f64]) -> PolyVec {
     if lhs.is_empty() || rhs.is_empty() {
         return PolyVec::new();
     }
-    let mut out: PolyVec = smallvec![0.0; lhs.len() + rhs.len() - 1];
+    let n = lhs.len() + rhs.len() - 1;
+    let mut out: PolyVec = smallvec![0.0; n];
+    // Inner loop: out[i..i+rhs.len()] += lv * rhs. One sub-slicing bounds
+    // check per outer iter lets LLVM elide the inner-loop bounds checks and
+    // auto-vectorize the FMA. Hot path: ~13% self-time across poly_mul +
+    // poly_add + poly_scale per the smoke-fixture profile.
+    let out_slice = out.as_mut_slice();
     for (i, &lv) in lhs.iter().enumerate() {
-        for (j, &rv) in rhs.iter().enumerate() {
-            out[i + j] += lv * rv;
+        let dst = &mut out_slice[i..i + rhs.len()];
+        for (d, &rv) in dst.iter_mut().zip(rhs.iter()) {
+            *d += lv * rv;
         }
     }
     out
 }
 
+#[inline]
 fn poly_sub(lhs: &[f64], rhs: &[f64]) -> PolyVec {
-    let mut out: PolyVec = smallvec![0.0; lhs.len().max(rhs.len())];
-    for (idx, value) in lhs.iter().enumerate() {
-        out[idx] += value;
+    let mut out: PolyVec = SmallVec::new();
+    out.extend_from_slice(lhs);
+    if rhs.len() > lhs.len() {
+        out.resize(rhs.len(), 0.0);
     }
-    for (idx, value) in rhs.iter().enumerate() {
-        out[idx] -= value;
+    for (d, &v) in out[..rhs.len()].iter_mut().zip(rhs.iter()) {
+        *d -= v;
     }
     out
 }
 
+#[inline]
 fn poly_add(lhs: &[f64], rhs: &[f64]) -> PolyVec {
-    let mut out: PolyVec = smallvec![0.0; lhs.len().max(rhs.len())];
-    for (idx, value) in lhs.iter().enumerate() {
-        out[idx] += value;
-    }
-    for (idx, value) in rhs.iter().enumerate() {
-        out[idx] += value;
+    // Copy the longer operand verbatim, then add the shorter onto its
+    // prefix. Avoids the redundant zero-fill of `smallvec![0.0; n]` plus
+    // two additive passes from the legacy implementation.
+    let (a, b) = if lhs.len() >= rhs.len() {
+        (lhs, rhs)
+    } else {
+        (rhs, lhs)
+    };
+    let mut out: PolyVec = SmallVec::new();
+    out.extend_from_slice(a);
+    for (d, &v) in out[..b.len()].iter_mut().zip(b.iter()) {
+        *d += v;
     }
     out
 }
 
+#[inline]
 fn poly_scale(poly: &[f64], scale: f64) -> PolyVec {
-    poly.iter().map(|value| scale * value).collect()
+    let mut out: PolyVec = SmallVec::with_capacity(poly.len());
+    for &v in poly {
+        out.push(scale * v);
+    }
+    out
 }
 
 fn spatial_block_primary_loading(block_idx: usize) -> Result<Array1<f64>, String> {
@@ -3513,31 +3605,29 @@ impl SurvivalMarginalSlopeFamily {
         row: usize,
         block_states: &[ParameterBlockState],
     ) -> Result<SurvivalMarginalSlopeDynamicRow, String> {
+        let mut out = SurvivalMarginalSlopeDynamicRow::empty_workspace();
+        self.row_dynamic_q_geometry_into(row, block_states, &mut out)?;
+        Ok(out)
+    }
+
+    /// Pooled-buffer variant of [`row_dynamic_q_geometry`]. Resizes and
+    /// zero-fills `out` in place, then writes the same row geometry into the
+    /// caller-owned workspace. Used by hot rayon `try_fold` accumulators that
+    /// thread one `SurvivalMarginalSlopeDynamicRow` per worker thread to
+    /// eliminate the ~250 KB-per-call allocator traffic the fresh-allocation
+    /// path would incur at biobank-scale `n`.
+    fn row_dynamic_q_geometry_into(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        out: &mut SurvivalMarginalSlopeDynamicRow,
+    ) -> Result<(), String> {
         let beta_time = &block_states[0].beta;
         let beta_marginal = &block_states[1].beta;
         let p_time = beta_time.len();
         let p_marginal = beta_marginal.len();
 
-        let mut out = SurvivalMarginalSlopeDynamicRow {
-            q0: 0.0,
-            q1: 0.0,
-            qd1: 0.0,
-            dq0_time: Array1::zeros(p_time),
-            dq1_time: Array1::zeros(p_time),
-            dqd1_time: Array1::zeros(p_time),
-            dq0_marginal: Array1::zeros(p_marginal),
-            dq1_marginal: Array1::zeros(p_marginal),
-            dqd1_marginal: Array1::zeros(p_marginal),
-            d2q0_time_time: Array2::zeros((p_time, p_time)),
-            d2q1_time_time: Array2::zeros((p_time, p_time)),
-            d2qd1_time_time: Array2::zeros((p_time, p_time)),
-            d2q0_time_marginal: Array2::zeros((p_time, p_marginal)),
-            d2q1_time_marginal: Array2::zeros((p_time, p_marginal)),
-            d2qd1_time_marginal: Array2::zeros((p_time, p_marginal)),
-            d2q0_marginal_marginal: Array2::zeros((p_marginal, p_marginal)),
-            d2q1_marginal_marginal: Array2::zeros((p_marginal, p_marginal)),
-            d2qd1_marginal_marginal: Array2::zeros((p_marginal, p_marginal)),
-        };
+        out.reset(p_time, p_marginal);
 
         if !self.flex_timewiggle_active() {
             out.q0 = self.design_entry.dot_row(row, beta_time)
@@ -3575,7 +3665,7 @@ impl SurvivalMarginalSlopeFamily {
                 out.dq0_marginal.assign(&marginal_row.view());
                 out.dq1_marginal.assign(&marginal_row.view());
             }
-            return Ok(out);
+            return Ok(());
         }
 
         let time_tail = self.time_wiggle_range();
@@ -3698,7 +3788,7 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
 
-        Ok(out)
+        Ok(())
     }
 
     fn timewiggle_marginal_psi_row_lift(
@@ -4460,7 +4550,7 @@ impl SurvivalMarginalSlopeFamily {
 
         let cell_accums = cached
             .cells
-            .par_iter()
+            .iter()
             .map(|entry| -> Result<FirstOrderCellAccum, String> {
                 let state = &entry.state;
                 let fixed = &entry.fixed;
@@ -4504,7 +4594,7 @@ impl SurvivalMarginalSlopeFamily {
 
         let d_u_cell_accums = cached
             .cells
-            .par_iter()
+            .iter()
             .map(|entry| -> Result<Vec<f64>, String> {
                 let cell = entry.partition_cell.cell;
                 let state = &entry.state;
@@ -4622,7 +4712,7 @@ impl SurvivalMarginalSlopeFamily {
 
         let cell_accums = cached
             .cells
-            .par_iter()
+            .iter()
             .map(|entry| -> Result<ExactTimepointCellAccum, String> {
                 let neg_cell = entry.neg_cell;
                 let state = &entry.state;
@@ -4725,7 +4815,7 @@ impl SurvivalMarginalSlopeFamily {
 
         let d_u_cell_accums = cached
             .cells
-            .par_iter()
+            .iter()
             .map(|entry| -> Result<Vec<f64>, String> {
                 let cell = entry.partition_cell.cell;
                 let state = &entry.state;
@@ -4855,7 +4945,7 @@ impl SurvivalMarginalSlopeFamily {
         if need_d_uv {
             let d_uv_cell_accums = cached
                 .cells
-                .par_iter()
+                .iter()
                 .map(|entry| -> Result<Vec<f64>, String> {
                     let cell = entry.partition_cell.cell;
                     let state = &entry.state;
@@ -6052,27 +6142,31 @@ impl SurvivalMarginalSlopeFamily {
     {
         let slices = block_slices(self, block_states);
         let make_acc = || DynamicQBlockwiseAccumulator::new(&slices);
+        // See `evaluate_exact_newton_joint_dynamic_q_dense` for rationale.
+        let make_acc_ws = || (make_acc(), SurvivalMarginalSlopeDynamicRow::empty_workspace());
 
         let acc = (0..self.n)
             .into_par_iter()
-            .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
-                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-                let (row_nll, primary_gradient, primary_hessian) = row_terms(row, &q_geom)?;
-                acc.log_likelihood -= row_nll;
+            .try_fold(make_acc_ws, |mut acc, row| -> Result<_, String> {
+                let (state, q_geom) = &mut acc;
+                self.row_dynamic_q_geometry_into(row, block_states, q_geom)?;
+                let (row_nll, primary_gradient, primary_hessian) = row_terms(row, q_geom)?;
+                state.log_likelihood -= row_nll;
                 self.accumulate_dynamic_q_blockwise_row(
                     row,
-                    &q_geom,
+                    q_geom,
                     primary,
                     primary_gradient.view(),
                     primary_hessian.view(),
-                    &mut acc,
+                    state,
                 )?;
                 Ok(acc)
             })
-            .try_reduce(make_acc, |mut left, right| -> Result<_, String> {
-                left.add_assign(&right);
+            .try_reduce(make_acc_ws, |mut left, right| -> Result<_, String> {
+                left.0.add_assign(&right.0);
                 Ok(left)
-            })?;
+            })?
+            .0;
 
         Ok(acc.into_family_evaluation())
     }
@@ -6409,7 +6503,7 @@ impl SurvivalMarginalSlopeFamily {
 
         let cell_accums = cached
             .cells
-            .par_iter()
+            .iter()
             .map(
                 |cell_entry| -> Result<DirectionalTimepointCellAccum, String> {
                     let neg_cell = cell_entry.neg_cell;
@@ -6800,7 +6894,7 @@ impl SurvivalMarginalSlopeFamily {
         // D_u_dir: directional derivative of the density normalization first derivative.
         let d_u_dir_cell_accums = cached
             .cells
-            .par_iter()
+            .iter()
             .map(|cell_entry| -> Result<Array1<f64>, String> {
                 let mut d_u_dir = Array1::<f64>::zeros(p);
                 let cell = cell_entry.partition_cell.cell;
@@ -6907,7 +7001,7 @@ impl SurvivalMarginalSlopeFamily {
         if need_d_uv_dir {
             let d_uv_dir_cell_accums = cached
                 .cells
-                .par_iter()
+                .iter()
                 .map(|cell_entry| -> Result<Array2<f64>, String> {
                     let mut d_uv_dir = Array2::<f64>::zeros((p, p));
                     let cell = cell_entry.partition_cell.cell;
@@ -7313,7 +7407,7 @@ impl SurvivalMarginalSlopeFamily {
 
         let cell_accums = cached
             .cells
-            .par_iter()
+            .iter()
             .map(|ce| -> Result<BiDirectionalTimepointCellAccum, String> {
                 let mut f_a = 0.0f64;
                 let mut f_aa = 0.0f64;
@@ -8188,7 +8282,7 @@ impl SurvivalMarginalSlopeFamily {
 
         let d_uv_uv_cell_accums = cached
             .cells
-            .par_iter()
+            .iter()
             .map(|ce| -> Result<Array2<f64>, String> {
                 let mut d_uv_uv = Array2::<f64>::zeros((p, p));
                 let cell = ce.partition_cell.cell;
@@ -10630,39 +10724,48 @@ impl SurvivalMarginalSlopeFamily {
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
         let make_acc = || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w);
 
+        // See `evaluate_exact_newton_joint_dynamic_q_dense` for rationale: the
+        // per-thread accumulator embeds a `SurvivalMarginalSlopeDynamicRow`
+        // workspace so the nine Array2/Array1 buffers are reused across all
+        // rows handled by one rayon worker.
+        let make_acc_ws = || (make_acc(), SurvivalMarginalSlopeDynamicRow::empty_workspace());
         let acc = if self.effective_flex_active(block_states)? {
             let primary = flex_primary_slices(self);
             (0..self.n)
                 .into_par_iter()
-                .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
-                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                .try_fold(make_acc_ws, |mut acc, row| -> Result<_, String> {
+                    let (state, q_geom) = &mut acc;
+                    self.row_dynamic_q_geometry_into(row, block_states, q_geom)?;
                     let (_, g, h) = self.compute_row_flex_primary_gradient_hessian_exact(
                         row,
                         block_states,
-                        &q_geom,
+                        q_geom,
                         &primary,
                     )?;
-                    acc.add_pullback_with_q_geometry(self, row, &q_geom, &g, &h)?;
+                    state.add_pullback_with_q_geometry(self, row, q_geom, &g, &h)?;
                     Ok(acc)
                 })
-                .try_reduce(make_acc, |mut a, b| -> Result<_, String> {
-                    a.add(&b);
+                .try_reduce(make_acc_ws, |mut a, b| -> Result<_, String> {
+                    a.0.add(&b.0);
                     Ok(a)
                 })?
+                .0
         } else {
             (0..self.n)
                 .into_par_iter()
-                .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
-                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                .try_fold(make_acc_ws, |mut acc, row| -> Result<_, String> {
+                    let (state, q_geom) = &mut acc;
+                    self.row_dynamic_q_geometry_into(row, block_states, q_geom)?;
                     let (_, g, h) =
                         self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
-                    acc.add_pullback_with_q_geometry(self, row, &q_geom, &g, &h)?;
+                    state.add_pullback_with_q_geometry(self, row, q_geom, &g, &h)?;
                     Ok(acc)
                 })
-                .try_reduce(make_acc, |mut a, b| -> Result<_, String> {
-                    a.add(&b);
+                .try_reduce(make_acc_ws, |mut a, b| -> Result<_, String> {
+                    a.0.add(&b.0);
                     Ok(a)
                 })?
+                .0
         };
 
         let diagonal = acc.diagonal(&slices);
@@ -10694,45 +10797,47 @@ impl SurvivalMarginalSlopeFamily {
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let row_weights = outer_row_weights_by_index(options, self.n);
+        let make_acc_ws = || {
+            (
+                BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                SurvivalMarginalSlopeDynamicRow::empty_workspace(),
+            )
+        };
         let acc = row_iter
             .into_par_iter()
-            .try_fold(
-                || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-                |mut acc, row| -> Result<_, String> {
-                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-                    let h_pi = self
-                        .compute_row_flex_primary_gradient_hessian_exact(
-                            row,
-                            block_states,
-                            &q_geom,
-                            &primary,
-                        )?
-                        .2;
-                    let u_d = self.row_primary_direction_from_flat_dynamic(
+            .try_fold(make_acc_ws, |mut acc, row| -> Result<_, String> {
+                let (state, q_geom) = &mut acc;
+                self.row_dynamic_q_geometry_into(row, block_states, q_geom)?;
+                let h_pi = self
+                    .compute_row_flex_primary_gradient_hessian_exact(
                         row,
                         block_states,
-                        &slices,
-                        d_beta_flat,
-                    )?;
-                    let mut t_ud =
-                        self.row_flex_primary_third_contracted_exact(row, block_states, &u_d)?;
-                    let mut h_ud = h_pi.dot(&u_d);
-                    let w = row_weights[row];
-                    if w != 1.0 {
-                        h_ud.mapv_inplace(|v| v * w);
-                        t_ud.mapv_inplace(|v| v * w);
-                    }
-                    acc.add_pullback_with_q_geometry(self, row, &q_geom, &h_ud, &t_ud)?;
-                    Ok(acc)
-                },
-            )
-            .try_reduce(
-                || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-                |mut a, b| -> Result<_, String> {
-                    a.add(&b);
-                    Ok(a)
-                },
-            )?;
+                        q_geom,
+                        &primary,
+                    )?
+                    .2;
+                let u_d = self.row_primary_direction_from_flat_dynamic(
+                    row,
+                    block_states,
+                    &slices,
+                    d_beta_flat,
+                )?;
+                let mut t_ud =
+                    self.row_flex_primary_third_contracted_exact(row, block_states, &u_d)?;
+                let mut h_ud = h_pi.dot(&u_d);
+                let w = row_weights[row];
+                if w != 1.0 {
+                    h_ud.mapv_inplace(|v| v * w);
+                    t_ud.mapv_inplace(|v| v * w);
+                }
+                state.add_pullback_with_q_geometry(self, row, q_geom, &h_ud, &t_ud)?;
+                Ok(acc)
+            })
+            .try_reduce(make_acc_ws, |mut a, b| -> Result<_, String> {
+                a.0.add(&b.0);
+                Ok(a)
+            })?
+            .0;
         Ok(Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>)
     }
 
@@ -10758,45 +10863,38 @@ impl SurvivalMarginalSlopeFamily {
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let row_weights = outer_row_weights_by_index(options, self.n);
+        let make_acc_ws = || {
+            (
+                BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                SurvivalMarginalSlopeDynamicRow::empty_workspace(),
+            )
+        };
         let acc = row_iter
             .into_par_iter()
-            .try_fold(
-                || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-                |mut acc, row| -> Result<_, String> {
-                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-                    let ud = self.row_primary_direction_from_flat_dynamic(
-                        row,
-                        block_states,
-                        &slices,
-                        d_u,
-                    )?;
-                    let ue = self.row_primary_direction_from_flat_dynamic(
-                        row,
-                        block_states,
-                        &slices,
-                        d_v,
-                    )?;
-                    let mut q_de =
-                        self.row_flex_primary_fourth_contracted_exact(row, block_states, &ud, &ue)?;
-                    let t_d =
-                        self.row_flex_primary_third_contracted_exact(row, block_states, &ud)?;
-                    let mut gamma = t_d.dot(&ue);
-                    let w = row_weights[row];
-                    if w != 1.0 {
-                        gamma.mapv_inplace(|v| v * w);
-                        q_de.mapv_inplace(|v| v * w);
-                    }
-                    acc.add_pullback_with_q_geometry(self, row, &q_geom, &gamma, &q_de)?;
-                    Ok(acc)
-                },
-            )
-            .try_reduce(
-                || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-                |mut a, b| -> Result<_, String> {
-                    a.add(&b);
-                    Ok(a)
-                },
-            )?;
+            .try_fold(make_acc_ws, |mut acc, row| -> Result<_, String> {
+                let (state, q_geom) = &mut acc;
+                self.row_dynamic_q_geometry_into(row, block_states, q_geom)?;
+                let ud =
+                    self.row_primary_direction_from_flat_dynamic(row, block_states, &slices, d_u)?;
+                let ue =
+                    self.row_primary_direction_from_flat_dynamic(row, block_states, &slices, d_v)?;
+                let mut q_de =
+                    self.row_flex_primary_fourth_contracted_exact(row, block_states, &ud, &ue)?;
+                let t_d = self.row_flex_primary_third_contracted_exact(row, block_states, &ud)?;
+                let mut gamma = t_d.dot(&ue);
+                let w = row_weights[row];
+                if w != 1.0 {
+                    gamma.mapv_inplace(|v| v * w);
+                    q_de.mapv_inplace(|v| v * w);
+                }
+                state.add_pullback_with_q_geometry(self, row, q_geom, &gamma, &q_de)?;
+                Ok(acc)
+            })
+            .try_reduce(make_acc_ws, |mut a, b| -> Result<_, String> {
+                a.0.add(&b.0);
+                Ok(a)
+            })?
+            .0;
         Ok(Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>)
     }
 }
@@ -11341,47 +11439,58 @@ impl SurvivalMarginalSlopeFamily {
         };
 
         type Acc = (f64, Array1<f64>, Array2<f64>);
-        let make_acc = || -> Acc {
+        // Per-thread accumulator carries a `SurvivalMarginalSlopeDynamicRow`
+        // workspace alongside the (nll, gradient, hessian) tuple so the nine
+        // Array2/Array1 buffers inside it are reused across all rows assigned
+        // to a single rayon worker. At biobank scale this eliminates the
+        // ~80 GB-per-sweep allocator traffic the fresh-allocation path used.
+        type AccWithWs = (Acc, SurvivalMarginalSlopeDynamicRow);
+        let make_acc = || -> AccWithWs {
             (
-                0.0,
-                Array1::zeros(p_total),
-                Array2::zeros((p_total, p_total)),
+                (
+                    0.0,
+                    Array1::zeros(p_total),
+                    Array2::zeros((p_total, p_total)),
+                ),
+                SurvivalMarginalSlopeDynamicRow::empty_workspace(),
             )
         };
 
-        (0..self.n)
+        let final_acc = (0..self.n)
             .into_par_iter()
             .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
-                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                let (state, q_geom) = &mut acc;
+                self.row_dynamic_q_geometry_into(row, block_states, q_geom)?;
                 let (row_nll, f_pi, f_pipi) = if flex_active {
                     self.compute_row_flex_primary_gradient_hessian_exact(
                         row,
                         block_states,
-                        &q_geom,
+                        q_geom,
                         &primary,
                     )?
                 } else {
                     self.compute_row_primary_gradient_hessian_uncached(row, block_states)?
                 };
-                acc.0 -= row_nll;
+                state.0 -= row_nll;
                 self.accumulate_dynamic_q_joint_row(
                     row,
                     &slices,
-                    &q_geom,
+                    q_geom,
                     f_pi.view(),
                     f_pipi.view(),
                     &identity_blocks,
-                    &mut acc.1,
-                    &mut acc.2,
+                    &mut state.1,
+                    &mut state.2,
                 )?;
                 Ok(acc)
             })
             .try_reduce(make_acc, |mut left, right| -> Result<_, String> {
-                left.0 += right.0;
-                left.1 += &right.1;
-                left.2 += &right.2;
+                left.0.0 += right.0.0;
+                left.0.1 += &right.0.1;
+                left.0.2 += &right.0.2;
                 Ok(left)
-            })
+            })?;
+        Ok(final_acc.0)
     }
 
     fn evaluate_exact_newton_joint_dense(
@@ -15055,6 +15164,93 @@ mod tests {
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::array;
 
+    fn poly_mul_legacy(lhs: &[f64], rhs: &[f64]) -> PolyVec {
+        if lhs.is_empty() || rhs.is_empty() {
+            return PolyVec::new();
+        }
+        let mut out: PolyVec = smallvec![0.0; lhs.len() + rhs.len() - 1];
+        for (i, &lv) in lhs.iter().enumerate() {
+            for (j, &rv) in rhs.iter().enumerate() {
+                out[i + j] += lv * rv;
+            }
+        }
+        out
+    }
+
+    fn poly_add_legacy(lhs: &[f64], rhs: &[f64]) -> PolyVec {
+        let mut out: PolyVec = smallvec![0.0; lhs.len().max(rhs.len())];
+        for (idx, value) in lhs.iter().enumerate() {
+            out[idx] += value;
+        }
+        for (idx, value) in rhs.iter().enumerate() {
+            out[idx] += value;
+        }
+        out
+    }
+
+    fn poly_sub_legacy(lhs: &[f64], rhs: &[f64]) -> PolyVec {
+        let mut out: PolyVec = smallvec![0.0; lhs.len().max(rhs.len())];
+        for (idx, value) in lhs.iter().enumerate() {
+            out[idx] += value;
+        }
+        for (idx, value) in rhs.iter().enumerate() {
+            out[idx] -= value;
+        }
+        out
+    }
+
+    fn poly_scale_legacy(poly: &[f64], scale: f64) -> PolyVec {
+        poly.iter().map(|value| scale * value).collect()
+    }
+
+    #[test]
+    fn poly_kernels_match_legacy_implementations() {
+        // Locks numerical agreement with the pre-tightening implementations of
+        // poly_mul/add/sub/scale. Bit-for-bit identical (same FMA pairings,
+        // same summation order). Covers same-length, lhs-longer, rhs-longer,
+        // empty, length-1, and the typical cubic×cubic shape.
+        let cases: &[(&[f64], &[f64])] = &[
+            (&[], &[]),
+            (&[], &[1.0, 2.0, 3.0]),
+            (&[2.0], &[3.0]),
+            (&[1.0, 2.0, 3.0, 4.0], &[5.0, -6.0, 7.0, -8.0]),
+            (&[0.5, -0.25, 0.125], &[1.0, 2.0, 3.0, 4.0, 5.0]),
+            (&[1.0, 0.0, -1.0], &[0.0, 1.0, 0.0]),
+            (
+                &[1e-12, 1e-6, 1.0, 1e6, 1e12],
+                &[-1e-12, -1e-6, -1.0, -1e6, -1e12],
+            ),
+        ];
+        for (lhs, rhs) in cases {
+            let mul_new: Vec<f64> = poly_mul(lhs, rhs).to_vec();
+            let mul_old: Vec<f64> = poly_mul_legacy(lhs, rhs).to_vec();
+            assert_eq!(
+                mul_new, mul_old,
+                "poly_mul mismatch for lhs={lhs:?}, rhs={rhs:?}"
+            );
+            let add_new: Vec<f64> = poly_add(lhs, rhs).to_vec();
+            let add_old: Vec<f64> = poly_add_legacy(lhs, rhs).to_vec();
+            assert_eq!(
+                add_new, add_old,
+                "poly_add mismatch for lhs={lhs:?}, rhs={rhs:?}"
+            );
+            let sub_new: Vec<f64> = poly_sub(lhs, rhs).to_vec();
+            let sub_old: Vec<f64> = poly_sub_legacy(lhs, rhs).to_vec();
+            assert_eq!(
+                sub_new, sub_old,
+                "poly_sub mismatch for lhs={lhs:?}, rhs={rhs:?}"
+            );
+            for &scale in &[0.0, 1.0, -1.0, 2.5, -0.125] {
+                let scl_new: Vec<f64> = poly_scale(lhs, scale).to_vec();
+                let scl_old: Vec<f64> = poly_scale_legacy(lhs, scale).to_vec();
+                assert_eq!(
+                    scl_new, scl_old,
+                    "poly_scale mismatch for poly={lhs:?}, scale={scale}"
+                );
+            }
+        }
+    }
+
     fn empty_termspec() -> TermCollectionSpec {
         TermCollectionSpec {
             linear_terms: vec![],
@@ -16705,6 +16901,179 @@ mod tests {
                 1e-8,
                 &format!("gradient[{idx}]"),
             );
+        }
+    }
+
+    #[test]
+    fn row_dynamic_q_geometry_into_pooled_matches_fresh_allocation_bitwise() {
+        // Regression: `row_dynamic_q_geometry_into` reuses a caller-owned
+        // `SurvivalMarginalSlopeDynamicRow` workspace (resized + zero-filled
+        // in place) instead of allocating nine fresh Array2/Array1 buffers
+        // per row. Both code paths must return bit-for-bit identical
+        // contents, with the workspace path additionally verified to leave
+        // the same answer when re-entered against an already-populated
+        // buffer (so the in-place `reset` correctly wipes stale state).
+        let score_runtime = test_deviation_runtime();
+        let link_runtime = test_deviation_runtime();
+        let marginal_design = array![[0.7, -0.2], [0.1, 0.6]];
+        let marginal_beta = array![0.35, -0.1];
+        let logslope_design = array![[1.0], [0.5]];
+        let logslope_beta = array![0.2];
+        let (time_wiggle_knots, time_wiggle_degree, time_wiggle_ncols) =
+            standard_test_time_wiggle();
+        let family = SurvivalMarginalSlopeFamily {
+            n: 2,
+            event: Arc::new(array![1.0, 0.0]),
+            weights: Arc::new(array![1.0, 0.8]),
+            z: Arc::new(array![0.15, -0.25]),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(array![
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0]
+            ]),
+            design_exit: DesignMatrix::from(array![
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0]
+            ]),
+            design_derivative_exit: DesignMatrix::from(array![
+                [1.0, 0.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0, 0.0]
+            ]),
+            offset_entry: Arc::new(array![0.05, -0.02]),
+            offset_exit: Arc::new(array![0.15, 0.08]),
+            derivative_offset_exit: Arc::new(array![0.9, 1.1]),
+            marginal_design: DesignMatrix::from(marginal_design.clone()),
+            logslope_design: DesignMatrix::from(logslope_design.clone()),
+            score_warp: Some(score_runtime.clone()),
+            link_dev: Some(link_runtime.clone()),
+            time_linear_constraints: None,
+            time_wiggle_knots: Some(time_wiggle_knots),
+            time_wiggle_degree: Some(time_wiggle_degree),
+            time_wiggle_ncols,
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.0, 0.08, -0.03, 0.02, -0.01],
+                eta: array![0.0, 0.0],
+            },
+            ParameterBlockState {
+                beta: marginal_beta.clone(),
+                eta: marginal_design.dot(&marginal_beta),
+            },
+            ParameterBlockState {
+                beta: logslope_beta.clone(),
+                eta: logslope_design.dot(&logslope_beta),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(score_runtime.basis_dim()),
+                eta: Array1::zeros(2),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(link_runtime.basis_dim()),
+                eta: Array1::zeros(2),
+            },
+        ];
+
+        // Compare each row, twice — first into a virgin workspace, then
+        // into the same workspace re-used after a different row has
+        // already populated it. Both must equal the fresh-allocation path
+        // bit-for-bit.
+        let mut workspace = SurvivalMarginalSlopeDynamicRow::empty_workspace();
+        // Pre-load the workspace with row 1 so the row 0 comparison
+        // exercises the buffer-reuse zeroing logic on a non-trivial state.
+        family
+            .row_dynamic_q_geometry_into(1, &block_states, &mut workspace)
+            .expect("preload workspace with row 1");
+        for row in [0usize, 1usize, 0usize] {
+            let fresh = family
+                .row_dynamic_q_geometry(row, &block_states)
+                .expect("fresh-allocation row geometry");
+            family
+                .row_dynamic_q_geometry_into(row, &block_states, &mut workspace)
+                .expect("pooled-workspace row geometry");
+            assert_eq!(workspace.q0.to_bits(), fresh.q0.to_bits(), "row {row} q0");
+            assert_eq!(workspace.q1.to_bits(), fresh.q1.to_bits(), "row {row} q1");
+            assert_eq!(workspace.qd1.to_bits(), fresh.qd1.to_bits(), "row {row} qd1");
+            let array1_pairs: [(&Array1<f64>, &Array1<f64>, &str); 6] = [
+                (&workspace.dq0_time, &fresh.dq0_time, "dq0_time"),
+                (&workspace.dq1_time, &fresh.dq1_time, "dq1_time"),
+                (&workspace.dqd1_time, &fresh.dqd1_time, "dqd1_time"),
+                (&workspace.dq0_marginal, &fresh.dq0_marginal, "dq0_marginal"),
+                (&workspace.dq1_marginal, &fresh.dq1_marginal, "dq1_marginal"),
+                (
+                    &workspace.dqd1_marginal,
+                    &fresh.dqd1_marginal,
+                    "dqd1_marginal",
+                ),
+            ];
+            for (lhs, rhs, label) in array1_pairs {
+                assert_eq!(lhs.shape(), rhs.shape(), "row {row} {label} shape");
+                for (i, (l, r)) in lhs.iter().zip(rhs.iter()).enumerate() {
+                    assert_eq!(
+                        l.to_bits(),
+                        r.to_bits(),
+                        "row {row} {label}[{i}] lhs={l:.17e} rhs={r:.17e}",
+                    );
+                }
+            }
+            let array2_pairs: [(&Array2<f64>, &Array2<f64>, &str); 9] = [
+                (
+                    &workspace.d2q0_time_time,
+                    &fresh.d2q0_time_time,
+                    "d2q0_time_time",
+                ),
+                (
+                    &workspace.d2q1_time_time,
+                    &fresh.d2q1_time_time,
+                    "d2q1_time_time",
+                ),
+                (
+                    &workspace.d2qd1_time_time,
+                    &fresh.d2qd1_time_time,
+                    "d2qd1_time_time",
+                ),
+                (
+                    &workspace.d2q0_time_marginal,
+                    &fresh.d2q0_time_marginal,
+                    "d2q0_time_marginal",
+                ),
+                (
+                    &workspace.d2q1_time_marginal,
+                    &fresh.d2q1_time_marginal,
+                    "d2q1_time_marginal",
+                ),
+                (
+                    &workspace.d2qd1_time_marginal,
+                    &fresh.d2qd1_time_marginal,
+                    "d2qd1_time_marginal",
+                ),
+                (
+                    &workspace.d2q0_marginal_marginal,
+                    &fresh.d2q0_marginal_marginal,
+                    "d2q0_marginal_marginal",
+                ),
+                (
+                    &workspace.d2q1_marginal_marginal,
+                    &fresh.d2q1_marginal_marginal,
+                    "d2q1_marginal_marginal",
+                ),
+                (
+                    &workspace.d2qd1_marginal_marginal,
+                    &fresh.d2qd1_marginal_marginal,
+                    "d2qd1_marginal_marginal",
+                ),
+            ];
+            for (lhs, rhs, label) in array2_pairs {
+                assert_eq!(lhs.shape(), rhs.shape(), "row {row} {label} shape");
+                for ((idx, l), r) in lhs.indexed_iter().zip(rhs.iter()) {
+                    assert_eq!(
+                        l.to_bits(),
+                        r.to_bits(),
+                        "row {row} {label}[{idx:?}] lhs={l:.17e} rhs={r:.17e}",
+                    );
+                }
+            }
         }
     }
 
