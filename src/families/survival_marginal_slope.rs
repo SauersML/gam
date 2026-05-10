@@ -5441,6 +5441,13 @@ impl SurvivalMarginalSlopeFamily {
     /// block_states[0].eta is from the exit design and is NOT used here;
     /// all 3 time-block linear predictors are recomputed from beta_time
     /// because the time block has 3 design matrices sharing one coefficient vector.
+    ///
+    /// Note: hot callers (third/fourth contracted tensor builders) now route
+    /// through `row_neglog_directional_jet_batched` to share q-geometry and
+    /// jet construction across the 10 upper-triangular (a, b) cells. This
+    /// per-cell variant is retained as a regression baseline for the
+    /// batched-vs-legacy equivalence test below.
+    #[allow(dead_code)]
     fn row_neglog_directional_refs(
         &self,
         row: usize,
@@ -5567,6 +5574,210 @@ impl SurvivalMarginalSlopeFamily {
         } else {
             Ok(total.coeff(total.full_mask()))
         }
+    }
+
+    /// Batched variant of `row_neglog_directional_refs` returning the full
+    /// `MultiDirJet` for the per-row NLL composed against an arbitrary
+    /// ordered list of `dirs` (one direction per jet bit).
+    ///
+    /// Callers reading higher-order contracted tensors (third/fourth)
+    /// previously looped the 10 upper-triangular (a, b) pairs and called
+    /// `row_neglog_directional_refs` ten times, each rebuilding the same
+    /// q-geometry, the same primary jets, and rerunning the same composed
+    /// unary derivatives. By packing the basis directions e_0..e_3 alongside
+    /// the user-supplied `dir` (and optional `dir_v`) into one larger jet, the
+    /// per-row q-geometry + jet-construction work is shared across all 10
+    /// upper-triangular cells. Off-diagonal entries are then a single mask
+    /// read; diagonal entries fall back to a small per-axis jet that still
+    /// reuses no work between cells.
+    ///
+    /// `dirs.len()` must be in `1..=8` (MAX_DIRS in `jet_partitions`).
+    fn row_neglog_directional_jet_batched(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        dirs: &[ArrayView1<'_, f64>],
+    ) -> Result<MultiDirJet, String> {
+        crate::families::jet_partitions::ROW_NEGLOG_CALLS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let k = dirs.len();
+        if k == 0 || k > 8 {
+            return Err(format!(
+                "survival marginal-slope row directional jet expects 1..=8 directions, got {k}"
+            ));
+        }
+        let wi = self.weights[row];
+        let di = self.event[row];
+        let zi = self.z[row];
+
+        // Primary scalar jets: q0, q1, qd1, g. Fixed-capacity stack buffers
+        // (k ≤ 8) avoid heap allocation in the per-row hot loop.
+        let mut q0_first_buf = [0.0f64; 8];
+        let mut q1_first_buf = [0.0f64; 8];
+        let mut qd1_first_buf = [0.0f64; 8];
+        let mut g_first_buf = [0.0f64; 8];
+        for (i, dir) in dirs.iter().enumerate() {
+            q0_first_buf[i] = dir[0];
+            q1_first_buf[i] = dir[1];
+            qd1_first_buf[i] = dir[2];
+            g_first_buf[i] = dir[3];
+        }
+        let q0_first: &[f64] = &q0_first_buf[..k];
+        let q1_first: &[f64] = &q1_first_buf[..k];
+        let qd1_first: &[f64] = &qd1_first_buf[..k];
+        let g_first: &[f64] = &g_first_buf[..k];
+
+        // Reuse the realized q-geometry (timewiggle / frailty manifold).
+        let q_geom = self.row_dynamic_q_values(row, block_states)?;
+        let q0_val = q_geom.q0;
+        let q1_val = q_geom.q1;
+        let qd1_val = q_geom.qd1;
+        let g_val = block_states[2].eta[row];
+
+        let q0_jet = MultiDirJet::linear(k, q0_val, q0_first);
+        let q1_jet = MultiDirJet::linear(k, q1_val, q1_first);
+        let qd1_jet = MultiDirJet::linear(k, qd1_val, qd1_first);
+        let g_jet = MultiDirJet::linear(k, g_val, g_first);
+
+        // observed_g = frailty_scale * g
+        let observed_g_jet = g_jet.scale(self.probit_frailty_scale());
+        // c = sqrt(1 + observed_g^2)
+        let one_plus_b2 = MultiDirJet::constant(k, 1.0).add(&observed_g_jet.mul(&observed_g_jet));
+        let c_jet = one_plus_b2.compose_unary(unary_derivatives_sqrt(one_plus_b2.coeff(0)));
+
+        let a0_jet = q0_jet.mul(&c_jet);
+        let a1_jet = q1_jet.mul(&c_jet);
+        let ad1_jet = qd1_jet.mul(&c_jet);
+
+        let z_jet = MultiDirJet::constant(k, zi);
+        let eta0_jet = a0_jet.add(&observed_g_jet.mul(&z_jet));
+        let eta1_jet = a1_jet.add(&observed_g_jet.mul(&z_jet));
+
+        let neg_eta0 = eta0_jet.scale(-1.0);
+        let entry_term = neg_eta0
+            .compose_unary(unary_derivatives_neglog_phi(neg_eta0.coeff(0), wi))
+            .scale(-1.0);
+
+        let neg_eta1 = eta1_jet.scale(-1.0);
+        let exit_term = neg_eta1.compose_unary(unary_derivatives_neglog_phi(
+            neg_eta1.coeff(0),
+            wi * (1.0 - di),
+        ));
+
+        let event_density_term = if di > 0.0 {
+            eta1_jet
+                .compose_unary(unary_derivatives_log_normal_pdf(eta1_jet.coeff(0)))
+                .scale(-wi * di)
+        } else {
+            MultiDirJet::zero(k)
+        };
+
+        let qd1_lower = self.time_derivative_lower_bound();
+        let qd1_val_chk = qd1_jet.coeff(0);
+        let ad1_val = ad1_jet.coeff(0);
+        if survival_derivative_guard_violated(qd1_val_chk, qd1_lower) {
+            return Err(format!(
+                "survival marginal-slope monotonicity violated at row {row}: raw time derivative={qd1_val_chk:.3e} must be at least derivative_guard={qd1_lower:.3e}; transformed time derivative={ad1_val:.3e}"
+            ));
+        }
+        let time_deriv_term = if di > 0.0 {
+            ad1_jet
+                .compose_unary(unary_derivatives_log(ad1_val))
+                .scale(-wi * di)
+        } else {
+            MultiDirJet::zero(k)
+        };
+
+        let total = exit_term
+            .add(&entry_term)
+            .add(&event_density_term)
+            .add(&time_deriv_term);
+
+        Ok(total)
+    }
+
+    /// Build the row's third-order contracted tensor `T[a][b] = ∂_{e_a} ∂_{e_b} ∂_{dir}` of NLL_i
+    /// against the four primary axes (a, b ∈ {0..N_PRIMARY}). Six off-diagonal
+    /// entries are read from a single batched k=5 jet over [e_0..e_3, dir];
+    /// four diagonal entries (a == b) need order-3 in a single basis axis and
+    /// fall back to a k=3 jet [e_a, e_a, dir]. Result is symmetric.
+    fn row_primary_third_contracted_batched(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        dir: ArrayView1<'_, f64>,
+    ) -> Result<[[f64; 4]; 4], String> {
+        let e0 = unit_primary_direction_ref(0).view();
+        let e1 = unit_primary_direction_ref(1).view();
+        let e2 = unit_primary_direction_ref(2).view();
+        let e3 = unit_primary_direction_ref(3).view();
+        // One k=5 jet covers all 6 off-diagonal (a < b) entries via masks
+        // `(1<<a) | (1<<b) | (1<<4)`.
+        let batched =
+            self.row_neglog_directional_jet_batched(row, block_states, &[e0, e1, e2, e3, dir])?;
+        let dir_bit = 1usize << 4;
+        let mut r = [[0.0_f64; 4]; 4];
+        for a in 0..N_PRIMARY {
+            for b in (a + 1)..N_PRIMARY {
+                let mask = (1usize << a) | (1usize << b) | dir_bit;
+                let value = batched.coeff(mask);
+                r[a][b] = value;
+                r[b][a] = value;
+            }
+        }
+        // Diagonal entries: ∂²_{e_a} ∂_{dir} require two copies of e_a in
+        // distinct bit positions. A k=3 jet [e_a, e_a, dir] read at full
+        // mask (7) supplies that.
+        for a in 0..N_PRIMARY {
+            let ea = unit_primary_direction_ref(a).view();
+            let diag_jet =
+                self.row_neglog_directional_jet_batched(row, block_states, &[ea, ea, dir])?;
+            r[a][a] = diag_jet.coeff(diag_jet.full_mask());
+        }
+        Ok(r)
+    }
+
+    /// Build the row's fourth-order contracted tensor
+    /// `T[a][b] = ∂_{e_a} ∂_{e_b} ∂_{dir_u} ∂_{dir_v}` of NLL_i, mirrored.
+    fn row_primary_fourth_contracted_batched(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        dir_u: ArrayView1<'_, f64>,
+        dir_v: ArrayView1<'_, f64>,
+    ) -> Result<[[f64; 4]; 4], String> {
+        let e0 = unit_primary_direction_ref(0).view();
+        let e1 = unit_primary_direction_ref(1).view();
+        let e2 = unit_primary_direction_ref(2).view();
+        let e3 = unit_primary_direction_ref(3).view();
+        // One k=6 jet covers all 6 off-diagonal (a < b) entries via masks
+        // `(1<<a) | (1<<b) | (1<<4) | (1<<5)`.
+        let batched = self.row_neglog_directional_jet_batched(
+            row,
+            block_states,
+            &[e0, e1, e2, e3, dir_u, dir_v],
+        )?;
+        let u_bit = 1usize << 4;
+        let v_bit = 1usize << 5;
+        let mut r = [[0.0_f64; 4]; 4];
+        for a in 0..N_PRIMARY {
+            for b in (a + 1)..N_PRIMARY {
+                let mask = (1usize << a) | (1usize << b) | u_bit | v_bit;
+                let value = batched.coeff(mask);
+                r[a][b] = value;
+                r[b][a] = value;
+            }
+        }
+        for a in 0..N_PRIMARY {
+            let ea = unit_primary_direction_ref(a).view();
+            let diag_jet = self.row_neglog_directional_jet_batched(
+                row,
+                block_states,
+                &[ea, ea, dir_u, dir_v],
+            )?;
+            r[a][a] = diag_jet.coeff(diag_jet.full_mask());
+        }
+        Ok(r)
     }
 
     /// Compute per-row primary gradient and Hessian using the closed-form
@@ -6339,14 +6550,13 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         dir: ArrayView1<'_, f64>,
     ) -> Result<Array2<f64>, String> {
+        // Batched path delegating to the shared k=5 jet helper. The stack
+        // tensor is then copied once into Array2 at the API boundary.
+        let r = self.row_primary_third_contracted_batched(row, block_states, dir)?;
         let mut out = Array2::<f64>::zeros((N_PRIMARY, N_PRIMARY));
         for a in 0..N_PRIMARY {
-            let da = unit_primary_direction_ref(a).view();
-            for b in a..N_PRIMARY {
-                let db = unit_primary_direction_ref(b).view();
-                let value = self.row_neglog_directional_refs(row, block_states, &[da, db, dir])?;
-                out[[a, b]] = value;
-                out[[b, a]] = value;
+            for b in 0..N_PRIMARY {
+                out[[a, b]] = r[a][b];
             }
         }
         Ok(out)
@@ -9298,15 +9508,12 @@ impl SurvivalMarginalSlopeFamily {
         dir_u: ArrayView1<'_, f64>,
         dir_v: ArrayView1<'_, f64>,
     ) -> Result<Array2<f64>, String> {
+        // Batched path delegating to the shared k=6 jet helper.
+        let r = self.row_primary_fourth_contracted_batched(row, block_states, dir_u, dir_v)?;
         let mut out = Array2::<f64>::zeros((N_PRIMARY, N_PRIMARY));
         for a in 0..N_PRIMARY {
-            let da = unit_primary_direction_ref(a).view();
-            for b in a..N_PRIMARY {
-                let db = unit_primary_direction_ref(b).view();
-                let value =
-                    self.row_neglog_directional_refs(row, block_states, &[da, db, dir_u, dir_v])?;
-                out[[a, b]] = value;
-                out[[b, a]] = value;
+            for b in 0..N_PRIMARY {
+                out[[a, b]] = r[a][b];
             }
         }
         Ok(out)
@@ -11554,25 +11761,13 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
     }
 
     fn row_third_contracted(&self, row: usize, dir: &[f64; 4]) -> Result<[[f64; 4]; 4], String> {
-        // Zero-allocation hot path: views over stack arrays, fused contraction
-        // loop writes directly into the [[f64;4];4] result without allocating
-        // an intermediate Array1 or Array2.
+        // Batched path: one k=5 MultiDirJet [e_0..e_3, dir] covers all 6
+        // off-diagonal (a,b) entries via mask reads; 4 small k=3 jets handle
+        // diagonal ∂²_{e_a} ∂_{dir} entries. Replaces the legacy 10 separate
+        // calls into row_neglog_directional_refs.
         let dir_view = ndarray::aview1(&dir[..]);
-        let mut r = [[0.0_f64; 4]; 4];
-        for a in 0..N_PRIMARY {
-            let da = unit_primary_direction_ref(a).view();
-            for b in a..N_PRIMARY {
-                let db = unit_primary_direction_ref(b).view();
-                let value = self.family.row_neglog_directional_refs(
-                    row,
-                    &self.block_states,
-                    &[da, db, dir_view],
-                )?;
-                r[a][b] = value;
-                r[b][a] = value;
-            }
-        }
-        Ok(r)
+        self.family
+            .row_primary_third_contracted_batched(row, &self.block_states, dir_view)
     }
 
     fn row_fourth_contracted(
@@ -11581,25 +11776,13 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
         dir_u: &[f64; 4],
         dir_v: &[f64; 4],
     ) -> Result<[[f64; 4]; 4], String> {
-        // Zero-allocation hot path: views over stack arrays, fused contraction
-        // loop writes directly into the [[f64;4];4] result.
+        // Batched path: one k=6 MultiDirJet [e_0..e_3, dir_u, dir_v] covers
+        // the 6 off-diagonal (a,b) entries; 4 k=4 jets handle the diagonal
+        // ∂²_{e_a} ∂_{dir_u} ∂_{dir_v} entries.
         let u_view = ndarray::aview1(&dir_u[..]);
         let v_view = ndarray::aview1(&dir_v[..]);
-        let mut r = [[0.0_f64; 4]; 4];
-        for a in 0..N_PRIMARY {
-            let da = unit_primary_direction_ref(a).view();
-            for b in a..N_PRIMARY {
-                let db = unit_primary_direction_ref(b).view();
-                let value = self.family.row_neglog_directional_refs(
-                    row,
-                    &self.block_states,
-                    &[da, db, u_view, v_view],
-                )?;
-                r[a][b] = value;
-                r[b][a] = value;
-            }
-        }
-        Ok(r)
+        self.family
+            .row_primary_fourth_contracted_batched(row, &self.block_states, u_view, v_view)
     }
 }
 
@@ -19372,5 +19555,358 @@ mod tests {
             "joint Hessian flex-no-wiggle dH operator HT rel {}",
             rel
         );
+    }
+
+    /// Build a small flex fixture wired to a fresh `SurvivalInterceptWarmStartCache`.
+    /// `n` is small so we can iterate over every row in the assertion loop, and
+    /// the score-warp deviation is configured non-trivially so the calibration
+    /// solver has to actually iterate (no exact-zero short-circuit applies in
+    /// survival: there's no degenerate fast path equivalent to bernoulli's
+    /// `exact_zero_deviation`, so every cold solve goes through the bracket).
+    fn make_warm_start_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
+        let mut family = make_flex_no_wiggle_test_family(n);
+        family.intercept_warm_starts = Some(new_intercept_warm_start_cache(n));
+        family
+    }
+
+    /// Exercise the warm-start cache end-to-end on the gradient/Hessian path:
+    /// 1. Solve every row's (entry, exit) intercepts on a cold family to get
+    ///    the exact converged `a` values.
+    /// 2. Build a warm family with the cache pre-populated to those values.
+    /// 3. Build a cold family with the cache initialised but empty (NaN).
+    /// 4. Assert the per-row (NLL, gradient, Hessian) produced by both
+    ///    families are numerically identical to ~1e-12 relative — the cache
+    ///    must not perturb the answer.
+    /// 5. Assert the warm family's evaluator-call count is strictly lower
+    ///    than the cold family's — if warm starts are silently bypassed
+    ///    (e.g., None slot threaded through) the counts would match and this
+    ///    assertion would fire.
+    /// Build flex block states with a *non-trivial* score-warp coefficient
+    /// vector so the cold closed-form rigid seed is meaningfully off-root.
+    /// Without this, beta_h = 0 leaves the score warp as the identity and the
+    /// rigid seed equals the converged intercept exactly — the cold and warm
+    /// paths both finish in one evaluator call and the count assertion can't
+    /// distinguish them. We perturb a single basis coordinate by a small
+    /// amount (well inside the monotone-feasible region for the test basis).
+    fn flex_no_wiggle_perturbed_test_block_states(
+        family: &SurvivalMarginalSlopeFamily,
+    ) -> Vec<ParameterBlockState> {
+        let mut states = flex_no_wiggle_test_block_states(family);
+        if let Some(score_state) = states.get_mut(3) {
+            if score_state.beta.len() >= 2 {
+                score_state.beta[0] = 0.18;
+                score_state.beta[1] = -0.12;
+            } else if !score_state.beta.is_empty() {
+                score_state.beta[0] = 0.18;
+            }
+        }
+        states
+    }
+
+    #[test]
+    fn survival_intercept_warm_starts_match_cold_and_reduce_eval_count() {
+        let n = 8usize;
+        let states = flex_no_wiggle_perturbed_test_block_states(
+            &make_flex_no_wiggle_test_family(n),
+        );
+
+        // Step 1: cold family without any cache — capture the converged (a0, a1)
+        // per row so we can pre-populate the warm cache.
+        let cold_no_cache = make_flex_no_wiggle_test_family(n);
+        assert!(cold_no_cache.intercept_warm_starts.is_none());
+        assert!(cold_no_cache.effective_flex_active(&states).unwrap());
+        let beta_h = cold_no_cache.flex_score_beta(&states).unwrap();
+        let beta_w = cold_no_cache.flex_link_beta(&states).unwrap();
+        let g_block = &states[2].eta;
+
+        let mut q0_per_row = Vec::with_capacity(n);
+        let mut q1_per_row = Vec::with_capacity(n);
+        let mut qd1_per_row = Vec::with_capacity(n);
+        let mut a0_per_row = Vec::with_capacity(n);
+        let mut a1_per_row = Vec::with_capacity(n);
+        for row in 0..n {
+            let q_geom = cold_no_cache.row_dynamic_q_values(row, &states).unwrap();
+            q0_per_row.push(q_geom.q0);
+            q1_per_row.push(q_geom.q1);
+            qd1_per_row.push(q_geom.qd1);
+            let (a0, _) = cold_no_cache
+                .solve_row_survival_intercept(q_geom.q0, g_block[row], beta_h, beta_w)
+                .unwrap();
+            let (a1, _) = cold_no_cache
+                .solve_row_survival_intercept(q_geom.q1, g_block[row], beta_h, beta_w)
+                .unwrap();
+            a0_per_row.push(a0);
+            a1_per_row.push(a1);
+        }
+
+        // Step 2: warm family with the cache pre-populated to the converged
+        // intercepts. The solver should accept these as the seed and converge
+        // in ~0–1 refine iters instead of the cold bracket walk.
+        let warm_family = make_warm_start_test_family(n);
+        {
+            let cache = warm_family
+                .intercept_warm_starts
+                .as_ref()
+                .expect("warm cache present");
+            for row in 0..n {
+                cache.store(row, SurvivalInterceptSlotKind::Entry, a0_per_row[row]);
+                cache.store(row, SurvivalInterceptSlotKind::Exit, a1_per_row[row]);
+            }
+        }
+
+        // Step 3: cold family with cache attached but NaN-initialised. This
+        // exercises the warm-start code path on the cold-start side, so any
+        // diff vs the warm-populated family isolates the seed behaviour.
+        let cold_family = make_warm_start_test_family(n);
+
+        let primary = flex_primary_slices(&warm_family);
+
+        // Step 4: per-row (NLL, gradient, Hessian) must match to ~1e-12 rel.
+        survival_intercept_test_counter::reset();
+        let mut warm_results = Vec::with_capacity(n);
+        for row in 0..n {
+            let res = warm_family
+                .compute_row_flex_primary_gradient_hessian_from_parts(
+                    row,
+                    q0_per_row[row],
+                    q1_per_row[row],
+                    qd1_per_row[row],
+                    g_block[row],
+                    beta_h,
+                    beta_w,
+                    &primary,
+                )
+                .expect("warm gradient/hessian");
+            warm_results.push(res);
+        }
+        let warm_evals = survival_intercept_test_counter::get();
+
+        survival_intercept_test_counter::reset();
+        let mut cold_results = Vec::with_capacity(n);
+        for row in 0..n {
+            let res = cold_family
+                .compute_row_flex_primary_gradient_hessian_from_parts(
+                    row,
+                    q0_per_row[row],
+                    q1_per_row[row],
+                    qd1_per_row[row],
+                    g_block[row],
+                    beta_h,
+                    beta_w,
+                    &primary,
+                )
+                .expect("cold gradient/hessian");
+            cold_results.push(res);
+        }
+        let cold_evals = survival_intercept_test_counter::get();
+
+        for row in 0..n {
+            let (warm_nll, warm_grad, warm_hess) = &warm_results[row];
+            let (cold_nll, cold_grad, cold_hess) = &cold_results[row];
+
+            let nll_rel = (warm_nll - cold_nll).abs()
+                / (1e-300_f64).max(cold_nll.abs().max(warm_nll.abs()));
+            assert!(
+                nll_rel <= 1e-12,
+                "row {row}: warm NLL {warm_nll:.17e} vs cold NLL {cold_nll:.17e}, rel {nll_rel:.3e}",
+            );
+
+            let grad_max_abs = cold_grad.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+            let grad_rel = warm_grad
+                .iter()
+                .zip(cold_grad.iter())
+                .map(|(w, c)| (w - c).abs())
+                .fold(0.0_f64, f64::max)
+                / (1e-300_f64).max(grad_max_abs);
+            assert!(
+                grad_rel <= 1e-12,
+                "row {row}: warm vs cold gradient drift rel {grad_rel:.3e}",
+            );
+
+            let hess_max_abs = cold_hess.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+            let hess_rel = warm_hess
+                .iter()
+                .zip(cold_hess.iter())
+                .map(|(w, c)| (w - c).abs())
+                .fold(0.0_f64, f64::max)
+                / (1e-300_f64).max(hess_max_abs);
+            assert!(
+                hess_rel <= 1e-12,
+                "row {row}: warm vs cold Hessian drift rel {hess_rel:.3e}",
+            );
+        }
+
+        // Step 5: warm-start path must spend strictly fewer evaluator calls
+        // than the cold path. If a future refactor accidentally threads `None`
+        // through `solve_row_survival_intercept_with_slot` (silently bypassing
+        // the cache), these two counts would be identical and the test fails
+        // loudly. The exact ratio depends on the bracket-walk dynamics but
+        // pre-seeding at the converged root collapses the safeguarded refine
+        // loop into a 1–2-step Newton confirmation.
+        assert!(
+            warm_evals > 0,
+            "warm-start path made zero evaluator calls — counter not wired?"
+        );
+        assert!(
+            cold_evals > 0,
+            "cold-start path made zero evaluator calls — counter not wired?"
+        );
+        assert!(
+            warm_evals < cold_evals,
+            "warm-start eval count {warm_evals} is not lower than cold {cold_evals}; \
+             warm starts may be silently bypassed",
+        );
+    }
+
+    /// Regression: the batched k=5 / k=6 jet path for `row_primary_third_contracted`
+    /// and `row_primary_fourth_contracted` must agree to ~1e-12 relative with
+    /// the legacy 10-call path that built a fresh k=3 / k=4 jet per
+    /// upper-triangular (a, b) cell. Exercises both score_warp and link_dev
+    /// in the same fixture as the operator-vs-dense regression so the
+    /// composed-unary derivative chain is non-trivial.
+    #[test]
+    fn row_third_and_fourth_contracted_batched_matches_legacy_per_cell() {
+        let score_runtime = test_deviation_runtime();
+        let link_runtime = test_deviation_runtime();
+        let marginal_design = array![[0.7, -0.2], [0.1, 0.6]];
+        let marginal_beta = array![0.35, -0.1];
+        let logslope_design = array![[1.0], [0.5]];
+        let logslope_beta = array![0.2];
+        let (time_wiggle_knots, time_wiggle_degree, time_wiggle_ncols) =
+            standard_test_time_wiggle();
+        let family = SurvivalMarginalSlopeFamily {
+            n: 2,
+            event: Arc::new(array![1.0, 0.0]),
+            weights: Arc::new(array![1.0, 0.8]),
+            z: Arc::new(array![0.15, -0.25]),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(array![
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0]
+            ]),
+            design_exit: DesignMatrix::from(array![
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0]
+            ]),
+            design_derivative_exit: DesignMatrix::from(array![
+                [1.0, 0.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0, 0.0]
+            ]),
+            offset_entry: Arc::new(array![0.05, -0.02]),
+            offset_exit: Arc::new(array![0.15, 0.08]),
+            derivative_offset_exit: Arc::new(array![0.9, 1.1]),
+            marginal_design: DesignMatrix::from(marginal_design.clone()),
+            logslope_design: DesignMatrix::from(logslope_design.clone()),
+            score_warp: Some(score_runtime.clone()),
+            link_dev: Some(link_runtime.clone()),
+            time_linear_constraints: None,
+            time_wiggle_knots: Some(time_wiggle_knots),
+            time_wiggle_degree: Some(time_wiggle_degree),
+            time_wiggle_ncols,
+            intercept_warm_starts: None,
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.0, 0.08, -0.03, 0.02, -0.01],
+                eta: array![0.0, 0.0],
+            },
+            ParameterBlockState {
+                beta: marginal_beta.clone(),
+                eta: marginal_design.dot(&marginal_beta),
+            },
+            ParameterBlockState {
+                beta: logslope_beta.clone(),
+                eta: logslope_design.dot(&logslope_beta),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(score_runtime.basis_dim()),
+                eta: Array1::zeros(2),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(link_runtime.basis_dim()),
+                eta: Array1::zeros(2),
+            },
+        ];
+
+        // Use two non-axis-aligned, non-orthogonal directions so the
+        // contracted tensors stress every term of the Faà di Bruno expansion
+        // (especially the diagonal cells that hit a degenerate `[e_a, e_a, …]`
+        // jet in the batched path).
+        let dir_u = array![0.31, -0.42, 0.18, 0.27];
+        let dir_v = array![-0.11, 0.55, -0.07, 0.14];
+
+        for row in 0..family.n {
+            // Legacy third: 10 k=3 jet calls.
+            let mut legacy_third = [[0.0_f64; 4]; 4];
+            for a in 0..N_PRIMARY {
+                let da = unit_primary_direction_ref(a).view();
+                for b in a..N_PRIMARY {
+                    let db = unit_primary_direction_ref(b).view();
+                    let value = family
+                        .row_neglog_directional_refs(
+                            row,
+                            &block_states,
+                            &[da, db, dir_u.view()],
+                        )
+                        .expect("legacy third per-cell");
+                    legacy_third[a][b] = value;
+                    legacy_third[b][a] = value;
+                }
+            }
+            let batched_third = family
+                .row_primary_third_contracted_batched(row, &block_states, dir_u.view())
+                .expect("batched third");
+            for a in 0..N_PRIMARY {
+                for b in 0..N_PRIMARY {
+                    let l = legacy_third[a][b];
+                    let r = batched_third[a][b];
+                    let denom = l.abs().max(1.0);
+                    let rel = (l - r).abs() / denom;
+                    assert!(
+                        rel <= 1e-12,
+                        "row {row} third[{a}][{b}]: legacy={l:.17e} batched={r:.17e} rel={rel:.3e}",
+                    );
+                }
+            }
+
+            // Legacy fourth: 10 k=4 jet calls.
+            let mut legacy_fourth = [[0.0_f64; 4]; 4];
+            for a in 0..N_PRIMARY {
+                let da = unit_primary_direction_ref(a).view();
+                for b in a..N_PRIMARY {
+                    let db = unit_primary_direction_ref(b).view();
+                    let value = family
+                        .row_neglog_directional_refs(
+                            row,
+                            &block_states,
+                            &[da, db, dir_u.view(), dir_v.view()],
+                        )
+                        .expect("legacy fourth per-cell");
+                    legacy_fourth[a][b] = value;
+                    legacy_fourth[b][a] = value;
+                }
+            }
+            let batched_fourth = family
+                .row_primary_fourth_contracted_batched(
+                    row,
+                    &block_states,
+                    dir_u.view(),
+                    dir_v.view(),
+                )
+                .expect("batched fourth");
+            for a in 0..N_PRIMARY {
+                for b in 0..N_PRIMARY {
+                    let l = legacy_fourth[a][b];
+                    let r = batched_fourth[a][b];
+                    let denom = l.abs().max(1.0);
+                    let rel = (l - r).abs() / denom;
+                    assert!(
+                        rel <= 1e-12,
+                        "row {row} fourth[{a}][{b}]: legacy={l:.17e} batched={r:.17e} rel={rel:.3e}",
+                    );
+                }
+            }
+        }
     }
 }
