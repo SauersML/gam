@@ -586,7 +586,7 @@ pub struct TimeBlockInput {
 }
 
 pub(crate) fn structural_time_coefficient_constraints(
-    design_derivative_exit: &Array2<f64>,
+    design_derivative_exit: &DesignMatrix,
     derivative_offset_exit: &Array1<f64>,
     derivative_guard: f64,
 ) -> Result<Option<LinearInequalityConstraints>, String> {
@@ -4374,7 +4374,7 @@ fn validate_time_block(
         );
     }
     structural_time_coefficient_lower_bounds_with_monotone_time_wiggle(
-        &b.design_derivative_exit.to_dense(),
+        &b.design_derivative_exit,
         &b.derivative_offset_exit,
         derivative_guard,
         monotone_time_wiggle_ncols,
@@ -4453,7 +4453,7 @@ fn lower_bound_constraints(lower_bounds: &Array1<f64>) -> Option<LinearInequalit
 }
 
 fn structural_time_coefficient_lower_bounds(
-    design_derivative_exit: &Array2<f64>,
+    design_derivative_exit: &DesignMatrix,
     derivative_offset_exit: &Array1<f64>,
     lower_bound: f64,
 ) -> Result<Option<Array1<f64>>, String> {
@@ -4477,6 +4477,7 @@ fn structural_time_coefficient_lower_bounds(
     const FEASIBILITY_TOL: f64 = 1e-12;
 
     let p = design_derivative_exit.ncols();
+    let nrows = design_derivative_exit.nrows();
     let mut lower_bounds = Array1::from_elem(p, f64::NEG_INFINITY);
     let mut has_structural_support = false;
     for (row, &offset) in derivative_offset_exit.iter().enumerate() {
@@ -4491,13 +4492,23 @@ fn structural_time_coefficient_lower_bounds(
             ));
         }
     }
+    // Stream column-by-column so operator-backed (Lazy) designs never have to
+    // materialize as a single nrows×ncols dense buffer. `extract_column` is
+    // O(n) for dense, O(nnz_j) for sparse, and O(matvec_n) for lazy operators
+    // — the operator-form path the strict policy demands.
     let mut col_maxes: Vec<(usize, f64)> = Vec::with_capacity(p.min(8));
     let mut total_subtol_nonzeros = 0_usize;
     for col in 0..p {
+        let column = design_derivative_exit.extract_column(col);
+        if column.len() != nrows {
+            return Err(format!(
+                "structural time coefficient bounds: extract_column returned {} entries for column {col}, expected {nrows}",
+                column.len()
+            ));
+        }
         let mut has_positive_support = false;
         let mut col_max = 0.0_f64;
-        for row in 0..design_derivative_exit.nrows() {
-            let value = design_derivative_exit[[row, col]];
+        for (row, &value) in column.iter().enumerate() {
             if !value.is_finite() {
                 return Err(format!(
                     "structural time coefficient bounds require finite derivative design entries; found row {row}, column {col}"
@@ -4562,7 +4573,7 @@ fn structural_time_coefficient_lower_bounds(
         if total_subtol_nonzeros > 0 {
             log::warn!(
                 "structural time coefficient bounds: no derivative-active column on this candidate's exit-time design ({} rows × {} cols, sub-tolerance nonzero entries (1e-30 < |v| ≤ {:.0e}): {}, first-8 col max(|.|): {:?}); skipping the structural lower-bound ridge — fit may converge to a non-monotone-in-time hazard",
-                design_derivative_exit.nrows(),
+                nrows,
                 p,
                 DERIVATIVE_TOL,
                 total_subtol_nonzeros,
@@ -4575,7 +4586,7 @@ fn structural_time_coefficient_lower_bounds(
 }
 
 fn structural_time_coefficient_lower_bounds_with_monotone_time_wiggle(
-    design_derivative_exit: &Array2<f64>,
+    design_derivative_exit: &DesignMatrix,
     derivative_offset_exit: &Array1<f64>,
     lower_bound: f64,
     monotone_time_wiggle_ncols: usize,
@@ -4670,7 +4681,7 @@ fn prepare_identified_time_block(
     let design_derivative_exit = input.design_derivative_exit.to_dense();
     let penalties = input.penalties.clone();
     let coefficient_lower_bounds = structural_time_coefficient_lower_bounds_with_monotone_time_wiggle(
-        &design_derivative_exit,
+        &input.design_derivative_exit,
         &input.derivative_offset_exit,
         derivative_guard,
         monotone_time_wiggle_ncols,
