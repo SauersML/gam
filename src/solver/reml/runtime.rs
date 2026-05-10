@@ -2470,8 +2470,51 @@ impl<'a> RemlState<'a> {
             .eigh(Side::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
 
-        let (structural_rank, log_det) =
-            positive_penalty_rank_and_logdet(evals.as_slice().unwrap());
+        // Use the STRUCTURAL penalty rank from the canonical-penalty
+        // decomposition rather than a numerical-threshold rank assessment.
+        //
+        // Why: the threshold path (`positive_penalty_rank_and_logdet`) uses
+        // `100·p·ε_machine·max_ev` as its cutoff. With the ridge floor
+        // added to `s_lambda` above, the null-direction eigenvalues sit at
+        // `ridge` (a fixed number) while `max_ev` scales linearly with λ,
+        // so `λ × ε_machine` crossing the ridge floor flips the rank
+        // assessment between p and the true structural rank as ρ varies.
+        // The result was a step change in `penalty_rank`, which in turn
+        // toggled the rank-deficient LAML projection in the cost — a
+        // discrete cliff that biased the outer optimizer toward
+        // over-smoothed local minima (see fuzz seed=92: ~18-unit cost drop
+        // between ρ=9 and ρ=12 with no underlying smooth gradient).
+        //
+        // The structural rank is invariant in λ by construction (the
+        // basis fixes the null space), so the cost surface stays C∞ in ρ.
+        // We still take the eigh log-sum across the top
+        // `structural_rank` eigenvalues so that any column-rank-deficient
+        // basis (e.g. user-supplied data triggering a non-trivial QR
+        // pivot at construction) gets the same numerical log|S|+ as
+        // before — the only change is which eigenvalues count as
+        // "active", and that count is now anchored to the basis.
+        let p = e_transformed.ncols();
+        let structural_rank = if self.canonical_penalties.is_empty() {
+            let (rank, log_det) =
+                positive_penalty_rank_and_logdet(evals.as_slice().unwrap());
+            return Ok((rank, log_det));
+        } else {
+            self.canonical_penalties
+                .iter()
+                .map(crate::construction::CanonicalPenalty::rank)
+                .sum::<usize>()
+                .min(p)
+        };
+
+        // eigh returns eigenvalues sorted ascending; the structural null
+        // directions live at the bottom of the spectrum. Sum the top
+        // `structural_rank` log-eigenvalues for log|S|+.
+        let evals_slice = evals.as_slice().unwrap();
+        let log_det: f64 = evals_slice
+            .iter()
+            .skip(p.saturating_sub(structural_rank))
+            .filter_map(|&ev| if ev > 0.0 { Some(ev.ln()) } else { None })
+            .sum();
 
         Ok((structural_rank, log_det))
     }

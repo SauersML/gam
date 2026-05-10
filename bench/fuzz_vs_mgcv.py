@@ -55,6 +55,7 @@ import inspect
 import json
 import math
 import os
+import secrets
 import subprocess
 import tempfile
 import time
@@ -85,6 +86,7 @@ from run_suite import (
 ROOT = Path(__file__).resolve().parent.parent
 RUST_BINARY = ROOT / "target" / "release" / "gam"
 RESULTS_FILE = Path(__file__).resolve().parent / "fuzz_results.jsonl"
+META_FILE = Path(__file__).resolve().parent / "fuzz_results.meta.json"
 DEFAULT_R_TIMEOUT = 180
 DEFAULT_RUST_TIMEOUT = 180
 
@@ -1662,7 +1664,21 @@ def main() -> None:
     parser.add_argument("--n-trials", type=int, default=_default_n_trials(),
                         help="Number of trials. Defaults track FUZZ_DEPTH "
                              "(lean=100 / default=200 / deep=500 / heavy=1000).")
-    parser.add_argument("--seed-start", type=int, default=42)
+    parser.add_argument(
+        "--seed-start",
+        type=int,
+        default=None,
+        help=(
+            "Starting integer seed for scenario generation. Each scenario "
+            "seed is fully deterministic (same seed -> same n, basis, signal, "
+            "noise, x distribution, etc.), so passing a specific value "
+            "reproduces the exact set of trials a previous run produced. "
+            "When omitted, the harness chooses a fresh seed from a "
+            "system-entropy source so different invocations explore different "
+            "scenario windows -- the chosen value is printed prominently and "
+            "saved to bench/fuzz_results.meta.json for later replay."
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--top", type=int, default=15)
     parser.add_argument("--family", type=str, default=None, choices=["gaussian", "binomial"])
@@ -1697,6 +1713,33 @@ def main() -> None:
     if "ok" not in (r_check.stdout or ""):
         print("R + mgcv not available"); sys.exit(1)
 
+    # Seed-start selection: deterministic when --seed-start is passed,
+    # entropy-driven when omitted. Each invocation that does not pin a value
+    # explores a different scenario window so the harness keeps surfacing
+    # new failure modes over time, but the chosen seed is printed and
+    # persisted to META_FILE so any specific run is exactly replayable via
+    # `--seed-start <value>`.
+    #
+    # Resume semantics: with --resume, fall back to the previously-saved
+    # seed_start in META_FILE so the continuation lands in the same window
+    # the original run was exploring. Re-rolling would shift the resumed
+    # batch onto unrelated scenarios, defeating the point of resume.
+    seed_start_explicit = args.seed_start is not None
+    if not seed_start_explicit:
+        if args.resume and META_FILE.exists():
+            try:
+                saved = json.loads(META_FILE.read_text())
+                if isinstance(saved, dict) and isinstance(saved.get("seed_start"), int):
+                    args.seed_start = int(saved["seed_start"])
+            except (OSError, json.JSONDecodeError):
+                pass
+    if args.seed_start is None:
+        # 31-bit positive int: comfortably within numpy.random.RandomState's
+        # accepted range (0..2**32-1) while staying small enough to print
+        # cleanly. Drawn from the OS entropy pool, not time, so two
+        # invocations within the same wallclock second still diverge.
+        args.seed_start = secrets.randbelow(2**31 - 1) + 1
+
     existing_seeds = set()
     results = []
     if not args.resume and RESULTS_FILE.exists():
@@ -1717,7 +1760,10 @@ def main() -> None:
     if target_new_trials == 0:
         print_leaderboard(results, top_n=args.top); return
 
+    seed_origin = "explicit" if seed_start_explicit else "auto (system entropy)"
     print(f"Running {target_new_trials} trials")
+    print(f"  Seed start:        {args.seed_start}  [{seed_origin}]")
+    print(f"  Replay this run:   --seed-start {args.seed_start}")
     print(f"  Smooth functions:  {len(SMOOTH_FN)} 1D + {len(SMOOTH_FN_2D)} 2D")
     print(f"  Noise types:       {len(NOISE_FN)}")
     print(f"  X distributions:   {len(XDIST_FN)}")
@@ -1728,7 +1774,34 @@ def main() -> None:
     print(f"  R timeout:         {args.r_timeout}s")
     print(f"  Time budget:       {args.max_total_seconds}s" if args.max_total_seconds else "  Time budget:       none")
     print(f"  Scenario cost cap: {args.max_scenario_cost:g}" if args.max_scenario_cost is not None else "  Scenario cost cap: none")
-    print(f"  Results: {RESULTS_FILE}\n")
+    print(f"  Results: {RESULTS_FILE}")
+    print(f"  Metadata: {META_FILE}\n")
+
+    # Persist the chosen seed (and the rest of the invocation) so any local
+    # replay can reproduce the exact set of trials this run produced -- the
+    # CI run prints the seed to logs, but META_FILE is the structured
+    # source of truth that survives log rotation. `--resume` deliberately
+    # uses the existing seed_start written here, so a replayed run
+    # continues from the same window rather than re-rolling.
+    META_FILE.write_text(
+        json.dumps(
+            {
+                "seed_start": args.seed_start,
+                "seed_start_origin": seed_origin,
+                "n_trials": args.n_trials,
+                "family": args.family,
+                "model_type": args.model_type,
+                "basis": args.basis,
+                "max_scenario_cost": args.max_scenario_cost,
+                "rust_timeout": args.rust_timeout,
+                "r_timeout": args.r_timeout,
+                "max_total_seconds": args.max_total_seconds,
+                "wallclock_started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            },
+            indent=2,
+        )
+        + "\n"
+    )
 
     # Pre-generate enough runnable scenarios so cost-capped skips do not
     # lower coverage below the requested CI sample size.

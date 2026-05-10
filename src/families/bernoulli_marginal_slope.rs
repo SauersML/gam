@@ -13273,6 +13273,43 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         if block_states.len() != specs.len() {
             return Ok(None);
         }
+        // Auto-derive an outer-score subsample at biobank scale. The full
+        // row trace is O(n × cell_work); stratified Horvitz–Thompson
+        // subsampling produces an unbiased estimate at O(K × cell_work)
+        // with K/n ≈ 0.10. The auto-derived mask is only installed when
+        // the caller has not already provided one — explicit caller
+        // configuration always wins.
+        let auto_options;
+        let owned_options;
+        let options: &BlockwiseFitOptions = if options.outer_score_subsample.is_some() {
+            options
+        } else {
+            auto_options = crate::families::marginal_slope_shared::AutoOuterSubsampleOptions::default();
+            let stratum_secondary: Vec<u8> = self.y.iter().map(|v| if *v > 0.5 { 1u8 } else { 0u8 }).collect();
+            match crate::families::marginal_slope_shared::auto_outer_score_subsample(
+                self.z.as_slice().expect("z must be contiguous"),
+                Some(&stratum_secondary),
+                &auto_options,
+            ) {
+                Some(mask) => {
+                    let mut cloned = options.clone();
+                    let n_full = mask.n_full;
+                    let k = mask.len();
+                    log::info!(
+                        "[BMS auto-subsample] n={} K={} fraction={:.3} expected_grad_noise={:.2}%",
+                        n_full,
+                        k,
+                        k as f64 / n_full.max(1) as f64,
+                        100.0 * (1.0 / (k as f64).sqrt())
+                            * (1.0 - k as f64 / n_full.max(1) as f64).sqrt()
+                    );
+                    cloned.outer_score_subsample = Some(std::sync::Arc::new(mask));
+                    owned_options = cloned;
+                    &owned_options
+                }
+                None => options,
+            }
+        };
         let ranges = Self::block_ranges_from_specs(specs);
         let total = ranges.last().map(|(_, end)| *end).unwrap_or(0);
         if total == 0 {
@@ -13397,10 +13434,19 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }
 
         let started = std::time::Instant::now();
-        let correction_traces = if let Some(workspace) = hessian_workspace.as_ref()
-            && let Some(traces) =
-                workspace.projected_directional_derivative_traces(factor, &directions)?
-        {
+        // The workspace's projected trace path is full-data only and
+        // does not consult `options.outer_score_subsample`. When a
+        // subsample is active (auto-derived above or explicitly
+        // supplied) we route through the family-side fallback which
+        // honors the mask; otherwise the workspace fast path is fine.
+        let workspace_traces = if options.outer_score_subsample.is_some() {
+            None
+        } else if let Some(workspace) = hessian_workspace.as_ref() {
+            workspace.projected_directional_derivative_traces(factor, &directions)?
+        } else {
+            None
+        };
+        let correction_traces = if let Some(traces) = workspace_traces {
             traces
         } else {
             let owned_cache =
