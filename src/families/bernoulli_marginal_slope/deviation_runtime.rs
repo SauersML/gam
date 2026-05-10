@@ -382,6 +382,84 @@ impl DeviationRuntime {
         })
     }
 
+    // The per-block `smoothness_nullspace_orthogonal_complement` transform
+    // above eliminates within-block polynomial aliasing (constants/linears in
+    // η_pilot) so the location block can carry the intercept. That handles
+    // single-flex-block configurations. When two flex blocks of η_pilot are
+    // simultaneously active (score-warp + linkwiggle), each is individually
+    // orthogonal to constants, but their column spans still overlap inside
+    // the orthogonal complement of constants — both are cubic I-spline bases
+    // of the same scalar argument. The overlap manifests as a near-null
+    // direction in the joint penalized Hessian: a linear combination of
+    // β_score_warp and β_link_dev that produces zero net η-contribution at
+    // the rigid-pilot training points yet costs only the (penalised) basis
+    // norm, so Newton steps along that direction blow up.
+    //
+    // Compose an external column transform `T` (shape `basis_dim × new_dim`)
+    // into the cubic span tables and monotonicity constraints. After this
+    // call every `design(...)`-style method returns matrices in the new
+    // `new_dim`-column parameterisation: `runtime.design(values) ==
+    // old_runtime.design(values) · T`. Penalties built later via
+    // `integrated_derivative_penalty_with_nullity` are also expressed in
+    // the new parameterisation.
+    //
+    // Used by `cross_orthogonalize_link_dev_against_score_warp` to enforce
+    // the joint-design identifiability invariant
+    // `A_train^T (C_train · T) = 0`, where `A_train` is the score-warp
+    // design at training points and `C_train` is the link-deviation design
+    // at the same points. The choice `T = null(A_train^T C_train)` makes
+    // the joint design `[X_loc | X_logslope | A | C·T]` full column rank
+    // (up to numerical tolerance), so `σ_min(joint H+S)` is bounded below
+    // by the smallest positive eigenvalue of S regardless of how β shifts
+    // the linear-predictor distribution. This generalises the per-block
+    // null-space drop above to the cross-block aliasing that arises
+    // whenever multiple flex blocks parameterise overlapping function
+    // classes.
+    pub(crate) fn compose_external_column_transform(
+        &mut self,
+        transform: &Array2<f64>,
+    ) -> Result<(), String> {
+        let old_dim = self.basis_dim;
+        if transform.nrows() != old_dim {
+            return Err(format!(
+                "DeviationRuntime cross-block transform shape mismatch: \
+                 transform rows={}, expected basis_dim={}",
+                transform.nrows(),
+                old_dim,
+            ));
+        }
+        let new_dim = transform.ncols();
+        if new_dim == 0 {
+            return Err(
+                "DeviationRuntime cross-block transform reduces basis dim to 0; \
+                 the candidate's column span is fully aliased by the anchor block"
+                    .to_string(),
+            );
+        }
+        if new_dim > old_dim {
+            return Err(format!(
+                "DeviationRuntime cross-block transform must not increase basis dim; \
+                 got new_dim={} from old_dim={}",
+                new_dim, old_dim,
+            ));
+        }
+        self.span_c0 = fast_ab(&self.span_c0, transform);
+        self.span_c1 = fast_ab(&self.span_c1, transform);
+        self.span_c2 = fast_ab(&self.span_c2, transform);
+        self.span_c3 = fast_ab(&self.span_c3, transform);
+        // `right_boundary_value_row` is a 1-D row vector of length basis_dim;
+        // right-multiplying by T (basis_dim × new_dim) gives the new row.
+        self.right_boundary_value_row = self.right_boundary_value_row.dot(transform);
+        // Monotonicity rows (n_constraints × basis_dim) follow the same
+        // right-multiplication. The constraint inequality `A β ≥ ε - 1`
+        // becomes `(A · T) β_new ≥ ε - 1` under the reparameterisation
+        // β = T β_new, so the row matrix is right-multiplied directly.
+        self.monotonicity_constraint_rows =
+            fast_ab(&self.monotonicity_constraint_rows, transform);
+        self.basis_dim = new_dim;
+        Ok(())
+    }
+
     // ── public field accessors ──
 
     pub fn degree(&self) -> usize {
@@ -956,4 +1034,6 @@ impl DeviationRuntime {
             ))
         }
     }
+
 }
+
