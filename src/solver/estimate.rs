@@ -1086,6 +1086,14 @@ pub struct ExternalOptimResult {
     pub standard_deviation: f64,
     pub iterations: usize,
     pub finalgrad_norm: f64,
+    /// True iff the outer optimizer reached a stationary point (gradient
+    /// norm below tolerance), as reported by the optimizer itself. False
+    /// when the run exhausted its iteration budget without reaching the
+    /// gradient tolerance. Downstream consumers should NOT assume that a
+    /// fit with `outer_converged == false` is unusable — it may still be
+    /// the best basin reached given the budget — but they must not treat
+    /// it as certified-converged either.
+    pub outer_converged: bool,
     pub pirls_status: crate::pirls::PirlsStatus,
     pub deviance: f64,
     /// Stable quadratic penalty term βᵀSβ, including any solver ridge quadratic.
@@ -2758,6 +2766,7 @@ where
         standard_deviation,
         iterations: iters,
         finalgrad_norm,
+        outer_converged: outer_result.converged,
         pirls_status,
         deviance: pirls_res.deviance,
         stable_penalty_term: pirls_res.stable_penalty_term,
@@ -4805,7 +4814,7 @@ where
         stable_penalty_term: result.stable_penalty_term,
         penalized_objective,
         outer_iterations: result.iterations,
-        outer_converged: true,
+        outer_converged: result.outer_converged,
         outer_gradient_norm: result.finalgrad_norm,
         standard_deviation: result.standard_deviation,
         covariance_conditional,

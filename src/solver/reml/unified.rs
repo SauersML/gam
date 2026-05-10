@@ -4789,6 +4789,22 @@ pub fn reml_laml_evaluate(
                 + 0.5 * (log_det_h - log_det_s)
                 + (denom / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
 
+            log::info!(
+                "[REML-COST gaussian] rho=[{}] dp={:.6e} phi={:.6e} log|H|={:.6e} log|S|+={:.6e} \
+                 hess_corr={:.6e} n-Mp={:.1} cost={:.6e}",
+                rho.iter()
+                    .map(|v| format!("{v:.3}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                dp_c,
+                phi,
+                log_det_h,
+                log_det_s,
+                solution.hessian_logdet_correction,
+                denom,
+                cost,
+            );
+
             (cost, phi, dp_cgrad, dp_cgrad2)
         }
         DispersionHandling::Fixed {

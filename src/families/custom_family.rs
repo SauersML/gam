@@ -9637,16 +9637,54 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 converged = true;
                 break;
             }
-            // No-progress break: a tiny accepted step paired with a
-            // tiny objective change means further iteration will not
-            // improve the iterate. Exit even if the residual has not
-            // reached its own tolerance — the rank-deficient null-mode
-            // case described in the line-search-failure path below.
+            // Post-step KKT-on-null certification.
+            //
+            // A tiny accepted step paired with a tiny objective change is
+            // the rank-deficient null-mode signature: any descent
+            // direction the joint Hessian can resolve has been exhausted,
+            // and any non-zero gradient residual must live in the null
+            // space (or against a feasibility barrier). Both are
+            // first-order optimality in the constrained sense, so the
+            // iterate satisfies KKT on the resolved subspace even when
+            // ‖∇L − Sβ‖∞ stays above its formal tolerance.
+            //
+            // This mirrors the line-search-failure path's KKT-on-null
+            // certification at the trust-region-collapse signature:
+            //   trust_region_collapsed && last_cycle_obj_change_below_tol
+            //       && made_progress
+            // The post-step signal is strictly stronger because the
+            // line-search SUCCEEDED with a tiny step, so we have direct
+            // evidence that any decrease available within the trust
+            // region was already captured this cycle — no need to wait
+            // for the trust radius to collapse to its 1e-9 floor.
+            //
+            // The `made_progress = cycles_done >= 2` guard avoids
+            // certifying on a degenerate cycle-0 line-search clamp
+            // (initial β stuck at the barrier or at machine-zero
+            // gradient that nonetheless isn't an optimum). Without this
+            // guard a single tiny accepted step at cycle 0 would
+            // mis-certify as KKT before the algorithm has had a chance
+            // to resolve the geometry.
+            //
+            // Without this certification the post-loop dispatch
+            // escalates the non-convergence into the strict
+            // coupled-exact Err — that error is reserved for actual
+            // algorithmic breakdown (Hessian unavailable, NaN delta,
+            // linear solver failure). A stalled-but-intact iterate is
+            // not breakdown; surfacing it as such would force the outer
+            // optimizer to back away from a perfectly usable iterate.
             if accepted_step_inf <= step_tol && objective_change <= objective_tol {
+                let made_progress = cycles_done >= 2;
                 eprintln!(
-                    "[JN-EXIT] cycle={cycle} reason=no_progress_stagnation accepted_step_inf={accepted_step_inf:.3e} step_tol={step_tol:.3e} objective_change={objective_change:.3e} objective_tol={objective_tol:.3e} residual={residual:.3e} residual_tol={residual_tol:.3e}"
+                    "[JN-EXIT] cycle={cycle} reason=no_progress_stagnation accepted_step_inf={accepted_step_inf:.3e} step_tol={step_tol:.3e} objective_change={objective_change:.3e} objective_tol={objective_tol:.3e} residual={residual:.3e} residual_tol={residual_tol:.3e} made_progress={made_progress}"
                 );
-                break;
+                if made_progress {
+                    converged = true;
+                    break;
+                }
+                // !made_progress: too early to certify. Skip the break
+                // and let the next cycle either escape via Newton or
+                // re-trigger this branch with made_progress=true.
             }
             // Carry the objective-stagnation signal into the next
             // cycle so the line-search-failure path above can pair it

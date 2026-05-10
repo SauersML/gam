@@ -515,6 +515,23 @@ impl<const K: usize, T: RowKernel<K>> RowKernelDirectionalDerivativeOperator<K, 
     /// math to `trace_projected_factor`, but the per-(row, col)
     /// `jacobian_action(row, F[:, col])` is replaced by a strided read out
     /// of `jf`.
+    ///
+    /// **Gram-form inner contraction.** The natural inner sum
+    /// `Σ_k_col vec_kᵀ Tᵣ vec_k` (with `vec_k[a] = jf[r, a·rank + k_col]`)
+    /// is rewritten as `Σ_{a,b} Tᵣ[a][b] · Mᵣ[a][b]` where
+    /// `Mᵣ[a][b] = Σ_k_col jf[r, a·rank + k_col] · jf[r, b·rank + k_col]`.
+    /// Each `Mᵣ[a][b]` is then a dot product of two contiguous length-`rank`
+    /// slices of `jf` (the layout `jf[r, k·rank + k_col]` puts the rank
+    /// dimension stride-1 within each K-block), so the per-row inner work
+    /// is `K(K+1)/2` contiguous SIMD-friendly dot products + `K²` final
+    /// contraction. The previous form did `rank` strided gathers of
+    /// stride-`rank` per row plus a full `K²` bilinear per gather, which
+    /// is both more arithmetic (rank·K² vs K(K+1)/2·rank + K²) and fully
+    /// non-vectorisable. At biobank shape (rank≈100, K=4) this trims the
+    /// inner-loop arithmetic from `rank·K² ≈ 1600` ops to
+    /// `K(K+1)/2·rank + K² ≈ 1016` ops per row and gives the autovectoriser
+    /// stride-1 access. K is a const-generic small int so the K-loops are
+    /// fully unrolled.
     fn trace_projected_factor_with_jf(&self, factor: &Array2<f64>, jf: ArrayView2<'_, f64>) -> f64 {
         let rank = factor.ncols();
         let n_rows = self.kern.n_rows();
@@ -533,22 +550,27 @@ impl<const K: usize, T: RowKernel<K>> RowKernelDirectionalDerivativeOperator<K, 
                 let jf_slice = jf_row
                     .to_slice()
                     .expect("J·F is built standard-layout (row-major)");
-                let mut row_total = 0.0_f64;
-                for k_col in 0..rank {
-                    let mut vec_k = [0.0_f64; K];
-                    for k in 0..K {
-                        vec_k[k] = jf_slice[k * rank + k_col];
-                    }
-                    // (T_r vec_k)^T vec_k — K is a const-generic small int.
-                    let mut quad = 0.0_f64;
-                    for a in 0..K {
-                        let mut t_dot = 0.0_f64;
-                        for b in 0..K {
-                            t_dot += third[a][b] * vec_k[b];
+                // Build the K×K Gram of jf-K-blocks: gram[a][b] = <jf[a-block], jf[b-block]>.
+                // Symmetric, so only the upper triangle is computed.
+                let mut gram = [[0.0_f64; K]; K];
+                for a in 0..K {
+                    let row_a = &jf_slice[a * rank..(a + 1) * rank];
+                    for b in a..K {
+                        let row_b = &jf_slice[b * rank..(b + 1) * rank];
+                        let mut s = 0.0_f64;
+                        for k_col in 0..rank {
+                            s += row_a[k_col] * row_b[k_col];
                         }
-                        quad += vec_k[a] * t_dot;
+                        gram[a][b] = s;
+                        gram[b][a] = s;
                     }
-                    row_total += quad;
+                }
+                // Σ_{a,b} T_r[a][b] · gram[a][b] — both K×K, K is const-generic small.
+                let mut row_total = 0.0_f64;
+                for a in 0..K {
+                    for b in 0..K {
+                        row_total += third[a][b] * gram[a][b];
+                    }
                 }
                 row_total
             })
@@ -692,6 +714,9 @@ impl<const K: usize, T: RowKernel<K>> RowKernelSecondDirectionalDerivativeOperat
         cache.get_or_insert_with(key, || self.compute_jf(factor))
     }
 
+    /// See `RowKernelDirectionalDerivativeOperator::trace_projected_factor_with_jf`
+    /// for the Gram-form inner-contraction rationale; identical structure with
+    /// `T_r = row_fourth_contracted(r, J_r·u, J_r·v)`.
     fn trace_projected_factor_with_jf(&self, factor: &Array2<f64>, jf: ArrayView2<'_, f64>) -> f64 {
         let rank = factor.ncols();
         let n_rows = self.kern.n_rows();
@@ -711,21 +736,26 @@ impl<const K: usize, T: RowKernel<K>> RowKernelSecondDirectionalDerivativeOperat
                 let jf_slice = jf_row
                     .to_slice()
                     .expect("J·F is built standard-layout (row-major)");
-                let mut row_total = 0.0_f64;
-                for k_col in 0..rank {
-                    let mut vec_k = [0.0_f64; K];
-                    for k in 0..K {
-                        vec_k[k] = jf_slice[k * rank + k_col];
-                    }
-                    let mut quad = 0.0_f64;
-                    for a in 0..K {
-                        let mut t_dot = 0.0_f64;
-                        for b in 0..K {
-                            t_dot += fourth[a][b] * vec_k[b];
+                // Gram of jf K-blocks (length-`rank` contiguous slices); see
+                // first-derivative variant for the algebra.
+                let mut gram = [[0.0_f64; K]; K];
+                for a in 0..K {
+                    let row_a = &jf_slice[a * rank..(a + 1) * rank];
+                    for b in a..K {
+                        let row_b = &jf_slice[b * rank..(b + 1) * rank];
+                        let mut s = 0.0_f64;
+                        for k_col in 0..rank {
+                            s += row_a[k_col] * row_b[k_col];
                         }
-                        quad += vec_k[a] * t_dot;
+                        gram[a][b] = s;
+                        gram[b][a] = s;
                     }
-                    row_total += quad;
+                }
+                let mut row_total = 0.0_f64;
+                for a in 0..K {
+                    for b in 0..K {
+                        row_total += fourth[a][b] * gram[a][b];
+                    }
                 }
                 row_total
             })
@@ -869,5 +899,269 @@ impl<const K: usize, T: RowKernel<K> + 'static> ExactNewtonJointHessianWorkspace
                 p: self.cache.p,
             },
         )))
+    }
+}
+
+#[cfg(test)]
+mod gram_inner_contraction_tests {
+    use super::*;
+    use crate::solver::estimate::reml::unified::ProjectedFactorCache;
+    use ndarray::Array2;
+
+    /// Synthetic K=4 row kernel: dense `(n × p)` design `X` per primary scalar
+    /// (so each row's Jacobian is a sparse-style stack of K row vectors), with
+    /// arbitrary K×K third / fourth contracted derivatives that depend on row
+    /// and direction. Used only to exercise `trace_projected_factor_with_jf`
+    /// against an independent reference contraction loop.
+    struct SyntheticKernel {
+        n: usize,
+        p: usize,
+        // Designs[k]: n × p, contributes the k-th primary scalar.
+        designs: [Array2<f64>; 4],
+    }
+
+    impl SyntheticKernel {
+        fn new(n: usize, p: usize, seed: u64) -> Self {
+            let mut s = seed;
+            let mut next = || -> f64 {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((s >> 33) as f64 / (u32::MAX as f64)) - 0.5
+            };
+            let mut mk = || -> Array2<f64> {
+                Array2::from_shape_fn((n, p), |_| next())
+            };
+            let d0 = mk();
+            let d1 = mk();
+            let d2 = mk();
+            let d3 = mk();
+            Self {
+                n,
+                p,
+                designs: [d0, d1, d2, d3],
+            }
+        }
+    }
+
+    impl RowKernel<4> for SyntheticKernel {
+        fn n_rows(&self) -> usize {
+            self.n
+        }
+        fn n_coefficients(&self) -> usize {
+            self.p
+        }
+        fn row_kernel(&self, _row: usize) -> Result<(f64, [f64; 4], [[f64; 4]; 4]), String> {
+            Ok((0.0, [0.0; 4], [[0.0; 4]; 4]))
+        }
+        fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; 4] {
+            let mut out = [0.0_f64; 4];
+            for k in 0..4 {
+                let design_row = self.designs[k].row(row);
+                let mut s = 0.0_f64;
+                for j in 0..self.p {
+                    s += design_row[j] * d_beta[j];
+                }
+                out[k] = s;
+            }
+            out
+        }
+        fn jacobian_transpose_action(&self, row: usize, v: &[f64; 4], out: &mut [f64]) {
+            for k in 0..4 {
+                let design_row = self.designs[k].row(row);
+                for j in 0..self.p {
+                    out[j] += design_row[j] * v[k];
+                }
+            }
+        }
+        fn add_pullback_hessian(
+            &self,
+            _row: usize,
+            _h: &[[f64; 4]; 4],
+            _target: &mut Array2<f64>,
+        ) {
+            unreachable!("not used in this regression test")
+        }
+        fn add_diagonal_quadratic(
+            &self,
+            _row: usize,
+            _h: &[[f64; 4]; 4],
+            _diag: &mut [f64],
+        ) {
+            unreachable!("not used in this regression test")
+        }
+        fn row_third_contracted(&self, row: usize, dir: &[f64; 4]) -> Result<[[f64; 4]; 4], String> {
+            // Arbitrary symmetric K×K matrix that depends on row and dir.
+            let mut t = [[0.0_f64; 4]; 4];
+            let row_f = (row as f64) * 0.013;
+            for a in 0..4 {
+                for b in a..4 {
+                    let v = (row_f + a as f64 * 0.7 + b as f64 * 1.3).sin()
+                        + dir[a] * 0.25
+                        + dir[b] * 0.5
+                        + dir[(a + b) % 4] * 0.125;
+                    t[a][b] = v;
+                    t[b][a] = v;
+                }
+            }
+            Ok(t)
+        }
+        fn row_fourth_contracted(
+            &self,
+            row: usize,
+            dir_u: &[f64; 4],
+            dir_v: &[f64; 4],
+        ) -> Result<[[f64; 4]; 4], String> {
+            let mut t = [[0.0_f64; 4]; 4];
+            let row_f = (row as f64) * 0.011 + 0.31;
+            for a in 0..4 {
+                for b in a..4 {
+                    let v = (row_f + a as f64 * 0.9 + b as f64 * 1.7).cos()
+                        + dir_u[a] * 0.13
+                        + dir_v[b] * 0.27
+                        + dir_u[(a + b) % 4] * dir_v[(a + 1) % 4] * 0.05;
+                    t[a][b] = v;
+                    t[b][a] = v;
+                }
+            }
+            Ok(t)
+        }
+    }
+
+    /// Independent reference: per-row, per-column bilinear-of-K-vector form,
+    /// matching the pre-Gram code path. Locks the optimised
+    /// `trace_projected_factor_with_jf` against the original contraction.
+    fn reference_trace_first<const K: usize>(
+        kern: &impl RowKernel<K>,
+        direction: &[f64],
+        factor: &Array2<f64>,
+    ) -> f64 {
+        let n_rows = kern.n_rows();
+        let rank = factor.ncols();
+        let p = factor.nrows();
+        let mut total = 0.0_f64;
+        for row in 0..n_rows {
+            let mut dir_k_buf = [0.0_f64; 16];
+            let dir_k_arr = kern.jacobian_action(row, direction);
+            for k in 0..K {
+                dir_k_buf[k] = dir_k_arr[k];
+            }
+            let third = kern
+                .row_third_contracted(row, &dir_k_arr)
+                .expect("third");
+            let _ = dir_k_buf;
+            for k_col in 0..rank {
+                // vec_k[k] = (J_r · F[:, k_col])[k]
+                let mut col = vec![0.0_f64; p];
+                for j in 0..p {
+                    col[j] = factor[[j, k_col]];
+                }
+                let vec_k = kern.jacobian_action(row, &col);
+                let mut quad = 0.0_f64;
+                for a in 0..K {
+                    let mut t_dot = 0.0_f64;
+                    for b in 0..K {
+                        t_dot += third[a][b] * vec_k[b];
+                    }
+                    quad += vec_k[a] * t_dot;
+                }
+                total += quad;
+            }
+        }
+        total
+    }
+
+    fn reference_trace_second<const K: usize>(
+        kern: &impl RowKernel<K>,
+        direction_u: &[f64],
+        direction_v: &[f64],
+        factor: &Array2<f64>,
+    ) -> f64 {
+        let n_rows = kern.n_rows();
+        let rank = factor.ncols();
+        let p = factor.nrows();
+        let mut total = 0.0_f64;
+        for row in 0..n_rows {
+            let dir_u = kern.jacobian_action(row, direction_u);
+            let dir_v = kern.jacobian_action(row, direction_v);
+            let fourth = kern.row_fourth_contracted(row, &dir_u, &dir_v).expect("fourth");
+            for k_col in 0..rank {
+                let mut col = vec![0.0_f64; p];
+                for j in 0..p {
+                    col[j] = factor[[j, k_col]];
+                }
+                let vec_k = kern.jacobian_action(row, &col);
+                let mut quad = 0.0_f64;
+                for a in 0..K {
+                    let mut t_dot = 0.0_f64;
+                    for b in 0..K {
+                        t_dot += fourth[a][b] * vec_k[b];
+                    }
+                    quad += vec_k[a] * t_dot;
+                }
+                total += quad;
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn gram_inner_contraction_matches_reference() {
+        let n = 32;
+        let p = 11;
+        let rank = 7;
+        let kern = Arc::new(SyntheticKernel::new(n, p, 0xC0FFEE));
+
+        // Build a random direction and factor.
+        let mut s = 0xDEADBEEF_u64;
+        let mut next = || -> f64 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 33) as f64 / (u32::MAX as f64)) - 0.5
+        };
+        let direction: Vec<f64> = (0..p).map(|_| next()).collect();
+        let direction_u: Vec<f64> = (0..p).map(|_| next()).collect();
+        let direction_v: Vec<f64> = (0..p).map(|_| next()).collect();
+        let factor = Array2::from_shape_fn((p, rank), |_| next());
+
+        // First-derivative operator.
+        let op1 = RowKernelDirectionalDerivativeOperator {
+            kern: Arc::clone(&kern),
+            direction: direction.clone(),
+            p,
+        };
+        let cache = ProjectedFactorCache::default();
+        let got1_uncached = HyperOperator::trace_projected_factor(&op1, &factor);
+        let got1_cached = op1.trace_projected_factor_cached(&factor, &cache);
+        let ref1 = reference_trace_first::<4>(&*kern, &direction, &factor);
+        let rel1_uncached = (got1_uncached - ref1).abs() / ref1.abs().max(1e-12);
+        let rel1_cached = (got1_cached - ref1).abs() / ref1.abs().max(1e-12);
+        assert!(
+            rel1_uncached < 1e-10,
+            "first-derivative Gram path drifted: rel={rel1_uncached:.3e} got={got1_uncached} ref={ref1}",
+        );
+        assert!(
+            rel1_cached < 1e-10,
+            "first-derivative cached Gram path drifted: rel={rel1_cached:.3e} got={got1_cached} ref={ref1}",
+        );
+
+        // Second-derivative operator.
+        let op2 = RowKernelSecondDirectionalDerivativeOperator {
+            kern: Arc::clone(&kern),
+            direction_u: direction_u.clone(),
+            direction_v: direction_v.clone(),
+            p,
+        };
+        let cache2 = ProjectedFactorCache::default();
+        let got2_uncached = HyperOperator::trace_projected_factor(&op2, &factor);
+        let got2_cached = op2.trace_projected_factor_cached(&factor, &cache2);
+        let ref2 = reference_trace_second::<4>(&*kern, &direction_u, &direction_v, &factor);
+        let rel2_uncached = (got2_uncached - ref2).abs() / ref2.abs().max(1e-12);
+        let rel2_cached = (got2_cached - ref2).abs() / ref2.abs().max(1e-12);
+        assert!(
+            rel2_uncached < 1e-10,
+            "second-derivative Gram path drifted: rel={rel2_uncached:.3e} got={got2_uncached} ref={ref2}",
+        );
+        assert!(
+            rel2_cached < 1e-10,
+            "second-derivative cached Gram path drifted: rel={rel2_cached:.3e} got={got2_cached} ref={ref2}",
+        );
     }
 }
