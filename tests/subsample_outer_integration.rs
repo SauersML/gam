@@ -85,13 +85,7 @@ fn per_row_ht_weight_recovers_full_data_sum_under_constant_within_stratum() {
     let n_full = 100usize;
     // Stratum A: a single rare row at index 0; per-row contribution c_A = 7.0.
     // Stratum B: rows 1..n_full; per-row contribution c_B = 1.0.
-    let c_at = |i: usize| -> f64 {
-        if i == 0 {
-            7.0
-        } else {
-            1.0
-        }
-    };
+    let c_at = |i: usize| -> f64 { if i == 0 { 7.0 } else { 1.0 } };
     let true_sum: f64 = (0..n_full).map(c_at).sum();
     assert!((true_sum - (7.0 + 99.0)).abs() < 1e-12);
 
