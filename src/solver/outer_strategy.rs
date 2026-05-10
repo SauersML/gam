@@ -395,6 +395,7 @@ impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {
 /// Duchon, or survival passes.
 pub(crate) const OUTER_HVP_MATERIALIZE_MAX_DIM: usize = 64;
 const BFGS_LINE_SEARCH_REJECT_COST: f64 = 1.0e300;
+const BFGS_OBJECTIVE_STALL_EVALS: usize = 3;
 
 /// Whether an analytic derivative is available for a given order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1854,6 +1855,9 @@ struct OuterFirstOrderBridge<'a> {
     /// finite cost before invoking the expensive inner solve.
     line_search_step_cap: Option<f64>,
     last_gradient_point: Option<Array1<f64>>,
+    objective_stall_rel_tol: Option<f64>,
+    last_gradient_cost: Option<f64>,
+    objective_stall_evals: usize,
 }
 
 impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
@@ -1944,12 +1948,36 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
             .map_err(|err| into_objective_error("outer eval failed", err))?;
         let eval = finite_outer_first_order_eval_or_error("outer eval failed", self.layout, eval)?;
         let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let mut gradient = eval.gradient;
         if self.g_norm_initial.is_none() && g_norm.is_finite() && g_norm > 0.0 {
             self.g_norm_initial = Some(g_norm);
         }
         if g_norm.is_finite() {
             self.last_g_norm = Some(g_norm);
         }
+        if let (Some(rel_tol), Some(prev_cost)) =
+            (self.objective_stall_rel_tol, self.last_gradient_cost)
+        {
+            let cost_delta = (prev_cost - eval.cost).abs();
+            let tol = rel_tol * (1.0 + prev_cost.abs().max(eval.cost.abs()));
+            if cost_delta <= tol {
+                self.objective_stall_evals = self.objective_stall_evals.saturating_add(1);
+            } else {
+                self.objective_stall_evals = 0;
+            }
+            if self.objective_stall_evals >= BFGS_OBJECTIVE_STALL_EVALS {
+                gradient.fill(0.0);
+                self.last_g_norm = Some(0.0);
+                log::info!(
+                    "[OUTER/BFGS] objective-stall convergence: cost_delta={:.3e} tol={:.3e} stalled_evals={} cost={:.6e}",
+                    cost_delta,
+                    tol,
+                    self.objective_stall_evals,
+                    eval.cost,
+                );
+            }
+        }
+        self.last_gradient_cost = Some(eval.cost);
         self.last_gradient_point = Some(x.clone());
         log::info!(
             "[STAGE] outer eval end order=ValueAndGradient elapsed={:.3}s cost={:.6e} |g|={:.3e} (first-order bridge, iter={})",
@@ -1961,7 +1989,7 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         self.iter_count = self.iter_count.saturating_add(1);
         Ok(FirstOrderSample {
             value: eval.cost,
-            gradient: eval.gradient,
+            gradient,
         })
     }
 }
@@ -4461,6 +4489,9 @@ fn run_outer_with_plan(
                     last_g_norm: None,
                     line_search_step_cap: config.bfgs_step_cap,
                     last_gradient_point: config.bfgs_step_cap.map(|_| seed.clone()),
+                    objective_stall_rel_tol: config.bfgs_step_cap.map(|_| config.tolerance),
+                    last_gradient_cost: config.bfgs_step_cap.map(|_| seed_eval.cost),
+                    objective_stall_evals: 0,
                 };
                 // Hand the precomputed (cost, gradient) seed eval to
                 // `opt::Bfgs` so its first internal `eval_grad` call is
@@ -5480,6 +5511,9 @@ mod tests {
             last_g_norm: None,
             line_search_step_cap: Some(0.5),
             last_gradient_point: None,
+            objective_stall_rel_tol: None,
+            last_gradient_cost: None,
+            objective_stall_evals: 0,
         };
 
         FirstOrderObjective::eval_grad(&mut bridge, &array![0.0])
@@ -5498,6 +5532,62 @@ mod tests {
         assert_eq!(accepted, 0.25);
         assert_eq!(cost_calls.load(Ordering::Relaxed), 1);
         assert_eq!(eval_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn first_order_bridge_stops_capped_bfgs_on_objective_stall() {
+        let eval_calls = Arc::new(AtomicUsize::new(0));
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Unavailable);
+        let mut obj = problem.build_objective(
+            (),
+            |_: &mut (), _: &Array1<f64>| Ok(1000.0),
+            {
+                let eval_calls = Arc::clone(&eval_calls);
+                move |_: &mut (), _: &Array1<f64>| {
+                    let call = eval_calls.fetch_add(1, Ordering::Relaxed);
+                    let cost = match call {
+                        0 => 999.9995,
+                        1 => 999.9990,
+                        _ => 999.9987,
+                    };
+                    Ok(OuterEval {
+                        cost,
+                        gradient: array![4.0],
+                        hessian: HessianResult::Unavailable,
+                    })
+                }
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let mut bridge = OuterFirstOrderBridge {
+            obj: &mut obj,
+            layout: OuterThetaLayout::new(1, 0),
+            outer_inner_cap: None,
+            iter_count: 0,
+            g_norm_initial: None,
+            last_g_norm: None,
+            line_search_step_cap: Some(0.5),
+            last_gradient_point: Some(array![0.0]),
+            objective_stall_rel_tol: Some(1.0e-6),
+            last_gradient_cost: Some(1000.0),
+            objective_stall_evals: 0,
+        };
+
+        let first = FirstOrderObjective::eval_grad(&mut bridge, &array![0.0])
+            .expect("first near-stall eval should still expose the true gradient");
+        let second = FirstOrderObjective::eval_grad(&mut bridge, &array![0.0])
+            .expect("second near-stall eval should still expose the true gradient");
+        let third = FirstOrderObjective::eval_grad(&mut bridge, &array![0.0])
+            .expect("third near-stall eval should signal convergence to BFGS");
+
+        assert_eq!(first.gradient[0], 4.0);
+        assert_eq!(second.gradient[0], 4.0);
+        assert_eq!(third.gradient[0], 0.0);
+        assert_eq!(bridge.last_g_norm, Some(0.0));
+        assert_eq!(eval_calls.load(Ordering::Relaxed), 3);
     }
 
     #[test]
