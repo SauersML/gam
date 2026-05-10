@@ -12939,7 +12939,9 @@ pub(crate) fn exact_joint_multistart_outer_problem(
         .with_rho_bound(12.0)
         .with_heuristic_lambdas(seed_heuristic);
     if let Some(screening_cap) = screening_cap {
-        problem = problem.with_screening_cap(screening_cap);
+        problem = problem
+            .with_screening_cap(screening_cap)
+            .with_screen_initial_rho(true);
     }
     problem
 }
