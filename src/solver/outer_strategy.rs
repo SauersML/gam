@@ -4460,7 +4460,7 @@ fn run_outer_with_plan(
                     g_norm_initial: None,
                     last_g_norm: None,
                     line_search_step_cap: config.bfgs_step_cap,
-                    last_gradient_point: None,
+                    last_gradient_point: config.bfgs_step_cap.map(|_| seed.clone()),
                 };
                 // Hand the precomputed (cost, gradient) seed eval to
                 // `opt::Bfgs` so its first internal `eval_grad` call is
