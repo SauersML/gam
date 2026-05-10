@@ -12376,10 +12376,7 @@ pub(crate) fn hutchpp_estimate_trace_hinv_operator_cross<H: HessianOperator + ?S
     let sketch_dim = config.hutchpp_sketch_dim.unwrap_or(0).min(p);
     let mut rng_state = Xoshiro256SS::from_seed(config.seed);
 
-    let apply_m = |hop: &H,
-                   x: ArrayView1<'_, f64>,
-                   tmp: &mut Array1<f64>|
-     -> Array1<f64> {
+    let apply_m = |hop: &H, x: ArrayView1<'_, f64>, tmp: &mut Array1<f64>| -> Array1<f64> {
         // M x = H⁻¹ A_L H⁻¹ A_R x
         right.mul_vec_into(x, tmp.view_mut());
         let mid = hop.stochastic_trace_solve(tmp, config.solve_rel_tol);

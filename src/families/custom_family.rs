@@ -9148,7 +9148,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     ) {
                         Ok(matrix) => matrix,
                         Err(e) => {
-                            eprintln!("[JN-EXIT] cycle={cycle} reason=dense_lhs_materialize_err err={e}");
+                            eprintln!(
+                                "[JN-EXIT] cycle={cycle} reason=dense_lhs_materialize_err err={e}"
+                            );
                             break;
                         }
                     };
@@ -9172,7 +9174,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 };
                 if !delta.iter().all(|v| v.is_finite()) {
                     let n_nan = delta.iter().filter(|v| !v.is_finite()).count();
-                    eprintln!("[JN-EXIT] cycle={cycle} reason=delta_non_finite n_nan={n_nan} dim={}", delta.len());
+                    eprintln!(
+                        "[JN-EXIT] cycle={cycle} reason=delta_non_finite n_nan={n_nan} dim={}",
+                        delta.len()
+                    );
                     break; // Fall back to blockwise
                 }
                 (beta_joint.clone() + &delta, None)
