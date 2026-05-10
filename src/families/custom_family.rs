@@ -9228,12 +9228,19 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     options.ridge_policy,
                     &block_constraints,
                 )?;
-            if current_stationarity_residual <= residual_tol
-                && last_cycle_obj_change_below_tol
-                && step_inf <= step_tol
-            {
+            // KKT certificate: ‖∇L − Sβ‖_∞ ≤ residual_tol together with
+            // ‖δ‖_∞ ≤ step_tol is sufficient first-order optimality of the
+            // penalized objective; no descent direction exists from the
+            // current point. Conditioning that exit on additional evidence
+            // of objective progress in the previous cycle would refuse to
+            // recognize convergence at a starting point that already sits
+            // at the optimum (e.g. balanced data with an intercept-only
+            // fit, where ∇ℓ vanishes by symmetry from cycle 0 and the
+            // Newton step is identically zero so the trust-region search
+            // can never produce a strictly negative actual reduction).
+            if current_stationarity_residual <= residual_tol && step_inf <= step_tol {
                 log::info!(
-                    "[PIRLS/joint-Newton convergence] cycle {:>3} | pre-line-search converged: step_inf={:.3e} (tol={:.3e}) | residual={:.3e} (tol={:.3e}) | previous objective change below tol",
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | pre-line-search converged: step_inf={:.3e} (tol={:.3e}) | residual={:.3e} (tol={:.3e})",
                     cycle,
                     step_inf,
                     step_tol,
