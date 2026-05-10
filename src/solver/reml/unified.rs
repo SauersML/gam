@@ -167,6 +167,19 @@ pub trait HessianOperator: Send + Sync {
         matrix: &Array2<f64>,
         op: &dyn HyperOperator,
     ) -> f64 {
+        if op.is_implicit() && self.dim() >= 128 {
+            let mut config = StochasticTraceConfig::default();
+            let sketch = (self.dim() / 32).clamp(4, 16);
+            config.hutchpp_sketch_dim = Some(sketch);
+            config.n_probes_max = (sketch * 4).max(32);
+            config.n_probes_min = sketch.max(8);
+            // Wrap the dense LHS in a matrix-backed HyperOperator so the
+            // shared cross routine can call mul_vec_into on it.
+            let lhs = DenseMatrixHyperOperator {
+                matrix: matrix.clone(),
+            };
+            return hutchpp_estimate_trace_hinv_operator_cross(self, &lhs, op, &config);
+        }
         if op.is_implicit() {
             log::warn!(
                 "trace_hinv_matrix_operator_cross: materializing implicit HyperOperator — \
@@ -185,7 +198,25 @@ pub trait HessianOperator: Send + Sync {
         left: &dyn HyperOperator,
         right: &dyn HyperOperator,
     ) -> f64 {
-        if left.is_implicit() || right.is_implicit() {
+        let l_implicit = left.is_implicit();
+        let r_implicit = right.is_implicit();
+        if (l_implicit || r_implicit) && self.dim() >= 128 {
+            let mut config = StochasticTraceConfig::default();
+            let sketch = (self.dim() / 32).clamp(4, 16);
+            config.hutchpp_sketch_dim = Some(sketch);
+            config.n_probes_max = (sketch * 4).max(32);
+            config.n_probes_min = sketch.max(8);
+            // Same-operator self-cross is PSD; the squared form is the
+            // exact algorithm for that case (lower variance, no sign).
+            if std::ptr::eq(
+                left as *const dyn HyperOperator as *const (),
+                right as *const dyn HyperOperator as *const (),
+            ) {
+                return hutchpp_estimate_trace_hinv_op_squared(self, left, &config);
+            }
+            return hutchpp_estimate_trace_hinv_operator_cross(self, left, right, &config);
+        }
+        if l_implicit || r_implicit {
             log::warn!(
                 "trace_hinv_operator_cross: materializing implicit HyperOperator(s) — \
                  backend should provide a matrix-free override"
@@ -11740,6 +11771,13 @@ impl StochasticTraceEstimator {
             return 0.0;
         }
 
+        if self.config.hutchpp_sketch_dim.is_some() {
+            let op = DenseMatrixHyperOperator {
+                matrix: matrix.clone(),
+            };
+            return hutchpp_estimate_trace_hinv_op_squared(hop, &op, &self.config);
+        }
+
         let mut q = Array1::<f64>::zeros(p);
         self.estimate_matrix_from_probe_batch(hop, 1, |z, probe_values| {
             let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
@@ -11757,6 +11795,10 @@ impl StochasticTraceEstimator {
         let p = hop.dim();
         if p == 0 {
             return 0.0;
+        }
+
+        if self.config.hutchpp_sketch_dim.is_some() {
+            return hutchpp_estimate_trace_hinv_op_squared(hop, op, &self.config);
         }
 
         let n_obs = op.w_diag.len();
@@ -12191,6 +12233,228 @@ pub(crate) fn hutchpp_estimate_trace_hinv_operator<H: HessianOperator + ?Sized>(
                 let denom = (mean.abs()).max(config.tau_rel);
                 if stderr / denom <= config.relative_tol {
                     let _ = m; // matvec count just for documentation
+                    break;
+                }
+            }
+        }
+    }
+    let mean_residual = if count > 0 { sum / count as f64 } else { 0.0 };
+    t_low + mean_residual
+}
+
+/// Hutch++ estimate of `tr((H⁻¹ A)²) = tr(H⁻¹ A H⁻¹ A)` for a symmetric
+/// HVP-only operator `A`. Cost per applied "matvec" is 2 H⁻¹ solves and
+/// 2 A applies; total cost is `2 m_s + m_h` such matvecs.
+///
+/// Although `B = H⁻¹ A` is not symmetric in the standard inner product,
+/// `B²` is similar to `(H^{-1/2} A H^{-1/2})²` (PSD), so its trace is
+/// nonnegative and Hutch++ on the linear map `x ↦ B² x` produces an
+/// unbiased estimate of `tr(B²)` on standard probes.
+pub(crate) fn hutchpp_estimate_trace_hinv_op_squared<H: HessianOperator + ?Sized>(
+    hop: &H,
+    op: &dyn HyperOperator,
+    config: &StochasticTraceConfig,
+) -> f64 {
+    let p = hop.dim();
+    debug_assert_eq!(op.dim(), p, "Hutch++ squared: operator dim mismatch");
+    if p == 0 {
+        return 0.0;
+    }
+    let sketch_dim = config.hutchpp_sketch_dim.unwrap_or(0).min(p);
+    let mut rng_state = Xoshiro256SS::from_seed(config.seed);
+
+    // Apply B² = H⁻¹ A H⁻¹ A in place via two solve+apply legs.
+    let apply_b_squared = |hop: &H,
+                           op: &dyn HyperOperator,
+                           input: ArrayView1<'_, f64>,
+                           tmp: &mut Array1<f64>|
+     -> Array1<f64> {
+        op.mul_vec_into(input, tmp.view_mut());
+        let mid = hop.stochastic_trace_solve(tmp, config.solve_rel_tol);
+        op.mul_vec_into(mid.view(), tmp.view_mut());
+        hop.stochastic_trace_solve(tmp, config.solve_rel_tol)
+    };
+
+    let mut q = Array2::<f64>::zeros((p, sketch_dim));
+    let mut q_rank = 0usize;
+    if sketch_dim > 0 {
+        let mut y = Array2::<f64>::zeros((p, sketch_dim));
+        let mut z = Array1::<f64>::zeros(p);
+        let mut tmp = Array1::<f64>::zeros(p);
+        for j in 0..sketch_dim {
+            rademacher_probe_into(z.view_mut(), &mut rng_state);
+            let w = apply_b_squared(hop, op, z.view(), &mut tmp);
+            y.column_mut(j).assign(&w);
+        }
+        q_rank = modified_gram_schmidt(&y, &mut q);
+    }
+
+    let mut t_low = 0.0;
+    if q_rank > 0 {
+        let mut tmp = Array1::<f64>::zeros(p);
+        for j in 0..q_rank {
+            let qcol = q.column(j).to_owned();
+            let w = apply_b_squared(hop, op, qcol.view(), &mut tmp);
+            t_low += qcol.dot(&w);
+        }
+    }
+
+    let used = 2 * q_rank;
+    let residual_budget_max = config.n_probes_max.saturating_sub(used);
+    let residual_min = config.n_probes_min.min(residual_budget_max);
+    let residual_budget = residual_budget_max.max(residual_min);
+    if residual_budget == 0 {
+        return t_low;
+    }
+
+    let mut sum = 0.0;
+    let mut sum_sq = 0.0;
+    let mut count = 0usize;
+    let mut z = Array1::<f64>::zeros(p);
+    let mut z_tilde = Array1::<f64>::zeros(p);
+    let mut tmp = Array1::<f64>::zeros(p);
+    let check_interval = 4usize;
+    for _ in 0..residual_budget {
+        rademacher_probe_into(z.view_mut(), &mut rng_state);
+        z_tilde.assign(&z);
+        if q_rank > 0 {
+            for j in 0..q_rank {
+                let qcol = q.column(j);
+                let proj = qcol.dot(&z);
+                if proj != 0.0 {
+                    z_tilde.scaled_add(-proj, &qcol);
+                }
+            }
+        }
+        let w = apply_b_squared(hop, op, z_tilde.view(), &mut tmp);
+        let q_val = z_tilde.dot(&w);
+        sum += q_val;
+        sum_sq += q_val * q_val;
+        count += 1;
+
+        if count >= residual_min && count % check_interval == 0 && count >= 2 {
+            let n = count as f64;
+            let mean = sum / n;
+            let var = (sum_sq - n * mean * mean) / (n - 1.0).max(1.0);
+            if var.is_finite() && var >= 0.0 {
+                let stderr = (var / n).sqrt();
+                let denom = (mean.abs()).max(config.tau_rel);
+                if stderr / denom <= config.relative_tol {
+                    break;
+                }
+            }
+        }
+    }
+    let mean_residual = if count > 0 { sum / count as f64 } else { 0.0 };
+    t_low + mean_residual
+}
+
+/// Hutch++-style estimate of `tr(H⁻¹ A_left H⁻¹ A_right)` for two
+/// (possibly distinct) symmetric HVP-only operators. Uses a shared
+/// sketch built from `M = M_L M_R` where `M_L = H⁻¹ A_left` and
+/// `M_R = H⁻¹ A_right`; per matvec is 2 H⁻¹ solves + 2 A applies.
+///
+/// On standard Rademacher probes `E[zᵀ M z] = tr(M)` regardless of
+/// symmetry, so the residual Hutchinson average is unbiased even when
+/// `M` is not self-adjoint in the standard inner product.
+///
+/// A leave-one-out XTrace estimator (Epperly & Tropp 2024, arxiv
+/// 2301.07825) would reduce variance further by exchanging each probe
+/// between sketch and residual roles, at O(m²) bookkeeping cost.
+pub(crate) fn hutchpp_estimate_trace_hinv_operator_cross<H: HessianOperator + ?Sized>(
+    hop: &H,
+    left: &dyn HyperOperator,
+    right: &dyn HyperOperator,
+    config: &StochasticTraceConfig,
+) -> f64 {
+    let p = hop.dim();
+    debug_assert_eq!(left.dim(), p, "cross trace: left operator dim mismatch");
+    debug_assert_eq!(right.dim(), p, "cross trace: right operator dim mismatch");
+    if p == 0 {
+        return 0.0;
+    }
+    let sketch_dim = config.hutchpp_sketch_dim.unwrap_or(0).min(p);
+    let mut rng_state = Xoshiro256SS::from_seed(config.seed);
+
+    let apply_m = |hop: &H,
+                   x: ArrayView1<'_, f64>,
+                   tmp: &mut Array1<f64>|
+     -> Array1<f64> {
+        // M x = H⁻¹ A_L H⁻¹ A_R x
+        right.mul_vec_into(x, tmp.view_mut());
+        let mid = hop.stochastic_trace_solve(tmp, config.solve_rel_tol);
+        left.mul_vec_into(mid.view(), tmp.view_mut());
+        hop.stochastic_trace_solve(tmp, config.solve_rel_tol)
+    };
+
+    let mut q = Array2::<f64>::zeros((p, sketch_dim));
+    let mut q_rank = 0usize;
+    if sketch_dim > 0 {
+        let mut y = Array2::<f64>::zeros((p, sketch_dim));
+        let mut z = Array1::<f64>::zeros(p);
+        let mut tmp = Array1::<f64>::zeros(p);
+        for j in 0..sketch_dim {
+            rademacher_probe_into(z.view_mut(), &mut rng_state);
+            let w = apply_m(hop, z.view(), &mut tmp);
+            y.column_mut(j).assign(&w);
+        }
+        q_rank = modified_gram_schmidt(&y, &mut q);
+    }
+
+    // T_low = tr(Qᵀ M Q): for non-symmetric M this is the projected
+    // trace of M restricted to range(Q), which is exact on that
+    // subspace.
+    let mut t_low = 0.0;
+    if q_rank > 0 {
+        let mut tmp = Array1::<f64>::zeros(p);
+        for j in 0..q_rank {
+            let qcol = q.column(j).to_owned();
+            let w = apply_m(hop, qcol.view(), &mut tmp);
+            t_low += qcol.dot(&w);
+        }
+    }
+
+    let used = 2 * q_rank;
+    let residual_budget_max = config.n_probes_max.saturating_sub(used);
+    let residual_min = config.n_probes_min.min(residual_budget_max);
+    let residual_budget = residual_budget_max.max(residual_min);
+    if residual_budget == 0 {
+        return t_low;
+    }
+
+    let mut sum = 0.0;
+    let mut sum_sq = 0.0;
+    let mut count = 0usize;
+    let mut z = Array1::<f64>::zeros(p);
+    let mut z_tilde = Array1::<f64>::zeros(p);
+    let mut tmp = Array1::<f64>::zeros(p);
+    let check_interval = 4usize;
+    for _ in 0..residual_budget {
+        rademacher_probe_into(z.view_mut(), &mut rng_state);
+        z_tilde.assign(&z);
+        if q_rank > 0 {
+            for j in 0..q_rank {
+                let qcol = q.column(j);
+                let proj = qcol.dot(&z);
+                if proj != 0.0 {
+                    z_tilde.scaled_add(-proj, &qcol);
+                }
+            }
+        }
+        let w = apply_m(hop, z_tilde.view(), &mut tmp);
+        let q_val = z_tilde.dot(&w);
+        sum += q_val;
+        sum_sq += q_val * q_val;
+        count += 1;
+
+        if count >= residual_min && count % check_interval == 0 && count >= 2 {
+            let n = count as f64;
+            let mean = sum / n;
+            let var = (sum_sq - n * mean * mean) / (n - 1.0).max(1.0);
+            if var.is_finite() && var >= 0.0 {
+                let stderr = (var / n).sqrt();
+                let denom = (mean.abs()).max(config.tau_rel);
+                if stderr / denom <= config.relative_tol {
                     break;
                 }
             }
@@ -14175,6 +14439,201 @@ mod tests {
         assert!(
             rel_err <= rel_err_plain * 2.0 + 0.01,
             "Hutch++ ({rel_err:.4}) should be competitive with Hutchinson ({rel_err_plain:.4})"
+        );
+    }
+
+    #[test]
+    fn hutchpp_estimate_trace_hinv_op_squared_matches_exact() {
+        // SPD H and symmetric A; compare tr(H⁻¹ A H⁻¹ A) to the exact
+        // value computed via trace_hinv_product_cross(A, A) =
+        // tr((H⁻¹ A) (H⁻¹ A)).
+        let h = array![
+            [4.0, 1.0, 0.5, 0.0, 0.0, 0.0],
+            [1.0, 3.0, 0.2, 0.0, 0.0, 0.0],
+            [0.5, 0.2, 2.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 5.0, 0.7, 0.1],
+            [0.0, 0.0, 0.0, 0.7, 4.0, 0.3],
+            [0.0, 0.0, 0.0, 0.1, 0.3, 3.0],
+        ];
+        let a = array![
+            [1.0, 0.3, 0.0, 0.1, 0.0, 0.0],
+            [0.3, 0.5, 0.1, 0.0, 0.2, 0.0],
+            [0.0, 0.1, 0.2, 0.0, 0.0, 0.05],
+            [0.1, 0.0, 0.0, 0.8, 0.2, 0.0],
+            [0.0, 0.2, 0.0, 0.2, 0.6, 0.1],
+            [0.0, 0.0, 0.05, 0.0, 0.1, 0.4],
+        ];
+        let hop = DenseSpectralOperator::from_symmetric(&h).unwrap();
+        let a_op = DenseMatrixHyperOperator { matrix: a.clone() };
+
+        let exact = hop.trace_hinv_product_cross(&a, &a);
+
+        let config = StochasticTraceConfig {
+            n_probes_min: 16,
+            n_probes_max: 96,
+            relative_tol: 0.005,
+            tau_rel: 1e-10,
+            solve_rel_tol: 1e-10,
+            seed: 0xC0FFEE,
+            hutchpp_sketch_dim: Some(3),
+        };
+        let est = hutchpp_estimate_trace_hinv_op_squared(&hop, &a_op, &config);
+        let rel_err = (est - exact).abs() / exact.abs().max(1e-10);
+        assert!(
+            rel_err < 0.05,
+            "Hutch++ tr((H⁻¹A)²) est={est:.6} exact={exact:.6} rel_err={rel_err:.4}"
+        );
+
+        // Wired path: estimate_second_order_single_dense routes through
+        // Hutch++ when hutchpp_sketch_dim is Some(_).
+        let estimator = StochasticTraceEstimator::new(config.clone());
+        let est_wired = estimator.estimate_second_order_single_dense(&hop, &a);
+        let rel_err_wired = (est_wired - exact).abs() / exact.abs().max(1e-10);
+        assert!(
+            rel_err_wired < 0.05,
+            "wired Hutch++ second-order est={est_wired:.6} exact={exact:.6} rel_err={rel_err_wired:.4}"
+        );
+        assert!(
+            (est_wired - est).abs() <= 1e-12,
+            "wired path must call hutchpp_estimate_trace_hinv_op_squared with the same seed/config"
+        );
+    }
+
+    #[test]
+    fn hutchpp_estimate_trace_hinv_operator_cross_matches_exact() {
+        let h = array![
+            [4.0, 1.0, 0.5, 0.0, 0.0, 0.0],
+            [1.0, 3.0, 0.2, 0.0, 0.0, 0.0],
+            [0.5, 0.2, 2.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 5.0, 0.7, 0.1],
+            [0.0, 0.0, 0.0, 0.7, 4.0, 0.3],
+            [0.0, 0.0, 0.0, 0.1, 0.3, 3.0],
+        ];
+        let a = array![
+            [1.0, 0.3, 0.0, 0.1, 0.0, 0.0],
+            [0.3, 0.5, 0.1, 0.0, 0.2, 0.0],
+            [0.0, 0.1, 0.2, 0.0, 0.0, 0.05],
+            [0.1, 0.0, 0.0, 0.8, 0.2, 0.0],
+            [0.0, 0.2, 0.0, 0.2, 0.6, 0.1],
+            [0.0, 0.0, 0.05, 0.0, 0.1, 0.4],
+        ];
+        let b = array![
+            [0.5, 0.0, 0.1, 0.0, 0.05, 0.0],
+            [0.0, 0.7, 0.0, 0.2, 0.0, 0.1],
+            [0.1, 0.0, 0.4, 0.0, 0.15, 0.0],
+            [0.0, 0.2, 0.0, 0.6, 0.0, 0.05],
+            [0.05, 0.0, 0.15, 0.0, 0.3, 0.0],
+            [0.0, 0.1, 0.0, 0.05, 0.0, 0.5],
+        ];
+        let hop = DenseSpectralOperator::from_symmetric(&h).unwrap();
+        let a_op = DenseMatrixHyperOperator { matrix: a.clone() };
+        let b_op = DenseMatrixHyperOperator { matrix: b.clone() };
+
+        let exact = hop.trace_hinv_product_cross(&a, &b);
+
+        let config = StochasticTraceConfig {
+            n_probes_min: 16,
+            n_probes_max: 128,
+            relative_tol: 0.005,
+            tau_rel: 1e-10,
+            solve_rel_tol: 1e-10,
+            seed: 0xDEAD_BEEF,
+            hutchpp_sketch_dim: Some(3),
+        };
+        let est = hutchpp_estimate_trace_hinv_operator_cross(&hop, &a_op, &b_op, &config);
+        let rel_err = (est - exact).abs() / exact.abs().max(1e-10);
+        assert!(
+            rel_err < 0.07,
+            "Hutch++ cross trace est={est:.6} exact={exact:.6} rel_err={rel_err:.4}"
+        );
+    }
+
+    #[test]
+    fn trace_hinv_operator_cross_default_routes_implicit_to_hutchpp() {
+        // Build a synthetic 200-dim SPD H and an HVP-only operator pair
+        // (mark `is_implicit() = true`) so the trait default routes
+        // through the Hutch++ path. The exact reference comes from the
+        // dense materialization of the same operator.
+        let p = 200usize;
+        let mut h = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            h[[i, i]] = 5.0 + (i as f64) * 0.01;
+            if i + 1 < p {
+                h[[i, i + 1]] = 0.2;
+                h[[i + 1, i]] = 0.2;
+            }
+        }
+        let mut a = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            a[[i, i]] = 1.0 + 0.005 * (i as f64);
+            if i + 2 < p {
+                a[[i, i + 2]] = 0.1;
+                a[[i + 2, i]] = 0.1;
+            }
+        }
+        let hop = DenseSpectralOperator::from_symmetric(&h).unwrap();
+
+        // Wrapper that masquerades as implicit so the default route fires.
+        struct ImplicitDense(Array2<f64>);
+        impl HyperOperator for ImplicitDense {
+            fn dim(&self) -> usize {
+                self.0.nrows()
+            }
+            fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+                let mut out = Array1::<f64>::zeros(self.0.nrows());
+                dense_matvec_into(&self.0, v.view(), out.view_mut());
+                out
+            }
+            fn mul_vec_into(&self, v: ArrayView1<'_, f64>, out: ArrayViewMut1<'_, f64>) {
+                dense_matvec_into(&self.0, v, out);
+            }
+            fn to_dense(&self) -> Array2<f64> {
+                self.0.clone()
+            }
+            fn is_implicit(&self) -> bool {
+                true
+            }
+        }
+
+        let a_op = ImplicitDense(a.clone());
+        let exact = hop.trace_hinv_product_cross(&a, &a);
+        // Same-operator path: routes through the squared estimator.
+        let est_same = hop.trace_hinv_operator_cross(&a_op, &a_op);
+        assert!(est_same.is_finite(), "cross trace must be finite");
+        let rel_err_same = (est_same - exact).abs() / exact.abs().max(1e-10);
+        assert!(
+            rel_err_same < 0.10,
+            "default same-op cross routing est={est_same:.6} exact={exact:.6} rel_err={rel_err_same:.4}"
+        );
+
+        // Distinct-operator path: routes through the cross estimator.
+        let mut b = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            b[[i, i]] = 0.6 + 0.003 * (i as f64);
+            if i + 1 < p {
+                b[[i, i + 1]] = 0.05;
+                b[[i + 1, i]] = 0.05;
+            }
+        }
+        let b_op = ImplicitDense(b.clone());
+        let exact_ab = hop.trace_hinv_product_cross(&a, &b);
+        let est_ab = hop.trace_hinv_operator_cross(&a_op, &b_op);
+        assert!(est_ab.is_finite(), "cross trace (a,b) must be finite");
+        let rel_err_ab = (est_ab - exact_ab).abs() / exact_ab.abs().max(1e-10);
+        assert!(
+            rel_err_ab < 0.10,
+            "default distinct-op cross routing est={est_ab:.6} exact={exact_ab:.6} rel_err={rel_err_ab:.4}"
+        );
+
+        // Matrix-operator path: routes through the cross estimator with
+        // a synthetic dense LHS wrapper.
+        let exact_ma = hop.trace_hinv_product_cross(&a, &b);
+        let est_ma = hop.trace_hinv_matrix_operator_cross(&a, &b_op);
+        assert!(est_ma.is_finite(), "matrix-op cross trace must be finite");
+        let rel_err_ma = (est_ma - exact_ma).abs() / exact_ma.abs().max(1e-10);
+        assert!(
+            rel_err_ma < 0.10,
+            "default matrix-operator cross routing est={est_ma:.6} exact={exact_ma:.6} rel_err={rel_err_ma:.4}"
         );
     }
 
