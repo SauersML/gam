@@ -3,10 +3,10 @@ use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution,
     CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef,
-    CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointPsiDirectCache,
-    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
-    ExactNewtonOuterCurvature, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    PenaltyMatrix, PsiDesignMap, build_embedded_dense_psi_operator,
+    CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
+    ExactNewtonJointPsiDirectCache, ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms,
+    ExactNewtonJointPsiWorkspace, ExactNewtonOuterCurvature, FamilyEvaluation, ParameterBlockSpec,
+    ParameterBlockState, PenaltyMatrix, PsiDesignMap, build_embedded_dense_psi_operator,
     build_rowwise_kronecker_psi_operator, evaluate_custom_family_joint_hyper,
     evaluate_custom_family_joint_hyper_efs, first_psi_linear_map, fit_custom_family,
     resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi_map, second_psi_linear_map,
@@ -1846,33 +1846,33 @@ impl SurvivalLocationScaleFamily {
             d_h_d,
             d2_h_h0,
             d2_h_h1,
-            dq_t: dynamic.dq_t_exit.clone(),
-            dq_ls: dynamic.dq_ls_exit.clone(),
-            d2q_tls: dynamic.d2q_tls_exit.clone(),
-            d2q_ls: dynamic.d2q_ls_exit.clone(),
-            d3q_tls_ls: dynamic.d3q_tls_ls_exit.clone(),
-            d3q_ls: dynamic.d3q_ls_exit.clone(),
-            d4q_tls_ls_ls: dynamic.d4q_tls_ls_ls_exit.clone(),
-            d4q_ls: dynamic.d4q_ls_exit.clone(),
-            dq_t_entry: Some(dynamic.dq_t_entry.clone()),
-            dq_ls_entry: Some(dynamic.dq_ls_entry.clone()),
-            d2q_tls_entry: Some(dynamic.d2q_tls_entry.clone()),
-            d2q_ls_entry: Some(dynamic.d2q_ls_entry.clone()),
-            d3q_tls_ls_entry: Some(dynamic.d3q_tls_ls_entry.clone()),
-            d3q_ls_entry: Some(dynamic.d3q_ls_entry.clone()),
-            d4q_tls_ls_ls_entry: Some(dynamic.d4q_tls_ls_ls_entry.clone()),
-            d4q_ls_entry: Some(dynamic.d4q_ls_entry.clone()),
-            dqdot_t: dynamic.dqdot_t.clone(),
-            dqdot_ls: dynamic.dqdot_ls.clone(),
-            dqdot_td: dynamic.dqdot_td.clone(),
-            dqdot_lsd: dynamic.dqdot_lsd.clone(),
-            d2qdot_tt: dynamic.d2qdot_tt.clone(),
-            d2qdot_tls: dynamic.d2qdot_tls.clone(),
-            d2qdot_ttd: dynamic.d2qdot_ttd.clone(),
-            d2qdot_tlsd: dynamic.d2qdot_tlsd.clone(),
-            d2qdot_ls: dynamic.d2qdot_ls.clone(),
-            d2qdot_lstd: dynamic.d2qdot_lstd.clone(),
-            d2qdot_lslsd: dynamic.d2qdot_lslsd.clone(),
+            dq_t: dynamic.dq_t_exit,
+            dq_ls: dynamic.dq_ls_exit,
+            d2q_tls: dynamic.d2q_tls_exit,
+            d2q_ls: dynamic.d2q_ls_exit,
+            d3q_tls_ls: dynamic.d3q_tls_ls_exit,
+            d3q_ls: dynamic.d3q_ls_exit,
+            d4q_tls_ls_ls: dynamic.d4q_tls_ls_ls_exit,
+            d4q_ls: dynamic.d4q_ls_exit,
+            dq_t_entry: Some(dynamic.dq_t_entry),
+            dq_ls_entry: Some(dynamic.dq_ls_entry),
+            d2q_tls_entry: Some(dynamic.d2q_tls_entry),
+            d2q_ls_entry: Some(dynamic.d2q_ls_entry),
+            d3q_tls_ls_entry: Some(dynamic.d3q_tls_ls_entry),
+            d3q_ls_entry: Some(dynamic.d3q_ls_entry),
+            d4q_tls_ls_ls_entry: Some(dynamic.d4q_tls_ls_ls_entry),
+            d4q_ls_entry: Some(dynamic.d4q_ls_entry),
+            dqdot_t: dynamic.dqdot_t,
+            dqdot_ls: dynamic.dqdot_ls,
+            dqdot_td: dynamic.dqdot_td,
+            dqdot_lsd: dynamic.dqdot_lsd,
+            d2qdot_tt: dynamic.d2qdot_tt,
+            d2qdot_tls: dynamic.d2qdot_tls,
+            d2qdot_ttd: dynamic.d2qdot_ttd,
+            d2qdot_tlsd: dynamic.d2qdot_tlsd,
+            d2qdot_ls: dynamic.d2qdot_ls,
+            d2qdot_lstd: dynamic.d2qdot_lstd,
+            d2qdot_lslsd: dynamic.d2qdot_lslsd,
         })
     }
 
@@ -8784,6 +8784,165 @@ impl SurvivalLocationScaleFamily {
 
         Ok(out)
     }
+
+    fn evaluate_log_likelihood_and_block_gradients(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<(f64, Vec<Array1<f64>>), String> {
+        let n = self.n;
+        let dynamic = self.build_dynamic_geometry(block_states)?;
+        let mut ll = 0.0;
+
+        let mut grad_time_eta_h0 = Array1::<f64>::zeros(n);
+        let mut grad_time_eta_h1 = Array1::<f64>::zeros(n);
+        let mut grad_time_eta_d = Array1::<f64>::zeros(n);
+        let mut d1_q0 = Array1::<f64>::zeros(n);
+        let mut d1_q1 = Array1::<f64>::zeros(n);
+        let mut d1_qdot = Array1::<f64>::zeros(n);
+
+        let assign_row_derivatives =
+            |i: usize,
+             row: SurvivalRowDerivatives,
+             d1_q0: &mut Array1<f64>,
+             d1_q1: &mut Array1<f64>,
+             d1_qdot: &mut Array1<f64>,
+             grad_time_eta_h0: &mut Array1<f64>,
+             grad_time_eta_h1: &mut Array1<f64>,
+             grad_time_eta_d: &mut Array1<f64>| {
+                d1_q0[i] = row.d1_q0;
+                d1_q1[i] = row.d1_q1;
+                d1_qdot[i] = row.d1_qdot1;
+                grad_time_eta_h0[i] = row.grad_time_eta_h0;
+                grad_time_eta_h1[i] = row.grad_time_eta_h1;
+                grad_time_eta_d[i] = row.grad_time_eta_d;
+            };
+
+        if n >= Self::EVALUATE_PARALLEL_ROW_THRESHOLD && rayon::current_num_threads() > 1 {
+            struct RowDerivativeAccumulator {
+                ll: f64,
+                rows: Vec<(usize, SurvivalRowDerivatives)>,
+            }
+
+            let make_acc = || RowDerivativeAccumulator {
+                ll: 0.0,
+                rows: Vec::new(),
+            };
+            let acc = (0..n)
+                .into_par_iter()
+                .try_fold(make_acc, |mut acc, i| -> Result<_, String> {
+                    let state = self.row_predictor_state(
+                        dynamic.h_entry[i],
+                        dynamic.h_exit[i],
+                        dynamic.hdot_exit[i],
+                        dynamic.q_entry[i],
+                        dynamic.q_exit[i],
+                        dynamic.qdot_exit[i],
+                    );
+                    if let Some(row) = self.row_derivatives(i, state)? {
+                        acc.ll += row.ll;
+                        acc.rows.push((i, row));
+                    }
+                    Ok(acc)
+                })
+                .try_reduce(make_acc, |mut a, mut b| {
+                    a.ll += b.ll;
+                    a.rows.append(&mut b.rows);
+                    Ok::<_, String>(a)
+                })?;
+
+            ll = acc.ll;
+            for (i, row) in acc.rows {
+                assign_row_derivatives(
+                    i,
+                    row,
+                    &mut d1_q0,
+                    &mut d1_q1,
+                    &mut d1_qdot,
+                    &mut grad_time_eta_h0,
+                    &mut grad_time_eta_h1,
+                    &mut grad_time_eta_d,
+                );
+            }
+        } else {
+            for i in 0..n {
+                let state = self.row_predictor_state(
+                    dynamic.h_entry[i],
+                    dynamic.h_exit[i],
+                    dynamic.hdot_exit[i],
+                    dynamic.q_entry[i],
+                    dynamic.q_exit[i],
+                    dynamic.qdot_exit[i],
+                );
+                let Some(row) = self.row_derivatives(i, state)? else {
+                    continue;
+                };
+                ll += row.ll;
+                assign_row_derivatives(
+                    i,
+                    row,
+                    &mut d1_q0,
+                    &mut d1_q1,
+                    &mut d1_qdot,
+                    &mut grad_time_eta_h0,
+                    &mut grad_time_eta_h1,
+                    &mut grad_time_eta_d,
+                );
+            }
+        }
+
+        let grad_time = dynamic.time_jac_entry.t().dot(&grad_time_eta_h0)
+            + dynamic.time_jac_exit.t().dot(&grad_time_eta_h1)
+            + dynamic.time_jac_deriv.t().dot(&grad_time_eta_d);
+
+        let grad_t = if let (Some(x_t_entry), Some(x_t_deriv)) = (
+            self.x_threshold_entry.as_ref(),
+            self.x_threshold_deriv.as_ref(),
+        ) {
+            let grad_exit = &d1_q1 * &dynamic.dq_t_exit + &d1_qdot * &dynamic.dqdot_t;
+            let grad_entry = &d1_q0 * &dynamic.dq_t_entry;
+            let grad_deriv = &d1_qdot * &dynamic.dqdot_td;
+            self.x_threshold.transpose_vector_multiply(&grad_exit)
+                + x_t_entry.transpose_vector_multiply(&grad_entry)
+                + x_t_deriv.transpose_vector_multiply(&grad_deriv)
+        } else {
+            self.x_threshold.transpose_vector_multiply(
+                &(&d1_q1 * &dynamic.dq_t_exit
+                    + &d1_q0 * &dynamic.dq_t_entry
+                    + &d1_qdot * &dynamic.dqdot_t),
+            )
+        };
+
+        let grad_ls = if let (Some(x_ls_entry), Some(x_ls_deriv)) = (
+            self.x_log_sigma_entry.as_ref(),
+            self.x_log_sigma_deriv.as_ref(),
+        ) {
+            let grad_exit = &d1_q1 * &dynamic.dq_ls_exit + &d1_qdot * &dynamic.dqdot_ls;
+            let grad_entry = &d1_q0 * &dynamic.dq_ls_entry;
+            let grad_deriv = &d1_qdot * &dynamic.dqdot_lsd;
+            self.x_log_sigma.transpose_vector_multiply(&grad_exit)
+                + x_ls_entry.transpose_vector_multiply(&grad_entry)
+                + x_ls_deriv.transpose_vector_multiply(&grad_deriv)
+        } else {
+            self.x_log_sigma.transpose_vector_multiply(
+                &(&d1_q1 * &dynamic.dq_ls_exit
+                    + &d1_q0 * &dynamic.dq_ls_entry
+                    + &d1_qdot * &dynamic.dqdot_ls),
+            )
+        };
+
+        let mut block_gradients = vec![grad_time, grad_t, grad_ls];
+        if let (Some(xw_exit), Some(xw_entry), Some(xw_qdot)) = (
+            dynamic.wiggle_basis_exit.as_ref(),
+            dynamic.wiggle_basis_entry.as_ref(),
+            dynamic.wiggle_qdot_basis_exit.as_ref(),
+        ) {
+            let gradw =
+                xw_exit.t().dot(&d1_q1) + xw_entry.t().dot(&d1_q0) + xw_qdot.t().dot(&d1_qdot);
+            block_gradients.push(gradw);
+        }
+
+        Ok((ll, block_gradients))
+    }
 }
 
 impl SurvivalExactNewtonJointPsiWorkspace {
@@ -8900,159 +9059,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        let n = self.n;
-        let dynamic = self.build_dynamic_geometry(block_states)?;
-        let mut ll = 0.0;
-
-        // Per-row derivative collection — used for gradient only.
-        let mut grad_time_eta_h0 = Array1::<f64>::zeros(n);
-        let mut grad_time_eta_h1 = Array1::<f64>::zeros(n);
-        let mut grad_time_eta_d = Array1::<f64>::zeros(n);
-        let mut d1_q0 = Array1::<f64>::zeros(n);
-        let mut d1_q1 = Array1::<f64>::zeros(n);
-        let mut d1_qdot = Array1::<f64>::zeros(n);
-
-        let assign_row_derivatives =
-            |i: usize,
-             row: SurvivalRowDerivatives,
-             d1_q0: &mut Array1<f64>,
-             d1_q1: &mut Array1<f64>,
-             d1_qdot: &mut Array1<f64>,
-             grad_time_eta_h0: &mut Array1<f64>,
-             grad_time_eta_h1: &mut Array1<f64>,
-             grad_time_eta_d: &mut Array1<f64>| {
-                d1_q0[i] = row.d1_q0;
-                d1_q1[i] = row.d1_q1;
-                d1_qdot[i] = row.d1_qdot1;
-                grad_time_eta_h0[i] = row.grad_time_eta_h0;
-                grad_time_eta_h1[i] = row.grad_time_eta_h1;
-                grad_time_eta_d[i] = row.grad_time_eta_d;
-            };
-
-        if n >= Self::EVALUATE_PARALLEL_ROW_THRESHOLD && rayon::current_num_threads() > 1 {
-            struct RowDerivativeAccumulator {
-                ll: f64,
-                rows: Vec<(usize, SurvivalRowDerivatives)>,
-            }
-
-            let make_acc = || RowDerivativeAccumulator {
-                ll: 0.0,
-                rows: Vec::new(),
-            };
-            let acc = (0..n)
-                .into_par_iter()
-                .try_fold(make_acc, |mut acc, i| -> Result<_, String> {
-                    let state = self.row_predictor_state(
-                        dynamic.h_entry[i],
-                        dynamic.h_exit[i],
-                        dynamic.hdot_exit[i],
-                        dynamic.q_entry[i],
-                        dynamic.q_exit[i],
-                        dynamic.qdot_exit[i],
-                    );
-                    if let Some(row) = self.row_derivatives(i, state)? {
-                        acc.ll += row.ll;
-                        acc.rows.push((i, row));
-                    }
-                    Ok(acc)
-                })
-                .try_reduce(make_acc, |mut a, mut b| {
-                    a.ll += b.ll;
-                    a.rows.append(&mut b.rows);
-                    Ok::<_, String>(a)
-                })?;
-
-            ll = acc.ll;
-            for (i, row) in acc.rows {
-                assign_row_derivatives(
-                    i,
-                    row,
-                    &mut d1_q0,
-                    &mut d1_q1,
-                    &mut d1_qdot,
-                    &mut grad_time_eta_h0,
-                    &mut grad_time_eta_h1,
-                    &mut grad_time_eta_d,
-                );
-            }
-        } else {
-            for i in 0..n {
-                let state = self.row_predictor_state(
-                    dynamic.h_entry[i],
-                    dynamic.h_exit[i],
-                    dynamic.hdot_exit[i],
-                    dynamic.q_entry[i],
-                    dynamic.q_exit[i],
-                    dynamic.qdot_exit[i],
-                );
-                let Some(row) = self.row_derivatives(i, state)? else {
-                    continue;
-                };
-                ll += row.ll;
-                assign_row_derivatives(
-                    i,
-                    row,
-                    &mut d1_q0,
-                    &mut d1_q1,
-                    &mut d1_qdot,
-                    &mut grad_time_eta_h0,
-                    &mut grad_time_eta_h1,
-                    &mut grad_time_eta_d,
-                );
-            }
-        }
-
-        // Per-block gradients (O(n·p_k) each, no Hessian algebra).
-        let grad_time = dynamic.time_jac_entry.t().dot(&grad_time_eta_h0)
-            + dynamic.time_jac_exit.t().dot(&grad_time_eta_h1)
-            + dynamic.time_jac_deriv.t().dot(&grad_time_eta_d);
-
-        let grad_t = if let (Some(x_t_entry), Some(x_t_deriv)) = (
-            self.x_threshold_entry.as_ref(),
-            self.x_threshold_deriv.as_ref(),
-        ) {
-            let grad_exit = &d1_q1 * &dynamic.dq_t_exit + &d1_qdot * &dynamic.dqdot_t;
-            let grad_entry = &d1_q0 * &dynamic.dq_t_entry;
-            let grad_deriv = &d1_qdot * &dynamic.dqdot_td;
-            self.x_threshold.transpose_vector_multiply(&grad_exit)
-                + x_t_entry.transpose_vector_multiply(&grad_entry)
-                + x_t_deriv.transpose_vector_multiply(&grad_deriv)
-        } else {
-            self.x_threshold.transpose_vector_multiply(
-                &(&d1_q1 * &dynamic.dq_t_exit
-                    + &d1_q0 * &dynamic.dq_t_entry
-                    + &d1_qdot * &dynamic.dqdot_t),
-            )
-        };
-
-        let grad_ls = if let (Some(x_ls_entry), Some(x_ls_deriv)) = (
-            self.x_log_sigma_entry.as_ref(),
-            self.x_log_sigma_deriv.as_ref(),
-        ) {
-            let grad_exit = &d1_q1 * &dynamic.dq_ls_exit + &d1_qdot * &dynamic.dqdot_ls;
-            let grad_entry = &d1_q0 * &dynamic.dq_ls_entry;
-            let grad_deriv = &d1_qdot * &dynamic.dqdot_lsd;
-            self.x_log_sigma.transpose_vector_multiply(&grad_exit)
-                + x_ls_entry.transpose_vector_multiply(&grad_entry)
-                + x_ls_deriv.transpose_vector_multiply(&grad_deriv)
-        } else {
-            self.x_log_sigma.transpose_vector_multiply(
-                &(&d1_q1 * &dynamic.dq_ls_exit
-                    + &d1_q0 * &dynamic.dq_ls_entry
-                    + &d1_qdot * &dynamic.dqdot_ls),
-            )
-        };
-
-        let mut block_gradients = vec![grad_time, grad_t, grad_ls];
-        if let (Some(xw_exit), Some(xw_entry), Some(xw_qdot)) = (
-            dynamic.wiggle_basis_exit.as_ref(),
-            dynamic.wiggle_basis_entry.as_ref(),
-            dynamic.wiggle_qdot_basis_exit.as_ref(),
-        ) {
-            let gradw =
-                xw_exit.t().dot(&d1_q1) + xw_entry.t().dot(&d1_q0) + xw_qdot.t().dot(&d1_qdot);
-            block_gradients.push(gradw);
-        }
+        let (ll, block_gradients) =
+            self.evaluate_log_likelihood_and_block_gradients(block_states)?;
 
         // Block-diagonal direct path — assemble only the principal blocks
         // the inner solver consumes. The cross blocks (h_ht, h_hl, h_hw,
@@ -9184,6 +9192,47 @@ impl CustomFamily for SurvivalLocationScaleFamily {
     ) -> Result<Option<Array2<f64>>, String> {
         let q = self.collect_joint_quantities(block_states)?;
         self.assemble_joint_hessian_from_quantities(&q, block_states)
+    }
+
+    fn exact_newton_joint_gradient_evaluation(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        let (log_likelihood, block_gradients) =
+            self.evaluate_log_likelihood_and_block_gradients(block_states)?;
+        if block_gradients.len() != specs.len() {
+            return Err(format!(
+                "SurvivalLocationScaleFamily joint gradient block count mismatch: gradients={}, specs={}",
+                block_gradients.len(),
+                specs.len()
+            ));
+        }
+
+        let total_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+        let mut gradient = Array1::<f64>::zeros(total_p);
+        let mut offset = 0usize;
+        for (block_idx, (block_gradient, spec)) in
+            block_gradients.iter().zip(specs.iter()).enumerate()
+        {
+            let width = spec.design.ncols();
+            if block_gradient.len() != width {
+                return Err(format!(
+                    "SurvivalLocationScaleFamily joint gradient length mismatch for block {block_idx}: got {}, expected {}",
+                    block_gradient.len(),
+                    width
+                ));
+            }
+            gradient
+                .slice_mut(s![offset..offset + width])
+                .assign(block_gradient);
+            offset += width;
+        }
+
+        Ok(Some(ExactNewtonJointGradientEvaluation {
+            log_likelihood,
+            gradient,
+        }))
     }
 
     fn has_explicit_joint_hessian(&self) -> bool {
@@ -12526,6 +12575,38 @@ mod tests {
             scalar,
             row_sum
         );
+    }
+
+    #[test]
+    fn survival_joint_gradient_evaluation_matches_evaluate_block_gradients() {
+        let family = survival_exact_newton_test_family();
+        let states =
+            survival_exact_newton_rebuild_states(&array![0.2], &array![0.35], &array![-0.15]);
+        let specs = survival_outergradient_testspecs();
+        let joint = family
+            .exact_newton_joint_gradient_evaluation(&states, &specs)
+            .expect("joint gradient evaluation")
+            .expect("survival location-scale should provide joint gradient");
+        let eval = family.evaluate(&states).expect("full evaluate");
+
+        assert!((joint.log_likelihood - eval.log_likelihood).abs() <= 1e-12);
+
+        let mut expected = Array1::<f64>::zeros(joint.gradient.len());
+        let mut offset = 0usize;
+        for (spec, work) in specs.iter().zip(eval.blockworking_sets.iter()) {
+            let width = spec.design.ncols();
+            let BlockWorkingSet::ExactNewton { gradient, .. } = work else {
+                panic!("survival location-scale blocks should use exact Newton");
+            };
+            expected
+                .slice_mut(s![offset..offset + width])
+                .assign(gradient);
+            offset += width;
+        }
+
+        for (actual, expected) in joint.gradient.iter().zip(expected.iter()) {
+            assert!((actual - expected).abs() <= 1e-12);
+        }
     }
 
     #[test]
