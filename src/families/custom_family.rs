@@ -8759,34 +8759,29 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 0.0
             };
 
-        let initial_max_joint_step = family.joint_newton_max_step_inf(specs);
-        if !initial_max_joint_step.is_finite() || initial_max_joint_step <= 0.0 {
+        // The inf-norm β-space cap previously applied here
+        // (`joint_newton_max_step_inf`, default 20.0) is intentionally
+        // not used. It conflated two distinct concerns and bound the
+        // step on every cycle of quasi-saturated problems where the
+        // optimum sits at large |β|:
+        //   (a) η-overflow safety — a physical limit specific to the
+        //       family's likelihood evaluator. Owned by the family via
+        //       `max_feasible_step_size`, called by the line search.
+        //   (b) Newton-model trust — an algorithmic limit that adapts
+        //       via rho. Owned by `joint_trust_radius` below, updated
+        //       by `update_joint_trust_region_radius` on every attempt.
+        // The L2 trust radius is strictly tighter than an inf-norm cap
+        // of the same magnitude (|·|_∞ ≤ |·|_2), so removing the cap
+        // does not weaken safety on any block. The trait method
+        // `joint_newton_max_step_inf` is retained for backward
+        // compatibility but no longer consulted; we still validate the
+        // returned value to surface family-side bugs.
+        let _initial_max_joint_step_unused = family.joint_newton_max_step_inf(specs);
+        if !_initial_max_joint_step_unused.is_finite() || _initial_max_joint_step_unused <= 0.0 {
             return Err(format!(
-                "joint Newton max step cap must be finite and positive, got {initial_max_joint_step}"
+                "joint Newton max step cap must be finite and positive, got {_initial_max_joint_step_unused}"
             ));
         }
-        // Adaptive inf-norm cap. The family-supplied default (e.g. 20.0) is
-        // sized so a single-cycle Δβ never crashes the link function on
-        // typical-scale problems where |β_opt| ~ O(1)–O(10). On
-        // quasi-saturated problems where the true optimum sits at |β| ~
-        // O(10²)–O(10³) along a near-linear ridge in the likelihood, that
-        // same cap binds every cycle: rho=1.0 on every accepted step
-        // (model is exact along the ridge) but β can only grow by 20 per
-        // cycle, forcing 50–100 inner cycles to traverse a valley Newton
-        // would otherwise leap in one shot.
-        //
-        // Treat sustained "step-clamped + high rho + accepted" cycles as
-        // empirical proof the cap is the binding constraint, not the
-        // model. Grow the cap geometrically; shrink it back on any
-        // rejection or low-rho cycle. Floor at the family default so we
-        // never exceed the family's own safety budget on the first cycle
-        // of a fresh fit.
-        let mut max_joint_step = initial_max_joint_step;
-        let mut consecutive_high_rho_clamped_cycles: usize = 0;
-        let mut last_accepted_rho: f64 = f64::NAN;
-        const ADAPTIVE_CAP_GROWTH_THRESHOLD: usize = 3;
-        const ADAPTIVE_CAP_GROWTH_FACTOR: f64 = 2.0;
-        const ADAPTIVE_CAP_CEILING: f64 = 1.0e4;
 
         // Cross-cycle convergence carry-over: set at the end of every
         // accepted cycle so the next cycle can distinguish a true KKT
@@ -9121,7 +9116,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // backtracking step search.
             let hessian_and_qp_elapsed = hessian_started.elapsed();
             let line_search_started = std::time::Instant::now();
-            let mut delta = &candidate_beta - &beta_joint;
+            let delta = &candidate_beta - &beta_joint;
 
             // Trust-region globalization for the joint Newton proposal.  The
             // previous implementation used up to eight backtracking likelihood
@@ -9129,11 +9124,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // scale).  Here the step is truncated before evaluation and the
             // single trial objective is accepted only when the actual decrease
             // is positive relative to the local quadratic model.
-            let mut step_inf = delta.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
-            if step_inf > max_joint_step {
-                delta.mapv_inplace(|v| v * (max_joint_step / step_inf));
-                step_inf = max_joint_step;
-            }
+            let step_inf = delta.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
 
             let old_beta: Vec<Array1<f64>> = states.iter().map(|s| s.beta.clone()).collect();
             let old_objective = lastobjective;
@@ -9350,7 +9341,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         cached_active_sets =
                             scatter_joint_active_set(joint_active_set, &block_constraints);
                     }
-                    last_accepted_rho = trust_update.rho;
                     accepted = true;
                     break;
                 }
@@ -9366,8 +9356,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // failed trust-region search. Falling through into blockwise
                 // would switch a coupled exact-Hessian problem onto a
                 // principal-block surrogate, which is the ridge-drift failure
-                // mode this path is meant to avoid.
-                max_joint_step = (max_joint_step * 0.5).max(initial_max_joint_step);
+                // mode this path is meant to avoid. The trust-region radius
+                // already collapsed via the attempt loop's shrink rules, so
+                // the next cycle's Newton proposal will be evaluated under
+                // a tighter L2 bound without any parallel adaptation here.
                 log::info!(
                     "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=false hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} reject_model={} reject_likelihood={} reject_objective={} first_likelihood_reject={} grad_reload=0.000s total={:.3}s",
                     cycle,
@@ -9443,27 +9435,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 continue;
             }
 
-            // Adaptive cap growth on accepted cycles. When the step
-            // hits the inf-norm cap AND the trust-region rho is high
-            // (model is accurate to within 25%), we have empirical
-            // evidence the cap — not the model — is the binding
-            // constraint. After ADAPTIVE_CAP_GROWTH_THRESHOLD such
-            // cycles in a row, double the cap so Newton can take the
-            // bigger step it was already pricing correctly. Anything
-            // less than high-rho-and-clamped resets the streak.
-            let step_was_clamped_at_cap = step_inf >= 0.95 * max_joint_step;
-            let model_is_accurate = last_accepted_rho.is_finite() && last_accepted_rho > 0.75;
-            if step_was_clamped_at_cap && model_is_accurate {
-                consecutive_high_rho_clamped_cycles += 1;
-                if consecutive_high_rho_clamped_cycles >= ADAPTIVE_CAP_GROWTH_THRESHOLD {
-                    max_joint_step =
-                        (max_joint_step * ADAPTIVE_CAP_GROWTH_FACTOR).min(ADAPTIVE_CAP_CEILING);
-                    consecutive_high_rho_clamped_cycles = 0;
-                }
-            } else {
-                consecutive_high_rho_clamped_cycles = 0;
-            }
-
             let grad_reload_started = std::time::Instant::now();
             let (log_likelihood, gradient, eval, workspace) = load_joint_gradient_evaluation(
                 family,
@@ -9475,14 +9446,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             )?;
             let grad_reload_elapsed = grad_reload_started.elapsed();
             log::info!(
-                "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=true hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} grad_reload={:.3}s total={:.3}s max_joint_step={:.2e}",
+                "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=true hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} grad_reload={:.3}s total={:.3}s",
                 cycle,
                 hessian_and_qp_elapsed.as_secs_f64(),
                 line_search_elapsed.as_secs_f64(),
                 line_search_attempts,
                 grad_reload_elapsed.as_secs_f64(),
                 cycle_started.elapsed().as_secs_f64(),
-                max_joint_step,
             );
             current_log_likelihood = log_likelihood;
             cached_joint_gradient = gradient;
@@ -9687,23 +9657,24 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     // call returns Err / +∞, BFGS κ-optim backs off the divergent ρ
     // region, and the outer loop progresses instead of grinding.
 
-    // Adaptive per-block step cap. Mirrors the joint-Newton sibling
-    // (`max_joint_step`) for the same root cause: a fixed
-    // `MAX_NEWTON_STEP` chosen for typical |β|=O(1) problems binds every
-    // cycle when the optimum sits at |β|=O(10²)–O(10³) along a
-    // near-linear ridge, forcing 50–100 inner cycles to traverse a
-    // valley each block could otherwise leap in one shot. Track
-    // per-block: any block whose line search keeps accepting α=1 with
-    // the proposal at its cap has empirically certified the cap is too
-    // tight. Grow that block's cap geometrically; shrink it back if the
-    // line search starts cutting α hard or fails outright. Floor at the
-    // family-safe initial value so we never undercut the family's own
-    // first-cycle safety budget.
+    // Per-block trust-region radius in β-space. Mirrors the
+    // joint-Newton `max_joint_step` for the same reason: blockwise
+    // historically used a static `MAX_NEWTON_STEP = 20.0` cap that
+    // conflated η-overflow safety with Newton-model trust. The η-safety
+    // half belongs in the family's `max_feasible_step_size` barrier
+    // check (already invoked inside the line search below); this
+    // variable handles only the algorithmic trust-region half. The
+    // family-supplied initial value is the floor (the family itself
+    // declares it safe for a fresh fit). Without explicit rho
+    // computation per block, the proxy "α=1 line-search acceptance with
+    // the proposal clamped at the cap" plays the rho > 0.75 role: it
+    // certifies both that the model was trustworthy at full step and
+    // that the cap was the binding constraint. Standard 2.0 grow / 0.5
+    // shrink. No artificial ceiling — line-search rejection halves the
+    // cap if it ever exceeds what the family can tolerate, so runaway
+    // is bounded by the same mechanism that bounds the joint path.
     const BLOCK_NEWTON_STEP_INITIAL: f64 = 20.0;
-    const BLOCK_NEWTON_STEP_CEILING: f64 = 1.0e4;
-    const BLOCK_CAP_GROWTH_THRESHOLD: usize = 3;
     let mut block_max_step: Vec<f64> = vec![BLOCK_NEWTON_STEP_INITIAL; specs.len()];
-    let mut block_consecutive_full_clamped: Vec<usize> = vec![0; specs.len()];
 
     let mut prev_log_likelihood_for_divergence_check = cached_eval.log_likelihood;
     let mut consecutive_frozen_loglik_cycles: usize = 0;
@@ -9894,25 +9865,21 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     break;
                 }
             }
-            // Adaptive cap update: the line search just told us how
-            // trustworthy this block's quadratic model was. α=1
-            // accepted with the proposal at the cap → cap is binding,
-            // grow it after the threshold of consecutive corroborating
-            // cycles (mirrors joint-Newton's `consecutive_high_rho_clamped_cycles`).
-            // Anything weaker (α<1, line-search rejection) shrinks the
-            // cap toward the family-safe initial value.
+            // Trust-region update for this block's β-space cap. The
+            // line-search outcome plays the rho role:
+            //   * α=1 accepted with proposal at the cap → model was
+            //     trustworthy at full step AND the cap was the binding
+            //     constraint, so double the cap (standard TR growth).
+            //   * α≤1/8 (heavy backtrack) or line search failed → the
+            //     model misled us at this scale, halve the cap (standard
+            //     TR shrink) but never undercut the family floor.
+            //   * Otherwise (full step accepted but not at cap, or mild
+            //     backtracking) → cap is well-sized, leave it.
             let was_clamped = raw_step_inf >= 0.95 * block_cap;
             if accepted && accepted_bt == 0 && was_clamped {
-                block_consecutive_full_clamped[b] += 1;
-                if block_consecutive_full_clamped[b] >= BLOCK_CAP_GROWTH_THRESHOLD {
-                    block_max_step[b] = (block_max_step[b] * 2.0).min(BLOCK_NEWTON_STEP_CEILING);
-                    block_consecutive_full_clamped[b] = 0;
-                }
-            } else {
-                block_consecutive_full_clamped[b] = 0;
-                if !accepted || accepted_bt >= 3 {
-                    block_max_step[b] = (block_max_step[b] * 0.5).max(BLOCK_NEWTON_STEP_INITIAL);
-                }
+                block_max_step[b] *= 2.0;
+            } else if !accepted || accepted_bt >= 3 {
+                block_max_step[b] = (block_max_step[b] * 0.5).max(BLOCK_NEWTON_STEP_INITIAL);
             }
             if !accepted {
                 states[b].beta.assign(&beta_old);
