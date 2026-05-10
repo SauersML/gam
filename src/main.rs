@@ -9201,8 +9201,8 @@ fn write_gaussian_location_scale_prediction_csv(
     write_prediction_csv_unified(path, &cols)
 }
 
-/// Convenience wrapper for survival predictions (includes derived
-/// `survival_prob`, `risk_score`, and `failure_prob` columns).
+/// Convenience wrapper for survival predictions. Survival output uses explicit
+/// probability semantics because the event probability is `1 - survival_prob`.
 fn write_survival_prediction_csv(
     path: &Path,
     eta: ArrayView1<'_, f64>,
@@ -9218,10 +9218,9 @@ fn write_survival_prediction_csv(
 
     let mut cols: Vec<(&str, &[f64])> = vec![
         ("eta", &eta_v),
-        ("mean", &surv_v),
         ("survival_prob", &surv_v),
-        ("risk_score", &risk_v),
         ("failure_prob", &fail_v),
+        ("risk_score", &risk_v),
     ];
 
     let se_v: Vec<f64>;
@@ -12402,7 +12401,7 @@ mod tests {
         let text = fs::read_to_string(&path).expect("read csv");
         let header = text.lines().next().unwrap_or("");
         assert_eq!(
-            header, "eta,mean,survival_prob,risk_score,failure_prob",
+            header, "eta,survival_prob,failure_prob,risk_score",
             "survival output schema changed unexpectedly"
         );
 
@@ -12464,7 +12463,7 @@ mod tests {
         let text = fs::read_to_string(&path).expect("read csv");
         let header = text.lines().next().unwrap_or("");
         assert_eq!(
-            header, "eta,mean,survival_prob,risk_score,failure_prob,mean_lower,mean_upper",
+            header, "eta,survival_prob,failure_prob,risk_score,mean_lower,mean_upper",
             "survival output must include bounds when supplied without effective_se",
         );
 
@@ -13757,7 +13756,7 @@ mod tests {
         let csv = fs::read_to_string(&out_path).expect("prediction csv");
         let lines = csv.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0], "eta,mean,survival_prob,risk_score,failure_prob");
+        assert_eq!(lines[0], "eta,survival_prob,failure_prob,risk_score");
     }
 
     #[test]

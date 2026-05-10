@@ -4070,6 +4070,9 @@ fn run_outer_with_plan(
         screening_enabled,
     )
     .min(seeds.len());
+    if config.initial_rho.is_some() && seed_budget == 1 && seeds.len() > 1 {
+        seeds.truncate(1);
+    }
     if should_screen_seeds(config, the_plan.solver, seeds.len(), seed_budget) {
         seeds = rank_seeds_with_screening(obj, config, context, &seeds);
     }
@@ -6703,14 +6706,14 @@ mod tests {
     }
 
     #[test]
-    fn run_screening_reorders_expensive_seeds_before_full_startup_eval() {
+    fn run_screening_reorders_expensive_generated_seeds_before_full_startup_eval() {
         let mut seed_config = crate::seeding::SeedConfig::default();
-        seed_config.seed_budget = 1;
+        seed_config.max_seeds = 4;
+        seed_config.seed_budget = 2;
         seed_config.risk_profile = crate::seeding::SeedRiskProfile::GeneralizedLinear;
         let screening_cap = Arc::new(AtomicUsize::new(0));
-        let initial_seed = array![9.0];
         let valid_seed = crate::seeding::generate_rho_candidates(1, None, &seed_config)
-            .first()
+            .last()
             .expect("seed generator should yield at least one candidate")
             .clone();
         let started = Arc::new(Mutex::new(Vec::new()));
@@ -6719,7 +6722,6 @@ mod tests {
             .with_hessian(DeclaredHessianForm::Either)
             .with_seed_config(seed_config)
             .with_screening_cap(Arc::clone(&screening_cap))
-            .with_initial_rho(initial_seed.clone())
             .with_max_iter(1);
         let mut obj = problem.build_objective(
             (),
@@ -6762,6 +6764,68 @@ mod tests {
             "screening should move the lowest-cost seed to the front before full startup eval",
         );
         assert_eq!(screening_cap.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn initial_rho_with_single_seed_budget_skips_expensive_screening() {
+        let mut seed_config = crate::seeding::SeedConfig::default();
+        seed_config.max_seeds = 4;
+        seed_config.seed_budget = 1;
+        seed_config.risk_profile = crate::seeding::SeedRiskProfile::GeneralizedLinear;
+        let screening_cap = Arc::new(AtomicUsize::new(0));
+        let screening_calls = Arc::new(AtomicUsize::new(0));
+        let initial_seed = array![9.0];
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Either)
+            .with_seed_config(seed_config)
+            .with_screening_cap(Arc::clone(&screening_cap))
+            .with_initial_rho(initial_seed.clone())
+            .with_max_iter(1);
+        let mut obj = problem.build_objective(
+            (),
+            {
+                let screening_calls = Arc::clone(&screening_calls);
+                move |_: &mut (), _theta: &Array1<f64>| {
+                    screening_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(0.0)
+                }
+            },
+            {
+                let started = Arc::clone(&started);
+                let initial_seed = initial_seed.clone();
+                move |_: &mut (), theta: &Array1<f64>| {
+                    started.lock().unwrap().push(theta.clone());
+                    if theta == &initial_seed {
+                        Ok(OuterEval {
+                            cost: 0.0,
+                            gradient: array![0.0],
+                            hessian: HessianResult::Analytic(array![[1.0]]),
+                        })
+                    } else {
+                        Ok(OuterEval::infeasible(theta.len()))
+                    }
+                }
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let result = problem
+            .run(&mut obj, "initial rho should be authoritative")
+            .expect("initial-rho startup should not spend seed-screening solves");
+        assert_eq!(result.rho, initial_seed);
+        assert_eq!(
+            screening_calls.load(Ordering::Relaxed),
+            0,
+            "explicit initial rho plus seed_budget=1 should skip screening"
+        );
+        assert_eq!(
+            started.lock().unwrap().first().cloned(),
+            Some(initial_seed),
+            "solver should start from the explicit initial rho"
+        );
+        assert_eq!(screening_cap.load(Ordering::Relaxed), 0);
     }
 
     #[test]
