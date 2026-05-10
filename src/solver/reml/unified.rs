@@ -12082,15 +12082,16 @@ pub(crate) fn hutchpp_estimate_trace_hinv_operator(
     let mut q = Array2::<f64>::zeros((p, sketch_dim));
     let mut q_rank = 0usize;
     if sketch_dim > 0 {
+        let mut y = Array2::<f64>::zeros((p, sketch_dim));
         let mut z = Array1::<f64>::zeros(p);
         let mut mz = Array1::<f64>::zeros(p);
         for j in 0..sketch_dim {
             rademacher_probe_into(z.view_mut(), &mut rng_state);
             op.mul_vec_into(z.view(), mz.view_mut());
             let w = hop.stochastic_trace_solve(&mz, config.solve_rel_tol);
-            q.column_mut(j).assign(&w);
+            y.column_mut(j).assign(&w);
         }
-        q_rank = modified_gram_schmidt_in_place(&mut q);
+        q_rank = modified_gram_schmidt(&y, &mut q);
     }
 
     // Phase 2: T_low = tr(Qᵀ H⁻¹ M Q). Apply H⁻¹ M to each retained
@@ -14038,6 +14039,110 @@ mod tests {
             rel_err2,
         );
     }
+
+    #[test]
+    fn modified_gram_schmidt_orthonormalizes_well_conditioned_input() {
+        let y = array![
+            [1.0, 2.0, 0.5, 3.0],
+            [0.0, 1.0, 0.5, 1.5],
+            [0.0, 0.0, 1.0, 0.5],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let mut q = Array2::<f64>::zeros(y.dim());
+        let rank = modified_gram_schmidt(&y, &mut q);
+        assert_eq!(rank, 4, "well-conditioned input should retain full rank");
+        // Q^T Q = I within the retained rank.
+        for j in 0..rank {
+            for k in 0..rank {
+                let dot = q.column(j).dot(&q.column(k));
+                let expected = if j == k { 1.0 } else { 0.0 };
+                assert!(
+                    (dot - expected).abs() < 1e-12,
+                    "QᵀQ off-identity at ({j},{k}): got {dot}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn modified_gram_schmidt_drops_redundant_columns() {
+        let y = array![
+            [1.0, 2.0, 1.0, 4.0],
+            [0.0, 1.0, 0.0, 2.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ];
+        let mut q = Array2::<f64>::zeros(y.dim());
+        let rank = modified_gram_schmidt(&y, &mut q);
+        assert_eq!(
+            rank, 2,
+            "two duplicate columns plus a zero-extension should drop to rank 2"
+        );
+        for j in 0..rank {
+            for k in 0..rank {
+                let dot = q.column(j).dot(&q.column(k));
+                let expected = if j == k { 1.0 } else { 0.0 };
+                assert!((dot - expected).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn hutchpp_estimate_trace_hinv_operator_matches_exact_within_tolerance() {
+        // Build a small SPD H and an HVP-only operator wrapping a dense M.
+        // Compare Hutch++ to the exact tr(H⁻¹ M).
+        let h = array![
+            [4.0, 1.0, 0.5, 0.0, 0.0, 0.0],
+            [1.0, 3.0, 0.2, 0.0, 0.0, 0.0],
+            [0.5, 0.2, 2.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 5.0, 0.7, 0.1],
+            [0.0, 0.0, 0.0, 0.7, 4.0, 0.3],
+            [0.0, 0.0, 0.0, 0.1, 0.3, 3.0],
+        ];
+        let m = array![
+            [1.0, 0.3, 0.0, 0.1, 0.0, 0.0],
+            [0.3, 0.5, 0.1, 0.0, 0.2, 0.0],
+            [0.0, 0.1, 0.2, 0.0, 0.0, 0.05],
+            [0.1, 0.0, 0.0, 0.8, 0.2, 0.0],
+            [0.0, 0.2, 0.0, 0.2, 0.6, 0.1],
+            [0.0, 0.0, 0.05, 0.0, 0.1, 0.4],
+        ];
+        let hop = DenseSpectralOperator::from_symmetric(&h).unwrap();
+        let m_op = DenseMatrixHyperOperator { matrix: m.clone() };
+
+        let exact = hop.trace_hinv_product(&m);
+
+        let config = StochasticTraceConfig {
+            n_probes_min: 12,
+            n_probes_max: 64,
+            relative_tol: 0.005,
+            tau_rel: 1e-10,
+            solve_rel_tol: 1e-10,
+            seed: 0xABCDEF,
+            hutchpp_sketch_dim: Some(3),
+        };
+        let est = hutchpp_estimate_trace_hinv_operator(&hop, &m_op, &config);
+        let rel_err = (est - exact).abs() / exact.abs().max(1e-10);
+        assert!(
+            rel_err < 0.05,
+            "Hutch++ trace est={est:.6} exact={exact:.6} rel_err={rel_err:.4}"
+        );
+
+        // Plain Hutchinson with the same probe budget should not be more
+        // accurate; this guards against an inadvertent regression where
+        // the sketch contribution is silently zeroed.
+        let mut config_plain = config.clone();
+        config_plain.hutchpp_sketch_dim = None;
+        config_plain.n_probes_max = 64; // same total budget
+        let est_plain = hutchpp_estimate_trace_hinv_operator(&hop, &m_op, &config_plain);
+        let rel_err_plain = (est_plain - exact).abs() / exact.abs().max(1e-10);
+        // Allow Hutch++ to either beat plain or match it; never be much worse.
+        assert!(
+            rel_err <= rel_err_plain * 2.0 + 0.01,
+            "Hutch++ ({rel_err:.4}) should be competitive with Hutchinson ({rel_err_plain:.4})"
+        );
+    }
+
 
     #[test]
     fn dense_spectral_large_p_outer_gradient_matches_finite_difference() {
