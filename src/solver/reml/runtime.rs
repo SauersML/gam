@@ -2495,8 +2495,7 @@ impl<'a> RemlState<'a> {
         // "active", and that count is now anchored to the basis.
         let p = e_transformed.ncols();
         let structural_rank = if self.canonical_penalties.is_empty() {
-            let (rank, log_det) =
-                positive_penalty_rank_and_logdet(evals.as_slice().unwrap());
+            let (rank, log_det) = positive_penalty_rank_and_logdet(evals.as_slice().unwrap());
             return Ok((rank, log_det));
         } else {
             self.canonical_penalties

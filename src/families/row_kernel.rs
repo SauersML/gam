@@ -924,12 +924,12 @@ mod gram_inner_contraction_tests {
         fn new(n: usize, p: usize, seed: u64) -> Self {
             let mut s = seed;
             let mut next = || -> f64 {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((s >> 33) as f64 / (u32::MAX as f64)) - 0.5
             };
-            let mut mk = || -> Array2<f64> {
-                Array2::from_shape_fn((n, p), |_| next())
-            };
+            let mut mk = || -> Array2<f64> { Array2::from_shape_fn((n, p), |_| next()) };
             let d0 = mk();
             let d1 = mk();
             let d2 = mk();
@@ -972,23 +972,17 @@ mod gram_inner_contraction_tests {
                 }
             }
         }
-        fn add_pullback_hessian(
-            &self,
-            _row: usize,
-            _h: &[[f64; 4]; 4],
-            _target: &mut Array2<f64>,
-        ) {
+        fn add_pullback_hessian(&self, _row: usize, _h: &[[f64; 4]; 4], _target: &mut Array2<f64>) {
             unreachable!("not used in this regression test")
         }
-        fn add_diagonal_quadratic(
-            &self,
-            _row: usize,
-            _h: &[[f64; 4]; 4],
-            _diag: &mut [f64],
-        ) {
+        fn add_diagonal_quadratic(&self, _row: usize, _h: &[[f64; 4]; 4], _diag: &mut [f64]) {
             unreachable!("not used in this regression test")
         }
-        fn row_third_contracted(&self, row: usize, dir: &[f64; 4]) -> Result<[[f64; 4]; 4], String> {
+        fn row_third_contracted(
+            &self,
+            row: usize,
+            dir: &[f64; 4],
+        ) -> Result<[[f64; 4]; 4], String> {
             // Arbitrary symmetric K×K matrix that depends on row and dir.
             let mut t = [[0.0_f64; 4]; 4];
             let row_f = (row as f64) * 0.013;
@@ -1044,9 +1038,7 @@ mod gram_inner_contraction_tests {
             for k in 0..K {
                 dir_k_buf[k] = dir_k_arr[k];
             }
-            let third = kern
-                .row_third_contracted(row, &dir_k_arr)
-                .expect("third");
+            let third = kern.row_third_contracted(row, &dir_k_arr).expect("third");
             let _ = dir_k_buf;
             for k_col in 0..rank {
                 // vec_k[k] = (J_r · F[:, k_col])[k]
@@ -1082,7 +1074,9 @@ mod gram_inner_contraction_tests {
         for row in 0..n_rows {
             let dir_u = kern.jacobian_action(row, direction_u);
             let dir_v = kern.jacobian_action(row, direction_v);
-            let fourth = kern.row_fourth_contracted(row, &dir_u, &dir_v).expect("fourth");
+            let fourth = kern
+                .row_fourth_contracted(row, &dir_u, &dir_v)
+                .expect("fourth");
             for k_col in 0..rank {
                 let mut col = vec![0.0_f64; p];
                 for j in 0..p {
@@ -1113,7 +1107,9 @@ mod gram_inner_contraction_tests {
         // Build a random direction and factor.
         let mut s = 0xDEADBEEF_u64;
         let mut next = || -> f64 {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 33) as f64 / (u32::MAX as f64)) - 0.5
         };
         let direction: Vec<f64> = (0..p).map(|_| next()).collect();
