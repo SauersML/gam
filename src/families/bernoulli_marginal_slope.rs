@@ -2477,9 +2477,7 @@ fn empirical_rigid_calibration_eval(
     // happens on dimensionless quantities of bounded magnitude. When the ratio
     // also underflows (deep tail), the result is a clean numerical zero —
     // Halley reduces to Newton, which is what the solver does anyway.
-    let exp_safe = |log_x: f64| -> f64 {
-        if log_x > -740.0 { log_x.exp() } else { 0.0 }
-    };
+    let exp_safe = |log_x: f64| -> f64 { if log_x > -740.0 { log_x.exp() } else { 0.0 } };
     let pos_over_cdf = if sum_pos > 0.0 {
         exp_safe(log_max_pos + sum_pos.ln() - log_s_cdf)
     } else {
@@ -24793,76 +24791,4 @@ mod tests {
         let rel = rel_diff_array2(&scaled, &exp);
         assert!(rel < 1e-12, "joint Hessian dH HT rel {}", rel);
     }
-
-#[test]
-    fn factor_spectrum_analysis_small() {
-        use crate::estimate::reml::unified::PseudoLogdetMode;
-        use crate::linalg::faer_ndarray::FaerEigh;
-        
-        // Use small n=100 fixture
-        let (family, states, _cache, _direction) = 
-            flex_hessian_matvec_fixture(100).expect("fixture");
-        
-        // Build joint Hessian like batched_outer_gradient_terms does
-        let h = family.exact_newton_joint_hessian(&states)
-            .expect("hessian compute")
-            .expect("hessian exists");
-        
-        let p = h.nrows();
-        println!("[SPECTRUM] Joint Hessian: p={}", p);
-        
-        // Add a small regularization (like ridge floor from options)
-        let mut h_reg = h.clone();
-        let ridge = 1e-10;
-        for i in 0..p {
-            h_reg[[i, i]] += ridge;
-        }
-        
-        // Build DenseSpectralOperator
-        let spectral = DenseSpectralOperator::from_symmetric_with_mode(
-            &h_reg,
-            PseudoLogdetMode::Smooth
-        ).expect("spectral operator");
-        
-        // Get the g_factor (logdet gradient factor)
-        let factor = spectral.logdet_gradient_factor();
-        println!("[SPECTRUM] Factor shape: {}x{}", factor.nrows(), factor.ncols());
-        
-        // Compute F F^T and get its SVD
-        let fft = factor.t().dot(factor);
-        println!("[SPECTRUM] F F^T computed, shape: {}x{}", fft.nrows(), fft.ncols());
-        
-        // Compute eigenvalues of F F^T (these are squares of singular values of F)
-        let (eigenvalues, _) = fft
-            .eigh(faer::Side::Lower)
-            .expect("eigendecomposition of F F^T");
-        
-        let mut eigvals_sorted: Vec<f64> = eigenvalues.as_slice().unwrap().to_vec();
-        eigvals_sorted.sort_by(|a: &f64, b: &f64| b.partial_cmp(a).unwrap());
-        
-        let total_trace: f64 = eigvals_sorted.iter().sum();
-        println!("[SPECTRUM] Total trace(F F^T) = {}", total_trace);
-        
-        // Print spectrum
-        println!("[SPECTRUM] Singular values (as sqrt of eigenvalues):");
-        for (i, &eig) in eigvals_sorted.iter().take(20.min(p)).enumerate() {
-            let sigma = eig.sqrt();
-            let cumsum: f64 = eigvals_sorted.iter().take(i+1).sum::<f64>() / total_trace;
-            println!("  sigma[{}] = {:e}  cumsum = {}", i, sigma, cumsum);
-        }
-        
-        // Report cumulative trace mass at key truncations
-        let check_ranks = vec![5, 10, 20, 40, p/2, p];
-        println!("\n[SPECTRUM] Cumulative trace mass at truncations:");
-        for r_prime in check_ranks {
-            if r_prime > p {
-                continue;
-            }
-            let partial: f64 = eigvals_sorted.iter().take(r_prime).sum();
-            let ratio = partial / total_trace;
-            println!("  r_prime={}: {}", r_prime, ratio);
-        }
-    }
-
-
 }
