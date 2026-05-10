@@ -10859,14 +10859,16 @@ impl SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
 
 impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
-        // Same rationale as the Bernoulli marginal-slope override: when the
-        // family is willing to materialize the dense joint Hessian directly
-        // (p_total below the family's internal threshold), exposing it here
-        // lets `MatrixFreeSpdOperator::materialize_dense_operator` skip the
-        // p canonical-basis HVP loop and just wrap the dense matvec. At
-        // biobank scale (p_total≈200) this trims hundreds of seconds per
-        // outer-Hessian build.
-        self.family.exact_newton_joint_hessian(&self.block_states)
+        // The operator we already built in `Self::new` carries every block
+        // (h_tt, h_mm, h_gg, h_tm, …) of the joint Hessian. Asking the family
+        // to re-materialize a dense p×p Hessian via
+        // `evaluate_exact_newton_joint_dynamic_q_dense` would re-walk all n
+        // rows just to repeat the J^T H J + Σ f K pullback we just finished;
+        // at biobank scale that is the same n-row sweep twice per inner
+        // joint-Newton cycle. Reuse the operator's `to_dense()` instead — an
+        // O(p²) block copy. Numerically identical to the dense path modulo
+        // FMA summation order.
+        Ok(Some(self.joint_hessian_operator.to_dense()))
     }
 
     fn hessian_matvec(&self, beta_flat: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
@@ -16703,6 +16705,91 @@ mod tests {
                 &format!("gradient[{idx}]"),
             );
         }
+    }
+
+    #[test]
+    fn flex_timewiggle_operator_to_dense_matches_evaluate_dense_joint_hessian() {
+        // Regression: SurvivalMarginalSlopeExactNewtonJointHessianWorkspace::
+        // hessian_dense() now returns the already-built operator's
+        // to_dense() instead of re-running
+        // evaluate_exact_newton_joint_dynamic_q_dense (a second full n-row
+        // sweep). Both code paths must agree on the joint p×p Hessian.
+        let score_runtime = test_deviation_runtime();
+        let link_runtime = test_deviation_runtime();
+        let marginal_design = array![[0.7, -0.2], [0.1, 0.6]];
+        let marginal_beta = array![0.35, -0.1];
+        let logslope_design = array![[1.0], [0.5]];
+        let logslope_beta = array![0.2];
+        let (time_wiggle_knots, time_wiggle_degree, time_wiggle_ncols) =
+            standard_test_time_wiggle();
+        let family = SurvivalMarginalSlopeFamily {
+            n: 2,
+            event: Arc::new(array![1.0, 0.0]),
+            weights: Arc::new(array![1.0, 0.8]),
+            z: Arc::new(array![0.15, -0.25]),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(array![
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0]
+            ]),
+            design_exit: DesignMatrix::from(array![
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0]
+            ]),
+            design_derivative_exit: DesignMatrix::from(array![
+                [1.0, 0.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0, 0.0]
+            ]),
+            offset_entry: Arc::new(array![0.05, -0.02]),
+            offset_exit: Arc::new(array![0.15, 0.08]),
+            derivative_offset_exit: Arc::new(array![0.9, 1.1]),
+            marginal_design: DesignMatrix::from(marginal_design.clone()),
+            logslope_design: DesignMatrix::from(logslope_design.clone()),
+            score_warp: Some(score_runtime.clone()),
+            link_dev: Some(link_runtime.clone()),
+            time_linear_constraints: None,
+            time_wiggle_knots: Some(time_wiggle_knots),
+            time_wiggle_degree: Some(time_wiggle_degree),
+            time_wiggle_ncols,
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.0, 0.08, -0.03, 0.02, -0.01],
+                eta: array![0.0, 0.0],
+            },
+            ParameterBlockState {
+                beta: marginal_beta.clone(),
+                eta: marginal_design.dot(&marginal_beta),
+            },
+            ParameterBlockState {
+                beta: logslope_beta.clone(),
+                eta: logslope_design.dot(&logslope_beta),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(score_runtime.basis_dim()),
+                eta: Array1::zeros(2),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(link_runtime.basis_dim()),
+                eta: Array1::zeros(2),
+            },
+        ];
+
+        let (_, _, dense) = family
+            .evaluate_exact_newton_joint_dynamic_q_dense(&block_states)
+            .expect("dense joint Hessian");
+        let (operator, _) = family
+            .exact_newton_joint_hessian_operator(&block_states)
+            .expect("joint Hessian operator");
+        let op_dense = operator.to_dense();
+
+        assert_eq!(op_dense.shape(), dense.shape());
+        let diff = max_abs_diff_mat(&op_dense, &dense);
+        assert!(
+            diff <= 1e-10,
+            "operator.to_dense() differs from evaluate_dense by {diff:.3e}",
+        );
     }
 
     #[test]
