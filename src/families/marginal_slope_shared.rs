@@ -881,6 +881,96 @@ pub fn auto_outer_score_subsample(
     Some(build_outer_score_subsample(z, secondary, k, options.seed))
 }
 
+/// Two-phase auto-subsample guard shared across marginal-slope families.
+///
+/// Returns `Some(cloned_options)` carrying a freshly stratified
+/// Horvitz-Thompson mask when the caller has opted in via
+/// `options.auto_outer_subsample`, has not already supplied a mask, and
+/// the per-family phase counter is below `phase1_budget`. Returns `None`
+/// when the caller's options should be used unchanged (either subsample
+/// is disabled / pre-installed, the budget is exhausted, or the problem
+/// is too small for `auto_outer_score_subsample` to find a benefit).
+///
+/// The `phase_counter` and `last_rho` pair together implement
+/// distinct-step detection: line searches re-call the family at the
+/// same ρ during step-size retries, but the budget is meant to count
+/// outer iterations, not function evaluations. The counter only ticks
+/// when the incoming ρ differs from the last observed ρ in L2 by
+/// > 1e-10 — well below any meaningful BFGS step on log-scale ρ, well
+/// above float-noise from cloning. The mutex around `last_rho` is the
+/// minimal coordination needed: `(counter, last_rho)` must update
+/// together so two threads cannot both decide "new ρ" and double-bump.
+///
+/// The transition at `phase_idx == phase1_budget` is logged exactly
+/// once via `log::info!` with the supplied `family_label`. Each phase-1
+/// install also logs the planned mask size and predicted gradient
+/// noise. Callers running with auto-subsample disabled see no logging.
+pub fn maybe_install_auto_outer_subsample(
+    options: &crate::custom_family::BlockwiseFitOptions,
+    z: &[f64],
+    stratum_secondary: Option<&[u8]>,
+    current_rho: &Array1<f64>,
+    phase_counter: &Arc<std::sync::atomic::AtomicUsize>,
+    last_rho: &Arc<std::sync::Mutex<Option<Array1<f64>>>>,
+    phase1_budget: usize,
+    family_label: &'static str,
+) -> Option<crate::custom_family::BlockwiseFitOptions> {
+    if options.outer_score_subsample.is_some() || !options.auto_outer_subsample {
+        return None;
+    }
+    let phase_idx = {
+        let mut guard = last_rho
+            .lock()
+            .expect("auto_subsample_last_rho mutex poisoned");
+        let new_step = match guard.as_ref() {
+            None => true,
+            Some(prev) if prev.len() != current_rho.len() => true,
+            Some(prev) => {
+                let mut sq = 0.0_f64;
+                for (a, b) in current_rho.iter().zip(prev.iter()) {
+                    let d = a - b;
+                    sq += d * d;
+                }
+                sq.sqrt() > 1e-10
+            }
+        };
+        if new_step {
+            *guard = Some(current_rho.clone());
+            phase_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        } else {
+            phase_counter
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .saturating_sub(1)
+        }
+    };
+    if phase_idx >= phase1_budget {
+        if phase_idx == phase1_budget {
+            log::info!(
+                "[{family_label} auto-subsample] Phase 1 budget exhausted after {} evals; \
+                 Phase 2 (full data) for remaining iterations",
+                phase1_budget
+            );
+        }
+        return None;
+    }
+    let auto_options = AutoOuterSubsampleOptions::default();
+    let mask = auto_outer_score_subsample(z, stratum_secondary, &auto_options)?;
+    let n_full = mask.n_full;
+    let k = mask.len();
+    log::info!(
+        "[{family_label} auto-subsample] phase=1 eval={}/{} n={} K={} fraction={:.3} expected_grad_noise={:.2}%",
+        phase_idx + 1,
+        phase1_budget,
+        n_full,
+        k,
+        k as f64 / n_full.max(1) as f64,
+        100.0 * (1.0 / (k as f64).sqrt()) * (1.0 - k as f64 / n_full.max(1) as f64).sqrt()
+    );
+    let mut cloned = options.clone();
+    cloned.outer_score_subsample = Some(Arc::new(mask));
+    Some(cloned)
+}
+
 pub fn build_outer_score_subsample(
     z: &[f64],
     stratum_secondary: &[u8],

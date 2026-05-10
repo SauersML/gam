@@ -53,7 +53,8 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::prelude::*;
 use smallvec::{SmallVec, smallvec};
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Mutex};
 
 /// Inline-stored polynomial coefficient vector for survival marginal-slope
 /// integrand assembly. `poly_*` helpers in this module routinely build
@@ -182,7 +183,31 @@ struct SurvivalMarginalSlopeFamily {
     /// the cache to length-`n`. When `None`, the solver behaves exactly as it
     /// did before the warm-start machinery was added (closed-form rigid seed).
     intercept_warm_starts: Option<Arc<SurvivalInterceptWarmStartCache>>,
+    /// Per-fit counter of outer evaluations. Increments on each distinct
+    /// outer step (detected via the concatenated-beta proxy stored in
+    /// `auto_subsample_last_rho`). Drives the same two-phase
+    /// auto-subsample schedule used by `BernoulliMarginalSlopeFamily`:
+    /// the first `SURVIVAL_MGS_AUTO_SUBSAMPLE_PHASE1_BUDGET` evaluations
+    /// install a stratified Horvitz-Thompson mask (Phase 1, ≈ 1 %
+    /// gradient noise); subsequent evaluations revert to full data
+    /// (Phase 2). The counter resets per fit because each fit
+    /// constructs a fresh family.
+    auto_subsample_phase_counter: Arc<AtomicUsize>,
+    /// Companion to `auto_subsample_phase_counter`. Stores the
+    /// concatenated-beta vector seen at the most recent counter bump.
+    /// Survival entry points (`*_workspace_with_options`) do not receive
+    /// the outer ρ directly, so we use the joint coefficient vector as
+    /// a stable per-outer-eval key. Within a single outer eval all
+    /// downstream calls share the same betas, so retries don't bump the
+    /// counter; across outer evals the betas change so the counter
+    /// increments cleanly.
+    auto_subsample_last_rho: Arc<Mutex<Option<Array1<f64>>>>,
 }
+
+/// Number of outer evaluations the survival auto-subsample schedule
+/// spends in Phase 1 before reverting to full data. Mirrors the BMS
+/// budget so the two families share an empirical noise-floor schedule.
+const SURVIVAL_MGS_AUTO_SUBSAMPLE_PHASE1_BUDGET: usize = 12;
 
 /// Discriminates the two intercept slots per row: the entry-time intercept
 /// (solved against `q0`) and the exit-time intercept (solved against `q1`).
@@ -2831,6 +2856,54 @@ impl SurvivalMarginalSlopeFamily {
     #[inline]
     fn probit_frailty_scale(&self) -> f64 {
         probit_frailty_scale(self.gaussian_frailty_sd)
+    }
+
+    /// Two-phase auto-subsample entry: when the caller has opted in via
+    /// `options.auto_outer_subsample` and Phase 1 still has budget, this
+    /// returns a cloned `BlockwiseFitOptions` carrying a freshly built
+    /// stratified Horvitz-Thompson mask. Otherwise returns `None` and
+    /// the caller uses the original options unchanged.
+    ///
+    /// Survival entry points (`*_workspace_with_options`,
+    /// `log_likelihood_only_with_options`) do not receive the outer ρ
+    /// directly, so we derive a per-outer-eval key by concatenating the
+    /// joint coefficient vector across blocks. Within a single outer
+    /// eval downstream calls share the same betas, so retries do not
+    /// double-bump; across outer evals the betas change so the counter
+    /// increments cleanly. This is the documented fallback for
+    /// families that lack an explicit ρ at the entry point.
+    fn install_auto_outer_subsample_options(
+        &self,
+        options: &BlockwiseFitOptions,
+        block_states: &[ParameterBlockState],
+    ) -> Option<BlockwiseFitOptions> {
+        let mut total_len = 0usize;
+        for state in block_states {
+            total_len += state.beta.len();
+        }
+        let mut beta_proxy = Array1::<f64>::zeros(total_len);
+        let mut cursor = 0usize;
+        for state in block_states {
+            let len = state.beta.len();
+            if len > 0 {
+                beta_proxy
+                    .slice_mut(s![cursor..cursor + len])
+                    .assign(&state.beta);
+                cursor += len;
+            }
+        }
+        let event_secondary: Vec<u8> =
+            self.event.iter().map(|v| if *v > 0.5 { 1u8 } else { 0u8 }).collect();
+        crate::families::marginal_slope_shared::maybe_install_auto_outer_subsample(
+            options,
+            self.z.as_slice().expect("z must be contiguous"),
+            Some(&event_secondary),
+            &beta_proxy,
+            &self.auto_subsample_phase_counter,
+            &self.auto_subsample_last_rho,
+            SURVIVAL_MGS_AUTO_SUBSAMPLE_PHASE1_BUDGET,
+            "survival-mgs",
+        )
     }
 
     /// Outer-aware variant of `log_likelihood_only`. When
@@ -14037,6 +14110,15 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         options: &BlockwiseFitOptions,
     ) -> Result<f64, String> {
+        let owned;
+        let options: &BlockwiseFitOptions =
+            match self.install_auto_outer_subsample_options(options, block_states) {
+                Some(cloned) => {
+                    owned = cloned;
+                    &owned
+                }
+                None => options,
+            };
         SurvivalMarginalSlopeFamily::log_likelihood_only_with_options(self, block_states, options)
     }
 
@@ -14118,6 +14200,15 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         }
         // Flex / timewiggle path: store the options on the workspace so the
         // directional-derivative methods can pick up the outer-row subsample.
+        let owned;
+        let options: &BlockwiseFitOptions =
+            match self.install_auto_outer_subsample_options(options, block_states) {
+                Some(cloned) => {
+                    owned = cloned;
+                    &owned
+                }
+                None => options,
+            };
         Ok(Some(Arc::new(
             SurvivalMarginalSlopeExactNewtonJointHessianWorkspace::new(
                 self.clone(),
@@ -14294,6 +14385,15 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        let owned;
+        let options: &BlockwiseFitOptions =
+            match self.install_auto_outer_subsample_options(options, block_states) {
+                Some(cloned) => {
+                    owned = cloned;
+                    &owned
+                }
+                None => options,
+            };
         Ok(Some(Arc::new(SurvivalMarginalSlopePsiWorkspace::new(
             self.clone(),
             block_states.to_vec(),
@@ -15096,6 +15196,8 @@ pub fn fit_survival_marginal_slope_terms(
             time_wiggle_degree: spec.timewiggle_block.as_ref().map(|w| w.degree),
             time_wiggle_ncols: derived_time_wiggle_ncols.unwrap_or(0),
             intercept_warm_starts: Some(Arc::clone(&intercept_warm_starts)),
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         }
     };
 
@@ -15734,6 +15836,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -16016,6 +16120,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -16140,6 +16246,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -16294,6 +16402,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -16376,6 +16486,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let specs = vec![
             dummy_blockspec(1),
@@ -16417,6 +16529,8 @@ mod tests {
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let specs = vec![
             dummy_blockspec(5),
@@ -16498,6 +16612,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let specs = vec![
             dummy_penalized_blockspec(p_time, 1),
@@ -16541,6 +16657,8 @@ mod tests {
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let specs = vec![
             dummy_penalized_blockspec(12, 2),
@@ -16583,6 +16701,8 @@ mod tests {
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -16650,6 +16770,8 @@ mod tests {
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -16723,6 +16845,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -16821,6 +16945,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let marginal_beta = array![0.35, -0.1];
         let logslope_beta = array![0.2];
@@ -16879,6 +17005,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -16959,6 +17087,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17045,6 +17175,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17133,6 +17265,8 @@ mod tests {
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17217,6 +17351,8 @@ mod tests {
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17272,6 +17408,8 @@ mod tests {
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17363,6 +17501,8 @@ mod tests {
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17535,6 +17675,8 @@ mod tests {
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17606,6 +17748,8 @@ mod tests {
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17688,6 +17832,8 @@ mod tests {
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17769,6 +17915,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17837,6 +17985,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17941,6 +18091,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17991,6 +18143,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -18044,6 +18198,8 @@ mod tests {
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -18094,6 +18250,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -18161,6 +18319,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let spec = ParameterBlockSpec {
             name: "time_surface".to_string(),
@@ -18221,6 +18381,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let spec = ParameterBlockSpec {
             name: "time_surface".to_string(),
@@ -18284,6 +18446,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let states = vec![
             ParameterBlockState {
@@ -18347,6 +18511,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -18432,6 +18598,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -18880,6 +19048,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -19420,6 +19590,8 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -19805,6 +19977,8 @@ mod tests {
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -19908,5 +20082,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn survival_auto_subsample_phase_counter_field_initializes_to_zero() {
+        let family = make_closed_form_test_family(8);
+        assert_eq!(
+            family
+                .auto_subsample_phase_counter
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "fresh family must start at Phase-1 step 0"
+        );
+        assert!(
+            family
+                .auto_subsample_last_rho
+                .lock()
+                .expect("auto_subsample_last_rho mutex poisoned")
+                .is_none(),
+            "fresh family must have no recorded last-rho proxy"
+        );
     }
 }
