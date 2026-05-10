@@ -4038,8 +4038,13 @@ impl SurvivalMarginalSlopeFamily {
             64,
         )?;
         let a = solution.root;
-        let (residual, final_deriv, _) = eval(a)?;
-        let abs_deriv = final_deriv.abs();
+        // The solver already evaluated `eval` at `solution.root` during the
+        // refine loop and returned the resulting `residual` (best_f) and
+        // `abs_deriv` (best_abs_deriv). Reusing them here saves one full
+        // calibration evaluation per row × 2 (entry + exit) per joint-Newton
+        // sweep — at biobank n=320k this is 640k spared evaluations per pass.
+        let residual = solution.residual;
+        let abs_deriv = solution.abs_deriv;
         if !abs_deriv.is_finite() || abs_deriv == 0.0 {
             return Err(format!(
                 "survival marginal-slope intercept solve failed: \
