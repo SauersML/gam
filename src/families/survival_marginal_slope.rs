@@ -5587,7 +5587,8 @@ impl SurvivalMarginalSlopeFamily {
                 let mut value = 0.0;
                 for q_u in 0..3 {
                     for q_v in 0..3 {
-                        value += primary_hessian[[q_u, q_v]] * dq_time[q_u][a] * dq_marginal[q_v][b];
+                        value +=
+                            primary_hessian[[q_u, q_v]] * dq_time[q_u][a] * dq_marginal[q_v][b];
                     }
                     value += primary_gradient[q_u] * d2q_time_marginal[q_u][[a, b]];
                 }
