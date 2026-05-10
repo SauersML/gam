@@ -721,7 +721,7 @@ fn prepare_latent_time_block(
         .design_derivative_exit
         .try_to_dense_by_chunks("latent survival derivative time design")?;
     let linear_constraints = structural_time_coefficient_constraints(
-        &design_derivative_exit,
+        &input.design_derivative_exit,
         &input.derivative_offset_exit,
         derivative_guard,
     )?;
