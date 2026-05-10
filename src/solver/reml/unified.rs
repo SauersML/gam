@@ -11015,6 +11015,15 @@ pub struct StochasticTraceConfig {
     pub solve_rel_tol: f64,
     /// RNG seed for reproducibility.
     pub seed: u64,
+    /// Hutch++ low-rank sketch dimension. `None` = plain Hutchinson.
+    /// `Some(m_s)` runs the Meyer–Musco Hutch++ split: m_s sketch matvecs
+    /// build an orthonormal range basis Q via randomized range finder, the
+    /// projected trace tr(QᵀM Q) is computed exactly (m_s additional
+    /// matvecs), and the residual tr((I-QQᵀ)M(I-QQᵀ)) is estimated by
+    /// Hutchinson with the remaining probe budget. Achieves O(1/ε)
+    /// matvecs for ε relative error vs O(1/ε²) for plain Hutchinson;
+    /// the gain is largest when M has rapidly decaying singular values.
+    pub hutchpp_sketch_dim: Option<usize>,
 }
 
 impl Default for StochasticTraceConfig {
@@ -11026,6 +11035,7 @@ impl Default for StochasticTraceConfig {
             tau_rel: 1e-8,
             solve_rel_tol: 1e-8,
             seed: 0xCAFE_BABE,
+            hutchpp_sketch_dim: None,
         }
     }
 }
@@ -11048,6 +11058,7 @@ impl StochasticTraceConfig {
             tau_rel: 1e-3,
             solve_rel_tol: if large_problem { 1e-4 } else { 1e-5 },
             seed: 0xC0A5_7ACE,
+            hutchpp_sketch_dim: None,
         }
     }
 }
@@ -11971,6 +11982,186 @@ fn rademacher_probe_into(mut z: ArrayViewMut1<'_, f64>, rng: &mut Xoshiro256SS) 
         bits >>= 1;
         remaining_bits -= 1;
     }
+}
+
+/// Modified Gram–Schmidt orthonormalization of the columns of `y`,
+/// writing the orthonormal basis into `q` and returning the retained
+/// rank.
+///
+/// `y` and `q` must have the same shape `(p, m)`. Columns whose
+/// reduction norm falls below `1e-12` of the largest input column
+/// norm are dropped (numerical-rank cutoff). After this call,
+/// `q.column(0..rank)` is column-orthonormal and approximates
+/// `range(y)`; later columns of `q` are zeroed.
+fn modified_gram_schmidt(y: &Array2<f64>, q: &mut Array2<f64>) -> usize {
+    let p = y.nrows();
+    let m = y.ncols();
+    debug_assert_eq!(q.dim(), (p, m));
+    q.fill(0.0);
+    if p == 0 || m == 0 {
+        return 0;
+    }
+    let mut max_norm: f64 = 0.0;
+    for j in 0..m {
+        let n = y.column(j).dot(&y.column(j)).sqrt();
+        if n > max_norm {
+            max_norm = n;
+        }
+    }
+    let drop_tol = (max_norm * 1.0e-12).max(f64::MIN_POSITIVE);
+    let mut rank = 0usize;
+    for j in 0..m {
+        let mut v = y.column(j).to_owned();
+        for k in 0..rank {
+            let qk = q.column(k);
+            let proj = qk.dot(&v);
+            if proj != 0.0 {
+                v.scaled_add(-proj, &qk);
+            }
+        }
+        let norm = v.dot(&v).sqrt();
+        if !norm.is_finite() || norm <= drop_tol {
+            continue;
+        }
+        let inv = 1.0 / norm;
+        v.iter_mut().for_each(|x| *x *= inv);
+        q.column_mut(rank).assign(&v);
+        rank += 1;
+    }
+    rank
+}
+
+/// Hutch++ estimate of `tr(H⁻¹ M)` where `M` is accessed through its
+/// matrix-vector product (operator-only, dim p).
+///
+/// Total cost: `2 m_s + m_h` H⁻¹ solves and `M·v` matvecs, where
+/// `m_s = config.hutchpp_sketch_dim.unwrap_or(0)` and `m_h` is the
+/// number of residual Hutchinson probes drawn (between
+/// `config.n_probes_min` and `config.n_probes_max - 2 m_s`).
+///
+/// When `hutchpp_sketch_dim` is `None`, this falls back to plain
+/// Hutchinson on the full probe budget — the result is deterministic
+/// for a given seed because the probe RNG is seeded from
+/// `config.seed`.
+///
+/// # Algorithm (Meyer–Musco 2021, SOSA)
+///
+/// 1. Sketch: draw `Z_s ∈ {±1}^{p × m_s}` Rademacher, compute
+///    `Y = H⁻¹ M Z_s`, orthonormalize columns: `Y = Q R`.
+/// 2. Low-rank trace: `T_low = tr(Qᵀ H⁻¹ M Q)` exactly via `m_s`
+///    additional matvecs into `W = H⁻¹ M Q` and accumulating
+///    `Σ_j Q[:,j] · W[:,j]`.
+/// 3. Residual Hutchinson on the orthogonal complement: for each
+///    residual probe `z`, set `z̃ = (I - Q Qᵀ) z`, compute
+///    `w̃ = H⁻¹ M z̃`, and accumulate `z̃ · w̃` (which equals
+///    `z̃ᵀ (H⁻¹ M) z̃` because `z̃` is in the complement).
+/// 4. Output: `T_low + (1/m_h) Σ residual estimates`.
+///
+/// # When this wins over plain Hutchinson
+///
+/// Hutch++ converges in `O(1/ε)` matvecs vs `O(1/ε²)` for Hutchinson.
+/// The gain is largest when `H⁻¹ M` has rapid singular-value decay —
+/// the sketch captures the dominant subspace exactly and Hutchinson
+/// only handles the small residual. For roughly-flat spectra both
+/// methods perform similarly per-matvec.
+pub(crate) fn hutchpp_estimate_trace_hinv_operator(
+    hop: &dyn HessianOperator,
+    op: &dyn HyperOperator,
+    config: &StochasticTraceConfig,
+) -> f64 {
+    let p = hop.dim();
+    debug_assert_eq!(op.dim(), p, "Hutch++: operator dim mismatch");
+    if p == 0 {
+        return 0.0;
+    }
+    let sketch_dim = config.hutchpp_sketch_dim.unwrap_or(0).min(p);
+    let mut rng_state = Xoshiro256SS::from_seed(config.seed);
+
+    // Phase 1: build orthonormal Q ∈ R^{p × sketch_dim} approximating
+    // range(H⁻¹ M) via a randomized range finder.
+    let mut q = Array2::<f64>::zeros((p, sketch_dim));
+    let mut q_rank = 0usize;
+    if sketch_dim > 0 {
+        let mut z = Array1::<f64>::zeros(p);
+        let mut mz = Array1::<f64>::zeros(p);
+        for j in 0..sketch_dim {
+            rademacher_probe_into(z.view_mut(), &mut rng_state);
+            op.mul_vec_into(z.view(), mz.view_mut());
+            let w = hop.stochastic_trace_solve(&mz, config.solve_rel_tol);
+            q.column_mut(j).assign(&w);
+        }
+        q_rank = modified_gram_schmidt_in_place(&mut q);
+    }
+
+    // Phase 2: T_low = tr(Qᵀ H⁻¹ M Q). Apply H⁻¹ M to each retained
+    // column of Q and accumulate Q[:,j] · W[:,j].
+    let mut t_low = 0.0;
+    if q_rank > 0 {
+        let mut mq = Array1::<f64>::zeros(p);
+        for j in 0..q_rank {
+            let qcol = q.column(j).to_owned();
+            op.mul_vec_into(qcol.view(), mq.view_mut());
+            let w = hop.stochastic_trace_solve(&mq, config.solve_rel_tol);
+            t_low += qcol.dot(&w);
+        }
+    }
+
+    // Phase 3: residual Hutchinson on (I - Q Qᵀ) M (I - Q Qᵀ).
+    // Budget = remaining matvecs from n_probes_max minus the 2*q_rank
+    // we already spent (sketch + Q-trace), but never below n_probes_min.
+    let used = 2 * q_rank;
+    let residual_budget_max = config.n_probes_max.saturating_sub(used);
+    let residual_min = config.n_probes_min.min(residual_budget_max);
+    let residual_budget = residual_budget_max.max(residual_min);
+    if residual_budget == 0 {
+        return t_low;
+    }
+
+    let mut sum = 0.0;
+    let mut sum_sq = 0.0;
+    let mut count = 0usize;
+    let mut z = Array1::<f64>::zeros(p);
+    let mut z_tilde = Array1::<f64>::zeros(p);
+    let mut mz = Array1::<f64>::zeros(p);
+    let check_interval = 4usize;
+    for m in 0..residual_budget {
+        rademacher_probe_into(z.view_mut(), &mut rng_state);
+        // z_tilde = (I - Q Qᵀ) z = z - Q (Qᵀ z)
+        z_tilde.assign(&z);
+        if q_rank > 0 {
+            for j in 0..q_rank {
+                let qcol = q.column(j);
+                let proj = qcol.dot(&z);
+                if proj != 0.0 {
+                    z_tilde.scaled_add(-proj, &qcol);
+                }
+            }
+        }
+        op.mul_vec_into(z_tilde.view(), mz.view_mut());
+        let w = hop.stochastic_trace_solve(&mz, config.solve_rel_tol);
+        let q_val = z_tilde.dot(&w);
+        sum += q_val;
+        sum_sq += q_val * q_val;
+        count += 1;
+
+        // Adaptive stopping: same Welford-style relative-error check
+        // as `estimate_from_probe_batch`, applied to the residual mean.
+        if count >= residual_min && count % check_interval == 0 && count >= 2 {
+            let n = count as f64;
+            let mean = sum / n;
+            let var = (sum_sq - n * mean * mean) / (n - 1.0).max(1.0);
+            if var.is_finite() && var >= 0.0 {
+                let stderr = (var / n).sqrt();
+                let denom = (mean.abs()).max(config.tau_rel);
+                if stderr / denom <= config.relative_tol {
+                    let _ = m; // matvec count just for documentation
+                    break;
+                }
+            }
+        }
+    }
+    let mean_residual = if count > 0 { sum / count as f64 } else { 0.0 };
+    t_low + mean_residual
 }
 
 #[cfg(test)]
@@ -13822,6 +14013,7 @@ mod tests {
             tau_rel: 1e-10,
             solve_rel_tol: 1e-8,
             seed: 42,
+            hutchpp_sketch_dim: None,
         };
         let estimator = StochasticTraceEstimator::new(config);
         let matrices: Vec<&Array2<f64>> = vec![&a1, &a2];
