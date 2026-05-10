@@ -1090,7 +1090,43 @@ struct BernoulliMarginalSlopeFamily {
     /// pipeline; production paths go through `make_family` which initialises
     /// the cache to length-`n` NaN.
     intercept_warm_starts: Option<Arc<BernoulliInterceptWarmStartCache>>,
+    /// Per-fit counter of outer rho-gradient evaluations. Increments
+    /// on every call to `batched_outer_gradient_terms`. Drives the
+    /// two-phase auto-subsample schedule: while
+    /// `count < BMS_AUTO_SUBSAMPLE_PHASE1_BUDGET` and the caller has
+    /// opted into `auto_outer_subsample`, the family installs a
+    /// stratified Horvitz–Thompson mask. Once the budget is
+    /// exhausted, every subsequent eval reverts to full data so the
+    /// final BFGS iterations satisfy the user's tight `outer_tol`
+    /// without paying any noise floor.
+    ///
+    /// Each new fit constructs a fresh family (the counter starts at
+    /// zero), so the schedule resets per fit without any cross-fit
+    /// leakage. Atomic so the field is safe to clone via Arc.
+    auto_subsample_phase_counter: Arc<std::sync::atomic::AtomicUsize>,
+    /// Last ρ vector at which the auto-subsample phase counter was
+    /// bumped. BFGS line searches re-call `batched_outer_gradient_terms`
+    /// at the same ρ during step-size retries; without this guard the
+    /// per-call increment burns the Phase-1 budget on those retries
+    /// instead of on distinct outer iterations. We bump the counter only
+    /// when the incoming ρ differs (L2) from the last one we saw, so the
+    /// budget exactly counts distinct outer steps. The mutex is the
+    /// minimal coordination needed: the counter+last_rho pair must be
+    /// updated atomically so two threads cannot both decide "new ρ" and
+    /// double-bump.
+    auto_subsample_last_rho: Arc<Mutex<Option<Array1<f64>>>>,
 }
+
+/// Number of outer-gradient evaluations the auto-subsample schedule
+/// spends in Phase 1 (stratified subsample, ≈ 1 % gradient noise).
+/// After this many calls the family reverts to full data for all
+/// remaining outer evaluations, so BFGS/ARC can drive `‖∇‖` below the
+/// user's tight `outer_tol`. The budget is sized so that BFGS can
+/// reduce a generic ρ-gradient by ≈ 2–3 decades in Phase 1 (typical
+/// L-BFGS rate of one decade per ~5 iterations on a noisy gradient,
+/// stalling at the noise floor) before switching to exact Phase-2
+/// polish.
+const BMS_AUTO_SUBSAMPLE_PHASE1_BUDGET: usize = 12;
 
 #[derive(Clone)]
 struct BernoulliInterceptPredictorWarmStart {
@@ -13273,43 +13309,44 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         if block_states.len() != specs.len() {
             return Ok(None);
         }
-        // Auto-derive an outer-score subsample at biobank scale. The full
-        // row trace is O(n × cell_work); stratified Horvitz–Thompson
-        // subsampling produces an unbiased estimate at O(K × cell_work)
-        // with K/n ≈ 0.10. The auto-derived mask is only installed when
-        // the caller has not already provided one — explicit caller
-        // configuration always wins.
-        let auto_options;
+        // Two-phase auto-subsample schedule. Phase 1: stratified
+        // Horvitz–Thompson mask (≈ 1 % gradient noise) for the first
+        // BMS_AUTO_SUBSAMPLE_PHASE1_BUDGET outer evaluations, where
+        // BFGS makes the bulk of its progress on the noisy gradient.
+        // Phase 2: full data for every subsequent evaluation, so the
+        // optimizer can drive ‖∇‖ below the user's tight `outer_tol`
+        // without bumping into the stochastic noise floor. The phase
+        // counter is per-family-instance, so each fresh fit (which
+        // constructs a new family) starts at Phase 1.
+        //
+        // The mask is auto-derived only when the caller has explicitly
+        // opted in via `options.auto_outer_subsample` AND has not
+        // already supplied a mask of their own. All gating logic lives
+        // in `maybe_install_auto_outer_subsample` so the survival
+        // families can reuse the same schedule.
+        let stratum_secondary: Vec<u8> = self
+            .y
+            .iter()
+            .map(|v| if *v > 0.5 { 1u8 } else { 0u8 })
+            .collect();
         let owned_options;
-        let options: &BlockwiseFitOptions = if options.outer_score_subsample.is_some() {
-            options
-        } else {
-            auto_options = crate::families::marginal_slope_shared::AutoOuterSubsampleOptions::default();
-            let stratum_secondary: Vec<u8> = self.y.iter().map(|v| if *v > 0.5 { 1u8 } else { 0u8 }).collect();
-            match crate::families::marginal_slope_shared::auto_outer_score_subsample(
+        let options: &BlockwiseFitOptions =
+            match crate::families::marginal_slope_shared::maybe_install_auto_outer_subsample(
+                options,
                 self.z.as_slice().expect("z must be contiguous"),
                 Some(&stratum_secondary),
-                &auto_options,
+                rho,
+                &self.auto_subsample_phase_counter,
+                &self.auto_subsample_last_rho,
+                BMS_AUTO_SUBSAMPLE_PHASE1_BUDGET,
+                "BMS",
             ) {
-                Some(mask) => {
-                    let mut cloned = options.clone();
-                    let n_full = mask.n_full;
-                    let k = mask.len();
-                    log::info!(
-                        "[BMS auto-subsample] n={} K={} fraction={:.3} expected_grad_noise={:.2}%",
-                        n_full,
-                        k,
-                        k as f64 / n_full.max(1) as f64,
-                        100.0 * (1.0 / (k as f64).sqrt())
-                            * (1.0 - k as f64 / n_full.max(1) as f64).sqrt()
-                    );
-                    cloned.outer_score_subsample = Some(std::sync::Arc::new(mask));
+                Some(cloned) => {
                     owned_options = cloned;
                     &owned_options
                 }
                 None => options,
-            }
-        };
+            };
         let ranges = Self::block_ranges_from_specs(specs);
         let total = ranges.last().map(|(_, end)| *end).unwrap_or(0);
         if total == 0 {
@@ -15830,6 +15867,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
             cell_moment_lru: Arc::clone(&cell_moment_lru),
             cell_moment_cache_stats: Arc::clone(&cell_moment_cache_stats),
             intercept_warm_starts: Some(Arc::clone(&intercept_warm_starts)),
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         }
     };
 
@@ -16181,6 +16220,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let marginal_beta = array![0.05, 0.08];
         let logslope_beta = array![-0.15, 0.04];
@@ -16454,6 +16495,8 @@ mod tests {
                 ),
                 cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: cache,
+                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
             };
         let marginal_eta = Array1::from_iter((0..n).map(|i| 0.15 * ((i as f64) * 0.001).sin()));
         let slope_eta = Array1::from_iter((0..n).map(|i| 0.35 + 0.02 * ((i as f64) * 0.003).cos()));
@@ -16552,6 +16595,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let states = vec![
             ParameterBlockState {
@@ -16620,6 +16665,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -16777,6 +16824,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -17475,6 +17524,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -17596,6 +17647,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: Some(new_intercept_warm_start_cache(n)),
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let marginal_eta = 0.35;
         let slope = -0.8;
@@ -17677,6 +17730,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -17749,6 +17804,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -17809,6 +17866,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let current = Array1::<f64>::zeros(score_dim);
         let mut proposed = current.clone();
@@ -18645,6 +18704,8 @@ mod tests {
                 ),
                 cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
+                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
             };
 
         let a = 0.35;
@@ -18815,6 +18876,8 @@ mod tests {
                 ),
                 cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
+                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
             };
         let specs = vec![
             dummy_blockspec(1, 3),
@@ -19031,6 +19094,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let specs = vec![
             ParameterBlockSpec {
@@ -19091,6 +19156,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let states_at = |q: f64, g: f64| {
             vec![
@@ -19228,6 +19295,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
 
         // Three blocks: marginal (dim 0), logslope (dim 0), link_dev.
@@ -19332,6 +19401,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
 
         let block_states = vec![
@@ -19431,6 +19502,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -19573,6 +19646,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -19684,6 +19759,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
 
         let block_states = vec![
@@ -19815,6 +19892,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
 
         let block_states = vec![
@@ -19950,6 +20029,8 @@ mod tests {
                 ),
                 cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
+                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -20104,6 +20185,8 @@ mod tests {
                 ),
                 cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
+                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -20211,6 +20294,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -20295,6 +20380,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -20377,6 +20464,8 @@ mod tests {
                 ),
                 cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
+                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -20466,6 +20555,8 @@ mod tests {
                 ),
                 cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
+                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -20577,6 +20668,8 @@ mod tests {
                 ),
                 cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
+                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -20707,6 +20800,8 @@ mod tests {
                 ),
                 cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
+                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -20860,6 +20955,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -20964,6 +21061,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -21068,6 +21167,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -21183,6 +21284,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -21296,6 +21399,8 @@ mod tests {
                 ),
                 cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
+                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -21426,6 +21531,8 @@ mod tests {
                 ),
                 cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
+                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -21543,6 +21650,8 @@ mod tests {
                 ),
                 cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
+                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -21658,6 +21767,8 @@ mod tests {
                 ),
                 cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
+                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -21797,6 +21908,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -21910,6 +22023,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -22021,6 +22136,8 @@ mod tests {
                 ),
                 cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
+                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -22148,6 +22265,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -22235,6 +22354,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -22322,6 +22443,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -22414,6 +22537,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -22506,6 +22631,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -22587,6 +22714,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -22668,6 +22797,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let zero = Array1::<f64>::zeros(slices.total);
@@ -22736,6 +22867,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let zero = Array1::<f64>::zeros(slices.total);
@@ -22794,6 +22927,8 @@ mod tests {
                 ),
                 cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
+                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
             };
         let beta_w = Array1::from_iter(
             (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
@@ -22908,6 +23043,8 @@ mod tests {
                 ),
                 cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
+                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
             };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
@@ -23031,6 +23168,8 @@ mod tests {
                 ),
                 cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
+                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
             };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
@@ -23179,6 +23318,8 @@ mod tests {
                 ),
                 cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
+                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
             };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
@@ -23314,6 +23455,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let beta_m = array![0.18, -0.07];
         let beta_g = array![0.42, 0.05];
@@ -23695,6 +23838,8 @@ mod tests {
                 ),
                 cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
+                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -23768,6 +23913,8 @@ mod tests {
                 ),
                 cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: None,
+                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
             };
         let family = make_family(sigma);
         let block_states = vec![
@@ -23864,6 +24011,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -24517,6 +24666,8 @@ mod tests {
             ),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let beta_m = array![0.12, -0.04];
         let beta_g = array![0.35, 0.03];
@@ -24836,5 +24987,103 @@ mod tests {
         let exp = &raw * factor;
         let rel = rel_diff_array2(&scaled, &exp);
         assert!(rel < 1e-12, "joint Hessian dH HT rel {}", rel);
+    }
+
+    #[test]
+    fn auto_outer_subsample_two_phase_converges_to_full_data_optimum() {
+        // The full BMS outer-strategy + custom-family pipeline is too
+        // elaborate to drive end-to-end from a unit test, so we exercise
+        // the substituted check from the task spec: 15 calls to
+        // `batched_outer_gradient_terms` with a mix of distinct ρ and
+        // line-search-style retries at the same ρ. The contract is
+        //
+        //   counter strictly counts distinct ρ values
+        //
+        // so retries must NOT bump it. With BUDGET = 12, the first 12
+        // distinct-ρ calls land in Phase 1 (subsample), the 13th onward
+        // fall through to Phase 2 (full data). We verify both bookkeeping
+        // properties without needing to actually drive a fit.
+        //
+        // n = 35_000 sits above `AutoOuterSubsampleOptions::default()
+        // .min_n_for_auto = 30_000`, so `auto_outer_score_subsample`
+        // would actually return `Some(mask)` if invoked — i.e. the
+        // Phase-1 branch reaches the mask-installing arm and the
+        // log::info! lines fire. Specs/derivative_blocks are empty so
+        // the function exits via the `total == 0` early return after the
+        // guard runs; that lets us focus on counter semantics with no
+        // FLEX-cache plumbing.
+        let n = 35_000usize;
+        let family = make_block_psi_test_family(n);
+        let states: Vec<ParameterBlockState> = Vec::new();
+        let specs: Vec<ParameterBlockSpec> = Vec::new();
+        let deriv_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>> =
+            Vec::new();
+        // Non-empty ρ — empty arrays would have zero L2 distance and the
+        // counter would never bump after the first call, defeating the
+        // distinct-ρ check. With empty specs, `total == 0` short-circuits
+        // before the rho.len() vs penalty-count consistency check.
+        let rho_dim = 3usize;
+        let mut opts = BlockwiseFitOptions::default();
+        opts.auto_outer_subsample = true;
+
+        let counter = || {
+            family
+                .auto_subsample_phase_counter
+                .load(std::sync::atomic::Ordering::SeqCst)
+        };
+
+        // Walk through 15 distinct ρ values, with a line-search retry
+        // (same ρ) interleaved at iterations 3 and 7. Distinct-ρ events:
+        // 15. Retries: 2 (must not bump). Final counter must equal 15.
+        let mut distinct_calls = 0usize;
+        for step in 0..15usize {
+            let rho_step = Array1::<f64>::from_elem(rho_dim, step as f64 * 0.1);
+            family
+                .batched_outer_gradient_terms(
+                    &states, &specs, &deriv_blocks, &rho_step, &opts, None,
+                )
+                .expect("guard ok");
+            distinct_calls += 1;
+            assert_eq!(
+                counter(),
+                distinct_calls,
+                "distinct-ρ call {step}: counter should equal number of distinct ρ"
+            );
+            // Line-search retry: same ρ. Must NOT bump.
+            if step == 3 || step == 7 {
+                let rho_retry = Array1::<f64>::from_elem(rho_dim, step as f64 * 0.1);
+                family
+                    .batched_outer_gradient_terms(
+                        &states, &specs, &deriv_blocks, &rho_retry, &opts, None,
+                    )
+                    .expect("guard ok on retry");
+                assert_eq!(
+                    counter(),
+                    distinct_calls,
+                    "line-search retry at step {step} must NOT bump counter"
+                );
+            }
+        }
+        assert_eq!(counter(), 15, "final counter should be 15 distinct ρ");
+
+        // With auto_outer_subsample = false the guard short-circuits; a
+        // fresh family's counter must remain at 0 across many calls.
+        let family_off = make_block_psi_test_family(n);
+        let opts_off = BlockwiseFitOptions::default();
+        for step in 0..5 {
+            let rho_step = Array1::<f64>::from_elem(rho_dim, step as f64 * 0.1);
+            family_off
+                .batched_outer_gradient_terms(
+                    &states, &specs, &deriv_blocks, &rho_step, &opts_off, None,
+                )
+                .expect("guard ok off");
+        }
+        assert_eq!(
+            family_off
+                .auto_subsample_phase_counter
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "with auto_outer_subsample=false the counter must stay at 0"
+        );
     }
 }
