@@ -14250,7 +14250,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let mut effective_kappa_options = kappa_options.clone();
     let flex_spatial_scale_path = (spec.score_warp.is_some() || spec.link_dev.is_some())
         && effective_kappa_options.pilot_subsample_threshold > 0
-        && spec.y.len() >= effective_kappa_options.pilot_subsample_threshold.saturating_mul(2)
+        && spec.y.len()
+            >= effective_kappa_options
+                .pilot_subsample_threshold
+                .saturating_mul(2)
         && effective_kappa_options.enabled;
     if flex_spatial_scale_path {
         let marginal_terms = spatial_length_scale_term_indices(&spec.marginalspec);
@@ -14618,6 +14621,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
         true,
+        None,
         |theta, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;

@@ -1948,6 +1948,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 analytic_joint_derivatives_available,
                 analytic_joint_derivatives_available,
                 gamlss_disable_fixed_point,
+                None,
                 |theta, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
                     let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
                     let fit = {

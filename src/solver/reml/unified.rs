@@ -11961,9 +11961,7 @@ mod tests {
         // by eviction; we still cache it (refusing to cache would force
         // a recompute on every query, defeating the cache's purpose).
         let cache = ProjectedFactorCache::with_budget(8);
-        let huge = cache.get_or_insert_with(make_factor_key(1), || {
-            Array2::from_elem((4, 4), 1.0)
-        });
+        let huge = cache.get_or_insert_with(make_factor_key(1), || Array2::from_elem((4, 4), 1.0));
         assert_eq!(huge[[0, 0]], 1.0);
         assert_eq!(cache.len(), 1);
     }
