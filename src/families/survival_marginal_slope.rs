@@ -444,6 +444,15 @@ struct SurvivalFlexTimepointExact {
     d_uv: Array2<f64>,
 }
 
+struct SurvivalFlexTimepointFirstOrderExact {
+    eta: f64,
+    chi: f64,
+    d: f64,
+    eta_u: Array1<f64>,
+    chi_u: Array1<f64>,
+    d_u: Array1<f64>,
+}
+
 /// Directional extensions of a timepoint's exact quantities, contracted with
 /// a single direction.  These are the pieces needed to compose the third-order
 /// NLL contraction.
@@ -472,6 +481,35 @@ struct SurvivalTimeWiggleGeometry {
     d3q_dq03: Array1<f64>,
     d4q_dq04: Array1<f64>,
     d5q_dq05: Array1<f64>,
+}
+
+#[derive(Clone)]
+struct SurvivalTimeWiggleFirstOrderGeometry {
+    basis: Array2<f64>,
+    basis_d1: Array2<f64>,
+    basis_d2: Array2<f64>,
+    dq_dq0: Array1<f64>,
+    d2q_dq02: Array1<f64>,
+}
+
+#[derive(Clone)]
+struct SurvivalMarginalSlopeDynamicRowValues {
+    q0: f64,
+    q1: f64,
+    qd1: f64,
+}
+
+#[derive(Clone)]
+struct SurvivalMarginalSlopeDynamicRowGradient {
+    q0: f64,
+    q1: f64,
+    qd1: f64,
+    dq0_time: Array1<f64>,
+    dq1_time: Array1<f64>,
+    dqd1_time: Array1<f64>,
+    dq0_marginal: Array1<f64>,
+    dq1_marginal: Array1<f64>,
+    dqd1_marginal: Array1<f64>,
 }
 
 #[derive(Clone)]
@@ -2677,7 +2715,7 @@ impl SurvivalMarginalSlopeFamily {
                 || 0.0,
                 |mut ll, weighted| -> Result<_, String> {
                     let i = weighted.index;
-                    let q_geom = self.row_dynamic_q_geometry(i, block_states)?;
+                    let q_geom = self.row_dynamic_q_values(i, block_states)?;
                     let g = block_states[2].eta[i];
                     let (nll, _, _) = row_primary_closed_form(
                         q_geom.q0,
@@ -2746,7 +2784,7 @@ impl SurvivalMarginalSlopeFamily {
         let wi = self.weights[row];
         let di = self.event[row];
         let zi = self.z[row];
-        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+        let q_geom = self.row_dynamic_q_values(row, block_states)?;
 
         let first = |idx: usize| -> Vec<f64> { dirs.iter().map(|dir| dir[idx]).collect() };
         let q0_jet = MultiDirJet::linear(k, q_geom.q0, &first(0));
@@ -3191,11 +3229,11 @@ impl SurvivalMarginalSlopeFamily {
         (p_total - p_w)..p_total
     }
 
-    fn time_wiggle_geometry(
+    fn time_wiggle_first_order_geometry(
         &self,
         h0: ndarray::ArrayView1<'_, f64>,
         beta_w: ndarray::ArrayView1<'_, f64>,
-    ) -> Result<Option<SurvivalTimeWiggleGeometry>, String> {
+    ) -> Result<Option<SurvivalTimeWiggleFirstOrderGeometry>, String> {
         let (Some(knots), Some(degree)) =
             (self.time_wiggle_knots.as_ref(), self.time_wiggle_degree)
         else {
@@ -3204,44 +3242,270 @@ impl SurvivalMarginalSlopeFamily {
         let basis = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 0)?;
         let basis_d1 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 1)?;
         let basis_d2 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 2)?;
-        let basis_d3 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 3)?;
-        let basis_d4 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 4)?;
-        let basis_d5 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 5)?;
         if basis.ncols() != beta_w.len()
             || basis_d1.ncols() != beta_w.len()
             || basis_d2.ncols() != beta_w.len()
-            || basis_d3.ncols() != beta_w.len()
+        {
+            return Err(format!(
+                "survival marginal-slope timewiggle basis/beta mismatch: B..B''={},{},{} betaw={}",
+                basis.ncols(),
+                basis_d1.ncols(),
+                basis_d2.ncols(),
+                beta_w.len()
+            ));
+        }
+        let dq_dq0 = fast_av(&basis_d1, &beta_w) + 1.0;
+        let d2q_dq02 = fast_av(&basis_d2, &beta_w);
+        Ok(Some(SurvivalTimeWiggleFirstOrderGeometry {
+            basis,
+            basis_d1,
+            basis_d2,
+            dq_dq0,
+            d2q_dq02,
+        }))
+    }
+
+    fn time_wiggle_geometry(
+        &self,
+        h0: ndarray::ArrayView1<'_, f64>,
+        beta_w: ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Option<SurvivalTimeWiggleGeometry>, String> {
+        let first = self.time_wiggle_first_order_geometry(h0, beta_w)?;
+        let Some(first) = first else {
+            return Ok(None);
+        };
+        let (Some(knots), Some(degree)) =
+            (self.time_wiggle_knots.as_ref(), self.time_wiggle_degree)
+        else {
+            return Ok(None);
+        };
+        let basis_d3 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 3)?;
+        let basis_d4 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 4)?;
+        let basis_d5 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 5)?;
+        if basis_d3.ncols() != beta_w.len()
             || basis_d4.ncols() != beta_w.len()
             || basis_d5.ncols() != beta_w.len()
         {
             return Err(format!(
-                "survival marginal-slope timewiggle basis/beta mismatch: B..B'''''={},{},{},{},{},{} betaw={}",
-                basis.ncols(),
-                basis_d1.ncols(),
-                basis_d2.ncols(),
+                "survival marginal-slope timewiggle high-order basis/beta mismatch: B'''..B'''''={},{},{} betaw={}",
                 basis_d3.ncols(),
                 basis_d4.ncols(),
                 basis_d5.ncols(),
                 beta_w.len()
             ));
         }
-        let dq_dq0 = fast_av(&basis_d1, &beta_w) + 1.0;
-        let d2q_dq02 = fast_av(&basis_d2, &beta_w);
         let d3q_dq03 = fast_av(&basis_d3, &beta_w);
         let d4q_dq04 = fast_av(&basis_d4, &beta_w);
         let d5q_dq05 = fast_av(&basis_d5, &beta_w);
         Ok(Some(SurvivalTimeWiggleGeometry {
-            basis,
-            basis_d1,
-            basis_d2,
+            basis: first.basis,
+            basis_d1: first.basis_d1,
+            basis_d2: first.basis_d2,
             basis_d3,
             basis_d4,
-            dq_dq0,
-            d2q_dq02,
+            dq_dq0: first.dq_dq0,
+            d2q_dq02: first.d2q_dq02,
             d3q_dq03,
             d4q_dq04,
             d5q_dq05,
         }))
+    }
+
+    fn row_dynamic_q_values(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+    ) -> Result<SurvivalMarginalSlopeDynamicRowValues, String> {
+        let beta_time = &block_states[0].beta;
+        if !self.flex_timewiggle_active() {
+            return Ok(SurvivalMarginalSlopeDynamicRowValues {
+                q0: self.design_entry.dot_row(row, beta_time)
+                    + self.offset_entry[row]
+                    + block_states[1].eta[row],
+                q1: self.design_exit.dot_row(row, beta_time)
+                    + self.offset_exit[row]
+                    + block_states[1].eta[row],
+                qd1: self.design_derivative_exit.dot_row(row, beta_time)
+                    + self.derivative_offset_exit[row],
+            });
+        }
+
+        let time_tail = self.time_wiggle_range();
+        let p_base = time_tail.start;
+        let beta_time_base = beta_time.slice(s![..p_base]);
+        let beta_time_w = beta_time.slice(s![time_tail.clone()]);
+        let entry_chunk = self
+            .design_entry
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("row_dynamic_q_values design_entry: {e}"))?;
+        let exit_chunk = self
+            .design_exit
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("row_dynamic_q_values design_exit: {e}"))?;
+        let deriv_chunk = self
+            .design_derivative_exit
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("row_dynamic_q_values design_derivative_exit: {e}"))?;
+        let x_entry_base = entry_chunk.row(0).slice(s![..p_base]).to_owned();
+        let x_exit_base = exit_chunk.row(0).slice(s![..p_base]).to_owned();
+        let x_deriv_base = deriv_chunk.row(0).slice(s![..p_base]).to_owned();
+
+        let base_marginal = block_states[1].eta[row];
+        let h0 = x_entry_base.dot(&beta_time_base) + self.offset_entry[row] + base_marginal;
+        let h1 = x_exit_base.dot(&beta_time_base) + self.offset_exit[row] + base_marginal;
+        let d_raw = x_deriv_base.dot(&beta_time_base) + self.derivative_offset_exit[row];
+
+        let entry_geom = self
+            .time_wiggle_first_order_geometry(Array1::from_vec(vec![h0]).view(), beta_time_w)?
+            .ok_or_else(|| {
+                "survival marginal-slope timewiggle metadata is present but value geometry could not be built at entry"
+                    .to_string()
+            })?;
+        let exit_geom = self
+            .time_wiggle_first_order_geometry(Array1::from_vec(vec![h1]).view(), beta_time_w)?
+            .ok_or_else(|| {
+                "survival marginal-slope timewiggle metadata is present but value geometry could not be built at exit"
+                    .to_string()
+            })?;
+
+        Ok(SurvivalMarginalSlopeDynamicRowValues {
+            q0: h0 + entry_geom.basis.row(0).dot(&beta_time_w),
+            q1: h1 + exit_geom.basis.row(0).dot(&beta_time_w),
+            qd1: exit_geom.dq_dq0[0] * d_raw,
+        })
+    }
+
+    fn row_dynamic_q_gradient(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+    ) -> Result<SurvivalMarginalSlopeDynamicRowGradient, String> {
+        let beta_time = &block_states[0].beta;
+        let beta_marginal = &block_states[1].beta;
+        let p_time = beta_time.len();
+        let p_marginal = beta_marginal.len();
+
+        let mut out = SurvivalMarginalSlopeDynamicRowGradient {
+            q0: 0.0,
+            q1: 0.0,
+            qd1: 0.0,
+            dq0_time: Array1::zeros(p_time),
+            dq1_time: Array1::zeros(p_time),
+            dqd1_time: Array1::zeros(p_time),
+            dq0_marginal: Array1::zeros(p_marginal),
+            dq1_marginal: Array1::zeros(p_marginal),
+            dqd1_marginal: Array1::zeros(p_marginal),
+        };
+
+        if !self.flex_timewiggle_active() {
+            out.q0 = self.design_entry.dot_row(row, beta_time)
+                + self.offset_entry[row]
+                + block_states[1].eta[row];
+            out.q1 = self.design_exit.dot_row(row, beta_time)
+                + self.offset_exit[row]
+                + block_states[1].eta[row];
+            out.qd1 = self.design_derivative_exit.dot_row(row, beta_time)
+                + self.derivative_offset_exit[row];
+            let time_entry_chunk = self
+                .design_entry
+                .try_row_chunk(row..row + 1)
+                .map_err(|e| format!("row_dynamic_q_gradient design_entry: {e}"))?;
+            let time_exit_chunk = self
+                .design_exit
+                .try_row_chunk(row..row + 1)
+                .map_err(|e| format!("row_dynamic_q_gradient design_exit: {e}"))?;
+            let time_deriv_chunk = self
+                .design_derivative_exit
+                .try_row_chunk(row..row + 1)
+                .map_err(|e| format!("row_dynamic_q_gradient design_derivative_exit: {e}"))?;
+            out.dq0_time.assign(&time_entry_chunk.row(0));
+            out.dq1_time.assign(&time_exit_chunk.row(0));
+            out.dqd1_time.assign(&time_deriv_chunk.row(0));
+            if p_marginal > 0 {
+                let marginal_chunk = self
+                    .marginal_design
+                    .try_row_chunk(row..row + 1)
+                    .map_err(|e| format!("row_dynamic_q_gradient marginal_design: {e}"))?;
+                let marginal_row = marginal_chunk.row(0);
+                out.dq0_marginal.assign(&marginal_row);
+                out.dq1_marginal.assign(&marginal_row);
+            }
+            return Ok(out);
+        }
+
+        let time_tail = self.time_wiggle_range();
+        let p_base = time_tail.start;
+        let beta_time_base = beta_time.slice(s![..p_base]);
+        let beta_time_w = beta_time.slice(s![time_tail.clone()]);
+        let entry_chunk = self
+            .design_entry
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("row_dynamic_q_gradient design_entry: {e}"))?;
+        let exit_chunk = self
+            .design_exit
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("row_dynamic_q_gradient design_exit: {e}"))?;
+        let deriv_chunk = self
+            .design_derivative_exit
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("row_dynamic_q_gradient design_derivative_exit: {e}"))?;
+        let x_entry_base = entry_chunk.row(0).slice(s![..p_base]).to_owned();
+        let x_exit_base = exit_chunk.row(0).slice(s![..p_base]).to_owned();
+        let x_deriv_base = deriv_chunk.row(0).slice(s![..p_base]).to_owned();
+        let marginal_row = if p_marginal > 0 {
+            let marginal_chunk = self
+                .marginal_design
+                .try_row_chunk(row..row + 1)
+                .map_err(|e| format!("row_dynamic_q_gradient marginal_design: {e}"))?;
+            Some(marginal_chunk.row(0).to_owned())
+        } else {
+            None
+        };
+
+        let base_marginal = block_states[1].eta[row];
+        let h0 = x_entry_base.dot(&beta_time_base) + self.offset_entry[row] + base_marginal;
+        let h1 = x_exit_base.dot(&beta_time_base) + self.offset_exit[row] + base_marginal;
+        let d_raw = x_deriv_base.dot(&beta_time_base) + self.derivative_offset_exit[row];
+
+        let entry_geom = self
+            .time_wiggle_first_order_geometry(Array1::from_vec(vec![h0]).view(), beta_time_w)?
+            .ok_or_else(|| {
+                "survival marginal-slope timewiggle metadata is present but gradient geometry could not be built at entry"
+                    .to_string()
+            })?;
+        let exit_geom = self
+            .time_wiggle_first_order_geometry(Array1::from_vec(vec![h1]).view(), beta_time_w)?
+            .ok_or_else(|| {
+                "survival marginal-slope timewiggle metadata is present but gradient geometry could not be built at exit"
+                    .to_string()
+            })?;
+
+        out.q0 = h0 + entry_geom.basis.row(0).dot(&beta_time_w);
+        out.q1 = h1 + exit_geom.basis.row(0).dot(&beta_time_w);
+        out.qd1 = exit_geom.dq_dq0[0] * d_raw;
+
+        for j in 0..p_base {
+            out.dq0_time[j] = entry_geom.dq_dq0[0] * x_entry_base[j];
+            out.dq1_time[j] = exit_geom.dq_dq0[0] * x_exit_base[j];
+            out.dqd1_time[j] = exit_geom.d2q_dq02[0] * d_raw * x_exit_base[j]
+                + exit_geom.dq_dq0[0] * x_deriv_base[j];
+        }
+        for local_idx in 0..time_tail.len() {
+            let coeff_idx = time_tail.start + local_idx;
+            out.dq0_time[coeff_idx] = entry_geom.basis[[0, local_idx]];
+            out.dq1_time[coeff_idx] = exit_geom.basis[[0, local_idx]];
+            out.dqd1_time[coeff_idx] = exit_geom.basis_d1[[0, local_idx]] * d_raw;
+        }
+
+        if let Some(marginal_row) = marginal_row.as_ref() {
+            for j in 0..p_marginal {
+                out.dq0_marginal[j] = entry_geom.dq_dq0[0] * marginal_row[j];
+                out.dq1_marginal[j] = exit_geom.dq_dq0[0] * marginal_row[j];
+                out.dqd1_marginal[j] = exit_geom.d2q_dq02[0] * d_raw * marginal_row[j];
+            }
+        }
+
+        Ok(out)
     }
 
     fn row_dynamic_q_geometry(
@@ -4061,7 +4325,7 @@ impl SurvivalMarginalSlopeFamily {
         row: usize,
         block_states: &[ParameterBlockState],
     ) -> Result<f64, String> {
-        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+        let q_geom = self.row_dynamic_q_values(row, block_states)?;
         let g = block_states[2].eta[row];
         let beta_h = self.flex_score_beta(block_states)?;
         let beta_w = self.flex_link_beta(block_states)?;
@@ -4120,13 +4384,14 @@ impl SurvivalMarginalSlopeFamily {
     /// Build a cached partition: cells + moment states + fixed partials,
     /// computed once per (a, b, β_h, β_w) and reused across the three
     /// integration passes (F, D, D_uv).
-    fn build_cached_partition(
+    fn build_cached_partition_with_moment_order(
         &self,
         primary: &FlexPrimarySlices,
         a: f64,
         b: f64,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
+        moment_order: usize,
     ) -> Result<CachedPartitionCells, String> {
         let raw_cells = self.denested_partition_cells(a, b, beta_h, beta_w)?;
         let mut cells = Vec::with_capacity(raw_cells.len());
@@ -4142,7 +4407,7 @@ impl SurvivalMarginalSlopeFamily {
             };
             let z_mid = exact_kernel::interval_probe_point(cell.left, cell.right)?;
             let u_mid = a + b * z_mid;
-            let state = exact_kernel::evaluate_cell_moments(cell, 24)?;
+            let state = exact_kernel::evaluate_cell_moments(cell, moment_order)?;
             let fixed = self.denested_cell_primary_fixed_partials(
                 primary,
                 a,
@@ -4160,6 +4425,176 @@ impl SurvivalMarginalSlopeFamily {
             });
         }
         Ok(CachedPartitionCells { cells })
+    }
+
+    fn build_cached_partition(
+        &self,
+        primary: &FlexPrimarySlices,
+        a: f64,
+        b: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+    ) -> Result<CachedPartitionCells, String> {
+        self.build_cached_partition_with_moment_order(primary, a, b, beta_h, beta_w, 24)
+    }
+
+    fn compute_survival_timepoint_first_order_exact(
+        &self,
+        row: usize,
+        primary: &FlexPrimarySlices,
+        q: f64,
+        q_index: usize,
+        a: f64,
+        b: f64,
+        d_calibration: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+    ) -> Result<SurvivalFlexTimepointFirstOrderExact, String> {
+        let p = primary.total;
+        let cached =
+            self.build_cached_partition_with_moment_order(primary, a, b, beta_h, beta_w, 9)?;
+
+        struct FirstOrderCellAccum {
+            f_u: Vec<f64>,
+        }
+
+        let cell_accums = cached
+            .cells
+            .par_iter()
+            .map(|entry| -> Result<FirstOrderCellAccum, String> {
+                let state = &entry.state;
+                let fixed = &entry.fixed;
+                let mut f_u = vec![0.0; p];
+                for u in 0..p {
+                    let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
+                    f_u[u] = exact_kernel::cell_first_derivative_from_moments(
+                        &neg_coeff_u,
+                        &state.moments,
+                    )?;
+                }
+                Ok(FirstOrderCellAccum { f_u })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        let mut f_u = Array1::<f64>::zeros(p);
+        for acc in cell_accums {
+            for u in 0..p {
+                f_u[u] += acc.f_u[u];
+            }
+        }
+        f_u[q_index] += crate::probability::normal_pdf(q);
+
+        let d_check = self.evaluate_survival_denom_d(a, b, beta_h, beta_w)?;
+        if !d_check.is_finite() || d_check <= 0.0 {
+            return Err(format!(
+                "survival marginal-slope row {row} produced non-positive density normalization D={d_check:.3e}"
+            ));
+        }
+        let d_rel_err = (d_check - d_calibration).abs() / d_check.max(d_calibration.abs()).max(1.0);
+        if !d_calibration.is_finite() || d_calibration <= 0.0 || d_rel_err > 1e-8 {
+            return Err(format!(
+                "survival marginal-slope row {row} produced inconsistent calibration derivative: solve={d_calibration:.12e}, direct={d_check:.12e}"
+            ));
+        }
+
+        let mut a_u = Array1::<f64>::zeros(p);
+        for u in 0..p {
+            a_u[u] = f_u[u] / d_check;
+        }
+
+        let d_u_cell_accums = cached
+            .cells
+            .par_iter()
+            .map(|entry| -> Result<Vec<f64>, String> {
+                let cell = entry.partition_cell.cell;
+                let state = &entry.state;
+                let fixed = &entry.fixed;
+                let eta_poly = vec![cell.c0, cell.c1, cell.c2, cell.c3];
+                let chi_poly = fixed.dc_da.to_vec();
+                let eta_aa_poly = fixed.dc_daa.to_vec();
+                let mut d_u = vec![0.0; p];
+                for u in 0..p {
+                    let eta_u_poly = poly_add(&poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u]);
+                    let chi_u_poly =
+                        poly_add(&poly_scale(&eta_aa_poly, a_u[u]), &fixed.coeff_au[u]);
+                    let integrand = poly_sub(
+                        &chi_u_poly,
+                        &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_poly),
+                    );
+                    d_u[u] = exact_kernel::cell_polynomial_integral_from_moments(
+                        &integrand,
+                        &state.moments,
+                        "survival D_t first derivative",
+                    )?;
+                }
+                Ok(d_u)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut d_u = Array1::<f64>::zeros(p);
+        for cell_d_u in d_u_cell_accums {
+            for u in 0..p {
+                d_u[u] += cell_d_u[u];
+            }
+        }
+
+        let z_obs = self.z[row];
+        let u_obs = a + b * z_obs;
+        let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
+        let eta = eval_coeff4_at(&obs.coeff, z_obs);
+        let chi = eval_coeff4_at(&obs.dc_da, z_obs);
+        let eta_aa = eval_coeff4_at(&obs.dc_daa, z_obs);
+
+        let mut rho = Array1::<f64>::zeros(p);
+        let mut tau = Array1::<f64>::zeros(p);
+        let scale = self.probit_frailty_scale();
+        rho[primary.g] = eval_coeff4_at(&obs.dc_db, z_obs);
+        tau[primary.g] = eval_coeff4_at(&obs.dc_dab, z_obs);
+
+        if let (Some(h_range), Some(runtime)) = (primary.h.as_ref(), self.score_warp.as_ref()) {
+            for local_idx in 0..h_range.len() {
+                let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
+                let idx = h_range.start + local_idx;
+                rho[idx] = eval_coeff4_at(
+                    &scale_coeff4(
+                        exact_kernel::score_basis_cell_coefficients(basis_span, b),
+                        scale,
+                    ),
+                    z_obs,
+                );
+            }
+        }
+        if let (Some(w_range), Some(runtime)) = (primary.w.as_ref(), self.link_dev.as_ref()) {
+            for local_idx in 0..w_range.len() {
+                let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
+                let idx = w_range.start + local_idx;
+                rho[idx] = eval_coeff4_at(
+                    &scale_coeff4(
+                        exact_kernel::link_basis_cell_coefficients(basis_span, a, b),
+                        scale,
+                    ),
+                    z_obs,
+                );
+                let (dc_aw, _) =
+                    exact_kernel::link_basis_cell_coefficient_partials(basis_span, a, b);
+                tau[idx] = eval_coeff4_at(&scale_coeff4(dc_aw, scale), z_obs);
+            }
+        }
+
+        let mut eta_u = Array1::<f64>::zeros(p);
+        let mut chi_u = Array1::<f64>::zeros(p);
+        for u in 0..p {
+            eta_u[u] = chi * a_u[u] + rho[u];
+            chi_u[u] = eta_aa * a_u[u] + tau[u];
+        }
+
+        Ok(SurvivalFlexTimepointFirstOrderExact {
+            eta,
+            chi,
+            d: d_check,
+            eta_u,
+            chi_u,
+            d_u,
+        })
     }
 
     fn compute_survival_timepoint_exact(
@@ -4551,6 +4986,95 @@ impl SurvivalMarginalSlopeFamily {
         )
     }
 
+    fn compute_row_flex_primary_gradient_exact(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        q_geom: &SurvivalMarginalSlopeDynamicRowGradient,
+        primary: &FlexPrimarySlices,
+    ) -> Result<(f64, Array1<f64>), String> {
+        let g = block_states[2].eta[row];
+        let beta_h = self.flex_score_beta(block_states)?;
+        let beta_w = self.flex_link_beta(block_states)?;
+        self.compute_row_flex_primary_gradient_from_parts(
+            row, q_geom.q0, q_geom.q1, q_geom.qd1, g, beta_h, beta_w, primary,
+        )
+    }
+
+    fn compute_row_flex_primary_gradient_from_parts(
+        &self,
+        row: usize,
+        q0: f64,
+        q1: f64,
+        qd1: f64,
+        g: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        primary: &FlexPrimarySlices,
+    ) -> Result<(f64, Array1<f64>), String> {
+        if survival_derivative_guard_violated(qd1, self.derivative_guard) {
+            return Err(format!(
+                "survival marginal-slope monotonicity violated at row {row}: qd1={qd1:.3e} < guard={:.3e}",
+                self.derivative_guard
+            ));
+        }
+
+        let (a0, d0) = self.solve_row_survival_intercept(q0, g, beta_h, beta_w)?;
+        let (a1, d1) = self.solve_row_survival_intercept(q1, g, beta_h, beta_w)?;
+        let entry = self.compute_survival_timepoint_first_order_exact(
+            row, primary, q0, primary.q0, a0, g, d0, beta_h, beta_w,
+        )?;
+        let exit = self.compute_survival_timepoint_first_order_exact(
+            row, primary, q1, primary.q1, a1, g, d1, beta_h, beta_w,
+        )?;
+
+        if !exit.chi.is_finite() || exit.chi <= 0.0 {
+            return Err(format!(
+                "survival marginal-slope row {row} produced non-positive observed chi1={:.3e}",
+                exit.chi
+            ));
+        }
+
+        let wi = self.weights[row];
+        let di = self.event[row];
+        let (log_surv0, _) = signed_probit_logcdf_and_mills_ratio(-entry.eta);
+        let (log_surv1, _) = signed_probit_logcdf_and_mills_ratio(-exit.eta);
+        let (entry_k1, _, _, _) = signed_probit_neglog_derivatives_up_to_fourth(-entry.eta, -wi)?;
+        let (exit_k1, _, _, _) =
+            signed_probit_neglog_derivatives_up_to_fourth(-exit.eta, wi * (1.0 - di))?;
+        let log_phi_eta1 = -0.5 * (exit.eta * exit.eta + std::f64::consts::TAU.ln());
+        let log_phi_q1 = -0.5 * (q1 * q1 + std::f64::consts::TAU.ln());
+        let row_nll = wi
+            * (log_surv0
+                - (1.0 - di) * log_surv1
+                - di * log_phi_eta1
+                - di * exit.chi.ln()
+                - di * log_phi_q1
+                + di * exit.d.ln()
+                - di * qd1.ln());
+
+        let p = primary.total;
+        let mut grad = Array1::<f64>::zeros(p);
+        let entry_u1 = -entry_k1;
+        let exit_surv_u1 = -exit_k1;
+
+        for u in 0..p {
+            grad[u] += entry_u1 * entry.eta_u[u];
+            grad[u] += exit_surv_u1 * exit.eta_u[u];
+            grad[u] += wi * di * exit.eta * exit.eta_u[u];
+            grad[u] -= wi * di * exit.chi_u[u] / exit.chi;
+            if u == primary.q1 {
+                grad[u] += wi * di * q1;
+            }
+            grad[u] += wi * di * exit.d_u[u] / exit.d;
+            if u == primary.qd1 {
+                grad[u] -= wi * di / qd1;
+            }
+        }
+
+        Ok((row_nll, grad))
+    }
+
     fn compute_row_flex_primary_gradient_hessian_from_parts(
         &self,
         row: usize,
@@ -4704,7 +5228,7 @@ impl SurvivalMarginalSlopeFamily {
         // Reuse the realized q-geometry so exact directional derivatives stay on
         // the same timewiggle-aware/frailty-aware manifold as the closed-form
         // primary gradient/Hessian and the exact outer-derivative paths.
-        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+        let q_geom = self.row_dynamic_q_values(row, block_states)?;
         let q0_val = q_geom.q0;
         let q1_val = q_geom.q1;
         let qd1_val = q_geom.qd1;
@@ -4802,7 +5326,7 @@ impl SurvivalMarginalSlopeFamily {
         row: usize,
         block_states: &[ParameterBlockState],
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
-        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+        let q_geom = self.row_dynamic_q_values(row, block_states)?;
         let g = block_states[2].eta[row];
         let (nll, grad_arr, hess_arr) = row_primary_closed_form(
             q_geom.q0,
@@ -4910,6 +5434,41 @@ impl SurvivalMarginalSlopeFamily {
         row: usize,
         slices: &BlockSlices,
         q_geom: &SurvivalMarginalSlopeDynamicRow,
+        primary_gradient: ndarray::ArrayView1<'_, f64>,
+        joint_gradient: &mut Array1<f64>,
+    ) -> Result<(), String> {
+        let dq_time = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
+        let dq_marginal = [
+            &q_geom.dq0_marginal,
+            &q_geom.dq1_marginal,
+            &q_geom.dqd1_marginal,
+        ];
+
+        for (q_idx, dq) in dq_time.iter().enumerate() {
+            for coeff_idx in 0..dq.len() {
+                joint_gradient[slices.time.start + coeff_idx] -=
+                    primary_gradient[q_idx] * dq[coeff_idx];
+            }
+        }
+        for (q_idx, dq) in dq_marginal.iter().enumerate() {
+            for coeff_idx in 0..dq.len() {
+                joint_gradient[slices.marginal.start + coeff_idx] -=
+                    primary_gradient[q_idx] * dq[coeff_idx];
+            }
+        }
+        self.logslope_design.axpy_row_into(
+            row,
+            -primary_gradient[3],
+            &mut joint_gradient.slice_mut(s![slices.logslope.clone()]),
+        )?;
+        Ok(())
+    }
+
+    fn accumulate_dynamic_q_core_gradient_first_order(
+        &self,
+        row: usize,
+        slices: &BlockSlices,
+        q_geom: &SurvivalMarginalSlopeDynamicRowGradient,
         primary_gradient: ndarray::ArrayView1<'_, f64>,
         joint_gradient: &mut Array1<f64>,
     ) -> Result<(), String> {
@@ -10910,19 +11469,30 @@ impl SurvivalMarginalSlopeFamily {
         (0..self.n)
             .into_par_iter()
             .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
-                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-                let (row_nll, f_pi, _) = if flex_active {
-                    self.compute_row_flex_primary_gradient_hessian_exact(
+                let q_geom = self.row_dynamic_q_gradient(row, block_states)?;
+                let (row_nll, f_pi) = if flex_active {
+                    self.compute_row_flex_primary_gradient_exact(
                         row,
                         block_states,
                         &q_geom,
                         &primary,
                     )?
                 } else {
-                    self.compute_row_primary_gradient_hessian_uncached(row, block_states)?
+                    let (nll, grad_arr, _) = row_primary_closed_form(
+                        q_geom.q0,
+                        q_geom.q1,
+                        q_geom.qd1,
+                        block_states[2].eta[row],
+                        self.z[row],
+                        self.weights[row],
+                        self.event[row],
+                        self.derivative_guard,
+                        self.probit_frailty_scale(),
+                    )?;
+                    (nll, Array1::from_vec(grad_arr.to_vec()))
                 };
                 acc.0 -= row_nll;
-                self.accumulate_dynamic_q_core_gradient(
+                self.accumulate_dynamic_q_core_gradient_first_order(
                     row,
                     &slices,
                     &q_geom,
@@ -16112,6 +16682,80 @@ mod tests {
         ];
 
         assert_blockwise_matches_joint_principal_blocks(&family, &block_states);
+    }
+
+    #[test]
+    fn flex_timewiggle_fast_gradient_matches_dense_joint_gradient() {
+        let score_runtime = test_deviation_runtime();
+        let link_runtime = test_deviation_runtime();
+        let marginal_design = array![[0.7, -0.2]];
+        let marginal_beta = array![0.35, -0.1];
+        let logslope_design = array![[1.0]];
+        let logslope_beta = array![0.2];
+        let (time_wiggle_knots, time_wiggle_degree, time_wiggle_ncols) =
+            standard_test_time_wiggle();
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![1.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.15]),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
+            design_exit: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
+            design_derivative_exit: DesignMatrix::from(array![[1.0, 0.0, 0.0, 0.0, 0.0]]),
+            offset_entry: Arc::new(array![0.05]),
+            offset_exit: Arc::new(array![0.15]),
+            derivative_offset_exit: Arc::new(array![0.9]),
+            marginal_design: DesignMatrix::from(marginal_design.clone()),
+            logslope_design: DesignMatrix::from(logslope_design.clone()),
+            score_warp: Some(score_runtime.clone()),
+            link_dev: Some(link_runtime.clone()),
+            time_linear_constraints: None,
+            time_wiggle_knots: Some(time_wiggle_knots),
+            time_wiggle_degree: Some(time_wiggle_degree),
+            time_wiggle_ncols,
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.0, 0.08, -0.03, 0.02, -0.01],
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: marginal_beta.clone(),
+                eta: marginal_design.dot(&marginal_beta),
+            },
+            ParameterBlockState {
+                beta: logslope_beta.clone(),
+                eta: logslope_design.dot(&logslope_beta),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(score_runtime.basis_dim()),
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(link_runtime.basis_dim()),
+                eta: Array1::zeros(1),
+            },
+        ];
+
+        let (fast_ll, fast_grad) = family
+            .evaluate_exact_newton_joint_gradient_dynamic_q(&block_states)
+            .expect("fast gradient should evaluate");
+        let (dense_ll, dense_grad, _) = family
+            .evaluate_exact_newton_joint_dynamic_q_dense(&block_states)
+            .expect("dense joint derivatives should evaluate");
+
+        assert_close(fast_ll, dense_ll, 1e-10, "log-likelihood");
+        assert_eq!(fast_grad.len(), dense_grad.len());
+        for idx in 0..fast_grad.len() {
+            assert_close(
+                fast_grad[idx],
+                dense_grad[idx],
+                1e-8,
+                &format!("gradient[{idx}]"),
+            );
+        }
     }
 
     #[test]

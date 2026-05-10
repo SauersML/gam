@@ -4858,8 +4858,8 @@ pub fn reml_laml_evaluate(
             )
         })
         .collect();
-    let need_rho_v = effective_deriv.has_corrections();
-    let rho_v_ks: Option<Vec<Array1<f64>>> = if need_rho_v {
+    let need_family_corrections = effective_deriv.has_corrections();
+    let rho_v_ks: Option<Vec<Array1<f64>>> = if need_family_corrections {
         Some(
             rho_curvature_a_k_betas
                 .par_iter()
@@ -4869,14 +4869,22 @@ pub fn reml_laml_evaluate(
     } else {
         None
     };
-    let rho_corrections: Vec<Option<DriftDerivResult>> = if effective_deriv.has_corrections() {
+    let ext_v_is: Vec<Array1<f64>> = solution
+        .ext_coords
+        .par_iter()
+        .map(|coord| hop.solve(&coord.g))
+        .collect();
+    let coord_corrections: Vec<Option<DriftDerivResult>> = if need_family_corrections {
         let rho_vs = rho_v_ks
             .as_ref()
             .expect("rho mode responses required for Hessian corrections");
+        let mut correction_vs = Vec::with_capacity(k + ext_dim);
+        correction_vs.extend(rho_vs.iter().cloned());
+        correction_vs.extend(ext_v_is.iter().cloned());
         let correction_work = solution
             .n_observations
             .saturating_mul(hop.dim())
-            .saturating_mul(k.max(1));
+            .saturating_mul((k + ext_dim).max(1));
         // Small coefficient systems produce bounded-size correction operators;
         // keep their independent row contractions parallel even at large n.
         let correction_parallel_work_limit = if hop.dim() <= 512 {
@@ -4887,34 +4895,45 @@ pub fn reml_laml_evaluate(
         let parallel_corrections = correction_work <= correction_parallel_work_limit;
         if effective_deriv.has_batched_hessian_derivative_corrections() {
             log::info!(
-                "[STAGE] reml_laml rho_corrections mode=batched k={} n={} dim={} work={}",
+                "[STAGE] reml_laml coord_corrections mode=batched k={} ext_dim={} n={} dim={} work={}",
                 k,
+                ext_dim,
                 solution.n_observations,
                 hop.dim(),
                 correction_work
             );
-            effective_deriv.hessian_derivative_corrections_result(rho_vs)?
+            effective_deriv.hessian_derivative_corrections_result(&correction_vs)?
         } else if parallel_corrections {
-            rho_vs
+            correction_vs
                 .par_iter()
                 .map(|v_k| effective_deriv.hessian_derivative_correction_result(v_k))
                 .collect::<Result<Vec<_>, _>>()?
         } else {
             log::info!(
-                "[STAGE] reml_laml rho_corrections mode=serial k={} n={} dim={} work={}",
+                "[STAGE] reml_laml coord_corrections mode=serial k={} ext_dim={} n={} dim={} work={}",
                 k,
+                ext_dim,
                 solution.n_observations,
                 hop.dim(),
                 correction_work
             );
-            rho_vs
+            correction_vs
                 .iter()
                 .map(|v_k| effective_deriv.hessian_derivative_correction_result(v_k))
                 .collect::<Result<Vec<_>, _>>()?
         }
     } else {
-        (0..k).map(|_| None).collect()
+        (0..(k + ext_dim)).map(|_| None).collect()
     };
+    if coord_corrections.len() != k + ext_dim {
+        return Err(format!(
+            "REML/LAML derivative correction count mismatch: got {}, expected {}",
+            coord_corrections.len(),
+            k + ext_dim
+        ));
+    }
+    let rho_corrections = &coord_corrections[..k];
+    let ext_corrections = &coord_corrections[k..];
 
     // --- Stochastic trace estimation decision ---
     //
@@ -4959,14 +4978,9 @@ pub fn reml_laml_evaluate(
         }
 
         // ext-coordinates: H_i = B_i + D_beta H[-v_i].
-        for coord in solution.ext_coords.iter() {
-            let correction = if effective_deriv.has_corrections() {
-                let v_i = hop.solve(&coord.g);
-                effective_deriv.hessian_derivative_correction_result(&v_i)?
-            } else {
-                None
-            };
-            match hyper_coord_total_drift_result(&coord.drift, correction.as_ref(), hop.dim()) {
+        for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
+            let correction = ext_corrections[ext_idx].as_ref();
+            match hyper_coord_total_drift_result(&coord.drift, correction, hop.dim()) {
                 DriftDerivResult::Dense(matrix) => {
                     dense_matrices.push(matrix);
                     coord_has_operator.push(false);
@@ -5102,9 +5116,6 @@ pub fn reml_laml_evaluate(
             let ext_coord_start = std::time::Instant::now();
             let grad_idx = k + ext_idx;
 
-            // Mode response magnitude: v_i = H⁻¹(g_i), with β_i = −v_i.
-            let v_i = hop.solve(&coord.g);
-
             // Trace term: tr(K · Ḣ_i) where Ḣ_i = B_i + D_β H[−v_i].
             //
             // Kernel choice pairs with the cost:
@@ -5128,13 +5139,8 @@ pub fn reml_laml_evaluate(
             } else if let Some(ref stoch_traces) = stochastic_trace_values {
                 stoch_traces[k + ext_idx]
             } else {
-                let correction = if effective_deriv.has_corrections() {
-                    effective_deriv.hessian_derivative_correction_result(&v_i)?
-                } else {
-                    None
-                };
-                let drift =
-                    hyper_coord_total_drift_result(&coord.drift, correction.as_ref(), hop.dim());
+                let correction = ext_corrections[ext_idx].as_ref();
+                let drift = hyper_coord_total_drift_result(&coord.drift, correction, hop.dim());
                 match (&solution.penalty_subspace_trace, drift) {
                     (Some(kernel), DriftDerivResult::Dense(matrix)) => {
                         kernel.trace_projected_logdet(&matrix)
@@ -5311,11 +5317,19 @@ pub fn reml_laml_evaluate(
         );
         let assembly_start = std::time::Instant::now();
         let result = if use_operator {
+            let coord_vs_for_hessian = rho_v_ks.as_ref().map(|rho_vs| {
+                let mut all = Vec::with_capacity(k + ext_dim);
+                all.extend(rho_vs.iter().cloned());
+                all.extend(ext_v_is.iter().cloned());
+                all
+            });
             match build_outer_hessian_operator(
                 solution,
                 &lambdas,
                 effective_deriv,
                 hessian_kernel.expect("checked is_some above"),
+                coord_vs_for_hessian.as_deref(),
+                Some(&coord_corrections),
             ) {
                 Ok(op) => {
                     let mut hessian =
@@ -7073,6 +7087,8 @@ fn build_outer_hessian_operator(
     lambdas: &[f64],
     effective_deriv: &dyn HessianDerivativeProvider,
     kernel: OuterHessianDerivativeKernel,
+    precomputed_coord_vs: Option<&[Array1<f64>]>,
+    precomputed_coord_corrections: Option<&[Option<DriftDerivResult>]>,
 ) -> Result<UnifiedOuterHessianOperator, String> {
     let hop = Arc::clone(&solution.hessian_op);
     let k = lambdas.len();
@@ -7109,23 +7125,97 @@ fn build_outer_hessian_operator(
             _ => (1.0, 1.0, 1.0, 0.0, false),
         };
 
-    let mut coords = Vec::with_capacity(total);
-    let mut rho_penalty_a_k_betas: Vec<Array1<f64>> = Vec::with_capacity(k);
+    let rho_penalty_a_k_betas: Vec<Array1<f64>> = (0..k)
+        .into_par_iter()
+        .map(|idx| penalty_a_k_beta(&solution.penalty_coords[idx], &solution.beta, lambdas[idx]))
+        .collect();
+    let rho_curvature_a_k_betas: Vec<Array1<f64>> = (0..k)
+        .into_par_iter()
+        .map(|idx| {
+            penalty_a_k_beta(
+                &solution.penalty_coords[idx],
+                &solution.beta,
+                curvature_lambdas[idx],
+            )
+        })
+        .collect();
     // Mode responses are fixed-β stationarity derivatives and always use
     // the full Hessian solve.  Rank-deficient LAML changes only the logdet
     // trace kernel, handled below through `subspace`; projecting these solves
     // would change β_i/β_ij curvature semantics.
     let subspace = solution.penalty_subspace_trace.as_deref();
     let dispatch_solve = |v: &Array1<f64>| -> Array1<f64> { hop.solve(v) };
+    let coord_vs_storage;
+    let coord_vs: &[Array1<f64>] = if let Some(precomputed) = precomputed_coord_vs {
+        if precomputed.len() != total {
+            return Err(format!(
+                "outer Hessian precomputed mode-response count mismatch: got {}, expected {}",
+                precomputed.len(),
+                total
+            ));
+        }
+        precomputed
+    } else {
+        let mut owned: Vec<Array1<f64>> = rho_curvature_a_k_betas
+            .par_iter()
+            .map(dispatch_solve)
+            .collect();
+        owned.extend(
+            solution
+                .ext_coords
+                .par_iter()
+                .map(|coord| dispatch_solve(&coord.g))
+                .collect::<Vec<_>>(),
+        );
+        coord_vs_storage = owned;
+        &coord_vs_storage
+    };
+
+    let coord_corrections_storage;
+    let coord_corrections: &[Option<DriftDerivResult>] = if let Some(precomputed) =
+        precomputed_coord_corrections
+    {
+        if precomputed.len() != total {
+            return Err(format!(
+                "outer Hessian precomputed correction count mismatch: got {}, expected {}",
+                precomputed.len(),
+                total
+            ));
+        }
+        precomputed
+    } else if effective_deriv.has_corrections() {
+        if effective_deriv.has_batched_hessian_derivative_corrections() {
+            log::info!(
+                "[STAGE] outer_hessian coord_corrections mode=batched k={} ext_dim={} n={} dim={}",
+                k,
+                ext_dim,
+                solution.n_observations,
+                hop.dim()
+            );
+            coord_corrections_storage =
+                effective_deriv.hessian_derivative_corrections_result(coord_vs)?;
+        } else {
+            coord_corrections_storage = coord_vs
+                .par_iter()
+                .map(|v_i| effective_deriv.hessian_derivative_correction_result(v_i))
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        &coord_corrections_storage
+    } else {
+        coord_corrections_storage = (0..total).map(|_| None).collect::<Vec<_>>();
+        &coord_corrections_storage
+    };
+
+    let mut coords = Vec::with_capacity(total);
     for idx in 0..k {
         let coord = &solution.penalty_coords[idx];
-        let penalty_a_k_beta_vec = penalty_a_k_beta(coord, &solution.beta, lambdas[idx]);
-        let curvature_a_k_beta = penalty_a_k_beta(coord, &solution.beta, curvature_lambdas[idx]);
-        let v_k = dispatch_solve(&curvature_a_k_beta);
-        let correction = effective_deriv.hessian_derivative_correction_result(&v_k)?;
+        let penalty_a_k_beta_vec = rho_penalty_a_k_betas[idx].clone();
+        let curvature_a_k_beta = rho_curvature_a_k_betas[idx].clone();
+        let v_k = coord_vs[idx].clone();
+        let correction = coord_corrections[idx].as_ref();
         let mut total_dense = None;
         let mut total_operators = Vec::new();
-        match penalty_total_drift_result(coord, curvature_lambdas[idx], correction.as_ref()) {
+        match penalty_total_drift_result(coord, curvature_lambdas[idx], correction) {
             DriftDerivResult::Dense(matrix) => total_dense = Some(matrix),
             DriftDerivResult::Operator(op) => total_operators.push(op),
         }
@@ -7140,7 +7230,6 @@ fn build_outer_hessian_operator(
             _ => None,
         };
         let a_i = 0.5 * solution.beta.dot(&penalty_a_k_beta_vec);
-        rho_penalty_a_k_betas.push(penalty_a_k_beta_vec);
         coords.push(OuterHessianCoord {
             a: a_i,
             g: curvature_a_k_beta,
@@ -7153,10 +7242,11 @@ fn build_outer_hessian_operator(
     }
 
     for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
-        let v_i = dispatch_solve(&coord.g);
-        let correction = effective_deriv.hessian_derivative_correction_result(&v_i)?;
+        let coord_idx = k + ext_idx;
+        let v_i = coord_vs[coord_idx].clone();
+        let correction = coord_corrections[coord_idx].as_ref();
         let (total_dense, total_operators) =
-            hyper_coord_total_drift_parts(&coord.drift, correction.as_ref());
+            hyper_coord_total_drift_parts(&coord.drift, correction);
         let (base_dense, base_operators) = hyper_coord_total_drift_parts(&coord.drift, None);
         let dense_rotated = match (hop.as_dense_spectral(), total_dense.as_ref()) {
             (Some(dense_hop), Some(matrix)) => Some(dense_hop.rotate_to_eigenbasis(matrix)),
@@ -12399,6 +12489,8 @@ mod tests {
             &lambdas,
             solution.deriv_provider.as_ref(),
             kernel,
+            None,
+            None,
         )
         .unwrap();
         let materialized =
@@ -12611,6 +12703,8 @@ mod tests {
             &lambdas,
             solution.deriv_provider.as_ref(),
             kernel,
+            None,
+            None,
         )
         .unwrap();
 
@@ -12745,6 +12839,8 @@ mod tests {
             &lambdas,
             solution.deriv_provider.as_ref(),
             kernel,
+            None,
+            None,
         )
         .unwrap();
         let materialized =
@@ -12964,6 +13060,8 @@ mod tests {
             &lambdas,
             solution.deriv_provider.as_ref(),
             kernel,
+            None,
+            None,
         )
         .unwrap();
         let materialized =
