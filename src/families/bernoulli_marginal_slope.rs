@@ -1388,72 +1388,37 @@ fn append_deviation_function_penalty(
     Ok(())
 }
 
-// Cross-block identifiability for two simultaneously-active deviation flex
-// blocks of the same scalar argument (here: η_pilot). Each block's basis is
-// individually orthogonal to its own smoothness-penalty null space (the
-// `smoothness_nullspace_orthogonal_complement` transform applied inside
-// `DeviationRuntime::try_new` removes constants, linears, etc., according to
-// `max_penalty_derivative_order`). That makes each block identifiable in
-// isolation against the location intercept. It does NOT make two flex blocks
-// jointly identifiable: both bases live in the same orthogonal complement of
-// {1, η_pilot, …} inside `L²(η_pilot)`, and two cubic I-spline bases of the
-// same argument with overlapping knot ranges parameterise overlapping
-// function classes inside that complement.
+// Cross-block identifiability for the BMS family's parametric and flex
+// blocks. Each deviation block's basis is individually orthogonal to its
+// own smoothness-penalty null space (`smoothness_nullspace_orthogonal_complement`
+// inside `DeviationRuntime::try_new`), but that only makes each block
+// identifiable in isolation. Two flex blocks of overlapping argument
+// classes (or a flex block whose column span at training rows reproduces
+// parametric features) leave a near-null direction in the joint penalised
+// Hessian: a linear combination of `β` across blocks produces zero net
+// η-contribution at training rows yet costs only the (penalised) basis
+// norm. Newton steps blow up along that direction and the inner solver
+// either drifts indefinitely along the null mode or, at biobank scale,
+// breaks the constrained QP active-set iteration once `W = p(1−p)` further
+// degrades the data Hessian.
 //
-// The overlap manifests at runtime as a near-null direction of the joint
-// penalised Hessian `H + S`: a linear combination of `β_score_warp` and
-// `β_link_dev` produces zero net η-contribution at the rigid-pilot training
-// points yet costs only the (penalised) basis norm. Newton steps along that
-// direction blow up — `‖H⁻¹ g‖_∞` grows like `1 / λ_min(H + S)` — and the
-// inner solver either drifts indefinitely along the null mode or, more
-// commonly at biobank scale, breaks the constrained QP active-set iteration
-// when the saturated `W = p(1−p)` further degrades the data Hessian.
+// The principled fix is the standard GAM identifiability convention
+// (Wood, §5.4 / mgcv `gam.side`) generalised to multi-anchor unions:
+// reparameterise each later block so its column span at training rows is
+// orthogonal to the union of every earlier block's column span. With
+// `M_i = A_i^T C` (anchor `i` cross-Gram) and `T = null(vstack(M_i))`
+// (the right null-space of the stacked cross-Gram, computed via
+// `eigh(Σ_i M_i^T M_i)`), the new block basis `C · T` satisfies
+// `A_i^T (C · T) ≈ 0` for every anchor. The joint design then has full
+// numerical column rank, `σ_min(joint H + S) ≥ λ_min(S₊)` regardless of
+// how β shifts the linear-predictor distribution, and the soft "+∞" /
+// divergence-detection / trust-region-collapse-as-KKT scaffolding in the
+// inner solver becomes vestigial rather than load-bearing.
 //
-// The principled fix is the standard GAM identifiability convention (Wood,
-// *Generalized Additive Models*, §5.4 / mgcv `gam.side`): impose a side
-// condition that makes each successive flex block's column span orthogonal
-// to every earlier block's column span at the training-data inner product,
-// *as a one-time reparameterisation at family construction*. Concretely:
-// keep the first block's basis intact and reparameterise the second so that
-//
-//     A_train^T (C_train · T) = 0
-//
-// where `A_train` is the anchor block's design at the training points and
-// `C_train` is the candidate block's design at the same points. The columns
-// of `T` span `null(A_train^T C_train)` — the cross-Gram matrix's null
-// space. After this transform the joint design `[X_loc | X_logslope | A | C·T]`
-// has full column rank up to numerical tolerance, so `σ_min(H + S) ≥
-// λ_min(S₊)` regardless of how β shifts the linear-predictor distribution,
-// and the entire scaffolding of soft "+∞" / divergence-detection / trust-
-// region-collapse-as-KKT bookkeeping in the inner solver becomes vestigial
-// rather than load-bearing.
-//
-// Implementation notes:
-// * Both designs are evaluated at the rigid-pilot η₀ values for the n
-//   training rows (`q0_seed`). The padding rows used by `link_dev_seed`
-//   (boundary anchors for I-spline knot stability) are not part of the
-//   identifiability invariant — only the training rows where the data
-//   likelihood lives.
-// * `null(A^T C)` is extracted via the eigendecomposition of `(A^T C)^T (A^T C)`
-//   on `R^{p_c}`. This gives every right singular direction of `A^T C`,
-//   including the `p_c − rank(M)` null directions, in a single small dense
-//   eigh on a `p_c × p_c` matrix (`p_c ≲ 20` for cubic I-spline blocks). A
-//   thin SVD on `M = A^T C` would only return `min(p_a, p_c)` right vectors,
-//   missing the null space when `p_a < p_c`.
-// * The transform `T` is composed into `link_dev.runtime` via
-//   `compose_external_column_transform`, which right-multiplies the cubic
-//   span tables, the right-boundary value row, and the monotonicity
-//   constraint matrix. The candidate block is then rebuilt from the
-//   reparameterised runtime: design at `link_dev_design_seed`, penalties
-//   from `runtime.integrated_derivative_penalty_with_nullity`, fresh
-//   zero-initialised β.
-// * The pass is a no-op (returns `Ok(())`) when the bases are already
-//   orthogonal at training points, when either block is empty, or when the
-//   anchor design is rank-deficient enough that the cross-Gram has no
-//   significant singular values. The hard error case — the candidate is
-//   *fully* aliased by the anchor and would reduce to zero columns —
-//   surfaces a configuration problem at the basis-construction layer
-//   rather than allowing a silent degenerate fit.
+// `enforce_cross_block_identifiability_for_flex_block` is the entry point;
+// `CrossBlockAnchor` distinguishes parametric anchors (any `DesignMatrix`,
+// reduced via column-by-column transpose-matvec so sparse/lazy designs
+// never densify) from already-evaluated flex anchors (dense `Array2`).
 /// Anchor source for cross-block identifiability orthogonalisation.
 ///
 /// `enforce_cross_block_identifiability_for_flex_block` reparameterises a
