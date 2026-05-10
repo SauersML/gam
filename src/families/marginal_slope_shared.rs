@@ -627,11 +627,7 @@ impl OuterScoreSubsample {
     /// Wrap a vector of `(index, weight, stratum)` triples. The mask is
     /// derived as the sorted/dedup'd index list. Used by the stratified
     /// builder to install per-row HT weights.
-    pub fn from_weighted_rows(
-        mut rows: Vec<WeightedOuterRow>,
-        n_full: usize,
-        seed: u64,
-    ) -> Self {
+    pub fn from_weighted_rows(mut rows: Vec<WeightedOuterRow>, n_full: usize, seed: u64) -> Self {
         rows.sort_by_key(|r| r.index);
         rows.dedup_by_key(|r| r.index);
         let mask: Vec<usize> = rows.iter().map(|r| r.index).collect();
@@ -1117,5 +1113,4 @@ mod tests {
             scale
         );
     }
-
 }
