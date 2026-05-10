@@ -3467,6 +3467,7 @@ struct OuterConfig {
     initial_rho: Option<Array1<f64>>,
     fallback_policy: FallbackPolicy,
     screening_cap: Option<Arc<AtomicUsize>>,
+    screen_initial_rho: bool,
     /// Outer-aware inner-PIRLS iteration cap (sibling of `screening_cap`).
     /// When set, the BFGS bridge drives this atomic on every accepted
     /// gradient eval to coarsen the inner Newton solve at early outer iters
@@ -3493,6 +3494,7 @@ impl Default for OuterConfig {
             initial_rho: None,
             fallback_policy: FallbackPolicy::Automatic,
             screening_cap: None,
+            screen_initial_rho: false,
             outer_inner_cap: None,
             solver_class: SolverClass::Primary,
             operator_initial_trust_radius: None,
@@ -3529,6 +3531,7 @@ pub struct OuterProblem {
     initial_rho: Option<Array1<f64>>,
     fallback_policy: FallbackPolicy,
     screening_cap: Option<Arc<AtomicUsize>>,
+    screen_initial_rho: bool,
     outer_inner_cap: Option<InnerProgressFeedback>,
     solver_class: SolverClass,
     operator_initial_trust_radius: Option<f64>,
@@ -3554,6 +3557,7 @@ impl OuterProblem {
             initial_rho: None,
             fallback_policy: FallbackPolicy::Automatic,
             screening_cap: None,
+            screen_initial_rho: false,
             outer_inner_cap: None,
             solver_class: SolverClass::Primary,
             operator_initial_trust_radius: None,
@@ -3623,6 +3627,14 @@ impl OuterProblem {
     }
     pub fn with_screening_cap(mut self, screening_cap: Arc<AtomicUsize>) -> Self {
         self.screening_cap = Some(screening_cap);
+        self
+    }
+    /// Allow seed screening to rank the explicit initial rho against generated
+    /// candidates even when the effective seed budget is one. The default keeps
+    /// a user-provided initial point authoritative and avoids a separate
+    /// screening pass.
+    pub fn with_screen_initial_rho(mut self, screen_initial_rho: bool) -> Self {
+        self.screen_initial_rho = screen_initial_rho;
         self
     }
     /// Wire the bidirectional inner-PIRLS feedback channel.
@@ -3706,6 +3718,7 @@ impl OuterProblem {
             initial_rho: self.initial_rho.clone(),
             fallback_policy: self.fallback_policy,
             screening_cap: self.screening_cap.clone(),
+            screen_initial_rho: self.screen_initial_rho,
             outer_inner_cap: self.outer_inner_cap.clone(),
             solver_class: self.solver_class,
             operator_initial_trust_radius: self.operator_initial_trust_radius,
@@ -4073,10 +4086,13 @@ fn run_outer_with_plan(
         screening_enabled,
     )
     .min(seeds.len());
-    if config.initial_rho.is_some() && seed_budget == 1 && seeds.len() > 1 {
-        seeds.truncate(1);
-    }
-    if should_screen_seeds(config, the_plan.solver, seeds.len(), seed_budget) {
+    let explicit_initial_rho_owns_single_seed_budget = config.initial_rho.is_some()
+        && seed_budget == 1
+        && seeds.len() > 1
+        && !config.screen_initial_rho;
+    if !explicit_initial_rho_owns_single_seed_budget
+        && should_screen_seeds(config, the_plan.solver, seeds.len(), seed_budget)
+    {
         seeds = rank_seeds_with_screening(obj, config, context, &seeds);
     }
     log::debug!(
@@ -6850,6 +6866,7 @@ mod tests {
             .with_seed_config(seed_config)
             .with_screening_cap(Arc::clone(&screening_cap))
             .with_initial_rho(initial_seed)
+            .with_screen_initial_rho(true)
             .with_max_iter(1);
         let mut obj = problem.build_objective(
             (),
@@ -6928,6 +6945,7 @@ mod tests {
             .with_seed_config(seed_config)
             .with_screening_cap(Arc::clone(&screening_cap))
             .with_initial_rho(initial_seed.clone())
+            .with_screen_initial_rho(true)
             .with_max_iter(1);
         let mut obj = problem.build_objective(
             (),
