@@ -1388,6 +1388,217 @@ fn append_deviation_function_penalty(
     Ok(())
 }
 
+// Cross-block identifiability for two simultaneously-active deviation flex
+// blocks of the same scalar argument (here: η_pilot). Each block's basis is
+// individually orthogonal to its own smoothness-penalty null space (the
+// `smoothness_nullspace_orthogonal_complement` transform applied inside
+// `DeviationRuntime::try_new` removes constants, linears, etc., according to
+// `max_penalty_derivative_order`). That makes each block identifiable in
+// isolation against the location intercept. It does NOT make two flex blocks
+// jointly identifiable: both bases live in the same orthogonal complement of
+// {1, η_pilot, …} inside `L²(η_pilot)`, and two cubic I-spline bases of the
+// same argument with overlapping knot ranges parameterise overlapping
+// function classes inside that complement.
+//
+// The overlap manifests at runtime as a near-null direction of the joint
+// penalised Hessian `H + S`: a linear combination of `β_score_warp` and
+// `β_link_dev` produces zero net η-contribution at the rigid-pilot training
+// points yet costs only the (penalised) basis norm. Newton steps along that
+// direction blow up — `‖H⁻¹ g‖_∞` grows like `1 / λ_min(H + S)` — and the
+// inner solver either drifts indefinitely along the null mode or, more
+// commonly at biobank scale, breaks the constrained QP active-set iteration
+// when the saturated `W = p(1−p)` further degrades the data Hessian.
+//
+// The principled fix is the standard GAM identifiability convention (Wood,
+// *Generalized Additive Models*, §5.4 / mgcv `gam.side`): impose a side
+// condition that makes each successive flex block's column span orthogonal
+// to every earlier block's column span at the training-data inner product,
+// *as a one-time reparameterisation at family construction*. Concretely:
+// keep the first block's basis intact and reparameterise the second so that
+//
+//     A_train^T (C_train · T) = 0
+//
+// where `A_train` is the anchor block's design at the training points and
+// `C_train` is the candidate block's design at the same points. The columns
+// of `T` span `null(A_train^T C_train)` — the cross-Gram matrix's null
+// space. After this transform the joint design `[X_loc | X_logslope | A | C·T]`
+// has full column rank up to numerical tolerance, so `σ_min(H + S) ≥
+// λ_min(S₊)` regardless of how β shifts the linear-predictor distribution,
+// and the entire scaffolding of soft "+∞" / divergence-detection / trust-
+// region-collapse-as-KKT bookkeeping in the inner solver becomes vestigial
+// rather than load-bearing.
+//
+// Implementation notes:
+// * Both designs are evaluated at the rigid-pilot η₀ values for the n
+//   training rows (`q0_seed`). The padding rows used by `link_dev_seed`
+//   (boundary anchors for I-spline knot stability) are not part of the
+//   identifiability invariant — only the training rows where the data
+//   likelihood lives.
+// * `null(A^T C)` is extracted via the eigendecomposition of `(A^T C)^T (A^T C)`
+//   on `R^{p_c}`. This gives every right singular direction of `A^T C`,
+//   including the `p_c − rank(M)` null directions, in a single small dense
+//   eigh on a `p_c × p_c` matrix (`p_c ≲ 20` for cubic I-spline blocks). A
+//   thin SVD on `M = A^T C` would only return `min(p_a, p_c)` right vectors,
+//   missing the null space when `p_a < p_c`.
+// * The transform `T` is composed into `link_dev.runtime` via
+//   `compose_external_column_transform`, which right-multiplies the cubic
+//   span tables, the right-boundary value row, and the monotonicity
+//   constraint matrix. The candidate block is then rebuilt from the
+//   reparameterised runtime: design at `link_dev_design_seed`, penalties
+//   from `runtime.integrated_derivative_penalty_with_nullity`, fresh
+//   zero-initialised β.
+// * The pass is a no-op (returns `Ok(())`) when the bases are already
+//   orthogonal at training points, when either block is empty, or when the
+//   anchor design is rank-deficient enough that the cross-Gram has no
+//   significant singular values. The hard error case — the candidate is
+//   *fully* aliased by the anchor and would reduce to zero columns —
+//   surfaces a configuration problem at the basis-construction layer
+//   rather than allowing a silent degenerate fit.
+pub(crate) fn cross_orthogonalize_link_dev_against_score_warp(
+    score_warp: &DeviationPrepared,
+    link_dev: &mut DeviationPrepared,
+    score_warp_arg_at_training_rows: &Array1<f64>,
+    link_dev_arg_at_training_rows: &Array1<f64>,
+    link_dev_design_seed: &Array1<f64>,
+    link_dev_cfg: &DeviationBlockConfig,
+) -> Result<(), String> {
+    use crate::faer_ndarray::FaerEigh;
+
+    let anchor_design = score_warp.runtime.design(score_warp_arg_at_training_rows)?;
+    let candidate_design = link_dev.runtime.design(link_dev_arg_at_training_rows)?;
+    if anchor_design.nrows() != candidate_design.nrows() {
+        return Err(format!(
+            "cross-block identifiability: anchor/candidate row mismatch ({} vs {})",
+            anchor_design.nrows(),
+            candidate_design.nrows(),
+        ));
+    }
+    let p_anchor = anchor_design.ncols();
+    let p_candidate = candidate_design.ncols();
+    if p_anchor == 0 || p_candidate == 0 {
+        return Ok(());
+    }
+
+    // Cross-Gram `M = A^T C` (p_anchor × p_candidate). At biobank scale n is
+    // 320 000 and both p's are ≲ 20, so the contraction is dominated by the
+    // n-axis: ~n · p_anchor · p_candidate flops, ~130 Mflops total — a few
+    // hundredths of a second compared to the per-cycle 35 s dense Hessian
+    // build it eliminates.
+    let cross_gram = anchor_design.t().dot(&candidate_design);
+
+    // Eigendecomposition of `M^T M` (p_candidate × p_candidate, PSD) gives
+    // every right singular direction of `M` along with its squared singular
+    // value, including the `p_candidate − rank(M)` null directions. Faer's
+    // `eigh` returns eigenvalues ascending, so the smallest sit at the
+    // front: those whose value is below the rank-detection threshold span
+    // `null(M)` and become the columns of the reparameterisation `T`.
+    let normal_gram = cross_gram.t().dot(&cross_gram);
+    let (eigenvalues, eigenvectors) = normal_gram
+        .eigh(faer::Side::Lower)
+        .map_err(|e| format!("cross-block identifiability eigh failed: {e}"))?;
+    let eigenvalues_slice = eigenvalues
+        .as_slice()
+        .ok_or_else(|| "cross-block identifiability eigenvalues not contiguous".to_string())?;
+    let lambda_max = eigenvalues_slice
+        .iter()
+        .copied()
+        .fold(0.0_f64, f64::max);
+    if lambda_max <= 0.0 {
+        // `A^T C` is identically zero — bases are already orthogonal.
+        return Ok(());
+    }
+    // Threshold on the squared singular values: `σ²` below
+    // `λ_max · n · ε²_rel` is treated as numerical zero. The `ε²_rel`
+    // tolerance comes from `positive_eigenvalue_threshold` which scales
+    // by 100 · machine_epsilon · max(|λ|). Squaring `M` doubled the
+    // effective conditioning, so we widen to `64 · n · ε²` to keep
+    // borderline-orthogonal directions on the kept side. (Identical to
+    // the convention used by the existing per-block null-space drop.)
+    let n_train = anchor_design.nrows() as f64;
+    let null_threshold = lambda_max * (64.0 * n_train.max(1.0) * f64::EPSILON * f64::EPSILON);
+    let null_indices: Vec<usize> = eigenvalues_slice
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &lam)| (lam <= null_threshold).then_some(idx))
+        .collect();
+    if null_indices.is_empty() {
+        // Every right singular value of `M = A^T C` is well above the noise
+        // floor: `rank(M) = p_candidate`, i.e., `null(A^T C) = {0}`. There
+        // are zero candidate directions whose induced column of `C` is
+        // orthogonal to `span(A)` — the candidate basis is fully captured
+        // by the anchor at training points (`span(C) ⊆ span(A)` numerically).
+        // No reparameterisation can recover identifiability here; the joint
+        // design simply does not have room for both blocks. This is a
+        // configuration-time defect (the two flex bases are too similar)
+        // rather than a runtime issue, so we surface it explicitly instead
+        // of letting the inner solver collide with the resulting rank-
+        // deficient Hessian.
+        return Err(format!(
+            "cross-block identifiability: link-deviation basis ({} cols) is fully \
+             aliased by the score-warp anchor ({} cols). span(C) ⊆ span(A) up to \
+             numerical tolerance ({:.3e}) at the {} training rows, so zero \
+             independent directions remain after orthogonalisation. The two \
+             flex-basis configurations carry the same information; reduce one \
+             block's knot count, change one block's knot configuration, or \
+             disable one of the simultaneously-active flex blocks.",
+            p_candidate,
+            p_anchor,
+            null_threshold,
+            anchor_design.nrows(),
+        ));
+    }
+    // `null_indices.len() == p_candidate` would mean every eigenvalue of
+    // `M^T M` is below threshold, i.e., `M ≈ 0` so the bases were already
+    // orthogonal at training points. The earlier `lambda_max <= 0.0` branch
+    // handles the exact-zero case; for the strictly-positive-but-below-
+    // threshold case (extremely rare, but mathematically valid), treat it
+    // as already-orthogonal and skip the reparameterisation.
+    if null_indices.len() == p_candidate {
+        return Ok(());
+    }
+    // Keep candidate directions in the null space of M. These are the
+    // directions of β_candidate whose induced columns of C are orthogonal
+    // to span(A) at training points.
+    let mut t_final = Array2::<f64>::zeros((p_candidate, null_indices.len()));
+    for (out_col, &in_col) in null_indices.iter().enumerate() {
+        t_final.column_mut(out_col).assign(&eigenvectors.column(in_col));
+    }
+    let kept = t_final.ncols();
+
+    // Compose the transform into the runtime, then rebuild the prepared
+    // block (design, penalties, initial β) in the new parameterisation.
+    link_dev.runtime.compose_external_column_transform(&t_final)?;
+    let new_design = link_dev.runtime.design(link_dev_design_seed)?;
+    let new_p = new_design.ncols();
+    debug_assert_eq!(new_p, kept);
+    link_dev.block.design =
+        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(new_design));
+    link_dev.block.penalties.clear();
+    link_dev.block.nullspace_dims.clear();
+    let penalty_orders = resolve_deviation_operator_orders(link_dev_cfg)?;
+    for order in penalty_orders {
+        append_deviation_function_penalty(&mut link_dev.block, &link_dev.runtime, order)?;
+    }
+    if link_dev_cfg.double_penalty {
+        append_deviation_function_penalty(&mut link_dev.block, &link_dev.runtime, 0)?;
+    }
+    link_dev.block.initial_beta = Some(Array1::zeros(new_p));
+
+    log::info!(
+        "[BMS cross-block identifiability] link-deviation basis reparameterised against \
+         score-warp anchor: kept {}/{} directions (anchor cols={}, dropped={}, \
+         training rows={}, λ_max(M^T M)={:.3e}, drop tol={:.3e})",
+        new_p,
+        p_candidate,
+        p_anchor,
+        p_candidate - new_p,
+        anchor_design.nrows(),
+        lambda_max,
+        null_threshold,
+    );
+    Ok(())
+}
+
 pub(crate) fn project_monotone_feasible_beta(
     runtime: &DeviationRuntime,
     current: &Array1<f64>,
@@ -15091,29 +15302,58 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // (which would double total work at biobank scale):
     //   q0 ≈ a0 · √(1 + (s_f b0)²) + s_f b0 · z[i]
     // where b0 is the frailty-adjusted rigid logslope seed.
-    let link_dev_prepared = spec
-        .link_dev
-        .as_ref()
-        .map(|cfg| {
-            let q0_seed = Array1::from_iter((0..spec.z.len()).map(|row| {
-                let a0 = bernoulli_marginal_link_map(
-                    &spec.base_link,
-                    baseline.0 + spec.marginal_offset[row],
-                )
-                .expect("validated bernoulli marginal base link should produce finite pilot q")
-                .q;
-                let b0 = baseline.1 + spec.logslope_offset[row];
-                rigid_observed_eta(a0, b0, spec.z[row], probit_scale)
-            }));
-            let link_dev_seed = padded_deviation_seed(&q0_seed, 1.0, 0.5);
-            build_link_deviation_block_from_knots_design_seed_and_weights(
-                &link_dev_seed,
-                &q0_seed,
-                &spec.weights,
-                cfg,
+    // Build the link-deviation block. When score-warp is also active, apply
+    // the cross-block identifiability transform inline so the resulting
+    // `link_dev_prepared` already lives in the joint-orthogonal
+    // parameterisation — every later consumer (the family runtime, the
+    // block-spec pusher, hints, prediction-time runtime clones) sees the
+    // reparameterised basis without further bookkeeping.
+    let link_dev_prepared = if let Some(cfg) = spec.link_dev.as_ref() {
+        let q0_seed = Array1::from_iter((0..spec.z.len()).map(|row| {
+            let a0 = bernoulli_marginal_link_map(
+                &spec.base_link,
+                baseline.0 + spec.marginal_offset[row],
             )
-        })
-        .transpose()?;
+            .expect("validated bernoulli marginal base link should produce finite pilot q")
+            .q;
+            let b0 = baseline.1 + spec.logslope_offset[row];
+            rigid_observed_eta(a0, b0, spec.z[row], probit_scale)
+        }));
+        let link_dev_seed = padded_deviation_seed(&q0_seed, 1.0, 0.5);
+        let mut prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
+            &link_dev_seed,
+            &q0_seed,
+            &spec.weights,
+            cfg,
+        )?;
+        // Cross-block identifiability: when both score-warp and link-
+        // deviation flex blocks are simultaneously active, each is
+        // individually orthogonal to the location intercept (per-block
+        // smoothness-null-space drop) but their column spans still overlap
+        // inside the orthogonal complement of {1, η_pilot}. Without this
+        // pass the joint penalised Hessian carries a near-null direction
+        // along the cross-block aliasing axis, σ_min(H+S) collapses to the
+        // ridge floor, and the inner Newton step diverges. Reparameterise
+        // the link-deviation basis so its column span at the training rows
+        // is orthogonal to the score-warp basis's column span at the same
+        // rows; this is the standard GAM `gam.side` convention applied at
+        // family construction. See
+        // `cross_orthogonalize_link_dev_against_score_warp` for the full
+        // mathematical justification and dimensional analysis.
+        if let Some(score_prepared) = score_warp_prepared.as_ref() {
+            cross_orthogonalize_link_dev_against_score_warp(
+                score_prepared,
+                &mut prepared,
+                &spec.z,
+                &q0_seed,
+                &link_dev_seed,
+                cfg,
+            )?;
+        }
+        Some(prepared)
+    } else {
+        None
+    };
     let extra_rho0 = {
         let mut out = Vec::new();
         if let Some(ref prepared) = score_warp_prepared {
@@ -15609,6 +15849,102 @@ mod tests {
                 "entry {idx}: actual={a:.17e}, expected={e:.17e}, rel={rel:.3e}, tol={tol:.3e}"
             );
         }
+    }
+
+    #[test]
+    fn cross_block_identifiability_makes_link_dev_orthogonal_to_score_warp() {
+        // Minimal regression test for the joint-design identifiability
+        // invariant. Without the cross-block reparameterisation, two cubic
+        // I-spline bases of overlapping arguments produce a near-singular
+        // joint Hessian; with it, the candidate's design columns are
+        // orthogonal to the anchor's at training rows up to numerical
+        // tolerance, and the joint design has full column rank by
+        // construction. The benchmark-scale failure
+        // ("coupled exact-joint inner solve exited the joint Newton path
+        // before convergence") manifests through this aliasing channel —
+        // this test fires the same code path on a small synthetic case.
+        let n = 64usize;
+        let z = Array1::from_iter((0..n).map(|i| {
+            let t = (i as f64) / (n as f64 - 1.0);
+            -1.5 + 3.0 * t
+        }));
+        let weights = Array1::from_elem(n, 1.0);
+        let cfg = DeviationBlockConfig {
+            num_internal_knots: 4,
+            ..DeviationBlockConfig::default()
+        };
+        let score_prepared = build_score_warp_deviation_block_from_seed(&z, &cfg)
+            .expect("score-warp fixture");
+        // Use a near-affine map of `z` so the link-deviation basis evaluates
+        // to functions strongly correlated with score-warp evaluations —
+        // this is the regime the cross-block invariant is designed for.
+        let q0_seed = Array1::from_iter(z.iter().map(|zi| 0.1 + 0.45 * zi));
+        let link_seed = padded_deviation_seed(&q0_seed, 1.0, 0.5);
+        let mut link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
+            &link_seed, &q0_seed, &weights, &cfg,
+        )
+        .expect("link-deviation fixture");
+        let p_link_before = link_prepared.runtime.basis_dim();
+        cross_orthogonalize_link_dev_against_score_warp(
+            &score_prepared,
+            &mut link_prepared,
+            &z,
+            &q0_seed,
+            &link_seed,
+            &cfg,
+        )
+        .expect("cross-block reparameterisation should succeed for non-degenerate overlap");
+        let p_link_after = link_prepared.runtime.basis_dim();
+        assert!(
+            p_link_after > 0 && p_link_after <= p_link_before,
+            "cross-block transform must shrink (or preserve) basis_dim, got {} -> {}",
+            p_link_before,
+            p_link_after,
+        );
+        // Cross-Gram on training rows should now be at the noise floor.
+        let anchor = score_prepared
+            .runtime
+            .design(&z)
+            .expect("anchor design at training rows");
+        let candidate = link_prepared
+            .runtime
+            .design(&q0_seed)
+            .expect("candidate design at training rows");
+        assert_eq!(candidate.ncols(), p_link_after);
+        let cross = anchor.t().dot(&candidate);
+        let max_abs = cross.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        let anchor_norm = anchor.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let candidate_norm = candidate.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let scale = anchor_norm * candidate_norm * (n as f64).sqrt();
+        assert!(
+            max_abs <= 1.0e-9 * scale.max(1.0),
+            "cross-Gram should be at noise floor after orthogonalisation; \
+             max|A^T C|={max_abs:.3e}, scale={scale:.3e}",
+        );
+        // Penalties were rebuilt in the new parameterisation: each penalty
+        // matrix must match the new basis dimension.
+        for (idx, penalty) in link_prepared.block.penalties.iter().enumerate() {
+            let dense = penalty.to_dense();
+            assert_eq!(
+                dense.ncols(),
+                p_link_after,
+                "penalty {idx} ncols {} does not match new basis_dim {}",
+                dense.ncols(),
+                p_link_after,
+            );
+            assert_eq!(
+                dense.nrows(),
+                p_link_after,
+                "penalty {idx} nrows {} does not match new basis_dim {}",
+                dense.nrows(),
+                p_link_after,
+            );
+        }
+        assert_eq!(
+            link_prepared.block.design.ncols(),
+            p_link_after,
+            "rebuilt design column count must match new basis_dim",
+        );
     }
 
     #[test]
