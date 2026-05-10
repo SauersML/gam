@@ -9373,10 +9373,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // Adaptive cap shrink on rejection. The line search exhausted
                 // its retries and could not find an accepted step, so the
                 // cap that produced this proposal was too generous. Halve
-                // the cap (down to the family-supplied floor) so the next
-                // cycle's Newton proposal is rescaled into a region where
-                // the quadratic model is trustworthy.
-                consecutive_high_rho_clamped_cycles = 0;
+                // the cap (down to the family-supplied floor); if joint
+                // Newton retries this cycle (i.e. converged is not certified
+                // and we fall through to blockwise that re-enters joint via
+                // a later outer iteration), the next attempt will rescale
+                // the Newton proposal into a region where the quadratic
+                // model is trustworthy.
                 max_joint_step = (max_joint_step * 0.5).max(initial_max_joint_step);
                 log::info!(
                     "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=false hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} reject_model={} reject_likelihood={} reject_objective={} first_likelihood_reject={} grad_reload=0.000s total={:.3}s",
