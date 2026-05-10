@@ -486,6 +486,20 @@ pub fn cost_gated_first_order_max_iter(
     requested.min(affordable.max(MIN_FIRST_ORDER_ITERS))
 }
 
+/// Local trust budget for first-order outer BFGS on log-smoothing parameters.
+///
+/// One unit in `rho = log(lambda)` is an `e`-fold smoothing-parameter change.
+/// For objectives where each value-only line-search probe runs a full inner fit,
+/// BFGS must stay in a local model region and spend work on accepted gradient
+/// samples, not on unbounded strong-Wolfe bracketing probes.
+pub fn first_order_bfgs_loglambda_step_cap(has_outer_hessian: bool) -> Option<f64> {
+    if has_outer_hessian {
+        None
+    } else {
+        Some(1.0)
+    }
+}
+
 pub(crate) fn exact_newton_outer_geometry_supports_second_order_solver<F: CustomFamily + ?Sized>(
     family: &F,
 ) -> bool {
@@ -8430,6 +8444,32 @@ fn apply_joint_penalized_hessian_into(
     Ok(())
 }
 
+fn stabilized_joint_solver_diagonal_ridge<F: CustomFamily + ?Sized>(
+    family: &F,
+    source: &JointHessianSource,
+    ranges: &[(usize, usize)],
+    s_lambdas: &[Array2<f64>],
+    base_diagonal_ridge: f64,
+    ridge_floor: f64,
+) -> f64 {
+    if use_exact_newton_strict_spd(family) {
+        return base_diagonal_ridge;
+    }
+    let JointHessianSource::Dense(h_joint) = source else {
+        return base_diagonal_ridge;
+    };
+    let mut lhs = h_joint.clone();
+    add_joint_penalty_to_matrix(&mut lhs, ranges, s_lambdas, base_diagonal_ridge);
+    let shift = exact_newton_stabilizing_shift(&lhs, ridge_floor).unwrap_or(0.0);
+    if shift > 0.0 {
+        log::debug!(
+            "[PIRLS/joint-Newton] stabilized dense penalized Hessian with diagonal shift {:.3e}",
+            shift
+        );
+    }
+    base_diagonal_ridge + shift
+}
+
 fn joint_quadratic_predicted_reduction(
     rhs: &Array1<f64>,
     hpen_delta: &Array1<f64>,
@@ -8889,6 +8929,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let trace_diagonal_ridge = joint_mode_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE;
             let joint_hessian_is_dense =
                 matches!(&joint_hessian_source, JointHessianSource::Dense(_));
+            let joint_solver_diagonal_ridge = stabilized_joint_solver_diagonal_ridge(
+                family,
+                &joint_hessian_source,
+                &ranges,
+                &s_lambdas,
+                trace_diagonal_ridge,
+                options.ridge_floor,
+            );
 
             let solve_joint_constraints_dense =
                 !matrix_free_joint_requested || joint_hessian_is_dense;
@@ -8904,6 +8952,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     Err(_) => break,
                 };
                 add_joint_penalty_to_matrix(&mut lhs, &ranges, &s_lambdas, trace_diagonal_ridge);
+                if joint_solver_diagonal_ridge != trace_diagonal_ridge {
+                    for d in 0..lhs.nrows() {
+                        lhs[[d, d]] += joint_solver_diagonal_ridge - trace_diagonal_ridge;
+                    }
+                }
                 check_linear_feasibility(&beta_joint, constraints, 1e-8)
                     .map_err(|e| format!("joint Newton constrained solve: {e}"))?;
                 let warm_joint_active =
@@ -8973,14 +9026,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             &h_joint.diag().to_owned(),
                             &ranges,
                             &s_lambdas,
-                            trace_diagonal_ridge,
+                            joint_solver_diagonal_ridge,
                         ),
                         JointHessianSource::Operator { diagonal, .. } => {
                             joint_penalty_preconditioner_diag(
                                 diagonal,
                                 &ranges,
                                 &s_lambdas,
-                                trace_diagonal_ridge,
+                                joint_solver_diagonal_ridge,
                             )
                         }
                     };
@@ -9007,7 +9060,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                         &ranges,
                                         &s_lambdas,
                                         v,
-                                        trace_diagonal_ridge,
+                                        joint_solver_diagonal_ridge,
                                         &mut pen,
                                     );
                                     *out += &*pen;
@@ -9043,7 +9096,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                         &ranges,
                                         &s_lambdas,
                                         v,
-                                        trace_diagonal_ridge,
+                                        joint_solver_diagonal_ridge,
                                         &mut pen,
                                     );
                                     *out += &*pen;
@@ -9094,7 +9147,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         &mut lhs,
                         &ranges,
                         &s_lambdas,
-                        trace_diagonal_ridge,
+                        joint_solver_diagonal_ridge,
                     );
                     let solver = crate::linalg::utils::StableSolver::new("joint Newton inner");
                     delta = solver.solvevectorwithridge_retries(
@@ -9236,7 +9289,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     &joint_hessian_source,
                     &ranges,
                     &s_lambdas,
-                    trace_diagonal_ridge,
+                    joint_solver_diagonal_ridge,
                     &trial_delta,
                     &mut hpen_delta,
                 )
@@ -9253,7 +9306,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             &joint_hessian_source,
                             &ranges,
                             &s_lambdas,
-                            trace_diagonal_ridge,
+                            joint_solver_diagonal_ridge,
                             &rhs,
                         ) {
                             Ok(descent_delta) => {
@@ -14833,6 +14886,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         family.coefficient_gradient_cost(specs),
         need_outer_hessian,
     );
+    let bfgs_step_cap = first_order_bfgs_loglambda_step_cap(need_outer_hessian);
     if outer_max_iter < options.outer_max_iter {
         log::info!(
             "[OUTER] custom family: first-order work gate reduced outer_max_iter {} -> {}",
@@ -14862,6 +14916,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         .with_fallback_policy(fallback_policy)
         .with_tolerance(options.outer_tol)
         .with_max_iter(outer_max_iter)
+        .with_bfgs_step_cap(bfgs_step_cap)
         .with_seed_config(family.outer_seed_config(n_rho))
         .with_screening_cap(Arc::clone(&screening_cap))
         .with_initial_rho(rho0.clone());
@@ -17338,6 +17393,40 @@ mod tests {
         assert!((result.block_states[0].beta[0] - 0.8).abs() < 1e-8);
         assert!((result.block_states[1].beta[0] - 0.8).abs() < 1e-8);
         assert_eq!(result.active_sets, vec![None, None]);
+    }
+
+    #[test]
+    fn joint_solver_ridge_stabilizes_dense_indefinite_coupled_hessian() {
+        let family = TwoBlockJointConstrainedFamily { coupling: 2.0 };
+        let source = JointHessianSource::Dense(array![[1.0, 2.0], [2.0, 1.0]]);
+        let ranges = vec![(0, 1), (1, 2)];
+        let s_lambdas = vec![Array2::zeros((1, 1)), Array2::zeros((1, 1))];
+        let ridge = stabilized_joint_solver_diagonal_ridge(
+            &family,
+            &source,
+            &ranges,
+            &s_lambdas,
+            JOINT_TRACE_STABILITY_RIDGE,
+            1e-12,
+        );
+
+        assert!(
+            ridge > 1.0,
+            "dense joint solver ridge should lift the negative eigenvalue; got {ridge}"
+        );
+        let JointHessianSource::Dense(mut stabilized) = source else {
+            unreachable!("test source is dense");
+        };
+        add_joint_penalty_to_matrix(&mut stabilized, &ranges, &s_lambdas, ridge);
+        let min_eval = 0.5
+            * (stabilized[[0, 0]] + stabilized[[1, 1]]
+                - ((stabilized[[0, 0]] - stabilized[[1, 1]]).powi(2)
+                    + 4.0 * stabilized[[0, 1]].powi(2))
+                .sqrt());
+        assert!(
+            min_eval > 0.0,
+            "stabilized dense joint Hessian should be SPD; min_eval={min_eval}"
+        );
     }
 
     #[test]

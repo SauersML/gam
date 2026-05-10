@@ -477,6 +477,65 @@ fn sparse_csr_weighted_xtwx_rows(
     xtwx
 }
 
+fn streaming_sparse_csc_xt_diag_x(
+    col_ptr: &[usize],
+    row_idx: &[usize],
+    vals: &[f64],
+    n: usize,
+    p: usize,
+    weights: ArrayView1<'_, f64>,
+    out: &mut Array2<f64>,
+) {
+    if n == 0 || p == 0 {
+        return;
+    }
+
+    let chunk_rows = dense_materialization_chunk_rows(n, p);
+    let par = faer::get_global_parallelism();
+    let mut x_chunk = Array2::<f64>::zeros((chunk_rows, p).f());
+    let mut wx_chunk = Array2::<f64>::zeros((chunk_rows, p).f());
+    let mut out_view = array2_to_matmut(out);
+
+    for start in (0..n).step_by(chunk_rows) {
+        let rows = (n - start).min(chunk_rows);
+        {
+            let mut x_slice = x_chunk.slice_mut(s![0..rows, ..]);
+            let mut wx_slice = wx_chunk.slice_mut(s![0..rows, ..]);
+            x_slice.fill(0.0);
+            wx_slice.fill(0.0);
+            let end = start + rows;
+            for col in 0..p {
+                let col_start = col_ptr[col];
+                let col_end = col_ptr[col + 1];
+                let rows_for_col = &row_idx[col_start..col_end];
+                let local_start = rows_for_col.partition_point(|&row| row < start);
+                let local_end = rows_for_col.partition_point(|&row| row < end);
+                for local_ptr in local_start..local_end {
+                    let ptr = col_start + local_ptr;
+                    let row = row_idx[ptr];
+                    let local = row - start;
+                    let wi = weights[row];
+                    let value = vals[ptr];
+                    x_slice[[local, col]] += value;
+                    wx_slice[[local, col]] += wi * value;
+                }
+            }
+        }
+        let x_slice = x_chunk.slice(s![0..rows, ..]);
+        let wx_slice = wx_chunk.slice(s![0..rows, ..]);
+        let x_view = FaerArrayView::new(&x_slice);
+        let wx_view = FaerArrayView::new(&wx_slice);
+        matmul(
+            out_view.as_mut(),
+            Accum::Add,
+            x_view.as_ref().transpose(),
+            wx_view.as_ref(),
+            1.0,
+            par,
+        );
+    }
+}
+
 fn sparse_csr_diag_gram(
     row_ptr: &[usize],
     col_idx: &[usize],
@@ -644,7 +703,10 @@ impl SparseDesignMatrix {
 
     pub fn to_dense_arc(&self) -> Arc<Array2<f64>> {
         self.try_to_dense_arc("SparseDesignMatrix::to_dense_arc")
-            .unwrap_or_else(|msg| panic!("{msg}"))
+            .unwrap_or_else(|msg| {
+                let bt = std::backtrace::Backtrace::force_capture();
+                panic!("{msg}\nbacktrace:\n{bt}")
+            })
     }
 
     pub fn to_csr_arc(&self) -> Option<Arc<SparseRowMat<usize, f64>>> {
@@ -4265,11 +4327,11 @@ pub fn xt_diag_x_symmetric(
             //
             // Two regimes:
             //   (A) Numerically dense — Matern / Duchon: every column has a
-            //       nonzero, so XᵀWX fills in completely. Densify via the
-            //       cached `to_dense_arc` and dispatch to the
-            //       `streaming_blas_xt_diag_x` path (faer parallel matmul,
-            //       SIMD GEMM). This avoids both the symbolic build and the
-            //       scalar accumulate entirely.
+            //       nonzero, so XᵀWX fills in completely. Use the BLAS path
+            //       when policy permits materializing the dense design, or a
+            //       bounded CSC-to-dense-row-chunk BLAS path when it does not.
+            //       Both avoid the symbolic sparse-Hessian build and scalar
+            //       accumulation.
             //   (B) Genuinely sparse — B-spline / banded: per-row work is
             //       O(nnz_row²) at small constant factor; the sparse
             //       row-parallel accumulator is the right tool.
@@ -4282,9 +4344,24 @@ pub fn xt_diag_x_symmetric(
             let avg_nnz_row = if n > 0 { nnz_x / n } else { p };
             let dense_regime = 4 * avg_nnz_row >= p;
             if dense_regime {
-                let xd = xs.to_dense_arc();
                 let mut xtwx = Array2::<f64>::zeros((p, p));
-                streaming_blas_xt_diag_x(xd.as_ref(), diag, &mut xtwx);
+                let dense_bytes =
+                    checked_dense_nbytes(n, p, "xt_diag_x_symmetric dense sparse route")?;
+                if dense_bytes <= MAX_SPARSE_TO_DENSE_BYTES {
+                    let xd = xs.try_to_dense_arc("xt_diag_x_symmetric dense sparse route")?;
+                    streaming_blas_xt_diag_x(xd.as_ref(), diag, &mut xtwx);
+                } else {
+                    let (symbolic, values) = xs.parts();
+                    streaming_sparse_csc_xt_diag_x(
+                        symbolic.col_ptr(),
+                        symbolic.row_idx(),
+                        values,
+                        n,
+                        p,
+                        diag.view(),
+                        &mut xtwx,
+                    );
+                }
                 return Ok(SymmetricMatrix::Dense(xtwx));
             }
             // Genuinely-sparse fallback: row-parallel accumulator that
@@ -4958,9 +5035,9 @@ impl LinearOperator for DesignMatrix {
                 //       a nonzero in every column for every row, so XᵀWX has
                 //       O(p²) fills and the scalar row-loop is dominated by
                 //       memory traffic over O(n·nnz_row²) ≈ O(n·p²) ops.  Faer
-                //       hand-tuned BLAS3 in `streaming_blas_xt_diag_x` runs
-                //       parallel + SIMD over the densified design and beats
-                //       any scalar rayon sparse loop by an order of magnitude.
+                //       hand-tuned BLAS3 runs parallel + SIMD over either the
+                //       cached dense design or bounded CSC-materialized row
+                //       chunks, depending on the dense materialization policy.
                 //
                 //   (B) Genuinely sparse — B-spline / banded bases keep
                 //       nnz_row at a small constant (4–6), so the per-row
@@ -4979,9 +5056,25 @@ impl LinearOperator for DesignMatrix {
                 let avg_nnz_row = if n > 0 { nnz_x / n } else { p };
                 let dense_regime = 4 * avg_nnz_row >= p;
                 if dense_regime {
-                    let xd = xs.to_dense_arc();
                     let mut xtwx = Array2::<f64>::zeros((p, p));
-                    streaming_blas_xt_diag_x(xd.as_ref(), weights, &mut xtwx);
+                    let dense_bytes =
+                        checked_dense_nbytes(n, p, "DesignMatrix::diag_xtw_x dense sparse route")?;
+                    if dense_bytes <= MAX_SPARSE_TO_DENSE_BYTES {
+                        let xd =
+                            xs.try_to_dense_arc("DesignMatrix::diag_xtw_x dense sparse route")?;
+                        streaming_blas_xt_diag_x(xd.as_ref(), weights, &mut xtwx);
+                    } else {
+                        let (symbolic, values) = xs.parts();
+                        streaming_sparse_csc_xt_diag_x(
+                            symbolic.col_ptr(),
+                            symbolic.row_idx(),
+                            values,
+                            n,
+                            p,
+                            weights.view(),
+                            &mut xtwx,
+                        );
+                    }
                     return Ok(xtwx);
                 }
                 let csr = xs
@@ -6609,7 +6702,7 @@ mod tests {
         DenseDesignOperator, DesignMatrix, EmbeddedColumnBlock, MultiChannelOperator,
         ReparamOperator, RowwiseKroneckerOperator, SparseDesignMatrix, SparseHessianAccumulator,
         dense_matvec, dense_operator_to_dense_by_chunks, dense_transpose_matvec,
-        dense_transpose_weighted_response, dense_xtwx_view,
+        dense_transpose_weighted_response, dense_xtwx_view, streaming_sparse_csc_xt_diag_x,
     };
     use crate::linalg::matrix::LinearOperator;
     use crate::linalg::utils::{PcgSolveInfo, StableSolver};
@@ -6776,6 +6869,57 @@ mod tests {
             .try_to_dense_arc("matrix test")
             .expect_err("huge sparse densification should be rejected");
         assert!(err.contains("refusing to densify sparse design"));
+    }
+
+    #[test]
+    fn streaming_sparse_csc_xt_diag_x_matches_dense_signed_weights() {
+        let sparse = SparseColMat::try_new_from_triplets(
+            4,
+            3,
+            &[
+                Triplet::new(0, 0, 1.0),
+                Triplet::new(1, 0, 2.0),
+                Triplet::new(2, 0, -1.0),
+                Triplet::new(0, 1, 0.5),
+                Triplet::new(1, 1, -3.0),
+                Triplet::new(3, 1, 4.0),
+                Triplet::new(0, 2, 2.0),
+                Triplet::new(2, 2, 1.5),
+                Triplet::new(3, 2, -0.25),
+            ],
+        )
+        .expect("sparse matrix");
+        let design = SparseDesignMatrix::new(sparse.clone());
+        let dense = design.to_dense_arc();
+        let weights = array![1.0, -2.0, 0.5, -1.5];
+        let (symbolic, values) = sparse.parts();
+        let mut got = Array2::<f64>::zeros((3, 3));
+        streaming_sparse_csc_xt_diag_x(
+            symbolic.col_ptr(),
+            symbolic.row_idx(),
+            values,
+            4,
+            3,
+            weights.view(),
+            &mut got,
+        );
+
+        let mut expected = Array2::<f64>::zeros((3, 3));
+        for row in 0..4 {
+            for a in 0..3 {
+                for b in 0..3 {
+                    expected[[a, b]] += weights[row] * dense[[row, a]] * dense[[row, b]];
+                }
+            }
+        }
+        let max_diff = (&got - &expected)
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_diff < 1e-12,
+            "streamed sparse weighted Gram mismatch: max_diff={max_diff}"
+        );
     }
 
     #[test]
