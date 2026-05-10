@@ -1318,9 +1318,10 @@ impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
             side: Side,
         ) -> Result<(Array1<f64>, Array2<f64>), FaerLinalgError> {
             let faerview = FaerArrayView::new(matrix);
-            let eigen = faerview
-                .as_ref()
-                .self_adjoint_eigen(side)
+            let eigen = catch_unwind(AssertUnwindSafe(|| {
+                faerview.as_ref().self_adjoint_eigen(side)
+            }))
+            .map_err(|_| FaerLinalgError::FactorizationFailed)?
                 .map_err(FaerLinalgError::SelfAdjointEigen)?;
             let values = diag_to_array(eigen.S());
             let vectors = mat_to_array(eigen.U());

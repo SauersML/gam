@@ -8592,6 +8592,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     } else {
         family.exact_newton_joint_hessian(&states)?.is_some()
     };
+    let coupled_exact_joint_required = specs.len() >= 2
+        && !family.likelihood_blocks_uncoupled()
+        && (family.has_explicit_joint_hessian() || has_workspace_source);
     // Multi-block families have always taken the joint path when an exact
     // joint Hessian is available. Single-block families also take it when a
     // coefficient-Hessian workspace is wired; dense vs. operator form is a
@@ -8728,9 +8731,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     // per cycle instead of iterating between blocks. This converges quadratically
     // (5-10 steps) instead of linearly (20-100+ blockwise cycles).
     //
-    // Falls back to blockwise iteration if the joint Hessian is unavailable
-    // or the joint solve fails. Linear constraints are handled directly in the
-    // joint step whenever they can be assembled blockwise.
+    // Generic block-diagonal surrogate families may still fall back to
+    // blockwise iteration if the joint surrogate is unavailable. Families that
+    // advertise a real coupled joint Hessian must not: the blockwise loop only
+    // sees principal blocks, so it drops the cross-block curvature that makes
+    // the joint problem well conditioned near saturated optima.
 
     if use_joint_newton {
         // Build block ranges for the joint system.
@@ -9370,13 +9375,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             }
             let line_search_elapsed = line_search_started.elapsed();
             if !accepted {
-                // Note: no cap-shrink on rejection. The joint-Newton inner
-                // loop unconditionally `break`s here and falls through to
-                // either a converged-return or the blockwise path; there
-                // is no "next joint-Newton cycle" within this PIRLS call
-                // that would observe a smaller cap. If the outer optimizer
-                // re-enters joint-Newton later, the cap is reinitialized
-                // from the family-supplied default.
+                // Retry the joint Newton loop from the same state after a
+                // failed trust-region search. Falling through into blockwise
+                // would switch a coupled exact-Hessian problem onto a
+                // principal-block surrogate, which is the ridge-drift failure
+                // mode this path is meant to avoid.
+                max_joint_step = (max_joint_step * 0.5).max(initial_max_joint_step);
                 log::info!(
                     "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=false hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} reject_model={} reject_likelihood={} reject_objective={} first_likelihood_reject={} grad_reload=0.000s total={:.3}s",
                     cycle,
@@ -9444,7 +9448,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 if trust_region_collapsed && last_cycle_obj_change_below_tol && made_progress {
                     converged = true;
                 }
-                break; // Fall back to blockwise
+                cycles_done = cycle + 1;
+                if converged {
+                    break;
+                }
+                last_cycle_obj_change_below_tol = false;
+                continue;
             }
 
             // Adaptive cap growth on accepted cycles. When the step
@@ -9691,6 +9700,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 s_lambdas,
                 joint_workspace: cached_joint_workspace.clone(),
             });
+        }
+        if coupled_exact_joint_required {
+            return Err(
+                "coupled exact-joint inner solve exited the joint Newton path before convergence"
+                    .to_string(),
+            );
         }
         // Otherwise fall through to blockwise iteration below.
     }
