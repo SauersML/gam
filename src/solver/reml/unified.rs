@@ -1563,27 +1563,147 @@ fn projected_factor_value_fingerprint(factor: ArrayView2<'_, f64>) -> (u64, u64)
     (h1, h2)
 }
 
-#[derive(Default)]
+/// Memoizer for `X · F` design-projection products keyed on a
+/// `(design, factor)` fingerprint.
+///
+/// The cache trades memory for arithmetic: a 32-axis ψ-sweep that would
+/// otherwise repeat the same `O(n · p · rank)` GEMM for every axis hits
+/// the same cache slot 32 times. At biobank scale that is the
+/// difference between minutes and seconds of design-GEMM work (see
+/// [`ImplicitHyperOperator::trace_projected_factor_cached`] for the
+/// usage rationale).
+///
+/// The cache is bounded by a byte budget. When inserting a new entry
+/// would exceed the budget, the *least-recently-used* entries are
+/// evicted until it fits. A budget of `0` (or `usize::MAX`) disables
+/// eviction. The default is `Self::DEFAULT_BUDGET_BYTES` — large
+/// enough to hold any realistic working set for in-memory problems
+/// while still bounding worst-case peak resident memory at biobank
+/// scale, where a single `(n, rank) = (320K, 95)` projection consumes
+/// ~243 MiB and a sweep over many distinct factors could otherwise
+/// pin tens of GiB.
 pub struct ProjectedFactorCache {
-    entries: Mutex<HashMap<ProjectedFactorKey, Arc<Array2<f64>>>>,
+    inner: Mutex<ProjectedFactorCacheInner>,
+}
+
+struct ProjectedFactorCacheInner {
+    entries: HashMap<ProjectedFactorKey, ProjectedFactorEntry>,
+    next_seq: u64,
+    total_bytes: usize,
+    budget_bytes: usize,
+}
+
+struct ProjectedFactorEntry {
+    value: Arc<Array2<f64>>,
+    bytes: usize,
+    last_used: u64,
+}
+
+impl Default for ProjectedFactorCache {
+    fn default() -> Self {
+        Self::with_budget(Self::DEFAULT_BUDGET_BYTES)
+    }
 }
 
 impl ProjectedFactorCache {
+    /// Default byte budget for the cache. Aligned with the biobank-scale
+    /// `ResourcePolicy::max_single_materialization_bytes` (2 GiB) so
+    /// production REML evaluations on typical hardware stay bounded
+    /// without artificially throttling small problems whose entire
+    /// working set fits trivially.
+    pub const DEFAULT_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+    /// Construct a cache with an explicit byte budget. A budget of `0`
+    /// disables eviction (legacy unbounded behavior); any non-zero
+    /// budget enables LRU eviction once total cached bytes plus the
+    /// next entry would exceed it.
+    pub fn with_budget(budget_bytes: usize) -> Self {
+        Self {
+            inner: Mutex::new(ProjectedFactorCacheInner {
+                entries: HashMap::new(),
+                next_seq: 0,
+                total_bytes: 0,
+                budget_bytes,
+            }),
+        }
+    }
+
     pub fn get_or_insert_with(
         &self,
         key: ProjectedFactorKey,
         compute: impl FnOnce() -> Array2<f64>,
     ) -> Arc<Array2<f64>> {
-        let mut entries = self
-            .entries
+        let mut inner = self
+            .inner
             .lock()
             .expect("projected factor cache lock poisoned");
-        if let Some(value) = entries.get(&key).cloned() {
-            return value;
+        inner.next_seq += 1;
+        let now = inner.next_seq;
+        if let Some(entry) = inner.entries.get_mut(&key) {
+            entry.last_used = now;
+            return entry.value.clone();
         }
+        // Compute under the lock: concurrent callers racing on the same
+        // key collapse to a single GEMM, matching the original cache
+        // contract. Callers that need parallelism on distinct keys can
+        // partition by key (e.g. one cache per `DenseSpectralOperator`).
         let computed = Arc::new(compute());
-        entries.insert(key, computed.clone());
+        let bytes = computed.len().saturating_mul(std::mem::size_of::<f64>());
+        // LRU eviction. Skip when the budget is disabled or when the
+        // new entry alone exceeds the budget (in which case eviction
+        // can never make it fit; we accept the over-budget insertion
+        // because the alternative — refusing to cache — guarantees a
+        // recompute on every query).
+        if inner.budget_bytes > 0 && bytes <= inner.budget_bytes {
+            while inner.total_bytes.saturating_add(bytes) > inner.budget_bytes
+                && !inner.entries.is_empty()
+            {
+                let Some(oldest_key) = inner
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, e)| e.last_used)
+                    .map(|(k, _)| *k)
+                else {
+                    break;
+                };
+                if let Some(removed) = inner.entries.remove(&oldest_key) {
+                    inner.total_bytes = inner.total_bytes.saturating_sub(removed.bytes);
+                }
+            }
+        }
+        inner.entries.insert(
+            key,
+            ProjectedFactorEntry {
+                value: computed.clone(),
+                bytes,
+                last_used: now,
+            },
+        );
+        inner.total_bytes = inner.total_bytes.saturating_add(bytes);
         computed
+    }
+
+    /// Number of entries currently cached. Intended for diagnostics
+    /// and tests; production code should not branch on this.
+    pub fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .map(|inner| inner.entries.len())
+            .unwrap_or(0)
+    }
+
+    /// Total bytes resident in the cache. Intended for diagnostics
+    /// and tests.
+    pub fn total_bytes(&self) -> usize {
+        self.inner
+            .lock()
+            .map(|inner| inner.total_bytes)
+            .unwrap_or(0)
+    }
+
+    /// `true` when the cache holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

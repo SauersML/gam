@@ -18,6 +18,11 @@ pub fn add_scaled_coeff4(target: &mut [f64; 4], source: &[f64; 4], scale: f64) {
 }
 
 #[inline]
+fn coeff4_dot(left: &[f64; 4], right: &[f64; 4]) -> f64 {
+    left[0] * right[0] + left[1] * right[1] + left[2] * right[2] + left[3] * right[3]
+}
+
+#[inline]
 pub fn scale_coeff4(source: [f64; 4], scale: f64) -> [f64; 4] {
     [
         source[0] * scale,
@@ -377,6 +382,34 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
         out
     }
 
+    pub(crate) fn add_directional_family_adjoint(
+        &self,
+        family: &[[f64; 4]],
+        coeff_adjoint: &[f64; 4],
+        support: CoeffSupport,
+        direction_adjoint: &mut [f64],
+    ) {
+        debug_assert!(direction_adjoint.len() > self.primary_index);
+        if support.include_primary {
+            direction_adjoint[self.primary_index] +=
+                coeff4_dot(coeff_adjoint, &family[self.primary_index]);
+        }
+        if support.include_h {
+            if let Some(h_range) = self.h_range.as_ref() {
+                for idx in h_range.clone() {
+                    direction_adjoint[idx] += coeff4_dot(coeff_adjoint, &family[idx]);
+                }
+            }
+        }
+        if support.include_w {
+            if let Some(w_range) = self.w_range.as_ref() {
+                for idx in w_range.clone() {
+                    direction_adjoint[idx] += coeff4_dot(coeff_adjoint, &family[idx]);
+                }
+            }
+        }
+    }
+
     pub(crate) fn mixed_directional_from_b_family(
         &self,
         family: &[[f64; 4]],
@@ -435,6 +468,22 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
             return out;
         }
         [0.0; 4]
+    }
+
+    pub(crate) fn add_param_directional_from_b_family_adjoint(
+        &self,
+        family: &[[f64; 4]],
+        param: usize,
+        coeff_adjoint: &[f64; 4],
+        support: CoeffSupport,
+        direction_adjoint: &mut [f64],
+    ) {
+        debug_assert!(direction_adjoint.len() > self.primary_index);
+        if param == self.primary_index {
+            self.add_directional_family_adjoint(family, coeff_adjoint, support, direction_adjoint);
+        } else if self.param_supported(param, support.without_primary()) {
+            direction_adjoint[self.primary_index] += coeff4_dot(coeff_adjoint, &family[param]);
+        }
     }
 
     pub(crate) fn param_mixed_from_bb_family(
@@ -504,6 +553,25 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
             return out;
         }
         [0.0; 4]
+    }
+
+    pub(crate) fn add_pair_directional_from_bb_family_adjoint(
+        &self,
+        family: &[[f64; 4]],
+        u: usize,
+        v: usize,
+        coeff_adjoint: &[f64; 4],
+        support: CoeffSupport,
+        direction_adjoint: &mut [f64],
+    ) {
+        debug_assert!(direction_adjoint.len() > self.primary_index);
+        if u == self.primary_index && v == self.primary_index {
+            self.add_directional_family_adjoint(family, coeff_adjoint, support, direction_adjoint);
+        } else if u == self.primary_index && self.param_supported(v, support.without_primary()) {
+            direction_adjoint[self.primary_index] += coeff4_dot(coeff_adjoint, &family[v]);
+        } else if v == self.primary_index && self.param_supported(u, support.without_primary()) {
+            direction_adjoint[self.primary_index] += coeff4_dot(coeff_adjoint, &family[u]);
+        }
     }
 
     pub(crate) fn pair_mixed_from_bbb_family(
