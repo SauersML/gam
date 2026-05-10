@@ -14229,7 +14229,6 @@ pub fn fit_transformation_normal(
         },
         // exact_fn
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], eval_mode| {
-            use crate::solver::estimate::reml::unified::EvalMode;
             ensure_exact_geometry(&specs[0], &designs[0])?;
             let mut cache_ref = exact_geometry_cache.borrow_mut();
             let geometry = cache_ref
