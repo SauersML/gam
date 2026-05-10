@@ -2940,27 +2940,46 @@ fn evaluate_non_affine_cell_state(
     // step recurrences in reduce_quartic/sextic_moments, which amplify
     // roundoff by (1/lead)^n with lead = 2c2²/3c3² and overflow to NaN for
     // small c2/c3 cells that arise naturally in production.
+    //
+    // Hot-path notes:
+    //   * `cell.eta(z)` is computed once via Horner and reused both to form
+    //     `q(z) = 0.5*(z² + η²)` and to feed `normal_cdf(eta)`; the previous
+    //     formulation called `cell.q(z)` which redundantly recomputed η.
+    //   * `half_width` is folded into the per-node weight, eliminating the
+    //     post-loop scaling pass over `moments` and the trailing
+    //     `* half_width` on `value_integral`.
+    //   * The inner moment accumulation reborrows the moments slice as `&mut
+    //     [f64]` and steps via raw indexing so the compiler emits a clean
+    //     bounds-check-hoisted FMA chain.
     let mut moments: CellMomentVec = smallvec![0.0_f64; max_degree + 1];
     let mut value_integral = 0.0_f64;
     let center = 0.5 * (cell.left + cell.right);
     let half_width = 0.5 * (cell.right - cell.left);
+    let inv_sqrt_tau = 1.0 / (std::f64::consts::TAU).sqrt();
+    let c0 = cell.c0;
+    let c1 = cell.c1;
+    let c2 = cell.c2;
+    let c3 = cell.c3;
+    let moments_slice: &mut [f64] = &mut moments;
+    debug_assert_eq!(GL_NODES.len(), GL_WEIGHTS.len());
     for (&node, &weight) in GL_NODES.iter().zip(GL_WEIGHTS.iter()) {
         let z = center + half_width * node;
-        let eta = cell.eta(z);
-        let moment_weight = weight * (-cell.q(z)).exp();
+        // Horner-form eta: c0 + z*(c1 + z*(c2 + z*c3)).
+        let eta = c3.mul_add(z, c2).mul_add(z, c1).mul_add(z, c0);
+        let q = 0.5 * (z * z + eta * eta);
+        let scaled_weight = weight * half_width;
+        let moment_weight = scaled_weight * (-q).exp();
         let mut z_pow = 1.0_f64;
-        for moment in &mut moments {
-            *moment = moment_weight.mul_add(z_pow, *moment);
+        for slot in moments_slice.iter_mut() {
+            *slot = moment_weight.mul_add(z_pow, *slot);
             z_pow *= z;
         }
-        value_integral += weight * (-0.5 * z * z).exp() * normal_cdf(eta);
-    }
-    for moment in &mut moments {
-        *moment *= half_width;
+        value_integral =
+            (scaled_weight * (-0.5 * z * z).exp()).mul_add(normal_cdf(eta), value_integral);
     }
     Ok(CellMomentState {
         branch,
-        value: value_integral * half_width / (std::f64::consts::TAU).sqrt(),
+        value: value_integral * inv_sqrt_tau,
         moments,
     })
 }
@@ -2973,17 +2992,22 @@ fn evaluate_non_affine_cell_derivative_state(
     let mut moments: CellMomentVec = smallvec![0.0_f64; max_degree + 1];
     let center = 0.5 * (cell.left + cell.right);
     let half_width = 0.5 * (cell.right - cell.left);
+    let c0 = cell.c0;
+    let c1 = cell.c1;
+    let c2 = cell.c2;
+    let c3 = cell.c3;
+    let moments_slice: &mut [f64] = &mut moments;
+    debug_assert_eq!(GL_NODES.len(), GL_WEIGHTS.len());
     for (&node, &weight) in GL_NODES.iter().zip(GL_WEIGHTS.iter()) {
         let z = center + half_width * node;
-        let moment_weight = weight * (-cell.q(z)).exp();
+        let eta = c3.mul_add(z, c2).mul_add(z, c1).mul_add(z, c0);
+        let q = 0.5 * (z * z + eta * eta);
+        let moment_weight = (weight * half_width) * (-q).exp();
         let mut z_pow = 1.0_f64;
-        for moment in &mut moments {
-            *moment = moment_weight.mul_add(z_pow, *moment);
+        for slot in moments_slice.iter_mut() {
+            *slot = moment_weight.mul_add(z_pow, *slot);
             z_pow *= z;
         }
-    }
-    for moment in &mut moments {
-        *moment *= half_width;
     }
     Ok(CellDerivativeMomentState { branch, moments })
 }
@@ -6087,6 +6111,143 @@ mod tests {
                 max_rel <= 10.0 * epsilon,
                 "epsilon={epsilon:.1e} max_rel={max_rel:.3e}"
             );
+        }
+    }
+
+    /// Locks in numerical equivalence of the optimized
+    /// `evaluate_non_affine_cell_state` against an inline reference
+    /// implementation that mirrors the prior pre-fold structure
+    /// (separate `cell.eta(z)` / `cell.q(z)` calls; post-loop
+    /// `* half_width`; trailing `value_integral * half_width / sqrt(TAU)`).
+    /// Any drift larger than 1e-13 relative would indicate the hot-path
+    /// rewrite changed the math.
+    #[test]
+    fn non_affine_cell_state_matches_prefold_reference_to_1e_minus_13() {
+        // Reference: byte-for-byte the structure of the previous
+        // implementation. Kept local to this test to avoid leaking a second
+        // public surface.
+        fn reference(
+            cell: DenestedCubicCell,
+            branch: ExactCellBranch,
+            max_degree: usize,
+        ) -> CellMomentState {
+            let mut moments: CellMomentVec = smallvec![0.0_f64; max_degree + 1];
+            let mut value_integral = 0.0_f64;
+            let center = 0.5 * (cell.left + cell.right);
+            let half_width = 0.5 * (cell.right - cell.left);
+            for (&node, &weight) in GL_NODES.iter().zip(GL_WEIGHTS.iter()) {
+                let z = center + half_width * node;
+                let eta = cell.eta(z);
+                let moment_weight = weight * (-cell.q(z)).exp();
+                let mut z_pow = 1.0_f64;
+                for moment in &mut moments {
+                    *moment = moment_weight.mul_add(z_pow, *moment);
+                    z_pow *= z;
+                }
+                value_integral += weight * (-0.5 * z * z).exp() * normal_cdf(eta);
+            }
+            for moment in &mut moments {
+                *moment *= half_width;
+            }
+            CellMomentState {
+                branch,
+                value: value_integral * half_width / (std::f64::consts::TAU).sqrt(),
+                moments,
+            }
+        }
+
+        // Hand-rolled inputs that cross both Quartic and Sextic branches and
+        // exercise positive/negative coefficients, asymmetric intervals, and
+        // a wide degree range (matches survival_marginal_slope's degree=9
+        // production call as well as the bernoulli outer-step degree=24).
+        let cells = [
+            DenestedCubicCell {
+                left: -1.25,
+                right: -0.2,
+                c0: -0.35,
+                c1: 0.85,
+                c2: 0.04,
+                c3: -0.015,
+            },
+            DenestedCubicCell {
+                left: -0.2,
+                right: 0.55,
+                c0: 0.12,
+                c1: -0.65,
+                c2: -0.025,
+                c3: 0.02,
+            },
+            DenestedCubicCell {
+                left: 0.55,
+                right: 1.6,
+                c0: 0.42,
+                c1: 0.35,
+                c2: 0.018,
+                c3: 0.012,
+            },
+            DenestedCubicCell {
+                left: -3.0,
+                right: -1.0,
+                c0: 1.7,
+                c1: -0.4,
+                c2: 0.11,
+                c3: -0.07,
+            },
+        ];
+        let degrees = [0_usize, 4, 9, 16, 24];
+        for cell in cells {
+            let branch = branch_cell(cell).expect("branch");
+            assert_ne!(branch, ExactCellBranch::Affine);
+            for max_degree in degrees {
+                let actual = evaluate_non_affine_cell_state(cell, branch, max_degree)
+                    .expect("optimized non-affine");
+                let expected = reference(cell, branch, max_degree);
+                assert_eq!(actual.branch, expected.branch);
+                assert_eq!(actual.moments.len(), expected.moments.len());
+                let denom_v = expected.value.abs().max(1.0);
+                let rel_v = (actual.value - expected.value).abs() / denom_v;
+                let actual_v = actual.value;
+                let expected_v = expected.value;
+                assert!(
+                    rel_v <= 1e-13,
+                    "value rel mismatch for {cell:?} degree {max_degree}: \
+                     actual={actual_v:.17e} expected={expected_v:.17e} rel={rel_v:.3e}"
+                );
+                for (k, (lhs, rhs)) in actual
+                    .moments
+                    .iter()
+                    .zip(expected.moments.iter())
+                    .enumerate()
+                {
+                    let denom = rhs.abs().max(1.0);
+                    let rel = (lhs - rhs).abs() / denom;
+                    assert!(
+                        rel <= 1e-13,
+                        "moment {k} rel mismatch for {cell:?} degree {max_degree}: \
+                         actual={lhs:.17e} expected={rhs:.17e} rel={rel:.3e}"
+                    );
+                }
+
+                // Also lock in the derivative-state path on the same
+                // inputs so the (parallel) edit there can't drift.
+                let actual_deriv =
+                    evaluate_non_affine_cell_derivative_state(cell, branch, max_degree)
+                        .expect("optimized derivative");
+                for (k, (lhs, rhs)) in actual_deriv
+                    .moments
+                    .iter()
+                    .zip(expected.moments.iter())
+                    .enumerate()
+                {
+                    let denom = rhs.abs().max(1.0);
+                    let rel = (lhs - rhs).abs() / denom;
+                    assert!(
+                        rel <= 1e-13,
+                        "deriv moment {k} rel mismatch for {cell:?} degree {max_degree}: \
+                         actual={lhs:.17e} expected={rhs:.17e} rel={rel:.3e}"
+                    );
+                }
+            }
         }
     }
 }
