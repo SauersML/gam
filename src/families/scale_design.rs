@@ -486,11 +486,7 @@ fn solve_scale_projection(
     let mut filter = Array1::<f64>::zeros(rank);
     for k in 0..rank {
         let s = singular[k];
-        filter[k] = if s > cutoff && s > 0.0 {
-            1.0 / s
-        } else {
-            0.0
-        };
+        filter[k] = if s > cutoff && s > 0.0 { 1.0 / s } else { 0.0 };
     }
 
     let chunk_cols = (SCALE_DESIGN_TARGET_CHUNK_BYTES / (n.max(1) * std::mem::size_of::<f64>()))

@@ -1322,13 +1322,19 @@ impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
                 faerview.as_ref().self_adjoint_eigen(side)
             }))
             .map_err(|_| FaerLinalgError::FactorizationFailed)?
-                .map_err(FaerLinalgError::SelfAdjointEigen)?;
+            .map_err(FaerLinalgError::SelfAdjointEigen)?;
             let values = diag_to_array(eigen.S());
             let vectors = mat_to_array(eigen.U());
             Ok((values, vectors))
         }
 
         let owned = self.to_owned();
+        if owned.nrows() != owned.ncols() {
+            return Err(FaerLinalgError::FactorizationFailed);
+        }
+        if owned.nrows() == 0 {
+            return Ok((Array1::zeros(0), Array2::zeros((0, 0))));
+        }
         if owned.iter().any(|value| !value.is_finite()) {
             return Err(FaerLinalgError::SelfAdjointEigenNonFiniteInput);
         }

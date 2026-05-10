@@ -3654,8 +3654,8 @@ fn binomial_neglog_q_fourth_derivative_probit_closed_form(
 
     let right_prime = right * (right - q);
     let right_m3 = right_prime * (2.0 * right - q) - right;
-    let right_m4 = right_m3 * (2.0 * right - q) + 2.0 * right_prime * right_prime
-        - 2.0 * right_prime;
+    let right_m4 =
+        right_m3 * (2.0 * right - q) + 2.0 * right_prime * right_prime - 2.0 * right_prime;
 
     weight * ((1.0 - y) * right_m4 + y * left_m4)
 }
@@ -4354,11 +4354,7 @@ fn log1mexp_neg_positive(z: f64) -> f64 {
 }
 
 #[inline]
-fn bernoulli_log_likelihood_from_probability(
-    y: f64,
-    weight: f64,
-    mu: f64,
-) -> Result<f64, String> {
+fn bernoulli_log_likelihood_from_probability(y: f64, weight: f64, mu: f64) -> Result<f64, String> {
     if weight == 0.0 {
         return Ok(0.0);
     }
@@ -4368,20 +4364,12 @@ fn bernoulli_log_likelihood_from_probability(
         ));
     }
     let log_mu = if mu == 0.0 {
-        if y == 0.0 {
-            0.0
-        } else {
-            f64::NEG_INFINITY
-        }
+        if y == 0.0 { 0.0 } else { f64::NEG_INFINITY }
     } else {
         mu.ln()
     };
     let log_one_minus = if mu == 1.0 {
-        if y == 1.0 {
-            0.0
-        } else {
-            f64::NEG_INFINITY
-        }
+        if y == 1.0 { 0.0 } else { f64::NEG_INFINITY }
     } else {
         (1.0 - mu).ln()
     };
@@ -4412,10 +4400,12 @@ fn binomial_location_scale_log_likelihood(
         return Ok(0.0);
     }
     match link_kind {
-        InverseLink::Standard(LinkFunction::Probit) => Ok(weight
-            * (y * normal_logcdf(q) + (1.0_f64 - y) * normal_logsf(q))),
-        InverseLink::Standard(LinkFunction::Logit) => Ok(weight
-            * (-y * stable_softplus(-q) - (1.0_f64 - y) * stable_softplus(q))),
+        InverseLink::Standard(LinkFunction::Probit) => {
+            Ok(weight * (y * normal_logcdf(q) + (1.0_f64 - y) * normal_logsf(q)))
+        }
+        InverseLink::Standard(LinkFunction::Logit) => {
+            Ok(weight * (-y * stable_softplus(-q) - (1.0_f64 - y) * stable_softplus(q)))
+        }
         InverseLink::Standard(LinkFunction::CLogLog) => {
             let z = q.exp();
             let log_p = if z == 0.0 {
@@ -20782,8 +20772,14 @@ mod tests {
             m2 > 0.9 && m2 < 1.1,
             "right-tail probit curvature should stay near one, got {m2}"
         );
-        assert!(m3.is_finite(), "third derivative must stay finite, got {m3}");
-        assert!(m4.is_finite(), "fourth derivative must stay finite, got {m4}");
+        assert!(
+            m3.is_finite(),
+            "third derivative must stay finite, got {m3}"
+        );
+        assert!(
+            m4.is_finite(),
+            "fourth derivative must stay finite, got {m4}"
+        );
     }
 
     #[test]

@@ -2931,45 +2931,45 @@ impl SurvivalMarginalSlopeFamily {
         // Bit-deterministic reduction: see `chunked_row_reduction`.
         let (objective_psi, score_t, score_m, score_g, score_h, score_w, acc) =
             chunked_row_reduction(
-            row_iter.as_slice(),
-            || {
-                (
-                    0.0,
-                    Array1::zeros(p_t),
-                    Array1::zeros(p_m),
-                    Array1::zeros(p_g),
-                    Array1::zeros(p_h),
-                    Array1::zeros(p_w),
-                    BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-                )
-            },
-            |row, a| -> Result<(), String> {
-                let (mut obj, mut grad, mut hess) =
-                    self.row_sigma_primary_terms(row, block_states, false)?;
-                let w = row_weights[row];
-                if w != 1.0 {
-                    obj *= w;
-                    grad.mapv_inplace(|v| v * w);
-                    hess.mapv_inplace(|v| v * w);
-                }
-                a.0 += obj;
-                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-                self.accumulate_score_with_q_geometry(
-                    row, &q_geom, &grad, &mut a.1, &mut a.2, &mut a.3,
-                )?;
-                a.6.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess)?;
-                Ok(())
-            },
-            |total, chunk| {
-                total.0 += chunk.0;
-                total.1 += &chunk.1;
-                total.2 += &chunk.2;
-                total.3 += &chunk.3;
-                total.4 += &chunk.4;
-                total.5 += &chunk.5;
-                total.6.add(&chunk.6);
-            },
-        )?;
+                row_iter.as_slice(),
+                || {
+                    (
+                        0.0,
+                        Array1::zeros(p_t),
+                        Array1::zeros(p_m),
+                        Array1::zeros(p_g),
+                        Array1::zeros(p_h),
+                        Array1::zeros(p_w),
+                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                    )
+                },
+                |row, a| -> Result<(), String> {
+                    let (mut obj, mut grad, mut hess) =
+                        self.row_sigma_primary_terms(row, block_states, false)?;
+                    let w = row_weights[row];
+                    if w != 1.0 {
+                        obj *= w;
+                        grad.mapv_inplace(|v| v * w);
+                        hess.mapv_inplace(|v| v * w);
+                    }
+                    a.0 += obj;
+                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    self.accumulate_score_with_q_geometry(
+                        row, &q_geom, &grad, &mut a.1, &mut a.2, &mut a.3,
+                    )?;
+                    a.6.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess)?;
+                    Ok(())
+                },
+                |total, chunk| {
+                    total.0 += chunk.0;
+                    total.1 += &chunk.1;
+                    total.2 += &chunk.2;
+                    total.3 += &chunk.3;
+                    total.4 += &chunk.4;
+                    total.5 += &chunk.5;
+                    total.6.add(&chunk.6);
+                },
+            )?;
 
         let mut score_psi = Array1::zeros(slices.total);
         score_psi
@@ -3028,45 +3028,45 @@ impl SurvivalMarginalSlopeFamily {
         // Bit-deterministic reduction: see `chunked_row_reduction`.
         let (objective_psi_psi, score_t, score_m, score_g, score_h, score_w, acc) =
             chunked_row_reduction(
-            row_iter.as_slice(),
-            || {
-                (
-                    0.0,
-                    Array1::zeros(p_t),
-                    Array1::zeros(p_m),
-                    Array1::zeros(p_g),
-                    Array1::zeros(p_h),
-                    Array1::zeros(p_w),
-                    BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-                )
-            },
-            |row, a| -> Result<(), String> {
-                let (mut obj, mut grad, mut hess) =
-                    self.row_sigma_primary_terms(row, block_states, true)?;
-                let w = row_weights[row];
-                if w != 1.0 {
-                    obj *= w;
-                    grad.mapv_inplace(|v| v * w);
-                    hess.mapv_inplace(|v| v * w);
-                }
-                a.0 += obj;
-                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-                self.accumulate_score_with_q_geometry(
-                    row, &q_geom, &grad, &mut a.1, &mut a.2, &mut a.3,
-                )?;
-                a.6.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess)?;
-                Ok(())
-            },
-            |total, chunk| {
-                total.0 += chunk.0;
-                total.1 += &chunk.1;
-                total.2 += &chunk.2;
-                total.3 += &chunk.3;
-                total.4 += &chunk.4;
-                total.5 += &chunk.5;
-                total.6.add(&chunk.6);
-            },
-        )?;
+                row_iter.as_slice(),
+                || {
+                    (
+                        0.0,
+                        Array1::zeros(p_t),
+                        Array1::zeros(p_m),
+                        Array1::zeros(p_g),
+                        Array1::zeros(p_h),
+                        Array1::zeros(p_w),
+                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                    )
+                },
+                |row, a| -> Result<(), String> {
+                    let (mut obj, mut grad, mut hess) =
+                        self.row_sigma_primary_terms(row, block_states, true)?;
+                    let w = row_weights[row];
+                    if w != 1.0 {
+                        obj *= w;
+                        grad.mapv_inplace(|v| v * w);
+                        hess.mapv_inplace(|v| v * w);
+                    }
+                    a.0 += obj;
+                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    self.accumulate_score_with_q_geometry(
+                        row, &q_geom, &grad, &mut a.1, &mut a.2, &mut a.3,
+                    )?;
+                    a.6.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess)?;
+                    Ok(())
+                },
+                |total, chunk| {
+                    total.0 += chunk.0;
+                    total.1 += &chunk.1;
+                    total.2 += &chunk.2;
+                    total.3 += &chunk.3;
+                    total.4 += &chunk.4;
+                    total.5 += &chunk.5;
+                    total.6.add(&chunk.6);
+                },
+            )?;
 
         let mut score_psi_psi = Array1::zeros(slices.total);
         score_psi_psi
