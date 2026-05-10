@@ -454,8 +454,7 @@ impl DeviationRuntime {
         // right-multiplication. The constraint inequality `A β ≥ ε - 1`
         // becomes `(A · T) β_new ≥ ε - 1` under the reparameterisation
         // β = T β_new, so the row matrix is right-multiplied directly.
-        self.monotonicity_constraint_rows =
-            fast_ab(&self.monotonicity_constraint_rows, transform);
+        self.monotonicity_constraint_rows = fast_ab(&self.monotonicity_constraint_rows, transform);
         self.basis_dim = new_dim;
         Ok(())
     }
@@ -1034,6 +1033,4 @@ impl DeviationRuntime {
             ))
         }
     }
-
 }
-
