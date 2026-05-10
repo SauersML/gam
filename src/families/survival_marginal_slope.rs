@@ -14275,7 +14275,7 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
     }
     if let Some(beta0) = &spec.time_block.initial_beta {
         let derivative_constraints = structural_time_coefficient_constraints(
-            &spec.time_block.design_derivative_exit.to_dense(),
+            &spec.time_block.design_derivative_exit,
             &spec.time_block.derivative_offset_exit,
             spec.derivative_guard,
         )?;
@@ -14631,7 +14631,7 @@ pub fn fit_survival_marginal_slope_terms(
     let score_warp_runtime = score_warp_prepared.as_ref().map(|p| p.runtime.clone());
     let link_dev_runtime = link_dev_prepared.as_ref().map(|p| p.runtime.clone());
     let time_linear_constraints = structural_time_coefficient_constraints(
-        &design_derivative_exit.to_dense(),
+        &design_derivative_exit,
         derivative_offset_exit.as_ref(),
         derivative_guard,
     )?;
@@ -17322,7 +17322,10 @@ mod tests {
                 Array2::zeros((2, 0)),
             )),
             time_linear_constraints: structural_time_coefficient_constraints(
-                &array![[1.0, 2.0], [3.0, 4.0]],
+                &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+                    [1.0, 2.0],
+                    [3.0, 4.0]
+                ])),
                 &array![0.25, 0.5],
                 1e-4,
             )
@@ -17381,7 +17384,7 @@ mod tests {
                 Array2::zeros((1, 0)),
             )),
             time_linear_constraints: structural_time_coefficient_constraints(
-                &array![[1.0, 0.0]],
+                &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0, 0.0]])),
                 &array![1e-6],
                 1e-6,
             )
@@ -17445,7 +17448,7 @@ mod tests {
             score_warp: None,
             link_dev: None,
             time_linear_constraints: structural_time_coefficient_constraints(
-                &array![[1.0, 0.0]],
+                &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0, 0.0]])),
                 &array![0.2],
                 1e-4,
             )
