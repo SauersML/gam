@@ -2892,8 +2892,11 @@ impl SurvivalMarginalSlopeFamily {
                 cursor += len;
             }
         }
-        let event_secondary: Vec<u8> =
-            self.event.iter().map(|v| if *v > 0.5 { 1u8 } else { 0u8 }).collect();
+        let event_secondary: Vec<u8> = self
+            .event
+            .iter()
+            .map(|v| if *v > 0.5 { 1u8 } else { 0u8 })
+            .collect();
         crate::families::marginal_slope_shared::maybe_install_auto_outer_subsample(
             options,
             self.z.as_slice().expect("z must be contiguous"),
@@ -6589,7 +6592,12 @@ impl SurvivalMarginalSlopeFamily {
         let slices = block_slices(self, block_states);
         let make_acc = || DynamicQBlockwiseAccumulator::new(&slices);
         // See `evaluate_exact_newton_joint_dynamic_q_dense` for rationale.
-        let make_acc_ws = || (make_acc(), SurvivalMarginalSlopeDynamicRow::empty_workspace());
+        let make_acc_ws = || {
+            (
+                make_acc(),
+                SurvivalMarginalSlopeDynamicRow::empty_workspace(),
+            )
+        };
 
         let acc = (0..self.n)
             .into_par_iter()
@@ -11194,7 +11202,12 @@ impl SurvivalMarginalSlopeFamily {
         // per-thread accumulator embeds a `SurvivalMarginalSlopeDynamicRow`
         // workspace so the nine Array2/Array1 buffers are reused across all
         // rows handled by one rayon worker.
-        let make_acc_ws = || (make_acc(), SurvivalMarginalSlopeDynamicRow::empty_workspace());
+        let make_acc_ws = || {
+            (
+                make_acc(),
+                SurvivalMarginalSlopeDynamicRow::empty_workspace(),
+            )
+        };
         let acc = if self.effective_flex_active(block_states)? {
             let primary = flex_primary_slices(self);
             (0..self.n)
@@ -17546,7 +17559,11 @@ mod tests {
                 .expect("pooled-workspace row geometry");
             assert_eq!(workspace.q0.to_bits(), fresh.q0.to_bits(), "row {row} q0");
             assert_eq!(workspace.q1.to_bits(), fresh.q1.to_bits(), "row {row} q1");
-            assert_eq!(workspace.qd1.to_bits(), fresh.qd1.to_bits(), "row {row} qd1");
+            assert_eq!(
+                workspace.qd1.to_bits(),
+                fresh.qd1.to_bits(),
+                "row {row} qd1"
+            );
             let array1_pairs: [(&Array1<f64>, &Array1<f64>, &str); 6] = [
                 (&workspace.dq0_time, &fresh.dq0_time, "dq0_time"),
                 (&workspace.dq1_time, &fresh.dq1_time, "dq1_time"),
@@ -19778,9 +19795,8 @@ mod tests {
     #[test]
     fn survival_intercept_warm_starts_match_cold_and_reduce_eval_count() {
         let n = 8usize;
-        let states = flex_no_wiggle_perturbed_test_block_states(
-            &make_flex_no_wiggle_test_family(n),
-        );
+        let states =
+            flex_no_wiggle_perturbed_test_block_states(&make_flex_no_wiggle_test_family(n));
 
         // Step 1: cold family without any cache — capture the converged (a0, a1)
         // per row so we can pre-populate the warm cache.
@@ -19876,8 +19892,8 @@ mod tests {
             let (warm_nll, warm_grad, warm_hess) = &warm_results[row];
             let (cold_nll, cold_grad, cold_hess) = &cold_results[row];
 
-            let nll_rel = (warm_nll - cold_nll).abs()
-                / (1e-300_f64).max(cold_nll.abs().max(warm_nll.abs()));
+            let nll_rel =
+                (warm_nll - cold_nll).abs() / (1e-300_f64).max(cold_nll.abs().max(warm_nll.abs()));
             assert!(
                 nll_rel <= 1e-12,
                 "row {row}: warm NLL {warm_nll:.17e} vs cold NLL {cold_nll:.17e}, rel {nll_rel:.3e}",
@@ -20018,11 +20034,7 @@ mod tests {
                 for b in a..N_PRIMARY {
                     let db = unit_primary_direction_ref(b).view();
                     let value = family
-                        .row_neglog_directional_refs(
-                            row,
-                            &block_states,
-                            &[da, db, dir_u.view()],
-                        )
+                        .row_neglog_directional_refs(row, &block_states, &[da, db, dir_u.view()])
                         .expect("legacy third per-cell");
                     legacy_third[a][b] = value;
                     legacy_third[b][a] = value;
