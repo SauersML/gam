@@ -1604,11 +1604,15 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
     }
     let mut t_final = Array2::<f64>::zeros((p_candidate, null_indices.len()));
     for (out_col, &in_col) in null_indices.iter().enumerate() {
-        t_final.column_mut(out_col).assign(&eigenvectors.column(in_col));
+        t_final
+            .column_mut(out_col)
+            .assign(&eigenvectors.column(in_col));
     }
     let kept = t_final.ncols();
 
-    candidate.runtime.compose_external_column_transform(&t_final)?;
+    candidate
+        .runtime
+        .compose_external_column_transform(&t_final)?;
     // Re-evaluate at the same training-row argument used at construction so
     // `block.design`'s row count is preserved at `n`.
     let new_design = candidate.runtime.design(candidate_arg_at_training_rows)?;
@@ -15425,12 +15429,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             anchors.push(CrossBlockAnchor::FlexEvaluation(a));
         }
         let _ = link_dev_seed; // padded knot-seed retained only for knot construction
-        enforce_cross_block_identifiability_for_flex_block(
-            &mut prepared,
-            &q0_seed,
-            cfg,
-            &anchors,
-        )?;
+        enforce_cross_block_identifiability_for_flex_block(&mut prepared, &q0_seed, cfg, &anchors)?;
         Some(prepared)
     } else {
         None
@@ -15963,8 +15962,8 @@ mod tests {
             num_internal_knots: 5,
             ..DeviationBlockConfig::default()
         };
-        let score_prepared = build_score_warp_deviation_block_from_seed(&z, &score_cfg)
-            .expect("score-warp fixture");
+        let score_prepared =
+            build_score_warp_deviation_block_from_seed(&z, &score_cfg).expect("score-warp fixture");
         // Use a near-affine map of `z` so the link-deviation basis evaluates
         // to functions strongly correlated with score-warp evaluations —
         // this is the regime the cross-block invariant is designed for.
