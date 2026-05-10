@@ -493,11 +493,7 @@ pub fn cost_gated_first_order_max_iter(
 /// BFGS must stay in a local model region and spend work on accepted gradient
 /// samples, not on unbounded strong-Wolfe bracketing probes.
 pub fn first_order_bfgs_loglambda_step_cap(has_outer_hessian: bool) -> Option<f64> {
-    if has_outer_hessian {
-        None
-    } else {
-        Some(1.0)
-    }
+    if has_outer_hessian { None } else { Some(1.0) }
 }
 
 pub(crate) fn exact_newton_outer_geometry_supports_second_order_solver<F: CustomFamily + ?Sized>(
