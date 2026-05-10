@@ -167,6 +167,73 @@ struct SurvivalMarginalSlopeFamily {
     time_wiggle_knots: Option<Array1<f64>>,
     time_wiggle_degree: Option<usize>,
     time_wiggle_ncols: usize,
+    /// Per-row cache of the previous PIRLS iter's converged intercepts. Two
+    /// slots per row: `[entry_q0, exit_q1]`. Across consecutive PIRLS
+    /// iterations β changes only a little, so the previously-converged `a` is
+    /// an excellent initial guess for the calibration root and typically lets
+    /// the solver finish in ~1–2 iterations versus the rigid closed-form seed
+    /// which can be many bracket-expansion steps away. Slots are initialised
+    /// to `NaN` (sentinel for "not yet solved") and overwritten with the
+    /// converged intercept on every successful call.
+    ///
+    /// Set to `None` for unit-test fixtures that build a
+    /// `SurvivalMarginalSlopeFamily` directly without running the full fit
+    /// pipeline; production paths go through `make_family` which initialises
+    /// the cache to length-`n`. When `None`, the solver behaves exactly as it
+    /// did before the warm-start machinery was added (closed-form rigid seed).
+    intercept_warm_starts: Option<Arc<SurvivalInterceptWarmStartCache>>,
+}
+
+/// Discriminates the two intercept slots per row: the entry-time intercept
+/// (solved against `q0`) and the exit-time intercept (solved against `q1`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurvivalInterceptSlotKind {
+    Entry = 0,
+    Exit = 1,
+}
+
+/// Per-row warm-start storage for the survival calibration root solver.
+/// Two atomic `f64::to_bits` slots per row — one for the entry intercept
+/// (`q = q0`) and one for the exit intercept (`q = q1`). NaN bits flag a
+/// slot that hasn't been populated yet.
+struct SurvivalInterceptWarmStartCache {
+    entry: Vec<std::sync::atomic::AtomicU64>,
+    exit: Vec<std::sync::atomic::AtomicU64>,
+}
+
+impl SurvivalInterceptWarmStartCache {
+    #[inline]
+    fn slots_for(&self, kind: SurvivalInterceptSlotKind) -> &[std::sync::atomic::AtomicU64] {
+        match kind {
+            SurvivalInterceptSlotKind::Entry => &self.entry,
+            SurvivalInterceptSlotKind::Exit => &self.exit,
+        }
+    }
+
+    #[inline]
+    fn load(&self, row: usize, kind: SurvivalInterceptSlotKind) -> Option<f64> {
+        let slot = self.slots_for(kind).get(row)?;
+        let value = f64::from_bits(slot.load(std::sync::atomic::Ordering::Relaxed));
+        value.is_finite().then_some(value)
+    }
+
+    #[inline]
+    fn store(&self, row: usize, kind: SurvivalInterceptSlotKind, a: f64) {
+        if let Some(slot) = self.slots_for(kind).get(row) {
+            slot.store(a.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+fn new_intercept_warm_start_cache(n: usize) -> Arc<SurvivalInterceptWarmStartCache> {
+    Arc::new(SurvivalInterceptWarmStartCache {
+        entry: (0..n)
+            .map(|_| std::sync::atomic::AtomicU64::new(f64::NAN.to_bits()))
+            .collect(),
+        exit: (0..n)
+            .map(|_| std::sync::atomic::AtomicU64::new(f64::NAN.to_bits()))
+            .collect(),
+    })
 }
 
 #[derive(Clone, Default)]
@@ -4017,6 +4084,7 @@ impl SurvivalMarginalSlopeFamily {
         Ok((f, f_a, f_aa))
     }
 
+    #[cfg(test)]
     fn solve_row_survival_intercept(
         &self,
         q: f64,
@@ -4024,19 +4092,63 @@ impl SurvivalMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<(f64, f64), String> {
+        self.solve_row_survival_intercept_with_slot(q, slope, beta_h, beta_w, None)
+    }
+
+    fn solve_row_survival_intercept_with_slot(
+        &self,
+        q: f64,
+        slope: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        slot: Option<(usize, SurvivalInterceptSlotKind)>,
+    ) -> Result<(f64, f64), String> {
         let eval = |a: f64| -> Result<(f64, f64, f64), String> {
+            #[cfg(test)]
+            {
+                survival_intercept_test_counter::bump();
+            }
             self.evaluate_denested_survival_calibration(a, q, slope, beta_h, beta_w)
         };
         let probit_scale = self.probit_frailty_scale();
-        let a_init = q * rigid_observed_scale(slope, probit_scale) / probit_scale;
-        let solution = super::monotone_root::solve_monotone_root_detailed(
+        let a_closed_form = q * rigid_observed_scale(slope, probit_scale) / probit_scale;
+
+        // Prefer the previous PIRLS iter's converged intercept as the initial
+        // guess; β changes only a little between consecutive PIRLS iterations,
+        // so the previous answer is typically within a few root-solver steps
+        // of the new one. If the slot is None (no cache wired) or the stored
+        // bits decode to a non-finite value (uninitialised NaN sentinel /
+        // stale), fall back to the closed-form rigid seed — preserving the
+        // exact pre-warm-start behaviour.
+        let cached_a = slot.and_then(|(row, kind)| {
+            self.intercept_warm_starts
+                .as_ref()
+                .and_then(|cache| cache.load(row, kind))
+        });
+        let a_init = cached_a.unwrap_or(a_closed_form);
+        let mut solve_result = super::monotone_root::solve_monotone_root_detailed(
             &eval,
             a_init,
             "survival intercept",
             1e-12,
             64,
             64,
-        )?;
+        );
+        // If the warm-started solve failed, retry once from the closed-form
+        // seed. Cached `a` from a prior PIRLS iter can be far enough from the
+        // current root (e.g., after a large β step) that the bracketing search
+        // exhausts; the closed-form seed always sits in the correct basin.
+        if cached_a.is_some() && solve_result.is_err() {
+            solve_result = super::monotone_root::solve_monotone_root_detailed(
+                &eval,
+                a_closed_form,
+                "survival intercept",
+                1e-12,
+                64,
+                64,
+            );
+        }
+        let solution = solve_result?;
         let a = solution.root;
         // The solver already evaluated `eval` at `solution.root` during the
         // refine loop and returned the resulting `residual` (best_f) and
@@ -4100,6 +4212,15 @@ impl SurvivalMarginalSlopeFamily {
                  achieved survival={achieved_survival:.6e}, probability_tol={probability_tol:.3e}\
                  {log_tail_detail}"
             ));
+        }
+
+        // Cache the converged intercept for the next PIRLS iter, if a slot
+        // was provided. When `slot` is None this is a no-op, preserving the
+        // exact pre-warm-start behaviour.
+        if let Some((row, kind)) = slot {
+            if let Some(cache) = self.intercept_warm_starts.as_ref() {
+                cache.store(row, kind, a);
+            }
         }
 
         Ok((a, abs_deriv))
@@ -4445,8 +4566,20 @@ impl SurvivalMarginalSlopeFamily {
                 self.derivative_guard
             ));
         }
-        let (a0, _) = self.solve_row_survival_intercept(q0, g, beta_h, beta_w)?;
-        let (a1, d1) = self.solve_row_survival_intercept(q1, g, beta_h, beta_w)?;
+        let (a0, _) = self.solve_row_survival_intercept_with_slot(
+            q0,
+            g,
+            beta_h,
+            beta_w,
+            Some((row, SurvivalInterceptSlotKind::Entry)),
+        )?;
+        let (a1, d1) = self.solve_row_survival_intercept_with_slot(
+            q1,
+            g,
+            beta_h,
+            beta_w,
+            Some((row, SurvivalInterceptSlotKind::Exit)),
+        )?;
         if !d1.is_finite() || d1 <= 0.0 {
             return Err(format!(
                 "survival marginal-slope row {row} produced non-positive density normalization D1={d1:.3e} (calibration derivative {:.3e})",
@@ -5114,8 +5247,20 @@ impl SurvivalMarginalSlopeFamily {
             ));
         }
 
-        let (a0, d0) = self.solve_row_survival_intercept(q0, g, beta_h, beta_w)?;
-        let (a1, d1) = self.solve_row_survival_intercept(q1, g, beta_h, beta_w)?;
+        let (a0, d0) = self.solve_row_survival_intercept_with_slot(
+            q0,
+            g,
+            beta_h,
+            beta_w,
+            Some((row, SurvivalInterceptSlotKind::Entry)),
+        )?;
+        let (a1, d1) = self.solve_row_survival_intercept_with_slot(
+            q1,
+            g,
+            beta_h,
+            beta_w,
+            Some((row, SurvivalInterceptSlotKind::Exit)),
+        )?;
         let entry = self.compute_survival_timepoint_first_order_exact(
             row, primary, q0, primary.q0, a0, g, d0, beta_h, beta_w,
         )?;
@@ -5188,8 +5333,20 @@ impl SurvivalMarginalSlopeFamily {
             ));
         }
 
-        let (a0, d0) = self.solve_row_survival_intercept(q0, g, beta_h, beta_w)?;
-        let (a1, d1) = self.solve_row_survival_intercept(q1, g, beta_h, beta_w)?;
+        let (a0, d0) = self.solve_row_survival_intercept_with_slot(
+            q0,
+            g,
+            beta_h,
+            beta_w,
+            Some((row, SurvivalInterceptSlotKind::Entry)),
+        )?;
+        let (a1, d1) = self.solve_row_survival_intercept_with_slot(
+            q1,
+            g,
+            beta_h,
+            beta_w,
+            Some((row, SurvivalInterceptSlotKind::Exit)),
+        )?;
         let entry = self.compute_survival_timepoint_exact(
             row, primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, false,
         )?;
@@ -8631,8 +8788,20 @@ impl SurvivalMarginalSlopeFamily {
             ));
         }
 
-        let (a0, d0) = self.solve_row_survival_intercept(q0, g, beta_h, beta_w)?;
-        let (a1, d1) = self.solve_row_survival_intercept(q1, g, beta_h, beta_w)?;
+        let (a0, d0) = self.solve_row_survival_intercept_with_slot(
+            q0,
+            g,
+            beta_h,
+            beta_w,
+            Some((row, SurvivalInterceptSlotKind::Entry)),
+        )?;
+        let (a1, d1) = self.solve_row_survival_intercept_with_slot(
+            q1,
+            g,
+            beta_h,
+            beta_w,
+            Some((row, SurvivalInterceptSlotKind::Exit)),
+        )?;
 
         let entry = self.compute_survival_timepoint_exact(
             row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, false,
@@ -8786,8 +8955,20 @@ impl SurvivalMarginalSlopeFamily {
             ));
         }
 
-        let (a0, d0) = self.solve_row_survival_intercept(q0, g, beta_h, beta_w)?;
-        let (a1, d1) = self.solve_row_survival_intercept(q1, g, beta_h, beta_w)?;
+        let (a0, d0) = self.solve_row_survival_intercept_with_slot(
+            q0,
+            g,
+            beta_h,
+            beta_w,
+            Some((row, SurvivalInterceptSlotKind::Entry)),
+        )?;
+        let (a1, d1) = self.solve_row_survival_intercept_with_slot(
+            q1,
+            g,
+            beta_h,
+            beta_w,
+            Some((row, SurvivalInterceptSlotKind::Exit)),
+        )?;
 
         let entry_base = self.compute_survival_timepoint_exact(
             row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, false,
@@ -14705,6 +14886,7 @@ pub fn fit_survival_marginal_slope_terms(
         .map(|timewiggle| time_wiggle_basis_ncols(&timewiggle.knots, timewiggle.degree))
         .transpose()?;
 
+    let intercept_warm_starts = new_intercept_warm_start_cache(n);
     let make_family = |marginal_design: &TermCollectionDesign,
                        logslope_design: &TermCollectionDesign,
                        sigma: Option<f64>|
@@ -14730,6 +14912,7 @@ pub fn fit_survival_marginal_slope_terms(
             time_wiggle_knots: spec.timewiggle_block.as_ref().map(|w| w.knots.clone()),
             time_wiggle_degree: spec.timewiggle_block.as_ref().map(|w| w.degree),
             time_wiggle_ncols: derived_time_wiggle_ncols.unwrap_or(0),
+            intercept_warm_starts: Some(Arc::clone(&intercept_warm_starts)),
         }
     };
 
@@ -15161,6 +15344,28 @@ pub fn fit_survival_marginal_slope_terms(
     })
 }
 
+/// Thread-local invocation counter used by the warm-start unit test to
+/// assert that pre-populating the per-row intercept cache reduces the number
+/// of `evaluate_denested_survival_calibration` calls. Compiled into the
+/// `solve_row_survival_intercept_with_slot` evaluator only under `cfg(test)`,
+/// so the production hot path is byte-identical.
+#[cfg(test)]
+mod survival_intercept_test_counter {
+    use std::cell::Cell;
+    thread_local! {
+        static COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+    pub(super) fn bump() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+    pub(super) fn reset() {
+        COUNT.with(|c| c.set(0));
+    }
+    pub(super) fn get() -> u64 {
+        COUNT.with(|c| c.get())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -15345,6 +15550,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         }
     }
 
@@ -15626,6 +15832,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         }
     }
 
@@ -15749,6 +15956,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -15902,6 +16110,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -15983,6 +16192,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         };
         let specs = vec![
             dummy_blockspec(1),
@@ -16023,6 +16233,7 @@ mod tests {
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
+            intercept_warm_starts: None,
         };
         let specs = vec![
             dummy_blockspec(5),
@@ -16103,6 +16314,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         };
         let specs = vec![
             dummy_penalized_blockspec(p_time, 1),
@@ -16145,6 +16357,7 @@ mod tests {
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
+            intercept_warm_starts: None,
         };
         let specs = vec![
             dummy_penalized_blockspec(12, 2),
@@ -16186,6 +16399,7 @@ mod tests {
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -16252,6 +16466,7 @@ mod tests {
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -16324,6 +16539,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -16421,6 +16637,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         };
         let marginal_beta = array![0.35, -0.1];
         let logslope_beta = array![0.2];
@@ -16478,6 +16695,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -16557,6 +16775,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -16642,6 +16861,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -16729,6 +16949,7 @@ mod tests {
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -16812,6 +17033,7 @@ mod tests {
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -16866,6 +17088,7 @@ mod tests {
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -16956,6 +17179,7 @@ mod tests {
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17127,6 +17351,7 @@ mod tests {
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17197,6 +17422,7 @@ mod tests {
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17278,6 +17504,7 @@ mod tests {
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17358,6 +17585,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17425,6 +17653,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17528,6 +17757,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17577,6 +17807,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17629,6 +17860,7 @@ mod tests {
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
             time_wiggle_ncols,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17678,6 +17910,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17744,6 +17977,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         };
         let spec = ParameterBlockSpec {
             name: "time_surface".to_string(),
@@ -17803,6 +18037,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         };
         let spec = ParameterBlockSpec {
             name: "time_surface".to_string(),
@@ -17865,6 +18100,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         };
         let states = vec![
             ParameterBlockState {
@@ -17927,6 +18163,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -18011,6 +18248,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -18458,6 +18696,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         }
     }
 
@@ -18997,6 +19236,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
         }
     }
 

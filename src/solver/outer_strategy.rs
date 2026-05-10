@@ -2585,10 +2585,15 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
             g_norm,
         );
         log::info!(
-            "[OUTER] eval#{n} (grad) cost={cost:.6e} |g|={gnorm:.3e}",
+            "[OUTER] eval#{n} (grad) cost={cost:.6e} |g|={gnorm:.3e} rho=[{rho}]",
             n = self.eval_count,
             cost = eval.cost,
             gnorm = g_norm,
+            rho = x
+                .iter()
+                .map(|v| format!("{v:.3}"))
+                .collect::<Vec<_>>()
+                .join(","),
         );
         Ok(FirstOrderSample {
             value: eval.cost,
@@ -2670,10 +2675,15 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
             g_norm,
         );
         log::info!(
-            "[OUTER] eval#{n} (hess) cost={cost:.6e} |g|={gnorm:.3e}",
+            "[OUTER] eval#{n} (hess) cost={cost:.6e} |g|={gnorm:.3e} rho=[{rho}]",
             n = self.eval_count,
             cost = eval.cost,
             gnorm = g_norm,
+            rho = x
+                .iter()
+                .map(|v| format!("{v:.3}"))
+                .collect::<Vec<_>>()
+                .join(","),
         );
         let hessian = build_bridge_hessian_for_source(
             self.hessian_source,
