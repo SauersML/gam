@@ -771,6 +771,116 @@ fn splitmix64(state: &mut u64) -> u64 {
 /// of those weights for diagnostics only.
 ///
 /// Panics if `z.len() != stratum_secondary.len()`.
+
+/// Configuration for the automatic outer-score subsampler.
+///
+/// At biobank scale (n ≥ tens of thousands) the marginal-slope outer
+/// rho-gradient computes a sum-over-rows trace
+/// `tr(F Fᵀ M_k) = Σ_i row_i(k)` whose per-row work is dominated by
+/// the cell-moment kernel. Stratified Horvitz–Thompson subsampling
+/// replaces the full sum with an unbiased estimator using `K` of `N`
+/// rows; the trace cost drops from `O(N · cell_work)` to
+/// `O(K · cell_work)`.
+///
+/// # Math
+///
+/// Estimator `T̂ = Σ_{i∈S} w_i · row_i` with HT weights
+/// `w_i = N_h / K_h` (per-stratum) is unbiased: `E[T̂] = T`.
+///
+/// Variance under stratified SRS without replacement:
+/// `Var(T̂) = Σ_h N_h² (1 − K_h/N_h) S_h² / K_h`
+/// where `S_h²` is the within-stratum variance of per-row contributions.
+/// With proportional allocation `K_h = K · N_h/N`, the standard deviation
+/// of `T̂` relative to `T` is roughly
+/// `σ(T̂)/T ≈ (1/√K) · √(1 − K/N) · cv_within`
+/// where `cv_within` is the within-stratum coefficient of variation.
+///
+/// The defaults are tuned so that the relative gradient-noise σ stays
+/// below ≈ 1 % across realistic `n` ∈ [30 000, 300 000+], assuming
+/// `cv_within ≲ 1` (which holds for marginal-slope contributions
+/// because the z-decile stratification absorbs the dominant
+/// inhomogeneity).
+#[derive(Clone, Debug)]
+pub struct AutoOuterSubsampleOptions {
+    /// Below this `n`, the auto-subsampler always returns `None` (use
+    /// full data). Default 30 000.
+    pub min_n_for_auto: usize,
+    /// Floor on `K`, so the relative gradient noise stays bounded
+    /// even when the target fraction would round to a smaller `K`.
+    /// `K = max(min_k, round(n · target_fraction))`. Default 10 000
+    /// gives `σ/T ≤ 1 %` for cv_within ≤ 1 and any `n ≥ min_n_for_auto`.
+    pub min_k: usize,
+    /// Target ratio `K / n` once `n ≫ min_k`. Default 0.10.
+    pub target_fraction: f64,
+    /// RNG seed for stratified mask construction. Default
+    /// `0xA075_8AMP_LE_5UB5` (deterministic across runs at the same
+    /// `n`, so CRN holds across BFGS iterations).
+    pub seed: u64,
+}
+
+impl Default for AutoOuterSubsampleOptions {
+    fn default() -> Self {
+        Self {
+            min_n_for_auto: 30_000,
+            min_k: 10_000,
+            target_fraction: 0.10,
+            seed: 0xA075_8A8B_1ED5_5B5C,
+        }
+    }
+}
+
+impl AutoOuterSubsampleOptions {
+    /// Compute the K that this configuration would pick for a given n.
+    /// Returns `None` if `n < min_n_for_auto` (caller should not subsample).
+    pub fn target_k(&self, n: usize) -> Option<usize> {
+        if n < self.min_n_for_auto {
+            return None;
+        }
+        let k_target = ((n as f64) * self.target_fraction).round() as usize;
+        let k = k_target.max(self.min_k).min(n);
+        if k >= n {
+            // Borderline: target_fraction × n already covers the dataset.
+            // No subsampling buys nothing here.
+            None
+        } else {
+            Some(k)
+        }
+    }
+}
+
+/// Build a stratified outer-score subsample automatically from problem
+/// characteristics. Returns `None` for problems too small to benefit
+/// (the caller should fall back to the full-data path).
+///
+/// Stratification matches `build_outer_score_subsample`: 100 z-deciles
+/// × the supplied secondary stratum (typically the {0, 1} response
+/// indicator). When `stratum_secondary` is `None` the secondary
+/// dimension collapses to a single bin.
+///
+/// The returned mask carries proper Horvitz–Thompson weights so that
+/// `Σ_{i ∈ mask} weight_i · row_i` is an unbiased estimate of the
+/// full row sum.
+pub fn auto_outer_score_subsample(
+    z: &[f64],
+    stratum_secondary: Option<&[u8]>,
+    options: &AutoOuterSubsampleOptions,
+) -> Option<OuterScoreSubsample> {
+    let n = z.len();
+    let k = options.target_k(n)?;
+    let secondary_storage;
+    let secondary: &[u8] = if let Some(s) = stratum_secondary {
+        if s.len() != n {
+            // Caller error; fall through to no-subsample rather than panic.
+            return None;
+        }
+        s
+    } else {
+        secondary_storage = vec![0u8; n];
+        &secondary_storage
+    };
+    Some(build_outer_score_subsample(z, secondary, k, options.seed))
+}
+
 pub fn build_outer_score_subsample(
     z: &[f64],
     stratum_secondary: &[u8],
@@ -1083,6 +1193,76 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_outer_score_subsample_skips_small_problems() {
+        let n = 1000;
+        let z: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let opts = AutoOuterSubsampleOptions::default();
+        assert!(
+            auto_outer_score_subsample(&z, None, &opts).is_none(),
+            "n={n} below default min_n_for_auto=30000 should not subsample"
+        );
+    }
+
+    #[test]
+    fn auto_outer_score_subsample_returns_target_k_above_threshold() {
+        let n = 60_000;
+        let z: Vec<f64> = (0..n).map(|i| (i as f64).sin()).collect();
+        let opts = AutoOuterSubsampleOptions::default();
+        let mask = auto_outer_score_subsample(&z, None, &opts)
+            .expect("n=60000 should auto-subsample with default options");
+        // Default target_fraction=0.10 and min_k=10000 → K = max(10000, 6000) = 10000.
+        assert_eq!(mask.n_full, n);
+        assert!(
+            mask.len() >= 9_900 && mask.len() <= 10_200,
+            "expected K≈10_000, got {}",
+            mask.len()
+        );
+        // HT weights should reconstruct n_full in expectation: sum of
+        // per-row weights ≈ n_full (allowing for small allocation rounding).
+        let weight_sum: f64 = mask.rows.iter().map(|r| r.weight).sum();
+        let rel_err = (weight_sum - n as f64).abs() / n as f64;
+        assert!(
+            rel_err < 0.02,
+            "HT weight sum {weight_sum:.3} should ≈ n_full={n}, rel_err={rel_err:.4}"
+        );
+    }
+
+    #[test]
+    fn auto_outer_score_subsample_horvitz_thompson_unbiased() {
+        // On a synthetic per-row contribution `t_i = z_i² + 1`, verify
+        // the HT-weighted sum over the auto-mask matches the full sum
+        // within 3 standard deviations of the predicted estimator
+        // variance. This guards against silent regressions in either
+        // the stratified mask construction or the weight assignment.
+        let n = 50_000;
+        let z: Vec<f64> = (0..n)
+            .map(|i| ((i as f64) / n as f64) * 2.0 - 1.0)
+            .collect();
+        let stratum: Vec<u8> = (0..n).map(|i| if i % 3 == 0 { 1 } else { 0 }).collect();
+        let opts = AutoOuterSubsampleOptions {
+            seed: 0xC0FFEE,
+            ..AutoOuterSubsampleOptions::default()
+        };
+        let t: Vec<f64> = z.iter().map(|zi| zi * zi + 1.0).collect();
+        let exact: f64 = t.iter().sum();
+        let mask = auto_outer_score_subsample(&z, Some(&stratum), &opts)
+            .expect("n=50000 should auto-subsample");
+        let estimate: f64 = mask.rows.iter().map(|r| r.weight * t[r.index]).sum();
+        // Predicted standard error: σ ≈ (1/√K) · √(1 − K/N) · cv · |T|.
+        // For t_i ∈ [1, 2], cv ≲ 0.4. Be generous (factor 5) to keep
+        // the test robust against PRNG-dependent allocation jitter.
+        let k = mask.len();
+        let predicted_se =
+            exact * 0.4 * (1.0 / (k as f64).sqrt()) * (1.0 - k as f64 / n as f64).sqrt();
+        let observed_err = (estimate - exact).abs();
+        assert!(
+            observed_err < 5.0 * predicted_se.max(1.0),
+            "HT estimate {estimate:.3} vs exact {exact:.3}: err={observed_err:.3} exceeds 5×predicted_se={:.3}",
+            predicted_se
+        );
+    }
 
     #[test]
     fn subsample_full_n_equals_no_subsample() {
