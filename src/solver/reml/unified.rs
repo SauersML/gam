@@ -88,6 +88,17 @@
 //! serves all rho coordinates; a probe-based estimator would require
 //! `O(m · k_directions)` row passes vs the existing single row pass.
 //! See `bernoulli_marginal_slope::row_primary_third_trace_gradient_with_moments`.
+//!
+//! ## Orthogonal axis: row subsampling for biobank-scale fits
+//!
+//! Trace estimators here reduce work *within* the Hessian structure
+//! for a fixed row set. The marginal-slope families have a separate,
+//! complementary mechanism that reduces the row set itself: stratified
+//! Horvitz–Thompson outer-score subsampling (see
+//! `families::marginal_slope_shared`). The two compose naturally — a
+//! Hutch++ trace against an `H⁻¹ M` operator stays valid when `M` is
+//! itself a partial-row sum, and the row subsample's variance bound
+//! is independent of the trace estimator used inside the per-row work.
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Zip};
 use rayon::prelude::*;
