@@ -1,3 +1,34 @@
+//! Shared kernels and outer-evaluation infrastructure for the
+//! marginal-slope family of GAMs (BMS, survival, latent survival).
+//!
+//! # Outer-row subsampling
+//!
+//! At biobank scale (n ≥ tens of thousands) the outer rho-gradient is
+//! a sum-over-rows trace whose per-row cost is dominated by the cubic
+//! cell-moment kernel. The pieces here — [`AutoOuterSubsampleOptions`],
+//! [`auto_outer_score_subsample`], [`maybe_install_auto_outer_subsample`],
+//! and [`build_outer_score_subsample`] — implement a stratified
+//! Horvitz–Thompson estimator that replaces the full row sum with an
+//! unbiased sample, gated by an explicit
+//! [`crate::custom_family::BlockwiseFitOptions::auto_outer_subsample`]
+//! opt-in.
+//!
+//! `maybe_install_auto_outer_subsample` is the entry point family
+//! impls call: it consults the per-family phase counter and the
+//! per-family last-ρ mutex (used to detect distinct outer steps),
+//! installs a stratified mask for the first
+//! `BMS_AUTO_SUBSAMPLE_PHASE1_BUDGET` (or family analog) outer
+//! evaluations, and reverts to full data afterward so the BFGS/ARC
+//! convergence target `outer_tol` is reached on exact gradients
+//! rather than chasing the stochastic noise floor.
+//!
+//! This subsampling is **complementary** to the trace-estimator tier
+//! system documented at the top of `solver::reml::unified` (exact /
+//! Hutchinson multi-target / Hutch++ single-target). They operate on
+//! orthogonal axes — the trace estimators reduce work *within* the
+//! Hessian structure for a fixed row set; subsampling reduces the row
+//! set itself for the family-specific row-trace path.
+
 use crate::custom_family::CustomFamilyBlockPsiDerivative;
 use crate::families::cubic_cell_kernel::{self, DenestedPartitionCell, LocalSpanCubic};
 use crate::families::jet_partitions::MultiDirJet;
