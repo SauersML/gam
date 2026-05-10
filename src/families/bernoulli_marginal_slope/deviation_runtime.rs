@@ -403,7 +403,7 @@ impl DeviationRuntime {
     // `integrated_derivative_penalty_with_nullity` are also expressed in
     // the new parameterisation.
     //
-    // Used by `cross_orthogonalize_link_dev_against_score_warp` to enforce
+    // Used by `enforce_cross_block_identifiability_for_flex_block` to enforce
     // the joint-design identifiability invariant
     // `A_train^T (C_train · T) = 0`, where `A_train` is the score-warp
     // design at training points and `C_train` is the link-deviation design
