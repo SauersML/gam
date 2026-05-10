@@ -25040,7 +25040,12 @@ mod tests {
             let rho_step = Array1::<f64>::from_elem(rho_dim, step as f64 * 0.1);
             family
                 .batched_outer_gradient_terms(
-                    &states, &specs, &deriv_blocks, &rho_step, &opts, None,
+                    &states,
+                    &specs,
+                    &deriv_blocks,
+                    &rho_step,
+                    &opts,
+                    None,
                 )
                 .expect("guard ok");
             distinct_calls += 1;
@@ -25054,7 +25059,12 @@ mod tests {
                 let rho_retry = Array1::<f64>::from_elem(rho_dim, step as f64 * 0.1);
                 family
                     .batched_outer_gradient_terms(
-                        &states, &specs, &deriv_blocks, &rho_retry, &opts, None,
+                        &states,
+                        &specs,
+                        &deriv_blocks,
+                        &rho_retry,
+                        &opts,
+                        None,
                     )
                     .expect("guard ok on retry");
                 assert_eq!(
@@ -25074,7 +25084,12 @@ mod tests {
             let rho_step = Array1::<f64>::from_elem(rho_dim, step as f64 * 0.1);
             family_off
                 .batched_outer_gradient_terms(
-                    &states, &specs, &deriv_blocks, &rho_step, &opts_off, None,
+                    &states,
+                    &specs,
+                    &deriv_blocks,
+                    &rho_step,
+                    &opts_off,
+                    None,
                 )
                 .expect("guard ok off");
         }
