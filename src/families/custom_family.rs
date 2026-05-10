@@ -8894,6 +8894,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 None => {
                     let h_joint_opt = family.exact_newton_joint_hessian(&states)?;
                     let Some(h_joint) = h_joint_opt else {
+                        eprintln!("[JN-EXIT] cycle={cycle} reason=hessian_unavailable");
                         break; // Fall back to blockwise if joint Hessian unavailable
                     };
                     match symmetrized_square_matrix(
@@ -8902,16 +8903,24 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         "joint Newton inner exact-newton Hessian shape mismatch",
                     ) {
                         Ok(matrix) => JointHessianSource::Dense(matrix),
-                        Err(_) => break,
+                        Err(e) => {
+                            eprintln!("[JN-EXIT] cycle={cycle} reason=hessian_shape_err err={e}");
+                            break;
+                        }
                     }
                 }
             };
 
             // Concatenate block gradients and betas.
             let Some(grad_joint) = cached_joint_gradient.clone() else {
+                eprintln!("[JN-EXIT] cycle={cycle} reason=grad_joint_none");
                 break;
             };
             if grad_joint.len() != total_p {
+                eprintln!(
+                    "[JN-EXIT] cycle={cycle} reason=grad_joint_len_mismatch len={} expected={total_p}",
+                    grad_joint.len()
+                );
                 break;
             }
             let mut beta_joint = Array1::<f64>::zeros(total_p);
@@ -9129,6 +9138,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 }
                 if delta.is_none() {
                     if pcg_requested {
+                        eprintln!("[JN-EXIT] cycle={cycle} reason=pcg_no_delta");
                         break;
                     }
                     let mut lhs = match materialize_joint_hessian_source(
@@ -9137,7 +9147,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         "joint Newton inner dense fallback Hessian materialization",
                     ) {
                         Ok(matrix) => matrix,
-                        Err(_) => break,
+                        Err(e) => {
+                            eprintln!("[JN-EXIT] cycle={cycle} reason=dense_lhs_materialize_err err={e}");
+                            break;
+                        }
                     };
                     add_joint_penalty_to_matrix(
                         &mut lhs,
@@ -9154,9 +9167,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 }
 
                 let Some(delta) = delta else {
+                    eprintln!("[JN-EXIT] cycle={cycle} reason=delta_none_after_dense");
                     break; // Fall back to blockwise
                 };
                 if !delta.iter().all(|v| v.is_finite()) {
+                    let n_nan = delta.iter().filter(|v| !v.is_finite()).count();
+                    eprintln!("[JN-EXIT] cycle={cycle} reason=delta_non_finite n_nan={n_nan} dim={}", delta.len());
                     break; // Fall back to blockwise
                 }
                 (beta_joint.clone() + &delta, None)
@@ -9536,6 +9552,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 
             // Check convergence via joint stationarity
             let Some(gradient) = cached_joint_gradient.as_ref() else {
+                eprintln!("[JN-EXIT] cycle={cycle} reason=post_accept_grad_none");
                 break;
             };
             let residual = exact_newton_joint_stationarity_inf_norm_from_gradient(
@@ -9621,6 +9638,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // reached its own tolerance — the rank-deficient null-mode
             // case described in the line-search-failure path below.
             if accepted_step_inf <= step_tol && objective_change <= objective_tol {
+                eprintln!(
+                    "[JN-EXIT] cycle={cycle} reason=no_progress_stagnation accepted_step_inf={accepted_step_inf:.3e} step_tol={step_tol:.3e} objective_change={objective_change:.3e} objective_tol={objective_tol:.3e} residual={residual:.3e} residual_tol={residual_tol:.3e}"
+                );
                 break;
             }
             // Carry the objective-stagnation signal into the next
@@ -9684,6 +9704,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             });
         }
         if coupled_exact_joint_required {
+            eprintln!(
+                "[JN-EXIT-OUTER] cycles_done={cycles_done} converged={converged} inner_max_cycles={inner_max_cycles}"
+            );
             return Err(
                 "coupled exact-joint inner solve exited the joint Newton path before convergence"
                     .to_string(),
