@@ -74,7 +74,26 @@ pub trait HessianOperator: Send + Sync {
     ///
     /// Default implementation materializes `B` densely. Backends with
     /// native operator traces (notably sparse Cholesky) should override it.
+    ///
+    /// For HVP-only (implicit) operators on large problems we route
+    /// through Hutch++ — the Meyer–Musco split estimator achieves O(1/ε)
+    /// matvecs vs O(1/ε²) for plain Hutchinson, and avoids the O(p²)
+    /// memory + O(p) HVP cost of materializing the operator densely.
     fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
+        // Hutch++ fast path for the warn-and-materialize default. Only
+        // backends that fall through to this default reach here;
+        // backends with native operator traces override it. We require
+        // an implicit operator (so materialization is expensive) and a
+        // moderately-large dim (so 2 m_s + m_h matvecs beats `dim`
+        // dense HVPs).
+        if op.is_implicit() && self.dim() >= 128 {
+            let mut config = StochasticTraceConfig::default();
+            let sketch = (self.dim() / 32).clamp(4, 16);
+            config.hutchpp_sketch_dim = Some(sketch);
+            config.n_probes_max = (sketch * 4).max(32);
+            config.n_probes_min = sketch.max(8);
+            return hutchpp_estimate_trace_hinv_operator(self, op, &config);
+        }
         if op.is_implicit() {
             log::warn!(
                 "trace_hinv_operator: materializing implicit HyperOperator — \
@@ -225,7 +244,23 @@ pub trait HessianOperator: Send + Sync {
     ///
     /// Default implementation materializes `B` densely. For Cholesky-based
     /// backends this equals `trace_hinv_operator`.
+    ///
+    /// When `logdet_traces_match_hinv_kernel()` is true (Cholesky-style
+    /// backends where `trace_logdet_gradient(A) = trace_hinv_product(A)`)
+    /// and the operator is implicit on a moderate-or-large problem, route
+    /// through Hutch++ to avoid the dense materialization. Spectral
+    /// backends override this to false (their logdet trace uses
+    /// regularized eigenvalue weights, not `H⁻¹`), so they keep the
+    /// materialize path or provide their own override.
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
+        if op.is_implicit() && self.dim() >= 128 && self.logdet_traces_match_hinv_kernel() {
+            let mut config = StochasticTraceConfig::default();
+            let sketch = (self.dim() / 32).clamp(4, 16);
+            config.hutchpp_sketch_dim = Some(sketch);
+            config.n_probes_max = (sketch * 4).max(32);
+            config.n_probes_min = sketch.max(8);
+            return hutchpp_estimate_trace_hinv_operator(self, op, &config);
+        }
         if op.is_implicit() {
             log::warn!(
                 "trace_logdet_operator: materializing implicit HyperOperator — \
@@ -12064,8 +12099,8 @@ fn modified_gram_schmidt(y: &Array2<f64>, q: &mut Array2<f64>) -> usize {
 /// the sketch captures the dominant subspace exactly and Hutchinson
 /// only handles the small residual. For roughly-flat spectra both
 /// methods perform similarly per-matvec.
-pub(crate) fn hutchpp_estimate_trace_hinv_operator(
-    hop: &dyn HessianOperator,
+pub(crate) fn hutchpp_estimate_trace_hinv_operator<H: HessianOperator + ?Sized>(
+    hop: &H,
     op: &dyn HyperOperator,
     config: &StochasticTraceConfig,
 ) -> f64 {
