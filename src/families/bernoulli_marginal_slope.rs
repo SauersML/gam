@@ -49,13 +49,6 @@ mod deviation_runtime;
 pub(crate) mod exact_kernel;
 pub use deviation_runtime::DeviationRuntime;
 
-/// Row count where flexible marginal-slope outer-Hessian calculus stops being
-/// a useful optimizer acceleration. Above this gate the exact profiled Hessian
-/// spends most of its time in third/fourth β-derivative contractions over the
-/// FLEX cell kernel; exact value/gradient evaluations keep the same likelihood,
-/// calibration, and inner Newton solve without paying that curvature bill.
-const BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT: usize = 50_000;
-
 #[derive(Clone, Debug)]
 pub struct DeviationBlockConfig {
     pub degree: usize,
@@ -5913,9 +5906,6 @@ impl BernoulliMarginalSlopeFamily {
         let row_cell_moments = match row_cell_mask {
             Some(mask) => {
                 self.build_row_cell_moments_bundle(block_states, &row_contexts, 21, Some(mask))?
-            }
-            None if n < BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT => {
-                self.build_row_cell_moments_bundle(block_states, &row_contexts, 21, None)?
             }
             None => None,
         };
@@ -12577,11 +12567,6 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     ) -> crate::custom_family::ExactOuterDerivativeOrder {
         use crate::custom_family::ExactOuterDerivativeOrder;
 
-        let flex_active = self.score_warp.is_some() || self.link_dev.is_some();
-        if flex_active && self.y.len() >= BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT {
-            return ExactOuterDerivativeOrder::First;
-        }
-
         let coefficient_work = self
             .coefficient_hessian_cost(specs)
             .max(self.coefficient_gradient_cost(specs));
@@ -13295,14 +13280,6 @@ impl BernoulliMarginalSlopeLineSearchWorkspace {
                     21,
                     Some(mask),
                 )?,
-                None if self.family.y.len() < BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT => {
-                    self.family.build_row_cell_moments_bundle(
-                        &self.block_states,
-                        &cache.row_contexts,
-                        21,
-                        None,
-                    )?
-                }
                 None => None,
             };
             BernoulliMarginalSlopeExactNewtonJointHessianWorkspace::from_cache(
@@ -14272,7 +14249,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
     validate_spec(data_view, &spec)?;
     let mut effective_kappa_options = kappa_options.clone();
     let flex_spatial_scale_path = (spec.score_warp.is_some() || spec.link_dev.is_some())
-        && spec.y.len() >= BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT
+        && effective_kappa_options.pilot_subsample_threshold > 0
+        && spec.y.len() >= effective_kappa_options.pilot_subsample_threshold.saturating_mul(2)
         && effective_kappa_options.enabled;
     if flex_spatial_scale_path {
         let marginal_terms = spatial_length_scale_term_indices(&spec.marginalspec);
@@ -14291,6 +14269,12 @@ pub fn fit_bernoulli_marginal_slope_terms(
             effective_kappa_options.pilot_subsample_threshold,
             &effective_kappa_options,
         );
+        // The current biobank FLEX path fits the user's initialized spatial
+        // geometry on the full data. Full joint κ/aniso optimization is exact
+        // but is a separate 49-parameter problem with its own row-moment
+        // batching requirements; routing the fixed-length-scale benchmark
+        // through that path changes the fitted formula and misses the rho
+        // optimizer target.
         effective_kappa_options.enabled = false;
         log::info!(
             "[BMS spatial] n={} flex=true pilot_geometry_updates={} iterative_spatial_outer=false",
@@ -17342,7 +17326,7 @@ mod tests {
     }
 
     #[test]
-    fn flexible_family_routes_outer_derivatives_by_scale() {
+    fn flexible_family_keeps_outer_hessian_at_large_scale() {
         let seed = array![-1.0, 0.0, 1.0];
         let score_prepared = build_score_warp_deviation_block_from_seed(
             &seed,
@@ -17386,7 +17370,7 @@ mod tests {
         );
         assert!(family.exact_newton_joint_psi_workspace_for_first_order_terms());
 
-        let n_large = BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT;
+        let n_large = 50_001usize;
         let mut large_flex_family = family.clone();
         large_flex_family.y = Arc::new(Array1::zeros(n_large));
         large_flex_family.weights = Arc::new(Array1::ones(n_large));
@@ -17399,7 +17383,7 @@ mod tests {
         assert_eq!(
             large_flex_family
                 .exact_outer_derivative_order(&large_flex_specs, &BlockwiseFitOptions::default()),
-            ExactOuterDerivativeOrder::First
+            ExactOuterDerivativeOrder::Second
         );
 
         let mut large_rigid_family = large_flex_family.clone();

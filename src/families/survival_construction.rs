@@ -1000,45 +1000,6 @@ pub fn build_survival_time_basis(
             )
             .map_err(|e| format!("failed to build ispline derivative basis: {e}"))?;
 
-            // Diagnostic: is `db_exit` itself non-zero coming out of
-            // `create_basis(BasisOptions::first_derivative())`?  CI evidence
-            // (commit f98a32ab) shows the downstream `x_derivative_time`
-            // ends up exactly all-zeros at biobank shape (320k × 11),
-            // which can only happen if either `db_exit` is all-zero here
-            // or the cumsum-and-keep_cols loop below wipes everything.
-            // Log once per build with shape + maxabs, plus the first row's
-            // raw values, so the next CI cycle distinguishes those cases.
-            {
-                let db_exit_view = db_exit_arc.as_ref();
-                let mut max_abs = 0.0_f64;
-                let mut nonzero_count = 0_usize;
-                for row in 0..db_exit_view.nrows() {
-                    for col in 0..db_exit_view.ncols() {
-                        let v = db_exit_view[[row, col]].abs();
-                        if v > 1e-30 {
-                            nonzero_count += 1;
-                        }
-                        if v > max_abs {
-                            max_abs = v;
-                        }
-                    }
-                }
-                let row0: Vec<(usize, f64)> = (0..db_exit_view.ncols().min(8))
-                    .map(|j| (j, db_exit_view[[0, j]]))
-                    .collect();
-                log::warn!(
-                    "[ispline-build] db_exit shape={}x{}, max_abs={:.3e}, nonzero(>1e-30)={}, row0[0..8]={:?}, log_exit[0]={:.6}, knotvec[0]={:.6}, knotvec[-1]={:.6}",
-                    db_exit_view.nrows(),
-                    db_exit_view.ncols(),
-                    max_abs,
-                    nonzero_count,
-                    row0,
-                    log_exit[0],
-                    knotvec[0],
-                    knotvec[knotvec.len() - 1],
-                );
-            }
-
             // Build full-width I-spline bases inside a block scope so the
             // large Arc allocations are freed when the block ends.
             let (x_entry_time, x_exit_time, keep_cols, p_time, p_time_full) = {
@@ -2774,8 +2735,9 @@ pub fn build_time_varying_survival_covariate_template(
 #[cfg(test)]
 mod tests {
     use super::{
-        SurvivalBaselineConfig, SurvivalBaselineTarget, baseline_chain_rule_gradient,
-        baseline_offset_theta_partials, build_survival_marginal_slope_baseline_offsets,
+        SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalTimeBasisConfig,
+        baseline_chain_rule_gradient, baseline_offset_theta_partials,
+        build_survival_marginal_slope_baseline_offsets, build_survival_time_basis,
         build_survival_timewiggle_from_baseline, evaluate_survival_baseline,
         evaluate_survival_marginal_slope_baseline, marginal_slope_baseline_chain_rule_gradient,
         marginal_slope_baseline_chain_rule_hessian, marginal_slope_baseline_offset_theta_partials,
@@ -2805,6 +2767,42 @@ mod tests {
         assert_eq!(build.penalties.len(), 3);
         assert_eq!(build.nullspace_dims, vec![1, 2, 3]);
         assert!(build.ncols > 0);
+    }
+
+    #[test]
+    fn ispline_time_derivative_is_nonzero_at_right_boundary() {
+        let age_entry = array![1.0_f64, 1.0, 1.0];
+        let age_exit = array![4.0_f64, 4.0, 4.0];
+        let left = 1.0_f64.ln();
+        let right = 4.0_f64.ln();
+        let mid = left + 0.5 * (right - left);
+        let knots = array![left, left, left, left, mid, right, right, right, right];
+
+        let built = build_survival_time_basis(
+            &age_entry,
+            &age_exit,
+            SurvivalTimeBasisConfig::ISpline {
+                degree: 2,
+                knots,
+                keep_cols: Vec::new(),
+                smooth_lambda: 1e-2,
+            },
+            None,
+        )
+        .expect("build right-boundary ispline time basis");
+
+        let derivative = built.x_derivative_time.as_dense_cow();
+        let max_abs = derivative.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        assert!(
+            max_abs > 1e-8,
+            "right-boundary I-spline derivative must use the left-hand endpoint slope"
+        );
+        for row in derivative.rows() {
+            assert!(
+                row.iter().any(|v| *v > 1e-8),
+                "each row at the right boundary needs a positive hazard derivative"
+            );
+        }
     }
 
     #[test]

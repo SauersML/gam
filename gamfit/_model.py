@@ -34,6 +34,7 @@ _SURVIVAL_TIME_GRID_MODEL_CLASSES = frozenset(
     {
         "survival",
         "survival marginal-slope",
+        "survival location-scale",
     }
 )
 _MARGINAL_SLOPE_MODEL_CLASSES = frozenset(
@@ -215,6 +216,13 @@ class SurvivalPrediction:
                 n_times=times_arr.size,
             )
         return self._survival_block(params, times_arr)
+
+    def failure_at(self, times: Any) -> Any:
+        """Failure/event probability ``1 - S(t)`` at each requested time."""
+        import numpy as np
+
+        survival = np.asarray(self.survival_at(times), dtype=float)
+        return np.clip(1.0 - survival, 0.0, 1.0)
 
     def survival_se_at(self, times: Any) -> Any:
         """Delta-method standard error on ``S(t)`` at each requested time.
@@ -489,9 +497,9 @@ class Model:
         * Bernoulli marginal-slope: returns a calibrated probability array in
           ``(0, 1)`` of shape ``(n_samples,)``.
         * Survival models: returns a :class:`SurvivalPrediction` whose
-          ``.hazard_at``, ``.survival_at``, and ``.cumulative_hazard_at``
-          helpers evaluate the fitted hazard surface on a user-supplied time
-          grid.
+          ``.hazard_at``, ``.survival_at``, ``.failure_at``, and
+          ``.cumulative_hazard_at`` helpers evaluate the fitted hazard surface
+          on a user-supplied time grid.
 
         ``with_uncertainty`` (survival only): when ``True``, the returned
         :class:`SurvivalPrediction` also carries delta-method standard

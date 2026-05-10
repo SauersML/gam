@@ -526,6 +526,36 @@ fn apply_dense_bspline_extrapolation(
     Ok(())
 }
 
+#[inline]
+fn one_sided_derivative_eval_point(x: f64, knotview: ArrayView1<f64>, degree: usize) -> f64 {
+    let num_basis = knotview.len().saturating_sub(degree + 1);
+    if num_basis == 0 {
+        return x;
+    }
+    let left = knotview[degree];
+    let right = knotview[num_basis];
+    if !left.is_finite() || !right.is_finite() || left >= right {
+        return x;
+    }
+    if x <= left {
+        let next = left.next_up();
+        if next < right {
+            next
+        } else {
+            left + 0.5 * (right - left)
+        }
+    } else if x >= right {
+        let prev = right.next_down();
+        if prev > left {
+            prev
+        } else {
+            left + 0.5 * (right - left)
+        }
+    } else {
+        x
+    }
+}
+
 impl BasisOutputFormat for Sparse {
     type Output = SparseColMat<usize, f64>;
     const IS_SPARSE: bool = true;
@@ -669,7 +699,7 @@ fn evaluate_splines_derivative_sparse_intowith_lower(
     let x_eval = if num_basis > 0 {
         let left = knotview[degree];
         let right = knotview[num_basis];
-        x.clamp(left, right)
+        one_sided_derivative_eval_point(x.clamp(left, right), knotview, degree)
     } else {
         x
     };
@@ -18221,9 +18251,11 @@ pub fn evaluate_bspline_derivative_scalar_into(
         *v = 0.0;
     }
 
+    let x_eval = one_sided_derivative_eval_point(x, knot_vector, degree);
+
     // Evaluate lower-degree (k-1) basis functions
     internal::evaluate_splines_at_point_into(
-        x,
+        x_eval,
         degree - 1,
         knot_vector,
         &mut lower_basis[..num_basis_lower],
@@ -23050,6 +23082,35 @@ mod tests {
                 assert_abs_diff_eq!(db_raw[[i, j]], db_c[[i, j]], epsilon = 1e-10);
             }
         }
+    }
+
+    #[test]
+    fn test_first_derivative_uses_one_sided_endpoint_limits() {
+        let knots = array![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 4.0, 4.0, 4.0];
+        let degree = 3usize;
+        let x = array![0.0, 4.0];
+        let (db, _) = create_basis::<Dense>(
+            x.view(),
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::first_derivative(),
+        )
+        .unwrap();
+        let db = db.as_ref();
+        assert!(
+            db.row(0).iter().any(|v| v.abs() > 1e-8),
+            "left endpoint derivative must use the right-hand slope"
+        );
+        assert!(
+            db.row(1).iter().any(|v| v.abs() > 1e-8),
+            "right endpoint derivative must use the left-hand slope"
+        );
+        assert_abs_diff_eq!(db.row(0).sum(), 0.0, epsilon = 1e-10);
+        assert_abs_diff_eq!(db.row(1).sum(), 0.0, epsilon = 1e-10);
+        assert!(db[[0, 0]] < 0.0);
+        assert!(db[[0, 1]] > 0.0);
+        assert!(db[[1, db.ncols() - 2]] < 0.0);
+        assert!(db[[1, db.ncols() - 1]] > 0.0);
     }
 
     #[test]

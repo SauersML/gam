@@ -2066,17 +2066,20 @@ fn predict_table_survival(
     });
     let eta_se_vec = result.eta_se.as_ref().map(|v| v.to_vec());
 
-    // Always populate a columns block for the backward-compatible
-    // Python path. `mean` tracks the per-row survival at exit time
-    // (column 0 when time_grid=None, otherwise derived from the last
-    // evaluated grid point in the same row). `eta` carries the
-    // linear_predictor.
+    // Populate explicit probability columns. For survival models the event
+    // probability is `1 - survival_prob`; an ambiguous `mean` column makes
+    // fixed-time Brier/calibration scoring easy to invert.
     let mut columns = BTreeMap::<String, Vec<f64>>::new();
     columns.insert("eta".to_string(), result.linear_predictor.to_vec());
-    let mean_col: Vec<f64> = (0..n)
+    let survival_col: Vec<f64> = (0..n)
         .map(|i| result.survival[[i, t.saturating_sub(1)]])
         .collect();
-    columns.insert("mean".to_string(), mean_col);
+    let failure_col: Vec<f64> = survival_col
+        .iter()
+        .map(|s| (1.0 - *s).clamp(0.0, 1.0))
+        .collect();
+    columns.insert("survival_prob".to_string(), survival_col);
+    columns.insert("failure_prob".to_string(), failure_col);
 
     let likelihood_mode_str = match result.likelihood_mode {
         gam::survival_construction::SurvivalLikelihoodMode::MarginalSlope => "marginal-slope",
