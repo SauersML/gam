@@ -15265,6 +15265,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
         rho: &ndarray::Array1<f64>,
+        _options: &BlockwiseFitOptions,
         _hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     ) -> Result<Option<BatchedOuterGradientTerms>, String> {
         use crate::faer_ndarray::FaerCholesky;

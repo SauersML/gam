@@ -9112,6 +9112,14 @@ impl DenseSpectralOperator {
         self.eigenvectors.t().dot(matrix).dot(&self.eigenvectors)
     }
 
+    /// Factor `F` satisfying `trace(G_epsilon(H) A) = trace(F^T A F)`.
+    ///
+    /// Structured row-local operators use this to contract the logdet-gradient
+    /// trace directly in row space without forming `A F` in coefficient space.
+    pub fn logdet_gradient_factor(&self) -> &Array2<f64> {
+        &self.g_factor
+    }
+
     #[inline]
     fn trace_hinv_product_cross_rotated(&self, a_rot: &Array2<f64>, b_rot: &Array2<f64>) -> f64 {
         let mut result = 0.0;
