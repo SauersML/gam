@@ -1678,6 +1678,14 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
     Ok(())
 }
 
+/// Legacy single-anchor wrapper preserved for downstream callers that
+/// orthogonalise link-deviation against score-warp only. New call sites
+/// (including the BMS family construction itself, as of this fix) use
+/// `enforce_cross_block_identifiability_for_flex_block` directly with the
+/// full anchor union (parametric + score-warp). The wrapper remains so
+/// any out-of-tree consumers can be migrated incrementally; once they are,
+/// it can be removed without changing the math.
+#[allow(dead_code)]
 pub(crate) fn cross_orthogonalize_link_dev_against_score_warp(
     score_warp: &DeviationPrepared,
     link_dev: &mut DeviationPrepared,
@@ -15515,11 +15523,32 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // the latent-measure split is enforced upstream via the empirical
     // intercept solve in `build_row_exact_context_with_stats`, not in the
     // deviation basis.
-    let score_warp_prepared = spec
-        .score_warp
-        .as_ref()
-        .map(|cfg| build_score_warp_deviation_block_from_seed(&spec.z, cfg))
-        .transpose()?;
+    // Score-warp basis is built first, then immediately reparameterised
+    // against the parametric span (marginal + logslope columns at the n
+    // training rows) so its column span is orthogonal to span(X_marginal,
+    // X_logslope) by construction. This is the first half of the joint-
+    // design identifiability invariant; the second half (link-deviation
+    // orthogonalised against parametric + the now-reparameterised score-
+    // warp) runs inside the link-deviation closure below. Together they
+    // ensure `[X_marginal | X_logslope | Φ_score_warp · T_sw |
+    // Φ_link_dev · T_lw]` has full numerical column rank, structurally
+    // bounding `σ_min(joint H + S) ≥ λ_min(S) > 0` regardless of how β
+    // drifts the linear predictor distribution during PIRLS.
+    let score_warp_prepared = if let Some(cfg) = spec.score_warp.as_ref() {
+        let mut prepared = build_score_warp_deviation_block_from_seed(&spec.z, cfg)?;
+        enforce_cross_block_identifiability_for_flex_block(
+            &mut prepared,
+            &spec.z,
+            cfg,
+            &[
+                CrossBlockAnchor::Parametric(&marginal_design.design),
+                CrossBlockAnchor::Parametric(&logslope_design.design),
+            ],
+        )?;
+        Some(prepared)
+    } else {
+        None
+    };
     // Build the link-deviation block if requested.  The seed only determines
     // knot placement for the deviation basis, so we use the closed-form
     // pooled-intercept probit solution instead of a full rigid pilot solve
@@ -15550,30 +15579,46 @@ pub fn fit_bernoulli_marginal_slope_terms(
             &spec.weights,
             cfg,
         )?;
-        // Cross-block identifiability: when both score-warp and link-
-        // deviation flex blocks are simultaneously active, each is
-        // individually orthogonal to the location intercept (per-block
-        // smoothness-null-space drop) but their column spans still overlap
-        // inside the orthogonal complement of {1, η_pilot}. Without this
-        // pass the joint penalised Hessian carries a near-null direction
-        // along the cross-block aliasing axis, σ_min(H+S) collapses to the
-        // ridge floor, and the inner Newton step diverges. Reparameterise
-        // the link-deviation basis so its column span at the training rows
-        // is orthogonal to the score-warp basis's column span at the same
-        // rows; this is the standard GAM `gam.side` convention applied at
-        // family construction. See
-        // `cross_orthogonalize_link_dev_against_score_warp` for the full
-        // mathematical justification and dimensional analysis.
-        if let Some(score_prepared) = score_warp_prepared.as_ref() {
-            cross_orthogonalize_link_dev_against_score_warp(
-                score_prepared,
-                &mut prepared,
-                &spec.z,
-                &q0_seed,
-                &link_dev_seed,
-                cfg,
-            )?;
+        // Cross-block identifiability for the link-deviation basis. The
+        // anchor union covers BOTH possible aliasing channels:
+        //
+        //  - Parametric: location and logslope designs evaluated at the n
+        //    training rows. Columns of `Φ_link_dev(q0)` that reproduce
+        //    parametric features become null-direction targets in the
+        //    joint penalised Hessian since `S_link_dev` has no mass on
+        //    them.
+        //
+        //  - Score-warp (when active): the now-reparameterised score-warp
+        //    basis, also evaluated at training rows. Both flex bases are
+        //    cubic I-spline cubic combinations of an η-pilot scalar, and
+        //    even with each block's own smoothness-null-space drop their
+        //    column spans can still overlap inside the orthogonal
+        //    complement of `{1, η_pilot}`.
+        //
+        // After the orthogonalisation, `[X_marginal | X_logslope |
+        // Φ_score_warp · T_sw | Φ_link_dev · T_lw]` has full numerical
+        // column rank at training rows, so `σ_min(joint H+S) ≥ λ_min(S)
+        // > 0` for every β. This is the standard GAM `gam.side`
+        // convention generalised to multi-anchor unions (mgcv applies it
+        // sequentially across smooths sharing a covariate).
+        let score_warp_anchor_design = score_warp_prepared
+            .as_ref()
+            .map(|sw| sw.runtime.design(&spec.z))
+            .transpose()?;
+        let mut anchors = vec![
+            CrossBlockAnchor::Parametric(&marginal_design.design),
+            CrossBlockAnchor::Parametric(&logslope_design.design),
+        ];
+        if let Some(ref a) = score_warp_anchor_design {
+            anchors.push(CrossBlockAnchor::FlexEvaluation(a));
         }
+        let _ = link_dev_seed; // padded knot-seed retained only for knot construction
+        enforce_cross_block_identifiability_for_flex_block(
+            &mut prepared,
+            &q0_seed,
+            cfg,
+            &anchors,
+        )?;
         Some(prepared)
     } else {
         None
@@ -16118,13 +16163,16 @@ mod tests {
         )
         .expect("link-deviation fixture");
         let p_link_before = link_prepared.runtime.basis_dim();
-        cross_orthogonalize_link_dev_against_score_warp(
-            &score_prepared,
+        let _ = link_seed; // padded knot-seed retained only for knot construction
+        let anchor_design_for_test = score_prepared
+            .runtime
+            .design(&z)
+            .expect("score-warp anchor design");
+        enforce_cross_block_identifiability_for_flex_block(
             &mut link_prepared,
-            &z,
             &q0_seed,
-            &link_seed,
             &link_cfg,
+            &[CrossBlockAnchor::FlexEvaluation(&anchor_design_for_test)],
         )
         .expect("cross-block reparameterisation should succeed for non-degenerate overlap");
         let p_link_after = link_prepared.runtime.basis_dim();
