@@ -11346,13 +11346,9 @@ mod root_cause_tests {
             linear_constraints: None,
             initial_lm_lambda: None,
         };
-        let summary = runworking_model_pirls(
-            &mut model,
-            Coefficients::new(array![0.0]),
-            &options,
-            |_| {},
-        )
-        .expect("converged scalar model should produce a result");
+        let summary =
+            runworking_model_pirls(&mut model, Coefficients::new(array![0.0]), &options, |_| {})
+                .expect("converged scalar model should produce a result");
         assert!(
             matches!(
                 summary.exported_laplace_curvature,
@@ -11408,13 +11404,9 @@ mod root_cause_tests {
             linear_constraints: None,
             initial_lm_lambda: None,
         };
-        let summary = runworking_model_pirls(
-            &mut model,
-            Coefficients::new(array![0.0]),
-            &options,
-            |_| {},
-        )
-        .expect("canonical surrogate model should converge");
+        let summary =
+            runworking_model_pirls(&mut model, Coefficients::new(array![0.0]), &options, |_| {})
+                .expect("canonical surrogate model should converge");
         assert!(
             matches!(
                 summary.exported_laplace_curvature,
