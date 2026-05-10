@@ -11207,6 +11207,7 @@ fn try_exact_joint_spatial_aniso_optimization(
         kappa_options.rel_tol.max(1e-6),
         kappa_options.max_outer_iter.max(1),
         Some(kappa_options.log_step.clamp(0.25, 1.0)),
+        None,
     );
 
     let eval_outer = |ctx: &mut &mut AnisoJointContext<'_>,
@@ -11502,6 +11503,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
         kappa_options.rel_tol.max(1e-6),
         kappa_options.max_outer_iter.max(1),
         Some(kappa_options.log_step.clamp(0.25, 1.0)),
+        None,
     );
 
     let eval_outer = |ctx: &mut &mut IsoJointContext<'_>,
@@ -12900,12 +12902,13 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     tolerance: f64,
     max_iter: usize,
     bfgs_step_cap: Option<f64>,
+    screening_cap: Option<Arc<AtomicUsize>>,
 ) -> crate::solver::outer_strategy::OuterProblem {
     let mut seed_heuristic = theta0.to_vec();
     for value in &mut seed_heuristic[..rho_dim] {
         *value = value.exp();
     }
-    crate::solver::outer_strategy::OuterProblem::new(n_params)
+    let mut problem = crate::solver::outer_strategy::OuterProblem::new(n_params)
         .with_gradient(gradient)
         .with_hessian(hessian)
         .with_prefer_gradient_only(prefer_gradient_only)
@@ -12934,7 +12937,11 @@ pub(crate) fn exact_joint_multistart_outer_problem(
             ..Default::default()
         })
         .with_rho_bound(12.0)
-        .with_heuristic_lambdas(seed_heuristic)
+        .with_heuristic_lambdas(seed_heuristic);
+    if let Some(screening_cap) = screening_cap {
+        problem = problem.with_screening_cap(screening_cap);
+    }
+    problem
 }
 
 pub fn optimize_spatial_length_scale_exact_joint<FitOut, FitFn, ExactFn, ExactEfsFn>(
@@ -12947,6 +12954,7 @@ pub fn optimize_spatial_length_scale_exact_joint<FitOut, FitFn, ExactFn, ExactEf
     analytic_joint_gradient_available: bool,
     analytic_joint_hessian_available: bool,
     disable_fixed_point: bool,
+    screening_cap: Option<Arc<AtomicUsize>>,
     mut fit_fn: FitFn,
     mut exact_fn: ExactFn,
     mut exact_efs_fn: ExactEfsFn,
@@ -13125,6 +13133,7 @@ where
         kappa_options.rel_tol.max(1e-6),
         kappa_options.max_outer_iter.max(1),
         Some(kappa_options.log_step.clamp(0.25, 1.0)),
+        screening_cap.clone(),
     );
 
     // Helper: collect specs and designs from cache into owned Vecs for closure calls.
@@ -15922,6 +15931,7 @@ mod tests {
             true,
             true,
             false,
+            None,
             |theta, specs, designs| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
@@ -16362,6 +16372,7 @@ mod tests {
             true,
             true,
             false,
+            None,
             |theta, specs, designs| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
@@ -18302,6 +18313,7 @@ mod tests {
             true,
             true,
             false,
+            None,
             |theta, specs, designs| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
