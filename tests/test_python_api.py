@@ -563,6 +563,7 @@ def test_survival_prediction_dense_surfaces_smoke() -> None:
         "survival must be non-increasing in time; offending row indices: "
         f"{np.argwhere(deltas > 1e-9)[:10].tolist()}"
     )
+    np.testing.assert_allclose(pred.failure_at(grid), 1.0 - survival)
 
     cumhaz = pred.cumulative_hazard_at(grid)
     assert cumhaz.shape == (2, grid.shape[0])

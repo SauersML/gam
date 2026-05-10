@@ -11890,6 +11890,84 @@ mod tests {
     use approx::assert_relative_eq;
     use ndarray::array;
 
+    fn make_factor_key(seed: u64) -> ProjectedFactorKey {
+        // Build a unique-by-seed key without going through
+        // `from_factor_view` so the test can inject fingerprints
+        // directly. Using public construction via a real ArrayView2
+        // would couple this test to ndarray pointer aliasing.
+        ProjectedFactorKey {
+            design_id: 1,
+            factor_ptr: seed as usize,
+            rows: 1,
+            cols: 1,
+            row_stride: 1,
+            col_stride: 1,
+            value_hash: seed,
+            value_hash2: seed.wrapping_mul(31),
+        }
+    }
+
+    #[test]
+    fn projected_factor_cache_lru_evicts_oldest_under_budget() {
+        let entry_floats = 32usize;
+        let entry_bytes = entry_floats * std::mem::size_of::<f64>();
+        // Budget that fits exactly two entries — inserting a third must
+        // evict the least-recently-used one.
+        let cache = ProjectedFactorCache::with_budget(entry_bytes * 2);
+
+        let make = |seed: u64| -> Array2<f64> { Array2::from_elem((4, 8), seed as f64) };
+
+        let _a = cache.get_or_insert_with(make_factor_key(1), || make(1));
+        let _b = cache.get_or_insert_with(make_factor_key(2), || make(2));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.total_bytes(), entry_bytes * 2);
+
+        // Bump `a`'s recency so it survives the next eviction.
+        let _a_again = cache.get_or_insert_with(make_factor_key(1), || make(1));
+
+        // Inserting `c` must evict `b` (oldest), not `a` (most recent).
+        let _c = cache.get_or_insert_with(make_factor_key(3), || make(3));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.total_bytes(), entry_bytes * 2);
+
+        // `a` and `c` survive; `b` was evicted.
+        let post_a = cache.get_or_insert_with(make_factor_key(1), || make(99));
+        let post_c = cache.get_or_insert_with(make_factor_key(3), || make(99));
+        assert_eq!(post_a[[0, 0]], 1.0, "a survived eviction");
+        assert_eq!(post_c[[0, 0]], 3.0, "c is the freshly inserted entry");
+
+        let post_b = cache.get_or_insert_with(make_factor_key(2), || make(99));
+        assert_eq!(
+            post_b[[0, 0]],
+            99.0,
+            "b was evicted; recompute closure runs"
+        );
+    }
+
+    #[test]
+    fn projected_factor_cache_zero_budget_disables_eviction() {
+        let cache = ProjectedFactorCache::with_budget(0);
+        for seed in 0..16 {
+            let _ = cache.get_or_insert_with(make_factor_key(seed), || {
+                Array2::from_elem((8, 8), seed as f64)
+            });
+        }
+        assert_eq!(cache.len(), 16);
+    }
+
+    #[test]
+    fn projected_factor_cache_oversize_entry_is_cached_unconditionally() {
+        // An entry larger than the entire budget cannot be made to fit
+        // by eviction; we still cache it (refusing to cache would force
+        // a recompute on every query, defeating the cache's purpose).
+        let cache = ProjectedFactorCache::with_budget(8);
+        let huge = cache.get_or_insert_with(make_factor_key(1), || {
+            Array2::from_elem((4, 4), 1.0)
+        });
+        assert_eq!(huge[[0, 0]], 1.0);
+        assert_eq!(cache.len(), 1);
+    }
+
     struct SentinelOuterHessianOperator {
         matrix: Array2<f64>,
     }
