@@ -1454,6 +1454,230 @@ fn append_deviation_function_penalty(
 //   *fully* aliased by the anchor and would reduce to zero columns —
 //   surfaces a configuration problem at the basis-construction layer
 //   rather than allowing a silent degenerate fit.
+/// Anchor source for cross-block identifiability orthogonalisation.
+///
+/// `enforce_cross_block_identifiability_for_flex_block` reparameterises a
+/// candidate flex block so its column span at the n training rows is
+/// orthogonal to the column spans of every supplied anchor. Each anchor
+/// contributes additively to the cross-Gram normal matrix `MᵀM`, which
+/// keeps the contraction at `O(n · p_anchor · p_candidate)` per anchor
+/// without ever stacking the anchors into a single matrix.
+pub(crate) enum CrossBlockAnchor<'a> {
+    /// Parametric design (location/logslope) at the n training rows. The
+    /// transpose-matvec API computes `Aᵀ · candidate_design` column-by-
+    /// column so sparse / lazy / operator-backed designs never have to
+    /// materialise.
+    Parametric(&'a DesignMatrix),
+    /// Flex block already evaluated at the training rows (`n × p_a`).
+    /// Used when reparameterising a *later* flex block against an
+    /// *earlier* flex block (e.g. link-deviation against the now-
+    /// identifiable score-warp basis).
+    FlexEvaluation(&'a Array2<f64>),
+}
+
+/// Enforce joint-design identifiability for a single flex block by
+/// reparameterising its basis so its column span at the n training rows
+/// is orthogonal to the union of every supplied anchor's column span.
+///
+/// This is the standard GAM `gam.side` convention generalised to multiple
+/// anchor sources. After applying the resulting reparameterisation `T`,
+/// the joint design `[anchor₁ | anchor₂ | … | candidate · T]` has full
+/// numerical column rank, so `σ_min(joint H+S) ≥ λ_min(S) > 0` for every
+/// β regardless of how the linear-predictor distribution shifts during
+/// PIRLS. This eliminates the near-null direction in the joint penalised
+/// Hessian that arises whenever the candidate flex block's column span
+/// overlaps an anchor's column span (parametric span aliasing, flex-flex
+/// aliasing, or both simultaneously).
+///
+/// # Math
+///
+/// Let `C ∈ ℝⁿˣᵖᶜ` be the candidate basis evaluated at the training rows.
+/// For each anchor `Aᵢ ∈ ℝⁿˣᵖᵃⁱ`, define the cross-Gram
+/// `Mᵢ = Aᵢᵀ · C ∈ ℝᵖᵃⁱˣᵖᶜ`. Stacking gives `M = vstack(Mᵢ) ∈ ℝᵖᵃˣᵖᶜ`
+/// (`p_a = Σᵢ p_aᵢ`). The right null-space of `M` is the set of
+/// β-directions in candidate space whose target image is orthogonal to
+/// every anchor span. Equivalently, `MᵀM = Σᵢ MᵢᵀMᵢ ∈ ℝᵖᶜˣᵖᶜ` is
+/// symmetric PSD; eigenvectors with eigenvalue below a relative threshold
+/// span `null(M)`. Those eigenvectors are taken as the columns of `T`, so
+/// the new candidate basis `C · T` satisfies `Aᵢᵀ (C · T) ≈ 0` for every
+/// anchor. The runtime composes `T` into its span tables; the prepared
+/// block's design / penalties / initial β are rebuilt in the new
+/// parameterisation.
+///
+/// # Cost
+///
+/// `MᵀM` is built additively without materialising the full `M`. For
+/// dense flex anchors this is one `Aᵀ C` and one `MᵀM` matmul per source
+/// (`O(n · p_a · p_c) + O(p_a · p_c²)` flops, both negligible compared to
+/// the per-cycle dense Hessian build at biobank scale). For
+/// `DesignMatrix` parametric anchors, `Aᵀ C` is assembled column-by-
+/// column via `transpose_vector_multiply` so sparse and operator-backed
+/// designs never densify. The eigendecomposition operates on a
+/// `p_c × p_c` matrix (≲ 50 in practice).
+///
+/// # No-op fast paths
+///
+/// * Anchor list is empty, or every anchor has zero columns.
+/// * `λ_max(MᵀM) ≤ 0` — bases already perfectly orthogonal.
+/// * Threshold accepts every eigenvalue — `MᵀM` is numerically zero.
+///
+/// # Hard error
+///
+/// `T` would have zero columns (candidate basis fully aliased by the
+/// anchor union). This is a basis-construction-layer configuration
+/// problem (the candidate carries the same information as the anchors);
+/// the diagnostic surfaces it explicitly rather than letting the inner
+/// solver collide with the resulting rank-deficient Hessian.
+pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
+    candidate: &mut DeviationPrepared,
+    candidate_arg_at_training_rows: &Array1<f64>,
+    candidate_cfg: &DeviationBlockConfig,
+    anchors: &[CrossBlockAnchor<'_>],
+) -> Result<(), String> {
+    use crate::faer_ndarray::FaerEigh;
+
+    let candidate_design = candidate.runtime.design(candidate_arg_at_training_rows)?;
+    let n = candidate_design.nrows();
+    let p_candidate = candidate_design.ncols();
+    if p_candidate == 0 {
+        return Ok(());
+    }
+
+    let mut normal_gram = Array2::<f64>::zeros((p_candidate, p_candidate));
+    let mut total_anchor_cols = 0usize;
+    for anchor in anchors {
+        match anchor {
+            CrossBlockAnchor::FlexEvaluation(a) => {
+                if a.nrows() != n {
+                    return Err(format!(
+                        "cross-block identifiability: flex anchor has {} rows, candidate has {}",
+                        a.nrows(),
+                        n,
+                    ));
+                }
+                let p_a = a.ncols();
+                if p_a == 0 {
+                    continue;
+                }
+                let m = a.t().dot(&candidate_design);
+                normal_gram = normal_gram + m.t().dot(&m);
+                total_anchor_cols += p_a;
+            }
+            CrossBlockAnchor::Parametric(d) => {
+                if d.nrows() != n {
+                    return Err(format!(
+                        "cross-block identifiability: parametric anchor has {} rows, candidate has {}",
+                        d.nrows(),
+                        n,
+                    ));
+                }
+                let p_a = d.ncols();
+                if p_a == 0 {
+                    continue;
+                }
+                let mut m = Array2::<f64>::zeros((p_a, p_candidate));
+                for j in 0..p_candidate {
+                    let col = candidate_design.column(j).to_owned();
+                    let mt_col = d.transpose_vector_multiply(&col);
+                    if mt_col.len() != p_a {
+                        return Err(format!(
+                            "cross-block identifiability: parametric Aᵀv produced {} entries, expected {}",
+                            mt_col.len(),
+                            p_a,
+                        ));
+                    }
+                    m.column_mut(j).assign(&mt_col);
+                }
+                normal_gram = normal_gram + m.t().dot(&m);
+                total_anchor_cols += p_a;
+            }
+        }
+    }
+    if total_anchor_cols == 0 {
+        return Ok(());
+    }
+
+    let (eigenvalues, eigenvectors) = normal_gram
+        .eigh(faer::Side::Lower)
+        .map_err(|e| format!("cross-block identifiability eigh failed: {e}"))?;
+    let eigenvalues_slice = eigenvalues
+        .as_slice()
+        .ok_or_else(|| "cross-block identifiability eigenvalues not contiguous".to_string())?;
+    let lambda_max = eigenvalues_slice.iter().copied().fold(0.0_f64, f64::max);
+    if lambda_max <= 0.0 {
+        return Ok(());
+    }
+    // Threshold on squared singular values: `σ²` below `λ_max · 64 · n · ε²`
+    // is treated as numerical zero. Squaring the cross-Gram into `MᵀM`
+    // doubles the effective conditioning, so we widen relative to
+    // `positive_eigenvalue_threshold`'s `100 · ε · max|λ|` convention to
+    // keep borderline-orthogonal directions on the kept side. Identical
+    // to the existing per-block null-space drop convention.
+    let n_train = n as f64;
+    let null_threshold = lambda_max * (64.0 * n_train.max(1.0) * f64::EPSILON * f64::EPSILON);
+    let null_indices: Vec<usize> = eigenvalues_slice
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &lam)| (lam <= null_threshold).then_some(idx))
+        .collect();
+    if null_indices.is_empty() {
+        return Err(format!(
+            "cross-block identifiability: candidate flex basis ({} cols) is fully \
+             aliased by anchor union ({} cols). span(C) ⊆ span(A) up to numerical \
+             tolerance ({:.3e}) at the {} training rows, so zero independent \
+             directions remain after orthogonalisation. The flex configuration \
+             carries the same information as an anchor; reduce knot count, change \
+             knot configuration, or disable a redundantly-active flex block.",
+            p_candidate, total_anchor_cols, null_threshold, n,
+        ));
+    }
+    if null_indices.len() == p_candidate {
+        // `MᵀM` is numerically zero — anchors and candidate already fully
+        // orthogonal at training points. (The exact-zero case was handled
+        // by the `lambda_max <= 0.0` branch above.)
+        return Ok(());
+    }
+    let mut t_final = Array2::<f64>::zeros((p_candidate, null_indices.len()));
+    for (out_col, &in_col) in null_indices.iter().enumerate() {
+        t_final.column_mut(out_col).assign(&eigenvectors.column(in_col));
+    }
+    let kept = t_final.ncols();
+
+    candidate.runtime.compose_external_column_transform(&t_final)?;
+    // Re-evaluate at the same training-row argument used at construction so
+    // `block.design`'s row count is preserved at `n`.
+    let new_design = candidate.runtime.design(candidate_arg_at_training_rows)?;
+    let new_p = new_design.ncols();
+    debug_assert_eq!(new_p, kept);
+    debug_assert_eq!(new_design.nrows(), n);
+    candidate.block.design =
+        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(new_design));
+    candidate.block.penalties.clear();
+    candidate.block.nullspace_dims.clear();
+    let penalty_orders = resolve_deviation_operator_orders(candidate_cfg)?;
+    for order in penalty_orders {
+        append_deviation_function_penalty(&mut candidate.block, &candidate.runtime, order)?;
+    }
+    if candidate_cfg.double_penalty {
+        append_deviation_function_penalty(&mut candidate.block, &candidate.runtime, 0)?;
+    }
+    candidate.block.initial_beta = Some(Array1::zeros(new_p));
+
+    log::info!(
+        "[BMS cross-block identifiability] flex block reparameterised: \
+         kept {}/{} directions (anchor cols={}, dropped={}, training rows={}, \
+         λ_max(MᵀM)={:.3e}, drop tol={:.3e})",
+        new_p,
+        p_candidate,
+        total_anchor_cols,
+        p_candidate - new_p,
+        n,
+        lambda_max,
+        null_threshold,
+    );
+    Ok(())
+}
+
 pub(crate) fn cross_orthogonalize_link_dev_against_score_warp(
     score_warp: &DeviationPrepared,
     link_dev: &mut DeviationPrepared,
@@ -15869,11 +16093,20 @@ mod tests {
             -1.5 + 3.0 * t
         }));
         let weights = Array1::from_elem(n, 1.0);
-        let cfg = DeviationBlockConfig {
-            num_internal_knots: 4,
+        // Different knot counts ensure the candidate (link_dev) has strictly
+        // more basis directions than the anchor (score_warp), so `null(A^T C)`
+        // is guaranteed to have positive dimension and the orthogonalisation
+        // is non-trivial (not the rare full-aliasing case where every
+        // candidate direction is already captured by the anchor).
+        let score_cfg = DeviationBlockConfig {
+            num_internal_knots: 3,
             ..DeviationBlockConfig::default()
         };
-        let score_prepared = build_score_warp_deviation_block_from_seed(&z, &cfg)
+        let link_cfg = DeviationBlockConfig {
+            num_internal_knots: 5,
+            ..DeviationBlockConfig::default()
+        };
+        let score_prepared = build_score_warp_deviation_block_from_seed(&z, &score_cfg)
             .expect("score-warp fixture");
         // Use a near-affine map of `z` so the link-deviation basis evaluates
         // to functions strongly correlated with score-warp evaluations —
@@ -15881,7 +16114,7 @@ mod tests {
         let q0_seed = Array1::from_iter(z.iter().map(|zi| 0.1 + 0.45 * zi));
         let link_seed = padded_deviation_seed(&q0_seed, 1.0, 0.5);
         let mut link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
-            &link_seed, &q0_seed, &weights, &cfg,
+            &link_seed, &q0_seed, &weights, &link_cfg,
         )
         .expect("link-deviation fixture");
         let p_link_before = link_prepared.runtime.basis_dim();
