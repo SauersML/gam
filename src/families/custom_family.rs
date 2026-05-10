@@ -1808,6 +1808,34 @@ pub struct BlockwiseFitOptions {
     /// many places `BlockwiseFitOptions` is duplicated per-eval.
     pub outer_score_subsample:
         Option<Arc<crate::families::marginal_slope_shared::OuterScoreSubsample>>,
+    /// Opt-in gate for marginal-slope families to auto-derive a stratified
+    /// outer-score subsample at biobank scale (see
+    /// [`crate::families::marginal_slope_shared::auto_outer_score_subsample`]).
+    ///
+    /// **Default `false`.** Auto-subsampling makes the rho-gradient an
+    /// unbiased stochastic estimator with bounded relative variance
+    /// (≈ 1 % at the conservative defaults). That is sufficient for
+    /// rough exploratory fits but is *not* compatible with the default
+    /// `outer_tol = 1e-5` convergence target — a stochastic gradient
+    /// has a noise floor, and BFGS/ARC can keep iterating against it
+    /// without ever reducing `‖∇̂‖` below ε once the noise dominates
+    /// the signal. The optimizer will not falsely declare convergence
+    /// (it will hit `outer_max_iter` instead), but the returned ρ
+    /// will be within ≈ noise-floor of the true optimum, not tol.
+    ///
+    /// For production use in health-deployed fits, the recommended
+    /// pattern is two-stage:
+    ///   1. Phase 1: set `auto_outer_subsample = true` and a relaxed
+    ///      `outer_tol` (e.g. 1e-2) for a fast warm-up.
+    ///   2. Phase 2: clear the subsample (`outer_score_subsample = None`,
+    ///      `auto_outer_subsample = false`) and rerun BFGS from the
+    ///      Phase-1 optimum at the tight tolerance. The few full-data
+    ///      polish iterations dominate convergence accuracy without
+    ///      paying the full per-eval cost across the whole trajectory.
+    ///
+    /// When `outer_score_subsample` is already `Some(...)` the auto
+    /// path is bypassed entirely (caller-provided masks always win).
+    pub auto_outer_subsample: bool,
 }
 
 impl Default for BlockwiseFitOptions {
@@ -1838,6 +1866,7 @@ impl Default for BlockwiseFitOptions {
             line_search_prefer_workspace: false,
             early_exit_threshold: None,
             outer_score_subsample: None,
+            auto_outer_subsample: false,
         }
     }
 }
@@ -17264,6 +17293,7 @@ mod tests {
             line_search_prefer_workspace: false,
             early_exit_threshold: None,
             outer_score_subsample: None,
+            auto_outer_subsample: false,
         };
 
         let result = fit_custom_family(&OneBlockIdentityFamily, &[spec], &options)
@@ -17306,6 +17336,7 @@ mod tests {
             line_search_prefer_workspace: false,
             early_exit_threshold: None,
             outer_score_subsample: None,
+            auto_outer_subsample: false,
         };
         let per_block_log_lambdas = vec![array![10.0_f64.ln()]];
         let inner = inner_blockwise_fit(&family, &[spec], &per_block_log_lambdas, &options, None)
@@ -17351,6 +17382,7 @@ mod tests {
             line_search_prefer_workspace: false,
             early_exit_threshold: None,
             outer_score_subsample: None,
+            auto_outer_subsample: false,
         };
         let inner = inner_blockwise_fit(&family, &[spec], &[Array1::zeros(0)], &options, None)
             .expect("inner blockwise fit should succeed");
