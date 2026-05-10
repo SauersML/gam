@@ -117,7 +117,10 @@ fn scan_for_unclassified_handwavy(
         // Skip the ledger module itself, the build script, and the ledger
         // invariants test: all three legitimately mention every marker by
         // name as part of their own contract or fixture.
-        let rel_str = rel.to_string_lossy();
+        // Normalize Windows backslashes so the exemption comparison matches
+        // on every host. Without this, `src\approx_ledger.rs` slips through
+        // the filter and the scanner self-rejects on its own docstring.
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
         if rel_str == "src/approx_ledger.rs"
             || rel_str == "build.rs"
             || rel_str == "tests/approx_ledger_invariants.rs"
