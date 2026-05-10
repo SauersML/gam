@@ -26,7 +26,8 @@ use crate::families::row_kernel::{
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{
-    normal_cdf, normal_pdf, signed_probit_logcdf_and_mills_ratio, standard_normal_quantile,
+    normal_cdf, normal_logcdf, normal_pdf, signed_probit_logcdf_and_mills_ratio,
+    standard_normal_quantile,
 };
 use crate::smooth::{
     ExactJointHyperSetup, SmoothBasisSpec, SpatialLengthScaleOptimizationOptions,
@@ -2033,6 +2034,90 @@ fn pooled_probit_baseline(
     Ok((a / (1.0 + b * b).sqrt(), b))
 }
 
+// Compute a non-degenerate pilot η for the link-deviation cross-block
+// identifiability orthogonalisation.
+//
+// The rigid pooled probit pilot from `pooled_probit_baseline` is a scalar
+// pair `(a₀, b₀)`, so the rigid observed-scale linear predictor
+// `η_rigid[i] = a₀·√(1 + (s_f·b₀)²) + s_f·b₀·z[i]` is **exactly affine in z**
+// when the per-row offsets are zero. A degree-3 I-spline of an affine
+// function of `z` spans the same column space at training rows as a
+// degree-3 I-spline of `z` directly, so evaluating the link-deviation basis
+// at `η_rigid` and orthogonalising it against the score-warp basis (built
+// on `z`) produces a structurally singular cross-Gram — the candidate is
+// fully aliased even though at PIRLS time the link-deviation runtime is
+// re-evaluated at the current β-dependent η which carries genuine PC / age
+// structure that the score-warp cannot represent.
+//
+// One probit Gauss-Newton step from the rigid pilot, projected onto the
+// full marginal design at the W-IRLS working response, picks up that PC /
+// age structure cheaply (one `p_marg × p_marg` Cholesky plus a few matvecs
+// — `<<1 s` at biobank scale because `p_marg` is `O(10²)` whereas the
+// PIRLS dense Hessian build is `O(n·p²)` per cycle). The resulting
+// `η_pilot[i]` has the same row-by-row variation pattern PIRLS will see at
+// any non-degenerate β, so the orthogonalisation transform `T` drops only
+// the directions that are aliased *across all* β, not those that are
+// aliased only at the rigid (rank-1-in-z) pilot.
+fn pilot_eta_for_link_dev_orthogonalisation(
+    base_link: &InverseLink,
+    y: &Array1<f64>,
+    z: &Array1<f64>,
+    weights: &Array1<f64>,
+    marginal_design: &DesignMatrix,
+    marginal_offset: &Array1<f64>,
+    logslope_offset: &Array1<f64>,
+    baseline_marginal: f64,
+    baseline_logslope: f64,
+    probit_scale: f64,
+) -> Result<Array1<f64>, String> {
+    use crate::faer_ndarray::FaerCholesky;
+
+    let n = y.len();
+    if marginal_design.nrows() != n {
+        return Err(format!(
+            "pilot_eta_for_link_dev_orthogonalisation: marginal design has {} rows, expected {}",
+            marginal_design.nrows(),
+            n,
+        ));
+    }
+    let mut working_eta = Array1::<f64>::zeros(n);
+    let mut w_irls = Array1::<f64>::zeros(n);
+    let mut residual = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let a_pre = baseline_marginal + marginal_offset[i];
+        let b_pre = baseline_logslope + logslope_offset[i];
+        let q_marg = bernoulli_marginal_link_map(base_link, a_pre)
+            .map_err(|e| {
+                format!("pilot_eta_for_link_dev_orthogonalisation marginal link map: {e}")
+            })?
+            .q;
+        let eta = rigid_observed_eta(q_marg, b_pre, z[i], probit_scale);
+        working_eta[i] = eta;
+        let mu = clamp_bernoulli_link_probability(normal_cdf(eta));
+        let phi = normal_pdf(eta).max(1e-300);
+        let var = (mu * (1.0 - mu)).max(1e-300);
+        w_irls[i] = weights[i] * (phi * phi) / var;
+        residual[i] = (y[i] - mu) / phi;
+    }
+    let p_marg = marginal_design.ncols();
+    if p_marg == 0 {
+        return Ok(working_eta);
+    }
+    let xtwr = marginal_design.compute_xtwy(&w_irls, &residual)?;
+    let mut xtwx = marginal_design.compute_xtwx(&w_irls)?;
+    let trace_diag: f64 = (0..p_marg).map(|i| xtwx[[i, i]]).sum();
+    let ridge = (trace_diag / p_marg as f64).max(1e-12) * 1e-6;
+    for i in 0..p_marg {
+        xtwx[[i, i]] += ridge;
+    }
+    let factor = xtwx
+        .cholesky(faer::Side::Lower)
+        .map_err(|e| format!("pilot_eta_for_link_dev_orthogonalisation Cholesky failed: {e}"))?;
+    let delta_beta_marg = factor.solvevec(&xtwr);
+    let marg_contrib = marginal_design.dot(&delta_beta_marg);
+    Ok(&working_eta + &marg_contrib)
+}
+
 fn joint_setup(
     data: ArrayView2<'_, f64>,
     marginalspec: &TermCollectionSpec,
@@ -2246,31 +2331,174 @@ fn unary_derivatives_reciprocal(x: f64) -> [f64; 5] {
     [1.0 / x1, -1.0 / x2, 2.0 / x3, -6.0 / x4, 24.0 / x5]
 }
 
+/// Streaming log-sum-exp update: accumulate `exp(log_term)` into a running
+/// `(log_max, sum)` pair representing `Σ exp(log_term_i) = exp(log_max) · sum`.
+///
+/// When `log_term` exceeds the running max, the partial sum is rescaled in
+/// place so the new max becomes the reference point. This keeps everything
+/// inside the dynamic range of f64 with no allocation.
+#[inline]
+fn lse_accumulate(log_max: &mut f64, sum: &mut f64, log_term: f64) {
+    if !log_term.is_finite() {
+        return;
+    }
+    if log_term > *log_max {
+        if log_max.is_finite() {
+            *sum = *sum * (*log_max - log_term).exp() + 1.0;
+        } else {
+            *sum = 1.0;
+        }
+        *log_max = log_term;
+    } else {
+        *sum += (log_term - *log_max).exp();
+    }
+}
+
+/// Log-space residual evaluator for the empirical-frailty intercept calibration.
+///
+/// Solves, in log-space, the strictly-increasing equation
+///
+///   F(a) = log Σᵢ wᵢ Φ(a + b·zᵢ) − log μ★ = 0,
+///
+/// where `b = rigid_observed_logslope(slope, probit_scale)` and `(zᵢ, wᵢ)` are
+/// the supplied quadrature nodes and (positive) weights.
+///
+/// Mathematical structure of `F`:
+///   • `F ∈ C^∞(ℝ)`.
+///   • `F` is strictly increasing: `F'(a) = (Σ wᵢ φᵢ) / (Σ wᵢ Φᵢ) > 0` everywhere.
+///   • `F(a) → −∞` as `a → −∞`; `F(a) → log(Σ wᵢ) − log μ★ ≥ 0` as `a → +∞`.
+///   • Unique root `a★ ∈ ℝ` exists for every `μ★ ∈ (0, 1)`.
+///
+/// Why log-space: the linear-space residual `Σ wᵢ Φᵢ − μ★` and its derivative
+/// `Σ wᵢ φᵢ` are sums of strictly-positive `exp(−η²/2)`-scaled terms. When the
+/// seed `a` puts every quadrature node `ηᵢ = a + b·zᵢ` into the deep tail
+/// (|ηᵢ| ≳ 38), every term rounds to 0.0 in IEEE-754 and the derivative
+/// underflows to exactly zero — destroying Newton's update direction.  The
+/// log-space formulation evaluates `log φ(η) = −η²/2 − ½ log 2π` (always finite
+/// for any finite η) and `log Φ(η)` via the `erfcx`-based `normal_logcdf`
+/// (also always finite for any finite η).  All sums are accumulated by
+/// streaming log-sum-exp, so `F`, `F'`, and `F''` are finite for every finite
+/// `a` and the global Newton/Halley iteration converges from any seed.
+///
+/// Returns `(F, F', F'')`.  In the deep left tail Newton converges linearly
+/// (Mills ratio: `F'(a) ≈ |a|`, step ≈ `|a|/2`); near the root convergence is
+/// quadratic with Newton or cubic with Halley.
 fn empirical_rigid_calibration_eval(
     intercept: f64,
-    target_mu: f64,
+    log_target_mu: f64,
     slope: f64,
     probit_scale: f64,
     nodes: &[f64],
     weights: &[f64],
 ) -> Result<(f64, f64, f64), String> {
-    let observed_slope = rigid_observed_logslope(slope, probit_scale);
-    let mut f = -target_mu;
-    let mut f_a = 0.0;
-    let mut f_aa = 0.0;
-    for (&node, &weight) in nodes.iter().zip(weights.iter()) {
-        let eta = intercept + observed_slope * node;
-        let pdf = normal_pdf(eta);
-        f += weight * normal_cdf(eta);
-        f_a += weight * pdf;
-        f_aa -= weight * eta * pdf;
-    }
-    if !(f.is_finite() && f_a.is_finite() && f_aa.is_finite() && f_a > 0.0) {
+    if !intercept.is_finite() {
         return Err(format!(
-            "empirical latent calibration produced invalid root state: f={f}, f_a={f_a}, f_aa={f_aa}"
+            "empirical latent calibration: non-finite intercept {intercept}"
         ));
     }
-    Ok((f, f_a, f_aa))
+    let observed_slope = rigid_observed_logslope(slope, probit_scale);
+    const HALF_LOG_2PI: f64 = 0.918_938_533_204_672_8; // 0.5 * ln(2π)
+
+    // Streaming LSE accumulators for log Σ wᵢ φᵢ and log Σ wᵢ Φᵢ.
+    let mut log_max_phi = f64::NEG_INFINITY;
+    let mut sum_phi = 0.0_f64;
+    let mut log_max_cdf = f64::NEG_INFINITY;
+    let mut sum_cdf = 0.0_f64;
+
+    // Streaming signed LSE for Σ wᵢ ηᵢ φᵢ, split into positive and negative
+    // legs so the cancellation `pos − neg` happens once at the end on a
+    // finite, well-scaled remainder.
+    let mut log_max_pos = f64::NEG_INFINITY;
+    let mut sum_pos = 0.0_f64;
+    let mut log_max_neg = f64::NEG_INFINITY;
+    let mut sum_neg = 0.0_f64;
+
+    for (&node, &weight) in nodes.iter().zip(weights.iter()) {
+        if !(weight.is_finite() && weight > 0.0) {
+            continue;
+        }
+        let eta = intercept + observed_slope * node;
+        if !eta.is_finite() {
+            return Err(format!(
+                "empirical latent calibration: non-finite η at intercept={intercept}, slope={slope}, node={node}"
+            ));
+        }
+        let log_w = weight.ln();
+        let log_phi = -0.5 * eta * eta - HALF_LOG_2PI;
+        let log_term_phi = log_w + log_phi;
+        let log_term_cdf = log_w + normal_logcdf(eta);
+
+        lse_accumulate(&mut log_max_phi, &mut sum_phi, log_term_phi);
+        lse_accumulate(&mut log_max_cdf, &mut sum_cdf, log_term_cdf);
+
+        if eta != 0.0 {
+            let log_term_eta_phi = log_term_phi + eta.abs().ln();
+            if eta > 0.0 {
+                lse_accumulate(&mut log_max_pos, &mut sum_pos, log_term_eta_phi);
+            } else {
+                lse_accumulate(&mut log_max_neg, &mut sum_neg, log_term_eta_phi);
+            }
+        }
+    }
+
+    if !(sum_phi.is_finite() && sum_cdf.is_finite() && sum_phi > 0.0 && sum_cdf > 0.0) {
+        return Err(format!(
+            "empirical latent calibration: log-space accumulation failed (sum_phi={sum_phi}, sum_cdf={sum_cdf}, intercept={intercept})"
+        ));
+    }
+
+    let log_s_phi = log_max_phi + sum_phi.ln();
+    let log_s_cdf = log_max_cdf + sum_cdf.ln();
+
+    // F = log Σ wᵢ Φᵢ − log μ★
+    let f = log_s_cdf - log_target_mu;
+    // F' = exp(log Σ wᵢ φᵢ − log Σ wᵢ Φᵢ).
+    //
+    // F' is mathematically strictly positive everywhere — `Σ wᵢ φᵢ` and
+    // `Σ wᵢ Φᵢ` are both sums of strictly-positive terms with positive weights.
+    // In the far right tail, Mills ratio gives `φᵢ/Φᵢ → 0` exponentially, so
+    // `log F' → −∞` and `(log F').exp()` IEEE-underflows to 0.0. Mathematically
+    // it is a tiny positive number; floor it at `f64::MIN_POSITIVE` so the
+    // monotone-root solver sees a strictly-positive derivative and routes
+    // through its bracket-by-doubling phase (which only needs the *sign* of
+    // `F'`, not its magnitude). Newton would propose `Δa = −F/F' = ±∞`, the
+    // solver detects that and falls through to bracketing automatically.
+    let log_f_prime = log_s_phi - log_s_cdf;
+    let f_prime = if log_f_prime > -740.0 {
+        log_f_prime.exp()
+    } else {
+        f64::MIN_POSITIVE
+    };
+
+    // F'' = (d/da)(S_φ/S_Φ) = (S_φ' S_Φ − S_φ²)/S_Φ²
+    //     = −(Σ wᵢ ηᵢ φᵢ)/S_Φ − (F')²
+    // The η-weighted sum is cancellation-prone; combine its positive and
+    // negative legs against the same `log_s_cdf` reference so the subtraction
+    // happens on dimensionless quantities of bounded magnitude. When the ratio
+    // also underflows (deep tail), the result is a clean numerical zero —
+    // Halley reduces to Newton, which is what the solver does anyway.
+    let exp_safe = |log_x: f64| -> f64 {
+        if log_x > -740.0 { log_x.exp() } else { 0.0 }
+    };
+    let pos_over_cdf = if sum_pos > 0.0 {
+        exp_safe(log_max_pos + sum_pos.ln() - log_s_cdf)
+    } else {
+        0.0
+    };
+    let neg_over_cdf = if sum_neg > 0.0 {
+        exp_safe(log_max_neg + sum_neg.ln() - log_s_cdf)
+    } else {
+        0.0
+    };
+    let s_etaphi_over_s_cdf = pos_over_cdf - neg_over_cdf;
+    let f_double_prime = -s_etaphi_over_s_cdf - f_prime * f_prime;
+
+    if !(f.is_finite() && f_prime.is_finite() && f_prime > 0.0 && f_double_prime.is_finite()) {
+        return Err(format!(
+            "empirical latent calibration: non-finite log-space state f={f}, f'={f_prime}, f''={f_double_prime} at intercept={intercept}"
+        ));
+    }
+    Ok((f, f_prime, f_double_prime))
 }
 
 pub(crate) fn empirical_intercept_from_marginal(
@@ -2287,15 +2515,19 @@ pub(crate) fn empirical_intercept_from_marginal(
             "empirical latent calibration requires target mu in (0,1), got {target_mu}"
         ));
     }
+    let log_target_mu = target_mu.ln();
     let seed =
         initial.unwrap_or_else(|| rigid_intercept_from_marginal(target_q, slope, probit_scale));
     let eval = |a: f64| {
-        empirical_rigid_calibration_eval(a, target_mu, slope, probit_scale, nodes, weights)
+        empirical_rigid_calibration_eval(a, log_target_mu, slope, probit_scale, nodes, weights)
     };
-    // Newton/Halley converges quadratically from the closed-form Gaussian seed
-    // (residual hits ~1e-15 in 3 iters), so we tighten the solver contract to
-    // 1e-13 — calibration callers can then assert <=1e-10 robustly.
-    let abs_tol = 1e-13_f64.max(4.0 * f64::EPSILON * target_mu.abs());
+    // Convergence is on the log-space residual |F| = |log Σ wᵢ Φᵢ − log μ★|.
+    // Near the root this is the relative error in the calibrated probability,
+    // so 1e-13 in log-space corresponds to absolute residual μ★ · 1e-13 in
+    // linear space — strictly tighter than the legacy 1e-13 absolute tolerance
+    // for every μ★ ∈ (0, 1). The 4·ε floor keeps the contract meaningful when
+    // μ★ approaches 1 (where log Σ Φᵢ approaches 0).
+    let abs_tol = 1e-13_f64.max(4.0 * f64::EPSILON);
     let (root, _, f_best) = super::monotone_root::solve_monotone_root(
         eval,
         seed,
@@ -2306,7 +2538,7 @@ pub(crate) fn empirical_intercept_from_marginal(
     )?;
     if f_best.abs() > abs_tol {
         return Err(format!(
-            "empirical latent intercept solve failed: residual={f_best:.3e} at a={root:.6}, target mu={target_mu:.6}"
+            "empirical latent intercept solve failed: log-residual={f_best:.3e} at a={root:.6}, target mu={target_mu:.6}"
         ));
     }
     Ok(root)
@@ -15365,33 +15597,48 @@ pub fn fit_bernoulli_marginal_slope_terms(
     } else {
         None
     };
-    // Build the link-deviation block if requested.  The seed only determines
-    // knot placement for the deviation basis, so we use the closed-form
-    // pooled-intercept probit solution instead of a full rigid pilot solve
-    // (which would double total work at biobank scale):
-    //   q0 ≈ a0 · √(1 + (s_f b0)²) + s_f b0 · z[i]
-    // where b0 is the frailty-adjusted rigid logslope seed.
-    // Build the link-deviation block. When score-warp is also active, apply
-    // the cross-block identifiability transform inline so the resulting
-    // `link_dev_prepared` already lives in the joint-orthogonal
-    // parameterisation — every later consumer (the family runtime, the
-    // block-spec pusher, hints, prediction-time runtime clones) sees the
-    // reparameterised basis without further bookkeeping.
+    // Build the link-deviation block. The basis lives in η-space, and at
+    // PIRLS time `runtime.design(η_current)` is re-evaluated at the
+    // current β-dependent η, so the basis is genuinely β-dependent during
+    // optimisation. The construction-time seed is used only for (a) knot
+    // placement in η-space and (b) the cross-block identifiability check
+    // that computes the basis-space transform `T` orthogonalising the
+    // candidate against the parametric and score-warp anchors at training
+    // rows.
+    //
+    // Using the rigid pooled probit pilot directly (`q0 = a₀·√(…) + s_f·
+    // b₀·z`) is structurally degenerate: with zero per-row offsets it is
+    // affine in z, so a degree-3 I-spline of `q0` spans the same column
+    // space at training rows as a degree-3 I-spline of z, and the cross-
+    // block check finds the candidate fully aliased by the score-warp
+    // anchor even though at any non-rigid β the link-deviation carries
+    // PC/age structure the score-warp cannot represent.
+    //
+    // Instead, seed both knot placement and the orthogonalisation pivot at
+    // a non-rigid pilot η computed via one probit Gauss-Newton step from
+    // the rigid pilot onto the full marginal design (see
+    // `pilot_eta_for_link_dev_orthogonalisation`). The pilot is row-varying
+    // in PCs/age and the resulting `T` drops only directions aliased
+    // across all β. The score-warp basis at training rows is also threaded
+    // in as a flex anchor when active so the kept directions are jointly
+    // orthogonal to parametric ⊕ score-warp.
     let link_dev_prepared = if let Some(cfg) = spec.link_dev.as_ref() {
-        let q0_seed = Array1::from_iter((0..spec.z.len()).map(|row| {
-            let a0 = bernoulli_marginal_link_map(
-                &spec.base_link,
-                baseline.0 + spec.marginal_offset[row],
-            )
-            .expect("validated bernoulli marginal base link should produce finite pilot q")
-            .q;
-            let b0 = baseline.1 + spec.logslope_offset[row];
-            rigid_observed_eta(a0, b0, spec.z[row], probit_scale)
-        }));
-        let link_dev_seed = padded_deviation_seed(&q0_seed, 1.0, 0.5);
+        let eta_pilot = pilot_eta_for_link_dev_orthogonalisation(
+            &spec.base_link,
+            &spec.y,
+            &spec.z,
+            &spec.weights,
+            &marginal_design.design,
+            &spec.marginal_offset,
+            &spec.logslope_offset,
+            baseline.0,
+            baseline.1,
+            probit_scale,
+        )?;
+        let link_dev_seed = padded_deviation_seed(&eta_pilot, 1.0, 0.5);
         let mut prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
             &link_dev_seed,
-            &q0_seed,
+            &eta_pilot,
             &spec.weights,
             cfg,
         )?;
@@ -15429,7 +15676,12 @@ pub fn fit_bernoulli_marginal_slope_terms(
             anchors.push(CrossBlockAnchor::FlexEvaluation(a));
         }
         let _ = link_dev_seed; // padded knot-seed retained only for knot construction
-        enforce_cross_block_identifiability_for_flex_block(&mut prepared, &q0_seed, cfg, &anchors)?;
+        enforce_cross_block_identifiability_for_flex_block(
+            &mut prepared,
+            &eta_pilot,
+            cfg,
+            &anchors,
+        )?;
         Some(prepared)
     } else {
         None
@@ -23254,6 +23506,82 @@ mod tests {
         assert!((empirical_mu - target_mu).abs() <= 1e-10);
     }
 
+    /// Pathological warm-start: a stale cached intercept buried so deep in
+    /// the left tail that every quadrature node `ηᵢ = a + b·zᵢ` underflows
+    /// `φ(ηᵢ)` and `Φ(ηᵢ)` to exactly zero in linear arithmetic. The legacy
+    /// linear-space evaluator computed `f' = Σ wᵢ φᵢ = 0.0` and rejected the
+    /// state as invalid; the log-space reformulation evaluates `log Φ(η)` via
+    /// `erfcx` with full precision in any tail and produces a globally
+    /// monotone, finite-derivative residual that the monotone-root solver
+    /// can drive back to the basin from any seed. This exercises that path
+    /// directly so a regression to the linear-space formulation breaks here.
+    #[test]
+    fn empirical_intercept_recovers_from_deep_tail_warm_start() {
+        let nodes = vec![-2.0, -0.25, 0.5, 3.0];
+        let weights = vec![0.2, 0.3, 0.1, 0.4];
+        let target_q = -0.35;
+        let target_mu = normal_cdf(target_q);
+        let slope = 0.8;
+        let scale = 0.9;
+        // Warm start at a = -100: every η = -100 + 0.72·z lies in the deep
+        // left tail, where linear-space φ and Φ both round to 0.0 in IEEE-754.
+        let stale_warm_start = Some(-100.0_f64);
+        let intercept = empirical_intercept_from_marginal(
+            target_mu,
+            target_q,
+            slope,
+            scale,
+            &nodes,
+            &weights,
+            stale_warm_start,
+        )
+        .expect("empirical intercept must recover from deep-tail warm start");
+        let calibrated = nodes
+            .iter()
+            .zip(weights.iter())
+            .map(|(&node, &weight)| weight * normal_cdf(intercept + scale * slope * node))
+            .sum::<f64>();
+        assert!(
+            (calibrated - target_mu).abs() <= 1e-10,
+            "calibrated mu={calibrated} should match target_mu={target_mu} from any seed"
+        );
+    }
+
+    /// Same recovery contract on the right tail (a +∞-side stale warm start),
+    /// where it is `1 − Φ` that underflows in linear arithmetic. The
+    /// log-space residual is bounded above by `−log μ★ < ∞`, and the natural
+    /// Newton step in this region is small (`F'(a) → 0` slowly), so the
+    /// solver still drives `F → 0` from any seed.
+    #[test]
+    fn empirical_intercept_recovers_from_far_right_warm_start() {
+        let nodes = vec![-2.0, -0.25, 0.5, 3.0];
+        let weights = vec![0.2, 0.3, 0.1, 0.4];
+        let target_q = -0.35;
+        let target_mu = normal_cdf(target_q);
+        let slope = 0.8;
+        let scale = 0.9;
+        let stale_warm_start = Some(50.0_f64);
+        let intercept = empirical_intercept_from_marginal(
+            target_mu,
+            target_q,
+            slope,
+            scale,
+            &nodes,
+            &weights,
+            stale_warm_start,
+        )
+        .expect("empirical intercept must recover from far-right warm start");
+        let calibrated = nodes
+            .iter()
+            .zip(weights.iter())
+            .map(|(&node, &weight)| weight * normal_cdf(intercept + scale * slope * node))
+            .sum::<f64>();
+        assert!(
+            (calibrated - target_mu).abs() <= 1e-10,
+            "calibrated mu={calibrated} should match target_mu={target_mu} from any seed"
+        );
+    }
+
     #[test]
     fn auto_latent_measure_preserves_standard_normal_fast_path() {
         let n = 2001usize;
@@ -24465,4 +24793,76 @@ mod tests {
         let rel = rel_diff_array2(&scaled, &exp);
         assert!(rel < 1e-12, "joint Hessian dH HT rel {}", rel);
     }
+
+#[test]
+    fn factor_spectrum_analysis_small() {
+        use crate::estimate::reml::unified::PseudoLogdetMode;
+        use crate::linalg::faer_ndarray::FaerEigh;
+        
+        // Use small n=100 fixture
+        let (family, states, _cache, _direction) = 
+            flex_hessian_matvec_fixture(100).expect("fixture");
+        
+        // Build joint Hessian like batched_outer_gradient_terms does
+        let h = family.exact_newton_joint_hessian(&states)
+            .expect("hessian compute")
+            .expect("hessian exists");
+        
+        let p = h.nrows();
+        println!("[SPECTRUM] Joint Hessian: p={}", p);
+        
+        // Add a small regularization (like ridge floor from options)
+        let mut h_reg = h.clone();
+        let ridge = 1e-10;
+        for i in 0..p {
+            h_reg[[i, i]] += ridge;
+        }
+        
+        // Build DenseSpectralOperator
+        let spectral = DenseSpectralOperator::from_symmetric_with_mode(
+            &h_reg,
+            PseudoLogdetMode::Smooth
+        ).expect("spectral operator");
+        
+        // Get the g_factor (logdet gradient factor)
+        let factor = spectral.logdet_gradient_factor();
+        println!("[SPECTRUM] Factor shape: {}x{}", factor.nrows(), factor.ncols());
+        
+        // Compute F F^T and get its SVD
+        let fft = factor.t().dot(factor);
+        println!("[SPECTRUM] F F^T computed, shape: {}x{}", fft.nrows(), fft.ncols());
+        
+        // Compute eigenvalues of F F^T (these are squares of singular values of F)
+        let (eigenvalues, _) = fft
+            .eigh(faer::Side::Lower)
+            .expect("eigendecomposition of F F^T");
+        
+        let mut eigvals_sorted: Vec<f64> = eigenvalues.as_slice().unwrap().to_vec();
+        eigvals_sorted.sort_by(|a: &f64, b: &f64| b.partial_cmp(a).unwrap());
+        
+        let total_trace: f64 = eigvals_sorted.iter().sum();
+        println!("[SPECTRUM] Total trace(F F^T) = {}", total_trace);
+        
+        // Print spectrum
+        println!("[SPECTRUM] Singular values (as sqrt of eigenvalues):");
+        for (i, &eig) in eigvals_sorted.iter().take(20.min(p)).enumerate() {
+            let sigma = eig.sqrt();
+            let cumsum: f64 = eigvals_sorted.iter().take(i+1).sum::<f64>() / total_trace;
+            println!("  sigma[{}] = {:e}  cumsum = {}", i, sigma, cumsum);
+        }
+        
+        // Report cumulative trace mass at key truncations
+        let check_ranks = vec![5, 10, 20, 40, p/2, p];
+        println!("\n[SPECTRUM] Cumulative trace mass at truncations:");
+        for r_prime in check_ranks {
+            if r_prime > p {
+                continue;
+            }
+            let partial: f64 = eigvals_sorted.iter().take(r_prime).sum();
+            let ratio = partial / total_trace;
+            println!("  r_prime={}: {}", r_prime, ratio);
+        }
+    }
+
+
 }
