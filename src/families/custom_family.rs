@@ -8609,7 +8609,7 @@ fn load_joint_gradient_evaluation<F: CustomFamily + Clone + Send + Sync + 'stati
     }
     let eval = family.evaluate(states)?;
     let log_likelihood = eval.log_likelihood;
-    let gradient = exact_newton_joint_gradient_from_eval(&eval, specs)?;
+    let gradient = exact_newton_joint_gradient_from_eval(&eval, specs, states)?;
     Ok((log_likelihood, gradient, Some(eval), workspace))
 }
 
@@ -10240,10 +10240,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // Re-evaluate at current β to get the joint gradient and Hessian.
             refresh_all_block_etas(family, specs, &mut states)?;
             let eval_for_polish = family.evaluate(&states)?;
-            let grad_full = match exact_newton_joint_gradient_from_eval(&eval_for_polish, specs)? {
-                Some(g) => g,
-                None => break,
-            };
+            let grad_full =
+                match exact_newton_joint_gradient_from_eval(&eval_for_polish, specs, &states)? {
+                    Some(g) => g,
+                    None => break,
+                };
             let h_joint_opt = family.exact_newton_joint_hessian(&states)?;
             let Some(h_joint) = h_joint_opt else { break };
             let mut h_dense = match symmetrized_square_matrix(
@@ -14500,6 +14501,7 @@ fn exact_newton_joint_stationarity_inf_norm<F: CustomFamily + ?Sized>(
 fn exact_newton_joint_gradient_from_eval(
     eval: &FamilyEvaluation,
     specs: &[ParameterBlockSpec],
+    states: &[ParameterBlockState],
 ) -> Result<Option<Array1<f64>>, String> {
     if eval.blockworking_sets.len() != specs.len() {
         return Err(format!(
@@ -14508,28 +14510,86 @@ fn exact_newton_joint_gradient_from_eval(
             specs.len()
         ));
     }
+    if states.len() != specs.len() {
+        return Err(format!(
+            "exact-newton joint gradient extraction: state count {} does not match spec count {}",
+            states.len(),
+            specs.len()
+        ));
+    }
     let total_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
     let mut gradient = Array1::<f64>::zeros(total_p);
     let mut offset = 0usize;
-    for (spec, work) in specs.iter().zip(eval.blockworking_sets.iter()) {
+    for ((spec, work), state) in specs
+        .iter()
+        .zip(eval.blockworking_sets.iter())
+        .zip(states.iter())
+    {
         let width = spec.design.ncols();
-        let BlockWorkingSet::ExactNewton {
-            gradient: block_gradient,
-            ..
-        } = work
-        else {
-            return Ok(None);
-        };
-        if block_gradient.len() != width {
-            return Err(format!(
-                "exact-newton joint gradient extraction: block gradient length mismatch, got {}, expected {}",
-                block_gradient.len(),
-                width
-            ));
+        match work {
+            BlockWorkingSet::ExactNewton {
+                gradient: block_gradient,
+                ..
+            } => {
+                if block_gradient.len() != width {
+                    return Err(format!(
+                        "exact-newton joint gradient extraction: block gradient length mismatch, got {}, expected {}",
+                        block_gradient.len(),
+                        width
+                    ));
+                }
+                gradient
+                    .slice_mut(ndarray::s![offset..offset + width])
+                    .assign(block_gradient);
+            }
+            BlockWorkingSet::Diagonal {
+                working_response,
+                working_weights,
+            } => {
+                // Recover the per-block log-likelihood score from the IRLS
+                // working set.  By construction of the IRLS pseudo-response
+                //
+                //     z_i = η_i + (∂ℓ/∂η_i) / w_i,
+                //
+                // so the row score is `w_i (z_i − η_i)` and the
+                // coefficient-space score is
+                //
+                //     ∇_β_b log L = X_b^T (w ⊙ (z − η)).
+                //
+                // Without this branch the joint-Newton path is unable to
+                // assemble its RHS for families that emit Diagonal working
+                // sets alongside an exact joint Hessian (e.g. Gaussian
+                // location-scale): the inner fit returns non-converged, and
+                // the outer evaluator falls into the nonconverged-result
+                // branch and reports a zero outer gradient.
+                let n = working_response.len();
+                if working_weights.len() != n || state.eta.len() != n || spec.design.nrows() != n {
+                    return Err(format!(
+                        "exact-newton joint gradient extraction: diagonal working-set length mismatch (z={}, w={}, η={}, X_rows={})",
+                        working_response.len(),
+                        working_weights.len(),
+                        state.eta.len(),
+                        spec.design.nrows()
+                    ));
+                }
+                let mut weighted = Array1::<f64>::zeros(n);
+                for i in 0..n {
+                    weighted[i] = working_weights[i] * (working_response[i] - state.eta[i]);
+                }
+                let block_gradient =
+                    <DesignMatrix as LinearOperator>::apply_transpose(&spec.design, &weighted);
+                if block_gradient.len() != width {
+                    return Err(format!(
+                        "exact-newton joint gradient extraction: diagonal block transpose length mismatch, got {}, expected {}",
+                        block_gradient.len(),
+                        width
+                    ));
+                }
+                gradient
+                    .slice_mut(ndarray::s![offset..offset + width])
+                    .assign(&block_gradient);
+            }
         }
-        gradient
-            .slice_mut(ndarray::s![offset..offset + width])
-            .assign(block_gradient);
         offset += width;
     }
     Ok(Some(gradient))
