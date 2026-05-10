@@ -9657,22 +9657,17 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     // call returns Err / +∞, BFGS κ-optim backs off the divergent ρ
     // region, and the outer loop progresses instead of grinding.
 
-    // Per-block trust-region radius in β-space. Mirrors the
-    // joint-Newton `max_joint_step` for the same reason: blockwise
-    // historically used a static `MAX_NEWTON_STEP = 20.0` cap that
-    // conflated η-overflow safety with Newton-model trust. The η-safety
-    // half belongs in the family's `max_feasible_step_size` barrier
-    // check (already invoked inside the line search below); this
-    // variable handles only the algorithmic trust-region half. The
-    // family-supplied initial value is the floor (the family itself
-    // declares it safe for a fresh fit). Without explicit rho
-    // computation per block, the proxy "α=1 line-search acceptance with
-    // the proposal clamped at the cap" plays the rho > 0.75 role: it
-    // certifies both that the model was trustworthy at full step and
-    // that the cap was the binding constraint. Standard 2.0 grow / 0.5
-    // shrink. No artificial ceiling — line-search rejection halves the
-    // cap if it ever exceeds what the family can tolerate, so runaway
-    // is bounded by the same mechanism that bounds the joint path.
+    // Per-block trust-region radius in β-space. Updated each cycle by
+    // `update_joint_trust_region_radius` (the same function the
+    // joint-Newton path uses) on a real model-vs-truth rho computed
+    // from each block's penalized quadratic. The η-overflow safety
+    // half of the previous static `MAX_NEWTON_STEP = 20.0` is owned by
+    // the family's `max_feasible_step_size` barrier check, called by
+    // the line search below; this variable handles only the
+    // algorithmic trust-region half. The initial seed value is the
+    // family-declared safe step for a fresh fit; the function then
+    // adapts it freely (clamped to [1e-12, 1e6] by the function
+    // itself, same as the joint path).
     const BLOCK_NEWTON_STEP_INITIAL: f64 = 20.0;
     let mut block_max_step: Vec<f64> = vec![BLOCK_NEWTON_STEP_INITIAL; specs.len()];
 
@@ -9773,28 +9768,29 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let beta_new = family.post_update_block_beta(&states, b, spec, beta_new_raw)?;
             let beta_old = states[b].beta.clone();
             let raw_delta = &beta_new - &beta_old;
-            // Trust region: cap the infinity-norm of the Newton step to
-            // prevent eta from jumping into regions where exp() overflows.
-            // The cap is generous enough to never slow normal convergence
-            // on typical-scale problems (a coefficient change of 20 means
-            // exp(eta) changes by ~5e8) but prevents catastrophic jumps
-            // to eta > 700. The cap is per-block adaptive — see the
-            // declaration of `block_max_step` outside the cycle loop.
-            // Falls back to the family-safe initial floor whenever the
-            // line search rejects or has to cut α hard.
-            const MAX_NEWTON_STEP: f64 = BLOCK_NEWTON_STEP_INITIAL;
+            // Per-block trust-region radius in β-space. The cap is the
+            // current value of `block_max_step[b]`, updated below via
+            // `update_joint_trust_region_radius` (the same function the
+            // joint-Newton path uses) once we know rho. No hand-rolled
+            // step-sizing logic here.
             let block_cap = block_max_step[b];
-            let step_inf = raw_delta
+            let raw_step_inf = raw_delta
                 .iter()
                 .copied()
                 .map(f64::abs)
                 .fold(0.0_f64, f64::max);
-            let raw_step_inf = step_inf;
-            let delta = if step_inf > block_cap {
-                &raw_delta * (block_cap / step_inf)
+            let delta = if raw_step_inf > block_cap {
+                &raw_delta * (block_cap / raw_step_inf)
             } else {
                 raw_delta
             };
+            let step_inf = raw_step_inf.min(block_cap);
+            // Capture the objective at the start of this block update so
+            // we can compute the true `actual_reduction` once the line
+            // search has finished. `objective_cycle_prev` is the running
+            // total: it advances inside the line search whenever a trial
+            // is accepted, so we must snapshot it here.
+            let obj_before_block = objective_cycle_prev;
             let old_block_penalty =
                 block_quadratic_penalty(&beta_old, s_lambda, ridge, options.ridge_policy);
             let step = delta.iter().copied().map(f64::abs).fold(0.0, f64::max);
@@ -9865,22 +9861,76 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     break;
                 }
             }
-            // Trust-region update for this block's β-space cap. The
-            // line-search outcome plays the rho role:
-            //   * α=1 accepted with proposal at the cap → model was
-            //     trustworthy at full step AND the cap was the binding
-            //     constraint, so double the cap (standard TR growth).
-            //   * α≤1/8 (heavy backtrack) or line search failed → the
-            //     model misled us at this scale, halve the cap (standard
-            //     TR shrink) but never undercut the family floor.
-            //   * Otherwise (full step accepted but not at cap, or mild
-            //     backtracking) → cap is well-sized, leave it.
-            let was_clamped = raw_step_inf >= 0.95 * block_cap;
-            if accepted && accepted_bt == 0 && was_clamped {
-                block_max_step[b] *= 2.0;
-            } else if !accepted || accepted_bt >= 3 {
-                block_max_step[b] = (block_max_step[b] * 0.5).max(BLOCK_NEWTON_STEP_INITIAL);
-            }
+            // Trust-region update for this block, using the same
+            // `update_joint_trust_region_radius` strategy the
+            // joint-Newton path uses. Predicted reduction is computed
+            // from the per-block penalized quadratic model:
+            //
+            //   Q(β + αδ) ≈ Q(β) − α·rhs·δ + 0.5·α²·δ·H_pen·δ
+            //   predicted_reduction(α) = α·(rhs·δ) − 0.5·α²·(δ·H_pen·δ)
+            //
+            // where `rhs = score − S·β (− ridge·β)` is the penalized
+            // gradient (in maximize-direction) and `H_pen = H + S
+            // (+ ridge·I)` is the penalized observed information.
+            // Actual reduction is the true penalized objective change
+            // measured by the line search; rho = actual / predicted is
+            // the standard model-vs-truth ratio that drives the same
+            // 0.25 / 0.75 grow-shrink rules `update_joint_trust_region_radius`
+            // already implements for the joint path.
+            let alpha_accepted = if accepted {
+                0.5_f64.powi(accepted_bt as i32)
+            } else {
+                0.0
+            };
+            let (rhs_block, hpen_delta_full): (Array1<f64>, Array1<f64>) = match work {
+                BlockWorkingSet::ExactNewton { gradient, hessian } => {
+                    let mut rhs = gradient - &s_lambda.dot(&beta_old);
+                    let mut hpen = hessian.dot(&delta);
+                    hpen += &s_lambda.dot(&delta);
+                    if options.ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+                        rhs.scaled_add(-ridge, &beta_old);
+                        hpen.scaled_add(ridge, &delta);
+                    }
+                    (rhs, hpen)
+                }
+                BlockWorkingSet::Diagonal {
+                    working_response,
+                    working_weights,
+                } => {
+                    // IRLS local-quadratic gradient and Hessian:
+                    //   rhs = X^T W (z − Xβ) − Sβ
+                    //   H_pen δ = X^T W X δ + Sδ
+                    let xb = spec.design.matrixvectormultiply(&beta_old);
+                    let resid = working_response - &xb;
+                    let w_resid = &resid * working_weights;
+                    let mut rhs = spec.design.transpose_vector_multiply(&w_resid);
+                    rhs -= &s_lambda.dot(&beta_old);
+                    let xd_local: Array1<f64> = match &x_delta {
+                        Some(xd) => xd.clone(),
+                        None => spec.design.matrixvectormultiply(&delta),
+                    };
+                    let wxd = &xd_local * working_weights;
+                    let mut hpen = spec.design.transpose_vector_multiply(&wxd);
+                    hpen += &s_lambda.dot(&delta);
+                    if options.ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+                        rhs.scaled_add(-ridge, &beta_old);
+                        hpen.scaled_add(ridge, &delta);
+                    }
+                    (rhs, hpen)
+                }
+            };
+            let rhs_dot_delta = rhs_block.dot(&delta);
+            let delta_dot_hpen = delta.dot(&hpen_delta_full);
+            let predicted_reduction = alpha_accepted * rhs_dot_delta
+                - 0.5 * alpha_accepted * alpha_accepted * delta_dot_hpen;
+            let actual_reduction = obj_before_block - objective_cycle_prev;
+            let trust_update = update_joint_trust_region_radius(
+                block_max_step[b],
+                alpha_accepted * step_inf,
+                actual_reduction,
+                predicted_reduction,
+            );
+            block_max_step[b] = trust_update.radius;
             if !accepted {
                 states[b].beta.assign(&beta_old);
                 eta_checkpoint.restore_eta(&mut states[b]);
@@ -9890,8 +9940,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         raw_descent -= &beta_old.mapv(|v| ridge * v);
                     }
                     let raw_norm = raw_descent.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
-                    let descent_dir = if raw_norm > MAX_NEWTON_STEP {
-                        &raw_descent * (MAX_NEWTON_STEP / raw_norm)
+                    let descent_dir = if raw_norm > block_cap {
+                        &raw_descent * (block_cap / raw_norm)
                     } else {
                         raw_descent
                     };
