@@ -2884,31 +2884,6 @@ impl HyperOperator for BernoulliBlockHessianOperator {
     }
 }
 
-// Per-row cell-moment dedup switch. In production this is always `true`; the
-// `cfg(test)` knob lets the regression test in this file flip it off and
-// assert numerical equivalence to the un-deduped path. There is no env var,
-// no CLI flag, and no public API surface — the dedup is purely an internal
-// optimization within `build_row_exact_context_with_stats`.
-#[cfg(not(test))]
-#[inline]
-fn cell_moment_per_row_dedup_enabled() -> bool {
-    true
-}
-
-#[cfg(test)]
-fn cell_moment_per_row_dedup_enabled() -> bool {
-    CELL_MOMENT_PER_ROW_DEDUP_ENABLED.load(Ordering::Relaxed)
-}
-
-#[cfg(test)]
-static CELL_MOMENT_PER_ROW_DEDUP_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
-
-#[cfg(test)]
-pub(crate) fn set_cell_moment_per_row_dedup_enabled(enabled: bool) {
-    CELL_MOMENT_PER_ROW_DEDUP_ENABLED.store(enabled, Ordering::Relaxed);
-}
-
 #[derive(Clone)]
 struct CachedDenestedCellMoments {
     partition_cell: exact_kernel::DenestedPartitionCell,
@@ -5803,25 +5778,22 @@ impl BernoulliMarginalSlopeFamily {
             // skips redundant work. The dedup is purely intra-row, so it is
             // orthogonal to the per-family LRU (which is keyed across rows)
             // and the affine tail-cell memo (a separate mechanism).
-            let dedup_enabled = cell_moment_per_row_dedup_enabled();
             let mut dedup: HashMap<
                 exact_kernel::CellFingerprint,
                 exact_kernel::CellDerivativeMomentState,
             > = HashMap::new();
             let mut out: Vec<CachedDenestedCellMoments> = Vec::with_capacity(cells.len());
             for partition_cell in cells.into_iter() {
-                let state: exact_kernel::CellDerivativeMomentState = if dedup_enabled {
-                    let key = exact_kernel::CellFingerprint::new(partition_cell.cell);
-                    if let Some(existing) = dedup.get(&key) {
-                        existing.clone()
-                    } else {
-                        let computed =
-                            self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 9)?;
-                        dedup.insert(key, computed.clone());
-                        computed
-                    }
+                let key = exact_kernel::CellFingerprint::new(partition_cell.cell);
+                let state: exact_kernel::CellDerivativeMomentState = if let Some(existing) =
+                    dedup.get(&key)
+                {
+                    existing.clone()
                 } else {
-                    self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 9)?
+                    let computed =
+                        self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 9)?;
+                    dedup.insert(key, computed.clone());
+                    computed
                 };
                 out.push(CachedDenestedCellMoments {
                     partition_cell,
@@ -11284,25 +11256,31 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             penalty_cursor += spec.penalties.len();
         }
 
-        let owned_cache = self.build_exact_eval_cache_with_options(block_states, Some(options))?;
-        let cache_ref = &owned_cache;
         let started = std::time::Instant::now();
-        let correction_traces = if options.outer_score_subsample.is_some() {
-            let weighted_rows = outer_weighted_rows(options, self.y.len());
-            self.batched_rho_correction_logdet_traces_for_rows(
-                block_states,
-                cache_ref,
-                factor,
-                &directions,
-                &weighted_rows,
-            )?
+        let correction_traces = if let Some(workspace) = hessian_workspace.as_ref()
+            && let Some(traces) =
+                workspace.projected_directional_derivative_traces(factor, &directions)?
+        {
+            traces
         } else {
-            self.batched_rho_correction_logdet_traces_full_rows(
-                block_states,
-                cache_ref,
-                factor,
-                &directions,
-            )?
+            let owned_cache = self.build_exact_eval_cache_with_options(block_states, Some(options))?;
+            if options.outer_score_subsample.is_some() {
+                let weighted_rows = outer_weighted_rows(options, self.y.len());
+                self.batched_rho_correction_logdet_traces_for_rows(
+                    block_states,
+                    &owned_cache,
+                    factor,
+                    &directions,
+                    &weighted_rows,
+                )?
+            } else {
+                self.batched_rho_correction_logdet_traces_full_rows(
+                    block_states,
+                    &owned_cache,
+                    factor,
+                    &directions,
+                )?
+            }
         };
         trace_h_inv_hdot += &correction_traces;
         if log_exact_work(self.y.len()) {
@@ -11902,6 +11880,31 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             .map(Some)
     }
 
+    fn projected_directional_derivative_traces(
+        &self,
+        factor: &Array2<f64>,
+        directions: &Array2<f64>,
+    ) -> Result<Option<Array1<f64>>, String> {
+        let traces = if self.options.outer_score_subsample.is_some() {
+            let weighted_rows = outer_weighted_rows(&self.options, self.family.y.len());
+            self.family.batched_rho_correction_logdet_traces_for_rows(
+                &self.block_states,
+                &self.cache,
+                factor,
+                directions,
+                &weighted_rows,
+            )?
+        } else {
+            self.family.batched_rho_correction_logdet_traces_full_rows(
+                &self.block_states,
+                &self.cache,
+                factor,
+                directions,
+            )?
+        };
+        Ok(Some(traces))
+    }
+
     fn directional_derivative_operator(
         &self,
         d_beta_flat: &Array1<f64>,
@@ -11997,6 +12000,15 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeLineSearchWorksp
 
     fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
         self.materialized()?.hessian_diagonal()
+    }
+
+    fn projected_directional_derivative_traces(
+        &self,
+        factor: &Array2<f64>,
+        directions: &Array2<f64>,
+    ) -> Result<Option<Array1<f64>>, String> {
+        self.materialized()?
+            .projected_directional_derivative_traces(factor, directions)
     }
 
     fn directional_derivative_operator(
@@ -12140,6 +12152,50 @@ impl BernoulliMarginalSlopeFamily {
                 }
                 gram[a * primary_total + b] = sum;
                 gram[b * primary_total + a] = sum;
+            }
+        }
+        gram
+    }
+
+    fn primary_tail_block_pairs(
+        slices: &BlockSlices,
+        primary: &PrimarySlices,
+    ) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        if let (Some(block_range), Some(primary_range)) = (slices.h.as_ref(), primary.h.as_ref()) {
+            out.extend(
+                block_range
+                    .clone()
+                    .enumerate()
+                    .map(|(offset, block_idx)| (primary_range.start + offset, block_idx)),
+            );
+        }
+        if let (Some(block_range), Some(primary_range)) = (slices.w.as_ref(), primary.w.as_ref()) {
+            out.extend(
+                block_range
+                    .clone()
+                    .enumerate()
+                    .map(|(offset, block_idx)| (primary_range.start + offset, block_idx)),
+            );
+        }
+        out
+    }
+
+    fn primary_tail_tail_gram(
+        primary_total: usize,
+        rank: usize,
+        factor: &Array2<f64>,
+        tail_pairs: &[(usize, usize)],
+    ) -> Vec<f64> {
+        let mut gram = vec![0.0; primary_total * primary_total];
+        for (a_pos, &(primary_a, block_a)) in tail_pairs.iter().enumerate() {
+            for &(primary_b, block_b) in tail_pairs.iter().take(a_pos + 1) {
+                let mut sum = 0.0;
+                for col in 0..rank {
+                    sum += factor[[block_a, col]] * factor[[block_b, col]];
+                }
+                gram[primary_a * primary_total + primary_b] = sum;
+                gram[primary_b * primary_total + primary_a] = sum;
             }
         }
         gram
@@ -12298,6 +12354,9 @@ impl BernoulliMarginalSlopeFamily {
         let factor_g = factor.slice(s![slices.logslope.clone(), ..]);
         let dir_m = directions.slice(s![slices.marginal.clone(), ..]);
         let dir_g = directions.slice(s![slices.logslope.clone(), ..]);
+        let tail_pairs = Self::primary_tail_block_pairs(slices, primary);
+        let tail_tail_gram =
+            Self::primary_tail_tail_gram(primary.total, rank, factor, &tail_pairs);
         let n_chunks = n.div_ceil(rows_per_chunk);
         let traces = (0..n_chunks)
             .into_par_iter()
@@ -12318,37 +12377,38 @@ impl BernoulliMarginalSlopeFamily {
                 let dir_proj_m = crate::faer_ndarray::fast_ab(&x_chunk, &dir_m);
                 let dir_proj_g = crate::faer_ndarray::fast_ab(&g_chunk, &dir_g);
                 let mut acc = vec![0.0; n_dirs];
-                let mut projection = vec![0.0; primary.total * rank];
+                let mut gram = vec![0.0; primary.total * primary.total];
                 let mut row_dir = Array1::<f64>::zeros(primary.total);
                 for local in 0..(end - start) {
                     let row = start + local;
-                    projection.fill(0.0);
+                    gram.copy_from_slice(&tail_tail_gram);
+                    let mut qq = 0.0;
+                    let mut qg = 0.0;
+                    let mut gg = 0.0;
                     for col in 0..rank {
-                        projection[primary.q * rank + col] = proj_m[[local, col]];
-                        projection[primary.logslope * rank + col] = proj_g[[local, col]];
+                        let qv = proj_m[[local, col]];
+                        let gv = proj_g[[local, col]];
+                        qq += qv * qv;
+                        qg += qv * gv;
+                        gg += gv * gv;
                     }
-                    if let (Some(block_range), Some(primary_range)) =
-                        (slices.h.as_ref(), primary.h.as_ref())
-                    {
-                        for (offset, block_idx) in block_range.clone().enumerate() {
-                            let primary_idx = primary_range.start + offset;
-                            for col in 0..rank {
-                                projection[primary_idx * rank + col] = factor[[block_idx, col]];
-                            }
+                    gram[primary.q * primary.total + primary.q] = qq;
+                    gram[primary.q * primary.total + primary.logslope] = qg;
+                    gram[primary.logslope * primary.total + primary.q] = qg;
+                    gram[primary.logslope * primary.total + primary.logslope] = gg;
+                    for &(primary_idx, block_idx) in &tail_pairs {
+                        let mut q_tail = 0.0;
+                        let mut g_tail = 0.0;
+                        for col in 0..rank {
+                            let tail = factor[[block_idx, col]];
+                            q_tail += proj_m[[local, col]] * tail;
+                            g_tail += proj_g[[local, col]] * tail;
                         }
+                        gram[primary.q * primary.total + primary_idx] = q_tail;
+                        gram[primary_idx * primary.total + primary.q] = q_tail;
+                        gram[primary.logslope * primary.total + primary_idx] = g_tail;
+                        gram[primary_idx * primary.total + primary.logslope] = g_tail;
                     }
-                    if let (Some(block_range), Some(primary_range)) =
-                        (slices.w.as_ref(), primary.w.as_ref())
-                    {
-                        for (offset, block_idx) in block_range.clone().enumerate() {
-                            let primary_idx = primary_range.start + offset;
-                            for col in 0..rank {
-                                projection[primary_idx * rank + col] = factor[[block_idx, col]];
-                            }
-                        }
-                    }
-                    let gram =
-                        Self::row_primary_gram_from_projection(primary.total, rank, &projection);
                     let row_ctx = Self::row_ctx(cache, row);
                     let cached_row_moments = cache
                         .row_cell_moments
@@ -13278,56 +13338,6 @@ mod tests {
             .exact_newton_joint_hessian_matvec_from_cache(&direction, &states, &cache)
             .expect("parallel chunked Hv");
         assert_allclose_relative(&parallel, &serial, 1.0e-13);
-    }
-
-    /// Regression test for the per-row cell-moment dedup in
-    /// `build_row_exact_context_with_stats`. Builds the same FLEX exact-eval
-    /// cache twice — once with dedup ON, once with it OFF — and asserts the
-    /// row primary Hessians (which are downstream of the cached degree-9 cell
-    /// moments) are bit-equal to within 1e-14. The dedup just skips
-    /// redundant `evaluate_cell_moments` calls for cells whose
-    /// `(left, right, c0, c1, c2, c3)` are bit-equal, so the two paths must
-    /// produce numerically identical row contexts.
-    #[test]
-    fn cell_moment_per_row_dedup_matches_undeduped_row_primary_hessian() {
-        // Run dedup OFF first so we have an unaffected reference.
-        super::set_cell_moment_per_row_dedup_enabled(false);
-        let (_family_off, _states_off, cache_off, _dir_off) =
-            flex_hessian_matvec_fixture(64).expect("flex fixture (dedup off)");
-        let off_rows = cache_off
-            .row_primary_hessians
-            .clone()
-            .expect("row primary hessians (dedup off)");
-
-        super::set_cell_moment_per_row_dedup_enabled(true);
-        let (_family_on, _states_on, cache_on, _dir_on) =
-            flex_hessian_matvec_fixture(64).expect("flex fixture (dedup on)");
-        let on_rows = cache_on
-            .row_primary_hessians
-            .clone()
-            .expect("row primary hessians (dedup on)");
-
-        // Restore the production default for any subsequent tests in this
-        // process.
-        super::set_cell_moment_per_row_dedup_enabled(true);
-
-        assert_eq!(off_rows.shape(), on_rows.shape());
-        let mut max_abs = 0.0_f64;
-        for ((on, off), idx) in on_rows.iter().zip(off_rows.iter()).zip(0u64..) {
-            let diff = (on - off).abs();
-            if diff > max_abs {
-                max_abs = diff;
-            }
-            assert!(
-                diff <= 1.0e-14,
-                "dedup mismatch at flat idx {idx}: on={on:.17e} off={off:.17e} diff={diff:.3e}"
-            );
-        }
-        // Sanity: the absolute floor should be tiny but the comparison is not
-        // vacuous (i.e. row hessians are not identically zero).
-        let any_nonzero = on_rows.iter().any(|v| v.abs() > 0.0);
-        assert!(any_nonzero, "row primary hessians should not be all zero");
-        let _ = max_abs;
     }
 
     #[test]

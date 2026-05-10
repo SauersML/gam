@@ -4639,6 +4639,21 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
         Ok(None)
     }
 
+    /// Exact row-local contractions for
+    /// `trace(F^T · D_beta H[d_j] · F)` over many coefficient directions.
+    ///
+    /// Workspaces that own the current row cache can implement this to avoid
+    /// rebuilding row contexts or materializing each `D_beta H[d_j]` as a
+    /// coefficient-space operator when the caller only needs its projected
+    /// trace against the fixed logdet factor `F`.
+    fn projected_directional_derivative_traces(
+        &self,
+        _factor: &Array2<f64>,
+        _directions: &Array2<f64>,
+    ) -> Result<Option<Array1<f64>>, String> {
+        Ok(None)
+    }
+
     fn directional_derivative(
         &self,
         d_beta_flat: &Array1<f64>,
@@ -8739,12 +8754,34 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 0.0
             };
 
-        let max_joint_step = family.joint_newton_max_step_inf(specs);
-        if !max_joint_step.is_finite() || max_joint_step <= 0.0 {
+        let initial_max_joint_step = family.joint_newton_max_step_inf(specs);
+        if !initial_max_joint_step.is_finite() || initial_max_joint_step <= 0.0 {
             return Err(format!(
-                "joint Newton max step cap must be finite and positive, got {max_joint_step}"
+                "joint Newton max step cap must be finite and positive, got {initial_max_joint_step}"
             ));
         }
+        // Adaptive inf-norm cap. The family-supplied default (e.g. 20.0) is
+        // sized so a single-cycle Δβ never crashes the link function on
+        // typical-scale problems where |β_opt| ~ O(1)–O(10). On
+        // quasi-saturated problems where the true optimum sits at |β| ~
+        // O(10²)–O(10³) along a near-linear ridge in the likelihood, that
+        // same cap binds every cycle: rho=1.0 on every accepted step
+        // (model is exact along the ridge) but β can only grow by 20 per
+        // cycle, forcing 50–100 inner cycles to traverse a valley Newton
+        // would otherwise leap in one shot.
+        //
+        // Treat sustained "step-clamped + high rho + accepted" cycles as
+        // empirical proof the cap is the binding constraint, not the
+        // model. Grow the cap geometrically; shrink it back on any
+        // rejection or low-rho cycle. Floor at the family default so we
+        // never exceed the family's own safety budget on the first cycle
+        // of a fresh fit.
+        let mut max_joint_step = initial_max_joint_step;
+        let mut consecutive_high_rho_clamped_cycles: usize = 0;
+        let mut last_accepted_rho: f64 = f64::NAN;
+        const ADAPTIVE_CAP_GROWTH_THRESHOLD: usize = 3;
+        const ADAPTIVE_CAP_GROWTH_FACTOR: f64 = 2.0;
+        const ADAPTIVE_CAP_CEILING: f64 = 1.0e4;
 
         // Divergence-detection state for the joint-Newton path. Mirrors
         // the blockwise sibling later in this function: a near-null
@@ -9321,6 +9358,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         cached_active_sets =
                             scatter_joint_active_set(joint_active_set, &block_constraints);
                     }
+                    last_accepted_rho = trust_update.rho;
                     accepted = true;
                     break;
                 }
@@ -9332,6 +9370,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             }
             let line_search_elapsed = line_search_started.elapsed();
             if !accepted {
+                // Adaptive cap shrink on rejection. The line search exhausted
+                // its retries and could not find an accepted step, so the
+                // cap that produced this proposal was too generous. Halve
+                // the cap (down to the family-supplied floor) so the next
+                // cycle's Newton proposal is rescaled into a region where
+                // the quadratic model is trustworthy.
+                consecutive_high_rho_clamped_cycles = 0;
+                max_joint_step = (max_joint_step * 0.5).max(initial_max_joint_step);
                 log::info!(
                     "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=false hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} reject_model={} reject_likelihood={} reject_objective={} first_likelihood_reject={} grad_reload=0.000s total={:.3}s",
                     cycle,
@@ -9402,6 +9448,27 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 break; // Fall back to blockwise
             }
 
+            // Adaptive cap growth on accepted cycles. When the step
+            // hits the inf-norm cap AND the trust-region rho is high
+            // (model is accurate to within 25%), we have empirical
+            // evidence the cap — not the model — is the binding
+            // constraint. After ADAPTIVE_CAP_GROWTH_THRESHOLD such
+            // cycles in a row, double the cap so Newton can take the
+            // bigger step it was already pricing correctly. Anything
+            // less than high-rho-and-clamped resets the streak.
+            let step_was_clamped_at_cap = step_inf >= 0.95 * max_joint_step;
+            let model_is_accurate = last_accepted_rho.is_finite() && last_accepted_rho > 0.75;
+            if step_was_clamped_at_cap && model_is_accurate {
+                consecutive_high_rho_clamped_cycles += 1;
+                if consecutive_high_rho_clamped_cycles >= ADAPTIVE_CAP_GROWTH_THRESHOLD {
+                    max_joint_step =
+                        (max_joint_step * ADAPTIVE_CAP_GROWTH_FACTOR).min(ADAPTIVE_CAP_CEILING);
+                    consecutive_high_rho_clamped_cycles = 0;
+                }
+            } else {
+                consecutive_high_rho_clamped_cycles = 0;
+            }
+
             let grad_reload_started = std::time::Instant::now();
             let (log_likelihood, gradient, eval, workspace) = load_joint_gradient_evaluation(
                 family,
@@ -9413,13 +9480,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             )?;
             let grad_reload_elapsed = grad_reload_started.elapsed();
             log::info!(
-                "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=true hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} grad_reload={:.3}s total={:.3}s",
+                "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=true hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} grad_reload={:.3}s total={:.3}s max_joint_step={:.2e}",
                 cycle,
                 hessian_and_qp_elapsed.as_secs_f64(),
                 line_search_elapsed.as_secs_f64(),
                 line_search_attempts,
                 grad_reload_elapsed.as_secs_f64(),
                 cycle_started.elapsed().as_secs_f64(),
+                max_joint_step,
             );
             current_log_likelihood = log_likelihood;
             cached_joint_gradient = gradient;
@@ -9632,8 +9700,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         Some(eval) => eval,
         None => family.evaluate(&states)?,
     };
-    current_log_likelihood = cached_eval.log_likelihood;
-    lastobjective = -current_log_likelihood + current_penalty;
+    lastobjective = -cached_eval.log_likelihood + current_penalty;
 
     // Divergence-detection state for the blockwise loop.
     //
@@ -9682,7 +9749,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             "[PIRLS/blockwise coord] cycle {:>3}/{} | -loglik {:.6e} | penalty {:.6e} | objective {:.6e}",
             cycle,
             inner_max_cycles,
-            -current_log_likelihood,
+            -cached_eval.log_likelihood,
             current_penalty,
             lastobjective,
         );

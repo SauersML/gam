@@ -35,9 +35,8 @@ use crate::families::custom_family::{
     ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
     ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, FamilyEvaluation,
     MaterializablePsiDerivativeOperator, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
-    build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
-    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, fit_custom_family,
-    fit_custom_family_fixed_log_lambdas,
+    build_block_spatial_psi_derivatives, evaluate_custom_family_joint_hyper,
+    evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
 };
 use crate::families::gamlss::{
     initializewiggle_knots_from_seed, solve_penalizedweighted_projection,
@@ -13990,14 +13989,29 @@ pub fn fit_transformation_normal(
     let rho_floor = -12.0;
     let rho_lower = Array1::<f64>::from_elem(n_penalties, rho_floor);
     let rho_upper = Array1::<f64>::from_elem(n_penalties, 12.0);
-    let probe_blocks = vec![probe_block];
-    let (_, cap_hessian) = custom_family_outer_derivatives(&probe_family, &probe_blocks, &options);
+    let probe_blocks = vec![probe_block.clone()];
+    let (_, cap_hessian) = crate::families::custom_family::custom_family_outer_derivatives(
+        &probe_family,
+        &probe_blocks,
+        &options,
+    );
     let analytic_gradient = analytic_psi_available;
-    let analytic_hessian_supported = analytic_gradient && cap_hessian.is_analytic();
-    let analytic_hessian = analytic_hessian_supported;
-    if analytic_hessian_supported {
+    let n_obs = response.len();
+    let p_dim = probe_block.design.ncols();
+    let k_outer = n_penalties + kappa0.len();
+    let outer_hessian_would_use_operator =
+        crate::solver::estimate::reml::unified::use_outer_hessian_operator_path(
+            n_obs, p_dim, k_outer,
+        );
+    let analytic_hessian =
+        analytic_gradient && cap_hessian.is_analytic() && !outer_hessian_would_use_operator;
+    if analytic_hessian {
         log::info!(
-            "[transformation-normal] CTN exact joint analytic outer Hessian enabled for spatial kappa optimization"
+            "[transformation-normal] CTN exact joint analytic outer Hessian enabled for spatial kappa optimization (n={n_obs} p={p_dim} k={k_outer})"
+        );
+    } else if analytic_gradient && cap_hessian.is_analytic() {
+        log::info!(
+            "[transformation-normal] CTN spatial kappa optimization using exact analytic gradient with BFGS; exact outer Hessian disabled at this scale (n={n_obs} p={p_dim} k={k_outer}) because callback second-derivative traces dominate wall-clock"
         );
     }
 
@@ -14147,9 +14161,11 @@ pub fn fit_transformation_normal(
         analytic_gradient,
         analytic_hessian,
         // Transformation-normal has β-dependent H (through 1/h'²), so the
-        // EFS Wood-Fasiolo PSD invariant fails. Keep fixed-point disabled,
-        // while still exposing CTN's exact analytic Hessian to the outer trust
-        // solver when the matrix-free callback path is available.
+        // EFS Wood-Fasiolo PSD invariant fails. Keep fixed-point disabled.
+        // The exact outer Hessian remains enabled for small problems; at
+        // matrix-free crossover scale, use BFGS on the exact analytic gradient
+        // because CTN's callback second-derivative trace terms dominate
+        // wall-clock.
         true,
         // fit_fn
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
