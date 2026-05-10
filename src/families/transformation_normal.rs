@@ -60,7 +60,7 @@ use crate::solver::estimate::reml::unified::{
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
@@ -14262,17 +14262,7 @@ pub fn fit_transformation_normal(
                 store_warm_start(theta, eval.warm_start.clone());
             }
 
-            let screening_active = matches!(eval_mode, EvalMode::ValueOnly)
-                && exact_screening_cap.load(Ordering::Relaxed) > 0;
             if !eval.inner_converged {
-                if screening_active && eval.objective.is_finite() {
-                    log::debug!(
-                        "[transformation-normal] accepting finite partial CTN exact-joint seed-screening cost at cap={} objective={:.6e}",
-                        exact_screening_cap.load(Ordering::Relaxed),
-                        eval.objective
-                    );
-                    return Ok((eval.objective, eval.gradient, eval.outer_hessian));
-                }
                 return Err(format!(
                     "transformation exact joint inner solve did not converge for eval_mode={eval_mode:?}; cached warm start for retry"
                 ));
