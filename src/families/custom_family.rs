@@ -1080,6 +1080,7 @@ pub trait CustomFamily {
         _specs: &[ParameterBlockSpec],
         _derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
         _rho: &Array1<f64>,
+        _options: &BlockwiseFitOptions,
         _hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     ) -> Result<Option<BatchedOuterGradientTerms>, String> {
         Ok(None)
@@ -12965,6 +12966,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             specs,
             &derivative_blocks_for_batch,
             rho_current,
+            options,
             workspace_for_batch.clone(),
         ) {
             // Sanity check: batched output must match (rho_dim + psi_dim).
