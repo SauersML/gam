@@ -821,7 +821,10 @@ fn should_screen_seeds(
 ) -> bool {
     config.screening_cap.is_some()
         && generated_seed_count > seed_budget
-        && matches!(solver, Solver::Arc | Solver::Efs | Solver::HybridEfs)
+        && matches!(
+            solver,
+            Solver::Arc | Solver::Bfgs | Solver::Efs | Solver::HybridEfs
+        )
 }
 
 #[inline]
@@ -6824,6 +6827,76 @@ mod tests {
             started.lock().unwrap().first().cloned(),
             Some(initial_seed),
             "solver should start from the explicit initial rho"
+        );
+        assert_eq!(screening_cap.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn run_screening_reorders_bfgs_seeds_before_full_startup_eval() {
+        let mut seed_config = crate::seeding::SeedConfig::default();
+        seed_config.seed_budget = 1;
+        seed_config.risk_profile = crate::seeding::SeedRiskProfile::Gaussian;
+        let screening_cap = Arc::new(AtomicUsize::new(0));
+        let initial_seed = array![9.0];
+        let valid_seed = crate::seeding::generate_rho_candidates(1, None, &seed_config)
+            .first()
+            .expect("seed generator should yield at least one candidate")
+            .clone();
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let screening_calls = Arc::new(AtomicUsize::new(0));
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Unavailable)
+            .with_seed_config(seed_config)
+            .with_screening_cap(Arc::clone(&screening_cap))
+            .with_initial_rho(initial_seed)
+            .with_max_iter(1);
+        let mut obj = problem.build_objective(
+            (),
+            {
+                let valid_seed = valid_seed.clone();
+                let screening_calls = Arc::clone(&screening_calls);
+                move |_: &mut (), theta: &Array1<f64>| {
+                    screening_calls.fetch_add(1, Ordering::Relaxed);
+                    if theta == &valid_seed {
+                        Ok(0.0)
+                    } else {
+                        Ok(1000.0)
+                    }
+                }
+            },
+            {
+                let valid_seed = valid_seed.clone();
+                let started = Arc::clone(&started);
+                move |_: &mut (), theta: &Array1<f64>| {
+                    started.lock().unwrap().push(theta.clone());
+                    if theta == &valid_seed {
+                        Ok(OuterEval {
+                            cost: 0.0,
+                            gradient: array![0.0],
+                            hessian: HessianResult::Unavailable,
+                        })
+                    } else {
+                        Ok(OuterEval::infeasible(theta.len()))
+                    }
+                }
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let result = problem
+            .run(&mut obj, "BFGS screening should reorder expensive seeds")
+            .expect("screened BFGS startup should reach the best generated seed");
+        assert_eq!(result.plan_used.solver, Solver::Bfgs);
+        assert_eq!(result.rho, valid_seed);
+        assert_eq!(
+            started.lock().unwrap().first().cloned(),
+            Some(valid_seed),
+            "BFGS screening should move the lowest-cost seed to the front before full startup eval",
+        );
+        assert!(
+            screening_calls.load(Ordering::Relaxed) > 1,
+            "BFGS seed screening should rank candidates with cost-only probes first",
         );
         assert_eq!(screening_cap.load(Ordering::Relaxed), 0);
     }

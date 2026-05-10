@@ -60,6 +60,7 @@ use crate::solver::estimate::reml::unified::{
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
@@ -14041,6 +14042,9 @@ pub fn fit_transformation_normal(
 
     // Shared mutable state for warm-starting across optimizer iterations.
     let exact_warm_start: RefCell<Option<TransformationExactWarmStart>> = RefCell::new(None);
+    let exact_screening_cap = Arc::new(AtomicUsize::new(0));
+    let mut exact_options = options.clone();
+    exact_options.screening_max_inner_iterations = Some(Arc::clone(&exact_screening_cap));
 
     let joint_setup =
         ExactJointHyperSetup::new(rho0, rho_lower, rho_upper, kappa0, kappa_lower, kappa_upper);
@@ -14167,6 +14171,7 @@ pub fn fit_transformation_normal(
         // because CTN's callback second-derivative trace terms dominate
         // wall-clock.
         true,
+        Some(Arc::clone(&exact_screening_cap)),
         // fit_fn
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             ensure_exact_geometry(&specs[0], &designs[0])?;
@@ -14180,7 +14185,7 @@ pub fn fit_transformation_normal(
             let fit = fit_custom_family_fixed_log_lambdas(
                 &geometry.family,
                 &geometry.blocks,
-                &options,
+                &exact_options,
                 warm_start.as_ref(),
                 0,
                 0.0,
@@ -14224,6 +14229,7 @@ pub fn fit_transformation_normal(
         },
         // exact_fn
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], eval_mode| {
+            use crate::solver::estimate::reml::unified::EvalMode;
             ensure_exact_geometry(&specs[0], &designs[0])?;
             let mut cache_ref = exact_geometry_cache.borrow_mut();
             let geometry = cache_ref
@@ -14235,7 +14241,7 @@ pub fn fit_transformation_normal(
             let eval = evaluate_custom_family_joint_hyper(
                 &geometry.family,
                 &geometry.blocks,
-                &options,
+                &exact_options,
                 &rho,
                 &geometry.derivative_blocks,
                 warm_start.as_ref(),
@@ -14256,7 +14262,17 @@ pub fn fit_transformation_normal(
                 store_warm_start(theta, eval.warm_start.clone());
             }
 
+            let screening_active = matches!(eval_mode, EvalMode::ValueOnly)
+                && exact_screening_cap.load(Ordering::Relaxed) > 0;
             if !eval.inner_converged {
+                if screening_active && eval.objective.is_finite() {
+                    log::debug!(
+                        "[transformation-normal] accepting finite partial CTN exact-joint seed-screening cost at cap={} objective={:.6e}",
+                        exact_screening_cap.load(Ordering::Relaxed),
+                        eval.objective
+                    );
+                    return Ok((eval.objective, eval.gradient, eval.outer_hessian));
+                }
                 return Err(format!(
                     "transformation exact joint inner solve did not converge for eval_mode={eval_mode:?}; cached warm start for retry"
                 ));
@@ -14275,7 +14291,7 @@ pub fn fit_transformation_normal(
             let eval = evaluate_custom_family_joint_hyper_efs(
                 &geometry.family,
                 &geometry.blocks,
-                &options,
+                &exact_options,
                 &rho,
                 &geometry.derivative_blocks,
                 warm_start.as_ref(),

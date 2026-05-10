@@ -14370,6 +14370,7 @@ pub fn fit_survival_marginal_slope_terms(
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
         true,
+        None,
         |theta, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let eval_started = std::time::Instant::now();
             log::info!(
