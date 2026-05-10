@@ -14143,7 +14143,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn dense_spectral_large_p_outer_gradient_matches_finite_difference() {
         let rho = 0.2;
