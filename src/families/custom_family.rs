@@ -457,6 +457,29 @@ pub struct OuterDerivativePolicy {
     /// Predicted per-eval work for one `ValueAndGradient` evaluation.
     /// Rounded conservatively *up* via `saturating_mul`.
     pub predicted_gradient_work: u128,
+    /// True when the family's outer-only paths consume
+    /// [`BlockwiseFitOptions::outer_score_subsample`] and produce
+    /// Horvitz-Thompson-weighted partial sums (i.e. the family overrides
+    /// `log_likelihood_only_with_options`,
+    /// `exact_newton_joint_psi_workspace_with_options`, and any other
+    /// outer-only hooks reached by `evaluate_custom_family_joint_hyper`).
+    ///
+    /// Determines whether the κ optimizer's pilot/polish staging schedule
+    /// engages: when this is `false`, [`Self::should_use_staged_kappa`]
+    /// returns `false` regardless of `n`. Engaging the schedule on a
+    /// family that ignores the subsample is strictly worse than not
+    /// engaging it — the schedule builds a `RowSet::Subsample` and the
+    /// boundary plumbing installs an `OuterScoreSubsample` on options,
+    /// but the family's default outer-only paths fall back to full-data
+    /// sums, so the pilot evaluation costs the same as the polish but
+    /// adds a Vec allocation per eval.
+    ///
+    /// Families that do **not** consume the subsample (default for new
+    /// implementations, including the GAMLSS location-scale families
+    /// today) leave this `false`. Families that do consume (today:
+    /// `BernoulliMarginalSlopeFamily`) override `outer_derivative_policy`
+    /// to set this `true`.
+    pub subsample_capable: bool,
 }
 
 impl OuterDerivativePolicy {
@@ -532,6 +555,15 @@ impl OuterDerivativePolicy {
     /// or `psi_dim`) where a single full-data gradient sweep still
     /// dominates the κ trajectory.
     pub fn should_use_staged_kappa(&self, n: usize) -> bool {
+        if !self.subsample_capable {
+            // Family does not consume `outer_score_subsample` on its
+            // outer-only paths. Engaging the schedule would build a
+            // pilot `RowSet::Subsample` whose only effect is per-eval
+            // Vec/Arc bookkeeping — the underlying coefficient gradient
+            // would still sum every row. Gate the schedule off until
+            // the family override declares consumption.
+            return false;
+        }
         n >= Self::STAGED_KAPPA_TRIGGER_N
             || self.predicted_gradient_work > Self::OUTER_GRADIENT_WORK_BUDGET
     }
@@ -922,6 +954,14 @@ pub trait CustomFamily {
             capability,
             predicted_gradient_work,
             predicted_hessian_work,
+            // Default `false`: the trait's default outer-only paths
+            // (`log_likelihood_only_with_options`,
+            // `exact_newton_joint_psi_workspace_with_options`, ...)
+            // forward to the no-options variants and ignore
+            // `outer_score_subsample`. Families that override those
+            // hooks to honour HT-weighted partial sums must override
+            // this method and set `subsample_capable = true`.
+            subsample_capable: false,
         }
     }
 
@@ -9240,25 +9280,22 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // directly when it fires.
         let mut last_cycle_obj_change_below_tol = false;
 
-        // Consecutive-plateau counter for the relaxed KKT-on-null
-        // certificate. The post-step certificate at
-        // `accepted_step_inf <= step_tol && objective_change <= objective_tol`
-        // requires the accepted Newton step to be tiny in *absolute*
-        // terms (step_tol = inner_tol * (1 + ‖β‖∞)). In two-block
-        // location-scale fits with shared smooth structure the line
-        // search can keep accepting steps of order ~1e-3 along a
-        // near-null direction long after the objective has plateaued,
-        // and the strict step gate never closes. This counter recognises
-        // that multiple successive accepted cycles whose objective
-        // change is sub-tolerance is itself a KKT-on-null certificate:
-        // the model has converged on the resolvable subspace, and
-        // further iteration burns wall-clock without information gain.
-        // Reset to 0 on any cycle whose objective change exceeds
-        // tolerance (or on a line-search failure cycle, where the
-        // existing `last_cycle_obj_change_below_tol = false` reset is
-        // mirrored here for symmetry).
-        let mut plateau_streak: usize = 0;
-        const PLATEAU_STREAK_THRESHOLD: usize = 3;
+        // Predicted-reduction tracker for the principled trust-region
+        // stopping criterion (Conn-Gould-Toint, *Trust-Region Methods*,
+        // Theorem 6.4.6). The Newton model at the accepted step has a
+        // predicted decrease `m(0) − m(δ) = −g·δ − 0.5·δ·H·δ`. For an
+        // unclipped Newton step (H·δ = −g) this is `0.5·g·H⁻¹·g`, the
+        // Newton decrement squared / 2. When the model itself predicts
+        // a decrease smaller than the objective tolerance, no descent
+        // direction the Hessian can resolve will lower the objective
+        // by more than `objective_tol`, and continuing is wall-clock
+        // waste regardless of whether the raw gradient residual or
+        // step-norm gates have closed.
+        //
+        // Tracked here at cycle scope so the end-of-cycle convergence
+        // test can consume the value from the accepted trust-region
+        // attempt. Reset every cycle alongside the line-search state.
+        let mut accepted_predicted_reduction: f64 = f64::INFINITY;
 
         // Adaptive inner cycle cap (Task 6): track the descent ratio
         // `current_residual / previous_residual` over a sliding 3-cycle
@@ -9893,6 +9930,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         cached_active_sets =
                             scatter_joint_active_set(joint_active_set, &block_constraints);
                     }
+                    // Record the Newton-model predicted decrease at this
+                    // accepted attempt for the end-of-cycle stopping
+                    // criterion (Conn-Gould-Toint Theorem 6.4.6). For a
+                    // trust-region-clipped step, `predicted_reduction`
+                    // is the model's promised decrease at the realized
+                    // step magnitude; for an unclipped Newton step it
+                    // equals half the Newton decrement squared.
+                    accepted_predicted_reduction = predicted_reduction;
                     accepted = true;
                     break;
                 }
@@ -9984,7 +10029,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     break;
                 }
                 last_cycle_obj_change_below_tol = false;
-                plateau_streak = 0;
+                accepted_predicted_reduction = f64::INFINITY;
                 continue;
             }
 
@@ -10208,42 +10253,72 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // and let the next cycle either escape via Newton or
                 // re-trigger this branch with made_progress=true.
             }
-            // Consecutive-plateau KKT-on-null certificate.
+            // Newton-model predicted-reduction certificate
+            // (Conn-Gould-Toint, *Trust-Region Methods*, Theorem 6.4.6).
             //
-            // Two cases the absolute-step certificate above misses but
-            // which are still genuine first-order optimality on the
-            // resolvable subspace:
+            // The trust-region attempt that was just accepted promised a
+            // decrease of `accepted_predicted_reduction = −g·δ −
+            // 0.5·δ·H·δ` at the realized step. When the model's
+            // prediction AND the realized objective change both fall
+            // at or below `objective_tol`, the Newton model itself
+            // certifies that no further iteration with the current
+            // curvature can reduce the penalized objective by more
+            // than tolerance — exactly the textbook stopping criterion
+            // for a successful trust-region method on a quadratic model.
             //
-            // 1. Line search succeeds with `accepted_step_inf` of order
-            //    ~1e-3 along a near-null direction of the joint Hessian.
-            //    The objective is plateaued (objective_change ≤
-            //    objective_tol) but the absolute step gate
-            //    `accepted_step_inf ≤ inner_tol * (1 + ‖β‖∞)` never
-            //    closes because step_tol is fixed at ~1e-6.
+            // Pairing the two checks defends against two failure modes:
             //
-            // 2. Two-block GAMLSS with shared smooth structure: the
-            //    cross-block Hessian can keep producing non-tiny accepted
-            //    steps in a direction that does not reduce the
-            //    objective. The Newton model's predicted reduction
-            //    (bounded by `objective_change` once the line search
-            //    accepts) is the right convergence signal here.
+            // 1. Heavily trust-region-clipped step where the model
+            //    *under*-predicts (rare; the model overestimates by
+            //    construction). Predicted ≤ tol but actual_reduction
+            //    much larger would mean we are exiting before the
+            //    iterate has fully exploited the available descent —
+            //    the `objective_change ≤ objective_tol` corroboration
+            //    blocks this.
             //
-            // Requiring three successive plateaued accepted cycles
-            // distinguishes a single fortunate flat step from sustained
-            // identification-limited stalling. The `cycles_done >=
-            // PLATEAU_STREAK_THRESHOLD + 1` guard keeps cycle-0 noise
-            // from triggering a false certificate before Newton has
-            // resolved the geometry.
-            if objective_change <= objective_tol {
-                plateau_streak = plateau_streak.saturating_add(1);
-            } else {
-                plateau_streak = 0;
-            }
-            if plateau_streak >= PLATEAU_STREAK_THRESHOLD
-                && cycles_done >= PLATEAU_STREAK_THRESHOLD + 1
+            // 2. Model collapse near a degenerate iterate where the
+            //    quadratic predicts ≈ 0 decrease but the actual step
+            //    overshoots through a non-quadratic region. Same guard
+            //    applies.
+            //
+            // Why this is strictly stronger than the existing
+            // `accepted_step_inf ≤ step_tol` certificate above:
+            //
+            // (a) Near-null Hessian directions. When λ_min(H) is small,
+            //     the Newton step δ = −H⁻¹g is large in the null
+            //     direction, the trust region clips it, and the
+            //     predicted reduction at the clipped step shrinks to
+            //     the curvature bound `0.5·λ_min·radius²`. The raw
+            //     `‖g‖∞` residual can stay O(1) along the null
+            //     direction while the model itself has nothing more to
+            //     give — exactly the regime where the raw-residual
+            //     certificate refuses to fire and where the absolute
+            //     `step_inf ≤ inner_tol·(1 + ‖β‖∞)` gate sees a step
+            //     three or more orders above tolerance.
+            //
+            // (b) Two-block GAMLSS with shared smooth structure. The
+            //     coupled cross-block Hessian routinely produces
+            //     accepted steps of order ~1e-3 in coefficient norm
+            //     while the model's predicted decrease and the realized
+            //     decrease are both well below `objective_tol`. The
+            //     absolute step gate stays open across dozens of
+            //     cycles; the predicted-reduction certificate exits as
+            //     soon as the model itself reports it is out of
+            //     descent.
+            //
+            // The `cycles_done >= 2` guard prevents certification on a
+            // degenerate cycle-0 acceptance (initial β stuck against a
+            // barrier with model-zero predicted reduction before Newton
+            // has resolved the geometry). This matches the
+            // `made_progress` guard used by every other relaxed
+            // certificate in this function.
+            if accepted_predicted_reduction.is_finite()
+                && accepted_predicted_reduction <= objective_tol
+                && objective_change <= objective_tol
+                && cycles_done >= 2
             {
                 eprintln!(
-                    "[JN-EXIT] cycle={cycle} reason=plateau_streak streak={plateau_streak} objective_change={objective_change:.3e} objective_tol={objective_tol:.3e} accepted_step_inf={accepted_step_inf:.3e} residual={residual:.3e} residual_tol={residual_tol:.3e}"
+                    "[JN-EXIT] cycle={cycle} reason=predicted_reduction_below_tol predicted_reduction={accepted_predicted_reduction:.3e} objective_change={objective_change:.3e} objective_tol={objective_tol:.3e} accepted_step_inf={accepted_step_inf:.3e} residual={residual:.3e} residual_tol={residual_tol:.3e}"
                 );
                 converged = true;
                 break;
