@@ -14428,6 +14428,15 @@ pub fn fit_transformation_normal(
         analytic_gradient,
         analytic_hessian,
     );
+    // Outer derivative policy (P2.3): consult the family's CTN-specific
+    // override so the cost gate uses the Khatri–Rao row-streamed shape
+    // (`O(n · (rho + psi) · p)` gradient; `min(dense, mfree)` Hessian)
+    // rather than the generic `coefficient_*_cost × K` default.
+    let outer_derivative_policy = probe_family.outer_derivative_policy(
+        &probe_blocks,
+        joint_setup.log_kappa_dim(),
+        &options,
+    );
     let solved = optimize_spatial_length_scale_exact_joint(
         covariate_data,
         &block_specs_slice,
@@ -14445,6 +14454,7 @@ pub fn fit_transformation_normal(
         // wall-clock.
         true,
         Some(Arc::clone(&exact_screening_cap)),
+        outer_derivative_policy,
         // fit_fn
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             ensure_exact_geometry(&specs[0], &designs[0])?;

@@ -15475,6 +15475,10 @@ pub fn fit_survival_marginal_slope_terms(
     // joint Hessian (hazard multipliers depend on current β); the
     // Wood-Fasiolo PSD invariant that justifies EFS fails here, so
     // disable fixed-point at plan time.
+    let outer_policy = {
+        let psi_dim = setup.theta0().len() - setup.rho_dim();
+        initial_family.outer_derivative_policy(&initial_blocks, psi_dim, options)
+    };
     let solved = optimize_spatial_length_scale_exact_joint(
         data,
         &[marginalspec_boot.clone(), logslopespec_boot.clone()],
@@ -15486,6 +15490,7 @@ pub fn fit_survival_marginal_slope_terms(
         analytic_joint_hessian_available,
         true,
         None,
+        outer_policy,
         |theta, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let eval_started = std::time::Instant::now();
             log::info!(
