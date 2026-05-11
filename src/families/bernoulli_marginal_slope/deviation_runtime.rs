@@ -3,7 +3,63 @@ use crate::faer_ndarray::{FaerEigh, fast_ab};
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::pirls::LinearInequalityConstraints;
 use crate::span::{breakpoints_from_knots, span_index_for_breakpoints};
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ArrayView2};
+
+/// Cross-block anchor residual stored on the runtime.
+///
+/// After cross-block orthogonalisation against parametric anchors, the
+/// candidate flex block's design at any row is
+///
+///   design_row(x) = pure_span_row(x) − n_row · M
+///
+/// where `n_row` is the per-row stacked vector of parametric anchor values
+/// (length `d` = sum of component ncols), and `M` is `residual_coefficients`
+/// (shape `d × basis_dim`). The orthonormalising rotation `R` constructed
+/// at training time has already been baked into `M = R · K_w · V`, so the
+/// runtime's evaluation path only needs `n_row · M` per row.
+#[derive(Clone, Debug)]
+pub struct AnchorResidual {
+    /// d × k matrix; design row subtracts `n_row · residual_coefficients`.
+    pub residual_coefficients: Array2<f64>,
+    pub null_basis_evaluator: AnchorNullSpaceEvaluator,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub enum AnchorNullSpaceEvaluator {
+    /// Reserved for the post-cross-block path where the candidate has
+    /// no residual but the predictor still needs to declare an empty
+    /// evaluator slot. Not constructed today.
+    Empty,
+    Stacked {
+        components: Vec<AnchorNullSpaceComponent>,
+        /// d × d rotation R such that Q-row(x) = N-row(x) · R. In the
+        /// current construction R is baked into `residual_coefficients`,
+        /// so this field is the identity matrix and the design evaluator
+        /// computes `subtract = n_row · residual_coefficients`.
+        orthonormalising_rotation: Array2<f64>,
+    },
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub enum AnchorNullSpaceComponent {
+    /// Parametric anchor — at predict time the parent predictor reconstructs
+    /// the per-row vector from the saved marginal/logslope blocks; the
+    /// runtime only needs to know which block and how many columns. The
+    /// `block` tag is consumed by the serde plumbing in
+    /// `inference::model::SavedAnchorComponent`.
+    Parametric {
+        block: ParametricAnchorBlock,
+        ncols: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum ParametricAnchorBlock {
+    Marginal,
+    Logslope,
+}
 
 fn integrate_polynomial_product(left: &[f64], right: &[f64], width: f64) -> f64 {
     let mut total = 0.0;
@@ -44,6 +100,15 @@ pub struct DeviationRuntime {
     /// Used for constant-tail continuation outside support: the deviation
     /// saturates at this value for all z > right endpoint.
     right_boundary_value_row: Array1<f64>,
+    /// Cross-block anchor residualisation state. `None` until
+    /// `compose_anchor_orthogonalisation` is called.
+    anchor_residual: Option<AnchorResidual>,
+    /// Stacked parametric-anchor rows at training rows (n × d). Used by
+    /// `design_at_training_with_residual` to rebuild `block.design` after
+    /// orthogonalisation. Dropped before serialisation; predict-time
+    /// reconstruction rebuilds anchor rows fresh at the predict-time
+    /// feature rows.
+    anchor_rows_at_training: Option<Array2<f64>>,
 }
 
 /// Build the integrated derivative penalty matrix `P` on the *raw* I-spline
@@ -379,6 +444,8 @@ impl DeviationRuntime {
             span_c3,
             monotonicity_constraint_rows,
             right_boundary_value_row,
+            anchor_residual: None,
+            anchor_rows_at_training: None,
         })
     }
 
@@ -403,32 +470,56 @@ impl DeviationRuntime {
     // `integrated_derivative_penalty_with_nullity` are also expressed in
     // the new parameterisation.
     //
-    // Used by `enforce_cross_block_identifiability_for_flex_block` to enforce
-    // the joint-design identifiability invariant
-    // `A_train^T (C_train · T) = 0`, where `A_train` is the score-warp
-    // design at training points and `C_train` is the link-deviation design
-    // at the same points. The choice `T = null(A_train^T C_train)` makes
-    // the joint design `[X_loc | X_logslope | A | C·T]` full column rank
-    // (up to numerical tolerance), so `σ_min(joint H+S)` is bounded below
-    // by the smallest positive eigenvalue of S regardless of how β shifts
-    // the linear-predictor distribution. This generalises the per-block
-    // null-space drop above to the cross-block aliasing that arises
-    // whenever multiple flex blocks parameterise overlapping function
-    // classes.
-    pub(crate) fn compose_external_column_transform(
+    // Used by `enforce_cross_block_identifiability_for_flex_block` to
+    // enforce the joint-design identifiability invariant in the W-metric
+    // (W = p(1−p) at training rows). With `A_train` the stacked parametric
+    // anchors and `C_train = span_eval(values)` the candidate basis at the
+    // training rows, the residualised candidate is
+    //
+    //     C̃_train = (I − P_A^{(W)}) C_train,    P_A^{(W)} = A(AᵀWA)⁻¹AᵀW
+    //
+    // and the kept directions are the eigenvectors of `C̃ᵀ W C̃` above the
+    // numerical noise floor. The block-triangular reparameterisation
+    // `Aβ_A + Cβ_C = A(β_A + Bβ_C) + (C − AB)β_C` with `B = (AᵀWA)⁻¹AᵀWC`
+    // means dropping a direction in C̃ drops *exactly* a direction
+    // span(C) shares with span(A) under W, leaving no aliasing in the
+    // joint design `[X_loc | X_logslope | A | C·V − N·M]` (full column
+    // rank up to numerical tolerance, so `σ_min(joint H+S) ≥ λ_min(S₊)`
+    // regardless of how β shifts the linear-predictor distribution).
+    //
+    // The old `T = null(A_trainᵀ C_train)` algorithm was wrong: that
+    // null-space is the candidate directions *already* exactly W-orthogonal
+    // to A (Gram = 0), not the directions left after projecting A out.
+    // `null(AᵀC) = ∅` does NOT imply `span(C) ⊆ span(A)` — counterexample
+    // `A = e₁`, `C = e₁ + e₂` has `AᵀC = 1 ≠ 0` (empty null space) yet
+    // `(I − P_A) C = e₂ ≠ 0`. Whenever the anchor is wider than the
+    // candidate (d ≥ p_c) the old test generically returned ∅ even when
+    // the residualised candidate had full rank, prompting a spurious
+    // "fully aliased" hard-error. The current code residualises and keeps
+    // exactly the surviving rank.
+    /// Compose a rank-reveal right-selector and an optional anchor-residual.
+    /// After this call, `design(x)` returns
+    ///   design_row(x) = span_eval(x) · V  −  n_row(x) · residual.residual_coefficients
+    /// where V is `right_selector` (applied via right-multiplication into
+    /// `span_c{0..3}`). Only the `design()` path (derivative_order=0) subtracts
+    /// the residual: the anchor argument is a different scalar variable than
+    /// the candidate argument, so d/dx of `n_row(x)` w.r.t. the candidate
+    /// argument is identically zero.
+    pub(crate) fn compose_anchor_orthogonalisation(
         &mut self,
-        transform: &Array2<f64>,
+        right_selector: &Array2<f64>,
+        residual: Option<AnchorResidual>,
     ) -> Result<(), String> {
         let old_dim = self.basis_dim;
-        if transform.nrows() != old_dim {
+        if right_selector.nrows() != old_dim {
             return Err(format!(
                 "DeviationRuntime cross-block transform shape mismatch: \
                  transform rows={}, expected basis_dim={}",
-                transform.nrows(),
+                right_selector.nrows(),
                 old_dim,
             ));
         }
-        let new_dim = transform.ncols();
+        let new_dim = right_selector.ncols();
         if new_dim == 0 {
             return Err(
                 "DeviationRuntime cross-block transform reduces basis dim to 0; \
@@ -443,20 +534,141 @@ impl DeviationRuntime {
                 new_dim, old_dim,
             ));
         }
-        self.span_c0 = fast_ab(&self.span_c0, transform);
-        self.span_c1 = fast_ab(&self.span_c1, transform);
-        self.span_c2 = fast_ab(&self.span_c2, transform);
-        self.span_c3 = fast_ab(&self.span_c3, transform);
+        if let Some(ref res) = residual {
+            let d_expected: usize = match &res.null_basis_evaluator {
+                AnchorNullSpaceEvaluator::Empty => 0,
+                AnchorNullSpaceEvaluator::Stacked {
+                    components,
+                    orthonormalising_rotation,
+                } => {
+                    let sum: usize = components
+                        .iter()
+                        .map(|c| match c {
+                            AnchorNullSpaceComponent::Parametric { ncols, .. } => *ncols,
+                        })
+                        .sum();
+                    if orthonormalising_rotation.nrows() != sum
+                        || orthonormalising_rotation.ncols() != sum
+                    {
+                        return Err(format!(
+                            "DeviationRuntime anchor residual: rotation must be {}×{}, got {}×{}",
+                            sum,
+                            sum,
+                            orthonormalising_rotation.nrows(),
+                            orthonormalising_rotation.ncols(),
+                        ));
+                    }
+                    sum
+                }
+            };
+            if res.residual_coefficients.nrows() != d_expected {
+                return Err(format!(
+                    "DeviationRuntime anchor residual: residual_coefficients rows={}, expected sum-of-component-ncols={}",
+                    res.residual_coefficients.nrows(),
+                    d_expected,
+                ));
+            }
+            if res.residual_coefficients.ncols() != new_dim {
+                return Err(format!(
+                    "DeviationRuntime anchor residual: residual_coefficients cols={}, expected new basis dim {}",
+                    res.residual_coefficients.ncols(),
+                    new_dim,
+                ));
+            }
+        }
+        self.span_c0 = fast_ab(&self.span_c0, right_selector);
+        self.span_c1 = fast_ab(&self.span_c1, right_selector);
+        self.span_c2 = fast_ab(&self.span_c2, right_selector);
+        self.span_c3 = fast_ab(&self.span_c3, right_selector);
         // `right_boundary_value_row` is a 1-D row vector of length basis_dim;
-        // right-multiplying by T (basis_dim × new_dim) gives the new row.
-        self.right_boundary_value_row = self.right_boundary_value_row.dot(transform);
+        // right-multiplying by V (basis_dim × new_dim) gives the new row.
+        self.right_boundary_value_row = self.right_boundary_value_row.dot(right_selector);
         // Monotonicity rows (n_constraints × basis_dim) follow the same
         // right-multiplication. The constraint inequality `A β ≥ ε - 1`
-        // becomes `(A · T) β_new ≥ ε - 1` under the reparameterisation
-        // β = T β_new, so the row matrix is right-multiplied directly.
-        self.monotonicity_constraint_rows = fast_ab(&self.monotonicity_constraint_rows, transform);
+        // becomes `(A · V) β_new ≥ ε - 1` under the reparameterisation
+        // β = V β_new, so the row matrix is right-multiplied directly.
+        self.monotonicity_constraint_rows =
+            fast_ab(&self.monotonicity_constraint_rows, right_selector);
         self.basis_dim = new_dim;
+        self.anchor_residual = residual;
         Ok(())
+    }
+
+    /// Accessor for the anchor-residual state set via
+    /// `compose_anchor_orthogonalisation`. Save-time code uses this to
+    /// snapshot the residual into the saved model; predict-time code
+    /// reconstructs the per-row η correction `n_row · residual_coefficients · β`.
+    pub fn anchor_residual(&self) -> Option<&AnchorResidual> {
+        self.anchor_residual.as_ref()
+    }
+
+    /// Set / replace the cached parametric-anchor rows at training rows.
+    /// Stored only at training time; predict-time reconstruction does not
+    /// use this cache (it evaluates anchor rows fresh).
+    pub(crate) fn set_anchor_rows_at_training(&mut self, rows: Array2<f64>) {
+        self.anchor_rows_at_training = Some(rows);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn cached_anchor_rows_at_training(&self) -> Option<&Array2<f64>> {
+        self.anchor_rows_at_training.as_ref()
+    }
+
+    /// Evaluate `design(values) - anchor_rows · M` where `anchor_rows` is
+    /// the n × d parametric-anchor matrix at the same rows as `values`.
+    /// Mandatory when `anchor_residual` is set; for runtimes without a
+    /// residual this is equivalent to `design(values)` and the
+    /// `anchor_rows` shape must be `n × 0`.
+    pub fn design_with_anchor_rows(
+        &self,
+        values: &Array1<f64>,
+        anchor_rows: ArrayView2<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let mut out = self.evaluate_span_polynomial_design_raw(values, 0)?;
+        if let Some(residual) = &self.anchor_residual {
+            if anchor_rows.nrows() != values.len() {
+                return Err(format!(
+                    "design_with_anchor_rows: anchor_rows has {} rows, expected {} (matching values)",
+                    anchor_rows.nrows(),
+                    values.len(),
+                ));
+            }
+            if anchor_rows.ncols() != residual.residual_coefficients.nrows() {
+                return Err(format!(
+                    "design_with_anchor_rows: anchor_rows has {} cols, expected {} (sum of component ncols)",
+                    anchor_rows.ncols(),
+                    residual.residual_coefficients.nrows(),
+                ));
+            }
+            let subtract = anchor_rows.dot(&residual.residual_coefficients);
+            out = out - subtract;
+        } else if anchor_rows.ncols() != 0 {
+            // Permit empty 0-col anchor rows without complaint; otherwise
+            // hard-error so callers don't silently pass mismatched rows.
+            return Err(format!(
+                "design_with_anchor_rows: runtime has no anchor residual but anchor_rows has {} cols",
+                anchor_rows.ncols(),
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Rebuild the training-row design after orthogonalisation, using
+    /// `anchor_rows_at_training` set via `set_anchor_rows_at_training`.
+    pub(crate) fn design_at_training_with_residual(
+        &self,
+        values: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        if let Some(rows) = self.anchor_rows_at_training.as_ref() {
+            self.design_with_anchor_rows(values, rows.view())
+        } else if self.anchor_residual.is_some() {
+            Err(
+                "design_at_training_with_residual: runtime has anchor_residual but no cached training anchor rows"
+                    .to_string(),
+            )
+        } else {
+            self.design(values)
+        }
     }
 
     // ── public field accessors ──
@@ -506,7 +718,11 @@ impl DeviationRuntime {
         Ok(())
     }
 
-    fn evaluate_span_polynomial_design(
+    /// Raw cubic-span polynomial design evaluation, without any
+    /// anchor-residual subtraction. Internal — callers that need the
+    /// residualised design must go through `design()` (which asserts no
+    /// residual) or `design_with_anchor_rows()`.
+    fn evaluate_span_polynomial_design_raw(
         &self,
         values: &Array1<f64>,
         derivative_order: usize,
@@ -557,24 +773,34 @@ impl DeviationRuntime {
         Ok(out)
     }
 
+    /// Pure-span design (no anchor-residual subtraction). Callers must
+    /// ensure the runtime has no anchor residual; otherwise use
+    /// `design_with_anchor_rows`. Derivative paths are unaffected: the
+    /// residual subtraction `n_row · M` is constant in the candidate
+    /// argument, so its derivatives are identically zero.
     pub fn design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        self.evaluate_span_polynomial_design(values, 0)
+        debug_assert!(
+            self.anchor_residual.is_none(),
+            "DeviationRuntime::design called on a runtime with an anchor residual; \
+             use design_with_anchor_rows or design_at_training_with_residual instead"
+        );
+        self.evaluate_span_polynomial_design_raw(values, 0)
     }
 
     pub fn first_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        self.evaluate_span_polynomial_design(values, 1)
+        self.evaluate_span_polynomial_design_raw(values, 1)
     }
 
     pub fn second_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        self.evaluate_span_polynomial_design(values, 2)
+        self.evaluate_span_polynomial_design_raw(values, 2)
     }
 
     pub fn third_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        self.evaluate_span_polynomial_design(values, 3)
+        self.evaluate_span_polynomial_design_raw(values, 3)
     }
 
     pub fn fourth_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        self.evaluate_span_polynomial_design(values, 4)
+        self.evaluate_span_polynomial_design_raw(values, 4)
     }
 
     pub(crate) fn integrated_derivative_penalty_with_nullity(
