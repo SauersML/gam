@@ -36,7 +36,9 @@ pub mod types;
 pub use data::{
     encode_recordswith_inferred_schema, load_csvwith_inferred_schema, load_csvwith_schema,
 };
-pub use inference::{alo, data, diagnostics, generative, hmc, predict, probability, quadrature};
+pub use inference::{
+    alo, data, diagnostics, generative, hmc, predict, probability, quadrature, sample,
+};
 pub use linalg::{faer_ndarray, matrix, utils};
 pub use resource::{
     ByteLruCache, DerivativeStorageMode, MaterializationPolicy, MatrixMaterializationError,
