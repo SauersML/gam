@@ -22,6 +22,7 @@ order=1, power=2, length_scale=1)` with `logslope =` same Duchon term.
 |  10000 | 38 s |            37.7 s |         11 | true      |
 |  20000 | 18 s |            17.9 s |          ? | true      |
 |  50000 |285 s |           285.5 s |         11 | true      |
+| 100000 |454 s |           453.9 s |         10 | true      |
 
 ¹ N=100: outer rejects all seeds because inner PIRLS spins 100 cycles
   with `beta_inf=3.4e4, residual=3.3e-4 > tol=5.8e-6` — symptomatic of
