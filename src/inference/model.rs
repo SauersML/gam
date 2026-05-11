@@ -1989,10 +1989,7 @@ impl FittedModel {
             baseline_time_wiggle: self.saved_baseline_time_wiggle()?,
             score_warp: self.payload().score_warp_runtime.clone(),
             link_deviation: self.payload().link_deviation_runtime.clone(),
-            latent_z_rank_int_calibration: self
-                .payload()
-                .latent_z_rank_int_calibration
-                .clone(),
+            latent_z_rank_int_calibration: self.payload().latent_z_rank_int_calibration.clone(),
         };
         if matches!(
             runtime.model_class,

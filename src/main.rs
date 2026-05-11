@@ -13720,16 +13720,18 @@ mod tests {
         assert_eq!(rows.len(), 2);
         for i in 0..rows.len() {
             let eta = rows[i]["eta"].parse::<f64>().expect("eta should parse");
-            let mean = rows[i]["mean"].parse::<f64>().expect("mean should parse");
+            let survival_prob = rows[i]["survival_prob"]
+                .parse::<f64>()
+                .expect("survival_prob should parse");
             assert!(
                 (eta - expected.eta[i]).abs() <= 1e-12,
                 "row {i}: eta mismatch: got {eta}, expected {}",
                 expected.eta[i]
             );
+            let expected_survival_prob = expected.mean[i].clamp(0.0, 1.0);
             assert!(
-                (mean - expected.mean[i]).abs() <= 1e-12,
-                "row {i}: mean mismatch: got {mean}, expected {}",
-                expected.mean[i]
+                (survival_prob - expected_survival_prob).abs() <= 1e-12,
+                "row {i}: survival_prob mismatch: got {survival_prob}, expected {expected_survival_prob}",
             );
         }
     }

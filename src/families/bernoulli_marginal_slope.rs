@@ -638,7 +638,9 @@ impl LatentZRankIntCalibration {
         }
         for (idx, value) in z.iter().enumerate() {
             if !value.is_finite() {
-                return Err(format!("rank-INT calibration: z[{idx}] = {value} not finite"));
+                return Err(format!(
+                    "rank-INT calibration: z[{idx}] = {value} not finite"
+                ));
             }
         }
         for (idx, weight) in weights.iter().enumerate() {
@@ -2033,7 +2035,11 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
         .ok_or_else(|| "G_N eigenvalues not contiguous".to_string())?;
     let lambda_max_n = g_n_evals_slice.iter().copied().fold(0.0_f64, f64::max);
     let n_train_f = n as f64;
-    let g_n_threshold = lambda_max_n * (64.0 * n_train_f.max(1.0) * f64::EPSILON * f64::EPSILON);
+    // Rank-truncation tolerance for the W-Gram eigendecomposition. The
+    // standard LAPACK convention for "is this eigenvalue numerically zero?"
+    // is `λ_max · max(m,n) · ε`. The factor 64 is a small safety margin
+    // covering the two matmul layers (W-scaling and `Nᵀ N`) that feed `G_N`.
+    let g_n_threshold = lambda_max_n * (64.0 * n_train_f.max(1.0) * f64::EPSILON);
     let g_n_kept: Vec<usize> = g_n_evals_slice
         .iter()
         .enumerate()
@@ -2077,16 +2083,20 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
         .as_slice()
         .ok_or_else(|| "G_C̃ eigenvalues not contiguous".to_string())?;
     let lambda_max_c = gc_evals_slice.iter().copied().fold(0.0_f64, f64::max);
-    // Anchor the drop threshold to the *input* candidate spectrum, not to
-    // C̃'s own λ_max. When span(C) ⊆ span(A) the residualised matrix is
-    // mathematically zero and every eigenvalue of C̃ᵀWC̃ sits at FP noise
-    // — λ_max_c is then itself at noise floor and a relative-only
-    // threshold collapses, keeping the noise. ‖c_sqw‖_F² = tr(CᵀWC) is
-    // the absolute reference: it bounds Σ λᵢ(C̃ᵀWC̃) from above and is
-    // unchanged by anchor projection cancellation.
-    let c_input_frob_sq: f64 = c_sqw.iter().map(|x| x * x).sum();
-    let drop_tol =
-        c_input_frob_sq * (64.0 * n_train_f.max(1.0) * f64::EPSILON * f64::EPSILON);
+    // Rank-truncation tolerance for `C̃ᵀWC̃`. Directions in `span(C)` that
+    // lie inside `span(A)` produce eigenvalues at the floating-point noise
+    // floor of `eigh` after the residualisation matmuls — empirically on
+    // the link-deviation fixtures this floor is `O(‖c_sqw‖²_F · n · ε)`,
+    // not `O(… · ε²)`, because the propagated rounding in
+    // `c_tilde = c_sqw − q_w · k_w` and the subsequent `c_tildeᵀ c_tilde`
+    // matmul each contribute a `n · ε` term that dominates the `ε²` floor
+    // a purely linear-Frobenius analysis would predict. Anchor the reference
+    // to `max(λ_max(C̃ᵀWC̃), ‖c_sqw‖²_F)`: under full alias, `λ_max_c` itself
+    // sits at noise floor, so the input-spectrum Frobenius `‖c_sqw‖²_F =
+    // tr(CᵀWC)` keeps the threshold above the noise floor.
+    let c_sqw_norm_sq: f64 = c_sqw.iter().map(|v| v * v).sum();
+    let lambda_max_ref = lambda_max_c.max(c_sqw_norm_sq);
+    let drop_tol = lambda_max_ref * (64.0 * n_train_f.max(1.0) * f64::EPSILON);
     let pos_indices: Vec<usize> = gc_evals_slice
         .iter()
         .enumerate()
@@ -3149,7 +3159,14 @@ impl RigidProbitKernel {
     /// the rigid-path log-likelihood-only loop in
     /// [`log_likelihood_only_with_options`].
     #[inline]
-    fn neglog_only(q: f64, g: f64, z: f64, y: f64, w: f64, probit_scale: f64) -> Result<f64, String> {
+    fn neglog_only(
+        q: f64,
+        g: f64,
+        z: f64,
+        y: f64,
+        w: f64,
+        probit_scale: f64,
+    ) -> Result<f64, String> {
         let s = 2.0 * y - 1.0;
         let observed_logslope = rigid_observed_logslope(g, probit_scale);
         let c = (1.0 + observed_logslope * observed_logslope).sqrt();
@@ -4757,13 +4774,9 @@ impl BernoulliMarginalSlopeFamily {
                 self.weights[row],
                 self.probit_frailty_scale(),
             ),
-            Some(grid) => self.empirical_rigid_neglog_only(
-                row,
-                marginal,
-                slope,
-                &grid.nodes,
-                &grid.weights,
-            ),
+            Some(grid) => {
+                self.empirical_rigid_neglog_only(row, marginal, slope, &grid.nodes, &grid.weights)
+            }
         }
     }
 
@@ -5449,35 +5462,37 @@ impl BernoulliMarginalSlopeFamily {
         // `batched_outer_gradient_terms`'s rho-gradient subsampling), so
         // rare-event imbalanced fits keep proper class representation
         // in every trial probe.
-        let (effective_options, trial_subsample_installed) = if options.early_exit_threshold.is_some()
-            && options.outer_score_subsample.is_none()
-            && n >= Self::AUTO_LINE_SEARCH_SUBSAMPLE_N
-        {
-            let stratum_secondary: Vec<u8> = self
-                .y
-                .iter()
-                .map(|v| if *v > 0.5 { 1u8 } else { 0u8 })
-                .collect();
-            let z_slice = self
-                .z
-                .as_slice()
-                .expect("BMS family z must be contiguous for line-search subsample");
-            let auto_opts = crate::families::marginal_slope_shared::AutoOuterSubsampleOptions::default();
-            match crate::families::marginal_slope_shared::auto_outer_score_subsample(
-                z_slice,
-                Some(&stratum_secondary),
-                &auto_opts,
-            ) {
-                Some(subsample) => {
-                    let mut cloned = options.clone();
-                    cloned.outer_score_subsample = Some(std::sync::Arc::new(subsample));
-                    (std::borrow::Cow::Owned(cloned), true)
+        let (effective_options, trial_subsample_installed) =
+            if options.early_exit_threshold.is_some()
+                && options.outer_score_subsample.is_none()
+                && n >= Self::AUTO_LINE_SEARCH_SUBSAMPLE_N
+            {
+                let stratum_secondary: Vec<u8> = self
+                    .y
+                    .iter()
+                    .map(|v| if *v > 0.5 { 1u8 } else { 0u8 })
+                    .collect();
+                let z_slice = self
+                    .z
+                    .as_slice()
+                    .expect("BMS family z must be contiguous for line-search subsample");
+                let auto_opts =
+                    crate::families::marginal_slope_shared::AutoOuterSubsampleOptions::default();
+                match crate::families::marginal_slope_shared::auto_outer_score_subsample(
+                    z_slice,
+                    Some(&stratum_secondary),
+                    &auto_opts,
+                ) {
+                    Some(subsample) => {
+                        let mut cloned = options.clone();
+                        cloned.outer_score_subsample = Some(std::sync::Arc::new(subsample));
+                        (std::borrow::Cow::Owned(cloned), true)
+                    }
+                    None => (std::borrow::Cow::Borrowed(options), false),
                 }
-                None => (std::borrow::Cow::Borrowed(options), false),
-            }
-        } else {
-            (std::borrow::Cow::Borrowed(options), false)
-        };
+            } else {
+                (std::borrow::Cow::Borrowed(options), false)
+            };
         let options: &BlockwiseFitOptions = &effective_options;
         let weighted_rows = outer_weighted_rows(options, n);
         if !flex_active {
@@ -14104,7 +14119,8 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 .iter()
                 .map(|spec| spec.design.ncols() as u128)
                 .sum::<u128>();
-            n.saturating_mul(k).saturating_mul(p_total.saturating_add(1))
+            n.saturating_mul(k)
+                .saturating_mul(p_total.saturating_add(1))
         };
         // Gradient work model: half the Hessian work (one fewer
         // accumulation pass; matches `default_coefficient_gradient_cost`).
@@ -14488,7 +14504,11 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         if !self.effective_flex_active(block_states)? {
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
             let cache = build_row_kernel_cache(&kern, &crate::families::row_kernel::RowSet::All)?;
-            return Ok(Some(row_kernel_hessian_dense(&kern, &cache, &crate::families::row_kernel::RowSet::All)));
+            return Ok(Some(row_kernel_hessian_dense(
+                &kern,
+                &cache,
+                &crate::families::row_kernel::RowSet::All,
+            )));
         }
 
         // Build the dense joint Hessian by accumulating per-row primary
@@ -14524,7 +14544,10 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
             let cache = build_row_kernel_cache(&kern, &crate::families::row_kernel::RowSet::All)?;
             return Ok(Some(ExactNewtonJointGradientEvaluation {
-                log_likelihood: row_kernel_log_likelihood(&cache, &crate::families::row_kernel::RowSet::All),
+                log_likelihood: row_kernel_log_likelihood(
+                    &cache,
+                    &crate::families::row_kernel::RowSet::All,
+                ),
                 gradient: Self::exact_newton_score_from_objective_gradient(row_kernel_gradient(
                     &kern,
                     &cache,
@@ -14577,8 +14600,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             // assembly function honour it uniformly via the Horvitz–Thompson
             // weights carried on each `WeightedOuterRow`.
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
-            let rows =
-                crate::families::row_kernel::RowSet::from_options(options, self.y.len());
+            let rows = crate::families::row_kernel::RowSet::from_options(options, self.y.len());
             Ok(Some(Arc::new(RowKernelHessianWorkspace::with_rows(
                 kern, rows,
             )?)))
@@ -17321,8 +17343,7 @@ mod tests {
                 anchor_dense[[i, j]] = 0.5 * x + 0.5 * y;
             }
         }
-        let anchor_design =
-            DesignMatrix::Dense(DenseDesignMatrix::from(anchor_dense.clone()));
+        let anchor_design = DesignMatrix::Dense(DenseDesignMatrix::from(anchor_dense.clone()));
         let link_cfg = DeviationBlockConfig {
             num_internal_knots: 2,
             ..DeviationBlockConfig::default()
@@ -17398,7 +17419,10 @@ mod tests {
         .expect("link-dev fixture");
         let _ = link_seed;
         let p_before = link_prepared.runtime.basis_dim();
-        assert!(p_before >= 2, "fixture must have at least two basis columns");
+        assert!(
+            p_before >= 2,
+            "fixture must have at least two basis columns"
+        );
         // Build a 1-column anchor equal to the first column of the
         // candidate's training-row design — i.e. `A = C[:, 0]`. This is
         // exactly the textbook `A = e₁`, `C = [e₁ | e₂ | …]` shape: AᵀC
@@ -17413,8 +17437,7 @@ mod tests {
         anchor_dense
             .column_mut(0)
             .assign(&candidate_design.column(0));
-        let anchor_design =
-            DesignMatrix::Dense(DenseDesignMatrix::from(anchor_dense.clone()));
+        let anchor_design = DesignMatrix::Dense(DenseDesignMatrix::from(anchor_dense.clone()));
         use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
         enforce_cross_block_identifiability_for_flex_block(
             &mut link_prepared,
@@ -17592,8 +17615,7 @@ mod tests {
         let q_t_extra = q.t().dot(&extra);
         let extra_orth = &extra - &q.dot(&q_t_extra);
         anchor_dense.column_mut(k_alias).assign(&extra_orth);
-        let anchor_design =
-            DesignMatrix::Dense(DenseDesignMatrix::from(anchor_dense.clone()));
+        let anchor_design = DesignMatrix::Dense(DenseDesignMatrix::from(anchor_dense.clone()));
         use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
         let p_before = link_prepared.runtime.basis_dim();
         enforce_cross_block_identifiability_for_flex_block(
@@ -24866,7 +24888,10 @@ mod tests {
             LatentMeasureCalibration::RankInverseNormal(cal) => {
                 // Knot table is non-empty and the transformed sample is
                 // (approximately) N(0,1) by construction.
-                assert!(!cal.sorted_z.is_empty(), "rank-INT knot table must be non-empty");
+                assert!(
+                    !cal.sorted_z.is_empty(),
+                    "rank-INT knot table must be non-empty"
+                );
                 assert_eq!(cal.sorted_z.len(), cal.weighted_cdf.len());
                 // Strictly increasing knots and strictly increasing CDF.
                 for w in cal.sorted_z.windows(2) {
