@@ -16771,13 +16771,14 @@ mod tests {
     }
 
     /// Case (3) from the bug analysis: true alias `span(C) ⊆ span(A)`.
-    /// Build an anchor as a random full-rank linear combination of the
-    /// candidate's columns (`A = C · B` with `B` of rank p_c). The
-    /// residualised candidate `(I − P_A) C` is numerically zero, so the
-    /// algorithm must surface the hard "zero directions remaining" error
-    /// rather than silently passing noise directions through.
+    /// Use a thin QR of the candidate's training-row design to build an
+    /// orthonormal basis `Q` for span(C); then `A = Q` gives `AᵀA = I`
+    /// (well-conditioned, no near-zero pivots), so the W-metric projection
+    /// `(I − P_A) C` is numerically zero and the algorithm must surface
+    /// the hard "zero directions remaining" error.
     #[test]
     fn cross_block_identifiability_true_alias_returns_hard_error() {
+        use crate::faer_ndarray::FaerQr;
         use crate::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
         let n = 64usize;
         let z = Array1::from_iter((0..n).map(|i| {
@@ -16796,28 +16797,15 @@ mod tests {
         )
         .expect("link-dev fixture");
         let _ = link_seed;
-        let p_before = link_prepared.runtime.basis_dim();
-        assert!(p_before >= 2, "fixture must have at least two basis columns");
         let candidate_design = link_prepared
             .runtime
             .design(&q0_seed)
             .expect("candidate training-row design");
-        // A = C · B with B a deterministic full-rank p_c × (p_c + 2)
-        // matrix (wider than C so AᵀA is full rank in the kept block).
-        let p_c = candidate_design.ncols();
-        let p_a = p_c + 2;
-        let mut b = ndarray::Array2::<f64>::zeros((p_c, p_a));
-        for i in 0..p_c {
-            for j in 0..p_a {
-                b[[i, j]] = ((i as f64 + 1.0) * 0.31 + (j as f64 + 1.0) * 0.71).sin()
-                    + 0.5 * ((i as f64) * (j as f64) * 0.13).cos();
-            }
-            // Diagonal boost so columns are well-conditioned.
-            if i < p_a {
-                b[[i, i]] += 1.0;
-            }
-        }
-        let anchor_dense = candidate_design.dot(&b);
+        // Thin QR of C: Q is n × p_c orthonormal with span(Q) = span(C),
+        // R is p_c × p_c. Use Q as the anchor so AᵀA = I (no inverse
+        // amplification of numerical noise).
+        let (q, _r) = candidate_design.qr().expect("thin QR of candidate");
+        let anchor_dense = q;
         let anchor_design = DesignMatrix::Dense(DenseDesignMatrix::from(anchor_dense));
         use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
         let result = enforce_cross_block_identifiability_for_flex_block(
@@ -16835,14 +16823,18 @@ mod tests {
         );
     }
 
-    /// Case (4) from the bug analysis: partial alias. Anchor reproduces
-    /// `k_alias` columns of the candidate exactly; the remaining
-    /// `p_c − k_alias` directions are independent. The residualisation
-    /// theorem must keep exactly the surviving rank — neither over-keeping
-    /// (the old `null(AᵀC)` algorithm would over-keep noise once the
-    /// stacked Gram became defective) nor under-keeping.
+    /// Case (4) from the bug analysis: partial alias. Build an anchor
+    /// whose first k_alias columns are the leading orthonormal basis
+    /// vectors of span(C) (so each lies entirely inside span(C)), plus
+    /// one extra column entirely outside span(C). The residualisation
+    /// theorem must keep exactly `effective_rank(C) − k_alias` directions
+    /// — neither over-keeping (old `null(AᵀC)` could pass noise through)
+    /// nor under-keeping. Using QR-orthonormal anchor columns avoids the
+    /// numerical-conditioning sensitivity that would arise from inverting
+    /// an ill-conditioned `AᵀWA` built from raw I-spline columns.
     #[test]
     fn cross_block_identifiability_partial_alias_keeps_residual_rank() {
+        use crate::faer_ndarray::FaerQr;
         use crate::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
         let n = 96usize;
         let z = Array1::from_iter((0..n).map(|i| {
@@ -16861,32 +16853,43 @@ mod tests {
         )
         .expect("link-dev fixture");
         let _ = link_seed;
-        let p_before = link_prepared.runtime.basis_dim();
-        assert!(p_before >= 3, "partial-alias test needs p_before >= 3");
         let candidate_design = link_prepared
             .runtime
             .design(&q0_seed)
             .expect("candidate training-row design");
-        // Anchor has k_alias columns reproducing the first k_alias columns
-        // of C exactly, plus one extra column entirely outside span(C) so
-        // the parametric span is not contained in span(C). The W-metric
-        // residualisation must drop exactly k_alias directions.
-        let k_alias = (p_before / 2).max(1);
+        // QR gives Q (n × p_c) orthonormal with span(Q) = span(C). The
+        // candidate's effective rank at training rows equals the rank of
+        // R (its leading nonzero diagonal entries). For the row counts
+        // and knot configs used here, p_c is small so we just take the
+        // full Q and let the algorithm itself report the surviving rank.
+        let (q, _r) = candidate_design.qr().expect("thin QR of candidate");
+        let p_c = candidate_design.ncols();
+        // k_alias < p_c so partial (not full) alias.
+        let k_alias = (p_c / 2).max(1);
+        assert!(
+            k_alias + 1 <= p_c,
+            "partial-alias test needs p_c > k_alias + 1, got p_c={p_c}, k_alias={k_alias}",
+        );
         let p_a = k_alias + 1;
         let mut anchor_dense = ndarray::Array2::<f64>::zeros((n, p_a));
         for j in 0..k_alias {
-            anchor_dense
-                .column_mut(j)
-                .assign(&candidate_design.column(j));
+            anchor_dense.column_mut(j).assign(&q.column(j));
         }
-        // Extra column: a deterministic pattern unrelated to C.
+        // Extra column: deterministic high-frequency pattern unrelated to
+        // span(C). Apply (I − Q Qᵀ) to it so the extra column lies
+        // entirely in the orthogonal complement of span(C); this makes
+        // span(A) ∩ span(C) have rank exactly k_alias by construction.
+        let mut extra = Array1::<f64>::zeros(n);
         for i in 0..n {
-            anchor_dense[[i, k_alias]] =
-                ((i as f64 * 0.17).sin() + (i as f64 * 0.41).cos()) * 0.5;
+            extra[i] = ((i as f64 * 0.17).sin() + (i as f64 * 0.41).cos()) * 0.5;
         }
+        let q_t_extra = q.t().dot(&extra);
+        let extra_orth = &extra - &q.dot(&q_t_extra);
+        anchor_dense.column_mut(k_alias).assign(&extra_orth);
         let anchor_design =
             DesignMatrix::Dense(DenseDesignMatrix::from(anchor_dense.clone()));
         use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
+        let p_before = link_prepared.runtime.basis_dim();
         enforce_cross_block_identifiability_for_flex_block(
             &mut link_prepared,
             &q0_seed,
@@ -16905,8 +16908,6 @@ mod tests {
             p_before,
             p_after,
         );
-        // Anchor-orthogonality of the kept design under unweighted Gram
-        // (weights are uniform in this test, so unweighted ≡ W-metric).
         let new_design = link_prepared
             .runtime
             .design_at_training_with_residual(&q0_seed)
