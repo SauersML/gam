@@ -94,8 +94,12 @@ z = model.predict(test_df)                       # shape (n,)
 
 # 2-column DataFrame (id_column opts in)
 df = model.predict(test_df, id_column="patient", return_type="pandas")
-z = df["z"].to_numpy()                           # extract the column
+z = df["z"].to_numpy()                           # transformation-normal column
 ```
+
+The second (value) column is named `z` for transformation-normal output
+and `mean` for Bernoulli marginal-slope output. Use
+`df["mean"].to_numpy()` for the latter.
 
 ## Passing through identifier columns
 

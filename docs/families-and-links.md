@@ -63,9 +63,13 @@ survival or rare events.
 (positive continuous):
 
 ```python
-gamfit.fit(df, "count ~ s(time) + offset_log_exposure + link(type=log)",
+gamfit.fit(df, "count ~ s(time) + link(type=log)",
            family="poisson", offset="offset_log_exposure")
 ```
+
+The offset column is supplied via `offset=`; do not also place it on the
+formula RHS (a bare RHS identifier would be parsed as a linear term with
+its own coefficient).
 
 ### SAS (sinh-arcsinh) — `link(type=sas)`
 

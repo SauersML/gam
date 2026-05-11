@@ -12,19 +12,19 @@ This is what `gamlss` calls "distributional regression". Use it when:
 
 ## Enabling location-scale
 
-Pass a second formula for the noise / scale submodel via the `predict_noise`
-key in `config`:
+Pass a second formula for the noise / scale submodel via the
+`noise_formula` key in `config`:
 
 ```python
 gamfit.fit(
     df,
     "y ~ s(x1) + s(x2)",
-    config={"predict_noise": "s(x1)"},
+    config={"noise_formula": "s(x1)"},
 )
 ```
 
-The main formula models the location (mean). The `predict_noise` formula
-models log-scale. Both share the same covariate table.
+The main formula models the location (mean). The `noise_formula` models
+log-scale. Both share the same covariate table.
 
 This works for:
 
@@ -39,20 +39,23 @@ gamfit.fit(
     df,
     "Surv(entry, exit, event) ~ s(age) + bmi",
     survival_likelihood="location-scale",
-    config={"predict_noise": "s(age)"},
+    config={"noise_formula": "s(age)"},
 )
 ```
 
 ## Prediction output
 
-A Gaussian location-scale fit returns `sigma` alongside `eta` and `mean`:
+A Gaussian location-scale fit produces the same prediction columns as a
+standard Gaussian fit:
 
 ```python
 preds = model.predict(test_df, interval=0.95)
-# Columns: eta, mean, sigma, mean_lower, mean_upper
+# Columns: eta, mean, effective_se, mean_lower, mean_upper
 ```
 
-The `sigma` column is the per-row predicted standard deviation.
+`effective_se` is the delta-method standard error on the linear
+predictor; `mean_lower` / `mean_upper` are the response-scale credible
+bands at the requested `interval`.
 
 For survival location-scale, predictions are a
 [`SurvivalPrediction`](predictions.md#survivalprediction) object. Pass
@@ -70,7 +73,7 @@ se_S = pred.survival_se_at([1, 5, 10])  # populated for location-scale
 Location-scale models fall back to the Gaussian Laplace approximation
 rather than NUTS, because the predictive linear predictor is non-linear in
 the joint coefficient vector. The returned `PosteriorSamples` object has
-`posterior.method == "laplace_gaussian"`, `rhat == 1.0`, and predictive
+`posterior.method == "laplace"`, `rhat == 1.0`, and predictive
 bands flow through the same `.predict(...)` interface. See
 [posterior-sampling.md](posterior-sampling.md).
 
