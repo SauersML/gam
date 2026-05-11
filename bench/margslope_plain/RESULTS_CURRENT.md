@@ -134,3 +134,49 @@ N=100K in ~120 s instead of the projected ~500 s.
 
 This is the highest-impact optimization left for the plain margslope path
 at biobank scale.
+
+## Post-WIP-rebuild results (Conn-Gould-Toint inner stopping)
+
+Rebuilt binary at commit 431a1f57 (parallel-WIP) installs a Conn-Gould-
+Toint trust-region predicted-reduction certificate for the inner
+PIRLS (`accepted_predicted_reduction <= objective_tol &&
+objective_change <= objective_tol && cycles_done >= 2`).
+
+Effect on the open small-n problem cases:
+
+| case          | pre-WIP                | post-WIP                |
+| ------------- | ---------------------- | ----------------------- |
+| N=100 plain   | fail (100 cycles)      | fail (100 cycles)¹      |
+| N=200 plain   | 4.9 s, converged=false | 5.1 s, converged=false  |
+| N=50 SD/60 s  | timeout, 9 KAPPA evals | timeout, 10 KAPPA evals²|
+
+¹ N=100 inner PIRLS still hits the 100-cycle cap at cycle 99 with
+  `predicted_reduction=6.838e-6` vs `objective_tol=5.785e-6` — just
+  1.18× above tol. The CGT certificate would trigger if PIRLS could
+  run ~2 more cycles, but the cap blocks it. The existing
+  cap-extension at line 10096 gates on `residual <= 10·residual_tol`
+  which doesn't fire here (residual 60× tol). A second extension
+  branch keyed on `predicted_reduction <= 2·objective_tol` would
+  unblock this exact case.
+
+² N=50 SD per-KAPPA-eval cost dropped from ~10 s to ~5 s (2×) because
+  the CGT criterion now exits inner PIRLS early on many rank-deficient
+  inner solves where the predicted reduction falls below tol while
+  the raw residual stays large. Sampled exit reasons from a single
+  N=50 SD run:
+    [JN-EXIT] cycle=14 reason=predicted_reduction_below_tol pred=5.6e-3 tol=2e-2
+    [JN-EXIT] cycle=36 reason=predicted_reduction_below_tol pred=0.62  tol=0.9
+    [JN-EXIT] cycle=45 reason=predicted_reduction_below_tol pred=0.19  tol=0.23
+    [JN-EXIT] cycle=93 reason=predicted_reduction_below_tol pred=9e-7  tol=1.3e-6
+  Saves 10–80 PIRLS cycles per inner solve. With a 180 s budget the
+  KAPPA optimizer reaches ~12 evals at theta_norm=2.64 and continues
+  slow tail convergence (log_kappa_norm 0.16 stable across the last
+  several evals).
+
+The post-WIP fix is genuinely better; it does not yet solve the N=100
+plain failure or the N=50 SD 30-second goal, but the inner-solve cost
+reduction is a meaningful step toward both. The remaining gap requires
+either (a) extending the plateau cap-extension to fire on
+predicted-reduction-near-tol, or (b) fixing the underlying rank
+deficiency at n < p via auto-bumped ridge in the operator-mode joint
+Newton path.
