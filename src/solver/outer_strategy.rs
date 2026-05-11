@@ -4002,7 +4002,11 @@ fn run_outer(
         let mut prev_attempt_grad_norm: Option<f64> = None;
 
         let outcome = loop {
-            let active_config: &OuterConfig = retry_config.as_ref().unwrap_or(config);
+            // Bind the active config by cloning into a local owned value so
+            // subsequent retry-config assignment does not collide with the
+            // borrow used inside this iteration body.
+            let active_config_owned: OuterConfig = retry_config.clone().unwrap_or_else(|| config.clone());
+            let active_config: &OuterConfig = &active_config_owned;
             match run_outer_with_plan(obj, active_config, context, attempt_cap, &the_plan) {
                 Ok(result) => {
                     if result.converged
@@ -4052,8 +4056,13 @@ fn run_outer(
                         cur_grad_norm,
                         next_trust_radius,
                     );
-                    prev_attempt_grad_norm = Some(cur_grad_norm);
+                    // Snapshot the cap-feedback handle before we
+                    // reassign `retry_config` (which currently backs
+                    // `active_config`'s borrow). `InnerProgressFeedback`
+                    // is an Arc-wrapper bundle, so the clone is cheap.
+                    let cap_feedback = active_config.outer_inner_cap.clone();
                     let mut next = active_config.clone();
+                    prev_attempt_grad_norm = Some(cur_grad_norm);
                     next.initial_rho = Some(result.rho.clone());
                     next.operator_initial_trust_radius = next_trust_radius;
                     retry_config = Some(next);
@@ -4066,7 +4075,7 @@ fn run_outer(
                     // The next outer iter consumes ρ near a near-stationary
                     // point where exact β / gradient / Hessian is the
                     // load-bearing input to the operator-TR geometry.
-                    if let Some(feedback) = active_config.outer_inner_cap.as_ref() {
+                    if let Some(feedback) = cap_feedback.as_ref() {
                         feedback.cap.store(0, Ordering::Relaxed);
                     }
                 }
@@ -6616,20 +6625,23 @@ mod tests {
 
     #[test]
     fn run_nonconverged_arc_stays_on_arc_after_budget_retry_ladder() {
-        // Under the budget-bump retry ladder (commit c96c4233), an ARC
-        // primary that exhausts its iteration budget is retried up to two
-        // additional times with `max_iter *= 2` per retry, warm-started
-        // from the previous attempt's last rho — preserving the analytic
-        // outer Hessian instead of demoting to a strictly weaker
-        // BFGS+BfgsApprox surface. After the ladder is exhausted, the
-        // runner returns the final `Ok(OuterResult{converged:false})` from
+        // When an ARC primary exhausts its iteration budget, the runner
+        // reseeds a fresh ARC attempt from the previous attempt's last
+        // ρ and trust radius (up to two retries) and uncaps the inner
+        // PIRLS cap for the resumed run via the InnerProgressFeedback
+        // handle. Retries are gated on attempt-over-attempt `‖g‖`
+        // halving so a deterministic-replay trajectory falls through.
+        // The objective's analytic outer Hessian is preserved across
+        // every attempt — no lateral demote to BFGS+BfgsApprox. After
+        // the retries are exhausted (or the gate fires), the runner
+        // returns the final `Ok(OuterResult{converged:false})` from
         // the last ARC attempt; the plan stays ARC + Analytic Hessian.
         //
         // We use `cost = x^4`, `grad = 4 x^3`, `hess = 12 x^2` from
-        // `initial_rho = [5.0]` with `max_iter = 1`. ARC cannot reach the
-        // optimum from x=5 within the available budget (1 → 2 → 4 outer
-        // iterations on a quartic); thus the ladder surfaces a
-        // non-converged result without lateral demotion.
+        // `initial_rho = [5.0]` with `max_iter = 1`. Newton-style ARC
+        // steps on x^4 contract the gradient by ~3× per attempt, so
+        // the halving gate passes and both retries proceed; ARC still
+        // cannot reach the optimum in three single-iter attempts.
         let mut seed_config = crate::seeding::SeedConfig::default();
         seed_config.seed_budget = 1;
         let problem = OuterProblem::new(1)
