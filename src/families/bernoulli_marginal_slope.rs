@@ -169,6 +169,13 @@ pub struct BernoulliMarginalSlopeFitResult {
     pub link_dev_runtime: Option<DeviationRuntime>,
     /// Learned or fixed Gaussian-shift frailty SD.  `None` = no frailty.
     pub gaussian_frailty_sd: Option<f64>,
+    /// Structured warnings emitted during fit-time setup when a flex
+    /// block was fully aliased by its anchor union and got dropped. The
+    /// fit proceeds without the dropped block (its contribution to the
+    /// joint design was numerically reproducible by the anchor span, so
+    /// keeping it would leave the joint Hessian rank-deficient). Empty
+    /// for fits where every flex block carried independent directions.
+    pub cross_block_warnings: Vec<CrossBlockIdentifiabilityWarning>,
 }
 
 #[derive(Clone, Debug)]
@@ -1505,9 +1512,17 @@ pub(crate) enum CrossBlockAnchor<'a> {
 ///   continue with a zero-rank block. The candidate is left in its
 ///   pre-call state (the reparameterisation is never applied) so the
 ///   caller can safely discard it.
+#[derive(Debug)]
 pub(crate) enum CrossBlockIdentifiabilityOutcome {
-    Reparameterised { kept: usize, dropped: usize },
-    FullyAliased { reason: String },
+    Reparameterised {
+        #[allow(dead_code)]
+        kept: usize,
+        #[allow(dead_code)]
+        dropped: usize,
+    },
+    FullyAliased {
+        reason: String,
+    },
 }
 
 /// Structured warning surfaced by the BMS family when a candidate flex
@@ -1680,7 +1695,10 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
         // anchor's penalised span is structurally orthogonal to the
         // candidate's unpenalised null space (which is empty after the
         // drop). Return cleanly.
-        return Ok(());
+        return Ok(CrossBlockIdentifiabilityOutcome::Reparameterised {
+            kept: p_candidate,
+            dropped: 0,
+        });
     }
 
     // Stack into N_train ∈ ℝ^{n × d} with d = total_parametric_cols.
@@ -1749,7 +1767,10 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
     if r == 0 {
         // Anchor block has no positive eigenvalues under W (degenerate
         // weights or numerically zero N) — nothing to orthogonalise.
-        return Ok(());
+        return Ok(CrossBlockIdentifiabilityOutcome::Reparameterised {
+            kept: p_candidate,
+            dropped: 0,
+        });
     }
     // R = U_pos · diag(λ^{-1/2}) (d × r). Q_w_sqw = N_train_sqw · R is
     // the n × r orthonormal basis under the W inner product (in sqrt-W
@@ -1788,24 +1809,32 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
         .collect();
     let k_kept = pos_indices.len();
     if k_kept == 0 {
-        return Err(format!(
-            "cross-block identifiability: candidate flex basis ({p_c} cols) has zero \
-             directions remaining after residualisation against the unpenalised \
-             null-space of the anchor union ({d_local} parametric anchor cols, weighted \
-             training-row rank {r}). The residualised basis (I - P_A) C has numerical \
-             rank zero at the {n} training rows under the joint-Hessian row metric, \
-             so every direction in span(C) is reproducible by the parametric anchors \
-             up to numerical tolerance {drop_tol:.3e}. The candidate flex block \
-             carries no information the parametric blocks do not already capture in \
-             their unpenalised span; disable this flex block or drop a parametric \
-             term that exactly reproduces the flex argument. Knot count is NOT the \
-             relevant lever for this failure mode.",
+        // Every direction in span(C) is reproducible by the anchor union
+        // up to numerical tolerance — the candidate flex block carries
+        // zero independent directions. Return `FullyAliased` so the
+        // caller can drop the block with a structured warning instead of
+        // aborting the fit; keeping a zero-rank block is mathematically
+        // meaningless and would only push the failure further into the
+        // inner solver.
+        let reason = format!(
+            "candidate flex basis ({p_c} cols) has zero directions remaining after \
+             residualisation against the unpenalised null-space of the anchor union \
+             ({d_local} parametric anchor cols, weighted training-row rank {r}). The \
+             residualised basis (I - P_A) C has numerical rank zero at the {n} training \
+             rows under the joint-Hessian row metric, so every direction in span(C) is \
+             reproducible by the parametric anchors up to numerical tolerance \
+             {drop_tol:.3e}. The candidate flex block carries no information the \
+             parametric blocks do not already capture in their unpenalised span; \
+             disable this flex block or drop a parametric term that exactly reproduces \
+             the flex argument. Knot count is NOT the relevant lever for this failure \
+             mode.",
             p_c = p_candidate,
             d_local = d_total,
             r = r,
             n = n,
             drop_tol = drop_tol,
-        ));
+        );
+        return Ok(CrossBlockIdentifiabilityOutcome::FullyAliased { reason });
     }
     let mut v_selector = Array2::<f64>::zeros((p_candidate, k_kept));
     for (out_col, &in_col) in pos_indices.iter().enumerate() {
@@ -1872,7 +1901,10 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
         lambda_max_c = lambda_max_c,
         drop_tol = drop_tol,
     );
-    Ok(())
+    Ok(CrossBlockIdentifiabilityOutcome::Reparameterised {
+        kept: new_p,
+        dropped: p_candidate - new_p,
+    })
 }
 
 pub(crate) fn project_monotone_feasible_beta(
@@ -16096,10 +16128,11 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // Φ_link_dev · T_lw]` has full numerical column rank, structurally
     // bounding `σ_min(joint H + S) ≥ λ_min(S) > 0` regardless of how β
     // drifts the linear predictor distribution during PIRLS.
+    let mut cross_block_warnings: Vec<CrossBlockIdentifiabilityWarning> = Vec::new();
     let score_warp_prepared = if let Some(cfg) = spec.score_warp.as_ref() {
         use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
         let mut prepared = build_score_warp_deviation_block_from_seed(&spec.z, cfg)?;
-        enforce_cross_block_identifiability_for_flex_block(
+        let outcome = enforce_cross_block_identifiability_for_flex_block(
             &mut prepared,
             &spec.z,
             cfg,
@@ -16113,7 +16146,21 @@ pub fn fit_bernoulli_marginal_slope_terms(
             ],
             &spec.weights,
         )?;
-        Some(prepared)
+        match outcome {
+            CrossBlockIdentifiabilityOutcome::Reparameterised { .. } => Some(prepared),
+            CrossBlockIdentifiabilityOutcome::FullyAliased { reason } => {
+                log::warn!(
+                    "[BMS cross-block identifiability] score-warp block fully aliased \
+                     by marginal+logslope anchors; dropping the block. {reason}"
+                );
+                cross_block_warnings.push(CrossBlockIdentifiabilityWarning {
+                    candidate_label: "score_warp",
+                    anchor_summary: "marginal+logslope".to_string(),
+                    reason,
+                });
+                None
+            }
+        }
     } else {
         None
     };
@@ -16202,7 +16249,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             anchor_tags.push(None);
         }
         let _ = link_dev_seed; // padded knot-seed retained only for knot construction
-        enforce_cross_block_identifiability_for_flex_block(
+        let outcome = enforce_cross_block_identifiability_for_flex_block(
             &mut prepared,
             &eta_pilot,
             cfg,
@@ -16210,7 +16257,21 @@ pub fn fit_bernoulli_marginal_slope_terms(
             &anchor_tags,
             &spec.weights,
         )?;
-        Some(prepared)
+        match outcome {
+            CrossBlockIdentifiabilityOutcome::Reparameterised { .. } => Some(prepared),
+            CrossBlockIdentifiabilityOutcome::FullyAliased { reason } => {
+                log::warn!(
+                    "[BMS cross-block identifiability] link-deviation block fully aliased \
+                     by parametric + score-warp anchors; dropping the block. {reason}"
+                );
+                cross_block_warnings.push(CrossBlockIdentifiabilityWarning {
+                    candidate_label: "link_deviation",
+                    anchor_summary: "marginal+logslope+score_warp".to_string(),
+                    reason,
+                });
+                None
+            }
+        }
     } else {
         None
     };
@@ -16575,6 +16636,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         score_warp_runtime,
         link_dev_runtime,
         gaussian_frailty_sd: final_sigma_cell.get(),
+        cross_block_warnings,
     })
 }
 
@@ -16961,9 +17023,12 @@ mod tests {
     /// orthonormal basis `Q` for span(C); then `A = Q` gives `AᵀA = I`
     /// (well-conditioned, no near-zero pivots), so the W-metric projection
     /// `(I − P_A) C` is numerically zero and the algorithm must surface
-    /// the hard "zero directions remaining" error.
+    /// the `FullyAliased` outcome (previously this was a hard error; P5
+    /// converts it to a structured outcome the caller drops with a
+    /// warning rather than aborting the fit, since keeping a zero-rank
+    /// block is mathematically meaningless).
     #[test]
-    fn cross_block_identifiability_true_alias_returns_hard_error() {
+    fn cross_block_identifiability_true_alias_returns_fully_aliased_outcome() {
         use crate::faer_ndarray::FaerQr;
         use crate::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
         let n = 64usize;
@@ -16994,19 +17059,28 @@ mod tests {
         let anchor_dense = q;
         let anchor_design = DesignMatrix::Dense(DenseDesignMatrix::from(anchor_dense));
         use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
-        let result = enforce_cross_block_identifiability_for_flex_block(
+        let outcome = enforce_cross_block_identifiability_for_flex_block(
             &mut link_prepared,
             &q0_seed,
             &link_cfg,
             &[CrossBlockAnchor::Parametric(&anchor_design)],
             &[Some(ParametricAnchorBlock::Marginal)],
             &weights,
-        );
-        let err = result.expect_err("true alias must produce a hard error");
-        assert!(
-            err.contains("zero directions remaining"),
-            "expected hard error mentioning 'zero directions remaining', got: {err}",
-        );
+        )
+        .expect("true alias must produce a structured FullyAliased outcome");
+        match outcome {
+            CrossBlockIdentifiabilityOutcome::FullyAliased { reason } => {
+                assert!(
+                    reason.contains("zero directions remaining"),
+                    "expected FullyAliased reason mentioning 'zero directions remaining', got: {reason}",
+                );
+            }
+            CrossBlockIdentifiabilityOutcome::Reparameterised { kept, dropped } => {
+                panic!(
+                    "expected FullyAliased outcome but got Reparameterised(kept={kept}, dropped={dropped})"
+                );
+            }
+        }
     }
 
     /// Case (4) from the bug analysis: partial alias. Build an anchor
