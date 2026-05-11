@@ -103,7 +103,7 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Zip};
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use crate::faer_ndarray::FaerEigh;
 use crate::linalg::matrix::DesignMatrix;
@@ -11055,9 +11055,18 @@ impl HessianOperator for BlockCoupledOperator {
 /// `DenseSpectralOperator`.
 pub struct MatrixFreeSpdOperator {
     apply: Arc<dyn Fn(&Array1<f64>) -> Array1<f64> + Send + Sync>,
-    cached_logdet: OnceLock<f64>,
+    cached_logdet: crate::resource::RayonSafeOnce<f64>,
     n_dim: usize,
-    dense_spectral: OnceLock<Option<DenseSpectralOperator>>,
+    // `RayonSafeOnce`, not `OnceLock`: `materialize_dense_operator` invokes
+    // `apply`, which for operator-source joint Hessians dispatches a nested
+    // `into_par_iter` (e.g. `exact_newton_joint_hessian_matvec_from_cache`).
+    // With a plain `OnceLock`, concurrent rayon workers entering
+    // `solve`/`logdet` from inside an outer par_iter would park on the
+    // OnceLock's OS condvar; the leader's nested par_iter would then starve
+    // for workers. `RayonSafeOnce` keeps init lock-free — racers may
+    // duplicate the dim²-matvec build, but the first to publish wins and
+    // steady-state matches `OnceLock`.
+    dense_spectral: crate::resource::RayonSafeOnce<Option<DenseSpectralOperator>>,
 }
 
 impl MatrixFreeSpdOperator {
@@ -11072,9 +11081,9 @@ impl MatrixFreeSpdOperator {
 
         Self {
             apply,
-            cached_logdet: OnceLock::new(),
+            cached_logdet: crate::resource::RayonSafeOnce::new(),
             n_dim: dim,
-            dense_spectral: OnceLock::new(),
+            dense_spectral: crate::resource::RayonSafeOnce::new(),
         }
     }
 

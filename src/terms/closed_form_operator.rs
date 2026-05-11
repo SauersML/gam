@@ -8,7 +8,6 @@
 //! callers that explicitly need a materialized matrix, and caches only that
 //! opt-in dense build.
 
-use std::sync::OnceLock;
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1};
 use rayon::prelude::*;
@@ -54,13 +53,18 @@ pub struct ClosedFormPenaltyOperator {
     diagonal_epsilon: f64,
     /// Lazily-populated dense form. Populated only by `dense_form`; the
     /// matvec/diag/trace/log-det paths stay matrix-free.
-    cached_dense: OnceLock<Array2<f64>>,
+    ///
+    /// `RayonSafeOnce` (not `OnceLock`) because `build_dense` runs faer
+    /// GEMMs (`fast_ab`, `fast_atb`) which dispatch nested rayon work — a
+    /// plain `OnceLock` here would deadlock if `dense_form` is first hit
+    /// concurrently from inside an outer par_iter. See
+    /// `feedback_oncelock_rayon_deadlock`.
+    cached_dense: crate::resource::RayonSafeOnce<Array2<f64>>,
 }
 
-// `OnceLock<T>` is not `Clone`; cloning the operator resets its cache so the
-// new instance rebuilds on first use. This matches the legacy `derive(Clone)`
-// behavior (which also produced a fresh dense build per matvec — the cache is
-// strictly an addition).
+// Cloning the operator resets its cache so the new instance rebuilds on first
+// use. This matches the legacy `derive(Clone)` behavior (which also produced a
+// fresh dense build per matvec — the cache is strictly an addition).
 impl Clone for ClosedFormPenaltyOperator {
     fn clone(&self) -> Self {
         Self {
@@ -75,7 +79,7 @@ impl Clone for ClosedFormPenaltyOperator {
             polynomial_block_cols: self.polynomial_block_cols,
             outer_identifiability: self.outer_identifiability.clone(),
             diagonal_epsilon: self.diagonal_epsilon,
-            cached_dense: OnceLock::new(),
+            cached_dense: crate::resource::RayonSafeOnce::new(),
         }
     }
 }
@@ -123,7 +127,7 @@ impl ClosedFormPenaltyOperator {
             polynomial_block_cols,
             outer_identifiability: outer_identifiability.cloned(),
             diagonal_epsilon,
-            cached_dense: OnceLock::new(),
+            cached_dense: crate::resource::RayonSafeOnce::new(),
         }
     }
 
