@@ -1,21 +1,19 @@
 # Location-scale models
 
-A standard GAM models the **mean** of the response as a function of
-covariates. A *location-scale* GAM models the **mean and the
-variance/scale** jointly — each as its own smooth function of covariates.
+A standard GAM models the **mean** of the response. A *location-scale* GAM
+models the **mean and the variance/scale** jointly — each as its own smooth
+function of covariates.
 
-This is what `gamlss` calls "distributional regression". You use it when:
+This is what `gamlss` calls "distributional regression". Use it when:
 
 - Residual variance is itself a function of covariates (heteroscedasticity).
-- You care about the spread, not just the centre — e.g. risk margins,
-  prediction intervals that vary with `x`.
-- Survival data has non-proportional shape (you want a flexible scale).
+- You need prediction intervals that vary with `x`.
+- Survival data has non-proportional shape and you want a flexible scale.
 
 ## Enabling location-scale
 
-The Python API exposes location-scale through the `config` kwarg with the
-key `predict_noise`, which carries a second formula for the noise / scale
-submodel:
+Pass a second formula for the noise / scale submodel via the `predict_noise`
+key in `config`:
 
 ```python
 gamfit.fit(
@@ -54,8 +52,7 @@ preds = model.predict(test_df, interval=0.95)
 # Columns: eta, mean, sigma, mean_lower, mean_upper
 ```
 
-The `sigma` column is the per-row predicted standard deviation — it's the
-location-scale model's distinctive output.
+The `sigma` column is the per-row predicted standard deviation.
 
 For survival location-scale, predictions are a
 [`SurvivalPrediction`](predictions.md#survivalprediction) object. Pass
@@ -70,19 +67,19 @@ se_S = pred.survival_se_at([1, 5, 10])  # populated for location-scale
 
 ## Posterior sampling
 
-Location-scale models currently fall back to the Gaussian Laplace
-approximation rather than exact NUTS (the predictive linear-predictor is
-non-linear in the joint coefficient vector). The returned `PosteriorSamples`
-object behaves identically — `posterior.method == "laplace_gaussian"`,
-`rhat == 1.0`, and the predictive bands flow through the same `.predict(...)`
-interface. See [posterior-sampling.md](posterior-sampling.md).
+Location-scale models fall back to the Gaussian Laplace approximation
+rather than NUTS, because the predictive linear predictor is non-linear in
+the joint coefficient vector. The returned `PosteriorSamples` object has
+`posterior.method == "laplace_gaussian"`, `rhat == 1.0`, and predictive
+bands flow through the same `.predict(...)` interface. See
+[posterior-sampling.md](posterior-sampling.md).
 
-## When to use location-scale vs a transformation
+## Location-scale vs transformation
 
-If you have lopsided / skewed residuals, location-scale can model that
+For lopsided / skewed residuals, location-scale models the
 heteroscedasticity, but a *conditional transformation* model
-(`transformation_normal=True`) is often cleaner: it transforms the response
-so the residual structure becomes N(0, 1) conditionally. See
+(`transformation_normal=True`) transforms the response so the residual
+structure becomes N(0, 1) conditionally. See
 [marginal-slope.md](marginal-slope.md) for the transformation-normal flow.
 
 Rule of thumb:

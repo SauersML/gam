@@ -1,7 +1,6 @@
 # Cookbook
 
-Self-contained, runnable recipes for common and advanced patterns. Each one
-matches a pattern exercised in the test suite, so it's been seen to work.
+Runnable recipes. Each matches a pattern in the test suite.
 
 ## Fit a Gaussian GAM with intervals
 
