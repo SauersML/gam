@@ -357,18 +357,19 @@ def render_marginal_slope_3d() -> None:
     pc2 = rng.uniform(-1.0, 1.0, n)
     z = rng.standard_normal(n)
 
-    # Baseline log-odds: a gentle peak + valley so the lower surface has
-    # visible structure without dominating.
+    # Baseline log-odds: three peaks + a valley.  Gives the lower
+    # surface a clearly non-flat landscape.
     baseline = (
-        -0.4
-        + 1.0 * np.exp(-((pc1 - 0.30) ** 2 + (pc2 + 0.20) ** 2) / 0.18)
-        - 0.9 * np.exp(-((pc1 + 0.45) ** 2 + (pc2 - 0.55) ** 2) / 0.16)
+        -0.6
+        + 1.4 * np.exp(-((pc1 - 0.30) ** 2 + (pc2 + 0.15) ** 2) / 0.14)
+        - 1.0 * np.exp(-((pc1 + 0.50) ** 2 + (pc2 - 0.55) ** 2) / 0.12)
+        + 0.8 * np.exp(-((pc1 + 0.15) ** 2 + (pc2 + 0.60) ** 2) / 0.10)
     )
-    # Spatially-varying slope-of-z, always positive: gentle in the
-    # bottom-left corner, stronger in the top-right.  Keeps the two
-    # surfaces in their natural baseline / elevated order without
-    # crossing.
-    slope = 0.6 + 1.4 / (1.0 + np.exp(-2.5 * (pc1 + pc2 - 0.4)))
+    # Spatially-varying slope-of-z: always positive but a sharp wedge,
+    # ≈ 0.2 in the bottom-left to ≈ 2.6 in the top-right.  Pulls the
+    # elevated surface farther from the baseline in one corner than the
+    # other without making them cross.
+    slope = 0.2 + 2.4 / (1.0 + np.exp(-3.0 * (pc1 + pc2 - 0.0)))
     eta = baseline + slope * z
     prob = 1.0 / (1.0 + np.exp(-eta))
     case = (rng.uniform(size=n) < prob).astype(float)
