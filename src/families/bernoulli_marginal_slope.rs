@@ -13379,34 +13379,45 @@ impl BernoulliMarginalSlopeFamily {
                 .iter()
                 .enumerate()
                 .all(|(row, wr)| wr.index == row && wr.weight == 1.0);
-        // Pre-warm per-row caches the row loop transitively materializes, so the
+        // Pre-warm the per-row caches the row loop transitively reaches, so the
         // first row to enter the par_iter does not lazily run a nested
-        // `(0..n).into_par_iter()` inside a `RayonSafeOnce::get_or_init` race
-        // and force every other outer worker to either redo the same parallel
-        // build or starve the pool. The rigid path's third-derivative tensor is
-        // the load-bearing one (`rigid_third_full_cached`); the flex path
-        // already has its degree-21 cell-moments bundle primed by
-        // `BernoulliMarginalSlopeLineSearchWorkspace::materialized`.
+        // `into_par_iter()` inside a `OnceLock::get_or_init` / `RayonSafeOnce`
+        // race and starve the outer pool. Two distinct hazards:
+        //   1. The rigid third-derivative tensor cache (`rigid_third_full_cached`).
+        //      Used by the chunked / else branches when `!flex_active`; harmless
+        //      to populate even when the `!flex_active` rank-1 branch will not
+        //      consult it.
+        //   2. Lazy dense materialization of any kernel / coefficient-transform
+        //      design operator (`ChunkedKernelDesignOperator::materialized_combined`
+        //      → `build_row_chunk_combined` runs `par_chunks_mut`). Multiple
+        //      racing outer workers each spawn that nested parallel build, and
+        //      with the rigid rank-1 row body (`dot_row_view`, `syr_row_into`)
+        //      every row touches both designs — guaranteed contention. Touching
+        //      a single row on the main thread before the par_iter forces the
+        //      OnceLock-guarded build once, leaving the par_iter body to read
+        //      already-materialized `Array2` rows in O(p).
         // Mirrors the same discipline applied in
         // `exact_newton_joint_hessiansecond_directional_derivative_from_cache_with_options`.
-        if !flex_active {
+        if !flex_active && n > 0 {
             let _ = self.rigid_third_full_cached(block_states, cache, 0)?;
         }
-        // Skip the outer par_iter when the per-row body cannot pay for its
-        // scheduling overhead, or when we are already inside a rayon worker
-        // (so an outer par_iter is holding pool slots). Both cases turn the
-        // row-level par_iter into a net loss — at small `n*p*dirs` the per-row
-        // body is dominated by accumulator construction, and when nested the
-        // par_iter risks starving the pool on any `Mutex`/`OnceLock` racing in
-        // the per-row body (LRU caches, lazy cell-moment evaluation, etc.).
-        const ROW_PAR_FLOPS_THRESHOLD: usize = 1_000_000;
-        let row_body_flops = n_rows
-            .saturating_mul(slices.total)
-            .saturating_mul(slices.total)
-            .saturating_mul(n_dirs.max(1));
+        if n > 0 {
+            let warm_marg = Array1::<f64>::zeros(slices.marginal.end - slices.marginal.start);
+            let _ = self.marginal_design.dot_row_view(0, warm_marg.view());
+            let warm_log = Array1::<f64>::zeros(slices.logslope.end - slices.logslope.start);
+            let _ = self.logslope_design.dot_row_view(0, warm_log.view());
+        }
+        // Even with the warm-up above, fall back to a serial row loop when the
+        // par_iter cannot pay for its own dispatch overhead, or when we are
+        // already inside a rayon worker (so an outer par_iter is holding pool
+        // slots and a nested `into_par_iter` here would risk pool starvation
+        // on the LRU mutex inside `evaluate_cell_derivative_moments_lru`,
+        // etc.). At biobank n_rows the per-row body's design materialization
+        // and pullback work dominates dispatch, so the par_iter is preserved.
+        const ROW_PAR_MIN_ROWS: usize = 4_096;
         let run_rows_serial = rayon::current_thread_index().is_some()
-            || row_body_flops < ROW_PAR_FLOPS_THRESHOLD
-            || rayon::current_num_threads() <= 1;
+            || rayon::current_num_threads() <= 1
+            || n_rows < ROW_PAR_MIN_ROWS;
         let mut accs = if !flex_active {
             if run_rows_serial {
                 let mut accs = make_accs();
@@ -13490,75 +13501,84 @@ impl BernoulliMarginalSlopeFamily {
                 .step_by(chunk_rows)
                 .map(|start| (start, (start + chunk_rows).min(n)))
                 .collect::<Vec<_>>();
-            chunks
-                .into_par_iter()
-                .map(
-                    |(start, end)| -> Result<Vec<BernoulliBlockHessianAccumulator>, String> {
-                        let n_dirs = d_beta_flats.len();
-                        let len = end - start;
-                        let mut accs = make_accs();
-                        let mut w_mm = (0..n_dirs)
-                            .map(|_| Array1::<f64>::zeros(len))
-                            .collect::<Vec<_>>();
-                        let mut w_mg = (0..n_dirs)
-                            .map(|_| Array1::<f64>::zeros(len))
-                            .collect::<Vec<_>>();
-                        let mut w_gg = (0..n_dirs)
-                            .map(|_| Array1::<f64>::zeros(len))
-                            .collect::<Vec<_>>();
+            let chunk_body =
+                |(start, end): (usize, usize)| -> Result<Vec<BernoulliBlockHessianAccumulator>, String> {
+                    let n_dirs = d_beta_flats.len();
+                    let len = end - start;
+                    let mut accs = make_accs();
+                    let mut w_mm = (0..n_dirs)
+                        .map(|_| Array1::<f64>::zeros(len))
+                        .collect::<Vec<_>>();
+                    let mut w_mg = (0..n_dirs)
+                        .map(|_| Array1::<f64>::zeros(len))
+                        .collect::<Vec<_>>();
+                    let mut w_gg = (0..n_dirs)
+                        .map(|_| Array1::<f64>::zeros(len))
+                        .collect::<Vec<_>>();
 
-                        for row in start..end {
-                            let local = row - start;
-                            let row_ctx = Self::row_ctx(cache, row);
-                            let row_dirs = d_beta_flats
-                                .iter()
-                                .map(|d_beta_flat| {
-                                    self.row_primary_direction_from_flat(
-                                        row,
-                                        slices,
-                                        primary,
-                                        d_beta_flat,
-                                    )
-                                })
-                                .collect::<Result<Vec<_>, String>>()?;
-                            let thirds = self.row_primary_third_contracted_many_with_moments(
-                                row,
-                                block_states,
-                                cache,
-                                row_ctx,
-                                &row_dirs,
-                            )?;
-                            for (idx, third) in thirds.iter().enumerate() {
-                                w_mm[idx][local] = third[[0, 0]];
-                                w_mg[idx][local] = third[[0, 1]];
-                                w_gg[idx][local] = third[[1, 1]];
-                                accs[idx].add_hw_pullback_only(self, row, slices, primary, third);
-                            }
-                            bump_progress(&progress);
+                    for row in start..end {
+                        let local = row - start;
+                        let row_ctx = Self::row_ctx(cache, row);
+                        let row_dirs = d_beta_flats
+                            .iter()
+                            .map(|d_beta_flat| {
+                                self.row_primary_direction_from_flat(
+                                    row, slices, primary, d_beta_flat,
+                                )
+                            })
+                            .collect::<Result<Vec<_>, String>>()?;
+                        let thirds = self.row_primary_third_contracted_many_with_moments(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            &row_dirs,
+                        )?;
+                        for (idx, third) in thirds.iter().enumerate() {
+                            w_mm[idx][local] = third[[0, 0]];
+                            w_mg[idx][local] = third[[0, 1]];
+                            w_gg[idx][local] = third[[1, 1]];
+                            accs[idx].add_hw_pullback_only(self, row, slices, primary, third);
                         }
+                        bump_progress(&progress);
+                    }
 
-                        for idx in 0..n_dirs {
-                            accs[idx].add_weighted_design_grams(
-                                self,
-                                start..end,
-                                &w_mm[idx],
-                                &w_mg[idx],
-                                &w_gg[idx],
-                            )?;
-                        }
-                        Ok(accs)
-                    },
-                )
-                .try_reduce(make_accs, |mut left, right| -> Result<_, String> {
-                    for (l, r) in left.iter_mut().zip(right.iter()) {
+                    for idx in 0..n_dirs {
+                        accs[idx].add_weighted_design_grams(
+                            self,
+                            start..end,
+                            &w_mm[idx],
+                            &w_mg[idx],
+                            &w_gg[idx],
+                        )?;
+                    }
+                    Ok(accs)
+                };
+            if run_rows_serial {
+                let mut accs = make_accs();
+                for chunk in chunks {
+                    let partial = chunk_body(chunk)?;
+                    for (l, r) in accs.iter_mut().zip(partial.iter()) {
                         l.add(r);
                     }
-                    Ok(left)
-                })?
+                }
+                accs
+            } else {
+                chunks
+                    .into_par_iter()
+                    .map(chunk_body)
+                    .try_reduce(make_accs, |mut left, right| -> Result<_, String> {
+                        for (l, r) in left.iter_mut().zip(right.iter()) {
+                            l.add(r);
+                        }
+                        Ok(left)
+                    })?
+            }
         } else {
-            weighted_rows
-                .into_par_iter()
-                .try_fold(make_accs, |mut accs, wr| -> Result<_, String> {
+            let row_body =
+                |wr: WeightedOuterRow,
+                 accs: &mut Vec<BernoulliBlockHessianAccumulator>|
+                 -> Result<(), String> {
                     let row = wr.index;
                     let w = wr.weight;
                     let row_ctx = Self::row_ctx(cache, row);
@@ -13582,14 +13602,28 @@ impl BernoulliMarginalSlopeFamily {
                         accs[idx].add_pullback(self, row, slices, primary, &third);
                     }
                     bump_progress(&progress);
-                    Ok(accs)
-                })
-                .try_reduce(make_accs, |mut left, right| -> Result<_, String> {
-                    for (l, r) in left.iter_mut().zip(right.iter()) {
-                        l.add(r);
-                    }
-                    Ok(left)
-                })?
+                    Ok(())
+                };
+            if run_rows_serial {
+                let mut accs = make_accs();
+                for wr in weighted_rows.iter() {
+                    row_body(*wr, &mut accs)?;
+                }
+                accs
+            } else {
+                weighted_rows
+                    .into_par_iter()
+                    .try_fold(make_accs, |mut accs, wr| -> Result<_, String> {
+                        row_body(wr, &mut accs)?;
+                        Ok(accs)
+                    })
+                    .try_reduce(make_accs, |mut left, right| -> Result<_, String> {
+                        for (l, r) in left.iter_mut().zip(right.iter()) {
+                            l.add(r);
+                        }
+                        Ok(left)
+                    })?
+            }
         };
 
         let elapsed = started.elapsed().as_secs_f64();
