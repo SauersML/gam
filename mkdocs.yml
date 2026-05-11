@@ -1,0 +1,109 @@
+site_name: gamfit
+site_description: Formula-first generalized additive models for Python, backed by a high-performance Rust engine.
+site_url: https://gamfit.readthedocs.io/
+repo_url: https://github.com/SauersML/gam
+repo_name: SauersML/gam
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.tabs
+    - navigation.indexes
+    - toc.follow
+    - content.code.copy
+    - content.code.annotate
+    - search.suggest
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+
+plugins:
+  - search
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          paths: [.]
+          options:
+            docstring_style: numpy
+            docstring_section_style: table
+            show_source: false
+            show_root_heading: true
+            show_root_full_path: false
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            show_signature_annotations: true
+            separate_signature: true
+            line_length: 80
+            merge_init_into_class: true
+            members_order: source
+            filters:
+              - "!^_"
+              - "^__init__$"
+            extensions:
+              - griffe_inherited_docstrings
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+nav:
+  - Home: README.md
+  - Getting started:
+    - Install and first model: getting-started.md
+    - Data input formats: data-input.md
+  - Building a model:
+    - Formula DSL: formulas.md
+    - Families and link functions: families-and-links.md
+    - Survival models: survival.md
+    - Marginal-slope models: marginal-slope.md
+    - Location-scale models: location-scale.md
+  - Using a fitted model:
+    - Predictions: predictions.md
+    - Posterior sampling: posterior-sampling.md
+    - Diagnostics, summaries, reports: diagnostics.md
+    - scikit-learn integration: sklearn.md
+    - Save and load: persistence.md
+  - Reference:
+    - API reference: api-reference.md
+    - Exceptions: exceptions.md
+    - Cookbook: cookbook.md

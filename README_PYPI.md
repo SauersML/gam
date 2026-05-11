@@ -2,15 +2,18 @@
 
 [![PyPI](https://img.shields.io/pypi/v/gamfit.svg)](https://pypi.org/project/gamfit/)
 [![Python](https://img.shields.io/pypi/pyversions/gamfit.svg)](https://pypi.org/project/gamfit/)
+[![Docs](https://img.shields.io/readthedocs/gamfit.svg)](https://gamfit.readthedocs.io/)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](https://github.com/SauersML/gam/blob/main/LICENSE)
 
-A formula-first generalized additive model library for Python, backed by a
+Formula-first generalized additive models for Python, backed by a
 high-performance Rust engine.
 
-`gamfit` fits Gaussian, binomial, Poisson, and Gamma GLMs with smooth terms,
-random effects, location-scale extensions, survival likelihoods, and
-flexible/learnable links. Smoothing parameters are selected by REML or LAML.
-Posterior sampling uses NUTS.
+`gamfit` fits Gaussian, binomial, Poisson, and Gamma GLMs with smooth
+terms, random effects, bounded/constrained coefficients, location-scale
+extensions, survival likelihoods, and flexible/learnable links. Smoothing
+parameters are selected by REML or LAML. Posterior sampling uses NUTS.
+
+**Docs:** <https://gamfit.readthedocs.io/>
 
 ## Install
 
@@ -18,16 +21,10 @@ Posterior sampling uses NUTS.
 uv add gamfit
 ```
 
-Or with a managed Python (one-off, no project required):
+Wheels for Linux (x86_64, aarch64), macOS (x86_64, Apple silicon), and
+Windows. No Rust toolchain required.
 
-```bash
-uv pip install gamfit
-```
-
-Wheels are published for Linux (x86_64, aarch64), macOS (x86_64, Apple
-silicon), and Windows. No Rust toolchain required.
-
-## Quick start
+## 30-second tour
 
 ```python
 import gamfit
@@ -40,58 +37,77 @@ train = [
 ]
 
 model = gamfit.fit(train, "y ~ s(x)")
-predictions = model.predict([{"x": 1.5}, {"x": 2.5}], interval=0.95)
+print(model.predict([{"x": 1.5}, {"x": 2.5}], interval=0.95))
 print(model.summary())
 model.save("model.gam")
 ```
 
-Pandas, pyarrow, dict-of-columns, and list-of-records inputs all work
-without conversion.
+pandas, polars, pyarrow, numpy, dict-of-columns, and list-of-records inputs
+all work without conversion.
 
 ## What's different
 
-- **Three-part penalty structure.** Each smooth gets separate penalties
-  for magnitude, gradient, and curvature. Most GAM libraries use one
-  (curvature only) or two; the three-part decomposition gives the
-  smoother more degrees of freedom to distinguish flat-but-offset
-  functions from wiggly ones.
-- **Flexible link functions.** A spline offset from a base link (e.g.
-  probit) lets the data correct for link misspecification while
-  encoding the belief that the base link is approximately right.
-- **Surface smooths.** Thin-plate splines, Duchon radial bases with
-  triple-operator regularization, and Matérn covariance smooths in
-  arbitrary dimension, with automatic knot placement.
-- **Adaptive anisotropy.** Per-axis spatial anisotropy lets the model
-  shrink or stretch each feature axis independently within a single
-  joint smooth.
-- **Composable basis/kernel.** Mix and match the kernel of one spline
-  family with the length-scale behavior of another (e.g. Duchon kernel
-  with Matérn-style global κ scaling).
+- **Three-part penalty structure.** Each smooth gets separate penalties for
+  magnitude, gradient, and curvature. Most GAM libraries use one or two.
+- **Flexible link functions.** Spline offsets from a base link
+  (`link(type=flexible(probit))`), plus blended mixture links and SAS /
+  beta-logistic learnable shapes.
+- **Surface smooths in arbitrary dimension.** Thin-plate, Duchon (with
+  triple-operator regularization), Matérn covariance, with automatic knot
+  placement.
+- **Adaptive anisotropy.** Per-axis spatial anisotropy shrinks or stretches
+  each feature axis independently inside a single joint smooth.
+- **Composable basis/kernel.** Mix and match a spline kernel with a
+  length-scale behaviour (e.g. Duchon kernel with Matérn-style global κ).
+- **Marginal-slope models.** Decouple baseline risk from a calibrated
+  score's effect — for both Bernoulli and survival outcomes.
+- **Posterior sampling built in.** `model.sample(...)` runs NUTS where
+  supported and a Gaussian Laplace fallback elsewhere, behind one API.
 
-## scikit-learn integration
+## Highlights from the API
 
 ```python
-from gamfit.sklearn import GAMRegressor
+import gamfit
+from gamfit.sklearn import GAMRegressor, GAMClassifier
 
+# Validate before you fit
+gamfit.validate_formula(train, "y ~ s(x) + group(site)")
+
+# Posterior sampling and predictive bands
+posterior = model.sample(train, seed=42)
+bands = posterior.predict(test, level=0.95)
+
+# Survival
+gamfit.fit(df,
+    "Surv(entry, exit, event) ~ s(age) + bmi + timewiggle(internal_knots=6)",
+    survival_likelihood="transformation",
+)
+
+# scikit-learn
 est = GAMRegressor(formula="y ~ s(x)")
-est.fit(train)
-preds = est.predict([{"x": 1.5}, {"x": 2.5}])
+est.fit(X, y)
+
+# Diagnose, plot, report
+model.diagnose(train).metrics
+model.plot(train, x="x", kind="prediction")
+model.report("report.html")
 ```
 
 ## Public API
 
 | Symbol | Purpose |
 | --- | --- |
-| `gamfit.fit(data, formula, **kwargs)` | Fit a model from a dataset and a Wilkinson-style formula. |
+| `gamfit.fit(data, formula, **kwargs)` | Fit a model. |
 | `gamfit.load(path)` / `gamfit.loads(bytes)` | Reload a saved model. |
-| `gamfit.validate_formula(data, formula, ...)` | Type-check a formula against a dataset without fitting. |
-| `gamfit.build_info()` | Native-extension build metadata. |
-| `gamfit.explain_error(exc)` | Convert a `gamfit` exception into a human-readable hint. |
-| `gamfit.Model` | Fitted-model handle: `predict`, `summary`, `check`, `diagnose`, `plot`, `report`, `save`. |
-| `gamfit.sklearn.GAMRegressor` / `GAMClassifier` | scikit-learn-compatible estimators. |
+| `gamfit.validate_formula(data, formula, ...)` | Type-check a formula without fitting. |
+| `gamfit.build_info()` | Native extension build metadata. |
+| `gamfit.explain_error(exc)` | Human-readable hint for a gamfit exception. |
+| `gamfit.Model` | Fitted-model handle: `predict`, `summary`, `check`, `diagnose`, `plot`, `report`, `sample`, `save`. |
+| `gamfit.SurvivalPrediction` | Per-row hazard / survival surface; on-demand evaluation. |
+| `gamfit.SamplingConfig`, `PosteriorSamples`, `PosteriorPredictive` | NUTS / posterior interface. |
+| `gamfit.sklearn.GAMRegressor` / `GAMClassifier` | scikit-learn estimators. |
 
-See the [project documentation](https://github.com/SauersML/gam) for the
-full guide, the formula DSL reference, and the CLI.
+Full reference at <https://gamfit.readthedocs.io/en/latest/api-reference/>.
 
 ## Optional extras
 
@@ -105,5 +121,3 @@ uv add "gamfit[all]"        # everything
 ## License
 
 AGPL-3.0-or-later. See [LICENSE](https://github.com/SauersML/gam/blob/main/LICENSE).
-A commercial license is available for closed-source or SaaS use — see
-[COMMERCIAL.md](https://github.com/SauersML/gam/blob/main/COMMERCIAL.md).
