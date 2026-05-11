@@ -26163,9 +26163,6 @@ mod tests {
         for k in 0..p {
             for j in 0..p {
                 let r = (centers[[k, 0]] - centers[[j, 0]]).abs();
-                if r < 1e-14 {
-                    continue;
-                }
                 let core =
                     duchon_radial_core_psi_triplet(r, length_scale, p_order, s_order, d, &coeffs)
                         .unwrap();
@@ -26309,6 +26306,191 @@ mod tests {
             let fd_norm = fd.iter().map(|v| v * v).sum::<f64>().sqrt();
             eprintln!(
                 "[duchon_ls1] penalty {} analytic_norm={:.4e} fd_norm={:.4e} err={:.4e}",
+                idx, a_norm, fd_norm, err
+            );
+        }
+    }
+
+    /// FD-test the **design** derivative dX/dpsi against the rebuilt cost
+    /// design with frozen identifiability transform.
+    #[test]
+    fn test_duchon_design_log_kappa_derivative_matchesfd_dim1_power1_frozen() {
+        let n = 80usize;
+        let mut data = ndarray::Array2::<f64>::zeros((n, 1));
+        for i in 0..n {
+            data[[i, 0]] = i as f64 / (n as f64 - 1.0);
+        }
+        let mut spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+            length_scale: Some(1.0),
+            power: 1,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::default(),
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+        };
+        let base = build_duchon_basis(data.view(), &spec).expect("base build");
+        let z_frozen = match &base.metadata {
+            BasisMetadata::Duchon {
+                identifiability_transform,
+                ..
+            } => identifiability_transform.clone(),
+            _ => panic!("expected Duchon metadata"),
+        };
+        let centers = match &base.metadata {
+            BasisMetadata::Duchon { centers, .. } => centers.clone(),
+            _ => unreachable!(),
+        };
+        spec.center_strategy = CenterStrategy::UserProvided(centers);
+        spec.identifiability = match z_frozen {
+            Some(z) => SpatialIdentifiability::FrozenTransform { transform: z },
+            None => SpatialIdentifiability::None,
+        };
+        let derivative = build_duchon_basis_log_kappa_derivatives(data.view(), &spec)
+            .expect("analytic Duchon derivative should build");
+        let eps: f64 = 1e-5;
+        let ls_plus = 1.0 / eps.exp();
+        let ls_minus = 1.0 / (-eps).exp();
+        let mut spec_plus = spec.clone();
+        let mut spec_minus = spec.clone();
+        spec_plus.length_scale = Some(ls_plus);
+        spec_minus.length_scale = Some(ls_minus);
+        let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
+        let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
+        let plus_design = plus.design.to_dense();
+        let minus_design = minus.design.to_dense();
+        let fd_design = (&plus_design - &minus_design) / (2.0 * eps);
+        let analytic_design = match derivative.implicit_operator.as_ref() {
+            Some(op) => op
+                .materialize_first(0)
+                .expect("materialize first design derivative"),
+            None => derivative.first.design_derivative.clone(),
+        };
+        eprintln!(
+            "[duchon_d1_p1_frozen_design] analytic shape={:?} fd shape={:?}",
+            analytic_design.shape(),
+            fd_design.shape()
+        );
+        let a_norm = analytic_design.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let fd_norm = fd_design.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let err = if analytic_design.shape() == fd_design.shape() {
+            (&analytic_design - &fd_design)
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>()
+                .sqrt()
+        } else {
+            f64::NAN
+        };
+        eprintln!(
+            "[duchon_d1_p1_frozen_design] dX/dpsi: analytic_norm={:.4e} fd_norm={:.4e} err={:.4e}",
+            a_norm, fd_norm, err
+        );
+    }
+
+    /// Critical FD test mirroring iso-kappa REML path: uses FROZEN
+    /// identifiability transform captured from the design at kappa=1, then
+    /// FD's both the analytic derivative and the rebuilt-cost penalty with
+    /// the same frozen transform. If this fails, the bug is NOT in
+    /// kappa-dependence of Z; it's in the underlying derivative formula.
+    #[test]
+    fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_frozen() {
+        let n = 80usize;
+        let mut data = ndarray::Array2::<f64>::zeros((n, 1));
+        for i in 0..n {
+            data[[i, 0]] = i as f64 / (n as f64 - 1.0);
+        }
+        let mut spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+            length_scale: Some(1.0),
+            power: 1,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::default(),
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+        };
+        let base = build_duchon_basis(data.view(), &spec).expect("base build");
+        let z_frozen = match &base.metadata {
+            BasisMetadata::Duchon {
+                identifiability_transform,
+                ..
+            } => identifiability_transform.clone(),
+            _ => panic!("expected Duchon metadata"),
+        };
+        // Freeze the transform and also user-supply the centers so the spec
+        // is reproducible across length_scale shifts.
+        let centers = match &base.metadata {
+            BasisMetadata::Duchon { centers, .. } => centers.clone(),
+            _ => unreachable!(),
+        };
+        spec.center_strategy = CenterStrategy::UserProvided(centers);
+        spec.identifiability = match z_frozen {
+            Some(z) => SpatialIdentifiability::FrozenTransform { transform: z },
+            None => SpatialIdentifiability::None,
+        };
+        let derivative = build_duchon_basis_log_kappa_derivatives(data.view(), &spec)
+            .expect("analytic Duchon derivative should build");
+        let eps: f64 = 1e-5;
+        let ls_plus = 1.0 / eps.exp();
+        let ls_minus = 1.0 / (-eps).exp();
+        let mut spec_plus = spec.clone();
+        let mut spec_minus = spec.clone();
+        spec_plus.length_scale = Some(ls_plus);
+        spec_minus.length_scale = Some(ls_minus);
+        let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
+        let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
+        for idx in 0..derivative.first.penalties_derivative.len() {
+            let fd = (&plus.penalties[idx] - &minus.penalties[idx]) / (2.0 * eps);
+            let analytic = &derivative.first.penalties_derivative[idx];
+            let err = (analytic - &fd).iter().map(|v| v * v).sum::<f64>().sqrt();
+            let a_norm = analytic.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let fd_norm = fd.iter().map(|v| v * v).sum::<f64>().sqrt();
+            eprintln!(
+                "[duchon_d1_p1_frozen] penalty {} analytic_norm={:.4e} fd_norm={:.4e} err={:.4e}",
+                idx, a_norm, fd_norm, err
+            );
+        }
+    }
+
+    /// Same as `test_duchon_log_kappa_derivative_matchesfd_dim1_power1_linear`
+    /// but with identifiability=None, to test whether the kappa-dependence of
+    /// SpatialIdentifiability::OrthogonalToParametric is the source of the bug.
+    #[test]
+    fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_linear_no_ident() {
+        let n = 80usize;
+        let mut data = ndarray::Array2::<f64>::zeros((n, 1));
+        for i in 0..n {
+            data[[i, 0]] = i as f64 / (n as f64 - 1.0);
+        }
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+            length_scale: Some(1.0),
+            power: 1,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+        };
+        let derivative = build_duchon_basis_log_kappa_derivatives(data.view(), &spec)
+            .expect("analytic Duchon derivative should build");
+        let eps: f64 = 1e-5;
+        let kappa = 1.0;
+        let ls_plus = 1.0 / (kappa * eps.exp());
+        let ls_minus = 1.0 / (kappa * (-eps).exp());
+        let mut spec_plus = spec.clone();
+        let mut spec_minus = spec.clone();
+        spec_plus.length_scale = Some(ls_plus);
+        spec_minus.length_scale = Some(ls_minus);
+        let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
+        let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
+        for idx in 0..derivative.first.penalties_derivative.len() {
+            let fd = (&plus.penalties[idx] - &minus.penalties[idx]) / (2.0 * eps);
+            let analytic = &derivative.first.penalties_derivative[idx];
+            let err = (analytic - &fd).iter().map(|v| v * v).sum::<f64>().sqrt();
+            let a_norm = analytic.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let fd_norm = fd.iter().map(|v| v * v).sum::<f64>().sqrt();
+            eprintln!(
+                "[duchon_d1_p1_no_ident] penalty {} analytic_norm={:.4e} fd_norm={:.4e} err={:.4e}",
                 idx, a_norm, fd_norm, err
             );
         }
