@@ -405,26 +405,8 @@ def render_marginal_slope_3d() -> None:
     vmin = float(min(p_base.min(), p_high.min()))
     vmax = float(max(p_base.max(), p_high.max()))
 
-    fig = plt.figure(figsize=(10.6, 8.4))
-    fig.suptitle(
-        "Marginal-slope decomposition over a joint Duchon smooth",
-        fontsize=12, fontweight="semibold", color="#0f172a",
-        x=0.5, y=0.965,
-    )
-
-    # Legend row, well under the title
-    fig.text(0.16, 0.912, "  ", backgroundcolor="#3b528b",
-             fontsize=11, color="white")
-    fig.text(0.195, 0.910,
-             "baseline:   P(case | pc, z = 0)",
-             fontsize=10, color="#374151", va="center")
-    fig.text(0.50, 0.912, "  ", backgroundcolor="#b73779",
-             fontsize=11, color="white")
-    fig.text(0.535, 0.910,
-             "elevated:   P(case | pc, z = +2)",
-             fontsize=10, color="#374151", va="center")
-
-    ax = fig.add_axes([0.04, 0.10, 0.92, 0.78], projection="3d")
+    fig = plt.figure(figsize=(9.6, 7.4))
+    ax = fig.add_subplot(111, projection="3d")
 
     ls = LightSource(azdeg=315, altdeg=45)
     rgb_base = ls.shade(p_base, cmap=cm.viridis,
@@ -445,22 +427,29 @@ def render_marginal_slope_3d() -> None:
 
     ax.set_xlim(-1, 1); ax.set_ylim(-1, 1)
     ax.set_zlim(vmin - 0.02, vmax + 0.04)
-    style_3d_axes(ax, xlabel="pc1", ylabel="pc2", zlabel="P(case)")
-    ax.view_init(elev=24, azim=-58)
-    ax.set_box_aspect((1.0, 1.0, 0.70))
+    # `set_zlabel` gets clipped at this camera angle.  Annotate the
+    # z-quantity as a figure-coord label instead, on the same row as the
+    # two colour chips.
+    style_3d_axes(ax, xlabel="pc1", ylabel="pc2", zlabel="")
+    ax.view_init(elev=22, azim=-62)
+    ax.set_box_aspect((1.0, 1.0, 0.65))
 
-    fig.text(
-        0.5, 0.04,
-        "Two predicted-probability surfaces over (pc1, pc2): the "
-        "baseline population at z = 0, and the same population shifted "
-        "to z = +2.\n"
-        "The vertical gap between them is the score effect — and the "
-        "gap is itself a smooth function of where you stand in PC space.",
-        ha="center", fontsize=9, color="#6b7280",
-    )
+    # Top-row annotations: quantity name on the left, two colour chips
+    # on the right, tightly grouped.
+    fig.text(0.08, 0.94, "P(case)",
+             fontsize=11, fontweight="semibold", color="#0f172a",
+             va="center")
+    fig.text(0.45, 0.94, "   ", backgroundcolor="#3b528b",
+             fontsize=11, color="white", va="center")
+    fig.text(0.495, 0.938, "z = 0",
+             fontsize=10, color="#374151", va="center")
+    fig.text(0.66, 0.94, "   ", backgroundcolor="#b73779",
+             fontsize=11, color="white", va="center")
+    fig.text(0.705, 0.938, "z = +2",
+             fontsize=10, color="#374151", va="center")
 
     out = DOCS_IMAGES / "marginal_slope_3d.png"
-    fig.savefig(out, dpi=220, bbox_inches="tight", pad_inches=0.20)
+    fig.savefig(out, dpi=220, bbox_inches="tight", pad_inches=0.18)
     plt.close(fig)
     log(f"wrote {out}")
 
