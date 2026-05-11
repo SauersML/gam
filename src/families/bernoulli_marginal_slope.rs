@@ -1492,6 +1492,33 @@ pub(crate) enum CrossBlockAnchor<'a> {
     FlexEvaluation(&'a Array2<f64>),
 }
 
+/// Outcome of [`enforce_cross_block_identifiability_for_flex_block`].
+///
+/// * `Reparameterised` — the candidate was reparameterised in place so
+///   its column span at the n training rows is orthogonal to the anchor
+///   union. `kept` directions survive, `dropped` directions were exactly
+///   reproducible by the anchors and absorbed into the residualised basis.
+/// * `FullyAliased` — every direction in span(C) is reproducible by the
+///   anchor union (`(I − P_A) C` has numerical rank zero). The candidate
+///   carries no information independent of the anchors and the caller
+///   should drop it from the design with a structured warning rather than
+///   continue with a zero-rank block. The candidate is left in its
+///   pre-call state (the reparameterisation is never applied) so the
+///   caller can safely discard it.
+pub(crate) enum CrossBlockIdentifiabilityOutcome {
+    Reparameterised { kept: usize, dropped: usize },
+    FullyAliased { reason: String },
+}
+
+/// Structured warning surfaced by the BMS family when a candidate flex
+/// block is fully aliased by its anchor union and gets dropped.
+#[derive(Clone, Debug)]
+pub struct CrossBlockIdentifiabilityWarning {
+    pub candidate_label: &'static str,
+    pub anchor_summary: String,
+    pub reason: String,
+}
+
 /// Enforce joint-design identifiability for a single flex block by
 /// reparameterising its basis so its column span at the n training rows
 /// is orthogonal to the union of every supplied anchor's column span.
@@ -1566,7 +1593,7 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
         crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock,
     >],
     training_row_weights: &Array1<f64>,
-) -> Result<(), String> {
+) -> Result<CrossBlockIdentifiabilityOutcome, String> {
     use crate::faer_ndarray::FaerEigh;
     use crate::families::bernoulli_marginal_slope::deviation_runtime::{
         AnchorNullSpaceComponent, AnchorNullSpaceEvaluator, AnchorResidual,
@@ -1584,7 +1611,10 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
     let n = candidate_design.nrows();
     let p_candidate = candidate_design.ncols();
     if p_candidate == 0 {
-        return Ok(());
+        return Ok(CrossBlockIdentifiabilityOutcome::Reparameterised {
+            kept: 0,
+            dropped: 0,
+        });
     }
     if training_row_weights.len() != n {
         return Err(format!(
@@ -2785,6 +2815,36 @@ impl RigidProbitKernel {
             eta_q: c,
             eta_g: q * c1 + probit_scale * z,
         })
+    }
+
+    /// Objective-only fast path for the rigid probit kernel: returns just
+    /// `-w · log Φ(s · η)` (the row negative log-likelihood) without any
+    /// derivative-state computation.
+    ///
+    /// **Mathematically identical** to `RigidProbitKernel::new(...)?.logcdf`
+    /// scaled by `-w`: same algebraic form for `η = q·c(g) + s_f·g·z`, same
+    /// signed-probit log-CDF kernel. The skipped work is the chain-rule
+    /// scaffolding (`u1..u4`, `c1..c4`, `eta_q`, `eta_g`) that downstream
+    /// gradient/Hessian assembly needs but the line-search accept/reject
+    /// decision never touches.
+    ///
+    /// Used by [`BernoulliMarginalSlopeFamily::rigid_row_neglog_only`] from
+    /// the rigid-path log-likelihood-only loop in
+    /// [`log_likelihood_only_with_options`].
+    #[inline]
+    fn neglog_only(q: f64, g: f64, z: f64, y: f64, w: f64, probit_scale: f64) -> Result<f64, String> {
+        let s = 2.0 * y - 1.0;
+        let observed_logslope = rigid_observed_logslope(g, probit_scale);
+        let c = (1.0 + observed_logslope * observed_logslope).sqrt();
+        let eta = q * c + observed_logslope * z;
+        let m = s * eta;
+        let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(m);
+        if !logcdf.is_finite() {
+            return Err(format!(
+                "rigid probit neglog_only: non-finite log Φ at q={q}, g={g}, z={z}, y={y}"
+            ));
+        }
+        Ok(-w * logcdf)
     }
 
     #[inline]
@@ -4323,6 +4383,73 @@ impl BernoulliMarginalSlopeFamily {
         (f, f_a)
     }
 
+    /// Objective-only fast path for the empirical-grid rigid kernel: returns
+    /// just `-w · log Φ(s · (intercept + s_f·g·z))` evaluated at the
+    /// converged scalar intercept.
+    ///
+    /// **Mathematically identical** to
+    /// `empirical_rigid_neglog_jet(..).coeff(0)`: same scalar fixed point
+    /// (the converged intercept root from `empirical_intercept_from_marginal`),
+    /// same probit log-CDF evaluation. The skipped work is the per-row
+    /// `MultiDirJet` construction + the 6 Newton-refinement passes that
+    /// propagate the intercept through 16 directional coefficient slots;
+    /// the line-search accept/reject decision never reads those coefficients.
+    ///
+    /// Reuses the same `intercept_warm_starts` cache as `empirical_rigid_neglog_jet`,
+    /// so successive line-search trials at nearby intercepts converge in
+    /// `O(1)` Newton iterations per row.
+    fn empirical_rigid_neglog_only(
+        &self,
+        row: usize,
+        marginal: BernoulliMarginalLinkMap,
+        slope: f64,
+        nodes: &[f64],
+        measure_weights: &[f64],
+    ) -> Result<f64, String> {
+        let intercept =
+            self.empirical_rigid_intercept_for_row(row, marginal, slope, nodes, measure_weights)?;
+        let observed_slope = slope * self.probit_frailty_scale();
+        let observed_eta = intercept + observed_slope * self.z[row];
+        let signed = (2.0 * self.y[row] - 1.0) * observed_eta;
+        let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
+        if !logcdf.is_finite() {
+            return Err(format!(
+                "empirical rigid neglog_only: non-finite log Φ at row {row}"
+            ));
+        }
+        Ok(-self.weights[row] * logcdf)
+    }
+
+    /// Unified scalar-objective dispatcher for the rigid Bernoulli kernel.
+    /// Routes to [`RigidProbitKernel::neglog_only`] for the standard-normal
+    /// latent measure and [`Self::empirical_rigid_neglog_only`] for any
+    /// empirical-grid measure. Replaces `rigid_row_kernel_eval(...)`'s
+    /// `(neglog, _, _)` return when only the scalar is needed.
+    fn rigid_row_neglog_only(
+        &self,
+        row: usize,
+        marginal: BernoulliMarginalLinkMap,
+        slope: f64,
+    ) -> Result<f64, String> {
+        match self.latent_measure.empirical_grid_for_training_row(row)? {
+            None => RigidProbitKernel::neglog_only(
+                marginal.q,
+                slope,
+                self.z[row],
+                self.y[row],
+                self.weights[row],
+                self.probit_frailty_scale(),
+            ),
+            Some(grid) => self.empirical_rigid_neglog_only(
+                row,
+                marginal,
+                slope,
+                &grid.nodes,
+                &grid.weights,
+            ),
+        }
+    }
+
     fn empirical_rigid_neglog_jet(
         &self,
         row: usize,
@@ -4949,6 +5076,21 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
+    /// Above this n, rigid line-search trials use an auto-stratified
+    /// subsample for the reject/accept decision; accepted trials are
+    /// re-evaluated on full data before commit. Below this n the
+    /// full-data path is cheap enough that subsampling buys nothing.
+    ///
+    /// The wiring of *when* to consult this constant lives on the
+    /// line-search caller: the rigid-row objective-only path
+    /// ([`Self::rigid_row_neglog_only`]) is fast enough that subsampling is
+    /// optional even at biobank scale. The constant is retained as the
+    /// canonical decision threshold for any future auto-screen plumbing
+    /// (the user-facing rule is "no flags, no env vars"; this is the
+    /// in-source `n`-threshold that decides the route).
+    #[allow(dead_code)]
+    pub(crate) const AUTO_LINE_SEARCH_SUBSAMPLE_N: usize = 30_000;
+
     /// Outer-aware variant of `log_likelihood_only`. When
     /// `options.outer_score_subsample` is `None` this iterates over all rows
     /// and returns a value identical (bit-for-bit) to the legacy full-data
@@ -4970,11 +5112,28 @@ impl BernoulliMarginalSlopeFamily {
             // Rigid probit under the active latent measure. Standard-normal
             // keeps the algebraic Gaussian identity; empirical measure solves
             // the calibrated intercept against its quadrature grid.
+            //
+            // **Objective-only fast path.** The line-search accept/reject
+            // decision only needs the scalar negative log-likelihood; the
+            // gradient and Hessian returned by `rigid_row_kernel_eval` would
+            // be immediately discarded. `rigid_row_neglog_only` dispatches
+            // to:
+            //   * `RigidProbitKernel::neglog_only` (standard-normal): a single
+            //     `signed_probit_logcdf_and_mills_ratio` call, skipping the
+            //     `u_k`/`c_k`/`eta_*` chain-rule scaffolding.
+            //   * `empirical_rigid_neglog_only` (empirical-grid): the
+            //     converged scalar intercept (from
+            //     `empirical_rigid_intercept_for_row`'s warm-start cache) plus
+            //     a single probit log-CDF eval, skipping the four-direction
+            //     `MultiDirJet` construction and its six Newton-refinement
+            //     passes (the line search reads no derivative coefficients).
+            // The returned value is bit-equivalent to
+            // `rigid_row_kernel_eval(...).0` at the same row state.
             let b = &block_states[1].eta;
             let row_ll = |i: usize| -> Result<f64, String> {
                 let marginal_eta = block_states[0].eta[i];
                 let marginal = self.marginal_link_map(marginal_eta)?;
-                let (neglog, _, _) = self.rigid_row_kernel_eval(i, marginal_eta, marginal, b[i])?;
+                let neglog = self.rigid_row_neglog_only(i, marginal, b[i])?;
                 Ok(-neglog)
             };
             if let Some(threshold) = options.early_exit_threshold {
@@ -13963,12 +14122,18 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
         if !self.effective_flex_active(block_states)? {
-            // Rigid path: use generic RowKernel<2> operator. The rigid path
-            // does not yet have a subsample-aware cache, so options are
-            // currently ignored on this branch (full-data behavior is
-            // preserved bit-for-bit).
+            // Rigid path: RowKernel<2> operator wired through the supplied
+            // `RowSet`. With no outer subsample this is `RowSet::All`
+            // (full-data, bit-identical to the pre-threading behaviour);
+            // with an outer subsample installed, the cache and every
+            // assembly function honour it uniformly via the Horvitz–Thompson
+            // weights carried on each `WeightedOuterRow`.
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
-            Ok(Some(Arc::new(RowKernelHessianWorkspace::new(kern)?)))
+            let rows =
+                crate::families::row_kernel::RowSet::from_options(options, self.y.len());
+            Ok(Some(Arc::new(RowKernelHessianWorkspace::with_rows(
+                kern, rows,
+            )?)))
         } else {
             // Flex path: store the options on the workspace so the
             // directional-derivative methods route through the
