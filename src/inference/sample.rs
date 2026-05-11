@@ -771,8 +771,7 @@ fn sample_survival(
     let ridge_lambda = model.survivalridge_lambda.ok_or_else(|| {
         "saved survival model is missing survivalridge_lambda; refusing to \
          pick a load-time default (the historical 1e-4 fallback silently \
-         disagreed with the current 1e-6 fit-time CLI default). Refit on the \
-         current CLI."
+         disagreed with the 1e-6 fit-time default). Refit."
             .to_string()
     })?;
     let ridge_range_start =

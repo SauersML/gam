@@ -2019,7 +2019,7 @@ impl FittedModel {
             PredictModelClass::BernoulliMarginalSlope
         ) {
             let unified = self.payload().unified.as_ref().ok_or_else(|| {
-                "marginal-slope model is missing unified fit payload; refit with current CLI"
+                "marginal-slope model is missing unified fit payload; refit"
                     .to_string()
             })?;
             validate_marginal_slope_saved_fit(
@@ -2336,7 +2336,7 @@ impl FittedModel {
     pub fn require_data_schema(&self) -> Result<&DataSchema, String> {
         self.data_schema
             .as_ref()
-            .ok_or_else(|| "model is missing data_schema; refit with current CLI".to_string())
+            .ok_or_else(|| "model is missing data_schema; refit".to_string())
     }
 
     pub fn validate_for_persistence(&self) -> Result<(), String> {
@@ -2356,27 +2356,27 @@ impl FittedModel {
         self.validate_payload_version()?;
         if self.fit_result.is_none() {
             return Err(
-                "model is missing canonical fit_result payload; refit with current CLI".to_string(),
+                "model is missing canonical fit_result payload; refit".to_string(),
             );
         }
         if self.data_schema.is_none() {
-            return Err("model is missing data_schema; refit with current CLI".to_string());
+            return Err("model is missing data_schema; refit".to_string());
         }
         if self.training_headers.is_none() {
             return Err(
-                "model is missing training_headers; refit with current CLI to guarantee stable feature mapping at prediction time"
+                "model is missing training_headers; refit to guarantee stable feature mapping at prediction time"
                     .to_string(),
             );
         }
         let spec = self.resolved_termspec.as_ref().ok_or_else(|| {
-            "model is missing resolved_termspec; refit with the current CLI to guarantee train/predict design consistency"
+            "model is missing resolved_termspec; refit to guarantee train/predict design consistency"
                 .to_string()
         })?;
         validate_frozen_term_collectionspec(spec, "resolved_termspec")?;
 
         if self.formula_noise.is_some() && self.resolved_termspec_noise.is_none() {
             return Err(
-                "model defines formula_noise but is missing resolved_termspec_noise; refit with the current CLI"
+                "model defines formula_noise but is missing resolved_termspec_noise; refit"
                     .to_string(),
             );
         }
@@ -2385,7 +2385,7 @@ impl FittedModel {
         }
         if matches!(self.family_state, FittedFamily::TransformationNormal { .. }) {
             let score = self.transformation_score_calibration.ok_or_else(|| {
-                "transformation-normal model is missing transformation_score_calibration; refit with current CLI"
+                "transformation-normal model is missing transformation_score_calibration; refit"
                     .to_string()
             })?;
             score.validate("transformation-normal model")?;
@@ -2393,27 +2393,27 @@ impl FittedModel {
         if matches!(self.family_state, FittedFamily::MarginalSlope { .. }) {
             if self.formula_logslope.is_none() {
                 return Err(
-                    "marginal-slope model is missing formula_logslope; refit with current CLI"
+                    "marginal-slope model is missing formula_logslope; refit"
                         .to_string(),
                 );
             }
             if self.z_column.is_none() {
                 return Err(
-                    "marginal-slope model is missing z_column; refit with current CLI".to_string(),
+                    "marginal-slope model is missing z_column; refit".to_string(),
                 );
             }
             let z_normalization = self.latent_z_normalization.ok_or_else(|| {
-                "marginal-slope model is missing latent_z_normalization; refit with current CLI"
+                "marginal-slope model is missing latent_z_normalization; refit"
                     .to_string()
             })?;
             z_normalization.validate("marginal-slope model")?;
             let latent_measure = self.latent_measure.as_ref().ok_or_else(|| {
-                "marginal-slope model is missing latent_measure; refit with current CLI".to_string()
+                "marginal-slope model is missing latent_measure; refit".to_string()
             })?;
             latent_measure.validate("marginal-slope model latent_measure")?;
             if self.marginal_baseline.is_none() || self.logslope_baseline.is_none() {
                 return Err(
-                    "marginal-slope model is missing baseline offsets; refit with current CLI"
+                    "marginal-slope model is missing baseline offsets; refit"
                         .to_string(),
                 );
             }
@@ -2442,7 +2442,7 @@ impl FittedModel {
                 }
                 None => {
                     return Err(
-                        "marginal-slope model is missing family_state.frailty; refit with current CLI"
+                        "marginal-slope model is missing family_state.frailty; refit"
                             .to_string(),
                     );
                 }
@@ -2467,29 +2467,29 @@ impl FittedModel {
             if survival_likelihood.as_deref() == Some("marginal-slope") {
                 if self.formula_logslope.is_none() {
                     return Err(
-                        "survival marginal-slope model is missing formula_logslope; refit with current CLI"
+                        "survival marginal-slope model is missing formula_logslope; refit"
                             .to_string(),
                     );
                 }
                 if self.z_column.is_none() {
                     return Err(
-                        "survival marginal-slope model is missing z_column; refit with current CLI"
+                        "survival marginal-slope model is missing z_column; refit"
                             .to_string(),
                     );
                 }
                 let z_normalization = self.latent_z_normalization.ok_or_else(|| {
-                    "survival marginal-slope model is missing latent_z_normalization; refit with current CLI"
+                    "survival marginal-slope model is missing latent_z_normalization; refit"
                         .to_string()
                 })?;
                 z_normalization.validate("survival marginal-slope model")?;
                 let latent_measure = self.latent_measure.as_ref().ok_or_else(|| {
-                    "survival marginal-slope model is missing latent_measure; refit with current CLI"
+                    "survival marginal-slope model is missing latent_measure; refit"
                         .to_string()
                 })?;
                 latent_measure.validate("survival marginal-slope model latent_measure")?;
                 if self.logslope_baseline.is_none() {
                     return Err(
-                        "survival marginal-slope model is missing logslope_baseline; refit with current CLI"
+                        "survival marginal-slope model is missing logslope_baseline; refit"
                             .to_string(),
                     );
                 }
@@ -2650,7 +2650,7 @@ impl FittedModel {
             && self.survival_likelihood.is_none()
         {
             return Err(
-                "saved survival model is missing survival_likelihood metadata; refit with current CLI"
+                "saved survival model is missing survival_likelihood metadata; refit"
                     .to_string(),
             );
         }
@@ -2715,7 +2715,7 @@ impl FittedModel {
                 "fit_result",
             )?;
             let unified = self.unified.as_ref().ok_or_else(|| {
-                "marginal-slope model is missing unified fit payload; refit with current CLI"
+                "marginal-slope model is missing unified fit payload; refit"
                     .to_string()
             })?;
             validate_marginal_slope_saved_fit(
