@@ -9240,6 +9240,26 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // directly when it fires.
         let mut last_cycle_obj_change_below_tol = false;
 
+        // Consecutive-plateau counter for the relaxed KKT-on-null
+        // certificate. The post-step certificate at
+        // `accepted_step_inf <= step_tol && objective_change <= objective_tol`
+        // requires the accepted Newton step to be tiny in *absolute*
+        // terms (step_tol = inner_tol * (1 + ‖β‖∞)). In two-block
+        // location-scale fits with shared smooth structure the line
+        // search can keep accepting steps of order ~1e-3 along a
+        // near-null direction long after the objective has plateaued,
+        // and the strict step gate never closes. This counter recognises
+        // that multiple successive accepted cycles whose objective
+        // change is sub-tolerance is itself a KKT-on-null certificate:
+        // the model has converged on the resolvable subspace, and
+        // further iteration burns wall-clock without information gain.
+        // Reset to 0 on any cycle whose objective change exceeds
+        // tolerance (or on a line-search failure cycle, where the
+        // existing `last_cycle_obj_change_below_tol = false` reset is
+        // mirrored here for symmetry).
+        let mut plateau_streak: usize = 0;
+        const PLATEAU_STREAK_THRESHOLD: usize = 3;
+
         // Adaptive inner cycle cap (Task 6): track the descent ratio
         // `current_residual / previous_residual` over a sliding 3-cycle
         // window. When all three ratios are above 0.95 (plateau), the
@@ -9964,6 +9984,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     break;
                 }
                 last_cycle_obj_change_below_tol = false;
+                plateau_streak = 0;
                 continue;
             }
 
@@ -10186,6 +10207,46 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // !made_progress: too early to certify. Skip the break
                 // and let the next cycle either escape via Newton or
                 // re-trigger this branch with made_progress=true.
+            }
+            // Consecutive-plateau KKT-on-null certificate.
+            //
+            // Two cases the absolute-step certificate above misses but
+            // which are still genuine first-order optimality on the
+            // resolvable subspace:
+            //
+            // 1. Line search succeeds with `accepted_step_inf` of order
+            //    ~1e-3 along a near-null direction of the joint Hessian.
+            //    The objective is plateaued (objective_change ≤
+            //    objective_tol) but the absolute step gate
+            //    `accepted_step_inf ≤ inner_tol * (1 + ‖β‖∞)` never
+            //    closes because step_tol is fixed at ~1e-6.
+            //
+            // 2. Two-block GAMLSS with shared smooth structure: the
+            //    cross-block Hessian can keep producing non-tiny accepted
+            //    steps in a direction that does not reduce the
+            //    objective. The Newton model's predicted reduction
+            //    (bounded by `objective_change` once the line search
+            //    accepts) is the right convergence signal here.
+            //
+            // Requiring three successive plateaued accepted cycles
+            // distinguishes a single fortunate flat step from sustained
+            // identification-limited stalling. The `cycles_done >=
+            // PLATEAU_STREAK_THRESHOLD + 1` guard keeps cycle-0 noise
+            // from triggering a false certificate before Newton has
+            // resolved the geometry.
+            if objective_change <= objective_tol {
+                plateau_streak = plateau_streak.saturating_add(1);
+            } else {
+                plateau_streak = 0;
+            }
+            if plateau_streak >= PLATEAU_STREAK_THRESHOLD
+                && cycles_done >= PLATEAU_STREAK_THRESHOLD + 1
+            {
+                eprintln!(
+                    "[JN-EXIT] cycle={cycle} reason=plateau_streak streak={plateau_streak} objective_change={objective_change:.3e} objective_tol={objective_tol:.3e} accepted_step_inf={accepted_step_inf:.3e} residual={residual:.3e} residual_tol={residual_tol:.3e}"
+                );
+                converged = true;
+                break;
             }
             // Carry the objective-stagnation signal into the next
             // cycle so the line-search-failure path above can pair it

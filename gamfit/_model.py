@@ -8,6 +8,7 @@ from typing import Any, Sequence
 from ._binding import rust_module
 from ._diagnostics import Diagnostics
 from ._exceptions import map_exception
+from ._sampling import PosteriorSamples
 from ._schema import SchemaCheck
 from ._summary import Summary
 from ._tables import (
@@ -638,6 +639,87 @@ class Model:
             return str(html)
         Path(path).write_text(html, encoding="utf-8")
         return str(path)
+
+    def sample(
+        self,
+        data: Any,
+        *,
+        samples: int | None = None,
+        warmup: int | None = None,
+        chains: int | None = None,
+        target_accept: float | None = None,
+        seed: int | None = None,
+    ) -> PosteriorSamples:
+        """Draw from the model's posterior with NUTS.
+
+        Returns a :class:`PosteriorSamples` object carrying the raw
+        ``(n_draws, n_coeffs)`` numpy matrix, per-coefficient mean / std /
+        credible intervals, and convergence diagnostics (``rhat``,
+        ``ess``, ``converged``).
+
+        Defaults are dimension-aware — leaving every keyword unset gives
+        you a chain count, warmup length, and total sample budget tuned
+        to the fitted coefficient size (see
+        :func:`gam::hmc::NutsConfig::for_dimension` on the Rust side).
+        That heuristic already covers most usage; the keywords are there
+        for power users who want a longer run, a different acceptance
+        target, or a fixed seed for reproducibility.
+
+        Parameters
+        ----------
+        data:
+            Table-like input matching the model's training schema; the
+            same input formats accepted by :meth:`predict` are supported
+            here.  For survival models, the entry/exit/event columns are
+            consumed in addition to covariates.
+        samples:
+            Posterior draws per chain *after* warmup.  When omitted,
+            chosen automatically from the coefficient count.
+        warmup:
+            Warmup iterations per chain (defaults to ``samples`` when both
+            are left unset, otherwise to the adaptive default).
+        chains:
+            Number of independent chains.  Defaults adaptively to 2 or 4.
+        target_accept:
+            Target HMC acceptance rate in ``(0, 1)``.  Higher values give
+            smaller leapfrog steps and slower-but-more-robust mixing.
+        seed:
+            RNG seed for deterministic chain initialisation.
+
+        Notes
+        -----
+        Sampling currently supports standard GLM family models (Gaussian,
+        Binomial logit/probit/cloglog, Poisson, Gamma — with or without a
+        link-wiggle component) and survival likelihood modes other than
+        the latent and location-scale variants.  Unsupported model
+        classes raise :class:`gamfit.GamError` with a message mirroring
+        the CLI's ``gam sample`` behaviour.
+        """
+        headers, rows, _table_kind = normalize_table(data)
+        payload: dict[str, Any] = {}
+        if samples is not None:
+            payload["samples"] = int(samples)
+        if warmup is not None:
+            payload["warmup"] = int(warmup)
+        if chains is not None:
+            payload["chains"] = int(chains)
+        if target_accept is not None:
+            payload["target_accept"] = float(target_accept)
+        if seed is not None:
+            payload["seed"] = int(seed)
+        # Always pass a JSON document so the Rust side has a single decode
+        # path; an empty object is fine because every field is optional.
+        options_json = json.dumps(payload)
+        try:
+            raw = rust_module().sample_table(
+                self._model_bytes,
+                headers,
+                rows,
+                options_json,
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        return PosteriorSamples.from_ffi_json(raw)
 
     def save(self, path: str | Path) -> None:
         Path(path).write_bytes(self._model_bytes)

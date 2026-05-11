@@ -1907,6 +1907,30 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     let mean_penalty_count = builder.mean_penalty_count(&mean_boot_design);
     let noise_penalty_count = builder.noise_penalty_count(&noise_boot_design);
 
+    // Honor an explicit user-supplied `length_scale=X` on every spatial term
+    // in both the mean and noise blocks: when every term is κ-locked (no
+    // anisotropy, no per-axis ψ contrasts), the joint-spatial outer optimizer
+    // has nothing to optimize. Routing through it anyway wraps the full
+    // two-block coefficient solve inside an unnecessary outer loop where
+    // each evaluation runs the inner Newton from scratch. This is the same
+    // short-circuit the Bernoulli marginal-slope entry point performs at
+    // bernoulli_marginal_slope.rs:16432-16442; mirroring it here makes the
+    // GAMLSS path skip straight to the `(!enabled || log_kappa_dim == 0)`
+    // fast path in `optimize_spatial_length_scale_exact_joint`.
+    let mut effective_kappa_options = kappa_options.clone();
+    if effective_kappa_options.enabled
+        && crate::smooth::all_spatial_terms_kappa_fixed(&mean_bootspec)
+        && crate::smooth::all_spatial_terms_kappa_fixed(&noise_bootspec)
+    {
+        log::info!(
+            "[GAMLSS spatial] disabling κ/ψ optimization: every spatial term in \
+             both blocks has an explicit length_scale and no anisotropy; \
+             user-supplied kernel scale is fixed"
+        );
+        effective_kappa_options.enabled = false;
+    }
+    let kappa_options: &SpatialLengthScaleOptimizationOptions = &effective_kappa_options;
+
     // Macro to invoke the exact-joint spatial optimizer with shared closures.
     // The exact path evaluates the full profiled/Laplace objective over
     // theta = [rho, psi] with the real joint Hessian required by NewtonTR/ARC.
@@ -1941,22 +1965,70 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
             let outer_policy = {
                 // GAMLSS spatial path: psi_dim = log_kappa_dim + auxiliary_dim,
                 // matching the (theta_dim - rho_dim) decomposition the
-                // optimizer uses internally. The capability and predicted-work
-                // come from the family's `outer_derivative_policy`; we
-                // synthesize a minimal `ParameterBlockSpec` slice from the
-                // bootstrap designs so the cost model can read `n_b · p_b`
-                // without needing a fully-built family yet.
-                let _psi_dim = joint_setup.theta0().len() - joint_setup.rho_dim();
-                let capability = if analytic_joint_derivatives_available {
-                    crate::families::custom_family::ExactOuterDerivativeOrder::Second
-                } else {
-                    crate::families::custom_family::ExactOuterDerivativeOrder::First
+                // optimizer uses internally. Build realized ParameterBlockSpecs
+                // at the seed rho so the family's own cost model — which
+                // multiplies coefficient-gradient / coefficient-Hessian
+                // per-row cost by the joint outer-coordinate dimension and
+                // total p — produces honest `predicted_*_work` estimates.
+                // Previously this fed `predicted_*_work: 0` to the planner,
+                // which then ungated dense outer Hessian work that costs
+                // hundreds of seconds per eval at biobank scale (see
+                // `OuterDerivativePolicy::OUTER_HESSIAN_WORK_BUDGET`).
+                let psi_dim = joint_setup.theta0().len() - joint_setup.rho_dim();
+                let rho_seed = joint_setup
+                    .theta0()
+                    .slice(s![..joint_setup.rho_dim()])
+                    .to_owned();
+                let policy_blocks_res = builder.build_blocks(
+                    &rho_seed,
+                    &mean_boot_design,
+                    &noise_boot_design,
+                    mean_beta_hint_cell.borrow().clone(),
+                    noise_beta_hint_cell.borrow().clone(),
+                );
+                let mut policy = match policy_blocks_res {
+                    Ok(policy_blocks) => {
+                        let policy_family =
+                            builder.build_family(&mean_boot_design, &noise_boot_design);
+                        crate::families::custom_family::CustomFamily::outer_derivative_policy(
+                            &policy_family,
+                            &policy_blocks,
+                            psi_dim,
+                            options,
+                        )
+                    }
+                    Err(err) => {
+                        // Block construction at the seed should not fail for
+                        // any in-tree family, but if it does, fall back to a
+                        // policy that names the capability honestly and
+                        // declines to predict cost. Setting work to
+                        // `u128::MAX` routes the planner through gradient-only
+                        // BFGS (the universal Hessian-work budget is
+                        // saturating, so a sentinel is fine here).
+                        log::warn!(
+                            "[GAMLSS spatial] failed to realize policy blocks at seed rho ({err}); \
+                             routing outer optimizer through gradient-only BFGS"
+                        );
+                        let capability = if analytic_joint_derivatives_available {
+                            crate::families::custom_family::ExactOuterDerivativeOrder::Second
+                        } else {
+                            crate::families::custom_family::ExactOuterDerivativeOrder::First
+                        };
+                        crate::families::custom_family::OuterDerivativePolicy {
+                            capability,
+                            predicted_gradient_work: u128::MAX,
+                            predicted_hessian_work: u128::MAX,
+                        }
+                    }
                 };
-                crate::families::custom_family::OuterDerivativePolicy {
-                    capability,
-                    predicted_gradient_work: 0,
-                    predicted_hessian_work: 0,
+                if !analytic_joint_derivatives_available {
+                    // Capability must not exceed what the analytic derivatives
+                    // path can supply — the macro's hyper evaluator returns
+                    // an error otherwise.
+                    policy.capability =
+                        crate::families::custom_family::ExactOuterDerivativeOrder::First;
                 }
+                policy
             };
             optimize_spatial_length_scale_exact_joint(
                 data,
@@ -2018,7 +2090,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                  specs: &[TermCollectionSpec],
                  designs: &[TermCollectionDesign],
                  eval_mode,
-                 _row_set: &crate::families::row_kernel::RowSet| {
+                 row_set: &crate::families::row_kernel::RowSet| {
                     use crate::solver::estimate::reml::unified::EvalMode;
                     if !analytic_joint_derivatives_available {
                         return Err(
@@ -2053,10 +2125,36 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         &designs[1],
                     )?;
                     let warm_start = hyper_warm_start_cell.borrow().clone();
+                    // Forward the κ-staging row set to the family by installing it
+                    // on the canonical `outer_score_subsample` option. Inner-PIRLS
+                    // and final covariance still run on full data (the per-row
+                    // weight is consulted only by outer-only paths inside the
+                    // family). When the staging schedule is full-data the option
+                    // stays `None` and the call is equivalent to the prior path.
+                    let eval_options = match row_set {
+                        crate::families::row_kernel::RowSet::All => {
+                            std::borrow::Cow::Borrowed(options)
+                        }
+                        crate::families::row_kernel::RowSet::Subsample {
+                            rows,
+                            n_full,
+                        } => {
+                            let subsample = crate::families::marginal_slope_shared::
+                                OuterScoreSubsample::from_weighted_rows(
+                                    (**rows).clone(),
+                                    *n_full,
+                                    *n_full as u64,
+                                );
+                            let mut cloned = options.clone();
+                            cloned.outer_score_subsample =
+                                Some(std::sync::Arc::new(subsample));
+                            std::borrow::Cow::Owned(cloned)
+                        }
+                    };
                     let eval = evaluate_custom_family_joint_hyper(
                         &family,
                         &blocks,
-                        options,
+                        eval_options.as_ref(),
                         &rho,
                         &psiderivative_blocks,
                         warm_start.as_ref(),
