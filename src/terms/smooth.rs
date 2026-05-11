@@ -1359,6 +1359,24 @@ fn spatial_term_supports_hyper_optimization(spec: &TermCollectionSpec, term_idx:
     get_spatial_length_scale(spec, term_idx).is_some() || is_pure_duchon_aniso_term(spec, term_idx)
 }
 
+/// Returns `true` when a spatial term has NO outer optimization axes — i.e.
+/// the user provided an explicit `length_scale` without enabling anisotropy,
+/// so both the scalar κ and per-axis ψ contrasts are fixed.
+///
+/// This is the per-term predicate that distinguishes "fixed kernel scale"
+/// from "optimize the kernel scale" within the family entry points that
+/// want to honor an explicit user-supplied scale (e.g. Bernoulli
+/// marginal-slope, where the joint-spatial outer solver otherwise spends
+/// ~80 iters stalled on the user's chosen ρ at high gradient).
+pub fn spatial_term_has_locked_kappa(spec: &TermCollectionSpec, term_idx: usize) -> bool {
+    let aniso = get_spatial_aniso_log_scales(spec, term_idx);
+    let aniso_active = matches!(
+        (aniso.as_ref(), get_spatial_feature_dim(spec, term_idx)),
+        (Some(eta), Some(d)) if eta.len() == d && d > 0
+    );
+    get_spatial_length_scale(spec, term_idx).is_some() && !aniso_active
+}
+
 /// Per-term data-derived ψ = log κ bounds.
 ///
 /// Uses the same safe operating range documented in
@@ -9815,6 +9833,27 @@ pub(crate) fn spatial_length_scale_term_indices(spec: &TermCollectionSpec) -> Ve
         .enumerate()
         .filter_map(|(idx, _)| spatial_term_supports_hyper_optimization(spec, idx).then_some(idx))
         .collect()
+}
+
+/// Returns `true` when every spatial term in `spec` has a locked kernel
+/// scale (explicit `length_scale=X` without anisotropy) and therefore
+/// contributes no outer ψ/κ optimization axis. Empty term collections
+/// also return `true` — there are no kappas to optimize.
+///
+/// Used by family entry points that want to honor a user-supplied scalar
+/// length scale exactly: when all spatial terms are locked the n-block
+/// joint-spatial outer solver has nothing to optimize, and routing
+/// through it merely spends ~80 outer iters chasing a stalled ARC at the
+/// user's chosen ρ. Skipping straight to the rho-only path avoids that
+/// waste and respects the user's explicit kernel-scale input.
+pub fn all_spatial_terms_kappa_fixed(spec: &TermCollectionSpec) -> bool {
+    spec.smooth_terms
+        .iter()
+        .enumerate()
+        .all(|(idx, _)| {
+            !spatial_term_supports_hyper_optimization(spec, idx)
+                || spatial_term_has_locked_kappa(spec, idx)
+        })
 }
 
 fn fit_score(fit: &UnifiedFitResult) -> f64 {
