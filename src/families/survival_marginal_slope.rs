@@ -11956,11 +11956,12 @@ impl SurvivalMarginalSlopeFamily {
             self.evaluate_exact_newton_joint_dynamic_q_dense(block_states)
         } else {
             let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
-            let cache = build_row_kernel_cache(&kern, &crate::families::row_kernel::RowSet::All)?;
+            let rows = crate::families::row_kernel::RowSet::All;
+            let cache = build_row_kernel_cache(&kern, &rows)?;
             Ok((
-                row_kernel_log_likelihood(&cache),
-                -row_kernel_gradient(&kern, &cache),
-                row_kernel_hessian_dense(&kern, &cache),
+                row_kernel_log_likelihood(&cache, &rows),
+                -row_kernel_gradient(&kern, &cache, &rows),
+                row_kernel_hessian_dense(&kern, &cache, &rows),
             ))
         }
     }
@@ -13763,13 +13764,14 @@ impl SurvivalMarginalSlopeFamily {
         // quantities.  The cache evaluates every row kernel once and stores
         // (nll_i, g_i[4], H_i[4×4]).
         let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
-        let cache = build_row_kernel_cache(&kern, &crate::families::row_kernel::RowSet::All)?;
+        let rows = crate::families::row_kernel::RowSet::All;
+        let cache = build_row_kernel_cache(&kern, &rows)?;
 
-        let ll = row_kernel_log_likelihood(&cache);
+        let ll = row_kernel_log_likelihood(&cache, &rows);
 
         // Joint gradient:  g = -Σ_i Jᵢᵀ gᵢ  (sign: gᵢ are NLL gradients,
         // we negate to get log-likelihood gradient).
-        let nll_grad = row_kernel_gradient(&kern, &cache);
+        let nll_grad = row_kernel_gradient(&kern, &cache, &rows);
         let joint_gradient = -nll_grad;
 
         // Block-diagonal Hessians only — the inner solver consumes per-block
@@ -14169,10 +14171,11 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             }));
         }
         let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
-        let cache = build_row_kernel_cache(&kern, &crate::families::row_kernel::RowSet::All)?;
+        let rows = crate::families::row_kernel::RowSet::All;
+        let cache = build_row_kernel_cache(&kern, &rows)?;
         Ok(Some(ExactNewtonJointGradientEvaluation {
-            log_likelihood: row_kernel_log_likelihood(&cache),
-            gradient: -row_kernel_gradient(&kern, &cache),
+            log_likelihood: row_kernel_log_likelihood(&cache, &rows),
+            gradient: -row_kernel_gradient(&kern, &cache, &rows),
         }))
     }
 
@@ -14281,7 +14284,12 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         }
         let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
         let sl = d_beta_flat.as_slice().ok_or("non-contiguous d_beta")?;
-        crate::families::row_kernel::row_kernel_directional_derivative(&kern, sl).map(Some)
+        crate::families::row_kernel::row_kernel_directional_derivative(
+            &kern,
+            &crate::families::row_kernel::RowSet::All,
+            sl,
+        )
+        .map(Some)
     }
 
     fn exact_newton_joint_hessiansecond_directional_derivative(
@@ -14320,8 +14328,13 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
         let su = d_beta_u_flat.as_slice().ok_or("non-contiguous d_beta_u")?;
         let sv = d_beta_v_flat.as_slice().ok_or("non-contiguous d_beta_v")?;
-        crate::families::row_kernel::row_kernel_second_directional_derivative(&kern, su, sv)
-            .map(Some)
+        crate::families::row_kernel::row_kernel_second_directional_derivative(
+            &kern,
+            &crate::families::row_kernel::RowSet::All,
+            su,
+            sv,
+        )
+        .map(Some)
     }
 
     fn exact_newton_joint_psi_terms(
