@@ -786,23 +786,6 @@ fn splitmix64(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Build a deterministic stratified row subsample of size ≥ `k` from
-/// `(z, stratum_secondary)`.
-///
-/// Stratification: 100 z-deciles × distinct values of `stratum_secondary`
-/// (typically the {0,1} event/outcome indicator, giving ≤ 200 strata).
-/// Each non-empty stratum contributes `ceil(k * stratum_size / n)` rows
-/// drawn via a splitmix64-keyed Fisher-Yates partial shuffle so the result
-/// is reproducible from `(seed, stratum_id)`.
-///
-/// The returned mask is sorted, deduplicated, and never empty when `n > 0`.
-/// Per-row weights `w_i = N_h / k_h` (Horvitz-Thompson inverse-inclusion
-/// weights for the stratum the row came from) are assigned to
-/// `OuterScoreSubsample::rows`, and `weight_scale` is reported as the mean
-/// of those weights for diagnostics only.
-///
-/// Panics if `z.len() != stratum_secondary.len()`.
-
 /// Configuration for the automatic outer-score subsampler.
 ///
 /// At biobank scale (n ≥ tens of thousands) the marginal-slope outer
@@ -1002,6 +985,22 @@ pub fn maybe_install_auto_outer_subsample(
     Some(cloned)
 }
 
+/// Build a deterministic stratified row subsample of size ≥ `k` from
+/// `(z, stratum_secondary)`.
+///
+/// Stratification: 100 z-deciles × distinct values of `stratum_secondary`
+/// (typically the {0,1} event/outcome indicator, giving ≤ 200 strata).
+/// Each non-empty stratum contributes `ceil(k * stratum_size / n)` rows
+/// drawn via a splitmix64-keyed Fisher-Yates partial shuffle so the result
+/// is reproducible from `(seed, stratum_id)`.
+///
+/// The returned mask is sorted, deduplicated, and never empty when `n > 0`.
+/// Per-row weights `w_i = N_h / k_h` (Horvitz-Thompson inverse-inclusion
+/// weights for the stratum the row came from) are assigned to
+/// `OuterScoreSubsample::rows`, and `weight_scale` is reported as the mean
+/// of those weights for diagnostics only.
+///
+/// Panics if `z.len() != stratum_secondary.len()`.
 pub fn build_outer_score_subsample(
     z: &[f64],
     stratum_secondary: &[u8],
