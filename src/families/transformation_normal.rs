@@ -8167,6 +8167,21 @@ impl TransformationNormalJointHessianWorkspace {
 
 impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorkspace {
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+        // Amortization gate: only hand a dense matrix to the generic selector
+        // when one is already cached or when expected reuse against this
+        // (β, row_quantities) clears `p / SCOP_DENSE_AMORTIZATION_SAFETY`. The
+        // selector translates `None` into a `JointHessianSource::Operator`,
+        // which the inner-Newton PCG hot path consumes via `apply_into` (~k_PCG
+        // streamed HVPs per cycle). Forced dense materialization for callers
+        // that genuinely need a dense matrix (logdet, factorize) goes through
+        // `hessian_dense_forced` below, which always builds.
+        if !self.should_build_dense() {
+            return Ok(None);
+        }
+        Ok(Some(self.dense_hessian()?.clone()))
+    }
+
+    fn hessian_dense_forced(&self) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(self.dense_hessian()?.clone()))
     }
 
