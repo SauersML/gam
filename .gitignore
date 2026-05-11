@@ -89,6 +89,9 @@ dist/
 gamfit/_rust.abi3.so
 gamfit/*.dSYM/
 
+# MkDocs / docs build output
+site/
+
 # Lean/Lake build artifacts
 .lake/
 *.olean

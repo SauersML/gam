@@ -1,0 +1,25 @@
+# Read the Docs configuration file.
+# See https://docs.readthedocs.io/en/stable/config-file/v2.html
+
+version: 2
+
+build:
+  os: ubuntu-24.04
+  tools:
+    python: "3.12"
+
+mkdocs:
+  configuration: mkdocs.yml
+  fail_on_warning: false
+
+python:
+  install:
+    - requirements: docs/requirements.txt
+
+# Notes
+# - We do not pip-install gamfit itself on RTD. The mkdocstrings/Griffe handler
+#   parses the source under `gamfit/` statically (no import, no Rust toolchain
+#   required), and that's what produces the API reference. This keeps the
+#   docs build fast and avoids needing maturin/Rust on the RTD builder.
+# - The Material theme, the mkdocstrings python handler, and the markdown
+#   extensions used by the site are all listed in docs/requirements.txt.
