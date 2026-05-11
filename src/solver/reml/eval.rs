@@ -195,6 +195,28 @@ impl<'a> RemlState<'a> {
             return first_order_correction;
         }
 
+        // If the first-order path used a rank-deficient pseudo-inverse, the
+        // ρ-Hessian was indefinite or near-singular and the matrix-free ridged
+        // inverse used below would silently impute spurious variance along the
+        // dropped (unidentified) directions. Cubature sigma points propagated
+        // through that spurious V_ρ would manufacture higher-order corrections
+        // that are not supported by the data. The principled response is to
+        // honor the rank deficiency: return the first-order correction (which
+        // is already the correct rank-deficient inflation on the identified
+        // subspace) and skip cubature entirely.
+        if let Some(rank) = first_order.active_rank {
+            if rank < n_rho {
+                log::debug!(
+                    "Auto cubature skipped: first-order V_ρ is rank-deficient \
+                     ({}/{}); higher-order propagation would impute spurious \
+                     variance along unidentified directions.",
+                    rank,
+                    n_rho,
+                );
+                return first_order_correction;
+            }
+        }
+
         // Build V_rho from the outer Hessian around rho_hat.
         let mut hessian_rho = if let Some(h) = first_order.hessian_rho {
             h
