@@ -3580,6 +3580,12 @@ impl BernoulliBlockHessianAccumulator {
     /// psi_row lives in block `psi_block_idx` (0=marginal, 1=logslope).
     /// right_primary is a primary-space vector; its [0] component maps to marginal,
     /// [1] to logslope, and the rest to h/w (dense correction).
+    ///
+    /// Design rows are materialized once via `try_row_chunk` and reused across
+    /// the psi-index rank-1 sweeps.  Without that, `axpy_row_into` on a Lazy
+    /// operator re-dispatches `row_chunk_into` for every nonzero psi index
+    /// (psi_dim×rank-2 = 2*psi_dim row materializations per call), which is
+    /// the dominant cost of joint-spatial Hessian builds at biobank scale.
     fn add_rank1_psi_cross(
         &mut self,
         family: &BernoulliMarginalSlopeFamily,
@@ -3590,43 +3596,75 @@ impl BernoulliBlockHessianAccumulator {
         psi_row: &Array1<f64>,
         right_primary: &Array1<f64>,
     ) {
+        let need_marg = right_primary[0] != 0.0;
+        let need_log = right_primary[1] != 0.0;
+        let marg_chunk = if need_marg {
+            Some(
+                family
+                    .marginal_design
+                    .try_row_chunk(row..row + 1)
+                    .expect("marginal try_row_chunk in add_rank1_psi_cross"),
+            )
+        } else {
+            None
+        };
+        let log_chunk = if need_log {
+            Some(
+                family
+                    .logslope_design
+                    .try_row_chunk(row..row + 1)
+                    .expect("logslope try_row_chunk in add_rank1_psi_cross"),
+            )
+        } else {
+            None
+        };
+        let x_row = marg_chunk.as_ref().map(|c| c.row(0));
+        let g_row = log_chunk.as_ref().map(|c| c.row(0));
+
         // Marginal component of right_primary
-        if right_primary[0] != 0.0 {
+        if let Some(x_row) = x_row {
             match psi_block_idx {
                 0 => {
                     // psi=marginal, right=marginal -> h_mm, symmetric rank-2
-                    for (idx, &value) in psi_row.iter().enumerate() {
-                        if value == 0.0 {
+                    // h_mm += s * (psi outer x_row + x_row outer psi)
+                    let s = right_primary[0];
+                    let p = x_row.len();
+                    debug_assert_eq!(psi_row.len(), p);
+                    debug_assert_eq!(self.h_mm.nrows(), p);
+                    debug_assert_eq!(self.h_mm.ncols(), p);
+                    for i in 0..p {
+                        let psi_i = psi_row[i];
+                        if psi_i == 0.0 {
                             continue;
                         }
-                        let scale = right_primary[0] * value;
-                        {
-                            let mut col = self.h_mm.column_mut(idx);
-                            family
-                                .marginal_design
-                                .axpy_row_into(row, scale, &mut col)
-                                .expect("marginal axpy column mismatch");
+                        let coef = s * psi_i;
+                        let mut row_i = self.h_mm.row_mut(i);
+                        for j in 0..p {
+                            row_i[j] += coef * x_row[j];
                         }
-                        {
-                            let mut row_view = self.h_mm.row_mut(idx);
-                            family
-                                .marginal_design
-                                .axpy_row_into(row, scale, &mut row_view)
-                                .expect("marginal axpy row mismatch");
+                        // Transpose half: h_mm.col(i) += coef * x_row
+                        for j in 0..p {
+                            self.h_mm[[j, i]] += coef * x_row[j];
                         }
                     }
                 }
                 1 => {
                     // psi=logslope, right=marginal -> h_mg (marginal x logslope)
-                    for (idx, &value) in psi_row.iter().enumerate() {
-                        if value == 0.0 {
+                    // h_mg += right_primary[0] * outer(x_row, psi)
+                    let s = right_primary[0];
+                    let pm = x_row.len();
+                    let pl = psi_row.len();
+                    debug_assert_eq!(self.h_mg.nrows(), pm);
+                    debug_assert_eq!(self.h_mg.ncols(), pl);
+                    for j in 0..pl {
+                        let psi_j = psi_row[j];
+                        if psi_j == 0.0 {
                             continue;
                         }
-                        let mut col = self.h_mg.column_mut(idx);
-                        family
-                            .marginal_design
-                            .axpy_row_into(row, right_primary[0] * value, &mut col)
-                            .expect("marginal axpy column mismatch");
+                        let coef = s * psi_j;
+                        for i in 0..pm {
+                            self.h_mg[[i, j]] += coef * x_row[i];
+                        }
                     }
                 }
                 _ => {}
@@ -3634,41 +3672,48 @@ impl BernoulliBlockHessianAccumulator {
         }
 
         // Logslope component of right_primary
-        if right_primary[1] != 0.0 {
+        if let Some(g_row) = g_row {
             match psi_block_idx {
                 0 => {
-                    // psi=marginal, right=logslope -> h_mg
-                    for (idx, &value) in psi_row.iter().enumerate() {
-                        if value == 0.0 {
+                    // psi=marginal, right=logslope -> h_mg (marginal x logslope)
+                    // h_mg += right_primary[1] * outer(psi, g_row)
+                    let s = right_primary[1];
+                    let pm = psi_row.len();
+                    let pl = g_row.len();
+                    debug_assert_eq!(self.h_mg.nrows(), pm);
+                    debug_assert_eq!(self.h_mg.ncols(), pl);
+                    for i in 0..pm {
+                        let psi_i = psi_row[i];
+                        if psi_i == 0.0 {
                             continue;
                         }
-                        let mut row_view = self.h_mg.row_mut(idx);
-                        family
-                            .logslope_design
-                            .axpy_row_into(row, right_primary[1] * value, &mut row_view)
-                            .expect("logslope axpy row mismatch");
+                        let coef = s * psi_i;
+                        let mut row_i = self.h_mg.row_mut(i);
+                        for j in 0..pl {
+                            row_i[j] += coef * g_row[j];
+                        }
                     }
                 }
                 1 => {
                     // psi=logslope, right=logslope -> h_gg, symmetric rank-2
-                    for (idx, &value) in psi_row.iter().enumerate() {
-                        if value == 0.0 {
+                    // h_gg += s * (psi outer g_row + g_row outer psi)
+                    let s = right_primary[1];
+                    let p = g_row.len();
+                    debug_assert_eq!(psi_row.len(), p);
+                    debug_assert_eq!(self.h_gg.nrows(), p);
+                    debug_assert_eq!(self.h_gg.ncols(), p);
+                    for i in 0..p {
+                        let psi_i = psi_row[i];
+                        if psi_i == 0.0 {
                             continue;
                         }
-                        let scale = right_primary[1] * value;
-                        {
-                            let mut col = self.h_gg.column_mut(idx);
-                            family
-                                .logslope_design
-                                .axpy_row_into(row, scale, &mut col)
-                                .expect("logslope axpy column mismatch");
+                        let coef = s * psi_i;
+                        let mut row_i = self.h_gg.row_mut(i);
+                        for j in 0..p {
+                            row_i[j] += coef * g_row[j];
                         }
-                        {
-                            let mut row_view = self.h_gg.row_mut(idx);
-                            family
-                                .logslope_design
-                                .axpy_row_into(row, scale, &mut row_view)
-                                .expect("logslope axpy row mismatch");
+                        for j in 0..p {
+                            self.h_gg[[j, i]] += coef * g_row[j];
                         }
                     }
                 }
