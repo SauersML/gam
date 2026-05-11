@@ -41,8 +41,29 @@ class SamplingConfig:
 
     All fields are populated from the FFI payload so callers can reconstruct
     exactly which sampler invocation produced the draws — useful for
-    reproducibility logs and for telling whether an explicit `samples=...`
+    reproducibility logs and for telling whether an explicit ``samples=...``
     request was honored or auto-derived from the model dimension.
+
+    Attributes
+    ----------
+    n_samples : int
+        Post-warmup draws kept per chain.
+    n_warmup : int
+        Warmup draws discarded per chain before collecting ``n_samples``.
+    n_chains : int
+        Number of independent NUTS chains run by the engine.
+    target_accept : float
+        Step-size adaptation target acceptance probability in ``(0, 1)``.
+    seed : int
+        RNG seed actually consumed by the sampler.
+
+    Examples
+    --------
+    >>> post = model.sample(samples=500)
+    >>> post.config.n_samples
+    500
+    >>> post.config.target_accept
+    0.95
     """
 
     n_samples: int
@@ -52,6 +73,20 @@ class SamplingConfig:
     seed: int
 
     def to_dict(self) -> dict[str, Any]:
+        """Return the config as a plain JSON-serialisable ``dict``.
+
+        Returns
+        -------
+        dict[str, Any]
+            Mapping with keys ``n_samples``, ``n_warmup``, ``n_chains``,
+            ``target_accept``, ``seed``.
+
+        Examples
+        --------
+        >>> cfg = SamplingConfig(500, 1000, 4, 0.95, 42)
+        >>> cfg.to_dict()["n_chains"]
+        4
+        """
         return {
             "n_samples": self.n_samples,
             "n_warmup": self.n_warmup,
@@ -69,19 +104,42 @@ _NO_MODEL: bytes = b""
 
 @dataclass(frozen=True, eq=False)
 class PosteriorPredictive:
-    """Per-row posterior predictive draws on the linear-predictor and
-    response scales.
+    """Per-row posterior predictive draws on the link and response scales.
 
-    ``eta`` is the `(n_draws, n_rows)` matrix of draws on the link scale.
-    ``mean`` is the same draws pushed through the model's inverse link
-    (mean response scale).  Both are numpy float arrays.
+    Returned by :meth:`PosteriorSamples.predict_draws`, this container
+    holds the full ``(n_draws, n_rows)`` matrices of predictive draws
+    on both the linear-predictor (``eta``) and response (``mean``)
+    scales, along with link/class metadata used to re-apply the inverse
+    link on demand.
 
-    The ``summary(level)`` helper collapses the draws to per-row credible
-    intervals so callers can plot bands without materialising further
-    aggregates by hand.  The implementation walks the matrix once per
-    quantile call, which is fine for typical sizes; extremely large
-    grids should compute their own summaries from ``self.eta`` /
-    ``self.mean`` directly.
+    Attributes
+    ----------
+    eta : numpy.ndarray
+        ``(n_draws, n_rows)`` float matrix of draws on the link scale.
+    mean : numpy.ndarray
+        ``(n_draws, n_rows)`` float matrix of draws pushed through the
+        model's inverse link (mean response scale).
+    family_kind : str
+        Inverse-link tag emitted by the engine (``"identity"``,
+        ``"logit"``, ``"probit"``, ``"cloglog"``, ``"log"``, ...).
+    model_class : str
+        Saved-model predictive class string the underlying
+        :class:`PosteriorSamples` came from.
+
+    Notes
+    -----
+    Use :meth:`summary` to collapse the matrices to per-row credible
+    bands without writing the quantile reductions yourself.  For very
+    large prediction sets, prefer :meth:`PosteriorSamples.predict`
+    which streams chunk-by-chunk instead of materialising the full
+    ``(n_draws, n_rows)`` matrix here.
+
+    Examples
+    --------
+    >>> pp = post.predict_draws(new_data)
+    >>> pp.shape
+    (1000, 50)
+    >>> bands = pp.summary(level=0.9)
     """
 
     eta: Any
@@ -91,28 +149,85 @@ class PosteriorPredictive:
 
     @property
     def shape(self) -> tuple[int, int]:
+        """Shape of the link-scale draw matrix.
+
+        Returns
+        -------
+        tuple[int, int]
+            ``(n_draws, n_rows)``.
+
+        Examples
+        --------
+        >>> pp = post.predict_draws(new_data)
+        >>> pp.shape
+        (1000, 50)
+        """
         return tuple(self.eta.shape)  # type: ignore[return-value]
 
     @property
     def n_draws(self) -> int:
+        """Number of posterior predictive draws.
+
+        Returns
+        -------
+        int
+            Length of the leading axis of :attr:`eta`.
+
+        Examples
+        --------
+        >>> pp = post.predict_draws(new_data)
+        >>> pp.n_draws
+        1000
+        """
         return int(self.eta.shape[0])
 
     @property
     def n_rows(self) -> int:
+        """Number of prediction rows.
+
+        Returns
+        -------
+        int
+            Length of the trailing axis of :attr:`eta`.
+
+        Examples
+        --------
+        >>> pp = post.predict_draws(new_data)
+        >>> pp.n_rows
+        50
+        """
         return int(self.eta.shape[1])
 
     def summary(self, level: float = 0.95) -> dict[str, Any]:
-        """Per-row credible intervals on the link and response scale.
+        """Collapse predictive draws to per-row credible bands.
 
-        Returned dict keys: ``eta_mean``, ``eta_lower``, ``eta_upper``,
-        ``mean``, ``mean_lower``, ``mean_upper``.  Lower/upper are the
-        symmetric tail quantiles for the requested coverage ``level``.
+        Parameters
+        ----------
+        level : float, optional
+            Coverage probability of the equal-tailed credible interval
+            in ``(0, 1)``.  Default ``0.95``.
 
-        Because the inverse links we support are monotone, the response
-        quantiles are exactly the inverse link applied to the link
-        quantiles — we leverage that here instead of taking quantiles
-        of the response-scale draws separately (which would give the
-        same answer up to numerical noise).
+        Returns
+        -------
+        dict[str, numpy.ndarray]
+            Dict with six length-``n_rows`` arrays: ``eta_mean``,
+            ``eta_lower``, ``eta_upper`` (link scale) and ``mean``,
+            ``mean_lower``, ``mean_upper`` (response scale).
+
+        Notes
+        -----
+        Because the supported inverse links are monotone, response-scale
+        quantiles are computed as the inverse link applied to the link
+        quantiles rather than as quantiles of :attr:`mean` directly —
+        the two agree up to numerical noise and the link-quantile form
+        avoids re-walking the response-scale matrix.
+
+        Examples
+        --------
+        >>> pp = post.predict_draws(new_data)
+        >>> bands = pp.summary(level=0.9)
+        >>> bands["mean_lower"].shape
+        (50,)
         """
         import numpy as np
 
@@ -155,38 +270,58 @@ class PosteriorPredictive:
 class PosteriorSamples:
     """Posterior draws over the model's coefficient vector.
 
+    Returned by :meth:`gamfit.Model.sample`. This is the user-facing
+    surface for posterior reasoning: a numpy-first container with
+    named-column subscripting, credible-interval helpers, posterior
+    predictive utilities, ``.save`` / :meth:`load` round-trip, trace
+    plotting, a concise :meth:`__repr__`, and a notebook-friendly
+    rich-HTML representation (``_repr_html_``) that delegates to
+    :meth:`summary`.
+
     Attributes
     ----------
-    samples:
+    samples : numpy.ndarray
         ``(n_draws, n_coeffs)`` numpy array of draws.  ``n_draws`` is
         ``n_chains * n_samples`` (warmup is already discarded by the
         engine).
-    coefficient_names:
-        Tuple of column labels for ``samples``.  Currently the FFI emits
-        ``("beta_0", "beta_1", ...)``; future releases may carry the same
-        names the fitted model exposes via :class:`Summary`.
-    mean / std:
-        Per-coefficient posterior moments returned by the sampler.
-    rhat:
+    coefficient_names : tuple[str, ...]
+        Column labels for ``samples``.  Currently the FFI emits
+        ``("beta_0", "beta_1", ...)``; future releases may carry the
+        same names the fitted model exposes via :class:`Summary`.
+    mean : numpy.ndarray
+        Per-coefficient posterior mean reported by the sampler.
+    std : numpy.ndarray
+        Per-coefficient posterior standard deviation reported by the
+        sampler.
+    rhat : float
         Maximum split-Rhat across coefficients (exact NUTS only;
         ``1.0`` exactly for Laplace iid draws).
-    ess:
+    ess : float
         Minimum effective sample size across coefficients.
-    converged:
+    converged : bool
         Boolean convenience for ``rhat < 1.1``.
-    method:
+    method : str
         ``"nuts"`` for exact NUTS, ``"laplace_gaussian"`` for the
         Gaussian Laplace approximation around the fitted joint mode.
-    model_class:
+    model_class : str
         Saved-model predictive class string the draws came from.
-    family_kind:
+    family_kind : str
         Inverse-link tag (``"identity"``, ``"logit"``, ``"probit"``,
-        ``"cloglog"``, ``"log"``, ...).  Used by
-        :meth:`PosteriorSamples.predict` to push draws through the
-        correct inverse link.
-    config:
+        ``"cloglog"``, ``"log"``, ...).  Used by :meth:`predict` to
+        push draws through the correct inverse link.
+    config : SamplingConfig
         :class:`SamplingConfig` recording the chain count, warmup,
         ``target_accept``, and seed actually used.
+
+    Examples
+    --------
+    >>> post = model.sample(samples=1000, warmup=1000, chains=4)
+    >>> post.n_draws, post.n_coeffs
+    (4000, 12)
+    >>> post["x1"].mean()
+    0.342
+    >>> bands = post.predict(new_data, level=0.9)
+    >>> post.save("posterior.npz")
     """
 
     samples: Any
@@ -220,17 +355,36 @@ class PosteriorSamples:
         *,
         model_bytes: bytes = _NO_MODEL,
     ) -> "PosteriorSamples":
-        """Build a :class:`PosteriorSamples` from the FFI JSON payload.
+        """Internal factory: build a :class:`PosteriorSamples` from the FFI payload.
 
-        The FFI sends ``samples_flat`` as a row-major flattened array
-        plus shape metadata so we round-trip through ``numpy.reshape``
-        once.  Building a nested list of lists from JSON would otherwise
-        dominate decode time for biobank-scale draws.
+        Used by :meth:`gamfit.Model.sample` to wrap the dict produced by
+        the Rust sampler. End users should not call this directly.
 
-        ``model_bytes`` lets the caller (``Model.sample``) bundle the
-        saved-model bytes so downstream methods like
-        :meth:`PosteriorSamples.predict` have the model handy without
-        the user passing it back manually.
+        Parameters
+        ----------
+        payload : Mapping[str, Any]
+            Decoded FFI JSON payload. Must contain ``n_draws``,
+            ``n_coeffs``, ``samples_flat`` (row-major), ``rhat``,
+            ``ess``, ``converged`` and may contain
+            ``coefficient_names``, ``posterior_mean``,
+            ``posterior_std``, ``method``, ``model_class``,
+            ``family_kind``, and ``config``.
+        model_bytes : bytes, optional
+            Saved-model byte blob to bundle so downstream methods like
+            :meth:`predict` work without the user re-passing the model.
+
+        Returns
+        -------
+        PosteriorSamples
+            Reified posterior with samples reshaped to
+            ``(n_draws, n_coeffs)``.
+
+        Notes
+        -----
+        ``samples_flat`` is sent flat (row-major) so we round-trip
+        through ``numpy.reshape`` once. Building a nested list of
+        lists from JSON would otherwise dominate decode time for
+        biobank-scale draws.
         """
         import numpy as np
 
@@ -276,26 +430,93 @@ class PosteriorSamples:
         *,
         model_bytes: bytes = _NO_MODEL,
     ) -> "PosteriorSamples":
+        """Internal factory: build a :class:`PosteriorSamples` from a raw FFI JSON string.
+
+        Thin convenience around :meth:`from_ffi_payload` that decodes
+        the JSON itself. Used by :meth:`gamfit.Model.sample`; not
+        intended as a public API.
+
+        Parameters
+        ----------
+        raw : str
+            JSON-encoded FFI payload from the Rust sampler.
+        model_bytes : bytes, optional
+            Saved-model byte blob bundled into the returned object.
+
+        Returns
+        -------
+        PosteriorSamples
+            Same as :meth:`from_ffi_payload`.
+        """
         return cls.from_ffi_payload(json.loads(raw), model_bytes=model_bytes)
 
     # ---- Convenience accessors ------------------------------------------
 
     @property
     def n_draws(self) -> int:
+        """Total number of post-warmup draws across all chains.
+
+        Returns
+        -------
+        int
+            ``n_chains * n_samples``; the leading axis length of
+            :attr:`samples`.
+
+        Examples
+        --------
+        >>> post.n_draws
+        4000
+        """
         return int(self.samples.shape[0])
 
     @property
     def n_coeffs(self) -> int:
+        """Number of model coefficients (columns of :attr:`samples`).
+
+        Returns
+        -------
+        int
+            Trailing axis length of :attr:`samples`.
+
+        Examples
+        --------
+        >>> post.n_coeffs
+        12
+        """
         return int(self.samples.shape[1])
 
     @property
     def shape(self) -> tuple[int, int]:
+        """Shape of the underlying draws matrix.
+
+        Returns
+        -------
+        tuple[int, int]
+            ``(n_draws, n_coeffs)``.
+
+        Examples
+        --------
+        >>> post.shape
+        (4000, 12)
+        """
         return (self.n_draws, self.n_coeffs)
 
     @property
     def is_exact(self) -> bool:
-        """``True`` if the draws came from exact NUTS, ``False`` for the
-        Laplace approximation."""
+        """Whether the draws are exact NUTS rather than Laplace iid.
+
+        Returns
+        -------
+        bool
+            ``True`` if :attr:`method` is ``"nuts"``, ``False`` for
+            ``"laplace_gaussian"`` (the Gaussian Laplace approximation).
+
+        Examples
+        --------
+        >>> post = model.sample(samples=1000)
+        >>> post.is_exact
+        True
+        """
         return self.method == "nuts"
 
     def __len__(self) -> int:
@@ -307,12 +528,35 @@ class PosteriorSamples:
     def __getitem__(self, key: Any) -> Any:
         """Slice draws by coefficient name or numpy-style row index.
 
-        ``post["x1"]`` returns the 1-D vector of draws for the named
-        coefficient.  Every other key is forwarded to the underlying
-        numpy array, so ``post[0]`` is the 0th draw (a vector of length
-        ``n_coeffs``), ``post[:100]`` is the first 100 draws,
-        ``post[mask]`` filters rows by a boolean mask, and so on.  For
-        explicit column access by integer use ``post.samples[:, j]``.
+        Parameters
+        ----------
+        key : str or numpy index
+            If a ``str``, looked up against :attr:`coefficient_names`
+            and the corresponding column of :attr:`samples` is
+            returned.  Any other key (``int``, ``slice``, boolean
+            mask, fancy index, ...) is forwarded to the underlying
+            numpy array.
+
+        Returns
+        -------
+        numpy.ndarray
+            ``(n_draws,)`` column for a string key; otherwise whatever
+            ``samples[key]`` returns (typically a row or sub-block).
+
+        Raises
+        ------
+        KeyError
+            If a string key does not match any name in
+            :attr:`coefficient_names`.
+
+        Examples
+        --------
+        >>> post["beta_1"].shape
+        (4000,)
+        >>> post[0].shape
+        (12,)
+        >>> post[:100].shape
+        (100, 12)
         """
         if isinstance(key, str):
             try:
@@ -326,11 +570,39 @@ class PosteriorSamples:
         return self.samples[key]
 
     def to_numpy(self) -> Any:
-        """Return the raw ``(n_draws, n_coeffs)`` numpy array."""
+        """Return the raw draws as a numpy array.
+
+        Returns
+        -------
+        numpy.ndarray
+            ``(n_draws, n_coeffs)`` view of :attr:`samples` (not a
+            copy).
+
+        Examples
+        --------
+        >>> arr = post.to_numpy()
+        >>> arr.shape
+        (4000, 12)
+        """
         return self.samples
 
     def to_pandas(self) -> Any:
-        """Return draws as a pandas DataFrame with named coefficient columns."""
+        """Return draws as a pandas DataFrame with named coefficient columns.
+
+        Returns
+        -------
+        pandas.DataFrame
+            ``(n_draws, n_coeffs)`` DataFrame whose columns are
+            :attr:`coefficient_names`.
+
+        Examples
+        --------
+        >>> df = post.to_pandas()
+        >>> df.columns.tolist()[:2]
+        ['beta_0', 'beta_1']
+        >>> df["beta_1"].mean()
+        0.342
+        """
         import pandas as pd
 
         return pd.DataFrame(self.samples, columns=list(self.coefficient_names))
@@ -340,8 +612,27 @@ class PosteriorSamples:
     def interval(self, level: float = 0.95) -> Any:
         """Equal-tailed credible interval for each coefficient.
 
-        Returns an ``(n_coeffs, 2)`` numpy array of ``(lower, upper)``
-        bounds at the requested coverage ``level`` (default 95%).
+        Parameters
+        ----------
+        level : float, optional
+            Coverage probability in ``(0, 1)``. Default ``0.95``.
+
+        Returns
+        -------
+        numpy.ndarray
+            ``(n_coeffs, 2)`` array of ``(lower, upper)`` bounds at
+            the requested coverage.
+
+        Raises
+        ------
+        ValueError
+            If ``level`` is not strictly between 0 and 1.
+
+        Examples
+        --------
+        >>> ci = post.interval(level=0.9)
+        >>> ci.shape
+        (12, 2)
         """
         import numpy as np
 
@@ -357,11 +648,31 @@ class PosteriorSamples:
     def summary(self, level: float = 0.95) -> Summary:
         """Per-coefficient posterior summary as a :class:`Summary`.
 
-        The payload mirrors what ``Model.summary()`` returns: a list of
-        coefficient rows (``index``, ``name``, ``estimate``,
-        ``std_error``, ``ci_lower``, ``ci_upper``) plus top-level
-        convergence diagnostics and the sampler ``method`` so the result
-        prints/renders nicely in a notebook.
+        Parameters
+        ----------
+        level : float, optional
+            Coverage probability for the credible interval columns,
+            in ``(0, 1)``. Default ``0.95``.
+
+        Returns
+        -------
+        Summary
+            Coefficient rows (``index``, ``name``, ``estimate``,
+            ``std_error``, ``ci_lower``, ``ci_upper``) plus top-level
+            convergence diagnostics (``rhat``, ``ess``, ``converged``),
+            sampler ``method``, and the :class:`SamplingConfig` echo.
+            Renders nicely in a notebook via :class:`Summary` HTML.
+
+        Notes
+        -----
+        The payload mirrors what :meth:`gamfit.Model.summary` returns
+        for fitted models, so downstream rendering helpers work
+        uniformly on both fitted and sampled views.
+
+        Examples
+        --------
+        >>> post.summary(level=0.95)
+        Summary(method='nuts', n_coeffs=12, rhat=1.0021, converged=True)
         """
         intervals = self.interval(level)
         coefficients = [
@@ -402,25 +713,55 @@ class PosteriorSamples:
     ) -> dict[str, Any]:
         """Posterior predictive credible bands on new data.
 
-        Returns a dict with per-row arrays (length ``n_rows``):
-        ``eta_mean``, ``eta_lower``, ``eta_upper``, ``mean``,
-        ``mean_lower``, ``mean_upper``.  ``eta`` is on the linear-
-        predictor scale, ``mean`` on the response scale (inverse-link
-        applied).
+        Parameters
+        ----------
+        new_data : Any
+            Tabular new data (DataFrame, dict of columns, or any
+            object accepted by the engine's table normaliser) at which
+            to evaluate the predictive distribution.
+        chunk_size : int or None, optional
+            Number of prediction rows processed at once. Default
+            ``4096``. Pass ``None`` to disable chunking and form the
+            full ``(n_draws, n_rows)`` matrix (consider
+            :meth:`predict_draws` instead in that case).
+        level : float, optional
+            Coverage probability for the credible bands in ``(0, 1)``.
+            Default ``0.95``.
 
-        This walks chunks of rows through ``draws @ X.T`` and reduces
-        each chunk to quantiles immediately, so memory stays bounded
-        at roughly ``n_draws * chunk_size`` floats regardless of the
-        prediction-set size.  Set ``chunk_size=None`` to disable
-        chunking and materialise the full ``(n_draws, n_rows)``
-        matrix (use :meth:`predict_draws` for that explicit form).
+        Returns
+        -------
+        dict[str, numpy.ndarray]
+            Six length-``n_rows`` arrays: ``eta_mean``, ``eta_lower``,
+            ``eta_upper`` (link scale) and ``mean``, ``mean_lower``,
+            ``mean_upper`` (response scale, inverse link applied).
 
-        Currently supports standard non-link-wiggle GAM models; other
-        classes raise with a pointer to ``Model.predict(interval=...)``.
-        For Laplace-method posteriors the returned bands are exactly
-        the surface that ``model.predict(new_data, interval=level)``
-        produces analytically — different code path, same answer up to
-        Monte Carlo error.
+        Raises
+        ------
+        RuntimeError
+            If this :class:`PosteriorSamples` was loaded from disk
+            without a model context.
+        NotImplementedError
+            For model classes lacking a closed-form design matrix
+            (e.g. link-wiggle, survival) — use
+            :meth:`gamfit.Model.predict` instead.
+
+        Notes
+        -----
+        Walks chunks of rows through ``draws @ X.T`` and reduces each
+        chunk to quantiles immediately, so memory stays bounded at
+        roughly ``n_draws * chunk_size`` floats regardless of the
+        prediction-set size. For Laplace-method posteriors the
+        returned bands match what
+        ``model.predict(new_data, interval=level)`` produces
+        analytically, up to Monte Carlo error.
+
+        Examples
+        --------
+        >>> bands = post.predict(new_data, level=0.9)
+        >>> bands["mean_lower"].shape
+        (50,)
+        >>> bands["mean_upper"][0]
+        0.812
         """
         x = self._design_matrix(new_data)
         return _posterior_predict_bands(
@@ -434,10 +775,39 @@ class PosteriorSamples:
     def predict_draws(self, new_data: Any) -> PosteriorPredictive:
         """Full posterior predictive draws on new data.
 
-        Returns a :class:`PosteriorPredictive` whose ``.eta`` and
-        ``.mean`` matrices are ``(n_draws, n_rows)``.  Materialises the
-        full matrix — for very large prediction sets prefer
-        :meth:`predict` which streams per-row credible bands.
+        Parameters
+        ----------
+        new_data : Any
+            Tabular new data (DataFrame, dict of columns, or any
+            object accepted by the engine's table normaliser).
+
+        Returns
+        -------
+        PosteriorPredictive
+            Container whose :attr:`PosteriorPredictive.eta` and
+            :attr:`PosteriorPredictive.mean` are
+            ``(n_draws, n_rows)`` matrices on the link and response
+            scales respectively.
+
+        Raises
+        ------
+        RuntimeError
+            If this :class:`PosteriorSamples` was loaded from disk
+            without a model context.
+
+        Notes
+        -----
+        Materialises the full ``(n_draws, n_rows)`` matrix in memory.
+        For very large prediction sets prefer :meth:`predict`, which
+        streams per-row credible bands chunk-by-chunk.
+
+        Examples
+        --------
+        >>> pp = post.predict_draws(new_data)
+        >>> pp.shape
+        (4000, 50)
+        >>> pp.mean.std(axis=0).mean()
+        0.087
         """
         import numpy as np
 
@@ -482,11 +852,30 @@ class PosteriorSamples:
     def save(self, path: str | Path) -> str:
         """Save the posterior to an ``.npz`` archive.
 
+        Parameters
+        ----------
+        path : str or pathlib.Path
+            Destination ``.npz`` file path.
+
+        Returns
+        -------
+        str
+            String form of the resolved output path.
+
+        Notes
+        -----
         The archive carries the full ``(n_draws, n_coeffs)`` samples
-        matrix, the per-coefficient mean / std, convergence diagnostics,
-        method / class / family tags, the sampling config, and the saved
-        model bytes (so :meth:`predict` continues to work after a
-        load).  Roundtrip via :meth:`PosteriorSamples.load`.
+        matrix, the per-coefficient mean and std, convergence
+        diagnostics, method / class / family tags, the
+        :class:`SamplingConfig`, and the saved model bytes (so
+        :meth:`predict` continues to work after a round-trip via
+        :meth:`load`).
+
+        Examples
+        --------
+        >>> post.save("posterior.npz")
+        'posterior.npz'
+        >>> reloaded = PosteriorSamples.load("posterior.npz")
         """
         import numpy as np
 
@@ -513,8 +902,33 @@ class PosteriorSamples:
 
     @classmethod
     def load(cls, path: str | Path) -> "PosteriorSamples":
-        """Load a :class:`PosteriorSamples` from an ``.npz`` written by
-        :meth:`save`."""
+        """Load a :class:`PosteriorSamples` from an ``.npz`` archive.
+
+        Parameters
+        ----------
+        path : str or pathlib.Path
+            Path to an archive previously written by :meth:`save`.
+
+        Returns
+        -------
+        PosteriorSamples
+            Reconstructed posterior, including bundled model bytes so
+            :meth:`predict` keeps working.
+
+        Notes
+        -----
+        The archive uses ``allow_pickle=True`` to round-trip the JSON
+        metadata stored as a 0-d object array; only load archives you
+        produced via :meth:`save`.
+
+        Examples
+        --------
+        >>> post.save("posterior.npz")
+        'posterior.npz'
+        >>> reloaded = PosteriorSamples.load("posterior.npz")
+        >>> reloaded.n_draws == post.n_draws
+        True
+        """
         import numpy as np
 
         # `allow_pickle=True` is required because we ship the JSON
@@ -566,15 +980,40 @@ class PosteriorSamples:
     ) -> Any:
         """Matplotlib trace + marginal-density plot.
 
-        ``coefficients`` may be ``None`` (auto-select the first
-        ``max_panels`` coefficients), a single name/index, or an
-        iterable of names/indices.  Returns the matplotlib Figure.
+        Parameters
+        ----------
+        coefficients : None, str, int, or iterable of str/int, optional
+            Coefficients to plot. If ``None``, auto-selects the first
+            ``max_panels`` coefficients. A single name or integer
+            index plots one panel row; an iterable plots one row per
+            element.
+        max_panels : int, optional
+            Cap on the number of panel rows when ``coefficients`` is
+            ``None``. Default ``8``.
+        ax : numpy.ndarray of matplotlib Axes, optional
+            Pre-existing 2-D axes array of shape ``(n_panels, 2)``. If
+            ``None``, a fresh ``(n_panels, 2)`` figure is created.
 
-        Each row of the figure has two panels: the trace (draws vs
-        iteration index) on the left, the marginal density / histogram
-        on the right.  When ``ax`` is supplied it's expected to be a
-        2-D array of axes with shape ``(n_panels, 2)``; otherwise we
-        create a fresh figure.
+        Returns
+        -------
+        matplotlib.figure.Figure
+            The figure containing the trace and density panels.
+
+        Raises
+        ------
+        ValueError
+            If the resolved coefficient selection is empty.
+
+        Notes
+        -----
+        Each row has two panels: trace (draws vs iteration index) on
+        the left and a marginal density histogram on the right.
+
+        Examples
+        --------
+        >>> fig = post.plot_trace()
+        >>> fig = post.plot_trace(coefficients=["beta_0", "beta_1"])
+        >>> fig.savefig("trace.png")
         """
         import matplotlib.pyplot as plt
         import numpy as np

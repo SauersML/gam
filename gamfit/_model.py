@@ -55,41 +55,75 @@ _TRANSFORMATION_NORMAL_MODEL_CLASSES = frozenset(
 class SurvivalPrediction:
     """Per-row survival functions evaluated on demand.
 
+    Returned by :meth:`Model.predict` for survival-family models. The
+    ``*_at`` helpers (:meth:`hazard_at`, :meth:`cumulative_hazard_at`,
+    :meth:`survival_at`, :meth:`failure_at`) evaluate the fitted hazard
+    surface at any user-supplied time grid.
+
     When the FFI produced a dense ``(n_samples, n_times)`` grid of
-    hazard / survival / cumulative hazard values, the ``*_at`` helpers
+    hazard / survival / cumulative-hazard values, the ``*_at`` helpers
     linearly interpolate against that grid. Otherwise they fall back to
     the legacy plug-in piecewise-constant hazard reconstructed from
     ``parameters`` so bare-dataclass construction keeps working.
 
+    For very large queries (``n_rows * n_times`` exceeds roughly one
+    million cells), the ``*_at`` helpers internally evaluate the surface
+    in blocks via the matching ``*_at_chunks`` generator and then
+    assemble the dense result; callers that want to avoid the dense
+    allocation can iterate the chunk generators directly or stream a CSV
+    with :meth:`write_survival_at_csv`.
+
     Attributes
     ----------
-    model_class:
+    model_class : str
         The fitted model class string (e.g. ``"survival marginal-slope"``).
-    parameters:
+    parameters : ndarray
         Flat per-row parameters returned by the FFI. Shape
-        ``(n_samples, n_params_per_row)``. The exact column semantics depend
-        on ``model_class``; callers should treat this as opaque and prefer the
-        ``*_at`` helpers.
-    parameter_names:
+        ``(n_samples, n_params_per_row)``. The exact column semantics
+        depend on ``model_class``; callers should treat this as opaque
+        and prefer the ``*_at`` helpers.
+    parameter_names : tuple of str
         Column names corresponding to ``parameters``, in order.
-    times:
+    times : ndarray or None
         Shared 1-D time grid at which the hazard surfaces were evaluated.
-    hazard:
+    hazard : ndarray or None
         ``(n_samples, len(times))`` dense hazard surface from the FFI.
-    survival:
+    survival : ndarray or None
         ``(n_samples, len(times))`` dense survival surface from the FFI.
-    cumulative_hazard:
-        ``(n_samples, len(times))`` dense cumulative-hazard surface from the FFI.
-    linear_predictor:
-        ``(n_samples,)`` per-row linear predictor at each row's own exit time.
-    survival_se:
+    cumulative_hazard : ndarray or None
+        ``(n_samples, len(times))`` dense cumulative-hazard surface from
+        the FFI.
+    linear_predictor : ndarray or None
+        ``(n_samples,)`` per-row linear predictor at each row's own exit
+        time.
+    id_column : str or None
+        Optional name of the id column carried through from
+        :meth:`Model.predict` for use by :meth:`write_survival_at_csv`.
+    row_ids : sequence of str or None
+        Per-row identifiers aligned with ``parameters`` rows, populated
+        when ``id_column`` was supplied to :meth:`Model.predict`.
+    survival_se : ndarray or None
         ``(n_samples, len(times))`` delta-method standard errors on the
-        survival surface (response scale).  ``None`` unless the prediction
-        was issued with ``with_uncertainty=True``; then populated for
-        location-scale survival models.
-    eta_se:
+        survival surface (response scale). ``None`` unless the
+        prediction was issued with ``with_uncertainty=True``; then
+        populated for location-scale survival models.
+    eta_se : ndarray or None
         ``(n_samples,)`` delta-method SE on the linear predictor at each
-        row's own exit time, under the same conditions as ``survival_se``.
+        row's own exit time, under the same conditions as
+        ``survival_se``.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> pred = model.predict(test_df)        # survival model
+    >>> times = np.linspace(0.0, 10.0, 50)
+    >>> S = pred.survival_at(times)          # (n_rows, 50) ndarray
+    >>> h = pred.hazard_at(times)
+    >>> H = pred.cumulative_hazard_at(times)
+
+    See Also
+    --------
+    Model.predict : Returns a :class:`SurvivalPrediction` for survival models.
     """
 
     model_class: str
@@ -161,10 +195,38 @@ class SurvivalPrediction:
         return np.diff(cumulative_full, axis=1) / widths.reshape(1, -1)
 
     def hazard_at(self, times: Any) -> Any:
-        """Hazard rate ``h(t)`` evaluated at each time in ``times``.
+        """Evaluate the hazard rate ``h(t)`` at each requested time.
 
-        Returns an ``(n_samples, len(times))`` numpy array. Large requests are
-        evaluated in chunks internally before assembling the dense result.
+        When the FFI produced a dense hazard surface this linearly
+        interpolates against the returned grid; otherwise the hazard is
+        reconstructed from the cumulative-hazard differences. Large
+        requests are evaluated in chunks internally before assembling
+        the dense result.
+
+        Parameters
+        ----------
+        times : array_like
+            1-D sequence of finite, non-negative times at which to
+            evaluate the per-row hazard.
+
+        Returns
+        -------
+        ndarray
+            ``(n_samples, len(times))`` array of non-negative hazard
+            values, one row per prediction sample.
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> pred = model.predict(test_df)
+        >>> h = pred.hazard_at(np.linspace(0.0, 5.0, 11))
+        >>> h.shape
+        (len(test_df), 11)
+
+        See Also
+        --------
+        SurvivalPrediction.hazard_at_chunks : streaming chunked variant.
+        SurvivalPrediction.cumulative_hazard_at
         """
         times_arr = self._coerce_times(times)
         hazard = self._ffi_surface_at("hazard", times_arr, clip=(0.0, None))
@@ -182,7 +244,36 @@ class SurvivalPrediction:
         return self._hazard_from_cumulative(times_arr, cumulative)
 
     def cumulative_hazard_at(self, times: Any) -> Any:
-        """Cumulative hazard ``H(t) = -log S(t)`` at each requested time."""
+        """Evaluate the cumulative hazard ``H(t) = -log S(t)``.
+
+        When the FFI provided a dense cumulative-hazard surface this
+        interpolates against it directly; otherwise ``H(t)`` is derived
+        from :meth:`survival_at` via ``-log S(t)`` (clipped away from
+        zero for numerical safety).
+
+        Parameters
+        ----------
+        times : array_like
+            1-D sequence of finite, non-negative times.
+
+        Returns
+        -------
+        ndarray
+            ``(n_samples, len(times))`` array of non-negative cumulative
+            hazard values.
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> H = pred.cumulative_hazard_at(np.array([1.0, 2.0, 5.0]))
+        >>> np.all(np.diff(H, axis=1) >= 0)   # monotone non-decreasing
+        True
+
+        See Also
+        --------
+        SurvivalPrediction.survival_at
+        SurvivalPrediction.hazard_at
+        """
         import numpy as np
 
         times_arr = self._coerce_times(times)
@@ -195,14 +286,40 @@ class SurvivalPrediction:
         return -np.log(survival)
 
     def survival_at(self, times: Any) -> Any:
-        """Survival probability ``S(t)`` at each requested time.
+        """Evaluate the survival probability ``S(t)`` at each requested time.
 
-        When the FFI produced a dense hazard/survival surface we
-        linearly interpolate against the returned grid. Otherwise we
-        fall back to the plug-in identity ``S(t) = exp(-H(t))`` using a
-        per-row piecewise-constant hazard derived from ``parameters``
-        for bare-dataclass construction. Large requests are evaluated in
-        chunks internally before assembling the dense result.
+        When the FFI produced a dense hazard/survival surface this
+        linearly interpolates against the returned grid. Otherwise it
+        falls back to the plug-in identity ``S(t) = exp(-H(t))`` using
+        a per-row piecewise-constant hazard derived from
+        ``parameters`` (supports bare-dataclass construction). Large
+        requests are evaluated in chunks internally before assembling
+        the dense result.
+
+        Parameters
+        ----------
+        times : array_like
+            1-D sequence of finite, non-negative times.
+
+        Returns
+        -------
+        ndarray
+            ``(n_samples, len(times))`` array of survival probabilities
+            in ``[0, 1]``.
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> times = np.linspace(0.0, 5.0, 6)
+        >>> S = pred.survival_at(times)
+        >>> S[:, 0]                  # S(0) is 1 for every row
+        array([1., 1., ..., 1.])
+
+        See Also
+        --------
+        SurvivalPrediction.failure_at : returns ``1 - S(t)``.
+        SurvivalPrediction.survival_se_at : delta-method standard error.
+        SurvivalPrediction.survival_at_chunks : streaming chunked variant.
         """
         times_arr = self._coerce_times(times)
         survival = self._ffi_surface_at("survival", times_arr, clip=(0.0, 1.0))
@@ -219,7 +336,33 @@ class SurvivalPrediction:
         return self._survival_block(params, times_arr)
 
     def failure_at(self, times: Any) -> Any:
-        """Failure/event probability ``1 - S(t)`` at each requested time."""
+        """Evaluate the failure (event) probability ``F(t) = 1 - S(t)``.
+
+        Convenience wrapper around :meth:`survival_at`; the output is
+        clipped to ``[0, 1]`` to guard against tiny interpolation
+        excursions.
+
+        Parameters
+        ----------
+        times : array_like
+            1-D sequence of finite, non-negative times.
+
+        Returns
+        -------
+        ndarray
+            ``(n_samples, len(times))`` array of failure probabilities
+            in ``[0, 1]``.
+
+        Examples
+        --------
+        >>> F = pred.failure_at([1.0, 5.0, 10.0])
+        >>> F.shape[1]
+        3
+
+        See Also
+        --------
+        SurvivalPrediction.survival_at
+        """
         import numpy as np
 
         survival = np.asarray(self.survival_at(times), dtype=float)
@@ -230,9 +373,39 @@ class SurvivalPrediction:
 
         Returns ``None`` when the prediction was not issued with
         ``with_uncertainty=True`` (or the model class does not yet
-        support response-scale uncertainty).  When available, the
+        support response-scale uncertainty). When available, the
         returned array has shape ``(n_samples, len(times))`` and is
         clipped to be non-negative.
+
+        Parameters
+        ----------
+        times : array_like
+            1-D sequence of finite, non-negative times.
+
+        Returns
+        -------
+        ndarray or None
+            ``(n_samples, len(times))`` array of standard errors on the
+            survival surface, or ``None`` if no uncertainty was
+            requested.
+
+        Notes
+        -----
+        Pair with :meth:`survival_at` for response-scale credible
+        bands: ``S +/- z * SE`` with the standard caveats around the
+        Gaussian approximation near the ``[0, 1]`` boundaries.
+
+        Examples
+        --------
+        >>> pred = model.predict(test_df, with_uncertainty=True)
+        >>> S = pred.survival_at([1.0, 2.0])
+        >>> SE = pred.survival_se_at([1.0, 2.0])
+        >>> lower = (S - 1.96 * SE).clip(0.0, 1.0)
+
+        See Also
+        --------
+        SurvivalPrediction.survival_at
+        Model.predict : pass ``with_uncertainty=True`` to populate this.
         """
         if self.survival_se is None:
             return None
@@ -318,7 +491,46 @@ class SurvivalPrediction:
         people_chunk: int = DEFAULT_SURVIVAL_PEOPLE_CHUNK,
         time_grid_chunk: int = DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
     ) -> Any:
-        """Yield ``(row_slice, time_slice, survival_block)`` chunks."""
+        """Yield ``S(t)`` evaluations in row/time blocks.
+
+        Streaming counterpart to :meth:`survival_at` for queries large
+        enough that the dense ``(n_samples, len(times))`` allocation is
+        unwelcome. Each yielded block can be consumed (written to disk,
+        reduced, fed into a metric) and discarded before the next one
+        is produced.
+
+        Parameters
+        ----------
+        times : array_like
+            1-D sequence of finite, non-negative times.
+        people_chunk : int, optional
+            Maximum number of rows per yielded block. Defaults to
+            ``DEFAULT_SURVIVAL_PEOPLE_CHUNK`` (50 000).
+        time_grid_chunk : int, optional
+            Maximum number of time points per yielded block. Defaults
+            to ``DEFAULT_SURVIVAL_TIME_GRID_CHUNK`` (64).
+
+        Yields
+        ------
+        tuple of (slice, slice, ndarray)
+            ``(row_slice, time_slice, block)`` where ``block`` has
+            shape ``(row_slice.stop - row_slice.start,
+            time_slice.stop - time_slice.start)`` and the slices index
+            into the full ``(n_samples, len(times))`` result.
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> times = np.linspace(0.0, 10.0, 200)
+        >>> total = 0.0
+        >>> for _r, _t, block in pred.survival_at_chunks(times):
+        ...     total += float(block.sum())
+
+        See Also
+        --------
+        SurvivalPrediction.survival_at
+        SurvivalPrediction.write_survival_at_csv
+        """
         times_arr = self._coerce_times(times)
         ffi_chunks = self._ffi_surface_at_chunks(
             "survival",
@@ -352,7 +564,40 @@ class SurvivalPrediction:
         people_chunk: int = DEFAULT_SURVIVAL_PEOPLE_CHUNK,
         time_grid_chunk: int = DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
     ) -> Any:
-        """Yield ``(row_slice, time_slice, cumulative_hazard_block)`` chunks."""
+        """Yield ``H(t)`` evaluations in row/time blocks.
+
+        Streaming counterpart to :meth:`cumulative_hazard_at`. When the
+        FFI provided a dense cumulative-hazard surface this iterates
+        that surface directly; otherwise it derives ``H(t)`` from each
+        survival block returned by :meth:`survival_at_chunks`.
+
+        Parameters
+        ----------
+        times : array_like
+            1-D sequence of finite, non-negative times.
+        people_chunk : int, optional
+            Maximum number of rows per yielded block. Defaults to
+            ``DEFAULT_SURVIVAL_PEOPLE_CHUNK``.
+        time_grid_chunk : int, optional
+            Maximum number of time points per yielded block. Defaults
+            to ``DEFAULT_SURVIVAL_TIME_GRID_CHUNK``.
+
+        Yields
+        ------
+        tuple of (slice, slice, ndarray)
+            ``(row_slice, time_slice, block)`` of cumulative-hazard
+            values with shape matching the slice extents.
+
+        Examples
+        --------
+        >>> for r, t, H_block in pred.cumulative_hazard_at_chunks(times):
+        ...     handle.write(H_block.tobytes())
+
+        See Also
+        --------
+        SurvivalPrediction.cumulative_hazard_at
+        SurvivalPrediction.survival_at_chunks
+        """
         import numpy as np
 
         times_arr = self._coerce_times(times)
@@ -381,7 +626,43 @@ class SurvivalPrediction:
         people_chunk: int = DEFAULT_SURVIVAL_PEOPLE_CHUNK,
         time_grid_chunk: int = DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
     ) -> Any:
-        """Yield ``(row_slice, time_slice, hazard_block)`` chunks."""
+        """Yield ``h(t)`` evaluations in row/time blocks.
+
+        Streaming counterpart to :meth:`hazard_at`. When the FFI
+        provided a dense hazard surface this iterates that surface
+        directly; otherwise the hazard is derived from successive
+        cumulative-hazard blocks, carrying the previous block's tail
+        forward so the finite-difference at each block boundary stays
+        consistent with the non-chunked :meth:`hazard_at` result.
+
+        Parameters
+        ----------
+        times : array_like
+            1-D sequence of finite, non-negative times.
+        people_chunk : int, optional
+            Maximum number of rows per yielded block. Defaults to
+            ``DEFAULT_SURVIVAL_PEOPLE_CHUNK``.
+        time_grid_chunk : int, optional
+            Maximum number of time points per yielded block. Defaults
+            to ``DEFAULT_SURVIVAL_TIME_GRID_CHUNK``.
+
+        Yields
+        ------
+        tuple of (slice, slice, ndarray)
+            ``(row_slice, time_slice, block)`` of non-negative hazard
+            values with shape matching the slice extents.
+
+        Examples
+        --------
+        >>> peak = 0.0
+        >>> for _r, _t, h_block in pred.hazard_at_chunks(times):
+        ...     peak = max(peak, float(h_block.max()))
+
+        See Also
+        --------
+        SurvivalPrediction.hazard_at
+        SurvivalPrediction.cumulative_hazard_at_chunks
+        """
         times_arr = self._coerce_times(times)
         ffi_chunks = self._ffi_surface_at_chunks(
             "hazard",
@@ -429,7 +710,52 @@ class SurvivalPrediction:
         people_chunk: int = DEFAULT_SURVIVAL_PEOPLE_CHUNK,
         time_grid_chunk: int = DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
     ) -> str:
-        """Write chunked survival predictions as row,time,survival CSV."""
+        """Stream survival predictions to a CSV file.
+
+        Iterates :meth:`survival_at_chunks` and writes one row per
+        ``(prediction_row, time)`` pair, avoiding materialising the full
+        ``(n_samples, len(times))`` matrix in memory. When the
+        prediction was issued with an ``id_column`` (via
+        :meth:`Model.predict`), that column is included.
+
+        Parameters
+        ----------
+        path : str or pathlib.Path
+            Destination CSV file. Overwritten if it already exists.
+        times : array_like
+            1-D sequence of finite, non-negative times at which to
+            evaluate ``S(t)``.
+        people_chunk : int, optional
+            Maximum number of rows per internal block. Defaults to
+            ``DEFAULT_SURVIVAL_PEOPLE_CHUNK``.
+        time_grid_chunk : int, optional
+            Maximum number of time points per internal block. Defaults
+            to ``DEFAULT_SURVIVAL_TIME_GRID_CHUNK``.
+
+        Returns
+        -------
+        str
+            The string form of ``path``.
+
+        Notes
+        -----
+        Columns written are ``row, time, survival`` (or
+        ``row, <id_column>, time, survival`` when an id column is
+        present). The file is opened in text mode with UTF-8 encoding.
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> pred = model.predict(test_df, id_column="patient_id")
+        >>> pred.write_survival_at_csv(
+        ...     "survival.csv", np.linspace(0.0, 10.0, 64)
+        ... )
+        'survival.csv'
+
+        See Also
+        --------
+        SurvivalPrediction.survival_at_chunks
+        """
         import csv
 
         times_arr = self._coerce_times(times)
@@ -614,6 +940,24 @@ class Model:
         )
 
     def summary(self) -> Summary:
+        """Return the model summary (coefficients, family, deviance, REML score).
+
+        Returns
+        -------
+        Summary
+            A dict-like :class:`Summary` containing the fitted formula,
+            family / link name, model class, deviance, REML or LAML score,
+            iteration count, and the per-coefficient table (estimates,
+            standard errors, credible-interval bounds).  The summary is
+            cached on first call.
+
+        Examples
+        --------
+        >>> model = gamfit.fit(train, "y ~ s(x)")
+        >>> s = model.summary()
+        >>> print(s["family_name"], s["deviance"])
+        >>> s.coefficients_frame()      # pandas DataFrame, requires pandas
+        """
         if self._summary_cache is None:
             try:
                 payload = json.loads(rust_module().summary_json(self._model_bytes))
@@ -623,6 +967,33 @@ class Model:
         return self._summary_cache
 
     def check(self, data: Any) -> SchemaCheck:
+        """Validate ``data`` against the model's training schema.
+
+        Inexpensive: runs the schema validator only, no prediction.  Use
+        this before :meth:`predict` to surface column-name or type issues
+        as structured :class:`SchemaIssue` records rather than as a raised
+        :class:`SchemaMismatchError`.
+
+        Parameters
+        ----------
+        data:
+            Any table-like input (pandas DataFrame, dict of columns, list
+            of records, numpy array, etc.).
+
+        Returns
+        -------
+        SchemaCheck
+            ``check.ok`` is ``True`` when the data matches the training
+            schema; otherwise ``check.issues`` enumerates the problems.
+            ``check.raise_for_error()`` raises ``ValueError`` on failure.
+
+        Examples
+        --------
+        >>> check = model.check(test_df)
+        >>> if not check:
+        ...     for issue in check.issues:
+        ...         print(issue.kind, issue.column, issue.message)
+        """
         headers, rows, _table_kind = normalize_table(data)
         try:
             payload = json.loads(rust_module().check_json(self._model_bytes, headers, rows))
@@ -631,6 +1002,28 @@ class Model:
         return SchemaCheck.from_dict(payload)
 
     def report(self, path: str | Path | None = None) -> str:
+        """Generate a standalone HTML report of the fitted model.
+
+        The report contains the summary table, smooth-term visualisations,
+        and convergence diagnostics.  It is self-contained (no external
+        assets), so the file can be emailed or attached to a PR.
+
+        Parameters
+        ----------
+        path:
+            If given, write the HTML to this path and return the path.
+            If ``None`` (default), return the HTML as a string.
+
+        Returns
+        -------
+        str
+            HTML string (when ``path is None``) or the written path.
+
+        Examples
+        --------
+        >>> model.report("report.html")
+        >>> html = model.report()             # for inline Jupyter display
+        """
         try:
             html = rust_module().report_html(self._model_bytes)
         except Exception as exc:
@@ -756,17 +1149,39 @@ class Model:
         return flat.reshape(n_rows, n_cols)
 
     def save(self, path: str | Path) -> None:
+        """Serialise the fitted model to ``path``.
+
+        Writes a self-contained binary ``.gam`` file that
+        :func:`gamfit.load` round-trips.
+
+        Examples
+        --------
+        >>> model.save("model.gam")
+        >>> loaded = gamfit.load("model.gam")
+        """
         Path(path).write_bytes(self._model_bytes)
 
     def dumps(self) -> bytes:
+        """Return the serialised model as raw bytes.
+
+        Useful for in-memory transport.  :func:`gamfit.loads` is the
+        inverse.
+
+        Examples
+        --------
+        >>> blob = model.dumps()
+        >>> loaded = gamfit.loads(blob)
+        """
         return self._model_bytes
 
     @property
     def formula(self) -> str:
+        """The fitted Wilkinson-style formula string."""
         return str(self.summary()["formula"])
 
     @property
     def family_name(self) -> str:
+        """Human-readable family + link name (e.g. ``"Gaussian Identity"``)."""
         return str(self.summary()["family_name"])
 
     @property
@@ -791,10 +1206,23 @@ class Model:
 
     @property
     def response_name(self) -> str | None:
+        """Name of the response column, inferred from the formula.
+
+        Returns ``None`` for survival formulas (``Surv(...)``) and other
+        cases where the left-hand side isn't a single identifier.
+        """
         return response_column_name(self.formula)
 
     @property
     def training_table_kind(self) -> str | None:
+        """The kind of table the model was fit on.
+
+        One of ``"pandas"``, ``"polars"``, ``"pyarrow"``, ``"numpy"``,
+        ``"mapping"`` (dict of columns), ``"records"`` (list of dicts),
+        ``"rows"`` (2-D sequence), or ``None`` if the input kind wasn't
+        retained.  Used as a default ``return_type`` for :meth:`predict`
+        and :meth:`diagnose`.
+        """
         return self._training_table_kind
 
     def _model_class_from_summary(self) -> str:
@@ -867,6 +1295,55 @@ class Model:
         y: str | None = None,
         interval: float | None = 0.95,
     ) -> Diagnostics:
+        """Score the fitted model on held-out ``data``.
+
+        Calls :meth:`predict` on the feature columns of ``data`` and
+        compares the result against the observed response, packaging
+        the prediction, residuals, observed values, and (when
+        requested) credible bands into a :class:`Diagnostics` object.
+        Useful for ad-hoc held-out checks and for feeding the
+        :meth:`plot` method.
+
+        Parameters
+        ----------
+        data : table-like
+            Any table-like input accepted by :meth:`predict` that also
+            carries the response column.
+        y : str, optional
+            Name of the response column. Defaults to
+            :attr:`response_name`; required when that cannot be inferred
+            (e.g. survival formulas).
+        interval : float or None, optional
+            Credible-interval probability passed through to
+            :meth:`predict`. Set to ``None`` to skip interval columns.
+            Defaults to ``0.95``.
+
+        Returns
+        -------
+        Diagnostics
+            A :class:`Diagnostics` record containing the formula,
+            response name, observed values, the predicted table, and
+            residuals.
+
+        Raises
+        ------
+        ValueError
+            If the response column cannot be inferred or is missing from
+            ``data``.
+
+        Examples
+        --------
+        >>> diag = model.diagnose(test_df)
+        >>> diag.rmse, diag.r_squared
+        (0.42, 0.81)
+        >>> diag.predicted["mean"][:3]
+        [1.04, 1.21, 0.99]
+
+        See Also
+        --------
+        Model.predict
+        Model.plot
+        """
         columns, _kind = table_columns(data)
         response_name = y or self.response_name
         if response_name is None:
@@ -901,6 +1378,61 @@ class Model:
         kind: str = "prediction",
         ax: Any | None = None,
     ) -> Any:
+        """Plot the model's behaviour on ``data`` with matplotlib.
+
+        Runs :meth:`diagnose` against ``data`` and then renders one of
+        three standard diagnostic plots onto a matplotlib ``Axes``.
+
+        Parameters
+        ----------
+        data : table-like
+            Held-out data with the response column present (same
+            requirements as :meth:`diagnose`).
+        x : str, optional
+            Feature column to plot on the x-axis when
+            ``kind="prediction"``. Inferred automatically when there is
+            exactly one non-response feature column.
+        y : str, optional
+            Response column name. Defaults to :attr:`response_name`.
+        interval : float or None, optional
+            Credible-interval probability for the shaded band on
+            prediction plots. Ignored for ``residuals`` and
+            ``observed_vs_predicted`` plots. Defaults to ``0.95``.
+        kind : {"prediction", "residuals", "observed_vs_predicted"}, optional
+            * ``"prediction"`` (default) — mean curve over ``x`` with a
+              credible band and observed scatter overlay.
+            * ``"residuals"`` — residuals vs predicted mean.
+            * ``"observed_vs_predicted"`` — observed vs predicted with
+              a reference ``y = x`` line.
+        ax : matplotlib.axes.Axes, optional
+            Existing axes to draw onto. When omitted, a fresh
+            ``Axes`` is created via ``plt.subplots()``.
+
+        Returns
+        -------
+        matplotlib.axes.Axes
+            The axes that were drawn on.
+
+        Raises
+        ------
+        ValueError
+            If ``kind`` is not one of the supported choices, or if
+            ``x`` cannot be inferred for a multi-feature prediction
+            plot, or if the named ``x`` column is missing from
+            ``data``.
+
+        Examples
+        --------
+        >>> model.plot(test_df)                       # prediction with band
+        >>> model.plot(test_df, kind="residuals")
+        >>> ax = model.plot(test_df, kind="observed_vs_predicted")
+        >>> ax.set_title("Calibration on held-out fold")
+
+        See Also
+        --------
+        Model.diagnose
+        Model.predict
+        """
         import matplotlib.pyplot as plt
 
         columns, _table_kind = table_columns(data)
