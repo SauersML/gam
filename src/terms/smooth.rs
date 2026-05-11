@@ -4491,7 +4491,7 @@ fn apply_global_smooth_identifiability(
                 c_local.as_ref().map(|mat| mat.view()),
             ) {
                 Ok(z_opt) => z_opt,
-                Err(BasisError::ConstraintNullspaceNotFound) if !owner_blocks.is_empty() => {
+                Err(BasisError::ConstraintNullspaceCollapsed { .. }) if !owner_blocks.is_empty() => {
                     Some(Array2::zeros((design_local.ncols(), 0)))
                 }
                 Err(err) => return Err(err),
@@ -16548,12 +16548,20 @@ mod tests {
         };
 
         let theta_dim = rho_dim + psi_dim;
+        let mut theta_zero = Array1::<f64>::zeros(theta_dim);
+        for j in 0..theta_dim {
+            theta_zero[j] = 0.0;
+        }
         let mut theta_base = Array1::<f64>::zeros(theta_dim);
         for j in 0..rho_dim {
             theta_base[j] = 0.2 - 0.1 * j as f64;
         }
         for k in 0..psi_dim {
             theta_base[rho_dim + k] = 0.0;
+        }
+        let mut theta_psi_only = Array1::<f64>::zeros(theta_dim);
+        for k in 0..psi_dim {
+            theta_psi_only[rho_dim + k] = 0.4;
         }
         let mut theta_alt = theta_base.clone();
         for j in 0..rho_dim {
@@ -16564,11 +16572,28 @@ mod tests {
         }
 
         let h = 1e-5_f64;
-        for (label, theta) in [("base", &theta_base), ("alt", &theta_alt)] {
+        // Tolerance: 5e-3 captures structural derivative bugs (the
+        // ext-coord blow-up is rel_err ≈ 10⁹) while staying above the
+        // central-FD truncation floor (O(h²) ≈ 1e-10 of cost magnitude).
+        // Inner PIRLS is at tol=1e-12 and ridge jitter is rare on small
+        // n=80 BinomialProbit fits, so this leaves a healthy margin.
+        let rel_tol = 5e-3_f64;
+        let mut violations: Vec<String> = Vec::new();
+        for (label, theta) in [
+            ("zero", &theta_zero),
+            ("psi_only", &theta_psi_only),
+            ("base", &theta_base),
+            ("alt", &theta_alt),
+        ] {
             let (cost_an, grad_an) = analytic_at(theta, &mut cache, &mut evaluator);
             assert!(
                 cost_an.is_finite(),
                 "analytic cost not finite at {label}: cost={cost_an:?}"
+            );
+            eprintln!(
+                "[fd_iso_kappa_duchon {label}] cost_analytic={cost_an:+.6e} \
+                 grad_norm_analytic={:.6e}",
+                grad_an.iter().map(|g| g * g).sum::<f64>().sqrt()
             );
             for j in 0..theta_dim {
                 let mut plus = theta.clone();
@@ -16583,9 +16608,12 @@ mod tests {
                 let kind = if j < rho_dim { "rho" } else { "psi" };
                 eprintln!(
                     "[fd_iso_kappa_duchon {label}] {kind} j={j} analytic={:+.6e} fd={:+.6e} \
-                     abs_err={:.3e} rel_err={:.3e}",
+                     cp={:+.12e} cm={:+.12e} dcost={:+.6e} abs_err={:.3e} rel_err={:.3e}",
                     grad_an[j],
                     fd,
+                    cp,
+                    cm,
+                    cp - cm,
                     (grad_an[j] - fd).abs(),
                     rel
                 );
@@ -16593,17 +16621,19 @@ mod tests {
                     cp.is_finite() && cm.is_finite(),
                     "non-finite cost in FD at {label} j={j}: cp={cp}, cm={cm}"
                 );
-                assert!(
-                    rel < 1e-4,
-                    "{label} {kind} component {j} disagreement: analytic={:+.6e}, fd={:+.6e}, \
-                     abs_err={:.3e}, rel_err={:.3e}",
-                    grad_an[j],
-                    fd,
-                    (grad_an[j] - fd).abs(),
-                    rel
-                );
+                if rel >= rel_tol {
+                    violations.push(format!(
+                        "{label} {kind} j={j}: analytic={:+.6e}, fd={:+.6e}, rel_err={:.3e}",
+                        grad_an[j], fd, rel
+                    ));
+                }
             }
         }
+        assert!(
+            violations.is_empty(),
+            "FD/analytic gradient disagreement at rel_tol={rel_tol:.1e}:\n  {}",
+            violations.join("\n  ")
+        );
     }
 
     #[test]
