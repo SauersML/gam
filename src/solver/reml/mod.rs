@@ -595,6 +595,68 @@ mod tests {
     }
 
     #[test]
+    fn reset_outer_seed_state_clears_pirls_cache() {
+        // Build a minimal logit RemlState, populate the cross-call PIRLS LRU
+        // by evaluating the outer objective at one rho, then verify that
+        // reset_outer_seed_state wipes that LRU (alongside the eval bundle
+        // and warm-start signals). This pins down the cross-attempt
+        // cleanup contract that a budget-bump retry relies on.
+        let y = array![0.0, 1.0, 1.0, 0.0, 0.0, 1.0];
+        let w = Array1::<f64>::ones(y.len());
+        let x = array![
+            [1.0, -1.0, 0.2],
+            [1.0, -0.5, -0.4],
+            [1.0, 0.0, 0.7],
+            [1.0, 0.4, -0.3],
+            [1.0, 0.9, 0.1],
+            [1.0, 1.3, -0.6],
+        ];
+        let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.1, 0.15], [0.0, 0.15, 0.8],];
+        let rho = array![0.0];
+        let cfg = RemlConfig::external(
+            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+            1e-10,
+            false,
+        );
+        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
+
+        // Trigger a full outer eval so execute_pirls_if_needed inserts at
+        // least one entry into the cross-call PIRLS LRU.
+        state
+            .compute_outer_eval_with_order(
+                &rho,
+                crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+            )
+            .expect("outer eval should succeed");
+
+        let populated_len = state
+            .cache_manager
+            .pirls_cache
+            .read()
+            .unwrap()
+            .map
+            .len();
+        assert!(
+            populated_len > 0,
+            "evaluating the outer objective should populate the PIRLS LRU, got {populated_len}"
+        );
+
+        state.reset_outer_seed_state();
+
+        let cleared_len = state
+            .cache_manager
+            .pirls_cache
+            .read()
+            .unwrap()
+            .map
+            .len();
+        assert_eq!(
+            cleared_len, 0,
+            "reset_outer_seed_state must clear the cross-call PIRLS LRU; got {cleared_len} entries"
+        );
+    }
+
+    #[test]
     fn implicit_hyper_design_derivative_respects_full_model_embedding() {
         let operator = ImplicitDesignPsiDerivative::new(
             array![1.0, 2.0, 3.0, 4.0],
