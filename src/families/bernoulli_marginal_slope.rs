@@ -16371,6 +16371,26 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let data_view = data;
     validate_spec(data_view, &spec)?;
     let mut effective_kappa_options = kappa_options.clone();
+    // Honor explicit `length_scale=X` in the user's formula: when every
+    // spatial term in BOTH the marginal mean and log-slope blocks carries
+    // a user-supplied scalar length scale and no per-axis anisotropy is
+    // requested, there is nothing for the joint-spatial outer optimizer
+    // to do. Routing through it anyway spends ~80 outer ARC iters stalled
+    // at the user's chosen ρ (the n-block ARC's first proposed step lands
+    // at the box corner and never recovers), then falls through to the
+    // ρ-only "custom family" path which is what we wanted all along.
+    // Short-circuit straight to the ρ-only path.
+    let kappa_locked_marginal =
+        crate::smooth::all_spatial_terms_kappa_fixed(&spec.marginalspec);
+    let kappa_locked_logslope =
+        crate::smooth::all_spatial_terms_kappa_fixed(&spec.logslopespec);
+    if effective_kappa_options.enabled && kappa_locked_marginal && kappa_locked_logslope {
+        log::info!(
+            "[BMS spatial] disabling κ/ψ optimization: every spatial term has an \
+             explicit length_scale and no anisotropy; user-supplied kernel scale is fixed"
+        );
+        effective_kappa_options.enabled = false;
+    }
     let flex_spatial_scale_path = (spec.score_warp.is_some() || spec.link_dev.is_some())
         && effective_kappa_options.pilot_subsample_threshold > 0
         && spec.y.len()
