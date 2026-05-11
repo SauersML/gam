@@ -15846,7 +15846,7 @@ fn duchon_kernel_amplification(
     }
     let axis_scales = aniso_log_scales.map(aniso_axis_scales);
     let mut k_cc = Array2::<f64>::zeros((k, k));
-    let mut max_abs_kcc = 0.0_f64;
+    let mut nonzero = false;
     for i in 0..k {
         for j in 0..k {
             let r = if let Some(scales) = axis_scales.as_deref() {
@@ -15870,13 +15870,12 @@ fn duchon_kernel_amplification(
                 }
             };
             k_cc[[i, j]] = val;
-            let abs = val.abs();
-            if abs > max_abs_kcc {
-                max_abs_kcc = abs;
+            if val != 0.0 {
+                nonzero = true;
             }
         }
     }
-    if max_abs_kcc == 0.0 {
+    if !nonzero {
         return Ok(1.0);
     }
 
@@ -15901,16 +15900,11 @@ fn duchon_kernel_amplification(
     // (B^T B, eigendecomposition, whitening) stay in the regime where
     // relative errors are tracked, not dominated by absolute roundoff.
     let amp_floor = 1e-5_f64;
-    let amp = if post_rms >= amp_floor {
-        1.0
+    if post_rms >= amp_floor {
+        Ok(1.0)
     } else {
-        amp_floor / post_rms
-    };
-    eprintln!(
-        "[KAMP-DBG] duchon_kernel_amplification: k={}, length_scale={:?}, p={}, s={}, d={}, max_abs_kcc={:.3e}, post_rms={:.3e}, amp={:.6e}",
-        k, length_scale, p_order, s_order, d, max_abs_kcc, post_rms, amp
-    );
-    Ok(amp)
+        Ok(amp_floor / post_rms)
+    }
 }
 
 fn build_duchon_basis_designwithworkspace(
