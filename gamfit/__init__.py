@@ -37,9 +37,27 @@ except _metadata.PackageNotFoundError:
     __version__ = "0.0.0+unknown"
 
 def load_posterior(path: object) -> PosteriorSamples:
-    """Load a :class:`PosteriorSamples` from an ``.npz`` archive written
-    by :meth:`PosteriorSamples.save`.  Convenience wrapper for symmetry
-    with :func:`gamfit.load` / :func:`gamfit.fit`.
+    """Load a :class:`PosteriorSamples` archive from disk.
+
+    Thin wrapper around :meth:`PosteriorSamples.load` provided for symmetry
+    with :func:`gamfit.load` / :func:`gamfit.fit` at module level.
+
+    Parameters
+    ----------
+    path : str or pathlib.Path
+        Filesystem path to an ``.npz`` archive previously written by
+        :meth:`PosteriorSamples.save`.
+
+    Returns
+    -------
+    PosteriorSamples
+        Reconstructed posterior draws and metadata.
+
+    Examples
+    --------
+    >>> draws = gamfit.load_posterior("posterior.npz")
+    >>> draws.beta.shape
+    (1000, 42)
     """
     return PosteriorSamples.load(path)  # type: ignore[arg-type]
 
