@@ -2506,7 +2506,15 @@ struct ImplicitDerivativeOp {
     global_range: Range<usize>,
     total_dim: usize,
     /// Cached dense materialization (lazy, populated on first call to ops that need the full matrix).
-    cached_dense: std::sync::Arc<std::sync::OnceLock<Array2<f64>>>,
+    ///
+    /// Rayon-safe: `materialize_local` calls `materialize_first` / `_second_diag`
+    /// / `_second_cross` on the implicit basis-derivative operator, which for
+    /// streaming bases dispatches `(0..nc).into_par_iter().for_each(...)`. A plain
+    /// `std::sync::OnceLock` here would deadlock if `materialize_dense` were first
+    /// called concurrently from inside another rayon par_iter — racing workers
+    /// would park on the OnceLock's OS condvar, leaving the leader's nested
+    /// par_iter without workers. `RayonSafeOnce` runs init lock-free.
+    cached_dense: std::sync::Arc<crate::resource::RayonSafeOnce<Array2<f64>>>,
 }
 
 impl ImplicitDerivativeOp {
@@ -2634,7 +2642,7 @@ impl HyperDesignDerivative {
                 level,
                 global_range,
                 total_dim: total_cols,
-                cached_dense: std::sync::Arc::new(std::sync::OnceLock::new()),
+                cached_dense: std::sync::Arc::new(crate::resource::RayonSafeOnce::new()),
             }),
         }
     }

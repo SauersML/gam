@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 pub mod deviation_runtime;
 pub(crate) mod exact_kernel;
@@ -4194,10 +4194,15 @@ struct BernoulliMarginalSlopeExactEvalCache {
     /// callers reduce to a 2×2 [`contract_third_full`].
     ///
     /// Stored as `Result` because the build is fallible (per-row jet may
-    /// surface a non-finite value). Wrapping in `OnceLock` ensures the
-    /// expensive build runs exactly once across all concurrent threads;
-    /// failure is sticky and propagated identically to every caller.
-    rigid_third_full: OnceLock<Result<Vec<[[[f64; 2]; 2]; 2]>, String>>,
+    /// surface a non-finite value). Wrapped in `RayonSafeOnce` (not
+    /// `OnceLock`) because the init closure runs `(0..n).into_par_iter()`
+    /// — a plain `OnceLock` here deadlocks if the FIRST access happens
+    /// concurrently from inside another rayon par_iter, because the
+    /// racing workers park on the OnceLock's condvar and the leader's
+    /// nested par_iter loses its workers. With `RayonSafeOnce` racers may
+    /// duplicate the build, but no thread ever parks; first to publish
+    /// wins and steady-state is identical (sticky failure included).
+    rigid_third_full: crate::resource::RayonSafeOnce<Result<Vec<[[[f64; 2]; 2]; 2]>, String>>,
 
     /// Identifies the (β, options, subsample) state this cache was built
     /// against. Workspace `from_cache` entries verify this matches what
@@ -4212,7 +4217,8 @@ struct BernoulliMarginalSlopeExactEvalCache {
     /// rank=32. Per-row, the five distinct components are axis-invariant,
     /// so caching them lets every pair contraction be a 16-multiply 2×2
     /// bilinear instead of a fresh 8-direction empirical jet.
-    rigid_fourth_full: OnceLock<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
+    rigid_fourth_full:
+        crate::resource::RayonSafeOnce<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
 }
 
 // ── RowKernel<2> implementation (rigid path only) ────────────────────
@@ -4228,14 +4234,19 @@ struct BernoulliRigidRowKernel {
     /// runs at most once per row across the full ext-dim sweep, instead of
     /// once per (row, ψ-axis) pair. Per-axis `row_third_contracted` becomes
     /// a 2×2 bilinear contraction against the cached tensor.
-    third_full_cache: OnceLock<Vec<[[[f64; 2]; 2]; 2]>>,
+    ///
+    /// `RayonSafeOnce` (not `OnceLock`): init runs `(0..n).into_par_iter()`
+    /// and may be entered concurrently from inside an outer par_iter — see
+    /// `feedback_oncelock_rayon_deadlock` and `RayonSafeOnce`'s doc.
+    third_full_cache: crate::resource::RayonSafeOnce<Vec<[[[f64; 2]; 2]; 2]>>,
     /// Per-row uncontracted fourth-derivative tensor — the outer-Hessian
     /// analogue of `third_full_cache`. The second-directional-derivative
     /// operator's trace path touches every row × (u, v) pair; with this
     /// cache the heavy 8-direction empirical jet (or closed-form 5-component
     /// build) runs at most once per row, leaving each pair with a cheap
-    /// [`contract_fourth_full`] bilinear.
-    fourth_full_cache: OnceLock<Vec<[[[[f64; 2]; 2]; 2]; 2]>>,
+    /// [`contract_fourth_full`] bilinear. Uses `RayonSafeOnce` for the same
+    /// reason as `third_full_cache`.
+    fourth_full_cache: crate::resource::RayonSafeOnce<Vec<[[[[f64; 2]; 2]; 2]; 2]>>,
 }
 
 impl BernoulliRigidRowKernel {
@@ -4245,8 +4256,8 @@ impl BernoulliRigidRowKernel {
             family,
             block_states,
             slices,
-            third_full_cache: OnceLock::new(),
-            fourth_full_cache: OnceLock::new(),
+            third_full_cache: crate::resource::RayonSafeOnce::new(),
+            fourth_full_cache: crate::resource::RayonSafeOnce::new(),
         }
     }
 
@@ -4477,8 +4488,17 @@ struct BernoulliMarginalSlopeLineSearchWorkspace {
     cache: BernoulliMarginalSlopeExactEvalCache,
     options: BlockwiseFitOptions,
     log_likelihood: f64,
-    full_workspace:
-        OnceLock<Result<Arc<BernoulliMarginalSlopeExactNewtonJointHessianWorkspace>, String>>,
+    // `RayonSafeOnce` (not `OnceLock`): the materialization closure runs
+    // nested rayon work (`build_row_primary_hessian_cache`,
+    // `build_row_cell_moments_bundle`). If reached for the first time
+    // concurrently from inside an outer par_iter, a plain `OnceLock` would
+    // park the racing workers on its condvar and starve the leader's
+    // nested par_iter. `RayonSafeOnce` keeps init lock-free; pair this
+    // with the top-level `warm_up_outer_caches()` call for steady-state
+    // single-build behaviour.
+    full_workspace: crate::resource::RayonSafeOnce<
+        Result<Arc<BernoulliMarginalSlopeExactNewtonJointHessianWorkspace>, String>,
+    >,
 }
 
 struct BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
@@ -5651,7 +5671,7 @@ impl BernoulliMarginalSlopeFamily {
                     row_contexts,
                     row_cell_moments: None,
                     row_primary_hessians: None,
-                    rigid_third_full: OnceLock::new(),
+                    rigid_third_full: crate::resource::RayonSafeOnce::new(),
                     fingerprint: CacheFingerprint::compute(
                         block_states,
                         workspace_options
@@ -5660,11 +5680,11 @@ impl BernoulliMarginalSlopeFamily {
                             .map(|s| s.mask.as_slice()),
                         Some(workspace_options),
                     ),
-                    rigid_fourth_full: OnceLock::new(),
+                    rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
                 },
                 options: workspace_options.clone(),
                 log_likelihood,
-                full_workspace: OnceLock::new(),
+                full_workspace: crate::resource::RayonSafeOnce::new(),
             });
         if log_exact_work(n) {
             log::info!(
@@ -7142,9 +7162,9 @@ impl BernoulliMarginalSlopeFamily {
             row_contexts,
             row_cell_moments,
             row_primary_hessians: None,
-            rigid_third_full: OnceLock::new(),
+            rigid_third_full: crate::resource::RayonSafeOnce::new(),
             fingerprint: CacheFingerprint::compute(block_states, row_cell_mask, options),
-            rigid_fourth_full: OnceLock::new(),
+            rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
         })
     }
 
@@ -26065,9 +26085,9 @@ mod tests {
             row_contexts: cached.row_contexts.clone(),
             row_cell_moments: None,
             row_primary_hessians: None,
-            rigid_third_full: OnceLock::new(),
+            rigid_third_full: crate::resource::RayonSafeOnce::new(),
             fingerprint: cached.fingerprint.clone(),
-            rigid_fourth_full: OnceLock::new(),
+            rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
         };
         let direction =
             Array1::from_iter((0..cached.slices.total).map(|idx| 0.02 * ((idx % 5) as f64 - 2.0)));
@@ -26114,9 +26134,9 @@ mod tests {
             row_contexts: cached.row_contexts.clone(),
             row_cell_moments: None,
             row_primary_hessians: None,
-            rigid_third_full: OnceLock::new(),
+            rigid_third_full: crate::resource::RayonSafeOnce::new(),
             fingerprint: cached.fingerprint.clone(),
-            rigid_fourth_full: OnceLock::new(),
+            rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
         };
         let directions: Vec<_> = (0..4)
             .map(|rep| {

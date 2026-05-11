@@ -26088,6 +26088,87 @@ mod tests {
         );
     }
 
+    /// FD the **unnormalized** Gram penalty `S_raw = D^T D` for the failing
+    /// (d=1, p=2, s=1, ls=1) spec to isolate whether the bug is in
+    /// `gram_and_psi_derivatives_from_operator` / `D_psi` build or in
+    /// `normalize_penaltywith_psi_derivatives`.
+    #[test]
+    fn test_duchon_raw_gram_psi_derivative_fd_dim1() {
+        use ndarray::array;
+        let centers = array![[0.0_f64], [0.2], [0.45], [0.7]];
+        let nullspace_order = DuchonNullspaceOrder::Linear;
+        let power = 1usize;
+        let length_scale = 1.0_f64;
+        let mut workspace = BasisWorkspace::default();
+        let ops_base = build_duchon_collocation_operator_matriceswithworkspace(
+            centers.view(),
+            None,
+            Some(length_scale),
+            power,
+            nullspace_order,
+            None,
+            None,
+            2,
+            &mut workspace,
+        )
+        .expect("base ops");
+        let eps: f64 = 1e-5;
+        let ls_plus = 1.0 / (1.0 * eps.exp());
+        let ls_minus = 1.0 / (1.0 * (-eps).exp());
+        let ops_plus = build_duchon_collocation_operator_matriceswithworkspace(
+            centers.view(),
+            None,
+            Some(ls_plus),
+            power,
+            nullspace_order,
+            None,
+            None,
+            2,
+            &mut workspace,
+        )
+        .expect("plus ops");
+        let ops_minus = build_duchon_collocation_operator_matriceswithworkspace(
+            centers.view(),
+            None,
+            Some(ls_minus),
+            power,
+            nullspace_order,
+            None,
+            None,
+            2,
+            &mut workspace,
+        )
+        .expect("minus ops");
+
+        let s0_raw_base = symmetrize(&fast_ata(&ops_base.d0));
+        let s1_raw_base = symmetrize(&fast_ata(&ops_base.d1));
+        let s2_raw_base = symmetrize(&fast_ata(&ops_base.d2));
+        let fd_s0_raw =
+            (symmetrize(&fast_ata(&ops_plus.d0)) - symmetrize(&fast_ata(&ops_minus.d0)))
+                / (2.0 * eps);
+        let fd_s1_raw =
+            (symmetrize(&fast_ata(&ops_plus.d1)) - symmetrize(&fast_ata(&ops_minus.d1)))
+                / (2.0 * eps);
+        let fd_s2_raw =
+            (symmetrize(&fast_ata(&ops_plus.d2)) - symmetrize(&fast_ata(&ops_minus.d2)))
+                / (2.0 * eps);
+        eprintln!(
+            "[raw_gram_fd_d1] S0_raw_base norm={:.4e}; fd_S0_raw_psi norm={:.4e}",
+            s0_raw_base.iter().map(|v| v * v).sum::<f64>().sqrt(),
+            fd_s0_raw.iter().map(|v| v * v).sum::<f64>().sqrt()
+        );
+        eprintln!(
+            "[raw_gram_fd_d1] S1_raw_base norm={:.4e}; fd_S1_raw_psi norm={:.4e}",
+            s1_raw_base.iter().map(|v| v * v).sum::<f64>().sqrt(),
+            fd_s1_raw.iter().map(|v| v * v).sum::<f64>().sqrt()
+        );
+        eprintln!(
+            "[raw_gram_fd_d1] S2_raw_base norm={:.4e}; fd_S2_raw_psi norm={:.4e}",
+            s2_raw_base.iter().map(|v| v * v).sum::<f64>().sqrt(),
+            fd_s2_raw.iter().map(|v| v * v).sum::<f64>().sqrt()
+        );
+    }
+
     /// Variant of `test_duchon_log_kappa_derivative_matchesfd` at length_scale=1.0
     /// (kappa=1, psi=0) to check whether the analytic dS/d(log κ) formulas
     /// degrade at kappa=1 (where chain-rule corner cases are likeliest).

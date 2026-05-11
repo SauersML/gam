@@ -317,3 +317,102 @@ impl ResidentBytes for Arc<ndarray::Array2<f64>> {
             .saturating_mul(self.ncols())
     }
 }
+
+/// Lazy-init cache safe to call from inside rayon par_iter.
+///
+/// `std::sync::OnceLock::get_or_init` parks racing threads on an OS
+/// condition variable until the leader's init closure finishes. If the
+/// leader's init closure itself dispatches a nested `into_par_iter`, the
+/// parked threads are now unavailable as rayon workers, and the leader
+/// blocks waiting for chunks that no one can service. Classic deadlock.
+///
+/// `RayonSafeOnce` removes the trap by computing the value *outside* any
+/// lock. Concurrent racers may produce duplicate values; the first to
+/// publish wins, the rest drop their result. No thread ever parks waiting
+/// for another thread's init to finish, so nested rayon par_iter inside
+/// the init closure is safe.
+///
+/// Use this in place of `OnceLock` whenever the init closure transitively
+/// runs rayon work *and* the cache may be entered concurrently from
+/// inside another rayon par_iter. The redundant-work cost on first race
+/// is the price for never deadlocking; in practice the loser threads
+/// throw away one round of work and steady-state is identical to
+/// `OnceLock`.
+pub struct RayonSafeOnce<T> {
+    slot: std::sync::OnceLock<T>,
+}
+
+impl<T> RayonSafeOnce<T> {
+    pub const fn new() -> Self {
+        Self {
+            slot: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Returns the cached value if already populated.
+    #[inline]
+    pub fn get(&self) -> Option<&T> {
+        self.slot.get()
+    }
+
+    /// Returns the cached value, computing it if absent.
+    ///
+    /// The init closure runs WITHOUT holding any lock — calls from
+    /// concurrent rayon workers may all run it, and all but the first
+    /// to call `set` discard their result. This is the contract that
+    /// keeps nested `into_par_iter` inside `init` from deadlocking on
+    /// other workers parked on a `OnceLock`.
+    pub fn get_or_init<F>(&self, init: F) -> &T
+    where
+        F: FnOnce() -> T,
+    {
+        if let Some(v) = self.slot.get() {
+            return v;
+        }
+        let candidate = init();
+        let _ = self.slot.set(candidate);
+        self.slot
+            .get()
+            .expect("RayonSafeOnce slot populated by set() above")
+    }
+
+    /// Fallible variant of `get_or_init`.
+    pub fn get_or_try_init<F, E>(&self, init: F) -> Result<&T, E>
+    where
+        F: FnOnce() -> Result<T, E>,
+    {
+        if let Some(v) = self.slot.get() {
+            return Ok(v);
+        }
+        let candidate = init()?;
+        let _ = self.slot.set(candidate);
+        Ok(self
+            .slot
+            .get()
+            .expect("RayonSafeOnce slot populated by set() above"))
+    }
+}
+
+impl<T> Default for RayonSafeOnce<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Clone> Clone for RayonSafeOnce<T> {
+    fn clone(&self) -> Self {
+        let cloned = Self::new();
+        if let Some(value) = self.slot.get() {
+            let _ = cloned.slot.set(value.clone());
+        }
+        cloned
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for RayonSafeOnce<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RayonSafeOnce")
+            .field("slot", &self.slot.get())
+            .finish()
+    }
+}
