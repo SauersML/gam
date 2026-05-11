@@ -177,18 +177,6 @@ from gamfit.sklearn import GAMRegressor
 est = GAMRegressor(formula="y ~ s(x)").fit(X, y)
 ```
 
-## How does it stack up
-
-On the `prostate` benchmark (5-fold CV, binomial), gamfit's Rust
-engine reaches **AUC 0.705** alongside `mgcv` (AUC 0.704) and `gamlss`
-(AUC 0.711). `mgcv` is the fastest of the three; gamfit's value-add is
-not raw fit time on this scenario but the surrounding feature set
-(adaptive anisotropy, location-scale, marginal-slope, survival).
-Benchmark machinery and scenarios live in [`bench/`](bench/);
-aggregated results are in
-[`bench/prostate_gamair_results.json`](bench/prostate_gamair_results.json)
-and similar files.
-
 ## Where to learn more
 
 - **Python documentation:** <https://gamfit.readthedocs.io/> — getting
