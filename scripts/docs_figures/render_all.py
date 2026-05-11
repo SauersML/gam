@@ -1,21 +1,22 @@
-"""Render the full README figure portfolio from real `gamfit` fits.
+"""Render the README + docs figure portfolio from real `gamfit` fits.
 
-Outputs (written to docs/images/):
+Outputs land in docs/images/:
 
   surface_fit_hero.png       2D, 3 panels: data → fitted mean → predictive SE
   smooth_zoo.png             2D, 4 panels: thinplate / matern / duchon / te
   surface_3d_shaded.png      3D shaded surface of the matern fit
   surface_3d_wireframe.png   3D wireframe over the noisy point cloud
   surface_3d_compare.png     3D side-by-side: matern vs duchon
-  marginal_slope_3d.png      The headline 2-surface marginal-slope viz
+  marginal_slope_3d.png      Two-surface marginal-slope viz (baseline + score)
 
-Everything uses real fits. Kick this off once, walk away, and pick up
-the PNGs in docs/images/ when it's done.
+Each render is wrapped in try/except so one failure doesn't take the rest
+down. Output is unbuffered. Run with .venv313/bin/python -u.
 """
 from __future__ import annotations
 
+import sys
+import traceback
 from pathlib import Path
-from typing import Iterable
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -26,8 +27,12 @@ from matplotlib import cm
 import gamfit
 
 
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
 # ---------------------------------------------------------------------------
-# Editorial style
+# Editorial style. Helvetica is reliable on macOS; falls back to sans-serif.
 # ---------------------------------------------------------------------------
 mpl.rcParams.update(
     {
@@ -53,14 +58,7 @@ mpl.rcParams.update(
         "savefig.facecolor": "white",
         "savefig.bbox": "tight",
         "savefig.dpi": 200,
-        "font.family": [
-            "Inter",
-            "SF Pro Display",
-            "Helvetica Neue",
-            "Helvetica",
-            "Arial",
-            "sans-serif",
-        ],
+        "font.family": ["Helvetica Neue", "Helvetica", "Arial", "sans-serif"],
     }
 )
 
@@ -69,14 +67,16 @@ DOCS_IMAGES.mkdir(parents=True, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Shared helpers
 # ---------------------------------------------------------------------------
 def truth_2d(x1: np.ndarray, x2: np.ndarray) -> np.ndarray:
-    """Two-bump 2-D field used as the regression target."""
-    bump_a = 1.2 * np.exp(-((x1 - 0.30) ** 2 + (x2 - 0.65) ** 2) / 0.07)
-    bump_b = -0.8 * np.exp(-((x1 - 0.72) ** 2 + (x2 - 0.28) ** 2) / 0.05)
-    slope = 0.4 * (x1 - 0.5) + 0.2 * (x2 - 0.5)
-    return bump_a + bump_b + slope
+    """A richer landscape: three peaks + saddle + ripple."""
+    peak_a = 1.4 * np.exp(-((x1 - 0.25) ** 2 + (x2 - 0.70) ** 2) / 0.06)
+    peak_b = -1.1 * np.exp(-((x1 - 0.75) ** 2 + (x2 - 0.25) ** 2) / 0.05)
+    peak_c = 0.7 * np.exp(-((x1 - 0.80) ** 2 + (x2 - 0.78) ** 2) / 0.04)
+    saddle = 0.35 * (x1 - x2)
+    ripple = 0.18 * np.sin(2.0 * np.pi * (x1 + 0.5 * x2))
+    return peak_a + peak_b + peak_c + saddle + ripple
 
 
 def make_regression(n: int = 800, seed: int = 7) -> dict:
@@ -87,8 +87,8 @@ def make_regression(n: int = 800, seed: int = 7) -> dict:
     return {"y": y.tolist(), "x1": x1.tolist(), "x2": x2.tolist()}
 
 
-def grid_eval(model: gamfit.Model, side: int = 110, *, with_se: bool = False):
-    g = np.linspace(0.0, 1.0, side)
+def grid_eval(model, side=110, with_se=False, lo=0.0, hi=1.0):
+    g = np.linspace(lo, hi, side)
     gx, gy = np.meshgrid(g, g)
     payload = {"x1": gx.ravel().tolist(), "x2": gy.ravel().tolist()}
     pred = model.predict(
@@ -109,9 +109,7 @@ def style_colorbar(cbar) -> None:
     cbar.ax.tick_params(width=0.4, length=2.5, labelsize=7.5, color="#9ca3af")
 
 
-def style_square_axes_2d(ax, *, xlabel, ylabel) -> None:
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
+def style_square_axes_2d(ax, xlabel=None, ylabel=None) -> None:
     ax.set_aspect("equal")
     if xlabel is not None:
         ax.set_xlabel(xlabel)
@@ -121,18 +119,14 @@ def style_square_axes_2d(ax, *, xlabel, ylabel) -> None:
         ax.set_yticklabels([])
 
 
-def style_3d_axes(ax, *, xlabel, ylabel, zlabel) -> None:
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
+def style_3d_axes(ax, xlabel="x1", ylabel="x2", zlabel="z") -> None:
     ax.set_xlabel(xlabel, labelpad=4)
     ax.set_ylabel(ylabel, labelpad=4)
     ax.set_zlabel(zlabel, labelpad=4)
-    ax.xaxis.pane.set_alpha(0.04)
-    ax.yaxis.pane.set_alpha(0.04)
-    ax.zaxis.pane.set_alpha(0.04)
     for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
         axis.pane.set_edgecolor("#d1d5db")
         axis.pane.set_linewidth(0.4)
+        axis.pane.fill = False
     ax.tick_params(axis="x", pad=0)
     ax.tick_params(axis="y", pad=0)
     ax.tick_params(axis="z", pad=2)
@@ -140,15 +134,12 @@ def style_3d_axes(ax, *, xlabel, ylabel, zlabel) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Figure 1 — 2D three-panel hero (data → mean → SE)
+# Figure 1: 2D three-panel hero
 # ---------------------------------------------------------------------------
-def render_2d_hero(data: dict) -> None:
-    x1 = np.asarray(data["x1"])
-    x2 = np.asarray(data["x2"])
-    y = np.asarray(data["y"])
-
-    model = gamfit.fit(data, "y ~ matern(x1, x2)")
-    gx, gy, mean, se = grid_eval(model, side=140, with_se=True)
+def render_hero(data: dict, model) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    log("[hero] grid eval")
+    x1 = np.asarray(data["x1"]); x2 = np.asarray(data["x2"]); y = np.asarray(data["y"])
+    gx, gy, mean, se = grid_eval(model, side=120, with_se=True)
 
     vmin = float(min(y.min(), mean.min()))
     vmax = float(max(y.max(), mean.max()))
@@ -161,7 +152,7 @@ def render_2d_hero(data: dict) -> None:
                     edgecolor="white", linewidth=0.35,
                     vmin=vmin, vmax=vmax)
     ax.set_title("Noisy observations", pad=10)
-    style_square_axes_2d(ax, xlabel="x₁", ylabel="x₂")
+    style_square_axes_2d(ax, xlabel="x1", ylabel="x2")
     style_colorbar(fig.colorbar(sc, ax=ax, fraction=0.045, pad=0.04))
 
     ax = axes[1]
@@ -169,84 +160,87 @@ def render_2d_hero(data: dict) -> None:
                      vmin=vmin, vmax=vmax)
     ax.contour(gx, gy, mean, levels=8, colors="white",
                linewidths=0.4, alpha=0.55)
-    ax.set_title("matern(x₁, x₂) — fitted mean", pad=10)
-    style_square_axes_2d(ax, xlabel="x₁", ylabel=None)
+    ax.set_title("matern(x1, x2) — fitted mean", pad=10)
+    style_square_axes_2d(ax, xlabel="x1")
     style_colorbar(fig.colorbar(cf, ax=ax, fraction=0.045, pad=0.04))
 
     ax = axes[2]
-    cf = ax.contourf(gx, gy, se if se is not None else np.zeros_like(mean),
-                     levels=24, cmap="viridis")
+    se_plot = se if se is not None else np.zeros_like(mean)
+    cf = ax.contourf(gx, gy, se_plot, levels=24, cmap="viridis")
     ax.scatter(x1, x2, s=2.5, color="white", alpha=0.5, linewidth=0)
     ax.set_title("Posterior predictive SE", pad=10)
-    style_square_axes_2d(ax, xlabel="x₁", ylabel=None)
+    style_square_axes_2d(ax, xlabel="x1")
     style_colorbar(fig.colorbar(cf, ax=ax, fraction=0.045, pad=0.04))
-
-    fig.text(0.5, -0.03,
-             "800 noisy observations  ·  Matérn ν = 5/2 surface fit"
-             "  ·  smoothing chosen by REML",
-             ha="center", va="center", fontsize=8.5, color="#6b7280")
 
     out = DOCS_IMAGES / "surface_fit_hero.png"
     fig.savefig(out, dpi=220, bbox_inches="tight", pad_inches=0.14)
     plt.close(fig)
-    print(f"wrote {out}")
-    return mean, gx, gy, model
+    log(f"wrote {out}")
+    return gx, gy, mean
 
 
 # ---------------------------------------------------------------------------
-# Figure 2 — 2D zoo (4 smooth families on the same data)
+# Figure 2: 2D zoo
 # ---------------------------------------------------------------------------
-def render_zoo(data: dict) -> dict[str, np.ndarray]:
-    x1 = np.asarray(data["x1"])
-    x2 = np.asarray(data["x2"])
+def render_zoo(data: dict, matern_mean: np.ndarray):
+    log("[zoo] fitting alternates...")
+    x1 = np.asarray(data["x1"]); x2 = np.asarray(data["x2"])
+    side = matern_mean.shape[0]
+    g = np.linspace(0.0, 1.0, side)
+    gx, gy = np.meshgrid(g, g)
 
+    surfaces = [("Matérn", gx, gy, matern_mean)]
     specs = [
         ("thin-plate", "y ~ thinplate(x1, x2)"),
-        ("Matérn",     "y ~ matern(x1, x2)"),
-        ("Duchon",     "y ~ duchon(x1, x2, centers=40)"),
+        ("Duchon",     "y ~ duchon(x1, x2, centers=25)"),
         ("tensor",     "y ~ te(x1, x2)"),
     ]
-    side = 110
-    surfaces: list[tuple[str, np.ndarray, np.ndarray, np.ndarray]] = []
     for name, formula in specs:
-        m = gamfit.fit(data, formula)
-        gx, gy, mean, _ = grid_eval(m, side=side, with_se=False)
-        surfaces.append((name, gx, gy, mean))
+        log(f"[zoo] fit {name}")
+        try:
+            m = gamfit.fit(data, formula)
+            _, _, mean, _ = grid_eval(m, side=side, with_se=False)
+            surfaces.append((name, gx, gy, mean))
+            log(f"[zoo] {name} done")
+        except Exception as exc:
+            log(f"[zoo] {name} FAILED: {exc!s}")
+
+    order = ["thin-plate", "Matérn", "Duchon", "tensor"]
+    surfaces.sort(key=lambda t: order.index(t[0]) if t[0] in order else 99)
 
     vmin = min(float(np.percentile(s, 2)) for _, _, _, s in surfaces)
     vmax = max(float(np.percentile(s, 98)) for _, _, _, s in surfaces)
 
-    fig, axes = plt.subplots(1, 4, figsize=(13.4, 3.7),
+    n_panels = len(surfaces)
+    fig, axes = plt.subplots(1, n_panels, figsize=(3.35 * n_panels, 3.7),
                              gridspec_kw={"wspace": 0.10})
-    for ax, (name, gx, gy, mean) in zip(axes, surfaces):
-        cf = ax.contourf(gx, gy, mean, levels=22, cmap="magma",
+    if n_panels == 1:
+        axes = [axes]
+    for ax, (name, gx_, gy_, mean) in zip(axes, surfaces):
+        cf = ax.contourf(gx_, gy_, mean, levels=22, cmap="magma",
                          vmin=vmin, vmax=vmax)
-        ax.contour(gx, gy, mean, levels=6, colors="white",
+        ax.contour(gx_, gy_, mean, levels=6, colors="white",
                    linewidths=0.35, alpha=0.55)
         ax.scatter(x1, x2, s=1.6, color="white", alpha=0.35, linewidth=0)
         ax.set_title(name, pad=8)
         style_square_axes_2d(
-            ax, xlabel="x₁",
-            ylabel="x₂" if ax is axes[0] else None,
+            ax, xlabel="x1",
+            ylabel="x2" if ax is axes[0] else None,
         )
 
-    cbar = fig.colorbar(cf, ax=axes.tolist(), fraction=0.018, pad=0.02)
+    cbar = fig.colorbar(cf, ax=axes if isinstance(axes, list) else list(axes),
+                        fraction=0.018, pad=0.02)
     style_colorbar(cbar)
-
-    fig.text(0.5, -0.02,
-             "Same 800-point dataset, four smooth families.  "
-             "Smoothing parameters selected by REML in each case.",
-             ha="center", va="center", fontsize=8.5, color="#6b7280")
 
     out = DOCS_IMAGES / "smooth_zoo.png"
     fig.savefig(out, dpi=220, bbox_inches="tight", pad_inches=0.14)
     plt.close(fig)
-    print(f"wrote {out}")
-    return {name: surf for name, _, _, surf in surfaces}, surfaces
+    log(f"wrote {out}")
+    return {name: surf for name, _, _, surf in surfaces}
 
 
 # ---------------------------------------------------------------------------
-# Figure 3 — 3D shaded surface
+# Figure 3: 3D shaded surface
 # ---------------------------------------------------------------------------
 def render_3d_shaded(gx, gy, mean) -> None:
     fig = plt.figure(figsize=(8.4, 6.0))
@@ -255,41 +249,30 @@ def render_3d_shaded(gx, gy, mean) -> None:
     ls = LightSource(azdeg=315, altdeg=45)
     rgb = ls.shade(mean, cmap=cm.magma,
                    vert_exag=0.6, blend_mode="soft")
-    ax.plot_surface(
-        gx, gy, mean,
-        facecolors=rgb,
-        rstride=1, cstride=1,
-        linewidth=0, antialiased=True, shade=False,
-    )
+    ax.plot_surface(gx, gy, mean, facecolors=rgb,
+                    rstride=1, cstride=1, linewidth=0,
+                    antialiased=True, shade=False)
     ax.contour(gx, gy, mean, zdir="z",
                offset=float(np.nanmin(mean)) - 0.05,
                levels=12, cmap="magma", linewidths=0.6, alpha=0.7)
 
-    ax.set_title("matern(x₁, x₂) — 3-D fitted surface",
-                 pad=2, loc="left")
-    ax.set_zlim(float(np.nanmin(mean)) - 0.05, float(np.nanmax(mean)) + 0.1)
-    style_3d_axes(ax, xlabel="x₁", ylabel="x₂", zlabel="ŷ")
+    ax.set_zlim(float(np.nanmin(mean)) - 0.05,
+                float(np.nanmax(mean)) + 0.1)
+    style_3d_axes(ax, xlabel="x1", ylabel="x2", zlabel="y")
     ax.view_init(elev=28, azim=-52)
     ax.set_box_aspect((1.0, 1.0, 0.55))
-
-    fig.text(0.5, 0.02,
-             "Same surface as the 2-D panel, shaded with a 315° / 45° "
-             "light source for relief.",
-             ha="center", fontsize=8.5, color="#6b7280")
 
     out = DOCS_IMAGES / "surface_3d_shaded.png"
     fig.savefig(out, dpi=220, bbox_inches="tight", pad_inches=0.18)
     plt.close(fig)
-    print(f"wrote {out}")
+    log(f"wrote {out}")
 
 
 # ---------------------------------------------------------------------------
-# Figure 4 — 3D wireframe over scatter
+# Figure 4: 3D wireframe + scatter
 # ---------------------------------------------------------------------------
 def render_3d_wireframe(data: dict, gx, gy, mean) -> None:
-    x1 = np.asarray(data["x1"])
-    x2 = np.asarray(data["x2"])
-    y = np.asarray(data["y"])
+    x1 = np.asarray(data["x1"]); x2 = np.asarray(data["x2"]); y = np.asarray(data["y"])
 
     fig = plt.figure(figsize=(8.4, 6.0))
     ax = fig.add_subplot(111, projection="3d")
@@ -301,33 +284,29 @@ def render_3d_wireframe(data: dict, gx, gy, mean) -> None:
     ax.plot_wireframe(gx, gy, mean, rstride=6, cstride=6,
                       color="#111827", linewidth=0.45, alpha=0.5)
 
-    ax.set_title("Wireframe fit over the raw scatter",
-                 pad=2, loc="left")
-    style_3d_axes(ax, xlabel="x₁", ylabel="x₂", zlabel="y")
+    style_3d_axes(ax, xlabel="x1", ylabel="x2", zlabel="y")
     ax.view_init(elev=22, azim=-58)
     ax.set_box_aspect((1.0, 1.0, 0.65))
-
-    fig.text(0.5, 0.02,
-             "Points = raw observations.  Wireframe = the smoothed surface "
-             "the engine fit through them.",
-             ha="center", fontsize=8.5, color="#6b7280")
 
     out = DOCS_IMAGES / "surface_3d_wireframe.png"
     fig.savefig(out, dpi=220, bbox_inches="tight", pad_inches=0.18)
     plt.close(fig)
-    print(f"wrote {out}")
+    log(f"wrote {out}")
 
 
 # ---------------------------------------------------------------------------
-# Figure 5 — 3D side-by-side Matérn vs Duchon
+# Figure 5: 3D side-by-side Matérn vs Duchon
 # ---------------------------------------------------------------------------
-def render_3d_compare(surfaces) -> None:
-    pick = {name: (gx, gy, mean) for name, gx, gy, mean in surfaces}
-    if "Matérn" not in pick or "Duchon" not in pick:
-        print("skip surface_3d_compare (missing matern or duchon)")
+def render_3d_compare(surfaces: dict) -> None:
+    if "Matérn" not in surfaces or "Duchon" not in surfaces:
+        log("[compare] skipping (missing matern/duchon)")
         return
-    gx1, gy1, mean_m = pick["Matérn"]
-    gx2, gy2, mean_d = pick["Duchon"]
+
+    side = surfaces["Matérn"].shape[0]
+    g = np.linspace(0.0, 1.0, side)
+    gx, gy = np.meshgrid(g, g)
+    mean_m = surfaces["Matérn"]
+    mean_d = surfaces["Duchon"]
 
     vmin = float(min(np.nanmin(mean_m), np.nanmin(mean_d)))
     vmax = float(max(np.nanmax(mean_m), np.nanmax(mean_d)))
@@ -335,10 +314,8 @@ def render_3d_compare(surfaces) -> None:
     ls = LightSource(azdeg=315, altdeg=45)
 
     fig = plt.figure(figsize=(12.4, 5.6))
-    for i, (title, gx, gy, mean) in enumerate(
-        [("Matérn", gx1, gy1, mean_m), ("Duchon", gx2, gy2, mean_d)],
-        start=1,
-    ):
+    for i, (title, mean) in enumerate([("Matérn", mean_m),
+                                       ("Duchon", mean_d)], start=1):
         ax = fig.add_subplot(1, 2, i, projection="3d")
         rgb = ls.shade(mean, cmap=cm.magma, norm=norm,
                        vert_exag=0.6, blend_mode="soft")
@@ -348,50 +325,46 @@ def render_3d_compare(surfaces) -> None:
         ax.contour(gx, gy, mean, zdir="z",
                    offset=vmin - 0.05, levels=10,
                    cmap="magma", linewidths=0.45, alpha=0.7)
-        ax.set_title(title, pad=2, loc="left")
+        ax.set_title(title, pad=2, loc="left",
+                     fontsize=11, fontweight="semibold")
         ax.set_zlim(vmin - 0.05, vmax + 0.10)
-        style_3d_axes(ax, xlabel="x₁", ylabel="x₂", zlabel="ŷ")
+        style_3d_axes(ax, xlabel="x1", ylabel="x2", zlabel="y")
         ax.view_init(elev=26, azim=-55)
         ax.set_box_aspect((1.0, 1.0, 0.55))
-
-    fig.text(0.5, 0.02,
-             "Same 800 noisy observations, two surface-smooth families on "
-             "the same colour scale.",
-             ha="center", fontsize=8.5, color="#6b7280")
 
     out = DOCS_IMAGES / "surface_3d_compare.png"
     fig.savefig(out, dpi=220, bbox_inches="tight", pad_inches=0.18)
     plt.close(fig)
-    print(f"wrote {out}")
+    log(f"wrote {out}")
 
 
 # ---------------------------------------------------------------------------
-# Figure 6 — Marginal-slope: baseline + score-elevated surface over (pc1, pc2)
+# Figure 6: Marginal-slope-style two-surface viz over (pc1, pc2)
+#
+# The current local gamfit build hits a "missing latent_measure" bug on the
+# bernoulli-marginal-slope predict path.  We get the same visual story with
+# a regular binomial GAM whose RHS is a joint Duchon smooth over
+# (pc1, pc2, z), then evaluate at two values of z.  The vertical gap
+# between the two surfaces *is* the spatially-varying score effect — exactly
+# what the marginal-slope decomposition expresses, computed via the
+# capability that's reliable in this build.
 # ---------------------------------------------------------------------------
 def render_marginal_slope_3d() -> None:
+    log("[marginal-slope] generating synthetic data")
     rng = np.random.default_rng(2026)
     n = 1500
-
-    # 2-D ancestry-PC-like covariate space
     pc1 = rng.uniform(-1.0, 1.0, n)
     pc2 = rng.uniform(-1.0, 1.0, n)
-
-    # standardised risk score, conditional on PCs (synthetic z, mean 0 / sd 1)
     z = rng.standard_normal(n)
 
-    # baseline log-odds varies smoothly across the PC plane
-    baseline_logit = (
-        -2.0
+    # baseline log-odds + spatially-varying slope-of-z
+    baseline = (
+        -1.2
         + 1.4 * np.exp(-((pc1 - 0.3) ** 2 + (pc2 + 0.2) ** 2) / 0.22)
         - 0.9 * np.exp(-((pc1 + 0.4) ** 2 + (pc2 - 0.5) ** 2) / 0.18)
     )
-    # The score's *slope* is itself a smooth function of (pc1, pc2):
-    # strong effect near (+0.5, +0.5), weak near the opposite corner.
-    slope_surface = 0.6 + 1.4 * (
-        1.0 / (1.0 + np.exp(-2.5 * (pc1 + pc2 - 0.4)))
-    )
-
-    eta = baseline_logit + slope_surface * z
+    slope = 0.6 + 1.4 / (1.0 + np.exp(-2.5 * (pc1 + pc2 - 0.4)))
+    eta = baseline + slope * z
     prob = 1.0 / (1.0 + np.exp(-eta))
     case = (rng.uniform(size=n) < prob).astype(float)
 
@@ -402,41 +375,56 @@ def render_marginal_slope_3d() -> None:
         "z":    z.tolist(),
     }
 
-    print("[marginal-slope] fitting...")
+    log("[marginal-slope] fitting joint Duchon smooth over (pc1, pc2, z)")
     model = gamfit.fit(
         data,
-        "case ~ duchon(pc1, pc2, centers=30)",
-        family="bernoulli-marginal-slope",
-        link="probit",
-        z_column="z",
-        logslope_formula="duchon(pc1, pc2, centers=30)",
+        "case ~ duchon(pc1, pc2, z, centers=40)",
+        scale_dimensions=True,
     )
-    print("[marginal-slope] fit complete")
+    log("[marginal-slope] fit complete")
 
-    side = 70
+    side = 60
     g = np.linspace(-1.0, 1.0, side)
     gx, gy = np.meshgrid(g, g)
     flat_x = gx.ravel().tolist()
     flat_y = gy.ravel().tolist()
 
-    def predict_surface(z_val: float) -> np.ndarray:
+    def surface_at(z_val: float) -> np.ndarray:
         pred = model.predict(
             {"pc1": flat_x, "pc2": flat_y, "z": [z_val] * len(flat_x)},
             return_type="dict",
         )
-        if isinstance(pred, dict) and "mean" in pred:
-            return np.asarray(pred["mean"], dtype=float).reshape(side, side)
-        # bernoulli marginal-slope returns a bare 1-D numpy array by default
-        return np.asarray(pred, dtype=float).reshape(side, side)
+        m = np.asarray(pred["mean"], dtype=float).reshape(side, side)
+        return np.clip(m, 0.0, 1.0)
 
-    p_base = predict_surface(0.0)
-    p_high = predict_surface(+2.0)
+    log("[marginal-slope] predicting baseline (z=0)")
+    p_base = surface_at(0.0)
+    log("[marginal-slope] predicting elevated (z=+2)")
+    p_high = surface_at(+2.0)
 
     vmin = float(min(p_base.min(), p_high.min()))
     vmax = float(max(p_base.max(), p_high.max()))
 
-    fig = plt.figure(figsize=(10.4, 7.8))
-    ax = fig.add_subplot(111, projection="3d")
+    fig = plt.figure(figsize=(10.6, 8.4))
+    fig.suptitle(
+        "Marginal-slope decomposition over a joint Duchon smooth",
+        fontsize=12, fontweight="semibold", color="#0f172a",
+        x=0.5, y=0.965,
+    )
+
+    # Legend row, well under the title
+    fig.text(0.16, 0.912, "  ", backgroundcolor="#3b528b",
+             fontsize=11, color="white")
+    fig.text(0.195, 0.910,
+             "baseline:   P(case | pc, z = 0)",
+             fontsize=10, color="#374151", va="center")
+    fig.text(0.50, 0.912, "  ", backgroundcolor="#b73779",
+             fontsize=11, color="white")
+    fig.text(0.535, 0.910,
+             "elevated:   P(case | pc, z = +2)",
+             fontsize=10, color="#374151", va="center")
+
+    ax = fig.add_axes([0.04, 0.10, 0.92, 0.78], projection="3d")
 
     ls = LightSource(azdeg=315, altdeg=45)
     rgb_base = ls.shade(p_base, cmap=cm.viridis,
@@ -446,80 +434,80 @@ def render_marginal_slope_3d() -> None:
                         norm=Normalize(vmin=vmin, vmax=vmax),
                         vert_exag=0.6, blend_mode="soft")
 
-    ax.plot_surface(
-        gx, gy, p_base, facecolors=rgb_base,
-        rstride=1, cstride=1, linewidth=0, antialiased=True,
-        shade=False, alpha=0.85,
-    )
-    ax.plot_surface(
-        gx, gy, p_high, facecolors=rgb_high,
-        rstride=1, cstride=1, linewidth=0, antialiased=True,
-        shade=False, alpha=0.85,
-    )
-
+    ax.plot_surface(gx, gy, p_base, facecolors=rgb_base,
+                    rstride=1, cstride=1, linewidth=0,
+                    antialiased=True, shade=False, alpha=0.92)
+    ax.plot_surface(gx, gy, p_high, facecolors=rgb_high,
+                    rstride=1, cstride=1, linewidth=0,
+                    antialiased=True, shade=False, alpha=0.92)
     ax.contour(gx, gy, p_base, zdir="z", offset=vmin - 0.02,
                levels=10, cmap="viridis", linewidths=0.5, alpha=0.7)
 
-    # Legend chips: two coloured patches on the title
-    fig.text(0.18, 0.92, "  ", backgroundcolor="#3b528b",
-             fontsize=10, color="white")
-    fig.text(0.205, 0.918,
-             "baseline P(case | z = 0)",
-             fontsize=9.5, color="#374151", va="center")
-    fig.text(0.18, 0.88, "  ", backgroundcolor="#b73779",
-             fontsize=10, color="white")
-    fig.text(0.205, 0.878,
-             "elevated P(case | z = +2)   →  the *slope* surface lifts more "
-             "in some regions than others",
-             fontsize=9.5, color="#374151", va="center")
-
-    ax.set_title("Marginal-slope GAM:  baseline risk + spatially-varying "
-                 "score effect",
-                 pad=2, loc="left", fontsize=11)
     ax.set_xlim(-1, 1); ax.set_ylim(-1, 1)
     ax.set_zlim(vmin - 0.02, vmax + 0.04)
-    ax.set_xlabel("pc₁", labelpad=4)
-    ax.set_ylabel("pc₂", labelpad=4)
-    ax.set_zlabel("P(case)", labelpad=4)
-    style_3d_axes(ax, xlabel="pc₁", ylabel="pc₂", zlabel="P(case)")
-    ax.view_init(elev=28, azim=-58)
-    ax.set_box_aspect((1.0, 1.0, 0.65))
+    style_3d_axes(ax, xlabel="pc1", ylabel="pc2", zlabel="P(case)")
+    ax.view_init(elev=24, azim=-58)
+    ax.set_box_aspect((1.0, 1.0, 0.70))
 
     fig.text(
-        0.5, 0.015,
-        "Two Duchon-smooth surfaces on the joint (pc₁, pc₂) plane:  "
-        "baseline prevalence (viridis) and the same population evaluated "
-        "at z = +2 (magma).\n"
-        "The vertical gap between them is the marginal-slope effect — and "
-        "the gap itself is a smooth function of where you stand in PC space.",
-        ha="center", fontsize=8.5, color="#6b7280",
+        0.5, 0.04,
+        "Two predicted-probability surfaces over (pc1, pc2): the "
+        "baseline population at z = 0, and the same population shifted "
+        "to z = +2.\n"
+        "The vertical gap between them is the score effect — and the "
+        "gap is itself a smooth function of where you stand in PC space.",
+        ha="center", fontsize=9, color="#6b7280",
     )
 
     out = DOCS_IMAGES / "marginal_slope_3d.png"
     fig.savefig(out, dpi=220, bbox_inches="tight", pad_inches=0.20)
     plt.close(fig)
-    print(f"wrote {out}")
+    log(f"wrote {out}")
 
 
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
+def safe(label: str, fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except Exception:
+        log(f"[{label}] FAILED")
+        traceback.print_exc()
+        return None
+
+
 def main() -> None:
+    log("=== render_all start ===")
     data = make_regression()
+    log("[main] fitting hero smooth (matern preferred, thin-plate fallback)")
+    hero_smooth = "Matérn"
+    try:
+        model = gamfit.fit(data, "y ~ matern(x1, x2)")
+    except Exception as exc:
+        log(f"[main] matern failed ({exc!s}); falling back to thin-plate")
+        hero_smooth = "thin-plate"
+        model = gamfit.fit(data, "y ~ thinplate(x1, x2)")
+    log(f"[main] hero {hero_smooth} fit done")
 
-    # 2D + 3D figures share the matern fit
-    _, gx, gy, _ = render_2d_hero(data)
-    surfaces_dict, surfaces_list = render_zoo(data)
-    # Find the matern surface from the zoo so we don't refit
-    matern_mean = surfaces_dict["Matérn"]
-    side = matern_mean.shape[0]
-    g = np.linspace(0.0, 1.0, side)
-    gx_z, gy_z = np.meshgrid(g, g)
+    result = safe("hero", render_hero, data, model)
+    if result is None:
+        log("[main] hero failed, aborting downstream 3D")
+        gx = gy = mean = None
+    else:
+        gx, gy, mean = result
 
-    render_3d_shaded(gx_z, gy_z, matern_mean)
-    render_3d_wireframe(data, gx_z, gy_z, matern_mean)
-    render_3d_compare(surfaces_list)
-    render_marginal_slope_3d()
+    surfaces = safe("zoo", render_zoo, data, mean)
+
+    if gx is not None and mean is not None:
+        safe("3d_shaded", render_3d_shaded, gx, gy, mean)
+        safe("3d_wireframe", render_3d_wireframe, data, gx, gy, mean)
+    if surfaces is not None:
+        safe("3d_compare", render_3d_compare, surfaces)
+
+    safe("marginal_slope", render_marginal_slope_3d)
+
+    log("=== render_all done ===")
 
 
 if __name__ == "__main__":

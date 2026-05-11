@@ -54,6 +54,7 @@ scripts/jules_loop.py
 scripts/codex_nightrun.sh
 *.png
 !bench/aniso_demo/*.png
+!docs/images/*.png
 src/rust_digest.txt
 
 # Codex temp working directories
