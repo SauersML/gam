@@ -8992,12 +8992,15 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     let joint_workspace_requested = use_joint_newton && has_workspace_source;
     let inner_tol = options.inner_tol;
     let inner_max_cycles_base = options.inner_max_cycles;
-    // Baseline cap for this outer iteration. May be locally bumped below
-    // when the joint-Newton inner solve plateaus near the residual
-    // tolerance — see Task 6 "adaptive inner cycle cap". The bump is
-    // scoped to this call (one outer iteration); the next outer
-    // iteration starts again from `inner_max_cycles_base`.
-    let mut inner_max_cycles = capped_inner_max_cycles(options, inner_max_cycles_base);
+    // Per-outer-call inner-cycle cap. The earlier "adaptive inner cycle
+    // cap" doubled this mid-loop on plateaus, but that turned out to be
+    // the wrong response to stalled descent (descent ratios pinned at
+    // ~0.999 paired with a sub-tolerance objective change is the
+    // no-descent signal, not a "give Newton more cycles" signal). The
+    // plateau-flat-objective convergence certificate in the inner-cycle
+    // body now handles that case directly, so the cap stays fixed at the
+    // baseline for the lifetime of this outer call.
+    let inner_max_cycles = capped_inner_max_cycles(options, inner_max_cycles_base);
     // Each block's assembled penalty matrix depends only on that block's
     // penalties and smoothing parameters. Build these setup matrices in
     // parallel, but keep the coordinate-descent and line-search loops below
@@ -9365,27 +9368,34 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // attempt. Reset every cycle alongside the line-search state.
         let mut accepted_predicted_reduction: f64 = f64::INFINITY;
 
-        // Adaptive inner cycle cap (Task 6): track the descent ratio
-        // `current_residual / previous_residual` over a sliding 3-cycle
-        // window. When all three ratios are above 0.95 (plateau), the
-        // current cycle is past 80% of the cap, and the residual is
-        // within 10× of the residual tolerance, extend the cap to
-        // `min(2 * inner_max_cycles_base, 200)` for the remainder of
-        // THIS outer iteration only. The bump is held in the local
-        // `inner_max_cycles` binding, which is rebuilt fresh from
-        // `inner_max_cycles_base` on every outer call.
+        // Plateau / flat-objective convergence diagnostics. The sliding
+        // 3-cycle window of descent ratios `current_residual /
+        // previous_residual` measures how much Newton is shaving off
+        // the gradient residual per cycle. When all three sit above
+        // 0.95, Newton has effectively stopped reducing the residual —
+        // any remaining residual lives in directions where the
+        // penalized Hessian has near-zero curvature (null space ∩
+        // ill-conditioned identifiable directions). Paired with a
+        // Cauchy-on-objective signal (`consecutive_obj_flat_cycles ≥
+        // 3`), this is the no-descent certificate that recognizes
+        // convergence on the identifiable subspace without grinding
+        // another N Newton cycles against directions that cannot
+        // reduce the objective by more than numerical noise. See the
+        // end-of-cycle convergence block below for the firing
+        // condition.
         let mut descent_ratio_window: Vec<f64> = Vec::with_capacity(3);
         let mut previous_residual: Option<f64> = None;
-        let mut inner_cap_already_extended = false;
+        let mut consecutive_obj_flat_cycles: usize = 0;
 
         let mut joint_trust_radius = 1.0_f64;
-        // Hard upper bound for the for-loop's range. The adaptive cap
-        // extension below can raise `inner_max_cycles` mid-loop up to
-        // `min(2 * inner_max_cycles_base, 200)`, and Rust's for-loop
-        // evaluates its range bound only once, so we iterate against
-        // this ceiling and break manually whenever `cycle` reaches the
-        // current (possibly bumped) `inner_max_cycles`. Using a sentinel
-        // keeps the existing `continue` statements in the body working
+        // Hard upper bound for the for-loop's range. The cap is fixed at
+        // `inner_max_cycles` for the lifetime of this outer call (the
+        // earlier mid-loop cap extension was removed in favor of the
+        // plateau-flat-objective convergence certificate), but the
+        // sentinel pattern is retained — the `.max(200)` floor is a
+        // harmless safety pad and the explicit `cycle >= inner_max_cycles`
+        // break keeps the existing `continue` statements in the body
+        // working
         // (they advance `cycle` via the iterator), unlike a `while` +
         // manual-counter rewrite.
         let inner_loop_hard_ceiling = inner_max_cycles.max(200);
@@ -10220,53 +10230,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             }
             previous_residual = Some(residual);
 
-            // Plateau detection + one-shot cap extension. All three
-            // recent ratios > 0.95 means each cycle is shaving < 5% off
-            // the residual — Newton has stalled but is still bounded by
-            // the cap. If we're past 80% of the cap and EITHER the
-            // residual is within 10× of its tolerance OR the Newton-
-            // model's predicted reduction is already within 2× of the
-            // objective tolerance, doubling the cap (capped at 200)
-            // gives the solve room to grind out the last factor before
-            // the rejection guard fires.
-            //
-            // The predicted-reduction branch catches the rank-deficient
-            // small-n regime where `residual = ‖∇L − Sβ‖∞` stays well
-            // above its tolerance (60×–10⁴× at n < p) — because β keeps
-            // drifting along a near-null direction — while the local
-            // quadratic model's promised decrease has already collapsed
-            // to within numerical noise of the objective tolerance. At
-            // that point the Conn-Gould-Toint certificate (line 10253)
-            // is about to fire on its own, and the only thing blocking
-            // it is the iteration cap. One extra factor of 2 in the cap
-            // gives CGT room to certify within the model's known good
-            // behaviour, rather than burning the seed with a 100-cycle
-            // non-convergence rejection.
-            if !inner_cap_already_extended
-                && descent_ratio_window.len() == 3
-                && descent_ratio_window.iter().all(|r| *r > 0.95)
-                && cycle + 1 >= (inner_max_cycles * 4) / 5
-                && residual.is_finite()
-                && (residual <= 10.0 * residual_tol
-                    || (accepted_predicted_reduction.is_finite()
-                        && accepted_predicted_reduction <= 2.0 * objective_tol))
-            {
-                let extended_cap = (2usize * inner_max_cycles_base)
-                    .min(200)
-                    .max(inner_max_cycles);
-                if extended_cap > inner_max_cycles {
-                    log::info!(
-                        "[GAMLSS inner cycle cap extended] residual={:.3e}, last_3_descent_ratios=[{:.3}, {:.3}, {:.3}], new_cap={}",
-                        residual,
-                        descent_ratio_window[0],
-                        descent_ratio_window[1],
-                        descent_ratio_window[2],
-                        extended_cap,
-                    );
-                    inner_max_cycles = extended_cap;
-                    inner_cap_already_extended = true;
-                }
-            }
+            // (Plateau-flat-objective convergence certificate fires in
+            // the end-of-cycle convergence block below; see the
+            // `consecutive_obj_flat_cycles` branch after the CGT
+            // certificate.)
 
             // KKT convergence: a small post-step residual is the
             // canonical optimality certificate for the penalized
@@ -10408,6 +10375,49 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 converged = true;
                 break;
             }
+            // Plateau-flat-objective convergence certificate.
+            //
+            // When all three recent residual ratios sit above 0.95,
+            // Newton has stopped reducing the gradient residual along
+            // any direction the penalized Hessian can resolve — the
+            // remaining residual is locked into a curvature-bounded
+            // floor along null / ill-conditioned directions. If the
+            // objective has *also* been below `objective_tol` for the
+            // last three accepted cycles, the iterate is at a
+            // stationary point of the objective on the identifiable
+            // subspace, and the raw `‖∇L − Sβ‖∞` residual will not
+            // drop because there is no descent direction available.
+            //
+            // Operationally this is the projected-KKT certificate the
+            // raw residual gate cannot express: stalled descent ratios
+            // are the no-descent observation, and a Cauchy-on-
+            // objective tail is the convergence observation. Neither
+            // is sufficient alone — a stalled ratio with a still-
+            // shrinking objective means Newton is making small but
+            // real progress, and a flat objective with shrinking
+            // ratios means Newton is closing in fast and the residual
+            // gate will fire on its own. Their conjunction is the
+            // signal that further iteration is wall-clock waste.
+            //
+            // The `cycles_done >= 2` guard mirrors every other relaxed
+            // certificate in this function; it prevents certification
+            // on a degenerate cycle-0 stall (initial β at a barrier or
+            // machine-zero gradient that nonetheless is not optimal).
+            if descent_ratio_window.len() == 3
+                && descent_ratio_window.iter().all(|r| *r > 0.95)
+                && consecutive_obj_flat_cycles >= 3
+                && residual.is_finite()
+                && cycles_done >= 2
+            {
+                eprintln!(
+                    "[JN-EXIT] cycle={cycle} reason=plateau_objective_flat residual={residual:.3e} residual_tol={residual_tol:.3e} obj_change={objective_change:.3e} objective_tol={objective_tol:.3e} ratios=[{:.3},{:.3},{:.3}] consecutive_flat={consecutive_obj_flat_cycles} accepted_step_inf={accepted_step_inf:.3e} step_tol={step_tol:.3e}",
+                    descent_ratio_window[0],
+                    descent_ratio_window[1],
+                    descent_ratio_window[2],
+                );
+                converged = true;
+                break;
+            }
             // Carry the objective-stagnation signal into the next
             // cycle so the line-search-failure path above can pair it
             // with trust-region collapse to certify a KKT optimum on a
@@ -10417,6 +10427,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // above its tolerance, so a "previous cycle had small
             // residual" branch in the failure path could never fire.
             last_cycle_obj_change_below_tol = objective_change <= objective_tol;
+            if objective_change <= objective_tol {
+                consecutive_obj_flat_cycles = consecutive_obj_flat_cycles.saturating_add(1);
+            } else {
+                consecutive_obj_flat_cycles = 0;
+            }
         }
 
         // If joint Newton converged, skip the blockwise loop entirely.

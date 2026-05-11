@@ -12062,10 +12062,16 @@ mod tests {
             .expect("workspace build")
             .expect("workspace present");
 
+        // `hessian_dense` is amortization-gated; the toy spec carries no
+        // penalties, so `expected_reuse=1` against `p/SAFETY≥2` correctly
+        // routes through matrix-free. We're testing dense/HVP agreement,
+        // not the gate, so force the dense build via `hessian_dense_forced`.
+        // The amortization-gate behavior is exercised separately in
+        // `ctn_dense_hessian_amortization_gate_picks_matrix_free_when_p_dominates_reuse`.
         let dense_from_workspace = workspace
-            .hessian_dense()
-            .expect("workspace dense Hessian call")
-            .expect("workspace dense Hessian present");
+            .hessian_dense_forced()
+            .expect("workspace forced dense Hessian call")
+            .expect("workspace forced dense Hessian present");
         assert_eq!(dense_from_workspace.nrows(), p);
         assert_eq!(dense_from_workspace.ncols(), p);
         for i in 0..p {
