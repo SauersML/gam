@@ -5404,8 +5404,13 @@ pub fn reml_laml_evaluate(
                 incl_logdet_h,
                 incl_logdet_s,
             );
-            eprintln!(
-                "[RHO-GRAD-DBG] idx={} value={:+.6e} a_i={:+.6e} trace_logdet={:+.6e} ld_s_first={:+.6e} incl_h={} incl_s={}",
+            // Per-coordinate breakdown of the outer-gradient entry. Was a
+            // floor-level eprintln during the LAML cost-trajectory
+            // investigation; demoted to trace! so RUST_LOG=trace can still
+            // recover it without 91-line-per-iter stderr noise on default
+            // runs.
+            log::trace!(
+                "[RHO-GRAD] idx={} value={:+.6e} a_i={:+.6e} trace_logdet={:+.6e} ld_s_first={:+.6e} incl_h={} incl_s={}",
                 idx, value, a_i, trace_logdet_i, solution.penalty_logdet.first[idx], incl_logdet_h, incl_logdet_s
             );
             (idx, value)
@@ -5478,8 +5483,8 @@ pub fn reml_laml_evaluate(
                 incl_logdet_h,
                 incl_logdet_s,
             );
-            eprintln!(
-                "[EXT-GRAD-DBG] ext_idx={} value={:+.6e} coord.a={:+.6e} trace_logdet={:+.6e} ld_s={:+.6e} incl_h={} incl_s={}",
+            log::trace!(
+                "[EXT-GRAD] ext_idx={} value={:+.6e} coord.a={:+.6e} trace_logdet={:+.6e} ld_s={:+.6e} incl_h={} incl_s={}",
                 ext_idx, value, coord.a, trace_logdet_i, coord.ld_s, incl_logdet_h, incl_logdet_s
             );
             log::info!(
