@@ -9494,13 +9494,13 @@ impl DenseSpectralOperator {
     fn projected_operator(&self, factor: &Array2<f64>, op: &dyn HyperOperator) -> Array2<f64> {
         let start = std::time::Instant::now();
         let result = op.projected_matrix(factor);
-        log::info!(
-            "[STAGE] DenseSpectralOperator::projected_operator dim={} rank={} implicit={} elapsed={:.3}s",
+        let signature = format!(
+            "DenseSpectralOperator::projected_operator dim={} rank={} implicit={}",
             self.n_dim,
             factor.ncols(),
             op.is_implicit(),
-            start.elapsed().as_secs_f64(),
         );
+        dense_spectral_stage_log(&signature, start.elapsed().as_secs_f64());
         result
     }
 
@@ -9529,6 +9529,79 @@ impl DenseSpectralOperator {
         }
         result
     }
+}
+
+/// Coalesce repeated identical `[STAGE]` log lines from `DenseSpectralOperator`
+/// methods. First occurrence of a (method, dims, implicit-flags) signature
+/// logs immediately; identical consecutive repeats are silenced and accrue
+/// into a counter, emitting heartbeat summaries at doubling cadence
+/// (2, 4, 8, 16, …) and a final summary when the signature changes.
+fn dense_spectral_stage_log(signature: &str, elapsed_s: f64) {
+    use std::sync::Mutex;
+    struct Repeat {
+        signature: String,
+        count: u64,
+        total: f64,
+        min: f64,
+        max: f64,
+        next_heartbeat: u64,
+    }
+    static REPEAT: Mutex<Option<Repeat>> = Mutex::new(None);
+
+    let mut guard = match REPEAT.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    if let Some(state) = guard.as_mut() {
+        if state.signature == signature {
+            state.count += 1;
+            state.total += elapsed_s;
+            if elapsed_s < state.min {
+                state.min = elapsed_s;
+            }
+            if elapsed_s > state.max {
+                state.max = elapsed_s;
+            }
+            if state.count >= state.next_heartbeat {
+                log::info!(
+                    "[STAGE] {} (×{} so far, total={:.3}s min={:.3}s max={:.3}s avg={:.3}s)",
+                    state.signature,
+                    state.count,
+                    state.total,
+                    state.min,
+                    state.max,
+                    state.total / state.count as f64,
+                );
+                state.next_heartbeat = state.next_heartbeat.saturating_mul(2);
+            }
+            return;
+        }
+        // Signature changed — flush a final summary for the previous one
+        // when it ran more than once (the first occurrence already logged
+        // its own line, so a count of 1 needs no follow-up).
+        if state.count > 1 {
+            log::info!(
+                "[STAGE] {} final ×{} total={:.3}s min={:.3}s max={:.3}s avg={:.3}s",
+                state.signature,
+                state.count,
+                state.total,
+                state.min,
+                state.max,
+                state.total / state.count as f64,
+            );
+        }
+    }
+
+    log::info!("[STAGE] {} elapsed={:.3}s", signature, elapsed_s);
+    *guard = Some(Repeat {
+        signature: signature.to_string(),
+        count: 1,
+        total: elapsed_s,
+        min: elapsed_s,
+        max: elapsed_s,
+        next_heartbeat: 2,
+    });
 }
 
 impl HessianOperator for DenseSpectralOperator {
@@ -9593,13 +9666,13 @@ impl HessianOperator for DenseSpectralOperator {
     fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
         let start = std::time::Instant::now();
         let result = op.trace_projected_factor_cached(&self.w_factor, &self.projected_factor_cache);
-        log::info!(
-            "[STAGE] DenseSpectralOperator::trace_hinv_operator dim={} rank={} implicit={} elapsed={:.3}s",
+        let signature = format!(
+            "DenseSpectralOperator::trace_hinv_operator dim={} rank={} implicit={}",
             self.n_dim,
             self.w_factor.ncols(),
             op.is_implicit(),
-            start.elapsed().as_secs_f64(),
         );
+        dense_spectral_stage_log(&signature, start.elapsed().as_secs_f64());
         result
     }
 
@@ -9626,14 +9699,14 @@ impl HessianOperator for DenseSpectralOperator {
             let right_proj = self.projected_operator(&self.w_factor, right);
             self.trace_projected_cross(&left_proj, &right_proj)
         };
-        log::info!(
-            "[STAGE] DenseSpectralOperator::trace_hinv_operator_cross dim={} rank={} left_implicit={} right_implicit={} elapsed={:.3}s",
+        let signature = format!(
+            "DenseSpectralOperator::trace_hinv_operator_cross dim={} rank={} left_implicit={} right_implicit={}",
             self.n_dim,
             self.w_factor.ncols(),
             left.is_implicit(),
             right.is_implicit(),
-            start.elapsed().as_secs_f64(),
         );
+        dense_spectral_stage_log(&signature, start.elapsed().as_secs_f64());
         result
     }
 
@@ -9747,13 +9820,13 @@ impl HessianOperator for DenseSpectralOperator {
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
         let start = std::time::Instant::now();
         let result = op.trace_projected_factor_cached(&self.g_factor, &self.projected_factor_cache);
-        log::info!(
-            "[STAGE] DenseSpectralOperator::trace_logdet_operator dim={} rank={} implicit={} elapsed={:.3}s",
+        let signature = format!(
+            "DenseSpectralOperator::trace_logdet_operator dim={} rank={} implicit={}",
             self.n_dim,
             self.g_factor.ncols(),
             op.is_implicit(),
-            start.elapsed().as_secs_f64(),
         );
+        dense_spectral_stage_log(&signature, start.elapsed().as_secs_f64());
         result
     }
 
