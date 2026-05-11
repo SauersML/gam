@@ -16693,6 +16693,164 @@ mod tests {
     }
 
     #[test]
+    fn iso_kappa_duchon_dx_dpsi_matches_fd() {
+        // Compare analytic dX/dψ (from build_duchon_basis_log_kappa_derivatives)
+        // against centered FD of X(ψ+h) - X(ψ-h).
+        let n = 80usize;
+        let mut data = Array2::<f64>::zeros((n, 1));
+        for i in 0..n {
+            data[[i, 0]] = i as f64 / (n as f64 - 1.0);
+        }
+        let spec_orig = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "duchon_1d".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0],
+                    spec: DuchonBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                        length_scale: Some(1.0),
+                        power: 1,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: None,
+                        operator_penalties: DuchonOperatorPenaltySpec::default(),
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let design = build_term_collection_design(data.view(), &spec_orig).expect("design");
+        let frozen = freeze_term_collection_from_design(&spec_orig, &design).expect("freeze");
+
+        let build_design_at = |psi: f64| -> Array2<f64> {
+            // Rebuild design at psi via direct kernel build using frozen spec.
+            let mut s = frozen.clone();
+            if let SmoothBasisSpec::Duchon {
+                spec: ref mut duchon, ..
+            } = s.smooth_terms[0].basis
+            {
+                duchon.length_scale = Some((-psi).exp());
+            }
+            let d = build_term_collection_design(data.view(), &s).expect("rebuild");
+            d.design.to_dense()
+        };
+
+        // Build derivative at psi=0.
+        let psi_eval = 0.0_f64;
+        let duchon_spec = if let SmoothBasisSpec::Duchon { spec: ref s, .. } =
+            frozen.smooth_terms[0].basis
+        {
+            s.clone()
+        } else {
+            panic!("expected Duchon");
+        };
+        let mut duchon_spec_at = duchon_spec.clone();
+        duchon_spec_at.length_scale = Some((-psi_eval).exp());
+        let bundle = crate::basis::build_duchon_basis_log_kappa_derivatives(
+            data.view(),
+            &duchon_spec_at,
+        )
+        .expect("derivatives");
+        let op = bundle.implicit_operator.expect("implicit operator");
+        let p = op.p_out();
+
+        // FD reference.
+        let h = 1e-4_f64;
+        let x_plus = build_design_at(psi_eval + h);
+        let x_minus = build_design_at(psi_eval - h);
+        eprintln!(
+            "[DXDPSI_FD] X(+h)[0,0..3]={:?} X(-h)[0,0..3]={:?}",
+            x_plus.row(0).iter().take(3).copied().collect::<Vec<_>>(),
+            x_minus.row(0).iter().take(3).copied().collect::<Vec<_>>(),
+        );
+        eprintln!(
+            "[DXDPSI_FD] X(+h) shape={:?} X(-h) shape={:?} p_out={}",
+            x_plus.shape(), x_minus.shape(), p,
+        );
+        // Also build at psi_eval to compare cols.
+        let x_at = build_design_at(psi_eval);
+        let orig_design = build_term_collection_design(data.view(), &spec_orig).expect("rebuild orig");
+        eprintln!(
+            "[DXDPSI_FD] X(psi_eval) shape={:?} orig_design.ncols={}",
+            x_at.shape(),
+            orig_design.design.ncols(),
+        );
+
+        // Multiply analytic operator by unit basis vectors.
+        let mut analytic = Array2::<f64>::zeros((n, p));
+        let mut basisv = Array1::<f64>::zeros(p);
+        for j in 0..p {
+            basisv[j] = 1.0;
+            let col = op.forward_mul(0, &basisv.view()).expect("forward_mul");
+            analytic.column_mut(j).assign(&col);
+            basisv[j] = 0.0;
+        }
+
+        // Also check transpose_mul: X_tau^T v for v of length n.
+        // FD reference: X_tau^T v should be (X(+h)^T - X(-h)^T)/(2h) · v.
+        let smooth_start = 1usize;
+        let v_test = Array1::<f64>::from_shape_fn(n, |i| (i as f64 * 0.07).sin());
+        let analytic_tv = op.transpose_mul(0, &v_test.view()).expect("transpose_mul");
+        let fd_tv_full = (&x_plus.t() - &x_minus.t()) / (2.0 * h);
+        let fd_tv = fd_tv_full.dot(&v_test);
+        // Extract smooth portion only
+        let fd_tv_smooth = fd_tv.slice(s![smooth_start..(smooth_start + p)]).to_owned();
+        let _ = &fd_tv_smooth;
+        let max_tv_diff = analytic_tv
+            .iter()
+            .zip(fd_tv_smooth.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max);
+        let max_tv_abs = analytic_tv
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0f64, f64::max);
+        eprintln!(
+            "[DXDPSI_TV] max|analytic_tv - fd_tv|={:.3e}  max|analytic_tv|={:.3e}",
+            max_tv_diff, max_tv_abs
+        );
+        eprintln!(
+            "[DXDPSI_TV] analytic_tv={:?}",
+            analytic_tv.iter().take(p).copied().collect::<Vec<_>>()
+        );
+        eprintln!(
+            "[DXDPSI_TV] fd_tv_smooth={:?}",
+            fd_tv_smooth.iter().take(p).copied().collect::<Vec<_>>()
+        );
+        let fd_full = (&x_plus - &x_minus) / (2.0 * h);
+        let fd = fd_full.slice(s![.., smooth_start..(smooth_start + p)]).to_owned();
+        let mut max_diff = 0.0_f64;
+        let mut max_abs = 0.0_f64;
+        for i in 0..n {
+            for j in 0..p {
+                let d = (analytic[[i, j]] - fd[[i, j]]).abs();
+                if d > max_diff {
+                    max_diff = d;
+                }
+                if analytic[[i, j]].abs() > max_abs {
+                    max_abs = analytic[[i, j]].abs();
+                }
+            }
+        }
+        eprintln!(
+            "[DXDPSI_FD] max|analytic - fd|={:.3e}  max|analytic|={:.3e}",
+            max_diff, max_abs
+        );
+        eprintln!(
+            "[DXDPSI_FD] analytic[0,..]={:?}",
+            analytic.row(0).iter().take(p).copied().collect::<Vec<_>>(),
+        );
+        eprintln!(
+            "[DXDPSI_FD] fd[0,..]={:?}",
+            fd.row(0).iter().take(p).copied().collect::<Vec<_>>(),
+        );
+        assert!(max_diff < 5e-3 * max_abs.max(1e-3), "dX/dψ mismatch");
+    }
+
+    #[test]
     fn joint_build_and_freeze_shares_auto_spatial_centers_across_blocks() {
         let n = 400usize;
         let mut data = Array2::<f64>::zeros((n, 2));
