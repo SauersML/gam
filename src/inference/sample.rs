@@ -8,9 +8,12 @@
 
 use std::collections::HashMap;
 
+use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
+use rand::{RngExt, SeedableRng};
 
 use crate::basis::create_difference_penalty_matrix;
+use crate::faer_ndarray::FaerCholesky;
 use crate::estimate::{
     BlockRole, FitOptions, UnifiedFitResult, fit_gam, validate_all_finite,
 };
@@ -166,21 +169,154 @@ pub fn sample_saved_model(
     let family = model.likelihood();
     match model.predict_model_class() {
         PredictModelClass::Survival => {
-            sample_survival(model, data, col_map, training_headers, cfg)
+            // Latent / latent-binary / location-scale survival likelihoods
+            // have no exact NUTS implementation in the engine yet; fall
+            // through to the Laplace-Gaussian fallback so callers still
+            // get a posterior they can predict with. Royston-Parmar /
+            // Weibull / marginal-slope survival use the exact path.
+            let saved_likelihood_mode = require_saved_survival_likelihood_mode(model)?;
+            if matches!(
+                saved_likelihood_mode,
+                SurvivalLikelihoodMode::Latent
+                    | SurvivalLikelihoodMode::LatentBinary
+                    | SurvivalLikelihoodMode::LocationScale
+            ) {
+                laplace_gaussian_fallback(model, cfg, "survival posterior fallback")
+            } else {
+                sample_survival(model, data, col_map, training_headers, cfg)
+            }
         }
-        PredictModelClass::GaussianLocationScale | PredictModelClass::BinomialLocationScale => Err(
-            "sample for location-scale models is not available yet; sample the mean-only model instead"
-                .to_string(),
-        ),
-        PredictModelClass::BernoulliMarginalSlope => Err(
-            "sample for bernoulli marginal-slope models is not available yet".to_string(),
-        ),
-        PredictModelClass::TransformationNormal => Err(
-            "sample for transformation-normal models is not available yet".to_string(),
-        ),
         PredictModelClass::Standard => {
             sample_standard(model, data, col_map, training_headers, family, cfg)
         }
+        // For classes where the Rust core doesn't yet have an exact NUTS
+        // implementation we fall back to drawing from the Laplace
+        // (Gaussian) approximation of the posterior around the fitted
+        // joint mode, using the saved penalised Hessian. This is the
+        // standard "Bayesian credible interval" surface used by mgcv
+        // and similar packages: it drops higher-order posterior shape
+        // but lets every downstream consumer (credible intervals,
+        // posterior predictive, etc.) keep working uniformly across
+        // model classes.
+        PredictModelClass::GaussianLocationScale => {
+            laplace_gaussian_fallback(model, cfg, "gaussian location-scale posterior")
+        }
+        PredictModelClass::BinomialLocationScale => {
+            laplace_gaussian_fallback(model, cfg, "binomial location-scale posterior")
+        }
+        PredictModelClass::BernoulliMarginalSlope => {
+            laplace_gaussian_fallback(model, cfg, "bernoulli marginal-slope posterior")
+        }
+        PredictModelClass::TransformationNormal => {
+            laplace_gaussian_fallback(model, cfg, "transformation-normal posterior")
+        }
+    }
+}
+
+/// Draw iid samples from `N(mode, H^{-1})` using the saved penalised
+/// Hessian `H = L L^T`.
+///
+/// We solve `L^T δ = ε` for each iid `ε ~ N(0, I)` and report
+/// `β = mode + δ`. The resulting draws are unbiased samples of the
+/// Laplace-Gaussian approximation: their finite-sample mean / std
+/// converge to `(mode, diag(H^{-1})^{1/2})` and the implied credible
+/// bands match the surface that closed-form posterior tooling in
+/// `mgcv` and `gam` itself uses for prediction intervals.
+///
+/// `rationale` is a short label appearing in error messages so callers
+/// can tell which class fell back to this path. We mark `rhat = 1.0`
+/// and `ess = n_total` because the draws are iid by construction.
+fn laplace_gaussian_fallback(
+    model: &SavedModel,
+    cfg: &NutsConfig,
+    rationale: &'static str,
+) -> Result<NutsResult, String> {
+    let fit = fit_result_from_saved_model_for_prediction(model)?;
+    let mode = fit.beta.clone();
+    let p = mode.len();
+    if p == 0 {
+        return Err(format!(
+            "{rationale}: cannot sample from an empty coefficient vector"
+        ));
+    }
+    let h = fit.penalized_hessian().ok_or_else(|| {
+        format!(
+            "{rationale}: posterior fallback requires the explicit penalised Hessian; \
+             refit with exact geometry export to enable posterior sampling for this class."
+        )
+    })?;
+    if h.nrows() != p || h.ncols() != p {
+        return Err(format!(
+            "{rationale}: penalised Hessian is {}x{}, expected {}x{}",
+            h.nrows(),
+            h.ncols(),
+            p,
+            p
+        ));
+    }
+    let chol = h.cholesky(Side::Lower).map_err(|err| {
+        format!(
+            "{rationale}: Cholesky factorisation of the penalised Hessian failed: {err:?}"
+        )
+    })?;
+    let l = chol.lower_triangular();
+
+    let n_total = cfg.n_samples.saturating_mul(cfg.n_chains).max(1);
+    let mut samples = Array2::<f64>::zeros((n_total, p));
+    let mut rng = rand::rngs::StdRng::seed_from_u64(cfg.seed);
+    let mut eps = Array1::<f64>::zeros(p);
+    let mut delta = Array1::<f64>::zeros(p);
+    for k in 0..n_total {
+        for i in 0..p {
+            eps[i] = sample_standard_normal(&mut rng);
+        }
+        back_solve_lower_transpose(&l, &eps, &mut delta);
+        for i in 0..p {
+            samples[(k, i)] = mode[i] + delta[i];
+        }
+    }
+
+    let posterior_mean = samples
+        .mean_axis(ndarray::Axis(0))
+        .unwrap_or_else(|| Array1::<f64>::zeros(p));
+    let posterior_std = samples.std_axis(ndarray::Axis(0), 1.0);
+
+    Ok(NutsResult {
+        samples,
+        posterior_mean,
+        posterior_std,
+        rhat: 1.0,
+        ess: n_total as f64,
+        converged: true,
+    })
+}
+
+#[inline]
+fn sample_standard_normal<R: rand::Rng + ?Sized>(rng: &mut R) -> f64 {
+    // Box-Muller transform — sufficient for posterior-mean-style sampling.
+    // The same construction is used by the NUTS warmup; keeping it in
+    // sync avoids two divergent gaussian RNG paths inside the engine.
+    let u1 = rng.random::<f64>().max(1e-16);
+    let u2 = rng.random::<f64>();
+    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+}
+
+#[inline]
+fn back_solve_lower_transpose(l: &Array2<f64>, rhs: &Array1<f64>, out: &mut Array1<f64>) {
+    // Solve L^T · out = rhs for `out`, where `L` is the lower-triangular
+    // Cholesky factor of the penalised Hessian. Walks bottom-up since
+    // L^T is upper triangular.
+    let p = rhs.len();
+    debug_assert_eq!(l.nrows(), p);
+    debug_assert_eq!(l.ncols(), p);
+    debug_assert_eq!(out.len(), p);
+    for i in (0..p).rev() {
+        let mut v = rhs[i];
+        for j in (i + 1)..p {
+            v -= l[[j, i]] * out[j];
+        }
+        let d = l[[i, i]];
+        out[i] = if d.abs() > 1e-14 { v / d } else { 0.0 };
     }
 }
 

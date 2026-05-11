@@ -957,15 +957,18 @@ impl DenseDesignMatrix {
     }
 
     pub fn try_to_dense_arc(&self, context: &str) -> Result<Arc<Array2<f64>>, String> {
-        // Auto-strict from operator shape: at biobank n (or biobank p) we refuse
-        // any silent dense fallback even when no caller-supplied policy is at
-        // hand, mirroring the policy `for_problem` would have selected. Small
-        // operators still get the permissive default so non-operator bases work.
-        let policy = ResourcePolicy::for_problem(
-            self.nrows(),
-            self.ncols(),
-            crate::resource::ProblemHints::default(),
-        );
+        // Auto-policy from the design's own dense footprint. The earlier
+        // shape-based pick reused `for_problem(nrows, ncols, _)`, which is
+        // intended for classifying the *whole fitting problem* — it flips to
+        // `AnalyticOperatorRequired` at `nrows >= 100_000` regardless of
+        // column count. That was wrong for an individual design: a 102052x4
+        // operator-backed block dense-materializes to only ~3 MiB and is
+        // genuinely safe. We now pick the permissive policy and let the
+        // byte-cap inside the materialization guard reject anything that
+        // would actually blow the 256 MiB single-materialization budget.
+        // Callers that need strict refusal still get it by calling
+        // `try_to_dense_arc_with_policy(ctx, &analytic_operator_required())`.
+        let policy = ResourcePolicy::default_library();
         self.try_to_dense_arc_with_policy(context, &policy)
     }
 
