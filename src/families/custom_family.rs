@@ -11968,41 +11968,49 @@ fn joint_outer_evaluate(
                     let apply_h = Arc::clone(&h_joint);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
-                    Arc::new(MatrixFreeSpdOperator::new(total, move |v| {
-                        let mut out = apply_h.dot(v);
-                        let penalty = apply_joint_block_penalty(
-                            &apply_ranges,
-                            apply_s.as_ref(),
-                            v,
-                            trace_diagonal_ridge,
-                        );
-                        out += &penalty;
-                        out
-                    }))
+                    Arc::new(MatrixFreeSpdOperator::new_with_mode(
+                        total,
+                        move |v| {
+                            let mut out = apply_h.dot(v);
+                            let penalty = apply_joint_block_penalty(
+                                &apply_ranges,
+                                apply_s.as_ref(),
+                                v,
+                                trace_diagonal_ridge,
+                            );
+                            out += &penalty;
+                            out
+                        },
+                        pseudo_logdet_mode,
+                    ))
                 }
                 JointHessianSource::Operator { apply, .. } => {
                     let apply_h = Arc::clone(&apply);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
-                    Arc::new(MatrixFreeSpdOperator::new(total, move |v| {
-                        let mut out = match apply_h(v) {
-                            Ok(out) => out,
-                            Err(error) => {
-                                log::warn!(
-                                    "joint exact-newton operator matvec failed during outer trace construction: {error}"
-                                );
-                                Array1::<f64>::from_elem(total, f64::NAN)
-                            }
-                        };
-                        let penalty = apply_joint_block_penalty(
-                            &apply_ranges,
-                            apply_s.as_ref(),
-                            v,
-                            trace_diagonal_ridge,
-                        );
-                        out += &penalty;
-                        out
-                    }))
+                    Arc::new(MatrixFreeSpdOperator::new_with_mode(
+                        total,
+                        move |v| {
+                            let mut out = match apply_h(v) {
+                                Ok(out) => out,
+                                Err(error) => {
+                                    log::warn!(
+                                        "joint exact-newton operator matvec failed during outer trace construction: {error}"
+                                    );
+                                    Array1::<f64>::from_elem(total, f64::NAN)
+                                }
+                            };
+                            let penalty = apply_joint_block_penalty(
+                                &apply_ranges,
+                                apply_s.as_ref(),
+                                v,
+                                trace_diagonal_ridge,
+                            );
+                            out += &penalty;
+                            out
+                        },
+                        pseudo_logdet_mode,
+                    ))
                 }
             }
         } else {
@@ -12204,41 +12212,49 @@ fn joint_outer_evaluate_efs(
                     let apply_h = Arc::clone(&h_joint);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
-                    Arc::new(MatrixFreeSpdOperator::new(total, move |v| {
-                        let mut out = apply_h.dot(v);
-                        let penalty = apply_joint_block_penalty(
-                            &apply_ranges,
-                            apply_s.as_ref(),
-                            v,
-                            trace_diagonal_ridge,
-                        );
-                        out += &penalty;
-                        out
-                    }))
+                    Arc::new(MatrixFreeSpdOperator::new_with_mode(
+                        total,
+                        move |v| {
+                            let mut out = apply_h.dot(v);
+                            let penalty = apply_joint_block_penalty(
+                                &apply_ranges,
+                                apply_s.as_ref(),
+                                v,
+                                trace_diagonal_ridge,
+                            );
+                            out += &penalty;
+                            out
+                        },
+                        pseudo_logdet_mode,
+                    ))
                 }
                 JointHessianSource::Operator { apply, .. } => {
                     let apply_h = Arc::clone(&apply);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
-                    Arc::new(MatrixFreeSpdOperator::new(total, move |v| {
-                        let mut out = match apply_h(v) {
-                            Ok(out) => out,
-                            Err(error) => {
-                                log::warn!(
-                                    "joint exact-newton operator matvec failed during fixed-point trace construction: {error}"
-                                );
-                                Array1::<f64>::from_elem(total, f64::NAN)
-                            }
-                        };
-                        let penalty = apply_joint_block_penalty(
-                            &apply_ranges,
-                            apply_s.as_ref(),
-                            v,
-                            trace_diagonal_ridge,
-                        );
-                        out += &penalty;
-                        out
-                    }))
+                    Arc::new(MatrixFreeSpdOperator::new_with_mode(
+                        total,
+                        move |v| {
+                            let mut out = match apply_h(v) {
+                                Ok(out) => out,
+                                Err(error) => {
+                                    log::warn!(
+                                        "joint exact-newton operator matvec failed during fixed-point trace construction: {error}"
+                                    );
+                                    Array1::<f64>::from_elem(total, f64::NAN)
+                                }
+                            };
+                            let penalty = apply_joint_block_penalty(
+                                &apply_ranges,
+                                apply_s.as_ref(),
+                                v,
+                                trace_diagonal_ridge,
+                            );
+                            out += &penalty;
+                            out
+                        },
+                        pseudo_logdet_mode,
+                    ))
                 }
             }
         } else {
