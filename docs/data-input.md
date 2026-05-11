@@ -1,8 +1,8 @@
 # Data input formats
 
-`gamfit` accepts almost any rectangular Python object as `data`. The Rust
-engine works on (headers, rows-of-strings), and the Python layer takes care
-of normalising whatever you pass in.
+`gamfit` accepts most rectangular Python objects as `data`. The Rust
+engine works on (headers, rows-of-strings); the Python layer normalises
+the input.
 
 ## Supported input types
 
@@ -41,8 +41,8 @@ np.array([[1.0, 0.0], [2.0, 1.0], [3.0, 2.0]])
 
 ## What `predict()` returns
 
-By default, `predict()` returns the same format you trained on, when that
-makes sense. Override with `return_type=`:
+By default, `predict()` returns the same format used for training, when
+that applies. Override with `return_type=`:
 
 | `return_type` | Returns |
 | --- | --- |
@@ -64,13 +64,13 @@ model.predict(test_df, return_type="pandas")
 Cells are stringified before they cross the FFI boundary. Two rules:
 
 1. **No `None`, empty strings, or NaN** anywhere in the data. The engine
-   rejects these at the input layer with a clear error. Drop or impute first.
+   rejects these with an error. Drop or impute first.
 2. **All columns the same length.** Mismatched lengths raise `ValueError`
    before the engine sees them.
 
-Numeric coercion happens engine-side; you don't need to cast to float
-yourself. Categorical columns (strings) are accepted by terms like
-`group(site)` and are encoded by the engine.
+The engine handles numeric coercion; you don't need to cast to float.
+String columns are accepted by terms like `group(site)` and are encoded
+by the engine.
 
 ## Missing data
 
@@ -84,8 +84,9 @@ yourself. Categorical columns (strings) are accepted by terms like
 
 For model classes that return a 1-D z-score or probability rather than a
 two-column table, `predict()` returns a `numpy.ndarray` of shape
-`(n_samples,)` by default. Passing `return_type="pandas"` or an `id_column=`
-opts back into a two-column table — be careful when you flatten:
+`(n_samples,)` by default. Passing `return_type="pandas"` or an
+`id_column=` returns a two-column table instead. Be careful when
+flattening:
 
 ```python
 # 1-D numpy (default)
@@ -99,7 +100,7 @@ z = df["z"].to_numpy()                           # extract the column
 ## Passing through identifier columns
 
 If your data has a row-id column that isn't a model feature, name it with
-`id_column=` and `gamfit` preserves it in the output:
+`id_column=` and it is preserved in the output:
 
 ```python
 preds = model.predict(
@@ -113,4 +114,4 @@ preds = model.predict(
 # preds = {"patient_id": ["P001", "P002"], "eta": [...], "mean": [...]}
 ```
 
-The id column is not used by the model and may be of any type.
+The id column is not used by the model and may be any type.

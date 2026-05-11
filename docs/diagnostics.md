@@ -1,6 +1,6 @@
 # Diagnostics, summaries, plots, reports
 
-A fitted `Model` exposes five tools for understanding it:
+A fitted `Model` exposes five tools for inspecting it:
 
 | Method | Returns | What you get |
 | --- | --- | --- |
@@ -10,8 +10,7 @@ A fitted `Model` exposes five tools for understanding it:
 | `plot(data, x=…, kind=…)` | matplotlib axes | Prediction / residual / observed-vs-predicted plots. |
 | `report(path=None)` | HTML string or path | Standalone HTML summary with plots. |
 
-Plus `gamfit.validate_formula(...)` if you want to check a formula *before*
-you fit.
+`gamfit.validate_formula(...)` checks a formula before you fit.
 
 ## summary()
 
@@ -27,7 +26,7 @@ print(s["family_name"])
 print(s["coefficients"])       # list of dicts: name, estimate, std_error, ci_*
 ```
 
-`Summary` behaves like a dict; `summary.to_dict()` gives the full payload.
+`Summary` behaves like a dict; `summary.to_dict()` returns the full payload.
 
 If pandas is installed, `summary.coefficients_frame()` returns the
 coefficients as a `DataFrame` with one row per coefficient.
@@ -62,7 +61,7 @@ pass `interval=None` to skip interval bounds.
 
 ## check()
 
-Validate new data against the training schema *before* you call `predict()`:
+Validate new data against the training schema before calling `predict()`:
 
 ```python
 check = model.check(test_df)
@@ -76,12 +75,12 @@ else:
 ```
 
 `SchemaIssue` has three fields: `kind`, `column`, `message`. Typical kinds:
-`missing_column`, `type_mismatch`. `SchemaCheck` is truthy when it's clean,
+`missing_column`, `type_mismatch`. `SchemaCheck` is truthy when clean,
 so `if model.check(df): ...` is the short form.
 
 ## validate_formula()
 
-The same as `check()` for the formula itself — runs the parser and schema
+Equivalent to `check()` for the formula — runs the parser and schema
 checks but does no fitting:
 
 ```python
@@ -92,7 +91,7 @@ print(v["response_column"])     # "y"
 print(v.supported_by_python)    # True
 ```
 
-Useful in tests, CLI front-ends, or when constructing a formula
+Use it in tests, CLI front-ends, or when constructing a formula
 programmatically.
 
 ## plot()
@@ -113,20 +112,20 @@ plt.tight_layout()
 | `"residuals"` | Residuals vs. predicted mean. |
 | `"observed_vs_predicted"` | Observed vs predicted with identity line. |
 
-`x=` is required when the model has multiple features (so `plot` knows
-which axis to use). `y=` overrides the inferred response column. Requires
+`x=` is required when the model has multiple features, so `plot` knows
+which axis to use. `y=` overrides the inferred response column. Requires
 `gamfit[plot]`.
 
 ## report()
 
-A standalone HTML report you can email or attach to a PR:
+A standalone HTML report:
 
 ```python
 model.report("report.html")       # writes to disk; returns the path
 html = model.report()             # returns the HTML string
 ```
 
-The report contains the summary table, smooth visualisations, and the
+The report contains the summary table, smooth visualisations, and
 diagnose-style residual diagnostics for the data you pass in.
 
 ## Inspecting the model object
@@ -142,19 +141,18 @@ model.response_name             # str | None
 model.training_table_kind       # "pandas", "polars", "pyarrow", "dict", "records", "rows"
 ```
 
-These are read-only properties — useful when you've loaded a model from
-disk and want to know what kind of beast you're dealing with before calling
-`predict()`.
+These are read-only properties. Use them to inspect a model loaded from
+disk before calling `predict()`.
 
 ## When something looks wrong
 
 | Symptom | Try this |
 | --- | --- |
 | `diag.metrics["r_squared"]` low on training | The model is under-flexed. Raise `k` on smooths, or add interactions via `te(...)` / multi-d smooths. |
-| `rmse` low on training, high on test | Over-flexed. Reduce `k` or rely on default automatic complexity. |
+| `rmse` low on training, high on test | Over-flexed. Reduce `k` or rely on the default automatic complexity. |
 | `diagnose()` raises about response column | Pass `y=...` explicitly. |
 | `check()` fails on `missing_column` | Your prediction data is missing a feature the model needs. |
 | Predict raises `SchemaMismatchError` | Run `check()` first to identify which column. |
-| Predict raises `PredictionError` | The fitted model's class isn't yet supported in Python; the error message names the supported alternatives. |
+| Predict raises `PredictionError` | The fitted model's class isn't supported in Python; the error message names the supported alternatives. |
 
 See [exceptions.md](exceptions.md) for the full exception hierarchy.

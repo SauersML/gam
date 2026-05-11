@@ -5,9 +5,9 @@
 # gamfit { .gamfit-hero-title }
 
 <p class="gamfit-tagline" markdown>
-Formula-first generalized additive models for Python, backed by a
-high-performance Rust engine. REML/LAML smoothing, NUTS posteriors,
-survival, location-scale, and flexible links — in one fluent API.
+Formula-first generalized additive models for Python, backed by a Rust
+engine. REML/LAML smoothing, NUTS posteriors, survival, location-scale,
+and flexible links in one API.
 </p>
 
 <div class="gamfit-cta" markdown>
@@ -23,8 +23,8 @@ random effects, bounded/constrained coefficients, location-scale extensions,
 survival likelihoods, and flexible/learnable links. Smoothing parameters are
 selected by REML or LAML. Posterior sampling uses NUTS.
 
-This site is the in-depth Python documentation. If you just want a
-30-second pitch, read the [PyPI page](https://pypi.org/project/gamfit/).
+This site is the Python documentation. For a short overview, see the
+[PyPI page](https://pypi.org/project/gamfit/).
 
 ## Table of contents
 
@@ -65,8 +65,8 @@ This site is the in-depth Python documentation. If you just want a
 
 - [Full API reference](api-reference.md) — every public symbol in one place.
 - [Exceptions](exceptions.md) — the exception hierarchy and `explain_error()`.
-- [Cookbook](cookbook.md) — runnable recipes for common and advanced
-  patterns, all verified against the test suite.
+- [Cookbook](cookbook.md) — runnable recipes, verified against the test
+  suite.
 
 ## A complete tour in 30 lines
 
