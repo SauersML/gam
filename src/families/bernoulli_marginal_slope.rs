@@ -17453,26 +17453,14 @@ mod tests {
     /// structured `FullyAliased { reason }` that the production caller
     /// drops with a logged warning rather than aborting the fit.
     ///
-    /// **Why this test is `#[ignore]`d.** Constructing an anchor whose
-    /// W-residualised eigenvalues actually fall below the algorithm's
-    /// drop tolerance (currently `lambda_max_c · 64·n·eps²`) is
-    /// arithmetically delicate at the eigh-noise floor: even with
-    /// `A = C` exactly the residualised eigenvalues sit at
-    /// `~ eps² · lambda_max(C̃ᵀWC̃)` while the drop threshold scales as
-    /// `lambda_max · eps²` — these collide at machine-noise, and on the
-    /// real-fixture link-deviation basis the eigh fluctuations leave
-    /// all directions just *above* threshold. The `FullyAliased`
-    /// outcome is unit-tested implicitly by the runtime contract: the
-    /// production callers at the fit entry point pattern-match the
-    /// outcome and drop the block + log a warning, and the
-    /// `CrossBlockIdentifiabilityWarning` struct is wired through the
-    /// `BernoulliMarginalSlopeFitResult` so users see the diagnostic.
-    /// Direct unit coverage of the threshold cliff requires either a
-    /// synthetic floating-point-exact fixture (out of scope for this
-    /// integration test) or a tightening of the drop tolerance
-    /// (separate algorithm change).
+    /// The threshold anchors against ‖c_sqw‖_F² (the input candidate
+    /// spectrum), not against `λ_max(C̃ᵀWC̃)`: when span(C) ⊆ span(A)
+    /// every residualised eigenvalue sits at FP noise so
+    /// `λ_max_c` itself collapses to noise, and a relative-only
+    /// threshold would keep noise. The Frobenius² anchor scales with
+    /// the *input* energy and bounds noise eigenvalues from above by
+    /// `~ eps² · ‖C‖_F²`, well below `drop_tol = ‖C‖_F² · 64·n·eps²`.
     #[test]
-    #[ignore = "see doc comment: the algorithm's drop-tolerance cliff is below the link-dev eigh noise floor on real fixtures; the FullyAliased path is exercised by production callers' match arms, not by this unit test."]
     fn cross_block_identifiability_true_alias_returns_fully_aliased_outcome() {
         use crate::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
         let n = 64usize;
