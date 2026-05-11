@@ -1047,20 +1047,36 @@ impl<const K: usize, T: RowKernel<K>> RowKernelSecondDirectionalDerivativeOperat
 pub struct RowKernelHessianWorkspace<const K: usize, T: RowKernel<K>> {
     kern: Arc<T>,
     cache: RowKernelCache<K>,
+    rows: RowSet,
 }
 
 impl<const K: usize, T: RowKernel<K>> RowKernelHessianWorkspace<K, T> {
+    /// Full-data workspace: every row contributes with HT weight `1.0`.
+    /// Equivalent to [`Self::with_rows`] with `RowSet::All`.
     pub fn new(kern: T) -> Result<Self, String> {
+        Self::with_rows(kern, RowSet::All)
+    }
+
+    /// Build a workspace honouring the supplied [`RowSet`]. When the row
+    /// set is a `Subsample`, the row-kernel cache only evaluates the
+    /// sampled rows (the unsampled slots stay zero and are never read,
+    /// because aggregation in the assembly functions iterates the same
+    /// row set). All `joint_*_evaluation`, `hessian_*`, and
+    /// `*_directional_derivative*` paths route through that row set with
+    /// per-row Horvitz–Thompson weights, so the resulting trace and
+    /// gradient are unbiased estimators of the full-data values.
+    ///
+    /// Higher-order jet caches (third/fourth contracted) are NOT primed
+    /// here. PIRLS reuses this same workspace constructor for plain
+    /// gradient/Hessian evaluations and never touches `row_third_contracted`,
+    /// so priming at construction would burn ~3 s × n / scale on every
+    /// PIRLS cycle for a cache the gradient path never reads. Outer-eval
+    /// entry points instead call `warm_up_outer_caches` on the workspace
+    /// trait once, at top-level rayon, before the ext-coord `par_iter`.
+    pub fn with_rows(kern: T, rows: RowSet) -> Result<Self, String> {
         let kern = Arc::new(kern);
-        let cache = build_row_kernel_cache(&*kern, &RowSet::All)?;
-        // Higher-order jet caches (third/fourth contracted) are NOT primed
-        // here. PIRLS reuses this same workspace constructor for plain
-        // gradient/Hessian evaluations and never touches `row_third_contracted`,
-        // so priming at construction would burn ~3 s × n / scale on every
-        // PIRLS cycle for a cache the gradient path never reads. Outer-eval
-        // entry points instead call `warm_up_outer_caches` on the workspace
-        // trait once, at top-level rayon, before the ext-coord `par_iter`.
-        Ok(Self { kern, cache })
+        let cache = build_row_kernel_cache(&*kern, &rows)?;
+        Ok(Self { kern, cache, rows })
     }
 }
 
@@ -1078,15 +1094,15 @@ impl<const K: usize, T: RowKernel<K> + 'static> ExactNewtonJointHessianWorkspace
     }
 
     fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
-        Ok(Some(row_kernel_log_likelihood(&self.cache)))
+        Ok(Some(row_kernel_log_likelihood(&self.cache, &self.rows)))
     }
 
     fn joint_gradient_evaluation(
         &self,
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
         Ok(Some(ExactNewtonJointGradientEvaluation {
-            log_likelihood: row_kernel_log_likelihood(&self.cache),
-            gradient: -row_kernel_gradient(&*self.kern, &self.cache),
+            log_likelihood: row_kernel_log_likelihood(&self.cache, &self.rows),
+            gradient: -row_kernel_gradient(&*self.kern, &self.cache, &self.rows),
         }))
     }
 
@@ -1099,7 +1115,11 @@ impl<const K: usize, T: RowKernel<K> + 'static> ExactNewtonJointHessianWorkspace
         // every canonical basis vector: a `p * O(n*K^2)` redundant
         // re-stream of the row data. At biobank scale (n~320k, p~200) that
         // is hundreds of seconds of pure waste per outer-Hessian build.
-        Ok(Some(row_kernel_hessian_dense(&*self.kern, &self.cache)))
+        Ok(Some(row_kernel_hessian_dense(
+            &*self.kern,
+            &self.cache,
+            &self.rows,
+        )))
     }
 
     fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
@@ -1107,12 +1127,17 @@ impl<const K: usize, T: RowKernel<K> + 'static> ExactNewtonJointHessianWorkspace
         Ok(Some(row_kernel_hessian_matvec(
             &*self.kern,
             &self.cache,
+            &self.rows,
             sl,
         )))
     }
 
     fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
-        Ok(Some(row_kernel_hessian_diagonal(&*self.kern, &self.cache)))
+        Ok(Some(row_kernel_hessian_diagonal(
+            &*self.kern,
+            &self.cache,
+            &self.rows,
+        )))
     }
 
     fn directional_derivative(
@@ -1122,7 +1147,7 @@ impl<const K: usize, T: RowKernel<K> + 'static> ExactNewtonJointHessianWorkspace
         let sl = d_beta_flat
             .as_slice()
             .ok_or("directional_derivative: non-contiguous input")?;
-        row_kernel_directional_derivative(&*self.kern, sl).map(Some)
+        row_kernel_directional_derivative(&*self.kern, &self.rows, sl).map(Some)
     }
 
     fn directional_derivative_operator(
@@ -1137,6 +1162,7 @@ impl<const K: usize, T: RowKernel<K> + 'static> ExactNewtonJointHessianWorkspace
             kern: Arc::clone(&self.kern),
             direction,
             p: self.cache.p,
+            rows: self.rows.clone(),
         })))
     }
 
@@ -1151,7 +1177,7 @@ impl<const K: usize, T: RowKernel<K> + 'static> ExactNewtonJointHessianWorkspace
         let sv = d_beta_v
             .as_slice()
             .ok_or("second_directional_derivative: non-contiguous v")?;
-        row_kernel_second_directional_derivative(&*self.kern, su, sv).map(Some)
+        row_kernel_second_directional_derivative(&*self.kern, &self.rows, su, sv).map(Some)
     }
 
     fn second_directional_derivative_operator(
@@ -1173,6 +1199,7 @@ impl<const K: usize, T: RowKernel<K> + 'static> ExactNewtonJointHessianWorkspace
                 direction_u,
                 direction_v,
                 p: self.cache.p,
+                rows: self.rows.clone(),
             },
         )))
     }
@@ -1398,6 +1425,7 @@ mod gram_inner_contraction_tests {
             kern: Arc::clone(&kern),
             direction: direction.clone(),
             p,
+            rows: RowSet::All,
         };
         let cache = ProjectedFactorCache::default();
         let got1_uncached = HyperOperator::trace_projected_factor(&op1, &factor);
@@ -1420,6 +1448,7 @@ mod gram_inner_contraction_tests {
             direction_u: direction_u.clone(),
             direction_v: direction_v.clone(),
             p,
+            rows: RowSet::All,
         };
         let cache2 = ProjectedFactorCache::default();
         let got2_uncached = HyperOperator::trace_projected_factor(&op2, &factor);
