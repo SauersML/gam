@@ -8743,7 +8743,7 @@ fn covariance_from_model(
     mode: CovarianceModeArg,
 ) -> Result<Array2<f64>, String> {
     let fit = model.fit_result.as_ref().ok_or_else(|| {
-        "model is missing canonical fit_result payload; refit with current CLI".to_string()
+        "model is missing canonical fit_result payload; refit".to_string()
     })?;
     let cov = match mode {
         CovarianceModeArg::Corrected => fit.beta_covariance_corrected().or(fit.beta_covariance()),
@@ -8767,7 +8767,7 @@ fn covariance_from_model(
         });
     }
     Err(
-        "nonlinear posterior-mean prediction requires covariance or a saved penalized Hessian; refit model with current CLI"
+        "nonlinear posterior-mean prediction requires covariance or a saved penalized Hessian; refit"
             .to_string(),
     )
 }
@@ -8777,7 +8777,7 @@ fn prediction_backend_from_model<'a>(
     mode: CovarianceModeArg,
 ) -> Result<PredictionCovarianceBackend<'a>, String> {
     let fit = model.fit_result.as_ref().ok_or_else(|| {
-        "model is missing canonical fit_result payload; refit with current CLI".to_string()
+        "model is missing canonical fit_result payload; refit".to_string()
     })?;
     let covariance = match mode {
         CovarianceModeArg::Corrected => fit.beta_covariance_corrected().or(fit.beta_covariance()),
@@ -8798,7 +8798,7 @@ fn prediction_backend_from_model<'a>(
         .map_err(|e| format!("failed to factor saved penalized Hessian for prediction: {e}"));
     }
     Err(
-        "nonlinear posterior-mean prediction requires either covariance or a saved penalized Hessian; refit model with current CLI"
+        "nonlinear posterior-mean prediction requires either covariance or a saved penalized Hessian; refit"
             .to_string(),
     )
 }
