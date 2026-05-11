@@ -42,9 +42,16 @@ bench/diagf_*/
 bench/debug*_model.json
 bench/scenarios.*.json
 bench/fuzz_results*.jsonl
+bench/*results*.json
+bench/**/results*.json
+bench/**/results.json
+bench/**/RESULTS*.md
+bench/**/RESULTS*
 scripts/__pycache__/
 scripts/latest_benchmark_summary.md
 scripts/scripts/latest_benchmark_summary.md
+scripts/jules_loop.py
+scripts/codex_nightrun.sh
 *.png
 !bench/aniso_demo/*.png
 src/rust_digest.txt
