@@ -20164,10 +20164,44 @@ mod tests {
             penalized_spec(flex_p, n_large, 12),
             penalized_spec(flex_p, n_large, 12),
         ];
+        // Capability is always Second when the family advertises analytic
+        // second-order calculus — cost gating is a *policy* decision, not a
+        // capability claim. The runtime-realized cost gate lives on
+        // `outer_derivative_policy(...).declared_hessian_form()` and below
+        // we assert the high-work branch trips it.
         assert_eq!(
             high_work_flex_family
                 .exact_outer_derivative_order(&high_work_specs, &BlockwiseFitOptions::default()),
-            ExactOuterDerivativeOrder::First
+            ExactOuterDerivativeOrder::Second
+        );
+        let high_work_policy = high_work_flex_family.outer_derivative_policy(
+            &high_work_specs,
+            0,
+            &BlockwiseFitOptions::default(),
+        );
+        assert!(
+            high_work_policy.predicted_hessian_work
+                > crate::custom_family::OuterDerivativePolicy::OUTER_HESSIAN_WORK_BUDGET,
+            "high-work flex configuration must exceed the outer-Hessian work budget; \
+             got predicted={} budget={}",
+            high_work_policy.predicted_hessian_work,
+            crate::custom_family::OuterDerivativePolicy::OUTER_HESSIAN_WORK_BUDGET,
+        );
+        assert!(
+            matches!(
+                high_work_policy.declared_hessian_form(),
+                crate::solver::outer_strategy::DeclaredHessianForm::Unavailable
+            ),
+            "policy must declare the outer Hessian Unavailable when predicted work \
+             exceeds the budget; got {:?}",
+            high_work_policy.declared_hessian_form(),
+        );
+        assert_eq!(
+            high_work_policy.order_for_evaluation(
+                crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian,
+            ),
+            crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+            "policy must clamp ValueGradientHessian to ValueAndGradient in the high-work regime",
         );
 
         let mut large_rigid_family = large_flex_family.clone();
