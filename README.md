@@ -1,288 +1,243 @@
-# gam
+# gam &middot; gamfit
 
-`gam` is a formula-first CLI and Rust engine for generalized additive models.
+[![PyPI](https://img.shields.io/pypi/v/gamfit.svg)](https://pypi.org/project/gamfit/)
+[![Python](https://img.shields.io/pypi/pyversions/gamfit.svg)](https://pypi.org/project/gamfit/)
+[![Docs](https://img.shields.io/readthedocs/gamfit.svg)](https://gamfit.readthedocs.io/)
+[![Rust CI](https://github.com/SauersML/gam/actions/workflows/test.yml/badge.svg)](https://github.com/SauersML/gam/actions/workflows/test.yml)
+[![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 
-It fits Gaussian, binomial, Poisson, and Gamma GLMs with smooth terms, random effects, location-scale extensions, survival likelihoods, and flexible/learnable link functions. Smoothing parameters are selected by REML or LAML. Posterior sampling uses NUTS.
+A formula-first generalized additive model engine. Written in Rust for
+speed, with a polished Python library on top.
 
-Please open an issue if anything doesn't work as expected, if you'd like a new feature, or for questions.
+Fits Gaussian, binomial, Poisson, and Gamma GLMs with smooth terms,
+random effects, bounded/constrained coefficients, location-scale
+extensions, survival likelihoods, and flexible/learnable link functions.
+Smoothing parameters are selected by REML or LAML. Posterior sampling
+uses NUTS.
 
-## What's different
+**Docs:** <https://gamfit.readthedocs.io/> &middot; **PyPI:**
+<https://pypi.org/project/gamfit/>
 
-- **Three-part penalty structure.** Each smooth gets separate penalties for magnitude, gradient, and curvature. Most GAM libraries use one (curvature only) or two (curvature + combined magnitude/gradient). The three-part structure gives the smoother more degrees of freedom to distinguish flat-but-offset functions from wiggly ones.
-- **Flexible link functions.** A spline offset from a base link (e.g. probit) lets the data correct for link misspecification while encoding the belief that the base link is approximately right. Marginal-slope models use a calibrated de-nested probit transport kernel for score-warp/link-deviation terms, not an exact nested link composition or post-hoc calibration. The same mechanism applies to survival time basis functions.
-- **Surface smooths.** Thin-plate splines, Duchon radial bases with triple operator regularization, and Matern covariance-based smooths in arbitrary dimension, with automatic knot placement.
-- **Adaptive anisotropy.** Per-axis spatial anisotropy (`--scale-dimensions`) lets the model shrink or stretch each feature axis independently within a single joint smooth, instead of assuming isotropic smoothness. Matérn and hybrid Duchon optimize a global scale plus per-axis contrasts; pure Duchon optimizes the per-axis contrasts directly without introducing a global length scale.
-- **Composable basis/kernel.** You can combine the kernel of one spline family with the length-scale behavior of another (e.g. Duchon kernel with Matern-style global kappa scaling).
+## Two ways to use it
+
+```python
+# Python library (gamfit)
+import gamfit
+model = gamfit.fit(train, "y ~ s(x) + group(site)")
+preds = model.predict(test, interval=0.95)
+```
+
+```bash
+# Rust CLI (gam)
+gam fit data.csv 'y ~ smooth(x) + group(site)' --out model.json
+gam predict model.json new_data.csv --uncertainty
+gam report model.json data.csv
+```
+
+Pick whichever fits your workflow. The two share one engine, one
+formula DSL, and one on-disk format — train in the CLI, score in
+Python, or vice versa.
 
 ## Install
 
-### Prebuilt binary
+**Python.** Wheels for Linux (x86_64, aarch64), macOS (Intel + Apple
+silicon), and Windows. No Rust toolchain required.
 
-macOS, Linux, and Windows Git Bash:
+```bash
+uv add gamfit
+# or
+pip install gamfit
+```
+
+Optional extras: `gamfit[pandas]`, `gamfit[plot]`, `gamfit[sklearn]`,
+`gamfit[all]`.
+
+**Rust CLI.** One-liner installer for macOS, Linux, and Windows Git Bash:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SauersML/gam/main/install.sh | bash
 ```
 
-### Build from source
+Or build from source: `cargo build --release` — the binary lands at
+`./target/release/gam`.
 
-Requires [Rust](https://rustup.rs/).
+## What makes it different
 
-```bash
-git clone https://github.com/SauersML/gam.git
-cd gam
-cargo build --release
-```
+These are the features you can't really stitch together out of
+existing GAM libraries.
 
-The binary is at `./target/release/gam`. Add it to your `PATH` or use the full path in the examples below.
+### Three-part penalty structure
 
-### Python package
-
-The repo now includes a mixed Rust/Python package built around PyO3 and maturin.
-
-```bash
-uv venv
-source .venv/bin/activate
-uv pip install maturin
-maturin develop --manifest-path crates/gam-pyffi/Cargo.toml
-python -c "import gamfit; print(gamfit.build_info())"
-```
-
-Formula-first usage:
+Each smooth gets independent penalties on **magnitude, gradient, and
+curvature**. Most libraries collapse these into one (curvature only) or
+two — gamfit keeps them separate, so a flat-but-offset function and a
+wiggly function are penalized differently.
 
 ```python
-import gamfit
-
-train = [
-    {"y": 1.0, "x": 0.0},
-    {"y": 2.0, "x": 1.0},
-    {"y": 3.0, "x": 2.0},
-]
-
-model = gamfit.fit(train, "y ~ x")
-pred = model.predict([{"x": 1.5}, {"x": 2.5}], interval=0.95)
-summary = model.summary()
-check = model.check([{"x": 1.5}])
-diagnostics = model.diagnose(train)
-gamfit.validate_formula(train, "y ~ x")
-model.plot(train, kind="prediction")
-html = model.report()
-model.save("linear.gam")
+gamfit.fit(df, "z ~ duchon(pc1, pc2, pc3, pc4, centers=50)")
 ```
 
-scikit-learn usage:
+### Adaptive per-axis anisotropy
+
+Surface smooths can learn how much to shrink each axis independently.
+No more pretending that `(latitude, age, log_income)` deserves a single
+length-scale.
+
+```python
+gamfit.fit(df, "z ~ matern(pc1, pc2, pc3, pc4)", scale_dimensions=True)
+```
+
+Side-by-side: isotropic global smoothing on the left, learned per-axis
+anisotropy on the right. Same data, same formula skeleton, very
+different population stability.
+
+![adaptive anisotropy: isotropic vs per-axis](bench/aniso_demo/02_normalized.png)
+
+### Surface smooths in arbitrary dimension
+
+P-spline, thin-plate, Matérn, and **Duchon** radial bases — the last
+with triple-operator regularization (mass + tension + stiffness) and
+scale-free behaviour by default. Mix kernels and scaling regimes
+freely.
+
+```python
+gamfit.fit(df, "y ~ matern(x1, x2, x3, nu=5/2)")
+gamfit.fit(df, "y ~ duchon(x1, x2, x3, x4, centers=80)")
+gamfit.fit(df, "y ~ te(space, time, k=10)")   # tensor product
+```
+
+### Flexible / learnable link functions
+
+A spline offset on top of a base link lets the data correct for link
+misspecification. Or pick `blended(logit, probit)` for a learned
+mixture; or `sas` / `beta-logistic` for shape parameters learned from
+the data.
+
+```python
+gamfit.fit(df, "case ~ s(age) + link(type=flexible(probit))"
+                 " + linkwiggle(internal_knots=6)")
+```
+
+### Marginal-slope models
+
+For binary or survival outcomes with a calibrated risk score (e.g. a
+polygenic score), decouple **baseline risk** and **score effect** into
+separate formulas. The slope on the score becomes a smooth function of
+covariate space; the baseline can't absorb signal that belongs to it.
+
+```python
+gamfit.fit(
+    df,
+    "case ~ matern(pc1, pc2, pc3)",
+    family="bernoulli-marginal-slope",
+    link="probit",
+    z_column="pgs_z",
+    logslope_formula="matern(pc1, pc2, pc3)",
+)
+```
+
+### Survival with on-demand surfaces
+
+`Surv(entry, exit, event)` + four likelihood modes (transformation,
+Weibull, location-scale, marginal-slope) + a `SurvivalPrediction`
+object that evaluates `S(t)`, `h(t)`, `H(t)` on any time grid:
+
+```python
+pred = model.predict(test_df)
+S = pred.survival_at([1, 5, 10, 20])     # (n_rows, 4)
+H = pred.cumulative_hazard_at([10])      # (n_rows, 1)
+```
+
+For population-scale cohorts, stream straight to CSV without
+materialising the full matrix:
+`pred.write_survival_at_csv("surv.csv", times=[...])`.
+
+### NUTS posteriors
+
+`model.sample(...)` runs the No-U-Turn Sampler over the coefficient
+posterior conditional on the fitted smoothing parameters. Predictive
+bands stream in row chunks so memory stays bounded on large
+test sets.
+
+```python
+posterior = model.sample(train, seed=42)
+bands = posterior.predict(test, level=0.95)
+# eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper
+```
+
+### Bounded coefficients with informative priors
+
+Hard interval transforms with optional Beta priors — useful for
+proportions, mixing weights, or any coefficient that *must* live in
+`[a, b]`:
+
+```python
+gamfit.fit(df,
+    "y ~ age + bounded(prop, min=0, max=1, target=0.5, strength=3)")
+```
+
+### scikit-learn drop-in
 
 ```python
 from gamfit.sklearn import GAMRegressor
-
-est = GAMRegressor(formula="y ~ x")
-est.fit(train)
-pred = est.predict([{"x": 1.5}, {"x": 2.5}])
+est = GAMRegressor(formula="y ~ s(x)").fit(X, y)
 ```
 
-The native extension is `gamfit._rust`, while the public Python API lives under `gamfit/`.
+## How does it stack up
 
-## Quick start
+On the standard `prostate` benchmark (5-fold CV, binomial), gamfit's
+Rust engine reaches **AUC 0.705** in **3.5 s** fit time — sitting
+between `mgcv` (AUC 0.704, 4.4 s) and `pygam` (AUC 0.701, 9.8 s) for
+accuracy, faster than both. Benchmark machinery and scenarios live in
+[`bench/`](bench/); aggregated results are in
+[`bench/prostate_gamair_results.json`](bench/prostate_gamair_results.json)
+and friends.
 
-```bash
-# Fit a GAM with a smooth term
-gam fit data.csv 'y ~ smooth(x)' --out model.json
+## Where to learn more
 
-# Predict with uncertainty intervals
-gam predict model.json new_data.csv --out predictions.csv --uncertainty
+- **In-depth Python documentation:** <https://gamfit.readthedocs.io/>
+  &mdash; getting started, the full formula DSL, families and links,
+  survival, marginal-slope, posterior sampling, scikit-learn
+  integration, a runnable cookbook, and an auto-generated API
+  reference.
+- **CLI help:** `gam <command> --help` (commands: `fit`, `predict`,
+  `report`, `diagnose`, `sample`, `generate`).
+- **Cookbook of runnable recipes:** see
+  [docs/cookbook.md](docs/cookbook.md).
 
-# Build a standalone HTML report
-gam report model.json data.csv
+## Repository layout
 
-# Draw posterior samples
-gam sample model.json data.csv --out samples.csv
-
-# Generate synthetic response draws
-gam generate model.json data.csv --n-draws 5 --out synthetic.csv
-```
-
-## Commands
-
-| Command | What it does | Usage |
-| --- | --- | --- |
-| `fit` | Fit a model | `gam fit <DATA> <FORMULA> [--out model.json]` |
-| `predict` | Score new data | `gam predict <MODEL> <DATA> --out predictions.csv` |
-| `report` | Standalone HTML report | `gam report <MODEL> [DATA] [OUT]` |
-| `diagnose` | Terminal diagnostics | `gam diagnose <MODEL> <DATA>` |
-| `sample` | Posterior draws (NUTS) | `gam sample <MODEL> <DATA> [--out samples.csv]` |
-| `generate` | Synthetic outcomes | `gam generate <MODEL> <DATA> [--out synthetic.csv]` |
-
-`train` is an alias for `fit`. `simulate` is an alias for `generate`.
-
-Run `gam <command> --help` for full options.
-
-## Formula language
-
-```
-response ~ term + term + ...
-```
-
-### Response
-
-- Continuous, binary, count, or positive continuous: `y`
-- Survival (interval-censored): `Surv(entry_time, exit_time, event)`
-
-### Terms
-
-**Linear and constrained coefficients:**
-
-| Syntax | Effect |
+| Path | Contents |
 | --- | --- |
-| `x` or `linear(x)` | Penalized linear term |
-| `linear(x, min=0)` | Non-negative coefficient |
-| `linear(x, min=..., max=...)` | Box-constrained coefficient |
-| `nonnegative(x)` | Sugar for `linear(x, min=0)` |
-| `nonpositive(x)` | Sugar for `linear(x, max=0)` |
-| `bounded(x, min=0, max=1)` | Exact interval transform (no ridge) |
-| `bounded(x, ..., prior=uniform)` | Flat prior on bounded scale |
-| `bounded(x, ..., target=0.5, strength=3)` | Informative interior prior |
-
-**Random effects:**
-
-| Syntax | Effect |
-| --- | --- |
-| `group(id)` or `re(id)` | Random intercept per level of `id` |
-
-**Smooths:**
-
-| Syntax | Default basis |
-| --- | --- |
-| `smooth(x)` or `s(x)` | P-spline (B-spline + difference penalty) |
-| `smooth(x1, x2)` | Thin-plate spline |
-| `thinplate(x1, x2)` or `tps(x1, x2)` | Thin-plate spline |
-| `matern(x1, x2, ...)` | Matern covariance smooth |
-| `duchon(x1, x2, ...)` | Duchon radial basis with triple operator regularization (scale-free) |
-| `tensor(x, z)` or `te(x, z)` | Tensor-product B-splines |
-
-Common smooth options: `knots=`, `k=`, `centers=`, `degree=`, `penalty_order=`, `type=ps|tps|matern|duchon`. `double_penalty=true|false` applies to P-spline, thin-plate, tensor, and Matérn smooths; Duchon smooths use mass, tension, and stiffness operator penalties.
-
-Spatial smooths support per-axis anisotropy via `scale_dims=true` or the global `--scale-dimensions` flag. For pure Duchon this stays scale-free: the optimizer updates only centered per-axis shape contrasts, not a scalar `length_scale`.
-
-**Formula-level configuration:**
-
-| Syntax | Effect |
-| --- | --- |
-| `link(type=logit)` | Set link function |
-| `linkwiggle(internal_knots=10)` | Spline deviation from the base link |
-| `timewiggle(internal_knots=8)` | Spline deviation from the time basis (survival) |
-| `survmodel(spec=net, distribution=gaussian)` | Survival model configuration |
-
-### Auto-detection
-
-The family is inferred from the response column:
-
-- Binary `{0, 1}`: binomial with logit link
-- Everything else: Gaussian with identity link
-
-Override with `link(type=...)` in the formula. Poisson and Gamma families are available via explicit link specification.
-
-## Fit modes
-
-### Standard
-
-```bash
-gam fit data.csv 'y ~ age + smooth(bmi) + group(site)' --out model.json
-```
-
-### Location-scale (jointly model mean and variance)
-
-```bash
-gam fit data.csv 'y ~ smooth(x1) + smooth(x2)' \
-  --predict-noise 'smooth(x1)' \
-  --out model.json
-```
-
-Works for Gaussian and binomial families. For survival formulas, `--predict-noise` routes to the survival location-scale fitter.
-
-### Survival
-
-```bash
-gam fit data.csv \
-  'Surv(t0, t1, event) ~ age + smooth(bmi) + survmodel(spec=net, distribution=gaussian)' \
-  --survival-likelihood transformation \
-  --out model.json
-```
-
-Likelihood modes: `transformation`, `weibull`, `location-scale`.
-
-Add `--predict-noise` for distributional (location-scale) survival:
-
-```bash
-gam fit data.csv \
-  'Surv(t0, t1, event) ~ age + smooth(bmi) + survmodel(spec=net, distribution=gaussian)' \
-  --predict-noise 'smooth(age)' \
-  --out model.json
-```
-
-### Bernoulli marginal-slope
-
-Models `P(case | covariates, z)` where `z` is a standardized score (e.g. a polygenic risk score). The key idea: the baseline risk surface and the effect of `z` are decoupled into separate formulas. The main formula controls the population-level risk landscape (how risk varies with age, ancestry PCs, etc.), while `--logslope-formula` controls how strongly `z` modifies that risk at each point in covariate space. This decoupling lets you estimate spatially-varying effect sizes for `z` without the baseline absorbing signal that belongs to the slope, or vice versa.
-
-```bash
-gam fit data.csv \
-  'case ~ smooth(age) + matern(pc1, pc2, pc3)' \
-  --logslope-formula 'matern(pc1, pc2, pc3)' \
-  --z-column prs_z \
-  --out model.json
-```
-
-## Link functions
-
-Set via `link(type=...)` in the formula.
-
-| Link | Syntax |
-| --- | --- |
-| Identity | `link(type=identity)` |
-| Logit | `link(type=logit)` |
-| Probit | `link(type=probit)` |
-| Complementary log-log | `link(type=cloglog)` |
-| SAS (sinh-arcsinh) | `link(type=sas)` |
-| Beta-logistic | `link(type=beta-logistic)` |
-| Blended mixture | `link(type=blended(logit, probit))` |
-| Flexible (data-driven) | `link(type=flexible(logit))` |
-
-Flexible links add a spline offset to the base link, letting the data correct for link misspecification.
-
-## Prediction output
-
-| Model type | Default columns | With `--uncertainty` |
-| --- | --- | --- |
-| Standard / binomial | `eta, mean` | `+ effective_se, mean_lower, mean_upper` |
-| Gaussian location-scale | `eta, mean, sigma` | `+ mean_lower, mean_upper` |
-| Survival | `eta, mean, survival_prob, risk_score, failure_prob` | `+ effective_se, mean_lower, mean_upper` |
-
-## Other outputs
-
-**`gam report`** writes a standalone HTML file with model summary, smooth plots, and diagnostics. Pass training data for data-dependent diagnostics.
-
-**`gam sample`** writes posterior draws (`beta_0, beta_1, ...`) and a summary CSV. Uses NUTS (No-U-Turn Sampler).
-
-**`gam generate`** writes a matrix of synthetic outcomes (rows = draws, columns = data rows).
-
-**`gam diagnose`** prints terminal diagnostics. Supports `--alo` for approximate leave-one-out.
+| `src/` | Rust engine: fitting, inference, smooth construction, survival, CLI. |
+| `crates/gam-pyffi/` | PyO3 bindings (the `gamfit._rust` native extension). |
+| `gamfit/` | Pure-Python public API on top of the bindings. |
+| `docs/` | MkDocs/Material documentation sources (built to RTD). |
+| `tests/` | Rust + Python integration tests. |
+| `bench/` | Benchmark harness, scenario configs, datasets, plots. |
 
 ## Development
 
 ```bash
+# Rust
 cargo fmt --all
 cargo clippy --all-targets --all-features -- -A warnings -D clippy::correctness -D clippy::suspicious
 cargo test --all-features
+
+# Python docs (uses uv)
+uv venv --python 3.12 .venv-docs
+uv pip install --python .venv-docs/bin/python -r docs/requirements.txt
+.venv-docs/bin/mkdocs serve
 ```
 
-Benchmark suite:
+Benchmark suite: `python3 bench/run_suite.py --help`.
 
-```bash
-python3 bench/run_suite.py --help
-python3 bench/run_suite.py
-```
+## Issues, feedback, contributions
 
-Layout:
+Please open a [GitHub issue](https://github.com/SauersML/gam/issues)
+with bug reports, feature requests, or questions — including "this
+doesn't work the way I expect."
 
-- `src/` -- CLI, fitting engine, inference, smooth construction, survival machinery
-- `bench/` -- benchmark harness, scenario configs, datasets, comparison tooling
-- `tests/` -- integration tests
+## License
+
+AGPL-3.0-or-later. See [LICENSE](LICENSE).
