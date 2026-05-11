@@ -1,37 +1,37 @@
 # Marginal-slope models
 
-Marginal-slope is `gamfit`'s machinery for handling a **standardised risk
-score** (e.g. a polygenic score) whose effect on the outcome varies across
-covariate space. The defining feature: the baseline risk surface and the
-score's effect are decoupled into separate formulas, so the baseline can't
-absorb signal that belongs to the slope (or vice versa).
+Marginal-slope handles a **standardised risk score** (e.g. a polygenic
+score) whose effect on the outcome varies across covariate space. The
+baseline risk surface and the score's effect live in separate formulas, so
+the baseline cannot absorb signal that belongs to the slope (or vice
+versa).
 
-There are two flavours:
+Two flavours:
 
 - **Bernoulli marginal-slope** for binary outcomes.
 - **Survival marginal-slope** for time-to-event outcomes.
 
-Both pair naturally with **transformation-normal** calibration of the
-underlying score on ancestry/covariate PCs, so the input score is conditionally
+Both pair with **transformation-normal** calibration of the underlying
+score on ancestry/covariate PCs, so the input score is conditionally
 N(0, 1) before it enters the marginal-slope fit.
 
-## When you'd reach for this
+## When to use it
 
 You have:
 
 1. A binary or survival outcome.
 2. A continuous risk score, ideally already standardised (zero mean, unit
-   variance, marginally), perhaps a polygenic score, perhaps something else.
-3. A belief that the *score's* effect size varies across some covariate
-   space — across age, across ancestry PCs, etc.
+   variance, marginally) — a polygenic score or similar.
+3. Reason to believe the *score's* effect size varies across some
+   covariate space — across age, across ancestry PCs, etc.
 
 Standard logistic regression on `outcome ~ score + age + ...` forces a
-*single* slope on `score`. Marginal-slope lets the slope itself be a smooth
+*single* slope on `score`. Marginal-slope makes the slope itself a smooth
 function of the covariates while leaving the baseline as its own smooth.
 
 ## Stage 1: transformation-normal calibration
 
-If your raw score isn't already conditionally N(0, 1), fit:
+If your raw score is not already conditionally N(0, 1), fit:
 
 ```python
 calib = gamfit.fit(
@@ -128,17 +128,16 @@ model.model_class                  # full class string
 
 - **Order matters.** Run Stage 1 (transformation-normal) before Stage 2 so
   that `z_column` is genuinely conditionally N(0, 1).
-- **Scale your covariates** for Stage 1 — `scale_dimensions=True` is almost
-  always the right call when fitting transformation-normal on a handful of
-  PCs.
-- **Sampling / posterior:** Bernoulli marginal-slope, survival marginal-slope,
-  and transformation-normal models currently fall back to the Gaussian
-  Laplace approximation for `Model.sample(...)` rather than exact NUTS. The
-  posterior summary still works the same way — see
+- **Scale your covariates** for Stage 1. Set `scale_dimensions=True` when
+  fitting transformation-normal on a handful of PCs.
+- **Sampling / posterior:** Bernoulli marginal-slope, survival
+  marginal-slope, and transformation-normal models fall back to the
+  Gaussian Laplace approximation for `Model.sample(...)` rather than NUTS.
+  The posterior summary works the same way — see
   [posterior-sampling.md](posterior-sampling.md).
 - **Predict output:** Bernoulli marginal-slope returns a 1-D array of
   probabilities by default. Pass `id_column=` or `return_type="dict"` to
-  get a table back. Same warning applies to transformation-normal output.
+  get a table back. Same applies to transformation-normal output.
 
 ## Recipe: full two-stage pipeline
 

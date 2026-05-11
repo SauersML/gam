@@ -33,7 +33,7 @@ model.sample(
 
 | Kwarg | Default | Meaning |
 | --- | --- | --- |
-| `data` | (required) | Same shape as the data you fit on. Survival models consume `entry`, `exit`, `event` columns too. |
+| `data` | (required) | Same shape as the data you fit on. Survival models also consume `entry`, `exit`, `event` columns. |
 | `samples` | auto from coeff count | Post-warmup draws **per chain**. |
 | `warmup` | matches `samples` (or adaptive) | Warmup iterations per chain. Discarded. |
 | `chains` | 2 or 4 (auto) | Independent chains run in parallel. |
@@ -47,20 +47,20 @@ Total returned draws are `chains × samples`.
 | Model class | Sampler |
 | --- | --- |
 | Gaussian, binomial (logit/probit/cloglog), Poisson, Gamma | **NUTS** |
-| Survival (transformation, Weibull, marginal-slope, latent) | **NUTS** |
-| Survival location-scale | Gaussian Laplace |
-| Transformation-normal | Gaussian Laplace |
+| Standard GLM with `linkwiggle` | **NUTS** (joint link-wiggle path) |
+| Survival (transformation, Weibull, marginal-slope) | **NUTS** |
+| Survival (location-scale, latent, latent-binary) | Gaussian Laplace |
+| Gaussian / binomial location-scale | Gaussian Laplace |
 | Bernoulli marginal-slope | Gaussian Laplace |
-| Anything with `linkwiggle` | Gaussian Laplace |
+| Transformation-normal | Gaussian Laplace |
 
-When the engine falls back to Laplace, you'll see `posterior.method ==
-"laplace_gaussian"`, `rhat == 1.0`, `ess == n_draws`, and
-`converged == True` (the draws are i.i.d. by construction). The
-`PosteriorSamples` API is identical either way.
+On Laplace fallback, `posterior.method == "laplace"`, `rhat == 1.0`,
+`ess == n_draws`, and `converged == True` — the draws are i.i.d. by
+construction. The `PosteriorSamples` API is identical either way.
 
 ## SamplingConfig
 
-`posterior.config` echoes exactly what the sampler ran with:
+`posterior.config` echoes what the sampler ran with:
 
 ```python
 posterior.config.n_samples       # int
@@ -127,13 +127,13 @@ collapsing each chunk to quantiles on-the-fly. Memory stays bounded at
 roughly `n_draws × chunk_size × 8` bytes regardless of total prediction-set
 size. Set `chunk_size=None` to materialise the full matrix.
 
-Currently supports standard non-link-wiggle GAMs. Other model classes raise
-with a pointer to `Model.predict(interval=...)`.
+Supports standard non-link-wiggle GAMs. Other model classes raise with a
+pointer to `Model.predict(interval=...)`.
 
 ### Full draws
 
-If you need the raw `(n_draws, n_rows)` matrices (e.g. to propagate
-uncertainty into a derived quantity):
+For raw `(n_draws, n_rows)` matrices (e.g. to propagate uncertainty into a
+derived quantity):
 
 ```python
 pp = posterior.predict_draws(test_df)
@@ -168,7 +168,7 @@ bands = loaded.predict(new_data)   # works after a round-trip
 ```
 
 The `.npz` archive bundles the fitted model bytes too, so `predict()` on a
-loaded posterior doesn't require re-passing the model.
+loaded posterior does not require re-passing the model.
 
 ## Convergence diagnostics
 
@@ -183,9 +183,9 @@ Effective sample size: target ESS / n_draws > ~25%. Substantially lower
 means the chain is autocorrelated; raise `target_accept` to 0.85–0.9 or
 extend the run.
 
-If your sampler looks unhealthy:
+If the sampler looks unhealthy:
 
-1. Re-fit with `seed` set — maybe the initialisation was unlucky.
+1. Re-fit with `seed` set — the initialisation may have been unlucky.
 2. Double `warmup` and `samples`.
 3. Raise `target_accept` (0.85 → 0.9).
 4. Inspect `posterior.plot_trace(...)` for bimodality or trends.
@@ -200,8 +200,7 @@ The engine scales sampling parameters by the coefficient count:
 | `10–50` | 4 | 512 | 512 | 0.8 |
 | `> 50` | 4 | 1024 | 1024 | 0.85 |
 
-These are sensible starting points for typical GAMs. Override any of them
-explicitly with the corresponding kwarg.
+Override any of them with the corresponding kwarg.
 
 ## Recipes
 

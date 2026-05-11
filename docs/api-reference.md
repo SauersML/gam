@@ -1,11 +1,9 @@
 # API reference
 
-This page is **auto-generated** from the docstrings and type hints in the
-`gamfit` source. If you spot something wrong here, fix the docstring — the
-docs follow.
+This page is auto-generated from the docstrings and type hints in the
+`gamfit` source. To change it, edit the docstring.
 
-For narrative explanations of each part of the API, see the topical guides
-in the sidebar.
+For narrative explanations, see the topical guides in the sidebar.
 
 ## Top-level functions
 

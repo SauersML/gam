@@ -6,14 +6,15 @@
 [![Rust CI](https://github.com/SauersML/gam/actions/workflows/test.yml/badge.svg)](https://github.com/SauersML/gam/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 
-A formula-first generalized additive model engine. Written in Rust for
-speed, with a polished Python library on top.
+A formula-first generalized additive model engine. Written in Rust,
+with a Python library on top.
 
 Fits Gaussian, binomial, Poisson, and Gamma GLMs with smooth terms,
 random effects, bounded/constrained coefficients, location-scale
 extensions, survival likelihoods, and flexible/learnable link functions.
 Smoothing parameters are selected by REML or LAML. Posterior sampling
-uses NUTS.
+uses NUTS where supported, with a Gaussian Laplace fallback for model
+classes that don't yet have an exact NUTS path.
 
 **Docs:** <https://gamfit.readthedocs.io/> &middot; **PyPI:**
 <https://pypi.org/project/gamfit/>
@@ -34,9 +35,8 @@ gam predict model.json new_data.csv --uncertainty
 gam report model.json data.csv
 ```
 
-Pick whichever fits your workflow. The two share one engine, one
-formula DSL, and one on-disk format — train in the CLI, score in
-Python, or vice versa.
+Both share one engine, one formula DSL, and one on-disk format. Train
+in the CLI and score in Python, or vice versa.
 
 ## Install
 
@@ -63,15 +63,14 @@ Or build from source: `cargo build --release` — the binary lands at
 
 ## What makes it different
 
-These are the features you can't really stitch together out of
-existing GAM libraries.
+Features that other GAM libraries don't combine in one place.
 
 ### Three-part penalty structure
 
 Each smooth gets independent penalties on **magnitude, gradient, and
-curvature**. Most libraries collapse these into one (curvature only) or
-two — gamfit keeps them separate, so a flat-but-offset function and a
-wiggly function are penalized differently.
+curvature**. Most libraries use one (curvature only) or two. Keeping
+them separate penalizes a flat-but-offset function differently from a
+wiggly one.
 
 ```python
 gamfit.fit(df, "z ~ duchon(pc1, pc2, pc3, pc4, centers=50)")
@@ -79,26 +78,23 @@ gamfit.fit(df, "z ~ duchon(pc1, pc2, pc3, pc4, centers=50)")
 
 ### Adaptive per-axis anisotropy
 
-Surface smooths can learn how much to shrink each axis independently.
-No more pretending that `(latitude, age, log_income)` deserves a single
-length-scale.
+Surface smooths learn how much to shrink each axis independently, so
+`(latitude, age, log_income)` doesn't share a single length-scale.
 
 ```python
 gamfit.fit(df, "z ~ matern(pc1, pc2, pc3, pc4)", scale_dimensions=True)
 ```
 
 Side-by-side: isotropic global smoothing on the left, learned per-axis
-anisotropy on the right. Same data, same formula skeleton, very
-different population stability.
+anisotropy on the right. Same data, same formula skeleton.
 
 ![adaptive anisotropy: isotropic vs per-axis](bench/aniso_demo/02_normalized.png)
 
 ### Surface smooths in arbitrary dimension
 
-P-spline, thin-plate, Matérn, and **Duchon** radial bases — the last
-with triple-operator regularization (mass + tension + stiffness) and
-scale-free behaviour by default. Mix kernels and scaling regimes
-freely.
+P-spline, thin-plate, Matérn, and **Duchon** radial bases. Duchon uses
+triple-operator regularization (mass + tension + stiffness) and is
+scale-free by default. Kernels and scaling regimes can be mixed.
 
 ```python
 gamfit.fit(df, "y ~ matern(x1, x2, x3, nu=5/2)")
@@ -109,9 +105,8 @@ gamfit.fit(df, "y ~ te(space, time, k=10)")   # tensor product
 ### Flexible / learnable link functions
 
 A spline offset on top of a base link lets the data correct for link
-misspecification. Or pick `blended(logit, probit)` for a learned
-mixture; or `sas` / `beta-logistic` for shape parameters learned from
-the data.
+misspecification. `blended(logit, probit)` learns a mixture; `sas` and
+`beta-logistic` learn shape parameters from the data.
 
 ```python
 gamfit.fit(df, "case ~ s(age) + link(type=flexible(probit))"
@@ -121,9 +116,10 @@ gamfit.fit(df, "case ~ s(age) + link(type=flexible(probit))"
 ### Marginal-slope models
 
 For binary or survival outcomes with a calibrated risk score (e.g. a
-polygenic score), decouple **baseline risk** and **score effect** into
-separate formulas. The slope on the score becomes a smooth function of
-covariate space; the baseline can't absorb signal that belongs to it.
+polygenic score), put **baseline risk** and **score effect** in
+separate formulas. The slope on the score is a smooth function of
+covariate space, so the baseline can't absorb signal that belongs to
+it.
 
 ```python
 gamfit.fit(
@@ -148,16 +144,15 @@ S = pred.survival_at([1, 5, 10, 20])     # (n_rows, 4)
 H = pred.cumulative_hazard_at([10])      # (n_rows, 1)
 ```
 
-For population-scale cohorts, stream straight to CSV without
-materialising the full matrix:
-`pred.write_survival_at_csv("surv.csv", times=[...])`.
+For population-scale cohorts, stream to CSV without materialising the
+full matrix: `pred.write_survival_at_csv("surv.csv", times=[...])`.
 
 ### NUTS posteriors
 
 `model.sample(...)` runs the No-U-Turn Sampler over the coefficient
 posterior conditional on the fitted smoothing parameters. Predictive
-bands stream in row chunks so memory stays bounded on large
-test sets.
+bands stream in row chunks, so memory stays bounded on large test
+sets.
 
 ```python
 posterior = model.sample(train, seed=42)
@@ -167,9 +162,8 @@ bands = posterior.predict(test, level=0.95)
 
 ### Bounded coefficients with informative priors
 
-Hard interval transforms with optional Beta priors — useful for
-proportions, mixing weights, or any coefficient that *must* live in
-`[a, b]`:
+Hard interval transforms with optional Beta priors, for proportions,
+mixing weights, or any coefficient that must live in `[a, b]`:
 
 ```python
 gamfit.fit(df,
@@ -185,25 +179,25 @@ est = GAMRegressor(formula="y ~ s(x)").fit(X, y)
 
 ## How does it stack up
 
-On the standard `prostate` benchmark (5-fold CV, binomial), gamfit's
-Rust engine reaches **AUC 0.705** in **3.5 s** fit time — sitting
-between `mgcv` (AUC 0.704, 4.4 s) and `pygam` (AUC 0.701, 9.8 s) for
-accuracy, faster than both. Benchmark machinery and scenarios live in
-[`bench/`](bench/); aggregated results are in
+On the `prostate` benchmark (5-fold CV, binomial), gamfit's Rust
+engine reaches **AUC 0.705** alongside `mgcv` (AUC 0.704) and `gamlss`
+(AUC 0.711). `mgcv` is the fastest of the three; gamfit's value-add is
+not raw fit time on this scenario but the surrounding feature set
+(adaptive anisotropy, location-scale, marginal-slope, survival).
+Benchmark machinery and scenarios live in [`bench/`](bench/);
+aggregated results are in
 [`bench/prostate_gamair_results.json`](bench/prostate_gamair_results.json)
-and friends.
+and similar files.
 
 ## Where to learn more
 
-- **In-depth Python documentation:** <https://gamfit.readthedocs.io/>
-  &mdash; getting started, the full formula DSL, families and links,
-  survival, marginal-slope, posterior sampling, scikit-learn
-  integration, a runnable cookbook, and an auto-generated API
-  reference.
+- **Python documentation:** <https://gamfit.readthedocs.io/> — getting
+  started, the formula DSL, families and links, survival,
+  marginal-slope, posterior sampling, scikit-learn integration, a
+  runnable cookbook, and an auto-generated API reference.
 - **CLI help:** `gam <command> --help` (commands: `fit`, `predict`,
   `report`, `diagnose`, `sample`, `generate`).
-- **Cookbook of runnable recipes:** see
-  [docs/cookbook.md](docs/cookbook.md).
+- **Cookbook:** [docs/cookbook.md](docs/cookbook.md).
 
 ## Repository layout
 
@@ -234,9 +228,9 @@ Benchmark suite: `python3 bench/run_suite.py --help`.
 
 ## Issues, feedback, contributions
 
-Please open a [GitHub issue](https://github.com/SauersML/gam/issues)
-with bug reports, feature requests, or questions — including "this
-doesn't work the way I expect."
+Open a [GitHub issue](https://github.com/SauersML/gam/issues) for bug
+reports, feature requests, or questions — including "this doesn't
+work the way I expect."
 
 ## License
 

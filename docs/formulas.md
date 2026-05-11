@@ -1,18 +1,18 @@
 # Formula DSL reference
 
-Every model in `gamfit` is specified as a Wilkinson-style formula:
+Every model in `gamfit` uses a Wilkinson-style formula:
 
 ```
 response ~ term + term + ... + option(...)
 ```
 
-Terms are joined with `+`. Multiplication and `:` are *not* used — interaction
-structure comes from multivariate smooths (`s(x1, x2)`, `te(x1, x2)`,
-`matern(...)`, `duchon(...)`) rather than `x1*x2`.
+Terms are joined with `+`. `*` and `:` are not supported — interactions come
+from multivariate smooths (`s(x1, x2)`, `te(x1, x2)`, `matern(...)`,
+`duchon(...)`).
 
-This page is a reference for every term you can put on the right-hand side,
-every option each term accepts, and the formula-level options (`link(...)`,
-`linkwiggle(...)`, `timewiggle(...)`, `survmodel(...)`).
+This page lists every right-hand-side term, its options, and the
+formula-level options (`link(...)`, `linkwiggle(...)`, `timewiggle(...)`,
+`survmodel(...)`).
 
 ## The response (left of `~`)
 
@@ -24,8 +24,8 @@ every option each term accepts, and the formula-level options (`link(...)`,
 | `y` (positive continuous, with `link(type=log)`) | Gamma. |
 | `Surv(entry, exit, event)` | Survival model. See [survival.md](survival.md). |
 
-The family is auto-detected from the response column. Use `family=` or
-`link()` to override.
+The family is detected from the response column. Override with `family=` or
+`link()`.
 
 ## Linear and constrained coefficients
 
@@ -39,10 +39,10 @@ y ~ nonpositive(x)                   # sugar for linear(x, max=0)
 y ~ bounded(x, min=0, max=1)         # exact interval transform (no ridge)
 ```
 
-`linear(x, min=…, max=…)` keeps the ordinary penalized linear term but
-projects the coefficient into `[min, max]`. `bounded(...)` instead applies
-an exact interval transform — useful when you want hard bounds without the
-ridge term distorting your prior toward zero.
+`linear(x, min=…, max=…)` keeps the penalized linear term and projects the
+coefficient into `[min, max]`. `bounded(...)` applies an exact interval
+transform instead, giving hard bounds without a ridge term pulling toward
+zero.
 
 `bounded(...)` supports a prior on the unit-scaled interior:
 
@@ -55,19 +55,18 @@ bounded(x, min=0, max=1, beta_a=2.5, beta_b=2.5)     # explicit Beta(a, b)
 
 `prior=` options:
 
-- `none` — flat on the transformed scale, no penalty (default if `prior` is
-  omitted with no other prior args).
+- `none` — flat on the transformed scale, no penalty (default when no other
+  prior args are set).
 - `uniform` / `log-jacobian` — flat on the original scale (log-Jacobian
   correction).
-- `center` — Beta(2, 2) pulling toward the midpoint.
+- `center` — Beta(2, 2) toward the midpoint.
 
-`target` ∈ `(min, max)` with `strength > 0` is the convenient way to write
-"pull toward target with this much strength": it sets
+`target` ∈ `(min, max)` with `strength > 0` shorthand: sets
 `a = 1 + strength·z`, `b = 1 + strength·(1−z)`, where
 `z = (target − min) / (max − min)`.
 
-Aliases for box constraints: `linear`, `constrain`, `constraint`, `box`,
-`bounded` (the latter with the transform rather than ridge).
+Aliases for box constraints: `linear`, `constrain`, `constraint`, `box`.
+`bounded` uses the transform rather than the ridge.
 
 ## Random effects
 
@@ -77,8 +76,7 @@ y ~ x + re(site)            # alias
 ```
 
 Adds a random intercept per level of the grouping column. The column may be
-string- or integer-valued. Only random intercepts are supported — no random
-slopes.
+string- or integer-valued. Random slopes are not supported.
 
 ## Univariate smooths
 
@@ -92,8 +90,8 @@ y ~ s(x, type=ps)           # explicit P-spline
 y ~ s(x, double_penalty=true)
 ```
 
-Default `s(x)` for a single covariate is a cubic P-spline with a second-order
-difference penalty. Options:
+For a single covariate, `s(x)` defaults to a cubic P-spline with a
+second-order difference penalty. Options:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -104,8 +102,7 @@ difference penalty. Options:
 | `type` | `ps` (1-D), `tps` (2+D) | `ps`, `tps`, `matern`, `duchon`. |
 | `double_penalty` | `true` | Add a ridge penalty alongside the difference penalty. |
 
-Default `k`: `clamp(unique_values / 4, 4, max(20, cbrt(unique_values)))`. You
-rarely need to touch this.
+Default `k`: `clamp(unique_values / 4, 4, max(20, cbrt(unique_values)))`.
 
 ## Multivariate smooths
 
@@ -143,8 +140,7 @@ Radial basis with Matérn covariance kernel.
 | `double_penalty` | `true` | Ridge + main penalty. |
 | `scale_dims` | `false` | Per-axis anisotropy (learns axis contrasts). |
 
-Higher `nu` gives smoother sample paths; `5/2` is the standard "smooth but
-not analytic" choice.
+Higher `nu` gives smoother sample paths. `5/2` is smooth but not analytic.
 
 ### Duchon (`duchon`)
 
@@ -159,15 +155,13 @@ stiffness). Scale-free unless `length_scale` is given.
 | `length_scale` | none | Optional global scale (hybrid mode). |
 | `scale_dims` | `false` | Per-axis shape contrasts. Scale-free by default. |
 
-Three independent penalties (mass, tension, stiffness) get their own
-smoothing parameters under REML — this is the three-part penalty structure
-that distinguishes `gamfit` from libraries with a single curvature penalty.
+Three independent penalties (mass, tension, stiffness) each get their own
+smoothing parameter under REML.
 
 ### Tensor product (`te`, `tensor`)
 
-Kronecker product of univariate B-spline bases. Lets each axis have its own
-smoothing parameter — appropriate when axes have different units (e.g. space
-× time).
+Kronecker product of univariate B-spline bases. Each axis gets its own
+smoothing parameter. Use when axes have different units (e.g. space × time).
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -189,9 +183,8 @@ smoothing parameter — appropriate when axes have different units (e.g. space
 
 ## Adaptive anisotropy
 
-For any multi-d smooth that supports it, add `scale_dims=true` (or set
-`scale_dimensions=True` on `fit()`) to let the model learn how much to
-shrink each axis independently:
+For multi-d smooths that support it, add `scale_dims=true` (or set
+`scale_dimensions=True` on `fit()`) to learn per-axis shrinkage:
 
 ```python
 gamfit.fit(
@@ -204,9 +197,9 @@ gamfit.fit(
 - **Matérn / hybrid Duchon (with `length_scale`):** optimizes a global scale
   plus centered per-axis contrasts.
 - **Pure Duchon (no `length_scale`):** optimizes only the centered per-axis
-  contrasts — stays scale-free.
-- **Thin-plate / tensor:** standardizes inputs per axis before evaluating
-  the kernel.
+  contrasts; stays scale-free.
+- **Thin-plate / tensor:** standardizes inputs per axis before kernel
+  evaluation.
 
 ## Link function
 
@@ -232,16 +225,16 @@ y ~ x + link(type=flexible(probit))
 | `sas` | Sinh-arcsinh skewed link. Don't combine with `linkwiggle`. |
 | `beta-logistic` | Bounded link. Don't combine with `linkwiggle`. |
 | `blended(a, b, …)` | Mixture of two or more component inverse links (e.g. `logit`, `probit`, `cloglog`, `loglog`, `cauchit`). |
-| `flexible(base)` | A spline offset from a base link. Automatically enables `linkwiggle`. |
+| `flexible(base)` | A spline offset from a base link. Enables `linkwiggle`. |
 
-You can also set it from the Python side with `link=` on `fit()`:
+Set it from Python with `link=` on `fit()`:
 
 ```python
 gamfit.fit(df, "case ~ s(age)", link="logit")
 ```
 
-`link(type=...)` in the formula and `link=` on `fit()` are equivalent; if
-both are set, the formula-level option wins.
+`link(type=...)` in the formula and `link=` on `fit()` are equivalent. If
+both are set, the formula wins.
 
 ## `linkwiggle` — flexible link offset
 
@@ -251,9 +244,8 @@ y ~ s(x) + linkwiggle(internal_knots=10)
 y ~ s(x) + linkwiggle(degree=2, internal_knots=8, penalty_order=all)
 ```
 
-Adds a spline offset to a base link, letting the data correct for link
-misspecification while encoding the belief that the base link is
-approximately right.
+Adds a spline offset to a base link. The data can correct for link
+misspecification; the base link is the prior.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -272,8 +264,8 @@ Surv(entry, exit, event) ~ age + timewiggle(internal_knots=8)
 ```
 
 Same options as `linkwiggle`. Adds a spline offset to the survival time
-basis, so the baseline hazard can flex away from a parametric form. Only
-valid in survival formulas. See [survival.md](survival.md).
+basis so the baseline hazard can deviate from a parametric form. Survival
+formulas only. See [survival.md](survival.md).
 
 ## `survmodel` — survival configuration
 
@@ -286,10 +278,10 @@ Surv(entry, exit, event) ~ age + survmodel(spec=net, distribution=gaussian)
 | `spec` | Baseline specification, e.g. `net`. |
 | `distribution` | Distributional assumption, e.g. `gaussian`. |
 
-These typically pair with `survival_likelihood=` on `fit()` and the
-`--predict-noise` route. See [survival.md](survival.md) for full details.
+Pair with `survival_likelihood=` on `fit()` and the `--predict-noise` route.
+See [survival.md](survival.md).
 
-## A few full examples
+## Examples
 
 ```python
 # Simple GAM with a smooth and a linear term
