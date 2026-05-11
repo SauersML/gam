@@ -285,6 +285,50 @@ pub trait RowKernel<const K: usize>: Send + Sync {
     fn warm_up_directional_caches(&self) -> Result<(), String> {
         Ok(())
     }
+
+    /// Optional batched fast path for the `(n × K·rank)` projection
+    /// `J · F` that [`RowKernelDirectionalDerivativeOperator::compute_jf`]
+    /// builds row-by-row.
+    ///
+    /// `factor` is the `(p_total × rank)` coefficient-space factor `F`.
+    /// On success, returns a row-major `(n × K·rank)` matrix whose entry
+    /// `(r, k·rank + c)` equals `(J_r · F[:, c])[k]` — the exact same
+    /// layout the per-row fallback writes (see
+    /// `compute_jf`'s `jf_row[k * rank + k_col] = vec_k[k]`).
+    ///
+    /// **When to override.** For kernels whose `jacobian_action(r, …)` is
+    /// a linear combination of design-row dot products with disjoint
+    /// coefficient blocks, the whole `J · F` decomposes block-wise into a
+    /// fixed set of dense matrix-matrix products `X_block · F[block, :]`
+    /// that BLAS can dispatch as GEMM. Concretely for the bernoulli
+    /// marginal-slope row kernel (K=2):
+    ///
+    /// ```text
+    ///   [J · F]_{:, 0..rank}        = marginal_design · F[marg_range, :]
+    ///   [J · F]_{:, rank..2·rank}   = logslope_design · F[logs_range, :]
+    /// ```
+    ///
+    /// On hot biobank shapes (n ≈ 1e4–1e5, rank ≈ 81, K = 2) this turns
+    /// a 2-billion-op rayon-fanned per-row build into a pair of GEMMs
+    /// that fit cleanly in BLAS — measured ~5–10× faster end-to-end on
+    /// the plain margslope path because the build is the dominant per-
+    /// trace cost (`trace_logdet_operator` is rebuilt every outer eval
+    /// since `g_factor` changes with β, defeating the
+    /// `ProjectedFactorCache` value-hash key across iters).
+    ///
+    /// **Correctness contract.** Implementors must produce the same
+    /// numerical values as the per-row path within rounding noise. The
+    /// per-row reference is:
+    ///
+    /// ```text
+    ///   jf[r, k * rank + c] = jacobian_action(r, F[:, c])[k]
+    /// ```
+    ///
+    /// Returning `None` lets the caller fall back to the generic per-row
+    /// path; the default impl is `None`.
+    fn jacobian_action_matrix(&self, _factor: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
+        None
+    }
 }
 
 // ── Cache ────────────────────────────────────────────────────────────
@@ -733,10 +777,19 @@ impl<const K: usize, T: RowKernel<K>> RowKernelDirectionalDerivativeOperator<K, 
         let n_rows = self.kern.n_rows();
         let rank = factor.ncols();
         let stride = K * rank;
-        let mut jf = Array2::<f64>::zeros((n_rows, stride));
         if n_rows == 0 || rank == 0 {
+            return Array2::<f64>::zeros((n_rows, stride));
+        }
+        // BLAS-3 fast path: kernels with a linear design-row-dot-product
+        // Jacobian (e.g. bernoulli marginal-slope) decompose `J · F` into
+        // a fixed pair of dense matrix-matrix products. Skip the per-row
+        // rayon loop entirely when the kernel offers an override.
+        if let Some(jf) = self.kern.jacobian_action_matrix(factor.view()) {
+            debug_assert_eq!(jf.dim(), (n_rows, stride));
             return jf;
         }
+
+        let mut jf = Array2::<f64>::zeros((n_rows, stride));
         // Standard-layout `F^T` (rank × p) so each column of F is a contiguous
         // row of `f_t`, suitable for the slice-taking `jacobian_action`.
         let f_t: Array2<f64> = factor.t().as_standard_layout().into_owned();
