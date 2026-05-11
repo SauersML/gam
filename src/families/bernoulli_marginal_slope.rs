@@ -1153,6 +1153,62 @@ struct BernoulliMarginalSlopeFamily {
     /// updated atomically so two threads cannot both decide "new ρ" and
     /// double-bump.
     auto_subsample_last_rho: Arc<Mutex<Option<Array1<f64>>>>,
+    /// Per-outer-eval shared exact-eval cache. The Hessian and ψ workspaces
+    /// constructed for the same `(block_states, options)` consume an
+    /// identical cache build (row contexts + cell moments + per-row primary
+    /// Hessians + rigid third/fourth tensor warm-ups). This slot lets the
+    /// second workspace pick up the first one's primed `Arc` instead of
+    /// rebuilding from scratch. Keyed by a content fingerprint of the
+    /// joint β snapshot and the subsample Arc identity carried on the
+    /// options — a change in either invalidates the entry and forces a
+    /// fresh build on next access.
+    shared_eval_cache: Arc<Mutex<Option<SharedEvalCacheEntry>>>,
+}
+
+#[derive(Clone)]
+struct SharedEvalCacheFingerprint {
+    /// Flattened β snapshot across all blocks, in block order. The exact
+    /// cache build (row contexts + per-row jets + cell moments) is a pure
+    /// function of β + design + options, so byte-equal β + matching
+    /// subsample identity → identical cache.
+    betas: Vec<Array1<f64>>,
+    /// Pointer identity of the per-eval outer-score subsample Arc, if any.
+    /// `None` is distinct from `Some(_)` and from a different `Some` Arc.
+    subsample: Option<usize>,
+}
+
+impl SharedEvalCacheFingerprint {
+    fn from_inputs(block_states: &[ParameterBlockState], options: &BlockwiseFitOptions) -> Self {
+        let betas = block_states.iter().map(|s| s.beta.clone()).collect();
+        let subsample = options
+            .outer_score_subsample
+            .as_ref()
+            .map(|arc| Arc::as_ptr(arc) as usize);
+        Self { betas, subsample }
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        if self.subsample != other.subsample {
+            return false;
+        }
+        if self.betas.len() != other.betas.len() {
+            return false;
+        }
+        for (a, b) in self.betas.iter().zip(other.betas.iter()) {
+            if a.len() != b.len() {
+                return false;
+            }
+            if a.iter().zip(b.iter()).any(|(x, y)| x.to_bits() != y.to_bits()) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+struct SharedEvalCacheEntry {
+    fingerprint: SharedEvalCacheFingerprint,
+    cache: Arc<BernoulliMarginalSlopeExactEvalCache>,
 }
 
 /// Number of outer-gradient evaluations the auto-subsample schedule
@@ -3266,6 +3322,12 @@ struct BlockPsiRow {
     range: std::ops::Range<usize>,
     /// The p_block-length psi design derivative row.
     local_vec: Array1<f64>,
+}
+
+struct PsiAxisSpec {
+    block_idx: usize,
+    idx_primary: usize,
+    psi_map: crate::families::custom_family::PsiDesignMap,
 }
 
 #[derive(Clone)]
@@ -11993,13 +12055,22 @@ impl BernoulliMarginalSlopeFamily {
         cache: &BernoulliMarginalSlopeExactEvalCache,
         options: &BlockwiseFitOptions,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        let slices = &cache.slices;
-        let primary = &cache.primary;
         let Some((block_idx, local_idx)) = psi_derivative_location(derivative_blocks, psi_index)
         else {
             return Ok(None);
         };
-        let idx_primary = if block_idx == 0 { 0 } else { 1 };
+        let axis = self.resolve_psi_axis_spec(derivative_blocks, block_idx, local_idx)?;
+        let mut results =
+            self.run_psi_row_pass_for_axes(block_states, cache, options, &[axis])?;
+        Ok(Some(results.remove(0)))
+    }
+
+    fn resolve_psi_axis_spec(
+        &self,
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        block_idx: usize,
+        local_idx: usize,
+    ) -> Result<PsiAxisSpec, String> {
         let n = self.y.len();
         let deriv = &derivative_blocks[block_idx][local_idx];
         let (p_psi, psi_label) = match block_idx {
@@ -12017,8 +12088,6 @@ impl BernoulliMarginalSlopeFamily {
                 ));
             }
         };
-
-        // Build the psi design map once; per-row calls use direct row_vector(row).
         let psi_map = crate::families::custom_family::resolve_custom_family_x_psi_map(
             deriv,
             n,
@@ -12027,41 +12096,50 @@ impl BernoulliMarginalSlopeFamily {
             psi_label,
             &self.policy,
         )?;
+        Ok(PsiAxisSpec {
+            block_idx,
+            idx_primary: if block_idx == 0 { 0 } else { 1 },
+            psi_map,
+        })
+    }
 
-        // Eager-prime the per-row uncontracted third-derivative cache *before*
-        // entering the per-axis row `par_iter` so the build's own `par_iter`
-        // does not nest inside an active rayon job. Subsequent ψ-axis sweeps
-        // hit the cache via O(1) lookups in `rigid_third_full_cached`. Skipped
-        // on the FLEX path because that branch routes through the flex jet
-        // machinery, which has its own row-cell-moments cache.
+    fn run_psi_row_pass_for_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        options: &BlockwiseFitOptions,
+        axes: &[PsiAxisSpec],
+    ) -> Result<Vec<ExactNewtonJointPsiTerms>, String> {
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        let n = self.y.len();
+        let k = axes.len();
+
         if !self.effective_flex_active(block_states)? {
             let _ = self.rigid_third_full_cached(block_states, cache, 0)?;
         }
 
-        // Block-local accumulator path: avoids O(n p^2) dense Hessian
         let weighted_rows = outer_weighted_rows(options, n);
-        let (objective_psi, score_psi, block_acc) = weighted_rows
-            .into_par_iter()
-            .try_fold(
-                || {
+        let make_acc = || -> Vec<(f64, Array1<f64>, BernoulliBlockHessianAccumulator)> {
+            (0..k)
+                .map(|_| {
                     (
                         0.0f64,
                         Array1::<f64>::zeros(slices.total),
                         BernoulliBlockHessianAccumulator::new(slices),
                     )
-                },
+                })
+                .collect()
+        };
+        let folded = weighted_rows
+            .into_par_iter()
+            .try_fold(
+                make_acc,
                 |mut acc, wr| -> Result<_, String> {
                     let row = wr.index;
                     let w = wr.weight;
-                    let dir = self.row_primary_psi_direction_from_map(
-                        row,
-                        block_idx,
-                        &psi_map,
-                        block_states,
-                        primary,
-                    )?;
                     let row_ctx = Self::row_ctx(cache, row);
-                    let (f_pi, mut f_pipi) = self
+                    let (f_pi, f_pipi_base) = self
                         .compute_row_primary_gradient_hessian_reusing_cache(
                             row,
                             block_states,
@@ -12069,67 +12147,79 @@ impl BernoulliMarginalSlopeFamily {
                             row_ctx,
                             cache,
                         )?;
-                    let mut third = self.row_primary_third_contracted_recompute(
-                        row,
-                        block_states,
-                        cache,
-                        row_ctx,
-                        &dir,
-                    )?;
-                    let psi_row = self.block_psi_row_from_map(row, block_idx, &psi_map, slices)?;
-                    let mut f_pipi_dir = f_pipi.dot(&dir);
-                    if w != 1.0 {
-                        f_pipi.mapv_inplace(|v| v * w);
-                        third.mapv_inplace(|v| v * w);
-                        f_pipi_dir.mapv_inplace(|v| v * w);
-                    }
-                    acc.0 += w * f_pi.dot(&dir);
-                    acc.1
-                        .slice_mut(s![psi_row.range.clone()])
-                        .scaled_add(w * f_pi[idx_primary], &psi_row.local_vec);
-                    acc.1 += &self.pullback_primary_vector(row, slices, primary, &f_pipi_dir)?;
+                    for (axis_idx, axis) in axes.iter().enumerate() {
+                        let dir = self.row_primary_psi_direction_from_map(
+                            row,
+                            axis.block_idx,
+                            &axis.psi_map,
+                            block_states,
+                            primary,
+                        )?;
+                        let mut f_pipi = f_pipi_base.clone();
+                        let mut third = self.row_primary_third_contracted_recompute(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            &dir,
+                        )?;
+                        let psi_row = self.block_psi_row_from_map(
+                            row,
+                            axis.block_idx,
+                            &axis.psi_map,
+                            slices,
+                        )?;
+                        let mut f_pipi_dir = f_pipi.dot(&dir);
+                        if w != 1.0 {
+                            f_pipi.mapv_inplace(|v| v * w);
+                            third.mapv_inplace(|v| v * w);
+                            f_pipi_dir.mapv_inplace(|v| v * w);
+                        }
+                        let slot = &mut acc[axis_idx];
+                        slot.0 += w * f_pi.dot(&dir);
+                        slot.1
+                            .slice_mut(s![psi_row.range.clone()])
+                            .scaled_add(w * f_pi[axis.idx_primary], &psi_row.local_vec);
+                        slot.1 +=
+                            &self.pullback_primary_vector(row, slices, primary, &f_pipi_dir)?;
 
-                    // psi_row outer pullback(f_pipi[idx_primary,:]) + transpose
-                    // (already w-scaled above via f_pipi).
-                    let right_primary = f_pipi.row(idx_primary).to_owned();
-                    acc.2.add_rank1_psi_cross(
-                        self,
-                        row,
-                        slices,
-                        primary,
-                        block_idx,
-                        &psi_row.local_vec,
-                        &right_primary,
-                    );
-                    // third tensor pullback
-                    acc.2.add_pullback(self, row, slices, primary, &third);
+                        let right_primary = f_pipi.row(axis.idx_primary).to_owned();
+                        slot.2.add_rank1_psi_cross(
+                            self,
+                            row,
+                            slices,
+                            primary,
+                            axis.block_idx,
+                            &psi_row.local_vec,
+                            &right_primary,
+                        );
+                        slot.2.add_pullback(self, row, slices, primary, &third);
+                    }
                     Ok(acc)
                 },
             )
             .try_reduce(
-                || {
-                    (
-                        0.0f64,
-                        Array1::<f64>::zeros(slices.total),
-                        BernoulliBlockHessianAccumulator::new(slices),
-                    )
-                },
+                make_acc,
                 |mut left, right| -> Result<_, String> {
-                    left.0 += right.0;
-                    left.1 += &right.1;
-                    left.2.add(&right.2);
+                    for (l, r) in left.iter_mut().zip(right.into_iter()) {
+                        l.0 += r.0;
+                        l.1 += &r.1;
+                        l.2.add(&r.2);
+                    }
                     Ok(left)
                 },
             )?;
-        // Per-row HT weighting is applied inside the fold; the final
-        // accumulator is the unbiased estimator under variable per-row
-        // weights, so no post-sum rescale is needed.
-        Ok(Some(ExactNewtonJointPsiTerms {
-            objective_psi,
-            score_psi,
-            hessian_psi: Array2::zeros((0, 0)),
-            hessian_psi_operator: Some(std::sync::Arc::new(block_acc.into_operator(slices))),
-        }))
+
+        let mut out = Vec::with_capacity(k);
+        for (objective_psi, score_psi, block_acc) in folded.into_iter() {
+            out.push(ExactNewtonJointPsiTerms {
+                objective_psi,
+                score_psi,
+                hessian_psi: Array2::zeros((0, 0)),
+                hessian_psi_operator: Some(std::sync::Arc::new(block_acc.into_operator(slices))),
+            });
+        }
+        Ok(out)
     }
 
     fn exact_newton_joint_psisecond_order_terms_from_cache(
@@ -16107,6 +16197,41 @@ impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiW
             )
     }
 
+    fn first_order_terms_all(&self) -> Result<Option<Vec<ExactNewtonJointPsiTerms>>, String> {
+        let total: usize = self.derivative_blocks.iter().map(Vec::len).sum();
+        if total == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        for psi_index in 0..total {
+            if self
+                .family
+                .is_sigma_aux_index(&self.derivative_blocks, psi_index)
+            {
+                return Ok(None);
+            }
+        }
+        let mut axes: Vec<PsiAxisSpec> = Vec::with_capacity(total);
+        for psi_index in 0..total {
+            let Some((block_idx, local_idx)) =
+                psi_derivative_location(&self.derivative_blocks, psi_index)
+            else {
+                return Ok(None);
+            };
+            axes.push(self.family.resolve_psi_axis_spec(
+                &self.derivative_blocks,
+                block_idx,
+                local_idx,
+            )?);
+        }
+        let results = self.family.run_psi_row_pass_for_axes(
+            &self.block_states,
+            &self.cache,
+            &self.options,
+            &axes,
+        )?;
+        Ok(Some(results))
+    }
+
     fn second_order_terms(
         &self,
         psi_i: usize,
@@ -16647,6 +16772,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             intercept_warm_starts: Some(Arc::clone(&intercept_warm_starts)),
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         }
     };
 
@@ -17015,6 +17141,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let marginal_beta = array![0.05, 0.08];
         let logslope_beta = array![-0.15, 0.04];
@@ -17595,6 +17722,7 @@ mod tests {
                 intercept_warm_starts: cache,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let marginal_eta = Array1::from_iter((0..n).map(|i| 0.15 * ((i as f64) * 0.001).sin()));
         let slope_eta = Array1::from_iter((0..n).map(|i| 0.35 + 0.02 * ((i as f64) * 0.003).cos()));
@@ -17695,6 +17823,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let states = vec![
             ParameterBlockState {
@@ -17765,6 +17894,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -17924,6 +18054,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -18624,6 +18755,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -18747,6 +18879,7 @@ mod tests {
             intercept_warm_starts: Some(new_intercept_warm_start_cache(n)),
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let marginal_eta = 0.35;
         let slope = -0.8;
@@ -18830,6 +18963,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -18904,6 +19038,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -18966,6 +19101,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let current = Array1::<f64>::zeros(score_dim);
         let mut proposed = current.clone();
@@ -19804,6 +19940,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
             };
 
         let a = 0.35;
@@ -19976,6 +20113,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let specs = vec![
             dummy_blockspec(1, 3),
@@ -20194,6 +20332,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let specs = vec![
             ParameterBlockSpec {
@@ -20256,6 +20395,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let states_at = |q: f64, g: f64| {
             vec![
@@ -20395,6 +20535,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
 
         // Three blocks: marginal (dim 0), logslope (dim 0), link_dev.
@@ -20501,6 +20642,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
 
         let block_states = vec![
@@ -20602,6 +20744,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -20746,6 +20889,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -20859,6 +21003,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
 
         let block_states = vec![
@@ -20992,6 +21137,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
 
         let block_states = vec![
@@ -21129,6 +21275,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -21285,6 +21432,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -21394,6 +21542,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -21480,6 +21629,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -21564,6 +21714,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -21655,6 +21806,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -21768,6 +21920,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -21900,6 +22053,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -22055,6 +22209,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -22161,6 +22316,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -22267,6 +22423,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -22384,6 +22541,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -22499,6 +22657,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -22631,6 +22790,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -22750,6 +22910,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -22867,6 +23028,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -23008,6 +23170,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -23123,6 +23286,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -23236,6 +23400,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -23365,6 +23530,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -23454,6 +23620,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -23543,6 +23710,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -23637,6 +23805,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -23731,6 +23900,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -23814,6 +23984,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -23897,6 +24068,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let zero = Array1::<f64>::zeros(slices.total);
@@ -23967,6 +24139,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let zero = Array1::<f64>::zeros(slices.total);
@@ -24027,6 +24200,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let beta_w = Array1::from_iter(
             (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
@@ -24143,6 +24317,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
@@ -24268,6 +24443,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
@@ -24418,6 +24594,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
@@ -24555,6 +24732,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let beta_m = array![0.18, -0.07];
         let beta_g = array![0.42, 0.05];
@@ -24979,6 +25157,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -25054,6 +25233,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let family = make_family(sigma);
         let block_states = vec![
@@ -25152,6 +25332,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -25807,6 +25988,7 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let beta_m = array![0.12, -0.04];
         let beta_g = array![0.35, 0.03];
