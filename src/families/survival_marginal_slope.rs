@@ -11956,7 +11956,7 @@ impl SurvivalMarginalSlopeFamily {
             self.evaluate_exact_newton_joint_dynamic_q_dense(block_states)
         } else {
             let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
-            let cache = build_row_kernel_cache(&kern)?;
+            let cache = build_row_kernel_cache(&kern, &crate::families::row_kernel::RowSet::All)?;
             Ok((
                 row_kernel_log_likelihood(&cache),
                 -row_kernel_gradient(&kern, &cache),
@@ -13763,7 +13763,7 @@ impl SurvivalMarginalSlopeFamily {
         // quantities.  The cache evaluates every row kernel once and stores
         // (nll_i, g_i[4], H_i[4×4]).
         let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
-        let cache = build_row_kernel_cache(&kern)?;
+        let cache = build_row_kernel_cache(&kern, &crate::families::row_kernel::RowSet::All)?;
 
         let ll = row_kernel_log_likelihood(&cache);
 
@@ -14169,7 +14169,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             }));
         }
         let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
-        let cache = build_row_kernel_cache(&kern)?;
+        let cache = build_row_kernel_cache(&kern, &crate::families::row_kernel::RowSet::All)?;
         Ok(Some(ExactNewtonJointGradientEvaluation {
             log_likelihood: row_kernel_log_likelihood(&cache),
             gradient: -row_kernel_gradient(&kern, &cache),

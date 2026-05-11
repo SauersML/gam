@@ -13171,7 +13171,7 @@ impl BernoulliMarginalSlopeFamily {
         // the previous implementation paid.
         if !flex_active && slices.total < 512 {
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
-            let cache = build_row_kernel_cache(&kern)?;
+            let cache = build_row_kernel_cache(&kern, &crate::families::row_kernel::RowSet::All)?;
             let ll = row_kernel_log_likelihood(&cache);
             let joint_gradient = Self::exact_newton_score_from_objective_gradient(
                 row_kernel_gradient(&kern, &cache),
@@ -13880,7 +13880,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }
         if !self.effective_flex_active(block_states)? {
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
-            let cache = build_row_kernel_cache(&kern)?;
+            let cache = build_row_kernel_cache(&kern, &crate::families::row_kernel::RowSet::All)?;
             return Ok(Some(row_kernel_hessian_dense(&kern, &cache)));
         }
 
@@ -13915,7 +13915,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         self.validate_exact_monotonicity(block_states)?;
         if !self.effective_flex_active(block_states)? {
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
-            let cache = build_row_kernel_cache(&kern)?;
+            let cache = build_row_kernel_cache(&kern, &crate::families::row_kernel::RowSet::All)?;
             return Ok(Some(ExactNewtonJointGradientEvaluation {
                 log_likelihood: row_kernel_log_likelihood(&cache),
                 gradient: Self::exact_newton_score_from_objective_gradient(row_kernel_gradient(
