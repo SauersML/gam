@@ -13,6 +13,7 @@ use gam::families::survival_predict::{
     apply_inverse_link_state_to_fit_result, fit_result_from_saved_model_for_prediction,
 };
 use gam::gamlss::{BinomialLocationScaleFitResult, GaussianLocationScaleFitResult};
+use gam::hmc::{NutsConfig, NutsResult};
 use gam::inference::data::{
     EncodedDataset, UnseenCategoryPolicy, encode_recordswith_inferred_schema,
     encode_recordswith_schema,
@@ -81,6 +82,23 @@ struct PyFitConfig {
 
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PySampleOptions {
+    /// Posterior draws per chain (after warmup). When omitted, falls back to
+    /// `NutsConfig::for_dimension`.
+    samples: Option<usize>,
+    /// Warmup iterations per chain. When omitted, matches `samples` via the
+    /// dimension-adaptive default.
+    warmup: Option<usize>,
+    /// Number of parallel chains.
+    chains: Option<usize>,
+    /// Target HMC acceptance rate (0, 1).
+    target_accept: Option<f64>,
+    /// RNG seed for deterministic chain initialisation.
+    seed: Option<u64>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PyPredictOptions {
     interval: Option<f64>,
     time_grid: Option<Vec<f64>>,
@@ -128,6 +146,37 @@ struct SchemaCheckPayload {
 #[derive(Serialize)]
 struct PredictionPayload {
     columns: BTreeMap<String, Vec<f64>>,
+}
+
+/// JSON wire format for NUTS posterior draws.
+///
+/// `samples_flat` is a row-major flattening of an `(n_draws, n_coeffs)`
+/// matrix.  The Python side rebuilds the numpy array via
+/// `np.asarray(samples_flat).reshape(n_draws, n_coeffs)` — flat lists round
+/// trip through `serde_json` faster than nested ones at the sizes typical
+/// for biobank-scale work (millions of doubles), and they sidestep the
+/// per-row Python list construction cost.
+#[derive(Serialize)]
+struct SamplePayload {
+    samples_flat: Vec<f64>,
+    n_draws: usize,
+    n_coeffs: usize,
+    coefficient_names: Vec<String>,
+    posterior_mean: Vec<f64>,
+    posterior_std: Vec<f64>,
+    rhat: f64,
+    ess: f64,
+    converged: bool,
+    config: SampleConfigPayload,
+}
+
+#[derive(Serialize)]
+struct SampleConfigPayload {
+    n_samples: usize,
+    n_warmup: usize,
+    n_chains: usize,
+    target_accept: f64,
+    seed: u64,
 }
 
 #[derive(Serialize)]
@@ -179,6 +228,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "fit",
             "load",
             "predict",
+            "sample",
             "summary",
             "check",
             "report",
@@ -253,6 +303,18 @@ fn predict_table(
 }
 
 #[pyfunction]
+fn sample_table(
+    py: Python<'_>,
+    model_bytes: Vec<u8>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    options_json: Option<String>,
+) -> PyResult<String> {
+    py.detach(move || sample_table_impl(&model_bytes, headers, rows, options_json.as_deref()))
+        .map_err(py_value_error)
+}
+
+#[pyfunction]
 fn summary_json(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
     py.detach(move || summary_json_impl(&model_bytes))
         .map_err(py_value_error)
@@ -289,6 +351,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(load_model, module)?)?;
     module.add_function(wrap_pyfunction!(validate_formula_json, module)?)?;
     module.add_function(wrap_pyfunction!(predict_table, module)?)?;
+    module.add_function(wrap_pyfunction!(sample_table, module)?)?;
     module.add_function(wrap_pyfunction!(summary_json, module)?)?;
     module.add_function(wrap_pyfunction!(check_json, module)?)?;
     module.add_function(wrap_pyfunction!(report_html, module)?)?;
@@ -594,6 +657,83 @@ fn predict_table_impl(
 
     serde_json::to_string(&PredictionPayload { columns })
         .map_err(|err| format!("failed to serialize prediction payload: {err}"))
+}
+
+fn parse_sample_options(options_json: Option<&str>) -> Result<PySampleOptions, String> {
+    match options_json {
+        Some(raw) if !raw.trim().is_empty() => serde_json::from_str(raw)
+            .map_err(|err| format!("failed to parse sample options json: {err}")),
+        _ => Ok(PySampleOptions::default()),
+    }
+}
+
+fn resolve_nuts_config(model: &FittedModel, options: PySampleOptions) -> NutsConfig {
+    // Mirror the CLI's adaptive sizing so Python users get sensible defaults
+    // without having to think about chain/warmup counts: NUTS samples needed
+    // grow with the coefficient count, so we anchor on the saved beta length.
+    let n_base_params = model
+        .fit_result
+        .as_ref()
+        .map(|fr| fr.beta.len())
+        .unwrap_or(0);
+    let adaptive = NutsConfig::for_dimension(n_base_params);
+    NutsConfig {
+        n_samples: options.samples.unwrap_or(adaptive.n_samples),
+        nwarmup: options.warmup.unwrap_or(adaptive.nwarmup),
+        n_chains: options.chains.unwrap_or(adaptive.n_chains),
+        target_accept: options.target_accept.unwrap_or(adaptive.target_accept),
+        seed: options.seed.unwrap_or(adaptive.seed),
+    }
+}
+
+fn sample_table_impl(
+    model_bytes: &[u8],
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    options_json: Option<&str>,
+) -> Result<String, String> {
+    let model = load_model_impl(model_bytes)?;
+    let dataset = dataset_with_model_schema(&model, headers, rows)?;
+    let options = parse_sample_options(options_json)?;
+    let cfg = resolve_nuts_config(&model, options);
+    let col_map = dataset.column_map();
+    let training_headers = model.training_headers.as_ref();
+    let nuts = gam::sample::sample_saved_model(
+        &model,
+        dataset.values.view(),
+        &col_map,
+        training_headers,
+        &cfg,
+    )?;
+    serialize_sample_payload(&nuts, &cfg)
+}
+
+fn serialize_sample_payload(nuts: &NutsResult, cfg: &NutsConfig) -> Result<String, String> {
+    let n_draws = nuts.samples.nrows();
+    let n_coeffs = nuts.samples.ncols();
+    // Row-major flatten — ndarray's iter visits row-major already.
+    let samples_flat: Vec<f64> = nuts.samples.iter().copied().collect();
+    let coefficient_names: Vec<String> = (0..n_coeffs).map(|j| format!("beta_{j}")).collect();
+    let payload = SamplePayload {
+        samples_flat,
+        n_draws,
+        n_coeffs,
+        coefficient_names,
+        posterior_mean: nuts.posterior_mean.to_vec(),
+        posterior_std: nuts.posterior_std.to_vec(),
+        rhat: nuts.rhat,
+        ess: nuts.ess,
+        converged: nuts.converged,
+        config: SampleConfigPayload {
+            n_samples: cfg.n_samples,
+            n_warmup: cfg.nwarmup,
+            n_chains: cfg.n_chains,
+            target_accept: cfg.target_accept,
+            seed: cfg.seed,
+        },
+    };
+    serde_json::to_string(&payload)
+        .map_err(|err| format!("failed to serialize sample payload: {err}"))
 }
 
 fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
