@@ -7586,6 +7586,11 @@ impl CustomFamily for TransformationNormalFamily {
             capability,
             predicted_hessian_work: work_hess,
             predicted_gradient_work: work_grad,
+            // Transformation-normal does not override the outer-only
+            // `_with_options` hooks; its outer eval sums every row
+            // regardless of `outer_score_subsample`. Disable the
+            // κ pilot/polish schedule for this family.
+            subsample_capable: false,
         }
     }
 

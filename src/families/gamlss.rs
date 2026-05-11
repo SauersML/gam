@@ -1974,11 +1974,10 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 // which then ungated dense outer Hessian work that costs
                 // hundreds of seconds per eval at biobank scale (see
                 // `OuterDerivativePolicy::OUTER_HESSIAN_WORK_BUDGET`).
-                let psi_dim = joint_setup.theta0().len() - joint_setup.rho_dim();
-                let rho_seed = joint_setup
-                    .theta0()
-                    .slice(s![..joint_setup.rho_dim()])
-                    .to_owned();
+                let theta_seed = joint_setup.theta0();
+                let rho_dim = joint_setup.rho_dim();
+                let psi_dim = theta_seed.len() - rho_dim;
+                let rho_seed = theta_seed.slice(s![..rho_dim]).to_owned();
                 let policy_blocks_res = builder.build_blocks(
                     &rho_seed,
                     &mean_boot_design,
@@ -2018,6 +2017,11 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                             capability,
                             predicted_gradient_work: u128::MAX,
                             predicted_hessian_work: u128::MAX,
+                            // No GAMLSS family today overrides its
+                            // outer-only `_with_options` hooks to consume
+                            // `outer_score_subsample`; staged-κ would
+                            // build pilot masks the family then ignores.
+                            subsample_capable: false,
                         }
                     }
                 };
@@ -2064,7 +2068,28 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                             *noise_beta_hint_cell.borrow_mut() = Some(beta);
                         }
                         let family = builder.build_family(&designs[0], &designs[1]);
-                        if joint_setup.log_kappa_dim() > 0 {
+                        // Branch on whether the κ optimizer drives rho.
+                        //
+                        // * `log_kappa_dim() > 0 && kappa_options.enabled` ⇒
+                        //   the outer (ρ, ψ) optimizer is active and
+                        //   passes each candidate ρ to this closure;
+                        //   the inner fit must hold log-lambdas fixed
+                        //   at the supplied ρ so the outer derivative
+                        //   has a well-defined directional gradient.
+                        //
+                        // * Otherwise (κ disabled via the locked-κ
+                        //   short-circuit, or no spatial terms at all)
+                        //   the fast path in
+                        //   `optimize_spatial_length_scale_exact_joint`
+                        //   calls this closure exactly once at
+                        //   `theta = theta0`; ρ must still be optimized
+                        //   from data because the user never pinned it.
+                        //   `fit_custom_family` performs the joint
+                        //   ρ + coefficient REML fit at the user's
+                        //   (now-fixed) kernel scale, which is the
+                        //   intended behaviour when `length_scale=…` is
+                        //   set on every spatial term.
+                        if joint_setup.log_kappa_dim() > 0 && kappa_options.enabled {
                             let warm_start = hyper_warm_start_cell.borrow().clone();
                             fit_custom_family_fixed_log_lambdas(
                                 &family,

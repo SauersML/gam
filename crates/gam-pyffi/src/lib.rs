@@ -168,6 +168,20 @@ struct SamplePayload {
     ess: f64,
     converged: bool,
     config: SampleConfigPayload,
+    /// Short identifier for the saved model's predictive class (e.g.
+    /// "standard", "gaussian location-scale"). Lets the Python wrapper
+    /// pick the right posterior-predict path without re-parsing the
+    /// model.
+    model_class: String,
+    /// Inverse-link kind tag used by the Python wrapper to apply the
+    /// correct response-scale transform (`identity`, `logit`, `probit`,
+    /// `cloglog`, `log`, ...).
+    family_kind: String,
+    /// Whether the draws came from exact NUTS or the Laplace-Gaussian
+    /// fallback. Currently only "nuts" or "laplace"; callers can use
+    /// this to badge the posterior or to warn when a class has fallen
+    /// back to the approximate path.
+    method: String,
 }
 
 #[derive(Serialize)]
@@ -315,6 +329,40 @@ fn sample_table(
 }
 
 #[pyfunction]
+fn design_matrix_table(
+    py: Python<'_>,
+    model_bytes: Vec<u8>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+) -> PyResult<String> {
+    py.detach(move || design_matrix_table_impl(&model_bytes, headers, rows))
+        .map_err(py_value_error)
+}
+
+#[pyfunction]
+fn posterior_predict_table(
+    py: Python<'_>,
+    model_bytes: Vec<u8>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    samples_flat: Vec<f64>,
+    n_draws: usize,
+    n_coeffs: usize,
+) -> PyResult<String> {
+    py.detach(move || {
+        posterior_predict_table_impl(
+            &model_bytes,
+            headers,
+            rows,
+            samples_flat,
+            n_draws,
+            n_coeffs,
+        )
+    })
+    .map_err(py_value_error)
+}
+
+#[pyfunction]
 fn summary_json(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
     py.detach(move || summary_json_impl(&model_bytes))
         .map_err(py_value_error)
@@ -352,6 +400,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(validate_formula_json, module)?)?;
     module.add_function(wrap_pyfunction!(predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(sample_table, module)?)?;
+    module.add_function(wrap_pyfunction!(design_matrix_table, module)?)?;
+    module.add_function(wrap_pyfunction!(posterior_predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(summary_json, module)?)?;
     module.add_function(wrap_pyfunction!(check_json, module)?)?;
     module.add_function(wrap_pyfunction!(report_html, module)?)?;
@@ -705,10 +755,80 @@ fn sample_table_impl(
         training_headers,
         &cfg,
     )?;
-    serialize_sample_payload(&nuts, &cfg)
+    serialize_sample_payload(&model, &nuts, &cfg)
 }
 
-fn serialize_sample_payload(nuts: &NutsResult, cfg: &NutsConfig) -> Result<String, String> {
+fn design_matrix_table_impl(
+    _model_bytes: &[u8],
+    _headers: Vec<String>,
+    _rows: Vec<Vec<String>>,
+) -> Result<String, String> {
+    Err("design_matrix_table is not yet implemented at the FFI boundary".to_string())
+}
+
+fn posterior_predict_table_impl(
+    _model_bytes: &[u8],
+    _headers: Vec<String>,
+    _rows: Vec<Vec<String>>,
+    _samples_flat: Vec<f64>,
+    _n_draws: usize,
+    _n_coeffs: usize,
+) -> Result<String, String> {
+    Err("posterior_predict_table is not yet implemented at the FFI boundary".to_string())
+}
+
+/// Returns the inverse-link kind tag emitted to the Python wrapper.
+///
+/// The tag is intentionally lower-kebab-case so it can be matched as a
+/// plain string on the Python side (the Rust `LikelihoodFamily` enum
+/// itself is not part of the FFI surface). Families that don't have a
+/// closed-form scalar inverse link (`royston-parmar`, `binomial-sas`,
+/// `binomial-beta-logistic`) get their own tags so the Python side can
+/// refuse to compute a response-scale prediction by string-compare
+/// instead of by guessing.
+fn family_link_kind(family: LikelihoodFamily) -> &'static str {
+    match family {
+        LikelihoodFamily::GaussianIdentity => "identity",
+        LikelihoodFamily::BinomialLogit => "logit",
+        LikelihoodFamily::BinomialProbit => "probit",
+        LikelihoodFamily::BinomialCLogLog => "cloglog",
+        LikelihoodFamily::BinomialLatentCLogLog => "cloglog",
+        LikelihoodFamily::PoissonLog => "log",
+        LikelihoodFamily::GammaLog => "log",
+        LikelihoodFamily::BinomialMixture => "logit",
+        LikelihoodFamily::BinomialSas => "sas",
+        LikelihoodFamily::BinomialBetaLogistic => "beta-logistic",
+        LikelihoodFamily::RoystonParmar => "royston-parmar",
+    }
+}
+
+/// Did this `NutsResult` come from exact NUTS or the Laplace fallback?
+///
+/// We badge the payload so the Python wrapper can surface the method
+/// to users without re-deriving it from the model class. The fallback
+/// produces iid draws and reports `rhat = 1.0` exactly with
+/// `ess == n_draws`, which is a stable signature.
+fn nuts_method_label(model: &FittedModel) -> &'static str {
+    match model.predict_model_class() {
+        PredictModelClass::Standard => "nuts",
+        PredictModelClass::Survival => {
+            // Survival latent / latent-binary / location-scale fall
+            // back; everything else uses exact NUTS. Mirror the
+            // dispatch in `gam::sample::sample_saved_model`.
+            match model.survival_likelihood.as_deref() {
+                Some("latent") | Some("latent-binary") | Some("location-scale") => "laplace",
+                _ => "nuts",
+            }
+        }
+        _ => "laplace",
+    }
+}
+
+fn serialize_sample_payload(
+    model: &FittedModel,
+    nuts: &NutsResult,
+    cfg: &NutsConfig,
+) -> Result<String, String> {
     let n_draws = nuts.samples.nrows();
     let n_coeffs = nuts.samples.ncols();
     // Row-major flatten — ndarray's iter visits row-major already.
@@ -731,6 +851,9 @@ fn serialize_sample_payload(nuts: &NutsResult, cfg: &NutsConfig) -> Result<Strin
             target_accept: cfg.target_accept,
             seed: cfg.seed,
         },
+        model_class: prediction_model_class_label(model),
+        family_kind: family_link_kind(model.likelihood()).to_string(),
+        method: nuts_method_label(model).to_string(),
     };
     serde_json::to_string(&payload)
         .map_err(|err| format!("failed to serialize sample payload: {err}"))
