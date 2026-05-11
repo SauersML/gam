@@ -12552,28 +12552,50 @@ impl BernoulliMarginalSlopeFamily {
                     let row = wr.index;
                     let w = wr.weight;
                     {
-                        let dir_i = self.row_primary_psi_direction_from_map(
-                            row,
-                            block_i,
-                            &psi_map_i,
-                            block_states,
-                            primary,
-                        )?;
-                        let dir_j = self.row_primary_psi_direction_from_map(
-                            row,
-                            block_j,
-                            &psi_map_j,
-                            block_states,
-                            primary,
-                        )?;
-                        let dir_ij = self.row_primary_psi_second_direction_from_map(
-                            row,
-                            block_i,
-                            block_j,
-                            psi_map_ij.as_ref(),
-                            block_states,
-                            primary,
-                        )?;
+                        // Materialize each psi-design row once and reuse for
+                        // both the primary-space direction and the
+                        // BlockPsiRow embedding (previously two separate
+                        // psi_map.row_vector(row) calls per map per row).
+                        let psi_local_i = psi_map_i
+                            .row_vector(row)
+                            .map_err(|e| format!("bernoulli psi map_i row {row}: {e}"))?;
+                        let psi_local_j = psi_map_j
+                            .row_vector(row)
+                            .map_err(|e| format!("bernoulli psi map_j row {row}: {e}"))?;
+                        let dir_idx_i = if block_i == 0 {
+                            primary.q
+                        } else {
+                            primary.logslope
+                        };
+                        let dir_idx_j = if block_j == 0 {
+                            primary.q
+                        } else {
+                            primary.logslope
+                        };
+                        let mut dir_i = Array1::<f64>::zeros(primary.total);
+                        dir_i[dir_idx_i] =
+                            psi_local_i.dot(&block_states[block_i].beta);
+                        let mut dir_j = Array1::<f64>::zeros(primary.total);
+                        dir_j[dir_idx_j] =
+                            psi_local_j.dot(&block_states[block_j].beta);
+
+                        // dir_ij and br_ij share psi_map_ij; materialize once.
+                        let (dir_ij, psi_local_ij) = if let Some(ref pm_ij) =
+                            psi_map_ij
+                        {
+                            if block_i != block_j {
+                                (Array1::<f64>::zeros(primary.total), None)
+                            } else {
+                                let v = pm_ij.row_vector(row).map_err(|e| {
+                                    format!("bernoulli psi map_ij row {row}: {e}")
+                                })?;
+                                let mut d = Array1::<f64>::zeros(primary.total);
+                                d[dir_idx_i] = v.dot(&block_states[block_i].beta);
+                                (d, Some(v))
+                            }
+                        } else {
+                            (Array1::<f64>::zeros(primary.total), None)
+                        };
                         let row_ctx = Self::row_ctx(cache, row);
                         let (mut f_pi, mut f_pipi) = self
                             .compute_row_primary_gradient_hessian_reusing_cache(
@@ -12616,15 +12638,33 @@ impl BernoulliMarginalSlopeFamily {
                             third_j.mapv_inplace(|v| v * w);
                             fourth.mapv_inplace(|v| v * w);
                         }
-                        let br_i = self.block_psi_row_from_map(row, block_i, &psi_map_i, slices)?;
-                        let br_j = self.block_psi_row_from_map(row, block_j, &psi_map_j, slices)?;
-                        let br_ij = self.block_psi_second_row_from_map(
-                            row,
-                            block_i,
-                            block_j,
-                            psi_map_ij.as_ref(),
-                            slices,
-                        )?;
+                        let br_i = BlockPsiRow {
+                            block_idx: block_i,
+                            range: if block_i == 0 {
+                                slices.marginal.clone()
+                            } else {
+                                slices.logslope.clone()
+                            },
+                            local_vec: psi_local_i,
+                        };
+                        let br_j = BlockPsiRow {
+                            block_idx: block_j,
+                            range: if block_j == 0 {
+                                slices.marginal.clone()
+                            } else {
+                                slices.logslope.clone()
+                            },
+                            local_vec: psi_local_j,
+                        };
+                        let br_ij = psi_local_ij.map(|v| BlockPsiRow {
+                            block_idx: block_i,
+                            range: if block_i == 0 {
+                                slices.marginal.clone()
+                            } else {
+                                slices.logslope.clone()
+                            },
+                            local_vec: v,
+                        });
 
                         // --- scalar and score accumulation (unchanged) ---
                         acc.0 += dir_i.dot(&f_pipi.dot(&dir_j)) + f_pi.dot(&dir_ij);
