@@ -512,9 +512,7 @@ impl OuterDerivativePolicy {
     /// within the universal budget. Otherwise `Unavailable`, which routes
     /// the planner to gradient-only BFGS / L-BFGS — still convergent, just
     /// without the per-step Newton acceleration.
-    pub fn declared_hessian_form(
-        &self,
-    ) -> crate::solver::outer_strategy::DeclaredHessianForm {
+    pub fn declared_hessian_form(&self) -> crate::solver::outer_strategy::DeclaredHessianForm {
         use crate::solver::outer_strategy::DeclaredHessianForm;
         if !self.capability.has_hessian() {
             return DeclaredHessianForm::Unavailable;
@@ -8236,9 +8234,7 @@ pub(crate) fn custom_family_outer_derivatives<F: CustomFamily + ?Sized>(
     // the predicted Hessian work exceeds the universal budget. Quasi-Newton
     // BFGS / L-BFGS still converges to the exact MLE on gradient-only —
     // this is **not** a feature drop, see `OuterDerivativePolicy`'s doc.
-    let hessian = if options.use_outer_hessian
-        && include_exact_newton_logdet_h(family, options)
-    {
+    let hessian = if options.use_outer_hessian && include_exact_newton_logdet_h(family, options) {
         policy.declared_hessian_form()
     } else {
         DeclaredHessianForm::Unavailable
@@ -9023,12 +9019,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // Modest rho change: reuse prior β as-is (with the
                 // family's required post-update projection).
                 for (b, beta_seed) in seed.block_beta.iter().enumerate() {
-                    let beta_projected = family.post_update_block_beta(
-                        &states,
-                        b,
-                        &specs[b],
-                        beta_seed.clone(),
-                    )?;
+                    let beta_projected =
+                        family.post_update_block_beta(&states, b, &specs[b], beta_seed.clone())?;
                     states[b].beta.assign(&beta_projected);
                 }
                 cached_active_sets = seed.active_sets.clone();
@@ -9063,8 +9055,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // direction; everything else is the null space the
                     // penalty cannot resolve.
                     let pos_threshold = (1e-12 * max_abs_eval).max(1e-300);
-                    let beta_prior_norm: f64 =
-                        beta_seed.iter().map(|v| v * v).sum::<f64>().sqrt();
+                    let beta_prior_norm: f64 = beta_seed.iter().map(|v| v * v).sum::<f64>().sqrt();
                     // Form β_proj = U_pos U_posᵀ β.
                     let mut beta_proj = Array1::<f64>::zeros(p);
                     for k in 0..p {
@@ -9079,8 +9070,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             beta_proj[i] += evecs[[i, k]] * u_t_beta;
                         }
                     }
-                    let beta_proj_norm: f64 =
-                        beta_proj.iter().map(|v| v * v).sum::<f64>().sqrt();
+                    let beta_proj_norm: f64 = beta_proj.iter().map(|v| v * v).sum::<f64>().sqrt();
                     // Safety guard: pathological projection ratio.
                     if beta_prior_norm > 0.0 {
                         let ratio = beta_proj_norm / beta_prior_norm;
@@ -9102,12 +9092,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 }
                 if all_blocks_ok && projected_blocks.len() == specs.len() {
                     for (b, beta_proj) in projected_blocks.into_iter().enumerate() {
-                        let beta_post = family.post_update_block_beta(
-                            &states,
-                            b,
-                            &specs[b],
-                            beta_proj,
-                        )?;
+                        let beta_post =
+                            family.post_update_block_beta(&states, b, &specs[b], beta_proj)?;
                         states[b].beta.assign(&beta_post);
                     }
                     cached_active_sets = seed.active_sets.clone();
@@ -9124,12 +9110,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // soft-warm-start logic was introduced.
             for (b, beta_seed) in seed.block_beta.iter().enumerate() {
                 if beta_seed.len() == states[b].beta.len() {
-                    let beta_projected = family.post_update_block_beta(
-                        &states,
-                        b,
-                        &specs[b],
-                        beta_seed.clone(),
-                    )?;
+                    let beta_projected =
+                        family.post_update_block_beta(&states, b, &specs[b], beta_seed.clone())?;
                     states[b].beta.assign(&beta_projected);
                 }
             }
@@ -10096,8 +10078,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 && residual.is_finite()
                 && residual <= 10.0 * residual_tol
             {
-                let extended_cap =
-                    (2usize * inner_max_cycles_base).min(200).max(inner_max_cycles);
+                let extended_cap = (2usize * inner_max_cycles_base)
+                    .min(200)
+                    .max(inner_max_cycles);
                 if extended_cap > inner_max_cycles {
                     log::info!(
                         "[GAMLSS inner cycle cap extended] residual={:.3e}, last_3_descent_ratios=[{:.3}, {:.3}, {:.3}], new_cap={}",

@@ -7561,9 +7561,7 @@ impl CustomFamily for TransformationNormalFamily {
         //   * dense  ≈ `n · (rho_dim + psi_dim) · p_total^2`
         //   * mfree  ≈ `n · (rho_dim + psi_dim) · p_total · rho_dim`
         let capability = self.exact_outer_derivative_order(specs, options);
-        let n = specs
-            .first()
-            .map_or(0u128, |s| s.design.nrows() as u128);
+        let n = specs.first().map_or(0u128, |s| s.design.nrows() as u128);
         let p_total: u128 = specs
             .iter()
             .map(|s| s.design.ncols() as u128)
@@ -7572,9 +7570,7 @@ impl CustomFamily for TransformationNormalFamily {
             .iter()
             .map(|s| s.penalties.len() as u128)
             .fold(0u128, |acc, x| acc.saturating_add(x));
-        let k = rho_dim
-            .saturating_add(psi_dim as u128)
-            .max(1);
+        let k = rho_dim.saturating_add(psi_dim as u128).max(1);
         let p_eff = p_total.max(1);
         // Gradient work: one row sweep per outer coordinate.
         let work_grad = n.saturating_mul(k).saturating_mul(p_eff);
@@ -8104,8 +8100,7 @@ impl TransformationNormalJointHessianWorkspace {
             return Err("CTN dense Hessian cache produced non-finite values".to_string());
         }
         let arc = Arc::new(hessian);
-        self.persistent_dense_hessian
-            .install(key, Arc::clone(&arc));
+        self.persistent_dense_hessian.install(key, Arc::clone(&arc));
         let _ = self.dense_hessian_cache.set(arc);
         log::info!(
             "[STAGE] CTN dense Hessian cache build p={} elapsed={:.3}s",
@@ -14432,11 +14427,8 @@ pub fn fit_transformation_normal(
     // override so the cost gate uses the Khatri–Rao row-streamed shape
     // (`O(n · (rho + psi) · p)` gradient; `min(dense, mfree)` Hessian)
     // rather than the generic `coefficient_*_cost × K` default.
-    let outer_derivative_policy = probe_family.outer_derivative_policy(
-        &probe_blocks,
-        joint_setup.log_kappa_dim(),
-        &options,
-    );
+    let outer_derivative_policy =
+        probe_family.outer_derivative_policy(&probe_blocks, joint_setup.log_kappa_dim(), &options);
     let solved = optimize_spatial_length_scale_exact_joint(
         covariate_data,
         &block_specs_slice,

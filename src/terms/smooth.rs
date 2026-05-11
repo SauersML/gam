@@ -13186,11 +13186,7 @@ where
 
     let current_row_set: std::cell::RefCell<crate::families::row_kernel::RowSet> =
         if use_staged_kappa {
-            let pilot = build_uniform_pilot_subsample(
-                n_total,
-                KAPPA_PILOT_K,
-                n_total as u64,
-            );
+            let pilot = build_uniform_pilot_subsample(n_total, KAPPA_PILOT_K, n_total as u64);
             std::cell::RefCell::new(crate::families::row_kernel::RowSet::Subsample {
                 rows: std::sync::Arc::clone(&pilot.rows),
                 n_full: n_total,
