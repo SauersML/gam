@@ -26,7 +26,7 @@ from ._binding import RustExtensionUnavailableError
 from ._diagnostics import Diagnostics
 from ._exceptions import FormulaError, GamError, PredictionError, SchemaMismatchError
 from ._model import Model, SurvivalPrediction
-from ._sampling import PosteriorSamples, SamplingConfig
+from ._sampling import PosteriorPredictive, PosteriorSamples, SamplingConfig
 from ._schema import SchemaCheck, SchemaIssue
 from ._summary import Summary
 from ._validation import FormulaValidation
@@ -36,12 +36,21 @@ try:
 except _metadata.PackageNotFoundError:
     __version__ = "0.0.0+unknown"
 
+def load_posterior(path: object) -> PosteriorSamples:
+    """Load a :class:`PosteriorSamples` from an ``.npz`` archive written
+    by :meth:`PosteriorSamples.save`.  Convenience wrapper for symmetry
+    with :func:`gamfit.load` / :func:`gamfit.fit`.
+    """
+    return PosteriorSamples.load(path)  # type: ignore[arg-type]
+
+
 __all__ = [
     "Diagnostics",
     "FormulaError",
     "FormulaValidation",
     "GamError",
     "Model",
+    "PosteriorPredictive",
     "PosteriorSamples",
     "PredictionError",
     "RustExtensionUnavailableError",
@@ -56,6 +65,7 @@ __all__ = [
     "explain_error",
     "fit",
     "load",
+    "load_posterior",
     "loads",
     "validate_formula",
 ]

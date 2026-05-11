@@ -719,7 +719,41 @@ class Model:
             )
         except Exception as exc:
             raise map_exception(exc) from exc
-        return PosteriorSamples.from_ffi_json(raw)
+        # Bundle the saved-model bytes into the posterior so downstream
+        # methods like `posterior.predict(new_data)` can fetch a design
+        # matrix without the caller passing the model back in.
+        return PosteriorSamples.from_ffi_json(raw, model_bytes=self._model_bytes)
+
+    def design_matrix(self, data: Any) -> Any:
+        """Materialised design matrix for ``data`` against the saved model.
+
+        Returns an ``(n_rows, n_coeffs)`` numpy array — exactly the
+        matrix the engine uses internally for linear-predictor
+        evaluation.  Useful for custom posterior reasoning (e.g.
+        feeding draws into your own predictive routine) or for
+        debugging term layouts.
+
+        Currently restricted to standard non-link-wiggle GAM models;
+        other classes raise a clear error pointing at
+        :meth:`Model.predict` for the class-specific prediction path.
+        """
+        import numpy as np
+
+        headers, rows, _ = normalize_table(data)
+        try:
+            raw = rust_module().design_matrix_table(self._model_bytes, headers, rows)
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        parsed = json.loads(raw)
+        n_rows = int(parsed["n_rows"])
+        n_cols = int(parsed["n_cols"])
+        flat = np.asarray(parsed.get("x_flat", []), dtype=float)
+        if flat.size != n_rows * n_cols:
+            raise ValueError(
+                "design matrix FFI payload shape mismatch: "
+                f"got {flat.size} floats, expected {n_rows} * {n_cols}"
+            )
+        return flat.reshape(n_rows, n_cols)
 
     def save(self, path: str | Path) -> None:
         Path(path).write_bytes(self._model_bytes)

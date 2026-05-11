@@ -10155,16 +10155,33 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // Plateau detection + one-shot cap extension. All three
             // recent ratios > 0.95 means each cycle is shaving < 5% off
             // the residual — Newton has stalled but is still bounded by
-            // the cap. If we're past 80% of the cap and the residual is
-            // already within 10× of its tolerance, doubling the cap
-            // (capped at 200) gives the solve room to grind out the
-            // last factor of 10 before the rejection guard fires.
+            // the cap. If we're past 80% of the cap and EITHER the
+            // residual is within 10× of its tolerance OR the Newton-
+            // model's predicted reduction is already within 2× of the
+            // objective tolerance, doubling the cap (capped at 200)
+            // gives the solve room to grind out the last factor before
+            // the rejection guard fires.
+            //
+            // The predicted-reduction branch catches the rank-deficient
+            // small-n regime where `residual = ‖∇L − Sβ‖∞` stays well
+            // above its tolerance (60×–10⁴× at n < p) — because β keeps
+            // drifting along a near-null direction — while the local
+            // quadratic model's promised decrease has already collapsed
+            // to within numerical noise of the objective tolerance. At
+            // that point the Conn-Gould-Toint certificate (line 10253)
+            // is about to fire on its own, and the only thing blocking
+            // it is the iteration cap. One extra factor of 2 in the cap
+            // gives CGT room to certify within the model's known good
+            // behaviour, rather than burning the seed with a 100-cycle
+            // non-convergence rejection.
             if !inner_cap_already_extended
                 && descent_ratio_window.len() == 3
                 && descent_ratio_window.iter().all(|r| *r > 0.95)
                 && cycle + 1 >= (inner_max_cycles * 4) / 5
                 && residual.is_finite()
-                && residual <= 10.0 * residual_tol
+                && (residual <= 10.0 * residual_tol
+                    || (accepted_predicted_reduction.is_finite()
+                        && accepted_predicted_reduction <= 2.0 * objective_tol))
             {
                 let extended_cap = (2usize * inner_max_cycles_base)
                     .min(200)
