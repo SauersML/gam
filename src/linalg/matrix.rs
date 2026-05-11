@@ -3147,22 +3147,37 @@ impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
     /// Get-or-build the materialized [K_eff | poly] dense block.  Returns
     /// `None` when the block would exceed `MATERIALIZE_MAX_BYTES`; in that
     /// case callers must fall back to row-chunked evaluation.
+    ///
+    /// Implementation note: the build path runs `par_chunks_mut` inside
+    /// `kernel_chunk`, so we deliberately compute *outside* the
+    /// `OnceLock`. Using `get_or_init` would hold the lock across that
+    /// nested rayon work, and any sibling rayon workers that reach
+    /// `get_or_init` while the build is in flight would park on the
+    /// `OnceLock`'s OS mutex — starving the build's nested `par_iter`
+    /// and deadlocking the whole pool (every worker in
+    /// `pthread_mutex_wait`, init thread in `pthread_cond_wait`,
+    /// 0% CPU). See `feedback_oncelock_rayon_deadlock`. Computing
+    /// without the lock costs at most one redundant build per racing
+    /// caller — `OnceLock::set` discards losers; `get` after `set`
+    /// always observes the winning value regardless of who won.
     fn materialized_combined(&self) -> Option<&Array2<f64>> {
+        if let Some(slot) = self.materialized.get() {
+            return slot.as_ref().map(|a| a.as_ref());
+        }
+        let bytes = self
+            .n
+            .checked_mul(self.total_cols)
+            .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()));
+        let computed = match bytes {
+            Some(b) if b <= Self::MATERIALIZE_MAX_BYTES => {
+                Some(Arc::new(self.build_row_chunk_combined(0..self.n)))
+            }
+            _ => None,
+        };
+        let _ = self.materialized.set(computed);
         self.materialized
-            .get_or_init(|| {
-                let bytes = self
-                    .n
-                    .checked_mul(self.total_cols)
-                    .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()));
-                match bytes {
-                    Some(b) if b <= Self::MATERIALIZE_MAX_BYTES => {
-                        Some(Arc::new(self.build_row_chunk_combined(0..self.n)))
-                    }
-                    _ => None,
-                }
-            })
-            .as_ref()
-            .map(|a| a.as_ref())
+            .get()
+            .and_then(|opt| opt.as_ref().map(|a| a.as_ref()))
     }
 
     /// Evaluate kernel block for a range of rows: K[rows, :] or K[rows, :] * Z.
@@ -3437,43 +3452,51 @@ impl CoefficientTransformOperator {
     /// best-effort optimization, not a hard requirement, so a refusal must
     /// never panic — the streaming `row_chunk_into` / `apply` paths still
     /// work.
+    /// Same OnceLock-under-rayon hazard as
+    /// `ChunkedKernelDesignOperator::materialized_combined`: the inner
+    /// `try_to_dense_arc_with_policy` may dispatch parallel work
+    /// (kernel-evaluation chunks, BLAS GEMM via faer's rayon pool, etc.),
+    /// so we compute outside the lock and write with `set`. See
+    /// `feedback_oncelock_rayon_deadlock`.
     fn materialized_combined(&self) -> Option<&Array2<f64>> {
+        if let Some(slot) = self.materialized.get() {
+            return slot.as_ref().map(|a| a.as_ref());
+        }
+        let bytes = self
+            .n
+            .checked_mul(self.p_out)
+            .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()));
+        let computed = match bytes {
+            Some(b) if b <= Self::MATERIALIZE_MAX_BYTES => {
+                // Auto-strict at biobank shape: even though the cache's
+                // own MATERIALIZE_MAX_BYTES budget would admit this
+                // block, refuse densification when the operator's
+                // outer shape says we're in strict territory. Falls
+                // through to streaming row_chunk_into / apply paths.
+                let auto_policy = ResourcePolicy::for_problem(
+                    self.n,
+                    self.p_out,
+                    crate::resource::ProblemHints::default(),
+                );
+                let cache_policy = ResourcePolicy {
+                    max_single_materialization_bytes: Self::MATERIALIZE_MAX_BYTES,
+                    derivative_storage_mode: auto_policy.derivative_storage_mode,
+                    ..ResourcePolicy::default_library()
+                };
+                self.inner
+                    .try_to_dense_arc_with_policy(
+                        "CoefficientTransformOperator materialization",
+                        &cache_policy,
+                    )
+                    .ok()
+                    .map(|x| Arc::new(fast_ab(x.as_ref(), &self.transform)))
+            }
+            _ => None,
+        };
+        let _ = self.materialized.set(computed);
         self.materialized
-            .get_or_init(|| {
-                let bytes = self
-                    .n
-                    .checked_mul(self.p_out)
-                    .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()));
-                match bytes {
-                    Some(b) if b <= Self::MATERIALIZE_MAX_BYTES => {
-                        // Auto-strict at biobank shape: even though the cache's
-                        // own MATERIALIZE_MAX_BYTES budget would admit this
-                        // block, refuse densification when the operator's
-                        // outer shape says we're in strict territory. Falls
-                        // through to streaming row_chunk_into / apply paths.
-                        let auto_policy = ResourcePolicy::for_problem(
-                            self.n,
-                            self.p_out,
-                            crate::resource::ProblemHints::default(),
-                        );
-                        let cache_policy = ResourcePolicy {
-                            max_single_materialization_bytes: Self::MATERIALIZE_MAX_BYTES,
-                            derivative_storage_mode: auto_policy.derivative_storage_mode,
-                            ..ResourcePolicy::default_library()
-                        };
-                        self.inner
-                            .try_to_dense_arc_with_policy(
-                                "CoefficientTransformOperator materialization",
-                                &cache_policy,
-                            )
-                            .ok()
-                            .map(|x| Arc::new(fast_ab(x.as_ref(), &self.transform)))
-                    }
-                    _ => None,
-                }
-            })
-            .as_ref()
-            .map(|a| a.as_ref())
+            .get()
+            .and_then(|opt| opt.as_ref().map(|a| a.as_ref()))
     }
 }
 
