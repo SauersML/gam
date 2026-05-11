@@ -1,5 +1,7 @@
 use csv::StringRecord;
-use gam::bernoulli_marginal_slope::{BernoulliMarginalSlopeFitResult, DeviationRuntime};
+use gam::bernoulli_marginal_slope::{
+    BernoulliMarginalSlopeFitResult, DeviationRuntime, LatentMeasureKind,
+};
 use gam::estimate::{
     BlockRole, saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit,
     saved_sas_state_from_fit,
@@ -900,25 +902,6 @@ fn sample_table_impl(
     serialize_sample_payload(&model, &nuts, &cfg)
 }
 
-fn design_matrix_table_impl(
-    _model_bytes: &[u8],
-    _headers: Vec<String>,
-    _rows: Vec<Vec<String>>,
-) -> Result<String, String> {
-    Err("design_matrix_table is not yet implemented at the FFI boundary".to_string())
-}
-
-fn posterior_predict_table_impl(
-    _model_bytes: &[u8],
-    _headers: Vec<String>,
-    _rows: Vec<Vec<String>>,
-    _samples_flat: Vec<f64>,
-    _n_draws: usize,
-    _n_coeffs: usize,
-) -> Result<String, String> {
-    Err("posterior_predict_table is not yet implemented at the FFI boundary".to_string())
-}
-
 /// Returns the inverse-link kind tag emitted to the Python wrapper.
 ///
 /// The tag is intentionally lower-kebab-case so it can be matched as a
@@ -1666,6 +1649,8 @@ fn build_bernoulli_marginal_slope_ffi_payload(
         mean: ms_result.z_normalization.mean,
         sd: ms_result.z_normalization.sd,
     });
+    payload.latent_measure = Some(ms_result.latent_measure.clone());
+    payload.latent_z_rank_int_calibration = ms_result.latent_z_rank_int_calibration.clone();
     payload.marginal_baseline = Some(ms_result.baseline_marginal);
     payload.logslope_baseline = Some(ms_result.baseline_logslope);
     payload.link = Some(base_link.saved_string());
@@ -1745,6 +1730,7 @@ fn build_survival_marginal_slope_ffi_payload(
         mean: ms_result.z_normalization.mean,
         sd: ms_result.z_normalization.sd,
     });
+    payload.latent_measure = Some(LatentMeasureKind::StandardNormal);
     payload.logslope_baseline = Some(ms_result.baseline_slope);
     payload.score_warp_runtime = ms_result
         .score_warp_runtime
