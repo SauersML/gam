@@ -1898,18 +1898,20 @@ pub struct CompositeHyperOperator {
     pub dim_hint: usize,
 }
 
-/// Group composite operators by shared `(implicit_deriv, x_design, w_diag,
-/// c_x_psi_beta)` quadruple so every Duchon term whose implicit derivative
-/// state is identical across ψ-axes runs through a single row-kernel sweep
-/// via `trace_projected_factor_all_axes_with_xf`. Non-implicit operators
-/// and singletons fall through to the original per-op trace path.
+/// Group composite operators by shared `(implicit_deriv, x_design, w_diag)`
+/// so every Duchon ψ-axis built atop the same implicit derivative runs
+/// through a single row-kernel sweep via
+/// `trace_projected_factor_all_axes_with_xf`. Per-axis `s_psi` and
+/// `c_x_psi_beta` are threaded in individually so the batched path matches
+/// the per-axis path exactly. Non-implicit operators and singleton groups
+/// fall through to the original per-op trace path.
 fn composite_trace_implicit_batched(
     operators: &[Arc<dyn HyperOperator>],
     factor: &Array2<f64>,
     cache: Option<&ProjectedFactorCache>,
 ) -> f64 {
     let mut trace = 0.0;
-    let mut group_starts: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut group_starts: Vec<Vec<usize>> = Vec::new();
     let mut handled = vec![false; operators.len()];
 
     for (i, op) in operators.iter().enumerate() {
@@ -1930,35 +1932,27 @@ fn composite_trace_implicit_batched(
                     && Arc::ptr_eq(&impl_i.x_design, &impl_j.x_design)
                     && Arc::ptr_eq(&impl_i.w_diag, &impl_j.w_diag)
                     && impl_i.p == impl_j.p
-                    && match (
-                        impl_i.c_x_psi_beta.as_ref(),
-                        impl_j.c_x_psi_beta.as_ref(),
-                    ) {
-                        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                        (None, None) => true,
-                        _ => false,
-                    }
                 {
                     group.push(j);
                     handled[j] = true;
                 }
             }
         }
-        group_starts.push((i, group));
+        group_starts.push(group);
     }
 
-    for (_anchor, group) in &group_starts {
+    for group in &group_starts {
         if group.len() >= 2 {
             let lead = operators[group[0]].as_implicit().unwrap();
             let xf = match cache {
                 Some(c) => lead.cached_xf(factor, c),
                 None => Arc::new(lead.compute_xf(factor)),
             };
-            let axes: Vec<(usize, &Array2<f64>)> = group
+            let axes: Vec<(usize, &Array2<f64>, Option<&Array1<f64>>)> = group
                 .iter()
                 .map(|&k| {
                     let op = operators[k].as_implicit().unwrap();
-                    (op.axis, &op.s_psi)
+                    (op.axis, &op.s_psi, op.c_x_psi_beta.as_deref())
                 })
                 .collect();
             let values = lead.trace_projected_factor_all_axes_with_xf(factor, xf.view(), &axes);
@@ -2770,21 +2764,19 @@ impl ImplicitHyperOperator {
     }
 
     /// Batched-axis sibling of [`Self::trace_projected_factor_with_xf`].
-    /// For every (axis, s_psi) pair in `axes`, returns `tr(F^T B_d F)` using
-    /// a single sweep through the design rows: each chunk's radial scalars
-    /// `(phi, q, r²)` are evaluated once via
+    /// For every `(axis, s_psi, c_x_psi_beta)` tuple in `axes`, returns
+    /// `tr(F^T B_d F)` using a single sweep through the design rows: each
+    /// chunk's radial scalars `(phi, q, r²)` are evaluated once via
     /// `row_chunk_first_raw_all_axes`, then the per-axis `K_d · U_knot`
-    /// GEMM and fused inner products run inside that one row pass. The
-    /// shared `xf` and `c_x_psi_beta` are reused across axes (the latter
-    /// only contributes the per-axis correction in callers — here it is
-    /// kept axis-invariant, matching the existing single-axis path).
-    /// Caller is responsible for passing the correct `s_psi` for each
-    /// axis. Falls back to per-axis when `axes` is empty.
-    fn trace_projected_factor_all_axes_with_xf(
+    /// GEMM and fused inner products run inside that one row pass. Each
+    /// axis carries its own penalty matrix and (optional) third-derivative
+    /// correction vector so the per-axis result is numerically identical
+    /// (modulo accumulation order) to the existing per-axis path.
+    fn trace_projected_factor_all_axes_with_xf<'a>(
         &self,
         factor: &Array2<f64>,
         xf: ArrayView2<'_, f64>,
-        axes: &[(usize, &Array2<f64>)],
+        axes: &[(usize, &'a Array2<f64>, Option<&'a Array1<f64>>)],
     ) -> Vec<f64> {
         let n_axes = axes.len();
         if n_axes == 0 {
@@ -2802,10 +2794,8 @@ impl ImplicitHyperOperator {
             .min(n_obs);
 
         let w = self.w_diag.as_ref();
-        let c_opt = self.c_x_psi_beta.as_ref().map(|arc| arc.as_ref());
         let mut design_totals = vec![0.0_f64; n_axes];
-        let mut correction_total = 0.0_f64;
-        let mut have_correction = false;
+        let mut correction_totals = vec![0.0_f64; n_axes];
         let mut start = 0usize;
         while start < n_obs {
             let end = (start + chunk_rows).min(n_obs);
@@ -2816,10 +2806,11 @@ impl ImplicitHyperOperator {
                 .implicit_deriv
                 .row_chunk_first_raw_all_axes(start..end)
                 .expect("radial scalar evaluation failed during implicit hyper batched trace");
-            for (slot, (axis, _)) in axes.iter().enumerate() {
+            for (slot, (axis, _, c_opt)) in axes.iter().enumerate() {
                 let kd_chunk = &kd_all[*axis];
                 let dxf_chunk = crate::faer_ndarray::fast_ab(kd_chunk, &u_knot);
                 let mut design_total = design_totals[slot];
+                let mut correction_total = correction_totals[slot];
                 for i_local in 0..chunk_n {
                     let i = start + i_local;
                     let w_i = w[i];
@@ -2828,30 +2819,25 @@ impl ImplicitHyperOperator {
                     for k in 0..rank {
                         design_total += dxf_row[k] * w_i * xf_row[k];
                     }
-                }
-                design_totals[slot] = design_total;
-            }
-            if let Some(c) = c_opt {
-                have_correction = true;
-                for i_local in 0..chunk_n {
-                    let i = start + i_local;
-                    let c_i = c[i];
-                    let xf_row = xf_chunk.row(i_local);
-                    for k in 0..rank {
-                        let v = xf_row[k];
-                        correction_total += c_i * v * v;
+                    if let Some(c) = c_opt {
+                        let c_i = c[i];
+                        for k in 0..rank {
+                            let v = xf_row[k];
+                            correction_total += c_i * v * v;
+                        }
                     }
                 }
+                design_totals[slot] = design_total;
+                correction_totals[slot] = correction_total;
             }
             start = end;
         }
 
         let mut out = Vec::with_capacity(n_axes);
-        for (slot, (_axis, s_psi)) in axes.iter().enumerate() {
+        for (slot, (_axis, s_psi, _)) in axes.iter().enumerate() {
             let s_f = s_psi.dot(factor);
             let penalty: f64 = factor.iter().zip(s_f.iter()).map(|(&f, &s)| f * s).sum();
-            let correction = if have_correction { correction_total } else { 0.0 };
-            out.push(2.0 * design_totals[slot] + correction + penalty);
+            out.push(2.0 * design_totals[slot] + correction_totals[slot] + penalty);
         }
         out
     }
