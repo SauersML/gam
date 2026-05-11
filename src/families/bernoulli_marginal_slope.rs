@@ -13379,11 +13379,38 @@ impl BernoulliMarginalSlopeFamily {
                 .iter()
                 .enumerate()
                 .all(|(row, wr)| wr.index == row && wr.weight == 1.0);
+        // Pre-warm per-row caches the row loop transitively materializes, so the
+        // first row to enter the par_iter does not lazily run a nested
+        // `(0..n).into_par_iter()` inside a `RayonSafeOnce::get_or_init` race
+        // and force every other outer worker to either redo the same parallel
+        // build or starve the pool. The rigid path's third-derivative tensor is
+        // the load-bearing one (`rigid_third_full_cached`); the flex path
+        // already has its degree-21 cell-moments bundle primed by
+        // `BernoulliMarginalSlopeLineSearchWorkspace::materialized`.
+        // Mirrors the same discipline applied in
+        // `exact_newton_joint_hessiansecond_directional_derivative_from_cache_with_options`.
+        if !flex_active {
+            let _ = self.rigid_third_full_cached(block_states, cache, 0)?;
+        }
+        // Skip the outer par_iter when the per-row body cannot pay for its
+        // scheduling overhead, or when we are already inside a rayon worker
+        // (so an outer par_iter is holding pool slots). Both cases turn the
+        // row-level par_iter into a net loss — at small `n*p*dirs` the per-row
+        // body is dominated by accumulator construction, and when nested the
+        // par_iter risks starving the pool on any `Mutex`/`OnceLock` racing in
+        // the per-row body (LRU caches, lazy cell-moment evaluation, etc.).
+        const ROW_PAR_FLOPS_THRESHOLD: usize = 1_000_000;
+        let row_body_flops = n_rows
+            .saturating_mul(slices.total)
+            .saturating_mul(slices.total)
+            .saturating_mul(n_dirs.max(1));
+        let run_rows_serial = rayon::current_thread_index().is_some()
+            || row_body_flops < ROW_PAR_FLOPS_THRESHOLD
+            || rayon::current_num_threads() <= 1;
         let mut accs = if !flex_active {
-            weighted_rows
-                .clone()
-                .into_par_iter()
-                .try_fold(make_accs, |mut accs, wr| -> Result<_, String> {
+            if run_rows_serial {
+                let mut accs = make_accs();
+                for wr in weighted_rows.iter() {
                     let row = wr.index;
                     let w = wr.weight;
                     let marginal_eta = block_states[0].eta[row];
@@ -13411,14 +13438,49 @@ impl BernoulliMarginalSlopeFamily {
                         accs[idx].add_pullback(self, row, slices, primary, &t_arr);
                     }
                     bump_progress(&progress);
-                    Ok(accs)
-                })
-                .try_reduce(make_accs, |mut left, right| -> Result<_, String> {
-                    for (l, r) in left.iter_mut().zip(right.iter()) {
-                        l.add(r);
-                    }
-                    Ok(left)
-                })?
+                }
+                accs
+            } else {
+                weighted_rows
+                    .clone()
+                    .into_par_iter()
+                    .try_fold(make_accs, |mut accs, wr| -> Result<_, String> {
+                        let row = wr.index;
+                        let w = wr.weight;
+                        let marginal_eta = block_states[0].eta[row];
+                        let marginal = self.marginal_link_map(marginal_eta)?;
+                        let g = block_states[1].eta[row];
+                        for (idx, d_beta_flat) in d_beta_flats.iter().enumerate() {
+                            let dq = self
+                                .marginal_design
+                                .dot_row_view(row, d_beta_flat.slice(s![slices.marginal.clone()]));
+                            let dg = self
+                                .logslope_design
+                                .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
+                            let t = self.rigid_row_third_contracted(
+                                row,
+                                marginal_eta,
+                                marginal,
+                                g,
+                                dq,
+                                dg,
+                            )?;
+                            let mut t_arr = Array2::from_shape_fn((2, 2), |(a, b)| t[a][b]);
+                            if w != 1.0 {
+                                t_arr.mapv_inplace(|v| v * w);
+                            }
+                            accs[idx].add_pullback(self, row, slices, primary, &t_arr);
+                        }
+                        bump_progress(&progress);
+                        Ok(accs)
+                    })
+                    .try_reduce(make_accs, |mut left, right| -> Result<_, String> {
+                        for (l, r) in left.iter_mut().zip(right.iter()) {
+                            l.add(r);
+                        }
+                        Ok(left)
+                    })?
+            }
         } else if dense_contiguous_rows {
             let chunk_rows = {
                 const TARGET_CHUNK_FLOATS: usize = 1 << 17;

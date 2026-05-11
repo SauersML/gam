@@ -1145,44 +1145,106 @@ impl Hash for CellFingerprint {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct CachedCellMoments {
-    state: CellMomentState,
+    /// Regular (value) cell moments, populated by
+    /// `evaluate_cell_moments_cached`. None when only derivative moments
+    /// have been cached for this cell.
+    state: Option<CellMomentState>,
+    /// Derivative moments, populated by
+    /// `evaluate_cell_derivative_moments_cached`. None when only value
+    /// moments have been cached for this cell. Both variants share the
+    /// same `CellFingerprint` key so derivative-only callers do not evict
+    /// pre-cached value entries and vice versa.
+    derivative_state: Option<CellDerivativeMomentState>,
 }
 
 impl CachedCellMoments {
     #[inline]
     pub fn new(state: CellMomentState) -> Self {
-        Self { state }
+        Self {
+            state: Some(state),
+            derivative_state: None,
+        }
     }
 
     #[inline]
-    pub fn max_degree(&self) -> usize {
-        self.state.moments.len().saturating_sub(1)
+    pub fn new_derivative(state: CellDerivativeMomentState) -> Self {
+        Self {
+            state: None,
+            derivative_state: Some(state),
+        }
     }
 
     #[inline]
     pub fn state_for_degree(&self, max_degree: usize) -> Option<CellMomentState> {
-        if self.max_degree() < max_degree {
+        let state = self.state.as_ref()?;
+        if state.moments.len().saturating_sub(1) < max_degree {
             return None;
         }
-        let mut state = self.state.clone();
+        let mut state = state.clone();
         state.moments.truncate(max_degree + 1);
         Some(state)
+    }
+
+    #[inline]
+    pub fn derivative_state_for_degree(
+        &self,
+        max_degree: usize,
+    ) -> Option<CellDerivativeMomentState> {
+        let state = self.derivative_state.as_ref()?;
+        if state.moments.len().saturating_sub(1) < max_degree {
+            return None;
+        }
+        let mut state = state.clone();
+        state.moments.truncate(max_degree + 1);
+        Some(state)
+    }
+
+    #[inline]
+    pub fn with_value(mut self, state: CellMomentState) -> Self {
+        self.state = Some(state);
+        self
+    }
+
+    #[inline]
+    pub fn with_derivative(mut self, state: CellDerivativeMomentState) -> Self {
+        self.derivative_state = Some(state);
+        self
     }
 }
 
 impl ResidentBytes for CachedCellMoments {
     fn resident_bytes(&self) -> usize {
-        let spilled_bytes = if self.state.moments.spilled() {
-            self.state
-                .moments
-                .capacity()
-                .saturating_mul(std::mem::size_of::<f64>())
-        } else {
-            0
-        };
-        std::mem::size_of::<Self>().saturating_add(spilled_bytes)
+        let value_spilled = self
+            .state
+            .as_ref()
+            .map(|s| {
+                if s.moments.spilled() {
+                    s.moments
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<f64>())
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        let deriv_spilled = self
+            .derivative_state
+            .as_ref()
+            .map(|s| {
+                if s.moments.spilled() {
+                    s.moments
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<f64>())
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        std::mem::size_of::<Self>()
+            .saturating_add(value_spilled)
+            .saturating_add(deriv_spilled)
     }
 }
 
@@ -3181,19 +3243,63 @@ pub fn evaluate_cell_moments_cached(
     stats: Option<&CellMomentCacheStats>,
 ) -> Result<CellMomentState, String> {
     let key = CellFingerprint::new(cell);
-    if let Some(cached) = cache.get(&key) {
-        if let Some(state) = cached.state_for_degree(max_degree) {
-            if let Some(stats) = stats {
-                stats.hits.fetch_add(1, Ordering::Relaxed);
+    let existing_derivative = match cache.get(&key) {
+        Some(cached) => {
+            if let Some(state) = cached.state_for_degree(max_degree) {
+                if let Some(stats) = stats {
+                    stats.hits.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(state);
             }
-            return Ok(state);
+            cached.derivative_state.clone()
         }
-    }
+        None => None,
+    };
     if let Some(stats) = stats {
         stats.misses.fetch_add(1, Ordering::Relaxed);
     }
     let state = evaluate_cell_moments(cell, max_degree)?;
-    cache.insert(key, CachedCellMoments::new(state.clone()));
+    let mut entry = CachedCellMoments::new(state.clone());
+    if let Some(derivative) = existing_derivative {
+        entry = entry.with_derivative(derivative);
+    }
+    cache.insert(key, entry);
+    Ok(state)
+}
+
+/// Derivative-moment counterpart to [`evaluate_cell_moments_cached`]. Shares
+/// the value-moment LRU by storing both moment kinds in a single
+/// [`CachedCellMoments`] entry keyed on the cell fingerprint — derivative
+/// insertions preserve any pre-existing value state and vice versa, so the
+/// two callers never evict each other's work.
+pub fn evaluate_cell_derivative_moments_cached(
+    cell: DenestedCubicCell,
+    max_degree: usize,
+    cache: &CellMomentLruCache,
+    stats: Option<&CellMomentCacheStats>,
+) -> Result<CellDerivativeMomentState, String> {
+    let key = CellFingerprint::new(cell);
+    let existing_value = match cache.get(&key) {
+        Some(cached) => {
+            if let Some(state) = cached.derivative_state_for_degree(max_degree) {
+                if let Some(stats) = stats {
+                    stats.hits.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(state);
+            }
+            cached.state.clone()
+        }
+        None => None,
+    };
+    if let Some(stats) = stats {
+        stats.misses.fetch_add(1, Ordering::Relaxed);
+    }
+    let state = evaluate_cell_derivative_moments_uncached(cell, max_degree)?;
+    let mut entry = CachedCellMoments::new_derivative(state.clone());
+    if let Some(value) = existing_value {
+        entry = entry.with_value(value);
+    }
+    cache.insert(key, entry);
     Ok(state)
 }
 
