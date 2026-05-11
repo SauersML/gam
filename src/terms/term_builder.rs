@@ -306,11 +306,13 @@ pub fn build_smooth_basis(
             }
             if inferred {
                 let unique = unique_count_column(ds.values.column(c));
+                let ceiling = ((unique as f64).cbrt() as usize).max(20);
                 inference_notes.push(format!(
-                    "Automatically set {} internal knots for smooth '{}' from {} unique values (rule: clamp(unique/4, 4..20)). Override with knots=... or k=....",
+                    "Automatically set {} internal knots for smooth '{}' from {} unique values (rule: clamp(unique/4, 4..max(20, cbrt(unique))) = clamp(unique/4, 4..{})). Override with knots=... or k=....",
                     n_knots,
                     vars.join(","),
-                    unique
+                    unique,
+                    ceiling,
                 ));
             }
             Ok(SmoothBasisSpec::BSpline1D {

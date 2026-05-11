@@ -4879,6 +4879,17 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
         Ok(None)
     }
 
+    /// Forced dense materialization that bypasses any amortization gate the
+    /// workspace applies to `hessian_dense`. Callers that genuinely need a
+    /// dense matrix (logdet, factorize-based QP solves) use this so they pay
+    /// the workspace's structural direct-dense build cost rather than the
+    /// caller-side column-basis HVP fallback. Returning `None` means the
+    /// workspace has no preferred direct-dense path and the caller should
+    /// fall back to column-basis HVP via `hessian_matvec` / `apply`.
+    fn hessian_dense_forced(&self) -> Result<Option<Array2<f64>>, String> {
+        self.hessian_dense()
+    }
+
     fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
         Ok(None)
     }
@@ -7057,6 +7068,12 @@ enum JointHessianSource {
         /// loop. Wired from `workspace.hessian_matvec_into`.
         apply_into: Arc<dyn Fn(&Array1<f64>, &mut Array1<f64>) -> Result<(), String> + Send + Sync>,
         diagonal: Array1<f64>,
+        /// Forced dense materialization that bypasses the workspace's
+        /// `hessian_dense` amortization gate. Returns `Some` when the
+        /// workspace can build dense via a structural direct path (e.g.
+        /// CTN's `scop_gradient_and_negative_hessian`), `None` when the
+        /// caller should fall back to column-basis HVP through `apply`.
+        dense_forced: Arc<dyn Fn() -> Result<Option<Array2<f64>>, String> + Send + Sync>,
     },
 }
 
@@ -7113,8 +7130,34 @@ fn materialize_joint_hessian_source(
 ) -> Result<Array2<f64>, String> {
     match source {
         JointHessianSource::Dense(matrix) => Ok(matrix.clone()),
-        JointHessianSource::Operator { apply, .. } => {
+        JointHessianSource::Operator {
+            apply,
+            dense_forced,
+            ..
+        } => {
             ensure_exact_joint_hessian_dense_budget(total, context)?;
+            // Preferred path: the workspace exposes a structural direct-dense
+            // build (e.g. SCOP's `scop_gradient_and_negative_hessian`). That
+            // is `Θ(n·p²)` like column-basis HVP would be, but the constant
+            // factor is much better because the structural build sweeps rows
+            // once and uses BLAS-3 for the chain-rule pullback. Falling back
+            // to column-basis HVP would re-walk all `n` rows once per column.
+            if let Some(mut matrix) = dense_forced()? {
+                if matrix.nrows() != total || matrix.ncols() != total {
+                    return Err(format!(
+                        "{context}: dense_forced shape mismatch: got {}x{}, expected {total}x{total}",
+                        matrix.nrows(),
+                        matrix.ncols()
+                    ));
+                }
+                if matrix.iter().any(|value| !value.is_finite()) {
+                    return Err(format!(
+                        "{context}: dense_forced returned non-finite values"
+                    ));
+                }
+                symmetrize_dense_in_place(&mut matrix);
+                return Ok(matrix);
+            }
             let mut matrix = Array2::<f64>::zeros((total, total));
             let mut basis = Array1::<f64>::zeros(total);
             for col in 0..total {
@@ -7198,8 +7241,10 @@ fn exact_newton_joint_hessian_source_from_workspace(
 
     let workspace_apply = Arc::clone(workspace);
     let workspace_apply_into = Arc::clone(workspace);
+    let workspace_dense_forced = Arc::clone(workspace);
     let context_apply: Arc<str> = Arc::from(context);
     let context_apply_into = Arc::clone(&context_apply);
+    let context_dense_forced = Arc::clone(&context_apply);
     Ok(Some(JointHessianSource::Operator {
         apply: Arc::new(move |v: &Array1<f64>| {
             if v.len() != total {
@@ -7248,6 +7293,29 @@ fn exact_newton_joint_hessian_source_from_workspace(
             Ok(())
         }),
         diagonal,
+        dense_forced: Arc::new(move || -> Result<Option<Array2<f64>>, String> {
+            match workspace_dense_forced.hessian_dense_forced()? {
+                Some(mut matrix) => {
+                    if matrix.nrows() != total || matrix.ncols() != total {
+                        return Err(format!(
+                            "{}: hessian_dense_forced shape mismatch: got {}x{}, expected {total}x{total}",
+                            &*context_dense_forced,
+                            matrix.nrows(),
+                            matrix.ncols()
+                        ));
+                    }
+                    if matrix.iter().any(|value| !value.is_finite()) {
+                        return Err(format!(
+                            "{}: hessian_dense_forced returned non-finite values",
+                            &*context_dense_forced
+                        ));
+                    }
+                    symmetrize_dense_in_place(&mut matrix);
+                    Ok(Some(matrix))
+                }
+                None => Ok(None),
+            }
+        }),
     }))
 }
 
