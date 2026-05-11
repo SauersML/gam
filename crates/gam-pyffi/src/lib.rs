@@ -1996,6 +1996,9 @@ fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchored
             .into_iter()
             .map(|row| row.to_vec())
             .collect(),
+        anchor_residual_coefficients: None,
+        anchor_residual_components: Vec::new(),
+        anchor_residual_rotation: None,
     }
 }
 
