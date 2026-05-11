@@ -9792,6 +9792,24 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 refresh_all_block_etas(family, specs, &mut states)?;
                 let trial_penalty =
                     total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
+                // PSD invariant: ½β'S_λβ is non-negative for PSD S_λ by
+                // construction. A negative trial penalty beyond roundoff means
+                // S_λ has lost PSD upstream -- refuse the step regardless of
+                // what the rho-test thinks of the objective change, restore
+                // betas, and shrink the trust region so the next cycle re-enters
+                // the region where the quadratic model is sane. This is
+                // bookkeeping for a model violation (the penalty term of the
+                // quadratic model is not PSD), so it counts as a model reject.
+                let penalty_tol = 1e-10 * (1.0 + old_objective.abs() + current_penalty.abs());
+                if trial_penalty < -penalty_tol {
+                    model_rejects += 1;
+                    for (b, old) in old_beta.iter().enumerate() {
+                        states[b].beta.assign(old);
+                    }
+                    refresh_all_block_etas(family, specs, &mut states)?;
+                    joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
+                    continue;
+                }
                 // Families that can build a reusable workspace while computing
                 // the line-search likelihood do so here. Rejected attempts can
                 // still stop through the early-exit threshold; accepted full

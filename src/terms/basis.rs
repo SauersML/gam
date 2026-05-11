@@ -5823,6 +5823,52 @@ fn symmetrize_penalty(penalty: &Array2<f64>) -> Array2<f64> {
     sym
 }
 
+/// Project a (nearly-)symmetric matrix to the PSD cone by clamping
+/// negative eigenvalues to zero. A PenaltyMatrix is by definition PSD;
+/// this enforces that contract against the f64 noise floor so callers
+/// downstream (PIRLS, REML/LAML, outer-Hessian assembly) never see a
+/// quadratic form that goes negative on legitimate β.
+pub(crate) fn project_penalty_to_psd_cone(matrix: &Array2<f64>) -> Array2<f64> {
+    let sym = symmetrize_penalty(matrix);
+    let n = sym.nrows();
+    if n == 0 || n != sym.ncols() {
+        return sym;
+    }
+    let (evals, evecs) = match FaerEigh::eigh(&sym, Side::Lower) {
+        Ok(pair) => pair,
+        Err(_) => return sym,
+    };
+    if evals.is_empty() {
+        return sym;
+    }
+    let min_ev = evals.iter().copied().fold(f64::INFINITY, f64::min);
+    if min_ev >= 0.0 {
+        return sym;
+    }
+    let mut clamped = sym.clone();
+    for i in 0..n {
+        for j in 0..n {
+            let mut acc = 0.0_f64;
+            for k in 0..evals.len() {
+                let lam = evals[k];
+                if lam > 0.0 {
+                    acc += lam * evecs[[i, k]] * evecs[[j, k]];
+                }
+            }
+            clamped[[i, j]] = acc;
+        }
+    }
+    // Final symmetrize to wipe any reconstruction asymmetry at the noise floor.
+    for i in 0..n {
+        for j in 0..i {
+            let v = 0.5 * (clamped[[i, j]] + clamped[[j, i]]);
+            clamped[[i, j]] = v;
+            clamped[[j, i]] = v;
+        }
+    }
+    clamped
+}
+
 fn spectral_tolerance(sym: &Array2<f64>, evals: &Array1<f64>) -> f64 {
     let max_abs_ev = evals
         .iter()
@@ -26046,6 +26092,119 @@ mod tests {
                 .all(|v| v.abs() < 1e-12),
             "ThinPlate nullspace shrinkage second derivative should be zero"
         );
+    }
+
+    /// Variant of `test_duchon_log_kappa_derivative_matchesfd` at length_scale=1.0
+    /// (kappa=1, psi=0) to check whether the analytic dS/d(log κ) formulas
+    /// degrade at kappa=1 (where chain-rule corner cases are likeliest).
+    #[test]
+    fn test_duchon_log_kappa_derivative_matchesfd_lengthscale_one() {
+        let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
+        let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers),
+            length_scale: Some(1.0),
+            power: 2,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+        };
+        let derivative = build_duchon_basis_log_kappa_derivatives(data.view(), &spec)
+            .expect("analytic Duchon derivative should build");
+        let eps: f64 = 1e-5;
+        let kappa = 1.0;
+        let ls_plus = 1.0 / (kappa * eps.exp());
+        let ls_minus = 1.0 / (kappa * (-eps).exp());
+        let mut spec_plus = spec.clone();
+        let mut spec_minus = spec.clone();
+        spec_plus.length_scale = Some(ls_plus);
+        spec_minus.length_scale = Some(ls_minus);
+        let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
+        let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
+        for idx in 0..derivative.first.penalties_derivative.len() {
+            let fd = (&plus.penalties[idx] - &minus.penalties[idx]) / (2.0 * eps);
+            let analytic = &derivative.first.penalties_derivative[idx];
+            let err = (analytic - &fd).iter().map(|v| v * v).sum::<f64>().sqrt();
+            let a_norm = analytic.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let fd_norm = fd.iter().map(|v| v * v).sum::<f64>().sqrt();
+            eprintln!(
+                "[duchon_ls1] penalty {} analytic_norm={:.4e} fd_norm={:.4e} err={:.4e}",
+                idx, a_norm, fd_norm, err
+            );
+        }
+    }
+
+    /// Mirrors the failing iso-kappa-Duchon FD config: dim=1, power=1,
+    /// nullspace=Linear, length_scale=1.0. Confirms whether `s_psi`
+    /// from `build_duchon_basis_log_kappa_derivatives` matches dS/d(log κ)
+    /// of the rebuilt penalty for this 1D BinomialProbit-style spec.
+    #[test]
+    fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_linear() {
+        let n = 80usize;
+        let mut data = ndarray::Array2::<f64>::zeros((n, 1));
+        for i in 0..n {
+            data[[i, 0]] = i as f64 / (n as f64 - 1.0);
+        }
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+            length_scale: Some(1.0),
+            power: 1,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::default(),
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+        };
+        let derivative = build_duchon_basis_log_kappa_derivatives(data.view(), &spec)
+            .expect("analytic Duchon derivative should build");
+        let eps: f64 = 1e-5;
+        let kappa = 1.0 / spec.length_scale.expect("hybrid Duchon length_scale");
+        let ls_plus = 1.0 / (kappa * eps.exp());
+        let ls_minus = 1.0 / (kappa * (-eps).exp());
+        let mut spec_plus = spec.clone();
+        let mut spec_minus = spec.clone();
+        spec_plus.length_scale = Some(ls_plus);
+        spec_minus.length_scale = Some(ls_minus);
+        let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
+        let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
+        eprintln!(
+            "[duchon_d1_p1_linear] n_penalties={} analytic_n={}",
+            plus.penalties.len(),
+            derivative.first.penalties_derivative.len()
+        );
+        let base = build_duchon_basis(data.view(), &spec).expect("base build");
+        for idx in 0..derivative.first.penalties_derivative.len() {
+            let fd = (&plus.penalties[idx] - &minus.penalties[idx]) / (2.0 * eps);
+            let analytic = &derivative.first.penalties_derivative[idx];
+            let err = (analytic - &fd).iter().map(|v| v * v).sum::<f64>().sqrt();
+            let a_norm = analytic.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let fd_norm = fd.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let s0_base_norm = base.penalties[idx].iter().map(|v| v * v).sum::<f64>().sqrt();
+            let s0_plus_norm = plus.penalties[idx].iter().map(|v| v * v).sum::<f64>().sqrt();
+            let s0_minus_norm = minus.penalties[idx].iter().map(|v| v * v).sum::<f64>().sqrt();
+            eprintln!(
+                "[duchon_d1_p1_linear] penalty {} S_base_norm={:.6e} S_plus_norm={:.6e} S_minus_norm={:.6e}",
+                idx, s0_base_norm, s0_plus_norm, s0_minus_norm
+            );
+            eprintln!(
+                "[duchon_d1_p1_linear] penalty {} analytic_norm={:.4e} fd_norm={:.4e} err={:.4e}",
+                idx, a_norm, fd_norm, err
+            );
+            // First 9 entries of dS/dpsi for shape comparison.
+            let pr = |m: &ndarray::Array2<f64>, label: &str| {
+                let n = m.nrows().min(3);
+                let mut s = String::new();
+                for i in 0..n {
+                    for j in 0..n {
+                        s.push_str(&format!("{:+.4e} ", m[[i, j]]));
+                    }
+                    s.push_str("| ");
+                }
+                eprintln!("[duchon_d1_p1_linear] penalty {} {}: {}", idx, label, s);
+            };
+            pr(analytic, "analytic");
+            pr(&fd, "fd     ");
+        }
     }
 
     #[test]

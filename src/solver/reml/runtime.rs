@@ -3258,6 +3258,18 @@ impl<'a> RemlState<'a> {
         // seed starts fully cold.
         self.clear_warm_start_predictor_state();
         self.clear_warm_start_adaptive_signals();
+        // Inner-PIRLS iteration caps are cross-trajectory state: the
+        // previous outer's first-order bridge writes `outer_inner_cap`
+        // on every accepted gradient eval, and seed-screening writes
+        // `screening_max_inner_iterations` during cascade probes. A
+        // value left over from the prior trajectory would silently
+        // shape the first PIRLS solve at the new seed under a cap the
+        // new trajectory never chose. The next outer is responsible
+        // for re-establishing any cap it wants via its own bridge or
+        // screening hook; zeroing here is the safe baseline.
+        self.outer_inner_cap.store(0, Ordering::Relaxed);
+        self.screening_max_inner_iterations
+            .store(0, Ordering::Relaxed);
     }
 
     // Accessor methods for private fields

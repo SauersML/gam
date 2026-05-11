@@ -2848,6 +2848,8 @@ fn normalize_penalty_in_constrained_space(matrix: &Array2<f64>) -> (Array2<f64>,
     // This is the only normalization coherent with a REML objective that is
     // evaluated entirely in constrained coordinates.
     let matrix = (matrix + &matrix.t().to_owned()) * 0.5;
+    // Clamp noise-floor negative eigenvalues so β'Sβ is non-negative as a contract, not just in exact arithmetic.
+    let matrix = crate::terms::basis::project_penalty_to_psd_cone(&matrix);
     let c = matrix.iter().map(|v| v * v).sum::<f64>().sqrt();
     if c.is_finite() && c > 0.0 {
         (matrix.mapv(|v| v / c), c)
