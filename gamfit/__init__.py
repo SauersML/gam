@@ -11,7 +11,9 @@ Quick start::
 
     model = gamfit.fit(train, "y ~ s(x)")
     pred = model.predict(test, interval=0.95)
+    posterior = model.sample(train)          # NUTS draws over coefficients
     print(model.summary())
+    print(posterior)                         # one-line convergence summary
     model.save("model.gam")
 
 See https://github.com/SauersML/gam for the full guide.
@@ -24,6 +26,7 @@ from ._binding import RustExtensionUnavailableError
 from ._diagnostics import Diagnostics
 from ._exceptions import FormulaError, GamError, PredictionError, SchemaMismatchError
 from ._model import Model, SurvivalPrediction
+from ._sampling import PosteriorSamples, SamplingConfig
 from ._schema import SchemaCheck, SchemaIssue
 from ._summary import Summary
 from ._validation import FormulaValidation
@@ -39,8 +42,10 @@ __all__ = [
     "FormulaValidation",
     "GamError",
     "Model",
+    "PosteriorSamples",
     "PredictionError",
     "RustExtensionUnavailableError",
+    "SamplingConfig",
     "SchemaCheck",
     "SchemaIssue",
     "SchemaMismatchError",
