@@ -26,10 +26,11 @@ use crate::hmc::{
     run_nuts_sampling_flattened_family, run_survival_nuts_sampling_flattened,
 };
 use crate::inference::formula_dsl::{LinkWiggleFormulaSpec, parse_formula};
-use crate::inference::model::{FittedModel as SavedModel, PredictModelClass};
+use crate::inference::model::{
+    FittedModel as SavedModel, PredictModelClass, load_survival_time_basis_config_from_model,
+};
 use crate::smooth::{build_term_collection_design, weighted_blockwise_penalty_sum};
 use crate::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
-use crate::inference::model::load_survival_time_basis_config_from_model;
 use crate::survival_construction::{
     SurvivalLikelihoodMode, add_survival_time_derivative_guard_offset, build_survival_time_basis,
     build_survival_time_offsets_for_likelihood, center_survival_time_designs_at_anchor,
