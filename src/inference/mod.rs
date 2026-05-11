@@ -11,3 +11,4 @@ pub mod predict_input;
 pub mod prediction_linalg;
 pub mod probability;
 pub mod quadrature;
+pub mod sample;
