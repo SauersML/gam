@@ -721,8 +721,6 @@ pub(crate) struct InvertedRhoHessian {
     pub dropped_small_positive: usize,
     /// Eigenpairs dropped for |σ_i| ≤ neg_tol (numerical zero).
     pub dropped_numerical_zero: usize,
-    /// max(|σ_i|, 1.0) used to scale tolerances.
-    pub spectral_scale: f64,
     /// Smallest eigenvalue (signed) of the input Hessian.
     pub min_eigenvalue: f64,
     /// True whenever active_rank < n (i.e. anything was dropped). Cholesky fast
@@ -771,7 +769,6 @@ fn invert_regularized_rho_hessian(hessian_rho: &Array2<f64>) -> Option<InvertedR
             dropped_negative: 0,
             dropped_small_positive: 0,
             dropped_numerical_zero: 0,
-            spectral_scale: 1.0,
             min_eigenvalue: f64::NAN,
             repaired_hessian: false,
             eigenvalues: Array1::<f64>::zeros(0),
@@ -839,7 +836,6 @@ fn invert_regularized_rho_hessian(hessian_rho: &Array2<f64>) -> Option<InvertedR
         dropped_negative,
         dropped_small_positive,
         dropped_numerical_zero,
-        spectral_scale,
         min_eigenvalue,
         repaired_hessian: active_rank < n,
         eigenvalues,
@@ -2390,16 +2386,15 @@ where
             } else {
                 (bnds.1, bnds.0)
             };
+            // risk_shift is the default seed bias when no caller warm-start is given;
+            // it is NOT applied on top of a caller-supplied heuristic_lambdas.
             let risk_shift = match reml_seed_config.risk_profile {
                 SeedRiskProfile::Gaussian => 0.0,
                 SeedRiskProfile::GeneralizedLinear => 1.0,
                 SeedRiskProfile::Survival => 2.0,
             };
             let base = if let Some(h) = heuristic_lambdas.as_ref().filter(|h| h.len() == k) {
-                Array1::from_iter(h.iter().map(|&v| {
-                    let r = v.max(1e-12).ln();
-                    (r + risk_shift).clamp(lo, hi)
-                }))
+                Array1::from_iter(h.iter().map(|&v| v.max(1e-12).ln().clamp(lo, hi)))
             } else {
                 Array1::from_elem(k, risk_shift.clamp(lo, hi))
             };
@@ -5158,7 +5153,9 @@ where
         linear_constraints: opts.linear_constraints.clone(),
         firth_bias_reduction: Some(opts.firth_bias_reduction),
         penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
-        rho_prior: Default::default(),
+        // Propagate caller's rho_prior so inner outer-REML minimizes the
+        // same objective as paths that build ExternalOptimOptions directly.
+        rho_prior: opts.rho_prior.clone(),
         kronecker_penalty_system: opts.kronecker_penalty_system.clone(),
         kronecker_factored: opts.kronecker_factored.clone(),
     };
