@@ -180,3 +180,41 @@ either (a) extending the plateau cap-extension to fire on
 predicted-reduction-near-tol, or (b) fixing the underlying rank
 deficiency at n < p via auto-bumped ridge in the operator-mode joint
 Newton path.
+
+## Post-cap-extension-fix results (commit 0d4aea1a)
+
+The CGT predicted-reduction branch added to the inner cap-extension
+gate now fires at N=100 plain:
+
+  [GAMLSS inner cycle cap extended] residual=4.363e-4,
+    last_3_descent_ratios=[0.951, 0.951, 0.952], new_cap=200
+  [JN-EXIT] cycle=111 reason=predicted_reduction_below_tol
+    predicted_reduction=4.292e-6 objective_change=5.705e-6
+    objective_tol=5.785e-6
+
+Before: N=100 plain failed completely (all seeds rejected at cycle
+100 cap). After: N=100 plain fits in **3.7 s** with a saved model
+(converged=false flag, same family of gradient-noise issue as N=200).
+The cap-extension fired twice during the run; the CGT certificate
+fired 65 times across the trajectory.
+
+## Observed parallel-WIP perf regression at N≥1000
+
+Comparing the v3 binary (post all parallel WIP) to the pre-WIP binary
+on the same data files, no cap-extensions firing:
+
+| n      | pre-WIP | v3 (post-WIP) | ratio |
+| -----: | ------: | ------------: | ----: |
+|  1000  |  1.9 s  |       13.0 s  |  6.8× |
+| 20000  | 17.9 s  |       67.8 s  |  3.8× |
+
+The slowdown is in `DenseSpectralOperator::trace_logdet_operator`
+(avg 3.2 s/call at N=20000 in v3, vs ~0.2-0.5 s in pre-WIP). My cap-
+extension change does NOT fire on these sizes (confirmed by
+`grep -c "cycle cap extended" = 0`), so the regression is entirely
+from the parallel session's CGT + family-policy edits.
+
+The root-cause hot path is unchanged: `compute_jf` builds the (n × K·rank)
+Jacobian projection per-row, which is mathematically a BLAS-3 GEMM in
+disguise. The BLAS-3 refactor (documented in the earlier section) would
+both reverse the parallel-WIP regression and unlock N=100K in ~120 s.
