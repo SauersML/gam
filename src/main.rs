@@ -5508,21 +5508,17 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
                 &cfg,
             )?
         }
-        PredictModelClass::GaussianLocationScale | PredictModelClass::BinomialLocationScale => {
-            return Err(
-                "sample for location-scale models is not available yet; sample the mean-only model instead"
-                    .to_string(),
-            )
+        PredictModelClass::GaussianLocationScale => {
+            gam::sample::laplace_gaussian_fallback(&model, &cfg, "gaussian location-scale posterior")?
+        }
+        PredictModelClass::BinomialLocationScale => {
+            gam::sample::laplace_gaussian_fallback(&model, &cfg, "binomial location-scale posterior")?
         }
         PredictModelClass::BernoulliMarginalSlope => {
-            return Err(
-                "sample for bernoulli marginal-slope models is not available yet".to_string(),
-            )
+            gam::sample::laplace_gaussian_fallback(&model, &cfg, "bernoulli marginal-slope posterior")?
         }
         PredictModelClass::TransformationNormal => {
-            return Err(
-                "sample for transformation-normal models is not available yet".to_string(),
-            )
+            gam::sample::laplace_gaussian_fallback(&model, &cfg, "transformation-normal posterior")?
         }
         PredictModelClass::Standard => run_sample_standard(
             &mut progress,
@@ -5653,16 +5649,11 @@ fn run_sample_survival(
     let saved_likelihood_mode = require_saved_survival_likelihood_mode(model)?;
     if matches!(
         saved_likelihood_mode,
-        SurvivalLikelihoodMode::Latent | SurvivalLikelihoodMode::LatentBinary
+        SurvivalLikelihoodMode::Latent
+            | SurvivalLikelihoodMode::LatentBinary
+            | SurvivalLikelihoodMode::LocationScale
     ) {
-        return Err(
-            "sampling is not implemented for saved latent survival/binary models".to_string(),
-        );
-    }
-    if saved_likelihood_mode == SurvivalLikelihoodMode::LocationScale {
-        return Err(
-            "sample for survival-likelihood=location-scale is not implemented yet".to_string(),
-        );
+        return gam::sample::laplace_gaussian_fallback(model, cfg, "survival posterior fallback");
     }
     let entryname = model
         .survival_entry
