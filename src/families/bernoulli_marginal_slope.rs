@@ -13172,9 +13172,9 @@ impl BernoulliMarginalSlopeFamily {
         if !flex_active && slices.total < 512 {
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
             let cache = build_row_kernel_cache(&kern, &crate::families::row_kernel::RowSet::All)?;
-            let ll = row_kernel_log_likelihood(&cache);
+            let ll = row_kernel_log_likelihood(&cache, &crate::families::row_kernel::RowSet::All);
             let joint_gradient = Self::exact_newton_score_from_objective_gradient(
-                row_kernel_gradient(&kern, &cache),
+                row_kernel_gradient(&kern, &cache, &crate::families::row_kernel::RowSet::All),
             );
 
             let n = cache.n;
@@ -13881,7 +13881,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         if !self.effective_flex_active(block_states)? {
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
             let cache = build_row_kernel_cache(&kern, &crate::families::row_kernel::RowSet::All)?;
-            return Ok(Some(row_kernel_hessian_dense(&kern, &cache)));
+            return Ok(Some(row_kernel_hessian_dense(&kern, &cache, &crate::families::row_kernel::RowSet::All)));
         }
 
         // Build the dense joint Hessian by accumulating per-row primary
@@ -13917,9 +13917,11 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
             let cache = build_row_kernel_cache(&kern, &crate::families::row_kernel::RowSet::All)?;
             return Ok(Some(ExactNewtonJointGradientEvaluation {
-                log_likelihood: row_kernel_log_likelihood(&cache),
+                log_likelihood: row_kernel_log_likelihood(&cache, &crate::families::row_kernel::RowSet::All),
                 gradient: Self::exact_newton_score_from_objective_gradient(row_kernel_gradient(
-                    &kern, &cache,
+                    &kern,
+                    &cache,
+                    &crate::families::row_kernel::RowSet::All,
                 )),
             }));
         }
@@ -14011,7 +14013,12 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         if !self.effective_flex_active(block_states)? {
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
             let sl = d_beta_flat.as_slice().ok_or("non-contiguous d_beta")?;
-            crate::families::row_kernel::row_kernel_directional_derivative(&kern, sl).map(Some)
+            crate::families::row_kernel::row_kernel_directional_derivative(
+                &kern,
+                &crate::families::row_kernel::RowSet::All,
+                sl,
+            )
+            .map(Some)
         } else {
             let cache = self.build_exact_eval_cache(block_states)?;
             self.exact_newton_joint_hessian_directional_derivative_from_cache(
@@ -14032,8 +14039,13 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
             let su = d_beta_u_flat.as_slice().ok_or("non-contiguous d_beta_u")?;
             let sv = d_beta_v_flat.as_slice().ok_or("non-contiguous d_beta_v")?;
-            crate::families::row_kernel::row_kernel_second_directional_derivative(&kern, su, sv)
-                .map(Some)
+            crate::families::row_kernel::row_kernel_second_directional_derivative(
+                &kern,
+                &crate::families::row_kernel::RowSet::All,
+                su,
+                sv,
+            )
+            .map(Some)
         } else {
             let cache = self.build_exact_eval_cache(block_states)?;
             self.exact_newton_joint_hessiansecond_directional_derivative_from_cache(
