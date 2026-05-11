@@ -20,7 +20,6 @@ pub fn init_parallelism() {
     });
 }
 
-pub mod approx_ledger;
 pub mod families;
 pub mod inference;
 pub mod linalg;
