@@ -3974,20 +3974,32 @@ fn run_outer(
 
         obj.reset();
 
-        // ARC budget-bump retry ladder: when an Arc attempt exhausts its
-        // iteration budget, re-run the same Arc plan up to two additional
-        // times with `max_iter *= 2` per retry (3× and 7× original budget,
-        // capped well under 8×) warm-started from the previous attempt's
-        // last rho. This preserves ARC's analytic-Hessian geometry instead
-        // of demoting to a strictly weaker BFGS+BfgsApprox surface, while
-        // still bounding total work. Mirrors the retry structure already
-        // implicit in the cascade for EFS/HybridEFS.
+        // ARC budget-exhaustion retry: when an Arc attempt runs out of
+        // outer iterations, reseed a fresh Arc run from the previous
+        // attempt's last ρ and trust radius. Inner caches (PIRLS LRU,
+        // eval bundle, warm-start predictor, adaptive signals) are wiped
+        // by `obj.reset()`; the operator-TR's Cauchy/Newton/CG state has
+        // no resume API and is not preserved. The lever that changes for
+        // the resumed run is the inner-PIRLS cap (uncapped via the
+        // feedback handle), not `max_iter` — empirically the prior stall
+        // was an inner-tolerance / model-fidelity issue, not an outer
+        // budget shortfall, and doubling `max_iter` only replays the
+        // same trajectory byte-for-byte. The retry is gated on observed
+        // `‖g‖` progress so trajectories that made no headway fall
+        // through to the degraded plan instead of replaying.
         let mut arc_retries_left: u32 = if matches!(the_plan.solver, Solver::Arc) {
             2
         } else {
             0
         };
         let mut retry_config: Option<OuterConfig> = None;
+        // Tracks the previous ARC attempt's terminal `‖g‖`. The retry
+        // gate compares attempt-over-attempt: if a retry didn't move
+        // the gradient norm, the trajectory replayed (same seed, same
+        // trust radius, cold caches, deterministic optimizer) and
+        // further retries cannot help. First retry is unconditional
+        // (no prior attempt to compare against).
+        let mut prev_attempt_grad_norm: Option<f64> = None;
 
         let outcome = loop {
             let active_config: &OuterConfig = retry_config.as_ref().unwrap_or(config);
@@ -4002,28 +4014,61 @@ fn run_outer(
                     {
                         break Ok(result);
                     }
-                    let prev_max_iter = active_config.max_iter;
-                    let bumped_max_iter = prev_max_iter.saturating_mul(2);
+                    // Gate the retry on attempt-over-attempt `‖g‖`
+                    // progress. The first retry is unconditional (no
+                    // prior attempt). Subsequent retries fall through
+                    // to the degraded plan when the gradient norm did
+                    // not materially shrink — the deterministic
+                    // optimizer with the same seed and trust radius
+                    // would replay the same trajectory.
+                    let cur_grad_norm = result.final_grad_norm;
+                    if let Some(prev_g) = prev_attempt_grad_norm {
+                        let progressed = cur_grad_norm.is_finite()
+                            && prev_g.is_finite()
+                            && cur_grad_norm < 0.5 * prev_g;
+                        if !progressed {
+                            log::info!(
+                                "[OUTER] {context}: ARC retry stalled at \
+                                 iter={} cost={:.6e} |g|={:.6e} (prev |g|={:.6e}); \
+                                 deterministic replay suspected, falling through \
+                                 to degraded plan",
+                                result.iterations,
+                                result.final_value,
+                                cur_grad_norm,
+                                prev_g,
+                            );
+                            break Ok(result);
+                        }
+                    }
                     let next_trust_radius = result.operator_trust_radius;
                     log::info!(
                         "[OUTER] {context}: ARC attempt exhausted budget at \
-                         iter={} cost={:.6e} |g|={:.6e}; retrying ARC with \
-                         max_iter {} -> {} warm-started from last rho \
-                         and trust_radius {:?} (analytic-Hessian preservation)",
+                         iter={} cost={:.6e} |g|={:.6e}; resuming from last \
+                         rho + trust_radius={:?}, inner-PIRLS uncapped \
+                         (objective caches wiped; operator-TR Cauchy/Newton \
+                         state is not resumable)",
                         result.iterations,
                         result.final_value,
-                        result.final_grad_norm,
-                        prev_max_iter,
-                        bumped_max_iter,
+                        cur_grad_norm,
                         next_trust_radius,
                     );
+                    prev_attempt_grad_norm = Some(cur_grad_norm);
                     let mut next = active_config.clone();
-                    next.max_iter = bumped_max_iter;
                     next.initial_rho = Some(result.rho.clone());
                     next.operator_initial_trust_radius = next_trust_radius;
                     retry_config = Some(next);
                     arc_retries_left -= 1;
                     obj.reset();
+                    // Lift any inner-PIRLS cap for the resumed run. The
+                    // schedule's cold-start ladder (3/5/10) would
+                    // re-coarsen exactly the inner solves whose tolerance
+                    // is suspected to have starved the prior trajectory.
+                    // The next outer iter consumes ρ near a near-stationary
+                    // point where exact β / gradient / Hessian is the
+                    // load-bearing input to the operator-TR geometry.
+                    if let Some(feedback) = active_config.outer_inner_cap.as_ref() {
+                        feedback.cap.store(0, Ordering::Relaxed);
+                    }
                 }
                 Err(e) => break Err(e),
             }
