@@ -364,12 +364,11 @@ def render_marginal_slope_3d() -> None:
         + 1.0 * np.exp(-((pc1 - 0.30) ** 2 + (pc2 + 0.20) ** 2) / 0.18)
         - 0.9 * np.exp(-((pc1 + 0.45) ** 2 + (pc2 - 0.55) ** 2) / 0.16)
     )
-    # Strongly spatially-varying slope-of-z: negative in the bottom-left
-    # corner, strongly positive in the top-right.  This makes the two
-    # surfaces cross each other across the (pc1, pc2) plane — visually
-    # the most striking expression of "the slope is a smooth function
-    # of where you are".
-    slope = -0.4 + 3.0 / (1.0 + np.exp(-3.5 * (pc1 + pc2 - 0.1)))
+    # Spatially-varying slope-of-z, always positive: gentle in the
+    # bottom-left corner, stronger in the top-right.  Keeps the two
+    # surfaces in their natural baseline / elevated order without
+    # crossing.
+    slope = 0.6 + 1.4 / (1.0 + np.exp(-2.5 * (pc1 + pc2 - 0.4)))
     eta = baseline + slope * z
     prob = 1.0 / (1.0 + np.exp(-eta))
     case = (rng.uniform(size=n) < prob).astype(float)
@@ -403,9 +402,9 @@ def render_marginal_slope_3d() -> None:
         m = np.asarray(pred["mean"], dtype=float).reshape(side, side)
         return np.clip(m, 0.0, 1.0)
 
-    log("[marginal-slope] predicting low z (-2)")
-    p_base = surface_at(-2.0)
-    log("[marginal-slope] predicting high z (+2)")
+    log("[marginal-slope] predicting baseline (z=0)")
+    p_base = surface_at(0.0)
+    log("[marginal-slope] predicting elevated (z=+2)")
     p_high = surface_at(+2.0)
 
     vmin = float(min(p_base.min(), p_high.min()))
@@ -447,7 +446,7 @@ def render_marginal_slope_3d() -> None:
              va="center")
     fig.text(0.45, 0.94, "   ", backgroundcolor="#3b528b",
              fontsize=11, color="white", va="center")
-    fig.text(0.495, 0.938, "z = −2",
+    fig.text(0.495, 0.938, "z = 0",
              fontsize=10, color="#374151", va="center")
     fig.text(0.66, 0.94, "   ", backgroundcolor="#b73779",
              fontsize=11, color="white", va="center")
