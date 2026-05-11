@@ -12,6 +12,26 @@ from ._validation import FormulaValidation
 
 
 def build_info() -> dict[str, Any]:
+    """Return build/runtime metadata for the Rust extension.
+
+    Reports whether ``gamfit._rust`` was importable and, when available, the
+    build-time information exposed by the extension (version, commit, feature
+    flags). Useful for bug reports and for confirming a development build is
+    being used.
+
+    Returns
+    -------
+    dict
+        Always contains ``available`` (bool) and ``module`` (str). When the
+        extension loaded, additional engine-specific keys are merged in;
+        otherwise ``reason`` describes why import failed.
+
+    Examples
+    --------
+    >>> info = gamfit.build_info()
+    >>> info["available"]
+    True
+    """
     return extension_status()
 
 
@@ -197,11 +217,58 @@ def fit(
 
 
 def load(path: str | Path) -> Model:
+    """Load a fitted :class:`Model` previously written with :meth:`Model.save`.
+
+    Reads the raw bytes from ``path`` and dispatches to :func:`loads`.
+
+    Parameters
+    ----------
+    path : str or pathlib.Path
+        Filesystem path to the serialized model file.
+
+    Returns
+    -------
+    Model
+        Fitted model ready for prediction.
+
+    Raises
+    ------
+    GamError
+        If the file cannot be decoded by the Rust engine.
+
+    Examples
+    --------
+    >>> model = gamfit.load("model.gam")
+    >>> model.predict(test_df)
+    """
     model_bytes = Path(path).read_bytes()
     return loads(model_bytes)
 
 
 def loads(model_bytes: bytes) -> Model:
+    """Load a fitted :class:`Model` from an in-memory bytes payload.
+
+    Parameters
+    ----------
+    model_bytes : bytes
+        Raw serialized model produced by :meth:`Model.save` or
+        :meth:`Model.saves`.
+
+    Returns
+    -------
+    Model
+        Fitted model ready for prediction.
+
+    Raises
+    ------
+    GamError
+        If the payload is malformed or incompatible with the current engine.
+
+    Examples
+    --------
+    >>> with open("model.gam", "rb") as fh:
+    ...     model = gamfit.loads(fh.read())
+    """
     try:
         rust_module().load_model(model_bytes)
     except Exception as exc:
@@ -273,6 +340,32 @@ def validate_formula(
 
 
 def explain_error(exc: BaseException) -> str:
+    """Return a short, actionable hint describing how to recover from ``exc``.
+
+    Inspects the exception type and returns a one-line suggestion tailored to
+    the gamfit error hierarchy (:class:`FormulaError`,
+    :class:`SchemaMismatchError`, :class:`PredictionError`, :class:`GamError`,
+    :class:`RustExtensionUnavailableError`). Unrecognized exceptions fall back
+    to a generic message.
+
+    Parameters
+    ----------
+    exc : BaseException
+        The exception caught from a gamfit call.
+
+    Returns
+    -------
+    str
+        Human-readable remediation hint.
+
+    Examples
+    --------
+    >>> try:
+    ...     gamfit.fit(df, "y ~ s(nope)")
+    ... except gamfit.GamError as exc:
+    ...     print(gamfit.explain_error(exc))
+    Check the formula syntax and confirm every referenced column exists.
+    """
     if isinstance(exc, RustExtensionUnavailableError):
         return "Build the extension with maturin before calling Rust-backed APIs."
     from ._exceptions import FormulaError, GamError, PredictionError, SchemaMismatchError
