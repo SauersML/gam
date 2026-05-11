@@ -98,8 +98,30 @@ pub enum BasisError {
     #[error("QR decomposition failed while applying constraints: {0}")]
     LinalgError(#[from] FaerLinalgError),
 
-    #[error("Failed to identify a constraint nullspace basis; matrix is ill-conditioned.")]
-    ConstraintNullspaceNotFound,
+    #[error(
+        "Failed to identify a constraint nullspace basis at {site}: \
+         coefficient dim {coeff_dim}, cross-rank {cross_rank}, \
+         constraint Frobenius {cross_frobenius:.3e}, \
+         constrained Gram max eigenvalue {constrained_gram_max_eigenvalue:.3e} \
+         (min {constrained_gram_min_eigenvalue:.3e}, \
+         spectral tolerance {spectral_tolerance:.3e}). \
+         The smooth basis collapses onto the parametric block — typical causes: \
+         (a) the smooth's evaluated kernel underflows after projecting out the \
+         polynomial nullspace, leaving only floating-point noise (Duchon hybrid \
+         in moderate-to-high d with length_scale near pairwise center distances); \
+         (b) the parametric block already spans the smooth's column space \
+         (over-restrictive identifiability constraint); \
+         (c) the smooth has effective rank ≤ parametric-block size on this data."
+    )]
+    ConstraintNullspaceCollapsed {
+        site: &'static str,
+        cross_rank: usize,
+        coeff_dim: usize,
+        cross_frobenius: f64,
+        constrained_gram_max_eigenvalue: f64,
+        constrained_gram_min_eigenvalue: f64,
+        spectral_tolerance: f64,
+    },
 
     #[error(
         "Knot vector is degenerate: all Greville abscissae are equal, so linear constraint cannot be applied."
@@ -2529,17 +2551,15 @@ fn positive_spectral_whitener_from_gram(gram: &Array2<f64>) -> Result<Array2<f64
     let keep = eigenvalues.iter().filter(|&&ev| ev > tol).count();
     if keep == 0 {
         let min_ev = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
-        let gram_norm = gram.iter().map(|v| v * v).sum::<f64>().sqrt();
-        eprintln!(
-            "[NULL-DBG] positive_spectral_whitener_from_gram: keep=0 gram={}x{} gram_fro={:.3e} max_eval={:.3e} min_eval={:.3e} tol={:.3e}",
-            gram.nrows(),
-            gram.ncols(),
-            gram_norm,
-            max_eval,
-            min_ev,
-            tol,
-        );
-        return Err(BasisError::ConstraintNullspaceNotFound);
+        return Err(BasisError::ConstraintNullspaceCollapsed {
+            site: "positive_spectral_whitener_from_gram",
+            cross_rank: 0,
+            coeff_dim: gram.nrows(),
+            cross_frobenius: gram.iter().map(|v| v * v).sum::<f64>().sqrt(),
+            constrained_gram_max_eigenvalue: max_eval,
+            constrained_gram_min_eigenvalue: min_ev,
+            spectral_tolerance: tol,
+        });
     }
     // `eigh` returns eigenvalues in ascending order, so the largest `keep`
     // eigenvalues live at the tail.
@@ -2584,15 +2604,15 @@ fn orthogonality_transform_from_cross_and_gram(
     let (transform_raw, rank) = rrqr_nullspace_basis(constraint_cross, default_rrqr_rank_alpha())
         .map_err(BasisError::LinalgError)?;
     if rank >= k || transform_raw.ncols() == 0 {
-        eprintln!(
-            "[NULL-DBG] orthogonality_transform_from_cross_and_gram: rank={} k={} cross={}x{} cross_norm={:.3e}",
-            rank,
-            k,
-            constraint_cross.nrows(),
-            constraint_cross.ncols(),
-            constraint_cross.iter().map(|v| v * v).sum::<f64>().sqrt(),
-        );
-        return Err(BasisError::ConstraintNullspaceNotFound);
+        return Err(BasisError::ConstraintNullspaceCollapsed {
+            site: "orthogonality_transform_from_cross_and_gram",
+            cross_rank: rank,
+            coeff_dim: k,
+            cross_frobenius: constraint_cross.iter().map(|v| v * v).sum::<f64>().sqrt(),
+            constrained_gram_max_eigenvalue: f64::NAN,
+            constrained_gram_min_eigenvalue: f64::NAN,
+            spectral_tolerance: f64::NAN,
+        });
     }
 
     // Make the constrained design B*K_raw orthonormal under the W-inner product.
@@ -2764,12 +2784,19 @@ impl RadialScalarKind {
 /// Instead of persisting O(n*k*(d+2)) arrays, the operator stores the original
 /// data/centers/eta and recomputes q/t/s per chunk during matvec operations.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 enum StreamingAxisMode {
     /// Per-axis anisotropic ψ_a derivatives: expose one `s_a` component per axis.
-    PerAxis { eta: Vec<f64> },
+    PerAxis {
+        eta: Vec<f64>,
+        metric_weights: Arc<[f64]>,
+    },
     /// Scalar ψ derivative: expose a single component equal to the total
     /// scaled squared radius r² = Σ_a exp(2η_a) h_a².
-    ScalarTotal { eta: Vec<f64> },
+    ScalarTotal {
+        eta: Vec<f64>,
+        metric_weights: Arc<[f64]>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -2796,28 +2823,35 @@ impl StreamingRadialState {
         s_buf: &mut [f64],
     ) -> Result<(f64, f64, f64), BasisError> {
         match &self.axis_mode {
-            StreamingAxisMode::PerAxis { eta } => {
-                let dim = eta.len();
+            StreamingAxisMode::PerAxis {
+                eta: _,
+                metric_weights,
+            } => {
+                let dim = metric_weights.len();
                 debug_assert_eq!(s_buf.len(), dim);
-                let eta_mean = centered_aniso_log_scale_mean(eta);
+                debug_assert!(i < self.data.nrows() && j < self.centers.nrows());
+                debug_assert!(dim <= self.data.ncols() && dim <= self.centers.ncols());
                 let mut r2 = 0.0;
                 for a in 0..dim {
-                    let h = self.data[[i, a]] - self.centers[[j, a]];
-                    let w = aniso_metric_weight(eta[a], eta_mean);
-                    let s_a = w * h * h;
+                    let h = unsafe { self.data.uget((i, a)) - self.centers.uget((j, a)) };
+                    let s_a = metric_weights[a] * h * h;
                     s_buf[a] = s_a;
                     r2 += s_a;
                 }
                 self.radial_kind.eval_design_triplet(r2.sqrt())
             }
-            StreamingAxisMode::ScalarTotal { eta } => {
+            StreamingAxisMode::ScalarTotal {
+                eta: _,
+                metric_weights,
+            } => {
                 debug_assert_eq!(s_buf.len(), 1);
-                let eta_mean = centered_aniso_log_scale_mean(eta);
+                let dim = metric_weights.len();
+                debug_assert!(i < self.data.nrows() && j < self.centers.nrows());
+                debug_assert!(dim <= self.data.ncols() && dim <= self.centers.ncols());
                 let mut r2 = 0.0;
-                for a in 0..eta.len() {
-                    let h = self.data[[i, a]] - self.centers[[j, a]];
-                    let w = aniso_metric_weight(eta[a], eta_mean);
-                    r2 += w * h * h;
+                for a in 0..dim {
+                    let h = unsafe { self.data.uget((i, a)) - self.centers.uget((j, a)) };
+                    r2 += metric_weights[a] * h * h;
                 }
                 s_buf[0] = r2;
                 self.radial_kind.eval_design_triplet(r2.sqrt())
@@ -2999,6 +3033,7 @@ impl ImplicitDesignPsiDerivative {
         let n_axes = data.ncols();
         let psi_scale_share = radial_kind.raw_psi_isotropic_share();
         assert_eq!(eta.len(), n_axes);
+        let metric_weights: Arc<[f64]> = Arc::from(centered_aniso_metric_weights(&eta));
         Self {
             // Empty arrays -- not used in streaming mode.
             phi_values: Array1::<f64>::zeros(0),
@@ -3008,7 +3043,10 @@ impl ImplicitDesignPsiDerivative {
             streaming: Some(StreamingRadialState {
                 data,
                 centers,
-                axis_mode: StreamingAxisMode::PerAxis { eta },
+                axis_mode: StreamingAxisMode::PerAxis {
+                    eta,
+                    metric_weights,
+                },
                 radial_kind,
             }),
             ident_transform,
@@ -3038,6 +3076,7 @@ impl ImplicitDesignPsiDerivative {
         let n_knots = centers.nrows();
         let dim = data.ncols();
         assert_eq!(eta.len(), dim);
+        let metric_weights: Arc<[f64]> = Arc::from(centered_aniso_metric_weights(&eta));
         Self {
             phi_values: Array1::<f64>::zeros(0),
             axis_components: Array2::<f64>::zeros((0, 0)),
@@ -3046,7 +3085,10 @@ impl ImplicitDesignPsiDerivative {
             streaming: Some(StreamingRadialState {
                 data,
                 centers,
-                axis_mode: StreamingAxisMode::ScalarTotal { eta },
+                axis_mode: StreamingAxisMode::ScalarTotal {
+                    eta,
+                    metric_weights,
+                },
                 radial_kind,
             }),
             ident_transform,
@@ -4412,6 +4454,59 @@ impl ImplicitDesignPsiDerivative {
             };
             q * s + c * phi
         })
+    }
+
+    /// All-axis variant of [`Self::row_chunk_first_raw`]: produces the raw
+    /// first-order kernel scalars for every ψ-axis in a single sweep over
+    /// (row, knot) pairs. The radial scalars `(phi, q, r²)` only depend on
+    /// `r²` — not on the axis — so an N-axis Duchon term that previously
+    /// invoked `compute_pair` N× per (row, knot) now invokes it once and
+    /// fills N output matrices cheaply. Transformed `axis_combinations`
+    /// remap axes nontrivially, so defer to the per-axis path in that case.
+    pub fn row_chunk_first_raw_all_axes(
+        &self,
+        rows: std::ops::Range<usize>,
+    ) -> Result<Vec<Array2<f64>>, BasisError> {
+        let n_axes = self.n_axes();
+        if self.axis_combinations.is_some() {
+            let mut out = Vec::with_capacity(n_axes);
+            for a in 0..n_axes {
+                out.push(self.row_chunk_first_raw(a, rows.clone())?);
+            }
+            return Ok(out);
+        }
+        let c = self.psi_scale_share;
+        let chunk_n = rows.end - rows.start;
+        let mut out: Vec<Array2<f64>> = (0..n_axes)
+            .map(|_| Array2::<f64>::zeros((chunk_n, self.n_knots)))
+            .collect();
+        if let Some(st) = self.streaming.as_ref() {
+            let mut sb = vec![0.0; self.n_axes];
+            for (local, i) in rows.clone().enumerate() {
+                for j in 0..self.n_knots {
+                    let (phi, q, _t) = st.compute_pair(i, j, &mut sb)?;
+                    let cphi = c * phi;
+                    for a in 0..n_axes {
+                        out[a][[local, j]] = q * sb[a] + cphi;
+                    }
+                }
+            }
+        } else {
+            for (local, i) in rows.clone().enumerate() {
+                let base = i * self.n_knots;
+                for j in 0..self.n_knots {
+                    let idx = base + j;
+                    let phi = self.phi_values[idx];
+                    let q = self.q_values[idx];
+                    let cphi = c * phi;
+                    for a in 0..n_axes {
+                        let s = self.axis_components[[idx, a]];
+                        out[a][[local, j]] = q * s + cphi;
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub fn row_chunk_second_diag(
@@ -15630,22 +15725,40 @@ pub fn create_duchon_spline_basiswithworkspace(
 }
 
 /// Multiplicative amplification factor that lifts an underflowing Duchon
-/// kernel back into a representable range. Probes max|K_CC| (the kernel at
-/// every center pair) and returns `1/max` when the kernel collapses to the
-/// double-precision noise floor; otherwise returns `1.0`.
+/// kernel back into a representable range. The probe constructs the centers
+/// kernel matrix `K_CC` and its polynomial-orthogonal projection `K_CC · Z`,
+/// measures the per-entry RMS of `K_CC · Z`, and returns a multiplier that
+/// raises that scale to a fixed amplification floor when the residual lives
+/// near double-precision noise. Returns `1.0` whenever the basis is already
+/// well-conditioned.
 ///
-/// **Why**: in high d with a small length scale the spectral normalization
-/// `c = κ^{d/2-n} / ((2π)^{d/2}·2^{n-1}·Γ(n))` of the Matérn block is `~1e-14`,
-/// driving every `K(r) = c · r^ν · K_ν(κr)` to `~1e-16`. Downstream
-/// `B^T B` is then at `~1e-32` — below `eps²` — and the spectral whitener
-/// truncates everything as noise, even though the basis is mathematically
-/// well-defined.
+/// **Why**: there are two distinct underflow regimes, and probing only the
+/// raw kernel catches just one of them.
 ///
-/// Rescaling the basis by α = 1/max|K_CC| produces the same predictions
-/// (β rescales by α, REML's λ adapts). Since the probe is computed from
-/// `centers + kernel parameters` which are stored verbatim in
-/// `BasisMetadata::Duchon`, prediction recomputes an identical α — so
-/// fit-time and predict-time bases share a single coefficient frame.
+///   1. *Spectral coefficient underflow* (the original biobank-CTN case):
+///      with high `d` and small length scale the Matérn normalization
+///      `c = κ^{d/2-n} / ((2π)^{d/2}·2^{n-1}·Γ(n))` itself collapses to
+///      `~1e-14`, so every `K(r) = c · r^ν · K_ν(κr)` is `~1e-16` and even
+///      `max|K_CC|` is at noise.
+///
+///   2. *Post-projection underflow* (the d=10 hybrid case): `max|K_CC|`
+///      is moderate (e.g. `~1e-5`) but the kernel is nearly proportional to
+///      the constant `1` across centers — the partial-fraction expansion
+///      cancels almost completely on the relevant data scale, leaving only a
+///      tiny residual once `Z` strips the polynomial direction. `B = K · Z`
+///      then has column norms `~1e-10`, `B^T B` is at `~1e-20`, and the
+///      downstream parametric-orthogonality whitener truncates the entire
+///      spectrum as noise — surfacing as `ConstraintNullspaceCollapsed` from
+///      `positive_spectral_whitener_from_gram`.
+///
+/// Probing `K_CC · Z` instead of `K_CC` covers both regimes uniformly: in
+/// regime (1) `||K_CC·Z||` collapses with `||K_CC||`, in regime (2) only
+/// `||K_CC·Z||` collapses. Rescaling the basis by `α` produces the same
+/// predictions (β rescales by `α`, REML's λ adapts). Since the probe is
+/// determined entirely by `centers + kernel parameters + nullspace order` —
+/// all stored verbatim in `BasisMetadata::Duchon` — prediction recomputes
+/// an identical `α`, so fit-time and predict-time bases share a single
+/// coefficient frame.
 fn duchon_kernel_amplification(
     centers: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
@@ -15655,15 +15768,41 @@ fn duchon_kernel_amplification(
     aniso_log_scales: Option<&[f64]>,
     coeffs: Option<&DuchonPartialFractionCoeffs>,
     pure_poly_coeff: Option<&PolyharmonicBlockCoeff>,
-) -> f64 {
+    nullspace_order: DuchonNullspaceOrder,
+    cache: &mut BasisCacheContext,
+) -> Result<f64, BasisError> {
+    // Choose an amplification α so that the basis the rest of the pipeline
+    // sees — `B = (α · K) · Z`, where `Z` spans the null-space of the
+    // polynomial side conditions on the *centers* — sits in a range where
+    // `B^T B` clears double-precision noise. Probing only `max|K_CC|` (the
+    // raw kernel) is insufficient: with hybrid Matérn-Duchon kernels in
+    // moderate-to-high `d` the partial-fraction expansion can leave a
+    // nearly-constant kernel matrix whose `||K_CC·Z||` is many orders of
+    // magnitude smaller than `max|K_CC|`. The constant slice gets absorbed
+    // by `Z` (the polynomial-orthogonal projector) and the residual basis
+    // collapses to numerical zero, so the downstream parametric
+    // orthogonalization has nothing to whiten and aborts with
+    // `ConstraintNullspaceCollapsed`.
+    //
+    // We therefore probe the *post-Z* center-Gram norm directly:
+    //   m_post = ‖(K_CC · Z) · (K_CC · Z)^T‖_F   (proportional to ‖B^T B‖)
+    // and amplify when `m_post` is at or below ~1e-10 (well above the
+    // ~1e-15 noise floor but still tiny compared with any meaningful
+    // smoothing-relevant scale). This is the same well-posedness probe the
+    // original `max|K_CC|` heuristic targeted, applied to the right
+    // matrix. Centers-only — O(k³) per build, dwarfed by the n×k design
+    // assembly. Returns `α` so prediction-time code can recompute the same
+    // factor from `(centers, kernel_params)` and stay coefficient-frame-
+    // consistent with the fitted basis.
     let k = centers.nrows();
     if k == 0 {
-        return 1.0;
+        return Ok(1.0);
     }
     let axis_scales = aniso_log_scales.map(aniso_axis_scales);
-    let mut max_abs = 0.0_f64;
+    let mut k_cc = Array2::<f64>::zeros((k, k));
+    let mut max_abs_kcc = 0.0_f64;
     for i in 0..k {
-        for j in i..k {
+        for j in 0..k {
             let r = if let Some(scales) = axis_scales.as_deref() {
                 aniso_distance_rows_with_scales(centers, i, centers, j, scales)
             } else {
@@ -15681,21 +15820,45 @@ fn duchon_kernel_amplification(
                     coeffs,
                 ) {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(_) => 0.0,
                 }
             };
-            if val.abs() > max_abs {
-                max_abs = val.abs();
+            k_cc[[i, j]] = val;
+            let abs = val.abs();
+            if abs > max_abs_kcc {
+                max_abs_kcc = abs;
             }
         }
     }
-    // Only amplify when the kernel has underflowed. The 1e-10 threshold is
-    // well above any meaningful smoothing-relevant kernel scale yet far from
-    // 1.0, so well-conditioned kernels pass through unchanged (α = 1).
-    if max_abs > 0.0 && max_abs < 1e-10 {
-        1.0 / max_abs
+    if max_abs_kcc == 0.0 {
+        return Ok(1.0);
+    }
+
+    // Project K_CC onto the polynomial null-space; amplification must
+    // protect ‖K_CC·Z‖, not ‖K_CC‖.
+    let z = kernel_constraint_nullspace(centers, nullspace_order, cache)?;
+    let kz = fast_ab(&k_cc, &z);
+    let post_fro_sq: f64 = kz.iter().map(|v| v * v).sum();
+    if post_fro_sq == 0.0 {
+        // Pathological: nothing survives the polynomial projection. No
+        // amount of amplification can rescue a zero basis; let the
+        // downstream check emit its own diagnostic.
+        return Ok(1.0);
+    }
+    // Per-entry RMS of (K_CC·Z) — the scale that drives B's column norms.
+    let denom = (kz.nrows() * kz.ncols()).max(1) as f64;
+    let post_rms = (post_fro_sq / denom).sqrt();
+    // Threshold matches the original 1e-10 intent: keep well-conditioned
+    // bases (α = 1) while rescuing kernels whose post-Z residual lives
+    // anywhere near double-precision noise (~1e-15). The 1e-5 ceiling
+    // leaves five decades of headroom above noise so chained operations
+    // (B^T B, eigendecomposition, whitening) stay in the regime where
+    // relative errors are tracked, not dominated by absolute roundoff.
+    let amp_floor = 1e-5_f64;
+    if post_rms >= amp_floor {
+        Ok(1.0)
     } else {
-        1.0
+        Ok(amp_floor / post_rms)
     }
 }
 
@@ -15811,7 +15974,9 @@ fn build_duchon_basis_designwithworkspace(
         aniso_log_scales,
         coeffs.as_ref(),
         pure_poly_coeff.as_ref(),
-    );
+        nullspace_order,
+        &mut workspace.cache,
+    )?;
     let mut basis = Array2::<f64>::zeros((n, total_cols));
     // Process rows in chunks to amortize thread-local allocation across many rows.
     // Use larger chunks (1024) for better cache utilization at biobank scale.
@@ -15959,7 +16124,9 @@ pub fn build_duchon_basiswithworkspace(
             aniso.as_deref(),
             coeffs.as_ref(),
             pure_poly_coeff.as_ref(),
-        );
+            effective_nullspace_order,
+            &mut workspace.cache,
+        )?;
         let base_design = if let Some(eta) = aniso.as_ref() {
             let metric_weights = eta.iter().map(|&v| (2.0 * v).exp()).collect::<Vec<_>>();
             let coeffs = coeffs.clone();
@@ -17176,13 +17343,15 @@ pub fn apply_sum_to_zero_constraint(
     let (z, rank) =
         rrqr_nullspace_basis(&c_mat, default_rrqr_rank_alpha()).map_err(BasisError::LinalgError)?;
     if rank >= k {
-        eprintln!(
-            "[NULL-DBG] apply_sum_to_zero_constraint: rank={} k={} c_norm={:.3e}",
-            rank,
-            k,
-            c.iter().map(|v| v * v).sum::<f64>().sqrt(),
-        );
-        return Err(BasisError::ConstraintNullspaceNotFound);
+        return Err(BasisError::ConstraintNullspaceCollapsed {
+            site: "apply_sum_to_zero_constraint",
+            cross_rank: rank,
+            coeff_dim: k,
+            cross_frobenius: c.iter().map(|v| v * v).sum::<f64>().sqrt(),
+            constrained_gram_max_eigenvalue: f64::NAN,
+            constrained_gram_min_eigenvalue: f64::NAN,
+            spectral_tolerance: f64::NAN,
+        });
     }
     if rank == 0 {
         // Already orthogonal to the intercept constraint; keep full basis unchanged.
@@ -17499,16 +17668,27 @@ pub fn compute_geometric_constraint_transform(
     let (z, rank) = rrqr_nullspace_basis(&c_geom.t(), default_rrqr_rank_alpha())
         .map_err(BasisError::LinalgError)?;
     if rank >= k {
-        eprintln!(
-            "[NULL-DBG] compute_geometric_constraint_transform: rank={} k={}",
-            rank, k
-        );
-        return Err(BasisError::ConstraintNullspaceNotFound);
+        return Err(BasisError::ConstraintNullspaceCollapsed {
+            site: "compute_geometric_constraint_transform",
+            cross_rank: rank,
+            coeff_dim: k,
+            cross_frobenius: f64::NAN,
+            constrained_gram_max_eigenvalue: f64::NAN,
+            constrained_gram_min_eigenvalue: f64::NAN,
+            spectral_tolerance: f64::NAN,
+        });
     }
 
     if z.ncols() == 0 {
-        eprintln!("[NULL-DBG] compute_geometric_constraint_transform: z.ncols=0 k={}", k);
-        return Err(BasisError::ConstraintNullspaceNotFound);
+        return Err(BasisError::ConstraintNullspaceCollapsed {
+            site: "compute_geometric_constraint_transform",
+            cross_rank: 0,
+            coeff_dim: k,
+            cross_frobenius: f64::NAN,
+            constrained_gram_max_eigenvalue: f64::NAN,
+            constrained_gram_min_eigenvalue: f64::NAN,
+            spectral_tolerance: f64::NAN,
+        });
     }
 
     // 5. Build raw penalty and project: S_c = Z' S Z

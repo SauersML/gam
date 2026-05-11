@@ -1898,6 +1898,93 @@ pub struct CompositeHyperOperator {
     pub dim_hint: usize,
 }
 
+/// Group composite operators by shared `(implicit_deriv, x_design, w_diag,
+/// c_x_psi_beta)` quadruple so every Duchon term whose implicit derivative
+/// state is identical across ψ-axes runs through a single row-kernel sweep
+/// via `trace_projected_factor_all_axes_with_xf`. Non-implicit operators
+/// and singletons fall through to the original per-op trace path.
+fn composite_trace_implicit_batched(
+    operators: &[Arc<dyn HyperOperator>],
+    factor: &Array2<f64>,
+    cache: Option<&ProjectedFactorCache>,
+) -> f64 {
+    let mut trace = 0.0;
+    let mut group_starts: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut handled = vec![false; operators.len()];
+
+    for (i, op) in operators.iter().enumerate() {
+        if handled[i] {
+            continue;
+        }
+        let Some(impl_i) = op.as_implicit() else {
+            continue;
+        };
+        let mut group = vec![i];
+        handled[i] = true;
+        for j in (i + 1)..operators.len() {
+            if handled[j] {
+                continue;
+            }
+            if let Some(impl_j) = operators[j].as_implicit() {
+                if Arc::ptr_eq(&impl_i.implicit_deriv, &impl_j.implicit_deriv)
+                    && Arc::ptr_eq(&impl_i.x_design, &impl_j.x_design)
+                    && Arc::ptr_eq(&impl_i.w_diag, &impl_j.w_diag)
+                    && impl_i.p == impl_j.p
+                    && match (
+                        impl_i.c_x_psi_beta.as_ref(),
+                        impl_j.c_x_psi_beta.as_ref(),
+                    ) {
+                        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                        (None, None) => true,
+                        _ => false,
+                    }
+                {
+                    group.push(j);
+                    handled[j] = true;
+                }
+            }
+        }
+        group_starts.push((i, group));
+    }
+
+    for (_anchor, group) in &group_starts {
+        if group.len() >= 2 {
+            let lead = operators[group[0]].as_implicit().unwrap();
+            let xf = match cache {
+                Some(c) => lead.cached_xf(factor, c),
+                None => Arc::new(lead.compute_xf(factor)),
+            };
+            let axes: Vec<(usize, &Array2<f64>)> = group
+                .iter()
+                .map(|&k| {
+                    let op = operators[k].as_implicit().unwrap();
+                    (op.axis, &op.s_psi)
+                })
+                .collect();
+            let values = lead.trace_projected_factor_all_axes_with_xf(factor, xf.view(), &axes);
+            trace += values.iter().sum::<f64>();
+        } else {
+            let op = &operators[group[0]];
+            trace += match cache {
+                Some(c) => op.trace_projected_factor_cached(factor, c),
+                None => op.trace_projected_factor(factor),
+            };
+        }
+    }
+
+    for (i, op) in operators.iter().enumerate() {
+        if handled[i] {
+            continue;
+        }
+        trace += match cache {
+            Some(c) => op.trace_projected_factor_cached(factor, c),
+            None => op.trace_projected_factor(factor),
+        };
+    }
+
+    trace
+}
+
 impl HyperOperator for CompositeHyperOperator {
     fn dim(&self) -> usize {
         self.dim_hint
@@ -2005,9 +2092,7 @@ impl HyperOperator for CompositeHyperOperator {
                 .map(|(&f, &bf)| f * bf)
                 .sum::<f64>();
         }
-        for op in &self.operators {
-            trace += op.trace_projected_factor(factor);
-        }
+        trace += composite_trace_implicit_batched(&self.operators, factor, None);
         trace
     }
 
@@ -2029,9 +2114,7 @@ impl HyperOperator for CompositeHyperOperator {
                 .map(|(&f, &bf)| f * bf)
                 .sum::<f64>();
         }
-        for op in &self.operators {
-            trace += op.trace_projected_factor_cached(factor, cache);
-        }
+        trace += composite_trace_implicit_batched(&self.operators, factor, Some(cache));
         trace
     }
 
@@ -2684,6 +2767,93 @@ impl ImplicitHyperOperator {
         let penalty: f64 = factor.iter().zip(s_f.iter()).map(|(&f, &s)| f * s).sum();
 
         2.0 * design_total + correction_total + penalty
+    }
+
+    /// Batched-axis sibling of [`Self::trace_projected_factor_with_xf`].
+    /// For every (axis, s_psi) pair in `axes`, returns `tr(F^T B_d F)` using
+    /// a single sweep through the design rows: each chunk's radial scalars
+    /// `(phi, q, r²)` are evaluated once via
+    /// `row_chunk_first_raw_all_axes`, then the per-axis `K_d · U_knot`
+    /// GEMM and fused inner products run inside that one row pass. The
+    /// shared `xf` and `c_x_psi_beta` are reused across axes (the latter
+    /// only contributes the per-axis correction in callers — here it is
+    /// kept axis-invariant, matching the existing single-axis path).
+    /// Caller is responsible for passing the correct `s_psi` for each
+    /// axis. Falls back to per-axis when `axes` is empty.
+    fn trace_projected_factor_all_axes_with_xf(
+        &self,
+        factor: &Array2<f64>,
+        xf: ArrayView2<'_, f64>,
+        axes: &[(usize, &Array2<f64>)],
+    ) -> Vec<f64> {
+        let n_axes = axes.len();
+        if n_axes == 0 {
+            return Vec::new();
+        }
+        let rank = factor.ncols();
+        let n_obs = self.w_diag.len();
+        debug_assert_eq!(xf.dim(), (n_obs, rank));
+
+        let u_knot = self.implicit_deriv.unproject_matrix(&factor.view());
+
+        const TARGET_BYTES: usize = 8 * 1024 * 1024;
+        let chunk_rows = (TARGET_BYTES / ((self.p + rank).max(1) * 8))
+            .max(512)
+            .min(n_obs);
+
+        let w = self.w_diag.as_ref();
+        let c_opt = self.c_x_psi_beta.as_ref().map(|arc| arc.as_ref());
+        let mut design_totals = vec![0.0_f64; n_axes];
+        let mut correction_total = 0.0_f64;
+        let mut have_correction = false;
+        let mut start = 0usize;
+        while start < n_obs {
+            let end = (start + chunk_rows).min(n_obs);
+            let chunk_n = end - start;
+            let xf_chunk = xf.slice(ndarray::s![start..end, ..]);
+
+            let kd_all = self
+                .implicit_deriv
+                .row_chunk_first_raw_all_axes(start..end)
+                .expect("radial scalar evaluation failed during implicit hyper batched trace");
+            for (slot, (axis, _)) in axes.iter().enumerate() {
+                let kd_chunk = &kd_all[*axis];
+                let dxf_chunk = crate::faer_ndarray::fast_ab(kd_chunk, &u_knot);
+                let mut design_total = design_totals[slot];
+                for i_local in 0..chunk_n {
+                    let i = start + i_local;
+                    let w_i = w[i];
+                    let dxf_row = dxf_chunk.row(i_local);
+                    let xf_row = xf_chunk.row(i_local);
+                    for k in 0..rank {
+                        design_total += dxf_row[k] * w_i * xf_row[k];
+                    }
+                }
+                design_totals[slot] = design_total;
+            }
+            if let Some(c) = c_opt {
+                have_correction = true;
+                for i_local in 0..chunk_n {
+                    let i = start + i_local;
+                    let c_i = c[i];
+                    let xf_row = xf_chunk.row(i_local);
+                    for k in 0..rank {
+                        let v = xf_row[k];
+                        correction_total += c_i * v * v;
+                    }
+                }
+            }
+            start = end;
+        }
+
+        let mut out = Vec::with_capacity(n_axes);
+        for (slot, (_axis, s_psi)) in axes.iter().enumerate() {
+            let s_f = s_psi.dot(factor);
+            let penalty: f64 = factor.iter().zip(s_f.iter()).map(|(&f, &s)| f * s).sum();
+            let correction = if have_correction { correction_total } else { 0.0 };
+            out.push(2.0 * design_totals[slot] + correction + penalty);
+        }
+        out
     }
 
     fn accumulate_c_correction_xt_into(
@@ -5480,7 +5650,21 @@ pub fn reml_laml_evaluate(
                 Err(err) => return Err(err),
             }
         } else {
-            match compute_outer_hessian(solution, rho, &lambdas, hop, effective_deriv) {
+            let reml_workspace = RemlDerivativeWorkspace {
+                curvature_lambdas: &curvature_lambdas,
+                rho_penalty_a_k_betas: &rho_penalty_a_k_betas,
+                rho_curvature_a_k_betas: &rho_curvature_a_k_betas,
+                rho_v_ks: rho_v_ks.as_deref(),
+                coord_corrections: &coord_corrections,
+            };
+            match compute_outer_hessian(
+                solution,
+                rho,
+                &lambdas,
+                hop,
+                effective_deriv,
+                Some(&reml_workspace),
+            ) {
                 Ok(mut h) => {
                     // Add prior Hessian (second derivatives of the soft prior on ρ, ρ-only).
                     if let Some((_, _, Some(ref ph))) = prior_cost_gradient {
@@ -5943,6 +6127,17 @@ fn can_use_stochastic_logdet_hinv_kernel(
         && incl_logdet_h
 }
 
+/// Shared precomputed REML derivative intermediates threaded from the
+/// gradient pass into the dense Hessian assembler so the per-coordinate
+/// `penalty_a_k_beta` / `hop.solve` / drift-correction work is not repeated.
+pub(crate) struct RemlDerivativeWorkspace<'a> {
+    pub curvature_lambdas: &'a [f64],
+    pub rho_penalty_a_k_betas: &'a [Array1<f64>],
+    pub rho_curvature_a_k_betas: &'a [Array1<f64>],
+    pub rho_v_ks: Option<&'a [Array1<f64>]>,
+    pub coord_corrections: &'a [Option<DriftDerivResult>],
+}
+
 /// Compute the outer Hessian ∂²V/∂ρₖ∂ρₗ.
 ///
 /// Uses the precomputed HessianOperator for all linear algebra.
@@ -5952,16 +6147,29 @@ fn compute_outer_hessian(
     lambdas: &[f64],
     hop: &dyn HessianOperator,
     effective_deriv: &dyn HessianDerivativeProvider,
+    workspace: Option<&RemlDerivativeWorkspace<'_>>,
 ) -> Result<Array2<f64>, String> {
     let k = rho.len();
     let ext_dim = solution.ext_coords.len();
     let total = k + ext_dim;
     let mut hess = Array2::zeros((total, total));
-    let curvature_lambdas: Vec<f64> = lambdas
-        .iter()
-        .copied()
-        .map(|lambda| rho_curvature_lambda(solution, lambda))
-        .collect();
+    let curvature_lambdas_storage: Option<Vec<f64>> = if workspace.is_some() {
+        None
+    } else {
+        Some(
+            lambdas
+                .iter()
+                .copied()
+                .map(|lambda| rho_curvature_lambda(solution, lambda))
+                .collect(),
+        )
+    };
+    let curvature_lambdas: &[f64] = match workspace {
+        Some(ws) => ws.curvature_lambdas,
+        None => curvature_lambdas_storage
+            .as_deref()
+            .expect("curvature_lambdas_storage populated when workspace is None"),
+    };
 
     let (incl_logdet_h, incl_logdet_s) = match &solution.dispersion {
         DispersionHandling::ProfiledGaussian => (true, true),
@@ -5991,22 +6199,54 @@ fn compute_outer_hessian(
 
     // ── ρ precomputation ──
 
-    // Precompute both unscaled penalty derivatives and scaled H-curvature
-    // derivatives.  The former differentiates the quadratic penalty cost; the
-    // latter is only for H/logdet/IFT trace machinery.
-    let mut penalty_a_k_betas: Vec<Array1<f64>> = Vec::with_capacity(k);
-    let mut curvature_a_k_betas: Vec<Array1<f64>> = Vec::with_capacity(k);
-    let mut v_ks: Vec<Array1<f64>> = Vec::with_capacity(k);
+    let penalty_a_k_betas_storage: Option<Vec<Array1<f64>>> = if workspace.is_some() {
+        None
+    } else {
+        Some(
+            (0..k)
+                .map(|idx| {
+                    penalty_a_k_beta(&solution.penalty_coords[idx], &solution.beta, lambdas[idx])
+                })
+                .collect(),
+        )
+    };
+    let curvature_a_k_betas_storage: Option<Vec<Array1<f64>>> = if workspace.is_some() {
+        None
+    } else {
+        Some(
+            (0..k)
+                .map(|idx| {
+                    penalty_a_k_beta(
+                        &solution.penalty_coords[idx],
+                        &solution.beta,
+                        curvature_lambdas[idx],
+                    )
+                })
+                .collect(),
+        )
+    };
+    let penalty_a_k_betas: &[Array1<f64>] = match workspace {
+        Some(ws) => ws.rho_penalty_a_k_betas,
+        None => penalty_a_k_betas_storage.as_deref().expect("storage set"),
+    };
+    let curvature_a_k_betas: &[Array1<f64>] = match workspace {
+        Some(ws) => ws.rho_curvature_a_k_betas,
+        None => curvature_a_k_betas_storage.as_deref().expect("storage set"),
+    };
 
-    for idx in 0..k {
-        let coord = &solution.penalty_coords[idx];
-        let penalty_a_k_beta_vec = penalty_a_k_beta(coord, &solution.beta, lambdas[idx]);
-        let curvature_a_k_beta = penalty_a_k_beta(coord, &solution.beta, curvature_lambdas[idx]);
-        let v_k = hop.solve(&curvature_a_k_beta);
-        penalty_a_k_betas.push(penalty_a_k_beta_vec);
-        curvature_a_k_betas.push(curvature_a_k_beta);
-        v_ks.push(v_k);
-    }
+    let v_ks_storage: Option<Vec<Array1<f64>>> = match workspace.and_then(|ws| ws.rho_v_ks) {
+        Some(_) => None,
+        None => Some(
+            curvature_a_k_betas
+                .iter()
+                .map(|a_k_beta| hop.solve(a_k_beta))
+                .collect(),
+        ),
+    };
+    let v_ks: &[Array1<f64>] = match workspace.and_then(|ws| ws.rho_v_ks) {
+        Some(vs) => vs,
+        None => v_ks_storage.as_deref().expect("storage set"),
+    };
 
     // Precompute a_k = ½ β̂ᵀ Aₖ β̂ for profiled Gaussian correction.
     let rho_a_vals: Vec<f64> = (0..k)
@@ -6025,10 +6265,25 @@ fn compute_outer_hessian(
         let mut a_k = solution.penalty_coords[idx].scaled_dense_matrix(curvature_lambdas[idx]);
         a_k_matrices.push(a_k.clone());
 
-        let correction = if effective_deriv.has_corrections() {
-            effective_deriv.hessian_derivative_correction(&v_ks[idx])?
-        } else {
-            None
+        let correction: Option<Array2<f64>> = match workspace {
+            Some(ws) => match ws.coord_corrections[idx].as_ref() {
+                Some(DriftDerivResult::Dense(matrix)) => Some(matrix.clone()),
+                Some(DriftDerivResult::Operator(_)) => {
+                    if effective_deriv.has_corrections() {
+                        effective_deriv.hessian_derivative_correction(&v_ks[idx])?
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            },
+            None => {
+                if effective_deriv.has_corrections() {
+                    effective_deriv.hessian_derivative_correction(&v_ks[idx])?
+                } else {
+                    None
+                }
+            }
         };
         if let Some(corr) = correction {
             a_k += &corr;
@@ -9492,16 +9747,20 @@ impl DenseSpectralOperator {
 
     #[inline]
     fn projected_operator(&self, factor: &Array2<f64>, op: &dyn HyperOperator) -> Array2<f64> {
-        let start = std::time::Instant::now();
-        let result = op.projected_matrix(factor);
-        let signature = format!(
-            "DenseSpectralOperator::projected_operator dim={} rank={} implicit={}",
-            self.n_dim,
-            factor.ncols(),
-            op.is_implicit(),
-        );
-        dense_spectral_stage_log(&signature, start.elapsed().as_secs_f64());
-        result
+        if log::log_enabled!(log::Level::Info) {
+            let start = std::time::Instant::now();
+            let result = op.projected_matrix(factor);
+            let signature = format!(
+                "DenseSpectralOperator::projected_operator dim={} rank={} implicit={}",
+                self.n_dim,
+                factor.ncols(),
+                op.is_implicit(),
+            );
+            dense_spectral_stage_log(&signature, start.elapsed().as_secs_f64());
+            result
+        } else {
+            op.projected_matrix(factor)
+        }
     }
 
     #[inline]
@@ -9664,16 +9923,20 @@ impl HessianOperator for DenseSpectralOperator {
     }
 
     fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
-        let start = std::time::Instant::now();
-        let result = op.trace_projected_factor_cached(&self.w_factor, &self.projected_factor_cache);
-        let signature = format!(
-            "DenseSpectralOperator::trace_hinv_operator dim={} rank={} implicit={}",
-            self.n_dim,
-            self.w_factor.ncols(),
-            op.is_implicit(),
-        );
-        dense_spectral_stage_log(&signature, start.elapsed().as_secs_f64());
-        result
+        if log::log_enabled!(log::Level::Info) {
+            let start = std::time::Instant::now();
+            let result = op.trace_projected_factor_cached(&self.w_factor, &self.projected_factor_cache);
+            let signature = format!(
+                "DenseSpectralOperator::trace_hinv_operator dim={} rank={} implicit={}",
+                self.n_dim,
+                self.w_factor.ncols(),
+                op.is_implicit(),
+            );
+            dense_spectral_stage_log(&signature, start.elapsed().as_secs_f64());
+            result
+        } else {
+            op.trace_projected_factor_cached(&self.w_factor, &self.projected_factor_cache)
+        }
     }
 
     fn trace_hinv_matrix_operator_cross(
@@ -9691,23 +9954,33 @@ impl HessianOperator for DenseSpectralOperator {
         left: &dyn HyperOperator,
         right: &dyn HyperOperator,
     ) -> f64 {
-        let start = std::time::Instant::now();
-        let left_proj = self.projected_operator(&self.w_factor, left);
-        let result = if std::ptr::addr_eq(left, right) {
-            self.trace_projected_cross(&left_proj, &left_proj)
+        if log::log_enabled!(log::Level::Info) {
+            let start = std::time::Instant::now();
+            let left_proj = self.projected_operator(&self.w_factor, left);
+            let result = if std::ptr::addr_eq(left, right) {
+                self.trace_projected_cross(&left_proj, &left_proj)
+            } else {
+                let right_proj = self.projected_operator(&self.w_factor, right);
+                self.trace_projected_cross(&left_proj, &right_proj)
+            };
+            let signature = format!(
+                "DenseSpectralOperator::trace_hinv_operator_cross dim={} rank={} left_implicit={} right_implicit={}",
+                self.n_dim,
+                self.w_factor.ncols(),
+                left.is_implicit(),
+                right.is_implicit(),
+            );
+            dense_spectral_stage_log(&signature, start.elapsed().as_secs_f64());
+            result
         } else {
-            let right_proj = self.projected_operator(&self.w_factor, right);
-            self.trace_projected_cross(&left_proj, &right_proj)
-        };
-        let signature = format!(
-            "DenseSpectralOperator::trace_hinv_operator_cross dim={} rank={} left_implicit={} right_implicit={}",
-            self.n_dim,
-            self.w_factor.ncols(),
-            left.is_implicit(),
-            right.is_implicit(),
-        );
-        dense_spectral_stage_log(&signature, start.elapsed().as_secs_f64());
-        result
+            let left_proj = self.projected_operator(&self.w_factor, left);
+            if std::ptr::addr_eq(left, right) {
+                self.trace_projected_cross(&left_proj, &left_proj)
+            } else {
+                let right_proj = self.projected_operator(&self.w_factor, right);
+                self.trace_projected_cross(&left_proj, &right_proj)
+            }
+        }
     }
 
     fn trace_logdet_gradient(&self, a: &Array2<f64>) -> f64 {
@@ -9818,16 +10091,20 @@ impl HessianOperator for DenseSpectralOperator {
     }
 
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
-        let start = std::time::Instant::now();
-        let result = op.trace_projected_factor_cached(&self.g_factor, &self.projected_factor_cache);
-        let signature = format!(
-            "DenseSpectralOperator::trace_logdet_operator dim={} rank={} implicit={}",
-            self.n_dim,
-            self.g_factor.ncols(),
-            op.is_implicit(),
-        );
-        dense_spectral_stage_log(&signature, start.elapsed().as_secs_f64());
-        result
+        if log::log_enabled!(log::Level::Info) {
+            let start = std::time::Instant::now();
+            let result = op.trace_projected_factor_cached(&self.g_factor, &self.projected_factor_cache);
+            let signature = format!(
+                "DenseSpectralOperator::trace_logdet_operator dim={} rank={} implicit={}",
+                self.n_dim,
+                self.g_factor.ncols(),
+                op.is_implicit(),
+            );
+            dense_spectral_stage_log(&signature, start.elapsed().as_secs_f64());
+            result
+        } else {
+            op.trace_projected_factor_cached(&self.g_factor, &self.projected_factor_cache)
+        }
     }
 
     fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {
@@ -13107,6 +13384,7 @@ mod tests {
             &lambdas,
             solution.hessian_op.as_ref(),
             solution.deriv_provider.as_ref(),
+            None,
         )
         .unwrap();
         let kernel = solution
@@ -13321,6 +13599,7 @@ mod tests {
             &lambdas,
             solution.hessian_op.as_ref(),
             solution.deriv_provider.as_ref(),
+            None,
         )
         .unwrap();
         let kernel = solution
@@ -13457,6 +13736,7 @@ mod tests {
             &lambdas,
             solution.hessian_op.as_ref(),
             solution.deriv_provider.as_ref(),
+            None,
         )
         .unwrap();
         let kernel = solution
@@ -13678,6 +13958,7 @@ mod tests {
             &lambdas,
             solution.hessian_op.as_ref(),
             solution.deriv_provider.as_ref(),
+            None,
         )
         .unwrap();
         let kernel = solution
