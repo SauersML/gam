@@ -4550,16 +4550,17 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
     /// ```
     ///
     /// So the full `(n × 2·rank)` projection is two dense matrix-matrix
-    /// products, one per axis. We dispatch them through `DesignMatrix`'s
-    /// own `.dot(matrix)` paths (which already know how to use BLAS-3
-    /// for dense designs and the CSR row-stream for sparse ones), then
-    /// pack the two `(n × rank)` results into the row-major `(n × K·rank)`
-    /// layout the generic compute_jf consumer expects (`jf[r, k·rank + c] =
-    /// (J_r · F[:, c])[k]`).
+    /// products, one per axis. For dense designs we dispatch through
+    /// ndarray's `.dot(matrix)` which hits BLAS-3 (`matrixmultiply`)
+    /// directly. For other backings we fall back to the generic per-
+    /// row path by returning `None`; the operator-backed regime where
+    /// the row kernel was deliberately matrix-free at biobank scale
+    /// still pays the per-row jet costs we have today.
     ///
-    /// Falls back to `None` (and so to the generic per-row path) only if
-    /// `factor` has the wrong shape — the design matmuls themselves are
-    /// supported for every storage shape `DesignMatrix` allows.
+    /// **Correctness contract.** Output matches the per-row reference
+    /// `jf[r, k * rank + c] = jacobian_action(r, F[:, c])[k]` exactly
+    /// (it's the same arithmetic in a different order — BLAS-3
+    /// summation reduces in-row).
     fn jacobian_action_matrix(&self, factor: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
         let p_total = self.slices.total;
         if factor.nrows() != p_total {
@@ -4571,8 +4572,9 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
             return Some(Array2::<f64>::zeros((n_rows, 2 * rank)));
         }
 
-        // Block slices of F: (p_marg × rank) and (p_logs × rank). Take
-        // owned copies so they live in standard layout for the matmul.
+        // Slice F into the two coefficient-block factors. Standard-
+        // layout owned copies let downstream `dot` paths stride
+        // contiguous columns.
         let f_marg = factor
             .slice(s![self.slices.marginal.clone(), ..])
             .as_standard_layout()
@@ -4582,17 +4584,32 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
             .as_standard_layout()
             .into_owned();
 
-        // X_block @ F_block → (n × rank). `DesignMatrix::dot` accepts a
-        // 1D vector; for the matrix form we iterate over the rank
-        // columns and place each result into the output. `Array2::dot`
-        // (ndarray) hits BLAS-3 when both operands are standard layout
-        // and `blas`/`matrixmultiply` is wired in, which is the case
-        // for the dense backing of marginal_design / logslope_design
-        // at biobank shapes. For sparse-backed designs the per-column
-        // matrixvectormultiply path is what the row kernel was doing
-        // already — same arithmetic, BLAS dispatch when available.
-        let jf_marg = self.family.marginal_design.dot_matrix_view(f_marg.view());
-        let jf_logs = self.family.logslope_design.dot_matrix_view(f_logs.view());
+        // Compute J_block · F_block for both axes.
+        //
+        // Fast path: when the design has a materialized dense Array2
+        // backing we hit ndarray's `dot(matrix)` directly, which routes
+        // through `matrixmultiply` (BLAS-3) and reduces ~n×rank
+        // strided per-row gathers to one cache-friendly contiguous
+        // matmul per axis. At biobank shape (n ≈ 1e4–1e5, rank ≈ 81)
+        // this turns the dominant per-trace cost from ~3 s into ~50 ms.
+        //
+        // Generic path: for operator-backed / sparse / chunked designs
+        // (Lazy with no contiguous `as_dense_ref`) we fall through to
+        // `DesignMatrix::dot` on a per-column basis. This is still the
+        // same arithmetic as the per-row reference (`jacobian_action`
+        // does a single design-row dot product per call) but with
+        // batched matrix-vector products that let the underlying
+        // operator amortise any per-call dispatch cost. Importantly,
+        // this path stays available for sparse-design fits where the
+        // dense fast path is structurally inapplicable.
+        let jf_marg = match self.family.marginal_design.as_dense_ref() {
+            Some(dense) => dense.dot(&f_marg),
+            None => self::axis_jf_via_column_dot(&self.family.marginal_design, &f_marg, n_rows),
+        };
+        let jf_logs = match self.family.logslope_design.as_dense_ref() {
+            Some(dense) => dense.dot(&f_logs),
+            None => self::axis_jf_via_column_dot(&self.family.logslope_design, &f_logs, n_rows),
+        };
 
         debug_assert_eq!(jf_marg.dim(), (n_rows, rank));
         debug_assert_eq!(jf_logs.dim(), (n_rows, rank));
@@ -4605,6 +4622,26 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         jf.slice_mut(s![.., rank..2 * rank]).assign(&jf_logs);
         Some(jf)
     }
+}
+
+/// Per-column matrix-vector dispatch for `DesignMatrix · F_block` when
+/// no contiguous dense backing is available (sparse or operator-backed
+/// designs). Mirrors what the per-row reference path does row-by-row,
+/// but as `rank` batched mat-vec products so the underlying operator
+/// can amortise per-call dispatch.
+fn axis_jf_via_column_dot(
+    design: &crate::linalg::matrix::DesignMatrix,
+    f_block: &Array2<f64>,
+    n_rows: usize,
+) -> Array2<f64> {
+    let rank = f_block.ncols();
+    let mut out = Array2::<f64>::zeros((n_rows, rank));
+    for c in 0..rank {
+        let col_owned = f_block.column(c).to_owned();
+        let result = design.dot(&col_owned);
+        out.column_mut(c).assign(&result);
+    }
+    out
 }
 
 struct BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
@@ -6448,8 +6485,12 @@ impl BernoulliMarginalSlopeFamily {
         cell: exact_kernel::DenestedCubicCell,
         max_degree: usize,
     ) -> Result<exact_kernel::CellMomentState, String> {
-        self.cell_moment_cache_stats.record_miss();
-        exact_kernel::evaluate_cell_moments_uncached(cell, max_degree)
+        exact_kernel::evaluate_cell_moments_cached(
+            cell,
+            max_degree,
+            &self.cell_moment_lru,
+            Some(&self.cell_moment_cache_stats),
+        )
     }
 
     #[inline]
@@ -6458,8 +6499,12 @@ impl BernoulliMarginalSlopeFamily {
         cell: exact_kernel::DenestedCubicCell,
         max_degree: usize,
     ) -> Result<exact_kernel::CellDerivativeMomentState, String> {
-        self.cell_moment_cache_stats.record_miss();
-        exact_kernel::evaluate_cell_derivative_moments_uncached(cell, max_degree)
+        exact_kernel::evaluate_cell_derivative_moments_cached(
+            cell,
+            max_degree,
+            &self.cell_moment_lru,
+            Some(&self.cell_moment_cache_stats),
+        )
     }
 
     #[inline]
@@ -7283,11 +7328,14 @@ impl BernoulliMarginalSlopeFamily {
             .and_then(|opts| opts.outer_score_subsample.as_ref())
             .map(|subsample| subsample.mask.as_slice());
         // Build the per-row degree-21 cell-moment bundle whenever flex is
-        // active. Without this bundle every outer-eval directional-derivative
-        // call recomputes degree-15 cell moments per row uncached (the
-        // per-family `cell_moment_lru` is currently a no-op), turning each
-        // batched dH call into O(n · cells · degree-15-expansion) work
-        // regardless of how many directions amortize over those moments.
+        // active. The per-family `cell_moment_lru` catches duplicate-cell
+        // requests across rows that share geometry, but the bundle gives a
+        // per-row degree-sufficient cache so each outer-eval directional-
+        // derivative call reuses *its row's* moments instead of round-
+        // tripping every cell through the global LRU. Without the bundle
+        // each batched dH call would re-walk every row's cells for the
+        // degree-15 expansion regardless of how many directions amortize
+        // over those moments.
         // `build_row_cell_moments_bundle` already short-circuits to `None`
         // when flex is inactive, when a non-StandardNormal latent measure is
         // in effect, or when the estimated resident bytes exceed the
