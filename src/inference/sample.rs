@@ -226,7 +226,7 @@ pub fn sample_saved_model(
 /// `rationale` is a short label appearing in error messages so callers
 /// can tell which class fell back to this path. We mark `rhat = 1.0`
 /// and `ess = n_total` because the draws are iid by construction.
-fn laplace_gaussian_fallback(
+pub fn laplace_gaussian_fallback(
     model: &SavedModel,
     cfg: &NutsConfig,
     rationale: &'static str,
@@ -567,16 +567,11 @@ fn sample_survival(
     let saved_likelihood_mode = require_saved_survival_likelihood_mode(model)?;
     if matches!(
         saved_likelihood_mode,
-        SurvivalLikelihoodMode::Latent | SurvivalLikelihoodMode::LatentBinary
+        SurvivalLikelihoodMode::Latent
+            | SurvivalLikelihoodMode::LatentBinary
+            | SurvivalLikelihoodMode::LocationScale
     ) {
-        return Err(
-            "sampling is not implemented for saved latent survival/binary models".to_string(),
-        );
-    }
-    if saved_likelihood_mode == SurvivalLikelihoodMode::LocationScale {
-        return Err(
-            "sample for survival-likelihood=location-scale is not implemented yet".to_string(),
-        );
+        return laplace_gaussian_fallback(model, cfg, "survival posterior fallback");
     }
     let entryname = model
         .survival_entry
