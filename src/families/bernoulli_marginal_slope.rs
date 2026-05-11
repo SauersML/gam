@@ -30,7 +30,7 @@ use crate::probability::{
     standard_normal_quantile,
 };
 use crate::smooth::{
-    ExactJointHyperSetup, SmoothBasisSpec, SpatialLengthScaleOptimizationOptions,
+    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
     SpatialLogKappaCoords, TermCollectionDesign, TermCollectionSpec,
     apply_spatial_anisotropy_pilot_initializer, build_term_collection_designs_and_freeze_joint,
     optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
