@@ -2937,8 +2937,8 @@ pub(crate) fn empirical_intercept_from_marginal(
         ));
     }
     let log_target_mu = target_mu.ln();
-    let seed =
-        initial.unwrap_or_else(|| rigid_intercept_from_marginal(target_q, slope, probit_scale));
+    let closed_form_seed = rigid_intercept_from_marginal(target_q, slope, probit_scale);
+    let seed = initial.unwrap_or(closed_form_seed);
     let eval = |a: f64| {
         empirical_rigid_calibration_eval(a, log_target_mu, slope, probit_scale, nodes, weights)
     };
@@ -2949,14 +2949,39 @@ pub(crate) fn empirical_intercept_from_marginal(
     // for every μ★ ∈ (0, 1). The 4·ε floor keeps the contract meaningful when
     // μ★ approaches 1 (where log Σ Φᵢ approaches 0).
     let abs_tol = 1e-13_f64.max(4.0 * f64::EPSILON);
-    let (root, _, f_best) = super::monotone_root::solve_monotone_root(
-        eval,
-        seed,
-        "empirical latent intercept",
-        abs_tol,
-        64,
-        48,
-    )?;
+    let solve_from = |s: f64| {
+        super::monotone_root::solve_monotone_root(
+            &eval,
+            s,
+            "empirical latent intercept",
+            abs_tol,
+            64,
+            48,
+        )
+    };
+    // A cached warm start can be poisoned across iterations: the per-row
+    // `intercept_warm_starts` slot is shared by reference across line-search
+    // trials and across outer-search seed validations, and is written after
+    // every successful row-solve — including from rejected line-search trials
+    // whose β/slope was wild. When that stale `a` is paired with the current
+    // (much smaller) slope, the bracket-by-doubling phase can exhaust its
+    // budget without crossing zero. Fall back to the deterministic
+    // closed-form seed, which depends only on the current `(target_q, slope)`
+    // and is bounded by the analytic rigid-probit geometry, so the cache
+    // remains a pure speedup that cannot poison correctness.
+    let (root, _, f_best) = match solve_from(seed) {
+        Ok(v) => v,
+        Err(first_err) => {
+            if seed == closed_form_seed {
+                return Err(first_err);
+            }
+            solve_from(closed_form_seed).map_err(|retry_err| {
+                format!(
+                    "{first_err}; closed-form retry from a={closed_form_seed:.6}: {retry_err}"
+                )
+            })?
+        }
+    };
     if f_best.abs() > abs_tol {
         return Err(format!(
             "empirical latent intercept solve failed: log-residual={f_best:.3e} at a={root:.6}, target mu={target_mu:.6}"
@@ -12316,13 +12341,23 @@ impl BernoulliMarginalSlopeFamily {
                             cache,
                         )?;
                     for (axis_idx, axis) in axes.iter().enumerate() {
-                        let dir = self.row_primary_psi_direction_from_map(
-                            row,
-                            axis.block_idx,
-                            &axis.psi_map,
-                            block_states,
-                            primary,
-                        )?;
+                        // Single psi-map row materialization shared by `dir` and
+                        // `psi_row`; the prior code paths each issued an
+                        // independent `psi_map.row_vector(row)` call for the
+                        // same (row, axis) which doubled the per-row operator
+                        // dispatch cost for joint-spatial Hessian builds.
+                        let psi_local = axis
+                            .psi_map
+                            .row_vector(row)
+                            .map_err(|e| format!("bernoulli psi map row {row}: {e}"))?;
+                        let dir_idx = if axis.block_idx == 0 {
+                            primary.q
+                        } else {
+                            primary.logslope
+                        };
+                        let mut dir = Array1::<f64>::zeros(primary.total);
+                        dir[dir_idx] =
+                            psi_local.dot(&block_states[axis.block_idx].beta);
                         let mut f_pipi = f_pipi_base.clone();
                         let mut third = self.row_primary_third_contracted_recompute(
                             row,
@@ -12331,12 +12366,15 @@ impl BernoulliMarginalSlopeFamily {
                             row_ctx,
                             &dir,
                         )?;
-                        let psi_row = self.block_psi_row_from_map(
-                            row,
-                            axis.block_idx,
-                            &axis.psi_map,
-                            slices,
-                        )?;
+                        let psi_row = BlockPsiRow {
+                            block_idx: axis.block_idx,
+                            range: if axis.block_idx == 0 {
+                                slices.marginal.clone()
+                            } else {
+                                slices.logslope.clone()
+                            },
+                            local_vec: psi_local,
+                        };
                         let mut f_pipi_dir = f_pipi.dot(&dir);
                         if w != 1.0 {
                             f_pipi.mapv_inplace(|v| v * w);
