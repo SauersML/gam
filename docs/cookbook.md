@@ -191,9 +191,9 @@ gamfit.fit(
 gamfit.fit(
     df,
     "y ~ s(x1) + s(x2)",
-    config={"predict_noise": "s(x1)"},
+    config={"noise_formula": "s(x1)"},
 )
-# predict() returns eta, mean, sigma (+ mean_lower, mean_upper if interval=)
+# predict() returns eta, mean (+ effective_se, mean_lower, mean_upper if interval=)
 ```
 
 ## Pass through an identifier column
