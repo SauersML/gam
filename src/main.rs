@@ -1540,6 +1540,7 @@ fn run_fit_bernoulli_marginal_slope(
                 sd: solved.z_normalization.sd,
             },
             solved.latent_measure.clone(),
+            solved.latent_z_rank_int_calibration.clone(),
             solved.score_warp_runtime.as_ref(),
             solved.link_dev_runtime.as_ref(),
             base_link,
@@ -7253,6 +7254,9 @@ fn build_bernoulli_marginal_slope_saved_model(
     baseline_logslope: f64,
     latent_z_normalization: SavedLatentZNormalization,
     latent_measure: LatentMeasureKind,
+    latent_z_rank_int_calibration: Option<
+        gam::families::bernoulli_marginal_slope::LatentZRankIntCalibration,
+    >,
     score_warp_runtime: Option<&DeviationRuntime>,
     link_dev_runtime: Option<&DeviationRuntime>,
     base_link: InverseLink,
@@ -7276,6 +7280,7 @@ fn build_bernoulli_marginal_slope_saved_model(
     payload.z_column = Some(z_column);
     payload.latent_z_normalization = Some(latent_z_normalization);
     payload.latent_measure = Some(latent_measure);
+    payload.latent_z_rank_int_calibration = latent_z_rank_int_calibration;
     payload.marginal_baseline = Some(baseline_marginal);
     payload.logslope_baseline = Some(baseline_logslope);
     payload.link = Some(base_link.saved_string());
@@ -12021,6 +12026,7 @@ mod tests {
             LatentMeasureKind::StandardNormal,
             None,
             None,
+            None,
             InverseLink::Standard(LinkFunction::Probit),
             gam::families::lognormal_kernel::FrailtySpec::None,
         );
@@ -12098,6 +12104,7 @@ mod tests {
             LatentMeasureKind::StandardNormal,
             None,
             None,
+            None,
             InverseLink::Standard(LinkFunction::Probit),
             gam::families::lognormal_kernel::FrailtySpec::None,
         );
@@ -12150,6 +12157,7 @@ mod tests {
             0.0,
             SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
             LatentMeasureKind::StandardNormal,
+            None,
             None,
             None,
             InverseLink::Standard(LinkFunction::Probit),
