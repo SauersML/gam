@@ -30,7 +30,7 @@ use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodFamily};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
-use ndarray::Array1;
+use ndarray::{Array1, Array2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -734,6 +734,148 @@ fn resolve_nuts_config(model: &FittedModel, options: PySampleOptions) -> NutsCon
         target_accept: options.target_accept.unwrap_or(adaptive.target_accept),
         seed: options.seed.unwrap_or(adaptive.seed),
     }
+}
+
+#[derive(Serialize)]
+struct DesignMatrixPayload {
+    x_flat: Vec<f64>,
+    n_rows: usize,
+    n_cols: usize,
+    family_kind: String,
+    model_class: String,
+}
+
+fn design_matrix_table_impl(
+    model_bytes: &[u8],
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+) -> Result<String, String> {
+    let model = load_model_impl(model_bytes)?;
+    if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
+        return Err(format!(
+            "design_matrix currently supports only standard GAM models; got '{}'. \
+             For other classes use Model.predict / posterior.predict, which dispatch \
+             through the saved-model predictor.",
+            prediction_model_class_label(&model)
+        ));
+    }
+    if model.has_link_wiggle() {
+        return Err(
+            "design_matrix does not yet support link-wiggle models because the \
+             linear predictor is q0 + B(q0)·theta, not a single X·beta product. \
+             Use Model.predict for these models."
+                .to_string(),
+        );
+    }
+    let dataset = dataset_with_model_schema(&model, headers, rows)?;
+    let col_map = dataset.column_map();
+    let training_headers = model.training_headers.as_ref();
+    let spec = gam::survival_predict::resolve_termspec_for_prediction(
+        &model.resolved_termspec,
+        training_headers,
+        &col_map,
+        "resolved_termspec",
+    )?;
+    let design = gam::smooth::build_term_collection_design(dataset.values.view(), &spec)
+        .map_err(|err| format!("failed to build design matrix: {err}"))?;
+    let dense = design.design.to_dense();
+    let n_rows = dense.nrows();
+    let n_cols = dense.ncols();
+    // Row-major flatten matches numpy's default reshape order.
+    let x_flat: Vec<f64> = dense.iter().copied().collect();
+    let payload = DesignMatrixPayload {
+        x_flat,
+        n_rows,
+        n_cols,
+        family_kind: family_link_kind(model.likelihood()).to_string(),
+        model_class: prediction_model_class_label(&model),
+    };
+    serde_json::to_string(&payload)
+        .map_err(|err| format!("failed to serialize design matrix payload: {err}"))
+}
+
+#[derive(Serialize)]
+struct PosteriorPredictPayload {
+    eta_flat: Vec<f64>,
+    n_draws: usize,
+    n_rows: usize,
+    model_class: String,
+    family_kind: String,
+}
+
+fn posterior_predict_table_impl(
+    model_bytes: &[u8],
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    samples_flat: Vec<f64>,
+    n_draws: usize,
+    n_coeffs: usize,
+) -> Result<String, String> {
+    // Validation up front. The Python wrapper is expected to ship samples that
+    // already match the saved coefficient count; we catch shape mismatches
+    // here so the error surface stays consistent with the rest of the FFI
+    // surface instead of failing inside a matmul.
+    if samples_flat.len() != n_draws * n_coeffs {
+        return Err(format!(
+            "posterior_predict samples shape mismatch: got {} floats, expected {} * {}",
+            samples_flat.len(),
+            n_draws,
+            n_coeffs
+        ));
+    }
+    let model = load_model_impl(model_bytes)?;
+    if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
+        return Err(format!(
+            "posterior_predict currently supports only standard GAM models; got '{}'. \
+             Per-class posterior-predict paths for location-scale / marginal-slope / \
+             transformation-normal will be wired in a follow-up.",
+            prediction_model_class_label(&model)
+        ));
+    }
+    if model.has_link_wiggle() {
+        return Err(
+            "posterior_predict does not yet support link-wiggle models. The basis \
+             chain rule q0 + B(q0)·theta means eta is not X·beta and per-draw \
+             evaluation needs the link-wiggle runtime, which is a follow-up."
+                .to_string(),
+        );
+    }
+    let dataset = dataset_with_model_schema(&model, headers, rows)?;
+    let col_map = dataset.column_map();
+    let training_headers = model.training_headers.as_ref();
+    let spec = gam::survival_predict::resolve_termspec_for_prediction(
+        &model.resolved_termspec,
+        training_headers,
+        &col_map,
+        "resolved_termspec",
+    )?;
+    let design = gam::smooth::build_term_collection_design(dataset.values.view(), &spec)
+        .map_err(|err| format!("failed to build design matrix: {err}"))?;
+    let dense = design.design.to_dense();
+    let n_rows = dense.nrows();
+    if dense.ncols() != n_coeffs {
+        return Err(format!(
+            "posterior_predict coefficient count mismatch: samples have {} coefficients \
+             but rebuilt design has {} columns. The posterior was likely produced from a \
+             different fit than this model; rerun model.sample(...) on the same model.",
+            n_coeffs,
+            dense.ncols()
+        ));
+    }
+    let samples = Array2::<f64>::from_shape_vec((n_draws, n_coeffs), samples_flat)
+        .map_err(|err| format!("failed to reshape samples: {err}"))?;
+    // eta[k, i] = sum_j samples[k, j] * X[i, j] = (samples · X^T)[k, i].
+    let eta = samples.dot(&dense.t());
+    let eta_flat: Vec<f64> = eta.iter().copied().collect();
+    let payload = PosteriorPredictPayload {
+        eta_flat,
+        n_draws,
+        n_rows,
+        model_class: prediction_model_class_label(&model),
+        family_kind: family_link_kind(model.likelihood()).to_string(),
+    };
+    serde_json::to_string(&payload)
+        .map_err(|err| format!("failed to serialize posterior_predict payload: {err}"))
 }
 
 fn sample_table_impl(
