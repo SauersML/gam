@@ -995,7 +995,7 @@ fn predict_survival_location_scale_batch(
     ) = if with_uncertainty {
         let cov = saved_fit.beta_covariance().ok_or_else(|| {
             "survival location-scale uncertainty: saved fit is missing the \
-             posterior covariance; refit with the current CLI / library to \
+             posterior covariance; refit / library to \
              populate beta_covariance"
                 .to_string()
         })?;
@@ -1123,7 +1123,7 @@ pub fn require_saved_survival_likelihood_mode(
                 "saved latent survival model has contradictory survival_likelihood metadata: expected 'latent', got '{other}'"
             )),
             None => Err(
-                "saved latent survival model is missing survival_likelihood=latent metadata; refit with current CLI"
+                "saved latent survival model is missing survival_likelihood=latent metadata; refit"
                     .to_string(),
             ),
         };
@@ -1135,13 +1135,13 @@ pub fn require_saved_survival_likelihood_mode(
                 "saved latent binary model has contradictory survival_likelihood metadata: expected 'latent-binary', got '{other}'"
             )),
             None => Err(
-                "saved latent binary model is missing survival_likelihood=latent-binary metadata; refit with current CLI"
+                "saved latent binary model is missing survival_likelihood=latent-binary metadata; refit"
                     .to_string(),
             ),
         };
     }
     let raw = model.survival_likelihood.as_deref().ok_or_else(|| {
-        "saved survival model is missing survival_likelihood metadata; refit with current CLI"
+        "saved survival model is missing survival_likelihood metadata; refit"
             .to_string()
     })?;
     parse_survival_likelihood_mode(raw)
@@ -1169,12 +1169,12 @@ pub fn resolve_termspec_for_prediction(
 ) -> Result<TermCollectionSpec, String> {
     let saved = modelspec.as_ref().ok_or_else(|| {
         format!(
-            "model is missing {spec_label}; refit with the current CLI to guarantee train/predict design consistency"
+            "model is missing {spec_label}; refit to guarantee train/predict design consistency"
         )
     })?;
     saved.validate_frozen(spec_label)?;
     let headers = training_headers.ok_or_else(|| {
-        "model is missing training_headers; refit with the current CLI to guarantee stable feature mapping at prediction time"
+        "model is missing training_headers; refit to guarantee stable feature mapping at prediction time"
             .to_string()
     })?;
     let remapped = remap_term_collectionspec_columns(saved, headers, col_map)?;
@@ -1225,7 +1225,7 @@ pub fn fit_result_from_saved_model_for_prediction(
     model: &SavedModel,
 ) -> Result<UnifiedFitResult, String> {
     model.fit_result.clone().ok_or_else(|| {
-        "model is missing canonical fit_result payload; refit with current CLI".to_string()
+        "model is missing canonical fit_result payload; refit".to_string()
     })
 }
 
@@ -1239,7 +1239,7 @@ pub fn saved_survival_location_scale_fit_result(
 ) -> Result<UnifiedFitResult, String> {
     model.saved_prediction_runtime()?;
     let mut fit = model.fit_result.clone().ok_or_else(|| {
-        "saved location-scale survival model missing canonical fit_result; refit with current CLI"
+        "saved location-scale survival model missing canonical fit_result; refit"
             .to_string()
     })?;
     let inverse_link = resolve_survival_inverse_link_from_saved(model)?;

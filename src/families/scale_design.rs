@@ -85,7 +85,7 @@ pub fn scale_transform_from_payload(
             }))
         }
         _ => Err(
-            "saved scale transform payload is only partially populated; refit with current CLI"
+            "saved scale transform payload is only partially populated; refit"
                 .to_string(),
         ),
     }
