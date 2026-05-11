@@ -4536,6 +4536,75 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
             dir_v[1],
         ))
     }
+
+    /// BLAS-3 batched override of the generic per-row `J · F` build (see
+    /// `RowKernel::jacobian_action_matrix` for the contract and the
+    /// algebra).
+    ///
+    /// The bernoulli marginal-slope row Jacobian is a pure pair of
+    /// design-row dot products against disjoint coefficient blocks:
+    ///
+    /// ```text
+    ///   jacobian_action(r, β)[0] = marginal_design.row(r) · β[marg_range]
+    ///   jacobian_action(r, β)[1] = logslope_design.row(r) · β[logs_range]
+    /// ```
+    ///
+    /// So the full `(n × 2·rank)` projection is two dense matrix-matrix
+    /// products, one per axis. We dispatch them through `DesignMatrix`'s
+    /// own `.dot(matrix)` paths (which already know how to use BLAS-3
+    /// for dense designs and the CSR row-stream for sparse ones), then
+    /// pack the two `(n × rank)` results into the row-major `(n × K·rank)`
+    /// layout the generic compute_jf consumer expects (`jf[r, k·rank + c] =
+    /// (J_r · F[:, c])[k]`).
+    ///
+    /// Falls back to `None` (and so to the generic per-row path) only if
+    /// `factor` has the wrong shape — the design matmuls themselves are
+    /// supported for every storage shape `DesignMatrix` allows.
+    fn jacobian_action_matrix(&self, factor: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
+        let p_total = self.slices.total;
+        if factor.nrows() != p_total {
+            return None;
+        }
+        let n_rows = self.family.y.len();
+        let rank = factor.ncols();
+        if rank == 0 {
+            return Some(Array2::<f64>::zeros((n_rows, 2 * rank)));
+        }
+
+        // Block slices of F: (p_marg × rank) and (p_logs × rank). Take
+        // owned copies so they live in standard layout for the matmul.
+        let f_marg = factor
+            .slice(s![self.slices.marginal.clone(), ..])
+            .as_standard_layout()
+            .into_owned();
+        let f_logs = factor
+            .slice(s![self.slices.logslope.clone(), ..])
+            .as_standard_layout()
+            .into_owned();
+
+        // X_block @ F_block → (n × rank). `DesignMatrix::dot` accepts a
+        // 1D vector; for the matrix form we iterate over the rank
+        // columns and place each result into the output. `Array2::dot`
+        // (ndarray) hits BLAS-3 when both operands are standard layout
+        // and `blas`/`matrixmultiply` is wired in, which is the case
+        // for the dense backing of marginal_design / logslope_design
+        // at biobank shapes. For sparse-backed designs the per-column
+        // matrixvectormultiply path is what the row kernel was doing
+        // already — same arithmetic, BLAS dispatch when available.
+        let jf_marg = self.family.marginal_design.dot_matrix_view(f_marg.view());
+        let jf_logs = self.family.logslope_design.dot_matrix_view(f_logs.view());
+
+        debug_assert_eq!(jf_marg.dim(), (n_rows, rank));
+        debug_assert_eq!(jf_logs.dim(), (n_rows, rank));
+
+        // Pack into row-major (n × 2·rank): first `rank` columns are
+        // k=0 (marginal axis), next `rank` are k=1 (logslope axis). This
+        // mirrors the layout written by `compute_jf`'s strided write.
+        let mut jf = Array2::<f64>::zeros((n_rows, 2 * rank));
+        jf.slice_mut(s![.., 0..rank]).assign(&jf_marg);
+        jf.slice_mut(s![.., rank..2 * rank]).assign(&jf_logs);
+        Some(jf)
+    }
 }
 
 struct BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
