@@ -89,3 +89,47 @@ inner PIRLS at small n needs to converge in O(10) cycles, not 100+.
    meaningfully (avoiding the extra eval cost), or the convergence test
    should accept a cost-stagnant point as the optimum-within-numerical-
    precision and stop without falling through.
+
+## Hot-path analysis at N=50K and N=100K
+
+Profile shows the dominant cost is in `RowKernelDirectionalDerivativeOperator::compute_jf`
+(unified.rs:10106 calls `op.trace_projected_factor_cached` which calls `compute_jf` on
+first use of a new factor value). This builds a `(n_rows, K * rank)` row-major
+projection `J · F` where `J_r` is the per-row Jacobian.
+
+Current implementation (`row_kernel.rs:732-759`) loops per row with a strided write:
+
+```rust
+jf.as_slice_mut()
+    .par_chunks_mut(stride)
+    .enumerate()
+    .for_each(|(row, jf_row)| {
+        for k_col in 0..rank {
+            let vec_k = self.kern.jacobian_action(row, f_t.row(k_col).as_slice());
+            for k in 0..K {
+                jf_row[k * rank + k_col] = vec_k[k];
+            }
+        }
+    });
+```
+
+For marginal-slope `jacobian_action(row, slice)` is
+`[marginal_design.row(row).dot(slice[marg_range]),
+   logslope_design.row(row).dot(slice[logs_range])]` — two row-dot products.
+
+The full kernel is mathematically a **dense matrix-matrix product**:
+
+```
+J · F = [ marginal_design · F_marginal_block ;   (concatenated along K axis)
+          logslope_design  · F_logslope_block ]
+```
+
+A single BLAS-3 GEMM per K-axis (here, two GEMMs) would produce the same data
+with single-precision-friendly inner loops, avoiding rayon scheduling overhead
+on `K·rank = 162`-element chunks. Measured: at N=100K, each `compute_jf`
+takes ~4.5 s (avg over 21 calls); a GEMM at the same shapes should run in
+< 0.5 s. The per-eval outer cost would drop from ~48 s to ~10 s, fitting
+N=100K in ~120 s instead of the projected ~500 s.
+
+This is the highest-impact optimization left for the plain margslope path
+at biobank scale.
