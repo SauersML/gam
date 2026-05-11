@@ -1,13 +1,29 @@
-# gamfit documentation
+# gamfit
 
-`gamfit` is a formula-first generalized additive models library for Python,
-backed by a high-performance Rust engine. It fits Gaussian, binomial, Poisson,
-and Gamma GLMs with smooth terms, random effects, bounded/constrained
-coefficients, location-scale extensions, survival likelihoods, and
-flexible/learnable links. Smoothing parameters are selected by REML or LAML.
-Posterior sampling uses NUTS.
+<div class="gamfit-hero" markdown>
 
-This directory contains the in-depth Python documentation. If you just want a
+# gamfit { .gamfit-hero-title }
+
+<p class="gamfit-tagline" markdown>
+Formula-first generalized additive models for Python, backed by a
+high-performance Rust engine. REML/LAML smoothing, NUTS posteriors,
+survival, location-scale, and flexible links — in one fluent API.
+</p>
+
+<div class="gamfit-cta" markdown>
+[Get started](getting-started.md){ .md-button .md-button--primary }
+[API reference](api-reference.md){ .md-button }
+[GitHub](https://github.com/SauersML/gam){ .md-button }
+</div>
+
+</div>
+
+`gamfit` fits Gaussian, binomial, Poisson, and Gamma GLMs with smooth terms,
+random effects, bounded/constrained coefficients, location-scale extensions,
+survival likelihoods, and flexible/learnable links. Smoothing parameters are
+selected by REML or LAML. Posterior sampling uses NUTS.
+
+This site is the in-depth Python documentation. If you just want a
 30-second pitch, read the [PyPI page](https://pypi.org/project/gamfit/).
 
 ## Table of contents
