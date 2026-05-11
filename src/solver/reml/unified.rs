@@ -1767,6 +1767,30 @@ impl ProjectedFactorCache {
         key: ProjectedFactorKey,
         compute: impl FnOnce() -> Array2<f64>,
     ) -> Arc<Array2<f64>> {
+        // Fast path: probe the cache under a short critical section. If the
+        // entry is already materialized, bump its LRU timestamp and return.
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .expect("projected factor cache lock poisoned");
+            inner.next_seq += 1;
+            let now = inner.next_seq;
+            if let Some(entry) = inner.entries.get_mut(&key) {
+                entry.last_used = now;
+                return entry.value.clone();
+            }
+        }
+        // Compute *outside* the lock. The projection `J·F` runs a rayon
+        // `par_chunks_mut` inside; holding a mutex across rayon work
+        // dispatches to workers that may steal sibling jobs which also call
+        // `get_or_insert_with` on this cache, and those workers block on the
+        // mutex this thread still holds — classic nested-rayon mutex
+        // deadlock. Releasing here costs at most a duplicate compute on
+        // simultaneous misses against the same key, which we resolve on
+        // re-acquire by preferring the racer's cached value.
+        let computed = Arc::new(compute());
+        let bytes = computed.len().saturating_mul(std::mem::size_of::<f64>());
         let mut inner = self
             .inner
             .lock()
@@ -1774,15 +1798,12 @@ impl ProjectedFactorCache {
         inner.next_seq += 1;
         let now = inner.next_seq;
         if let Some(entry) = inner.entries.get_mut(&key) {
+            // Another caller computed and inserted the same key while we
+            // were busy. Keep theirs (already counted in `total_bytes`) and
+            // drop ours; mark the survivor as most-recently used.
             entry.last_used = now;
             return entry.value.clone();
         }
-        // Compute under the lock: concurrent callers racing on the same
-        // key collapse to a single GEMM, matching the original cache
-        // contract. Callers that need parallelism on distinct keys can
-        // partition by key (e.g. one cache per `DenseSpectralOperator`).
-        let computed = Arc::new(compute());
-        let bytes = computed.len().saturating_mul(std::mem::size_of::<f64>());
         // LRU eviction. Skip when the budget is disabled or when the
         // new entry alone exceeds the budget (in which case eviction
         // can never make it fit; we accept the over-budget insertion

@@ -204,6 +204,17 @@ pub fn solve_monotone_root_detailed_with_bracket(
         let f_init_negative = f_init < 0.0;
         let mut same_side = a_init; // last point with same sign as f_init
         let mut step_mag = (0.25 * (1.0 + a_init.abs())).max(1.0);
+        // Geometric step growth is unbounded mathematically, but in practice
+        // we cap to avoid runaway evaluations when F flatlines and never
+        // crosses (e.g. probit calibration where every probe saturates at
+        // ±∞). The cap scales with the magnitude of the seed: a huge
+        // `a_init` (say 1e6) needs proportional reach because a doubling
+        // schedule starting at 0.25·|a_init| only spans an `O(|a_init|)`
+        // window before a step would overshoot. An absolute 1e6 cap leaks
+        // when the seed itself sits near that bound; the scaled cap
+        // guarantees at least ~`max_bracket_iters` useful probes regardless
+        // of seed magnitude.
+        let step_cap = 1e6_f64.max(1024.0 * (1.0 + a_init.abs()));
         let mut found_other: Option<(f64, f64)> = None;
 
         for _ in 0..max_bracket_iters {
@@ -220,7 +231,7 @@ pub fn solve_monotone_root_detailed_with_bracket(
             }
             same_side = probe;
             step_mag *= 2.0;
-            if step_mag > 1e6 {
+            if step_mag > step_cap {
                 break;
             }
         }
