@@ -799,6 +799,32 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
             return Array2::<f64>::zeros((rank, rank));
         }
 
+        // BLAS-3 threshold gate.
+        //
+        // The override reorganises `Fᵀ B F` into K(K+1)/2 weighted
+        // matrix-matrix products + one per-row jet sweep, which is a
+        // big win at biobank scale (n ≥ 1e4, where the default
+        // mul_mat path's `rank × n` jet evaluations dominate). At
+        // small n the BLAS-3 setup cost (per-row T tensor allocation,
+        // axis-block copies for contiguous matmul layout, output
+        // symmetrization) overshadows the rank-many extra jet calls
+        // the per-column mul_mat path would do, and the override
+        // regresses N=200 from 5 s → 15 s. The threshold lets the
+        // override fire only where it materially wins.
+        //
+        // The gate is `n_rows * rank^2 > 2.5M` flop equivalence: at
+        // n=300, rank=81 (n·rank²≈2M) the per-column mul_mat path is
+        // ~1 ms cheaper than the BLAS-3 setup; at n=1000 the BLAS-3
+        // path overtakes; at n=20K it's 4× faster. The threshold
+        // matches that crossover. Below the threshold we fall through
+        // to the trait default which is implemented inline here to
+        // avoid a recursive call back into this method.
+        const BLAS3_PROJECTED_MATRIX_FLOP_THRESHOLD: usize = 2_500_000;
+        if n_rows.saturating_mul(rank).saturating_mul(rank) < BLAS3_PROJECTED_MATRIX_FLOP_THRESHOLD {
+            let op_factor = self.mul_mat(factor);
+            return factor.t().dot(&op_factor);
+        }
+
         // Build J·F once (BLAS-3 fast path when the kernel exposes one).
         let jf = self.compute_jf(factor);
         debug_assert_eq!(jf.dim(), (n_rows, K * rank));
@@ -892,6 +918,22 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
                 }
             }
         }
+        // Force exact symmetry: `out = ½(out + outᵀ)`.
+        //
+        // Mathematically `out` is symmetric — every contribution is
+        // either `M^T M` (a==b case) or `M + M^T` (a<b case). BLAS-3
+        // GEMM rounds the (i, j) and (j, i) entries independently
+        // through different summation orders, so the realised matrix
+        // can carry sub-ulp asymmetry. The downstream ARC outer
+        // optimizer reads this as a non-Hermitian Hessian and shrinks
+        // its trust radius defensively — at the same ρ, v5 (which got
+        // the symmetric `factor.T @ (B · F)` matrix back from the
+        // default mul_mat path) accepted a unit-scale step where v6
+        // takes a 1e-3 step. Symmetrizing here costs O(rank²) and
+        // restores deterministic ARC steps.
+        let out_t = out.t().to_owned();
+        out += &out_t;
+        out.mapv_inplace(|v| 0.5 * v);
         out
     }
 
