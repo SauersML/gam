@@ -6,7 +6,23 @@ from types import ModuleType
 
 
 class RustExtensionUnavailableError(ImportError):
-    pass
+    """Raised when the compiled ``gamfit._rust`` extension cannot be imported.
+
+    The Rust engine ships as a maturin-built extension module. When it is
+    missing (typical in a fresh source checkout that has not been built yet),
+    every Rust-backed API in :mod:`gamfit` raises this error eagerly so users
+    see a single, actionable message instead of an opaque ``ImportError``.
+
+    The fix is to build or install the package, e.g. ``maturin develop`` from
+    the ``gamfit`` source tree, or ``pip install gamfit`` from PyPI.
+
+    Examples
+    --------
+    >>> try:
+    ...     gamfit.fit(df, "y ~ s(x)")
+    ... except gamfit.RustExtensionUnavailableError as exc:
+    ...     print("build the extension first:", exc)
+    """
 
 
 @lru_cache(maxsize=1)

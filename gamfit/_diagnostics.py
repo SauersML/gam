@@ -7,6 +7,33 @@ from typing import Any
 
 @dataclass(frozen=True)
 class Diagnostics:
+    """Held-out / in-sample diagnostics for a fitted GAM.
+
+    Bundles observed responses, model-implied predictions, residuals, and
+    aggregate fit metrics (MAE, RMSE, bias, optional :math:`R^2`) into a
+    single immutable record. Returned by :meth:`Model.diagnose` and rendered
+    inline in notebooks via :meth:`_repr_html_`.
+
+    Key fields:
+
+    - ``formula``: the model formula used to produce the predictions.
+    - ``response_name``: name of the response column in the input table.
+    - ``observed``: actual response values aligned with ``predicted["mean"]``.
+    - ``residuals``: ``observed - predicted["mean"]`` per row.
+    - ``predicted``: dictionary of prediction series (``mean`` plus optional
+      ``mean_lower`` / ``mean_upper`` interval bounds).
+    - ``metrics``: scalar fit metrics (``n_obs``, ``mae``, ``rmse``, ``bias``,
+      and ``r_squared`` when the response varies).
+    - ``interval_lower`` / ``interval_upper``: optional pointwise prediction
+      bands when the underlying call requested an interval.
+
+    Examples
+    --------
+    >>> diag = model.diagnose(test)
+    >>> diag.metrics["rmse"]
+    0.42
+    """
+
     formula: str
     response_name: str
     observed: list[float]
@@ -25,6 +52,38 @@ class Diagnostics:
         observed: list[float],
         predicted: dict[str, list[float]],
     ) -> "Diagnostics":
+        """Construct a :class:`Diagnostics` from raw observed and predicted series.
+
+        Computes residuals and aggregate fit metrics (n, MAE, RMSE, bias, and
+        :math:`R^2` when the response variance is positive) from the inputs.
+
+        Parameters
+        ----------
+        formula : str
+            Model formula associated with the predictions.
+        response_name : str
+            Name of the response column.
+        observed : list of float
+            Observed response values.
+        predicted : dict of str to list of float
+            Prediction series. Must contain key ``"mean"``; may contain
+            ``"mean_lower"`` and ``"mean_upper"`` for interval bands.
+
+        Returns
+        -------
+        Diagnostics
+            Populated diagnostics record with computed residuals and metrics.
+
+        Examples
+        --------
+        >>> Diagnostics.from_predictions(
+        ...     formula="y ~ s(x)",
+        ...     response_name="y",
+        ...     observed=[1.0, 2.0, 3.0],
+        ...     predicted={"mean": [1.1, 1.9, 3.2]},
+        ... ).metrics["mae"]
+        0.13333333333333336
+        """
         mean = [float(value) for value in predicted["mean"]]
         residuals = [obs - pred for obs, pred in zip(observed, mean, strict=True)]
         n_obs = len(observed)
@@ -54,6 +113,19 @@ class Diagnostics:
         )
 
     def to_dict(self) -> dict[str, Any]:
+        """Return a plain ``dict`` snapshot of the diagnostics record.
+
+        Returns
+        -------
+        dict
+            Mapping with copies of every field, suitable for JSON-style
+            serialization or further inspection.
+
+        Examples
+        --------
+        >>> diag.to_dict()["metrics"]["rmse"]
+        0.42
+        """
         return {
             "formula": self.formula,
             "response_name": self.response_name,
