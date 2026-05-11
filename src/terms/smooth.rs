@@ -11896,7 +11896,7 @@ pub fn freeze_term_collection_from_design(
 
 #[derive(Debug, Clone)]
 struct SingleSmoothTermRealization {
-    design_local: Array2<f64>,
+    design_local: DesignMatrix,
     term: SmoothTerm,
     dropped_penaltyinfo: Vec<DroppedPenaltyBlockInfo>,
 }
@@ -11947,10 +11947,8 @@ fn finish_single_smooth_term_realization(
         BasisError::InvalidInput("single-term smooth build returned no term design".to_string())
     })?;
 
-    let design_local = design.to_dense();
-
     Ok(SingleSmoothTermRealization {
-        design_local,
+        design_local: design,
         term,
         dropped_penaltyinfo,
     })
@@ -12439,8 +12437,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             ));
         }
 
-        self.design.smooth.term_designs[term_idx] =
-            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design_local));
+        self.design.smooth.term_designs[term_idx] = design_local;
 
         for (offset, penalty_local) in penalties_local.iter().enumerate() {
             let smooth_penalty_idx = smooth_penalty_range.start + offset;
