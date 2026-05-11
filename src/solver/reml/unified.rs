@@ -11093,13 +11093,22 @@ pub struct MatrixFreeSpdOperator {
     // duplicate the dim²-matvec build, but the first to publish wins and
     // steady-state matches `OnceLock`.
     dense_spectral: crate::resource::RayonSafeOnce<Option<DenseSpectralOperator>>,
+    // Pseudo-logdet convention threaded from the family. The dense outer path
+    // already plumbs `PseudoLogdetMode` into `BlockCoupledOperator`; the
+    // matrix-free path materializes a `DenseSpectralOperator` lazily and must
+    // use the same convention so that `logdet`, `trace_hinv_product`, the
+    // IFT response `H⁻¹ g`, and every cross-trace agree with the dense path.
+    // Without this, families that declare `HardPseudo` (BMS, GAMLSS) silently
+    // get Smooth full-spectrum semantics on the matrix-free path, and outer
+    // gradients are inflated by `1/σ_j` over numerical null directions.
+    mode: PseudoLogdetMode,
 }
 
 impl MatrixFreeSpdOperator {
     const EXACT_DENSE_SPECTRAL_MAX_BYTES: usize = 512 * 1024 * 1024;
     const EXACT_DENSE_SPECTRAL_ARRAYS: usize = 6;
 
-    pub fn new<F>(dim: usize, apply: F) -> Self
+    pub fn new_with_mode<F>(dim: usize, apply: F, mode: PseudoLogdetMode) -> Self
     where
         F: Fn(&Array1<f64>) -> Array1<f64> + Send + Sync + 'static,
     {
@@ -11110,6 +11119,7 @@ impl MatrixFreeSpdOperator {
             cached_logdet: crate::resource::RayonSafeOnce::new(),
             n_dim: dim,
             dense_spectral: crate::resource::RayonSafeOnce::new(),
+            mode,
         }
     }
 
@@ -11166,7 +11176,7 @@ impl MatrixFreeSpdOperator {
                 matrix[[j, i]] = avg;
             }
         }
-        let result = DenseSpectralOperator::from_symmetric(&matrix).ok();
+        let result = DenseSpectralOperator::from_symmetric_with_mode(&matrix, self.mode).ok();
         log::info!(
             "[STAGE] matrix_free_spd materialize n_dim={} matvec_count={} elapsed={:.3}s",
             self.n_dim,
@@ -15405,7 +15415,11 @@ mod tests {
     #[test]
     fn stochastic_single_second_order_estimators_match_batched_paths() {
         let diag = array![4.0, 3.0, 2.0];
-        let hop = MatrixFreeSpdOperator::new(diag.len(), move |v| &diag * v);
+        let hop = MatrixFreeSpdOperator::new_with_mode(
+            diag.len(),
+            move |v| &diag * v,
+            PseudoLogdetMode::Smooth,
+        );
         let estimator = StochasticTraceEstimator::with_defaults();
         let dense = array![[0.8, 0.2, 0.0], [0.2, 0.5, 0.1], [0.0, 0.1, 0.7],];
         let op = DenseMatrixHyperOperator {
@@ -15440,7 +15454,11 @@ mod tests {
         let diag = array![4.0, 3.0, 2.0];
         let h = Array2::from_diag(&diag);
         let dense = DenseSpectralOperator::from_symmetric(&h).unwrap();
-        let op = MatrixFreeSpdOperator::new(diag.len(), move |v| &diag * v);
+        let op = MatrixFreeSpdOperator::new_with_mode(
+            diag.len(),
+            move |v| &diag * v,
+            PseudoLogdetMode::Smooth,
+        );
         let a = array![[0.7, 0.1, 0.0], [0.1, 0.4, 0.2], [0.0, 0.2, 0.5]];
 
         assert_relative_eq!(op.logdet(), dense.logdet(), epsilon = 1e-12);
