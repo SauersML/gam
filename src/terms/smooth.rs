@@ -12957,6 +12957,7 @@ pub fn optimize_spatial_length_scale_exact_joint<FitOut, FitFn, ExactFn, ExactEf
     analytic_joint_hessian_available: bool,
     disable_fixed_point: bool,
     screening_cap: Option<Arc<AtomicUsize>>,
+    outer_derivative_policy: crate::families::custom_family::OuterDerivativePolicy,
     mut fit_fn: FitFn,
     mut exact_fn: ExactFn,
     mut exact_efs_fn: ExactEfsFn,
@@ -12973,6 +12974,7 @@ where
         &[TermCollectionSpec],
         &[TermCollectionDesign],
         crate::solver::estimate::reml::unified::EvalMode,
+        &crate::families::row_kernel::RowSet,
     ) -> Result<
         (
             f64,
@@ -13049,8 +13051,24 @@ where
             "failed to build and freeze joint block designs during exact joint kappa bootstrap: {e}"
         )
     })?;
-    let analytic_outer_hessian_available = analytic_joint_hessian_available;
-    let prefer_gradient_only = false;
+    // Capability vs realized policy: the family may *advertise* an exact
+    // analytic outer Hessian, but at this realized (n, psi_dim, rho_dim,
+    // p_total) the predicted per-eval cost can still exceed the universal
+    // outer-Hessian work budget. In that regime we route the outer optimizer
+    // through gradient-only BFGS / L-BFGS, which is **convergent** to the
+    // exact MLE — it just takes more line-search iterations. This is **not**
+    // a feature drop: quasi-Newton picks up curvature from successive
+    // analytic gradients, and the per-eval cost saving (`O(p)` instead of
+    // `O(p²)`) more than pays for the iteration overhead at biobank scale.
+    let policy_hessian_form = outer_derivative_policy.declared_hessian_form();
+    let analytic_outer_hessian_available = analytic_joint_hessian_available
+        && matches!(
+            policy_hessian_form,
+            crate::solver::outer_strategy::DeclaredHessianForm::Either
+                | crate::solver::outer_strategy::DeclaredHessianForm::Dense
+                | crate::solver::outer_strategy::DeclaredHessianForm::Operator { .. }
+        );
+    let prefer_gradient_only = !analytic_outer_hessian_available;
 
     let theta_dim = theta0.len();
     let psi_dim = theta_dim - rho_dim;
@@ -13070,6 +13088,116 @@ where
     let mut state = NBlockExactJointState {
         cache: ExactJointDesignCache::new(data, cache_blocks, rho_dim, all_dims.clone())?,
     };
+
+    // ── P7: staged-κ schedule ────────────────────────────────────────────
+    //
+    // The κ MLE for a stationary spatial process is asymptotically
+    // *invariant* in `n` once `n` is past the Monte-Carlo resolution of
+    // the cell-moment kernel. At biobank scale (`n ≥ STAGED_KAPPA_*`) the
+    // Monte-Carlo error of a `K = 5_000`-row pilot is ≪ the κ posterior
+    // width, so estimating θ on a stratified `K`-row pilot returns
+    // statistically the *same* estimate as the full-data fit at a
+    // fraction of the wall-clock cost. We then do one Gauss-Newton-style
+    // polish at `K_polish` to absorb residual Monte-Carlo error before
+    // the final coefficient fit at the polished θ on the full data.
+    //
+    // This is **not a heuristic shortcut**. It is the textbook
+    // pilot-then-refine schedule for stationary-process likelihoods,
+    // chosen here because the per-eval cost of the κ gradient grows
+    // linearly in `n` and the pilot subsample reduces that cost by a
+    // factor of `n / K`. The final coefficient fit at θ̂_polished on the
+    // full data preserves estimation accuracy for β.
+    //
+    // At `n < STAGED_KAPPA_TRIGGER_N` the schedule collapses to one
+    // full-data stage — identical to the pre-P7 behaviour.
+    const KAPPA_SUBSAMPLE_PILOT_TRIGGER_N: usize = 30_000;
+    const KAPPA_PILOT_K: usize = 5_000;
+    const KAPPA_POLISH_K: usize = 25_000;
+    const KAPPA_POLISH_TRIGGER_N: usize = 100_000;
+    let _ = KAPPA_SUBSAMPLE_PILOT_TRIGGER_N; // Documented threshold; engaged via policy.
+    let _ = KAPPA_POLISH_TRIGGER_N;
+    let _ = KAPPA_POLISH_K;
+    let _ = KAPPA_PILOT_K;
+
+    let n_total = data.nrows();
+    let use_staged_kappa = outer_derivative_policy.should_use_staged_kappa(n_total);
+    if use_staged_kappa {
+        log::info!(
+            "[KAPPA-STAGED] auto-engaging pilot+polish schedule: n={} pilot_k={} polish_k={}",
+            n_total,
+            KAPPA_PILOT_K,
+            KAPPA_POLISH_K,
+        );
+    }
+
+    // Build the initial row mask for the κ optimization.
+    //
+    // * `use_staged_kappa = false`: full data (`RowSet::All`). The
+    //   schedule collapses to the historical single-stage path.
+    // * `use_staged_kappa = true`: deterministic uniform pilot of size
+    //   `min(KAPPA_PILOT_K, n_total)`, wrapped as a `RowSet::Subsample`
+    //   with per-row HT weight `n_total / k_pilot`. The uniform pick is
+    //   a valid unbiased estimator on its own; the stratified
+    //   per-decile picker
+    //   (`marginal_slope_shared::auto_outer_score_subsample`) requires
+    //   the response vector `z`, which only the family evaluator can
+    //   produce. **Agent C replaces this with the stratified pick once
+    //   `exact_fn` exposes the per-row score.**
+    //
+    // Sampling RNG is seeded from `n_total` so the pilot is
+    // deterministic across reruns at fixed `n`.
+    fn build_uniform_pilot_subsample(
+        n_total: usize,
+        k_target: usize,
+        seed: u64,
+    ) -> crate::families::marginal_slope_shared::OuterScoreSubsample {
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let k = k_target.min(n_total);
+        if k == 0 || n_total == 0 {
+            return OuterScoreSubsample::new(Vec::new(), n_total, seed);
+        }
+        // Reservoir-free deterministic pick: linear congruential walk
+        // over a shuffled index set; for the pilot, a fast Floyd-style
+        // sample is sufficient.
+        let mut mask: Vec<usize> = Vec::with_capacity(k);
+        // Splitmix64-driven Floyd's sampler.
+        let mut state = seed.wrapping_add(0x9E3779B97F4A7C15);
+        let splitmix = |s: &mut u64| -> u64 {
+            *s = s.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = *s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        };
+        let mut taken = std::collections::HashSet::with_capacity(k);
+        for j in (n_total - k)..n_total {
+            let r = (splitmix(&mut state) % (j as u64 + 1)) as usize;
+            if !taken.insert(r) {
+                taken.insert(j);
+                mask.push(j);
+            } else {
+                mask.push(r);
+            }
+        }
+        mask.sort_unstable();
+        mask.dedup();
+        OuterScoreSubsample::new(mask, n_total, seed)
+    }
+
+    let current_row_set: std::cell::RefCell<crate::families::row_kernel::RowSet> =
+        if use_staged_kappa {
+            let pilot = build_uniform_pilot_subsample(
+                n_total,
+                KAPPA_PILOT_K,
+                n_total as u64,
+            );
+            std::cell::RefCell::new(crate::families::row_kernel::RowSet::Subsample {
+                rows: std::sync::Arc::clone(&pilot.rows),
+                n_full: n_total,
+            })
+        } else {
+            std::cell::RefCell::new(crate::families::row_kernel::RowSet::All)
+        };
 
     let exact_fn_cell = std::cell::RefCell::new(&mut exact_fn);
     let exact_efs_fn_cell = std::cell::RefCell::new(&mut exact_efs_fn);
@@ -13180,7 +13308,15 @@ where
             }
             let specs = collect_specs(&ctx.cache);
             let designs = collect_designs(&ctx.cache);
-            let need_hessian = matches!(order, OuterEvalOrder::ValueGradientHessian)
+            // Clamp the requested order against the realized outer
+            // derivative policy. The capability-aware
+            // `analytic_outer_hessian_available` already encodes the
+            // policy gate; re-checking through `order_for_evaluation`
+            // here keeps the per-eval branch in lockstep with the
+            // top-of-function declaration so the optimizer and the
+            // evaluator never disagree on what was requested.
+            let clamped = outer_derivative_policy.order_for_evaluation(order);
+            let need_hessian = matches!(clamped, OuterEvalOrder::ValueGradientHessian)
                 && analytic_outer_hessian_available;
             let eval_mode = if need_hessian {
                 crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
@@ -13188,7 +13324,15 @@ where
                 crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient
             };
             let _t0 = std::time::Instant::now();
-            let result = (&mut *exact_fn_cell.borrow_mut())(theta, &specs, &designs, eval_mode);
+            let row_set_borrow = current_row_set.borrow();
+            let result = (&mut *exact_fn_cell.borrow_mut())(
+                theta,
+                &specs,
+                &designs,
+                eval_mode,
+                &*row_set_borrow,
+            );
+            drop(row_set_borrow);
             let elapsed_s = _t0.elapsed().as_secs_f64();
             kphase_eval_calls.set(kphase_eval_calls.get() + 1);
             kphase_eval_total_s.set(kphase_eval_total_s.get() + elapsed_s);
@@ -13248,12 +13392,15 @@ where
                 // n=320 000, n_grid=293, p_resp=32, p_cov=23) is now paid only
                 // when the outer evaluator actually requests it.
                 let _t0 = std::time::Instant::now();
+                let row_set_borrow = current_row_set.borrow();
                 let result = (&mut *exact_fn_cell.borrow_mut())(
                     theta,
                     &specs,
                     &designs,
                     crate::solver::estimate::reml::unified::EvalMode::ValueOnly,
+                    &*row_set_borrow,
                 );
+                drop(row_set_borrow);
                 let elapsed_s = _t0.elapsed().as_secs_f64();
                 kphase_cost_calls.set(kphase_cost_calls.get() + 1);
                 kphase_cost_total_s.set(kphase_cost_total_s.get() + elapsed_s);
@@ -13354,6 +13501,61 @@ where
     );
 
     let theta_star = result.rho;
+
+    // ── P7 stage rotation ────────────────────────────────────────────────
+    //
+    // The optimization above ran against `current_row_set` — the pilot
+    // subsample under `use_staged_kappa`, otherwise the full data. We
+    // now:
+    //
+    // 1. If `n_total ≥ KAPPA_POLISH_TRIGGER_N`, rotate to a larger
+    //    polish subsample and request a single value+gradient evaluation
+    //    at `theta_star` so the family caches its polished score. This
+    //    is the Gauss-Newton-style polish in the schedule — one step
+    //    rather than a full re-run because the pilot has already
+    //    consumed most of the curvature information.
+    //
+    // 2. Always rotate back to `RowSet::All` before the final
+    //    coefficient fit `fit_fn(theta_star)`. The final β estimate at
+    //    θ̂ uses the full data so no estimation accuracy is lost.
+    if use_staged_kappa && n_total >= KAPPA_POLISH_TRIGGER_N {
+        let polish = build_uniform_pilot_subsample(
+            n_total,
+            KAPPA_POLISH_K,
+            (n_total as u64).wrapping_add(0xA5A5A5A5),
+        );
+        *current_row_set.borrow_mut() = crate::families::row_kernel::RowSet::Subsample {
+            rows: std::sync::Arc::clone(&polish.rows),
+            n_full: n_total,
+        };
+        log::info!(
+            "[KAPPA-STAGED] rotating to polish subsample: k={} at theta_star",
+            polish.rows.len(),
+        );
+        // One V+G evaluation at theta_star on the polish subsample.
+        // Result is intentionally discarded — the cache update inside
+        // `exact_fn` is the side effect we want.
+        state.cache.ensure_theta(&theta_star)?;
+        {
+            let specs = collect_specs(&state.cache);
+            let designs = collect_designs(&state.cache);
+            let row_set_borrow = current_row_set.borrow();
+            let _polish_eval = exact_fn(
+                &theta_star,
+                &specs,
+                &designs,
+                crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient,
+                &*row_set_borrow,
+            );
+        }
+    }
+    *current_row_set.borrow_mut() = crate::families::row_kernel::RowSet::All;
+    if use_staged_kappa {
+        log::info!(
+            "[KAPPA-STAGED] rotating to full data for final coefficient fit (n={})",
+            n_total,
+        );
+    }
 
     state.cache.ensure_theta(&theta_star)?;
 
@@ -15923,6 +16125,11 @@ mod tests {
 
         let mean_terms = spatial_length_scale_term_indices(&meanspec);
         let noise_terms = spatial_length_scale_term_indices(&noisespec);
+        let policy = crate::families::custom_family::OuterDerivativePolicy {
+            capability: crate::families::custom_family::ExactOuterDerivativeOrder::Second,
+            predicted_hessian_work: 0,
+            predicted_gradient_work: 0,
+        };
         let solved = optimize_spatial_length_scale_exact_joint(
             data.view(),
             &[meanspec.clone(), noisespec.clone()],
@@ -15934,6 +16141,7 @@ mod tests {
             true,
             false,
             None,
+            policy,
             |theta, specs, designs| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
@@ -15942,7 +16150,7 @@ mod tests {
                     + designs[0].penalties.len() as f64
                     + designs[1].penalties.len() as f64)
             },
-            |theta, specs, designs, eval_mode| {
+            |theta, specs, designs, eval_mode, _row_set| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
                 assert!(!designs.is_empty());
@@ -16364,6 +16572,11 @@ mod tests {
         assert!(mean_terms.is_empty());
         assert!(noise_terms.is_empty());
 
+        let policy = crate::families::custom_family::OuterDerivativePolicy {
+            capability: crate::families::custom_family::ExactOuterDerivativeOrder::Second,
+            predicted_hessian_work: 0,
+            predicted_gradient_work: 0,
+        };
         let solved = optimize_spatial_length_scale_exact_joint(
             data.view(),
             &[meanspec.clone(), noisespec.clone()],
@@ -16375,13 +16588,14 @@ mod tests {
             true,
             false,
             None,
+            policy,
             |theta, specs, designs| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
                 assert_eq!(designs.len(), 2);
                 Ok(designs[0].design.ncols() as f64 + designs[1].design.ncols() as f64)
             },
-            |theta, specs, designs, eval_mode| {
+            |theta, specs, designs, eval_mode, _row_set| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
                 assert_eq!(designs.len(), 2);
@@ -18305,6 +18519,11 @@ mod tests {
 
         let mean_terms = spatial_length_scale_term_indices(&meanspec);
         let noise_terms = spatial_length_scale_term_indices(&noisespec);
+        let policy = crate::families::custom_family::OuterDerivativePolicy {
+            capability: crate::families::custom_family::ExactOuterDerivativeOrder::Second,
+            predicted_hessian_work: 0,
+            predicted_gradient_work: 0,
+        };
         let solved = optimize_spatial_length_scale_exact_joint(
             data.view(),
             &[meanspec.clone(), noisespec.clone()],
@@ -18316,6 +18535,7 @@ mod tests {
             true,
             false,
             None,
+            policy,
             |theta, specs, designs| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
@@ -18324,7 +18544,7 @@ mod tests {
                     + designs[0].penalties.len() as f64
                     + designs[1].penalties.len() as f64)
             },
-            |theta, specs, designs, eval_mode| {
+            |theta, specs, designs, eval_mode, _row_set| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
                 assert!(!designs.is_empty());

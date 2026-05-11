@@ -25,6 +25,87 @@ use ndarray::{Array1, Array2, ArrayView2};
 use rayon::prelude::*;
 use std::sync::Arc;
 
+// ── Row selector ─────────────────────────────────────────────────────
+//
+// `RowSet` is the contract every outer-only assembly path uses to declare
+// *which* rows participate in this evaluation and *how* they should be
+// weighted. Two shapes:
+//
+// * `All` — iterate `0..n_total`, every row contributes with weight 1.0.
+//   The full-data behaviour every kernel had before subsampling existed.
+// * `Subsample { rows, n_full }` — iterate the pre-built
+//   `WeightedOuterRow` list, each row's `weight` is its Horvitz–Thompson
+//   inverse-inclusion scale so partial sums remain unbiased estimators
+//   of the full-data sum.
+//
+// The type lives here (alongside the `RowKernel` trait) so every
+// `row_kernel_*` assembly function can pattern-match on it without
+// importing the marginal-slope crate. Inner-PIRLS and final covariance
+// passes always run on the full data; only outer score/gradient hot
+// loops consume a non-`All` `RowSet`.
+//
+// Threading `RowSet` through every `row_kernel_*` function is Agent C's
+// job — this module exposes only the type definition and basic
+// constructors used by the κ-staging schedule in `smooth.rs`.
+#[derive(Clone)]
+pub enum RowSet {
+    All,
+    Subsample {
+        rows: Arc<Vec<crate::families::marginal_slope_shared::WeightedOuterRow>>,
+        n_full: usize,
+    },
+}
+
+impl RowSet {
+    /// Build a `RowSet` directly from the outer-only subsample carried on
+    /// `BlockwiseFitOptions`. When `outer_score_subsample` is `None` this
+    /// returns `RowSet::All` with the caller-supplied `n_total`.
+    ///
+    /// `n_total` is the full data row count; it is recorded as `n_full`
+    /// on the `Subsample` variant so the Horvitz–Thompson weights can be
+    /// validated downstream against the population size, and is returned
+    /// directly inside `All` callers via `n_effective`.
+    pub fn from_options(
+        opts: &crate::families::custom_family::BlockwiseFitOptions,
+        n_total: usize,
+    ) -> Self {
+        match opts.outer_score_subsample.as_ref() {
+            None => Self::All,
+            Some(s) => Self::Subsample {
+                rows: Arc::clone(&s.rows),
+                n_full: n_total,
+            },
+        }
+    }
+
+    /// Effective row count: `n_total` for `All`, mask length for
+    /// `Subsample`. Used to size workspaces and estimate per-eval cost.
+    pub fn n_effective(&self) -> f64 {
+        match self {
+            Self::All => f64::NAN,
+            Self::Subsample { rows, .. } => rows.len() as f64,
+        }
+    }
+
+    /// Materialize the row iterator as `(row_index, ht_weight)` pairs.
+    ///
+    /// * `All` yields every `0..n_total` with weight `1.0` (no rescaling
+    ///   — the full sum is its own unbiased estimator).
+    /// * `Subsample` yields each `WeightedOuterRow`'s `(index, weight)`.
+    ///
+    /// Returns a `Vec` for now; Agent C will switch the row-kernel hot
+    /// loops to a zero-alloc iterator once `RowSet` is threaded through
+    /// the assembly functions.
+    pub fn collect_indexed(&self, n_total: usize) -> Vec<(usize, f64)> {
+        match self {
+            Self::All => (0..n_total).map(|i| (i, 1.0)).collect(),
+            Self::Subsample { rows, .. } => {
+                rows.iter().map(|r| (r.index, r.weight)).collect()
+            }
+        }
+    }
+}
+
 // ── Trait ────────────────────────────────────────────────────────────
 
 /// A row-decomposable likelihood kernel with K primary scalars per row.

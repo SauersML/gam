@@ -15525,7 +15525,11 @@ pub fn fit_survival_marginal_slope_terms(
             );
             Ok(fit)
         },
-        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], eval_mode| {
+        |theta,
+         specs: &[TermCollectionSpec],
+         designs: &[TermCollectionDesign],
+         eval_mode,
+         _row_set: &crate::families::row_kernel::RowSet| {
             use crate::solver::estimate::reml::unified::EvalMode;
             let eval_started = std::time::Instant::now();
             log::info!(

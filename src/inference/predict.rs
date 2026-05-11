@@ -894,7 +894,126 @@ pub struct BernoulliMarginalSlopePredictor {
     pub gaussian_frailty_sd: Option<f64>,
 }
 
+/// Per-runtime predict-time anchor correction matrices.
+///
+/// Built once per top-level predict call from the marginal + logslope
+/// designs at the prediction rows. Each `Array2<f64>` is shaped
+/// `n_predict × runtime.basis_dim` and holds `n_row(i) · M` for every
+/// prediction row, where `n_row(i)` is the concatenation of the marginal
+/// and logslope design rows in the runtime's anchor component order.
+///
+/// At any `local_cubic_at` / `basis_cubic_at` / `design` call site we
+/// subtract the appropriate slice of these matrices from the raw cubic
+/// output to apply the cross-block residual `n_row · M` correction.
+///
+/// `n_anchor_rows` is the underlying `n × d` parametric anchor stack
+/// (concatenated marginal + logslope). It is shared between the two
+/// runtimes' correction computations and reused by `design_with_anchor_rows`
+/// for the full-matrix evaluation sites.
+#[derive(Default)]
+struct BmsAnchorCorrections {
+    n_anchor_rows: Option<Array2<f64>>,
+    score_warp: Option<Array2<f64>>,
+    link_dev: Option<Array2<f64>>,
+}
+
+impl BmsAnchorCorrections {
+    fn is_empty(&self) -> bool {
+        self.n_anchor_rows.is_none() && self.score_warp.is_none() && self.link_dev.is_none()
+    }
+
+    fn score_warp_row(&self, row: usize) -> Option<ndarray::ArrayView1<'_, f64>> {
+        self.score_warp.as_ref().map(|m| m.row(row))
+    }
+
+    fn link_dev_row(&self, row: usize) -> Option<ndarray::ArrayView1<'_, f64>> {
+        self.link_dev.as_ref().map(|m| m.row(row))
+    }
+
+    fn n_anchor_rows_view(&self) -> Option<ndarray::ArrayView2<'_, f64>> {
+        self.n_anchor_rows.as_ref().map(|m| m.view())
+    }
+}
+
 impl BernoulliMarginalSlopePredictor {
+    /// Build the anchor correction matrices for a given predict-input batch.
+    ///
+    /// Returns an empty bundle (all `None`) when neither runtime carries
+    /// an anchor residual — this is the fast path for fits without
+    /// cross-block residualisation. When at least one runtime has a
+    /// residual, materialises the marginal + logslope designs at the
+    /// predict rows once and computes the per-runtime correction matrices
+    /// against each runtime's stored `M`.
+    fn build_anchor_correction_matrices(
+        &self,
+        input: &PredictInput,
+        design_logslope: &DesignMatrix,
+    ) -> Result<BmsAnchorCorrections, EstimationError> {
+        let needs_score = self
+            .score_warp_runtime
+            .as_ref()
+            .map_or(false, |r| r.anchor_residual_coefficients.is_some());
+        let needs_link = self
+            .link_deviation_runtime
+            .as_ref()
+            .map_or(false, |r| r.anchor_residual_coefficients.is_some());
+        if !needs_score && !needs_link {
+            return Ok(BmsAnchorCorrections::default());
+        }
+        // Materialise the marginal + logslope designs at predict rows.
+        // For biobank-scale predict batches the caller already chunks via
+        // `prediction_chunk_rows`, so this densification is bounded per
+        // chunk by `chunk_size × (p_marginal + p_logslope)`.
+        let marginal_dense = input
+            .design
+            .try_to_dense_arc("bernoulli marginal-slope predict-time marginal anchor materialisation")
+            .map_err(EstimationError::InvalidInput)?;
+        let logslope_dense = design_logslope
+            .try_to_dense_arc("bernoulli marginal-slope predict-time logslope anchor materialisation")
+            .map_err(EstimationError::InvalidInput)?;
+        let n_rows = marginal_dense.nrows();
+        if logslope_dense.nrows() != n_rows {
+            return Err(EstimationError::InvalidInput(format!(
+                "bernoulli marginal-slope predict anchor materialisation row mismatch: marginal {} vs logslope {}",
+                n_rows,
+                logslope_dense.nrows()
+            )));
+        }
+        let p_marginal = marginal_dense.ncols();
+        let p_logslope = logslope_dense.ncols();
+        let d = p_marginal + p_logslope;
+        let mut n_anchor_rows = Array2::<f64>::zeros((n_rows, d));
+        n_anchor_rows
+            .slice_mut(ndarray::s![.., 0..p_marginal])
+            .assign(&marginal_dense.view());
+        n_anchor_rows
+            .slice_mut(ndarray::s![.., p_marginal..d])
+            .assign(&logslope_dense.view());
+        let score_warp = if needs_score {
+            self.score_warp_runtime
+                .as_ref()
+                .unwrap()
+                .anchor_correction_matrix(n_anchor_rows.view())
+                .map_err(EstimationError::InvalidInput)?
+        } else {
+            None
+        };
+        let link_dev = if needs_link {
+            self.link_deviation_runtime
+                .as_ref()
+                .unwrap()
+                .anchor_correction_matrix(n_anchor_rows.view())
+                .map_err(EstimationError::InvalidInput)?
+        } else {
+            None
+        };
+        Ok(BmsAnchorCorrections {
+            n_anchor_rows: Some(n_anchor_rows),
+            score_warp,
+            link_dev,
+        })
+    }
+
     fn likelihood_family(&self) -> LikelihoodFamily {
         LikelihoodFamily::BinomialProbit
     }
@@ -1138,15 +1257,36 @@ impl BernoulliMarginalSlopePredictor {
         &self,
         eta0: &Array1<f64>,
         beta_link_dev: Option<&Array1<f64>>,
+        link_dev_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
     ) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
         if let (Some(runtime), Some(beta)) = (&self.link_deviation_runtime, beta_link_dev) {
+            // When the runtime carries a cross-block anchor residual, every
+            // raw-design row needs `n_row · M` subtracted. `correction_for_row`
+            // already holds the precomputed `n_row · M` for this predict row
+            // (length basis_dim), so the corrected basis contribution to η
+            // is `basis · beta - correction.dot(beta)` for every eta0 entry.
+            // Derivative paths are unaffected (the anchor argument is a
+            // different scalar than eta0).
             let basis = runtime
-                .design(eta0)
+                .design_uncorrected(eta0)
                 .map_err(EstimationError::InvalidInput)?;
+            let mut value = &basis.dot(beta) + eta0;
+            if let Some(corr) = link_dev_correction_for_row {
+                let offset = corr.dot(beta);
+                for v in value.iter_mut() {
+                    *v -= offset;
+                }
+            } else if runtime.anchor_residual_coefficients.is_some() {
+                return Err(EstimationError::InvalidInput(
+                    "bernoulli marginal-slope link-deviation runtime has an anchor residual but \
+                     no per-row correction was supplied to link_terms_value_d1"
+                        .to_string(),
+                ));
+            }
             let d1 = runtime
                 .first_derivative_design(eta0)
                 .map_err(EstimationError::InvalidInput)?;
-            Ok((eta0 + &basis.dot(beta), d1.dot(beta) + 1.0))
+            Ok((value, d1.dot(beta) + 1.0))
         } else {
             Ok((eta0.clone(), Array1::ones(eta0.len())))
         }
@@ -1158,6 +1298,8 @@ impl BernoulliMarginalSlopePredictor {
         b: f64,
         beta_score_warp: Option<&Array1<f64>>,
         beta_link_dev: Option<&Array1<f64>>,
+        score_warp_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
+        link_dev_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
     ) -> Result<
         Vec<crate::families::bernoulli_marginal_slope::exact_kernel::DenestedPartitionCell>,
         EstimationError,
@@ -1185,7 +1327,17 @@ impl BernoulliMarginalSlopePredictor {
                 if let (Some(runtime), Some(beta)) =
                     (self.score_warp_runtime.as_ref(), beta_score_warp)
                 {
-                    runtime.local_cubic_at(beta, z).map_err(|err| err)
+                    let mut span = runtime.local_cubic_at(beta, z)?;
+                    // `local_cubic_at`'s c0 is `Σ_j basis_c0[span][j] · beta[j]`.
+                    // The cross-block residual replaces basis_c0 by
+                    // basis_c0 − n_row · M, contributing a row-constant
+                    // `correction.dot(beta)` to c0. Higher coefficients
+                    // (c1..c3) depend on derivatives of the basis w.r.t.
+                    // its own argument and are untouched.
+                    if let Some(corr) = score_warp_correction_for_row {
+                        span.c0 -= corr.dot(beta);
+                    }
+                    Ok(span)
                 } else {
                     Ok(crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
                         left: 0.0,
@@ -1201,7 +1353,11 @@ impl BernoulliMarginalSlopePredictor {
                 if let (Some(runtime), Some(beta)) =
                     (self.link_deviation_runtime.as_ref(), beta_link_dev)
                 {
-                    runtime.local_cubic_at(beta, u).map_err(|err| err)
+                    let mut span = runtime.local_cubic_at(beta, u)?;
+                    if let Some(corr) = link_dev_correction_for_row {
+                        span.c0 -= corr.dot(beta);
+                    }
+                    Ok(span)
                 } else {
                     Ok(crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
                         left: 0.0,
@@ -1234,10 +1390,19 @@ impl BernoulliMarginalSlopePredictor {
         slope: f64,
         beta_score_warp: Option<&Array1<f64>>,
         beta_link_dev: Option<&Array1<f64>>,
+        score_warp_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
+        link_dev_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
     ) -> Result<(f64, f64, f64), EstimationError> {
         let marginal = bernoulli_marginal_link_map(&self.base_link, marginal_eta)
             .map_err(EstimationError::InvalidInput)?;
-        let cells = self.denested_partition_cells(a, slope, beta_score_warp, beta_link_dev)?;
+        let cells = self.denested_partition_cells(
+            a,
+            slope,
+            beta_score_warp,
+            beta_link_dev,
+            score_warp_correction_for_row,
+            link_dev_correction_for_row,
+        )?;
         let scale = self.probit_frailty_scale();
         let mut f = -marginal.mu;
         let mut f_a = 0.0;
@@ -1288,6 +1453,8 @@ impl BernoulliMarginalSlopePredictor {
         b: f64,
         beta_score_warp: Option<&Array1<f64>>,
         beta_link_dev: Option<&Array1<f64>>,
+        score_warp_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
+        link_dev_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
     ) -> Result<ObservedDenestedCellPartials, EstimationError> {
         use crate::families::bernoulli_marginal_slope::exact_kernel as exact;
 
@@ -1303,18 +1470,26 @@ impl BernoulliMarginalSlopePredictor {
         let score_span = if let (Some(runtime), Some(beta)) =
             (self.score_warp_runtime.as_ref(), beta_score_warp)
         {
-            runtime
+            let mut span = runtime
                 .local_cubic_at(beta, z_value)
-                .map_err(EstimationError::InvalidInput)?
+                .map_err(EstimationError::InvalidInput)?;
+            if let Some(corr) = score_warp_correction_for_row {
+                span.c0 -= corr.dot(beta);
+            }
+            span
         } else {
             zero_span
         };
         let link_span = if let (Some(runtime), Some(beta)) =
             (self.link_deviation_runtime.as_ref(), beta_link_dev)
         {
-            runtime
+            let mut span = runtime
                 .local_cubic_at(beta, u_value)
-                .map_err(EstimationError::InvalidInput)?
+                .map_err(EstimationError::InvalidInput)?;
+            if let Some(corr) = link_dev_correction_for_row {
+                span.c0 -= corr.dot(beta);
+            }
+            span
         } else {
             zero_span
         };
@@ -1350,6 +1525,8 @@ impl BernoulliMarginalSlopePredictor {
         beta_score_warp: Option<&Array1<f64>>,
         beta_link_dev: Option<&Array1<f64>>,
         grid: &EmpiricalZGrid,
+        score_warp_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
+        link_dev_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
     ) -> Result<(f64, f64, f64), EstimationError> {
         let marginal = bernoulli_marginal_link_map(&self.base_link, marginal_eta)
             .map_err(EstimationError::InvalidInput)?;
@@ -1363,6 +1540,8 @@ impl BernoulliMarginalSlopePredictor {
                 slope,
                 beta_score_warp,
                 beta_link_dev,
+                score_warp_correction_for_row,
+                link_dev_correction_for_row,
             )?;
             let eta = eval_coeff4_at(&obs.coeff, node);
             let eta_a = eval_coeff4_at(&obs.dc_da, node);
@@ -1383,6 +1562,8 @@ impl BernoulliMarginalSlopePredictor {
         beta_score_warp: Option<&Array1<f64>>,
         beta_link_dev: Option<&Array1<f64>>,
         empirical_grid: Option<&EmpiricalZGrid>,
+        score_warp_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
+        link_dev_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
     ) -> Result<(f64, f64, f64), EstimationError> {
         if let Some(grid) = empirical_grid {
             self.evaluate_empirical_denested_calibration(
@@ -1392,6 +1573,8 @@ impl BernoulliMarginalSlopePredictor {
                 beta_score_warp,
                 beta_link_dev,
                 grid,
+                score_warp_correction_for_row,
+                link_dev_correction_for_row,
             )
         } else {
             self.evaluate_denested_calibration(
@@ -1400,6 +1583,8 @@ impl BernoulliMarginalSlopePredictor {
                 slope,
                 beta_score_warp,
                 beta_link_dev,
+                score_warp_correction_for_row,
+                link_dev_correction_for_row,
             )
         }
     }
@@ -1452,40 +1637,10 @@ impl BernoulliMarginalSlopePredictor {
             runtime.validate_exact_replay_contract().map_err(|e| {
                 format!("bernoulli marginal-slope link-deviation runtime is invalid: {e}")
             })?;
-            // The cross-block anchor-residual subtraction path is not yet
-            // wired into the per-row predict callers (each `local_cubic_at`
-            // and `basis_cubic_at` site needs to assemble n_row from the
-            // parametric design rows and subtract `n_row · M`). Until that
-            // plumbing lands, refuse to load a saved model whose link-dev
-            // runtime carries an anchor residual rather than silently
-            // produce predictions that omit the residual correction.
-            if runtime.anchor_residual_coefficients.is_some() {
-                return Err(
-                    "bernoulli marginal-slope link-deviation runtime carries a cross-block \
-                     anchor residual that the predict-time evaluation path does not yet \
-                     reconstruct; refit with the current library after the predict-side \
-                     plumbing for `n_row · M` subtraction lands, or retrain without \
-                     cross-block residualisation"
-                        .to_string(),
-                );
-            }
         }
-        if let Some(runtime) = score_warp_runtime.as_ref()
-            && runtime.anchor_residual_coefficients.is_some()
-        {
-            // Same guard for the score-warp branch: training currently
-            // emits no anchor residual on score-warp (it has no
-            // parametric anchors that pass through the orthogonalisation
-            // with a non-degenerate weighted projection), but we make
-            // the load-side guard symmetric for future-proofing.
-            return Err(
-                "bernoulli marginal-slope score-warp runtime carries a cross-block \
-                 anchor residual that the predict-time evaluation path does not yet \
-                 reconstruct; refit with the current library after the predict-side \
-                 plumbing for `n_row · M` subtraction lands"
-                    .to_string(),
-            );
-        }
+        // Cross-block anchor residuals on either runtime are now applied
+        // per-row by every predict-time `local_cubic_at` / `basis_cubic_at`
+        // / `design` call site via `build_anchor_correction_matrices`.
         latent_z_normalization
             .validate("bernoulli marginal-slope predictor")
             .map_err(|e| {
@@ -1623,6 +1778,8 @@ impl BernoulliMarginalSlopePredictor {
         score_warp_beta: Option<&Array1<f64>>,
         empirical_grid: Option<&EmpiricalZGrid>,
         warm_start_buf: &mut Array1<f64>,
+        score_warp_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
+        link_dev_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
     ) -> Result<f64, EstimationError> {
         let marginal = bernoulli_marginal_link_map(&self.base_link, marginal_eta)
             .map_err(EstimationError::InvalidInput)?;
@@ -1634,6 +1791,8 @@ impl BernoulliMarginalSlopePredictor {
                 score_warp_beta,
                 link_dev_beta,
                 empirical_grid,
+                score_warp_correction_for_row,
+                link_dev_correction_for_row,
             )
             .map_err(|err| err.to_string())
         };
@@ -1644,7 +1803,8 @@ impl BernoulliMarginalSlopePredictor {
         if let (Some(_), Some(beta)) = (self.link_deviation_runtime.as_ref(), link_dev_beta) {
             warm_start_buf[0] = a_rigid;
             let one_pt = warm_start_buf.slice(ndarray::s![0..1]).to_owned();
-            let (l_val, l_d1) = self.link_terms_value_d1(&one_pt, Some(beta))?;
+            let (l_val, l_d1) =
+                self.link_terms_value_d1(&one_pt, Some(beta), link_dev_correction_for_row)?;
             let ell1 = l_d1[0];
             if ell1 > 1e-8 {
                 let ell0 = l_val[0] - ell1 * a_rigid;
@@ -1752,6 +1912,13 @@ impl BernoulliMarginalSlopePredictor {
         let chunk_size = prediction_chunk_rows(theta.len(), 1, n);
         let num_chunks = (n + chunk_size - 1) / chunk_size;
         let scale = self.probit_frailty_scale();
+        // Cross-block anchor corrections: when either runtime carries an
+        // anchor residual, precompute the per-row correction matrices
+        // (n × runtime_basis_dim) once. Each subsequent per-row evaluation
+        // subtracts the corresponding row of these matrices from the raw
+        // cubic-span basis output. When neither runtime has a residual,
+        // the returned bundle is empty and threading is a no-op.
+        let anchor_corrections = self.build_anchor_correction_matrices(input, design_logslope)?;
         let marginal_map = marginal_eta
             .iter()
             .map(|&eta| {
@@ -1862,7 +2029,22 @@ impl BernoulliMarginalSlopePredictor {
         let score_warp_obs_design = self
             .score_warp_runtime
             .as_ref()
-            .map(|runtime| runtime.design(&z).map_err(EstimationError::InvalidInput))
+            .map(|runtime| {
+                if runtime.anchor_residual_coefficients.is_some() {
+                    let anchor_rows = anchor_corrections.n_anchor_rows_view().ok_or_else(|| {
+                        EstimationError::InvalidInput(
+                            "bernoulli marginal-slope score-warp anchor residual present but \
+                             anchor_corrections bundle is missing the parametric anchor rows"
+                                .to_string(),
+                        )
+                    })?;
+                    runtime
+                        .design_with_anchor_rows(&z, anchor_rows)
+                        .map_err(EstimationError::InvalidInput)
+                } else {
+                    runtime.design(&z).map_err(EstimationError::InvalidInput)
+                }
+            })
             .transpose()?;
         let score_dev_obs = if let (Some(design), Some(beta)) =
             (score_warp_obs_design.as_ref(), beta_score_warp.clone())
@@ -1910,6 +2092,8 @@ impl BernoulliMarginalSlopePredictor {
                     let slope = logslope_eta[i];
                     let q = marginal_eta[i];
                     let empirical_grid = self.empirical_grid_for_prediction_row(input, i)?;
+                    let score_corr_row = anchor_corrections.score_warp_row(i);
+                    let link_corr_row = anchor_corrections.link_dev_row(i);
                     intercepts[local_row] = self.solve_intercept_scalar(
                         q,
                         slope,
@@ -1917,6 +2101,8 @@ impl BernoulliMarginalSlopePredictor {
                         score_warp_beta_owned.as_ref(),
                         empirical_grid.as_ref(),
                         &mut warm_start_buf,
+                        score_corr_row,
+                        link_corr_row,
                     )?;
 
                     if !need_gradient {
@@ -1931,6 +2117,8 @@ impl BernoulliMarginalSlopePredictor {
                         score_warp_beta_owned.as_ref(),
                         link_dev_beta_owned.as_ref(),
                         empirical_grid.as_ref(),
+                        score_corr_row,
+                        link_corr_row,
                     )?;
                     let m_a = m_a_raw.max(1e-12);
                     a_q.as_mut().unwrap()[local_row] = marginal_map[i].mu1 / m_a;
@@ -1945,6 +2133,8 @@ impl BernoulliMarginalSlopePredictor {
                                 slope,
                                 score_warp_beta_owned.as_ref(),
                                 link_dev_beta_owned.as_ref(),
+                                score_corr_row,
+                                link_corr_row,
                             )?;
                             let eta = eval_coeff4_at(&obs.coeff, node);
                             let pdf = normal_pdf(eta);
@@ -1952,9 +2142,18 @@ impl BernoulliMarginalSlopePredictor {
 
                             if let Some(runtime) = self.score_warp_runtime.as_ref() {
                                 for j in 0..score_warp_dim {
-                                    let basis_span = runtime
+                                    let mut basis_span = runtime
                                         .basis_cubic_at(j, node)
                                         .map_err(EstimationError::InvalidInput)?;
+                                    // `basis_cubic_at` returns the j-th basis
+                                    // function's local cubic; the residual
+                                    // subtracts `correction[j]` from the
+                                    // constant term (row-constant, basis-
+                                    // function-specific). Higher span
+                                    // coefficients are unaffected.
+                                    if let Some(corr) = score_corr_row {
+                                        basis_span.c0 -= corr[j];
+                                    }
                                     let coeffs = crate::families::bernoulli_marginal_slope::exact_kernel::score_basis_cell_coefficients(
                                         basis_span,
                                         slope,
@@ -1966,9 +2165,12 @@ impl BernoulliMarginalSlopePredictor {
 
                             if let Some(runtime) = self.link_deviation_runtime.as_ref() {
                                 for j in 0..link_dev_dim {
-                                    let basis_span = runtime
+                                    let mut basis_span = runtime
                                         .basis_cubic_at(j, intercept + slope * node)
                                         .map_err(EstimationError::InvalidInput)?;
+                                    if let Some(corr) = link_corr_row {
+                                        basis_span.c0 -= corr[j];
+                                    }
                                     let coeffs = crate::families::bernoulli_marginal_slope::exact_kernel::link_basis_cell_coefficients(
                                         basis_span,
                                         intercept,
@@ -1985,6 +2187,8 @@ impl BernoulliMarginalSlopePredictor {
                             slope,
                             score_warp_beta_owned.as_ref(),
                             link_dev_beta_owned.as_ref(),
+                            score_corr_row,
+                            link_corr_row,
                         )?;
                         for partition_cell in cells {
                             let cell = partition_cell.cell;
@@ -2012,9 +2216,12 @@ impl BernoulliMarginalSlopePredictor {
                             let mid = 0.5 * (cell.left + cell.right);
                             if let Some(runtime) = self.score_warp_runtime.as_ref() {
                                 for j in 0..score_warp_dim {
-                                    let basis_span = runtime
+                                    let mut basis_span = runtime
                                         .basis_cubic_at(j, mid)
                                         .map_err(EstimationError::InvalidInput)?;
+                                    if let Some(corr) = score_corr_row {
+                                        basis_span.c0 -= corr[j];
+                                    }
                                     let coeffs = crate::families::bernoulli_marginal_slope::exact_kernel::score_basis_cell_coefficients(
                                         basis_span, slope,
                                     );
@@ -2029,9 +2236,12 @@ impl BernoulliMarginalSlopePredictor {
 
                             if let Some(runtime) = self.link_deviation_runtime.as_ref() {
                                 for j in 0..link_dev_dim {
-                                    let basis_span = runtime
+                                    let mut basis_span = runtime
                                         .basis_cubic_at(j, intercept + slope * mid)
                                         .map_err(EstimationError::InvalidInput)?;
+                                    if let Some(corr) = link_corr_row {
+                                        basis_span.c0 -= corr[j];
+                                    }
                                     let coeffs = crate::families::bernoulli_marginal_slope::exact_kernel::link_basis_cell_coefficients(
                                         basis_span,
                                         intercept,
@@ -2123,9 +2333,22 @@ impl BernoulliMarginalSlopePredictor {
             self.link_deviation_runtime.as_ref(),
             link_dev_beta_owned.as_ref(),
         ) {
-            let basis = runtime
-                .design(&eta_base)
-                .map_err(EstimationError::InvalidInput)?;
+            let basis = if runtime.anchor_residual_coefficients.is_some() {
+                let anchor_rows = anchor_corrections.n_anchor_rows_view().ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "bernoulli marginal-slope link-deviation anchor residual present but \
+                         anchor_corrections bundle is missing the parametric anchor rows"
+                            .to_string(),
+                    )
+                })?;
+                runtime
+                    .design_with_anchor_rows(&eta_base, anchor_rows)
+                    .map_err(EstimationError::InvalidInput)?
+            } else {
+                runtime
+                    .design(&eta_base)
+                    .map_err(EstimationError::InvalidInput)?
+            };
             let dev = basis.dot(beta_owned);
             if need_gradient {
                 let d1 = runtime
@@ -2399,6 +2622,9 @@ impl BernoulliMarginalSlopePredictor {
                     .map_err(EstimationError::InvalidInput)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // Cross-block anchor corrections (see final_eta_and_gradient_from_theta
+        // for the design); precompute once before the per-row loop.
+        let anchor_corrections = self.build_anchor_correction_matrices(input, design_logslope)?;
         // Per-row: solve intercept scalar, evaluate denested calibration,
         // record (intercept, a_q). The `warm_start_buf` is just per-call
         // scratch — give each rayon worker its own buffer via fold init.
@@ -2411,6 +2637,8 @@ impl BernoulliMarginalSlopePredictor {
                     let q = marginal_eta[i];
                     let slope = logslope_eta[i];
                     let empirical_grid = self.empirical_grid_for_prediction_row(input, i)?;
+                    let score_corr_row = anchor_corrections.score_warp_row(i);
+                    let link_corr_row = anchor_corrections.link_dev_row(i);
                     let intercept = self.solve_intercept_scalar(
                         q,
                         slope,
@@ -2418,6 +2646,8 @@ impl BernoulliMarginalSlopePredictor {
                         self.beta_score_warp.as_ref(),
                         empirical_grid.as_ref(),
                         warm_start_buf,
+                        score_corr_row,
+                        link_corr_row,
                     )?;
                     let (_, m_a_raw, _) = self.evaluate_prediction_calibration(
                         intercept,
@@ -2426,6 +2656,8 @@ impl BernoulliMarginalSlopePredictor {
                         self.beta_score_warp.as_ref(),
                         self.beta_link_dev.as_ref(),
                         empirical_grid.as_ref(),
+                        score_corr_row,
+                        link_corr_row,
                     )?;
                     let m_a = m_a_raw.max(1e-12);
                     Ok((intercept, marginal_map[i].mu1 / m_a))
@@ -2444,10 +2676,23 @@ impl BernoulliMarginalSlopePredictor {
             self.score_warp_runtime.as_ref(),
             self.beta_score_warp.as_ref(),
         ) {
-            runtime
-                .design(&z)
-                .map_err(EstimationError::InvalidInput)?
-                .dot(beta)
+            let design = if runtime.anchor_residual_coefficients.is_some() {
+                let anchor_rows = anchor_corrections.n_anchor_rows_view().ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "bernoulli marginal-slope score-warp anchor residual present but \
+                         anchor_corrections bundle is missing the parametric anchor rows"
+                            .to_string(),
+                    )
+                })?;
+                runtime
+                    .design_with_anchor_rows(&z, anchor_rows)
+                    .map_err(EstimationError::InvalidInput)?
+            } else {
+                runtime
+                    .design(&z)
+                    .map_err(EstimationError::InvalidInput)?
+            };
+            design.dot(beta)
         } else {
             Array1::zeros(n)
         };
@@ -2456,9 +2701,22 @@ impl BernoulliMarginalSlopePredictor {
             self.link_deviation_runtime.as_ref(),
             self.beta_link_dev.as_ref(),
         ) {
-            let basis = runtime
-                .design(&eta_base)
-                .map_err(EstimationError::InvalidInput)?;
+            let basis = if runtime.anchor_residual_coefficients.is_some() {
+                let anchor_rows = anchor_corrections.n_anchor_rows_view().ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "bernoulli marginal-slope link-deviation anchor residual present but \
+                         anchor_corrections bundle is missing the parametric anchor rows"
+                            .to_string(),
+                    )
+                })?;
+                runtime
+                    .design_with_anchor_rows(&eta_base, anchor_rows)
+                    .map_err(EstimationError::InvalidInput)?
+            } else {
+                runtime
+                    .design(&eta_base)
+                    .map_err(EstimationError::InvalidInput)?
+            };
             let dev = basis.dot(beta);
             let d1 = runtime
                 .first_derivative_design(&eta_base)

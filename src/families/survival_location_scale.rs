@@ -10902,6 +10902,20 @@ pub(crate) fn fit_survival_location_scale_terms(
     // Survival location-scale is a multi-block family with β-dependent
     // joint Hessian: disable EFS/HybridEFS at plan time so the outer never
     // pays for a stalled fixed-point attempt before landing on BFGS.
+    let outer_policy = {
+        let psi_dim = joint_setup.theta0().len() - joint_setup.rho_dim();
+        let _ = psi_dim;
+        let capability = if analytic_joint_hessian_available {
+            crate::families::custom_family::ExactOuterDerivativeOrder::Second
+        } else {
+            crate::families::custom_family::ExactOuterDerivativeOrder::First
+        };
+        crate::families::custom_family::OuterDerivativePolicy {
+            capability,
+            predicted_gradient_work: 0,
+            predicted_hessian_work: 0,
+        }
+    };
     let solved = optimize_spatial_length_scale_exact_joint(
         data,
         &[spec.thresholdspec.clone(), spec.log_sigmaspec.clone()],
@@ -10913,6 +10927,7 @@ pub(crate) fn fit_survival_location_scale_terms(
         analytic_joint_hessian_available,
         true,
         None,
+        outer_policy,
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             let fit = fit_survival_location_scale(build_spec(
@@ -10928,7 +10943,11 @@ pub(crate) fn fit_survival_location_scale_terms(
             wiggle_beta_hint.replace(fit.beta_link_wiggle());
             Ok(fit)
         },
-        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], eval_mode| {
+        |theta,
+         specs: &[TermCollectionSpec],
+         designs: &[TermCollectionDesign],
+         eval_mode,
+         _row_set: &crate::families::row_kernel::RowSet| {
             use crate::solver::estimate::reml::unified::EvalMode;
             if !analytic_joint_gradient_available {
                 return Err(

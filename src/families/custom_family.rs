@@ -420,6 +420,161 @@ pub fn exact_outer_order_with_outer_hvp(
     exact_outer_order_from_capability(specs, coefficient_cost)
 }
 
+/// Realized outer-derivative policy at the current problem size.
+///
+/// Capability (the family can produce exact 2nd-order calculus) is independent
+/// of policy (we ask for it on *this* problem). At biobank scale the dense
+/// outer Hessian is mathematically available but economically catastrophic:
+/// a single `n=320 000`, `psi_dim=64` evaluation costs 200–600 s of wall-clock
+/// and dominates the total fit. Quasi-Newton outer BFGS converges to the same
+/// stationary point using only successive analytic gradients — this is **not**
+/// a feature drop, it is the optimization-theory-standard convergent
+/// alternative whose per-eval cost is `O(n · p_total · K)` rather than the
+/// Hessian's `O(n · p_total² · K)`.
+///
+/// `OuterDerivativePolicy` records the family's *capability*, the *predicted
+/// per-eval cost* for both gradient-only and Hessian paths, and exposes the
+/// two policy queries the outer optimizer actually needs:
+///
+/// * [`order_for_evaluation`](Self::order_for_evaluation) — clamp a requested
+///   evaluation order against the policy gate.
+/// * [`declared_hessian_form`](Self::declared_hessian_form) — what shape the
+///   outer-strategy planner should declare to its plan ladder.
+/// * [`should_use_staged_kappa`](Self::should_use_staged_kappa) — auto-route
+///   the κ optimizer through the pilot/polish schedule at large `n`.
+///
+/// All thresholds are *const* — no env vars, no CLI flags. The cost model is
+/// the family's own `coefficient_gradient_cost` / `coefficient_hessian_cost`
+/// scaled by the joint outer-coordinate dimension, with `saturating_mul` so
+/// overflow rounds up to the budget ceiling rather than wrapping silently.
+#[derive(Clone, Copy, Debug)]
+pub struct OuterDerivativePolicy {
+    /// What exact calculus the family advertises in principle.
+    pub capability: ExactOuterDerivativeOrder,
+    /// Predicted per-eval work for one `ValueGradientHessian` evaluation.
+    /// Rounded conservatively *up* via `saturating_mul`.
+    pub predicted_hessian_work: u128,
+    /// Predicted per-eval work for one `ValueAndGradient` evaluation.
+    /// Rounded conservatively *up* via `saturating_mul`.
+    pub predicted_gradient_work: u128,
+}
+
+impl OuterDerivativePolicy {
+    /// Universal full-data outer-Hessian work ceiling, in flop-equivalent
+    /// units. Above this the optimizer requests `ValueAndGradient` only;
+    /// quasi-Newton BFGS / L-BFGS picks up curvature from successive
+    /// gradients. This is **convergent** to the exact MLE, not a feature
+    /// drop — see the `OuterDerivativePolicy` doc-comment.
+    pub const OUTER_HESSIAN_WORK_BUDGET: u128 = 100_000_000;
+
+    /// Per-eval gradient work ceiling above which the κ schedule switches
+    /// to the staged pilot/polish path. At biobank scale (n ≳ 100 k) even
+    /// the gradient sweep takes minutes per outer iter; subsampling the
+    /// pilot stage cuts that to seconds and leaves the final polish on
+    /// full data to recover the MLE.
+    pub const OUTER_GRADIENT_WORK_BUDGET: u128 = 50_000_000_000;
+
+    /// Pilot subsample auto-engages when full-data `n` exceeds this. Below
+    /// this the κ schedule collapses to a single full-data stage —
+    /// behaviour identical to the pre-P7 path.
+    pub const STAGED_KAPPA_TRIGGER_N: usize = 30_000;
+
+    /// Clamp a requested evaluation order against the policy gate.
+    ///
+    /// Returns the highest order this policy permits for the requested order:
+    /// * `ValueGradientHessian` requested → keep only if `declared_hessian_form`
+    ///   is something other than `Unavailable`.
+    /// * `ValueAndGradient` requested → always permitted (gradient-only is
+    ///   universal).
+    pub fn order_for_evaluation(
+        &self,
+        requested: crate::solver::outer_strategy::OuterEvalOrder,
+    ) -> crate::solver::outer_strategy::OuterEvalOrder {
+        use crate::solver::outer_strategy::OuterEvalOrder;
+        match requested {
+            OuterEvalOrder::ValueAndGradient => OuterEvalOrder::ValueAndGradient,
+            OuterEvalOrder::ValueGradientHessian => {
+                if matches!(
+                    self.declared_hessian_form(),
+                    crate::solver::outer_strategy::DeclaredHessianForm::Unavailable
+                ) {
+                    OuterEvalOrder::ValueAndGradient
+                } else {
+                    OuterEvalOrder::ValueGradientHessian
+                }
+            }
+        }
+    }
+
+    /// Outer Hessian declaration for the outer-strategy planner.
+    ///
+    /// `Either` ⇔ capability has Hessian *and* predicted Hessian work is
+    /// within the universal budget. Otherwise `Unavailable`, which routes
+    /// the planner to gradient-only BFGS / L-BFGS — still convergent, just
+    /// without the per-step Newton acceleration.
+    pub fn declared_hessian_form(
+        &self,
+    ) -> crate::solver::outer_strategy::DeclaredHessianForm {
+        use crate::solver::outer_strategy::DeclaredHessianForm;
+        if !self.capability.has_hessian() {
+            return DeclaredHessianForm::Unavailable;
+        }
+        if self.predicted_hessian_work <= Self::OUTER_HESSIAN_WORK_BUDGET {
+            DeclaredHessianForm::Either
+        } else {
+            DeclaredHessianForm::Unavailable
+        }
+    }
+
+    /// True when the κ optimizer should auto-route through the staged
+    /// pilot/polish schedule. Triggers when **either** the data is big
+    /// (`n ≥ STAGED_KAPPA_TRIGGER_N`) **or** the per-eval gradient work
+    /// exceeds `OUTER_GRADIENT_WORK_BUDGET`. The second clause catches
+    /// problems with moderate `n` but very wide design (large `p_total`
+    /// or `psi_dim`) where a single full-data gradient sweep still
+    /// dominates the κ trajectory.
+    pub fn should_use_staged_kappa(&self, n: usize) -> bool {
+        n >= Self::STAGED_KAPPA_TRIGGER_N
+            || self.predicted_gradient_work > Self::OUTER_GRADIENT_WORK_BUDGET
+    }
+}
+
+/// Total outer-coordinate dimensionality used by the default policy work
+/// model: `rho_dim + psi_dim`. Each outer evaluation propagates one
+/// directional derivative per outer coordinate through the inner solve.
+#[inline]
+fn outer_coord_dim_for_policy(specs: &[ParameterBlockSpec], psi_dim: usize) -> u128 {
+    let rho_total: u128 = specs
+        .iter()
+        .map(|s| s.penalties.len() as u128)
+        .fold(0u128, |acc, k| acc.saturating_add(k));
+    rho_total.saturating_add(psi_dim as u128)
+}
+
+/// Default predicted-cost model for [`OuterDerivativePolicy`]:
+///
+/// * gradient work ≈ `coefficient_gradient_cost · (rho_dim + psi_dim)`
+/// * Hessian work  ≈ `coefficient_hessian_cost  · (rho_dim + psi_dim)`
+///
+/// Each outer coordinate triggers one analytic directional derivative
+/// through the inner solve; the dense Hessian assembly carries the extra
+/// `O(p_total)` factor already captured by `coefficient_hessian_cost`.
+///
+/// All multiplications saturate so an overflow rounds *up* to the gate
+/// ceiling: we'd rather drop one Hessian evaluation that we could have
+/// afforded than crash on a 600 s eval.
+pub fn default_outer_derivative_policy_costs(
+    specs: &[ParameterBlockSpec],
+    psi_dim: usize,
+    grad_cost: u64,
+    hess_cost: u64,
+) -> (u128, u128) {
+    let k = outer_coord_dim_for_policy(specs, psi_dim);
+    let grad = (grad_cost as u128).saturating_mul(k.max(1));
+    let hess = (hess_cost as u128).saturating_mul(k.max(1));
+    (grad, hess)
+}
+
 /// Default coefficient-space Hessian cost: `Σ_b n_b · p_b²`, summed across
 /// blocks. Represents the work to assemble or apply the dense block-diagonal
 /// inner Hessian once.
@@ -703,6 +858,16 @@ pub trait CustomFamily {
     /// advertises either dense outer Hessian blocks or profiled outer-Hessian
     /// HVPs. Large problems must stay exact and select an operator
     /// representation; they are not demoted to first-order optimizers.
+    ///
+    /// **Capability vs policy.** This method is the *capability query*: it
+    /// reports the highest analytic order this family implements. The
+    /// economic gate at the current problem size lives on
+    /// [`Self::outer_derivative_policy`], which compares predicted per-eval
+    /// work against [`OuterDerivativePolicy::OUTER_HESSIAN_WORK_BUDGET`] and
+    /// downgrades to `ValueAndGradient` when the dense Hessian would
+    /// dominate the fit. Outer-optimizer call sites consult the *policy*
+    /// (not this raw order) when deciding what to request from the
+    /// evaluator.
     fn exact_outer_derivative_order(
         &self,
         specs: &[ParameterBlockSpec],
@@ -721,6 +886,45 @@ pub trait CustomFamily {
             coefficient_work,
             self.outer_hyper_hessian_hvp_available(specs),
         )
+    }
+
+    /// Realized outer-derivative policy at the current problem size.
+    ///
+    /// Combines the capability query [`Self::exact_outer_derivative_order`]
+    /// with the predicted per-eval cost from
+    /// [`Self::coefficient_gradient_cost`] / [`Self::coefficient_hessian_cost`]
+    /// and the joint outer-coordinate dimension `rho_dim + psi_dim` to decide
+    /// what to *actually request* from the evaluator on a per-call basis.
+    ///
+    /// **This is the single point where the cost gate lives.** Older code
+    /// scattered family-specific work-limit constants (e.g.
+    /// `FLEX_DENSE_OUTER_HESSIAN_ROW_THIRD_WORK_LIMIT` and the rigid variant
+    /// in `bernoulli_marginal_slope.rs`) — those are being migrated to
+    /// per-family overrides of *this* method so the policy decision is
+    /// uniform across the codebase.
+    ///
+    /// Families with non-generic cost models (Khatri–Rao CTN, matrix-free
+    /// HVP families, marginal-slope row-third workloads) should override
+    /// this directly and set the `predicted_*_work` fields from their own
+    /// cost model. The default uses the generic
+    /// `n × (rho_dim + psi_dim) × p_total` shape via
+    /// [`default_outer_derivative_policy_costs`].
+    fn outer_derivative_policy(
+        &self,
+        specs: &[ParameterBlockSpec],
+        psi_dim: usize,
+        options: &BlockwiseFitOptions,
+    ) -> OuterDerivativePolicy {
+        let capability = self.exact_outer_derivative_order(specs, options);
+        let grad_cost = self.coefficient_gradient_cost(specs);
+        let hess_cost = self.coefficient_hessian_cost(specs);
+        let (predicted_gradient_work, predicted_hessian_work) =
+            default_outer_derivative_policy_costs(specs, psi_dim, grad_cost, hess_cost);
+        OuterDerivativePolicy {
+            capability,
+            predicted_gradient_work,
+            predicted_hessian_work,
+        }
     }
 
     /// Family-specific outer seeding policy.
@@ -8012,21 +8216,30 @@ pub(crate) fn custom_family_outer_derivatives<F: CustomFamily + ?Sized>(
 ) {
     use crate::solver::outer_strategy::{DeclaredHessianForm, Derivative};
 
-    let order = family.exact_outer_derivative_order(specs, options);
-    let gradient = if order.has_gradient() {
+    // The capability-vs-policy split: capability tells us *what the family
+    // can compute*; policy tells us *what we should ask for at this size*.
+    //
+    // For the outer-strategy declaration here we have only `specs` and
+    // `options` (no resolved psi_dim), so policy is queried at
+    // psi_dim = 0 — the gradient/Hessian forms returned here are the
+    // pre-psi declarations consumed by the outer planner ladder. The
+    // per-iter clamp in `optimize_spatial_length_scale_exact_joint`
+    // consults `outer_derivative_policy` again with the realized
+    // psi_dim for the κ optimizer.
+    let policy = family.outer_derivative_policy(specs, 0, options);
+    let gradient = if policy.capability.has_gradient() {
         Derivative::Analytic
     } else {
         Derivative::Unavailable
     };
-    // The analytic outer Hessian is routed to ARC whenever the realized family
-    // exposes second-order calculus. Matrix-free Hessian support is a
-    // representation capability used by the evaluator; it must not be hidden
-    // from the outer optimizer by a cost-based first-order policy.
+    // Even with a capable family we route through `Unavailable` whenever
+    // the predicted Hessian work exceeds the universal budget. Quasi-Newton
+    // BFGS / L-BFGS still converges to the exact MLE on gradient-only —
+    // this is **not** a feature drop, see `OuterDerivativePolicy`'s doc.
     let hessian = if options.use_outer_hessian
         && include_exact_newton_logdet_h(family, options)
-        && order.has_hessian()
     {
-        DeclaredHessianForm::Either
+        policy.declared_hessian_form()
     } else {
         DeclaredHessianForm::Unavailable
     };
