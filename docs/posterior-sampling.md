@@ -85,7 +85,7 @@ Container for posterior draws.
 | `rhat` | `float` | Max split-Rhat. `< 1.01` excellent, `< 1.05` good, `< 1.1` OK. |
 | `ess` | `float` | Min effective sample size across coefficients. |
 | `converged` | `bool` | `rhat < 1.1`. |
-| `method` | `str` | `"nuts"` or `"laplace_gaussian"`. |
+| `method` | `str` | `"nuts"` or `"laplace"`. |
 | `model_class`, `family_kind` | `str` | Model class string and inverse-link tag. |
 | `config` | `SamplingConfig` | What the sampler ran with. |
 | `n_draws`, `n_coeffs`, `shape`, `is_exact` | properties | Convenience. |
@@ -192,13 +192,16 @@ If the sampler looks unhealthy:
 
 ## Numerical defaults
 
-The engine scales sampling parameters by the coefficient count:
+The engine derives sampling parameters from the coefficient count `p`
+(`NutsConfig::for_dimension` in `src/inference/hmc.rs`):
 
-| Coefficients | `n_chains` | `n_samples` | `n_warmup` | `target_accept` |
-| --- | --- | --- | --- | --- |
-| `< 10` | 2 | 256 | 256 | 0.8 |
-| `10–50` | 4 | 512 | 512 | 0.8 |
-| `> 50` | 4 | 1024 | 1024 | 0.85 |
+| Parameter | Rule |
+| --- | --- |
+| `n_chains` | `2` if `p ≤ 50`, else `4`. |
+| `n_samples` | `clamp(round(100·p·(1 + 2·√p)·1.5), 500, 10_000)` — target ≈ 100 effective samples per coefficient assuming NUTS autocorrelation `τ ≈ √p`. |
+| `n_warmup` | Same as `n_samples`. |
+| `target_accept` | `0.8` always. |
+| `seed` | `42` (a `seed=` kwarg overrides). |
 
 Override any of them with the corresponding kwarg.
 

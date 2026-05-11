@@ -11,7 +11,7 @@ HTML repr, and trace plots all come along for free.
 `PosteriorSamples.method` discloses which sampler produced the draws:
 
 * ``"nuts"`` — exact No-U-Turn sampling around the fitted joint mode.
-* ``"laplace_gaussian"`` — iid draws from `N(beta_hat, H_penalized^-1)`,
+* ``"laplace"`` — iid draws from `N(beta_hat, H_penalized^-1)`,
   the Gaussian (Laplace) approximation of the posterior.  Used for
   model classes where exact NUTS is not yet wired in the engine.  The
   same surface mgcv / Wood-style GAM tooling uses for credible bands.
@@ -301,7 +301,7 @@ class PosteriorSamples:
     converged : bool
         Boolean convenience for ``rhat < 1.1``.
     method : str
-        ``"nuts"`` for exact NUTS, ``"laplace_gaussian"`` for the
+        ``"nuts"`` for exact NUTS, ``"laplace"`` for the
         Gaussian Laplace approximation around the fitted joint mode.
     model_class : str
         Saved-model predictive class string the draws came from.
@@ -509,7 +509,7 @@ class PosteriorSamples:
         -------
         bool
             ``True`` if :attr:`method` is ``"nuts"``, ``False`` for
-            ``"laplace_gaussian"`` (the Gaussian Laplace approximation).
+            ``"laplace"`` (the Gaussian Laplace approximation).
 
         Examples
         --------
