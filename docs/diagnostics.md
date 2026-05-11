@@ -138,7 +138,7 @@ model.is_survival               # bool
 model.is_marginal_slope         # bool
 model.is_transformation_normal  # bool
 model.response_name             # str | None
-model.training_table_kind       # "pandas", "polars", "pyarrow", "dict", "records", "rows"
+model.training_table_kind       # "pandas", "polars", "pyarrow", "numpy", "mapping", "records", "rows"
 ```
 
 These are read-only properties. Use them to inspect a model loaded from
