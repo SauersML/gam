@@ -23,7 +23,7 @@ print(s["reml_score"])
 print(s["iterations"])
 print(s["model_class"])
 print(s["family_name"])
-print(s["coefficients"])       # list of dicts: name, estimate, std_error, ci_*
+print(s["coefficients"])       # list of dicts: index, estimate, std_error
 ```
 
 `Summary` behaves like a dict; `summary.to_dict()` returns the full payload.
