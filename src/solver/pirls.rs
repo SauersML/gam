@@ -1694,10 +1694,6 @@ impl<'a> GamWorkingModel<'a> {
             &self.link_kind,
             &self.workspace.eta_buf,
             self.y,
-            &self.lastmu,
-            &self.last_dmu_deta,
-            &self.last_d2mu_deta2,
-            &self.last_d3mu_deta3,
             &self.lastweights,
             self.priorweights,
             &mut self.lasthessian_weights,
@@ -5326,10 +5322,6 @@ impl PirlsResult {
                     inverse_link,
                     &self.final_eta,
                     y,
-                    &self.solvemu,
-                    &solve_dmu_deta,
-                    &solve_d2mu_deta2,
-                    &solve_d3mu_deta3,
                     &self.solveweights,
                     priorweights,
                 )?
@@ -7978,9 +7970,20 @@ fn supports_observed_hessian_curvature_for_likelihood(
 #[inline]
 fn eta_for_observed_hessian_jet(inverse_link: &InverseLink, eta: f64) -> f64 {
     match inverse_link {
+        // Why: canonical links keep V(mu) representable across the full f64 eta range; only guard against inf.
         InverseLink::Standard(LinkFunction::Logit | LinkFunction::Log) => eta.clamp(-700.0, 700.0),
         InverseLink::Standard(LinkFunction::Identity) => eta,
-        _ => eta.clamp(-30.0, 30.0),
+        // Why: probit mu=Phi(eta) saturates to 1.0 in f64 by |eta|~8.3; +/-6 keeps V=mu(1-mu) ~ 1e-9 representable.
+        InverseLink::Standard(LinkFunction::Probit) => eta.clamp(-6.0, 6.0),
+        // Why: cloglog has mu~exp(eta) for eta<<0 (underflows below ~-23) and 1-mu~exp(-exp(eta)) collapses by eta=3.
+        InverseLink::Standard(LinkFunction::CLogLog) | InverseLink::LatentCLogLog(_) => {
+            eta.clamp(-23.0, 3.0)
+        }
+        // Why: SAS / beta-logistic / mixture compose logistic-like sigmoids that saturate by |eta|~20 (logistic(20)~1-2e-9).
+        InverseLink::Standard(LinkFunction::Sas | LinkFunction::BetaLogistic)
+        | InverseLink::Sas(_)
+        | InverseLink::BetaLogistic(_)
+        | InverseLink::Mixture(_) => eta.clamp(-20.0, 20.0),
     }
 }
 
@@ -8035,10 +8038,6 @@ fn compute_observed_hessian_curvature_arrays_into(
     inverse_link: &InverseLink,
     eta: &Array1<f64>,
     y: ArrayView1<'_, f64>,
-    mu: &Array1<f64>,
-    dmu_deta: &Array1<f64>,
-    d2mu_deta2: &Array1<f64>,
-    d3mu_deta3: &Array1<f64>,
     fisher_weights: &Array1<f64>,
     priorweights: ArrayView1<'_, f64>,
     hessian_weights: &mut Array1<f64>,
@@ -8088,21 +8087,20 @@ fn compute_observed_hessian_curvature_arrays_into(
         .enumerate()
         .try_for_each(|(i, ((w_out, c_out), d_out))| -> Result<(), EstimationError> {
             let eta_used = eta_for_observed_hessian_jet(inverse_link, eta[i]);
+            // Why: closed-form observed_weight_noncanonical requires (mu, d1..d3, h4) at one consistent eta;
+            // mixing PIRLS-state jets at unclamped eta with h4 at eta_used produced 0/0 in phi_v* divisions,
+            // surfacing as: "observed Hessian curvature is not positive finite at row N: observed=NaN, fisher=0".
+            let jet =
+                crate::mixture_link::inverse_link_jet_for_inverse_link(inverse_link, eta_used)?;
             let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
                 inverse_link, eta_used,
             )?;
-            let jet = MixtureInverseLinkJet {
-                mu: mu[i],
-                d1: dmu_deta[i],
-                d2: d2mu_deta2[i],
-                d3: d3mu_deta3[i],
-            };
             let (w_obs, c_obs, d_obs) = observed_weight_dispatch(
                 weight_family,
                 weight_link,
                 eta_used,
                 y[i],
-                mu[i],
+                jet.mu,
                 phi,
                 priorweights[i].max(0.0),
                 jet,
@@ -8131,10 +8129,6 @@ fn compute_observed_hessian_curvature_arrays(
     inverse_link: &InverseLink,
     eta: &Array1<f64>,
     y: ArrayView1<'_, f64>,
-    mu: &Array1<f64>,
-    dmu_deta: &Array1<f64>,
-    d2mu_deta2: &Array1<f64>,
-    d3mu_deta3: &Array1<f64>,
     fisher_weights: &Array1<f64>,
     priorweights: ArrayView1<'_, f64>,
 ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
@@ -8147,10 +8141,6 @@ fn compute_observed_hessian_curvature_arrays(
         inverse_link,
         eta,
         y,
-        mu,
-        dmu_deta,
-        d2mu_deta2,
-        d3mu_deta3,
         fisher_weights,
         priorweights,
         &mut hessian_weights,
@@ -9717,9 +9707,6 @@ mod tests {
         let mu = eta.mapv(f64::exp);
         let y = array![1.8, 0.7];
         let w = array![2.0, 0.5];
-        let dmu = mu.clone();
-        let d2mu = mu.clone();
-        let d3mu = mu.clone();
         let fisher = w.clone();
 
         let (w_obs, c_obs, d_obs) = compute_observed_hessian_curvature_arrays(
@@ -9727,10 +9714,6 @@ mod tests {
             &InverseLink::Standard(LinkFunction::Log),
             &eta,
             y.view(),
-            &mu,
-            &dmu,
-            &d2mu,
-            &d3mu,
             &fisher,
             w.view(),
         )
