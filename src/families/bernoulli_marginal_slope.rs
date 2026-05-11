@@ -148,8 +148,8 @@ impl BernoulliMarginalSlopeTermSpec {
             marginal_offset,
             logslope_offset,
             frailty,
-            score_warp: Some(protocol.score_warp),
-            link_dev: Some(protocol.link_deviation),
+            score_warp: protocol.score_warp,
+            link_dev: protocol.link_deviation,
             latent_z_policy: protocol.latent_score.into_policy(),
         }
     }
@@ -7234,12 +7234,19 @@ impl BernoulliMarginalSlopeFamily {
         let row_cell_mask = options
             .and_then(|opts| opts.outer_score_subsample.as_ref())
             .map(|subsample| subsample.mask.as_slice());
-        let row_cell_moments = match row_cell_mask {
-            Some(mask) => {
-                self.build_row_cell_moments_bundle(block_states, &row_contexts, 21, Some(mask))?
-            }
-            None => None,
-        };
+        // Build the per-row degree-21 cell-moment bundle whenever flex is
+        // active. Without this bundle every outer-eval directional-derivative
+        // call recomputes degree-15 cell moments per row uncached (the
+        // per-family `cell_moment_lru` is currently a no-op), turning each
+        // batched dH call into O(n · cells · degree-15-expansion) work
+        // regardless of how many directions amortize over those moments.
+        // `build_row_cell_moments_bundle` already short-circuits to `None`
+        // when flex is inactive, when a non-StandardNormal latent measure is
+        // in effect, or when the estimated resident bytes exceed the
+        // resource policy budget — so unconditionally calling it here is
+        // safe at biobank scale.
+        let row_cell_moments =
+            self.build_row_cell_moments_bundle(block_states, &row_contexts, 21, row_cell_mask)?;
         Ok(BernoulliMarginalSlopeExactEvalCache {
             slices,
             primary,
@@ -13209,12 +13216,39 @@ impl BernoulliMarginalSlopeFamily {
         let started = std::time::Instant::now();
 
         let n_rows = weighted_rows.len();
+        let n_dirs = d_beta_flats.len();
+        let flex_active = self.effective_flex_active(block_states)?;
+        let bundle_present = cache.row_cell_moments.is_some();
+        log::info!(
+            "[BMS batched dH start] n={} rows={} p={} dirs={} flex={} cell_moments_bundle={}",
+            n,
+            n_rows,
+            slices.total,
+            n_dirs,
+            flex_active,
+            bundle_present,
+        );
+        let progress = Arc::new(AtomicUsize::new(0));
+        let progress_step = (n_rows / 8).max(1);
+        let progress_started = started;
+        let bump_progress = |progress: &AtomicUsize| {
+            let now = progress.fetch_add(1, Ordering::Relaxed) + 1;
+            if now == n_rows || now % progress_step == 0 {
+                log::info!(
+                    "[BMS batched dH progress] rows={}/{} dirs={} elapsed={:.3}s",
+                    now,
+                    n_rows,
+                    n_dirs,
+                    progress_started.elapsed().as_secs_f64(),
+                );
+            }
+        };
         let dense_contiguous_rows = weighted_rows.len() == n
             && weighted_rows
                 .iter()
                 .enumerate()
                 .all(|(row, wr)| wr.index == row && wr.weight == 1.0);
-        let mut accs = if !self.effective_flex_active(block_states)? {
+        let mut accs = if !flex_active {
             weighted_rows
                 .clone()
                 .into_par_iter()
@@ -13245,6 +13279,7 @@ impl BernoulliMarginalSlopeFamily {
                         }
                         accs[idx].add_pullback(self, row, slices, primary, &t_arr);
                     }
+                    bump_progress(&progress);
                     Ok(accs)
                 })
                 .try_reduce(make_accs, |mut left, right| -> Result<_, String> {
@@ -13353,6 +13388,7 @@ impl BernoulliMarginalSlopeFamily {
                                 w_gg[idx][local] = third[[1, 1]];
                                 accs[idx].add_hw_pullback_only(self, row, slices, primary, third);
                             }
+                            bump_progress(&progress);
                         }
 
                         for idx in 0..n_dirs {
@@ -13438,6 +13474,7 @@ impl BernoulliMarginalSlopeFamily {
                         }
                         accs[idx].add_pullback(self, row, slices, primary, &third);
                     }
+                    bump_progress(&progress);
                     Ok(accs)
                 })
                 .try_reduce(make_accs, |mut left, right| -> Result<_, String> {
@@ -13449,16 +13486,14 @@ impl BernoulliMarginalSlopeFamily {
         };
 
         let elapsed = started.elapsed().as_secs_f64();
-        if log_exact_work(n) {
-            log::info!(
-                "[BMS batched dH] n={} rows={} p={} dirs={} elapsed={:.3}s",
-                n,
-                n_rows,
-                slices.total,
-                d_beta_flats.len(),
-                elapsed
-            );
-        }
+        log::info!(
+            "[BMS batched dH] n={} rows={} p={} dirs={} elapsed={:.3}s",
+            n,
+            n_rows,
+            slices.total,
+            n_dirs,
+            elapsed
+        );
         Ok(accs
             .drain(..)
             .map(|acc| Some(Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>))
@@ -13499,6 +13534,18 @@ impl BernoulliMarginalSlopeFamily {
         let n = self.y.len();
         let make_acc = || BernoulliBlockHessianAccumulator::new(slices);
         let weighted_rows = outer_weighted_rows(options, n);
+
+        // Eager-prime the per-row uncontracted fourth-derivative cache *before*
+        // entering the per-row `par_iter` so the OnceLock's nested-`par_iter`
+        // build does not race with rayon workers that have already parked on
+        // the lock — see `feedback_oncelock_rayon_deadlock` and the mirror
+        // pre-warm for the third-derivative tensor at the top of
+        // `compute_gradient_and_hessian_via_psi_axes`. Skipped on the FLEX
+        // path because that branch routes through the flex jet machinery
+        // instead of `rigid_fourth_full_cached`.
+        if !self.effective_flex_active(block_states)? {
+            let _ = self.rigid_fourth_full_cached(block_states, cache, 0)?;
+        }
 
         // ── Rigid closed-form: 4th-order scalar kernel ───────────────
         if !self.effective_flex_active(block_states)? {
@@ -13585,6 +13632,13 @@ impl BernoulliMarginalSlopeFamily {
         let n = self.y.len();
         let make_acc = || BernoulliBlockHessianAccumulator::new(slices);
         let weighted_rows = outer_weighted_rows(options, n);
+
+        // Eager-prime the per-row uncontracted fourth-derivative cache *before*
+        // entering the per-row `par_iter` to avoid the OnceLock-under-rayon
+        // deadlock — see `feedback_oncelock_rayon_deadlock`.
+        if !self.effective_flex_active(block_states)? {
+            let _ = self.rigid_fourth_full_cached(block_states, cache, 0)?;
+        }
 
         if !self.effective_flex_active(block_states)? {
             let block_acc = weighted_rows
@@ -15095,6 +15149,23 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
 }
 
 impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeLineSearchWorkspace {
+    /// Pre-materialize the full workspace at top-level rayon, *before* any
+    /// outer ext-coordinate `par_iter` enters. The lazy `OnceLock`-guarded
+    /// init in [`Self::materialized`] runs nested `into_par_iter()` calls
+    /// inside the init closure (`build_row_primary_hessian_cache`,
+    /// `build_row_cell_moments_bundle`); when several rayon workers race
+    /// into `materialized` from inside an outer par_iter, all-but-one park
+    /// on the OnceLock's OS mutex and the initializer's nested par_iter
+    /// starves waiting for chunks that those parked workers can never run
+    /// — classic OnceLock-under-rayon deadlock (every thread sleeps in
+    /// pthread_mutex/cond_wait, 0% CPU). Warming here turns the eventual
+    /// `materialized` calls inside the outer par_iter into pure O(1) reads
+    /// of the already-populated OnceLock.
+    fn warm_up_outer_caches(&self) -> Result<(), String> {
+        self.materialized()?;
+        Ok(())
+    }
+
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
         self.materialized()?.hessian_dense()
     }
