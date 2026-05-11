@@ -48,7 +48,7 @@ use std::path::Path;
 /// Do NOT bump for purely additive `Option<T>` fields that the save-time
 /// invariant (`validate_for_persistence`) does not yet require. Those are
 /// forward-compatible.
-pub const MODEL_PAYLOAD_VERSION: u32 = 4;
+pub const MODEL_PAYLOAD_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DataSchema {
@@ -541,6 +541,10 @@ pub struct SavedBaselineTimeWiggleRuntime {
     pub beta: Vec<f64>,
 }
 
+// Re-export so saved-model consumers can refer to the anchor-block tag
+// without reaching across module boundaries.
+pub use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SavedAnchoredDeviationRuntime {
     pub kernel: String,
@@ -550,6 +554,38 @@ pub struct SavedAnchoredDeviationRuntime {
     pub span_c1: Vec<Vec<f64>>,
     pub span_c2: Vec<Vec<f64>>,
     pub span_c3: Vec<Vec<f64>>,
+    /// Cross-block anchor-residual coefficient matrix `M` of shape
+    /// `d × basis_dim`. When present, predict-time evaluation subtracts
+    /// `n_row · M` from each cubic-span row (where `n_row` stacks the
+    /// per-row parametric anchor values in the order given by
+    /// `anchor_residual_components`).
+    #[serde(default)]
+    pub anchor_residual_coefficients: Option<Vec<Vec<f64>>>,
+    /// Ordered list of parametric anchor components whose stacked row
+    /// values combine into `n_row`. Empty unless
+    /// `anchor_residual_coefficients` is `Some`.
+    #[serde(default)]
+    pub anchor_residual_components: Vec<SavedAnchorComponent>,
+    /// Optional `d × d` orthonormalising rotation. The current
+    /// construction bakes the rotation into
+    /// `anchor_residual_coefficients`, so this is always either `None`
+    /// or the identity. Reserved for layouts that store the rotation
+    /// separately from the coefficient matrix.
+    #[serde(default)]
+    pub anchor_residual_rotation: Option<Vec<Vec<f64>>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedAnchorComponent {
+    pub kind: SavedAnchorKind,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum SavedAnchorKind {
+    Parametric {
+        block: ParametricAnchorBlock,
+        ncols: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -939,6 +975,86 @@ impl SavedAnchoredDeviationRuntime {
         self.validate_coefficient_matrix(&self.span_c2, "c2", span_count)?;
         self.validate_coefficient_matrix(&self.span_c3, "c3", span_count)?;
         self.validate_c2_span_continuity()?;
+        self.validate_anchor_residual_shape()?;
+        Ok(())
+    }
+
+    fn validate_anchor_residual_shape(&self) -> Result<(), String> {
+        let coeffs = match self.anchor_residual_coefficients.as_ref() {
+            Some(c) => c,
+            None => {
+                if !self.anchor_residual_components.is_empty() {
+                    return Err(
+                        "saved anchored deviation runtime has anchor_residual_components but no anchor_residual_coefficients"
+                            .to_string(),
+                    );
+                }
+                if self.anchor_residual_rotation.is_some() {
+                    return Err(
+                        "saved anchored deviation runtime has anchor_residual_rotation but no anchor_residual_coefficients"
+                            .to_string(),
+                    );
+                }
+                return Ok(());
+            }
+        };
+        let d: usize = self
+            .anchor_residual_components
+            .iter()
+            .map(|c| match &c.kind {
+                SavedAnchorKind::Parametric { ncols, .. } => *ncols,
+            })
+            .sum();
+        if coeffs.len() != d {
+            return Err(format!(
+                "saved anchored deviation runtime anchor_residual_coefficients has {} rows; expected {} (sum of component ncols)",
+                coeffs.len(),
+                d,
+            ));
+        }
+        for (i, row) in coeffs.iter().enumerate() {
+            if row.len() != self.basis_dim {
+                return Err(format!(
+                    "saved anchored deviation runtime anchor_residual_coefficients row {} has width {}, expected basis_dim {}",
+                    i,
+                    row.len(),
+                    self.basis_dim,
+                ));
+            }
+            for (j, &v) in row.iter().enumerate() {
+                if !v.is_finite() {
+                    return Err(format!(
+                        "saved anchored deviation runtime anchor_residual_coefficients ({i},{j}) is non-finite"
+                    ));
+                }
+            }
+        }
+        if let Some(rot) = self.anchor_residual_rotation.as_ref() {
+            if rot.len() != d {
+                return Err(format!(
+                    "saved anchored deviation runtime anchor_residual_rotation has {} rows; expected {}",
+                    rot.len(),
+                    d,
+                ));
+            }
+            for (i, row) in rot.iter().enumerate() {
+                if row.len() != d {
+                    return Err(format!(
+                        "saved anchored deviation runtime anchor_residual_rotation row {} has width {}; expected {}",
+                        i,
+                        row.len(),
+                        d,
+                    ));
+                }
+                for (j, &v) in row.iter().enumerate() {
+                    if !v.is_finite() {
+                        return Err(format!(
+                            "saved anchored deviation runtime anchor_residual_rotation ({i},{j}) is non-finite"
+                        ));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2686,6 +2802,9 @@ mod tests {
             span_c1: vec![vec![0.0; basis_dim]],
             span_c2: vec![vec![0.0; basis_dim]],
             span_c3: vec![vec![0.0; basis_dim]],
+            anchor_residual_coefficients: None,
+            anchor_residual_components: Vec::new(),
+            anchor_residual_rotation: None,
         }
     }
 
