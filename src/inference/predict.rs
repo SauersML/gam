@@ -918,6 +918,7 @@ struct BmsAnchorCorrections {
 }
 
 impl BmsAnchorCorrections {
+    #[allow(dead_code)]
     fn is_empty(&self) -> bool {
         self.n_anchor_rows.is_none() && self.score_warp.is_none() && self.link_dev.is_none()
     }
