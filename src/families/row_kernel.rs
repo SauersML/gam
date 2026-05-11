@@ -100,9 +100,7 @@ impl RowSet {
     pub fn collect_indexed(&self, n_total: usize) -> Vec<(usize, f64)> {
         match self {
             Self::All => (0..n_total).map(|i| (i, 1.0)).collect(),
-            Self::Subsample { rows, .. } => {
-                rows.iter().map(|r| (r.index, r.weight)).collect()
-            }
+            Self::Subsample { rows, .. } => rows.iter().map(|r| (r.index, r.weight)).collect(),
         }
     }
 
@@ -146,9 +144,7 @@ impl RowSet {
         E: Send,
     {
         match self {
-            Self::All => (0..n_total)
-                .into_par_iter()
-                .try_for_each(|i| body(i, 1.0)),
+            Self::All => (0..n_total).into_par_iter().try_for_each(|i| body(i, 1.0)),
             Self::Subsample { rows, .. } => {
                 rows.par_iter().try_for_each(|r| body(r.index, r.weight))
             }
@@ -162,13 +158,7 @@ impl RowSet {
     /// Returns the reduced result. No `Vec` is allocated per call; both
     /// branches forward directly to rayon's `par_iter` adapters.
     #[inline]
-    pub fn par_reduce_fold<T, I, F, R>(
-        &self,
-        n_total: usize,
-        init: I,
-        fold: F,
-        reduce: R,
-    ) -> T
+    pub fn par_reduce_fold<T, I, F, R>(&self, n_total: usize, init: I, fold: F, reduce: R) -> T
     where
         T: Send,
         I: Fn() -> T + Send + Sync,
@@ -495,10 +485,7 @@ pub fn row_kernel_gradient<const K: usize>(
 }
 
 /// Log-likelihood from cached row kernels: ℓ = -Σ_i w_i · nll_i over `rows`.
-pub fn row_kernel_log_likelihood<const K: usize>(
-    cache: &RowKernelCache<K>,
-    rows: &RowSet,
-) -> f64 {
+pub fn row_kernel_log_likelihood<const K: usize>(cache: &RowKernelCache<K>, rows: &RowSet) -> f64 {
     let total = rows.par_reduce_fold(
         cache.n,
         || 0.0_f64,
@@ -639,9 +626,10 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
             |mut acc, row, w| {
                 let dir_k = self.kern.jacobian_action(row, &self.direction);
                 let vec_k = self.kern.jacobian_action(row, direction);
-                let third = self.kern.row_third_contracted(row, &dir_k).expect(
-                    "row-kernel third contraction should succeed for validated directions",
-                );
+                let third = self
+                    .kern
+                    .row_third_contracted(row, &dir_k)
+                    .expect("row-kernel third contraction should succeed for validated directions");
                 let mut action = [0.0_f64; K];
                 for a in 0..K {
                     let mut sum = 0.0;

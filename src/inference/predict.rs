@@ -979,10 +979,14 @@ impl BernoulliMarginalSlopePredictor {
         // chunk by `chunk_size × (p_marginal + p_logslope)`.
         let marginal_dense = input
             .design
-            .try_to_dense_arc("bernoulli marginal-slope predict-time marginal anchor materialisation")
+            .try_to_dense_arc(
+                "bernoulli marginal-slope predict-time marginal anchor materialisation",
+            )
             .map_err(EstimationError::InvalidInput)?;
         let logslope_dense = design_logslope
-            .try_to_dense_arc("bernoulli marginal-slope predict-time logslope anchor materialisation")
+            .try_to_dense_arc(
+                "bernoulli marginal-slope predict-time logslope anchor materialisation",
+            )
             .map_err(EstimationError::InvalidInput)?;
         let n_rows = marginal_dense.nrows();
         if logslope_dense.nrows() != n_rows {
@@ -2745,9 +2749,7 @@ impl BernoulliMarginalSlopePredictor {
                     .design_with_anchor_rows(&z, anchor_rows)
                     .map_err(EstimationError::InvalidInput)?
             } else {
-                runtime
-                    .design(&z)
-                    .map_err(EstimationError::InvalidInput)?
+                runtime.design(&z).map_err(EstimationError::InvalidInput)?
             };
             design.dot(beta)
         } else {
@@ -5638,9 +5640,7 @@ mod tests {
             .expect("Some correction when residual is present");
         for i in 0..n {
             for j in 0..runtime.basis_dim {
-                assert!(
-                    (raw[[i, j]] - correction[[i, j]] - corrected[[i, j]]).abs() < 1e-12,
-                );
+                assert!((raw[[i, j]] - correction[[i, j]] - corrected[[i, j]]).abs() < 1e-12,);
             }
         }
     }
