@@ -1,13 +1,13 @@
 # scikit-learn integration
 
-`gamfit.sklearn` provides two estimators that play nicely with sklearn's
+`gamfit.sklearn` provides two estimators that work with sklearn's
 pipeline, cross-validation, and grid-search machinery:
 
 - `GAMRegressor` — for continuous responses (extends `RegressorMixin`).
 - `GAMClassifier` — for binary classification (extends `ClassifierMixin`).
 
-Install with `pip install gamfit[sklearn]` so you get `scikit-learn` and
-`numpy` as dependencies.
+Install with `pip install gamfit[sklearn]` to pull in `scikit-learn` and
+`numpy`.
 
 ## GAMRegressor
 
@@ -39,7 +39,7 @@ GAMRegressor(
 ```
 
 All five parameters are surfaced as sklearn `get_params()` keys, so
-`GridSearchCV` and friends just work.
+`GridSearchCV` and friends work directly.
 
 ### Two ways to bind the response
 
@@ -49,8 +49,7 @@ If your formula uses `y ~ ...`, pass `y` separately to `fit()`:
 GAMRegressor(formula="y ~ s(x)").fit(X, y)
 ```
 
-If your formula is RHS-only (e.g. `"s(x)"`), `gamfit` auto-prepends `"y ~"`
-for you:
+If your formula is RHS-only (e.g. `"s(x)"`), `gamfit` prepends `"y ~"`:
 
 ```python
 GAMRegressor(formula="s(x)").fit(X, y)  # internally rewrites to "y ~ s(x)"
@@ -67,8 +66,8 @@ GAMRegressor(formula="s(x)").fit(X, y)  # internally rewrites to "y ~ s(x)"
 | `check(X)` | `SchemaCheck` | Delegates to `model_.check()`. |
 | `report(path=None)` | `str` | Delegates to `model_.report()`. |
 
-After `fit()`, the underlying `Model` is at `est.model_` so you can drop
-down to the full `gamfit.Model` API at any time:
+After `fit()`, the underlying `Model` is at `est.model_`, so you can drop
+down to the full `gamfit.Model` API:
 
 ```python
 est.model_.sample(X, seed=42)
@@ -91,7 +90,7 @@ acc   = est.score(X, y)             # accuracy
 `classes_` is set to `np.array([0, 1])` after `fit()` for sklearn
 compatibility. `predict_proba()` clips to `[0, 1]` and column 0 is `1 - p`.
 
-The threshold for `predict()` is fixed at `0.5`. If you want a different
+The threshold for `predict()` is fixed at `0.5`. For a different
 threshold, use `predict_proba()` and threshold manually.
 
 ## In a Pipeline
@@ -110,8 +109,8 @@ pipe.fit(X, y)
 preds = pipe.predict(X_test)
 ```
 
-The GAM step accepts whatever the previous step emits — `pandas.DataFrame`,
-numpy array, dict-of-columns are all fine.
+The GAM step accepts whatever the previous step emits: `pandas.DataFrame`,
+numpy array, or dict-of-columns.
 
 ## Cross-validation
 
@@ -158,6 +157,6 @@ print(grid.best_params_, grid.best_score_)
 ## No GAMSurvival wrapper (yet)
 
 There is no sklearn-style wrapper for survival models — `Surv(...)` doesn't
-fit the `(X, y)` contract that sklearn expects. For survival, call
+fit the `(X, y)` contract sklearn expects. For survival, call
 `gamfit.fit(...)` directly and use the `SurvivalPrediction` object returned
 by `Model.predict(...)`. See [survival.md](survival.md).

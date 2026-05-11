@@ -5,13 +5,14 @@
 [![Docs](https://img.shields.io/readthedocs/gamfit.svg)](https://gamfit.readthedocs.io/)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](https://github.com/SauersML/gam/blob/main/LICENSE)
 
-Formula-first generalized additive models for Python, backed by a
-high-performance Rust engine.
+Formula-first generalized additive models for Python, backed by a Rust
+engine.
 
 `gamfit` fits Gaussian, binomial, Poisson, and Gamma GLMs with smooth
 terms, random effects, bounded/constrained coefficients, location-scale
 extensions, survival likelihoods, and flexible/learnable links. Smoothing
-parameters are selected by REML or LAML. Posterior sampling uses NUTS.
+parameters are selected by REML or LAML. Posterior sampling uses NUTS
+where supported, with a Gaussian Laplace fallback elsewhere.
 
 **Docs:** <https://gamfit.readthedocs.io/>
 
@@ -50,19 +51,19 @@ all work without conversion.
 - **Three-part penalty structure.** Each smooth gets separate penalties for
   magnitude, gradient, and curvature. Most GAM libraries use one or two.
 - **Flexible link functions.** Spline offsets from a base link
-  (`link(type=flexible(probit))`), plus blended mixture links and SAS /
+  (`link(type=flexible(probit))`), blended mixture links, and SAS /
   beta-logistic learnable shapes.
 - **Surface smooths in arbitrary dimension.** Thin-plate, Duchon (with
-  triple-operator regularization), Matérn covariance, with automatic knot
-  placement.
+  triple-operator regularization), and Matérn covariance, with automatic
+  knot placement.
 - **Adaptive anisotropy.** Per-axis spatial anisotropy shrinks or stretches
   each feature axis independently inside a single joint smooth.
-- **Composable basis/kernel.** Mix and match a spline kernel with a
+- **Composable basis/kernel.** Combine a spline kernel with a
   length-scale behaviour (e.g. Duchon kernel with Matérn-style global κ).
-- **Marginal-slope models.** Decouple baseline risk from a calibrated
-  score's effect — for both Bernoulli and survival outcomes.
-- **Posterior sampling built in.** `model.sample(...)` runs NUTS where
-  supported and a Gaussian Laplace fallback elsewhere, behind one API.
+- **Marginal-slope models.** Separate baseline risk from a calibrated
+  score's effect, for both Bernoulli and survival outcomes.
+- **Posterior sampling.** `model.sample(...)` runs NUTS where supported,
+  with a Gaussian Laplace fallback elsewhere, behind one API.
 
 ## Highlights from the API
 

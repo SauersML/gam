@@ -17,8 +17,8 @@ The three arguments are column names:
 - `exit` — the observation time (event time or censoring time).
 - `event` — 1 if the event occurred at `exit`, 0 if censored.
 
-All three must be present in `data` as numeric columns. Negative entry times
-are allowed, but `exit >= entry` is required per row.
+All three must be present in `data` as numeric columns. Negative entry
+times are allowed; `exit >= entry` is required per row.
 
 ## Likelihood modes
 
@@ -28,7 +28,7 @@ Pick one via `survival_likelihood=` on `fit()`:
 | --- | --- |
 | `"transformation"` | Flexible, semi-parametric. Recommended starting point. |
 | `"weibull"` | Parametric Weibull baseline + linear covariate effects on log hazard. |
-| `"location-scale"` | Joint location-scale; combine with `--predict-noise` route. |
+| `"location-scale"` | Joint location-scale; combine with the `predict_noise` config key. |
 | `"marginal-slope"` | Separates baseline risk from a calibrated score's effect. See [marginal-slope.md](marginal-slope.md). |
 | `"latent"` | Latent-frailty model with parametric baseline. |
 
@@ -62,22 +62,21 @@ gamfit.fit(df,
 
 ## Time-wiggle: flexible baseline departures
 
-In any survival formula you can drop in a spline offset to the baseline:
+In any survival formula, drop in a spline offset to the baseline:
 
 ```
 Surv(entry, exit, event) ~ s(bmi) + timewiggle(internal_knots=8)
 ```
 
 `timewiggle` takes the same options as `linkwiggle` (`internal_knots`,
-`degree`, `penalty_order`, `double_penalty`) and lets the baseline hazard or
-cumulative hazard flex away from the parametric form. Use it when you
-believe the rough shape is, say, Gompertz but want the data to make small
-corrections.
+`degree`, `penalty_order`, `double_penalty`) and lets the baseline hazard
+or cumulative hazard flex away from the parametric form. Use it when the
+rough shape is, say, Gompertz but the data should make small corrections.
 
 ## Frailty
 
-For unmeasured between-subject heterogeneity in survival, enable frailty
-with `frailty_kind=`:
+For unmeasured between-subject heterogeneity, enable frailty with
+`frailty_kind=`:
 
 | `frailty_kind` | Effect |
 | --- | --- |
@@ -98,8 +97,8 @@ gamfit.fit(df,
 - **`frailty_sd`**: fix the frailty standard deviation. Omit to let
   hazard-multiplier models learn it.
 - **`hazard_loading`**: only used with `frailty_kind="hazard-multiplier"`.
-  `"full"` loads frailty into every observation; `"loaded-vs-unloaded"` lets
-  the model split observations into two regimes.
+  `"full"` loads frailty into every observation; `"loaded-vs-unloaded"`
+  splits observations into two regimes.
 
 ## Predicting from a survival model
 
@@ -141,10 +140,9 @@ upper = S + 1.96 * se_S
 lower = (S - 1.96 * se_S).clip(0.0, 1.0)
 ```
 
-`with_uncertainty=True` is currently honored for location-scale survival
-models. For other survival modes, use `Model.sample(...)` and the
-posterior-predictive route instead — see
-[posterior-sampling.md](posterior-sampling.md).
+`with_uncertainty=True` is honored for location-scale survival models. For
+other survival modes, use `Model.sample(...)` and the posterior-predictive
+route — see [posterior-sampling.md](posterior-sampling.md).
 
 ## Complete example
 

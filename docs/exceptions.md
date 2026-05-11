@@ -1,7 +1,7 @@
 # Exceptions
 
-`gamfit` raises a small set of dedicated exception types. All of them
-inherit from a common base so you can catch them generically.
+`gamfit` raises a small set of dedicated exception types. They share a
+common base so you can catch them generically.
 
 ## Hierarchy
 
@@ -21,8 +21,8 @@ ImportError
 ### `GamError`
 
 Base class. Raised when the Rust engine returns an error that doesn't map
-to one of the more specific types below. Catch this if you want a single
-`except` for "something gamfit-side went wrong".
+to one of the more specific types below. Catch this for a single
+`except` covering "something gamfit-side went wrong".
 
 ### `FormulaError`
 
@@ -57,13 +57,13 @@ if not check.ok:
 ### `PredictionError`
 
 Prediction failed for a reason that isn't a schema mismatch — for example,
-the fitted model class isn't yet supported by the Python predict path. The
+the fitted model class isn't supported by the Python predict path. The
 error message names what's supported.
 
 ### `RustExtensionUnavailableError`
 
-The compiled extension `gamfit._rust` failed to load. This is rare on the
-prebuilt wheels but can happen if you installed from source without a Rust
+The compiled extension `gamfit._rust` failed to load. Rare on the
+prebuilt wheels; happens if you installed from source without a Rust
 toolchain.
 
 ```python

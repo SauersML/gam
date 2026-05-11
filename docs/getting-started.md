@@ -3,7 +3,7 @@
 ## Installation
 
 Wheels are published for Linux (x86_64, aarch64), macOS (x86_64, Apple
-silicon), and Windows. No Rust toolchain required for the prebuilt wheels.
+silicon), and Windows. The prebuilt wheels do not require a Rust toolchain.
 
 ```bash
 uv add gamfit
@@ -15,8 +15,8 @@ Or as a one-off without a project:
 uv pip install gamfit
 ```
 
-`pip install gamfit` works too. The pre-built wheel ships with a vendored
-Rust extension (`gamfit._rust`).
+`pip install gamfit` works too. The wheel includes the Rust extension
+(`gamfit._rust`).
 
 ### Optional extras
 
@@ -28,9 +28,9 @@ uv add "gamfit[all]"        # everything
 ```
 
 Plain `gamfit` works without any of these. Adding `pandas`/`pyarrow` only
-changes what `predict()` *returns* (and accepts) — the engine itself never
-depends on them. Without `matplotlib`, `Model.plot()` and posterior trace
-plots will raise. Without `scikit-learn`, `gamfit.sklearn` imports will fail.
+changes what `predict()` returns (and accepts); the engine does not depend
+on them. Without `matplotlib`, `Model.plot()` and posterior trace plots
+raise. Without `scikit-learn`, `gamfit.sklearn` imports fail.
 
 ### Verifying the install
 
@@ -40,8 +40,8 @@ print(gamfit.__version__)
 print(gamfit.build_info())
 ```
 
-`build_info()` returns a dict including `available: True` when the Rust
-extension loaded. If `available: False`, surface the diagnostic message with
+`build_info()` returns a dict with `available: True` when the Rust
+extension loaded. If `available: False`, get the diagnostic with
 `gamfit.explain_error(...)`.
 
 ## Your first model
@@ -63,13 +63,11 @@ print(model)
 
 Three things happened:
 
-1. **Family inferred.** `y` is continuous, so the family is Gaussian and the
-   default link is identity. (Override with `family=` or `link=`.)
+1. **Family inferred.** `y` is continuous, so the family is Gaussian with
+   identity link. Override with `family=` or `link=`.
 2. **Smooth fit.** `s(x)` is a P-spline (cubic B-spline + difference penalty).
-   Its complexity is chosen automatically — you don't pick `k` unless you want
-   to.
-3. **Smoothing parameter selected by REML.** No grid search, no manual
-   tuning.
+   The basis size is chosen automatically; pass `k=` to set it yourself.
+3. **Smoothing parameter selected by REML.**
 
 ## Predict
 
@@ -78,15 +76,15 @@ preds = model.predict([{"x": 1.5}, {"x": 2.5}])
 ```
 
 Returns the linear predictor (`eta`) and the response-scale mean (`mean`),
-in the same table format you passed in. For credible intervals:
+in the same table format passed in. For credible intervals:
 
 ```python
 preds = model.predict([{"x": 1.5}, {"x": 2.5}], interval=0.95)
 # Columns: eta, mean, effective_se, mean_lower, mean_upper
 ```
 
-See [predictions.md](predictions.md) for `return_type`, `id_column`, and the
-survival-specific `SurvivalPrediction` object.
+See [predictions.md](predictions.md) for `return_type`, `id_column`, and
+the `SurvivalPrediction` object.
 
 ## Inspect
 
@@ -98,7 +96,7 @@ model.plot(train, x="x")            # matplotlib (requires gamfit[plot])
 model.report("out.html")            # standalone HTML report
 ```
 
-See [diagnostics.md](diagnostics.md) for the full set.
+See [diagnostics.md](diagnostics.md) for the full list.
 
 ## Persist
 
@@ -112,8 +110,8 @@ The `.gam` file is a binary blob that round-trips exactly. See
 
 ## Posterior sampling
 
-Smoothing parameters are point estimates from REML, but you can draw from
-the posterior of the coefficients conditional on those:
+Smoothing parameters are point estimates from REML. To draw from the
+posterior of the coefficients conditional on those estimates:
 
 ```python
 posterior = model.sample(train, seed=42)
@@ -124,19 +122,18 @@ print(posterior)
 bands = posterior.predict(test, level=0.95)
 ```
 
-NUTS is used where possible; a Gaussian Laplace fallback is used for model
-classes that don't yet support exact NUTS (location-scale survival, latent
-survival, transformation-normal, Bernoulli marginal-slope, link-wiggle). See
-[posterior-sampling.md](posterior-sampling.md).
+NUTS is used where possible. A Gaussian Laplace fallback is used for model
+classes without exact NUTS support (location-scale survival, latent
+survival, transformation-normal, Bernoulli marginal-slope, link-wiggle).
+See [posterior-sampling.md](posterior-sampling.md).
 
 ## Where to go next
 
-- Real models have multiple smooths and constraints —
-  [formulas.md](formulas.md) covers the full DSL.
-- For classification, count, positive-continuous data, or non-default links —
+- Multiple smooths and constraints: [formulas.md](formulas.md) covers the
+  full DSL.
+- Classification, count, positive-continuous data, or non-default links:
   [families-and-links.md](families-and-links.md).
-- For survival data, see [survival.md](survival.md) and (if you have a risk
-  score) [marginal-slope.md](marginal-slope.md).
-- For pandas / pipelines / cross-validation patterns —
-  [sklearn.md](sklearn.md).
-- For runnable end-to-end recipes — [cookbook.md](cookbook.md).
+- Survival data: [survival.md](survival.md) and, if you have a risk score,
+  [marginal-slope.md](marginal-slope.md).
+- pandas / pipelines / cross-validation: [sklearn.md](sklearn.md).
+- End-to-end recipes: [cookbook.md](cookbook.md).

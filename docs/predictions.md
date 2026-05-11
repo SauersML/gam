@@ -1,9 +1,8 @@
 # Predictions
 
-`Model.predict(...)` is the universal predict entry point. The shape of its
-return value depends on the **fitted model class** and on a couple of
-kwargs (`interval`, `id_column`, `return_type`, `with_uncertainty`). This
-page covers all of it.
+`Model.predict(...)` is the single predict entry point. The shape of its
+return value depends on the fitted model class and on a few
+kwargs (`interval`, `id_column`, `return_type`, `with_uncertainty`).
 
 ## Signature
 
@@ -46,7 +45,7 @@ preds = model.predict(test_df, interval=0.95)
 # Columns: eta, mean, effective_se, mean_lower, mean_upper
 ```
 
-The intervals here come from the asymptotic frequentist covariance of the
+These intervals come from the asymptotic frequentist covariance of the
 fitted coefficients propagated through the link function. For full posterior
 credible bands (with smoothing-parameter conditional uncertainty), use
 [posterior sampling](posterior-sampling.md).
@@ -70,7 +69,7 @@ preserved verbatim in the output.
 
 ## SurvivalPrediction
 
-For any survival model, `predict()` returns a `SurvivalPrediction` instance.
+For any survival model, `predict()` returns a `SurvivalPrediction`.
 It exposes the fitted hazard surface on demand:
 
 ```python
@@ -146,13 +145,13 @@ lower = (S - 1.96 * se_S).clip(0.0, 1.0)
 ```
 
 For other survival modes (transformation, Weibull, marginal-slope, latent),
-use `Model.sample(...)` + `PosteriorSamples.predict_draws(...)` to get
+use `Model.sample(...)` + `PosteriorSamples.predict_draws(...)` for
 posterior uncertainty. See [posterior-sampling.md](posterior-sampling.md).
 
 ## Getting the raw design matrix
 
 For non-link-wiggle standard GAMs, `Model.design_matrix(data)` returns the
-materialised `(n_rows, n_coeffs)` matrix that the engine uses internally for
+materialised `(n_rows, n_coeffs)` matrix the engine uses internally for
 the linear predictor:
 
 ```python
@@ -161,6 +160,6 @@ posterior = model.sample(train_df)
 custom_eta = posterior.samples @ X.T    # (n_draws, n_rows)
 ```
 
-This is handy when you want to compose your own posterior quantity that
-isn't a straightforward `predict()` call. Currently restricted to standard
+Use this to compose your own posterior quantity that
+isn't a straightforward `predict()` call. Restricted to standard
 non-link-wiggle GAMs.
