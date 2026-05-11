@@ -486,20 +486,33 @@ class Model:
     ) -> Any:
         """Predict from ``data``.
 
-        The return shape depends on the fitted model class:
+        Default return (when ``id_column`` and ``return_type`` are both
+        omitted) depends on the fitted model class:
 
-        * Gaussian / Binomial / Standard models: returns a table (dict, pandas
-          DataFrame, pyarrow Table, ...) matching the training table kind with
-          an ``eta`` and ``mean`` column (plus interval columns when
+        * Gaussian / Binomial / Standard models: a table (dict, pandas
+          DataFrame, pyarrow Table, ...) matching the training table kind
+          with an ``eta`` and ``mean`` column (plus interval columns when
           ``interval`` is given).
-        * Transformation-normal models: returns the per-row transformed
-          z-score as a numpy array of shape ``(n_samples,)``.
-        * Bernoulli marginal-slope: returns a calibrated probability array in
-          ``(0, 1)`` of shape ``(n_samples,)``.
-        * Survival models: returns a :class:`SurvivalPrediction` whose
+        * Transformation-normal models: a per-row transformed z-score as a
+          1-D numpy array of shape ``(n_samples,)``.
+        * Bernoulli marginal-slope: a calibrated probability vector in
+          ``(0, 1)`` as a 1-D numpy array of shape ``(n_samples,)``.
+        * Survival models: a :class:`SurvivalPrediction` whose
           ``.hazard_at``, ``.survival_at``, ``.failure_at``, and
-          ``.cumulative_hazard_at`` helpers evaluate the fitted hazard surface
-          on a user-supplied time grid.
+          ``.cumulative_hazard_at`` helpers evaluate the fitted hazard
+          surface on a user-supplied time grid.
+
+        Passing ``id_column`` or ``return_type`` switches the
+        array-returning model classes (transformation-normal and
+        Bernoulli marginal-slope) to the **table form**: a 2-column table
+        ``(id_column, "z" or "mean")`` rather than a bare 1-D array.
+        Naively flattening that table with ``np.asarray(...)`` /
+        ``.to_numpy()`` yields shape ``(n_samples, 2)``, which is a
+        common cause of silent broadcasting bugs in downstream metric
+        code that expects a 1-D probability vector.  When you need the
+        probabilities as an array after asking for an id column, extract
+        the column explicitly, e.g. ``out["mean"]`` /
+        ``np.asarray(out["mean"], dtype=float)``.
 
         ``with_uncertainty`` (survival only): when ``True``, the returned
         :class:`SurvivalPrediction` also carries delta-method standard
