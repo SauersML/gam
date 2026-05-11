@@ -77,7 +77,6 @@ jobs:
           command: build
           target: ${{ matrix.platform.target }}
           args: >-
-            --release
             --profile=release-pypi
             --strip
             --out dist
@@ -113,7 +112,6 @@ jobs:
           command: build
           target: ${{ matrix.target }}
           args: >-
-            --release
             --profile=release-pypi
             --strip
             --out dist
@@ -151,7 +149,6 @@ jobs:
           command: build
           target: ${{ matrix.platform.target }}
           args: >-
-            --release
             --profile=release-pypi
             --strip
             --out dist
@@ -187,7 +184,6 @@ jobs:
           command: build
           target: ${{ matrix.target }}
           args: >-
-            --release
             --profile=release-pypi
             --strip
             --out dist
