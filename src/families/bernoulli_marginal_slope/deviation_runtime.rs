@@ -25,12 +25,7 @@ pub struct AnchorResidual {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub enum AnchorNullSpaceEvaluator {
-    /// Reserved for the post-cross-block path where the candidate has
-    /// no residual but the predictor still needs to declare an empty
-    /// evaluator slot. Not constructed today.
-    Empty,
     Stacked {
         components: Vec<AnchorNullSpaceComponent>,
         /// d × d rotation R such that Q-row(x) = N-row(x) · R. In the
@@ -42,7 +37,6 @@ pub enum AnchorNullSpaceEvaluator {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub enum AnchorNullSpaceComponent {
     /// Parametric anchor — at predict time the parent predictor reconstructs
     /// the per-row vector from the saved marginal/logslope blocks; the
@@ -536,7 +530,6 @@ impl DeviationRuntime {
         }
         if let Some(ref res) = residual {
             let d_expected: usize = match &res.null_basis_evaluator {
-                AnchorNullSpaceEvaluator::Empty => 0,
                 AnchorNullSpaceEvaluator::Stacked {
                     components,
                     orthonormalising_rotation,
@@ -607,11 +600,6 @@ impl DeviationRuntime {
     /// use this cache (it evaluates anchor rows fresh).
     pub(crate) fn set_anchor_rows_at_training(&mut self, rows: Array2<f64>) {
         self.anchor_rows_at_training = Some(rows);
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn cached_anchor_rows_at_training(&self) -> Option<&Array2<f64>> {
-        self.anchor_rows_at_training.as_ref()
     }
 
     /// Evaluate `design(values) - anchor_rows · M` where `anchor_rows` is

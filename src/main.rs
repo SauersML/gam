@@ -6956,7 +6956,6 @@ fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchored
                 .collect::<Vec<Vec<f64>>>(),
         );
         match &residual.null_basis_evaluator {
-            AnchorNullSpaceEvaluator::Empty => {}
             AnchorNullSpaceEvaluator::Stacked {
                 components,
                 orthonormalising_rotation,
