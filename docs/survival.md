@@ -28,7 +28,7 @@ Pick one via `survival_likelihood=` on `fit()`:
 | --- | --- |
 | `"transformation"` | Flexible, semi-parametric. Recommended starting point. |
 | `"weibull"` | Parametric Weibull baseline + linear covariate effects on log hazard. |
-| `"location-scale"` | Joint location-scale; combine with the `predict_noise` config key. |
+| `"location-scale"` | Joint location-scale; combine with the `noise_formula` config key. |
 | `"marginal-slope"` | Separates baseline risk from a calibrated score's effect. See [marginal-slope.md](marginal-slope.md). |
 | `"latent"` | Latent-frailty model with parametric baseline. |
 
