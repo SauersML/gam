@@ -3249,6 +3249,8 @@ impl<'a> RemlState<'a> {
 
     pub(crate) fn reset_outer_seed_state(&self) {
         self.cache_manager.invalidate_eval_bundle();
+        // Drop cross-call PIRLS LRU entries: cached β may have been computed under a coarsened inner cap, so reusing them on retry skips real work and bit-replays the prior attempt.
+        self.cache_manager.pirls_cache.write().unwrap().clear();
         // The outer is restarting from a fresh seed — the previous
         // trajectory's warm-start signals are calibrated to a different
         // ρ-path and would mislead both predictors and the adaptive cap
