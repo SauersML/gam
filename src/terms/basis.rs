@@ -2528,6 +2528,17 @@ fn positive_spectral_whitener_from_gram(gram: &Array2<f64>) -> Result<Array2<f64
         .max(f64::EPSILON);
     let keep = eigenvalues.iter().filter(|&&ev| ev > tol).count();
     if keep == 0 {
+        let min_ev = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
+        let gram_norm = gram.iter().map(|v| v * v).sum::<f64>().sqrt();
+        eprintln!(
+            "[NULL-DBG] positive_spectral_whitener_from_gram: keep=0 gram={}x{} gram_fro={:.3e} max_eval={:.3e} min_eval={:.3e} tol={:.3e}",
+            gram.nrows(),
+            gram.ncols(),
+            gram_norm,
+            max_eval,
+            min_ev,
+            tol,
+        );
         return Err(BasisError::ConstraintNullspaceNotFound);
     }
     // `eigh` returns eigenvalues in ascending order, so the largest `keep`
@@ -2573,6 +2584,14 @@ fn orthogonality_transform_from_cross_and_gram(
     let (transform_raw, rank) = rrqr_nullspace_basis(constraint_cross, default_rrqr_rank_alpha())
         .map_err(BasisError::LinalgError)?;
     if rank >= k || transform_raw.ncols() == 0 {
+        eprintln!(
+            "[NULL-DBG] orthogonality_transform_from_cross_and_gram: rank={} k={} cross={}x{} cross_norm={:.3e}",
+            rank,
+            k,
+            constraint_cross.nrows(),
+            constraint_cross.ncols(),
+            constraint_cross.iter().map(|v| v * v).sum::<f64>().sqrt(),
+        );
         return Err(BasisError::ConstraintNullspaceNotFound);
     }
 
@@ -17157,6 +17176,12 @@ pub fn apply_sum_to_zero_constraint(
     let (z, rank) =
         rrqr_nullspace_basis(&c_mat, default_rrqr_rank_alpha()).map_err(BasisError::LinalgError)?;
     if rank >= k {
+        eprintln!(
+            "[NULL-DBG] apply_sum_to_zero_constraint: rank={} k={} c_norm={:.3e}",
+            rank,
+            k,
+            c.iter().map(|v| v * v).sum::<f64>().sqrt(),
+        );
         return Err(BasisError::ConstraintNullspaceNotFound);
     }
     if rank == 0 {
@@ -17474,10 +17499,15 @@ pub fn compute_geometric_constraint_transform(
     let (z, rank) = rrqr_nullspace_basis(&c_geom.t(), default_rrqr_rank_alpha())
         .map_err(BasisError::LinalgError)?;
     if rank >= k {
+        eprintln!(
+            "[NULL-DBG] compute_geometric_constraint_transform: rank={} k={}",
+            rank, k
+        );
         return Err(BasisError::ConstraintNullspaceNotFound);
     }
 
     if z.ncols() == 0 {
+        eprintln!("[NULL-DBG] compute_geometric_constraint_transform: z.ncols=0 k={}", k);
         return Err(BasisError::ConstraintNullspaceNotFound);
     }
 
