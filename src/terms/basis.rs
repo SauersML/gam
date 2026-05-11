@@ -15855,11 +15855,16 @@ fn duchon_kernel_amplification(
     // (B^T B, eigendecomposition, whitening) stay in the regime where
     // relative errors are tracked, not dominated by absolute roundoff.
     let amp_floor = 1e-5_f64;
-    if post_rms >= amp_floor {
-        Ok(1.0)
+    let amp = if post_rms >= amp_floor {
+        1.0
     } else {
-        Ok(amp_floor / post_rms)
-    }
+        amp_floor / post_rms
+    };
+    eprintln!(
+        "[KAMP-DBG] duchon_kernel_amplification: k={}, length_scale={:?}, p={}, s={}, d={}, max_abs_kcc={:.3e}, post_rms={:.3e}, amp={:.6e}",
+        k, length_scale, p_order, s_order, d, max_abs_kcc, post_rms, amp
+    );
+    Ok(amp)
 }
 
 fn build_duchon_basis_designwithworkspace(
