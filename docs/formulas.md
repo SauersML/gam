@@ -66,7 +66,9 @@ bounded(x, min=0, max=1, beta_a=2.5, beta_b=2.5)     # explicit Beta(a, b)
 `z = (target − min) / (max − min)`.
 
 Aliases for box constraints: `linear`, `constrain`, `constraint`, `box`.
-`bounded` uses the transform rather than the ridge.
+`bounded(...)` is a separate term that uses an exact interval transform
+plus an optional Beta prior (parameterised by `target` / `strength`)
+rather than a quadratic ridge.
 
 ## Random effects
 

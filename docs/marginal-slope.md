@@ -67,8 +67,8 @@ probs = model.predict(test_df, return_type="dict")["mean"]
 ```
 
 - `family="bernoulli-marginal-slope"` selects the marginal-slope likelihood.
-- `link="probit"` — the standard choice; `cloglog` also works. Probit pairs
-  with the Gaussian z assumption.
+- `link="probit"` — required. Bernoulli marginal-slope only supports the
+  probit base link, which pairs with the Gaussian z assumption.
 - `z_column="z"` — name of the standardised score column in `df` and `test_df`.
 - `logslope_formula="..."` — formula governing how `z`'s log-slope varies
   across covariates. Typically a smooth on the same covariates as the
@@ -112,7 +112,9 @@ gamfit.fit(df,
 )
 ```
 
-See [survival.md](survival.md#frailty) for the frailty options.
+Survival marginal-slope only supports `frailty_kind="gaussian-shift"` with
+a fixed `frailty_sd`; `"hazard-multiplier"` is rejected at fit time. See
+[survival.md](survival.md#frailty) for the broader frailty options.
 
 ## Detecting marginal-slope models after loading
 
@@ -130,10 +132,10 @@ model.model_class                  # full class string
   that `z_column` is genuinely conditionally N(0, 1).
 - **Scale your covariates** for Stage 1. Set `scale_dimensions=True` when
   fitting transformation-normal on a handful of PCs.
-- **Sampling / posterior:** Bernoulli marginal-slope, survival
-  marginal-slope, and transformation-normal models fall back to the
-  Gaussian Laplace approximation for `Model.sample(...)` rather than NUTS.
-  The posterior summary works the same way — see
+- **Sampling / posterior:** Bernoulli marginal-slope and
+  transformation-normal models fall back to the Gaussian Laplace
+  approximation for `Model.sample(...)`. Survival marginal-slope uses
+  exact NUTS over the joint coefficient vector. See
   [posterior-sampling.md](posterior-sampling.md).
 - **Predict output:** Bernoulli marginal-slope returns a 1-D array of
   probabilities by default. Pass `id_column=` or `return_type="dict"` to

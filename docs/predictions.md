@@ -19,7 +19,7 @@ model.predict(
 
 | Kwarg | Default | Meaning |
 | --- | --- | --- |
-| `interval` | `None` | Credible interval level in `(0, 1)`, e.g. `0.95`. Standard / Gaussian / binomial models only. |
+| `interval` | `None` | Credible interval level in `(0, 1)`, e.g. `0.95`. Honoured by standard GLM families (Gaussian, binomial, Poisson, Gamma) and Gaussian / binomial location-scale; ignored for survival (use `with_uncertainty=`), transformation-normal, and marginal-slope. |
 | `return_type` | `None` | `"dict"`, `"numpy"`, `"pandas"`, `"polars"`, `"pyarrow"`, or `None` (infer from input or training kind). |
 | `id_column` | `None` | Name of a column in `data` to preserve in the output. |
 | `with_uncertainty` | `False` | Survival models: delta-method SEs on the survival surface and linear predictor. |
@@ -29,7 +29,7 @@ model.predict(
 | Model class | Default return | Columns / fields |
 | --- | --- | --- |
 | **Standard** (Gaussian, binomial, Poisson, Gamma) | Table | `eta`, `mean` (+ `effective_se`, `mean_lower`, `mean_upper` if `interval`). |
-| **Gaussian location-scale** | Table | `eta`, `mean`, `sigma` (+ `mean_lower`, `mean_upper` if `interval`). |
+| **Gaussian / binomial location-scale** | Table | `eta`, `mean` (+ `effective_se`, `mean_lower`, `mean_upper` if `interval`). |
 | **Transformation-normal** | 1-D `numpy.ndarray` | Per-row conditional z-scores. |
 | **Bernoulli marginal-slope** | 1-D `numpy.ndarray` | Per-row probabilities in `(0, 1)`. |
 | **Survival** (any mode) | `SurvivalPrediction` | Object with `hazard_at`, `survival_at`, `cumulative_hazard_at`, `failure_at`. |
