@@ -1,11 +1,25 @@
 site_name: gamfit
 site_description: Formula-first generalized additive models for Python, backed by a high-performance Rust engine.
+site_author: SauersML
 site_url: https://gamfit.readthedocs.io/
 repo_url: https://github.com/SauersML/gam
 repo_name: SauersML/gam
 edit_uri: edit/main/docs/
 
 docs_dir: docs
+
+extra_css:
+  - stylesheets/extra.css
+
+extra:
+  generator: false
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/SauersML/gam
+      name: gamfit on GitHub
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/gamfit/
+      name: gamfit on PyPI
 
 theme:
   name: material
@@ -40,6 +54,10 @@ theme:
 
 plugins:
   - search
+  - social:
+      # Cairo/Pillow can be finicky on local macOS. CI / RTD set CI=true and
+      # will build the OG cards; local dev skips it unless explicitly enabled.
+      enabled: !ENV [CI, false]
   - mkdocstrings:
       default_handler: python
       handlers:
@@ -79,12 +97,16 @@ markdown_extensions:
       line_spans: __span
       pygments_lang_class: true
   - pymdownx.inlinehilite
+  - pymdownx.keys
   - pymdownx.snippets
   - pymdownx.superfences
   - pymdownx.tabbed:
       alternate_style: true
   - pymdownx.tasklist:
       custom_checkbox: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
 
 nav:
   - Home: README.md
