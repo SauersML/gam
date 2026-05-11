@@ -50,6 +50,12 @@ fitted coefficients propagated through the link function. For full posterior
 credible bands (with smoothing-parameter conditional uncertainty), use
 [posterior sampling](posterior-sampling.md).
 
+For a multi-D smooth, calling `predict(interval=0.95)` gives you both the
+fitted mean and a pointwise predictive SE; the SE is largest where the
+covariates are sparse:
+
+![data → fitted mean → predictive SE](images/surface_fit_hero.png)
+
 ## Passing through an identifier column
 
 ```python

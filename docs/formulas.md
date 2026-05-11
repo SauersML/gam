@@ -174,6 +174,11 @@ smoothing parameter. Use when axes have different units (e.g. space × time).
 
 ### Picking the right smooth
 
+The four multivariate families recover the same headline structure when
+the truth is reasonable, but they take different paths to get there:
+
+![four smooth families on the same dataset](images/smooth_zoo.png)
+
 | You have... | Use... |
 | --- | --- |
 | One covariate | `s(x)` (P-spline). |
@@ -182,6 +187,10 @@ smoothing parameter. Use when axes have different units (e.g. space × time).
 | 3+ coordinates, especially in different units | `duchon(...)` with `scale_dims=true`, or `matern(...)`. |
 | You want to control wiggliness directly | `matern(...)` with `nu`. |
 | You want scale-free behaviour | `duchon(...)` without `length_scale`. |
+
+Matérn and Duchon on the same data, viewed in 3-D:
+
+![3D side-by-side: Matern vs Duchon](images/surface_3d_compare.png)
 
 ## Adaptive anisotropy
 

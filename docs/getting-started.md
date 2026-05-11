@@ -69,6 +69,11 @@ Three things happened:
    The basis size is chosen automatically; pass `k=` to set it yourself.
 3. **Smoothing parameter selected by REML.**
 
+In two dimensions the same thing looks like this — raw observations as
+points, the fitted smooth as a wireframe through them:
+
+![wireframe over scatter](images/surface_3d_wireframe.png)
+
 ## Predict
 
 ```python

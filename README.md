@@ -19,6 +19,8 @@ classes that don't yet have an exact NUTS path.
 **Docs:** <https://gamfit.readthedocs.io/> &middot; **PyPI:**
 <https://pypi.org/project/gamfit/>
 
+![3D Matérn fit on a noisy 2-D landscape](docs/images/surface_3d_shaded.png)
+
 ## Two ways to use it
 
 ```python
@@ -85,11 +87,6 @@ Surface smooths learn how much to shrink each axis independently, so
 gamfit.fit(df, "z ~ matern(pc1, pc2, pc3, pc4)", scale_dimensions=True)
 ```
 
-Side-by-side: isotropic global smoothing on the left, learned per-axis
-anisotropy on the right. Same data, same formula skeleton.
-
-![adaptive anisotropy: isotropic vs per-axis](bench/aniso_demo/02_normalized.png)
-
 ### Surface smooths in arbitrary dimension
 
 P-spline, thin-plate, Matérn, and **Duchon** radial bases. Duchon uses
@@ -131,6 +128,12 @@ gamfit.fit(
     logslope_formula="matern(pc1, pc2, pc3)",
 )
 ```
+
+![two-surface marginal-slope viz over a joint Duchon smooth](docs/images/marginal_slope_3d.png)
+
+Two predicted-probability surfaces over the same `(pc1, pc2)` plane —
+one at `z = 0`, one at `z = +2`. The vertical gap between them is the
+spatially-varying score effect.
 
 ### Survival with on-demand surfaces
 
