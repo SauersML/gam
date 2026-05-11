@@ -16265,6 +16265,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // joint Hessian: EFS/HybridEFS fixed-point structural invariant fails,
     // so we disable fixed-point at plan time rather than burning cycles on
     // a stalled first attempt that silently falls back.
+    let outer_policy = {
+        let psi_dim = setup.theta0().len() - setup.rho_dim();
+        initial_family.outer_derivative_policy(&initial_blocks, psi_dim, options)
+    };
     let solved = optimize_spatial_length_scale_exact_joint(
         data_view,
         &[marginalspec_boot.clone(), logslopespec_boot.clone()],
@@ -16276,6 +16280,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         analytic_joint_hessian_available,
         true,
         None,
+        outer_policy,
         |theta, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
@@ -16306,7 +16311,11 @@ pub fn fit_bernoulli_marginal_slope_terms(
             }
             Ok(fit)
         },
-        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], eval_mode| {
+        |theta,
+         specs: &[TermCollectionSpec],
+         designs: &[TermCollectionDesign],
+         eval_mode,
+         _row_set: &crate::families::row_kernel::RowSet| {
             use crate::solver::estimate::reml::unified::EvalMode;
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
