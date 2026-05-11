@@ -747,7 +747,6 @@ pub(crate) struct RidgePlanner {
     ridge: f64,
     attempts: usize,
     scale: f64,
-    ledger: crate::types::StabilizationLedger,
 }
 
 impl RidgePlanner {
@@ -761,32 +760,17 @@ impl RidgePlanner {
         // RidgePlanner is *strictly* a numerical-perturbation device: the
         // perturbation is applied so a Cholesky factorization succeeds for
         // an inverse / linear solve, and the matrix the caller hands back
-        // to the rest of the system is the unperturbed one. The ledger
-        // entry below is the canonical record of that semantic.
-        let ledger = crate::types::StabilizationLedger::numerical_perturbation(
-            min_step,
-            crate::types::StabilizationRule::FixedConstant,
-            None,
-        );
+        // to the rest of the system is the unperturbed one.
         Self {
             cond_estimate: None,
             ridge: min_step,
             attempts: 0,
             scale,
-            ledger,
         }
     }
 
     pub(crate) fn ridge(&self) -> f64 {
         self.ridge
-    }
-
-    /// Canonical accounting record for the ridge currently planned/applied.
-    /// Always `NumericalPerturbation`-kind: the planner exists to make a
-    /// linear solve succeed, never to change the model.
-    #[allow(dead_code)] // exposed for downstream telemetry/tests
-    pub(crate) fn ledger(&self) -> crate::types::StabilizationLedger {
-        self.ledger
     }
 
     #[inline]
@@ -813,9 +797,7 @@ impl RidgePlanner {
         // condition-number sqrt heuristics that happen to land in the same
         // ballpark only by coincidence.
         let spd_floor = self.scale * 1e-8;
-        let mut chose_via_inertia = false;
         let mut next_ridge = if let Some((lam_min, _lam_max)) = symmetric_extremes(matrix) {
-            chose_via_inertia = true;
             // δ = max(min_step, τ - λ_min). Multiply by a small safety
             // factor (1.5×) on the deficit so a single eigensolver round-off
             // does not leave us a hair below τ on the first retry.
@@ -863,19 +845,6 @@ impl RidgePlanner {
         }
 
         self.ridge = next_ridge;
-        // Reflect the new escalation state in the ledger so any downstream
-        // consumer (telemetry, debug logging) sees a consistent record.
-        self.ledger = crate::types::StabilizationLedger::numerical_perturbation(
-            self.ridge,
-            if chose_via_inertia {
-                crate::types::StabilizationRule::InertiaTarget { spd_floor }
-            } else {
-                crate::types::StabilizationRule::BackoffEscalation {
-                    attempts: self.attempts,
-                }
-            },
-            None,
-        );
     }
 
     pub(crate) fn attempts(&self) -> usize {

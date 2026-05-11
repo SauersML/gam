@@ -930,11 +930,6 @@ struct BmsAnchorCorrections {
 }
 
 impl BmsAnchorCorrections {
-    #[allow(dead_code)]
-    fn is_empty(&self) -> bool {
-        self.n_anchor_rows.is_none() && self.score_warp.is_none() && self.link_dev.is_none()
-    }
-
     fn score_warp_row(&self, row: usize) -> Option<ndarray::ArrayView1<'_, f64>> {
         self.score_warp.as_ref().map(|m| m.row(row))
     }
