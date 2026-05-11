@@ -2732,13 +2732,37 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
 /// matrix-free TR). The bridge's inner-cap schedule reads
 /// `accepted_iter` from the feedback channel instead of inferring
 /// it from raw eval counts.
+///
+/// Also emits the trust-region accept/reject decision at INFO level
+/// so logs can distinguish a trial-eval `[OUTER] eval#k (hess)` line
+/// (emitted unconditionally inside the bridge before opt decides
+/// accept/reject) from the actually-accepted iterate. Without this
+/// pairing, a sequence of trial logs with non-monotone costs looks
+/// like the optimizer accepting ascent steps, when in reality some
+/// are rejected and the iterate stays put.
 struct OuterAcceptObserver {
     feedback: InnerProgressFeedback,
 }
 
 impl OptimizerObserver for OuterAcceptObserver {
-    fn on_step_accepted(&mut self, _info: &StepInfo) {
+    fn on_step_accepted(&mut self, info: &StepInfo) {
         self.feedback.accepted_iter.fetch_add(1, Ordering::Relaxed);
+        log::info!(
+            "[OUTER step] iter={} accepted step_norm={:.3e} actual={:+.3e} predicted={:+.3e}",
+            info.iter,
+            info.step_norm,
+            info.actual_decrease,
+            info.predicted_decrease,
+        );
+    }
+    fn on_step_rejected(&mut self, info: &StepInfo) {
+        log::info!(
+            "[OUTER step] iter={} REJECTED step_norm={:.3e} actual={:+.3e} predicted={:+.3e}",
+            info.iter,
+            info.step_norm,
+            info.actual_decrease,
+            info.predicted_decrease,
+        );
     }
 }
 
