@@ -7559,42 +7559,6 @@ impl BernoulliMarginalSlopeFamily {
         Ok(out)
     }
 
-    fn row_primary_psi_second_direction_from_map(
-        &self,
-        row: usize,
-        block_i: usize,
-        block_j: usize,
-        psi_map_ij: Option<&crate::families::custom_family::PsiDesignMap>,
-        block_states: &[ParameterBlockState],
-        primary: &PrimarySlices,
-    ) -> Result<Array1<f64>, String> {
-        if block_i != block_j {
-            return Ok(Array1::<f64>::zeros(primary.total));
-        }
-        let psi_map_ij = psi_map_ij.expect("psi_map_ij must be provided when block_i == block_j");
-        let mut out = Array1::<f64>::zeros(primary.total);
-        match block_i {
-            0 => {
-                let x_row = psi_map_ij
-                    .row_vector(row)
-                    .map_err(|e| format!("survival rowwise psi map: {e}"))?;
-                out[primary.q] = x_row.dot(&block_states[0].beta);
-            }
-            1 => {
-                let x_row = psi_map_ij
-                    .row_vector(row)
-                    .map_err(|e| format!("survival rowwise psi map: {e}"))?;
-                out[primary.logslope] = x_row.dot(&block_states[1].beta);
-            }
-            _ => {
-                return Err(format!(
-                    "bernoulli marginal-slope psi second direction only supports marginal/logslope blocks, got block {block_i}"
-                ));
-            }
-        }
-        Ok(out)
-    }
-
     fn pullback_primary_vector(
         &self,
         row: usize,
@@ -7668,44 +7632,6 @@ impl BernoulliMarginalSlopeFamily {
             range,
             local_vec,
         })
-    }
-
-    fn block_psi_second_row_from_map(
-        &self,
-        row: usize,
-        block_i: usize,
-        block_j: usize,
-        psi_map_ij: Option<&crate::families::custom_family::PsiDesignMap>,
-        slices: &BlockSlices,
-    ) -> Result<Option<BlockPsiRow>, String> {
-        if block_i != block_j {
-            return Ok(None);
-        }
-        let psi_map_ij = psi_map_ij.expect("psi_map_ij must be provided when block_i == block_j");
-        let (local_vec, range) = match block_i {
-            0 => (
-                psi_map_ij
-                    .row_vector(row)
-                    .map_err(|e| format!("survival rowwise psi map: {e}"))?,
-                slices.marginal.clone(),
-            ),
-            1 => (
-                psi_map_ij
-                    .row_vector(row)
-                    .map_err(|e| format!("survival rowwise psi map: {e}"))?,
-                slices.logslope.clone(),
-            ),
-            _ => {
-                return Err(format!(
-                    "bernoulli marginal-slope psi second embedding only supports marginal/logslope blocks, got block {block_i}"
-                ));
-            }
-        };
-        Ok(Some(BlockPsiRow {
-            block_idx: block_i,
-            range,
-            local_vec,
-        }))
     }
 
     /// Returns (neg_log_lik, gradient, Hessian) in primary coordinates.
