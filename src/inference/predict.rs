@@ -5504,6 +5504,91 @@ mod tests {
     }
 
     #[test]
+    fn saved_anchored_deviation_runtime_design_with_anchor_rows_applies_residual() {
+        use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
+        use crate::inference::model::{SavedAnchorComponent, SavedAnchorKind};
+
+        let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
+        let prepared =
+            crate::families::bernoulli_marginal_slope::build_score_warp_deviation_block_from_seed(
+                &seed,
+                &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
+                    num_internal_knots: 4,
+                    ..Default::default()
+                },
+            )
+            .expect("build saved anchored deviation runtime");
+        let mut runtime = saved_runtime_from_deviation_runtime(&prepared.runtime);
+
+        // Inject a non-trivial anchor residual: d = 3 anchor cols,
+        // M = arbitrary 3 × basis_dim matrix, identity rotation.
+        let d = 3usize;
+        let m: Vec<Vec<f64>> = (0..d)
+            .map(|i| {
+                (0..runtime.basis_dim)
+                    .map(|j| 0.1 * (i as f64 + 1.0) - 0.05 * (j as f64 + 1.0))
+                    .collect()
+            })
+            .collect();
+        runtime.anchor_residual_coefficients = Some(m.clone());
+        runtime.anchor_residual_components = vec![SavedAnchorComponent {
+            kind: SavedAnchorKind::Parametric {
+                block: ParametricAnchorBlock::Marginal,
+                ncols: d,
+            },
+        }];
+        runtime.anchor_residual_rotation = None;
+
+        let values = array![-1.0, 0.0, 0.5, 2.0];
+        let n = values.len();
+        let anchor_rows = Array2::from_shape_fn((n, d), |(i, j)| {
+            0.3 * (i as f64 + 1.0) - 0.1 * (j as f64 + 1.0)
+        });
+
+        let raw = runtime
+            .design_uncorrected(&values)
+            .expect("uncorrected design");
+        let corrected = runtime
+            .design_with_anchor_rows(&values, anchor_rows.view())
+            .expect("design with anchor rows");
+
+        // Manually compute expected: raw - anchor_rows · M
+        let mut m_dense = Array2::<f64>::zeros((d, runtime.basis_dim));
+        for (i, row) in m.iter().enumerate() {
+            for (j, &v) in row.iter().enumerate() {
+                m_dense[[i, j]] = v;
+            }
+        }
+        let expected = &raw - &anchor_rows.dot(&m_dense);
+
+        for i in 0..n {
+            for j in 0..runtime.basis_dim {
+                assert!(
+                    (corrected[[i, j]] - expected[[i, j]]).abs() < 1e-12,
+                    "residual-corrected design mismatch at ({i}, {j}): \
+                     got {got}, expected {exp}",
+                    got = corrected[[i, j]],
+                    exp = expected[[i, j]],
+                );
+            }
+        }
+
+        // anchor_correction_matrix should produce N · M (n × basis_dim) so
+        // that raw - correction == corrected, row by row.
+        let correction = runtime
+            .anchor_correction_matrix(anchor_rows.view())
+            .expect("anchor correction matrix")
+            .expect("Some correction when residual is present");
+        for i in 0..n {
+            for j in 0..runtime.basis_dim {
+                assert!(
+                    (raw[[i, j]] - correction[[i, j]] - corrected[[i, j]]).abs() < 1e-12,
+                );
+            }
+        }
+    }
+
+    #[test]
     fn bernoulli_marginal_slope_rigid_gaussian_frailty_uses_scaled_closed_form() {
         let predictor = BernoulliMarginalSlopePredictor {
             beta_marginal: array![0.7],
