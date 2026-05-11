@@ -1452,6 +1452,39 @@ impl BernoulliMarginalSlopePredictor {
             runtime.validate_exact_replay_contract().map_err(|e| {
                 format!("bernoulli marginal-slope link-deviation runtime is invalid: {e}")
             })?;
+            // The cross-block anchor-residual subtraction path is not yet
+            // wired into the per-row predict callers (each `local_cubic_at`
+            // and `basis_cubic_at` site needs to assemble n_row from the
+            // parametric design rows and subtract `n_row · M`). Until that
+            // plumbing lands, refuse to load a saved model whose link-dev
+            // runtime carries an anchor residual rather than silently
+            // produce predictions that omit the residual correction.
+            if runtime.anchor_residual_coefficients.is_some() {
+                return Err(
+                    "bernoulli marginal-slope link-deviation runtime carries a cross-block \
+                     anchor residual that the predict-time evaluation path does not yet \
+                     reconstruct; refit with the current library after the predict-side \
+                     plumbing for `n_row · M` subtraction lands, or retrain without \
+                     cross-block residualisation"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(runtime) = score_warp_runtime.as_ref()
+            && runtime.anchor_residual_coefficients.is_some()
+        {
+            // Same guard for the score-warp branch: training currently
+            // emits no anchor residual on score-warp (it has no
+            // parametric anchors that pass through the orthogonalisation
+            // with a non-degenerate weighted projection), but we make
+            // the load-side guard symmetric for future-proofing.
+            return Err(
+                "bernoulli marginal-slope score-warp runtime carries a cross-block \
+                 anchor residual that the predict-time evaluation path does not yet \
+                 reconstruct; refit with the current library after the predict-side \
+                 plumbing for `n_row · M` subtraction lands"
+                    .to_string(),
+            );
         }
         latent_z_normalization
             .validate("bernoulli marginal-slope predictor")
@@ -4904,6 +4937,9 @@ mod tests {
                 .outer_iter()
                 .map(|row| row.to_vec())
                 .collect(),
+            anchor_residual_coefficients: None,
+            anchor_residual_components: Vec::new(),
+            anchor_residual_rotation: None,
         }
     }
 
@@ -5127,6 +5163,7 @@ mod tests {
                 kernel: "OldQuadrature".to_string(),
                 ..production_runtime.clone()
             }),
+            // existing field-init order (link_deviation_runtime is the next).
             link_deviation_runtime: None,
             gaussian_frailty_sd: None,
         };
