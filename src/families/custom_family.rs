@@ -8670,8 +8670,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     let use_joint_newton = has_joint_exacthessian && (specs.len() >= 2 || has_workspace_source);
     let joint_workspace_requested = use_joint_newton && has_workspace_source;
     let inner_tol = options.inner_tol;
-    let inner_max_cycles = options.inner_max_cycles;
-    let inner_max_cycles = capped_inner_max_cycles(options, inner_max_cycles);
+    let inner_max_cycles_base = options.inner_max_cycles;
+    // Baseline cap for this outer iteration. May be locally bumped below
+    // when the joint-Newton inner solve plateaus near the residual
+    // tolerance — see Task 6 "adaptive inner cycle cap". The bump is
+    // scoped to this call (one outer iteration); the next outer
+    // iteration starts again from `inner_max_cycles_base`.
+    let mut inner_max_cycles = capped_inner_max_cycles(options, inner_max_cycles_base);
     // Each block's assembled penalty matrix depends only on that block's
     // penalties and smoothing parameters. Build these setup matrices in
     // parallel, but keep the coordinate-descent and line-search loops below
@@ -8743,15 +8748,190 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 joint_workspace: cached.joint_workspace.clone(),
             });
         }
-        for (b, beta_seed) in seed.block_beta.iter().enumerate() {
-            if beta_seed.len() == states[b].beta.len() {
-                let beta_projected =
-                    family.post_update_block_beta(&states, b, &specs[b], beta_seed.clone())?;
-                states[b].beta.assign(&beta_projected);
+        // Soft warm-start across rho changes.
+        //
+        // Exact-rho match has already been handled (and short-circuited)
+        // above. We're here because either log-lambdas differ, the prior
+        // inner solve didn't converge, or the cached mode is missing.
+        // Rather than discarding the prior β entirely (the historical
+        // cold-start behavior), classify the change:
+        //
+        //   * modest rho change with same block/penalty structure:
+        //         keep prior β unchanged (penalty changed but the
+        //         coordinate system is the same, β is a fine seed).
+        //   * larger rho change but structure unchanged:
+        //         project β onto the new joint penalty's range space
+        //         (positive-eigenvalue subspace). This zeros out
+        //         components that the new penalty heavily damps,
+        //         giving the inner solver a starting point already
+        //         compatible with the new penalty geometry.
+        //   * structure change (penalty count or dimension differs):
+        //         fall through to cold start.
+        //
+        // A safety guard rejects projections whose 2-norm ratio against
+        // the prior β is pathological (>10 or <0.1) and reverts to cold
+        // start.
+        let expected_rho_len: usize = block_log_lambdas.iter().map(|v| v.len()).sum();
+        let structure_unchanged = seed.rho.len() == expected_rho_len
+            && seed.block_beta.len() == specs.len()
+            && seed
+                .block_beta
+                .iter()
+                .zip(specs.iter())
+                .all(|(beta_seed, spec)| beta_seed.len() == spec.design.ncols())
+            && seed
+                .block_beta
+                .iter()
+                .zip(&states)
+                .all(|(beta_seed, state)| beta_seed.len() == state.beta.len());
+
+        let rho_change_max = if structure_unchanged {
+            let mut offset = 0usize;
+            let mut max_change = 0.0_f64;
+            for block in block_log_lambdas {
+                let end = offset + block.len();
+                let old_slice = seed.rho.slice(s![offset..end]);
+                for (new_v, old_v) in block.iter().zip(old_slice.iter()) {
+                    let d = (new_v - old_v).abs();
+                    if d > max_change {
+                        max_change = d;
+                    }
+                }
+                offset = end;
+            }
+            Some(max_change)
+        } else {
+            None
+        };
+
+        let mut warm_start_path: &'static str = "cold";
+        if let Some(rho_change_max) = rho_change_max {
+            if rho_change_max < 0.5 {
+                // Modest rho change: reuse prior β as-is (with the
+                // family's required post-update projection).
+                for (b, beta_seed) in seed.block_beta.iter().enumerate() {
+                    let beta_projected = family.post_update_block_beta(
+                        &states,
+                        b,
+                        &specs[b],
+                        beta_seed.clone(),
+                    )?;
+                    states[b].beta.assign(&beta_projected);
+                }
+                cached_active_sets = seed.active_sets.clone();
+                refresh_all_block_etas(family, specs, &mut states)?;
+                warm_start_path = "unchanged";
+            } else {
+                // Larger rho change but penalty structure intact:
+                // project β onto the positive eigenspace of the new
+                // joint penalty per block.
+                let mut all_blocks_ok = true;
+                let mut projected_blocks: Vec<Array1<f64>> = Vec::with_capacity(specs.len());
+                for (b, beta_seed) in seed.block_beta.iter().enumerate() {
+                    let s_lambda = &s_lambdas[b];
+                    // Symmetrize defensively.
+                    let p = s_lambda.nrows();
+                    let mut sym = Array2::<f64>::zeros((p, p));
+                    for i in 0..p {
+                        for j in 0..p {
+                            sym[[i, j]] = 0.5 * (s_lambda[[i, j]] + s_lambda[[j, i]]);
+                        }
+                    }
+                    let (evals, evecs) = match FaerEigh::eigh(&sym, Side::Lower) {
+                        Ok(pair) => pair,
+                        Err(_) => {
+                            all_blocks_ok = false;
+                            break;
+                        }
+                    };
+                    let max_abs_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+                    // Standard positive-eigenvalue threshold: anything
+                    // above 1e-12 · max|λ| counts as a real penalty
+                    // direction; everything else is the null space the
+                    // penalty cannot resolve.
+                    let pos_threshold = (1e-12 * max_abs_eval).max(1e-300);
+                    let beta_prior_norm: f64 =
+                        beta_seed.iter().map(|v| v * v).sum::<f64>().sqrt();
+                    // Form β_proj = U_pos U_posᵀ β.
+                    let mut beta_proj = Array1::<f64>::zeros(p);
+                    for k in 0..p {
+                        if evals[k] <= pos_threshold {
+                            continue;
+                        }
+                        let mut u_t_beta = 0.0;
+                        for i in 0..p {
+                            u_t_beta += evecs[[i, k]] * beta_seed[i];
+                        }
+                        for i in 0..p {
+                            beta_proj[i] += evecs[[i, k]] * u_t_beta;
+                        }
+                    }
+                    let beta_proj_norm: f64 =
+                        beta_proj.iter().map(|v| v * v).sum::<f64>().sqrt();
+                    // Safety guard: pathological projection ratio.
+                    if beta_prior_norm > 0.0 {
+                        let ratio = beta_proj_norm / beta_prior_norm;
+                        if !ratio.is_finite() || ratio > 10.0 || ratio < 0.1 {
+                            log::debug!(
+                                "[GAMLSS soft warm-start] block {} projection ratio {:.3e} out of [0.1, 10]; falling back to cold start",
+                                b,
+                                ratio,
+                            );
+                            all_blocks_ok = false;
+                            break;
+                        }
+                    }
+                    if !beta_proj.iter().all(|v| v.is_finite()) {
+                        all_blocks_ok = false;
+                        break;
+                    }
+                    projected_blocks.push(beta_proj);
+                }
+                if all_blocks_ok && projected_blocks.len() == specs.len() {
+                    for (b, beta_proj) in projected_blocks.into_iter().enumerate() {
+                        let beta_post = family.post_update_block_beta(
+                            &states,
+                            b,
+                            &specs[b],
+                            beta_proj,
+                        )?;
+                        states[b].beta.assign(&beta_post);
+                    }
+                    cached_active_sets = seed.active_sets.clone();
+                    refresh_all_block_etas(family, specs, &mut states)?;
+                    warm_start_path = "projected";
+                }
             }
         }
-        cached_active_sets = seed.active_sets.clone();
-        refresh_all_block_etas(family, specs, &mut states)?;
+
+        if warm_start_path == "cold" {
+            // Historical cold-start: copy prior β where dimensions match
+            // (best-effort; mismatched blocks keep the freshly-built
+            // initial state). This is the same behavior as before the
+            // soft-warm-start logic was introduced.
+            for (b, beta_seed) in seed.block_beta.iter().enumerate() {
+                if beta_seed.len() == states[b].beta.len() {
+                    let beta_projected = family.post_update_block_beta(
+                        &states,
+                        b,
+                        &specs[b],
+                        beta_seed.clone(),
+                    )?;
+                    states[b].beta.assign(&beta_projected);
+                }
+            }
+            cached_active_sets = seed.active_sets.clone();
+            refresh_all_block_etas(family, specs, &mut states)?;
+        }
+
+        log::debug!(
+            "[GAMLSS soft warm-start] path={} (structure_unchanged={}, rho_change_max={})",
+            warm_start_path,
+            structure_unchanged,
+            rho_change_max
+                .map(|v| format!("{:.3e}", v))
+                .unwrap_or_else(|| "n/a".to_string()),
+        );
     }
     let (
         mut current_log_likelihood,
@@ -8861,8 +9041,34 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // directly when it fires.
         let mut last_cycle_obj_change_below_tol = false;
 
+        // Adaptive inner cycle cap (Task 6): track the descent ratio
+        // `current_residual / previous_residual` over a sliding 3-cycle
+        // window. When all three ratios are above 0.95 (plateau), the
+        // current cycle is past 80% of the cap, and the residual is
+        // within 10× of the residual tolerance, extend the cap to
+        // `min(2 * inner_max_cycles_base, 200)` for the remainder of
+        // THIS outer iteration only. The bump is held in the local
+        // `inner_max_cycles` binding, which is rebuilt fresh from
+        // `inner_max_cycles_base` on every outer call.
+        let mut descent_ratio_window: Vec<f64> = Vec::with_capacity(3);
+        let mut previous_residual: Option<f64> = None;
+        let mut inner_cap_already_extended = false;
+
         let mut joint_trust_radius = 1.0_f64;
-        for cycle in 0..inner_max_cycles {
+        // Hard upper bound for the for-loop's range. The adaptive cap
+        // extension below can raise `inner_max_cycles` mid-loop up to
+        // `min(2 * inner_max_cycles_base, 200)`, and Rust's for-loop
+        // evaluates its range bound only once, so we iterate against
+        // this ceiling and break manually whenever `cycle` reaches the
+        // current (possibly bumped) `inner_max_cycles`. Using a sentinel
+        // keeps the existing `continue` statements in the body working
+        // (they advance `cycle` via the iterator), unlike a `while` +
+        // manual-counter rewrite.
+        let inner_loop_hard_ceiling = inner_max_cycles.max(200);
+        for cycle in 0..inner_loop_hard_ceiling {
+            if cycle >= inner_max_cycles {
+                break;
+            }
             // Fires at the top of each inner joint-Newton cycle so CI logs can
             // distinguish "inner spin" (thousands of these) from "outer-assembly
             // spin" (zero of these). Emitted at info-level so the silent-grind
@@ -9644,6 +9850,54 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 objective_tol,
                 beta_inf,
             );
+
+            // Update the descent-ratio sliding window (Task 6 adaptive
+            // cap). Only meaningful when the previous cycle produced a
+            // strictly positive residual; otherwise the ratio is
+            // undefined and we leave the window untouched (the
+            // unconditional `previous_residual` refresh at the bottom of
+            // this block keeps the chain going).
+            if let Some(prev) = previous_residual
+                && prev > 0.0
+                && residual.is_finite()
+            {
+                let ratio = residual / prev;
+                if descent_ratio_window.len() == 3 {
+                    descent_ratio_window.remove(0);
+                }
+                descent_ratio_window.push(ratio);
+            }
+            previous_residual = Some(residual);
+
+            // Plateau detection + one-shot cap extension. All three
+            // recent ratios > 0.95 means each cycle is shaving < 5% off
+            // the residual — Newton has stalled but is still bounded by
+            // the cap. If we're past 80% of the cap and the residual is
+            // already within 10× of its tolerance, doubling the cap
+            // (capped at 200) gives the solve room to grind out the
+            // last factor of 10 before the rejection guard fires.
+            if !inner_cap_already_extended
+                && descent_ratio_window.len() == 3
+                && descent_ratio_window.iter().all(|r| *r > 0.95)
+                && cycle + 1 >= (inner_max_cycles * 4) / 5
+                && residual.is_finite()
+                && residual <= 10.0 * residual_tol
+            {
+                let extended_cap =
+                    (2usize * inner_max_cycles_base).min(200).max(inner_max_cycles);
+                if extended_cap > inner_max_cycles {
+                    log::info!(
+                        "[GAMLSS inner cycle cap extended] residual={:.3e}, last_3_descent_ratios=[{:.3}, {:.3}, {:.3}], new_cap={}",
+                        residual,
+                        descent_ratio_window[0],
+                        descent_ratio_window[1],
+                        descent_ratio_window[2],
+                        extended_cap,
+                    );
+                    inner_max_cycles = extended_cap;
+                    inner_cap_already_extended = true;
+                }
+            }
 
             // KKT convergence: a small post-step residual is the
             // canonical optimality certificate for the penalized
