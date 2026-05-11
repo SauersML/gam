@@ -938,6 +938,116 @@ impl CanonicalPenalty {
     }
 }
 
+/// Detect and report structurally identical (or near-identical) penalty pairs
+/// in the canonical bundle.
+///
+/// Two penalties `S_i`, `S_j` with the same `col_range` are compared by their
+/// matrix cosine:
+///
+///     cos(S_i, S_j) = tr(S_i S_j) / sqrt(tr(S_i^2) * tr(S_j^2))
+///
+/// Because `local` is symmetric, `tr(A·B) = sum_{r,c} A[r,c] * B[r,c]` — i.e.,
+/// the Frobenius inner product. Pairs with different `col_range` cannot be
+/// functionally identical and are skipped.
+///
+/// Logging policy:
+/// - `cos > 1 - 1e-8` → `log::warn!` with `[PENALTY-REDUNDANCY]`. Every such
+///   pair is emitted because it represents a structural model error (the LAML
+///   cost has a Z₂-symmetric saddle that ARC's cubic regularization will
+///   happily converge to under first-order stationarity).
+/// - `0.99 < cos ≤ 1 - 1e-8` → `log::info!` with `[PENALTY-SIMILARITY]`.
+///   At biobank scale (`k > 64`) only the top-3 highest-cosine such pairs are
+///   logged to bound log volume.
+///
+/// Returns `Vec<(i, j, cos)>` for the **redundant** pairs (cos > 1 - 1e-8),
+/// primarily to make this function unit-testable without a log capture.
+///
+/// Performance: this is O(k² · block_dim²); intended to be called exactly
+/// once per fit (e.g. from `RemlState::newwith_offset_shared`).
+pub fn report_penalty_pair_redundancy(
+    canonical: &[CanonicalPenalty],
+) -> Vec<(usize, usize, f64)> {
+    const REDUNDANCY_THRESHOLD: f64 = 1.0 - 1e-8;
+    const SIMILARITY_THRESHOLD: f64 = 0.99;
+    const BIOBANK_K_THRESHOLD: usize = 64;
+    const TOP_SIMILARITY_PAIRS: usize = 3;
+
+    let k = canonical.len();
+    let mut redundant: Vec<(usize, usize, f64)> = Vec::new();
+    let mut similar: Vec<(usize, usize, f64)> = Vec::new();
+
+    // Pre-compute tr(S_i^2) = sum of squares of S_i entries (Frobenius norm
+    // squared). `local` is symmetric, so this equals tr(S_i^T S_i) = tr(S_i^2).
+    let trace_sq: Vec<f64> = canonical
+        .iter()
+        .map(|p| p.local.iter().map(|&v| v * v).sum::<f64>())
+        .collect();
+
+    for i in 0..k {
+        if trace_sq[i] == 0.0 {
+            continue;
+        }
+        for j in (i + 1)..k {
+            if trace_sq[j] == 0.0 {
+                continue;
+            }
+            // Different col_range → cannot be functionally identical by
+            // construction (the block-local matrices live in disjoint or
+            // mismatched parameter subspaces).
+            if canonical[i].col_range != canonical[j].col_range {
+                continue;
+            }
+            // Shapes must match — they do when col_range matches because
+            // `local` is `block_dim × block_dim` and `block_dim = col_range.len()`.
+            debug_assert_eq!(canonical[i].local.dim(), canonical[j].local.dim());
+
+            let inner: f64 = canonical[i]
+                .local
+                .iter()
+                .zip(canonical[j].local.iter())
+                .map(|(&a, &b)| a * b)
+                .sum();
+            let denom = (trace_sq[i] * trace_sq[j]).sqrt();
+            if denom == 0.0 {
+                continue;
+            }
+            let cos = inner / denom;
+
+            if cos > REDUNDANCY_THRESHOLD {
+                redundant.push((i, j, cos));
+            } else if cos > SIMILARITY_THRESHOLD {
+                similar.push((i, j, cos));
+            }
+        }
+    }
+
+    // Always emit every redundancy — these are structural model errors.
+    for &(i, j, cos) in &redundant {
+        log::warn!(
+            "[PENALTY-REDUNDANCY] penalties i={i} j={j} are structurally identical \
+             (cos={cos:.6}) — model is over-parameterized along their antisymmetric \
+             direction; expect a Z₂-symmetric saddle in the LAML cost. Consider \
+             re-specifying (e.g. anisotropic→isotropic for spatial smoothers with \
+             weak axis signal)."
+        );
+    }
+
+    // Cap similarity log volume at biobank scale.
+    if k > BIOBANK_K_THRESHOLD && similar.len() > TOP_SIMILARITY_PAIRS {
+        similar.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        similar.truncate(TOP_SIMILARITY_PAIRS);
+    }
+    for (i, j, cos) in similar {
+        log::info!(
+            "[PENALTY-SIMILARITY] penalties i={i} j={j} are near-identical \
+             (cos={cos:.6}) — outer Hessian may be ill-conditioned along their \
+             antisymmetric direction."
+        );
+    }
+
+    redundant
+}
+
 /// Canonicalize a single `PenaltySpec` into a `CanonicalPenalty` by computing
 /// the block-local eigendecomposition and extracting the root.
 ///
@@ -2573,7 +2683,7 @@ mod tests {
     use super::{
         CanonicalPenalty, SubspaceLeakageMetrics, assess_subspace_leakage,
         classify_eigenvalues_strict, precompute_reparam_invariant_from_canonical,
-        stable_reparameterizationwith_invariant,
+        report_penalty_pair_redundancy, stable_reparameterizationwith_invariant,
     };
     use crate::construction::kronecker_product;
     use crate::estimate::EstimationError;
@@ -2954,5 +3064,76 @@ mod tests {
         let mut eigs = [scale, subtol];
         classify_eigenvalues_strict(&mut eigs, "test_sub_pos").expect("sub-tol positive ok");
         assert_eq!(eigs[1], 0.0);
+    }
+
+    /// Build a `CanonicalPenalty` directly from a symmetric `local` matrix.
+    /// Bypasses root extraction — the redundancy diagnostic only reads `local`
+    /// and `col_range`, so the rest is filler.
+    fn canonical_from_local(
+        local: Array2<f64>,
+        col_range: std::ops::Range<usize>,
+        total_dim: usize,
+    ) -> CanonicalPenalty {
+        let block_dim = local.nrows();
+        // A trivially valid root: zero rank. The diagnostic doesn't read root.
+        let root = Array2::<f64>::zeros((0, block_dim));
+        CanonicalPenalty {
+            root,
+            col_range,
+            total_dim,
+            nullity: 0,
+            local,
+            positive_eigenvalues: Vec::new(),
+            op: None,
+        }
+    }
+
+    #[test]
+    fn report_penalty_pair_redundancy_detects_identical_pair() {
+        // Penalty 0: a "generic" SPD matrix on cols 0..3.
+        let s0 = ndarray::array![
+            [2.0, 0.5, 0.0],
+            [0.5, 1.0, 0.25],
+            [0.0, 0.25, 1.5],
+        ];
+        // Penalties 1 and 2: identical block-local penalty on the SAME col_range.
+        // This is the Z₂-symmetric saddle scenario.
+        let s_shared = ndarray::array![
+            [1.0, -0.5, 0.0],
+            [-0.5, 2.0, -0.5],
+            [0.0, -0.5, 1.0],
+        ];
+
+        let bundle = vec![
+            canonical_from_local(s0, 0..3, 3),
+            canonical_from_local(s_shared.clone(), 0..3, 3),
+            canonical_from_local(s_shared, 0..3, 3),
+        ];
+
+        let redundant = report_penalty_pair_redundancy(&bundle);
+
+        // Exactly one redundant pair: (1, 2). Pairs (0, 1) and (0, 2) involve
+        // distinct matrices and must NOT be flagged.
+        assert_eq!(redundant.len(), 1, "expected exactly one redundant pair, got {:?}", redundant);
+        let (i, j, cos) = redundant[0];
+        assert_eq!((i, j), (1, 2));
+        assert!(
+            cos > 1.0 - 1e-12,
+            "cosine for identical penalties should be ~1.0, got {cos}"
+        );
+    }
+
+    #[test]
+    fn report_penalty_pair_redundancy_skips_different_col_ranges() {
+        // Two identical local matrices but on disjoint col_ranges. The
+        // function must NOT flag them — they live in different parameter
+        // subspaces by construction.
+        let s = ndarray::array![[1.0, 0.0], [0.0, 1.0]];
+        let bundle = vec![
+            canonical_from_local(s.clone(), 0..2, 4),
+            canonical_from_local(s, 2..4, 4),
+        ];
+        let redundant = report_penalty_pair_redundancy(&bundle);
+        assert!(redundant.is_empty(), "different col_ranges must not be flagged");
     }
 }

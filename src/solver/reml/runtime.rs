@@ -2078,6 +2078,12 @@ impl<'a> RemlState<'a> {
     {
         let x = x.into();
 
+        // Single-shot structural redundancy diagnostic. Fires exactly once
+        // per RemlState construction — see
+        // `crate::construction::report_penalty_pair_redundancy` for the
+        // logging policy. O(k² · block_dim²); negligible at fit-prep.
+        crate::construction::report_penalty_pair_redundancy(canonical_penalties.as_ref());
+
         let expected_len = canonical_penalties.len();
         let nullspace_dims = match nullspace_dims {
             Some(dims) => {
