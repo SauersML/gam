@@ -21,7 +21,7 @@ use crate::custom_family::{ExactNewtonJointGradientEvaluation, ExactNewtonJointH
 use crate::solver::estimate::reml::unified::{
     HyperOperator, ProjectedFactorCache, ProjectedFactorKey,
 };
-use ndarray::{Array1, Array2, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView2, s};
 use rayon::prelude::*;
 use std::sync::Arc;
 
@@ -754,6 +754,145 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
         }
         let jf = self.cached_jf(factor, cache);
         self.trace_projected_factor_with_jf(factor, jf.view())
+    }
+
+    /// BLAS-3 override of `F^T · B · F` for row-decomposable kernels.
+    ///
+    /// The default `HyperOperator::projected_matrix` routes through
+    /// `mul_mat`, which does `rank` independent `mul_vec` calls each
+    /// firing its own `par_reduce_fold` over n rows and recomputing
+    /// `row_third_contracted(row, J_r·direction)` per row. At biobank
+    /// shape (n ≈ 1e5, rank ≈ 80) that's `n × rank` jet evaluations =
+    /// ~8M per call — and `projected_matrix` is called multiple times
+    /// per outer eval. Measured 3 s/call at N=100K.
+    ///
+    /// **Algebraic reformulation.** Using the row decomposition
+    /// `B = Σ_r J_r^T T_r J_r`,
+    ///
+    /// ```text
+    ///   (Fᵀ B F)[c, d] = Σ_r Σ_{a,b} jf[r, a, c] · T_r[a, b] · jf[r, b, d]
+    ///                  = Σ_{a, b} (jf_a^T · diag(T_r[a, b]) · jf_b)[c, d]
+    /// ```
+    ///
+    /// where `jf_a = jf[:, a·rank..(a+1)·rank]` is the (n × rank) slice
+    /// for the a-th K-axis (already built by `compute_jf`'s BLAS-3 fast
+    /// path) and `T_r[a, b]` is a per-row scalar. T_r is symmetric, so
+    /// only `K·(K+1)/2` weighted matmuls are needed.
+    ///
+    /// **Cost.** Per (a, b) pair: one (n × rank) ← (n × rank) ⊙ weight
+    /// scale and one (rank × rank) ← (n × rank)ᵀ · (n × rank) BLAS-3
+    /// matmul. The per-row jet `row_third_contracted` is evaluated
+    /// once per row (`n` total) and stored in a (`n × K × K`) tensor,
+    /// not `n × rank` times like in the default mul_mat path.
+    ///
+    /// **Why this fires.** `compute_jf` is the same J·F build that the
+    /// trace path already optimised, so caching is consistent. For K=2
+    /// (bernoulli marginal-slope) this is 3 weighted matmuls + n
+    /// jet calls. For K=4 (survival marginal-slope) it's 10 weighted
+    /// matmuls; still dwarfed by the saved `rank × n` jet evaluations
+    /// the default path would have done.
+    fn projected_matrix(&self, factor: &Array2<f64>) -> Array2<f64> {
+        debug_assert_eq!(factor.nrows(), self.p);
+        let rank = factor.ncols();
+        let n_rows = self.kern.n_rows();
+        if rank == 0 || n_rows == 0 {
+            return Array2::<f64>::zeros((rank, rank));
+        }
+
+        // Build J·F once (BLAS-3 fast path when the kernel exposes one).
+        let jf = self.compute_jf(factor);
+        debug_assert_eq!(jf.dim(), (n_rows, K * rank));
+
+        // Per-row T_r tensor: T[r, a, b] = row_third_contracted(r,
+        // J_r·direction)[a][b]. Layout flat (n × K × K) row-major so
+        // each weight vector `T[:, a, b]` is stride-K² contiguous in
+        // memory after a transpose — but for the BLAS-3 step we only
+        // need n-length slices, which we extract as owned vectors below.
+        let direction = self.direction.as_slice();
+        let t_flat = self.rows.par_reduce_fold(
+            n_rows,
+            || vec![0.0_f64; n_rows * K * K],
+            |mut acc, row, w| {
+                let dir_k = self.kern.jacobian_action(row, direction);
+                let third = self
+                    .kern
+                    .row_third_contracted(row, &dir_k)
+                    .expect("row-kernel third contraction should succeed for validated directions");
+                let base = row * (K * K);
+                for a in 0..K {
+                    for b in 0..K {
+                        acc[base + a * K + b] = w * third[a][b];
+                    }
+                }
+                acc
+            },
+            |mut left, right| {
+                // rayon's fold().reduce() partitions rows uniquely across
+                // chunks, so every row's (a, b) slot is written by exactly
+                // one accumulator. All other accumulators keep the
+                // initial zero at that slot. Addition is therefore safe
+                // (zero + value = value) and matches the merge semantic
+                // used by the dense-output `mul_vec` reduce above.
+                debug_assert_eq!(left.len(), right.len());
+                for (l, r) in left.iter_mut().zip(right.iter()) {
+                    *l += *r;
+                }
+                left
+            },
+        );
+
+        // 3 (K=2) or 10 (K=4) BLAS-3 weighted matmuls. Each:
+        //   out += jf_a^T · diag(w_ab) · jf_b           (a == b)
+        //   out += jf_a^T · diag(w_ab) · jf_b + transpose  (a < b)
+        // Both use ndarray's `.dot(matrix)`; the elementwise scaling
+        // happens by multiplying the (n × rank) view by a (n × 1)
+        // broadcast column.
+        let mut out = Array2::<f64>::zeros((rank, rank));
+        // Owned (n × rank) blocks for cache-friendly BLAS-3 access.
+        // The strided view jf.slice([:, a·rank..]) has row-stride K·rank
+        // and would otherwise force BLAS into a slow per-row gemv.
+        let mut jf_axis_blocks: Vec<Array2<f64>> = Vec::with_capacity(K);
+        for a in 0..K {
+            jf_axis_blocks.push(
+                jf.slice(s![.., a * rank..(a + 1) * rank])
+                    .as_standard_layout()
+                    .into_owned(),
+            );
+        }
+        let mut w_col = Array1::<f64>::zeros(n_rows);
+        for a in 0..K {
+            for b in a..K {
+                for r in 0..n_rows {
+                    w_col[r] = t_flat[r * (K * K) + a * K + b];
+                }
+                // jf_a_weighted = jf_a · diag(w)
+                let mut jf_a_weighted = jf_axis_blocks[a].clone();
+                for r in 0..n_rows {
+                    let wr = w_col[r];
+                    if wr == 0.0 {
+                        for c in 0..rank {
+                            jf_a_weighted[[r, c]] = 0.0;
+                        }
+                    } else {
+                        for c in 0..rank {
+                            jf_a_weighted[[r, c]] *= wr;
+                        }
+                    }
+                }
+                let contrib = jf_a_weighted.t().dot(&jf_axis_blocks[b]);
+                if a == b {
+                    out += &contrib;
+                } else {
+                    // T_r is symmetric: the (b, a) coefficient equals
+                    // the (a, b) one, so the cross contribution lands
+                    // once with its transpose to cover both off-diag
+                    // blocks of the Σ_{a,b} T[a,b] outer-product sum.
+                    out += &contrib;
+                    out += &contrib.t();
+                }
+            }
+        }
+        out
     }
 
     fn to_dense(&self) -> Array2<f64> {
