@@ -1,6 +1,6 @@
 use crate::basis::BasisOptions;
 use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
-use crate::families::bernoulli_marginal_slope::LatentMeasureKind;
+use crate::families::bernoulli_marginal_slope::{LatentMeasureKind, LatentZRankIntCalibration};
 use crate::families::gamlss::{
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
 };
@@ -218,6 +218,14 @@ pub struct FittedModelPayload {
     pub latent_score_contract: Option<SavedLatentScoreContract>,
     #[serde(default)]
     pub latent_measure: Option<LatentMeasureKind>,
+    /// Optional rank-INT calibration for the latent score (BMS family).
+    /// When `Some`, the marginal-slope predictor routes the input `z`
+    /// through [`LatentZRankIntCalibration::apply_at_predict`] before the
+    /// closed-form standard-normal kernel, matching fit-time semantics.
+    /// `#[serde(default)]` so models persisted before this field existed
+    /// continue to deserialize cleanly (interpreted as: no calibration).
+    #[serde(default)]
+    pub latent_z_rank_int_calibration: Option<LatentZRankIntCalibration>,
     #[serde(default)]
     pub marginal_baseline: Option<f64>,
     #[serde(default)]
@@ -372,6 +380,7 @@ impl FittedModelPayload {
             latent_z_normalization: None,
             latent_score_contract: None,
             latent_measure: None,
+            latent_z_rank_int_calibration: None,
             marginal_baseline: None,
             logslope_baseline: None,
             score_warp_runtime: None,
@@ -597,6 +606,10 @@ pub struct SavedPredictionRuntime {
     pub baseline_time_wiggle: Option<SavedBaselineTimeWiggleRuntime>,
     pub score_warp: Option<SavedAnchoredDeviationRuntime>,
     pub link_deviation: Option<SavedAnchoredDeviationRuntime>,
+    /// Rank-INT latent-z calibration carried into the predictor build.
+    /// `None` for non-BMS models and for BMS fits whose latent measure
+    /// did not require rank-INT calibration.
+    pub latent_z_rank_int_calibration: Option<LatentZRankIntCalibration>,
 }
 
 fn gaussian_location_scale_mean_beta(fit: &UnifiedFitResult) -> Option<Array1<f64>> {
@@ -1976,6 +1989,10 @@ impl FittedModel {
             baseline_time_wiggle: self.saved_baseline_time_wiggle()?,
             score_warp: self.payload().score_warp_runtime.clone(),
             link_deviation: self.payload().link_deviation_runtime.clone(),
+            latent_z_rank_int_calibration: self
+                .payload()
+                .latent_z_rank_int_calibration
+                .clone(),
         };
         if matches!(
             runtime.model_class,
@@ -2267,6 +2284,7 @@ impl FittedModel {
                     self.family_state.frailty()?.clone(),
                     runtime.score_warp,
                     runtime.link_deviation,
+                    runtime.latent_z_rank_int_calibration,
                 )
                 .ok()?;
                 Some(Box::new(predictor) as Box<dyn PredictableModel>)

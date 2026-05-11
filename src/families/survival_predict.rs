@@ -1665,6 +1665,7 @@ pub fn build_saved_survival_marginal_slope_predictor(
             .unwrap_or(FrailtySpec::None),
         saved_score_runtime,
         saved_link_runtime,
+        model.latent_z_rank_int_calibration.clone(),
     )?;
 
     let pred_input = PredictInput {

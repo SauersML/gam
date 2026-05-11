@@ -892,6 +892,18 @@ pub struct BernoulliMarginalSlopePredictor {
     pub score_warp_runtime: Option<SavedAnchoredDeviationRuntime>,
     pub link_deviation_runtime: Option<SavedAnchoredDeviationRuntime>,
     pub gaussian_frailty_sd: Option<f64>,
+    /// Optional rank-INT latent-z calibration. When `Some`, every
+    /// predict-time z (after `latent_z_normalization`) is routed through
+    /// [`LatentZRankIntCalibration::apply_at_predict`] before entering
+    /// the standard-normal closed-form rigid kernel — mirroring the
+    /// fit-time transform applied to training z. The map is the exact
+    /// monotone, invertible (up to empirical-CDF resolution) piecewise-
+    /// linear interpolation on (sorted_z, weighted_cdf) followed by Φ⁻¹,
+    /// so the calibrated sample is N(0,1) by construction. `None` means
+    /// training-time z already passed the strict normality check and no
+    /// transform was applied.
+    pub(crate) latent_z_calibration:
+        Option<crate::families::bernoulli_marginal_slope::LatentZRankIntCalibration>,
 }
 
 /// Per-runtime predict-time anchor correction matrices.
@@ -1029,6 +1041,30 @@ impl BernoulliMarginalSlopePredictor {
 
     fn probit_frailty_scale(&self) -> f64 {
         marginal_slope_probit_frailty_scale(self.gaussian_frailty_sd)
+    }
+
+    /// Apply the (optional) rank-INT latent-z calibration to a batch of
+    /// normalized predict-time z values.
+    ///
+    /// The calibration was fit on the training z + weights as a Blom-
+    /// rankit weighted rank inverse-normal transform; the calibrated
+    /// sample is N(0, 1) by construction (exact, not approximate), which
+    /// is why the BMS standard-normal closed-form kernel is correct on
+    /// the calibrated scale. At predict time, every z that flows into a
+    /// kernel evaluation site (`final_eta_and_gradient_from_theta`,
+    /// `predict_eta_and_q_chain`, and indirectly the per-row `solve_intercept_scalar`
+    /// / `evaluate_prediction_calibration` / `observed_denested_cell_partials_at_z`
+    /// helpers that consume per-row scalar z values from the closure-
+    /// captured `z` array) must be routed through the same monotone
+    /// transform. When `latent_z_calibration` is `None`, this returns
+    /// the input unchanged — that case corresponds to training-time z
+    /// having passed the strict normality check, so no transform was
+    /// applied at fit time either.
+    fn apply_latent_z_calibration(&self, z: &Array1<f64>) -> Array1<f64> {
+        match &self.latent_z_calibration {
+            Some(cal) => Array1::from_iter(z.iter().map(|&zi| cal.apply_at_predict(zi))),
+            None => z.clone(),
+        }
     }
 
     fn rigid_intercept_from_marginal(&self, marginal_eta: f64, slope: f64) -> f64 {
@@ -1601,6 +1637,9 @@ impl BernoulliMarginalSlopePredictor {
         frailty: FrailtySpec,
         score_warp_runtime: Option<SavedAnchoredDeviationRuntime>,
         link_deviation_runtime: Option<SavedAnchoredDeviationRuntime>,
+        latent_z_calibration: Option<
+            crate::families::bernoulli_marginal_slope::LatentZRankIntCalibration,
+        >,
     ) -> Result<Self, String> {
         let gaussian_frailty_sd = match frailty {
             FrailtySpec::None => None,
@@ -1700,6 +1739,7 @@ impl BernoulliMarginalSlopePredictor {
             score_warp_runtime,
             link_deviation_runtime,
             gaussian_frailty_sd,
+            latent_z_calibration,
         })
     }
 
@@ -1852,10 +1892,20 @@ impl BernoulliMarginalSlopePredictor {
                 self.z_column
             ))
         })?;
-        let z = self
+        let z_normalized = self
             .latent_z_normalization
             .apply(z_raw, "bernoulli marginal-slope prediction")
             .map_err(EstimationError::InvalidInput)?;
+        // P4: when training applied a rank-INT calibration to the latent
+        // z (so the BMS rigid kernel could use the closed-form
+        // standard-normal path), the predictor MUST apply the same
+        // monotone transform to predict-time z before any kernel
+        // evaluation. The transform is mathematically exact: piecewise-
+        // linear interpolation on (sorted_z, weighted_cdf) followed by
+        // Φ⁻¹, both strictly monotone and invertible up to the empirical
+        // CDF resolution. `None` ⇒ training-time z passed the strict
+        // normality check, no transform was applied, leave z unchanged.
+        let z = self.apply_latent_z_calibration(&z_normalized);
         let design_logslope = input.design_noise.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput(
                 "bernoulli marginal-slope prediction requires logslope design".to_string(),
@@ -2533,10 +2583,16 @@ impl BernoulliMarginalSlopePredictor {
                 self.z_column
             ))
         })?;
-        let z = self
+        let z_normalized = self
             .latent_z_normalization
             .apply(z_raw, "bernoulli marginal-slope prediction")
             .map_err(EstimationError::InvalidInput)?;
+        // P4: see `final_eta_and_gradient_from_theta` for the rationale.
+        // The rank-INT calibration is a mathematically exact monotone
+        // transform; both the rigid standard-normal kernel and the
+        // implicit-function chain rule consume the calibrated z, never
+        // the raw normalized z, exactly mirroring fit-time semantics.
+        let z = self.apply_latent_z_calibration(&z_normalized);
         let design_logslope = input.design_noise.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput(
                 "bernoulli marginal-slope prediction requires logslope design".to_string(),
@@ -5425,6 +5481,7 @@ mod tests {
             // existing field-init order (link_deviation_runtime is the next).
             link_deviation_runtime: None,
             gaussian_frailty_sd: None,
+            latent_z_calibration: None,
         };
         let err = score_only
             .score_warp_runtime
@@ -5605,6 +5662,7 @@ mod tests {
             score_warp_runtime: None,
             link_deviation_runtime: None,
             gaussian_frailty_sd: Some(0.8),
+            latent_z_calibration: None,
         };
         let theta = predictor.theta();
         let input = PredictInput {
@@ -5673,6 +5731,7 @@ mod tests {
             score_warp_runtime: None,
             link_deviation_runtime: None,
             gaussian_frailty_sd: None,
+            latent_z_calibration: None,
         };
         let input = PredictInput {
             design: DesignMatrix::from(array![[1.0], [1.0]]),
@@ -5724,6 +5783,7 @@ mod tests {
             score_warp_runtime: None,
             link_deviation_runtime: None,
             gaussian_frailty_sd: Some(0.8),
+            latent_z_calibration: None,
         };
         let theta = predictor.theta();
         let input = PredictInput {
