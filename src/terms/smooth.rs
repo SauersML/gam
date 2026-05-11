@@ -7119,7 +7119,9 @@ fn adaptive_fit_options_base(options: &FitOptions, design: &TermCollectionDesign
         firth_bias_reduction: options.firth_bias_reduction,
         adaptive_regularization: None,
         penalty_shrinkage_floor: options.penalty_shrinkage_floor,
-        rho_prior: Default::default(),
+        // Propagate user-supplied rho_prior so the baseline/refit and the
+        // joint optimizer minimize the same REML objective.
+        rho_prior: options.rho_prior.clone(),
         kronecker_penalty_system: design.kronecker_penalty_system(),
         kronecker_factored: design
             .smooth
@@ -9869,8 +9871,14 @@ fn external_opts_for_design(
         firth_bias_reduction: Some(options.firth_bias_reduction),
         penalty_shrinkage_floor: options.penalty_shrinkage_floor,
         rho_prior: options.rho_prior.clone(),
-        kronecker_penalty_system: None,
-        kronecker_factored: None,
+        // Propagate Kronecker structure so the joint optimizer minimizes the
+        // same REML surface as the baseline/refit (adaptive_fit_options_base).
+        kronecker_penalty_system: design.kronecker_penalty_system(),
+        kronecker_factored: design
+            .smooth
+            .terms
+            .iter()
+            .find_map(|t| t.kronecker_factored.clone()),
     }
 }
 
@@ -10874,7 +10882,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
     //  AnisoBasisPsiDerivatives → DirectionalHyperParam → HyperCoord pipeline,
     //  giving Newton/BFGS quadratic convergence on the anisotropy parameters.
     // ───────────────────────────────────────────────────────────────────────
-    let theta_star = if use_aniso {
+    let (theta_star, joint_final_value) = if use_aniso {
         try_exact_joint_spatial_aniso_optimization(
             data,
             y,
@@ -10925,6 +10933,24 @@ fn try_exact_joint_spatial_length_scale_optimization(
         adaptive_diagnostics: best.adaptive_diagnostics.clone(),
     };
 
+    // Compare the joint optimizer's certified cost (final_value at theta*)
+    // against the baseline. Tolerance ≥ options.tol because both endpoints
+    // are outer-BFGS approximations accurate to options.tol; a tighter
+    // gate would reject true improvements due to floating-point noise.
+    let accept_tol = options
+        .tol
+        .max(1e-8 * baseline_score.abs())
+        .max(1e-12);
+    if joint_final_value > baseline_score + accept_tol {
+        log::info!(
+            "[spatial-kappa] exact joint spatial candidate worsened the profiled score (joint={:.6e}, baseline={:.6e}, tol={:.2e}); keeping the frozen baseline geometry",
+            joint_final_value,
+            baseline_score,
+            accept_tol,
+        );
+        return Ok(Some(baseline_result));
+    }
+
     let rho_star = theta_star.slice(s![..rho_dim]).mapv(f64::exp);
     let log_kappa_star =
         SpatialLogKappaCoords::from_theta_tail_with_dims(&theta_star, rho_dim, dims_per_term);
@@ -10940,18 +10966,17 @@ fn try_exact_joint_spatial_length_scale_optimization(
         options,
     )?;
 
+    // Stamp reml_score with joint_final_value so downstream consumers see a
+    // score consistent with the gate decision; the refit serves as a
+    // β/inference harvester at the certified (ρ*, ψ*).
+    let mut fit = optimized.fit;
+    fit.reml_score = joint_final_value;
     let optimized_result = FittedTermCollectionWithSpec {
-        fit: optimized.fit,
+        fit,
         design: optimized.design,
         resolvedspec,
         adaptive_diagnostics: optimized.adaptive_diagnostics,
     };
-    if fit_score(&optimized_result.fit) > baseline_score + 1e-10 {
-        log::info!(
-            "[spatial-kappa] exact joint spatial candidate worsened the profiled score; keeping the frozen baseline geometry"
-        );
-        return Ok(Some(baseline_result));
-    }
 
     Ok(Some(optimized_result))
 }
@@ -10992,7 +11017,7 @@ fn try_exact_joint_spatial_aniso_optimization(
     upper: &Array1<f64>,
     rho_dim: usize,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<Array1<f64>, EstimationError> {
+) -> Result<(Array1<f64>, f64), EstimationError> {
     // Use bounds and design metadata for validation.
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
@@ -11261,7 +11286,7 @@ fn try_exact_joint_spatial_aniso_optimization(
     // No sum-to-zero enforcement needed: ψ coordinates are unconstrained during
     // optimization. The decomposition into (ψ̄, η) happens in apply_tospec.
     let theta_star = result.rho;
-    Ok(theta_star)
+    Ok((theta_star, result.final_value))
 }
 
 /// Joint [ρ, κ] optimization for isotropic spatial terms using analytic
@@ -11293,7 +11318,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
     upper: &Array1<f64>,
     rho_dim: usize,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<Array1<f64>, EstimationError> {
+) -> Result<(Array1<f64>, f64), EstimationError> {
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
     use crate::solver::outer_strategy::{
@@ -11554,7 +11579,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
         result.final_value,
         result.final_grad_norm,
     );
-    Ok(result.rho)
+    Ok((result.rho, result.final_value))
 }
 
 fn set_spatial_length_scale(
@@ -16376,6 +16401,209 @@ mod tests {
             psi_block.iter().any(|value| value.abs() > 1e-10),
             "small aniso exact Hessian should carry non-zero ψ curvature"
         );
+    }
+
+    /// Finite-difference verification of the joint REML gradient on a Duchon
+    /// BinomialProbit configuration that reproduces the iso-kappa joint REML
+    /// `|g|≈3.5e7` blow-up. The 1D Duchon term uses `length_scale=Some(1.0)`
+    /// and a moderate number of centers so the active penalty count produces a
+    /// non-trivial ρ block alongside the single log-κ axis. The analytic
+    /// gradient assembled via `evaluate_joint_reml_outer_eval_at_theta` is
+    /// compared component-wise against a centered finite difference of the
+    /// cost via `evaluator.evaluate_cost_only` (the same cost path the joint
+    /// outer optimizer uses). Disagreement on the ext-coord component
+    /// isolates a wrong derivative in the log-κ gradient path.
+    #[test]
+    fn iso_kappa_duchon_binomial_probit_joint_gradient_matches_finite_difference() {
+        let n = 80usize;
+        let mut data = Array2::<f64>::zeros((n, 1));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            let eta = 1.4 * (2.0 * std::f64::consts::PI * t).sin() + 0.5 * (t - 0.5);
+            y[i] = if eta + 0.7 * (3.7 * (i as f64) + 1.0).sin() > 0.0 {
+                1.0
+            } else {
+                0.0
+            };
+        }
+        let weights = Array1::ones(n);
+        let offset = Array1::zeros(n);
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "duchon_1d".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0],
+                    spec: DuchonBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                        length_scale: Some(1.0),
+                        power: 1,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: None,
+                        operator_penalties: DuchonOperatorPenaltySpec::default(),
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let fit_opts = FitOptions {
+            latent_cloglog: None,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: false,
+            max_iter: 200,
+            tol: 1e-12,
+            nullspace_dims: vec![],
+            linear_constraints: None,
+            firth_bias_reduction: false,
+            adaptive_regularization: None,
+            penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
+        };
+
+        let design = build_term_collection_design(data.view(), &spec).expect("design");
+        let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
+        let spatial_terms = spatial_length_scale_term_indices(&frozen);
+        let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
+        assert_eq!(dims_per_term, vec![1], "1D Duchon should expose one log-κ");
+        let rho_dim = design.penalties.len();
+        let psi_dim: usize = dims_per_term.iter().sum();
+        assert!(psi_dim >= 1, "test requires at least one log-κ axis");
+
+        let external_opts =
+            external_opts_for_design(LikelihoodFamily::BinomialProbit, &design, &fit_opts);
+        let mut cache = SingleBlockExactJointDesignCache::new(
+            data.view(),
+            frozen.clone(),
+            design.clone(),
+            spatial_terms.clone(),
+            rho_dim,
+            dims_per_term.clone(),
+        )
+        .expect("single-block cache");
+        let mut evaluator = crate::estimate::ExternalJointHyperEvaluator::new(
+            y.view(),
+            weights.view(),
+            &design.design,
+            offset.view(),
+            &design.penalties,
+            &external_opts,
+            "iso-kappa Duchon BinomialProbit FD evaluator",
+        )
+        .expect("evaluator");
+
+        let cost_at = |theta: &Array1<f64>,
+                       cache: &mut SingleBlockExactJointDesignCache<'_>,
+                       evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>|
+         -> f64 {
+            cache.ensure_theta(theta).expect("ensure_theta");
+            let design = cache.design();
+            evaluator
+                .evaluate_cost_only(
+                    &design.design,
+                    &design.penalties,
+                    &design.nullspace_dims,
+                    design.linear_constraints.clone(),
+                    theta,
+                    rho_dim,
+                    None,
+                    "iso-kappa Duchon FD cost-only",
+                )
+                .expect("cost-only eval")
+        };
+
+        let analytic_at = |theta: &Array1<f64>,
+                           cache: &mut SingleBlockExactJointDesignCache<'_>,
+                           evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>|
+         -> (f64, Array1<f64>) {
+            cache.ensure_theta(theta).expect("ensure_theta");
+            let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
+                data.view(),
+                cache.spec(),
+                cache.design(),
+                &cache.spatial_terms,
+            )
+            .expect("hyper dirs build")
+            .expect("hyper dirs present");
+            let (cost, grad, _hess) = evaluate_joint_reml_outer_eval_at_theta(
+                evaluator,
+                cache.design(),
+                theta,
+                rho_dim,
+                hyper_dirs,
+                None,
+                crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+            )
+            .expect("outer eval");
+            (cost, grad)
+        };
+
+        let theta_dim = rho_dim + psi_dim;
+        let mut theta_base = Array1::<f64>::zeros(theta_dim);
+        for j in 0..rho_dim {
+            theta_base[j] = 0.2 - 0.1 * j as f64;
+        }
+        for k in 0..psi_dim {
+            theta_base[rho_dim + k] = 0.0;
+        }
+        let mut theta_alt = theta_base.clone();
+        for j in 0..rho_dim {
+            theta_alt[j] = 1.0 + 0.05 * j as f64;
+        }
+        for k in 0..psi_dim {
+            theta_alt[rho_dim + k] = 0.4;
+        }
+
+        let h = 1e-5_f64;
+        for (label, theta) in [("base", &theta_base), ("alt", &theta_alt)] {
+            let (cost_an, grad_an) = analytic_at(theta, &mut cache, &mut evaluator);
+            assert!(
+                cost_an.is_finite(),
+                "analytic cost not finite at {label}: cost={cost_an:?}"
+            );
+            for j in 0..theta_dim {
+                let mut plus = theta.clone();
+                plus[j] += h;
+                let mut minus = theta.clone();
+                minus[j] -= h;
+                let cp = cost_at(&plus, &mut cache, &mut evaluator);
+                let cm = cost_at(&minus, &mut cache, &mut evaluator);
+                let fd = (cp - cm) / (2.0 * h);
+                let denom = fd.abs().max(grad_an[j].abs()).max(1e-3);
+                let rel = (grad_an[j] - fd).abs() / denom;
+                let kind = if j < rho_dim { "rho" } else { "psi" };
+                eprintln!(
+                    "[fd_iso_kappa_duchon {label}] {kind} j={j} analytic={:+.6e} fd={:+.6e} \
+                     abs_err={:.3e} rel_err={:.3e}",
+                    grad_an[j],
+                    fd,
+                    (grad_an[j] - fd).abs(),
+                    rel
+                );
+                assert!(
+                    cp.is_finite() && cm.is_finite(),
+                    "non-finite cost in FD at {label} j={j}: cp={cp}, cm={cm}"
+                );
+                assert!(
+                    rel < 1e-4,
+                    "{label} {kind} component {j} disagreement: analytic={:+.6e}, fd={:+.6e}, \
+                     abs_err={:.3e}, rel_err={:.3e}",
+                    grad_an[j],
+                    fd,
+                    (grad_an[j] - fd).abs(),
+                    rel
+                );
+            }
+        }
     }
 
     #[test]
