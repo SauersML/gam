@@ -26088,6 +26088,110 @@ mod tests {
         );
     }
 
+    /// Compare analytic D0_psi/D1_psi/D2_psi (from
+    /// `build_duchon_operator_penalty_psi_derivatives` internals) against
+    /// FD of the cost-side collocation operators. Isolates whether the
+    /// bug lives in the operator-derivative formulas
+    /// (duchon_radial_core_psi_triplet + jets) vs the gram chain rule.
+    #[test]
+    fn test_duchon_operator_psi_derivatives_fd_dim1() {
+        use ndarray::array;
+        let centers = array![[0.0_f64], [0.2], [0.45], [0.7]];
+        let nullspace_order = DuchonNullspaceOrder::Linear;
+        let power = 1usize;
+        let length_scale = 1.0_f64;
+        let mut workspace = BasisWorkspace::default();
+        let eps: f64 = 1e-5;
+        let ls_plus = 1.0 / eps.exp();
+        let ls_minus = 1.0 / (-eps).exp();
+        let ops_plus = build_duchon_collocation_operator_matriceswithworkspace(
+            centers.view(),
+            None,
+            Some(ls_plus),
+            power,
+            nullspace_order,
+            None,
+            None,
+            2,
+            &mut workspace,
+        )
+        .expect("plus ops");
+        let ops_minus = build_duchon_collocation_operator_matriceswithworkspace(
+            centers.view(),
+            None,
+            Some(ls_minus),
+            power,
+            nullspace_order,
+            None,
+            None,
+            2,
+            &mut workspace,
+        )
+        .expect("minus ops");
+        let fd_d0 = (&ops_plus.d0 - &ops_minus.d0) / (2.0 * eps);
+        let fd_d1 = (&ops_plus.d1 - &ops_minus.d1) / (2.0 * eps);
+        let fd_d2 = (&ops_plus.d2 - &ops_minus.d2) / (2.0 * eps);
+        eprintln!("[op_psi_fd_d1] D0_plus[0..,0..] sample = {:?}", ops_plus.d0.row(0).to_vec());
+        eprintln!("[op_psi_fd_d1] D0_minus[0..,0..] sample = {:?}", ops_minus.d0.row(0).to_vec());
+        eprintln!("[op_psi_fd_d1] fd_D0[0,..] = {:?}", fd_d0.row(0).to_vec());
+        eprintln!("[op_psi_fd_d1] fd_D0 shape={:?}", fd_d0.shape());
+        eprintln!(
+            "[op_psi_fd_d1] fd_D0 norm={:.4e}",
+            fd_d0.iter().map(|v| v * v).sum::<f64>().sqrt()
+        );
+        eprintln!(
+            "[op_psi_fd_d1] fd_D1 norm={:.4e}",
+            fd_d1.iter().map(|v| v * v).sum::<f64>().sqrt()
+        );
+        eprintln!(
+            "[op_psi_fd_d1] fd_D2 norm={:.4e}",
+            fd_d2.iter().map(|v| v * v).sum::<f64>().sqrt()
+        );
+        // Print a few values of fd_D0 vs analytic.
+        // Analytic d0_psi (kernel cols only): the same internals as
+        // build_duchon_operator_penalty_psi_derivatives reach out for.
+        let p_order = 2usize;
+        let s_order = power;
+        let d = 1usize;
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+        let z_kernel =
+            kernel_constraint_nullspace(centers.view(), nullspace_order, &mut workspace.cache)
+                .expect("z kernel");
+        let p = centers.nrows();
+        let kernel_cols = z_kernel.ncols();
+        let mut d0_psi_analytic = ndarray::Array2::<f64>::zeros((p, kernel_cols));
+        for k in 0..p {
+            for j in 0..p {
+                let r = (centers[[k, 0]] - centers[[j, 0]]).abs();
+                if r < 1e-14 {
+                    continue;
+                }
+                let core =
+                    duchon_radial_core_psi_triplet(r, length_scale, p_order, s_order, d, &coeffs)
+                        .unwrap();
+                for col in 0..kernel_cols {
+                    d0_psi_analytic[[k, col]] += core.phi.psi * z_kernel[[j, col]];
+                }
+            }
+        }
+        // FD of D0 is the cost-side D0 (which after `fast_ab(d0_raw, z)` gives
+        // the same kernel-col matrix as analytic_kernel). Account for the
+        // polynomial padding: cost-side D0 has total_cols = kernel + poly.
+        // Take only the first kernel_cols columns.
+        let fd_d0_kernel = fd_d0.slice(ndarray::s![.., 0..kernel_cols]).to_owned();
+        let err = (&d0_psi_analytic - &fd_d0_kernel)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        eprintln!(
+            "[op_psi_fd_d1] analytic D0_psi vs FD D0_psi: analytic_norm={:.4e} fd_norm={:.4e} err={:.4e}",
+            d0_psi_analytic.iter().map(|v| v * v).sum::<f64>().sqrt(),
+            fd_d0_kernel.iter().map(|v| v * v).sum::<f64>().sqrt(),
+            err
+        );
+    }
+
     /// FD the **unnormalized** Gram penalty `S_raw = D^T D` for the failing
     /// (d=1, p=2, s=1, ls=1) spec to isolate whether the bug is in
     /// `gram_and_psi_derivatives_from_operator` / `D_psi` build or in
