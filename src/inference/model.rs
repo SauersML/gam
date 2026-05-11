@@ -1422,7 +1422,122 @@ impl SavedAnchoredDeviationRuntime {
     }
 
     pub fn design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
+        // Note: when the saved runtime carries an anchor residual
+        // (cross-block orthogonalisation), the value `design()` returns
+        // is the raw cubic span output *without* the per-row `n_row · M`
+        // subtraction. Callers used inside BMS prediction must either
+        // switch to `design_with_anchor_rows` (when the per-row anchor
+        // rows are available) or call `design_uncorrected` explicitly and
+        // apply the subtraction at the call site. For runtimes without a
+        // residual the two paths coincide.
         self.evaluate_span_polynomial_design(values, BasisOptions::value().derivative_order)
+    }
+
+    /// Raw cubic-span design without any anchor-residual subtraction.
+    ///
+    /// Exposed for callers that intend to apply the `n_row · M` correction
+    /// post-hoc (e.g., BMS `link_terms_value_d1` subtracts a precomputed
+    /// `correction.dot(beta)` scalar from the linear-predictor contribution
+    /// rather than building a full anchor-row matrix). Equivalent to
+    /// `design()` when no residual is present.
+    pub fn design_uncorrected(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
+        self.evaluate_span_polynomial_design(values, BasisOptions::value().derivative_order)
+    }
+
+    /// Evaluate the residual-corrected design at the supplied values.
+    ///
+    /// `anchor_rows` must be an `n × d` matrix where `n == values.len()`
+    /// and `d == sum of anchor_residual_components ncols`. Each row holds
+    /// the concatenated parametric anchor design at the same prediction
+    /// row as the corresponding `values[i]`. When the runtime has no
+    /// anchor residual, `anchor_rows` must have zero columns (or be
+    /// `Array2::zeros((n, 0))`).
+    pub fn design_with_anchor_rows(
+        &self,
+        values: &Array1<f64>,
+        anchor_rows: ndarray::ArrayView2<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let mut out =
+            self.evaluate_span_polynomial_design(values, BasisOptions::value().derivative_order)?;
+        if let Some(m_rows) = self.anchor_residual_coefficients.as_ref() {
+            let d = m_rows.len();
+            if anchor_rows.nrows() != values.len() {
+                return Err(format!(
+                    "design_with_anchor_rows: anchor_rows has {} rows, expected {} (matching values)",
+                    anchor_rows.nrows(),
+                    values.len(),
+                ));
+            }
+            if anchor_rows.ncols() != d {
+                return Err(format!(
+                    "design_with_anchor_rows: anchor_rows has {} cols, expected {} (sum of component ncols)",
+                    anchor_rows.ncols(),
+                    d,
+                ));
+            }
+            // Materialise M (d × basis_dim) once.
+            let mut m_dense = Array2::<f64>::zeros((d, self.basis_dim));
+            for (i, row) in m_rows.iter().enumerate() {
+                if row.len() != self.basis_dim {
+                    return Err(format!(
+                        "design_with_anchor_rows: anchor_residual_coefficients row {} has length {}, expected basis_dim {}",
+                        i,
+                        row.len(),
+                        self.basis_dim,
+                    ));
+                }
+                for (j, &v) in row.iter().enumerate() {
+                    m_dense[[i, j]] = v;
+                }
+            }
+            let subtract = anchor_rows.dot(&m_dense);
+            out = out - subtract;
+        } else if anchor_rows.ncols() != 0 {
+            return Err(format!(
+                "design_with_anchor_rows: runtime has no anchor residual but anchor_rows has {} cols",
+                anchor_rows.ncols(),
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Build the n × basis_dim per-row, per-basis correction matrix
+    /// `N · M` for a batch of predict rows.
+    ///
+    /// `n_anchor_rows` is the n × d matrix of stacked parametric anchor
+    /// rows at the prediction rows (concatenation of the marginal and
+    /// logslope design rows in component order). Returns `None` when the
+    /// runtime has no anchor residual (zero-cost path).
+    pub fn anchor_correction_matrix(
+        &self,
+        n_anchor_rows: ndarray::ArrayView2<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some(m_rows) = self.anchor_residual_coefficients.as_ref() else {
+            return Ok(None);
+        };
+        let d = m_rows.len();
+        if n_anchor_rows.ncols() != d {
+            return Err(format!(
+                "anchor_correction_matrix: anchor_rows has {} cols, expected {} (sum of component ncols)",
+                n_anchor_rows.ncols(),
+                d,
+            ));
+        }
+        let mut m_dense = Array2::<f64>::zeros((d, self.basis_dim));
+        for (i, row) in m_rows.iter().enumerate() {
+            if row.len() != self.basis_dim {
+                return Err(format!(
+                    "anchor_correction_matrix: M row {} has length {}, expected basis_dim {}",
+                    i,
+                    row.len(),
+                    self.basis_dim,
+                ));
+            }
+            for (j, &v) in row.iter().enumerate() {
+                m_dense[[i, j]] = v;
+            }
+        }
+        Ok(Some(n_anchor_rows.dot(&m_dense)))
     }
 
     pub fn first_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {

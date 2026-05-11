@@ -60,7 +60,9 @@ use crate::solver::estimate::reml::unified::{
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use std::cell::RefCell;
-use std::sync::atomic::AtomicUsize;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
@@ -135,6 +137,20 @@ const SCOP_PSI_PSI_HVP_TILE_COLS: usize = 32;
 /// genuinely moderate p so wide CTN fits remain row-streamed.
 const SCOP_HESSIAN_HVP_DENSE_CACHE_MAX_DIM: usize = 384;
 const SCOP_HESSIAN_HVP_DENSE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Amortization safety factor for the dense-Hessian build (P2.2).
+///
+/// Building the dense `p × p` Hessian costs `Θ(n · p²)`; one matrix-free
+/// HVP costs `Θ(n · p)`. Dense pays off iff the expected reuse count
+/// against the same `(β, row_quantities)` is at least
+/// `p_total / SCOP_DENSE_AMORTIZATION_SAFETY`. The safety factor of 2
+/// captures the gemv-vs-row-stream speed gap: even after the build, dense
+/// matvecs hit dense BLAS at the L2-cache-bound rate while matrix-free
+/// HVPs pay the SCOP chain rule arithmetic, so the dense matvec is ~2× as
+/// fast per operation. Tuning at biobank `p ≈ 200, rho_dim ≈ 30,
+/// expected_reuse ≈ 61` puts the threshold at 100 and selects matrix-free
+/// (correct: building dense would cost ~10⁹ flops to save ~5·10⁷ flops of
+/// streaming).
+const SCOP_DENSE_AMORTIZATION_SAFETY: usize = 2;
 
 fn beta_bits_match(cached: &Array1<f64>, candidate: &Array1<f64>) -> bool {
     cached.len() == candidate.len()
@@ -152,6 +168,79 @@ pub struct TransformationWarmStart {
     pub location: Array1<f64>,
     /// τ(x_i): conditional standard deviation at each observation's covariates.
     pub scale: Array1<f64>,
+}
+
+// ---------------------------------------------------------------------------
+// Persistent dense-Hessian cache (P2.1)
+// ---------------------------------------------------------------------------
+
+/// Cache key for the SCOP-CTN dense joint Hessian.
+///
+/// The Hessian depends on `(β, row_quantities(β))`; row_quantities is keyed
+/// on β by exact f64 bits, so a `(beta_hash, row_quantities_version)` pair
+/// uniquely identifies a build. We hash β bits (not values) so the key is
+/// bit-exact and avoids f64-Hash issues.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct CtnDenseHessianKey {
+    pub beta_hash: u64,
+    pub row_quantities_version: u64,
+}
+
+impl CtnDenseHessianKey {
+    fn from(beta: &Array1<f64>, row_quantities: &TransformationNormalRowQuantityCache) -> Self {
+        let mut hasher = DefaultHasher::new();
+        beta.len().hash(&mut hasher);
+        for value in beta.iter() {
+            value.to_bits().hash(&mut hasher);
+        }
+        let beta_hash = hasher.finish();
+        CtnDenseHessianKey {
+            beta_hash,
+            row_quantities_version: row_quantities.version,
+        }
+    }
+}
+
+/// Process-local persistent dense-Hessian cache shared across workspace
+/// re-creations.
+///
+/// **Single-slot, not LRU.** The access pattern inside the SCOP joint Newton
+/// inner solve is "many HVP probes share the same β within one trust-region
+/// step; β advances between steps." A 1-entry slot therefore hits exactly
+/// when it should (consecutive probes at the same β) and misses on every β
+/// advance — no eviction policy is needed. Without this persistent slot a
+/// fresh `TransformationNormalJointHessianWorkspace` is built every time the
+/// outer evaluator calls `exact_newton_joint_hessian_workspace`, and its
+/// inner `OnceLock` only amortizes within a single workspace lifetime; that
+/// is the source of the ~310× CTN dense Hessian rebuild storm at biobank
+/// scale.
+#[derive(Default)]
+pub(crate) struct CtnPersistentDenseHessianCache {
+    slot: Mutex<Option<(CtnDenseHessianKey, Arc<Array2<f64>>)>>,
+}
+
+impl CtnPersistentDenseHessianCache {
+    fn get(&self, key: &CtnDenseHessianKey) -> Option<Arc<Array2<f64>>> {
+        let slot = self
+            .slot
+            .lock()
+            .expect("CTN persistent dense Hessian cache mutex poisoned");
+        slot.as_ref().and_then(|(cached_key, cached)| {
+            if cached_key == key {
+                Some(Arc::clone(cached))
+            } else {
+                None
+            }
+        })
+    }
+
+    fn install(&self, key: CtnDenseHessianKey, hessian: Arc<Array2<f64>>) {
+        let mut slot = self
+            .slot
+            .lock()
+            .expect("CTN persistent dense Hessian cache mutex poisoned");
+        *slot = Some((key, hessian));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +312,20 @@ pub struct TransformationNormalFamily {
     /// and reciprocal powers behind a single exact-keyed entry instead of
     /// recomputing `h`, `h'`, `1/h'`, and derivative powers per call.
     row_quantity_cache: Arc<Mutex<Option<TransformationNormalRowQuantityCache>>>,
+    /// Monotonic counter bumped each time a fresh row_quantity build is
+    /// installed. The value tags every freshly built
+    /// `TransformationNormalRowQuantityCache.version` so downstream caches
+    /// (the persistent dense-Hessian slot) can key on
+    /// `(beta_bits, row_quantities_version)` without re-hashing every row
+    /// quantity. Atomic so the counter survives `Family::clone` (the family
+    /// clones its `Arc<...>` interior state — version counts must be shared
+    /// across the same logical family instance).
+    row_quantity_version: Arc<AtomicU64>,
+    /// Persistent dense Hessian cache (P2.1). Survives workspace
+    /// re-creation; keyed on the exact `(β bits, row_quantities version)`
+    /// pair. See [`CtnPersistentDenseHessianCache`] for the access-pattern
+    /// rationale (single-slot, not LRU).
+    persistent_dense_hessian: Arc<CtnPersistentDenseHessianCache>,
 }
 
 #[derive(Clone)]
@@ -235,6 +338,9 @@ struct TransformationNormalRowQuantityCache {
     h_upper: Arc<Array1<f64>>,
     endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
     log_likelihood: f64,
+    /// Monotonic version tag set at construction time. Used by the
+    /// persistent dense-Hessian cache key.
+    version: u64,
 }
 
 #[derive(Debug)]
@@ -803,6 +909,8 @@ impl TransformationNormalFamily {
             response_upper_floor_offset,
             covariate_dense_cache: Arc::new(Mutex::new(None)),
             row_quantity_cache: Arc::new(Mutex::new(None)),
+            row_quantity_version: Arc::new(AtomicU64::new(0)),
+            persistent_dense_hessian: Arc::new(CtnPersistentDenseHessianCache::default()),
         })
     }
 
@@ -963,6 +1071,8 @@ impl TransformationNormalFamily {
             response_upper_floor_offset,
             covariate_dense_cache: Arc::new(Mutex::new(None)),
             row_quantity_cache: Arc::new(Mutex::new(None)),
+            row_quantity_version: Arc::new(AtomicU64::new(0)),
+            persistent_dense_hessian: Arc::new(CtnPersistentDenseHessianCache::default()),
         })
     }
 
@@ -1188,6 +1298,15 @@ impl TransformationNormalFamily {
             &h_upper,
             self.weights.as_ref(),
         )?;
+        // Stamp this build with a fresh monotonic version so the persistent
+        // dense-Hessian cache key advances exactly once per row_quantity
+        // rebuild. `fetch_add` returns the *previous* value; +1 keeps the
+        // first installed cache at version 1 (0 is reserved for "never
+        // built").
+        let version = self
+            .row_quantity_version
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            .saturating_add(1);
         let row_quantities = TransformationNormalRowQuantityCache {
             beta: Arc::new(beta.clone()),
             gamma: Arc::new(gamma),
@@ -1197,6 +1316,7 @@ impl TransformationNormalFamily {
             h_upper: Arc::new(h_upper),
             endpoint_q: Arc::new(derived.endpoint_q),
             log_likelihood: derived.log_likelihood,
+            version,
         };
 
         let mut cache = self
@@ -7422,6 +7542,57 @@ impl CustomFamily for TransformationNormalFamily {
         self.coefficient_hessian_cost(specs) / 2
     }
 
+    fn outer_derivative_policy(
+        &self,
+        specs: &[crate::families::custom_family::ParameterBlockSpec],
+        psi_dim: usize,
+        options: &crate::families::custom_family::BlockwiseFitOptions,
+    ) -> crate::families::custom_family::OuterDerivativePolicy {
+        // The generic default model in `CustomFamily::outer_derivative_policy`
+        // uses `coefficient_hessian_cost × (rho_dim + psi_dim)`, which
+        // overstates CTN's actual per-eval Hessian work because the SCOP
+        // joint-Hessian path is row-streaming through the Khatri-Rao jet
+        // (its `O(n · p)` matrix-free HVP, not `O(n · p²)` dense build).
+        // Use a CTN-specific shape:
+        //
+        // * gradient ≈ `n · (rho_dim + psi_dim) · p_total`
+        //   (one directional jet sweep per outer coordinate, row-streamed)
+        // * Hessian  ≈ min(dense build, matrix-free HVP loop)
+        //   * dense  ≈ `n · (rho_dim + psi_dim) · p_total^2`
+        //   * mfree  ≈ `n · (rho_dim + psi_dim) · p_total · rho_dim`
+        let capability = self.exact_outer_derivative_order(specs, options);
+        let n = specs
+            .first()
+            .map_or(0u128, |s| s.design.nrows() as u128);
+        let p_total: u128 = specs
+            .iter()
+            .map(|s| s.design.ncols() as u128)
+            .fold(0u128, |acc, x| acc.saturating_add(x));
+        let rho_dim: u128 = specs
+            .iter()
+            .map(|s| s.penalties.len() as u128)
+            .fold(0u128, |acc, x| acc.saturating_add(x));
+        let k = rho_dim
+            .saturating_add(psi_dim as u128)
+            .max(1);
+        let p_eff = p_total.max(1);
+        // Gradient work: one row sweep per outer coordinate.
+        let work_grad = n.saturating_mul(k).saturating_mul(p_eff);
+        // Hessian work: pick whichever access shape would dominate. The
+        // amortization gate in `should_build_dense` (P2.2) picks the
+        // cheaper path at execution time; the policy budget mirrors that
+        // by taking the min so that genuinely Hessian-prohibitive
+        // problems still downgrade through the budget ceiling.
+        let dense_hess = work_grad.saturating_mul(p_eff);
+        let mfree_hess = work_grad.saturating_mul(rho_dim.max(1));
+        let work_hess = dense_hess.min(mfree_hess);
+        crate::families::custom_family::OuterDerivativePolicy {
+            capability,
+            predicted_hessian_work: work_hess,
+            predicted_gradient_work: work_grad,
+        }
+    }
+
     fn outer_seed_config(&self, n_params: usize) -> crate::seeding::SeedConfig {
         crate::seeding::SeedConfig {
             bounds: (-12.0, 12.0),
@@ -7708,7 +7879,7 @@ impl CustomFamily for TransformationNormalFamily {
     fn exact_newton_joint_hessian_workspace(
         &self,
         block_states: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
         if block_states.len() != 1 {
             return Err(format!(
@@ -7718,10 +7889,22 @@ impl CustomFamily for TransformationNormalFamily {
         }
         let beta = &block_states[0].beta;
         let row_quantities = self.row_quantities(beta)?;
+        // Expected HVP reuse this workspace will service before its
+        // `(β, row_quantities)` key advances. The outer-eval trace path
+        // performs ~`2·rho_dim` HVPs plus one diagonal call against the
+        // same key; the inner PCG also reuses the workspace's HVPs at the
+        // same β. Use `2·rho_dim + 1` as a conservative lower bound — the
+        // amortization gate (P2.2) compares this against `p_total / 2`,
+        // and any further reuse only widens the cache hit ratio in our
+        // favor. `specs` may be empty in test paths; treat that as 0
+        // penalties so the gate cleanly falls into the matrix-free regime.
+        let rho_dim: usize = specs.iter().map(|s| s.penalties.len()).sum();
+        let expected_reuse = rho_dim.saturating_mul(2).saturating_add(1);
         let workspace = TransformationNormalJointHessianWorkspace::new(
             Arc::new(self.clone()),
             beta.clone(),
             row_quantities.clone(),
+            expected_reuse,
         )?;
         Ok(Some(
             Arc::new(workspace) as Arc<dyn ExactNewtonJointHessianWorkspace>
@@ -7805,7 +7988,22 @@ struct TransformationNormalJointHessianWorkspace {
     family: Arc<TransformationNormalFamily>,
     beta: Array1<f64>,
     row_quantities: TransformationNormalRowQuantityCache,
-    dense_hessian_cache: OnceLock<Array2<f64>>,
+    /// Workspace-local handle to the most recently produced dense Hessian.
+    /// Shares storage with `persistent_dense_hessian` (P2.1) by `Arc`, so a
+    /// hit on the persistent slot installs into this `OnceLock` without
+    /// rebuilding. Keeps the existing `dense_hessian() -> &Array2<f64>`
+    /// borrow contract intact.
+    dense_hessian_cache: OnceLock<Arc<Array2<f64>>>,
+    /// Cross-workspace persistent dense-Hessian slot (P2.1). Cloned from
+    /// `family.persistent_dense_hessian` at construction; outlives the
+    /// workspace and survives `exact_newton_joint_hessian_workspace`
+    /// re-creation.
+    persistent_dense_hessian: Arc<CtnPersistentDenseHessianCache>,
+    /// Expected number of HVP + diagonal evaluations this workspace will
+    /// service during its lifetime. Used by the amortization gate (P2.2)
+    /// to decide between dense build (`O(n·p²)` build, `O(p²)` per matvec)
+    /// and matrix-free row-streaming (`O(n·p)` per matvec, no build).
+    expected_reuse: usize,
 }
 
 impl TransformationNormalJointHessianWorkspace {
@@ -7813,12 +8011,16 @@ impl TransformationNormalJointHessianWorkspace {
         family: Arc<TransformationNormalFamily>,
         beta: Array1<f64>,
         row_quantities: TransformationNormalRowQuantityCache,
+        expected_reuse: usize,
     ) -> Result<Self, String> {
+        let persistent_dense_hessian = Arc::clone(&family.persistent_dense_hessian);
         Ok(Self {
             family,
             beta,
             row_quantities,
             dense_hessian_cache: OnceLock::new(),
+            persistent_dense_hessian,
+            expected_reuse,
         })
     }
 
@@ -7826,21 +8028,65 @@ impl TransformationNormalJointHessianWorkspace {
         self.family.x_val_kron.ncols()
     }
 
-    fn dense_hessian_cache_enabled(&self) -> bool {
+    /// Amortization gate (P2.2).
+    ///
+    /// Dense build cost ≈ `n · p²`; one matrix-free HVP costs `n · p`. So
+    /// the dense path pays off only when expected reuse against this
+    /// `(β, row_quantities)` is at least `p_total / SAFETY`. The dense
+    /// path is also gated by an absolute memory budget so very wide
+    /// problems never instantiate a `p × p` matrix even when reuse counts
+    /// would technically justify it.
+    ///
+    /// When the persistent slot (P2.1) already holds a Hessian for the
+    /// exact current key, force-on the dense path: reusing the cached
+    /// matrix dominates streaming HVPs regardless of `expected_reuse`.
+    fn should_build_dense(&self) -> bool {
         let p_total = self.p_total();
+        if p_total == 0 {
+            return false;
+        }
         if p_total > SCOP_HESSIAN_HVP_DENSE_CACHE_MAX_DIM {
             return false;
         }
-        p_total
+        let bytes_ok = p_total
             .checked_mul(p_total)
             .and_then(|entries| entries.checked_mul(std::mem::size_of::<f64>()))
-            .is_some_and(|bytes| bytes <= SCOP_HESSIAN_HVP_DENSE_CACHE_MAX_BYTES)
+            .is_some_and(|bytes| bytes <= SCOP_HESSIAN_HVP_DENSE_CACHE_MAX_BYTES);
+        if !bytes_ok {
+            return false;
+        }
+        // Persistent cache hit shortcuts the cost model: reusing the cached
+        // matrix is always cheaper than re-streaming. See `dense_hessian()`
+        // for the install path that populates this slot.
+        let key = CtnDenseHessianKey::from(&self.beta, &self.row_quantities);
+        if self.persistent_dense_hessian.get(&key).is_some() {
+            return true;
+        }
+        // Cold miss: build only if reuse ≥ p / safety.
+        self.expected_reuse >= p_total / SCOP_DENSE_AMORTIZATION_SAFETY
     }
 
     fn dense_hessian(&self) -> Result<&Array2<f64>, String> {
+        // 1) Workspace-local fast path.
         if let Some(hessian) = self.dense_hessian_cache.get() {
-            return Ok(hessian);
+            return Ok(hessian.as_ref());
         }
+
+        // 2) Persistent slot hit (P2.1). Slot is single-entry: it hits
+        //    exactly when consecutive probes share `(β, row_quantities)`,
+        //    which is the common pattern inside one trust-region step (β
+        //    advances between steps; HVP probes share β within a step).
+        let key = CtnDenseHessianKey::from(&self.beta, &self.row_quantities);
+        if let Some(cached) = self.persistent_dense_hessian.get(&key) {
+            let _ = self.dense_hessian_cache.set(cached);
+            return self
+                .dense_hessian_cache
+                .get()
+                .map(|arc| arc.as_ref())
+                .ok_or_else(|| "CTN dense Hessian cache was not initialized".to_string());
+        }
+
+        // 3) Cold miss: rebuild, install in both slots, return.
         let dense_start = std::time::Instant::now();
         let (_, hessian) = self
             .family
@@ -7857,7 +8103,10 @@ impl TransformationNormalJointHessianWorkspace {
         if hessian.iter().any(|value| !value.is_finite()) {
             return Err("CTN dense Hessian cache produced non-finite values".to_string());
         }
-        let _ = self.dense_hessian_cache.set(hessian);
+        let arc = Arc::new(hessian);
+        self.persistent_dense_hessian
+            .install(key, Arc::clone(&arc));
+        let _ = self.dense_hessian_cache.set(arc);
         log::info!(
             "[STAGE] CTN dense Hessian cache build p={} elapsed={:.3}s",
             self.p_total(),
@@ -7865,6 +8114,7 @@ impl TransformationNormalJointHessianWorkspace {
         );
         self.dense_hessian_cache
             .get()
+            .map(|arc| arc.as_ref())
             .ok_or_else(|| "CTN dense Hessian cache was not initialized".to_string())
     }
 
@@ -7890,18 +8140,24 @@ impl TransformationNormalJointHessianWorkspace {
                 self.p_total()
             ));
         }
-        if self.dense_hessian_cache_enabled() {
+        if self.should_build_dense() {
             let hessian = self.dense_hessian()?;
             crate::faer_ndarray::fast_av_view_into(hessian, v, out.view_mut());
             return Ok(());
         }
+        // Matrix-free row-streaming HVP. Not an approximation: this is the
+        // exact same Hessian-vector product, computed by accumulating
+        // per-row SCOP chain-rule contributions instead of materializing
+        // the dense `p × p` matrix. Selected when expected reuse against
+        // `(β, row_quantities)` would not amortize the dense build, or
+        // when the dense matrix would exceed the absolute memory budget.
         self.family
             .scop_hessian_matvec_into(&self.beta, &self.row_quantities, v, out)
     }
 
     /// Exact diagonal of the unpenalized joint Hessian.
     fn compute_diagonal(&self) -> Result<Array1<f64>, String> {
-        if self.dense_hessian_cache_enabled() {
+        if self.should_build_dense() {
             return Ok(self.dense_hessian()?.diag().to_owned());
         }
         self.family
@@ -8259,6 +8515,13 @@ impl TransformationNormalPsiHessianOperator {
                 h_prime: row_h_prime,
                 endpoint_q,
                 log_likelihood,
+                // Synthetic row-quantity instance built from materialized
+                // pieces (psi/psi second-order test path); not connected to
+                // the family's version counter. Version 0 is reserved as
+                // "never installed" — the persistent dense-Hessian slot
+                // built from this entry will key on version=0 and is
+                // therefore distinct from any production build.
+                version: 0,
             },
         }
     }
@@ -11849,13 +12112,18 @@ mod tests {
         let (family, _, state, _) = toy_family_and_derivatives(&psi);
         let p = state.beta.len();
         let row_quantities = family.row_quantities(&state.beta).expect("row quantities");
+        // Pump expected_reuse far above `p / SAFETY` so the toy problem
+        // routes through the dense path; the amortization-gate behavior
+        // is exercised independently in
+        // `ctn_dense_hessian_amortization_gate_picks_matrix_free_when_p_dominates_reuse`.
         let workspace = TransformationNormalJointHessianWorkspace::new(
             Arc::new(family.clone()),
             state.beta.clone(),
             row_quantities,
+            usize::MAX,
         )
         .expect("workspace build");
-        assert!(workspace.dense_hessian_cache_enabled());
+        assert!(workspace.should_build_dense());
         assert!(workspace.dense_hessian_cache.get().is_none());
 
         let dense = family
@@ -13584,6 +13852,11 @@ impl ExactNewtonJointPsiWorkspace for TransformationNormalPsiWorkspace {
             h_upper: Arc::new(Array1::zeros(entry.row_h.len())),
             endpoint_q: Arc::clone(&entry.endpoint_q),
             log_likelihood: 0.0,
+            // Reconstructed from psi-cached row jets; not derived from the
+            // family's `row_quantities` builder. Version 0 (the
+            // "never built" sentinel) keeps any persistent-dense-Hessian
+            // entry built from this instance distinct from production builds.
+            version: 0,
         };
         let op = TransformationNormalPsiDhMatrixFreeOperator::new(
             Arc::new(self.family.clone()),
@@ -14228,7 +14501,11 @@ pub fn fit_transformation_normal(
             })
         },
         // exact_fn
-        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], eval_mode| {
+        |theta,
+         specs: &[TermCollectionSpec],
+         designs: &[TermCollectionDesign],
+         eval_mode,
+         _row_set: &crate::families::row_kernel::RowSet| {
             ensure_exact_geometry(&specs[0], &designs[0])?;
             let mut cache_ref = exact_geometry_cache.borrow_mut();
             let geometry = cache_ref

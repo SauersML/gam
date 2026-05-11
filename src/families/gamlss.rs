@@ -1938,6 +1938,26 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
             // rather than retried as a silent first attempt that stalls
             // for hundreds of seconds before the runner falls back.
             let gamlss_disable_fixed_point = true;
+            let outer_policy = {
+                // GAMLSS spatial path: psi_dim = log_kappa_dim + auxiliary_dim,
+                // matching the (theta_dim - rho_dim) decomposition the
+                // optimizer uses internally. The capability and predicted-work
+                // come from the family's `outer_derivative_policy`; we
+                // synthesize a minimal `ParameterBlockSpec` slice from the
+                // bootstrap designs so the cost model can read `n_b · p_b`
+                // without needing a fully-built family yet.
+                let psi_dim = joint_setup.theta0().len() - joint_setup.rho_dim();
+                let capability = if analytic_joint_derivatives_available {
+                    crate::families::custom_family::ExactOuterDerivativeOrder::Second
+                } else {
+                    crate::families::custom_family::ExactOuterDerivativeOrder::First
+                };
+                crate::families::custom_family::OuterDerivativePolicy {
+                    capability,
+                    predicted_gradient_work: 0,
+                    predicted_hessian_work: 0,
+                }
+            };
             optimize_spatial_length_scale_exact_joint(
                 data,
                 &[builder.meanspec().clone(), builder.noisespec().clone()],
@@ -1949,6 +1969,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 analytic_joint_derivatives_available,
                 gamlss_disable_fixed_point,
                 None,
+                outer_policy,
                 |theta, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
                     let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
                     let fit = {
@@ -1996,7 +2017,8 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 |theta,
                  specs: &[TermCollectionSpec],
                  designs: &[TermCollectionDesign],
-                 eval_mode| {
+                 eval_mode,
+                 _row_set: &crate::families::row_kernel::RowSet| {
                     use crate::solver::estimate::reml::unified::EvalMode;
                     if !analytic_joint_derivatives_available {
                         return Err(
