@@ -16188,6 +16188,10 @@ mod tests {
             capability: crate::families::custom_family::ExactOuterDerivativeOrder::Second,
             predicted_hessian_work: 0,
             predicted_gradient_work: 0,
+            // Test-style construction with zero predicted work — these
+            // paths never engage staged-κ, so the capability bit is
+            // moot. Keep `false` as the safe default.
+            subsample_capable: false,
         };
         let solved = optimize_spatial_length_scale_exact_joint(
             data.view(),
@@ -17026,6 +17030,10 @@ mod tests {
             capability: crate::families::custom_family::ExactOuterDerivativeOrder::Second,
             predicted_hessian_work: 0,
             predicted_gradient_work: 0,
+            // Test-style construction with zero predicted work — these
+            // paths never engage staged-κ, so the capability bit is
+            // moot. Keep `false` as the safe default.
+            subsample_capable: false,
         };
         let solved = optimize_spatial_length_scale_exact_joint(
             data.view(),
@@ -18973,6 +18981,10 @@ mod tests {
             capability: crate::families::custom_family::ExactOuterDerivativeOrder::Second,
             predicted_hessian_work: 0,
             predicted_gradient_work: 0,
+            // Test-style construction with zero predicted work — these
+            // paths never engage staged-κ, so the capability bit is
+            // moot. Keep `false` as the safe default.
+            subsample_capable: false,
         };
         let solved = optimize_spatial_length_scale_exact_joint(
             data.view(),

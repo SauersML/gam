@@ -10914,6 +10914,11 @@ pub(crate) fn fit_survival_location_scale_terms(
             capability,
             predicted_gradient_work: 0,
             predicted_hessian_work: 0,
+            // Survival location-scale does not consume
+            // `outer_score_subsample` on its outer-only paths; gate the
+            // pilot/polish schedule off so it doesn't allocate masks
+            // that the family will ignore.
+            subsample_capable: false,
         }
     };
     let solved = optimize_spatial_length_scale_exact_joint(

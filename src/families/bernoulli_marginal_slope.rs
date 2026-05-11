@@ -14111,6 +14111,13 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             capability,
             predicted_gradient_work,
             predicted_hessian_work,
+            // BMS overrides `log_likelihood_only_with_options`,
+            // `exact_newton_joint_psi_workspace_with_options`, and the
+            // exact-Newton workspace builders to consume
+            // `outer_score_subsample` with per-row Horvitz-Thompson
+            // weights. The κ pilot/polish staging schedule's per-eval
+            // cost actually drops proportionally to mask size.
+            subsample_capable: true,
         }
     }
 
