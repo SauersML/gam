@@ -5373,19 +5373,21 @@ pub fn reml_laml_evaluate(
                 )
                 .trace_logdet(hop)
             };
-            (
-                idx,
-                outer_gradient_entry(
-                    a_i,
-                    trace_logdet_i,
-                    solution.penalty_logdet.first[idx],
-                    &solution.dispersion,
-                    dp_cgrad,
-                    profiled_scale,
-                    incl_logdet_h,
-                    incl_logdet_s,
-                ),
-            )
+            let value = outer_gradient_entry(
+                a_i,
+                trace_logdet_i,
+                solution.penalty_logdet.first[idx],
+                &solution.dispersion,
+                dp_cgrad,
+                profiled_scale,
+                incl_logdet_h,
+                incl_logdet_s,
+            );
+            eprintln!(
+                "[RHO-GRAD-DBG] idx={} value={:+.6e} a_i={:+.6e} trace_logdet={:+.6e} ld_s_first={:+.6e} incl_h={} incl_s={}",
+                idx, value, a_i, trace_logdet_i, solution.penalty_logdet.first[idx], incl_logdet_h, incl_logdet_s
+            );
+            (idx, value)
         })
         .collect();
     for (idx, value) in rho_grad_entries {
@@ -5454,6 +5456,10 @@ pub fn reml_laml_evaluate(
                 profiled_scale,
                 incl_logdet_h,
                 incl_logdet_s,
+            );
+            eprintln!(
+                "[EXT-GRAD-DBG] ext_idx={} value={:+.6e} coord.a={:+.6e} trace_logdet={:+.6e} ld_s={:+.6e} incl_h={} incl_s={}",
+                ext_idx, value, coord.a, trace_logdet_i, coord.ld_s, incl_logdet_h, incl_logdet_s
             );
             log::info!(
                 "[STAGE] reml_laml ext_coord_trace ext_idx={} elapsed={:.3}s",

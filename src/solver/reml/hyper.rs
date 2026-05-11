@@ -1497,7 +1497,19 @@ impl<'a> RemlState<'a> {
                 )?
                 .dot(&beta_eval)
             };
-            let mut a_j = -u.dot(&x_tau_beta_j) + 0.5 * beta_eval.dot(&s_tau_j.dot(&beta_eval));
+            let term_u_x = -u.dot(&x_tau_beta_j);
+            let term_beta_s = 0.5 * beta_eval.dot(&s_tau_j.dot(&beta_eval));
+            let mut a_j = term_u_x + term_beta_s;
+            {
+                let xtb_norm = x_tau_beta_j.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let beta_norm = beta_eval.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let u_norm = u.iter().map(|v| v * v).sum::<f64>().sqrt();
+                eprintln!(
+                    "[A_J-DBG] j={} a_j={:+.6e} term_u_x={:+.6e} term_beta_s={:+.6e} \
+                     |x_tau_beta|={:.3e} |beta|={:.3e} |u|={:.3e} p_dim={}",
+                    j, a_j, term_u_x, term_beta_s, xtb_norm, beta_norm, u_norm, p_dim
+                );
+            }
             // Firth partial: Φ_{τ_j}|_β = 0.5 tr(I_r^{-1} I_{r,τ_j}).
             let mut firth_tau_kernel_j: Option<FirthTauPartialKernel> = None;
             let mut firth_g_j: Option<Array1<f64>> = None;
@@ -1948,7 +1960,24 @@ impl<'a> RemlState<'a> {
             let x_tau_beta_j = dir.x_tau_original.forward_mul_original(&beta_eval)?;
             let weighted_x_tau_beta_j = &*w_diag * &x_tau_beta_j;
 
-            let mut a_j = -u.dot(&x_tau_beta_j) + 0.5 * beta_eval.dot(&s_tau_j.dot(&beta_eval));
+            let term_u_x = -u.dot(&x_tau_beta_j);
+            let term_beta_s = 0.5 * beta_eval.dot(&s_tau_j.dot(&beta_eval));
+            let mut a_j = term_u_x + term_beta_s;
+            {
+                let xtb_norm = x_tau_beta_j.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let beta_norm = beta_eval.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let u_norm = u.iter().map(|v| v * v).sum::<f64>().sqrt();
+                // Show a few entries of x_tau and beta.
+                let xtb0 = if x_tau_beta_j.len() > 0 { x_tau_beta_j[0] } else { 0.0 };
+                let xtb_last = if !x_tau_beta_j.is_empty() {
+                    x_tau_beta_j[x_tau_beta_j.len() - 1]
+                } else { 0.0 };
+                eprintln!(
+                    "[A_J-ORIG] a_j={:+.6e} term_u_x={:+.6e} term_beta_s={:+.6e} \
+                     |x_tau_beta|={:.3e} |beta|={:.3e} |u|={:.3e} p_dim={} xtb0={:+.3e} xtb_last={:+.3e}",
+                    a_j, term_u_x, term_beta_s, xtb_norm, beta_norm, u_norm, p_dim, xtb0, xtb_last
+                );
+            }
             let mut g_j = dir.x_tau_original.transpose_mul_original(&u)?
                 - self.x().transpose_vector_multiply(&weighted_x_tau_beta_j)
                 - s_tau_j.dot(&beta_eval);
@@ -1981,6 +2010,13 @@ impl<'a> RemlState<'a> {
             };
 
             let ld_s_j = pld.tau_gradient_component(&s_tau_j);
+            {
+                let s_tau_fro = s_tau_j.iter().map(|v| v * v).sum::<f64>().sqrt();
+                eprintln!(
+                    "[LD_S-DBG] ld_s_j={:+.6e} |S_tau|_F={:.3e} p_dim={}",
+                    ld_s_j, s_tau_fro, p_dim
+                );
+            }
             let stored_g_j = if let Some(firth_g_j) = firth_g_j.as_ref() {
                 -&g_j - &(2.0 * firth_g_j)
             } else {

@@ -8315,7 +8315,6 @@ impl BernoulliMarginalSlopeFamily {
             cache,
             row_ctx,
             dir,
-            None,
         )
     }
 
@@ -8326,7 +8325,6 @@ impl BernoulliMarginalSlopeFamily {
         cache: &BernoulliMarginalSlopeExactEvalCache,
         row_ctx: &BernoulliMarginalSlopeRowExactContext,
         dir: &Array1<f64>,
-        row_cell_moments_override: Option<&[CachedDenestedCellMoments]>,
     ) -> Result<Array2<f64>, String> {
         if !self.effective_flex_active(block_states)? {
             // Hit the per-cache uncontracted-tensor cache if it has already
@@ -8389,9 +8387,7 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_uv_dir = Array2::<f64>::zeros((r, r));
 
         let owned_cells;
-        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = row_cell_moments_override {
-            cached
-        } else if let Some(cached) = cache
+        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = cache
             .row_cell_moments
             .as_ref()
             .and_then(|bundle| bundle.row(row, 15))
@@ -9058,7 +9054,6 @@ impl BernoulliMarginalSlopeFamily {
         cache: &BernoulliMarginalSlopeExactEvalCache,
         row_ctx: &BernoulliMarginalSlopeRowExactContext,
         gram: &[f64],
-        row_cell_moments_override: Option<&[CachedDenestedCellMoments]>,
     ) -> Result<Array1<f64>, String> {
         let primary = &cache.primary;
         let r = primary.total;
@@ -9125,9 +9120,7 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_uv = Array2::<f64>::zeros((r, r));
 
         let owned_cells;
-        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = row_cell_moments_override {
-            cached
-        } else if let Some(cached) = cache
+        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = cache
             .row_cell_moments
             .as_ref()
             .and_then(|bundle| bundle.row(row, 15))
@@ -9808,7 +9801,6 @@ impl BernoulliMarginalSlopeFamily {
         row_ctx: &BernoulliMarginalSlopeRowExactContext,
         row_dirs: &[Array1<f64>],
         gram: &[f64],
-        row_cell_moments_override: Option<&[CachedDenestedCellMoments]>,
     ) -> Result<Vec<f64>, String> {
         let primary = &cache.primary;
         let r = primary.total;
@@ -9836,7 +9828,6 @@ impl BernoulliMarginalSlopeFamily {
                 cache,
                 row_ctx,
                 gram,
-                row_cell_moments_override,
             )?;
             let traces = row_dirs
                 .iter()
@@ -9902,9 +9893,7 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_uv_dir = vec![0.0; n_dirs * r * r];
 
         let owned_cells;
-        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = row_cell_moments_override {
-            cached
-        } else if let Some(cached) = cache
+        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = cache
             .row_cell_moments
             .as_ref()
             .and_then(|bundle| bundle.row(row, 15))
@@ -13273,52 +13262,6 @@ impl BernoulliMarginalSlopeFamily {
                         for row in start..end {
                             let local = row - start;
                             let row_ctx = Self::row_ctx(cache, row);
-                            let cached_row_moments = cache
-                                .row_cell_moments
-                                .as_ref()
-                                .and_then(|bundle| bundle.row(row, 15));
-                            let mut owned_row_moments: Option<Vec<CachedDenestedCellMoments>> =
-                                None;
-                            if cached_row_moments.is_none()
-                                && self
-                                    .latent_measure
-                                    .empirical_grid_for_training_row(row)?
-                                    .is_none()
-                            {
-                                let point = self.primary_point_from_block_states(
-                                    row,
-                                    block_states,
-                                    primary,
-                                )?;
-                                let (_q, b, beta_h_owned, beta_w_owned) =
-                                    self.primary_point_components(&point, primary);
-                                let beta_h = beta_h_owned.as_ref();
-                                let beta_w = beta_w_owned.as_ref();
-                                let partitions = self.denested_partition_cells(
-                                    row_ctx.intercept,
-                                    b,
-                                    beta_h,
-                                    beta_w,
-                                )?;
-                                owned_row_moments =
-                                    Some(
-                                        partitions
-                                            .into_iter()
-                                            .map(|partition_cell| {
-                                                self.evaluate_cell_derivative_moments_lru(
-                                                    partition_cell.cell,
-                                                    15,
-                                                )
-                                                .map(|state| CachedDenestedCellMoments {
-                                                    partition_cell,
-                                                    state,
-                                                })
-                                            })
-                                            .collect::<Result<Vec<_>, String>>()?,
-                                    );
-                            }
-                            let row_moments =
-                                cached_row_moments.or_else(|| owned_row_moments.as_deref());
                             let row_dirs = d_beta_flats
                                 .iter()
                                 .map(|d_beta_flat| {
@@ -13336,7 +13279,6 @@ impl BernoulliMarginalSlopeFamily {
                                 cache,
                                 row_ctx,
                                 &row_dirs,
-                                row_moments,
                             )?;
                             for (idx, third) in thirds.iter().enumerate() {
                                 w_mm[idx][local] = third[[0, 0]];
@@ -13372,44 +13314,6 @@ impl BernoulliMarginalSlopeFamily {
                     let row = wr.index;
                     let w = wr.weight;
                     let row_ctx = Self::row_ctx(cache, row);
-                    let cached_row_moments = cache
-                        .row_cell_moments
-                        .as_ref()
-                        .and_then(|bundle| bundle.row(row, 15));
-                    let mut owned_row_moments: Option<Vec<CachedDenestedCellMoments>> = None;
-                    if cached_row_moments.is_none()
-                        && self
-                            .latent_measure
-                            .empirical_grid_for_training_row(row)?
-                            .is_none()
-                    {
-                        let point =
-                            self.primary_point_from_block_states(row, block_states, primary)?;
-                        let (_q, b, beta_h_owned, beta_w_owned) =
-                            self.primary_point_components(&point, primary);
-                        let beta_h = beta_h_owned.as_ref();
-                        let beta_w = beta_w_owned.as_ref();
-                        let partitions =
-                            self.denested_partition_cells(row_ctx.intercept, b, beta_h, beta_w)?;
-                        owned_row_moments = Some(
-                            partitions
-                                .into_iter()
-                                .map(|partition_cell| {
-                                    self.evaluate_cell_derivative_moments_lru(
-                                        partition_cell.cell,
-                                        15,
-                                    )
-                                    .map(|state| {
-                                        CachedDenestedCellMoments {
-                                            partition_cell,
-                                            state,
-                                        }
-                                    })
-                                })
-                                .collect::<Result<Vec<_>, String>>()?,
-                        );
-                    }
-                    let row_moments = cached_row_moments.or_else(|| owned_row_moments.as_deref());
                     let row_dirs = d_beta_flats
                         .iter()
                         .map(|d_beta_flat| {
@@ -13422,7 +13326,6 @@ impl BernoulliMarginalSlopeFamily {
                         cache,
                         row_ctx,
                         &row_dirs,
-                        row_moments,
                     )?;
                     for (idx, third) in thirds.iter_mut().enumerate() {
                         if w != 1.0 {
@@ -15394,7 +15297,6 @@ impl BernoulliMarginalSlopeFamily {
         cache: &BernoulliMarginalSlopeExactEvalCache,
         row_ctx: &BernoulliMarginalSlopeRowExactContext,
         row_dirs: &[Array1<f64>],
-        row_cell_moments_override: Option<&[CachedDenestedCellMoments]>,
     ) -> Result<Vec<Array2<f64>>, String> {
         let primary = &cache.primary;
         let r = primary.total;
@@ -15415,7 +15317,6 @@ impl BernoulliMarginalSlopeFamily {
                     cache,
                     row_ctx,
                     &row_dirs[0],
-                    row_cell_moments_override,
                 )?,
             ]);
         }
@@ -15478,9 +15379,7 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_uv_dir = vec![0.0; n_dirs * r * r];
 
         let owned_cells;
-        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = row_cell_moments_override {
-            cached
-        } else if let Some(cached) = cache
+        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = cache
             .row_cell_moments
             .as_ref()
             .and_then(|bundle| bundle.row(row, 15))
@@ -15946,38 +15845,6 @@ impl BernoulliMarginalSlopeFamily {
         Ok(out)
     }
 
-    fn build_owned_row_cell_moments_for_third(
-        &self,
-        row: usize,
-        block_states: &[ParameterBlockState],
-        primary: &PrimarySlices,
-        row_ctx: &BernoulliMarginalSlopeRowExactContext,
-    ) -> Result<Option<Vec<CachedDenestedCellMoments>>, String> {
-        if self
-            .latent_measure
-            .empirical_grid_for_training_row(row)?
-            .is_some()
-        {
-            return Ok(None);
-        }
-        let point = self.primary_point_from_block_states(row, block_states, primary)?;
-        let (_q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
-        let beta_h = beta_h_owned.as_ref();
-        let beta_w = beta_w_owned.as_ref();
-        let partitions = self.denested_partition_cells(row_ctx.intercept, b, beta_h, beta_w)?;
-        let moments = partitions
-            .into_iter()
-            .map(|partition_cell| {
-                self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 15)
-                    .map(|state| CachedDenestedCellMoments {
-                        partition_cell,
-                        state,
-                    })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        Ok(Some(moments))
-    }
-
     fn batched_rho_correction_logdet_traces_for_rows(
         &self,
         block_states: &[ParameterBlockState],
@@ -16007,23 +15874,6 @@ impl BernoulliMarginalSlopeFamily {
                 |mut acc, wr| -> Result<_, String> {
                     let row = wr.index;
                     let row_ctx = Self::row_ctx(cache, row);
-                    let cached_row_moments = cache
-                        .row_cell_moments
-                        .as_ref()
-                        .and_then(|bundle| bundle.row(row, 15));
-                    let owned_row_moments = if cached_row_moments.is_none()
-                        && self.effective_flex_active(block_states)?
-                    {
-                        self.build_owned_row_cell_moments_for_third(
-                            row,
-                            block_states,
-                            primary,
-                            row_ctx,
-                        )?
-                    } else {
-                        None
-                    };
-                    let row_moments = cached_row_moments.or_else(|| owned_row_moments.as_deref());
                     let mut projection = vec![0.0; primary.total * rank];
                     self.row_factor_primary_projection(
                         row,
@@ -16045,7 +15895,6 @@ impl BernoulliMarginalSlopeFamily {
                             row_ctx,
                             &[row_dir],
                             &gram,
-                            row_moments,
                         )?;
                         acc[0] += wr.weight * row_traces[0];
                         return Ok(acc);
@@ -16056,7 +15905,6 @@ impl BernoulliMarginalSlopeFamily {
                         cache,
                         row_ctx,
                         &gram,
-                        row_moments,
                     )?;
                     for dir_idx in 0..n_dirs {
                         let mut trace = trace_gradient[primary.q]
@@ -16182,23 +16030,6 @@ impl BernoulliMarginalSlopeFamily {
                         gram[primary_idx * primary.total + primary.logslope] = g_tail;
                     }
                     let row_ctx = Self::row_ctx(cache, row);
-                    let cached_row_moments = cache
-                        .row_cell_moments
-                        .as_ref()
-                        .and_then(|bundle| bundle.row(row, 15));
-                    let owned_row_moments = if cached_row_moments.is_none()
-                        && self.effective_flex_active(block_states)?
-                    {
-                        self.build_owned_row_cell_moments_for_third(
-                            row,
-                            block_states,
-                            primary,
-                            row_ctx,
-                        )?
-                    } else {
-                        None
-                    };
-                    let row_moments = cached_row_moments.or_else(|| owned_row_moments.as_deref());
                     if n_dirs == 1 {
                         row_dir.fill(0.0);
                         row_dir[primary.q] = dir_proj_m[[local, 0]];
@@ -16224,7 +16055,6 @@ impl BernoulliMarginalSlopeFamily {
                             row_ctx,
                             std::slice::from_ref(&row_dir),
                             &gram,
-                            row_moments,
                         )?;
                         acc[0] += row_traces[0];
                         continue;
@@ -16235,7 +16065,6 @@ impl BernoulliMarginalSlopeFamily {
                         cache,
                         row_ctx,
                         &gram,
-                        row_moments,
                     )?;
                     for dir_idx in 0..n_dirs {
                         let mut trace = trace_gradient[primary.q] * dir_proj_m[[local, dir_idx]]
@@ -17775,7 +17604,7 @@ mod tests {
             ];
             let many = family
                 .row_primary_third_trace_many_with_moments(
-                    row, &states, &cache, row_ctx, &row_dirs, &gram, None,
+                    row, &states, &cache, row_ctx, &row_dirs, &gram,
                 )
                 .expect("many-direction row trace");
             for (dir_idx, row_dir) in row_dirs.iter().enumerate() {
