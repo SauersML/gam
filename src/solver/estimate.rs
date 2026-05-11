@@ -696,6 +696,14 @@ pub(crate) fn smooth_floor_dp(dp: f64) -> (f64, f64, f64) {
 pub(crate) struct SmoothingCorrectionComputation {
     pub correction: Option<Array2<f64>>,
     pub hessian_rho: Option<Array2<f64>>,
+    /// Identified-subspace rank of the rho-Hessian inverse used to build
+    /// `correction`. `Some(n)` if the matrix was SPD and fully inverted;
+    /// `Some(r)` with `r < n` if the pseudo-inverse dropped non-identified
+    /// directions; `None` when no inversion was attempted or it failed before
+    /// producing a usable V_ρ. Downstream consumers (e.g. auto-cubature)
+    /// use this to decide whether higher-order corrections are even
+    /// meaningful — they aren't when V_ρ is rank-deficient.
+    pub active_rank: Option<usize>,
 }
 
 /// Result of pseudo-inverting the rho-space LAML Hessian on the identified subspace.
@@ -728,7 +736,12 @@ pub(crate) struct InvertedRhoHessian {
     pub repaired_hessian: bool,
     /// Per-eigenvalue classification (length n), aligned with the input matrix's
     /// eigendecomposition order from `eigh`. Used by the [INDEF-HESS] diagnostic.
+    /// Empty on the Cholesky fast path (matrix was SPD, no classification needed).
     pub eigenvalues: Array1<f64>,
+    /// Eigenvectors as columns, aligned with `eigenvalues`. Empty on the Cholesky
+    /// fast path. Carrying these here eliminates a second `eigh` call in the
+    /// `[INDEF-HESS]` diagnostic — the slow path computes them once and shares.
+    pub eigenvectors: Array2<f64>,
     /// Per-eigenvalue classification labels parallel to `eigenvalues`.
     pub classifications: Vec<EigenClassification>,
 }
@@ -772,6 +785,7 @@ fn invert_regularized_rho_hessian(hessian_rho: &Array2<f64>) -> Option<InvertedR
             min_eigenvalue: f64::NAN,
             repaired_hessian: false,
             eigenvalues: Array1::<f64>::zeros(0),
+            eigenvectors: Array2::<f64>::zeros((0, 0)),
             classifications: Vec::new(),
         });
     }
@@ -839,9 +853,25 @@ fn invert_regularized_rho_hessian(hessian_rho: &Array2<f64>) -> Option<InvertedR
         min_eigenvalue,
         repaired_hessian: active_rank < n,
         eigenvalues,
+        eigenvectors,
         classifications,
     })
 }
+
+/// Cosine threshold above which two penalty matrices are treated as the
+/// structural-redundancy signature in [INDEF-HESS] diagnostics. Pairs with
+/// cosine above this AND a dominant-negative eigenvector concentrated on
+/// the pair's antisymmetric direction trigger the headline
+/// `structural_redundancy_detected` line.
+const INDEF_HESS_STRUCTURAL_REDUNDANCY_COS: f64 = 0.999;
+
+/// Penalty-count crossover at which the [INDEF-HESS] pair dump switches from
+/// the full O(k²) grid to top-3 pairs only. Bounds log volume on biobank-scale
+/// rho_dim while keeping the per-pair detail useful for small models.
+const INDEF_HESS_PAIR_DUMP_GRID_MAX_K: usize = 16;
+
+/// Number of top-cosine pairs to dump when `n_pen > INDEF_HESS_PAIR_DUMP_GRID_MAX_K`.
+const INDEF_HESS_PAIR_DUMP_TOP_N: usize = 3;
 
 /// Diagnostic emitted whenever the post-fit rho-Hessian has at least one
 /// non-identified direction (active_rank < n). Reports the eigendecomposition,
@@ -865,24 +895,14 @@ fn dump_indefinite_rho_hessian_diagnostic(
         return;
     }
 
-    // Prefer the eigendecomposition already computed by the inverter; only
-    // recompute if it isn't available (call site without an `InvertedRhoHessian`).
+    // Reuse the eigendecomposition already computed by the inverter when present
+    // (the slow path always populates it). Only recompute on the rare paths
+    // where the diagnostic is called without an `InvertedRhoHessian` (e.g. the
+    // eigendecomposition-failed bail in `compute_smoothing_correction`).
     let (eigenvalues_owned, eigenvectors_owned);
     let (eigenvalues_ref, eigenvectors_ref) = match inverted {
-        Some(inv) if !inv.eigenvalues.is_empty() => {
-            // Need the eigenvectors too; the struct doesn't carry them, so
-            // we still recompute. But we trust the classifications.
-            match hessian_rho.eigh(faer::Side::Lower) {
-                Ok((evals, evecs)) => {
-                    eigenvalues_owned = evals;
-                    eigenvectors_owned = evecs;
-                    (&eigenvalues_owned, &eigenvectors_owned)
-                }
-                Err(err) => {
-                    log::warn!("[INDEF-HESS] eigendecomposition failed: {err}");
-                    return;
-                }
-            }
+        Some(inv) if !inv.eigenvalues.is_empty() && !inv.eigenvectors.is_empty() => {
+            (&inv.eigenvalues, &inv.eigenvectors)
         }
         _ => match hessian_rho.eigh(faer::Side::Lower) {
             Ok((evals, evecs)) => {
@@ -1010,22 +1030,24 @@ fn dump_indefinite_rho_hessian_diagnostic(
         }
     }
 
-    // Headline: structural redundancy detection. Pair cosine > 0.999 AND the
-    // dominant-negative eigenvector concentrates on (i, j) with opposite signs.
-    let mut headline_emitted = false;
+    // Headline: structural redundancy detection. Pair cosine above the
+    // structural-redundancy threshold AND the dominant-negative eigenvector's
+    // top-2 absolute components on indices (i, j) with opposite signs.
     if min_eig < 0.0 && v_neg.len() == n_pen {
         for p in &pairs {
-            if !(p.cos > 0.999) {
+            if !(p.cos > INDEF_HESS_STRUCTURAL_REDUNDANCY_COS) {
                 continue;
             }
-            // Top-2 absolute components of v_neg must be at indices i and j with
-            // opposite signs.
             let mut indexed: Vec<(usize, f64)> = v_neg
                 .iter()
                 .enumerate()
                 .map(|(idx, &val)| (idx, val))
                 .collect();
-            indexed.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+            indexed.sort_by(|a, b| {
+                b.1.abs()
+                    .partial_cmp(&a.1.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             if indexed.len() < 2 {
                 continue;
             }
@@ -1048,15 +1070,13 @@ fn dump_indefinite_rho_hessian_diagnostic(
                 p.cos,
                 p.antisym_proj,
             );
-            headline_emitted = true;
             break;
         }
     }
-    let _ = headline_emitted;
 
-    // Cap output: dump the full grid when small, otherwise only the top-3
+    // Cap output: dump the full grid when small, otherwise only the top-N
     // highest-cosine pairs.
-    if n_pen <= 16 {
+    if n_pen <= INDEF_HESS_PAIR_DUMP_GRID_MAX_K {
         for p in &pairs {
             log::warn!(
                 "[INDEF-HESS] pair=({},{}) cos={:.6} tr_ii={:.4e} tr_jj={:.4e} v_neg[i]-v_neg[j]/sqrt2={:.4e}",
@@ -1072,8 +1092,13 @@ fn dump_indefinite_rho_hessian_diagnostic(
         // keep the diagnostic O(k). The headline pair already captures intent.
     } else {
         let mut top: Vec<&PairCos> = pairs.iter().filter(|p| p.cos.is_finite()).collect();
-        top.sort_by(|a, b| b.cos.abs().partial_cmp(&a.cos.abs()).unwrap_or(std::cmp::Ordering::Equal));
-        for p in top.iter().take(3) {
+        top.sort_by(|a, b| {
+            b.cos
+                .abs()
+                .partial_cmp(&a.cos.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for p in top.iter().take(INDEF_HESS_PAIR_DUMP_TOP_N) {
             log::warn!(
                 "[INDEF-HESS] top_pair=({},{}) cos={:.6} tr_ii={:.4e} tr_jj={:.4e} v_neg[i]-v_neg[j]/sqrt2={:.4e}",
                 p.i,
@@ -1099,6 +1124,7 @@ fn compute_smoothing_correction(
         return SmoothingCorrectionComputation {
             correction: None,
             hessian_rho: None,
+            active_rank: None,
         };
     }
 
@@ -1137,6 +1163,7 @@ fn compute_smoothing_correction(
             return SmoothingCorrectionComputation {
                 correction: None,
                 hessian_rho: None,
+                active_rank: None,
             };
         }
     };
@@ -1187,6 +1214,7 @@ fn compute_smoothing_correction(
             return SmoothingCorrectionComputation {
                 correction: None,
                 hessian_rho: None,
+                active_rank: None,
             };
         }
     };
@@ -1213,6 +1241,7 @@ fn compute_smoothing_correction(
             return SmoothingCorrectionComputation {
                 correction: None,
                 hessian_rho: Some(hessian_rho),
+                active_rank: None,
             };
         }
     };
@@ -1239,6 +1268,7 @@ fn compute_smoothing_correction(
         return SmoothingCorrectionComputation {
             correction: None,
             hessian_rho: Some(hessian_rho),
+            active_rank: Some(0),
         };
     }
 
@@ -1261,6 +1291,7 @@ fn compute_smoothing_correction(
     }
 
     let repaired_hessian = inverted.repaired_hessian;
+    let active_rank_used = inverted.active_rank;
     let v_rho = inverted.inverse;
     if repaired_hessian {
         log::debug!(
@@ -1291,6 +1322,7 @@ fn compute_smoothing_correction(
         return SmoothingCorrectionComputation {
             correction: None,
             hessian_rho: Some(hessian_rho),
+            active_rank: Some(active_rank_used),
         };
     }
 
@@ -1319,6 +1351,7 @@ fn compute_smoothing_correction(
                 return SmoothingCorrectionComputation {
                     correction: None,
                     hessian_rho: Some(hessian_rho),
+                    active_rank: Some(active_rank_used),
                 };
             }
             if min_eig < 0.0 {
@@ -1335,6 +1368,7 @@ fn compute_smoothing_correction(
                 return SmoothingCorrectionComputation {
                     correction: Some(result),
                     hessian_rho: Some(hessian_rho),
+                    active_rank: Some(active_rank_used),
                 };
             }
         }
@@ -1345,6 +1379,7 @@ fn compute_smoothing_correction(
     SmoothingCorrectionComputation {
         correction: Some(v_corr_orig),
         hessian_rho: Some(hessian_rho),
+        active_rank: Some(active_rank_used),
     }
 }
 
@@ -6565,6 +6600,39 @@ mod invert_regularized_rho_hessian_tests {
     #[allow(dead_code)]
     fn _array1_use() -> Array1<f64> {
         Array1::<f64>::zeros(0)
+    }
+
+    /// The slow eigendecomposition path must populate `eigenvalues` AND
+    /// `eigenvectors` so the [INDEF-HESS] diagnostic doesn't have to recompute
+    /// `eigh` redundantly. The Cholesky fast path leaves both empty since the
+    /// diagnostic isn't invoked when the matrix is SPD.
+    #[test]
+    fn slow_path_populates_eigenvalues_and_eigenvectors() {
+        let (a, _q) = build_with_spectrum(&[10.0, 5.0, 2.0, -0.066]);
+        let inv = invert_regularized_rho_hessian(&a).expect("invert");
+        assert!(inv.repaired_hessian);
+        assert_eq!(inv.eigenvalues.len(), 4);
+        assert_eq!(inv.eigenvectors.shape(), &[4, 4]);
+        assert_eq!(inv.classifications.len(), 4);
+        // Eigenvectors are unit-norm and pairwise orthogonal.
+        for j in 0..4 {
+            let v = inv.eigenvectors.column(j);
+            let nrm: f64 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+            assert!(
+                (nrm - 1.0).abs() < 1e-9,
+                "eigenvector {j} not unit-norm: ‖v‖={nrm}"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_path_leaves_eigendecomp_fields_empty() {
+        let (a, _q) = build_with_spectrum(&[10.0, 5.0, 2.0, 1.0]);
+        let inv = invert_regularized_rho_hessian(&a).expect("invert");
+        assert!(!inv.repaired_hessian);
+        assert!(inv.eigenvalues.is_empty());
+        assert!(inv.eigenvectors.is_empty());
+        assert!(inv.classifications.is_empty());
     }
 }
 
