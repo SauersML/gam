@@ -373,80 +373,91 @@ pub fn build_row_kernel_cache<const K: usize>(
 
 // ── Generic assembly functions ───────────────────────────────────────
 
-/// Hessian–vector product: H · v = Σ_i Jᵢᵀ Hᵢ Jᵢ v.
+/// Hessian–vector product: H · v = Σ_i w_i · Jᵢᵀ Hᵢ Jᵢ v over `rows`.
 ///
-/// Uses cached row Hessians. No dense p×p matrix is formed.
+/// Uses cached row Hessians. No dense p×p matrix is formed. Each row
+/// contributes its `RowSet` HT weight (`1.0` for `All`, `1/π_i` for
+/// `Subsample`), so the sum is an unbiased estimator of the full-data
+/// Hessian–vector product.
 pub fn row_kernel_hessian_matvec<const K: usize>(
     kern: &(impl RowKernel<K> + ?Sized),
     cache: &RowKernelCache<K>,
+    rows: &RowSet,
     direction: &[f64],
 ) -> Array1<f64> {
     let p = cache.p;
-    let out = (0..cache.n)
-        .into_par_iter()
-        .fold(
-            || vec![0.0_f64; p],
-            |mut acc, row| {
-                // Project to K-dim primary space
-                let dir_k = kern.jacobian_action(row, direction);
-                // Apply K×K row Hessian
-                let h = &cache.hessians[row];
-                let mut action = [0.0_f64; K];
-                for a in 0..K {
-                    let mut s = 0.0;
-                    for b in 0..K {
-                        s += h[a][b] * dir_k[b];
-                    }
-                    action[a] = s;
+    let out = rows.par_reduce_fold(
+        cache.n,
+        || vec![0.0_f64; p],
+        |mut acc, row, w| {
+            // Project to K-dim primary space
+            let dir_k = kern.jacobian_action(row, direction);
+            // Apply K×K row Hessian, scaled by HT weight
+            let h = &cache.hessians[row];
+            let mut action = [0.0_f64; K];
+            for a in 0..K {
+                let mut s = 0.0;
+                for b in 0..K {
+                    s += h[a][b] * dir_k[b];
                 }
-                // Pull back to coefficient space
-                kern.jacobian_transpose_action(row, &action, &mut acc);
-                acc
-            },
-        )
-        .reduce(
-            || vec![0.0; p],
-            |mut a, b| {
-                for i in 0..a.len() {
-                    a[i] += b[i];
-                }
-                a
-            },
-        );
+                action[a] = w * s;
+            }
+            // Pull back to coefficient space
+            kern.jacobian_transpose_action(row, &action, &mut acc);
+            acc
+        },
+        |mut a, b| {
+            for i in 0..a.len() {
+                a[i] += b[i];
+            }
+            a
+        },
+    );
     Array1::from_vec(out)
 }
 
-/// Diagonal of the Hessian: diag(H) = Σ_i diag(Jᵢᵀ Hᵢ Jᵢ).
+/// Diagonal of the Hessian: diag(H) = Σ_i w_i · diag(Jᵢᵀ Hᵢ Jᵢ) over `rows`.
 ///
 /// Uses cached row Hessians and the family's sparse-aware diagonal
 /// accumulation. No dense p×p matrix is formed.
 pub fn row_kernel_hessian_diagonal<const K: usize>(
     kern: &(impl RowKernel<K> + ?Sized),
     cache: &RowKernelCache<K>,
+    rows: &RowSet,
 ) -> Array1<f64> {
     let p = cache.p;
-    let out = (0..cache.n)
-        .into_par_iter()
-        .fold(
-            || vec![0.0_f64; p],
-            |mut diag, row| {
+    let out = rows.par_reduce_fold(
+        cache.n,
+        || vec![0.0_f64; p],
+        |mut diag, row, w| {
+            if w == 1.0 {
                 kern.add_diagonal_quadratic(row, &cache.hessians[row], &mut diag);
-                diag
-            },
-        )
-        .reduce(
-            || vec![0.0; p],
-            |mut a, b| {
-                for i in 0..a.len() {
-                    a[i] += b[i];
+            } else {
+                // Multiply each row Hessian entry by HT weight before
+                // contributing to the diagonal — equivalent to scaling
+                // the resulting diag contributions by `w`.
+                let h = &cache.hessians[row];
+                let mut scaled = [[0.0_f64; K]; K];
+                for a in 0..K {
+                    for b in 0..K {
+                        scaled[a][b] = w * h[a][b];
+                    }
                 }
-                a
-            },
-        );
+                kern.add_diagonal_quadratic(row, &scaled, &mut diag);
+            }
+            diag
+        },
+        |mut a, b| {
+            for i in 0..a.len() {
+                a[i] += b[i];
+            }
+            a
+        },
+    );
     Array1::from_vec(out)
 }
 
-/// Gradient assembly: g = Σ_i Jᵢᵀ gᵢ.
+/// Gradient assembly: g = Σ_i w_i · Jᵢᵀ gᵢ over `rows`.
 ///
 /// Uses cached row gradients and the family's sparse-aware adjoint.
 /// The returned gradient is the negative log-likelihood gradient
@@ -454,35 +465,50 @@ pub fn row_kernel_hessian_diagonal<const K: usize>(
 pub fn row_kernel_gradient<const K: usize>(
     kern: &(impl RowKernel<K> + ?Sized),
     cache: &RowKernelCache<K>,
+    rows: &RowSet,
 ) -> Array1<f64> {
     let p = cache.p;
-    let out = (0..cache.n)
-        .into_par_iter()
-        .fold(
-            || vec![0.0_f64; p],
-            |mut acc, row| {
+    let out = rows.par_reduce_fold(
+        cache.n,
+        || vec![0.0_f64; p],
+        |mut acc, row, w| {
+            if w == 1.0 {
                 kern.jacobian_transpose_action(row, &cache.gradients[row], &mut acc);
-                acc
-            },
-        )
-        .reduce(
-            || vec![0.0; p],
-            |mut a, b| {
-                for i in 0..a.len() {
-                    a[i] += b[i];
+            } else {
+                let g = &cache.gradients[row];
+                let mut scaled = [0.0_f64; K];
+                for a in 0..K {
+                    scaled[a] = w * g[a];
                 }
-                a
-            },
-        );
+                kern.jacobian_transpose_action(row, &scaled, &mut acc);
+            }
+            acc
+        },
+        |mut a, b| {
+            for i in 0..a.len() {
+                a[i] += b[i];
+            }
+            a
+        },
+    );
     Array1::from_vec(out)
 }
 
-/// Log-likelihood from cached row kernels: ℓ = -Σ_i nll_i.
-pub fn row_kernel_log_likelihood<const K: usize>(cache: &RowKernelCache<K>) -> f64 {
-    -cache.nll.iter().sum::<f64>()
+/// Log-likelihood from cached row kernels: ℓ = -Σ_i w_i · nll_i over `rows`.
+pub fn row_kernel_log_likelihood<const K: usize>(
+    cache: &RowKernelCache<K>,
+    rows: &RowSet,
+) -> f64 {
+    let total = rows.par_reduce_fold(
+        cache.n,
+        || 0.0_f64,
+        |acc, row, w| acc + w * cache.nll[row],
+        |a, b| a + b,
+    );
+    -total
 }
 
-/// Dense Hessian assembly: H = Σ_i Jᵢᵀ Hᵢ Jᵢ.
+/// Dense Hessian assembly: H = Σ_i w_i · Jᵢᵀ Hᵢ Jᵢ over `rows`.
 ///
 /// Uses cached row Hessians and the family's sparse-aware pullback.
 /// Only needed for inference paths (ALO, posterior covariance) that
@@ -490,76 +516,110 @@ pub fn row_kernel_log_likelihood<const K: usize>(cache: &RowKernelCache<K>) -> f
 pub fn row_kernel_hessian_dense<const K: usize>(
     kern: &(impl RowKernel<K> + ?Sized),
     cache: &RowKernelCache<K>,
+    rows: &RowSet,
 ) -> Array2<f64> {
     let p = cache.p;
-    (0..cache.n)
-        .into_par_iter()
-        .fold(
-            || Array2::<f64>::zeros((p, p)),
-            |mut acc, row| {
+    rows.par_reduce_fold(
+        cache.n,
+        || Array2::<f64>::zeros((p, p)),
+        |mut acc, row, w| {
+            if w == 1.0 {
                 kern.add_pullback_hessian(row, &cache.hessians[row], &mut acc);
-                acc
-            },
-        )
-        .reduce(|| Array2::zeros((p, p)), |a, b| a + b)
+            } else {
+                let h = &cache.hessians[row];
+                let mut scaled = [[0.0_f64; K]; K];
+                for a in 0..K {
+                    for b in 0..K {
+                        scaled[a][b] = w * h[a][b];
+                    }
+                }
+                kern.add_pullback_hessian(row, &scaled, &mut acc);
+            }
+            acc
+        },
+        |a, b| a + b,
+    )
 }
 
-/// First directional derivative of the Hessian: ∂H/∂β[d_beta].
+/// First directional derivative of the Hessian: ∂H/∂β[d_beta] over `rows`.
 ///
 /// For each row, computes the third-order contracted derivative in
 /// primary space, then pulls back to coefficient space. Returns a
-/// dense p×p matrix consumed by the REML outer gradient.
+/// dense p×p matrix consumed by the REML outer gradient. Per-row
+/// contributions are HT-weighted.
 pub fn row_kernel_directional_derivative<const K: usize>(
     kern: &(impl RowKernel<K> + ?Sized),
+    rows: &RowSet,
     d_beta: &[f64],
 ) -> Result<Array2<f64>, String> {
     let n = kern.n_rows();
     let p = kern.n_coefficients();
-    (0..n)
-        .into_par_iter()
-        .try_fold(
-            || Array2::<f64>::zeros((p, p)),
-            |mut acc, row| -> Result<_, String> {
-                let dir_k = kern.jacobian_action(row, d_beta);
-                let third = kern.row_third_contracted(row, &dir_k)?;
+    rows.par_try_reduce_fold(
+        n,
+        || Array2::<f64>::zeros((p, p)),
+        |mut acc, row, w| -> Result<_, String> {
+            let dir_k = kern.jacobian_action(row, d_beta);
+            let third = kern.row_third_contracted(row, &dir_k)?;
+            if w == 1.0 {
                 kern.add_pullback_hessian(row, &third, &mut acc);
-                Ok(acc)
-            },
-        )
-        .try_reduce(|| Array2::zeros((p, p)), |a, b| Ok(a + b))
+            } else {
+                let mut scaled = [[0.0_f64; K]; K];
+                for a in 0..K {
+                    for b in 0..K {
+                        scaled[a][b] = w * third[a][b];
+                    }
+                }
+                kern.add_pullback_hessian(row, &scaled, &mut acc);
+            }
+            Ok(acc)
+        },
+        |a, b| Ok(a + b),
+    )
 }
 
-/// Second directional derivative of the Hessian: ∂²H/∂β²[d_u, d_v].
+/// Second directional derivative of the Hessian: ∂²H/∂β²[d_u, d_v] over `rows`.
 ///
 /// For each row, computes the fourth-order contracted derivative in
 /// primary space, then pulls back to coefficient space. Returns a
-/// dense p×p matrix consumed by the REML outer Hessian.
+/// dense p×p matrix consumed by the REML outer Hessian. Per-row
+/// contributions are HT-weighted.
 pub fn row_kernel_second_directional_derivative<const K: usize>(
     kern: &(impl RowKernel<K> + ?Sized),
+    rows: &RowSet,
     d_beta_u: &[f64],
     d_beta_v: &[f64],
 ) -> Result<Array2<f64>, String> {
     let n = kern.n_rows();
     let p = kern.n_coefficients();
-    (0..n)
-        .into_par_iter()
-        .try_fold(
-            || Array2::<f64>::zeros((p, p)),
-            |mut acc, row| -> Result<_, String> {
-                let dir_u = kern.jacobian_action(row, d_beta_u);
-                let dir_v = kern.jacobian_action(row, d_beta_v);
-                let fourth = kern.row_fourth_contracted(row, &dir_u, &dir_v)?;
+    rows.par_try_reduce_fold(
+        n,
+        || Array2::<f64>::zeros((p, p)),
+        |mut acc, row, w| -> Result<_, String> {
+            let dir_u = kern.jacobian_action(row, d_beta_u);
+            let dir_v = kern.jacobian_action(row, d_beta_v);
+            let fourth = kern.row_fourth_contracted(row, &dir_u, &dir_v)?;
+            if w == 1.0 {
                 kern.add_pullback_hessian(row, &fourth, &mut acc);
-                Ok(acc)
-            },
-        )
-        .try_reduce(|| Array2::zeros((p, p)), |a, b| Ok(a + b))
+            } else {
+                let mut scaled = [[0.0_f64; K]; K];
+                for a in 0..K {
+                    for b in 0..K {
+                        scaled[a][b] = w * fourth[a][b];
+                    }
+                }
+                kern.add_pullback_hessian(row, &scaled, &mut acc);
+            }
+            Ok(acc)
+        },
+        |a, b| Ok(a + b),
+    )
 }
 
 struct RowKernelDirectionalDerivativeOperator<const K: usize, T: RowKernel<K>> {
     kern: Arc<T>,
     direction: Vec<f64>,
     p: usize,
+    rows: RowSet,
 }
 
 impl<const K: usize, T: RowKernel<K>> HyperOperator
@@ -573,37 +633,33 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
         let direction = v
             .as_slice()
             .expect("row-kernel directional derivative operator requires contiguous input");
-        let out = (0..self.kern.n_rows())
-            .into_par_iter()
-            .fold(
-                || vec![0.0_f64; self.p],
-                |mut acc, row| {
-                    let dir_k = self.kern.jacobian_action(row, &self.direction);
-                    let vec_k = self.kern.jacobian_action(row, direction);
-                    let third = self.kern.row_third_contracted(row, &dir_k).expect(
-                        "row-kernel third contraction should succeed for validated directions",
-                    );
-                    let mut action = [0.0_f64; K];
-                    for a in 0..K {
-                        let mut sum = 0.0;
-                        for b in 0..K {
-                            sum += third[a][b] * vec_k[b];
-                        }
-                        action[a] = sum;
+        let out = self.rows.par_reduce_fold(
+            self.kern.n_rows(),
+            || vec![0.0_f64; self.p],
+            |mut acc, row, w| {
+                let dir_k = self.kern.jacobian_action(row, &self.direction);
+                let vec_k = self.kern.jacobian_action(row, direction);
+                let third = self.kern.row_third_contracted(row, &dir_k).expect(
+                    "row-kernel third contraction should succeed for validated directions",
+                );
+                let mut action = [0.0_f64; K];
+                for a in 0..K {
+                    let mut sum = 0.0;
+                    for b in 0..K {
+                        sum += third[a][b] * vec_k[b];
                     }
-                    self.kern.jacobian_transpose_action(row, &action, &mut acc);
-                    acc
-                },
-            )
-            .reduce(
-                || vec![0.0_f64; self.p],
-                |mut left, right| {
-                    for idx in 0..left.len() {
-                        left[idx] += right[idx];
-                    }
-                    left
-                },
-            );
+                    action[a] = w * sum;
+                }
+                self.kern.jacobian_transpose_action(row, &action, &mut acc);
+                acc
+            },
+            |mut left, right| {
+                for idx in 0..left.len() {
+                    left[idx] += right[idx];
+                }
+                left
+            },
+        );
         Array1::from_vec(out)
     }
 
@@ -669,7 +725,7 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
     }
 
     fn to_dense(&self) -> Array2<f64> {
-        row_kernel_directional_derivative(&*self.kern, &self.direction)
+        row_kernel_directional_derivative(&*self.kern, &self.rows, &self.direction)
             .expect("row-kernel directional derivative dense materialization should succeed")
     }
 
@@ -752,9 +808,10 @@ impl<const K: usize, T: RowKernel<K>> RowKernelDirectionalDerivativeOperator<K, 
         debug_assert_eq!(jf.dim(), (n_rows, K * rank));
         let direction = self.direction.as_slice();
 
-        (0..n_rows)
-            .into_par_iter()
-            .map(|row| -> f64 {
+        self.rows.par_reduce_fold(
+            n_rows,
+            || 0.0_f64,
+            |acc, row, w| {
                 let dir_k = self.kern.jacobian_action(row, direction);
                 let third = self
                     .kern
@@ -786,9 +843,10 @@ impl<const K: usize, T: RowKernel<K>> RowKernelDirectionalDerivativeOperator<K, 
                         row_total += third[a][b] * gram[a][b];
                     }
                 }
-                row_total
-            })
-            .sum()
+                acc + w * row_total
+            },
+            |a, b| a + b,
+        )
     }
 }
 
@@ -797,6 +855,7 @@ struct RowKernelSecondDirectionalDerivativeOperator<const K: usize, T: RowKernel
     direction_u: Vec<f64>,
     direction_v: Vec<f64>,
     p: usize,
+    rows: RowSet,
 }
 
 impl<const K: usize, T: RowKernel<K>> HyperOperator
@@ -810,38 +869,34 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
         let direction = v
             .as_slice()
             .expect("row-kernel second directional derivative operator requires contiguous input");
-        let out = (0..self.kern.n_rows())
-            .into_par_iter()
-            .fold(
-                || vec![0.0_f64; self.p],
-                |mut acc, row| {
-                    let dir_u = self.kern.jacobian_action(row, &self.direction_u);
-                    let dir_v = self.kern.jacobian_action(row, &self.direction_v);
-                    let vec_k = self.kern.jacobian_action(row, direction);
-                    let fourth = self.kern.row_fourth_contracted(row, &dir_u, &dir_v).expect(
-                        "row-kernel fourth contraction should succeed for validated directions",
-                    );
-                    let mut action = [0.0_f64; K];
-                    for a in 0..K {
-                        let mut sum = 0.0;
-                        for b in 0..K {
-                            sum += fourth[a][b] * vec_k[b];
-                        }
-                        action[a] = sum;
+        let out = self.rows.par_reduce_fold(
+            self.kern.n_rows(),
+            || vec![0.0_f64; self.p],
+            |mut acc, row, w| {
+                let dir_u = self.kern.jacobian_action(row, &self.direction_u);
+                let dir_v = self.kern.jacobian_action(row, &self.direction_v);
+                let vec_k = self.kern.jacobian_action(row, direction);
+                let fourth = self.kern.row_fourth_contracted(row, &dir_u, &dir_v).expect(
+                    "row-kernel fourth contraction should succeed for validated directions",
+                );
+                let mut action = [0.0_f64; K];
+                for a in 0..K {
+                    let mut sum = 0.0;
+                    for b in 0..K {
+                        sum += fourth[a][b] * vec_k[b];
                     }
-                    self.kern.jacobian_transpose_action(row, &action, &mut acc);
-                    acc
-                },
-            )
-            .reduce(
-                || vec![0.0_f64; self.p],
-                |mut left, right| {
-                    for idx in 0..left.len() {
-                        left[idx] += right[idx];
-                    }
-                    left
-                },
-            );
+                    action[a] = w * sum;
+                }
+                self.kern.jacobian_transpose_action(row, &action, &mut acc);
+                acc
+            },
+            |mut left, right| {
+                for idx in 0..left.len() {
+                    left[idx] += right[idx];
+                }
+                left
+            },
+        );
         Array1::from_vec(out)
     }
 
@@ -883,8 +938,13 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
     }
 
     fn to_dense(&self) -> Array2<f64> {
-        row_kernel_second_directional_derivative(&*self.kern, &self.direction_u, &self.direction_v)
-            .expect("row-kernel second directional derivative dense materialization should succeed")
+        row_kernel_second_directional_derivative(
+            &*self.kern,
+            &self.rows,
+            &self.direction_u,
+            &self.direction_v,
+        )
+        .expect("row-kernel second directional derivative dense materialization should succeed")
     }
 
     fn is_implicit(&self) -> bool {
@@ -938,9 +998,10 @@ impl<const K: usize, T: RowKernel<K>> RowKernelSecondDirectionalDerivativeOperat
         let direction_u = self.direction_u.as_slice();
         let direction_v = self.direction_v.as_slice();
 
-        (0..n_rows)
-            .into_par_iter()
-            .map(|row| -> f64 {
+        self.rows.par_reduce_fold(
+            n_rows,
+            || 0.0_f64,
+            |acc, row, w| {
                 let dir_u = self.kern.jacobian_action(row, direction_u);
                 let dir_v = self.kern.jacobian_action(row, direction_v);
                 let fourth = self.kern.row_fourth_contracted(row, &dir_u, &dir_v).expect(
@@ -971,9 +1032,10 @@ impl<const K: usize, T: RowKernel<K>> RowKernelSecondDirectionalDerivativeOperat
                         row_total += fourth[a][b] * gram[a][b];
                     }
                 }
-                row_total
-            })
-            .sum()
+                acc + w * row_total
+            },
+            |a, b| a + b,
+        )
     }
 }
 
@@ -990,7 +1052,7 @@ pub struct RowKernelHessianWorkspace<const K: usize, T: RowKernel<K>> {
 impl<const K: usize, T: RowKernel<K>> RowKernelHessianWorkspace<K, T> {
     pub fn new(kern: T) -> Result<Self, String> {
         let kern = Arc::new(kern);
-        let cache = build_row_kernel_cache(&*kern)?;
+        let cache = build_row_kernel_cache(&*kern, &RowSet::All)?;
         // Higher-order jet caches (third/fourth contracted) are NOT primed
         // here. PIRLS reuses this same workspace constructor for plain
         // gradient/Hessian evaluations and never touches `row_third_contracted`,
