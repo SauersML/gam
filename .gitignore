@@ -91,6 +91,7 @@ gamfit/*.dSYM/
 
 # MkDocs / docs build output
 site/
+.cache/
 
 # Lean/Lake build artifacts
 .lake/

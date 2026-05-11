@@ -1,0 +1,112 @@
+/* gamfit docs — editorial polish on top of mkdocs-material. */
+
+/* -------------------------------------------------------------- */
+/* Hero section (used on the landing page).                        */
+/* -------------------------------------------------------------- */
+
+.gamfit-hero {
+  text-align: center;
+  padding: 2.5rem 1rem 2rem;
+  margin: 0 auto 2rem;
+  max-width: 48rem;
+  border-bottom: 1px solid var(--md-default-fg-color--lightest);
+}
+
+.gamfit-hero h1 {
+  font-size: 2.4rem;
+  line-height: 1.15;
+  font-weight: 700;
+  margin: 0 0 0.6rem;
+  letter-spacing: -0.01em;
+}
+
+.gamfit-hero .gamfit-tagline {
+  font-size: 1.05rem;
+  line-height: 1.55;
+  color: var(--md-default-fg-color--light);
+  max-width: 36rem;
+  margin: 0 auto 1.6rem;
+}
+
+.gamfit-hero .gamfit-cta {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.6rem;
+  margin-top: 0.6rem;
+}
+
+.gamfit-hero .gamfit-cta .md-button {
+  margin: 0;
+}
+
+/* Drop the auto-generated H1 from the page title when the hero is present. */
+.gamfit-hero + h1,
+.md-typeset .gamfit-hero ~ h1:first-of-type {
+  /* Leave intact — Material still generates the heading anchor we rely on. */
+}
+
+/* -------------------------------------------------------------- */
+/* Tables — tighter, more editorial.                               */
+/* -------------------------------------------------------------- */
+
+.md-typeset table:not([class]) {
+  font-size: 0.78rem;
+  line-height: 1.5;
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-collapse: separate;
+  border-spacing: 0;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.md-typeset table:not([class]) th {
+  background: var(--md-default-fg-color--lightest);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  padding: 0.55em 0.9em;
+  border-bottom: 1px solid var(--md-default-fg-color--lightest);
+}
+
+.md-typeset table:not([class]) td {
+  padding: 0.5em 0.9em;
+  border-top: 1px solid var(--md-default-fg-color--lightest);
+}
+
+.md-typeset table:not([class]) tr:first-child td {
+  border-top: none;
+}
+
+/* -------------------------------------------------------------- */
+/* Code blocks — subtle accent stripe.                             */
+/* -------------------------------------------------------------- */
+
+.md-typeset pre > code,
+.md-typeset .highlight pre {
+  border-left: 3px solid var(--md-primary-fg-color);
+}
+
+.md-typeset .highlight {
+  border-radius: 4px;
+}
+
+/* Inline code: a touch more contrast without going neon. */
+.md-typeset code {
+  font-size: 0.86em;
+  padding: 0.12em 0.32em;
+}
+
+/* -------------------------------------------------------------- */
+/* mkdocstrings symbol blocks — give them a little air.            */
+/* -------------------------------------------------------------- */
+
+.md-typeset .doc-heading {
+  margin-top: 1.75rem;
+}
+
+.md-typeset .doc-contents {
+  padding-left: 0.25rem;
+  border-left: 1px solid var(--md-default-fg-color--lightest);
+  margin-left: 0;
+  padding-left: 1rem;
+}
