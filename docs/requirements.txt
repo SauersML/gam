@@ -6,3 +6,8 @@ griffe-inherited-docstrings>=1.0
 pymdown-extensions>=10.7
 # Used by mkdocstrings to format auto-generated function signatures.
 ruff>=0.6
+# Material's `social` plugin renders OG cards via Cairo + Pillow. Only
+# exercised when CI=true (see mkdocs.yml); listed unconditionally so RTD has
+# them available.
+cairosvg>=2.7
+pillow>=10.0
