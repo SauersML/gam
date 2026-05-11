@@ -1490,7 +1490,14 @@ impl SavedAnchoredDeviationRuntime {
                     m_dense[[i, j]] = v;
                 }
             }
-            let subtract = anchor_rows.dot(&m_dense);
+            // Effective subtraction is `n_anchor_rows · R · M` where R is
+            // the orthonormalising rotation. In the current construction R
+            // is baked into M (the saved rotation is identity and omitted),
+            // so the rotation step is a no-op; keep the multiplication
+            // explicit so a future non-identity persisted rotation is
+            // honoured automatically.
+            let rotated_anchor = self.rotated_anchor_rows(anchor_rows, d)?;
+            let subtract = rotated_anchor.dot(&m_dense);
             out = out - subtract;
         } else if anchor_rows.ncols() != 0 {
             return Err(format!(
@@ -1537,7 +1544,48 @@ impl SavedAnchoredDeviationRuntime {
                 m_dense[[i, j]] = v;
             }
         }
-        Ok(Some(n_anchor_rows.dot(&m_dense)))
+        // The effective correction is `n_anchor_rows · R · M` where R is
+        // the orthonormalising rotation. Rotation is identity in the
+        // current construction (omitted from the saved payload); we keep
+        // the explicit multiplication so a future non-identity rotation
+        // works without further plumbing.
+        let rotated = self.rotated_anchor_rows(n_anchor_rows, d)?;
+        Ok(Some(rotated.dot(&m_dense)))
+    }
+
+    /// Apply the orthonormalising rotation `R` (d × d) to a row-major
+    /// anchor matrix `N` (n × d). Returns `N` unchanged when no rotation
+    /// is persisted (the identity case) and `N · R` otherwise.
+    fn rotated_anchor_rows(
+        &self,
+        n_anchor_rows: ndarray::ArrayView2<f64>,
+        d: usize,
+    ) -> Result<Array2<f64>, String> {
+        let Some(rot_rows) = self.anchor_residual_rotation.as_ref() else {
+            return Ok(n_anchor_rows.to_owned());
+        };
+        if rot_rows.len() != d {
+            return Err(format!(
+                "rotated_anchor_rows: rotation has {} rows, expected {}",
+                rot_rows.len(),
+                d,
+            ));
+        }
+        let mut rotation = Array2::<f64>::zeros((d, d));
+        for (i, row) in rot_rows.iter().enumerate() {
+            if row.len() != d {
+                return Err(format!(
+                    "rotated_anchor_rows: rotation row {} has length {}, expected {}",
+                    i,
+                    row.len(),
+                    d,
+                ));
+            }
+            for (j, &v) in row.iter().enumerate() {
+                rotation[[i, j]] = v;
+            }
+        }
+        Ok(n_anchor_rows.dot(&rotation))
     }
 
     pub fn first_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {

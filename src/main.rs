@@ -1475,6 +1475,13 @@ fn run_fit_bernoulli_marginal_slope(
                 "[PHASE] bernoulli-margslope fit end elapsed={:.3}s",
                 phase_start.elapsed().as_secs_f64()
             );
+            for w in &result.cross_block_warnings {
+                println!(
+                    "WARNING: cross-block identifiability dropped flex block '{}' \
+                     (anchors: {}). {}",
+                    w.candidate_label, w.anchor_summary, w.reason
+                );
+            }
             result
         }
         Ok(_) => {
