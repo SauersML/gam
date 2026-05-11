@@ -14208,11 +14208,15 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
         if !self.effective_flex_active(block_states)? && !self.flex_timewiggle_active() {
-            // Rigid path: RowKernel<4> operator. The rigid path does not yet
-            // have a subsample-aware cache, so options are currently ignored
-            // here (full-data behavior preserved bit-for-bit).
+            // Rigid path: RowKernel<4> operator wired through the supplied
+            // `RowSet`. The cache and every assembly function honour the
+            // mask uniformly through the Horvitz–Thompson weights on each
+            // `WeightedOuterRow`.
             let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
-            return Ok(Some(Arc::new(RowKernelHessianWorkspace::new(kern)?)));
+            let rows = crate::families::row_kernel::RowSet::from_options(options, self.n);
+            return Ok(Some(Arc::new(RowKernelHessianWorkspace::with_rows(
+                kern, rows,
+            )?)));
         }
         // Flex / timewiggle path: store the options on the workspace so the
         // directional-derivative methods can pick up the outer-row subsample.
