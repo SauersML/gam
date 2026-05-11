@@ -93,15 +93,125 @@ impl RowSet {
     ///   — the full sum is its own unbiased estimator).
     /// * `Subsample` yields each `WeightedOuterRow`'s `(index, weight)`.
     ///
-    /// Returns a `Vec` for now; Agent C will switch the row-kernel hot
-    /// loops to a zero-alloc iterator once `RowSet` is threaded through
-    /// the assembly functions.
+    /// Kept as a fallback for non-hot-path callers that want a materialized
+    /// list. The row-kernel assembly hot loops use [`Self::par_for_each`]
+    /// and [`Self::par_reduce_fold`] directly so no `Vec` is allocated
+    /// per evaluation.
     pub fn collect_indexed(&self, n_total: usize) -> Vec<(usize, f64)> {
         match self {
             Self::All => (0..n_total).map(|i| (i, 1.0)).collect(),
             Self::Subsample { rows, .. } => {
                 rows.iter().map(|r| (r.index, r.weight)).collect()
             }
+        }
+    }
+
+    /// Number of contributing rows. For `All` this is `n_total`; for
+    /// `Subsample` this is the mask length. Used by callers that need to
+    /// size workspaces without consulting `n_effective` (which returns
+    /// NaN for `All`).
+    #[inline]
+    pub fn len(&self, n_total: usize) -> usize {
+        match self {
+            Self::All => n_total,
+            Self::Subsample { rows, .. } => rows.len(),
+        }
+    }
+
+    /// Parallel `for_each` over the row set with no per-call allocation.
+    ///
+    /// `body(row_index, ht_weight)` is invoked for each contributing row.
+    /// `All` calls with `weight = 1.0` and `row_index ∈ 0..n_total`;
+    /// `Subsample` calls with each `WeightedOuterRow`'s `(index, weight)`.
+    #[inline]
+    pub fn par_for_each<F>(&self, n_total: usize, body: F)
+    where
+        F: Fn(usize, f64) + Send + Sync,
+    {
+        match self {
+            Self::All => {
+                (0..n_total).into_par_iter().for_each(|i| body(i, 1.0));
+            }
+            Self::Subsample { rows, .. } => {
+                rows.par_iter().for_each(|r| body(r.index, r.weight));
+            }
+        }
+    }
+
+    /// Parallel `try_for_each` variant — short-circuits on the first `Err`.
+    #[inline]
+    pub fn par_try_for_each<F, E>(&self, n_total: usize, body: F) -> Result<(), E>
+    where
+        F: Fn(usize, f64) -> Result<(), E> + Send + Sync,
+        E: Send,
+    {
+        match self {
+            Self::All => (0..n_total)
+                .into_par_iter()
+                .try_for_each(|i| body(i, 1.0)),
+            Self::Subsample { rows, .. } => {
+                rows.par_iter().try_for_each(|r| body(r.index, r.weight))
+            }
+        }
+    }
+
+    /// Parallel fold-reduce over the row set. `init` produces a fresh
+    /// accumulator, `fold` is the per-row update, `reduce` combines two
+    /// accumulators.
+    ///
+    /// Returns the reduced result. No `Vec` is allocated per call; both
+    /// branches forward directly to rayon's `par_iter` adapters.
+    #[inline]
+    pub fn par_reduce_fold<T, I, F, R>(
+        &self,
+        n_total: usize,
+        init: I,
+        fold: F,
+        reduce: R,
+    ) -> T
+    where
+        T: Send,
+        I: Fn() -> T + Send + Sync,
+        F: Fn(T, usize, f64) -> T + Send + Sync,
+        R: Fn(T, T) -> T + Send + Sync,
+    {
+        match self {
+            Self::All => (0..n_total)
+                .into_par_iter()
+                .fold(&init, |acc, i| fold(acc, i, 1.0))
+                .reduce(&init, &reduce),
+            Self::Subsample { rows, .. } => rows
+                .par_iter()
+                .fold(&init, |acc, r| fold(acc, r.index, r.weight))
+                .reduce(&init, &reduce),
+        }
+    }
+
+    /// Parallel try-fold-reduce: short-circuits on the first `Err`.
+    #[inline]
+    pub fn par_try_reduce_fold<T, E, I, F, R>(
+        &self,
+        n_total: usize,
+        init: I,
+        fold: F,
+        reduce: R,
+    ) -> Result<T, E>
+    where
+        T: Send,
+        E: Send,
+        I: Fn() -> T + Send + Sync,
+        F: Fn(T, usize, f64) -> Result<T, E> + Send + Sync,
+        R: Fn(T, T) -> Result<T, E> + Send + Sync,
+    {
+        match self {
+            Self::All => (0..n_total)
+                .into_par_iter()
+                .try_fold(&init, |acc, i| fold(acc, i, 1.0))
+                .try_reduce(&init, &reduce),
+            Self::Subsample { rows, .. } => rows
+                .par_iter()
+                .try_fold(&init, |acc, r| fold(acc, r.index, r.weight))
+                .try_reduce(&init, &reduce),
         }
     }
 }
@@ -200,13 +310,18 @@ pub struct RowKernelCache<const K: usize> {
     pub hessians: Vec<[[f64; K]; K]>,
 }
 
-/// Build the cache by evaluating all row kernels in parallel.
+/// Build the cache by evaluating all row kernels in parallel over the
+/// supplied [`RowSet`].
 ///
-/// Rayon's `into_par_iter().map().collect()` over a `0..n` range preserves
-/// row-index order, so the resulting vectors satisfy `nll[i] = nll_i`,
-/// `gradients[i] = ∇_i`, `hessians[i] = H_i`. Errors short-circuit via
-/// `Result` collection — the first failing row's `Err` is returned and
-/// remaining work is dropped.
+/// * `RowSet::All` evaluates every row `0..kern.n_rows()`; the resulting
+///   vectors satisfy `nll[i] = nll_i` for every i.
+/// * `RowSet::Subsample` evaluates only the sampled indices; the
+///   per-row slots not in the sample remain at their zero default. Aggregation
+///   in the assembly functions iterates the same `RowSet`, so the unwritten
+///   slots are never read.
+///
+/// Errors short-circuit via `Result` collection — the first failing row's
+/// `Err` is returned and remaining work is dropped.
 ///
 /// At biobank scale (n ≳ 3·10⁵) the per-row kernels for survival/GAMLSS
 /// families dominate this build (multiple `exp`/`erf`/special calls per
@@ -214,20 +329,38 @@ pub struct RowKernelCache<const K: usize> {
 /// fully-parallel row-kernel framework.
 pub fn build_row_kernel_cache<const K: usize>(
     kern: &(impl RowKernel<K> + ?Sized),
+    rows: &RowSet,
 ) -> Result<RowKernelCache<K>, String> {
     let n = kern.n_rows();
     let p = kern.n_coefficients();
-    let rows: Vec<(f64, [f64; K], [[f64; K]; K])> = (0..n)
-        .into_par_iter()
-        .map(|row| kern.row_kernel(row))
-        .collect::<Result<Vec<_>, String>>()?;
-    let mut nll = Vec::with_capacity(n);
-    let mut gradients = Vec::with_capacity(n);
-    let mut hessians = Vec::with_capacity(n);
-    for (l, g, h) in rows {
-        nll.push(l);
-        gradients.push(g);
-        hessians.push(h);
+    let mut nll = vec![0.0_f64; n];
+    let mut gradients = vec![[0.0_f64; K]; n];
+    let mut hessians = vec![[[0.0_f64; K]; K]; n];
+    match rows {
+        RowSet::All => {
+            let evaluated: Vec<(f64, [f64; K], [[f64; K]; K])> = (0..n)
+                .into_par_iter()
+                .map(|row| kern.row_kernel(row))
+                .collect::<Result<Vec<_>, String>>()?;
+            for (i, (l, g, h)) in evaluated.into_iter().enumerate() {
+                nll[i] = l;
+                gradients[i] = g;
+                hessians[i] = h;
+            }
+        }
+        RowSet::Subsample { rows: list, .. } => {
+            // Evaluate only the sampled rows in parallel; scatter into
+            // the n-sized cache slots keyed by their full-data index.
+            let pairs: Vec<(usize, (f64, [f64; K], [[f64; K]; K]))> = list
+                .par_iter()
+                .map(|r| kern.row_kernel(r.index).map(|out| (r.index, out)))
+                .collect::<Result<Vec<_>, String>>()?;
+            for (idx, (l, g, h)) in pairs {
+                nll[idx] = l;
+                gradients[idx] = g;
+                hessians[idx] = h;
+            }
+        }
     }
     Ok(RowKernelCache {
         n,

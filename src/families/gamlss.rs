@@ -1946,7 +1946,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 // synthesize a minimal `ParameterBlockSpec` slice from the
                 // bootstrap designs so the cost model can read `n_b · p_b`
                 // without needing a fully-built family yet.
-                let psi_dim = joint_setup.theta0().len() - joint_setup.rho_dim();
+                let _psi_dim = joint_setup.theta0().len() - joint_setup.rho_dim();
                 let capability = if analytic_joint_derivatives_available {
                     crate::families::custom_family::ExactOuterDerivativeOrder::Second
                 } else {
