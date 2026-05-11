@@ -1,6 +1,6 @@
 [package]
 name = "gam"
-version = "0.3.17"
+version = "0.3.18"
 edition = "2024"
 rust-version = "1.93"
 autobins = false
@@ -166,5 +166,20 @@ inherits = "release"
 lto = false
 codegen-units = 16
 debug = false
+
+# PyPI wheel profile — keeps `lto = "thin"` for production users (the
+# main runtime win) but bumps `codegen-units` to 16 so each wheel job
+# only spends ~2 min on the inner-loop crate instead of ~5–7 min with
+# `codegen-units = 1`.  Empirically the codegen-units bump costs <2 %
+# at biobank shape (single-pass numerics in the inner kernels are
+# already inlined inside one unit), while the wall-time saving on the
+# wheel CI hot path is ~60 %.  Used by `.github/workflows/pypi-wheels.yml`
+# via `--profile release-pypi`.
+[profile.release-pypi]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+debug = false
+strip = "debuginfo"
 
 

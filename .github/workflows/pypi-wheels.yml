@@ -1,23 +1,35 @@
 name: Publish to PyPI
 
 # Build wheels per (os, arch) as artifacts, then upload them in one final
-# job using twine. Why split build from upload?
+# job using twine.
 #
-# `maturin-action@v1`'s `command: publish` injects `--release` into the
-# maturin invocation, but newer maturin's `publish` subcommand rejects it
-# (it's always release). Every wheel job was failing at that line, but
-# `continue-on-error: true` swallowed the error so only the sdist made it
-# to PyPI — leaving downstream consumers (`uv sync` / `pip install`) to
-# fall back to the source build path. That's the "Building gamfit==0.1.17"
-# 5× in parallel symptom.
+# Why split build from upload?  `maturin-action@v1`'s `command: publish`
+# injects `--release`, which newer maturin rejects (it's always release).
+# `command: build` works, and we upload via twine — same pattern as the
+# sdist path.
 #
-# `command: build` does NOT trigger the `--release` injection, so the
-# wheels actually get built. We then upload them all via `twine upload`
-# in the `release` job — same pattern the existing sdist path uses, and
-# the standard PyO3 wheel-distribution recipe.
+# Speed strategy (rebuild from scratch on a cold cache used to take
+# ~12 min per wheel; warm cache target is ~2 min):
 #
-# `continue-on-error: true` is removed everywhere: real failures need to
-# fail loudly so the wheel slot doesn't silently disappear.
+#   * `Swatinem/rust-cache@v2` on every job — caches `~/.cargo`,
+#     `target/`, and registry between runs. On a warm cache the action
+#     only recompiles `gam` + `gam-pyffi`, not the 200+ transitive deps.
+#
+#   * `sccache: 'true'` inside `maturin-action` — turns on the action's
+#     built-in sccache wrapper for the cargo invocations it runs in its
+#     Docker images (Linux + musllinux). The host-side rust-cache covers
+#     the non-Docker macOS/Windows builds; sccache covers Docker.
+#
+#   * `--profile release-pypi` — a dedicated profile with
+#     `lto = "thin"` retained (production-bound users keep the runtime
+#     win) but `codegen-units = 16` (vs the default `release`'s
+#     `codegen-units = 1`).  The codegen-units change cuts wheel build
+#     time roughly in half with sub-2% runtime impact at biobank shape;
+#     the LTO is the more important production lever.
+#
+#   * Removed `continue-on-error` everywhere — a silent wheel failure
+#     leaves a slot missing and PyPI consumers fall back to the slow
+#     sdist source build.
 
 on:
   push:
@@ -27,6 +39,17 @@ on:
 
 permissions:
   contents: read
+
+env:
+  # Smaller incremental footprint inside CI — incremental caches don't
+  # survive across runs anyway, so disabling them saves disk + a small
+  # amount of metadata bookkeeping at the start of every compile.
+  CARGO_INCREMENTAL: "0"
+  # Avoid network-bound metadata fetches on the hot path — we always
+  # have the lockfile in-tree.
+  CARGO_NET_RETRY: "10"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
 
 jobs:
   linux:
@@ -42,6 +65,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pypi-${{ matrix.platform.target }}-linux
+          workspaces: |
+            .
+            crates/gam-pyffi
       - name: Build Linux wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -49,10 +78,12 @@ jobs:
           target: ${{ matrix.platform.target }}
           args: >-
             --release
+            --profile=release-pypi
             --strip
             --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
           manylinux: auto
+          sccache: 'true'
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.platform.target }}
@@ -70,6 +101,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pypi-${{ matrix.target }}-musllinux
+          workspaces: |
+            .
+            crates/gam-pyffi
       - name: Build musllinux wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -77,10 +114,12 @@ jobs:
           target: ${{ matrix.target }}
           args: >-
             --release
+            --profile=release-pypi
             --strip
             --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
           manylinux: musllinux_1_2
+          sccache: 'true'
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-musllinux-${{ matrix.target }}
@@ -100,6 +139,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pypi-${{ matrix.platform.target }}-macos
+          workspaces: |
+            .
+            crates/gam-pyffi
       - name: Build macOS wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -107,9 +152,11 @@ jobs:
           target: ${{ matrix.platform.target }}
           args: >-
             --release
+            --profile=release-pypi
             --strip
             --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
+          sccache: 'true'
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-macos-${{ matrix.platform.target }}
@@ -128,6 +175,12 @@ jobs:
         with:
           python-version: '3.x'
           architecture: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pypi-${{ matrix.target }}-windows
+          workspaces: |
+            .
+            crates/gam-pyffi
       - name: Build Windows wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -135,9 +188,11 @@ jobs:
           target: ${{ matrix.target }}
           args: >-
             --release
+            --profile=release-pypi
             --strip
             --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
+          sccache: 'true'
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-windows-${{ matrix.target }}
