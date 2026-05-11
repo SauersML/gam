@@ -4337,7 +4337,11 @@ fn run_outer_with_plan(
                     // already learned instead of redoing the trust-radius
                     // adaptation from the configured initial radius.
                     match report.status {
-                        OptimizationStatus::Converged => {
+                        OptimizationStatus::Converged
+                        | OptimizationStatus::NumericallyConverged => {
+                            // NumericallyConverged is opt's exit when the predicted-reduction
+                            // cost-ratio test drops below the cost's ULP floor: continuing
+                            // would race float noise. Treat as a successful terminal state.
                             let mut result =
                                 solution_into_outer_result(report.solution, true, *the_plan);
                             result.operator_stop_reason =
