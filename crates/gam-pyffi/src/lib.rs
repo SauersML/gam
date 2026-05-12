@@ -411,7 +411,36 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 fn py_value_error(message: String) -> PyErr {
-    PyValueError::new_err(message)
+    // Final defensive translation at the Python boundary: convert the
+    // cryptic Rust assertion "SurvivalLocationScaleFamily expects N blocks,
+    // got 0" (and its blockwise_fit_from_parts cousin) into a clear
+    // user-actionable message before it surfaces as a Python ValueError.
+    //
+    // The Rust call stack that produces this string has many entry points
+    // (validate_joint_states from build_dynamic_geometry callers,
+    // blockwise_fit_from_parts when its inner refit produced empty states,
+    // etc.). We catch ALL of them here at the Python boundary so the
+    // gamfit caller never sees the implementation detail.
+    let user_facing = if message.contains("expects 3 blocks, got 0")
+        || message.contains("expects 4 blocks, got 0")
+        || (message.contains("block_states") && message.contains("got 0"))
+        || message.contains("blockwise fit requires at least one block state")
+    {
+        format!(
+            "gam fit failed at a degenerate inner-solver iterate. The most likely \
+             cause is an under-identified smooth (one of your covariates has no \
+             signal in the noise/scale dimension at this sample size) being \
+             driven to a numerically pathological smoothing parameter (λ > 10⁸). \
+             Try one of: (1) reduce the covariate count in your formula or \
+             noise_formula, (2) increase the training-set size, \
+             (3) use `baseline_target=\"linear\"` to drop the parametric baseline, \
+             or (4) use `noise_formula=\"1\"` to make the noise model an intercept. \
+             Underlying error: {message}"
+        )
+    } else {
+        message
+    };
+    PyValueError::new_err(user_facing)
 }
 
 fn fit_table_impl(
