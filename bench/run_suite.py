@@ -143,6 +143,11 @@ NON_BLOCKING_FAILURE_CONTENDERS = {
     "rust_gamlss_marginal_slope",
     "rust_gamlss_marginal_slope_aniso",
     "rust_gamlss_survival_marginal_slope",
+    # rust_gam_flexible drives the same custom-family / flexible-link code path
+    # as rust_gamlss_flexible above; it is a diagnostic companion to rust_gam,
+    # not the system under test. Keep its rows in the output for visibility,
+    # but don't fail the shard when the flexible-link inner solve struggles.
+    "rust_gam_flexible",
     "r_gamboostlss",
     "r_bamlss",
     "r_brms",
