@@ -8212,7 +8212,22 @@ def _append_contender_result_if_enabled(
 ) -> None:
     if not _is_contender_enabled(s_cfg, contender):
         return
-    row = build_row()
+    # Convert per-contender harness errors (e.g. formula-construction
+    # RuntimeError from _emit_joint_pc_term when a configuration is
+    # structurally infeasible) into a failed result row. Without this,
+    # an unhandled RuntimeError would kill the whole shard before the
+    # output JSON is written, hiding the very signal the bench is
+    # meant to surface. The row still propagates to the blocking-
+    # failure check below; it just no longer destroys the run record.
+    try:
+        row = build_row()
+    except RuntimeError as e:
+        row = {
+            "contender": contender,
+            "scenario_name": str(s_cfg.get("name", "")),
+            "status": "failed",
+            "error": f"harness error: {e}",
+        }
     if row is not None:
         results.append(row)
 
@@ -8621,6 +8636,7 @@ def main() -> None:
             if xgb_aft_row is not None:
                 results.append(xgb_aft_row)
 
+    deferred_exit_messages: list[str] = []
     for s_cfg in scenarios:
         s_name = s_cfg["name"]
         ds = dataset_for_scenario(s_cfg)
@@ -8641,29 +8657,24 @@ def main() -> None:
                 and r.get("contender") == required_contender
             ]
             if required_rows:
-                raise SystemExit(
+                deferred_exit_messages.append(
                     "required contender failed for scenario "
                     f"'{s_name}': {_format_blocking_failure(required_rows[0])}"
                 )
-            raise SystemExit(
-                f"missing required successful {required_contender} result for scenario '{s_name}'"
-            )
-
-    # Hard guard: benchmark runs must fail in CI for blocking contender failures.
-    # Non-blocking contenders still emit failed rows in the output for diagnostics.
-    failed_blocking = [
-        r for r in results if r.get("status") != "ok" and not _is_non_blocking_failure(r)
-    ]
-    if failed_blocking:
-        msgs = []
-        for r in failed_blocking:
-            msgs.append(_format_blocking_failure(r))
-        raise SystemExit("benchmark run failed:\n" + "\n".join(msgs))
+            else:
+                deferred_exit_messages.append(
+                    f"missing required successful {required_contender} result for scenario '{s_name}'"
+                )
 
     # Hard guard: benchmark outputs must declare an evaluation mode consistent with model_spec.
     _normalize_result_metadata(results)
     _validate_result_metadata(results)
 
+    # Always write the JSON output and figures BEFORE deciding whether
+    # to raise SystemExit for blocking failures. Otherwise a single
+    # blocking contender error nukes the entire shard's data record
+    # — figures, comparison rows, everything — even for contenders
+    # that ran cleanly, hiding the failure rather than surfacing it.
     payload = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "evaluation": {
@@ -8685,6 +8696,18 @@ def main() -> None:
     zip_path = args.out.parent / "figures.zip"
     zip_figure_dir(fig_dir, zip_path)
     print(f"Wrote {zip_path}")
+
+    # Now signal CI: benchmark runs must fail for blocking contender failures
+    # and unmet required-contender expectations collected above.
+    # Non-blocking contenders still emit failed rows in the output for diagnostics.
+    failed_blocking = [
+        r for r in results if r.get("status") != "ok" and not _is_non_blocking_failure(r)
+    ]
+    msgs: list[str] = list(deferred_exit_messages)
+    for r in failed_blocking:
+        msgs.append(_format_blocking_failure(r))
+    if msgs:
+        raise SystemExit("benchmark run failed:\n" + "\n".join(msgs))
 
 
 # ---------------------------------------------------------------------------
