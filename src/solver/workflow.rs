@@ -1192,7 +1192,38 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
             fit_binomial_location_scale_model(request).map(FitResult::BinomialLocationScale)
         }
         FitRequest::SurvivalLocationScale(request) => {
-            fit_survival_location_scale_model(request).map(FitResult::SurvivalLocationScale)
+            // Outermost defensive catch: any path that surfaces empty
+            // `block_states` to a family method (multiple possible —
+            // `validate_joint_states`, `blockwise_fit_from_parts`, etc.)
+            // produces a cryptic "expects N blocks, got 0" Python
+            // exception. The v0.3.31 projected-kernel REML fix should make
+            // the outer ρ-gradient cancel at large λ, preventing the
+            // ARC stall that triggers the downstream empty-states path —
+            // but as a last resort we convert any remaining error of that
+            // shape into a user-actionable message so the Python caller
+            // sees a clear cause instead of a Rust assertion artifact.
+            match fit_survival_location_scale_model(request)
+                .map(FitResult::SurvivalLocationScale)
+            {
+                Ok(fit) => Ok(fit),
+                Err(e)
+                    if e.contains("expects 3 blocks, got 0")
+                        || e.contains("expects 4 blocks, got 0")
+                        || (e.contains("block_states") && e.contains("got 0"))
+                        || e.contains("blockwise fit requires at least one block state") =>
+                {
+                    Err(format!(
+                        "survival location-scale fit failed: the smoothing-parameter optimizer \
+                         landed at a degenerate iterate where the inner solver's block state \
+                         was empty. This is the symptom of an under-identified smooth driven \
+                         to a numerically pathological λ (e.g. exp(20+)) on a small-data \
+                         subsample. Try: (1) reducing covariate count, (2) increasing n_train, \
+                         (3) `baseline_target=\"linear\"` to drop the parametric baseline, or \
+                         (4) `noise_formula=\"1\"` to drop the noise GAM. Underlying error: {e}"
+                    ))
+                }
+                Err(e) => Err(e),
+            }
         }
         FitRequest::SurvivalTransformation(request) => {
             fit_survival_transformation_model(request).map(FitResult::SurvivalTransformation)
