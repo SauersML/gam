@@ -1968,10 +1968,16 @@ impl<'a> RemlState<'a> {
                 let beta_norm = beta_eval.iter().map(|v| v * v).sum::<f64>().sqrt();
                 let u_norm = u.iter().map(|v| v * v).sum::<f64>().sqrt();
                 // Show a few entries of x_tau and beta.
-                let xtb0 = if x_tau_beta_j.len() > 0 { x_tau_beta_j[0] } else { 0.0 };
+                let xtb0 = if x_tau_beta_j.len() > 0 {
+                    x_tau_beta_j[0]
+                } else {
+                    0.0
+                };
                 let xtb_last = if !x_tau_beta_j.is_empty() {
                     x_tau_beta_j[x_tau_beta_j.len() - 1]
-                } else { 0.0 };
+                } else {
+                    0.0
+                };
                 eprintln!(
                     "[A_J-ORIG] a_j={:+.6e} term_u_x={:+.6e} term_beta_s={:+.6e} \
                      |x_tau_beta|={:.3e} |beta|={:.3e} |u|={:.3e} p_dim={} xtb0={:+.3e} xtb_last={:+.3e}",

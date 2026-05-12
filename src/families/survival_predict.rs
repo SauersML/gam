@@ -1141,8 +1141,7 @@ pub fn require_saved_survival_likelihood_mode(
         };
     }
     let raw = model.survival_likelihood.as_deref().ok_or_else(|| {
-        "saved survival model is missing survival_likelihood metadata; refit"
-            .to_string()
+        "saved survival model is missing survival_likelihood metadata; refit".to_string()
     })?;
     parse_survival_likelihood_mode(raw)
 }
@@ -1224,9 +1223,10 @@ fn remap_term_collectionspec_columns(
 pub fn fit_result_from_saved_model_for_prediction(
     model: &SavedModel,
 ) -> Result<UnifiedFitResult, String> {
-    model.fit_result.clone().ok_or_else(|| {
-        "model is missing canonical fit_result payload; refit".to_string()
-    })
+    model
+        .fit_result
+        .clone()
+        .ok_or_else(|| "model is missing canonical fit_result payload; refit".to_string())
 }
 
 /// Resolve the saved survival location-scale fit result.
@@ -1239,8 +1239,7 @@ pub fn saved_survival_location_scale_fit_result(
 ) -> Result<UnifiedFitResult, String> {
     model.saved_prediction_runtime()?;
     let mut fit = model.fit_result.clone().ok_or_else(|| {
-        "saved location-scale survival model missing canonical fit_result; refit"
-            .to_string()
+        "saved location-scale survival model missing canonical fit_result; refit".to_string()
     })?;
     let inverse_link = resolve_survival_inverse_link_from_saved(model)?;
     apply_inverse_link_state_to_fit_result(&mut fit, &inverse_link);

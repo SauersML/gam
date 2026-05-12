@@ -629,13 +629,7 @@ mod tests {
             )
             .expect("outer eval should succeed");
 
-        let populated_len = state
-            .cache_manager
-            .pirls_cache
-            .read()
-            .unwrap()
-            .map
-            .len();
+        let populated_len = state.cache_manager.pirls_cache.read().unwrap().map.len();
         assert!(
             populated_len > 0,
             "evaluating the outer objective should populate the PIRLS LRU, got {populated_len}"
@@ -643,13 +637,7 @@ mod tests {
 
         state.reset_outer_seed_state();
 
-        let cleared_len = state
-            .cache_manager
-            .pirls_cache
-            .read()
-            .unwrap()
-            .map
-            .len();
+        let cleared_len = state.cache_manager.pirls_cache.read().unwrap().map.len();
         assert_eq!(
             cleared_len, 0,
             "reset_outer_seed_state must clear the cross-call PIRLS LRU; got {cleared_len} entries"
