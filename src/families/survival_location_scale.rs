@@ -11483,10 +11483,31 @@ pub(crate) fn fit_survival_location_scale_terms(
                     // strictly better than a `SurvivalLocationScaleFamily
                     // expects 3 blocks, got 0` exception killing the whole
                     // gamfit.fit() call.
-                    Err(e) if e == SURVIVAL_LOCATION_SCALE_EMPTY_BLOCK_STATES_MARKER => {
+                    Err(e)
+                        if e == SURVIVAL_LOCATION_SCALE_EMPTY_BLOCK_STATES_MARKER
+                            || e.contains("expects 3 blocks, got 0")
+                            || e.contains("expects 4 blocks, got 0")
+                            || (e.contains("blockwise fit requires at least one block state"))
+                            || (e.contains("block_states") && e.contains("got 0")) =>
+                    {
+                        // Broadened catch: any error indicating an empty
+                        // block_states slate maps to the same "degraded BMA
+                        // candidate" fallback. The original sentinel catches
+                        // the path I instrumented in
+                        // `fit_survival_location_scale_with_geometry`, but
+                        // `validate_joint_states` and `blockwise_fit_from_parts`
+                        // produce structurally similar errors from the ~7 other
+                        // call sites of `build_dynamic_geometry` (Hessian
+                        // operator routes, EFS fixed-point, etc.) which can also
+                        // surface when an ARC deterministic-replay stall
+                        // collapses the inner refit's block layout.
+                        // Substituting zero residuals here lets the outer
+                        // baseline-θ BFGS see `‖g‖ = 0` at the bad candidate
+                        // and terminate cleanly rather than panicking the
+                        // whole `gam.fit()` call.
                         log::warn!(
                             "fit_survival_location_scale_terms: refit at converged ρ̂ \
-                             produced empty block_states; substituting zero offset \
+                             produced empty block_states ({e}); substituting zero offset \
                              residuals (degraded BMA candidate; outer θ-BFGS will \
                              terminate at this point)"
                         );
