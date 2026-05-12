@@ -125,6 +125,46 @@
       "seed": 20260301
     },
     {
+      "name": "geo_disease_eas_duchon_k6",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas_duchon_k12",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas_duchon_k6_downsample100x",
+      "n": 60,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas_duchon_k6_downsample50x",
+      "n": 120,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas_duchon_k6_downsample10x",
+      "n": 600,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas_duchon_k4_downsample500x",
+      "n": 12,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas_duchon_k4_downsample300x",
+      "n": 20,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas_duchon_k4_downsample150x",
+      "n": 60,
+      "seed": 20260301
+    },
+    {
       "name": "geo_disease_eas_duchon_k24",
       "n": 6000,
       "seed": 20260301
@@ -227,6 +267,11 @@
       "seed": 20260315
     },
     {
+      "name": "papuan_oce_duchon_k12",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
       "name": "papuan_oce_matern_k12",
       "n": 6000,
       "seed": 20260315
@@ -312,6 +357,18 @@
     },
     {
       "name": "geo_subpop16_tp_k24",
+      "seed": 20260330,
+      "prevalence_min": 0.02,
+      "prevalence_max": 0.4
+    },
+    {
+      "name": "geo_subpop16_duchon_k6",
+      "seed": 20260330,
+      "prevalence_min": 0.02,
+      "prevalence_max": 0.4
+    },
+    {
+      "name": "geo_subpop16_duchon_k12",
       "seed": 20260330,
       "prevalence_min": 0.02,
       "prevalence_max": 0.4
