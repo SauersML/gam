@@ -9874,7 +9874,16 @@ fn require_successful_spatial_optimization_result<T>(
 ) -> Result<T, EstimationError> {
     match result {
         Ok(Some((value, exact_score))) => {
-            if exact_score <= initial_score + 1e-10 {
+            // Allow rounding-level worsening: REML scores accumulate
+            // log-determinant terms whose finite-precision re-evaluation
+            // can drift well past 1e-10 absolute near a converged optimum
+            // (we have seen ~1e-6 between two evaluations whose printed
+            // values round to identical 6-digit scientific). Reject genuine
+            // worsenings (>1 unit) but admit anything within ~1e-6
+            // absolute / 1e-8 relative — meaningful REML gains are
+            // orders of magnitude larger.
+            let tol = 1e-6_f64.max(initial_score.abs() * 1e-8);
+            if exact_score <= initial_score + tol {
                 Ok(value)
             } else {
                 Err(EstimationError::RemlOptimizationFailed(format!(
