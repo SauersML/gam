@@ -55,6 +55,20 @@ on:
     tags:
       - 'v*'        # builds + publishes
   workflow_dispatch:
+    inputs:
+      linux_only:
+        # On-demand fast release path: skip the macOS + Windows matrices and
+        # publish a Linux-only wheel set (manylinux x86_64 + aarch64, musllinux
+        # x86_64 + aarch64, sdist). Trims a full PyPI run from ~13 min wall to
+        # ~4 min by dropping the macos-15-intel job (the slowest by ~3×).
+        # Off-PyPI consumers on macOS / Windows fall back to the sdist build,
+        # so this is only appropriate when you need to ship a Linux-side fix
+        # quickly and a follow-up full release can come later. Tag pushes
+        # (the normal release path) ignore this input and always run the
+        # full matrix.
+        description: 'Build only Linux wheels (skip macOS + Windows for fast on-demand releases)'
+        type: boolean
+        default: false
 
 # Cancel in-flight runs on the same ref when a new push lands.  Rapid
 # main-branch commits used to queue full wheel matrices behind each
@@ -170,6 +184,10 @@ jobs:
           if-no-files-found: error
 
   macos:
+    # Skipped on the on-demand `linux_only=true` workflow_dispatch path.
+    # Default workflow_dispatch and all push events leave this input empty
+    # or set to 'false', so the matrix runs normally.
+    if: github.event.inputs.linux_only != 'true'
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
@@ -208,6 +226,9 @@ jobs:
           if-no-files-found: error
 
   windows:
+    # Same gating as the macos job — skipped only when the on-demand
+    # `linux_only=true` input is set on a workflow_dispatch run.
+    if: github.event.inputs.linux_only != 'true'
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -265,7 +286,18 @@ jobs:
   release:
     name: Upload to PyPI
     # Only publish on tag pushes; main-branch runs are cache-warming only.
-    if: startsWith(github.ref, 'refs/tags/v')
+    # When the on-demand `linux_only=true` input is set on a workflow_dispatch
+    # against a tag ref, the macOS and Windows jobs are skipped — we still
+    # publish what built (Linux + musllinux + sdist) so the fast release
+    # path produces an installable PyPI version. Tolerate `skipped` on the
+    # two omitted jobs but require `success` on everything that did run.
+    if: |
+      startsWith(github.ref, 'refs/tags/v') &&
+      needs.linux.result == 'success' &&
+      needs.musllinux.result == 'success' &&
+      needs.sdist.result == 'success' &&
+      (needs.macos.result == 'success' || needs.macos.result == 'skipped') &&
+      (needs.windows.result == 'success' || needs.windows.result == 'skipped')
     needs:
       - linux
       - musllinux
