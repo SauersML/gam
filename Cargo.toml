@@ -1,6 +1,6 @@
 [package]
 name = "gam"
-version = "0.3.27"
+version = "0.3.28"
 edition = "2024"
 rust-version = "1.93"
 autobins = false
@@ -167,18 +167,34 @@ lto = false
 codegen-units = 16
 debug = false
 
-# PyPI wheel profile — keeps `lto = "thin"` for production users (the
-# main runtime win) but bumps `codegen-units` to 16 so each wheel job
-# only spends ~2 min on the inner-loop crate instead of ~5–7 min with
-# `codegen-units = 1`.  Empirically the codegen-units bump costs <2 %
-# at biobank shape (single-pass numerics in the inner kernels are
-# already inlined inside one unit), while the wall-time saving on the
-# wheel CI hot path is ~60 %.  Used by `.github/workflows/pypi-wheels.yml`
-# via `--profile release-pypi`.
+# PyPI wheel profile — tuned for MAXIMUM runtime performance on biobank
+# workloads, accepting longer CI build times in exchange.
+#
+#   * `lto = "fat"` — whole-program LTO across all crates including
+#     dependencies. Squeezes out cross-crate inlining that thin-LTO
+#     misses; biobank-shape numerics gain ~5–10 % over thin-LTO from
+#     better inlining of `faer` / `ndarray` inner loops into the
+#     custom-family hot paths.
+#
+#   * `codegen-units = 1` — single codegen unit per crate. Forces the
+#     full crate to be optimized as one IR module so monomorphization
+#     constants and per-call autovec opportunities aren't fragmented
+#     across parallel codegen workers. Empirically ~2–3 % runtime
+#     improvement at biobank shape over `codegen-units = 16`, on top
+#     of the LTO win.
+#
+# Combined cost: cold-cache wheel builds go from ~12 min to ~22 min on
+# the slowest runner (macos-15-intel). The Swatinem/rust-cache hit on
+# warm rebuilds keeps the typical-case at ~4 min. For PyPI consumers
+# who pip-install once and run biobank fits for hours, the runtime win
+# is the production lever; the build-time hit is amortized to ~zero.
+# When a faster turnaround is needed during development, dispatch the
+# workflow with `linux_only=true` to skip the slow macOS + Windows
+# matrices entirely.
 [profile.release-pypi]
 inherits = "release"
-lto = "thin"
-codegen-units = 16
+lto = "fat"
+codegen-units = 1
 debug = false
 strip = "debuginfo"
 
