@@ -43,6 +43,7 @@ use crate::smooth::{
     freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivativeinfo_list,
 };
+use crate::families::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
 use crate::solver::estimate::UnifiedFitResult;
 use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
@@ -723,6 +724,15 @@ pub struct SurvivalLocationScaleTermSpec {
     pub log_sigma_template: SurvivalCovariateTermBlockTemplate,
     pub timewiggle_block: Option<TimeWiggleBlockInput>,
     pub linkwiggle_block: Option<LinkWiggleBlockInput>,
+    /// Optional warm-start seed for the threshold-block log-smoothing parameters (ρ).
+    /// When `Some`, its length must equal the number of threshold penalties; values are
+    /// clamped to the outer-loop ρ bounds before being injected into `rho0`.
+    /// Used by the outer baseline-config CompassSearch to thread converged smoothing
+    /// from one probe into the next.
+    pub initial_threshold_log_lambdas: Option<Array1<f64>>,
+    /// Optional warm-start seed for the log-sigma-block log-smoothing parameters (ρ).
+    /// Same semantics as `initial_threshold_log_lambdas`.
+    pub initial_log_sigma_log_lambdas: Option<Array1<f64>>,
 }
 
 pub const DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD: f64 = 1e-6;
@@ -733,6 +743,16 @@ pub struct SurvivalLocationScaleTermFitResult {
     pub resolved_log_sigmaspec: TermCollectionSpec,
     pub threshold_design: TermCollectionDesign,
     pub log_sigma_design: TermCollectionDesign,
+    /// Per-row gradient of unpenalized NLL w.r.t. the three additive time-block
+    /// offset channels (entry / exit / derivative-at-exit) at the converged β.
+    /// Contracted with `∂o/∂θ_baseline` this yields the analytic θ-gradient
+    /// used by the with-gradient baseline optimizer.
+    pub baseline_offset_residuals: OffsetChannelResiduals,
+    /// 3×3 NLL Hessian per row on the offset channels, in
+    /// `(entry, exit, derivative)` order. Diagonal under location-scale —
+    /// the row likelihood is separable in `(u0, u1, g)`. Used by the analytic
+    /// θ-Hessian builder (chain rule second derivative).
+    pub baseline_offset_curvatures: OffsetChannelCurvatures,
 }
 
 /// Helper struct so callers can build a `UnifiedFitResult` from
@@ -1874,6 +1894,96 @@ impl SurvivalLocationScaleFamily {
             d2qdot_lstd: dynamic.d2qdot_lstd,
             d2qdot_lslsd: dynamic.d2qdot_lslsd,
         })
+    }
+
+    /// Per-row NLL gradient and curvature with respect to the three additive
+    /// time-block offset channels `(o_E, o_X, o_D)` (entry / exit / derivative-
+    /// at-exit). The baseline configuration enters the location-scale fit
+    /// **only** through these three offsets, so contracting these residuals
+    /// against `∂o/∂θ_baseline` gives the analytic θ-gradient of the
+    /// unpenalized NLL at converged β (envelope theorem on the penalized
+    /// objective; the penalty has no θ dependence).
+    ///
+    /// Algebra. With `ell_i = w_i[d(log f(u1) + log g) + (1-d) log S(u1) − log S(u0)]`
+    /// and `u0 = h0 + q0`, `u1 = h1 + q1`, `g = d_raw + qdot1`:
+    ///
+    ///   ∂(−ell_i)/∂h0   = − w_i r(u0)
+    ///   ∂(−ell_i)/∂h1   = − w_i [d ψ(u1) − (1−d) r(u1)]
+    ///   ∂(−ell_i)/∂dRaw = − w_i d / g                                (event-row only)
+    ///
+    /// and the row Hessian is diagonal in (h0, h1, dRaw) because `u0`, `u1`,
+    /// `g` are functionally independent (h0→u0, h1→u1, dRaw→g):
+    ///
+    ///   ∂²(−ell_i)/∂h0²   = − w_i r'(u0)
+    ///   ∂²(−ell_i)/∂h1²   = − w_i [d ψ'(u1) − (1−d) r'(u1)]
+    ///   ∂²(−ell_i)/∂dRaw² =   w_i d / g²
+    ///
+    /// The fields `grad_time_eta_*` / `h_time_*` produced by
+    /// [`Self::row_derivatives`] are the corresponding log-likelihood (not
+    /// NLL) partials; we negate `grad_time_eta_*` and the entry/exit second
+    /// derivatives (`h_time_h0`, `h_time_h1`) to recover the NLL convention.
+    /// The derivative-channel Hessian field `h_time_d` is already stored in
+    /// NLL sign (the joint Hessian builder uses `+h_time_d` whereas it uses
+    /// `−h_time_h0` / `−h_time_h1` for entry/exit; see the exact joint
+    /// `safe_fast_xt_diag_x` assembly).
+    pub(crate) fn offset_channel_geometry(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<(OffsetChannelResiduals, OffsetChannelCurvatures), String> {
+        let n = self.n;
+        let dynamic = self.build_dynamic_geometry(block_states)?;
+
+        let mut entry = Array1::<f64>::zeros(n);
+        let mut exit = Array1::<f64>::zeros(n);
+        let mut derivative = Array1::<f64>::zeros(n);
+        let mut curvatures = vec![[[0.0_f64; 3]; 3]; n];
+
+        let rows = (0..n)
+            .into_par_iter()
+            .map(|i| -> Result<(usize, f64, f64, f64, [[f64; 3]; 3]), String> {
+                let state = self.row_predictor_state(
+                    dynamic.h_entry[i],
+                    dynamic.h_exit[i],
+                    dynamic.hdot_exit[i],
+                    dynamic.q_entry[i],
+                    dynamic.q_exit[i],
+                    dynamic.qdot_exit[i],
+                );
+                let Some(row) = self.row_derivatives(i, state)? else {
+                    return Ok((i, 0.0, 0.0, 0.0, [[0.0; 3]; 3]));
+                };
+                // Convert ℓ-partials (h_time_*, grad_time_eta_*) to NLL partials.
+                // grad_time_eta_* hold ∂ℓ/∂{h0,h1,d_raw}; ∂NLL/∂o = −∂ℓ/∂h.
+                let r_entry = -row.grad_time_eta_h0;
+                let r_exit = -row.grad_time_eta_h1;
+                let r_deriv = -row.grad_time_eta_d;
+                // NLL Hessian on (h0,h1,d_raw): diagonal because the row likelihood
+                // factors through (u0, u1, g) which are functionally independent
+                // in (h0, h1, d_raw). Signs follow the exact-joint Hessian assembly
+                // which uses (−h_time_h0, −h_time_h1, +h_time_d) for the NLL block.
+                let mut curv = [[0.0_f64; 3]; 3];
+                curv[0][0] = -row.h_time_h0;
+                curv[1][1] = -row.h_time_h1;
+                curv[2][2] = row.h_time_d;
+                Ok((i, r_entry, r_exit, r_deriv, curv))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        for (i, r_entry, r_exit, r_deriv, curv) in rows {
+            entry[i] = r_entry;
+            exit[i] = r_exit;
+            derivative[i] = r_deriv;
+            curvatures[i] = curv;
+        }
+
+        Ok((
+            OffsetChannelResiduals {
+                exit,
+                entry,
+                derivative,
+            },
+            OffsetChannelCurvatures { rows: curvatures },
+        ))
     }
 
     fn exact_newton_joint_psi_direction(
@@ -10789,6 +10899,45 @@ pub(crate) fn fit_survival_location_scale_terms(
         rho0.slice_mut(s![range.start..range.end])
             .assign(&time_rho0);
     }
+    // Warm-start: inject converged ρ seeds from a previous fit if supplied. The values are
+    // clamped to the outer ρ bounds (±12) so that "dead" coordinates returned at extremes
+    // by a prior fit don't crowd the optimizer's box bound on the next probe.
+    if layout.k_threshold > 0 {
+        if let Some(seed) = spec.initial_threshold_log_lambdas.as_ref() {
+            if seed.len() != layout.k_threshold {
+                return Err(format!(
+                    "survival threshold initial_log_lambdas length mismatch: got {}, expected {}",
+                    seed.len(),
+                    layout.k_threshold
+                ));
+            }
+            let range = layout.threshold_range();
+            let mut slice = rho0.slice_mut(s![range.start..range.end]);
+            for (dst, src) in slice.iter_mut().zip(seed.iter()) {
+                if src.is_finite() {
+                    *dst = src.clamp(-12.0, 12.0);
+                }
+            }
+        }
+    }
+    if layout.k_log_sigma > 0 {
+        if let Some(seed) = spec.initial_log_sigma_log_lambdas.as_ref() {
+            if seed.len() != layout.k_log_sigma {
+                return Err(format!(
+                    "survival log_sigma initial_log_lambdas length mismatch: got {}, expected {}",
+                    seed.len(),
+                    layout.k_log_sigma
+                ));
+            }
+            let range = layout.log_sigma_range();
+            let mut slice = rho0.slice_mut(s![range.start..range.end]);
+            for (dst, src) in slice.iter_mut().zip(seed.iter()) {
+                if src.is_finite() {
+                    *dst = src.clamp(-12.0, 12.0);
+                }
+            }
+        }
+    }
     if layout.k_wiggle > 0 {
         let range = layout.wiggle_range();
         rho0.slice_mut(s![range.start..range.end])
@@ -11059,12 +11208,32 @@ pub(crate) fn fit_survival_location_scale_terms(
 
     let mut resolved_specs = solved.resolved_specs;
     let mut designs = solved.designs;
+    // Build offset-channel geometry at the converged β so callers can do a
+    // closed-form θ-gradient against the baseline offsets without rerunning
+    // the family. This consumes the same `build_spec` / preparation path that
+    // the inner solver used, so the family observed here is byte-identical
+    // (modulo the explicit warm-started log-λ) to the one the outer optimum
+    // landed at.
+    let rho_final = solved.fit.log_lambdas.clone();
+    let final_assembled = build_spec(
+        &rho_final,
+        &resolved_specs[0],
+        &resolved_specs[1],
+        &designs[0],
+        &designs[1],
+    )?;
+    let prepared_final = prepare_survival_location_scale_model(&final_assembled)?;
+    let (baseline_offset_residuals, baseline_offset_curvatures) = prepared_final
+        .family
+        .offset_channel_geometry(&solved.fit.block_states)?;
     Ok(SurvivalLocationScaleTermFitResult {
         fit: solved.fit,
         resolved_thresholdspec: resolved_specs.remove(0),
         resolved_log_sigmaspec: resolved_specs.remove(0),
         threshold_design: designs.remove(0),
         log_sigma_design: designs.remove(0),
+        baseline_offset_residuals,
+        baseline_offset_curvatures,
     })
 }
 

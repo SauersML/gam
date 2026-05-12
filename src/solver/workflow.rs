@@ -45,6 +45,7 @@ use crate::types::{
     WigglePenaltyConfig,
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
@@ -1226,9 +1227,11 @@ use crate::families::survival_construction::{
     build_survival_time_offsets_for_likelihood, build_survival_timewiggle_from_baseline,
     build_time_varying_survival_covariate_template, center_survival_time_designs_at_anchor,
     evaluate_survival_time_basis_row, initial_survival_baseline_config_for_fit,
+    baseline_chain_rule_gradient, location_scale_uses_probit_survival_baseline,
     marginal_slope_baseline_chain_rule_gradient, marginal_slope_baseline_chain_rule_hessian,
     normalize_survival_time_pair, optimize_survival_baseline_config,
-    optimize_survival_baseline_config_with_gradient, parse_survival_distribution,
+    optimize_survival_baseline_config_with_gradient,
+    optimize_survival_baseline_config_with_gradient_only, parse_survival_distribution,
     parse_survival_likelihood_mode, parse_survival_time_basis_config, positive_survival_time_seed,
     require_structural_survival_time_basis, resolve_survival_time_anchor_value,
     resolved_survival_time_basis_config_from_build, survival_derivative_guard_for_likelihood,
@@ -2390,9 +2393,21 @@ fn materialize_survival<'a>(
             Ok::<_, String>((prepared, time_block))
         };
 
+    // Warm-start cache for the outer CompassSearch over the baseline config: each probe
+    // runs a complete inner BFGS over ρ (log-smoothing) starting from zeros if cold; by
+    // capturing the previous probe's converged ρ (threshold + log_sigma blocks) and
+    // injecting it here, the next inner BFGS typically converges in 1-3 iterations
+    // instead of ~10, cutting per-probe cost roughly 5-10× across up to 60 probes per fit.
+    let location_scale_smoothing_warm_start: RefCell<Option<(Array1<f64>, Array1<f64>)>> =
+        RefCell::new(None);
     let build_location_scale_request =
         |candidate: &crate::families::survival_construction::SurvivalBaselineConfig| {
             let (prepared, time_block) = build_time_block(candidate)?;
+            let (initial_threshold_log_lambdas, initial_log_sigma_log_lambdas) =
+                match location_scale_smoothing_warm_start.borrow().as_ref() {
+                    Some((thr, lsg)) => (Some(thr.clone()), Some(lsg.clone())),
+                    None => (None, None),
+                };
             let spec = SurvivalLocationScaleTermSpec {
                 age_entry: age_entry.clone(),
                 age_exit: age_exit.clone(),
@@ -2411,6 +2426,8 @@ fn materialize_survival<'a>(
                 log_sigma_template: log_sigma_template.clone(),
                 timewiggle_block: prepared.timewiggle_block,
                 linkwiggle_block: None,
+                initial_threshold_log_lambdas,
+                initial_log_sigma_log_lambdas,
             };
             let optimize_inverse_link =
                 survival_inverse_link_has_free_parameters(&spec.inverse_link);
@@ -2618,18 +2635,96 @@ fn materialize_survival<'a>(
                 Ok((fit.fit.reml_score, gradient, hessian))
             },
         )?
+    } else if baseline_cfg.target != SurvivalBaselineTarget::Linear
+        && survival_mode == SurvivalLikelihoodMode::LocationScale
+    {
+        // Analytic θ-gradient path. The baseline configuration enters the
+        // location-scale fit only through the three additive time-block
+        // offsets (entry η, exit η, exit ∂η/∂t); at the converged β the
+        // envelope theorem gives
+        //
+        //   d(NLL)/dθ_k = Σ_i r^(E)_i ∂o_E_i/∂θ_k
+        //               + r^(X)_i ∂o_X_i/∂θ_k
+        //               + r^(D)_i ∂o_D_i/∂θ_k
+        //
+        // where r^(*) are populated by
+        // `SurvivalLocationScaleFamily::offset_channel_geometry` and the
+        // partials by `baseline_offset_theta_partials`. When the inverse
+        // link is probit/SAS/Mixture/etc., the location-scale family uses
+        // the probit-channel baseline q(t) instead, so we contract against
+        // `marginal_slope_baseline_offset_theta_partials` exactly as the
+        // marginal-slope path does. BFGS w/ this analytic gradient
+        // typically converges in ≲10 outer evaluations — one order of
+        // magnitude fewer probes than the gradient-free compass sweep that
+        // used to run on this path.
+        let probit_channel = location_scale_uses_probit_survival_baseline(Some(
+            &survival_inverse_link,
+        ));
+        optimize_survival_baseline_config_with_gradient_only(
+            &baseline_cfg,
+            "workflow survival location-scale baseline",
+            |candidate| {
+                let fit_result = fit_survival_location_scale_model(
+                    build_location_scale_request(candidate)?,
+                )
+                .map_err(|e| format!("survival location-scale fit failed: {e}"))?;
+                // Warm-start the next probe's threshold / log-σ smoothing parameters
+                // at the converged values for this probe.
+                let threshold_rho = fit_result.fit.fit.lambdas_threshold().mapv(f64::ln);
+                let log_sigma_rho = fit_result.fit.fit.lambdas_log_sigma().mapv(f64::ln);
+                *location_scale_smoothing_warm_start.borrow_mut() =
+                    Some((threshold_rho, log_sigma_rho));
+                let residuals = &fit_result.fit.baseline_offset_residuals;
+                let gradient = if probit_channel {
+                    marginal_slope_baseline_chain_rule_gradient(
+                        age_entry.view(),
+                        age_exit.view(),
+                        candidate,
+                        residuals,
+                    )?
+                } else {
+                    baseline_chain_rule_gradient(
+                        age_entry.view(),
+                        age_exit.view(),
+                        candidate,
+                        residuals,
+                    )?
+                }
+                .ok_or_else(|| {
+                    "workflow survival location-scale baseline unexpectedly has no theta gradient"
+                        .to_string()
+                })?;
+                // The envelope-theorem residual contraction is the exact
+                // θ-gradient of the *profile penalized NLL* −ℓ + ½βᵀSβ at
+                // converged (β̂, ρ̂). Optimizing `reml_score` (which includes
+                // ½ log|S_λ| − ½ log|H| LAML corrections) against this
+                // gradient would mismatch the cost surface, because the
+                // log-determinant terms have their own θ-dependence through
+                // H(β̂, θ). Use the matching profile-NLL cost here; the final
+                // model refit downstream still picks ρ via the full REML
+                // surface at the converged baseline θ.
+                let profile_cost = -fit_result.fit.fit.log_likelihood
+                    + 0.5 * fit_result.fit.fit.stable_penalty_term;
+                if !profile_cost.is_finite() {
+                    return Err(format!(
+                        "workflow survival location-scale baseline: non-finite profile cost \
+                         (log_likelihood={}, stable_penalty_term={}, cost={})",
+                        fit_result.fit.fit.log_likelihood,
+                        fit_result.fit.fit.stable_penalty_term,
+                        profile_cost
+                    ));
+                }
+                Ok((profile_cost, gradient))
+            },
+        )?
     } else if baseline_cfg.target != SurvivalBaselineTarget::Linear {
         optimize_survival_baseline_config(
             &baseline_cfg,
             "workflow survival baseline",
             |candidate| match survival_mode {
-                SurvivalLikelihoodMode::LocationScale => Ok(fit_survival_location_scale_model(
-                    build_location_scale_request(candidate)?,
-                )
-                .map_err(|e| format!("survival location-scale fit failed: {e}"))?
-                .fit
-                .fit
-                .reml_score),
+                SurvivalLikelihoodMode::LocationScale => unreachable!(
+                    "location-scale baseline profiling uses analytic chain-rule gradient"
+                ),
                 SurvivalLikelihoodMode::MarginalSlope => unreachable!(
                     "marginal-slope baseline profiling uses analytic GM-probit gradient"
                 ),
