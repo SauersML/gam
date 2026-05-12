@@ -5607,9 +5607,16 @@ pub fn reml_laml_evaluate(
             n_obs.saturating_mul(p_dim) >= MATRIX_FREE_OUTER_HESSIAN_NP_THRESHOLD;
         let large_k = k_outer >= MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD;
         let scale_prefers_operator = prefer_outer_hessian_operator(n_obs, p_dim, k_outer);
+        let callback_prefers_operator =
+            callback_operator_kernel && prefer_callback_outer_hessian_operator(n_obs, k_outer);
         let has_subspace_trace = solution.penalty_subspace_trace.is_some();
-        let use_operator =
-            hessian_kernel.is_some() && use_outer_hessian_operator_path(n_obs, p_dim, k_outer);
+        let use_operator = hessian_kernel.is_some()
+            && use_outer_hessian_operator_path(
+                n_obs,
+                p_dim,
+                k_outer,
+                callback_operator_kernel,
+            );
         // Reason mnemonic: which clause carried the routing.  This is purely
         // a log-telemetry attribution — the actual routing decision is made
         // above by `use_operator`.  When `choice=dense`, only "kernel_absent"
@@ -5617,8 +5624,10 @@ pub fn reml_laml_evaluate(
         // by itself flip the choice; see `use_outer_hessian_operator_path`).
         let route_reason = if hessian_kernel.is_none() {
             "kernel_absent"
-        } else if has_subspace_trace && scale_prefers_operator {
+        } else if has_subspace_trace && (scale_prefers_operator || callback_prefers_operator) {
             "subspace_projected_operator"
+        } else if callback_prefers_operator {
+            "callback_row_pair_work"
         } else if large_k {
             "large_k"
         } else if large_p {
@@ -5741,6 +5750,14 @@ pub(crate) const MATRIX_FREE_OUTER_HESSIAN_NP_THRESHOLD: usize = 4_000_000;
 /// `O(K · n · p²)`, so `K` itself drives the crossover.
 pub(crate) const MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD: usize = 32;
 
+/// Row-pair work cutoff for callback-backed outer Hessians.
+///
+/// Callback kernels expose exact row-local first/second Hessian drifts. Dense
+/// `K x K` assembly can still be expensive at tiny coefficient dimension
+/// because the dominant work is not `p x p` algebra; it is repeated row-kernel
+/// contractions over the upper-triangular coordinate pairs.
+pub(crate) const CALLBACK_OUTER_HESSIAN_ROW_PAIR_WORK_THRESHOLD: usize = 25_000_000;
+
 /// Predicate for selecting the matrix-free Hv-operator outer-Hessian
 /// representation over the dense `K × K` assembly.  Cost selects
 /// representation, never capability — the operator path delivers the same
@@ -5765,20 +5782,26 @@ pub(crate) fn prefer_outer_hessian_operator(n: usize, p: usize, k: usize) -> boo
     large_p || large_n_and_moderate_p || large_linear_work || large_k
 }
 
+pub(crate) fn prefer_callback_outer_hessian_operator(n: usize, k: usize) -> bool {
+    n.saturating_mul(k).saturating_mul(k) >= CALLBACK_OUTER_HESSIAN_ROW_PAIR_WORK_THRESHOLD
+}
+
 /// Selects the matrix-free outer-Hessian representation once a Hessian HVP
-/// kernel is available. Decision is purely cost-driven via the `(n, p, K)`
-/// crossover: the operator and dense paths produce identical math, so they
-/// only differ in assembly cost.
+/// kernel is available. Decision is cost-driven via the `(n, p, K)` crossover
+/// plus a callback-specific row-pair workload crossover: the operator and
+/// dense paths produce identical math, so they only differ in assembly cost.
 ///
 /// Real fast HVP capability (a family-supplied directional θθ operator) is
 /// routed separately through `HessianDerivativeProvider::family_outer_hessian_operator`,
-/// which short-circuits this function entirely at the call site. Whether a
-/// `Callback` kernel is present is therefore irrelevant here — Callback exposes
-/// the same per-coordinate `dh`/`d²h` work the dense path would do, just
-/// repackaged behind the operator interface, so it must not trip the operator
-/// path on tiny problems where dense assembly is cheaper.
-pub(crate) fn use_outer_hessian_operator_path(n: usize, p: usize, k: usize) -> bool {
+/// which short-circuits this function entirely at the call site.
+pub(crate) fn use_outer_hessian_operator_path(
+    n: usize,
+    p: usize,
+    k: usize,
+    callback_kernel: bool,
+) -> bool {
     prefer_outer_hessian_operator(n, p, k)
+        || (callback_kernel && prefer_callback_outer_hessian_operator(n, k))
 }
 
 fn is_hessian_unavailable(error: &str) -> bool {
@@ -13947,6 +13970,15 @@ mod tests {
             GaussianDerivatives.outer_hessian_derivative_kernel(),
             Some(OuterHessianDerivativeKernel::Gaussian)
         ));
+    }
+
+    #[test]
+    fn callback_outer_hessian_routes_by_row_pair_work_even_at_small_p() {
+        assert!(!prefer_outer_hessian_operator(155_980, 19, 23));
+        assert!(prefer_callback_outer_hessian_operator(155_980, 23));
+        assert!(use_outer_hessian_operator_path(155_980, 19, 23, true));
+        assert!(!use_outer_hessian_operator_path(155_980, 19, 23, false));
+        assert!(!use_outer_hessian_operator_path(1_000, 19, 23, true));
     }
 
     #[test]
