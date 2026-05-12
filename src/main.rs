@@ -78,9 +78,11 @@ use gam::survival_construction::{
     build_survival_time_offsets_for_likelihood, build_survival_timewiggle_from_baseline,
     build_time_varying_survival_covariate_template, center_survival_time_designs_at_anchor,
     evaluate_survival_time_basis_row, initial_survival_baseline_config_for_fit,
+    baseline_chain_rule_gradient, location_scale_uses_probit_survival_baseline,
     marginal_slope_baseline_chain_rule_gradient, marginal_slope_baseline_chain_rule_hessian,
     normalize_survival_time_pair, optimize_survival_baseline_config,
-    optimize_survival_baseline_config_with_gradient, parse_survival_distribution,
+    optimize_survival_baseline_config_with_gradient,
+    optimize_survival_baseline_config_with_gradient_only, parse_survival_distribution,
     parse_survival_likelihood_mode, parse_survival_time_basis_config, positive_survival_time_seed,
     require_structural_survival_time_basis, resolve_survival_time_anchor_value,
     resolved_survival_time_basis_config_from_build, survival_baseline_targetname,
@@ -4177,10 +4179,24 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 log_sigma_template: log_sigma_template.clone(),
                 timewiggle_block: prepared.timewiggle_block.clone(),
                 linkwiggle_block: None,
+                initial_threshold_log_lambdas: None,
+                initial_log_sigma_log_lambdas: None,
             }
         };
         if baseline_cfg.target != SurvivalBaselineTarget::Linear {
-            baseline_cfg = optimize_survival_baseline_config(
+            // BFGS on the analytic θ-gradient from
+            // `SurvivalLocationScaleTermFitResult::baseline_offset_residuals`
+            // contracted against `baseline_offset_theta_partials` (η-channel)
+            // or `marginal_slope_baseline_offset_theta_partials` (probit
+            // channel), depending on which baseline parametrization the
+            // location-scale family is consuming for this inverse link. The
+            // envelope-theorem argument that justifies this contraction is
+            // documented at `baseline_chain_rule_gradient` and at the
+            // analogous marginal-slope dispatch.
+            let probit_channel = location_scale_uses_probit_survival_baseline(Some(
+                &survival_inverse_link,
+            ));
+            baseline_cfg = optimize_survival_baseline_config_with_gradient_only(
                 &baseline_cfg,
                 "survival location-scale baseline",
                 |candidate| {
@@ -4221,7 +4237,44 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                             return Err(format!("survival location-scale fit failed: {e}"));
                         }
                     };
-                    Ok(fit.fit.fit.reml_score)
+                    let residuals = &fit.fit.baseline_offset_residuals;
+                    let gradient = if probit_channel {
+                        marginal_slope_baseline_chain_rule_gradient(
+                            age_entry.view(),
+                            age_exit.view(),
+                            candidate,
+                            residuals,
+                        )?
+                    } else {
+                        baseline_chain_rule_gradient(
+                            age_entry.view(),
+                            age_exit.view(),
+                            candidate,
+                            residuals,
+                        )?
+                    }
+                    .ok_or_else(|| {
+                        "survival location-scale baseline unexpectedly has no theta gradient"
+                            .to_string()
+                    })?;
+                    // The envelope residual contraction gives the θ-gradient
+                    // of the profile penalized NLL −ℓ + ½βᵀSβ at converged
+                    // (β̂, ρ̂). REML/LAML log-determinant corrections have
+                    // additional θ-dependence through H(β̂, θ), so optimizing
+                    // `reml_score` against this gradient would mismatch the
+                    // cost. Use the matching profile-NLL cost.
+                    let profile_cost = -fit.fit.fit.log_likelihood
+                        + 0.5 * fit.fit.fit.stable_penalty_term;
+                    if !profile_cost.is_finite() {
+                        return Err(format!(
+                            "survival location-scale baseline: non-finite profile cost \
+                             (log_likelihood={}, stable_penalty_term={}, cost={})",
+                            fit.fit.fit.log_likelihood,
+                            fit.fit.fit.stable_penalty_term,
+                            profile_cost
+                        ));
+                    }
+                    Ok((profile_cost, gradient))
                 },
             )?;
         }

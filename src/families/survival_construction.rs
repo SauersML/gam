@@ -497,10 +497,19 @@ where
     let target = initial.target;
     let lower = seed.mapv(|v| v - 6.0);
     let upper = seed.mapv(|v| v + 6.0);
+    // CompassSearch on a 3-dim baseline (α, λ, γ) at tol=1e-4 on a smooth REML
+    // surface converges in well under 60 probes; previously this was 240, which
+    // protected against essentially nothing useful while letting pathological
+    // fits eat ~50× the time they should. Every probe runs a complete inner
+    // BFGS over the smoothing log-λ from cold start (no ρ warm-start across
+    // probes), so probe count is the dominant per-fit cost for the
+    // location-scale + non-linear baseline path that lacks the analytic
+    // baseline gradient the marginal-slope path has at
+    // `optimize_survival_baseline_config_with_gradient`.
     let problem = OuterProblem::new(dim)
         .with_solver_class(SolverClass::AuxiliaryGradientFree)
         .with_tolerance(1e-4)
-        .with_max_iter(240)
+        .with_max_iter(60)
         .with_bounds(lower, upper)
         .with_heuristic_lambdas(seed.to_vec());
     let cost_fn = move |_: &mut (), theta: &ndarray::Array1<f64>| {
@@ -535,6 +544,94 @@ where
                 >,
             >,
         );
+    let result = problem
+        .run(&mut obj, context)
+        .map_err(|e| format!("{context} failed: {e}"))?;
+    survival_baseline_config_from_theta(target, &result.rho)
+}
+
+/// Gradient-only outer baseline-config optimizer. Mirrors
+/// [`optimize_survival_baseline_config_with_gradient`] but advertises
+/// `DeclaredHessianForm::Unavailable`, so the planner routes to BFGS and
+/// builds its own quasi-Newton curvature from successive gradient
+/// evaluations. Used by the survival location-scale path which has a
+/// closed-form θ-gradient (`baseline_chain_rule_gradient` /
+/// `marginal_slope_baseline_chain_rule_gradient`) but no native analytic
+/// θ-Hessian; BFGS on a 2–3 dim problem with an exact gradient typically
+/// converges in 5–10 outer evaluations versus the ~60 polls compass search
+/// used to spend on the same surface.
+pub fn optimize_survival_baseline_config_with_gradient_only<F>(
+    initial: &SurvivalBaselineConfig,
+    context: &str,
+    objective: F,
+) -> Result<SurvivalBaselineConfig, String>
+where
+    F: FnMut(&SurvivalBaselineConfig) -> Result<(f64, Array1<f64>), String>,
+{
+    use crate::solver::outer_strategy::{
+        DeclaredHessianForm, Derivative, HessianResult, OuterEval, OuterProblem, SolverClass,
+    };
+    let Some(seed) = survival_baseline_theta_from_config(initial)? else {
+        return Ok(initial.clone());
+    };
+    let dim = seed.len();
+    let target = initial.target;
+    let lower = seed.mapv(|v| v - 6.0);
+    let upper = seed.mapv(|v| v + 6.0);
+    let problem = OuterProblem::new(dim)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Unavailable)
+        .with_solver_class(SolverClass::Primary)
+        .with_tolerance(1e-4)
+        .with_max_iter(240)
+        .with_bounds(lower, upper)
+        .with_heuristic_lambdas(seed.to_vec());
+    let objective = std::rc::Rc::new(std::cell::RefCell::new(objective));
+    let cost_objective = std::rc::Rc::clone(&objective);
+    let cost_fn = move |_: &mut (), theta: &ndarray::Array1<f64>| {
+        let cfg = survival_baseline_config_from_theta(target, theta)
+            .map_err(crate::estimate::EstimationError::InvalidInput)?;
+        let (cost, gradient) = cost_objective.borrow_mut()(&cfg)
+            .map_err(crate::estimate::EstimationError::InvalidInput)?;
+        if gradient.len() != dim {
+            return Err(crate::estimate::EstimationError::InvalidInput(format!(
+                "{context}: baseline gradient dimension mismatch: got {}, expected {dim}",
+                gradient.len()
+            )));
+        }
+        Ok(cost)
+    };
+    let eval_objective = std::rc::Rc::clone(&objective);
+    let eval_fn = move |_: &mut (), theta: &ndarray::Array1<f64>| {
+        let cfg = survival_baseline_config_from_theta(target, theta)
+            .map_err(crate::estimate::EstimationError::InvalidInput)?;
+        let (cost, gradient) = eval_objective.borrow_mut()(&cfg)
+            .map_err(crate::estimate::EstimationError::InvalidInput)?;
+        if gradient.len() != dim {
+            return Err(crate::estimate::EstimationError::InvalidInput(format!(
+                "{context}: baseline gradient dimension mismatch: got {}, expected {dim}",
+                gradient.len()
+            )));
+        }
+        Ok(OuterEval {
+            cost,
+            gradient,
+            hessian: HessianResult::Unavailable,
+        })
+    };
+    let mut obj = problem.build_objective(
+        (),
+        cost_fn,
+        eval_fn,
+        None::<fn(&mut ())>,
+        None::<
+            fn(
+                &mut (),
+                &ndarray::Array1<f64>,
+            )
+                -> Result<crate::solver::outer_strategy::EfsEval, crate::estimate::EstimationError>,
+        >,
+    );
     let result = problem
         .run(&mut obj, context)
         .map_err(|e| format!("{context} failed: {e}"))?;
