@@ -2401,7 +2401,8 @@ fn materialize_survival<'a>(
     let location_scale_smoothing_warm_start: RefCell<Option<(Array1<f64>, Array1<f64>)>> =
         RefCell::new(None);
     let build_location_scale_request =
-        |candidate: &crate::families::survival_construction::SurvivalBaselineConfig| {
+        |candidate: &crate::families::survival_construction::SurvivalBaselineConfig,
+         allow_inverse_link_optimization: bool| {
             let (prepared, time_block) = build_time_block(candidate)?;
             let (initial_threshold_log_lambdas, initial_log_sigma_log_lambdas) =
                 match location_scale_smoothing_warm_start.borrow().as_ref() {
@@ -2429,8 +2430,15 @@ fn materialize_survival<'a>(
                 initial_threshold_log_lambdas,
                 initial_log_sigma_log_lambdas,
             };
-            let optimize_inverse_link =
-                survival_inverse_link_has_free_parameters(&spec.inverse_link);
+            // During baseline-θ BFGS probes we hold the inverse-link state
+            // fixed: otherwise every probe would trigger a nested
+            // CompassSearch over the SAS / BetaLogistic / Mixture link
+            // parameters, defeating the BFGS speedup entirely. The final
+            // fit (after baseline has converged) flips this back on, so
+            // joint baseline + link optimization still happens — just
+            // alternating instead of nested.
+            let optimize_inverse_link = allow_inverse_link_optimization
+                && survival_inverse_link_has_free_parameters(&spec.inverse_link);
             Ok::<_, String>(SurvivalLocationScaleFitRequest {
                 data: data.values.view(),
                 spec,
@@ -2665,7 +2673,7 @@ fn materialize_survival<'a>(
             "workflow survival location-scale baseline",
             |candidate| {
                 let fit_result = fit_survival_location_scale_model(
-                    build_location_scale_request(candidate)?,
+                    build_location_scale_request(candidate, false)?,
                 )
                 .map_err(|e| format!("survival location-scale fit failed: {e}"))?;
                 // Warm-start the next probe's threshold / log-σ smoothing parameters
@@ -2794,7 +2802,7 @@ fn materialize_survival<'a>(
             })
         }
         SurvivalLikelihoodMode::LocationScale => {
-            FitRequest::SurvivalLocationScale(build_location_scale_request(&baseline_cfg)?)
+            FitRequest::SurvivalLocationScale(build_location_scale_request(&baseline_cfg, true)?)
         }
         SurvivalLikelihoodMode::MarginalSlope => {
             FitRequest::SurvivalMarginalSlope(build_marginal_slope_request(&baseline_cfg)?)

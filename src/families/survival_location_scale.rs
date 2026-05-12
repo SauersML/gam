@@ -10765,10 +10765,27 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 fn fit_survival_location_scale(
     spec: SurvivalLocationScaleSpec,
 ) -> Result<UnifiedFitResult, String> {
+    let (fit, _geom) = fit_survival_location_scale_with_geometry(spec)?;
+    Ok(fit)
+}
+
+/// Variant that also returns the offset-channel residuals + curvatures at the
+/// converged β̂. We have to extract these *before* `finalize_survival_location_scale_fit`
+/// runs, because the location-scale finalizer empties `UnifiedFitResult::block_states`
+/// (see `survival_fit_from_parts` — `block_states: Vec::new()`), and the family's
+/// `offset_channel_geometry` method needs the raw, populated per-block state.
+fn fit_survival_location_scale_with_geometry(
+    spec: SurvivalLocationScaleSpec,
+) -> Result<
+    (UnifiedFitResult, (OffsetChannelResiduals, OffsetChannelCurvatures)),
+    String,
+> {
     let prepared = prepare_survival_location_scale_model(&spec)?;
     let options = survival_blockwise_fit_options(&spec);
     let fit = fit_custom_family(&prepared.family, &prepared.blockspecs, &options)?;
-    finalize_survival_location_scale_fit(&prepared, &fit)
+    let geom = prepared.family.offset_channel_geometry(&fit.block_states)?;
+    let finalized = finalize_survival_location_scale_fit(&prepared, &fit)?;
+    Ok((finalized, geom))
 }
 
 pub(crate) fn select_survival_link_wiggle_basis_from_pilot(
@@ -10960,6 +10977,15 @@ pub(crate) fn fit_survival_location_scale_terms(
             .and_then(|w| w.initial_beta.clone()),
     );
     let exact_warm_start = std::cell::RefCell::new(None::<CustomFamilyWarmStart>);
+    // Stash the geometry from the most recent inner fit. Updated on every
+    // value-closure call by the spatial optimizer; the last one written
+    // corresponds to the converged outer point. This avoids redoing
+    // `prepare_survival_location_scale_model` + a second fit pass after the
+    // optimizer returns, and (critically) avoids the post-finalize
+    // `block_states` wipe that would make the geometry call error out.
+    let last_geometry: std::cell::RefCell<
+        Option<(OffsetChannelResiduals, OffsetChannelCurvatures)>,
+    > = std::cell::RefCell::new(None);
 
     let build_spec = |rho: &Array1<f64>,
                       _: &TermCollectionSpec,
@@ -11084,7 +11110,7 @@ pub(crate) fn fit_survival_location_scale_terms(
         outer_policy,
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
-            let fit = fit_survival_location_scale(build_spec(
+            let (fit, geom) = fit_survival_location_scale_with_geometry(build_spec(
                 &rho,
                 &specs[0],
                 &specs[1],
@@ -11095,6 +11121,7 @@ pub(crate) fn fit_survival_location_scale_terms(
             threshold_beta_hint.replace(Some(fit.beta_threshold()));
             log_sigma_beta_hint.replace(Some(fit.beta_log_sigma()));
             wiggle_beta_hint.replace(fit.beta_link_wiggle());
+            *last_geometry.borrow_mut() = Some(geom);
             Ok(fit)
         },
         |theta,
@@ -11208,24 +11235,32 @@ pub(crate) fn fit_survival_location_scale_terms(
 
     let mut resolved_specs = solved.resolved_specs;
     let mut designs = solved.designs;
-    // Build offset-channel geometry at the converged β so callers can do a
-    // closed-form θ-gradient against the baseline offsets without rerunning
-    // the family. This consumes the same `build_spec` / preparation path that
-    // the inner solver used, so the family observed here is byte-identical
-    // (modulo the explicit warm-started log-λ) to the one the outer optimum
-    // landed at.
-    let rho_final = solved.fit.log_lambdas.clone();
-    let final_assembled = build_spec(
-        &rho_final,
-        &resolved_specs[0],
-        &resolved_specs[1],
-        &designs[0],
-        &designs[1],
-    )?;
-    let prepared_final = prepare_survival_location_scale_model(&final_assembled)?;
-    let (baseline_offset_residuals, baseline_offset_curvatures) = prepared_final
-        .family
-        .offset_channel_geometry(&solved.fit.block_states)?;
+    // Fast path: the value closure stashed the offset geometry from the
+    // *converged* inner fit (computed pre-finalize while `block_states` was
+    // still populated). No extra family prep / refit needed here.
+    //
+    // Fallback: if for some reason no value-closure call ran (or the
+    // optimizer's last evaluation happened through the gradient/EFS path
+    // without touching the value closure at the final ρ), recompute by
+    // redoing one inner fit at the final ρ̂. This pays an extra fit only when
+    // the cache is cold — the common location-scale path always populates it.
+    let (baseline_offset_residuals, baseline_offset_curvatures) =
+        match last_geometry.borrow_mut().take() {
+            Some(geom) => geom,
+            None => {
+                let rho_final = solved.fit.log_lambdas.clone();
+                let final_assembled = build_spec(
+                    &rho_final,
+                    &resolved_specs[0],
+                    &resolved_specs[1],
+                    &designs[0],
+                    &designs[1],
+                )?;
+                let (_refit, geom) =
+                    fit_survival_location_scale_with_geometry(final_assembled)?;
+                geom
+            }
+        };
     Ok(SurvivalLocationScaleTermFitResult {
         fit: solved.fit,
         resolved_thresholdspec: resolved_specs.remove(0),
