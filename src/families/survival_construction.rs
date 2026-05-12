@@ -3222,6 +3222,117 @@ mod tests {
         }
     }
 
+    /// Finite-difference verification of the analytic θ-gradient used by the
+    /// survival location-scale workflow path.
+    ///
+    /// At a converged β, the envelope theorem reduces the profile-NLL gradient
+    /// w.r.t. the baseline-config θ to a per-row residual contraction against
+    /// the per-row offset-channel partials ∂o/∂θ:
+    ///
+    ///   d(NLL)/dθ_k = Σ_i [ r_X[i]·∂η_exit/∂θ_k + r_E[i]·∂η_entry/∂θ_k
+    ///                       + r_D[i]·∂o_D_exit/∂θ_k ]
+    ///
+    /// (`baseline_chain_rule_gradient`). Because β is fixed, an explicit loss
+    /// `L(θ) = Σ_i [ r_X[i]·η(t_exit_i; θ) + r_E[i]·η(t_entry_i; θ)
+    ///              + r_D[i]·o_D(t_exit_i; θ) ]`
+    /// has gradient identically equal to the chain-rule output. Comparing the
+    /// analytic gradient to a central-difference of L over `evaluate_survival_baseline`
+    /// therefore exercises every piece of the chain rule (incl. the Gompertz
+    /// rate / shape / Makeham partials at both entry and exit ages) without
+    /// needing the full location-scale fit pipeline inside this unit-test
+    /// module. If the chain rule disagrees with FD here, the workflow's
+    /// gradient is wrong by exactly the same amount.
+    #[test]
+    fn gompertz_makeham_baseline_chain_rule_gradient_matches_finite_difference() {
+        let cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::GompertzMakeham,
+            scale: None,
+            shape: Some(0.05),
+            rate: Some(0.012),
+            makeham: Some(0.003),
+        };
+        // n = 8 small synthetic dataset spanning a realistic age range.
+        let age_entry = array![5.0, 8.0, 12.0, 0.5, 20.0, 30.0, 45.0, 60.0];
+        let age_exit = array![10.0, 15.0, 25.0, 4.0, 35.0, 50.0, 65.0, 80.0];
+        // Synthetic per-row NLL residuals on the three offset channels. Mix of
+        // signs / magnitudes / one zero-entry row (origin entry → r_E=0).
+        let residuals = OffsetChannelResiduals {
+            exit: array![0.42, -0.18, 0.73, -0.91, 0.05, -0.27, 0.61, -0.34],
+            entry: array![-0.12, 0.31, -0.44, 0.0, 0.16, -0.22, 0.07, -0.51],
+            derivative: array![1.04, -0.65, 0.18, -1.21, 0.42, -0.13, 0.88, -0.27],
+        };
+
+        let analytic = baseline_chain_rule_gradient(
+            age_entry.view(),
+            age_exit.view(),
+            &cfg,
+            &residuals,
+        )
+        .expect("analytic gradient ok")
+        .expect("GM baseline has a θ-gradient");
+        assert_eq!(analytic.len(), 3, "GM θ has 3 components");
+
+        // Evaluate the offset-projected loss at a perturbed θ. Mirrors the
+        // chain rule's algebra: the entry channel is only added for rows whose
+        // r_E is nonzero (matching baseline_chain_rule_gradient's gating that
+        // avoids calling evaluate_survival_baseline at age 0 for origin-entry
+        // rows).
+        let loss_at_cfg = |cfg_eval: &SurvivalBaselineConfig| -> f64 {
+            let mut acc = 0.0;
+            for i in 0..age_exit.len() {
+                let (eta_exit_i, od_exit_i) =
+                    evaluate_survival_baseline(age_exit[i], cfg_eval).expect("eval exit");
+                acc += residuals.exit[i] * eta_exit_i + residuals.derivative[i] * od_exit_i;
+                if residuals.entry[i] != 0.0 {
+                    let (eta_entry_i, _) = evaluate_survival_baseline(age_entry[i], cfg_eval)
+                        .expect("eval entry");
+                    acc += residuals.entry[i] * eta_entry_i;
+                }
+            }
+            acc
+        };
+
+        let theta0 = survival_baseline_theta_from_config(&cfg)
+            .expect("theta seed")
+            .expect("GM has θ");
+        // Spec requested δ = 1e-4 per axis. Use central differences over θ.
+        let delta = 1e-4;
+        let mut fd = Array1::<f64>::zeros(analytic.len());
+        for k in 0..analytic.len() {
+            let mut theta_plus = theta0.clone();
+            theta_plus[k] += delta;
+            let mut theta_minus = theta0.clone();
+            theta_minus[k] -= delta;
+            let cfg_plus = survival_baseline_config_from_theta(cfg.target, &theta_plus)
+                .expect("cfg(θ+δ)");
+            let cfg_minus = survival_baseline_config_from_theta(cfg.target, &theta_minus)
+                .expect("cfg(θ-δ)");
+            let lp = loss_at_cfg(&cfg_plus);
+            let lm = loss_at_cfg(&cfg_minus);
+            fd[k] = (lp - lm) / (2.0 * delta);
+        }
+
+        let analytic_norm = analytic.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        let max_err = analytic
+            .iter()
+            .zip(fd.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        let rel = max_err / (analytic_norm + 1e-12);
+        // Print so the deliverable can quote the exact max-error number.
+        eprintln!(
+            "gompertz_makeham_baseline_chain_rule_gradient_matches_finite_difference: \
+             analytic={analytic:?} fd={fd:?} max_err={max_err:.3e} \
+             analytic_inf_norm={analytic_norm:.3e} rel={rel:.3e}"
+        );
+        assert!(
+            rel < 1e-2,
+            "analytic θ-gradient disagrees with central FD beyond 1%: \
+             analytic={analytic:?}, fd={fd:?}, max_err={max_err:.3e}, \
+             rel={rel:.3e} (analytic_inf_norm={analytic_norm:.3e})"
+        );
+    }
+
     // ─── baseline_offset_theta_partials — analytic vs central-difference ─
 
     /// Central-difference of (eta, o_D) at fixed age wrt each θ component in
