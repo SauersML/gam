@@ -674,11 +674,18 @@ pub fn cost_gated_first_order_max_iter(
 /// Local trust budget for first-order outer BFGS on log-smoothing parameters.
 ///
 /// One unit in `rho = log(lambda)` is an `e`-fold smoothing-parameter change.
-/// For objectives where each value-only line-search probe runs a full inner fit,
-/// BFGS must stay in a local model region and spend work on accepted gradient
-/// samples, not on unbounded strong-Wolfe bracketing probes.
+/// Previously this cap was `1.0`, which throttled BFGS to ~1/5 of its
+/// quasi-Newton step on flat REML surfaces (the natural BFGS direction has
+/// `|d|_inf` of ~5 in log-λ for biobank-scale survival fits). Probes whose
+/// `step_inf > cap` are rejected for free in `OuterFirstOrderBridge::eval_cost`
+/// (returning `BFGS_LINE_SEARCH_REJECT_COST` without running an inner solve),
+/// so a larger cap costs nothing on rejection — it only lets Strong-Wolfe
+/// accept bigger steps that the inner-PIRLS divergence guard can already
+/// validate. `5.0` allows up to `e^5 ≈ 148`-fold smoothing-parameter change
+/// per accepted outer iter, which matches the typical quasi-Newton direction
+/// magnitude while still bounding pathological probes.
 pub fn first_order_bfgs_loglambda_step_cap(has_outer_hessian: bool) -> Option<f64> {
-    if has_outer_hessian { None } else { Some(1.0) }
+    if has_outer_hessian { None } else { Some(5.0) }
 }
 
 pub(crate) fn exact_newton_outer_geometry_supports_second_order_solver<F: CustomFamily + ?Sized>(
