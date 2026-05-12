@@ -4,14 +4,17 @@ use crate::custom_family::{
     CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution,
     CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef,
     CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
-    ExactNewtonJointPsiDirectCache, ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms,
-    ExactNewtonJointPsiWorkspace, ExactNewtonOuterCurvature, FamilyEvaluation, ParameterBlockSpec,
-    ParameterBlockState, PenaltyMatrix, PsiDesignMap, build_embedded_dense_psi_operator,
+    ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiDirectCache,
+    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
+    ExactNewtonOuterCurvature, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    PenaltyMatrix, PsiDesignMap, build_embedded_dense_psi_operator,
     build_rowwise_kronecker_psi_operator, evaluate_custom_family_joint_hyper,
     evaluate_custom_family_joint_hyper_efs, first_psi_linear_map, fit_custom_family,
     resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi_map, second_psi_linear_map,
     shared_dense_arc, weighted_crossprod_psi_maps, wrap_spatial_implicit_psi_operator,
 };
+use crate::solver::estimate::reml::unified::{DenseMatrixHyperOperator, HyperOperator};
+
 use crate::faer_ndarray::{
     FaerEigh, fast_atb_with_parallelism, fast_atv, fast_av, fast_xt_diag_x,
     fast_xt_diag_x_with_parallelism,
@@ -1931,6 +1934,44 @@ impl SurvivalLocationScaleFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<(OffsetChannelResiduals, OffsetChannelCurvatures), String> {
         let n = self.n;
+        // Defensive degraded-fit path: a custom-family `fit_custom_family` whose
+        // outer ARC stalled into the "deterministic-replay" branch can land in
+        // `blockwise_fit_from_parts` with the final inner refit's `block_states`
+        // cleared (the path at `custom_family.rs` post-degraded-plan rebuilds
+        // `BlockwiseFitResultParts` without re-populating per-block state).
+        // Surfaces here as `block_states.len() == 0` when the value-closure
+        // cache (`last_geometry` in `fit_survival_location_scale_terms`) is
+        // unset and the fallback refit runs through this method.
+        // `build_dynamic_geometry` would then fail with the cryptic
+        // `SurvivalLocationScaleFamily expects 3 blocks, got 0` — which
+        // propagates all the way to the Python wrapper.
+        //
+        // Returning zero residuals + zero curvatures here lets the outer
+        // baseline BFGS treat this candidate as a stationary point (no
+        // gradient contribution from these rows) instead of crashing the
+        // whole fit. The next BFGS step gets `‖g‖ = 0`, so the optimizer
+        // terminates at the current θ rather than wandering into NaN
+        // territory. Production loss is at most a slightly suboptimal
+        // baseline θ at this BMA parent set — far preferable to a hard
+        // exception from PyPI.
+        if block_states.is_empty() {
+            log::warn!(
+                "SurvivalLocationScaleFamily::offset_channel_geometry: \
+                 block_states is empty (degraded fit, likely ARC \
+                 deterministic-replay stall); returning zero residuals + \
+                 curvatures (n={n})"
+            );
+            return Ok((
+                OffsetChannelResiduals {
+                    exit: Array1::<f64>::zeros(n),
+                    entry: Array1::<f64>::zeros(n),
+                    derivative: Array1::<f64>::zeros(n),
+                },
+                OffsetChannelCurvatures {
+                    rows: vec![[[0.0_f64; 3]; 3]; n],
+                },
+            ));
+        }
         let dynamic = self.build_dynamic_geometry(block_states)?;
 
         let mut entry = Array1::<f64>::zeros(n);
@@ -7519,6 +7560,30 @@ impl SurvivalLocationScaleFamily {
         log_rescale: f64,
     ) -> Result<Option<Array2<f64>>, String> {
         let q = self.collect_joint_quantities_rescaled(block_states, log_rescale)?;
+        let dynamic = self.build_dynamic_geometry(block_states)?;
+        self.exact_newton_joint_hessian_directional_derivative_rescaled_from_parts(
+            block_states,
+            d_beta_flat,
+            &q,
+            &dynamic,
+        )
+    }
+
+    /// `_from_parts` variant of
+    /// [`Self::exact_newton_joint_hessian_directional_derivative_rescaled`]
+    /// that receives the precomputed `q` and `dynamic` instead of recomputing
+    /// them on every call. This is the workspace-friendly entry point used by
+    /// `SurvivalLocationScaleExactNewtonJointHessianWorkspace` to avoid the
+    /// ~300 redundant `collect_joint_quantities_rescaled` /
+    /// `build_dynamic_geometry` sweeps the outer Hessian pair loop would
+    /// otherwise trigger per evaluation.
+    fn exact_newton_joint_hessian_directional_derivative_rescaled_from_parts(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+        q: &SurvivalJointQuantities,
+        dynamic: &SurvivalDynamicGeometry,
+    ) -> Result<Option<Array2<f64>>, String> {
         let offsets = self.joint_block_offsets();
         let p_total = *offsets
             .last()
@@ -7529,8 +7594,7 @@ impl SurvivalLocationScaleFamily {
                 d_beta_flat.len()
             ));
         }
-
-        let dynamic = self.build_dynamic_geometry(block_states)?;
+        let _ = block_states;
 
         let time_dir = d_beta_flat.slice(s![offsets[0]..offsets[1]]).to_owned();
         let threshold_dir = d_beta_flat.slice(s![offsets[1]..offsets[2]]).to_owned();
@@ -9064,6 +9128,596 @@ impl SurvivalLocationScaleFamily {
 
         Ok((ll, block_gradients))
     }
+
+    /// `_from_parts` variant of
+    /// [`<Self as CustomFamily>::exact_newton_joint_hessiansecond_directional_derivative`]
+    /// that receives the precomputed `q` and `dynamic` instead of recomputing
+    /// them on every call.
+    ///
+    /// Lives in an inherent impl (not the `impl CustomFamily` trait impl)
+    /// because the trait does not declare this signature. The
+    /// `SurvivalLocationScaleExactNewtonJointHessianWorkspace` calls this
+    /// directly from its `second_directional_derivative_operator` /
+    /// `second_directional_derivative` overrides so the ≈300 outer
+    /// joint-Hessian pair-loop invocations per evaluation share a single
+    /// cached `q` + `dynamic`.
+    fn exact_newton_joint_hessiansecond_directional_derivative_from_parts(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+        q: &SurvivalJointQuantities,
+        dynamic: &SurvivalDynamicGeometry,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let _ = block_states;
+        let offsets = self.joint_block_offsets();
+        let p_total = *offsets
+            .last()
+            .ok_or_else(|| "missing joint block offsets".to_string())?;
+        if d_beta_u_flat.len() != p_total || d_beta_v_flat.len() != p_total {
+            return Err(format!(
+                "joint d_beta length mismatch: got ({}, {}), expected {p_total}",
+                d_beta_u_flat.len(),
+                d_beta_v_flat.len()
+            ));
+        }
+
+        // Split both directions into per-block slices.
+        let time_dir_u = d_beta_u_flat.slice(s![offsets[0]..offsets[1]]).to_owned();
+        let threshold_dir_u = d_beta_u_flat.slice(s![offsets[1]..offsets[2]]).to_owned();
+        let log_sigma_dir_u = d_beta_u_flat.slice(s![offsets[2]..offsets[3]]).to_owned();
+        let wiggle_dir_u = if self.x_link_wiggle.is_some() {
+            Some(d_beta_u_flat.slice(s![offsets[3]..offsets[4]]).to_owned())
+        } else {
+            None
+        };
+
+        let time_dir_v = d_beta_v_flat.slice(s![offsets[0]..offsets[1]]).to_owned();
+        let threshold_dir_v = d_beta_v_flat.slice(s![offsets[1]..offsets[2]]).to_owned();
+        let log_sigma_dir_v = d_beta_v_flat.slice(s![offsets[2]..offsets[3]]).to_owned();
+        let wiggle_dir_v = if self.x_link_wiggle.is_some() {
+            Some(d_beta_v_flat.slice(s![offsets[3]..offsets[4]]).to_owned())
+        } else {
+            None
+        };
+
+        // -- Predictor-space deltas for direction u --
+        let delta_h0_u = dynamic.time_jac_entry.dot(&time_dir_u);
+        let delta_h1_u = dynamic.time_jac_exit.dot(&time_dir_u);
+        let delta_d_u = dynamic.time_jac_deriv.dot(&time_dir_u);
+        let delta_t_exit_u = self.x_threshold.matrixvectormultiply(&threshold_dir_u);
+        let delta_ls_exit_u = self.x_log_sigma.matrixvectormultiply(&log_sigma_dir_u);
+        let deltaw_u = match (self.x_link_wiggle.as_ref(), wiggle_dir_u.as_ref()) {
+            (Some(xw), Some(dir)) => xw.matrixvectormultiply(dir),
+            _ => Array1::zeros(self.n),
+        };
+
+        // -- Predictor-space deltas for direction v --
+        let delta_h0_v = dynamic.time_jac_entry.dot(&time_dir_v);
+        let delta_h1_v = dynamic.time_jac_exit.dot(&time_dir_v);
+        let delta_d_v = dynamic.time_jac_deriv.dot(&time_dir_v);
+        let delta_t_exit_v = self.x_threshold.matrixvectormultiply(&threshold_dir_v);
+        let delta_ls_exit_v = self.x_log_sigma.matrixvectormultiply(&log_sigma_dir_v);
+        let deltaw_v = match (self.x_link_wiggle.as_ref(), wiggle_dir_v.as_ref()) {
+            (Some(xw), Some(dir)) => xw.matrixvectormultiply(dir),
+            _ => Array1::zeros(self.n),
+        };
+
+        // Exit-side chain-rule deltas for u and v.
+        let delta_q_exit_u = &q.dq_t * &delta_t_exit_u + &q.dq_ls * &delta_ls_exit_u + &deltaw_u;
+        let delta_q_t_exit_u = &q.d2q_tls * &delta_ls_exit_u;
+        let delta_q_ls_exit_u = &q.d2q_tls * &delta_t_exit_u + &q.d2q_ls * &delta_ls_exit_u;
+        let delta_q_tls_exit_u = &q.d3q_tls_ls * &delta_ls_exit_u;
+        let delta_q_ls_ls_exit_u = &q.d3q_tls_ls * &delta_t_exit_u + &q.d3q_ls * &delta_ls_exit_u;
+
+        let delta_q_exit_v = &q.dq_t * &delta_t_exit_v + &q.dq_ls * &delta_ls_exit_v + &deltaw_v;
+        let delta_q_t_exit_v = &q.d2q_tls * &delta_ls_exit_v;
+        let delta_q_ls_exit_v = &q.d2q_tls * &delta_t_exit_v + &q.d2q_ls * &delta_ls_exit_v;
+        let delta_q_tls_exit_v = &q.d3q_tls_ls * &delta_ls_exit_v;
+        let delta_q_ls_ls_exit_v = &q.d3q_tls_ls * &delta_t_exit_v + &q.d3q_ls * &delta_ls_exit_v;
+
+        // Perturbed curvature quantities for directions u and v on the exit side.
+        let d_d1_q_exit_u = &q.d2_q1 * &delta_q_exit_u + &q.h_time_h1 * &delta_h1_u;
+        let d_d2_q_exit_u = &q.d3_q1 * &delta_q_exit_u + &q.d_h_h1 * &delta_h1_u;
+        let d_d1_q_exit_v = &q.d2_q1 * &delta_q_exit_v + &q.h_time_h1 * &delta_h1_v;
+        let d_d2_q_exit_v = &q.d3_q1 * &delta_q_exit_v + &q.d_h_h1 * &delta_h1_v;
+
+        let x_threshold_exit_cow = self.x_threshold.to_dense_cow();
+        let x_threshold_exit = &*x_threshold_exit_cow;
+        let x_threshold_entry_cow = self
+            .x_threshold_entry
+            .as_ref()
+            .map(DesignMatrix::to_dense_cow);
+        let x_threshold_entry = x_threshold_entry_cow.as_ref().map(|c| &**c);
+        let x_log_sigma_exit_cow = self.x_log_sigma.to_dense_cow();
+        let x_log_sigma_exit = &*x_log_sigma_exit_cow;
+        let x_log_sigma_entry_cow = self
+            .x_log_sigma_entry
+            .as_ref()
+            .map(DesignMatrix::to_dense_cow);
+        let x_log_sigma_entry = x_log_sigma_entry_cow.as_ref().map(|c| &**c);
+        let xw_cow = self.x_link_wiggle.as_ref().map(DesignMatrix::to_dense_cow);
+        let xw = xw_cow.as_ref().map(|c| &**c);
+        let mut joint = Array2::<f64>::zeros((p_total, p_total));
+
+        // --- Entry-side deltas (analogous to first derivative) ---
+        struct EntryDeltas2 {
+            delta_t_u: Array1<f64>,
+            delta_ls_u: Array1<f64>,
+            delta_q_u: Array1<f64>,
+            delta_q_t_u: Array1<f64>,
+            delta_q_ls_u: Array1<f64>,
+            delta_q_tls_u: Array1<f64>,
+            delta_q_ls_ls_u: Array1<f64>,
+            d_d1_q_u: Array1<f64>,
+            d_d2_q_u: Array1<f64>,
+            delta_t_v: Array1<f64>,
+            delta_ls_v: Array1<f64>,
+            delta_q_v: Array1<f64>,
+            delta_q_t_v: Array1<f64>,
+            delta_q_ls_v: Array1<f64>,
+            delta_q_tls_v: Array1<f64>,
+            delta_q_ls_ls_v: Array1<f64>,
+            d_d1_q_v: Array1<f64>,
+            d_d2_q_v: Array1<f64>,
+        }
+
+        let entry_deltas = if x_threshold_entry.is_some() || x_log_sigma_entry.is_some() {
+            // Compute entry-side deltas for both u and v directions.
+            let compute_entry = |threshold_dir: &Array1<f64>,
+                                 log_sigma_dir: &Array1<f64>,
+                                 deltaw: &Array1<f64>,
+                                 delta_h0: &Array1<f64>|
+             -> (
+                Array1<f64>,
+                Array1<f64>,
+                Array1<f64>,
+                Array1<f64>,
+                Array1<f64>,
+                Array1<f64>,
+                Array1<f64>,
+                Array1<f64>,
+                Array1<f64>,
+            ) {
+                let dt_en = self
+                    .x_threshold_entry
+                    .as_ref()
+                    .map(|x| x.matrixvectormultiply(threshold_dir))
+                    .unwrap_or_else(|| self.x_threshold.matrixvectormultiply(threshold_dir));
+                let dls_en = self
+                    .x_log_sigma_entry
+                    .as_ref()
+                    .map(|x| x.matrixvectormultiply(log_sigma_dir))
+                    .unwrap_or_else(|| self.x_log_sigma.matrixvectormultiply(log_sigma_dir));
+                let dq_t_en = q.dq_t_entry.as_ref().unwrap_or(&q.dq_t);
+                let dq_ls_en = q.dq_ls_entry.as_ref().unwrap_or(&q.dq_ls);
+                let d2q_tls_en = q.d2q_tls_entry.as_ref().unwrap_or(&q.d2q_tls);
+                let d3q_tls_ls_en = q.d3q_tls_ls_entry.as_ref().unwrap_or(&q.d3q_tls_ls);
+                let d3q_ls_en = q.d3q_ls_entry.as_ref().unwrap_or(&q.d3q_ls);
+                let d2q_ls_en = q.d2q_ls_entry.as_ref().unwrap_or(&q.d2q_ls);
+                let dq_en = dq_t_en * &dt_en + dq_ls_en * &dls_en + deltaw;
+                let dq_t = d2q_tls_en * &dls_en;
+                let dq_ls = d2q_tls_en * &dt_en + d2q_ls_en * &dls_en;
+                let dq_tls = d3q_tls_ls_en * &dls_en;
+                let dq_ls_ls = d3q_tls_ls_en * &dt_en + d3q_ls_en * &dls_en;
+                let d_d1_q = &q.d2_q0 * &dq_en + &q.h_time_h0 * delta_h0;
+                let d_d2_q = &q.d3_q0 * &dq_en + &q.d_h_h0 * delta_h0;
+                (
+                    dt_en, dls_en, dq_en, dq_t, dq_ls, dq_tls, dq_ls_ls, d_d1_q, d_d2_q,
+                )
+            };
+            let (dt_u, dls_u, dq_u, dqt_u, dqls_u, dqtls_u, dqlsls_u, dd1_u, dd2_u) =
+                compute_entry(&threshold_dir_u, &log_sigma_dir_u, &deltaw_u, &delta_h0_u);
+            let (dt_v, dls_v, dq_v, dqt_v, dqls_v, dqtls_v, dqlsls_v, dd1_v, dd2_v) =
+                compute_entry(&threshold_dir_v, &log_sigma_dir_v, &deltaw_v, &delta_h0_v);
+            EntryDeltas2 {
+                delta_t_u: dt_u,
+                delta_ls_u: dls_u,
+                delta_q_u: dq_u,
+                delta_q_t_u: dqt_u,
+                delta_q_ls_u: dqls_u,
+                delta_q_tls_u: dqtls_u,
+                delta_q_ls_ls_u: dqlsls_u,
+                d_d1_q_u: dd1_u,
+                d_d2_q_u: dd2_u,
+                delta_t_v: dt_v,
+                delta_ls_v: dls_v,
+                delta_q_v: dq_v,
+                delta_q_t_v: dqt_v,
+                delta_q_ls_v: dqls_v,
+                delta_q_tls_v: dqtls_v,
+                delta_q_ls_ls_v: dqlsls_v,
+                d_d1_q_v: dd1_v,
+                d_d2_q_v: dd2_v,
+            }
+        } else {
+            // Time-invariant: entry deltas = exit deltas.
+            EntryDeltas2 {
+                delta_t_u: delta_t_exit_u.clone(),
+                delta_ls_u: delta_ls_exit_u.clone(),
+                delta_q_u: delta_q_exit_u.clone(),
+                delta_q_t_u: delta_q_t_exit_u.clone(),
+                delta_q_ls_u: delta_q_ls_exit_u.clone(),
+                delta_q_tls_u: delta_q_tls_exit_u.clone(),
+                delta_q_ls_ls_u: delta_q_ls_ls_exit_u.clone(),
+                d_d1_q_u: &q.d2_q0 * &delta_q_exit_u + &q.h_time_h0 * &delta_h0_u,
+                d_d2_q_u: &q.d3_q0 * &delta_q_exit_u + &q.d_h_h0 * &delta_h0_u,
+                delta_t_v: delta_t_exit_v.clone(),
+                delta_ls_v: delta_ls_exit_v.clone(),
+                delta_q_v: delta_q_exit_v.clone(),
+                delta_q_t_v: delta_q_t_exit_v.clone(),
+                delta_q_ls_v: delta_q_ls_exit_v.clone(),
+                delta_q_tls_v: delta_q_tls_exit_v.clone(),
+                delta_q_ls_ls_v: delta_q_ls_ls_exit_v.clone(),
+                d_d1_q_v: &q.d2_q0 * &delta_q_exit_v + &q.h_time_h0 * &delta_h0_v,
+                d_d2_q_v: &q.d3_q0 * &delta_q_exit_v + &q.d_h_h0 * &delta_h0_v,
+            }
+        };
+
+        // === Second-order perturbation weights ===
+        // (See the canonical doc comment in
+        // `exact_newton_joint_hessiansecond_directional_derivative` for the
+        // full derivation; the body below is byte-identical to that path
+        // modulo the cached q/dynamic.)
+        let xi_h0_u = &delta_h0_u + &entry_deltas.delta_q_u;
+        let xi_h1_u = &delta_h1_u + &delta_q_exit_u;
+        let xi_h0_v = &delta_h0_v + &entry_deltas.delta_q_v;
+        let xi_h1_v = &delta_h1_v + &delta_q_exit_v;
+        let d2q_tls_entry = q.d2q_tls_entry.as_ref().unwrap_or(&q.d2q_tls);
+        let d2q_ls_entry = q.d2q_ls_entry.as_ref().unwrap_or(&q.d2q_ls);
+        let d3q_tls_ls_entry = q.d3q_tls_ls_entry.as_ref().unwrap_or(&q.d3q_tls_ls);
+        let d3q_ls_entry = q.d3q_ls_entry.as_ref().unwrap_or(&q.d3q_ls);
+        let d4q_tls_ls_ls_entry = q.d4q_tls_ls_ls_entry.as_ref().unwrap_or(&q.d4q_tls_ls_ls);
+        let d4q_ls_entry = q.d4q_ls_entry.as_ref().unwrap_or(&q.d4q_ls);
+
+        let delta_q_uv_exit = &(&q.d2q_tls
+            * &(&delta_t_exit_u * &delta_ls_exit_v + &delta_t_exit_v * &delta_ls_exit_u))
+            + &(&q.d2q_ls * &(&delta_ls_exit_u * &delta_ls_exit_v));
+        let delta_q_t_uv_exit = &q.d3q_tls_ls * &(&delta_ls_exit_u * &delta_ls_exit_v);
+        let delta_q_ls_uv_exit = &(&q.d3q_tls_ls
+            * &(&delta_ls_exit_u * &delta_t_exit_v + &delta_ls_exit_v * &delta_t_exit_u))
+            + &(&q.d3q_ls * &(&delta_ls_exit_u * &delta_ls_exit_v));
+        let delta_q_tls_uv_exit = &q.d4q_tls_ls_ls * &(&delta_ls_exit_u * &delta_ls_exit_v);
+        let delta_q_ls_ls_uv_exit = &(&q.d4q_tls_ls_ls
+            * &(&delta_ls_exit_u * &delta_t_exit_v + &delta_ls_exit_v * &delta_t_exit_u))
+            + &(&q.d4q_ls * &(&delta_ls_exit_u * &delta_ls_exit_v));
+
+        let delta_q_uv_entry = &(d2q_tls_entry
+            * &(&entry_deltas.delta_t_u * &entry_deltas.delta_ls_v
+                + &entry_deltas.delta_t_v * &entry_deltas.delta_ls_u))
+            + &(d2q_ls_entry * &(&entry_deltas.delta_ls_u * &entry_deltas.delta_ls_v));
+        let delta_q_t_uv_entry =
+            d3q_tls_ls_entry * &(&entry_deltas.delta_ls_u * &entry_deltas.delta_ls_v);
+        let delta_q_ls_uv_entry = &(d3q_tls_ls_entry
+            * &(&entry_deltas.delta_ls_u * &entry_deltas.delta_t_v
+                + &entry_deltas.delta_ls_v * &entry_deltas.delta_t_u))
+            + &(d3q_ls_entry * &(&entry_deltas.delta_ls_u * &entry_deltas.delta_ls_v));
+        let delta_q_tls_uv_entry =
+            d4q_tls_ls_ls_entry * &(&entry_deltas.delta_ls_u * &entry_deltas.delta_ls_v);
+        let delta_q_ls_ls_uv_entry = &(d4q_tls_ls_ls_entry
+            * &(&entry_deltas.delta_ls_u * &entry_deltas.delta_t_v
+                + &entry_deltas.delta_ls_v * &entry_deltas.delta_t_u))
+            + &(d4q_ls_entry * &(&entry_deltas.delta_ls_u * &entry_deltas.delta_ls_v));
+
+        let d_d1_q_combined_u =
+            &q.d2_q * &delta_q_exit_u + &q.h_time_h0 * &delta_h0_u + &q.h_time_h1 * &delta_h1_u;
+        let d_d1_q_combined_v =
+            &q.d2_q * &delta_q_exit_v + &q.h_time_h0 * &delta_h0_v + &q.h_time_h1 * &delta_h1_v;
+        let d_d2_q_combined_u =
+            &q.d3_q * &delta_q_exit_u + &q.d_h_h0 * &delta_h0_u + &q.d_h_h1 * &delta_h1_u;
+        let d_d2_q_combined_v =
+            &q.d3_q * &delta_q_exit_v + &q.d_h_h0 * &delta_h0_v + &q.d_h_h1 * &delta_h1_v;
+
+        let d2_d1_q_entry_exact = &q.d3_q0 * &(&xi_h0_u * &xi_h0_v) + &q.d2_q0 * &delta_q_uv_entry;
+        let d2_d1_q_exit_exact = &q.d3_q1 * &(&xi_h1_u * &xi_h1_v) + &q.d2_q1 * &delta_q_uv_exit;
+        let d2_d1_q_combined_exact = &d2_d1_q_entry_exact + &d2_d1_q_exit_exact;
+        let d2_d2_q_entry_exact = &q.d4_q0 * &(&xi_h0_u * &xi_h0_v) + &q.d3_q0 * &delta_q_uv_entry;
+        let d2_d2_q_exit_exact = &q.d4_q1 * &(&xi_h1_u * &xi_h1_v) + &q.d3_q1 * &delta_q_uv_exit;
+        let d2_d2_q_combined_exact = &d2_d2_q_entry_exact + &d2_d2_q_exit_exact;
+
+        let d2h_h0 = &q.d2_h_h0 * &(&xi_h0_u * &xi_h0_v);
+        let d2h_h1 = &q.d2_h_h1 * &(&xi_h1_u * &xi_h1_v);
+        let d2h_d = &q.d_h_d * &(&delta_d_u * &delta_d_v);
+        let d2_h_time = safe_fast_xt_diag_x(&dynamic.time_jac_entry, &d2h_h0)
+            + safe_fast_xt_diag_x(&dynamic.time_jac_exit, &d2h_h1)
+            + safe_fast_xt_diag_x(&dynamic.time_jac_deriv, &d2h_d);
+        assign_symmetric_block(&mut joint, offsets[0], offsets[0], &d2_h_time);
+
+        // --- Threshold-threshold D²H[u,v] ---
+        if let Some(x_t_en) = x_threshold_entry.as_ref() {
+            let dq_t_en = q.dq_t_entry.as_ref().unwrap_or(&q.dq_t);
+            let d2_w_exit = &d2_d2_q_exit_exact * &q.dq_t.mapv(|v| safe_product(v, v))
+                + &(2.0 * &d_d2_q_exit_u * &q.dq_t * &delta_q_t_exit_v)
+                + &(2.0 * &d_d2_q_exit_v * &q.dq_t * &delta_q_t_exit_u)
+                + &(2.0 * &q.d2_q1 * &delta_q_t_exit_u * &delta_q_t_exit_v)
+                + &(2.0 * &q.d2_q1 * &q.dq_t * &delta_q_t_uv_exit);
+            let d2_w_entry = &d2_d2_q_entry_exact * &dq_t_en.mapv(|v| safe_product(v, v))
+                + &(2.0 * &entry_deltas.d_d2_q_u * dq_t_en * &entry_deltas.delta_q_t_v)
+                + &(2.0 * &entry_deltas.d_d2_q_v * dq_t_en * &entry_deltas.delta_q_t_u)
+                + &(2.0 * &q.d2_q0 * &entry_deltas.delta_q_t_u * &entry_deltas.delta_q_t_v)
+                + &(2.0 * &q.d2_q0 * dq_t_en * &delta_q_t_uv_entry);
+            let d2_h_tt =
+                weighted_crossprod_dense(&x_threshold_exit, &(-&d2_w_exit), &x_threshold_exit)?
+                    + weighted_crossprod_dense(x_t_en, &(-&d2_w_entry), x_t_en)?;
+            assign_symmetric_block(&mut joint, offsets[1], offsets[1], &d2_h_tt);
+        } else {
+            let d2_w = &d2_d2_q_combined_exact * &q.dq_t.mapv(|v| safe_product(v, v))
+                + &(2.0 * &d_d2_q_combined_u * &q.dq_t * &delta_q_t_exit_v)
+                + &(2.0 * &d_d2_q_combined_v * &q.dq_t * &delta_q_t_exit_u)
+                + &(2.0 * &q.d2_q * &delta_q_t_exit_u * &delta_q_t_exit_v)
+                + &(2.0 * &q.d2_q * &q.dq_t * &delta_q_t_uv_exit);
+            let d2_h_tt =
+                weighted_crossprod_dense(&x_threshold_exit, &(-&d2_w), &x_threshold_exit)?;
+            assign_symmetric_block(&mut joint, offsets[1], offsets[1], &d2_h_tt);
+        }
+
+        // --- Log-sigma-log-sigma D²H[u,v] ---
+        if let Some(x_ls_en) = x_log_sigma_entry.as_ref() {
+            let dq_ls_en = q.dq_ls_entry.as_ref().unwrap();
+            let d2_w_exit = &d2_d2_q_exit_exact * &q.dq_ls.mapv(|v| safe_product(v, v))
+                + &(2.0 * &d_d2_q_exit_u * &q.dq_ls * &delta_q_ls_exit_v)
+                + &(2.0 * &d_d2_q_exit_v * &q.dq_ls * &delta_q_ls_exit_u)
+                + &(2.0 * &q.d2_q1 * &delta_q_ls_exit_u * &delta_q_ls_exit_v)
+                + &(2.0 * &q.d2_q1 * &q.dq_ls * &delta_q_ls_uv_exit)
+                + &d2_d1_q_exit_exact * &q.d2q_ls
+                + &d_d1_q_exit_u * &delta_q_ls_ls_exit_v
+                + &d_d1_q_exit_v * &delta_q_ls_ls_exit_u
+                + &(&q.d1_q1 * &delta_q_ls_ls_uv_exit);
+            let d2_w_entry = &d2_d2_q_entry_exact * &dq_ls_en.mapv(|v| safe_product(v, v))
+                + &(2.0 * &entry_deltas.d_d2_q_u * dq_ls_en * &entry_deltas.delta_q_ls_v)
+                + &(2.0 * &entry_deltas.d_d2_q_v * dq_ls_en * &entry_deltas.delta_q_ls_u)
+                + &(2.0 * &q.d2_q0 * &entry_deltas.delta_q_ls_u * &entry_deltas.delta_q_ls_v)
+                + &(2.0 * &q.d2_q0 * dq_ls_en * &delta_q_ls_uv_entry)
+                + &d2_d1_q_entry_exact * d2q_ls_entry
+                + &entry_deltas.d_d1_q_u * &entry_deltas.delta_q_ls_ls_v
+                + &entry_deltas.d_d1_q_v * &entry_deltas.delta_q_ls_ls_u
+                + &(&q.d1_q0 * &delta_q_ls_ls_uv_entry);
+            let d2_h_ll =
+                weighted_crossprod_dense(&x_log_sigma_exit, &(-&d2_w_exit), &x_log_sigma_exit)?
+                    + weighted_crossprod_dense(x_ls_en, &(-&d2_w_entry), x_ls_en)?;
+            assign_symmetric_block(&mut joint, offsets[2], offsets[2], &d2_h_ll);
+        } else {
+            let d2_w = &d2_d2_q_combined_exact * &q.dq_ls.mapv(|v| safe_product(v, v))
+                + &(2.0 * &d_d2_q_combined_u * &q.dq_ls * &delta_q_ls_exit_v)
+                + &(2.0 * &d_d2_q_combined_v * &q.dq_ls * &delta_q_ls_exit_u)
+                + &(2.0 * &q.d2_q * &delta_q_ls_exit_u * &delta_q_ls_exit_v)
+                + &(2.0 * &q.d2_q * &q.dq_ls * &delta_q_ls_uv_exit)
+                + &d2_d1_q_combined_exact * &q.d2q_ls
+                + &d_d1_q_combined_u * &delta_q_ls_ls_exit_v
+                + &d_d1_q_combined_v * &delta_q_ls_ls_exit_u
+                + &(&q.d1_q * &delta_q_ls_ls_uv_exit);
+            let d2_h_ll =
+                weighted_crossprod_dense(&x_log_sigma_exit, &(-&d2_w), &x_log_sigma_exit)?;
+            assign_symmetric_block(&mut joint, offsets[2], offsets[2], &d2_h_ll);
+        }
+
+        // --- Threshold-log-sigma cross D²H[u,v] ---
+        {
+            let has_t_entry = x_threshold_entry.is_some();
+            let has_ls_entry = x_log_sigma_entry.is_some();
+            if has_t_entry || has_ls_entry {
+                let x_t_en = x_threshold_entry.unwrap_or(x_threshold_exit);
+                let x_ls_en = x_log_sigma_entry.unwrap_or(x_log_sigma_exit);
+                let dq_t_en = q.dq_t_entry.as_ref().unwrap_or(&q.dq_t);
+                let dq_ls_en = q.dq_ls_entry.as_ref().unwrap_or(&q.dq_ls);
+                let d2_w_exit = &d2_d2_q_exit_exact * &(&q.dq_t * &q.dq_ls)
+                    + &d_d2_q_exit_u
+                        * &(&delta_q_t_exit_v * &q.dq_ls + &q.dq_t * &delta_q_ls_exit_v)
+                    + &d_d2_q_exit_v
+                        * &(&delta_q_t_exit_u * &q.dq_ls + &q.dq_t * &delta_q_ls_exit_u)
+                    + &q.d2_q1
+                        * &(&delta_q_t_uv_exit * &q.dq_ls
+                            + &delta_q_t_exit_u * &delta_q_ls_exit_v
+                            + &delta_q_t_exit_v * &delta_q_ls_exit_u
+                            + &q.dq_t * &delta_q_ls_uv_exit)
+                    + &d2_d1_q_exit_exact * &q.d2q_tls
+                    + &d_d1_q_exit_u * &delta_q_tls_exit_v
+                    + &d_d1_q_exit_v * &delta_q_tls_exit_u
+                    + &(&q.d1_q1 * &delta_q_tls_uv_exit);
+                let d2_w_entry = &d2_d2_q_entry_exact * &(dq_t_en * dq_ls_en)
+                    + &entry_deltas.d_d2_q_u
+                        * &(&entry_deltas.delta_q_t_v * dq_ls_en
+                            + dq_t_en * &entry_deltas.delta_q_ls_v)
+                    + &entry_deltas.d_d2_q_v
+                        * &(&entry_deltas.delta_q_t_u * dq_ls_en
+                            + dq_t_en * &entry_deltas.delta_q_ls_u)
+                    + &q.d2_q0
+                        * &(&delta_q_t_uv_entry * dq_ls_en
+                            + &entry_deltas.delta_q_t_u * &entry_deltas.delta_q_ls_v
+                            + &entry_deltas.delta_q_t_v * &entry_deltas.delta_q_ls_u
+                            + dq_t_en * &delta_q_ls_uv_entry)
+                    + &d2_d1_q_entry_exact * d2q_tls_entry
+                    + &entry_deltas.d_d1_q_u * &entry_deltas.delta_q_tls_v
+                    + &entry_deltas.d_d1_q_v * &entry_deltas.delta_q_tls_u
+                    + &(&q.d1_q0 * &delta_q_tls_uv_entry);
+                let d2_h_tl =
+                    weighted_crossprod_dense(&x_threshold_exit, &(-&d2_w_exit), &x_log_sigma_exit)?
+                        + weighted_crossprod_dense(x_t_en, &(-&d2_w_entry), x_ls_en)?;
+                assign_symmetric_block(&mut joint, offsets[1], offsets[2], &d2_h_tl);
+            } else {
+                let d2_w = &d2_d2_q_combined_exact * &(&q.dq_t * &q.dq_ls)
+                    + &d_d2_q_combined_u
+                        * &(&delta_q_t_exit_v * &q.dq_ls + &q.dq_t * &delta_q_ls_exit_v)
+                    + &d_d2_q_combined_v
+                        * &(&delta_q_t_exit_u * &q.dq_ls + &q.dq_t * &delta_q_ls_exit_u)
+                    + &q.d2_q
+                        * &(&delta_q_t_uv_exit * &q.dq_ls
+                            + &delta_q_t_exit_u * &delta_q_ls_exit_v
+                            + &delta_q_t_exit_v * &delta_q_ls_exit_u
+                            + &q.dq_t * &delta_q_ls_uv_exit)
+                    + &d2_d1_q_combined_exact * &q.d2q_tls
+                    + &d_d1_q_combined_u * &delta_q_tls_exit_v
+                    + &d_d1_q_combined_v * &delta_q_tls_exit_u
+                    + &(&q.d1_q * &delta_q_tls_uv_exit);
+                let d2_h_tl =
+                    weighted_crossprod_dense(&x_threshold_exit, &(-&d2_w), &x_log_sigma_exit)?;
+                assign_symmetric_block(&mut joint, offsets[1], offsets[2], &d2_h_tl);
+            }
+        }
+
+        // --- Time-threshold cross D²H[u,v] ---
+        {
+            let dh_h0_u = &q.d_h_h0 * &(&delta_h0_u + &entry_deltas.delta_q_u);
+            let dh_h1_u = &q.d_h_h1 * &(&delta_h1_u + &delta_q_exit_u);
+            let dh_h0_v = &q.d_h_h0 * &(&delta_h0_v + &entry_deltas.delta_q_v);
+            let dh_h1_v = &q.d_h_h1 * &(&delta_h1_v + &delta_q_exit_v);
+            if let (Some(x_t_en), Some(_)) = (x_threshold_entry.as_ref(), q.dq_t_entry.as_ref()) {
+                let d2_w_exit = &dh_h1_u * &delta_q_t_exit_v
+                    + &dh_h1_v * &delta_q_t_exit_u
+                    + &q.h_time_h1 * &(&delta_q_t_exit_u * &xi_h1_v + &delta_q_t_exit_v * &xi_h1_u);
+                let d2_w_entry = &dh_h0_u * &entry_deltas.delta_q_t_v
+                    + &dh_h0_v * &entry_deltas.delta_q_t_u
+                    + &q.h_time_h0
+                        * &(&entry_deltas.delta_q_t_u * &xi_h0_v
+                            + &entry_deltas.delta_q_t_v * &xi_h0_u);
+                let d2_h_ht_exit =
+                    weighted_crossprod_dense(&self.x_time_exit, &(-&d2_w_exit), &x_threshold_exit)?;
+                let d2_h_ht_entry =
+                    weighted_crossprod_dense(&self.x_time_entry, &(-&d2_w_entry), x_t_en)?;
+                assign_symmetric_block(
+                    &mut joint,
+                    offsets[0],
+                    offsets[1],
+                    &(d2_h_ht_exit + d2_h_ht_entry),
+                );
+            } else {
+                let d2_h_ht_0 = weighted_crossprod_dense(
+                    &self.x_time_entry,
+                    &(-&(&dh_h0_u * &delta_q_t_exit_v
+                        + &dh_h0_v * &delta_q_t_exit_u
+                        + &q.h_time_h0
+                            * &(&delta_q_t_exit_u * &xi_h0_v + &delta_q_t_exit_v * &xi_h0_u))),
+                    &x_threshold_exit,
+                )?;
+                let d2_h_ht_1 = weighted_crossprod_dense(
+                    &self.x_time_exit,
+                    &(-&(&dh_h1_u * &delta_q_t_exit_v
+                        + &dh_h1_v * &delta_q_t_exit_u
+                        + &q.h_time_h1
+                            * &(&delta_q_t_exit_u * &xi_h1_v + &delta_q_t_exit_v * &xi_h1_u))),
+                    &x_threshold_exit,
+                )?;
+                assign_symmetric_block(
+                    &mut joint,
+                    offsets[0],
+                    offsets[1],
+                    &(d2_h_ht_0 + d2_h_ht_1),
+                );
+            }
+        }
+
+        // --- Time-log-sigma cross D²H[u,v] ---
+        {
+            let dh_h0_u = &q.d_h_h0 * &(&delta_h0_u + &entry_deltas.delta_q_u);
+            let dh_h1_u = &q.d_h_h1 * &(&delta_h1_u + &delta_q_exit_u);
+            let dh_h0_v = &q.d_h_h0 * &(&delta_h0_v + &entry_deltas.delta_q_v);
+            let dh_h1_v = &q.d_h_h1 * &(&delta_h1_v + &delta_q_exit_v);
+            if let (Some(x_ls_en), Some(_)) = (x_log_sigma_entry.as_ref(), q.dq_ls_entry.as_ref()) {
+                let d2_w_exit = &dh_h1_u * &delta_q_ls_exit_v
+                    + &dh_h1_v * &delta_q_ls_exit_u
+                    + &q.h_time_h1
+                        * &(&delta_q_ls_exit_u * &xi_h1_v + &delta_q_ls_exit_v * &xi_h1_u);
+                let d2_w_entry = &dh_h0_u * &entry_deltas.delta_q_ls_v
+                    + &dh_h0_v * &entry_deltas.delta_q_ls_u
+                    + &q.h_time_h0
+                        * &(&entry_deltas.delta_q_ls_u * &xi_h0_v
+                            + &entry_deltas.delta_q_ls_v * &xi_h0_u);
+                let d2_h_hl_exit =
+                    weighted_crossprod_dense(&self.x_time_exit, &(-&d2_w_exit), &x_log_sigma_exit)?;
+                let d2_h_hl_entry =
+                    weighted_crossprod_dense(&self.x_time_entry, &(-&d2_w_entry), x_ls_en)?;
+                assign_symmetric_block(
+                    &mut joint,
+                    offsets[0],
+                    offsets[2],
+                    &(d2_h_hl_exit + d2_h_hl_entry),
+                );
+            } else {
+                let d2_h_hl_0 = weighted_crossprod_dense(
+                    &self.x_time_entry,
+                    &(-&(&dh_h0_u * &delta_q_ls_exit_v
+                        + &dh_h0_v * &delta_q_ls_exit_u
+                        + &q.h_time_h0
+                            * &(&delta_q_ls_exit_u * &xi_h0_v + &delta_q_ls_exit_v * &xi_h0_u))),
+                    &x_log_sigma_exit,
+                )?;
+                let d2_h_hl_1 = weighted_crossprod_dense(
+                    &self.x_time_exit,
+                    &(-&(&dh_h1_u * &delta_q_ls_exit_v
+                        + &dh_h1_v * &delta_q_ls_exit_u
+                        + &q.h_time_h1
+                            * &(&delta_q_ls_exit_u * &xi_h1_v + &delta_q_ls_exit_v * &xi_h1_u))),
+                    &x_log_sigma_exit,
+                )?;
+                assign_symmetric_block(
+                    &mut joint,
+                    offsets[0],
+                    offsets[2],
+                    &(d2_h_hl_0 + d2_h_hl_1),
+                );
+            }
+        }
+
+        // --- Wiggle cross-blocks D²H[u,v] ---
+        if let (Some(xw_dense), Some(w_offset)) = (xw, offsets.get(3).copied()) {
+            let d2_d2_q_combined = d2_d2_q_combined_exact.clone();
+
+            // Threshold-wiggle D²H[u,v].
+            if let (Some(x_t_en), Some(dq_t_en)) =
+                (x_threshold_entry.as_ref(), q.dq_t_entry.as_ref())
+            {
+                let d2_tw_exit = &d2_d2_q_exit_exact * &q.dq_t
+                    + &q.d2_q1 * &(&delta_q_t_exit_u * &deltaw_v + &delta_q_t_exit_v * &deltaw_u);
+                let d2_tw_entry = &d2_d2_q_entry_exact * dq_t_en
+                    + &q.d2_q0
+                        * &(&entry_deltas.delta_q_t_u * &deltaw_v
+                            + &entry_deltas.delta_q_t_v * &deltaw_u);
+                let d2_h_tw =
+                    weighted_crossprod_dense(&x_threshold_exit, &(-&d2_tw_exit), xw_dense)?
+                        + weighted_crossprod_dense(x_t_en, &(-&d2_tw_entry), xw_dense)?;
+                assign_symmetric_block(&mut joint, offsets[1], w_offset, &d2_h_tw);
+            } else {
+                let d2_tw = &d2_d2_q_combined * &q.dq_t
+                    + &q.d2_q * &(&delta_q_t_exit_u * &deltaw_v + &delta_q_t_exit_v * &deltaw_u);
+                let d2_h_tw = weighted_crossprod_dense(&x_threshold_exit, &(-&d2_tw), xw_dense)?;
+                assign_symmetric_block(&mut joint, offsets[1], w_offset, &d2_h_tw);
+            }
+
+            // Log-sigma-wiggle D²H[u,v].
+            if let (Some(x_ls_en), Some(dq_ls_en)) =
+                (x_log_sigma_entry.as_ref(), q.dq_ls_entry.as_ref())
+            {
+                let d2_lw_exit = &d2_d2_q_exit_exact * &q.dq_ls
+                    + &q.d2_q1 * &(&delta_q_ls_exit_u * &deltaw_v + &delta_q_ls_exit_v * &deltaw_u);
+                let d2_lw_entry = &d2_d2_q_entry_exact * dq_ls_en
+                    + &q.d2_q0
+                        * &(&entry_deltas.delta_q_ls_u * &deltaw_v
+                            + &entry_deltas.delta_q_ls_v * &deltaw_u);
+                let d2_h_lw =
+                    weighted_crossprod_dense(&x_log_sigma_exit, &(-&d2_lw_exit), xw_dense)?
+                        + weighted_crossprod_dense(x_ls_en, &(-&d2_lw_entry), xw_dense)?;
+                assign_symmetric_block(&mut joint, offsets[2], w_offset, &d2_h_lw);
+            } else {
+                let d2_lw = &d2_d2_q_combined * &q.dq_ls
+                    + &q.d2_q * &(&delta_q_ls_exit_u * &deltaw_v + &delta_q_ls_exit_v * &deltaw_u);
+                let d2_h_lw = weighted_crossprod_dense(&x_log_sigma_exit, &(-&d2_lw), xw_dense)?;
+                assign_symmetric_block(&mut joint, offsets[2], w_offset, &d2_h_lw);
+            }
+
+            // Wiggle-wiggle D²H[u,v].
+            let d2_hww = weighted_crossprod_dense(xw_dense, &(-&d2_d2_q_combined), xw_dense)?;
+            assign_symmetric_block(&mut joint, w_offset, w_offset, &d2_hww);
+
+            // Time-wiggle D²H[u,v]: bilinear in (u,v) perturbation directions.
+            let d2_tw_h0 = &q.d_h_h0 * &(&xi_h0_u * &xi_h0_v);
+            let d2_tw_h1 = &q.d_h_h1 * &(&xi_h1_u * &xi_h1_v);
+            let d2_h0w = weighted_crossprod_dense(&self.x_time_entry, &(-&d2_tw_h0), xw_dense)?;
+            let d2_h1w = weighted_crossprod_dense(&self.x_time_exit, &(-&d2_tw_h1), xw_dense)?;
+            assign_symmetric_block(&mut joint, offsets[0], w_offset, &(d2_h0w + d2_h1w));
+        }
+
+        Ok(Some(joint))
+    }
 }
 
 impl SurvivalExactNewtonJointPsiWorkspace {
@@ -10067,610 +10721,15 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             self.hessian_deriv_log_rescale(block_states),
         )?;
         let dynamic = self.build_dynamic_geometry(block_states)?;
-        let offsets = self.joint_block_offsets();
-        let p_total = *offsets
-            .last()
-            .ok_or_else(|| "missing joint block offsets".to_string())?;
-        if d_beta_u_flat.len() != p_total || d_beta_v_flat.len() != p_total {
-            return Err(format!(
-                "joint d_beta length mismatch: got ({}, {}), expected {p_total}",
-                d_beta_u_flat.len(),
-                d_beta_v_flat.len()
-            ));
-        }
-
-        // Split both directions into per-block slices.
-        let time_dir_u = d_beta_u_flat.slice(s![offsets[0]..offsets[1]]).to_owned();
-        let threshold_dir_u = d_beta_u_flat.slice(s![offsets[1]..offsets[2]]).to_owned();
-        let log_sigma_dir_u = d_beta_u_flat.slice(s![offsets[2]..offsets[3]]).to_owned();
-        let wiggle_dir_u = if self.x_link_wiggle.is_some() {
-            Some(d_beta_u_flat.slice(s![offsets[3]..offsets[4]]).to_owned())
-        } else {
-            None
-        };
-
-        let time_dir_v = d_beta_v_flat.slice(s![offsets[0]..offsets[1]]).to_owned();
-        let threshold_dir_v = d_beta_v_flat.slice(s![offsets[1]..offsets[2]]).to_owned();
-        let log_sigma_dir_v = d_beta_v_flat.slice(s![offsets[2]..offsets[3]]).to_owned();
-        let wiggle_dir_v = if self.x_link_wiggle.is_some() {
-            Some(d_beta_v_flat.slice(s![offsets[3]..offsets[4]]).to_owned())
-        } else {
-            None
-        };
-
-        // -- Predictor-space deltas for direction u --
-        let delta_h0_u = dynamic.time_jac_entry.dot(&time_dir_u);
-        let delta_h1_u = dynamic.time_jac_exit.dot(&time_dir_u);
-        let delta_d_u = dynamic.time_jac_deriv.dot(&time_dir_u);
-        let delta_t_exit_u = self.x_threshold.matrixvectormultiply(&threshold_dir_u);
-        let delta_ls_exit_u = self.x_log_sigma.matrixvectormultiply(&log_sigma_dir_u);
-        let deltaw_u = match (self.x_link_wiggle.as_ref(), wiggle_dir_u.as_ref()) {
-            (Some(xw), Some(dir)) => xw.matrixvectormultiply(dir),
-            _ => Array1::zeros(self.n),
-        };
-
-        // -- Predictor-space deltas for direction v --
-        let delta_h0_v = dynamic.time_jac_entry.dot(&time_dir_v);
-        let delta_h1_v = dynamic.time_jac_exit.dot(&time_dir_v);
-        let delta_d_v = dynamic.time_jac_deriv.dot(&time_dir_v);
-        let delta_t_exit_v = self.x_threshold.matrixvectormultiply(&threshold_dir_v);
-        let delta_ls_exit_v = self.x_log_sigma.matrixvectormultiply(&log_sigma_dir_v);
-        let deltaw_v = match (self.x_link_wiggle.as_ref(), wiggle_dir_v.as_ref()) {
-            (Some(xw), Some(dir)) => xw.matrixvectormultiply(dir),
-            _ => Array1::zeros(self.n),
-        };
-
-        // Exit-side chain-rule deltas for u and v.
-        let delta_q_exit_u = &q.dq_t * &delta_t_exit_u + &q.dq_ls * &delta_ls_exit_u + &deltaw_u;
-        let delta_q_t_exit_u = &q.d2q_tls * &delta_ls_exit_u;
-        let delta_q_ls_exit_u = &q.d2q_tls * &delta_t_exit_u + &q.d2q_ls * &delta_ls_exit_u;
-        let delta_q_tls_exit_u = &q.d3q_tls_ls * &delta_ls_exit_u;
-        let delta_q_ls_ls_exit_u = &q.d3q_tls_ls * &delta_t_exit_u + &q.d3q_ls * &delta_ls_exit_u;
-
-        let delta_q_exit_v = &q.dq_t * &delta_t_exit_v + &q.dq_ls * &delta_ls_exit_v + &deltaw_v;
-        let delta_q_t_exit_v = &q.d2q_tls * &delta_ls_exit_v;
-        let delta_q_ls_exit_v = &q.d2q_tls * &delta_t_exit_v + &q.d2q_ls * &delta_ls_exit_v;
-        let delta_q_tls_exit_v = &q.d3q_tls_ls * &delta_ls_exit_v;
-        let delta_q_ls_ls_exit_v = &q.d3q_tls_ls * &delta_t_exit_v + &q.d3q_ls * &delta_ls_exit_v;
-
-        // Perturbed curvature quantities for directions u and v on the exit side.
-        let d_d1_q_exit_u = &q.d2_q1 * &delta_q_exit_u + &q.h_time_h1 * &delta_h1_u;
-        let d_d2_q_exit_u = &q.d3_q1 * &delta_q_exit_u + &q.d_h_h1 * &delta_h1_u;
-        let d_d1_q_exit_v = &q.d2_q1 * &delta_q_exit_v + &q.h_time_h1 * &delta_h1_v;
-        let d_d2_q_exit_v = &q.d3_q1 * &delta_q_exit_v + &q.d_h_h1 * &delta_h1_v;
-
-        let x_threshold_exit_cow = self.x_threshold.to_dense_cow();
-        let x_threshold_exit = &*x_threshold_exit_cow;
-        let x_threshold_entry_cow = self
-            .x_threshold_entry
-            .as_ref()
-            .map(DesignMatrix::to_dense_cow);
-        let x_threshold_entry = x_threshold_entry_cow.as_ref().map(|c| &**c);
-        let x_log_sigma_exit_cow = self.x_log_sigma.to_dense_cow();
-        let x_log_sigma_exit = &*x_log_sigma_exit_cow;
-        let x_log_sigma_entry_cow = self
-            .x_log_sigma_entry
-            .as_ref()
-            .map(DesignMatrix::to_dense_cow);
-        let x_log_sigma_entry = x_log_sigma_entry_cow.as_ref().map(|c| &**c);
-        let xw_cow = self.x_link_wiggle.as_ref().map(DesignMatrix::to_dense_cow);
-        let xw = xw_cow.as_ref().map(|c| &**c);
-        let mut joint = Array2::<f64>::zeros((p_total, p_total));
-
-        // --- Entry-side deltas (analogous to first derivative) ---
-        struct EntryDeltas2 {
-            delta_t_u: Array1<f64>,
-            delta_ls_u: Array1<f64>,
-            delta_q_u: Array1<f64>,
-            delta_q_t_u: Array1<f64>,
-            delta_q_ls_u: Array1<f64>,
-            delta_q_tls_u: Array1<f64>,
-            delta_q_ls_ls_u: Array1<f64>,
-            d_d1_q_u: Array1<f64>,
-            d_d2_q_u: Array1<f64>,
-            delta_t_v: Array1<f64>,
-            delta_ls_v: Array1<f64>,
-            delta_q_v: Array1<f64>,
-            delta_q_t_v: Array1<f64>,
-            delta_q_ls_v: Array1<f64>,
-            delta_q_tls_v: Array1<f64>,
-            delta_q_ls_ls_v: Array1<f64>,
-            d_d1_q_v: Array1<f64>,
-            d_d2_q_v: Array1<f64>,
-        }
-
-        let entry_deltas = if x_threshold_entry.is_some() || x_log_sigma_entry.is_some() {
-            // Compute entry-side deltas for both u and v directions.
-            let compute_entry = |threshold_dir: &Array1<f64>,
-                                 log_sigma_dir: &Array1<f64>,
-                                 deltaw: &Array1<f64>,
-                                 delta_h0: &Array1<f64>|
-             -> (
-                Array1<f64>,
-                Array1<f64>,
-                Array1<f64>,
-                Array1<f64>,
-                Array1<f64>,
-                Array1<f64>,
-                Array1<f64>,
-                Array1<f64>,
-                Array1<f64>,
-            ) {
-                let dt_en = self
-                    .x_threshold_entry
-                    .as_ref()
-                    .map(|x| x.matrixvectormultiply(threshold_dir))
-                    .unwrap_or_else(|| self.x_threshold.matrixvectormultiply(threshold_dir));
-                let dls_en = self
-                    .x_log_sigma_entry
-                    .as_ref()
-                    .map(|x| x.matrixvectormultiply(log_sigma_dir))
-                    .unwrap_or_else(|| self.x_log_sigma.matrixvectormultiply(log_sigma_dir));
-                let dq_t_en = q.dq_t_entry.as_ref().unwrap_or(&q.dq_t);
-                let dq_ls_en = q.dq_ls_entry.as_ref().unwrap_or(&q.dq_ls);
-                let d2q_tls_en = q.d2q_tls_entry.as_ref().unwrap_or(&q.d2q_tls);
-                let d3q_tls_ls_en = q.d3q_tls_ls_entry.as_ref().unwrap_or(&q.d3q_tls_ls);
-                let d3q_ls_en = q.d3q_ls_entry.as_ref().unwrap_or(&q.d3q_ls);
-                let d2q_ls_en = q.d2q_ls_entry.as_ref().unwrap_or(&q.d2q_ls);
-                let dq_en = dq_t_en * &dt_en + dq_ls_en * &dls_en + deltaw;
-                let dq_t = d2q_tls_en * &dls_en;
-                let dq_ls = d2q_tls_en * &dt_en + d2q_ls_en * &dls_en;
-                let dq_tls = d3q_tls_ls_en * &dls_en;
-                let dq_ls_ls = d3q_tls_ls_en * &dt_en + d3q_ls_en * &dls_en;
-                let d_d1_q = &q.d2_q0 * &dq_en + &q.h_time_h0 * delta_h0;
-                let d_d2_q = &q.d3_q0 * &dq_en + &q.d_h_h0 * delta_h0;
-                (
-                    dt_en, dls_en, dq_en, dq_t, dq_ls, dq_tls, dq_ls_ls, d_d1_q, d_d2_q,
-                )
-            };
-            let (dt_u, dls_u, dq_u, dqt_u, dqls_u, dqtls_u, dqlsls_u, dd1_u, dd2_u) =
-                compute_entry(&threshold_dir_u, &log_sigma_dir_u, &deltaw_u, &delta_h0_u);
-            let (dt_v, dls_v, dq_v, dqt_v, dqls_v, dqtls_v, dqlsls_v, dd1_v, dd2_v) =
-                compute_entry(&threshold_dir_v, &log_sigma_dir_v, &deltaw_v, &delta_h0_v);
-            EntryDeltas2 {
-                delta_t_u: dt_u,
-                delta_ls_u: dls_u,
-                delta_q_u: dq_u,
-                delta_q_t_u: dqt_u,
-                delta_q_ls_u: dqls_u,
-                delta_q_tls_u: dqtls_u,
-                delta_q_ls_ls_u: dqlsls_u,
-                d_d1_q_u: dd1_u,
-                d_d2_q_u: dd2_u,
-                delta_t_v: dt_v,
-                delta_ls_v: dls_v,
-                delta_q_v: dq_v,
-                delta_q_t_v: dqt_v,
-                delta_q_ls_v: dqls_v,
-                delta_q_tls_v: dqtls_v,
-                delta_q_ls_ls_v: dqlsls_v,
-                d_d1_q_v: dd1_v,
-                d_d2_q_v: dd2_v,
-            }
-        } else {
-            // Time-invariant: entry deltas = exit deltas.
-            EntryDeltas2 {
-                delta_t_u: delta_t_exit_u.clone(),
-                delta_ls_u: delta_ls_exit_u.clone(),
-                delta_q_u: delta_q_exit_u.clone(),
-                delta_q_t_u: delta_q_t_exit_u.clone(),
-                delta_q_ls_u: delta_q_ls_exit_u.clone(),
-                delta_q_tls_u: delta_q_tls_exit_u.clone(),
-                delta_q_ls_ls_u: delta_q_ls_ls_exit_u.clone(),
-                d_d1_q_u: &q.d2_q0 * &delta_q_exit_u + &q.h_time_h0 * &delta_h0_u,
-                d_d2_q_u: &q.d3_q0 * &delta_q_exit_u + &q.d_h_h0 * &delta_h0_u,
-                delta_t_v: delta_t_exit_v.clone(),
-                delta_ls_v: delta_ls_exit_v.clone(),
-                delta_q_v: delta_q_exit_v.clone(),
-                delta_q_t_v: delta_q_t_exit_v.clone(),
-                delta_q_ls_v: delta_q_ls_exit_v.clone(),
-                delta_q_tls_v: delta_q_tls_exit_v.clone(),
-                delta_q_ls_ls_v: delta_q_ls_ls_exit_v.clone(),
-                d_d1_q_v: &q.d2_q0 * &delta_q_exit_v + &q.h_time_h0 * &delta_h0_v,
-                d_d2_q_v: &q.d3_q0 * &delta_q_exit_v + &q.d_h_h0 * &delta_h0_v,
-            }
-        };
-
-        // === Second-order perturbation weights ===
-        //
-        // For D²H[u,v], we differentiate D_u H w.r.t. v. The key second-order
-        // weights for each observation are products of the two perturbation
-        // directions multiplied by the appropriate curvature derivative.
-        //
-        // The pattern: for each Hessian weight w(β), the first derivative is
-        //   D_u w = w' · δ_u,
-        // and the second derivative is
-        //   D²_{u,v} w = w'' · δ_u · δ_v + w' · δ²_{u,v}
-        // where δ²_{u,v} captures cross-terms from the chain rule on δ_u itself.
-        //
-        // For the time block, the Hessian has three contributions:
-        //   h_time_h0[i], h_time_h1[i], h_time_d[i]
-        // Their first derivatives w.r.t. β are d_h_h0, d_h_h1, d_h_d.
-        // The second derivatives use the 4th-order row quantities d2_h_h0
-        // and d2_h_h1 (d⁴ℓ/dh⁴), which are now stored in
-        // SurvivalJointQuantities.
-        //
-        // The 4th derivatives of ℓ w.r.t. q (d4_q0, d4_q1, d4_q) are also
-        // now available. They enter the bilinear D²(d2_q) computation as the
-        // leading coefficient: D²_{u,v}(d2_q) = d4_q · δq_u · δq_v + ...
-        //
-        // The 4th-order chain-rule derivatives of q (d4q_tls_ls_ls = u_ϑsss,
-        // d4q_ls = u_ssss) enter the bilinear derivatives of the 2nd-order
-        // chain quantities: D²_{ψ}(d2q_tls) and D²_{ψ}(d2q_ls).
-        //
-        // Together these provide the complete 4th-order Arbogast formula
-        // for the (ϑ,s,s,s) and (s,s,s,s) blocks of the outer Hessian drift
-        // Q[v_k, v_l]. See response.md Section 6.
-        //
-        // --- Time block D²H[u,v] ---
-        let xi_h0_u = &delta_h0_u + &entry_deltas.delta_q_u;
-        let xi_h1_u = &delta_h1_u + &delta_q_exit_u;
-        let xi_h0_v = &delta_h0_v + &entry_deltas.delta_q_v;
-        let xi_h1_v = &delta_h1_v + &delta_q_exit_v;
-        let d2q_tls_entry = q.d2q_tls_entry.as_ref().unwrap_or(&q.d2q_tls);
-        let d2q_ls_entry = q.d2q_ls_entry.as_ref().unwrap_or(&q.d2q_ls);
-        let d3q_tls_ls_entry = q.d3q_tls_ls_entry.as_ref().unwrap_or(&q.d3q_tls_ls);
-        let d3q_ls_entry = q.d3q_ls_entry.as_ref().unwrap_or(&q.d3q_ls);
-        let d4q_tls_ls_ls_entry = q.d4q_tls_ls_ls_entry.as_ref().unwrap_or(&q.d4q_tls_ls_ls);
-        let d4q_ls_entry = q.d4q_ls_entry.as_ref().unwrap_or(&q.d4q_ls);
-
-        let delta_q_uv_exit = &(&q.d2q_tls
-            * &(&delta_t_exit_u * &delta_ls_exit_v + &delta_t_exit_v * &delta_ls_exit_u))
-            + &(&q.d2q_ls * &(&delta_ls_exit_u * &delta_ls_exit_v));
-        let delta_q_t_uv_exit = &q.d3q_tls_ls * &(&delta_ls_exit_u * &delta_ls_exit_v);
-        let delta_q_ls_uv_exit = &(&q.d3q_tls_ls
-            * &(&delta_ls_exit_u * &delta_t_exit_v + &delta_ls_exit_v * &delta_t_exit_u))
-            + &(&q.d3q_ls * &(&delta_ls_exit_u * &delta_ls_exit_v));
-        let delta_q_tls_uv_exit = &q.d4q_tls_ls_ls * &(&delta_ls_exit_u * &delta_ls_exit_v);
-        let delta_q_ls_ls_uv_exit = &(&q.d4q_tls_ls_ls
-            * &(&delta_ls_exit_u * &delta_t_exit_v + &delta_ls_exit_v * &delta_t_exit_u))
-            + &(&q.d4q_ls * &(&delta_ls_exit_u * &delta_ls_exit_v));
-
-        let delta_q_uv_entry = &(d2q_tls_entry
-            * &(&entry_deltas.delta_t_u * &entry_deltas.delta_ls_v
-                + &entry_deltas.delta_t_v * &entry_deltas.delta_ls_u))
-            + &(d2q_ls_entry * &(&entry_deltas.delta_ls_u * &entry_deltas.delta_ls_v));
-        let delta_q_t_uv_entry =
-            d3q_tls_ls_entry * &(&entry_deltas.delta_ls_u * &entry_deltas.delta_ls_v);
-        let delta_q_ls_uv_entry = &(d3q_tls_ls_entry
-            * &(&entry_deltas.delta_ls_u * &entry_deltas.delta_t_v
-                + &entry_deltas.delta_ls_v * &entry_deltas.delta_t_u))
-            + &(d3q_ls_entry * &(&entry_deltas.delta_ls_u * &entry_deltas.delta_ls_v));
-        let delta_q_tls_uv_entry =
-            d4q_tls_ls_ls_entry * &(&entry_deltas.delta_ls_u * &entry_deltas.delta_ls_v);
-        let delta_q_ls_ls_uv_entry = &(d4q_tls_ls_ls_entry
-            * &(&entry_deltas.delta_ls_u * &entry_deltas.delta_t_v
-                + &entry_deltas.delta_ls_v * &entry_deltas.delta_t_u))
-            + &(d4q_ls_entry * &(&entry_deltas.delta_ls_u * &entry_deltas.delta_ls_v));
-
-        let d_d1_q_combined_u =
-            &q.d2_q * &delta_q_exit_u + &q.h_time_h0 * &delta_h0_u + &q.h_time_h1 * &delta_h1_u;
-        let d_d1_q_combined_v =
-            &q.d2_q * &delta_q_exit_v + &q.h_time_h0 * &delta_h0_v + &q.h_time_h1 * &delta_h1_v;
-        let d_d2_q_combined_u =
-            &q.d3_q * &delta_q_exit_u + &q.d_h_h0 * &delta_h0_u + &q.d_h_h1 * &delta_h1_u;
-        let d_d2_q_combined_v =
-            &q.d3_q * &delta_q_exit_v + &q.d_h_h0 * &delta_h0_v + &q.d_h_h1 * &delta_h1_v;
-
-        let d2_d1_q_entry_exact = &q.d3_q0 * &(&xi_h0_u * &xi_h0_v) + &q.d2_q0 * &delta_q_uv_entry;
-        let d2_d1_q_exit_exact = &q.d3_q1 * &(&xi_h1_u * &xi_h1_v) + &q.d2_q1 * &delta_q_uv_exit;
-        let d2_d1_q_combined_exact = &d2_d1_q_entry_exact + &d2_d1_q_exit_exact;
-        let d2_d2_q_entry_exact = &q.d4_q0 * &(&xi_h0_u * &xi_h0_v) + &q.d3_q0 * &delta_q_uv_entry;
-        let d2_d2_q_exit_exact = &q.d4_q1 * &(&xi_h1_u * &xi_h1_v) + &q.d3_q1 * &delta_q_uv_exit;
-        let d2_d2_q_combined_exact = &d2_d2_q_entry_exact + &d2_d2_q_exit_exact;
-
-        // Second-order time-time weight: bilinear in perturbation directions.
-        //
-        // The exact D²H[u,v] for the time block uses the 4th derivative of ℓ
-        // w.r.t. the time predictors (d2_h_h0, d2_h_h1). Previously this used
-        // d_h_h0 (= d³ℓ/dh0³) which is the coefficient for D¹H, not D²H.
-        // The correct bilinear coefficient is d⁴ℓ/dh0⁴ for the leading term.
-        // See response.md Section 6 for why 4th-order derivatives are needed.
-        let d2h_h0 = &q.d2_h_h0 * &(&xi_h0_u * &xi_h0_v);
-        let d2h_h1 = &q.d2_h_h1 * &(&xi_h1_u * &xi_h1_v);
-        let d2h_d = &q.d_h_d * &(&delta_d_u * &delta_d_v);
-        let d2_h_time = safe_fast_xt_diag_x(&dynamic.time_jac_entry, &d2h_h0)
-            + safe_fast_xt_diag_x(&dynamic.time_jac_exit, &d2h_h1)
-            + safe_fast_xt_diag_x(&dynamic.time_jac_deriv, &d2h_d);
-        assign_symmetric_block(&mut joint, offsets[0], offsets[0], &d2_h_time);
-
-        // --- Threshold-threshold D²H[u,v] ---
-        if let Some(x_t_en) = x_threshold_entry.as_ref() {
-            let dq_t_en = q.dq_t_entry.as_ref().unwrap_or(&q.dq_t);
-            let d2_w_exit = &d2_d2_q_exit_exact * &q.dq_t.mapv(|v| safe_product(v, v))
-                + &(2.0 * &d_d2_q_exit_u * &q.dq_t * &delta_q_t_exit_v)
-                + &(2.0 * &d_d2_q_exit_v * &q.dq_t * &delta_q_t_exit_u)
-                + &(2.0 * &q.d2_q1 * &delta_q_t_exit_u * &delta_q_t_exit_v)
-                + &(2.0 * &q.d2_q1 * &q.dq_t * &delta_q_t_uv_exit);
-            let d2_w_entry = &d2_d2_q_entry_exact * &dq_t_en.mapv(|v| safe_product(v, v))
-                + &(2.0 * &entry_deltas.d_d2_q_u * dq_t_en * &entry_deltas.delta_q_t_v)
-                + &(2.0 * &entry_deltas.d_d2_q_v * dq_t_en * &entry_deltas.delta_q_t_u)
-                + &(2.0 * &q.d2_q0 * &entry_deltas.delta_q_t_u * &entry_deltas.delta_q_t_v)
-                + &(2.0 * &q.d2_q0 * dq_t_en * &delta_q_t_uv_entry);
-            let d2_h_tt =
-                weighted_crossprod_dense(&x_threshold_exit, &(-&d2_w_exit), &x_threshold_exit)?
-                    + weighted_crossprod_dense(x_t_en, &(-&d2_w_entry), x_t_en)?;
-            assign_symmetric_block(&mut joint, offsets[1], offsets[1], &d2_h_tt);
-        } else {
-            let d2_w = &d2_d2_q_combined_exact * &q.dq_t.mapv(|v| safe_product(v, v))
-                + &(2.0 * &d_d2_q_combined_u * &q.dq_t * &delta_q_t_exit_v)
-                + &(2.0 * &d_d2_q_combined_v * &q.dq_t * &delta_q_t_exit_u)
-                + &(2.0 * &q.d2_q * &delta_q_t_exit_u * &delta_q_t_exit_v)
-                + &(2.0 * &q.d2_q * &q.dq_t * &delta_q_t_uv_exit);
-            let d2_h_tt =
-                weighted_crossprod_dense(&x_threshold_exit, &(-&d2_w), &x_threshold_exit)?;
-            assign_symmetric_block(&mut joint, offsets[1], offsets[1], &d2_h_tt);
-        }
-
-        // --- Log-sigma-log-sigma D²H[u,v] ---
-        if let Some(x_ls_en) = x_log_sigma_entry.as_ref() {
-            let dq_ls_en = q.dq_ls_entry.as_ref().unwrap();
-            let d2_w_exit = &d2_d2_q_exit_exact * &q.dq_ls.mapv(|v| safe_product(v, v))
-                + &(2.0 * &d_d2_q_exit_u * &q.dq_ls * &delta_q_ls_exit_v)
-                + &(2.0 * &d_d2_q_exit_v * &q.dq_ls * &delta_q_ls_exit_u)
-                + &(2.0 * &q.d2_q1 * &delta_q_ls_exit_u * &delta_q_ls_exit_v)
-                + &(2.0 * &q.d2_q1 * &q.dq_ls * &delta_q_ls_uv_exit)
-                + &d2_d1_q_exit_exact * &q.d2q_ls
-                + &d_d1_q_exit_u * &delta_q_ls_ls_exit_v
-                + &d_d1_q_exit_v * &delta_q_ls_ls_exit_u
-                + &(&q.d1_q1 * &delta_q_ls_ls_uv_exit);
-            let d2_w_entry = &d2_d2_q_entry_exact * &dq_ls_en.mapv(|v| safe_product(v, v))
-                + &(2.0 * &entry_deltas.d_d2_q_u * dq_ls_en * &entry_deltas.delta_q_ls_v)
-                + &(2.0 * &entry_deltas.d_d2_q_v * dq_ls_en * &entry_deltas.delta_q_ls_u)
-                + &(2.0 * &q.d2_q0 * &entry_deltas.delta_q_ls_u * &entry_deltas.delta_q_ls_v)
-                + &(2.0 * &q.d2_q0 * dq_ls_en * &delta_q_ls_uv_entry)
-                + &d2_d1_q_entry_exact * d2q_ls_entry
-                + &entry_deltas.d_d1_q_u * &entry_deltas.delta_q_ls_ls_v
-                + &entry_deltas.d_d1_q_v * &entry_deltas.delta_q_ls_ls_u
-                + &(&q.d1_q0 * &delta_q_ls_ls_uv_entry);
-            let d2_h_ll =
-                weighted_crossprod_dense(&x_log_sigma_exit, &(-&d2_w_exit), &x_log_sigma_exit)?
-                    + weighted_crossprod_dense(x_ls_en, &(-&d2_w_entry), x_ls_en)?;
-            assign_symmetric_block(&mut joint, offsets[2], offsets[2], &d2_h_ll);
-        } else {
-            let d2_w = &d2_d2_q_combined_exact * &q.dq_ls.mapv(|v| safe_product(v, v))
-                + &(2.0 * &d_d2_q_combined_u * &q.dq_ls * &delta_q_ls_exit_v)
-                + &(2.0 * &d_d2_q_combined_v * &q.dq_ls * &delta_q_ls_exit_u)
-                + &(2.0 * &q.d2_q * &delta_q_ls_exit_u * &delta_q_ls_exit_v)
-                + &(2.0 * &q.d2_q * &q.dq_ls * &delta_q_ls_uv_exit)
-                + &d2_d1_q_combined_exact * &q.d2q_ls
-                + &d_d1_q_combined_u * &delta_q_ls_ls_exit_v
-                + &d_d1_q_combined_v * &delta_q_ls_ls_exit_u
-                + &(&q.d1_q * &delta_q_ls_ls_uv_exit);
-            let d2_h_ll =
-                weighted_crossprod_dense(&x_log_sigma_exit, &(-&d2_w), &x_log_sigma_exit)?;
-            assign_symmetric_block(&mut joint, offsets[2], offsets[2], &d2_h_ll);
-        }
-
-        // --- Threshold-log-sigma cross D²H[u,v] ---
-        {
-            let has_t_entry = x_threshold_entry.is_some();
-            let has_ls_entry = x_log_sigma_entry.is_some();
-            if has_t_entry || has_ls_entry {
-                let x_t_en = x_threshold_entry.unwrap_or(x_threshold_exit);
-                let x_ls_en = x_log_sigma_entry.unwrap_or(x_log_sigma_exit);
-                let dq_t_en = q.dq_t_entry.as_ref().unwrap_or(&q.dq_t);
-                let dq_ls_en = q.dq_ls_entry.as_ref().unwrap_or(&q.dq_ls);
-                let d2_w_exit = &d2_d2_q_exit_exact * &(&q.dq_t * &q.dq_ls)
-                    + &d_d2_q_exit_u
-                        * &(&delta_q_t_exit_v * &q.dq_ls + &q.dq_t * &delta_q_ls_exit_v)
-                    + &d_d2_q_exit_v
-                        * &(&delta_q_t_exit_u * &q.dq_ls + &q.dq_t * &delta_q_ls_exit_u)
-                    + &q.d2_q1
-                        * &(&delta_q_t_uv_exit * &q.dq_ls
-                            + &delta_q_t_exit_u * &delta_q_ls_exit_v
-                            + &delta_q_t_exit_v * &delta_q_ls_exit_u
-                            + &q.dq_t * &delta_q_ls_uv_exit)
-                    + &d2_d1_q_exit_exact * &q.d2q_tls
-                    + &d_d1_q_exit_u * &delta_q_tls_exit_v
-                    + &d_d1_q_exit_v * &delta_q_tls_exit_u
-                    + &(&q.d1_q1 * &delta_q_tls_uv_exit);
-                let d2_w_entry = &d2_d2_q_entry_exact * &(dq_t_en * dq_ls_en)
-                    + &entry_deltas.d_d2_q_u
-                        * &(&entry_deltas.delta_q_t_v * dq_ls_en
-                            + dq_t_en * &entry_deltas.delta_q_ls_v)
-                    + &entry_deltas.d_d2_q_v
-                        * &(&entry_deltas.delta_q_t_u * dq_ls_en
-                            + dq_t_en * &entry_deltas.delta_q_ls_u)
-                    + &q.d2_q0
-                        * &(&delta_q_t_uv_entry * dq_ls_en
-                            + &entry_deltas.delta_q_t_u * &entry_deltas.delta_q_ls_v
-                            + &entry_deltas.delta_q_t_v * &entry_deltas.delta_q_ls_u
-                            + dq_t_en * &delta_q_ls_uv_entry)
-                    + &d2_d1_q_entry_exact * d2q_tls_entry
-                    + &entry_deltas.d_d1_q_u * &entry_deltas.delta_q_tls_v
-                    + &entry_deltas.d_d1_q_v * &entry_deltas.delta_q_tls_u
-                    + &(&q.d1_q0 * &delta_q_tls_uv_entry);
-                let d2_h_tl =
-                    weighted_crossprod_dense(&x_threshold_exit, &(-&d2_w_exit), &x_log_sigma_exit)?
-                        + weighted_crossprod_dense(x_t_en, &(-&d2_w_entry), x_ls_en)?;
-                assign_symmetric_block(&mut joint, offsets[1], offsets[2], &d2_h_tl);
-            } else {
-                let d2_w = &d2_d2_q_combined_exact * &(&q.dq_t * &q.dq_ls)
-                    + &d_d2_q_combined_u
-                        * &(&delta_q_t_exit_v * &q.dq_ls + &q.dq_t * &delta_q_ls_exit_v)
-                    + &d_d2_q_combined_v
-                        * &(&delta_q_t_exit_u * &q.dq_ls + &q.dq_t * &delta_q_ls_exit_u)
-                    + &q.d2_q
-                        * &(&delta_q_t_uv_exit * &q.dq_ls
-                            + &delta_q_t_exit_u * &delta_q_ls_exit_v
-                            + &delta_q_t_exit_v * &delta_q_ls_exit_u
-                            + &q.dq_t * &delta_q_ls_uv_exit)
-                    + &d2_d1_q_combined_exact * &q.d2q_tls
-                    + &d_d1_q_combined_u * &delta_q_tls_exit_v
-                    + &d_d1_q_combined_v * &delta_q_tls_exit_u
-                    + &(&q.d1_q * &delta_q_tls_uv_exit);
-                let d2_h_tl =
-                    weighted_crossprod_dense(&x_threshold_exit, &(-&d2_w), &x_log_sigma_exit)?;
-                assign_symmetric_block(&mut joint, offsets[1], offsets[2], &d2_h_tl);
-            }
-        }
-
-        // --- Time-threshold cross D²H[u,v] ---
-        {
-            let dh_h0_u = &q.d_h_h0 * &(&delta_h0_u + &entry_deltas.delta_q_u);
-            let dh_h1_u = &q.d_h_h1 * &(&delta_h1_u + &delta_q_exit_u);
-            let dh_h0_v = &q.d_h_h0 * &(&delta_h0_v + &entry_deltas.delta_q_v);
-            let dh_h1_v = &q.d_h_h1 * &(&delta_h1_v + &delta_q_exit_v);
-            if let (Some(x_t_en), Some(_)) = (x_threshold_entry.as_ref(), q.dq_t_entry.as_ref()) {
-                let d2_w_exit = &dh_h1_u * &delta_q_t_exit_v
-                    + &dh_h1_v * &delta_q_t_exit_u
-                    + &q.h_time_h1 * &(&delta_q_t_exit_u * &xi_h1_v + &delta_q_t_exit_v * &xi_h1_u);
-                let d2_w_entry = &dh_h0_u * &entry_deltas.delta_q_t_v
-                    + &dh_h0_v * &entry_deltas.delta_q_t_u
-                    + &q.h_time_h0
-                        * &(&entry_deltas.delta_q_t_u * &xi_h0_v
-                            + &entry_deltas.delta_q_t_v * &xi_h0_u);
-                let d2_h_ht_exit =
-                    weighted_crossprod_dense(&self.x_time_exit, &(-&d2_w_exit), &x_threshold_exit)?;
-                let d2_h_ht_entry =
-                    weighted_crossprod_dense(&self.x_time_entry, &(-&d2_w_entry), x_t_en)?;
-                assign_symmetric_block(
-                    &mut joint,
-                    offsets[0],
-                    offsets[1],
-                    &(d2_h_ht_exit + d2_h_ht_entry),
-                );
-            } else {
-                // The combined weight d2_w = h0 + h1 contributions is split across
-                // the two design matrices (x_time_entry, x_time_exit) below.
-                let d2_h_ht_0 = weighted_crossprod_dense(
-                    &self.x_time_entry,
-                    &(-&(&dh_h0_u * &delta_q_t_exit_v
-                        + &dh_h0_v * &delta_q_t_exit_u
-                        + &q.h_time_h0
-                            * &(&delta_q_t_exit_u * &xi_h0_v + &delta_q_t_exit_v * &xi_h0_u))),
-                    &x_threshold_exit,
-                )?;
-                let d2_h_ht_1 = weighted_crossprod_dense(
-                    &self.x_time_exit,
-                    &(-&(&dh_h1_u * &delta_q_t_exit_v
-                        + &dh_h1_v * &delta_q_t_exit_u
-                        + &q.h_time_h1
-                            * &(&delta_q_t_exit_u * &xi_h1_v + &delta_q_t_exit_v * &xi_h1_u))),
-                    &x_threshold_exit,
-                )?;
-                assign_symmetric_block(
-                    &mut joint,
-                    offsets[0],
-                    offsets[1],
-                    &(d2_h_ht_0 + d2_h_ht_1),
-                );
-            }
-        }
-
-        // --- Time-log-sigma cross D²H[u,v] ---
-        {
-            let dh_h0_u = &q.d_h_h0 * &(&delta_h0_u + &entry_deltas.delta_q_u);
-            let dh_h1_u = &q.d_h_h1 * &(&delta_h1_u + &delta_q_exit_u);
-            let dh_h0_v = &q.d_h_h0 * &(&delta_h0_v + &entry_deltas.delta_q_v);
-            let dh_h1_v = &q.d_h_h1 * &(&delta_h1_v + &delta_q_exit_v);
-            if let (Some(x_ls_en), Some(_)) = (x_log_sigma_entry.as_ref(), q.dq_ls_entry.as_ref()) {
-                let d2_w_exit = &dh_h1_u * &delta_q_ls_exit_v
-                    + &dh_h1_v * &delta_q_ls_exit_u
-                    + &q.h_time_h1
-                        * &(&delta_q_ls_exit_u * &xi_h1_v + &delta_q_ls_exit_v * &xi_h1_u);
-                let d2_w_entry = &dh_h0_u * &entry_deltas.delta_q_ls_v
-                    + &dh_h0_v * &entry_deltas.delta_q_ls_u
-                    + &q.h_time_h0
-                        * &(&entry_deltas.delta_q_ls_u * &xi_h0_v
-                            + &entry_deltas.delta_q_ls_v * &xi_h0_u);
-                let d2_h_hl_exit =
-                    weighted_crossprod_dense(&self.x_time_exit, &(-&d2_w_exit), &x_log_sigma_exit)?;
-                let d2_h_hl_entry =
-                    weighted_crossprod_dense(&self.x_time_entry, &(-&d2_w_entry), x_ls_en)?;
-                assign_symmetric_block(
-                    &mut joint,
-                    offsets[0],
-                    offsets[2],
-                    &(d2_h_hl_exit + d2_h_hl_entry),
-                );
-            } else {
-                let d2_h_hl_0 = weighted_crossprod_dense(
-                    &self.x_time_entry,
-                    &(-&(&dh_h0_u * &delta_q_ls_exit_v
-                        + &dh_h0_v * &delta_q_ls_exit_u
-                        + &q.h_time_h0
-                            * &(&delta_q_ls_exit_u * &xi_h0_v + &delta_q_ls_exit_v * &xi_h0_u))),
-                    &x_log_sigma_exit,
-                )?;
-                let d2_h_hl_1 = weighted_crossprod_dense(
-                    &self.x_time_exit,
-                    &(-&(&dh_h1_u * &delta_q_ls_exit_v
-                        + &dh_h1_v * &delta_q_ls_exit_u
-                        + &q.h_time_h1
-                            * &(&delta_q_ls_exit_u * &xi_h1_v + &delta_q_ls_exit_v * &xi_h1_u))),
-                    &x_log_sigma_exit,
-                )?;
-                assign_symmetric_block(
-                    &mut joint,
-                    offsets[0],
-                    offsets[2],
-                    &(d2_h_hl_0 + d2_h_hl_1),
-                );
-            }
-        }
-
-        // --- Wiggle cross-blocks D²H[u,v] ---
-        if let (Some(xw_dense), Some(w_offset)) = (xw, offsets.get(3).copied()) {
-            let d2_d2_q_combined = d2_d2_q_combined_exact.clone();
-
-            // Threshold-wiggle D²H[u,v].
-            if let (Some(x_t_en), Some(dq_t_en)) =
-                (x_threshold_entry.as_ref(), q.dq_t_entry.as_ref())
-            {
-                let d2_tw_exit = &d2_d2_q_exit_exact * &q.dq_t
-                    + &q.d2_q1 * &(&delta_q_t_exit_u * &deltaw_v + &delta_q_t_exit_v * &deltaw_u);
-                let d2_tw_entry = &d2_d2_q_entry_exact * dq_t_en
-                    + &q.d2_q0
-                        * &(&entry_deltas.delta_q_t_u * &deltaw_v
-                            + &entry_deltas.delta_q_t_v * &deltaw_u);
-                let d2_h_tw =
-                    weighted_crossprod_dense(&x_threshold_exit, &(-&d2_tw_exit), xw_dense)?
-                        + weighted_crossprod_dense(x_t_en, &(-&d2_tw_entry), xw_dense)?;
-                assign_symmetric_block(&mut joint, offsets[1], w_offset, &d2_h_tw);
-            } else {
-                let d2_tw = &d2_d2_q_combined * &q.dq_t
-                    + &q.d2_q * &(&delta_q_t_exit_u * &deltaw_v + &delta_q_t_exit_v * &deltaw_u);
-                let d2_h_tw = weighted_crossprod_dense(&x_threshold_exit, &(-&d2_tw), xw_dense)?;
-                assign_symmetric_block(&mut joint, offsets[1], w_offset, &d2_h_tw);
-            }
-
-            // Log-sigma-wiggle D²H[u,v].
-            if let (Some(x_ls_en), Some(dq_ls_en)) =
-                (x_log_sigma_entry.as_ref(), q.dq_ls_entry.as_ref())
-            {
-                let d2_lw_exit = &d2_d2_q_exit_exact * &q.dq_ls
-                    + &q.d2_q1 * &(&delta_q_ls_exit_u * &deltaw_v + &delta_q_ls_exit_v * &deltaw_u);
-                let d2_lw_entry = &d2_d2_q_entry_exact * dq_ls_en
-                    + &q.d2_q0
-                        * &(&entry_deltas.delta_q_ls_u * &deltaw_v
-                            + &entry_deltas.delta_q_ls_v * &deltaw_u);
-                let d2_h_lw =
-                    weighted_crossprod_dense(&x_log_sigma_exit, &(-&d2_lw_exit), xw_dense)?
-                        + weighted_crossprod_dense(x_ls_en, &(-&d2_lw_entry), xw_dense)?;
-                assign_symmetric_block(&mut joint, offsets[2], w_offset, &d2_h_lw);
-            } else {
-                let d2_lw = &d2_d2_q_combined * &q.dq_ls
-                    + &q.d2_q * &(&delta_q_ls_exit_u * &deltaw_v + &delta_q_ls_exit_v * &deltaw_u);
-                let d2_h_lw = weighted_crossprod_dense(&x_log_sigma_exit, &(-&d2_lw), xw_dense)?;
-                assign_symmetric_block(&mut joint, offsets[2], w_offset, &d2_h_lw);
-            }
-
-            // Wiggle-wiggle D²H[u,v].
-            let d2_hww = weighted_crossprod_dense(xw_dense, &(-&d2_d2_q_combined), xw_dense)?;
-            assign_symmetric_block(&mut joint, w_offset, w_offset, &d2_hww);
-
-            // Time-wiggle D²H[u,v]: bilinear in (u,v) perturbation directions.
-            let d2_tw_h0 = &q.d_h_h0 * &(&xi_h0_u * &xi_h0_v);
-            let d2_tw_h1 = &q.d_h_h1 * &(&xi_h1_u * &xi_h1_v);
-            let d2_h0w = weighted_crossprod_dense(&self.x_time_entry, &(-&d2_tw_h0), xw_dense)?;
-            let d2_h1w = weighted_crossprod_dense(&self.x_time_exit, &(-&d2_tw_h1), xw_dense)?;
-            assign_symmetric_block(&mut joint, offsets[0], w_offset, &(d2_h0w + d2_h1w));
-        }
-
-        Ok(Some(joint))
+        self.exact_newton_joint_hessiansecond_directional_derivative_from_parts(
+            block_states,
+            d_beta_u_flat,
+            d_beta_v_flat,
+            &q,
+            &dynamic,
+        )
     }
+
 
     fn block_linear_constraints(
         &self,
@@ -10760,13 +10819,143 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         }
         Ok(beta)
     }
+
+    /// Build a workspace that caches the direction-independent quantities
+    /// (`SurvivalJointQuantities` and `SurvivalDynamicGeometry`) used by the
+    /// joint-Hessian directional derivative paths.
+    ///
+    /// The outer joint-Hessian pair loop in the unified REML evaluator calls
+    /// `directional_derivative_operator` and `second_directional_derivative_operator`
+    /// ~`k(k+1)/2 + k` times per outer Hessian evaluation (≈ 323 times at
+    /// `k = 17`). Without the workspace, every call re-runs
+    /// `collect_joint_quantities_rescaled` + `build_dynamic_geometry`, two
+    /// O(n) row sweeps whose outputs depend only on `block_states`. The
+    /// workspace builds both once at top-level and routes every directional
+    /// derivative through the `_from_parts` variants that consume the cached
+    /// arrays.
+    fn exact_newton_joint_hessian_workspace(
+        &self,
+        block_states: &[ParameterBlockState],
+        _specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        Ok(Some(Arc::new(
+            SurvivalLocationScaleExactNewtonJointHessianWorkspace::new(
+                self.clone(),
+                block_states.to_vec(),
+            )?,
+        )))
+    }
 }
 
-fn fit_survival_location_scale(
-    spec: SurvivalLocationScaleSpec,
-) -> Result<UnifiedFitResult, String> {
-    let (fit, _geom) = fit_survival_location_scale_with_geometry(spec)?;
-    Ok(fit)
+/// Workspace caching the direction-independent state used by the survival
+/// location-scale joint-Hessian directional derivative operators.
+///
+/// The unified outer evaluator invokes `directional_derivative_operator` and
+/// `second_directional_derivative_operator` hundreds of times per outer
+/// Hessian evaluation (k first-pass `compute_dh(v_k)` calls + 2·k(k+1)/2
+/// `compute_dh`/`compute_d2h` calls in the pair loop). Each of those calls,
+/// when routed through the family's generic methods, restarts from
+/// `collect_joint_quantities_rescaled` and `build_dynamic_geometry` — two
+/// parallel O(n) row sweeps whose outputs depend solely on `block_states`,
+/// which is fixed across the entire Hessian evaluation. Caching these on the
+/// workspace and dispatching through the `_from_parts` variants eliminates
+/// the redundant sweeps.
+struct SurvivalLocationScaleExactNewtonJointHessianWorkspace {
+    family: SurvivalLocationScaleFamily,
+    block_states: Vec<ParameterBlockState>,
+    /// Cached `SurvivalJointQuantities` at the rescale used by the
+    /// directional-derivative entry points (`hessian_deriv_log_rescale`).
+    /// `collect_joint_quantities_rescaled` reads only `block_states` and the
+    /// scalar rescale; reusing it across all `directional_derivative_*` calls
+    /// is mathematically identical to recomputing it per call (modulo
+    /// floating-point reordering, which the family already accepts).
+    q: SurvivalJointQuantities,
+    /// Cached `SurvivalDynamicGeometry`. `build_dynamic_geometry` depends only
+    /// on `block_states`.
+    dynamic: SurvivalDynamicGeometry,
+}
+
+impl SurvivalLocationScaleExactNewtonJointHessianWorkspace {
+    fn new(
+        family: SurvivalLocationScaleFamily,
+        block_states: Vec<ParameterBlockState>,
+    ) -> Result<Self, String> {
+        let log_rescale = family.hessian_deriv_log_rescale(&block_states);
+        let q = family.collect_joint_quantities_rescaled(&block_states, log_rescale)?;
+        let dynamic = family.build_dynamic_geometry(&block_states)?;
+        Ok(Self {
+            family,
+            block_states,
+            q,
+            dynamic,
+        })
+    }
+}
+
+impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointHessianWorkspace {
+    fn directional_derivative(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.family
+            .exact_newton_joint_hessian_directional_derivative_rescaled_from_parts(
+                &self.block_states,
+                d_beta_flat,
+                &self.q,
+                &self.dynamic,
+            )
+    }
+
+    fn directional_derivative_operator(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
+        Ok(self
+            .family
+            .exact_newton_joint_hessian_directional_derivative_rescaled_from_parts(
+                &self.block_states,
+                d_beta_flat,
+                &self.q,
+                &self.dynamic,
+            )?
+            .map(|matrix| {
+                Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>
+            }))
+    }
+
+    fn second_directional_derivative(
+        &self,
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.family
+            .exact_newton_joint_hessiansecond_directional_derivative_from_parts(
+                &self.block_states,
+                d_beta_u_flat,
+                d_beta_v_flat,
+                &self.q,
+                &self.dynamic,
+            )
+    }
+
+    fn second_directional_derivative_operator(
+        &self,
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
+        Ok(self
+            .family
+            .exact_newton_joint_hessiansecond_directional_derivative_from_parts(
+                &self.block_states,
+                d_beta_u_flat,
+                d_beta_v_flat,
+                &self.q,
+                &self.dynamic,
+            )?
+            .map(|matrix| {
+                Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>
+            }))
+    }
 }
 
 /// Variant that also returns the offset-channel residuals + curvatures at the
@@ -10783,10 +10972,32 @@ fn fit_survival_location_scale_with_geometry(
     let prepared = prepare_survival_location_scale_model(&spec)?;
     let options = survival_blockwise_fit_options(&spec);
     let fit = fit_custom_family(&prepared.family, &prepared.blockspecs, &options)?;
+    // Defensive: `fit_custom_family`'s degraded-plan path (after an ARC
+    // deterministic-replay stall) can return a fit whose `block_states`
+    // were cleared. `offset_channel_geometry` already tolerates this case
+    // (returns zero residuals), but `finalize_survival_location_scale_fit`
+    // indexes `fit.block_states[BLOCK_TIME]` directly and would panic.
+    // Surface a clear sentinel error here; the workflow-level fallback in
+    // `fit_survival_location_scale_terms` matches on the sentinel and
+    // substitutes zero offset-channel residuals so the outer baseline BFGS
+    // can terminate at the current θ instead of propagating a hard panic up
+    // to the Python wrapper.
+    if fit.block_states.is_empty() {
+        return Err(SURVIVAL_LOCATION_SCALE_EMPTY_BLOCK_STATES_MARKER.to_string());
+    }
     let geom = prepared.family.offset_channel_geometry(&fit.block_states)?;
     let finalized = finalize_survival_location_scale_fit(&prepared, &fit)?;
     Ok((finalized, geom))
 }
+
+/// Sentinel error string surfaced by `fit_survival_location_scale_with_geometry`
+/// when a degraded inner fit returns empty `block_states`. See the matching
+/// `match` arm in `fit_survival_location_scale_terms`.
+pub(crate) const SURVIVAL_LOCATION_SCALE_EMPTY_BLOCK_STATES_MARKER: &str =
+    "fit_survival_location_scale_with_geometry: fit_custom_family \
+     returned a fit with empty block_states (likely ARC \
+     deterministic-replay stall in the inner outer solve); \
+     cannot finalize this fit";
 
 pub(crate) fn select_survival_link_wiggle_basis_from_pilot(
     pilot: &SurvivalLocationScaleTermFitResult,
@@ -11256,9 +11467,43 @@ pub(crate) fn fit_survival_location_scale_terms(
                     &designs[0],
                     &designs[1],
                 )?;
-                let (_refit, geom) =
-                    fit_survival_location_scale_with_geometry(final_assembled)?;
-                geom
+                match fit_survival_location_scale_with_geometry(final_assembled) {
+                    Ok((_refit, geom)) => geom,
+                    // Degraded-fit fallback: when the refit's inner ARC stalled
+                    // into deterministic-replay and produced an empty
+                    // `block_states`, `fit_survival_location_scale_with_geometry`
+                    // surfaces a sentinel error rather than letting
+                    // `finalize_survival_location_scale_fit` panic on the
+                    // out-of-bounds `block_states[BLOCK_TIME]` index. Substitute
+                    // zero offset-channel residuals so the outer baseline BFGS
+                    // sees `‖g‖ = 0` at this candidate and terminates cleanly
+                    // at the current θ̂ instead of propagating a hard panic up
+                    // through the Python wrapper. Production loss is at most a
+                    // slightly suboptimal baseline θ at this BMA parent-set —
+                    // strictly better than a `SurvivalLocationScaleFamily
+                    // expects 3 blocks, got 0` exception killing the whole
+                    // gamfit.fit() call.
+                    Err(e) if e == SURVIVAL_LOCATION_SCALE_EMPTY_BLOCK_STATES_MARKER => {
+                        log::warn!(
+                            "fit_survival_location_scale_terms: refit at converged ρ̂ \
+                             produced empty block_states; substituting zero offset \
+                             residuals (degraded BMA candidate; outer θ-BFGS will \
+                             terminate at this point)"
+                        );
+                        let n = data.nrows();
+                        (
+                            OffsetChannelResiduals {
+                                exit: Array1::<f64>::zeros(n),
+                                entry: Array1::<f64>::zeros(n),
+                                derivative: Array1::<f64>::zeros(n),
+                            },
+                            OffsetChannelCurvatures {
+                                rows: vec![[[0.0_f64; 3]; 3]; n],
+                            },
+                        )
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         };
     Ok(SurvivalLocationScaleTermFitResult {
@@ -14416,7 +14661,7 @@ mod tests {
             linkwiggle_block: None,
         };
 
-        match fit_survival_location_scale(spec) {
+        match fit_survival_location_scale_with_geometry(spec).map(|(fit, _)| fit) {
             Ok(result) => {
                 // Structural-monotonicity invariant implied by the test's
                 // name: the I-spline-like time block carries structural
