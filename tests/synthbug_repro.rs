@@ -36,7 +36,9 @@ fn synth_cohort(
             *v = normal.sample(rng);
         }
     }
-    let sex: Vec<i32> = (0..n).map(|_| if normal.sample(rng) > 0.0 { 1 } else { 0 }).collect();
+    let sex: Vec<i32> = (0..n)
+        .map(|_| if normal.sample(rng) > 0.0 { 1 } else { 0 })
+        .collect();
     let pgs_loadings: [f64; NUM_PCS] = std::array::from_fn(|_| normal.sample(rng) * 0.3);
     let pgs_raw: Vec<f64> = (0..n)
         .map(|i| {
@@ -65,7 +67,10 @@ fn synth_cohort(
     sorted.sort_by(f64::total_cmp);
     let q_idx = ((1.0 - prevalence) * (n as f64 - 1.0)).round() as usize;
     let threshold = sorted[q_idx.min(n - 1)];
-    let case: Vec<i32> = liability.iter().map(|&l| if l > threshold { 1 } else { 0 }).collect();
+    let case: Vec<i32> = liability
+        .iter()
+        .map(|&l| if l > threshold { 1 } else { 0 })
+        .collect();
     (0..n).map(|i| (case[i], sex[i], pgs[i], pcs[i])).collect()
 }
 
@@ -87,7 +92,11 @@ fn local_synth_copd_like_duchon_orth_to_parametric() {
     let n_train = train_pick.len();
     let pgs_train: Vec<f64> = train_pick.iter().map(|&i| cohort[i].2).collect();
     let pgs_mean = pgs_train.iter().sum::<f64>() / n_train as f64;
-    let pgs_var = pgs_train.iter().map(|x| (x - pgs_mean).powi(2)).sum::<f64>() / n_train as f64;
+    let pgs_var = pgs_train
+        .iter()
+        .map(|x| (x - pgs_mean).powi(2))
+        .sum::<f64>()
+        / n_train as f64;
     let pgs_std = pgs_var.sqrt();
 
     // Layout matches train_df[cols] with cols = ["case", "sex", "prs_z", PC1..PC10]
