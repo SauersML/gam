@@ -300,7 +300,18 @@ jobs:
     # `github.event_name == 'workflow_dispatch'` is the only condition that
     # works reliably for both transports — main-branch pushes still don't
     # publish because they're `push` events that don't satisfy the tag prefix.
+    # `always()` is REQUIRED. By default, when ANY `needs:` job is `skipped`
+    # (which is what happens for macos / windows under `linux_only=true`),
+    # GitHub Actions auto-skips the dependent job BEFORE evaluating the
+    # `if:` expression — so even though our explicit checks accept
+    # `result == 'skipped'`, the job never gets the chance to evaluate
+    # them. Prefixing with `always()` forces the condition to be
+    # evaluated despite skipped upstream needs. Without this, the
+    # `linux_only=true` dispatch builds successfully but the Upload to
+    # PyPI step silently skips — which is exactly what kept gamfit stuck
+    # at 0.1.43 on PyPI through v0.3.24..v0.3.34.
     if: |
+      always() &&
       (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') &&
       needs.linux.result == 'success' &&
       needs.musllinux.result == 'success' &&

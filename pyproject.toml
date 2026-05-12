@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "gamfit"
-version = "0.1.55"
+version = "0.1.56"
 description = "Formula-first generalized additive models with a high-performance Rust core"
 readme = "README_PYPI.md"
 requires-python = ">=3.10"
