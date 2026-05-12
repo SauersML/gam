@@ -5462,10 +5462,27 @@ impl<'a> RemlState<'a> {
         // Under `HardPseudo` the operator already masks null eigenpairs
         // consistently in `logdet`, `trace_logdet_*`, and `solve`, so the
         // correction is zero there and no projected-trace kernel is needed.
+        //
+        // Previously this kernel was only constructed when
+        // `penalty_rank < h_for_operator.ncols()` — i.e. only when the
+        // penalty matrix itself was structurally rank-deficient. That
+        // condition is wrong for non-Gaussian families: the leakage
+        // described above is driven by the third-derivative correction
+        // `D_β H[v]`, not by the rank of `S`. Even when `S_λ` has full
+        // rank (penalty_rank == p_total), the correction term still spills
+        // onto `null(S_λ_term)` for individual penalty components `S_k`
+        // whose ranges don't cover all of `range(S_λ)`. The result is a
+        // spurious nonzero outer gradient at large `λ_k` (where the
+        // unbalanced trace term dominates the `λ_k tr(S_λ⁺ S_k)` and
+        // `λ_k β'S_k β` terms that should cancel to zero), which makes
+        // ARC's deterministic-replay detector fire on a flat REML surface
+        // and surfaces "SurvivalLocationScaleFamily expects 3 blocks,
+        // got 0" panics in the downstream refit path. Building the
+        // projected kernel unconditionally under `Smooth` mode costs one
+        // extra eigendecomposition of `S_λ` per outer eval (microseconds
+        // at biobank p ≤ ~50) and restores the gradient cancellation.
         let (hessian_logdet_correction, penalty_subspace_trace) =
-            if matches!(hessian_mode, PseudoLogdetMode::Smooth)
-                && penalty_rank < h_for_operator.ncols()
-            {
+            if matches!(hessian_mode, PseudoLogdetMode::Smooth) {
                 use super::unified::HessianOperator;
                 let (log_det_h_proj, kernel) = self.fixed_subspace_hessian_projected_parts(
                     &h_for_operator,
