@@ -291,18 +291,17 @@ jobs:
     # publish what built (Linux + musllinux + sdist) so the fast release
     # path produces an installable PyPI version. Tolerate `skipped` on the
     # two omitted jobs but require `success` on everything that did run.
-    # Use `github.ref_name` (the short ref like `v0.3.34`) instead of
-    # `github.ref` (the full `refs/tags/v0.3.34`). For push events to a
-    # tag, `ref_name` is the tag name. For `workflow_dispatch` triggered
-    # via `gh workflow run --ref v0.3.34`, `ref_name` is also the tag
-    # name — whereas `github.ref` for workflow_dispatch surfaces as
-    # the dispatched ref but the `startsWith('refs/tags/v', ...)` check
-    # historically evaluated false on the dispatch path, silently
-    # skipping the Upload to PyPI step. Using `ref_name` makes both
-    # trigger types publish identically when the ref looks like a
-    # release tag.
+    # Publish when EITHER a tag push (`refs/tags/v*`) OR a `workflow_dispatch`
+    # fires. We've burned multiple debug cycles on `github.ref` vs
+    # `github.ref_name` semantics for workflow_dispatch: both interpretations
+    # silently evaluated false even when the dispatch was against a tag,
+    # leaving Upload to PyPI as `skipped` and PyPI permanently stuck at the
+    # last successful tag-push (0.1.43 / gam 0.3.23 in production). Trusting
+    # `github.event_name == 'workflow_dispatch'` is the only condition that
+    # works reliably for both transports — main-branch pushes still don't
+    # publish because they're `push` events that don't satisfy the tag prefix.
     if: |
-      startsWith(github.ref_name, 'v') &&
+      (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') &&
       needs.linux.result == 'success' &&
       needs.musllinux.result == 'success' &&
       needs.sdist.result == 'success' &&
