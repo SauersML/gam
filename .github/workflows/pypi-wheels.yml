@@ -56,6 +56,14 @@ on:
       - 'v*'        # builds + publishes
   workflow_dispatch:
 
+# Cancel in-flight runs on the same ref when a new push lands.  Rapid
+# main-branch commits used to queue full wheel matrices behind each
+# other; only the last one matters for cache-warming.  Tag pushes are
+# distinct refs so this never cancels a publishing run.
+concurrency:
+  group: pypi-wheels-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -69,6 +77,11 @@ env:
   CARGO_NET_RETRY: "10"
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+  # Sparse index avoids the multi-minute git clone of the full crates.io
+  # index on cold caches.  Identical cargo behavior on warm caches (the
+  # registry is already populated under ~/.cargo).  Does not affect the
+  # rustc invocation, so does not invalidate Swatinem/rust-cache keys.
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
 
 jobs:
   linux:
@@ -92,6 +105,11 @@ jobs:
           workspaces: |
             .
             crates/gam-pyffi
+          # Only main warms the per-runner cache; tag / workflow_dispatch
+          # runs read it but skip the ~30s upload step.  The shared-key is
+          # unchanged, so this does not invalidate anything that was saved.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - name: Build Linux wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -131,6 +149,8 @@ jobs:
           workspaces: |
             .
             crates/gam-pyffi
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - name: Build musllinux wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -168,6 +188,8 @@ jobs:
           workspaces: |
             .
             crates/gam-pyffi
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - name: Build macOS wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -203,6 +225,8 @@ jobs:
           workspaces: |
             .
             crates/gam-pyffi
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - name: Build Windows wheels
         uses: PyO3/maturin-action@v1
         with:

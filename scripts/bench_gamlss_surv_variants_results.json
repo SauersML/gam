@@ -1,0 +1,26 @@
+[
+  {
+    "label": "C: gompertz-makeham + lean sigma",
+    "seconds": 0.7143907499994384,
+    "ok": false,
+    "error": "invalid fit config json: unknown field `predict_noise`, expected one of `family`, `offset`, `weights`, `ridge_lambda`, `transformation_normal`, `survival_likelihood`, `baseline_target`, `baseline_scale`, `baseline_shape`, `baseline_rate`, `baseline_makeham`, `z_column`, `logslope_formula`, `link`, `"
+  },
+  {
+    "label": "A: gompertz-makeham + full sigma",
+    "seconds": 1.1367283330037026,
+    "ok": false,
+    "error": "invalid fit config json: unknown field `predict_noise`, expected one of `family`, `offset`, `weights`, `ridge_lambda`, `transformation_normal`, `survival_likelihood`, `baseline_target`, `baseline_scale`, `baseline_shape`, `baseline_rate`, `baseline_makeham`, `z_column`, `logslope_formula`, `link`, `"
+  },
+  {
+    "label": "B: weibull + full sigma",
+    "seconds": 1.0622276249923743,
+    "ok": false,
+    "error": "invalid fit config json: unknown field `predict_noise`, expected one of `family`, `offset`, `weights`, `ridge_lambda`, `transformation_normal`, `survival_likelihood`, `baseline_target`, `baseline_scale`, `baseline_shape`, `baseline_rate`, `baseline_makeham`, `z_column`, `logslope_formula`, `link`, `"
+  },
+  {
+    "label": "D: linear baseline + full sigma",
+    "seconds": 1.0616299999965122,
+    "ok": false,
+    "error": "invalid fit config json: unknown field `predict_noise`, expected one of `family`, `offset`, `weights`, `ridge_lambda`, `transformation_normal`, `survival_likelihood`, `baseline_target`, `baseline_scale`, `baseline_shape`, `baseline_rate`, `baseline_makeham`, `z_column`, `logslope_formula`, `link`, `"
+  }
+]
