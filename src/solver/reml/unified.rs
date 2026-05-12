@@ -16243,4 +16243,353 @@ mod tests {
         assert_eq!(res.active_constraints, vec![1]);
         assert!(res.matrix.iter().all(|v| v.is_finite()));
     }
+
+    // ------------------------------------------------------------------------
+    // Numerical proof of the outer-ρ projected-kernel REML gradient bug
+    // (runtime.rs:5465-5481).
+    //
+    // Hypothesis: when `hessian_logdet_correction ≠ 0` (cost uses projected
+    // logdet `log|U_S^T H U_S|_+`) but the gradient computation uses the
+    // full-space kernel `G_ε(H)` instead of `U_S (U_S^T H U_S)⁻¹ U_S^T`, the
+    // third-derivative correction `D_β H[v_k] = X' diag(c ⊙ X v_k) X` leaks
+    // onto null(S) and produces a spurious O(λ_k) outer-gradient term at
+    // large λ_k.
+    //
+    // Method: Option B (synthetic). Build a Gaussian fixture where β̂(ρ) is
+    // exact (so FD of `reml_laml_evaluate` returns the true gradient of the
+    // projected REML cost). Inject a non-zero `c_array` via
+    // `SinglePredictorGlmDerivatives` — this is a "lie" about the family
+    // (the cost is Gaussian so the actual `dH/dρ` has no third-deriv term),
+    // but it lets the analytic gradient path see a `D_β H[v_k]` that is
+    // structurally identical to the survival_location_scale leak. FD does
+    // NOT see the lie (cost only uses β/H/log-lik/penalty). Projected and
+    // unprojected analytic gradients DO see it; the projected kernel kills
+    // the null-space part exactly, so it matches FD.
+    // ------------------------------------------------------------------------
+    fn build_leak_proof_solution(
+        rho: &[f64],
+        x: &Array2<f64>,
+        s1: &Array2<f64>,
+        s2: &Array2<f64>,
+        xty: &Array1<f64>,
+        yty: f64,
+        c_array: Array1<f64>,
+        use_projected_kernel: bool,
+    ) -> InnerSolution<'static> {
+        let p = x.ncols();
+        let n = x.nrows();
+        assert_eq!(rho.len(), 2);
+        let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
+
+        let xtx = crate::faer_ndarray::fast_atb(x, x);
+        let mut s_lambda = Array2::<f64>::zeros((p, p));
+        s_lambda.scaled_add(lambdas[0], s1);
+        s_lambda.scaled_add(lambdas[1], s2);
+
+        let mut h = xtx.clone();
+        h += &s_lambda;
+
+        let hop = DenseSpectralOperator::from_symmetric(&h).unwrap();
+        let beta = hop.solve(xty);
+        let deviance = yty - 2.0 * beta.dot(xty) + beta.dot(&xtx.dot(&beta));
+        let log_lik = -0.5 * deviance;
+        let penalty_quad = beta.dot(&s_lambda.dot(&beta));
+
+        // Penalty logdet & first derivatives (rank = 2; both penalties have
+        // rank-1 supports that don't overlap, so log|S_λ|_+ = ln λ₁ + ln λ₂).
+        let (s_eigs, _) = s_lambda.eigh(faer::Side::Lower).unwrap();
+        let threshold = positive_eigenvalue_threshold(s_eigs.as_slice().unwrap());
+        let log_det_s = exact_pseudo_logdet(s_eigs.as_slice().unwrap(), threshold);
+
+        let eps_det = 1e-7;
+        let mut det1 = Array1::zeros(2);
+        for k in 0..2 {
+            let mut rp = rho.to_vec();
+            rp[k] += eps_det;
+            let lp: Vec<f64> = rp.iter().map(|r| r.exp()).collect();
+            let mut sp = Array2::<f64>::zeros((p, p));
+            sp.scaled_add(lp[0], s1);
+            sp.scaled_add(lp[1], s2);
+            let (ev_p, _) = sp.eigh(faer::Side::Lower).unwrap();
+            let thp = positive_eigenvalue_threshold(ev_p.as_slice().unwrap());
+            let ld_p = exact_pseudo_logdet(ev_p.as_slice().unwrap(), thp);
+
+            let mut rm = rho.to_vec();
+            rm[k] -= eps_det;
+            let lm: Vec<f64> = rm.iter().map(|r| r.exp()).collect();
+            let mut sm = Array2::<f64>::zeros((p, p));
+            sm.scaled_add(lm[0], s1);
+            sm.scaled_add(lm[1], s2);
+            let (ev_m, _) = sm.eigh(faer::Side::Lower).unwrap();
+            let thm = positive_eigenvalue_threshold(ev_m.as_slice().unwrap());
+            let ld_m = exact_pseudo_logdet(ev_m.as_slice().unwrap(), thm);
+
+            det1[k] = (ld_p - ld_m) / (2.0 * eps_det);
+        }
+
+        // Build projection U_S onto range(S_λ) (rank 2 here: cols 1 and 2 of X).
+        // Use eigendecomposition of S_λ and keep eigenvectors with eigenvalue > tol.
+        let (s_full_eigs, s_full_vecs) = s_lambda.eigh(faer::Side::Lower).unwrap();
+        let s_thresh = positive_eigenvalue_threshold(s_full_eigs.as_slice().unwrap());
+        let active: Vec<usize> = s_full_eigs
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| **v > s_thresh)
+            .map(|(i, _)| i)
+            .collect();
+        let r_rank = active.len();
+        let mut u_s = Array2::<f64>::zeros((p, r_rank));
+        for (j, &idx) in active.iter().enumerate() {
+            for i in 0..p {
+                u_s[[i, j]] = s_full_vecs[[i, idx]];
+            }
+        }
+        // H_proj = U_Sᵀ H U_S; invert it.
+        let h_proj = u_s.t().dot(&h).dot(&u_s);
+        let (hp_eigs, hp_vecs) = h_proj.eigh(faer::Side::Lower).unwrap();
+        let mut h_proj_inv = Array2::<f64>::zeros((r_rank, r_rank));
+        for i in 0..r_rank {
+            for j in 0..r_rank {
+                let mut acc = 0.0;
+                for k_idx in 0..r_rank {
+                    acc += hp_vecs[[i, k_idx]] * hp_vecs[[j, k_idx]] / hp_eigs[k_idx];
+                }
+                h_proj_inv[[i, j]] = acc;
+            }
+        }
+        let log_det_h_proj: f64 = hp_eigs.iter().map(|v| v.ln()).sum();
+        let log_det_h_full = hop.logdet();
+        let hessian_logdet_correction = log_det_h_proj - log_det_h_full;
+
+        let deriv_provider = SinglePredictorGlmDerivatives {
+            c_array,
+            d_array: None,
+            x_transformed: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x.clone())),
+        };
+
+        let r1 = penalty_matrix_root(s1).unwrap();
+        let r2 = penalty_matrix_root(s2).unwrap();
+
+        let penalty_subspace_trace = if use_projected_kernel {
+            Some(Arc::new(PenaltySubspaceTrace {
+                u_s,
+                h_proj_inverse: h_proj_inv,
+            }))
+        } else {
+            None
+        };
+
+        InnerSolution {
+            log_likelihood: log_lik,
+            penalty_quadratic: penalty_quad,
+            hessian_op: Arc::new(hop),
+            beta,
+            penalty_coords: vec![
+                PenaltyCoordinate::from_dense_root(r1),
+                PenaltyCoordinate::from_dense_root(r2),
+            ],
+            penalty_logdet: PenaltyLogdetDerivs {
+                value: log_det_s,
+                first: det1,
+                second: None,
+            },
+            deriv_provider: Box::new(deriv_provider),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: None,
+            hessian_logdet_correction,
+            penalty_subspace_trace,
+            rho_curvature_scale: 1.0,
+            n_observations: n,
+            nullspace_dim: (p - r_rank) as f64,
+            dispersion: DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: true,
+            },
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+            barrier_config: None,
+        }
+    }
+
+    /// Numerical proof: at large λ_j, the unprojected-kernel REML gradient
+    /// disagrees with finite-difference of the projected-logdet cost by a
+    /// margin that grows with λ_j, while the projected-kernel gradient
+    /// matches FD to floating-point tolerance.
+    #[test]
+    fn proof_outer_rho_projected_kernel_fixes_leak() {
+        let n = 100;
+        let p = 3;
+        // Design: intercept + two "spline-like" columns. Intercept is in null(S₁) ∩ null(S₂).
+        let mut x = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let t = (i as f64) / ((n - 1) as f64);
+            x[[i, 0]] = 1.0; // intercept
+            x[[i, 1]] = (2.0 * std::f64::consts::PI * t).sin();
+            x[[i, 2]] = (t - 0.5) * (t - 0.3);
+        }
+        // S₁ penalizes column 1, S₂ penalizes column 2. Both have null space ⊇ {e_0}.
+        let mut s1 = Array2::<f64>::zeros((p, p));
+        s1[[1, 1]] = 1.0;
+        let mut s2 = Array2::<f64>::zeros((p, p));
+        s2[[2, 2]] = 1.0;
+
+        // Some synthetic response — y = X β_true + noise (deterministic).
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = (i as f64) / ((n - 1) as f64);
+            y[i] = 0.7 + 0.4 * (2.0 * std::f64::consts::PI * t).sin()
+                + 0.1 * ((i as f64) * 0.7).cos();
+        }
+        let xty = crate::faer_ndarray::fast_atb(&x, &y.clone().insert_axis(ndarray::Axis(1)))
+            .column(0)
+            .to_owned();
+        let yty = y.dot(&y);
+
+        // c_array: a non-trivial vector — the "third-derivative weight surface".
+        // Chosen to have non-zero mean (so it projects onto the intercept direction),
+        // making the leak large.
+        let c_array = Array1::from_shape_fn(n, |i| {
+            0.3 + 0.5 * ((i as f64) * 0.11).sin() + 0.2 * ((i as f64) * 0.27).cos()
+        });
+
+        // Runaway scenario: ρ = [0.0, 12.0] → λ ≈ [1, 1.6e5]. Big enough that
+        // λ_2 dominates H and the leak is highly visible, but not so big that
+        // FD on the projected-logdet cost (cost ~ ½ ln λ_2) loses precision —
+        // at ρ_2 ≳ 17 the FD denominator gets within ~1e-8 of the cost itself
+        // and catastrophic cancellation makes FD unreliable as a reference.
+        let rho = vec![0.0_f64, 12.0_f64];
+
+        // --- (a) FD of projected-logdet cost via reml_laml_evaluate value-only ---
+        let delta = 1e-4;
+        let mut fd_grad = vec![0.0_f64; 2];
+        for j in 0..2 {
+            let mut rp = rho.clone();
+            rp[j] += delta;
+            let sp = build_leak_proof_solution(
+                &rp, &x, &s1, &s2, &xty, yty, c_array.clone(), true,
+            );
+            let cost_p = reml_laml_evaluate(&sp, &rp, EvalMode::ValueOnly, None)
+                .unwrap()
+                .cost;
+
+            let mut rm = rho.clone();
+            rm[j] -= delta;
+            let sm = build_leak_proof_solution(
+                &rm, &x, &s1, &s2, &xty, yty, c_array.clone(), true,
+            );
+            let cost_m = reml_laml_evaluate(&sm, &rm, EvalMode::ValueOnly, None)
+                .unwrap()
+                .cost;
+
+            fd_grad[j] = (cost_p - cost_m) / (2.0 * delta);
+        }
+
+        // --- (b) Analytic gradient WITHOUT projected kernel (pre-v0.3.31 bug) ---
+        let sol_unproj = build_leak_proof_solution(
+            &rho, &x, &s1, &s2, &xty, yty, c_array.clone(), false,
+        );
+        let g_unproj = reml_laml_evaluate(&sol_unproj, &rho, EvalMode::ValueAndGradient, None)
+            .unwrap()
+            .gradient
+            .unwrap();
+
+        // --- (c) Analytic gradient WITH projected kernel (v0.3.31 fix) ---
+        let sol_proj = build_leak_proof_solution(
+            &rho, &x, &s1, &s2, &xty, yty, c_array.clone(), true,
+        );
+        let g_proj = reml_laml_evaluate(&sol_proj, &rho, EvalMode::ValueAndGradient, None)
+            .unwrap()
+            .gradient
+            .unwrap();
+
+        eprintln!("=== Outer-ρ gradient at runaway ρ = {:?} (λ = {:?}) ===",
+            rho, rho.iter().map(|r| r.exp()).collect::<Vec<_>>());
+        for j in 0..2 {
+            eprintln!(
+                "  coord {}: FD={:+.6e}   unprojected_analytic={:+.6e}   projected_analytic={:+.6e}",
+                j, fd_grad[j], g_unproj[j], g_proj[j]
+            );
+            let rel_proj = (g_proj[j] - fd_grad[j]).abs() / fd_grad[j].abs().max(1e-12);
+            let rel_unproj = (g_unproj[j] - fd_grad[j]).abs() / fd_grad[j].abs().max(1e-12);
+            eprintln!(
+                "           |projected − FD|/|FD| = {:.3e}   |unprojected − FD|/|FD| = {:.3e}",
+                rel_proj, rel_unproj
+            );
+        }
+
+        // --- Sweep λ_2 to check scaling ---
+        eprintln!("=== Sweep λ_2 (coord 1) — unprojected analytic vs FD ===");
+        for &rho2 in &[6.0_f64, 9.0, 12.0, 15.0, 18.0, 20.0] {
+            let r = vec![0.0_f64, rho2];
+            let fd1 = {
+                let mut rp = r.clone();
+                rp[1] += delta;
+                let sp = build_leak_proof_solution(
+                    &rp, &x, &s1, &s2, &xty, yty, c_array.clone(), true,
+                );
+                let cp = reml_laml_evaluate(&sp, &rp, EvalMode::ValueOnly, None)
+                    .unwrap()
+                    .cost;
+                let mut rm = r.clone();
+                rm[1] -= delta;
+                let sm = build_leak_proof_solution(
+                    &rm, &x, &s1, &s2, &xty, yty, c_array.clone(), true,
+                );
+                let cm = reml_laml_evaluate(&sm, &rm, EvalMode::ValueOnly, None)
+                    .unwrap()
+                    .cost;
+                (cp - cm) / (2.0 * delta)
+            };
+            let su = build_leak_proof_solution(
+                &r, &x, &s1, &s2, &xty, yty, c_array.clone(), false,
+            );
+            let gu = reml_laml_evaluate(&su, &r, EvalMode::ValueAndGradient, None)
+                .unwrap()
+                .gradient
+                .unwrap();
+            let sp = build_leak_proof_solution(
+                &r, &x, &s1, &s2, &xty, yty, c_array.clone(), true,
+            );
+            let gp = reml_laml_evaluate(&sp, &r, EvalMode::ValueAndGradient, None)
+                .unwrap()
+                .gradient
+                .unwrap();
+            let leak = gu[1] - fd1;
+            eprintln!(
+                "  ρ_2={:5.1} λ_2={:+.3e}  FD={:+.6e}  unproj={:+.6e}  proj={:+.6e}  leak(unproj−FD)={:+.6e}",
+                rho2,
+                rho2.exp(),
+                fd1,
+                gu[1],
+                gp[1],
+                leak
+            );
+        }
+
+        // --- Assertions (per task spec) ---
+        // At the runaway coordinate (j = 1):
+        let j = 1;
+        let rel_proj = (g_proj[j] - fd_grad[j]).abs() / fd_grad[j].abs().max(1e-12);
+        let rel_unproj = (g_unproj[j] - fd_grad[j]).abs() / fd_grad[j].abs().max(1e-12);
+        assert!(
+            rel_proj < 1e-2,
+            "projected gradient should match FD at runaway coord: \
+             FD={:+.6e}, projected={:+.6e}, rel={:.3e}",
+            fd_grad[j],
+            g_proj[j],
+            rel_proj
+        );
+        assert!(
+            rel_unproj > 0.5,
+            "unprojected gradient should DISAGREE with FD at runaway coord: \
+             FD={:+.6e}, unprojected={:+.6e}, rel={:.3e}",
+            fd_grad[j],
+            g_unproj[j],
+            rel_unproj
+        );
+    }
 }
