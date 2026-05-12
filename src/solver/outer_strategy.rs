@@ -4029,7 +4029,8 @@ fn run_outer(
             // Bind the active config by cloning into a local owned value so
             // subsequent retry-config assignment does not collide with the
             // borrow used inside this iteration body.
-            let active_config_owned: OuterConfig = retry_config.clone().unwrap_or_else(|| config.clone());
+            let active_config_owned: OuterConfig =
+                retry_config.clone().unwrap_or_else(|| config.clone());
             let active_config: &OuterConfig = &active_config_owned;
             match run_outer_with_plan(obj, active_config, context, attempt_cap, &the_plan) {
                 Ok(result) => {

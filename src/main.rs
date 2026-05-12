@@ -74,11 +74,11 @@ use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSp
 use gam::survival_construction::{
     SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
     SurvivalTimeBasisConfig, SurvivalTimeBuildOutput, add_survival_time_derivative_guard_offset,
-    append_zero_tail_columns, build_latent_survival_baseline_offsets, build_survival_time_basis,
-    build_survival_time_offsets_for_likelihood, build_survival_timewiggle_from_baseline,
-    build_time_varying_survival_covariate_template, center_survival_time_designs_at_anchor,
-    evaluate_survival_time_basis_row, initial_survival_baseline_config_for_fit,
-    baseline_chain_rule_gradient, location_scale_uses_probit_survival_baseline,
+    append_zero_tail_columns, baseline_chain_rule_gradient, build_latent_survival_baseline_offsets,
+    build_survival_time_basis, build_survival_time_offsets_for_likelihood,
+    build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
+    center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
+    initial_survival_baseline_config_for_fit, location_scale_uses_probit_survival_baseline,
     marginal_slope_baseline_chain_rule_gradient, marginal_slope_baseline_chain_rule_hessian,
     normalize_survival_time_pair, optimize_survival_baseline_config,
     optimize_survival_baseline_config_with_gradient,
@@ -4193,9 +4193,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             // envelope-theorem argument that justifies this contraction is
             // documented at `baseline_chain_rule_gradient` and at the
             // analogous marginal-slope dispatch.
-            let probit_channel = location_scale_uses_probit_survival_baseline(Some(
-                &survival_inverse_link,
-            ));
+            let probit_channel =
+                location_scale_uses_probit_survival_baseline(Some(&survival_inverse_link));
             baseline_cfg = optimize_survival_baseline_config_with_gradient_only(
                 &baseline_cfg,
                 "survival location-scale baseline",
@@ -4263,8 +4262,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     // additional θ-dependence through H(β̂, θ), so optimizing
                     // `reml_score` against this gradient would mismatch the
                     // cost. Use the matching profile-NLL cost.
-                    let profile_cost = -fit.fit.fit.log_likelihood
-                        + 0.5 * fit.fit.fit.stable_penalty_term;
+                    let profile_cost =
+                        -fit.fit.fit.log_likelihood + 0.5 * fit.fit.fit.stable_penalty_term;
                     if !profile_cost.is_finite() {
                         return Err(format!(
                             "survival location-scale baseline: non-finite profile cost \
@@ -5551,25 +5550,29 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
     // Collapsing this dispatch requires SurvivalPredictor and
     // LocationScalePredictor implementations of PredictableModel.
     let nuts = match model.predict_model_class() {
-        PredictModelClass::Survival => {
-            run_sample_survival(
-                &mut progress,
-                &model,
-                ds.values.view(),
-                &col_map,
-                training_headers,
-                &cfg,
-            )?
-        }
-        PredictModelClass::GaussianLocationScale => {
-            gam::sample::laplace_gaussian_fallback(&model, &cfg, "gaussian location-scale posterior")?
-        }
-        PredictModelClass::BinomialLocationScale => {
-            gam::sample::laplace_gaussian_fallback(&model, &cfg, "binomial location-scale posterior")?
-        }
-        PredictModelClass::BernoulliMarginalSlope => {
-            gam::sample::laplace_gaussian_fallback(&model, &cfg, "bernoulli marginal-slope posterior")?
-        }
+        PredictModelClass::Survival => run_sample_survival(
+            &mut progress,
+            &model,
+            ds.values.view(),
+            &col_map,
+            training_headers,
+            &cfg,
+        )?,
+        PredictModelClass::GaussianLocationScale => gam::sample::laplace_gaussian_fallback(
+            &model,
+            &cfg,
+            "gaussian location-scale posterior",
+        )?,
+        PredictModelClass::BinomialLocationScale => gam::sample::laplace_gaussian_fallback(
+            &model,
+            &cfg,
+            "binomial location-scale posterior",
+        )?,
+        PredictModelClass::BernoulliMarginalSlope => gam::sample::laplace_gaussian_fallback(
+            &model,
+            &cfg,
+            "bernoulli marginal-slope posterior",
+        )?,
         PredictModelClass::TransformationNormal => {
             gam::sample::laplace_gaussian_fallback(&model, &cfg, "transformation-normal posterior")?
         }
@@ -8786,9 +8789,10 @@ fn covariance_from_model(
     model: &SavedModel,
     mode: CovarianceModeArg,
 ) -> Result<Array2<f64>, String> {
-    let fit = model.fit_result.as_ref().ok_or_else(|| {
-        "model is missing canonical fit_result payload; refit".to_string()
-    })?;
+    let fit = model
+        .fit_result
+        .as_ref()
+        .ok_or_else(|| "model is missing canonical fit_result payload; refit".to_string())?;
     let cov = match mode {
         CovarianceModeArg::Corrected => fit.beta_covariance_corrected().or(fit.beta_covariance()),
         CovarianceModeArg::Conditional => fit.beta_covariance(),
@@ -8820,9 +8824,10 @@ fn prediction_backend_from_model<'a>(
     model: &'a SavedModel,
     mode: CovarianceModeArg,
 ) -> Result<PredictionCovarianceBackend<'a>, String> {
-    let fit = model.fit_result.as_ref().ok_or_else(|| {
-        "model is missing canonical fit_result payload; refit".to_string()
-    })?;
+    let fit = model
+        .fit_result
+        .as_ref()
+        .ok_or_else(|| "model is missing canonical fit_result payload; refit".to_string())?;
     let covariance = match mode {
         CovarianceModeArg::Corrected => fit.beta_covariance_corrected().or(fit.beta_covariance()),
         CovarianceModeArg::Conditional => fit.beta_covariance(),

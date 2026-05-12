@@ -917,10 +917,7 @@ fn dump_indefinite_rho_hessian_diagnostic(
         },
     };
 
-    log::warn!(
-        "[INDEF-HESS] rho={:?}",
-        final_rho.as_slice().unwrap_or(&[]),
-    );
+    log::warn!("[INDEF-HESS] rho={:?}", final_rho.as_slice().unwrap_or(&[]),);
     log::warn!(
         "[INDEF-HESS] eigenvalues={:?}",
         eigenvalues_ref.as_slice().unwrap_or(&[]),

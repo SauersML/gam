@@ -8,7 +8,6 @@
 //! callers that explicitly need a materialized matrix, and caches only that
 //! opt-in dense build.
 
-
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1};
 use rayon::prelude::*;
 use smallvec::SmallVec;
