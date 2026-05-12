@@ -15847,7 +15847,23 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         .with_bfgs_step_cap(bfgs_step_cap)
         .with_seed_config(family.outer_seed_config(n_rho))
         .with_screening_cap(Arc::clone(&screening_cap))
-        .with_initial_rho(rho0.clone());
+        .with_initial_rho(rho0.clone())
+        // Tighten the per-coord ρ bound from the OuterConfig default of 30.
+        // `rho = 20` already corresponds to `λ = exp(20) ≈ 5×10⁸` — at that
+        // strength the corresponding smooth has been driven to a near-zero
+        // coefficient and the REML surface is dead-flat along that direction.
+        // ARC's quadratic model breaks down on the flat valley (Newton step
+        // repeats deterministically), the retry-stall detector fires, and the
+        // degraded-plan refit downstream surfaces empty-block_states failures
+        // that propagate as cryptic "expects 3 blocks, got 0" panics through
+        // the Python wrapper. Bounding ρ at 15 (`λ ≈ 3.3 × 10⁶`) is still
+        // pathologically strong shrinkage — any data signal that would prefer
+        // a larger λ is computationally indistinguishable from this cap — but
+        // keeps the optimizer in numerically tractable territory. This is the
+        // ROOT-CAUSE fix for the survival location-scale "0 blocks" crash; the
+        // workflow-level catches stay in place as a safety net for any other
+        // path that produces empty block_states.
+        .with_rho_bound(15.0);
 
     let eval_outer = |outer: &mut CustomOuterState,
                       rho: &Array1<f64>,
