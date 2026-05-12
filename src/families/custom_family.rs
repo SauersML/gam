@@ -15848,22 +15848,20 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         .with_seed_config(family.outer_seed_config(n_rho))
         .with_screening_cap(Arc::clone(&screening_cap))
         .with_initial_rho(rho0.clone())
-        // Tighten the per-coord ρ bound from the OuterConfig default of 30.
-        // `rho = 20` already corresponds to `λ = exp(20) ≈ 5×10⁸` — at that
-        // strength the corresponding smooth has been driven to a near-zero
-        // coefficient and the REML surface is dead-flat along that direction.
-        // ARC's quadratic model breaks down on the flat valley (Newton step
-        // repeats deterministically), the retry-stall detector fires, and the
-        // degraded-plan refit downstream surfaces empty-block_states failures
-        // that propagate as cryptic "expects 3 blocks, got 0" panics through
-        // the Python wrapper. Bounding ρ at 15 (`λ ≈ 3.3 × 10⁶`) is still
-        // pathologically strong shrinkage — any data signal that would prefer
-        // a larger λ is computationally indistinguishable from this cap — but
-        // keeps the optimizer in numerically tractable territory. This is the
-        // ROOT-CAUSE fix for the survival location-scale "0 blocks" crash; the
-        // workflow-level catches stay in place as a safety net for any other
-        // path that produces empty block_states.
-        .with_rho_bound(15.0);
+        // Tighten the per-coord ρ bound from the OuterConfig default of 30
+        // to 10. λ = exp(10) ≈ 22k is already extremely strong shrinkage —
+        // any smooth whose data prefers more aggressive shrinkage is
+        // statistically indistinguishable from "shrunk to nullspace." The
+        // bound prevents the optimizer from wandering into the dead-flat
+        // region around λ = 10⁹ where ARC's quadratic model breaks down,
+        // the retry-stall detector fires on a flat surface, and downstream
+        // empty-block_states crashes surface as the cryptic "expects 3
+        // blocks, got 0" Python exception. The v0.3.31 projected-kernel
+        // fix in `runtime.rs` should make the gradient cancel correctly at
+        // large λ so the optimizer naturally converges before hitting any
+        // cap, but tightening this bound is cheap belt-and-suspenders
+        // against any path that bypasses the projected-kernel fix.
+        .with_rho_bound(10.0);
 
     let eval_outer = |outer: &mut CustomOuterState,
                       rho: &Array1<f64>,
