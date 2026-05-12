@@ -3262,14 +3262,10 @@ mod tests {
             derivative: array![1.04, -0.65, 0.18, -1.21, 0.42, -0.13, 0.88, -0.27],
         };
 
-        let analytic = baseline_chain_rule_gradient(
-            age_entry.view(),
-            age_exit.view(),
-            &cfg,
-            &residuals,
-        )
-        .expect("analytic gradient ok")
-        .expect("GM baseline has a θ-gradient");
+        let analytic =
+            baseline_chain_rule_gradient(age_entry.view(), age_exit.view(), &cfg, &residuals)
+                .expect("analytic gradient ok")
+                .expect("GM baseline has a θ-gradient");
         assert_eq!(analytic.len(), 3, "GM θ has 3 components");
 
         // Evaluate the offset-projected loss at a perturbed θ. Mirrors the
@@ -3284,8 +3280,8 @@ mod tests {
                     evaluate_survival_baseline(age_exit[i], cfg_eval).expect("eval exit");
                 acc += residuals.exit[i] * eta_exit_i + residuals.derivative[i] * od_exit_i;
                 if residuals.entry[i] != 0.0 {
-                    let (eta_entry_i, _) = evaluate_survival_baseline(age_entry[i], cfg_eval)
-                        .expect("eval entry");
+                    let (eta_entry_i, _) =
+                        evaluate_survival_baseline(age_entry[i], cfg_eval).expect("eval entry");
                     acc += residuals.entry[i] * eta_entry_i;
                 }
             }
@@ -3303,10 +3299,10 @@ mod tests {
             theta_plus[k] += delta;
             let mut theta_minus = theta0.clone();
             theta_minus[k] -= delta;
-            let cfg_plus = survival_baseline_config_from_theta(cfg.target, &theta_plus)
-                .expect("cfg(θ+δ)");
-            let cfg_minus = survival_baseline_config_from_theta(cfg.target, &theta_minus)
-                .expect("cfg(θ-δ)");
+            let cfg_plus =
+                survival_baseline_config_from_theta(cfg.target, &theta_plus).expect("cfg(θ+δ)");
+            let cfg_minus =
+                survival_baseline_config_from_theta(cfg.target, &theta_minus).expect("cfg(θ-δ)");
             let lp = loss_at_cfg(&cfg_plus);
             let lm = loss_at_cfg(&cfg_minus);
             fd[k] = (lp - lm) / (2.0 * delta);

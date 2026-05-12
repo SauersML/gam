@@ -964,9 +964,7 @@ impl CanonicalPenalty {
 ///
 /// Performance: this is O(k² · block_dim²); intended to be called exactly
 /// once per fit (e.g. from `RemlState::newwith_offset_shared`).
-pub fn report_penalty_pair_redundancy(
-    canonical: &[CanonicalPenalty],
-) -> Vec<(usize, usize, f64)> {
+pub fn report_penalty_pair_redundancy(canonical: &[CanonicalPenalty]) -> Vec<(usize, usize, f64)> {
     const REDUNDANCY_THRESHOLD: f64 = 1.0 - 1e-8;
     const SIMILARITY_THRESHOLD: f64 = 0.99;
     const BIOBANK_K_THRESHOLD: usize = 64;
@@ -3091,18 +3089,10 @@ mod tests {
     #[test]
     fn report_penalty_pair_redundancy_detects_identical_pair() {
         // Penalty 0: a "generic" SPD matrix on cols 0..3.
-        let s0 = ndarray::array![
-            [2.0, 0.5, 0.0],
-            [0.5, 1.0, 0.25],
-            [0.0, 0.25, 1.5],
-        ];
+        let s0 = ndarray::array![[2.0, 0.5, 0.0], [0.5, 1.0, 0.25], [0.0, 0.25, 1.5],];
         // Penalties 1 and 2: identical block-local penalty on the SAME col_range.
         // This is the Z₂-symmetric saddle scenario.
-        let s_shared = ndarray::array![
-            [1.0, -0.5, 0.0],
-            [-0.5, 2.0, -0.5],
-            [0.0, -0.5, 1.0],
-        ];
+        let s_shared = ndarray::array![[1.0, -0.5, 0.0], [-0.5, 2.0, -0.5], [0.0, -0.5, 1.0],];
 
         let bundle = vec![
             canonical_from_local(s0, 0..3, 3),
@@ -3114,7 +3104,12 @@ mod tests {
 
         // Exactly one redundant pair: (1, 2). Pairs (0, 1) and (0, 2) involve
         // distinct matrices and must NOT be flagged.
-        assert_eq!(redundant.len(), 1, "expected exactly one redundant pair, got {:?}", redundant);
+        assert_eq!(
+            redundant.len(),
+            1,
+            "expected exactly one redundant pair, got {:?}",
+            redundant
+        );
         let (i, j, cos) = redundant[0];
         assert_eq!((i, j), (1, 2));
         assert!(
@@ -3134,6 +3129,9 @@ mod tests {
             canonical_from_local(s, 2..4, 4),
         ];
         let redundant = report_penalty_pair_redundancy(&bundle);
-        assert!(redundant.is_empty(), "different col_ranges must not be flagged");
+        assert!(
+            redundant.is_empty(),
+            "different col_ranges must not be flagged"
+        );
     }
 }
