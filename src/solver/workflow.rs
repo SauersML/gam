@@ -1237,8 +1237,8 @@ use crate::families::survival_construction::{
     resolved_survival_time_basis_config_from_build, survival_derivative_guard_for_likelihood,
 };
 use crate::families::survival_location_scale::{
-    SurvivalCovariateTermBlockTemplate, TimeBlockInput, TimeWiggleBlockInput,
-    residual_distribution_inverse_link,
+    SURVIVAL_LOCATION_SCALE_EMPTY_BLOCK_STATES_MARKER, SurvivalCovariateTermBlockTemplate,
+    TimeBlockInput, TimeWiggleBlockInput, residual_distribution_inverse_link,
 };
 use crate::inference::data::EncodedDataset as Dataset;
 use crate::inference::formula_dsl::{
@@ -2668,7 +2668,20 @@ fn materialize_survival<'a>(
         let probit_channel = location_scale_uses_probit_survival_baseline(Some(
             &survival_inverse_link,
         ));
-        optimize_survival_baseline_config_with_gradient_only(
+        // Catch errors at the optimizer-call site so a single bad θ
+        // candidate doesn't blow up the whole `gam.fit()` call. Specific
+        // failure mode: when the inner ρ-ARC stalls on a near-flat REML
+        // direction (smoothing param running to exp(20+) on an
+        // under-identified covariate at small n), the subsequent inner
+        // refit can produce a fit whose family methods see empty
+        // `block_states` and crash with "expects 3 blocks, got 0". The
+        // crash message originates from `validate_joint_states` and can
+        // bubble up from any of ~9 callers in the survival family. Rather
+        // than enumerating them all, catch the wrapper error here and
+        // fall back to the seed baseline_cfg — the gradient path made no
+        // progress, but the rest of the fit can proceed at the user's
+        // initial GM (α, λ, γ).
+        let baseline_outcome = optimize_survival_baseline_config_with_gradient_only(
             &baseline_cfg,
             "workflow survival location-scale baseline",
             |candidate| {
@@ -2724,7 +2737,25 @@ fn materialize_survival<'a>(
                 }
                 Ok((profile_cost, gradient))
             },
-        )?
+        );
+        match baseline_outcome {
+            Ok(baseline) => baseline,
+            Err(e)
+                if e.contains("expects 3 blocks, got 0")
+                    || e.contains("expects 4 blocks, got 0")
+                    || (e.contains("block_states") && e.contains("got 0"))
+                    || e.contains("blockwise fit requires at least one block state")
+                    || e.contains(SURVIVAL_LOCATION_SCALE_EMPTY_BLOCK_STATES_MARKER) =>
+            {
+                log::warn!(
+                    "workflow survival location-scale baseline: gradient-only BFGS \
+                     failed at an empty-block_states candidate ({e}); falling back \
+                     to the seed baseline_cfg as-is"
+                );
+                baseline_cfg.clone()
+            }
+            Err(e) => return Err(e),
+        }
     } else if baseline_cfg.target != SurvivalBaselineTarget::Linear {
         optimize_survival_baseline_config(
             &baseline_cfg,
