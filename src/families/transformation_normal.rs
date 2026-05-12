@@ -12336,6 +12336,7 @@ mod tests {
                 crate::solver::estimate::reml::unified::MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD,
                 crate::solver::estimate::reml::unified::MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N,
                 k_outer,
+                false,
             )
         );
 
@@ -14296,7 +14297,10 @@ pub fn fit_transformation_normal(
     let k_outer = n_penalties + kappa0.len();
     let outer_hessian_would_use_operator =
         crate::solver::estimate::reml::unified::use_outer_hessian_operator_path(
-            n_obs, p_dim, k_outer,
+            n_obs,
+            p_dim,
+            k_outer,
+            cap_hessian.is_analytic(),
         );
     let analytic_hessian =
         analytic_gradient && cap_hessian.is_analytic() && !outer_hessian_would_use_operator;
