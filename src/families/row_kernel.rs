@@ -820,7 +820,8 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
         // to the trait default which is implemented inline here to
         // avoid a recursive call back into this method.
         const BLAS3_PROJECTED_MATRIX_FLOP_THRESHOLD: usize = 2_500_000;
-        if n_rows.saturating_mul(rank).saturating_mul(rank) < BLAS3_PROJECTED_MATRIX_FLOP_THRESHOLD {
+        if n_rows.saturating_mul(rank).saturating_mul(rank) < BLAS3_PROJECTED_MATRIX_FLOP_THRESHOLD
+        {
             let op_factor = self.mul_mat(factor);
             return factor.t().dot(&op_factor);
         }
