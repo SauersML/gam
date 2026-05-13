@@ -10418,9 +10418,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             {
                 eprintln!(
                     "[JN-EXIT] cycle={cycle} reason=plateau_objective_flat residual={residual:.3e} residual_tol={residual_tol:.3e} obj_change={objective_change:.3e} objective_tol={objective_tol:.3e} ratios=[{:.3},{:.3},{:.3}] consecutive_flat={consecutive_obj_flat_cycles} accepted_step_inf={accepted_step_inf:.3e} step_tol={step_tol:.3e}",
-                    descent_ratio_window[0],
-                    descent_ratio_window[1],
-                    descent_ratio_window[2],
+                    descent_ratio_window[0], descent_ratio_window[1], descent_ratio_window[2],
                 );
                 converged = true;
                 break;
@@ -13933,9 +13931,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     // standard joint_outer_evaluate path below and only the gradient is
     // replaced. See `BatchedOuterGradientTerms`.
     let mut batched_gradient_override: Option<Array1<f64>> = None;
-    if eval_mode == EvalMode::ValueAndGradient
-        || eval_mode == EvalMode::ValueGradientHessian
-    {
+    if eval_mode == EvalMode::ValueAndGradient || eval_mode == EvalMode::ValueGradientHessian {
         let beta_flat_for_batch = flatten_state_betas(&inner.block_states, specs);
         let synced_states_for_batch = synchronized_states_from_flat_beta(
             family,
@@ -14045,7 +14041,8 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         return Ok(OuterObjectiveEvalResult {
                             objective: value_only.objective,
                             gradient,
-                            outer_hessian: crate::solver::outer_strategy::HessianResult::Unavailable,
+                            outer_hessian:
+                                crate::solver::outer_strategy::HessianResult::Unavailable,
                             warm_start: value_only.warm_start,
                             inner_converged: inner.converged,
                         });
