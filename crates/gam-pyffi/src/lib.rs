@@ -352,14 +352,7 @@ fn posterior_predict_table(
     n_coeffs: usize,
 ) -> PyResult<String> {
     py.detach(move || {
-        posterior_predict_table_impl(
-            &model_bytes,
-            headers,
-            rows,
-            samples_flat,
-            n_draws,
-            n_coeffs,
-        )
+        posterior_predict_table_impl(&model_bytes, headers, rows, samples_flat, n_draws, n_coeffs)
     })
     .map_err(py_value_error)
 }
