@@ -1,6 +1,6 @@
 use crate::families::bernoulli_marginal_slope::{
-    DEFAULT_EMPIRICAL_LATENT_GRID_SIZE, DeviationBlockConfig, LatentMeasureSpec,
-    LatentZCheckMode, LatentZNormalizationMode, LatentZPolicy,
+    DEFAULT_EMPIRICAL_LATENT_GRID_SIZE, DeviationBlockConfig, LatentMeasureSpec, LatentZCheckMode,
+    LatentZNormalizationMode, LatentZPolicy,
 };
 use crate::families::survival_construction::SurvivalBaselineTarget;
 use crate::types::{InverseLink, LinkFunction};
