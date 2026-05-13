@@ -28,6 +28,7 @@ use crate::families::scale_design::{
     build_scale_deviation_operator, build_scale_deviation_transform_design,
     infer_non_intercept_start_design,
 };
+use crate::families::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
 use crate::matrix::{
     BlockDesignOperator, DenseDesignMatrix, DesignBlock, DesignMatrix, EmbeddedColumnBlock,
     EmbeddedSquareBlock, MultiChannelOperator, RowwiseKroneckerOperator, SymmetricMatrix,
@@ -46,7 +47,6 @@ use crate::smooth::{
     freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivativeinfo_list,
 };
-use crate::families::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
 use crate::solver::estimate::UnifiedFitResult;
 use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
@@ -1981,33 +1981,35 @@ impl SurvivalLocationScaleFamily {
 
         let rows = (0..n)
             .into_par_iter()
-            .map(|i| -> Result<(usize, f64, f64, f64, [[f64; 3]; 3]), String> {
-                let state = self.row_predictor_state(
-                    dynamic.h_entry[i],
-                    dynamic.h_exit[i],
-                    dynamic.hdot_exit[i],
-                    dynamic.q_entry[i],
-                    dynamic.q_exit[i],
-                    dynamic.qdot_exit[i],
-                );
-                let Some(row) = self.row_derivatives(i, state)? else {
-                    return Ok((i, 0.0, 0.0, 0.0, [[0.0; 3]; 3]));
-                };
-                // Convert ℓ-partials (h_time_*, grad_time_eta_*) to NLL partials.
-                // grad_time_eta_* hold ∂ℓ/∂{h0,h1,d_raw}; ∂NLL/∂o = −∂ℓ/∂h.
-                let r_entry = -row.grad_time_eta_h0;
-                let r_exit = -row.grad_time_eta_h1;
-                let r_deriv = -row.grad_time_eta_d;
-                // NLL Hessian on (h0,h1,d_raw): diagonal because the row likelihood
-                // factors through (u0, u1, g) which are functionally independent
-                // in (h0, h1, d_raw). Signs follow the exact-joint Hessian assembly
-                // which uses (−h_time_h0, −h_time_h1, +h_time_d) for the NLL block.
-                let mut curv = [[0.0_f64; 3]; 3];
-                curv[0][0] = -row.h_time_h0;
-                curv[1][1] = -row.h_time_h1;
-                curv[2][2] = row.h_time_d;
-                Ok((i, r_entry, r_exit, r_deriv, curv))
-            })
+            .map(
+                |i| -> Result<(usize, f64, f64, f64, [[f64; 3]; 3]), String> {
+                    let state = self.row_predictor_state(
+                        dynamic.h_entry[i],
+                        dynamic.h_exit[i],
+                        dynamic.hdot_exit[i],
+                        dynamic.q_entry[i],
+                        dynamic.q_exit[i],
+                        dynamic.qdot_exit[i],
+                    );
+                    let Some(row) = self.row_derivatives(i, state)? else {
+                        return Ok((i, 0.0, 0.0, 0.0, [[0.0; 3]; 3]));
+                    };
+                    // Convert ℓ-partials (h_time_*, grad_time_eta_*) to NLL partials.
+                    // grad_time_eta_* hold ∂ℓ/∂{h0,h1,d_raw}; ∂NLL/∂o = −∂ℓ/∂h.
+                    let r_entry = -row.grad_time_eta_h0;
+                    let r_exit = -row.grad_time_eta_h1;
+                    let r_deriv = -row.grad_time_eta_d;
+                    // NLL Hessian on (h0,h1,d_raw): diagonal because the row likelihood
+                    // factors through (u0, u1, g) which are functionally independent
+                    // in (h0, h1, d_raw). Signs follow the exact-joint Hessian assembly
+                    // which uses (−h_time_h0, −h_time_h1, +h_time_d) for the NLL block.
+                    let mut curv = [[0.0_f64; 3]; 3];
+                    curv[0][0] = -row.h_time_h0;
+                    curv[1][1] = -row.h_time_h1;
+                    curv[2][2] = row.h_time_d;
+                    Ok((i, r_entry, r_exit, r_deriv, curv))
+                },
+            )
             .collect::<Result<Vec<_>, String>>()?;
 
         for (i, r_entry, r_exit, r_deriv, curv) in rows {
@@ -10730,7 +10732,6 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         )
     }
 
-
     fn block_linear_constraints(
         &self,
         _: &[ParameterBlockState],
@@ -10918,9 +10919,7 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
                 &self.q,
                 &self.dynamic,
             )?
-            .map(|matrix| {
-                Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>
-            }))
+            .map(|matrix| Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>))
     }
 
     fn second_directional_derivative(
@@ -10952,9 +10951,7 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
                 &self.q,
                 &self.dynamic,
             )?
-            .map(|matrix| {
-                Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>
-            }))
+            .map(|matrix| Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>))
     }
 }
 
@@ -10966,7 +10963,10 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
 fn fit_survival_location_scale_with_geometry(
     spec: SurvivalLocationScaleSpec,
 ) -> Result<
-    (UnifiedFitResult, (OffsetChannelResiduals, OffsetChannelCurvatures)),
+    (
+        UnifiedFitResult,
+        (OffsetChannelResiduals, OffsetChannelCurvatures),
+    ),
     String,
 > {
     let prepared = prepare_survival_location_scale_model(&spec)?;
@@ -10993,8 +10993,7 @@ fn fit_survival_location_scale_with_geometry(
 /// Sentinel error string surfaced by `fit_survival_location_scale_with_geometry`
 /// when a degraded inner fit returns empty `block_states`. See the matching
 /// `match` arm in `fit_survival_location_scale_terms`.
-pub(crate) const SURVIVAL_LOCATION_SCALE_EMPTY_BLOCK_STATES_MARKER: &str =
-    "fit_survival_location_scale_with_geometry: fit_custom_family \
+pub(crate) const SURVIVAL_LOCATION_SCALE_EMPTY_BLOCK_STATES_MARKER: &str = "fit_survival_location_scale_with_geometry: fit_custom_family \
      returned a fit with empty block_states (likely ARC \
      deterministic-replay stall in the inner outer solve); \
      cannot finalize this fit";
