@@ -84,10 +84,7 @@ pub fn scale_transform_from_payload(
                 projection_ridge_alpha,
             }))
         }
-        _ => Err(
-            "saved scale transform payload is only partially populated; refit"
-                .to_string(),
-        ),
+        _ => Err("saved scale transform payload is only partially populated; refit".to_string()),
     }
 }
 
