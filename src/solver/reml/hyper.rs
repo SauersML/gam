@@ -4,6 +4,21 @@ use crate::matrix::{
 };
 use ndarray::Zip;
 
+#[inline]
+fn directional_curvature_weights(
+    c_array: &Array1<f64>,
+    hessian_weights: &Array1<f64>,
+    eta_direction: &Array1<f64>,
+) -> Array1<f64> {
+    let crate::pirls::DirectionalWorkingCurvature::Diagonal(weights) =
+        crate::pirls::directionalworking_curvature_from_c_array(
+            c_array,
+            hessian_weights,
+            eta_direction,
+        );
+    weights
+}
+
 // ─── Binomial auxiliary terms for link-parameter ext_coord construction ───
 //
 // Mirrors the `BinomialAuxTerms` in estimate.rs but is local to the REML
@@ -1590,7 +1605,11 @@ impl<'a> RemlState<'a> {
                         // Non-Gaussian: c ⊙ (X_{ψ_d} β̂), length n. `x_tau_beta_j`
                         // was already computed above as X_{ψ_d} β̂.
                         let c_x_psi_beta = if !is_gaussian_identity {
-                            Some(std::sync::Arc::new(c_array * &x_tau_beta_j))
+                            Some(std::sync::Arc::new(directional_curvature_weights(
+                                c_array,
+                                w_diag,
+                                &x_tau_beta_j,
+                            )))
                         } else {
                             None
                         };
@@ -1657,7 +1676,8 @@ impl<'a> RemlState<'a> {
 
                 if !is_gaussian_identity {
                     // Third-derivative correction: X^T diag(c ⊙ X_{τ_j} β̂) X.
-                    let c_x_tau_beta = c_array * &x_tau_beta_j;
+                    let c_x_tau_beta =
+                        directional_curvature_weights(c_array, w_diag, &x_tau_beta_j);
                     let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
                     b_j +=
                         &Self::xt_diag_x_dense_into(x_dense, &c_x_tau_beta, &mut weighted_scratch);
@@ -2012,7 +2032,11 @@ impl<'a> RemlState<'a> {
             let c_x_tau_beta = if is_gaussian_identity {
                 None
             } else {
-                Some(&pirls_result.solve_c_array * &x_tau_beta_j)
+                Some(directional_curvature_weights(
+                    &pirls_result.solve_c_array,
+                    w_diag.as_ref(),
+                    &x_tau_beta_j,
+                ))
             };
 
             let ld_s_j = pld.tau_gradient_component(&s_tau_j);

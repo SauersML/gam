@@ -18541,9 +18541,11 @@ mod tests {
             )),
             time_linear_constraints: append_timewiggle_tail_nonnegative_constraints(
                 structural_time_coefficient_constraints(
-                &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0, 0.0]])),
-                &array![1e-6],
-                1e-6,
+                    &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                        1.0, 0.0
+                    ]])),
+                    &array![1e-6],
+                    1e-6,
                 )
                 .expect("time coefficient constraints"),
                 2,

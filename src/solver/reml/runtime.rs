@@ -5126,6 +5126,7 @@ impl<'a> RemlState<'a> {
                 let base = SinglePredictorGlmDerivatives {
                     c_array,
                     d_array: Some(d_array),
+                    hessian_weights: pirls_result.finalweights.clone(),
                     x_transformed,
                 };
                 if firth_active_for_derivs {
@@ -5242,6 +5243,7 @@ impl<'a> RemlState<'a> {
                         let base = SinglePredictorGlmDerivatives {
                             c_array,
                             d_array: Some(d_array),
+                            hessian_weights: pirls_result.finalweights.clone(),
                             x_transformed: self.x().clone(),
                         };
                         // Match the dense exact path: when Firth-logit is
