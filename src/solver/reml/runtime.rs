@@ -5484,6 +5484,11 @@ impl<'a> RemlState<'a> {
         let (hessian_logdet_correction, penalty_subspace_trace) =
             if matches!(hessian_mode, PseudoLogdetMode::Smooth) {
                 use super::unified::HessianOperator;
+                eprintln!(
+                    "[PROBE-RANK] penalty_rank={} p={} smooth_mode",
+                    penalty_rank,
+                    h_for_operator.ncols()
+                );
                 let (log_det_h_proj, kernel) = self.fixed_subspace_hessian_projected_parts(
                     &h_for_operator,
                     &e_for_logdet,
