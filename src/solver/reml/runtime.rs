@@ -2009,22 +2009,49 @@ impl<'a> RemlState<'a> {
     ///   H_eff = X' W_H X + S_lambda + ridge I,
     /// and adding another ridge here places the Laplace expansion on a different surface.
     ///
-    /// IMPORTANT: W_H here is the **observed-information** weight for non-canonical
-    /// links (or Fisher weight for canonical links, where the two coincide). The
-    /// `stabilizedhessian_transformed` from PIRLS was assembled with the Hessian-side
-    /// weights (`lasthessian_weights`), which are observed when PIRLS accepted that
-    /// curvature. This ensures log|H_eff| in the outer REML uses the correct Laplace
-    /// Hessian. See response.md Section 3 for the mathematical justification.
+    /// IMPORTANT: W_H here is the **final observed-information** weight for
+    /// non-canonical links (or Fisher weight for canonical links, where the two
+    /// coincide). PIRLS may rehydrate final Laplace curvature arrays after compacting
+    /// the accepted state; reusing `stabilizedhessian_transformed` would then evaluate
+    /// log|H_eff| on the accepted-step weights while the hyper-gradient differentiates
+    /// the final curvature arrays. Rebuilding from `finalweights` keeps the REML value
+    /// and hyper-derivative on the same Hessian surface.
     ///
     pub(super) fn effectivehessian(
         &self,
         pr: &PirlsResult,
+        rho: &Array1<f64>,
     ) -> Result<(Array2<f64>, RidgePassport), EstimationError> {
-        // Verify PD via SymmetricMatrix::factorize() (sparse-aware),
-        // then densify for the spectral evaluator which needs eigh().
-        let h = &pr.stabilizedhessian_transformed;
-        if h.factorize().is_ok() {
-            return Ok((h.to_dense(), pr.ridge_passport));
+        let mut h = pr
+            .x_transformed
+            .compute_xtwx(&pr.finalweights)
+            .map_err(|_| EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            })?;
+
+        let lambdas = rho.mapv(f64::exp);
+        for (k, cp) in pr.reparam_result.canonical_transformed.iter().enumerate() {
+            if k < lambdas.len() && lambdas[k] != 0.0 {
+                cp.accumulate_weighted(&mut h, lambdas[k]);
+            }
+        }
+
+        let ridge_delta = pr.ridge_passport.delta;
+        if ridge_delta != 0.0 {
+            for i in 0..h.nrows().min(h.ncols()) {
+                h[[i, i]] += ridge_delta;
+            }
+        }
+        enforce_symmetry(&mut h);
+
+        // Verify PD via the same dense factorization wrapper used by
+        // SymmetricMatrix-backed PIRLS Hessians, then return the dense matrix for the
+        // spectral evaluator.
+        if crate::linalg::matrix::SymmetricMatrix::Dense(h.clone())
+            .factorize()
+            .is_ok()
+        {
+            return Ok((h, pr.ridge_passport));
         }
 
         Err(EstimationError::ModelIsIllConditioned {
@@ -3324,7 +3351,7 @@ impl<'a> RemlState<'a> {
         key: Option<Vec<u64>>,
     ) -> Result<EvalShared, EstimationError> {
         let pirls_result = self.execute_pirls_if_needed(rho)?;
-        let (mut h_total, ridge_passport) = self.effectivehessian(pirls_result.as_ref())?;
+        let (mut h_total, ridge_passport) = self.effectivehessian(pirls_result.as_ref(), rho)?;
         let mut firth_dense_operator: Option<Arc<FirthDenseOperator>> = None;
         if self.config.firth_bias_reduction
             && matches!(self.config.link_function(), LinkFunction::Logit)
