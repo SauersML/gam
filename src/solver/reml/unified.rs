@@ -802,6 +802,9 @@ pub struct SinglePredictorGlmDerivatives {
     /// d_array: d²W_obs/dη², the second eta-derivative of the observed
     /// working curvature.  For canonical links this equals d_F.
     pub d_array: Option<Array1<f64>>,
+    /// Hessian-side working weights whose active rows define the curvature
+    /// surface being differentiated.
+    pub hessian_weights: Array1<f64>,
     /// Design matrix X in the transformed basis.
     pub x_transformed: DesignMatrix,
 }
@@ -823,11 +826,13 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         // scale, so we never materialize the full (n×p) dense block.
         let x_v = self.x_transformed.matrixvectormultiply(v_k); // X vₖ: n-vector
 
-        // Elementwise: −c ⊙ (X vₖ); par_for_each scales over n at biobank size.
-        let mut neg_c_xv = x_v;
-        Zip::from(&mut neg_c_xv)
-            .and(&self.c_array)
-            .par_for_each(|xv_i, &c_i| *xv_i *= -c_i);
+        let crate::pirls::DirectionalWorkingCurvature::Diagonal(mut neg_c_xv) =
+            crate::pirls::directionalworking_curvature_from_c_array(
+                &self.c_array,
+                &self.hessian_weights,
+                &x_v,
+            );
+        neg_c_xv.mapv_inplace(|value| -value);
 
         // −Xᵀ diag(c ⊙ Xvₖ) X via the design's matrix-free weighted gram.
         let result = self
@@ -857,11 +862,14 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         let n = self.x_transformed.nrows();
         let mut weights = Array1::zeros(n);
 
-        // c ⊙ X u_{kl}
-        Zip::from(&mut weights)
-            .and(&self.c_array)
-            .and(&x_ukl)
-            .par_for_each(|w, &c, &xu| *w = c * xu);
+        // c ⊙ X u_{kl}, masked the same way as the Hessian curvature surface.
+        let crate::pirls::DirectionalWorkingCurvature::Diagonal(first_weights) =
+            crate::pirls::directionalworking_curvature_from_c_array(
+                &self.c_array,
+                &self.hessian_weights,
+                &x_ukl,
+            );
+        weights.assign(&first_weights);
 
         // + d ⊙ (X vₖ) ⊙ (X vₗ)
         if let Some(ref d_array) = self.d_array {
@@ -869,7 +877,15 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
                 .and(d_array)
                 .and(&x_vk)
                 .and(&x_vl)
-                .par_for_each(|w, &d, &xvk, &xvl| *w += d * xvk * xvl);
+                .and(&self.hessian_weights)
+                .par_for_each(|w, &d, &xvk, &xvl, &h| {
+                    if h > 0.0 {
+                        let delta = d * xvk * xvl;
+                        if delta.is_finite() {
+                            *w += delta;
+                        }
+                    }
+                });
         }
 
         // Xᵀ diag(weights) X via the design's matrix-free weighted gram.
@@ -5495,49 +5511,46 @@ pub fn reml_laml_evaluate(
                         hop.trace_logdet_operator(op.as_ref())
                     }
                 };
-                // EXTRA PROBE: dense materialize op (B + correction) and trace via dense H_eigenvalues
+                // EXTRA PROBE: dump op.to_dense and check tr(K · op) two ways
                 if let Some(ds) = hop.as_exact_dense_spectral() {
                     let mut op_dense = Array2::<f64>::zeros((hop.dim(), hop.dim()));
                     let b_drift_again =
                         hyper_coord_total_drift_result(&coord.drift, None, hop.dim());
-                    if let DriftDerivResult::Operator(op) = b_drift_again {
-                        op_dense += &op.to_dense();
-                    }
-                    if let Some(corr) = correction {
-                        match corr {
-                            DriftDerivResult::Dense(m) => op_dense += m,
-                            DriftDerivResult::Operator(o) => op_dense += &o.to_dense(),
-                        }
-                    }
-                    let frob_b = {
-                        let b_drift = hyper_coord_total_drift_result(&coord.drift, None, hop.dim());
-                        if let DriftDerivResult::Operator(o) = b_drift {
-                            let d = o.to_dense();
-                            d.iter().map(|v| v * v).sum::<f64>().sqrt()
-                        } else {
-                            f64::NAN
-                        }
+                    let b_dense_for_dump = if let DriftDerivResult::Operator(op) = b_drift_again {
+                        op.to_dense()
+                    } else {
+                        Array2::<f64>::zeros((hop.dim(), hop.dim()))
                     };
-                    let frob_corr = if let Some(corr) = correction {
+                    op_dense += &b_dense_for_dump;
+                    let corr_dense_for_dump = if let Some(corr) = correction {
                         match corr {
-                            DriftDerivResult::Dense(m) => {
-                                m.iter().map(|v| v * v).sum::<f64>().sqrt()
-                            }
-                            DriftDerivResult::Operator(o) => o
-                                .to_dense()
-                                .iter()
-                                .map(|v| v * v)
-                                .sum::<f64>()
-                                .sqrt(),
+                            DriftDerivResult::Dense(m) => m.clone(),
+                            DriftDerivResult::Operator(o) => o.to_dense(),
                         }
                     } else {
-                        0.0
+                        Array2::<f64>::zeros((hop.dim(), hop.dim()))
                     };
+                    op_dense += &corr_dense_for_dump;
+                    let frob_b = b_dense_for_dump.iter().map(|v| v * v).sum::<f64>().sqrt();
+                    let frob_corr = corr_dense_for_dump.iter().map(|v| v * v).sum::<f64>().sqrt();
                     let frob_total = op_dense.iter().map(|v| v * v).sum::<f64>().sqrt();
+                    // Verify symmetry of op_dense (∂H/∂psi should be symmetric)
+                    let p = hop.dim();
+                    let mut max_asym = 0.0f64;
+                    for i in 0..p {
+                        for j in i+1..p {
+                            let asym = (op_dense[[i, j]] - op_dense[[j, i]]).abs();
+                            if asym > max_asym { max_asym = asym; }
+                        }
+                    }
+                    // Trace tr(K · op_dense) using ds.trace_logdet_h_k for the same matrix
+                    let trace_check = ds.trace_logdet_h_k(&op_dense, None);
+                    let trace_check_b = ds.trace_logdet_h_k(&b_dense_for_dump, None);
                     let _ = ds;
                     eprintln!(
-                        "[EXTRA] frob_b={:.6e} frob_corr={:.6e} frob_tot={:.6e}",
-                        frob_b, frob_corr, frob_total,
+                        "[EXTRA] frob_b={:.6e} frob_corr={:.6e} frob_tot={:.6e} max_asym={:.3e} \
+                         trace_check_total={:+.6e} trace_check_b={:+.6e}",
+                        frob_b, frob_corr, frob_total, max_asym, trace_check, trace_check_b
                     );
                 }
                 (full_trace, b_only_trace, full_trace - b_only_trace)
@@ -13455,6 +13468,7 @@ mod tests {
         let deriv_provider = SinglePredictorGlmDerivatives {
             c_array,
             d_array: Some(d_array),
+            hessian_weights: Array1::ones(3),
             x_transformed: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x)),
         };
 
@@ -13684,6 +13698,7 @@ mod tests {
         let deriv_provider = SinglePredictorGlmDerivatives {
             c_array,
             d_array: Some(d_array),
+            hessian_weights: Array1::ones(4),
             x_transformed: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x)),
         };
 
@@ -13803,6 +13818,7 @@ mod tests {
         let deriv_provider = SinglePredictorGlmDerivatives {
             c_array,
             d_array: Some(d_array),
+            hessian_weights: Array1::ones(4),
             x_transformed: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x)),
         };
         let h_proj = h[[1, 1]];
@@ -13916,6 +13932,7 @@ mod tests {
         let deriv_provider = SinglePredictorGlmDerivatives {
             c_array: array![0.31, -0.27, 0.19, -0.11],
             d_array: Some(array![0.17, -0.11, 0.23, 0.07]),
+            hessian_weights: Array1::ones(4),
             x_transformed: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x)),
         };
         let h_proj = h[[1, 1]];
@@ -16474,6 +16491,7 @@ mod tests {
         let deriv_provider = SinglePredictorGlmDerivatives {
             c_array,
             d_array: None,
+            hessian_weights: Array1::ones(n),
             x_transformed: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x.clone())),
         };
 
