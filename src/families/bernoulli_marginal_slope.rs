@@ -30,10 +30,10 @@ use crate::probability::{
     standard_normal_quantile,
 };
 use crate::smooth::{
-    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
-    SpatialLogKappaCoords, TermCollectionDesign, TermCollectionSpec,
-    apply_spatial_anisotropy_pilot_initializer, build_term_collection_designs_and_freeze_joint,
-    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
+    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
+    TermCollectionDesign, TermCollectionSpec, apply_spatial_anisotropy_pilot_initializer,
+    build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
+    spatial_length_scale_term_indices,
 };
 use crate::types::{InverseLink, LinkFunction, WigglePenaltyConfig};
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
@@ -1198,7 +1198,10 @@ impl SharedEvalCacheFingerprint {
             if a.len() != b.len() {
                 return false;
             }
-            if a.iter().zip(b.iter()).any(|(x, y)| x.to_bits() != y.to_bits()) {
+            if a.iter()
+                .zip(b.iter())
+                .any(|(x, y)| x.to_bits() != y.to_bits())
+            {
                 return false;
             }
         }
@@ -2976,9 +2979,7 @@ pub(crate) fn empirical_intercept_from_marginal(
                 return Err(first_err);
             }
             solve_from(closed_form_seed).map_err(|retry_err| {
-                format!(
-                    "{first_err}; closed-form retry from a={closed_form_seed:.6}: {retry_err}"
-                )
+                format!("{first_err}; closed-form retry from a={closed_form_seed:.6}: {retry_err}")
             })?
         }
     };
@@ -4287,8 +4288,7 @@ struct BernoulliMarginalSlopeExactEvalCache {
     /// rank=32. Per-row, the five distinct components are axis-invariant,
     /// so caching them lets every pair contraction be a 16-multiply 2×2
     /// bilinear instead of a fresh 8-direction empirical jet.
-    rigid_fourth_full:
-        crate::resource::RayonSafeOnce<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
+    rigid_fourth_full: crate::resource::RayonSafeOnce<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
 }
 
 // ── RowKernel<2> implementation (rigid path only) ────────────────────
@@ -7564,8 +7564,7 @@ impl BernoulliMarginalSlopeFamily {
             }
         }
         let mut cache = self.build_exact_eval_cache_with_options(block_states, Some(options))?;
-        cache.row_primary_hessians =
-            self.build_row_primary_hessian_cache(block_states, &cache)?;
+        cache.row_primary_hessians = self.build_row_primary_hessian_cache(block_states, &cache)?;
         if !self.effective_flex_active(block_states)? {
             let _ = self.rigid_third_full_cached(block_states, &cache, 0)?;
             let _ = self.rigid_fourth_full_cached(block_states, &cache, 0)?;
@@ -12296,8 +12295,7 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(None);
         };
         let axis = self.resolve_psi_axis_spec(derivative_blocks, block_idx, local_idx)?;
-        let mut results =
-            self.run_psi_row_pass_for_axes(block_states, cache, options, &[axis])?;
+        let mut results = self.run_psi_row_pass_for_axes(block_states, cache, options, &[axis])?;
         Ok(Some(results.remove(0)))
     }
 
@@ -12369,95 +12367,86 @@ impl BernoulliMarginalSlopeFamily {
         };
         let folded = weighted_rows
             .into_par_iter()
-            .try_fold(
-                make_acc,
-                |mut acc, wr| -> Result<_, String> {
-                    let row = wr.index;
-                    let w = wr.weight;
-                    let row_ctx = Self::row_ctx(cache, row);
-                    let (f_pi, f_pipi_base) = self
-                        .compute_row_primary_gradient_hessian_reusing_cache(
-                            row,
-                            block_states,
-                            primary,
-                            row_ctx,
-                            cache,
-                        )?;
-                    for (axis_idx, axis) in axes.iter().enumerate() {
-                        // Single psi-map row materialization shared by `dir` and
-                        // `psi_row`; the prior code paths each issued an
-                        // independent `psi_map.row_vector(row)` call for the
-                        // same (row, axis) which doubled the per-row operator
-                        // dispatch cost for joint-spatial Hessian builds.
-                        let psi_local = axis
-                            .psi_map
-                            .row_vector(row)
-                            .map_err(|e| format!("bernoulli psi map row {row}: {e}"))?;
-                        let dir_idx = if axis.block_idx == 0 {
-                            primary.q
+            .try_fold(make_acc, |mut acc, wr| -> Result<_, String> {
+                let row = wr.index;
+                let w = wr.weight;
+                let row_ctx = Self::row_ctx(cache, row);
+                let (f_pi, f_pipi_base) = self.compute_row_primary_gradient_hessian_reusing_cache(
+                    row,
+                    block_states,
+                    primary,
+                    row_ctx,
+                    cache,
+                )?;
+                for (axis_idx, axis) in axes.iter().enumerate() {
+                    // Single psi-map row materialization shared by `dir` and
+                    // `psi_row`; the prior code paths each issued an
+                    // independent `psi_map.row_vector(row)` call for the
+                    // same (row, axis) which doubled the per-row operator
+                    // dispatch cost for joint-spatial Hessian builds.
+                    let psi_local = axis
+                        .psi_map
+                        .row_vector(row)
+                        .map_err(|e| format!("bernoulli psi map row {row}: {e}"))?;
+                    let dir_idx = if axis.block_idx == 0 {
+                        primary.q
+                    } else {
+                        primary.logslope
+                    };
+                    let mut dir = Array1::<f64>::zeros(primary.total);
+                    dir[dir_idx] = psi_local.dot(&block_states[axis.block_idx].beta);
+                    let mut f_pipi = f_pipi_base.clone();
+                    let mut third = self.row_primary_third_contracted_recompute(
+                        row,
+                        block_states,
+                        cache,
+                        row_ctx,
+                        &dir,
+                    )?;
+                    let psi_row = BlockPsiRow {
+                        block_idx: axis.block_idx,
+                        range: if axis.block_idx == 0 {
+                            slices.marginal.clone()
                         } else {
-                            primary.logslope
-                        };
-                        let mut dir = Array1::<f64>::zeros(primary.total);
-                        dir[dir_idx] =
-                            psi_local.dot(&block_states[axis.block_idx].beta);
-                        let mut f_pipi = f_pipi_base.clone();
-                        let mut third = self.row_primary_third_contracted_recompute(
-                            row,
-                            block_states,
-                            cache,
-                            row_ctx,
-                            &dir,
-                        )?;
-                        let psi_row = BlockPsiRow {
-                            block_idx: axis.block_idx,
-                            range: if axis.block_idx == 0 {
-                                slices.marginal.clone()
-                            } else {
-                                slices.logslope.clone()
-                            },
-                            local_vec: psi_local,
-                        };
-                        let mut f_pipi_dir = f_pipi.dot(&dir);
-                        if w != 1.0 {
-                            f_pipi.mapv_inplace(|v| v * w);
-                            third.mapv_inplace(|v| v * w);
-                            f_pipi_dir.mapv_inplace(|v| v * w);
-                        }
-                        let slot = &mut acc[axis_idx];
-                        slot.0 += w * f_pi.dot(&dir);
-                        slot.1
-                            .slice_mut(s![psi_row.range.clone()])
-                            .scaled_add(w * f_pi[axis.idx_primary], &psi_row.local_vec);
-                        slot.1 +=
-                            &self.pullback_primary_vector(row, slices, primary, &f_pipi_dir)?;
+                            slices.logslope.clone()
+                        },
+                        local_vec: psi_local,
+                    };
+                    let mut f_pipi_dir = f_pipi.dot(&dir);
+                    if w != 1.0 {
+                        f_pipi.mapv_inplace(|v| v * w);
+                        third.mapv_inplace(|v| v * w);
+                        f_pipi_dir.mapv_inplace(|v| v * w);
+                    }
+                    let slot = &mut acc[axis_idx];
+                    slot.0 += w * f_pi.dot(&dir);
+                    slot.1
+                        .slice_mut(s![psi_row.range.clone()])
+                        .scaled_add(w * f_pi[axis.idx_primary], &psi_row.local_vec);
+                    slot.1 += &self.pullback_primary_vector(row, slices, primary, &f_pipi_dir)?;
 
-                        let right_primary = f_pipi.row(axis.idx_primary).to_owned();
-                        slot.2.add_rank1_psi_cross(
-                            self,
-                            row,
-                            slices,
-                            primary,
-                            axis.block_idx,
-                            &psi_row.local_vec,
-                            &right_primary,
-                        );
-                        slot.2.add_pullback(self, row, slices, primary, &third);
-                    }
-                    Ok(acc)
-                },
-            )
-            .try_reduce(
-                make_acc,
-                |mut left, right| -> Result<_, String> {
-                    for (l, r) in left.iter_mut().zip(right.into_iter()) {
-                        l.0 += r.0;
-                        l.1 += &r.1;
-                        l.2.add(&r.2);
-                    }
-                    Ok(left)
-                },
-            )?;
+                    let right_primary = f_pipi.row(axis.idx_primary).to_owned();
+                    slot.2.add_rank1_psi_cross(
+                        self,
+                        row,
+                        slices,
+                        primary,
+                        axis.block_idx,
+                        &psi_row.local_vec,
+                        &right_primary,
+                    );
+                    slot.2.add_pullback(self, row, slices, primary, &third);
+                }
+                Ok(acc)
+            })
+            .try_reduce(make_acc, |mut left, right| -> Result<_, String> {
+                for (l, r) in left.iter_mut().zip(right.into_iter()) {
+                    l.0 += r.0;
+                    l.1 += &r.1;
+                    l.2.add(&r.2);
+                }
+                Ok(left)
+            })?;
 
         let mut out = Vec::with_capacity(k);
         for (objective_psi, score_psi, block_acc) in folded.into_iter() {
@@ -12616,22 +12605,18 @@ impl BernoulliMarginalSlopeFamily {
                             primary.logslope
                         };
                         let mut dir_i = Array1::<f64>::zeros(primary.total);
-                        dir_i[dir_idx_i] =
-                            psi_local_i.dot(&block_states[block_i].beta);
+                        dir_i[dir_idx_i] = psi_local_i.dot(&block_states[block_i].beta);
                         let mut dir_j = Array1::<f64>::zeros(primary.total);
-                        dir_j[dir_idx_j] =
-                            psi_local_j.dot(&block_states[block_j].beta);
+                        dir_j[dir_idx_j] = psi_local_j.dot(&block_states[block_j].beta);
 
                         // dir_ij and br_ij share psi_map_ij; materialize once.
-                        let (dir_ij, psi_local_ij) = if let Some(ref pm_ij) =
-                            psi_map_ij
-                        {
+                        let (dir_ij, psi_local_ij) = if let Some(ref pm_ij) = psi_map_ij {
                             if block_i != block_j {
                                 (Array1::<f64>::zeros(primary.total), None)
                             } else {
-                                let v = pm_ij.row_vector(row).map_err(|e| {
-                                    format!("bernoulli psi map_ij row {row}: {e}")
-                                })?;
+                                let v = pm_ij
+                                    .row_vector(row)
+                                    .map_err(|e| format!("bernoulli psi map_ij row {row}: {e}"))?;
                                 let mut d = Array1::<f64>::zeros(primary.total);
                                 d[dir_idx_i] = v.dot(&block_states[block_i].beta);
                                 (d, Some(v))
@@ -13564,46 +13549,45 @@ impl BernoulliMarginalSlopeFamily {
                 }
                 accs
             } else {
-                chunks
-                    .into_par_iter()
-                    .map(chunk_body)
-                    .try_reduce(make_accs, |mut left, right| -> Result<_, String> {
+                chunks.into_par_iter().map(chunk_body).try_reduce(
+                    make_accs,
+                    |mut left, right| -> Result<_, String> {
                         for (l, r) in left.iter_mut().zip(right.iter()) {
                             l.add(r);
                         }
                         Ok(left)
-                    })?
+                    },
+                )?
             }
         } else {
-            let row_body =
-                |wr: WeightedOuterRow,
-                 accs: &mut Vec<BernoulliBlockHessianAccumulator>|
-                 -> Result<(), String> {
-                    let row = wr.index;
-                    let w = wr.weight;
-                    let row_ctx = Self::row_ctx(cache, row);
-                    let row_dirs = d_beta_flats
-                        .iter()
-                        .map(|d_beta_flat| {
-                            self.row_primary_direction_from_flat(row, slices, primary, d_beta_flat)
-                        })
-                        .collect::<Result<Vec<_>, String>>()?;
-                    let mut thirds = self.row_primary_third_contracted_many_with_moments(
-                        row,
-                        block_states,
-                        cache,
-                        row_ctx,
-                        &row_dirs,
-                    )?;
-                    for (idx, third) in thirds.iter_mut().enumerate() {
-                        if w != 1.0 {
-                            third.mapv_inplace(|v| v * w);
-                        }
-                        accs[idx].add_pullback(self, row, slices, primary, &third);
+            let row_body = |wr: WeightedOuterRow,
+                            accs: &mut Vec<BernoulliBlockHessianAccumulator>|
+             -> Result<(), String> {
+                let row = wr.index;
+                let w = wr.weight;
+                let row_ctx = Self::row_ctx(cache, row);
+                let row_dirs = d_beta_flats
+                    .iter()
+                    .map(|d_beta_flat| {
+                        self.row_primary_direction_from_flat(row, slices, primary, d_beta_flat)
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                let mut thirds = self.row_primary_third_contracted_many_with_moments(
+                    row,
+                    block_states,
+                    cache,
+                    row_ctx,
+                    &row_dirs,
+                )?;
+                for (idx, third) in thirds.iter_mut().enumerate() {
+                    if w != 1.0 {
+                        third.mapv_inplace(|v| v * w);
                     }
-                    bump_progress(&progress);
-                    Ok(())
-                };
+                    accs[idx].add_pullback(self, row, slices, primary, &third);
+                }
+                bump_progress(&progress);
+                Ok(())
+            };
             if run_rows_serial {
                 let mut accs = make_accs();
                 for wr in weighted_rows.iter() {
@@ -16649,10 +16633,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // at the box corner and never recovers), then falls through to the
     // ρ-only "custom family" path which is what we wanted all along.
     // Short-circuit straight to the ρ-only path.
-    let kappa_locked_marginal =
-        crate::smooth::all_spatial_terms_kappa_fixed(&spec.marginalspec);
-    let kappa_locked_logslope =
-        crate::smooth::all_spatial_terms_kappa_fixed(&spec.logslopespec);
+    let kappa_locked_marginal = crate::smooth::all_spatial_terms_kappa_fixed(&spec.marginalspec);
+    let kappa_locked_logslope = crate::smooth::all_spatial_terms_kappa_fixed(&spec.logslopespec);
     if effective_kappa_options.enabled && kappa_locked_marginal && kappa_locked_logslope {
         log::info!(
             "[BMS spatial] disabling κ/ψ optimization: every spatial term has an \

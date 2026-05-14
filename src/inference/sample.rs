@@ -13,15 +13,17 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use rand::{RngExt, SeedableRng};
 
 use crate::basis::create_difference_penalty_matrix;
+use crate::estimate::{BlockRole, FitOptions, UnifiedFitResult, fit_gam, validate_all_finite};
 use crate::faer_ndarray::FaerCholesky;
-use crate::estimate::{
-    BlockRole, FitOptions, UnifiedFitResult, fit_gam, validate_all_finite,
-};
 use crate::families::royston_parmar::{self, RoystonParmarInputs};
 use crate::families::survival_predict::{
     fit_result_from_saved_model_for_prediction, require_saved_survival_likelihood_mode,
     resolve_termspec_for_prediction, saved_baseline_timewiggle_components,
     saved_survival_runtime_baseline_config,
+};
+use crate::gamlss::{
+    append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_knots,
+    split_wiggle_penalty_orders,
 };
 use crate::hmc::{
     FamilyNutsInputs, GlmFlatInputs, LinkWiggleSplineArtifacts, NutsConfig, NutsFamily, NutsResult,
@@ -42,10 +44,6 @@ use crate::survival_construction::{
 };
 use crate::term_builder::resolve_role_col;
 use crate::types::LikelihoodFamily;
-use crate::gamlss::{
-    append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_knots,
-    split_wiggle_penalty_orders,
-};
 
 /// Reconstruct the `LinkWiggleFormulaSpec` from a saved model's
 /// baseline-time-wiggle runtime, returning `None` when the model has no
@@ -255,9 +253,7 @@ pub fn laplace_gaussian_fallback(
         ));
     }
     let chol = h.cholesky(Side::Lower).map_err(|err| {
-        format!(
-            "{rationale}: Cholesky factorisation of the penalised Hessian failed: {err:?}"
-        )
+        format!("{rationale}: Cholesky factorisation of the penalised Hessian failed: {err:?}")
     })?;
     let l = chol.lower_triangular();
 
@@ -769,12 +765,12 @@ fn sample_survival(
          disagreed with the 1e-6 fit-time default). Refit."
             .to_string()
     })?;
-    let ridge_range_start =
-        if time_build.basisname == "linear" && !model.has_baseline_time_wiggle() {
-            1
-        } else {
-            0
-        };
+    let ridge_range_start = if time_build.basisname == "linear" && !model.has_baseline_time_wiggle()
+    {
+        1
+    } else {
+        0
+    };
     if ridge_lambda > 0.0 && p > ridge_range_start {
         let dim = p - ridge_range_start;
         let mut ridge = Array2::<f64>::zeros((dim, dim));
