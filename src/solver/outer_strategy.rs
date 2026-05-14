@@ -1951,7 +1951,7 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
             .map_err(|err| into_objective_error("outer eval failed", err))?;
         let eval = finite_outer_first_order_eval_or_error("outer eval failed", self.layout, eval)?;
         let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
-        let mut gradient = eval.gradient;
+        let gradient = eval.gradient;
         if self.g_norm_initial.is_none() && g_norm.is_finite() && g_norm > 0.0 {
             self.g_norm_initial = Some(g_norm);
         }
@@ -1969,14 +1969,13 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
                 self.objective_stall_evals = 0;
             }
             if self.objective_stall_evals >= BFGS_OBJECTIVE_STALL_EVALS {
-                gradient.fill(0.0);
-                self.last_g_norm = Some(0.0);
                 log::info!(
-                    "[OUTER/BFGS] objective-stall convergence: cost_delta={:.3e} tol={:.3e} stalled_evals={} cost={:.6e}",
+                    "[OUTER/BFGS] objective stall observed without convergence: cost_delta={:.3e} tol={:.3e} stalled_evals={} cost={:.6e} |g|={:.3e}",
                     cost_delta,
                     tol,
                     self.objective_stall_evals,
                     eval.cost,
+                    g_norm,
                 );
             }
         }
@@ -5650,7 +5649,7 @@ mod tests {
     }
 
     #[test]
-    fn first_order_bridge_stops_capped_bfgs_on_objective_stall() {
+    fn first_order_bridge_keeps_true_gradient_on_objective_stall() {
         let eval_calls = Arc::new(AtomicUsize::new(0));
         let problem = OuterProblem::new(1)
             .with_gradient(Derivative::Analytic)
@@ -5696,12 +5695,12 @@ mod tests {
         let second = FirstOrderObjective::eval_grad(&mut bridge, &array![0.0])
             .expect("second near-stall eval should still expose the true gradient");
         let third = FirstOrderObjective::eval_grad(&mut bridge, &array![0.0])
-            .expect("third near-stall eval should signal convergence to BFGS");
+            .expect("third near-stall eval should still expose the true gradient");
 
         assert_eq!(first.gradient[0], 4.0);
         assert_eq!(second.gradient[0], 4.0);
-        assert_eq!(third.gradient[0], 0.0);
-        assert_eq!(bridge.last_g_norm, Some(0.0));
+        assert_eq!(third.gradient[0], 4.0);
+        assert_eq!(bridge.last_g_norm, Some(4.0));
         assert_eq!(eval_calls.load(Ordering::Relaxed), 3);
     }
 

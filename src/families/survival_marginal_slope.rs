@@ -14484,6 +14484,16 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                 block_states.len()
             ));
         }
+        if block_idx == 0 {
+            if let Some(constraints) = self.time_linear_constraints.as_ref() {
+                return Ok(project_onto_linear_constraints(
+                    beta.len(),
+                    constraints,
+                    Some(&beta),
+                ));
+            }
+            return Ok(beta);
+        }
         if self.score_warp.is_some() && block_idx == 3 {
             if let Some(runtime) = &self.score_warp {
                 let current = &block_states[3].beta;
@@ -14583,6 +14593,48 @@ fn inner_fit(
     options: &BlockwiseFitOptions,
 ) -> Result<UnifiedFitResult, String> {
     fit_custom_family(family, blocks, options).map_err(|e| e.to_string())
+}
+
+fn append_timewiggle_tail_nonnegative_constraints(
+    base: Option<LinearInequalityConstraints>,
+    p_total: usize,
+    time_wiggle_ncols: usize,
+) -> Result<Option<LinearInequalityConstraints>, String> {
+    let p_wiggle = time_wiggle_ncols.min(p_total);
+    if p_wiggle == 0 {
+        return Ok(base);
+    }
+    if let Some(base_constraints) = base.as_ref() {
+        if base_constraints.a.ncols() != p_total {
+            return Err(format!(
+                "survival marginal-slope time constraint width mismatch: constraints={}, time block={p_total}",
+                base_constraints.a.ncols()
+            ));
+        }
+        if base_constraints.a.nrows() != base_constraints.b.len() {
+            return Err(format!(
+                "survival marginal-slope time constraint row mismatch: A rows={}, b len={}",
+                base_constraints.a.nrows(),
+                base_constraints.b.len()
+            ));
+        }
+    }
+
+    let base_rows = base.as_ref().map_or(0, |constraints| constraints.a.nrows());
+    let rows = base_rows + p_wiggle;
+    let mut a = Array2::<f64>::zeros((rows, p_total));
+    let mut b = Array1::<f64>::zeros(rows);
+
+    if let Some(base_constraints) = base {
+        a.slice_mut(s![..base_rows, ..]).assign(&base_constraints.a);
+        b.slice_mut(s![..base_rows]).assign(&base_constraints.b);
+    }
+
+    let tail_start = p_total - p_wiggle;
+    for (row_offset, col) in (tail_start..p_total).enumerate() {
+        a[[base_rows + row_offset, col]] = 1.0;
+    }
+    Ok(Some(LinearInequalityConstraints { a, b }))
 }
 
 fn mean_abs(values: impl IntoIterator<Item = f64>) -> f64 {
@@ -15188,16 +15240,21 @@ pub fn fit_survival_marginal_slope_terms(
     let time_block_ref = spec.time_block.clone();
     let score_warp_runtime = score_warp_prepared.as_ref().map(|p| p.runtime.clone());
     let link_dev_runtime = link_dev_prepared.as_ref().map(|p| p.runtime.clone());
-    let time_linear_constraints = structural_time_coefficient_constraints(
-        &design_derivative_exit,
-        derivative_offset_exit.as_ref(),
-        derivative_guard,
-    )?;
     let derived_time_wiggle_ncols = spec
         .timewiggle_block
         .as_ref()
         .map(|timewiggle| time_wiggle_basis_ncols(&timewiggle.knots, timewiggle.degree))
         .transpose()?;
+    let structural_time_constraints = structural_time_coefficient_constraints(
+        &design_derivative_exit,
+        derivative_offset_exit.as_ref(),
+        derivative_guard,
+    )?;
+    let time_linear_constraints = append_timewiggle_tail_nonnegative_constraints(
+        structural_time_constraints,
+        design_exit.ncols(),
+        derived_time_wiggle_ncols.unwrap_or(0),
+    )?;
 
     let intercept_warm_starts = new_intercept_warm_start_cache(n);
     let make_family = |marginal_design: &TermCollectionDesign,
@@ -15695,6 +15752,7 @@ mod tests {
     use super::*;
     use crate::custom_family::{CustomFamily, ExactOuterDerivativeOrder};
     use crate::matrix::{DenseDesignMatrix, SymmetricMatrix};
+    use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::array;
 
@@ -18386,7 +18444,76 @@ mod tests {
     }
 
     #[test]
-    fn time_block_post_update_leaves_beta_unchanged() {
+    fn timewiggle_tail_constraints_are_part_of_time_block_feasibility() {
+        let structural = structural_time_coefficient_constraints(
+            &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                1.0, 0.0, 0.0
+            ]])),
+            &array![1e-6],
+            1e-6,
+        )
+        .expect("structural constraints");
+        let constraints = append_timewiggle_tail_nonnegative_constraints(structural, 3, 2)
+            .expect("combined constraints")
+            .expect("time constraints");
+
+        assert_eq!(constraints.a, Array2::<f64>::eye(3));
+        assert_eq!(constraints.b, Array1::<f64>::zeros(3));
+    }
+
+    #[test]
+    fn timewiggle_tail_step_is_clipped_before_it_can_flip_derivative() {
+        let constraints = append_timewiggle_tail_nonnegative_constraints(None, 2, 1)
+            .expect("tail constraints")
+            .expect("time constraints");
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![0.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.0]),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                0.0, 0.0
+            ]])),
+            design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                0.0, 0.0
+            ]])),
+            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[0.0, 0.0]],
+            )),
+            offset_entry: Arc::new(array![0.0]),
+            offset_exit: Arc::new(array![0.0]),
+            derivative_offset_exit: Arc::new(array![1e-6]),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
+            time_linear_constraints: Some(constraints),
+            score_warp: None,
+            link_dev: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 1,
+            intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+        };
+        let states = vec![ParameterBlockState {
+            beta: array![0.0, 0.5],
+            eta: array![0.0],
+        }];
+        let alpha = family
+            .max_feasible_step_size(&states, 0, &array![0.0, -1.0])
+            .expect("timewiggle tail step ceiling")
+            .expect("negative tail step should be bounded");
+        assert_relative_eq!(alpha, 0.4975, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn time_block_post_update_projects_structural_and_timewiggle_constraints() {
         let family = SurvivalMarginalSlopeFamily {
             n: 1,
             event: Arc::new(array![0.0]),
@@ -18412,17 +18539,22 @@ mod tests {
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((1, 0)),
             )),
-            time_linear_constraints: structural_time_coefficient_constraints(
+            time_linear_constraints: append_timewiggle_tail_nonnegative_constraints(
+                structural_time_coefficient_constraints(
                 &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0, 0.0]])),
                 &array![1e-6],
                 1e-6,
+                )
+                .expect("time coefficient constraints"),
+                2,
+                1,
             )
-            .expect("time coefficient constraints"),
+            .expect("combined time constraints"),
             score_warp: None,
             link_dev: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
-            time_wiggle_ncols: 0,
+            time_wiggle_ncols: 1,
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
@@ -18444,10 +18576,10 @@ mod tests {
                 }],
                 0,
                 &spec,
-                array![-0.3, 0.2],
+                array![-0.3, -0.2],
             )
             .expect("return time beta");
-        assert_eq!(beta, array![-0.3, 0.2]);
+        assert_eq!(beta, array![0.0, 0.0]);
     }
 
     #[test]
