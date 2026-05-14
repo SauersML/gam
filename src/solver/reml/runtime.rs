@@ -6108,19 +6108,6 @@ impl<'a> RemlState<'a> {
                         None,
                         None,
                     )
-                } else if matches!(
-                    bundle.pirls_result.coordinate_frame,
-                    pirls::PirlsCoordinateFrame::TransformedQs
-                ) && self
-                    .active_constraint_free_basis(bundle.pirls_result.as_ref())
-                    .is_none()
-                {
-                    (
-                        self.build_tau_hyper_coords_original_basis(rho, &bundle, hyper_dirs)?,
-                        None,
-                        None,
-                        None,
-                    )
                 } else {
                     (
                         self.build_tau_hyper_coords(rho, &bundle, hyper_dirs)?,
