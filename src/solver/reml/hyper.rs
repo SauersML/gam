@@ -2012,7 +2012,7 @@ impl<'a> RemlState<'a> {
             let c_x_tau_beta = if is_gaussian_identity {
                 None
             } else {
-                Some(&pirls_result.solve_c_array * &x_tau_beta_j)
+                Some(-(&pirls_result.solve_c_array * &x_tau_beta_j))
             };
 
             let ld_s_j = pld.tau_gradient_component(&s_tau_j);
