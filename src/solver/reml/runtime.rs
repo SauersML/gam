@@ -5526,6 +5526,7 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
         use super::unified::{HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator};
+        eprintln!("[PROBE-PATH] sparse_assembly");
 
         let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput("missing sparse exact evaluation payload".to_string())
@@ -5773,6 +5774,11 @@ impl<'a> RemlState<'a> {
                 && penalty_rank < h_total_original.ncols()
             {
                 use super::unified::HessianOperator;
+                eprintln!(
+                    "[PROBE-RANK orig] penalty_rank={} p={} smooth_mode",
+                    penalty_rank,
+                    h_total_original.ncols()
+                );
                 let qs = &pirls_result.reparam_result.qs;
                 let h_transformed = qs.t().dot(&h_total_original).dot(qs);
                 let (log_det_h_proj, kernel_trans) = self.fixed_subspace_hessian_projected_parts(
