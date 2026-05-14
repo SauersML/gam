@@ -3109,11 +3109,8 @@ impl HyperOperator for SparseDirectionalHyperOperator {
 
         // Non-Gaussian fixed-beta curvature: Xᵀ diag(c ⊙ X_tau β̂) X v
         if let Some(c_x_tau_beta) = self.c_x_tau_beta.as_ref() {
-            // EXPERIMENT: disable to check if c_x_tau_beta is the wrong-sign culprit
-            let _ = c_x_tau_beta;
-            let _ = &x_v;
-            // let weighted = c_x_tau_beta * &x_v;
-            // out += &self.x_design.transpose_vector_multiply(&weighted);
+            let weighted = c_x_tau_beta * &x_v;
+            out += &self.x_design.transpose_vector_multiply(&weighted);
         }
 
         // Firth fixed-beta partial: subtract (H_φ)_{τ}|_β v
@@ -5455,14 +5452,16 @@ pub fn reml_laml_evaluate(
             // trace through `range(S_+)` only, matching the cost exactly.
             // Gaussian identity skips this path harmlessly because `c = 0` forces
             // `D_β H = 0`, so `Ḣ` already lives entirely in `range(S_+)²`.
-            let trace_logdet_i = if !incl_logdet_h {
-                0.0
+            let (trace_logdet_i, trace_b_only_for_probe, trace_correction_only_for_probe) = if !incl_logdet_h {
+                (0.0, 0.0, 0.0)
             } else if let Some(ref stoch_traces) = stochastic_trace_values {
-                stoch_traces[k + ext_idx]
+                (stoch_traces[k + ext_idx], f64::NAN, f64::NAN)
             } else {
                 let correction = ext_corrections[ext_idx].as_ref();
-                let drift = hyper_coord_total_drift_result(&coord.drift, correction, hop.dim());
-                match (&solution.penalty_subspace_trace, drift) {
+                // PROBE: compute B-only and correction-only traces separately
+                let b_only_drift =
+                    hyper_coord_total_drift_result(&coord.drift, None, hop.dim());
+                let b_only_trace = match (&solution.penalty_subspace_trace, b_only_drift) {
                     (Some(kernel), DriftDerivResult::Dense(matrix)) => {
                         kernel.trace_projected_logdet(&matrix)
                     }
@@ -5473,8 +5472,33 @@ pub fn reml_laml_evaluate(
                     (None, DriftDerivResult::Operator(op)) => {
                         hop.trace_logdet_operator(op.as_ref())
                     }
-                }
+                };
+                let drift = hyper_coord_total_drift_result(&coord.drift, correction, hop.dim());
+                let full_trace = match (&solution.penalty_subspace_trace, drift) {
+                    (Some(kernel), DriftDerivResult::Dense(matrix)) => {
+                        kernel.trace_projected_logdet(&matrix)
+                    }
+                    (Some(kernel), DriftDerivResult::Operator(op)) => {
+                        kernel.trace_operator(op.as_ref())
+                    }
+                    (None, DriftDerivResult::Dense(matrix)) => hop.trace_logdet_h_k(&matrix, None),
+                    (None, DriftDerivResult::Operator(op)) => {
+                        hop.trace_logdet_operator(op.as_ref())
+                    }
+                };
+                (full_trace, b_only_trace, full_trace - b_only_trace)
             };
+
+            eprintln!(
+                "[EXT-TRACE-PROBE] ext_idx={} a={:+.6e} ld_s={:+.6e} \
+                 trace_full={:+.6e} trace_b_only={:+.6e} trace_correction={:+.6e}",
+                ext_idx,
+                coord.a,
+                coord.ld_s,
+                trace_logdet_i,
+                trace_b_only_for_probe,
+                trace_correction_only_for_probe
+            );
 
             let value = outer_gradient_entry(
                 coord.a,
