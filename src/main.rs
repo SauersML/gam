@@ -9022,7 +9022,7 @@ fn fit_result_from_external(ext: ExternalOptimResult) -> UnifiedFitResult {
         stable_penalty_term: ext.stable_penalty_term,
         penalized_objective,
         outer_iterations: ext.iterations,
-        outer_converged: true,
+        outer_converged: ext.outer_converged,
         outer_gradient_norm: ext.finalgrad_norm,
         standard_deviation: ext.standard_deviation,
         covariance_conditional,
@@ -9455,7 +9455,7 @@ mod tests {
         collect_spatial_smooth_usagewarnings, compact_fit_result_for_batch,
         compact_saved_multiblock_fit_result, compute_probit_q0_from_eta, core_saved_fit_result,
         covariance_from_model, effectivelinkwiggle_formulaspec, exact_kernel, family_to_string,
-        linkname, load_dataset_projected, parse_formula, parse_link_choice,
+        fit_result_from_external, linkname, load_dataset_projected, parse_formula, parse_link_choice,
         parse_matching_auxiliary_formula, parse_surv_response, parse_survival_inverse_link,
         parse_survival_time_basis_config, predict_gam, prepend_id_column_to_prediction_csv,
         pretty_familyname, required_columns_for_fit, resolve_family, summarizewiggle_domain,
@@ -9475,7 +9475,8 @@ mod tests {
     };
     use gam::bernoulli_marginal_slope::LatentMeasureKind;
     use gam::estimate::{
-        FitGeometry, FitInference, FittedBlock, FittedLinkState, UnifiedFitResultParts,
+        ExternalOptimResult, FitGeometry, FitInference, FittedBlock, FittedLinkState,
+        UnifiedFitResultParts,
     };
     use gam::gamlss::{
         buildwiggle_block_input_from_knots, monotone_wiggle_basis_with_derivative_order,
@@ -9589,6 +9590,41 @@ mod tests {
             !fit.outer_converged,
             "compact saved fit must not synthesize convergence for stalled fits"
         );
+    }
+
+    #[test]
+    fn external_fit_result_preserves_outer_convergence_flag() {
+        let ext = ExternalOptimResult {
+            beta: array![0.0],
+            lambdas: Array1::zeros(0),
+            likelihood_family: LikelihoodFamily::GaussianIdentity,
+            likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: LogLikelihoodNormalization::Full,
+            log_likelihood: -1.0,
+            standard_deviation: 1.0,
+            iterations: 17,
+            finalgrad_norm: 3.0,
+            outer_converged: false,
+            pirls_status: gam::pirls::PirlsStatus::Converged,
+            deviance: 2.0,
+            stable_penalty_term: 0.0,
+            max_abs_eta: 0.0,
+            constraint_kkt: None,
+            artifacts: Default::default(),
+            inference: None,
+            reml_score: 4.0,
+            fitted_link: FittedLinkState::Standard(None),
+        };
+
+        let fit = fit_result_from_external(ext);
+
+        assert_eq!(fit.outer_iterations, 17);
+        assert_eq!(fit.outer_gradient_norm, 3.0);
+        assert!(
+            !fit.outer_converged,
+            "external optimizer conversion must preserve the optimizer's convergence flag"
+        );
+        assert_eq!(fit.pirls_status, gam::pirls::PirlsStatus::Converged);
     }
 
     mod saved_survival_marginal_slope_test_support {
