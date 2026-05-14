@@ -16872,6 +16872,22 @@ mod tests {
         let fd = fd_full
             .slice(s![.., smooth_start..(smooth_start + p)])
             .to_owned();
+        let frozen_design =
+            build_term_collection_design(data.view(), &frozen).expect("frozen design");
+        let hyper_dirs =
+            try_build_spatial_log_kappa_hyper_dirs(data.view(), &frozen, &frozen_design, &[0])
+                .expect("hyper dirs")
+                .expect("hyper dirs present");
+        let embedded = hyper_dirs[0].x_tau_dense();
+        let embedded_diff = (&embedded - &fd_full)
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
+        let embedded_abs = embedded.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        eprintln!(
+            "[DXDPSI_EMBED] max|embedded - fd_full|={:.3e} max|embedded|={:.3e}",
+            embedded_diff, embedded_abs
+        );
         let mut max_diff = 0.0_f64;
         let mut max_abs = 0.0_f64;
         for i in 0..n {
@@ -16898,6 +16914,10 @@ mod tests {
             fd.row(0).iter().take(p).copied().collect::<Vec<_>>(),
         );
         assert!(max_diff < 5e-3 * max_abs.max(1e-3), "dX/dψ mismatch");
+        assert!(
+            embedded_diff < 5e-3 * embedded_abs.max(1e-3),
+            "embedded dX/dψ mismatch"
+        );
     }
 
     #[test]

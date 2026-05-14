@@ -5546,11 +5546,20 @@ pub fn reml_laml_evaluate(
                     // Trace tr(K · op_dense) using ds.trace_logdet_h_k for the same matrix
                     let trace_check = ds.trace_logdet_h_k(&op_dense, None);
                     let trace_check_b = ds.trace_logdet_h_k(&b_dense_for_dump, None);
+                    let v_psi_v = &ext_v_is[ext_idx];
+                    let v_psi_norm = v_psi_v.iter().map(|v| v*v).sum::<f64>().sqrt();
+                    let g_psi_norm = coord.g.iter().map(|v| v*v).sum::<f64>().sqrt();
+                    let beta_norm = (0..solution.beta.len()).map(|i| solution.beta[i]*solution.beta[i]).sum::<f64>().sqrt();
+                    let tr_b = b_dense_for_dump.diag().sum();
+                    let tr_corr = corr_dense_for_dump.diag().sum();
+                    // Compute eigenvalues spectrum range
                     let _ = ds;
                     eprintln!(
-                        "[EXTRA] frob_b={:.6e} frob_corr={:.6e} frob_tot={:.6e} max_asym={:.3e} \
-                         trace_check_total={:+.6e} trace_check_b={:+.6e}",
-                        frob_b, frob_corr, frob_total, max_asym, trace_check, trace_check_b
+                        "[EXTRA] frob_b={:.4e} frob_corr={:.4e} frob_tot={:.4e} max_asym={:.3e} \
+                         tr(K·op)={:+.4e} tr(K·B)={:+.4e} |v_psi|={:.4e} |g_psi|={:.4e} |beta|={:.4e} \
+                         tr(B)={:+.4e} tr(corr)={:+.4e}",
+                        frob_b, frob_corr, frob_total, max_asym, trace_check, trace_check_b,
+                        v_psi_norm, g_psi_norm, beta_norm, tr_b, tr_corr
                     );
                 }
                 (full_trace, b_only_trace, full_trace - b_only_trace)
