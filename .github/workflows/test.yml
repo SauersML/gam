@@ -105,9 +105,9 @@ jobs:
           #   - "P-IRLS INNER LOOP FAILED" — solver/reml/runtime.rs
           #     log::warn! emitted by the outer REML cost path when PIRLS
           #     returns an error.
-          #   - "P-IRLS failed convergence check" — runtime.rs log::error!
-          #     when the inner solve hits max iterations with gradient
-          #     norm still above the acceptable KKT band.
+          #   - "P-IRLS could not certify a valid minimum" — runtime.rs
+          #     log::error! when the inner solve hits max iterations with
+          #     gradient norm still above the acceptable KKT band.
           #   - "P-IRLS separation/non-convergence at current rho" —
           #     runtime.rs log::warn! used when PerfectSeparationDetected
           #     or PirlsDidNotConverge gets converted into +inf/infeasible
@@ -118,7 +118,7 @@ jobs:
           #     solver/outer_strategy.rs.
           #   - "no candidate seeds passed outer startup validation" —
           #     aggregate seed-loop error when started_seeds == 0.
-          forbidden='P-IRLS INNER LOOP FAILED|P-IRLS failed convergence check|P-IRLS separation/non-convergence at current rho|Perfect or quasi-perfect separation detected|seed candidates failed|no candidate seeds passed outer startup validation'
+          forbidden='P-IRLS INNER LOOP FAILED|P-IRLS could not certify a valid minimum|P-IRLS separation/non-convergence at current rho|Perfect or quasi-perfect separation detected|seed candidates failed|no candidate seeds passed outer startup validation'
           if [ "$test_status" -ne 0 ]; then
             if grep -nE "$forbidden" /tmp/cargo-test.log; then
               echo "::error::Forbidden runtime error signatures were found alongside a cargo test failure."
