@@ -4511,7 +4511,9 @@ fn apply_global_smooth_identifiability(
                 c_local.as_ref().map(|mat| mat.view()),
             ) {
                 Ok(z_opt) => z_opt,
-                Err(BasisError::ConstraintNullspaceCollapsed { .. }) if !owner_blocks.is_empty() => {
+                Err(BasisError::ConstraintNullspaceCollapsed { .. })
+                    if !owner_blocks.is_empty() =>
+                {
                     Some(Array2::zeros((design_local.ncols(), 0)))
                 }
                 Err(err) => return Err(err),
@@ -9847,13 +9849,10 @@ pub(crate) fn spatial_length_scale_term_indices(spec: &TermCollectionSpec) -> Ve
 /// user's chosen ρ. Skipping straight to the rho-only path avoids that
 /// waste and respects the user's explicit kernel-scale input.
 pub fn all_spatial_terms_kappa_fixed(spec: &TermCollectionSpec) -> bool {
-    spec.smooth_terms
-        .iter()
-        .enumerate()
-        .all(|(idx, _)| {
-            !spatial_term_supports_hyper_optimization(spec, idx)
-                || spatial_term_has_locked_kappa(spec, idx)
-        })
+    spec.smooth_terms.iter().enumerate().all(|(idx, _)| {
+        !spatial_term_supports_hyper_optimization(spec, idx)
+            || spatial_term_has_locked_kappa(spec, idx)
+    })
 }
 
 fn fit_score(fit: &UnifiedFitResult) -> f64 {
@@ -10987,10 +10986,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
     // against the baseline. Tolerance ≥ options.tol because both endpoints
     // are outer-BFGS approximations accurate to options.tol; a tighter
     // gate would reject true improvements due to floating-point noise.
-    let accept_tol = options
-        .tol
-        .max(1e-8 * baseline_score.abs())
-        .max(1e-12);
+    let accept_tol = options.tol.max(1e-8 * baseline_score.abs()).max(1e-12);
     if joint_final_value > baseline_score + accept_tol {
         log::info!(
             "[spatial-kappa] exact joint spatial candidate worsened the profiled score (joint={:.6e}, baseline={:.6e}, tol={:.2e}); keeping the frozen baseline geometry",
@@ -16523,19 +16519,21 @@ mod tests {
 
         let design = build_term_collection_design(data.view(), &spec).expect("design");
         let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
+        let frozen_design =
+            build_term_collection_design(data.view(), &frozen).expect("frozen design");
         let spatial_terms = spatial_length_scale_term_indices(&frozen);
         let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
         assert_eq!(dims_per_term, vec![1], "1D Duchon should expose one log-κ");
-        let rho_dim = design.penalties.len();
+        let rho_dim = frozen_design.penalties.len();
         let psi_dim: usize = dims_per_term.iter().sum();
         assert!(psi_dim >= 1, "test requires at least one log-κ axis");
 
         let external_opts =
-            external_opts_for_design(LikelihoodFamily::BinomialProbit, &design, &fit_opts);
+            external_opts_for_design(LikelihoodFamily::BinomialProbit, &frozen_design, &fit_opts);
         let mut cache = SingleBlockExactJointDesignCache::new(
             data.view(),
             frozen.clone(),
-            design.clone(),
+            frozen_design.clone(),
             spatial_terms.clone(),
             rho_dim,
             dims_per_term.clone(),
@@ -16544,9 +16542,9 @@ mod tests {
         let mut evaluator = crate::estimate::ExternalJointHyperEvaluator::new(
             y.view(),
             weights.view(),
-            &design.design,
+            &frozen_design.design,
             offset.view(),
-            &design.penalties,
+            &frozen_design.penalties,
             &external_opts,
             "iso-kappa Duchon BinomialProbit FD evaluator",
         )
@@ -16781,7 +16779,8 @@ mod tests {
             // Rebuild design at psi via direct kernel build using frozen spec.
             let mut s = frozen.clone();
             if let SmoothBasisSpec::Duchon {
-                spec: ref mut duchon, ..
+                spec: ref mut duchon,
+                ..
             } = s.smooth_terms[0].basis
             {
                 duchon.length_scale = Some((-psi).exp());
@@ -16792,20 +16791,17 @@ mod tests {
 
         // Build derivative at psi=0.
         let psi_eval = 0.0_f64;
-        let duchon_spec = if let SmoothBasisSpec::Duchon { spec: ref s, .. } =
-            frozen.smooth_terms[0].basis
-        {
-            s.clone()
-        } else {
-            panic!("expected Duchon");
-        };
+        let duchon_spec =
+            if let SmoothBasisSpec::Duchon { spec: ref s, .. } = frozen.smooth_terms[0].basis {
+                s.clone()
+            } else {
+                panic!("expected Duchon");
+            };
         let mut duchon_spec_at = duchon_spec.clone();
         duchon_spec_at.length_scale = Some((-psi_eval).exp());
-        let bundle = crate::basis::build_duchon_basis_log_kappa_derivatives(
-            data.view(),
-            &duchon_spec_at,
-        )
-        .expect("derivatives");
+        let bundle =
+            crate::basis::build_duchon_basis_log_kappa_derivatives(data.view(), &duchon_spec_at)
+                .expect("derivatives");
         let op = bundle.implicit_operator.expect("implicit operator");
         let p = op.p_out();
 
@@ -16820,11 +16816,14 @@ mod tests {
         );
         eprintln!(
             "[DXDPSI_FD] X(+h) shape={:?} X(-h) shape={:?} p_out={}",
-            x_plus.shape(), x_minus.shape(), p,
+            x_plus.shape(),
+            x_minus.shape(),
+            p,
         );
         // Also build at psi_eval to compare cols.
         let x_at = build_design_at(psi_eval);
-        let orig_design = build_term_collection_design(data.view(), &spec_orig).expect("rebuild orig");
+        let orig_design =
+            build_term_collection_design(data.view(), &spec_orig).expect("rebuild orig");
         eprintln!(
             "[DXDPSI_FD] X(psi_eval) shape={:?} orig_design.ncols={}",
             x_at.shape(),
@@ -16856,10 +16855,7 @@ mod tests {
             .zip(fd_tv_smooth.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f64, f64::max);
-        let max_tv_abs = analytic_tv
-            .iter()
-            .map(|v| v.abs())
-            .fold(0.0f64, f64::max);
+        let max_tv_abs = analytic_tv.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
         eprintln!(
             "[DXDPSI_TV] max|analytic_tv - fd_tv|={:.3e}  max|analytic_tv|={:.3e}",
             max_tv_diff, max_tv_abs
@@ -16873,7 +16869,9 @@ mod tests {
             fd_tv_smooth.iter().take(p).copied().collect::<Vec<_>>()
         );
         let fd_full = (&x_plus - &x_minus) / (2.0 * h);
-        let fd = fd_full.slice(s![.., smooth_start..(smooth_start + p)]).to_owned();
+        let fd = fd_full
+            .slice(s![.., smooth_start..(smooth_start + p)])
+            .to_owned();
         let mut max_diff = 0.0_f64;
         let mut max_abs = 0.0_f64;
         for i in 0..n {

@@ -1202,9 +1202,7 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
             // but as a last resort we convert any remaining error of that
             // shape into a user-actionable message so the Python caller
             // sees a clear cause instead of a Rust assertion artifact.
-            match fit_survival_location_scale_model(request)
-                .map(FitResult::SurvivalLocationScale)
-            {
+            match fit_survival_location_scale_model(request).map(FitResult::SurvivalLocationScale) {
                 Ok(fit) => Ok(fit),
                 Err(e)
                     if e.contains("expects 3 blocks, got 0")
@@ -1254,11 +1252,11 @@ use crate::families::family_meta::{family_to_string, is_binomial_family};
 use crate::families::survival_construction::{
     SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
     add_survival_time_derivative_guard_offset, append_zero_tail_columns,
-    build_latent_survival_baseline_offsets, build_survival_time_basis,
-    build_survival_time_offsets_for_likelihood, build_survival_timewiggle_from_baseline,
-    build_time_varying_survival_covariate_template, center_survival_time_designs_at_anchor,
-    evaluate_survival_time_basis_row, initial_survival_baseline_config_for_fit,
-    baseline_chain_rule_gradient, location_scale_uses_probit_survival_baseline,
+    baseline_chain_rule_gradient, build_latent_survival_baseline_offsets,
+    build_survival_time_basis, build_survival_time_offsets_for_likelihood,
+    build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
+    center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
+    initial_survival_baseline_config_for_fit, location_scale_uses_probit_survival_baseline,
     marginal_slope_baseline_chain_rule_gradient, marginal_slope_baseline_chain_rule_hessian,
     normalize_survival_time_pair, optimize_survival_baseline_config,
     optimize_survival_baseline_config_with_gradient,
@@ -2696,9 +2694,8 @@ fn materialize_survival<'a>(
         // typically converges in ≲10 outer evaluations — one order of
         // magnitude fewer probes than the gradient-free compass sweep that
         // used to run on this path.
-        let probit_channel = location_scale_uses_probit_survival_baseline(Some(
-            &survival_inverse_link,
-        ));
+        let probit_channel =
+            location_scale_uses_probit_survival_baseline(Some(&survival_inverse_link));
         // Catch errors at the optimizer-call site so a single bad θ
         // candidate doesn't blow up the whole `gam.fit()` call. Specific
         // failure mode: when the inner ρ-ARC stalls on a near-flat REML
@@ -2716,9 +2713,9 @@ fn materialize_survival<'a>(
             &baseline_cfg,
             "workflow survival location-scale baseline",
             |candidate| {
-                let fit_result = fit_survival_location_scale_model(
-                    build_location_scale_request(candidate, false)?,
-                )
+                let fit_result = fit_survival_location_scale_model(build_location_scale_request(
+                    candidate, false,
+                )?)
                 .map_err(|e| format!("survival location-scale fit failed: {e}"))?;
                 // Warm-start the next probe's threshold / log-σ smoothing parameters
                 // at the converged values for this probe.
