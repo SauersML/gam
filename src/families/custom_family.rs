@@ -8743,7 +8743,23 @@ fn update_joint_trust_region_radius(
     };
     let accepted = rho.is_finite() && rho > 0.0 && actual_reduction > 0.0;
     let mut radius = old_radius;
-    if !accepted || rho < 0.25 {
+    // Noise-floor protection (Conn-Gould-Toint §17.4): when both the predicted
+    // and actual reductions are at machine-epsilon scale, their ratio is pure
+    // FP noise and must not drive radius updates. Without this guard, a
+    // numerically converged inner solve can keep growing the radius via
+    // ρ ∈ (0.75, ∞) computed from e.g. actual=2.7e-9, predicted=2.0e-9
+    // (ρ=1.35), inflating the trust region until accepted moves of size
+    // step_inf ≈ radius drift β by orders of magnitude across cycles.
+    // Empirically (failing fuzz seed 1200983908): radius grew 3.6→7.2 with
+    // every "rho≈1.2" step at obj_change=1e-9, accumulating β_σ to 703.
+    let reduction_noise_floor = 1.0e-12_f64.max(1.0e-12 * old_radius.abs().max(1.0));
+    let at_noise_floor = predicted_reduction.abs() < reduction_noise_floor
+        && actual_reduction.abs() < reduction_noise_floor;
+    if at_noise_floor {
+        // Hold the radius. Do not shrink (we did not see a bad model fit) and
+        // do not grow (the rho signal is pure noise). The inner-loop exit
+        // criterion will fire on its own when reductions are below tol.
+    } else if !accepted || rho < 0.25 {
         radius *= 0.25;
         if !accepted && step_norm.is_finite() && step_norm > 0.0 {
             radius = radius.min(0.5 * step_norm);
