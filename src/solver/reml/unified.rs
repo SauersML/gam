@@ -5495,6 +5495,51 @@ pub fn reml_laml_evaluate(
                         hop.trace_logdet_operator(op.as_ref())
                     }
                 };
+                // EXTRA PROBE: dense materialize op (B + correction) and trace via dense H_eigenvalues
+                if let Some(ds) = hop.as_exact_dense_spectral() {
+                    let mut op_dense = Array2::<f64>::zeros((hop.dim(), hop.dim()));
+                    let b_drift_again =
+                        hyper_coord_total_drift_result(&coord.drift, None, hop.dim());
+                    if let DriftDerivResult::Operator(op) = b_drift_again {
+                        op_dense += &op.to_dense();
+                    }
+                    if let Some(corr) = correction {
+                        match corr {
+                            DriftDerivResult::Dense(m) => op_dense += m,
+                            DriftDerivResult::Operator(o) => op_dense += &o.to_dense(),
+                        }
+                    }
+                    let frob_b = {
+                        let b_drift = hyper_coord_total_drift_result(&coord.drift, None, hop.dim());
+                        if let DriftDerivResult::Operator(o) = b_drift {
+                            let d = o.to_dense();
+                            d.iter().map(|v| v * v).sum::<f64>().sqrt()
+                        } else {
+                            f64::NAN
+                        }
+                    };
+                    let frob_corr = if let Some(corr) = correction {
+                        match corr {
+                            DriftDerivResult::Dense(m) => {
+                                m.iter().map(|v| v * v).sum::<f64>().sqrt()
+                            }
+                            DriftDerivResult::Operator(o) => o
+                                .to_dense()
+                                .iter()
+                                .map(|v| v * v)
+                                .sum::<f64>()
+                                .sqrt(),
+                        }
+                    } else {
+                        0.0
+                    };
+                    let frob_total = op_dense.iter().map(|v| v * v).sum::<f64>().sqrt();
+                    let _ = ds;
+                    eprintln!(
+                        "[EXTRA] frob_b={:.6e} frob_corr={:.6e} frob_tot={:.6e}",
+                        frob_b, frob_corr, frob_total,
+                    );
+                }
                 (full_trace, b_only_trace, full_trace - b_only_trace)
             };
 
