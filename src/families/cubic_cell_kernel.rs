@@ -1097,6 +1097,27 @@ pub fn tail_cell_moment_cache_stats() -> TailCellMomentCacheStats {
     }
 }
 
+#[cfg(test)]
+fn evaluate_cell_moments_with_locked_tail_cache(
+    cache: &mut TailCellMomentCache,
+    cell: DenestedCubicCell,
+    max_degree: usize,
+) -> Result<CellMomentState, String> {
+    if TAIL_CELL_MOMENT_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+        && let Some(key) = tail_cell_cache_key(cell, max_degree)
+    {
+        if let Some(state) = cache.moments.get(&key).cloned() {
+            cache.hits += 1;
+            return Ok(state);
+        }
+        cache.misses += 1;
+        let state = evaluate_cell_moments_uncached(cell, max_degree)?;
+        let state = cache.moments.entry(key).or_insert_with(|| state.clone());
+        return Ok(state.clone());
+    }
+    evaluate_cell_moments_uncached(cell, max_degree)
+}
+
 #[derive(Clone, Copy, Debug, Eq)]
 pub struct CellFingerprint {
     c0: u64,
@@ -3397,7 +3418,10 @@ mod tests {
 
     #[test]
     fn affine_tail_cell_memo_matches_uncached_grid_and_records_hits() {
-        reset_tail_cell_moment_cache();
+        let mut tail_cache = tail_cell_moment_cache()
+            .lock()
+            .expect("tail cell moment cache mutex poisoned");
+        *tail_cache = TailCellMomentCache::default();
         let c0s = [-2.0, -0.25, 0.0, 1.5];
         let c1s = [-1.2, -0.05, 0.0, 0.8];
         let endpoints = [-4.0, -1.0, 0.0, 2.5, 6.0];
@@ -3420,10 +3444,18 @@ mod tests {
                             };
                             let expected = evaluate_cell_moments_uncached(cell, max_degree)
                                 .expect("uncached affine tail moments");
-                            let actual = evaluate_cell_moments(cell, max_degree)
-                                .expect("cached affine tail moments miss");
-                            let repeat = evaluate_cell_moments(cell, max_degree)
-                                .expect("cached affine tail moments hit");
+                            let actual = evaluate_cell_moments_with_locked_tail_cache(
+                                &mut tail_cache,
+                                cell,
+                                max_degree,
+                            )
+                            .expect("cached affine tail moments miss");
+                            let repeat = evaluate_cell_moments_with_locked_tail_cache(
+                                &mut tail_cache,
+                                cell,
+                                max_degree,
+                            )
+                            .expect("cached affine tail moments hit");
                             assert_eq!(actual.branch, expected.branch);
                             assert_eq!(repeat.branch, expected.branch);
                             assert_close_rel(
@@ -3456,7 +3488,11 @@ mod tests {
             }
         }
 
-        let stats = tail_cell_moment_cache_stats();
+        let stats = TailCellMomentCacheStats {
+            hits: tail_cache.hits,
+            misses: tail_cache.misses,
+            entries: tail_cache.moments.len(),
+        };
         assert_eq!(stats.misses, stats.entries);
         assert!(
             stats.hits >= stats.misses,

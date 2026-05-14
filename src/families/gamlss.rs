@@ -281,14 +281,35 @@ fn floor_positiveweight(rawweight: f64, minweight: f64) -> f64 {
 }
 
 #[inline]
-fn gaussian_log_sigma_irlsinfo_directional_derivative(weight: f64, sigma: f64, d_eta: f64) -> f64 {
+fn logb_dlog_sigma_deta(sigma: f64, d_sigma_deta: f64) -> f64 {
+    if d_sigma_deta.is_infinite() {
+        1.0
+    } else {
+        let value = d_sigma_deta / sigma;
+        if value.is_finite() {
+            value.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+}
+
+#[inline]
+fn gaussian_log_sigma_irlsinfo_directional_derivative(
+    weight: f64,
+    sigma: f64,
+    d_sigma_deta: f64,
+    d_eta: f64,
+) -> f64 {
     if weight == 0.0 || d_eta == 0.0 || !sigma.is_finite() || sigma <= 0.0 {
         return 0.0;
     }
-    // Logb form mirrors gaussian_jointrow_scalars: κ = 1 − b/σ ∈ [0, 1) and
-    // dκ/dη = κ(1−κ). Avoids the inf/inf NaN that the older d_sigma/sigma
-    // form produced at large η when both numerator and denominator overflow.
-    let g = 1.0 - LOGB_SIGMA_FLOOR / sigma;
+    // Logb form mirrors gaussian_jointrow_scalars: κ = exp(η)/(b + exp(η)) ∈ [0, 1)
+    // and dκ/dη = κ(1−κ). Use dσ/dη over σ directly so the η → −∞ tail
+    // preserves subnormal information instead of cancelling in `1 − b/σ`;
+    // the helper handles the η → +∞ inf/inf case by returning the analytic
+    // limit 1.
+    let g = logb_dlog_sigma_deta(sigma, d_sigma_deta);
     if !g.is_finite() || !(0.0..1.0).contains(&g) {
         return 0.0;
     }
@@ -335,17 +356,17 @@ fn gaussian_diagonal_row_kernel(
     // needed (the previous (1e-12, 1e24) clamp was a numerical bandaid for the
     // pure-exp link's σ→0 singularity and is structurally unnecessary here).
     // ApproxKind: Exact — working weight analytically bounded in (0, 1/b²].
-    let SigmaJet1 { sigma, d1: _ } = logb_sigma_jet1_scalar(eta_log_sigma);
+    let SigmaJet1 { sigma, d1 } = logb_sigma_jet1_scalar(eta_log_sigma);
     let inv_s2 = (sigma * sigma).recip();
     let residual = y - location_eta;
     let location_working_weight = floor_positiveweight(obs_weight * inv_s2, MIN_WEIGHT);
-    // dlog σ/dη = (∂σ/∂η)/σ = (σ−b)/σ = 1 − b/σ ∈ [0, 1).
-    // Use the (1 − b/σ) form so the η→+∞ tail (σ→∞ giving exp(η)/exp(η) = ∞/∞)
-    // evaluates cleanly to 1 instead of NaN; mathematically identical, but
-    // avoids feeding NaN into the IRLS info weight when overflow happens.
+    // dlog σ/dη = (∂σ/∂η)/σ = exp(η)/(b + exp(η)) ∈ [0, 1).
+    // Use dσ/dη over σ directly so the η→−∞ tail preserves subnormal
+    // derivative information instead of cancelling in `1 − b/σ`; the helper
+    // returns the analytic limit 1 for the η→+∞ inf/inf case.
     // Fisher info per obs = 2·(dσ/dη)²/σ² = 2·dlog_sigma_deta², matching the
     // formula for the pure-exp link (where dlog_sigma_deta ≡ 1).
-    let dlog_sigma_deta = 1.0 - LOGB_SIGMA_FLOOR / sigma;
+    let dlog_sigma_deta = logb_dlog_sigma_deta(sigma, d1);
     let log_sigma_working_weight = floor_positiveweight(
         2.0 * obs_weight * dlog_sigma_deta * dlog_sigma_deta,
         MIN_WEIGHT,
@@ -5105,12 +5126,11 @@ fn gaussian_jointrow_scalars(
     for i in 0..nobs {
         let jet = crate::families::sigma_link::logb_sigma_jet1_scalar(eta_ls[i]);
         let s = jet.sigma;
-        // κ = (σ − b)/σ = exp(η)/(b + exp(η)). Use the direct exp(η)/σ form
+        // κ = exp(η)/(b + exp(η)). Use the direct exp(η)/σ form
         // when finite — it preserves the precision of exp(η) at very negative
         // η (where 1 − b/σ catastrophically cancels because b/σ → 1). The
         // η → +∞ branch returns 1 cleanly without hitting ∞/∞ NaN.
-        let s_exp = jet.d1;
-        let ki = if s_exp.is_infinite() { 1.0 } else { s_exp / s };
+        let ki = logb_dlog_sigma_deta(s, jet.d1);
         let kp = ki * (1.0 - ki);
         let kdp = kp * (1.0 - 2.0 * ki);
         let wi = weights[i] / (s * s);
@@ -7036,9 +7056,11 @@ impl CustomFamily for GaussianLocationScaleFamily {
                 let dw_vec: Vec<f64> = (0..n)
                     .into_par_iter()
                     .map(|i| {
+                        let d1 = crate::families::sigma_link::logb_sigma_jet1_scalar(eta_ls[i]).d1;
                         gaussian_log_sigma_irlsinfo_directional_derivative(
                             self.weights[i],
                             sigma[i],
+                            d1,
                             d_eta[i],
                         )
                     })
@@ -20614,6 +20636,23 @@ mod tests {
         theta
     }
 
+    #[test]
+    fn logb_dlog_sigma_deta_preserves_negative_tail_precision() {
+        let eta = -703.4873664863218;
+        let SigmaJet1 { sigma, d1 } = logb_sigma_jet1_scalar(eta);
+
+        assert_eq!(
+            1.0 - LOGB_SIGMA_FLOOR / sigma,
+            0.0,
+            "the algebraically equivalent complement form must cancel at this eta"
+        );
+        assert!(
+            logb_dlog_sigma_deta(sigma, d1) > 0.0,
+            "d_sigma_deta / sigma must preserve the remaining tail derivative"
+        );
+        assert_eq!(logb_dlog_sigma_deta(f64::INFINITY, f64::INFINITY), 1.0);
+    }
+
     fn logistic_numdual<D: DualNum<f64> + Copy>(x: D) -> D {
         D::one() / (D::one() + (-x).exp())
     }
@@ -23506,7 +23545,7 @@ mod tests {
                 // step. Compute the expectation explicitly from the new link.
                 let sigma = logb_sigma_from_eta_scalar(eta_ls0);
                 let inv_s2 = (sigma * sigma).recip();
-                let dlog = 1.0 - LOGB_SIGMA_FLOOR / sigma;
+                let dlog = logb_dlog_sigma_deta(sigma, logb_sigma_jet1_scalar(eta_ls0).d1);
                 let residual = family.y[0] - eta_mu[0];
                 let expected_score =
                     family.weights[0] * (residual * residual * inv_s2 - 1.0) * dlog;
@@ -23608,7 +23647,7 @@ mod tests {
             for i in 0..n {
                 let w = weights[i];
                 let eta = eta_ls[i];
-                let SigmaJet1 { sigma, d1: _ } = logb_sigma_jet1_scalar(eta);
+                let SigmaJet1 { sigma, d1 } = logb_sigma_jet1_scalar(eta);
                 let inv_s2 = (sigma * sigma).recip();
                 let r = y[i] - mu[i];
                 ll += w * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma.ln()));
@@ -23619,7 +23658,7 @@ mod tests {
                     wmu[i] = floor_positiveweight(w * inv_s2, MIN_WEIGHT);
                     zmu[i] = mu[i] + r;
                 }
-                let dlogsigma_du = 1.0 - LOGB_SIGMA_FLOOR / sigma;
+                let dlogsigma_du = logb_dlog_sigma_deta(sigma, d1);
                 let info_u =
                     floor_positiveweight(2.0 * w * dlogsigma_du * dlogsigma_du, MIN_WEIGHT);
                 if info_u == 0.0 {
@@ -23642,7 +23681,7 @@ mod tests {
             let mut wls = Array1::<f64>::zeros(n);
             for i in 0..n {
                 let eta = eta_ls[i];
-                let SigmaJet1 { sigma, d1: _ } = logb_sigma_jet1_scalar(eta);
+                let SigmaJet1 { sigma, d1 } = logb_sigma_jet1_scalar(eta);
                 let inv_s2 = (sigma * sigma).recip();
                 let w = weights[i];
                 let r = y[i] - mu[i];
@@ -23654,7 +23693,7 @@ mod tests {
                     wmu[i] = floor_positiveweight(w * inv_s2, MIN_WEIGHT);
                     zmu[i] = mu[i] + r;
                 }
-                let dlogsigma_du = 1.0 - LOGB_SIGMA_FLOOR / sigma;
+                let dlogsigma_du = logb_dlog_sigma_deta(sigma, d1);
                 let info_u =
                     floor_positiveweight(2.0 * w * dlogsigma_du * dlogsigma_du, MIN_WEIGHT);
                 if info_u == 0.0 {

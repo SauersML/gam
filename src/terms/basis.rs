@@ -26131,8 +26131,14 @@ mod tests {
         let fd_d0 = (&ops_plus.d0 - &ops_minus.d0) / (2.0 * eps);
         let fd_d1 = (&ops_plus.d1 - &ops_minus.d1) / (2.0 * eps);
         let fd_d2 = (&ops_plus.d2 - &ops_minus.d2) / (2.0 * eps);
-        eprintln!("[op_psi_fd_d1] D0_plus[0..,0..] sample = {:?}", ops_plus.d0.row(0).to_vec());
-        eprintln!("[op_psi_fd_d1] D0_minus[0..,0..] sample = {:?}", ops_minus.d0.row(0).to_vec());
+        eprintln!(
+            "[op_psi_fd_d1] D0_plus[0..,0..] sample = {:?}",
+            ops_plus.d0.row(0).to_vec()
+        );
+        eprintln!(
+            "[op_psi_fd_d1] D0_minus[0..,0..] sample = {:?}",
+            ops_minus.d0.row(0).to_vec()
+        );
         eprintln!("[op_psi_fd_d1] fd_D0[0,..] = {:?}", fd_d0.row(0).to_vec());
         eprintln!("[op_psi_fd_d1] fd_D0 shape={:?}", fd_d0.shape());
         eprintln!(
@@ -26244,15 +26250,15 @@ mod tests {
         let s0_raw_base = symmetrize(&fast_ata(&ops_base.d0));
         let s1_raw_base = symmetrize(&fast_ata(&ops_base.d1));
         let s2_raw_base = symmetrize(&fast_ata(&ops_base.d2));
-        let fd_s0_raw =
-            (symmetrize(&fast_ata(&ops_plus.d0)) - symmetrize(&fast_ata(&ops_minus.d0)))
-                / (2.0 * eps);
-        let fd_s1_raw =
-            (symmetrize(&fast_ata(&ops_plus.d1)) - symmetrize(&fast_ata(&ops_minus.d1)))
-                / (2.0 * eps);
-        let fd_s2_raw =
-            (symmetrize(&fast_ata(&ops_plus.d2)) - symmetrize(&fast_ata(&ops_minus.d2)))
-                / (2.0 * eps);
+        let fd_s0_raw = (symmetrize(&fast_ata(&ops_plus.d0))
+            - symmetrize(&fast_ata(&ops_minus.d0)))
+            / (2.0 * eps);
+        let fd_s1_raw = (symmetrize(&fast_ata(&ops_plus.d1))
+            - symmetrize(&fast_ata(&ops_minus.d1)))
+            / (2.0 * eps);
+        let fd_s2_raw = (symmetrize(&fast_ata(&ops_plus.d2))
+            - symmetrize(&fast_ata(&ops_minus.d2)))
+            / (2.0 * eps);
         eprintln!(
             "[raw_gram_fd_d1] S0_raw_base norm={:.4e}; fd_S0_raw_psi norm={:.4e}",
             s0_raw_base.iter().map(|v| v * v).sum::<f64>().sqrt(),
@@ -26540,9 +26546,21 @@ mod tests {
             let err = (analytic - &fd).iter().map(|v| v * v).sum::<f64>().sqrt();
             let a_norm = analytic.iter().map(|v| v * v).sum::<f64>().sqrt();
             let fd_norm = fd.iter().map(|v| v * v).sum::<f64>().sqrt();
-            let s0_base_norm = base.penalties[idx].iter().map(|v| v * v).sum::<f64>().sqrt();
-            let s0_plus_norm = plus.penalties[idx].iter().map(|v| v * v).sum::<f64>().sqrt();
-            let s0_minus_norm = minus.penalties[idx].iter().map(|v| v * v).sum::<f64>().sqrt();
+            let s0_base_norm = base.penalties[idx]
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>()
+                .sqrt();
+            let s0_plus_norm = plus.penalties[idx]
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>()
+                .sqrt();
+            let s0_minus_norm = minus.penalties[idx]
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>()
+                .sqrt();
             eprintln!(
                 "[duchon_d1_p1_linear] penalty {} S_base_norm={:.6e} S_plus_norm={:.6e} S_minus_norm={:.6e}",
                 idx, s0_base_norm, s0_plus_norm, s0_minus_norm

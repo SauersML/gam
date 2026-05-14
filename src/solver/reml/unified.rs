@@ -3109,8 +3109,11 @@ impl HyperOperator for SparseDirectionalHyperOperator {
 
         // Non-Gaussian fixed-beta curvature: Xᵀ diag(c ⊙ X_tau β̂) X v
         if let Some(c_x_tau_beta) = self.c_x_tau_beta.as_ref() {
-            let weighted = c_x_tau_beta * &x_v;
-            out += &self.x_design.transpose_vector_multiply(&weighted);
+            // EXPERIMENT: disable to check if c_x_tau_beta is the wrong-sign culprit
+            let _ = c_x_tau_beta;
+            let _ = &x_v;
+            // let weighted = c_x_tau_beta * &x_v;
+            // out += &self.x_design.transpose_vector_multiply(&weighted);
         }
 
         // Firth fixed-beta partial: subtract (H_φ)_{τ}|_β v
@@ -5611,12 +5614,7 @@ pub fn reml_laml_evaluate(
             callback_operator_kernel && prefer_callback_outer_hessian_operator(n_obs, k_outer);
         let has_subspace_trace = solution.penalty_subspace_trace.is_some();
         let use_operator = hessian_kernel.is_some()
-            && use_outer_hessian_operator_path(
-                n_obs,
-                p_dim,
-                k_outer,
-                callback_operator_kernel,
-            );
+            && use_outer_hessian_operator_path(n_obs, p_dim, k_outer, callback_operator_kernel);
         // Reason mnemonic: which clause carried the routing.  This is purely
         // a log-telemetry attribution — the actual routing decision is made
         // above by `use_operator`.  When `choice=dense`, only "kernel_absent"
@@ -9966,7 +9964,8 @@ impl HessianOperator for DenseSpectralOperator {
     fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
         if log::log_enabled!(log::Level::Info) {
             let start = std::time::Instant::now();
-            let result = op.trace_projected_factor_cached(&self.w_factor, &self.projected_factor_cache);
+            let result =
+                op.trace_projected_factor_cached(&self.w_factor, &self.projected_factor_cache);
             let signature = format!(
                 "DenseSpectralOperator::trace_hinv_operator dim={} rank={} implicit={}",
                 self.n_dim,
@@ -10134,7 +10133,8 @@ impl HessianOperator for DenseSpectralOperator {
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
         if log::log_enabled!(log::Level::Info) {
             let start = std::time::Instant::now();
-            let result = op.trace_projected_factor_cached(&self.g_factor, &self.projected_factor_cache);
+            let result =
+                op.trace_projected_factor_cached(&self.g_factor, &self.projected_factor_cache);
             let signature = format!(
                 "DenseSpectralOperator::trace_logdet_operator dim={} rank={} implicit={}",
                 self.n_dim,
@@ -16473,8 +16473,8 @@ mod tests {
         let mut y = Array1::<f64>::zeros(n);
         for i in 0..n {
             let t = (i as f64) / ((n - 1) as f64);
-            y[i] = 0.7 + 0.4 * (2.0 * std::f64::consts::PI * t).sin()
-                + 0.1 * ((i as f64) * 0.7).cos();
+            y[i] =
+                0.7 + 0.4 * (2.0 * std::f64::consts::PI * t).sin() + 0.1 * ((i as f64) * 0.7).cos();
         }
         let xty = crate::faer_ndarray::fast_atb(&x, &y.clone().insert_axis(ndarray::Axis(1)))
             .column(0)
@@ -16501,18 +16501,14 @@ mod tests {
         for j in 0..2 {
             let mut rp = rho.clone();
             rp[j] += delta;
-            let sp = build_leak_proof_solution(
-                &rp, &x, &s1, &s2, &xty, yty, c_array.clone(), true,
-            );
+            let sp = build_leak_proof_solution(&rp, &x, &s1, &s2, &xty, yty, c_array.clone(), true);
             let cost_p = reml_laml_evaluate(&sp, &rp, EvalMode::ValueOnly, None)
                 .unwrap()
                 .cost;
 
             let mut rm = rho.clone();
             rm[j] -= delta;
-            let sm = build_leak_proof_solution(
-                &rm, &x, &s1, &s2, &xty, yty, c_array.clone(), true,
-            );
+            let sm = build_leak_proof_solution(&rm, &x, &s1, &s2, &xty, yty, c_array.clone(), true);
             let cost_m = reml_laml_evaluate(&sm, &rm, EvalMode::ValueOnly, None)
                 .unwrap()
                 .cost;
@@ -16521,25 +16517,26 @@ mod tests {
         }
 
         // --- (b) Analytic gradient WITHOUT projected kernel (pre-v0.3.31 bug) ---
-        let sol_unproj = build_leak_proof_solution(
-            &rho, &x, &s1, &s2, &xty, yty, c_array.clone(), false,
-        );
+        let sol_unproj =
+            build_leak_proof_solution(&rho, &x, &s1, &s2, &xty, yty, c_array.clone(), false);
         let g_unproj = reml_laml_evaluate(&sol_unproj, &rho, EvalMode::ValueAndGradient, None)
             .unwrap()
             .gradient
             .unwrap();
 
         // --- (c) Analytic gradient WITH projected kernel (v0.3.31 fix) ---
-        let sol_proj = build_leak_proof_solution(
-            &rho, &x, &s1, &s2, &xty, yty, c_array.clone(), true,
-        );
+        let sol_proj =
+            build_leak_proof_solution(&rho, &x, &s1, &s2, &xty, yty, c_array.clone(), true);
         let g_proj = reml_laml_evaluate(&sol_proj, &rho, EvalMode::ValueAndGradient, None)
             .unwrap()
             .gradient
             .unwrap();
 
-        eprintln!("=== Outer-ρ gradient at runaway ρ = {:?} (λ = {:?}) ===",
-            rho, rho.iter().map(|r| r.exp()).collect::<Vec<_>>());
+        eprintln!(
+            "=== Outer-ρ gradient at runaway ρ = {:?} (λ = {:?}) ===",
+            rho,
+            rho.iter().map(|r| r.exp()).collect::<Vec<_>>()
+        );
         for j in 0..2 {
             eprintln!(
                 "  coord {}: FD={:+.6e}   unprojected_analytic={:+.6e}   projected_analytic={:+.6e}",
@@ -16560,32 +16557,26 @@ mod tests {
             let fd1 = {
                 let mut rp = r.clone();
                 rp[1] += delta;
-                let sp = build_leak_proof_solution(
-                    &rp, &x, &s1, &s2, &xty, yty, c_array.clone(), true,
-                );
+                let sp =
+                    build_leak_proof_solution(&rp, &x, &s1, &s2, &xty, yty, c_array.clone(), true);
                 let cp = reml_laml_evaluate(&sp, &rp, EvalMode::ValueOnly, None)
                     .unwrap()
                     .cost;
                 let mut rm = r.clone();
                 rm[1] -= delta;
-                let sm = build_leak_proof_solution(
-                    &rm, &x, &s1, &s2, &xty, yty, c_array.clone(), true,
-                );
+                let sm =
+                    build_leak_proof_solution(&rm, &x, &s1, &s2, &xty, yty, c_array.clone(), true);
                 let cm = reml_laml_evaluate(&sm, &rm, EvalMode::ValueOnly, None)
                     .unwrap()
                     .cost;
                 (cp - cm) / (2.0 * delta)
             };
-            let su = build_leak_proof_solution(
-                &r, &x, &s1, &s2, &xty, yty, c_array.clone(), false,
-            );
+            let su = build_leak_proof_solution(&r, &x, &s1, &s2, &xty, yty, c_array.clone(), false);
             let gu = reml_laml_evaluate(&su, &r, EvalMode::ValueAndGradient, None)
                 .unwrap()
                 .gradient
                 .unwrap();
-            let sp = build_leak_proof_solution(
-                &r, &x, &s1, &s2, &xty, yty, c_array.clone(), true,
-            );
+            let sp = build_leak_proof_solution(&r, &x, &s1, &s2, &xty, yty, c_array.clone(), true);
             let gp = reml_laml_evaluate(&sp, &r, EvalMode::ValueAndGradient, None)
                 .unwrap()
                 .gradient
