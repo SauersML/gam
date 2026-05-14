@@ -4339,6 +4339,100 @@ impl SurvivalMarginalSlopeFamily {
         }
     }
 
+    /// Project a proposed time-block β so that every row's
+    /// `qd1 = D · β + offset ≥ derivative_guard` is satisfied with a
+    /// strictly positive margin. Bisects from `current` (assumed feasible)
+    /// toward `proposed` along the line segment, returning the largest
+    /// `α ∈ [0, 1]` such that `current + α·(proposed − current)` clears
+    /// the guard on all rows, then pulls back by 0.5 % to stay strictly
+    /// interior.
+    ///
+    /// Mirrors the role `project_monotone_feasible_beta` plays for
+    /// `score_warp` and `link_dev`. Without this projection, PIRLS' trust
+    /// region accepts time-block steps that walk right up to the
+    /// `qd1 ≥ guard` cliff (and across it under any subsequent
+    /// re-evaluation), because `row_primary_closed_form` enforces the
+    /// constraint only as an `Err` cliff at evaluation time — leaving no
+    /// repulsion from the boundary. Closed-form max-α suffices because
+    /// `qd1` is linear in β, so per-row feasibility along the segment is
+    /// `α · drift_r ≥ guard − qd1_current_r` for each row `r`.
+    fn project_time_qd1_feasible(
+        &self,
+        current: &Array1<f64>,
+        proposed: Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
+        let p = current.len();
+        if p == 0 || proposed.len() == 0 {
+            return Ok(proposed);
+        }
+        if proposed.len() != p {
+            return Err(format!(
+                "survival marginal-slope time-block projection length mismatch: current={p}, proposed={}",
+                proposed.len()
+            ));
+        }
+        let n_rows = self.derivative_offset_exit.len();
+        if n_rows == 0 {
+            return Ok(proposed);
+        }
+        let qd_design_current = self.design_derivative_exit.matrixvectormultiply(current);
+        let qd_design_proposed = self.design_derivative_exit.matrixvectormultiply(&proposed);
+        if qd_design_current.len() != n_rows || qd_design_proposed.len() != n_rows {
+            return Err(format!(
+                "survival marginal-slope time-block projection row count mismatch: design rows={} vs offset rows={n_rows}",
+                qd_design_current.len()
+            ));
+        }
+        let guard = self.derivative_guard;
+        let mut alpha = 1.0_f64;
+        let mut violated = false;
+        let mut worst_current_qd1 = f64::INFINITY;
+        let mut worst_current_row = 0usize;
+        for row in 0..n_rows {
+            let offset = self.derivative_offset_exit[row];
+            let qd1_current = qd_design_current[row] + offset;
+            if qd1_current < worst_current_qd1 {
+                worst_current_qd1 = qd1_current;
+                worst_current_row = row;
+            }
+            let qd1_proposed = qd_design_proposed[row] + offset;
+            if !survival_derivative_guard_violated(qd1_proposed, guard) {
+                continue;
+            }
+            violated = true;
+            let drift = qd1_proposed - qd1_current;
+            if drift >= 0.0 {
+                // Proposed violates but current is at-or-above the guard
+                // (caught below) and drift is non-negative — only possible
+                // if `current` itself violates by more than `proposed`,
+                // which the explicit feasibility check below handles.
+                continue;
+            }
+            // qd1(α) = qd1_current + α · drift, drift < 0.
+            // qd1(α) ≥ guard ⟺ α ≤ (qd1_current − guard) / (−drift).
+            let row_max = ((qd1_current - guard) / -drift).clamp(0.0, 1.0);
+            if row_max < alpha {
+                alpha = row_max;
+            }
+        }
+        if survival_derivative_guard_violated(worst_current_qd1, guard) {
+            return Err(format!(
+                "survival marginal-slope time-block current beta violates monotonicity at row {worst_current_row}: \
+                 qd1={worst_current_qd1:.3e} < guard={guard:.3e}"
+            ));
+        }
+        if !violated {
+            return Ok(proposed);
+        }
+        // Stay strictly interior to the constraint surface so that
+        // downstream re-evaluations (PIRLS gradient reload, REML
+        // coord-corrections trace, BFGS line-search probes) survive ULP
+        // jitter without crossing the cliff.
+        let alpha_safe = (0.995 * alpha).clamp(0.0, 1.0);
+        let direction = &proposed - current;
+        Ok(current + &direction.mapv(|v| v * alpha_safe))
+    }
+
     fn validate_exact_monotonicity(
         &self,
         block_states: &[ParameterBlockState],
@@ -14485,14 +14579,13 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             ));
         }
         if block_idx == 0 {
-            if let Some(constraints) = self.time_linear_constraints.as_ref() {
-                return Ok(project_onto_linear_constraints(
-                    beta.len(),
-                    constraints,
-                    Some(&beta),
-                ));
-            }
-            return Ok(beta);
+            let proposed = if let Some(constraints) = self.time_linear_constraints.as_ref() {
+                project_onto_linear_constraints(beta.len(), constraints, Some(&beta))
+            } else {
+                beta
+            };
+            let current = &block_states[0].beta;
+            return self.project_time_qd1_feasible(current, proposed);
         }
         if self.score_warp.is_some() && block_idx == 3 {
             if let Some(runtime) = &self.score_warp {

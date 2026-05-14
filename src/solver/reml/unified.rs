@@ -5035,9 +5035,19 @@ pub fn reml_laml_evaluate(
 
     let log_det_h = hop.logdet() + solution.hessian_logdet_correction;
     let log_det_s = solution.penalty_logdet.value;
+    let p_dim_for_probe = hop.dim();
+    let h_diag_for_probe: Vec<f64> = if p_dim_for_probe <= 12 {
+        (0..p_dim_for_probe).map(|j| {
+            let mut e = Array1::<f64>::zeros(p_dim_for_probe);
+            e[j] = 1.0;
+            let h_e = hop.mul_vec(&e);
+            h_e[j]
+        }).collect()
+    } else { Vec::new() };
     eprintln!(
-        "[COST-PROBE] log_det_h={:+.10e} log_det_s={:+.10e} ll={:+.10e} pen_q={:+.10e}",
+        "[COST-PROBE] log_det_h={:+.10e} log_det_s={:+.10e} ll={:+.10e} pen_q={:+.10e} H_diag={:?}",
         log_det_h, log_det_s, solution.log_likelihood, solution.penalty_quadratic,
+        h_diag_for_probe,
     );
 
     let (cost, profiled_scale, dp_cgrad, _dp_cgrad2) = match &solution.dispersion {
