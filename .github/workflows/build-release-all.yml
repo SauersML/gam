@@ -59,7 +59,7 @@ jobs:
             cpu: neoverse-n1
 
           # Windows x86_64
-          - os: windows-latest
+          - os: windows-2022
             target: x86_64-pc-windows-msvc
             artifact_name: gam.exe
             asset_name: gam-windows-x64
