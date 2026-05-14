@@ -5019,6 +5019,15 @@ pub fn reml_laml_evaluate(
 
     let log_det_h = hop.logdet() + solution.hessian_logdet_correction;
     let log_det_s = solution.penalty_logdet.value;
+    eprintln!(
+        "[COST-PROBE] log_det_h={:+.10e} log_det_s={:+.10e} hop_logdet={:+.10e} correction={:+.10e} ll={:+.10e} pen_q={:+.10e}",
+        log_det_h,
+        log_det_s,
+        hop.logdet(),
+        solution.hessian_logdet_correction,
+        solution.log_likelihood,
+        solution.penalty_quadratic
+    );
 
     let (cost, profiled_scale, dp_cgrad, _dp_cgrad2) = match &solution.dispersion {
         DispersionHandling::ProfiledGaussian => {
