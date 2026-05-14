@@ -10237,10 +10237,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             }
             previous_residual = Some(residual);
 
-            // (Plateau-flat-objective convergence certificate fires in
-            // the end-of-cycle convergence block below; see the
-            // `consecutive_obj_flat_cycles` branch after the CGT
-            // certificate.)
+            // Plateau-flat objective diagnostics are emitted in the
+            // end-of-cycle block below; they no longer certify convergence
+            // unless the residual test above has already fired.
 
             // KKT convergence: a small post-step residual is the
             // canonical optimality certificate for the penalized
@@ -10263,153 +10262,33 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 converged = true;
                 break;
             }
-            // Post-step KKT-on-null certification.
-            //
-            // A tiny accepted step paired with a tiny objective change is
-            // the rank-deficient null-mode signature: any descent
-            // direction the joint Hessian can resolve has been exhausted,
-            // and any non-zero gradient residual must live in the null
-            // space (or against a feasibility barrier). Both are
-            // first-order optimality in the constrained sense, so the
-            // iterate satisfies KKT on the resolved subspace even when
-            // ‖∇L − Sβ‖∞ stays above its formal tolerance.
-            //
-            // This mirrors the line-search-failure path's KKT-on-null
-            // certification at the trust-region-collapse signature:
-            //   trust_region_collapsed && last_cycle_obj_change_below_tol
-            //       && made_progress
-            // The post-step signal is strictly stronger because the
-            // line-search SUCCEEDED with a tiny step, so we have direct
-            // evidence that any decrease available within the trust
-            // region was already captured this cycle — no need to wait
-            // for the trust radius to collapse to its 1e-9 floor.
-            //
-            // The `made_progress = cycles_done >= 2` guard avoids
-            // certifying on a degenerate cycle-0 line-search clamp
-            // (initial β stuck at the barrier or at machine-zero
-            // gradient that nonetheless isn't an optimum). Without this
-            // guard a single tiny accepted step at cycle 0 would
-            // mis-certify as KKT before the algorithm has had a chance
-            // to resolve the geometry.
-            //
-            // Without this certification the post-loop dispatch
-            // escalates the non-convergence into the strict
-            // coupled-exact Err — that error is reserved for actual
-            // algorithmic breakdown (Hessian unavailable, NaN delta,
-            // linear solver failure). A stalled-but-intact iterate is
-            // not breakdown; surfacing it as such would force the outer
-            // optimizer to back away from a perfectly usable iterate.
+            // Diagnostic only: a tiny accepted step with a tiny objective
+            // change used to be treated as projected-KKT convergence, but
+            // the survival marginal-slope timewiggle path showed that this
+            // can mask a live residual and feed invalid exact derivatives to
+            // the outer optimizer. Convergence is now certified only by the
+            // explicit residual test above.
             if accepted_step_inf <= step_tol && objective_change <= objective_tol {
                 let made_progress = cycles_done >= 2;
                 eprintln!(
-                    "[JN-EXIT] cycle={cycle} reason=no_progress_stagnation accepted_step_inf={accepted_step_inf:.3e} step_tol={step_tol:.3e} objective_change={objective_change:.3e} objective_tol={objective_tol:.3e} residual={residual:.3e} residual_tol={residual_tol:.3e} made_progress={made_progress}"
+                    "[JN-CONTINUE] cycle={cycle} reason=no_progress_without_kkt accepted_step_inf={accepted_step_inf:.3e} step_tol={step_tol:.3e} objective_change={objective_change:.3e} objective_tol={objective_tol:.3e} residual={residual:.3e} residual_tol={residual_tol:.3e} made_progress={made_progress}"
                 );
-                if made_progress {
-                    converged = true;
-                    break;
-                }
-                // !made_progress: too early to certify. Skip the break
-                // and let the next cycle either escape via Newton or
-                // re-trigger this branch with made_progress=true.
             }
-            // Newton-model predicted-reduction certificate
-            // (Conn-Gould-Toint, *Trust-Region Methods*, Theorem 6.4.6).
-            //
-            // The trust-region attempt that was just accepted promised a
-            // decrease of `accepted_predicted_reduction = −g·δ −
-            // 0.5·δ·H·δ` at the realized step. When the model's
-            // prediction AND the realized objective change both fall
-            // at or below `objective_tol`, the Newton model itself
-            // certifies that no further iteration with the current
-            // curvature can reduce the penalized objective by more
-            // than tolerance — exactly the textbook stopping criterion
-            // for a successful trust-region method on a quadratic model.
-            //
-            // Pairing the two checks defends against two failure modes:
-            //
-            // 1. Heavily trust-region-clipped step where the model
-            //    *under*-predicts (rare; the model overestimates by
-            //    construction). Predicted ≤ tol but actual_reduction
-            //    much larger would mean we are exiting before the
-            //    iterate has fully exploited the available descent —
-            //    the `objective_change ≤ objective_tol` corroboration
-            //    blocks this.
-            //
-            // 2. Model collapse near a degenerate iterate where the
-            //    quadratic predicts ≈ 0 decrease but the actual step
-            //    overshoots through a non-quadratic region. Same guard
-            //    applies.
-            //
-            // Why this is strictly stronger than the existing
-            // `accepted_step_inf ≤ step_tol` certificate above:
-            //
-            // (a) Near-null Hessian directions. When λ_min(H) is small,
-            //     the Newton step δ = −H⁻¹g is large in the null
-            //     direction, the trust region clips it, and the
-            //     predicted reduction at the clipped step shrinks to
-            //     the curvature bound `0.5·λ_min·radius²`. The raw
-            //     `‖g‖∞` residual can stay O(1) along the null
-            //     direction while the model itself has nothing more to
-            //     give — exactly the regime where the raw-residual
-            //     certificate refuses to fire and where the absolute
-            //     `step_inf ≤ inner_tol·(1 + ‖β‖∞)` gate sees a step
-            //     three or more orders above tolerance.
-            //
-            // (b) Two-block GAMLSS with shared smooth structure. The
-            //     coupled cross-block Hessian routinely produces
-            //     accepted steps of order ~1e-3 in coefficient norm
-            //     while the model's predicted decrease and the realized
-            //     decrease are both well below `objective_tol`. The
-            //     absolute step gate stays open across dozens of
-            //     cycles; the predicted-reduction certificate exits as
-            //     soon as the model itself reports it is out of
-            //     descent.
-            //
-            // The `cycles_done >= 2` guard prevents certification on a
-            // degenerate cycle-0 acceptance (initial β stuck against a
-            // barrier with model-zero predicted reduction before Newton
-            // has resolved the geometry). This matches the
-            // `made_progress` guard used by every other relaxed
-            // certificate in this function.
+            // Diagnostic only: a small model-predicted reduction is not a
+            // KKT certificate when the residual is still above tolerance.
+            // Continue iterating so the outer derivative assembly never sees
+            // a knowingly non-stationary inner solve.
             if accepted_predicted_reduction.is_finite()
                 && accepted_predicted_reduction <= objective_tol
                 && objective_change <= objective_tol
                 && cycles_done >= 2
             {
                 eprintln!(
-                    "[JN-EXIT] cycle={cycle} reason=predicted_reduction_below_tol predicted_reduction={accepted_predicted_reduction:.3e} objective_change={objective_change:.3e} objective_tol={objective_tol:.3e} accepted_step_inf={accepted_step_inf:.3e} residual={residual:.3e} residual_tol={residual_tol:.3e}"
+                    "[JN-CONTINUE] cycle={cycle} reason=predicted_reduction_below_tol_without_kkt predicted_reduction={accepted_predicted_reduction:.3e} objective_change={objective_change:.3e} objective_tol={objective_tol:.3e} accepted_step_inf={accepted_step_inf:.3e} residual={residual:.3e} residual_tol={residual_tol:.3e}"
                 );
-                converged = true;
-                break;
             }
-            // Plateau-flat-objective convergence certificate.
-            //
-            // When all three recent residual ratios sit above 0.95,
-            // Newton has stopped reducing the gradient residual along
-            // any direction the penalized Hessian can resolve — the
-            // remaining residual is locked into a curvature-bounded
-            // floor along null / ill-conditioned directions. If the
-            // objective has *also* been below `objective_tol` for the
-            // last three accepted cycles, the iterate is at a
-            // stationary point of the objective on the identifiable
-            // subspace, and the raw `‖∇L − Sβ‖∞` residual will not
-            // drop because there is no descent direction available.
-            //
-            // Operationally this is the projected-KKT certificate the
-            // raw residual gate cannot express: stalled descent ratios
-            // are the no-descent observation, and a Cauchy-on-
-            // objective tail is the convergence observation. Neither
-            // is sufficient alone — a stalled ratio with a still-
-            // shrinking objective means Newton is making small but
-            // real progress, and a flat objective with shrinking
-            // ratios means Newton is closing in fast and the residual
-            // gate will fire on its own. Their conjunction is the
-            // signal that further iteration is wall-clock waste.
-            //
-            // The `cycles_done >= 2` guard mirrors every other relaxed
-            // certificate in this function; it prevents certification
-            // on a degenerate cycle-0 stall (initial β at a barrier or
-            // machine-zero gradient that nonetheless is not optimal).
+            // Diagnostic only: a flat objective plateau with a large
+            // residual is non-convergence, not a projected optimum.
             if descent_ratio_window.len() == 3
                 && descent_ratio_window.iter().all(|r| *r > 0.95)
                 && consecutive_obj_flat_cycles >= 3
@@ -10417,11 +10296,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 && cycles_done >= 2
             {
                 eprintln!(
-                    "[JN-EXIT] cycle={cycle} reason=plateau_objective_flat residual={residual:.3e} residual_tol={residual_tol:.3e} obj_change={objective_change:.3e} objective_tol={objective_tol:.3e} ratios=[{:.3},{:.3},{:.3}] consecutive_flat={consecutive_obj_flat_cycles} accepted_step_inf={accepted_step_inf:.3e} step_tol={step_tol:.3e}",
+                    "[JN-CONTINUE] cycle={cycle} reason=plateau_objective_flat_without_kkt residual={residual:.3e} residual_tol={residual_tol:.3e} obj_change={objective_change:.3e} objective_tol={objective_tol:.3e} ratios=[{:.3},{:.3},{:.3}] consecutive_flat={consecutive_obj_flat_cycles} accepted_step_inf={accepted_step_inf:.3e} step_tol={step_tol:.3e}",
                     descent_ratio_window[0], descent_ratio_window[1], descent_ratio_window[2],
                 );
-                converged = true;
-                break;
             }
             // Carry the objective-stagnation signal into the next
             // cycle so the line-search-failure path above can pair it
