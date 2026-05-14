@@ -5848,6 +5848,13 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
         _has_ext: bool,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
+        eprintln!(
+            "[PROBE-PATH] auto_assembly backend={:?} frame={:?} acfb_is_some={}",
+            bundle.backend_kind(),
+            bundle.pirls_result.coordinate_frame,
+            self.active_constraint_free_basis(bundle.pirls_result.as_ref())
+                .is_some()
+        );
         if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             self.build_sparse_assembly(rho, bundle, mode)
         } else if matches!(
