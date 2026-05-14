@@ -5036,13 +5036,8 @@ pub fn reml_laml_evaluate(
     let log_det_h = hop.logdet() + solution.hessian_logdet_correction;
     let log_det_s = solution.penalty_logdet.value;
     eprintln!(
-        "[COST-PROBE] log_det_h={:+.10e} log_det_s={:+.10e} hop_logdet={:+.10e} correction={:+.10e} ll={:+.10e} pen_q={:+.10e}",
-        log_det_h,
-        log_det_s,
-        hop.logdet(),
-        solution.hessian_logdet_correction,
-        solution.log_likelihood,
-        solution.penalty_quadratic
+        "[COST-PROBE] log_det_h={:+.10e} log_det_s={:+.10e} ll={:+.10e} pen_q={:+.10e}",
+        log_det_h, log_det_s, solution.log_likelihood, solution.penalty_quadratic,
     );
 
     let (cost, profiled_scale, dp_cgrad, _dp_cgrad2) = match &solution.dispersion {
@@ -5554,12 +5549,13 @@ pub fn reml_laml_evaluate(
                     let tr_corr = corr_dense_for_dump.diag().sum();
                     // Compute eigenvalues spectrum range
                     let _ = ds;
+                    let op_diag: Vec<f64> = (0..p).map(|i| op_dense[[i,i]]).collect();
                     eprintln!(
                         "[EXTRA] frob_b={:.4e} frob_corr={:.4e} frob_tot={:.4e} max_asym={:.3e} \
                          tr(K·op)={:+.4e} tr(K·B)={:+.4e} |v_psi|={:.4e} |g_psi|={:.4e} |beta|={:.4e} \
-                         tr(B)={:+.4e} tr(corr)={:+.4e}",
+                         tr(B)={:+.4e} tr(corr)={:+.4e} op_diag={:?}",
                         frob_b, frob_corr, frob_total, max_asym, trace_check, trace_check_b,
-                        v_psi_norm, g_psi_norm, beta_norm, tr_b, tr_corr
+                        v_psi_norm, g_psi_norm, beta_norm, tr_b, tr_corr, op_diag
                     );
                 }
                 (full_trace, b_only_trace, full_trace - b_only_trace)
