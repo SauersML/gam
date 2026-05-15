@@ -9928,13 +9928,32 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             const JOINT_TRUST_MAX_ATTEMPTS: usize = 24;
             let mut search_delta =
                 if step_inf <= step_tol && current_stationarity_residual > residual_tol {
-                    joint_preconditioned_descent_delta(
-                        &joint_hessian_source,
-                        &ranges,
-                        &s_lambdas,
-                        joint_solver_diagonal_ridge,
-                        &rhs,
-                    )?
+                    if let Some(constraints) = joint_constraints.as_ref() {
+                        match joint_constrained_preconditioned_descent_delta(
+                            &joint_hessian_source,
+                            &ranges,
+                            &s_lambdas,
+                            joint_solver_diagonal_ridge,
+                            &rhs,
+                            &beta_joint,
+                            constraints,
+                            search_joint_active_set.as_deref(),
+                        )? {
+                            Some((descent_delta, active_set)) => {
+                                search_joint_active_set = Some(active_set);
+                                descent_delta
+                            }
+                            None => Array1::<f64>::zeros(total_p),
+                        }
+                    } else {
+                        joint_preconditioned_descent_delta(
+                            &joint_hessian_source,
+                            &ranges,
+                            &s_lambdas,
+                            joint_solver_diagonal_ridge,
+                            &rhs,
+                        )?
+                    }
                 } else {
                     delta.clone()
                 };
@@ -21074,8 +21093,7 @@ mod tests {
         assert!(rejected.rho < 0.0);
         assert!((rejected.radius - 0.25).abs() < 1.0e-12);
 
-        let rejected_inside_radius =
-            update_joint_trust_region_radius(1.0, 1.0e-3, -0.1, 2.0, 1.0);
+        let rejected_inside_radius = update_joint_trust_region_radius(1.0, 1.0e-3, -0.1, 2.0, 1.0);
         assert!(!rejected_inside_radius.accepted);
         assert!(
             rejected_inside_radius.radius < 1.0e-3,
@@ -21087,6 +21105,44 @@ mod tests {
         assert!(poor.accepted);
         assert!((poor.rho - 0.1).abs() < 1.0e-12);
         assert!((poor.radius - 0.25).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn joint_trust_region_noise_floor_accepts_round_off_negative_actual() {
+        // Near-converged iterate at large objective scale: both the
+        // model-predicted decrease and the realized objective change are
+        // below the noise floor. Round-off can flip the sign of `actual`;
+        // the principled response is to accept (rho ≈ 1) rather than
+        // declare failure on the sign of noise. Mirrors the noise-floor
+        // branch in `src/solver/pirls.rs`.
+        let objective_scale = 1.66e5;
+        let noise_floor = objective_scale * 1e-14;
+        let predicted = noise_floor * 0.1;
+        let actual = -noise_floor * 0.5;
+        let update =
+            update_joint_trust_region_radius(1.0, 0.05, actual, predicted, objective_scale);
+        assert!(
+            update.accepted,
+            "sub-noise-floor sign flip must not reject as failure"
+        );
+        assert!((update.rho - 1.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn joint_trust_region_noise_floor_rejects_genuine_increase() {
+        // Genuine objective increase clearly beyond the noise floor must
+        // still be rejected even when predicted_reduction is sub-floor:
+        // this is real model failure, not round-off.
+        let objective_scale = 1.66e5;
+        let noise_floor = objective_scale * 1e-14;
+        let predicted = noise_floor * 0.1;
+        let actual = -1.0;
+        let update = update_joint_trust_region_radius(1.0, 0.5, actual, predicted, objective_scale);
+        assert!(
+            !update.accepted,
+            "objective increase beyond noise must reject"
+        );
+        assert!(update.rho.is_infinite() && update.rho < 0.0);
     }
 
     #[test]
@@ -21113,7 +21169,8 @@ mod tests {
         assert!(predicted > 0.0);
         assert!((predicted - actual).abs() < 1.0e-10);
 
-        let update = update_joint_trust_region_radius(0.25, step_norm, actual, predicted, old_objective);
+        let update =
+            update_joint_trust_region_radius(0.25, step_norm, actual, predicted, old_objective);
         assert!(update.accepted);
         assert!(trial_objective < old_objective);
     }
