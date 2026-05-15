@@ -15394,24 +15394,43 @@ fn synchronized_states_from_flat_beta<F: CustomFamily + Clone + Send + Sync + 's
 /// therefore not a convergence defect. This helper removes that normal-cone
 /// component before taking the inf-norm. Axis-aligned lower bounds are just a
 /// special case; coupled derivative-guard rows must use the same KKT geometry.
+///
+/// `known_active_rows`, when provided, seeds the working set with the QP
+/// solver's authoritative active rows. The post-update feasibility projections
+/// (`project_onto_linear_constraints`, `project_time_qd1_feasible`,
+/// `project_monotone_feasible_beta`) can leave the resulting β with row
+/// slacks slightly above the slack tolerance even though the QP identified
+/// the row as binding — slack-based detection alone then misses the row and
+/// leaves its Lagrange-multiplier mass in the projected residual, masking a
+/// valid KKT point. Seeding from the QP's active set is exact; the
+/// non-negative-multiplier iteration below then removes any seeded row whose
+/// least-squares multiplier turns out to be strictly negative, so the union
+/// of (QP active) ∪ (slack-detected) never declares false convergence.
 fn projected_stationarity_inf_norm(
     residual: &Array1<f64>,
     beta: &Array1<f64>,
     constraints: Option<&LinearInequalityConstraints>,
+    known_active_rows: Option<&[usize]>,
 ) -> f64 {
     debug_assert_eq!(residual.len(), beta.len());
     let raw_inf = residual.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
     let Some(constraints) = constraints else {
         return raw_inf;
     };
-    projected_linear_constraint_stationarity_inf_norm(residual, beta, constraints)
-        .unwrap_or(raw_inf)
+    projected_linear_constraint_stationarity_inf_norm(
+        residual,
+        beta,
+        constraints,
+        known_active_rows,
+    )
+    .unwrap_or(raw_inf)
 }
 
 fn projected_linear_constraint_stationarity_inf_norm(
     residual: &Array1<f64>,
     beta: &Array1<f64>,
     constraints: &LinearInequalityConstraints,
+    known_active_rows: Option<&[usize]>,
 ) -> Option<f64> {
     let p = beta.len();
     if residual.len() != p
@@ -15420,10 +15439,22 @@ fn projected_linear_constraint_stationarity_inf_norm(
     {
         return None;
     }
+    let n_rows = constraints.a.nrows();
     let raw_inf = residual.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    let mut active_rows = Vec::new();
+    // Union the slack-detected active rows with the optional QP-supplied
+    // hint. Using a boolean membership table preserves a canonical row order
+    // (matching the constraint matrix) so the rank-reduction below is
+    // deterministic across calls.
+    let mut in_active = vec![false; n_rows];
     let mut primal_violation = 0.0_f64;
-    for row in 0..constraints.a.nrows() {
+    if let Some(hint) = known_active_rows {
+        for &row in hint {
+            if row < n_rows && constraints.b[row].is_finite() {
+                in_active[row] = true;
+            }
+        }
+    }
+    for row in 0..n_rows {
         if constraints.b[row] == f64::NEG_INFINITY {
             continue;
         }
@@ -15437,12 +15468,16 @@ fn projected_linear_constraint_stationarity_inf_norm(
             return None;
         }
         primal_violation = primal_violation.max((-slack).max(0.0));
+        if in_active[row] {
+            continue;
+        }
         let scale = value.abs().max(constraints.b[row].abs()).max(1.0);
         let active_tol = 1e-6 * scale + 1e-10;
         if slack <= active_tol {
-            active_rows.push(row);
+            in_active[row] = true;
         }
     }
+    let mut active_rows: Vec<usize> = (0..n_rows).filter(|&row| in_active[row]).collect();
     if active_rows.is_empty() {
         return Some(raw_inf.max(primal_violation));
     }
@@ -15527,12 +15562,22 @@ fn exact_newton_joint_stationarity_inf_norm<F: CustomFamily + ?Sized>(
     s_lambdas: &[Array2<f64>],
     ridge: f64,
     ridge_policy: RidgePolicy,
+    block_active_sets: Option<&[Option<Vec<usize>>]>,
 ) -> Result<Option<f64>, String> {
     if eval.blockworking_sets.len() != states.len() || states.len() != s_lambdas.len() {
         return Err("exact-newton joint stationarity check: block dimension mismatch".to_string());
     }
     if specs.len() != states.len() {
         return Err("exact-newton joint stationarity check: spec/state count mismatch".to_string());
+    }
+    if let Some(sets) = block_active_sets
+        && sets.len() != states.len()
+    {
+        return Err(format!(
+            "exact-newton joint stationarity check: active-set count mismatch, got {}, expected {}",
+            sets.len(),
+            states.len()
+        ));
     }
 
     let block_constraints = collect_block_linear_constraints(family, states, specs)?;
@@ -15571,10 +15616,14 @@ fn exact_newton_joint_stationarity_inf_norm<F: CustomFamily + ?Sized>(
         if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
             residual += &states[b].beta.mapv(|v| ridge * v);
         }
+        let block_active_hint = block_active_sets
+            .and_then(|sets| sets.get(b))
+            .and_then(|opt| opt.as_deref());
         let block_inf = projected_stationarity_inf_norm(
             &residual,
             &states[b].beta,
             block_constraints[b].as_ref(),
+            block_active_hint,
         );
         inf_norm = inf_norm.max(block_inf);
     }
