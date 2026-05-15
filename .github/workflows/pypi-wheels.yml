@@ -70,13 +70,28 @@ on:
         type: boolean
         default: false
 
-# Cancel in-flight runs on the same ref when a new push lands.  Rapid
-# main-branch commits used to queue full wheel matrices behind each
-# other; only the last one matters for cache-warming.  Tag pushes are
-# distinct refs so this never cancels a publishing run.
+# Concurrency: queue, do NOT cancel.
+#
+# We *used* to set `cancel-in-progress: true` so rapid main-branch
+# commits wouldn't queue full wheel matrices behind each other (the
+# theory: only the last commit matters for cache-warming, so abort the
+# stale runs). That theory broke once the release job started uploading
+# on every main push: cancellation then meant *every* in-flight publish
+# got murdered by the next commit, and across a 50-min stretch of rapid
+# pushes not a single PyPI run completed — the wheel on PyPI stayed at
+# 0.1.56 even though main carried 0.1.59 with the qd1-feasibility fix.
+#
+# `cancel-in-progress: false` lets every push run to completion. Costs:
+# the queue can stack ~15-20 min of wheel builds during a burst of
+# pushes. Benefit: when a `Bump versions` commit lands, its run *will*
+# reach the Upload step and twine will publish; subsequent runs without
+# a bump become twine `--skip-existing` no-ops.
+#
+# Tag pushes are still distinct refs (`refs/tags/v*`) so the publishing
+# path is unaffected by main-branch concurrency either way.
 concurrency:
   group: pypi-wheels-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
