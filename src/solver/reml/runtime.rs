@@ -5750,13 +5750,7 @@ impl<'a> RemlState<'a> {
         // null directions.  Keep `log|H|`, its gradient, its cross-traces, and
         // `H⁻¹` solves consistent on the same reduced active subspace by using
         // `HardPseudo` whenever a Firth operator is in play.
-        let hessian_mode = if bundle.firth_dense_operator.is_some()
-            || bundle.firth_dense_operator_original.is_some()
-        {
-            PseudoLogdetMode::HardPseudo
-        } else {
-            PseudoLogdetMode::Smooth
-        };
+        let hessian_mode = PseudoLogdetMode::HardPseudo;
         let hessian_op = std::sync::Arc::new(
             DenseSpectralOperator::from_symmetric_with_mode(&h_total_original, hessian_mode)
                 .map_err(|e| {
@@ -6104,6 +6098,19 @@ impl<'a> RemlState<'a> {
                 } else if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
                     (
                         self.build_tau_hyper_coords_sparse_exact(rho, &bundle, hyper_dirs)?,
+                        None,
+                        None,
+                        None,
+                    )
+                } else if matches!(
+                    bundle.pirls_result.coordinate_frame,
+                    pirls::PirlsCoordinateFrame::TransformedQs
+                ) && self
+                    .active_constraint_free_basis(bundle.pirls_result.as_ref())
+                    .is_none()
+                {
+                    (
+                        self.build_tau_hyper_coords_original_basis(rho, &bundle, hyper_dirs)?,
                         None,
                         None,
                         None,
