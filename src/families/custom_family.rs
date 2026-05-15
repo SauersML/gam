@@ -13728,8 +13728,16 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     let strict_spd = use_exact_newton_strict_spd(family);
     let per_block = split_log_lambdas(rho_current, &penalty_counts)?;
     let mut inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
+    eprintln!(
+        "[PROBE-CFHI] custom_family_hyper_internal: inner.converged={} cycles={} rho_dim={} psi_dim={} eval_mode={:?}",
+        inner.converged, inner.cycles, rho_dim, psi_dim, eval_mode
+    );
     if !inner.converged {
         let theta_dim = rho_dim + psi_dim;
+        eprintln!(
+            "[PROBE-CFHI] nonconverged → HessianResult::Unavailable theta_dim={}",
+            theta_dim
+        );
         log::warn!(
             "[OUTER] custom-family inner solve did not converge after {} cycle(s); \
              skipping exact outer derivative assembly for theta_dim={} (rho_dim={}, psi_dim={})",
