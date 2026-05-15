@@ -7946,6 +7946,7 @@ pub fn outer_hessian_curvature_arrays(
     let mut w_out = Array1::<f64>::zeros(n);
     let mut c_out = Array1::<f64>::zeros(n);
     let mut d_out = Array1::<f64>::zeros(n);
+    let mut floored_count = 0usize;
     for i in 0..n {
         let floor = solver_hessian_weight_floor_for_outer(fisher_weights[i]);
         let w = hessian_weights[i];
@@ -7960,8 +7961,10 @@ pub fn outer_hessian_curvature_arrays(
             // ∂W_used/∂η on the floored branch is exactly zero.
             c_out[i] = 0.0;
             d_out[i] = 0.0;
+            floored_count += 1;
         }
     }
+    eprintln!("[FLOOR-DBG] n={} floored={}", n, floored_count);
     (w_out, c_out, d_out)
 }
 
