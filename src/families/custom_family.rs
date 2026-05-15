@@ -9427,23 +9427,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // directly when it fires.
         let mut last_cycle_obj_change_below_tol = false;
 
-        // Predicted-reduction tracker for the principled trust-region
-        // stopping criterion (Conn-Gould-Toint, *Trust-Region Methods*,
-        // Theorem 6.4.6). The Newton model at the accepted step has a
-        // predicted decrease `m(0) − m(δ) = −g·δ − 0.5·δ·H·δ`. For an
-        // unclipped Newton step (H·δ = −g) this is `0.5·g·H⁻¹·g`, the
-        // Newton decrement squared / 2. When the model itself predicts
-        // a decrease smaller than the objective tolerance, no descent
-        // direction the Hessian can resolve will lower the objective
-        // by more than `objective_tol`, and continuing is wall-clock
-        // waste regardless of whether the raw gradient residual or
-        // step-norm gates have closed.
-        //
-        // Tracked here at cycle scope so the end-of-cycle convergence
-        // test can consume the value from the accepted trust-region
-        // attempt. Reset every cycle alongside the line-search state.
-        let mut accepted_predicted_reduction: f64 = f64::INFINITY;
-
         let mut joint_trust_radius = 1.0_f64;
         // Hard upper bound for the for-loop's range. The cap is fixed at
         // `inner_max_cycles` for the lifetime of this outer call (the
@@ -10169,14 +10152,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         cached_active_sets =
                             scatter_joint_active_set(joint_active_set, &block_constraints);
                     }
-                    // Record the Newton-model predicted decrease at this
-                    // accepted attempt for the end-of-cycle stopping
-                    // criterion (Conn-Gould-Toint Theorem 6.4.6). For a
-                    // trust-region-clipped step, `predicted_reduction`
-                    // is the model's promised decrease at the realized
-                    // step magnitude; for an unclipped Newton step it
-                    // equals half the Newton decrement squared.
-                    accepted_predicted_reduction = predicted_reduction;
                     accepted = true;
                     break;
                 }
@@ -10329,7 +10304,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     break;
                 }
                 last_cycle_obj_change_below_tol = false;
-                accepted_predicted_reduction = f64::INFINITY;
                 continue;
             }
 
