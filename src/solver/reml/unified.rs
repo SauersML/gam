@@ -153,33 +153,18 @@ pub mod debug_stash {
     }
 
     thread_local! {
-        pub static CAPTURE: RefCell<Option<(Array2<f64>, Array2<f64>)>> = const { RefCell::new(None) };
         pub static TERMS: RefCell<TermStash> = RefCell::new(TermStash::default());
-        pub static ENABLED: RefCell<bool> = const { RefCell::new(false) };
     }
 
-    pub fn arm() {
-        ENABLED.with(|f| *f.borrow_mut() = true);
-        CAPTURE.with(|c| *c.borrow_mut() = None);
-        TERMS.with(|t| *t.borrow_mut() = TermStash::default());
-    }
-    pub fn disarm() {
-        ENABLED.with(|f| *f.borrow_mut() = false);
-    }
-    pub fn is_armed() -> bool {
-        ENABLED.with(|f| *f.borrow())
-    }
-    pub fn store(op: Array2<f64>, u: Array2<f64>) {
-        CAPTURE.with(|c| *c.borrow_mut() = Some((op, u)));
-    }
-    pub fn take() -> Option<(Array2<f64>, Array2<f64>)> {
-        CAPTURE.with(|c| c.borrow_mut().take())
-    }
-    #[allow(dead_code)]
+    /// Replace the per-thread `TermStash` with `stash`. Called from the
+    /// EIG-DECOMP diagnostic block in `reml_laml_evaluate`. Tests read the
+    /// most recently stored stash via `take_terms()`.
     pub fn store_terms(stash: TermStash) {
         TERMS.with(|t| *t.borrow_mut() = stash);
     }
-    #[allow(dead_code)]
+    /// Consume the per-thread `TermStash` and return its contents. Tests
+    /// call this after running an evaluation to inspect the diagnostic
+    /// captures (`unprojected_tr`, `production_tr`, term matrices, etc.).
     pub fn take_terms() -> TermStash {
         TERMS.with(|t| std::mem::take(&mut *t.borrow_mut()))
     }
@@ -5741,8 +5726,6 @@ pub fn reml_laml_evaluate(
                         ext_idx, unprojected_tr, production_trace, projection_active, per_mode
                     );
                     if ext_idx == 0 {
-                        debug_stash::store(op_dense.clone(), u_mat.clone());
-
                         // Per-term breakdown of the operator portion (B), plus
                         // the correction (D_β H[−v]) dense piece.
                         let mut stash = debug_stash::TermStash::default();
