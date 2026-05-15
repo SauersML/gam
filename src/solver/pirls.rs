@@ -509,6 +509,17 @@ pub trait WorkingModel {
         self.update_with_curvature(beta, curvature)
     }
 
+    fn screen_candidate(
+        &mut self,
+        beta: &Coefficients,
+        _: &Array1<f64>,
+        _: &LinearPredictor,
+        curvature: HessianCurvatureKind,
+    ) -> Result<CandidateEvaluation, EstimationError> {
+        self.update_candidate(beta, curvature)
+            .map(CandidateEvaluation::Full)
+    }
+
     fn supports_observed_information_curvature(&self) -> bool {
         false
     }
@@ -729,6 +740,51 @@ pub enum ExportedLaplaceCurvature {
         pd_tolerance: f64,
         gradient_norm: f64,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct CandidateScreen {
+    pub penalized_objective: f64,
+    pub deviance: f64,
+    pub penalty_term: f64,
+    pub arithmetic_finite: bool,
+}
+
+pub enum CandidateEvaluation {
+    Screen(CandidateScreen),
+    Full(WorkingState),
+}
+
+impl CandidateEvaluation {
+    #[inline]
+    fn penalized_objective(&self, firth_bias_reduction: bool) -> f64 {
+        match self {
+            Self::Screen(screen) => screen.penalized_objective,
+            Self::Full(state) => {
+                let mut value = state.deviance + state.penalty_term;
+                if firth_bias_reduction && let Some(jeffreys_logdet) = state.jeffreys_logdet() {
+                    value -= 2.0 * jeffreys_logdet;
+                }
+                value
+            }
+        }
+    }
+
+    #[inline]
+    fn arithmetic_finite(&self) -> bool {
+        match self {
+            Self::Screen(screen) => screen.arithmetic_finite,
+            Self::Full(state) => state.gradient.iter().all(|g| g.is_finite()),
+        }
+    }
+
+    #[inline]
+    fn into_full(self) -> Option<WorkingState> {
+        match self {
+            Self::Full(state) => Some(state),
+            Self::Screen(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1026,6 +1082,60 @@ impl PirlsWorkspace {
                     par,
                 );
             }
+        }
+    }
+
+    fn add_dense_xtwx_streaming_signed<S>(
+        weights: &Array1<f64>,
+        weighted_x_chunk: &mut Array2<f64>,
+        x: &ArrayBase<S, Ix2>,
+        out: &mut Array2<f64>,
+        par: Par,
+    ) where
+        S: Data<Elem = f64> + Sync,
+    {
+        let n = x.nrows();
+        let p = x.ncols();
+        if n == 0 || p == 0 {
+            return;
+        }
+        debug_assert_eq!(
+            weights.len(),
+            n,
+            "weight length must match row count for signed streamed XtWX"
+        );
+        let chunkrows = Self::dense_xtwx_chunkrows(p).min(n);
+        if weighted_x_chunk.ncols() != p || weighted_x_chunk.nrows() != chunkrows {
+            *weighted_x_chunk = Array2::zeros((chunkrows, p).f());
+        }
+        let mut outview = array2_to_matmut(out);
+        for start in (0..n).step_by(chunkrows) {
+            let rows = (n - start).min(chunkrows);
+            {
+                let mut chunk = weighted_x_chunk.slice_mut(s![0..rows, ..]);
+                let x_slice = x.slice(s![start..start + rows, ..]);
+                let w_slice = weights.slice(s![start..start + rows]);
+                Zip::from(chunk.rows_mut())
+                    .and(x_slice.rows())
+                    .and(&w_slice)
+                    .par_for_each(|mut dst, src, &w| {
+                        Zip::from(&mut dst)
+                            .and(&src)
+                            .for_each(|d, &xij| *d = xij * w);
+                    });
+            }
+            let weighted_rows = weighted_x_chunk.slice(s![0..rows, ..]);
+            let x_rows = x.slice(s![start..start + rows, ..]);
+            let weighted_view = FaerArrayView::new(&weighted_rows);
+            let x_view = FaerArrayView::new(&x_rows);
+            matmul(
+                outview.as_mut(),
+                Accum::Add,
+                x_view.as_ref().transpose(),
+                weighted_view.as_ref(),
+                1.0,
+                par,
+            );
         }
     }
 
@@ -1608,20 +1718,40 @@ impl<'a> GamWorkingModel<'a> {
             DesignMatrix::Dense(x) if x.is_materialized_dense() => {
                 let p = x.ncols();
                 let x_dense = x.to_dense_arc();
-                workspace.fill_sqrtweights(weights);
                 // Reuse workspace hessian buffer to avoid per-iteration allocation.
                 if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
                     workspace.hessian_buf = Array2::zeros((p, p).f());
                 } else {
                     workspace.hessian_buf.fill(0.0);
                 }
-                PirlsWorkspace::add_dense_xtwx_streaming_from_sqrt(
-                    &workspace.sqrtw,
-                    &mut workspace.weighted_x_chunk,
-                    x_dense.as_ref(),
-                    &mut workspace.hessian_buf,
-                    get_global_parallelism(),
-                );
+                crate::gpu::log_backend_inventory_once();
+                let large_enough = x.nrows() >= 100_000 || (x.nrows() * p) >= 2_000_000;
+                let gpu_decision =
+                    crate::gpu::decide(crate::gpu::GpuKernel::DenseXtWX, false, large_enough);
+                gpu_decision
+                    .require_supported()
+                    .map_err(EstimationError::InvalidInput)?;
+                gpu_decision.log();
+                if weights.iter().any(|&w| w < 0.0) {
+                    // Observed-information assembly may have signed row
+                    // weights.  Use Xᵀ(WX) exactly; never sqrt/clip.
+                    PirlsWorkspace::add_dense_xtwx_streaming_signed(
+                        weights,
+                        &mut workspace.weighted_x_chunk,
+                        x_dense.as_ref(),
+                        &mut workspace.hessian_buf,
+                        get_global_parallelism(),
+                    );
+                } else {
+                    workspace.fill_sqrtweights(weights);
+                    PirlsWorkspace::add_dense_xtwx_streaming_from_sqrt(
+                        &workspace.sqrtw,
+                        &mut workspace.weighted_x_chunk,
+                        x_dense.as_ref(),
+                        &mut workspace.hessian_buf,
+                        get_global_parallelism(),
+                    );
+                }
                 // Move the buffer out instead of cloning — saves O(p²) memcpy.
                 // Next call will reallocate (same cost as the existing zero-fill).
                 Ok(std::mem::take(&mut workspace.hessian_buf))
@@ -1701,6 +1831,113 @@ impl<'a> GamWorkingModel<'a> {
             &mut self.lasthessian_d,
         )?;
         Ok(HessianCurvatureKind::Observed)
+    }
+
+    fn screen_candidate_from_direction(
+        &mut self,
+        beta: &Coefficients,
+        direction: &Array1<f64>,
+        current_eta: &LinearPredictor,
+    ) -> Result<CandidateScreen, EstimationError> {
+        crate::gpu::log_backend_inventory_once();
+        let decision = crate::gpu::decide(
+            crate::gpu::GpuKernel::CandidateScreen,
+            false,
+            self.offset.len() >= 100_000,
+        );
+        decision
+            .require_supported()
+            .map_err(EstimationError::InvalidInput)?;
+        decision.log();
+
+        let n = self.offset.len();
+        if self.workspace.eta_buf.len() != n {
+            self.workspace.eta_buf = Array1::zeros(n);
+        }
+        if self.workspace.delta_eta.len() != n {
+            self.workspace.delta_eta = Array1::zeros(n);
+        }
+        let mut delta_eta = std::mem::take(&mut self.workspace.delta_eta);
+        self.transformed_matvec_into(&Coefficients::new(direction.clone()), &mut delta_eta);
+        Zip::from(&mut self.workspace.eta_buf)
+            .and(current_eta.as_ref())
+            .and(&delta_eta)
+            .par_for_each(|eta, &base, &delta| *eta = base + delta);
+        self.workspace.delta_eta = delta_eta;
+
+        if self.likelihood.scale.gamma_shape_is_estimated() {
+            let shape =
+                estimate_gamma_shape_from_eta(self.y, &self.workspace.eta_buf, self.priorweights);
+            self.likelihood = self.likelihood.with_gamma_shape(shape);
+        }
+
+        let integrated = self.covariate_se.as_ref().map(|se| IntegratedWorkingInput {
+            quadctx: &self.quadctx,
+            se: se.view(),
+            mixture_link_state: self.link_kind.mixture_state(),
+            sas_link_state: self.link_kind.sas_state(),
+        });
+        match &self.link_kind {
+            InverseLink::Mixture(_)
+            | InverseLink::LatentCLogLog(_)
+            | InverseLink::Sas(_)
+            | InverseLink::BetaLogistic(_) => {
+                if let Some(integ) = integrated {
+                    update_glmvectors_integrated_for_link(
+                        integ.quadctx,
+                        self.y,
+                        &self.workspace.eta_buf,
+                        integ.se,
+                        &self.link_kind,
+                        self.priorweights,
+                        &mut self.lastmu,
+                        &mut self.lastweights,
+                        &mut self.lastz,
+                        None,
+                    )?;
+                } else {
+                    update_glmvectors(
+                        self.y,
+                        &self.workspace.eta_buf,
+                        &self.link_kind,
+                        self.priorweights,
+                        &mut self.lastmu,
+                        &mut self.lastweights,
+                        &mut self.lastz,
+                        None,
+                    )?;
+                }
+            }
+            InverseLink::Standard(_) => {
+                self.likelihood.irls_update(
+                    self.y,
+                    &self.workspace.eta_buf,
+                    self.priorweights,
+                    &mut self.lastmu,
+                    &mut self.lastweights,
+                    &mut self.lastz,
+                    integrated,
+                    None,
+                )?;
+            }
+        }
+
+        let deviance = self
+            .likelihood
+            .loglik_deviance(self.y, &self.lastmu, self.priorweights)?;
+        let s_beta = self.penalty.apply(beta.as_ref());
+        let penalty_term = beta.as_ref().dot(&s_beta);
+        let penalized_objective = deviance + penalty_term;
+        let arithmetic_finite = penalized_objective.is_finite()
+            && self.workspace.eta_buf.iter().all(|v| v.is_finite())
+            && self.lastmu.iter().all(|v| v.is_finite())
+            && self.lastweights.iter().all(|v| v.is_finite());
+        Ok(CandidateScreen {
+            penalized_objective,
+            deviance,
+            penalty_term,
+            arithmetic_finite,
+        })
     }
 
     fn sparse_penalized_hessian(
@@ -2086,6 +2323,22 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let result = self.update_with_curvature(beta, curvature);
         self.firth_bias_reduction = firth_enabled;
         result
+    }
+
+    fn screen_candidate(
+        &mut self,
+        beta: &Coefficients,
+        direction: &Array1<f64>,
+        current_eta: &LinearPredictor,
+        curvature: HessianCurvatureKind,
+    ) -> Result<CandidateEvaluation, EstimationError> {
+        if self.firth_bias_reduction {
+            return self
+                .update_candidate(beta, curvature)
+                .map(CandidateEvaluation::Full);
+        }
+        self.screen_candidate_from_direction(beta, direction, current_eta)
+            .map(CandidateEvaluation::Screen)
     }
 
     fn supports_observed_information_curvature(&self) -> bool {
@@ -4262,12 +4515,17 @@ where
             }
             let candidate_beta = Coefficients::new(candidatevec);
             let candidate_eval_start = std::time::Instant::now();
-            let candidate_eval_result =
-                model.update_candidate(&candidate_beta, state.hessian_curvature);
+            let candidate_eval_result = model.screen_candidate(
+                &candidate_beta,
+                direction,
+                &state.eta,
+                state.hessian_curvature,
+            );
             lm_candidate_total += candidate_eval_start.elapsed();
             match candidate_eval_result {
-                Ok(candidate_state) => {
-                    let screening_penalized = penalizedobjective(&candidate_state);
+                Ok(candidate_eval) => {
+                    let screening_penalized =
+                        candidate_eval.penalized_objective(options.firth_bias_reduction);
                     let screening_reduction = current_penalized - screening_penalized;
 
                     // 4. Gain Ratio
@@ -4291,19 +4549,22 @@ where
                     // reason to reject a candidate; only non-finite objective
                     // or gradient arithmetic is. Saturation is diagnosed later
                     // by `pirls_soft_acceptance`.
-                    let candidate_grad_finite =
-                        candidate_state.gradient.iter().all(|g| g.is_finite());
+                    let candidate_arithmetic_finite = candidate_eval.arithmetic_finite();
 
                     if screening_rho > 0.0
                         && screening_penalized.is_finite()
-                        && candidate_grad_finite
+                        && candidate_arithmetic_finite
                     {
-                        let accepted_state = if options.firth_bias_reduction {
-                            let firth_curv_start = std::time::Instant::now();
-                            let firth_curv_result = model
+                        let accepted_state = if let Some(candidate_state) =
+                            candidate_eval.into_full()
+                        {
+                            candidate_state
+                        } else {
+                            let accepted_curv_start = std::time::Instant::now();
+                            let accepted_curv_result = model
                                 .update_with_curvature(&candidate_beta, state.hessian_curvature);
-                            curvature_total += firth_curv_start.elapsed();
-                            match firth_curv_result {
+                            curvature_total += accepted_curv_start.elapsed();
+                            match accepted_curv_result {
                                 Ok(state) => state,
                                 Err(err) => {
                                     if !is_lm_retriable_candidate_error(&err) {
@@ -4330,8 +4591,6 @@ where
                                     continue;
                                 }
                             }
-                        } else {
-                            candidate_state
                         };
                         let candidate_penalized = penalizedobjective(&accepted_state);
                         if candidate_penalized.is_finite()
