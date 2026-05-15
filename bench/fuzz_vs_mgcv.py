@@ -941,7 +941,10 @@ def _rust_mean_terms(cols: typing.Any, sc: typing.Any) -> typing.Any:
 
 
 def rust_mean_formula(cols: typing.Any, sc: typing.Any) -> typing.Any:
-    return _formula_from_terms("y", _rust_mean_terms(cols, sc))
+    terms = _rust_mean_terms(cols, sc)
+    if sc.family == "binomial":
+        terms = ["link(type=logit)"] + terms
+    return _formula_from_terms("y", terms)
 
 
 def rust_noise_terms(cols: typing.Any, sc: typing.Any) -> typing.Any:
