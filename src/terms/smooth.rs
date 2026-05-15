@@ -17279,7 +17279,6 @@ mod tests {
         let theta_dim = rho_dim + psi_dim;
         let theta_zero = Array1::<f64>::zeros(theta_dim);
 
-        crate::solver::estimate::reml::unified::debug_stash::arm();
         cache.ensure_theta(&theta_zero).expect("ensure_theta");
         let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
             data.view(), cache.spec(), cache.design(), &cache.spatial_terms,
@@ -17288,7 +17287,6 @@ mod tests {
             &mut evaluator, cache.design(), &theta_zero, rho_dim, hyper_dirs, None,
             crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
         ).expect("analytic outer eval");
-        crate::solver::estimate::reml::unified::debug_stash::disarm();
         let stash = crate::solver::estimate::reml::unified::debug_stash::take_terms();
 
         let unprojected_tr = stash.unprojected_tr
@@ -17468,7 +17466,6 @@ mod tests {
             l2_c_dnu, c_dnu_fd.iter().map(|v| v.abs()).fold(0.0_f64, f64::max));
 
         // ── Get ANALYTIC per-row diagonals via debug_stash.
-        crate::solver::estimate::reml::unified::debug_stash::arm();
         cache.ensure_theta(&theta_zero).expect("ensure_theta zero");
         let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
             data.view(), cache.spec(), cache.design(), &cache.spatial_terms,
@@ -17477,7 +17474,6 @@ mod tests {
             &mut evaluator, cache.design(), &theta_zero, rho_dim, hyper_dirs, None,
             crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
         ).expect("analytic outer eval");
-        crate::solver::estimate::reml::unified::debug_stash::disarm();
         let stash = crate::solver::estimate::reml::unified::debug_stash::take_terms();
         let c_x_tau_beta = stash.c_x_tau_beta_diag.clone().expect("term4 diag stashed");
         let x_v_psi = stash.c_x_v_psi_diag.clone().expect("X·v_ψ stashed");
