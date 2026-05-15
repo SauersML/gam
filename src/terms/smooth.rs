@@ -16951,6 +16951,104 @@ mod tests {
             );
         }
         eprintln!("[DIAG] reconstructed trace error (analytic - fd) = {:+.4e}", trace_diff);
+
+        // ── Step 8: directly check if U from analytic stash actually
+        // diagonalizes h_zero (debug whether the two H sources match).
+        let hz_eig = u_mat.t().dot(&h_zero).dot(&u_mat);
+        let mut off_max = 0.0_f64;
+        let mut diag_min = f64::INFINITY;
+        let mut diag_max = f64::NEG_INFINITY;
+        for i in 0..p {
+            for j in 0..p {
+                let v = hz_eig[[i, j]];
+                if i == j {
+                    diag_min = diag_min.min(v);
+                    diag_max = diag_max.max(v);
+                } else if v.abs() > off_max {
+                    off_max = v.abs();
+                }
+            }
+        }
+        eprintln!(
+            "[DIAG] U^T H_zero U: diag in [{:+.4e}, {:+.4e}], max off-diag = {:+.4e}",
+            diag_min, diag_max, off_max
+        );
+
+        // ── Step 9: directly take the eigendecomposition of fd_H (FD-built
+        // H at ψ=0) and of h_zero to see if they agree in spectrum.
+        let h_diff_frob: f64 = h_zero.iter().zip(h_zero.iter()).map(|_| 0.0).sum::<f64>();
+        let _ = h_diff_frob; // placeholder — main diagnostic above
+
+        // ── Step 10: original-basis examination of op - fd_H.
+        let mut orig_entries: Vec<(usize, usize, f64, f64, f64)> = Vec::with_capacity(p * p);
+        for i in 0..p {
+            for j in 0..p {
+                orig_entries.push((i, j, op_total[[i, j]], fd_h[[i, j]], op_total[[i, j]] - fd_h[[i, j]]));
+            }
+        }
+        orig_entries.sort_by(|a, b| b.4.abs().partial_cmp(&a.4.abs()).unwrap_or(std::cmp::Ordering::Equal));
+        eprintln!("[DIAG] ORIGINAL-basis (op - fd_H), sorted by |Δ| desc (top 20):");
+        for (rank, (i, j, oij, fij, d)) in orig_entries.iter().take(20).enumerate() {
+            eprintln!(
+                "  #{:02} (i={:2},j={:2})  op={:+.4e}  fd={:+.4e}  Δ={:+.4e}",
+                rank, i, j, oij, fij, d
+            );
+        }
+
+        // Dump the full op_total and fd_h as dense matrices (small, ~7×7).
+        eprintln!("[DIAG] op_total (original basis):");
+        for i in 0..p {
+            let row: Vec<String> = (0..p).map(|j| format!("{:+.3e}", op_total[[i, j]])).collect();
+            eprintln!("  row {}: [{}]", i, row.join(", "));
+        }
+        eprintln!("[DIAG] fd_H (original basis):");
+        for i in 0..p {
+            let row: Vec<String> = (0..p).map(|j| format!("{:+.3e}", fd_h[[i, j]])).collect();
+            eprintln!("  row {}: [{}]", i, row.join(", "));
+        }
+
+        // ── Step 11: also do the eigendecomp the RIGHT way: eigendecompose
+        // h_zero directly and project (op - fd_H) into THAT basis.
+        use crate::faer_ndarray::FaerEigh;
+        let (eigvals_zero, u_zero) = h_zero.eigh(faer::Side::Lower).expect("eigh on h_zero");
+        let diff_eig_correct = u_zero.t().dot(&diff).dot(&u_zero);
+        let op_eig_correct = u_zero.t().dot(&op_total).dot(&u_zero);
+        let fd_eig_correct = u_zero.t().dot(&fd_h).dot(&u_zero);
+        eprintln!("[DIAG] EIG basis of h_zero (the real H at ψ=0):");
+        eprintln!("  eigenvalues = {:?}", eigvals_zero.to_vec());
+        let mut trace_diff2 = 0.0_f64;
+        eprintln!("  per-mode diagonal contributions (this is the REAL eigenbasis):");
+        for j in 0..p {
+            let sigma = eigvals_zero[j];
+            let phi_prime = 1.0 / (sigma * sigma + eps_sq).sqrt();
+            let d = diff_eig_correct[[j, j]];
+            let c = phi_prime * d;
+            trace_diff2 += c;
+            eprintln!(
+                "    mode {:2}  σ={:+.4e}  op_jj={:+.4e}  fd_jj={:+.4e}  Δ_jj={:+.4e}  contrib={:+.4e}",
+                j, sigma, op_eig_correct[[j, j]], fd_eig_correct[[j, j]], d, c
+            );
+        }
+        eprintln!("[DIAG] (correct-basis) reconstructed trace error = {:+.4e}", trace_diff2);
+
+        // Also show off-diagonal magnitude in correct eigenbasis.
+        let mut max_off_diff = 0.0_f64;
+        let mut max_off_idx = (0usize, 0usize);
+        for i in 0..p {
+            for j in 0..p {
+                if i != j {
+                    let v = diff_eig_correct[[i, j]].abs();
+                    if v > max_off_diff {
+                        max_off_diff = v;
+                        max_off_idx = (i, j);
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "[DIAG] (correct-basis) max OFF-DIAGONAL Δ in (op-fd_H) = {:+.4e} at ({},{}) (off-diag doesn't enter trace)",
+            max_off_diff, max_off_idx.0, max_off_idx.1
+        );
     }
 
     #[test]
