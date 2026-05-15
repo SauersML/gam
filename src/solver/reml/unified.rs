@@ -130,6 +130,12 @@ pub mod debug_stash {
         pub term4: Option<Array2<f64>>,
         pub firth_partial: Option<Array2<f64>>,
         pub correction: Option<Array2<f64>>,
+        /// Per-row diagonal of term4: `c · X_τβ̂` (n-vector).
+        pub c_x_tau_beta_diag: Option<ndarray::Array1<f64>>,
+        /// `X · v_ψ` per row, where v_ψ = hop⁻¹·stored_g. The correction
+        /// matrix is `−X' diag(c · X · v_ψ) X`, so multiplying this by c
+        /// (from PIRLS) gives the diagonal entering the correction sandwich.
+        pub c_x_v_psi_diag: Option<ndarray::Array1<f64>>,
     }
 
     thread_local! {
@@ -5715,6 +5721,14 @@ pub fn reml_laml_evaluate(
                                 stash.term3 = Some(bd.term3);
                                 stash.term4 = bd.term4;
                                 stash.firth_partial = bd.firth_partial;
+                                // Stash term4's diagonal `c · X_τβ̂` directly.
+                                stash.c_x_tau_beta_diag = sd.c_x_tau_beta.clone();
+                                // Also stash `X · v_ψ` per row, where
+                                // v_ψ = ext_v_is[ext_idx] = hop⁻¹·coord.g.
+                                // The diagonal entering correction is `c · X · v_ψ`;
+                                // multiplying by the test's known c gives that diagonal.
+                                let v_i = &ext_v_is[ext_idx];
+                                stash.c_x_v_psi_diag = Some(sd.x_design.matrixvectormultiply(v_i));
                             }
                         }
                         if let Some(c) = correction {
