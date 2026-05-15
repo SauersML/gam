@@ -17524,7 +17524,7 @@ mod tests {
         crate::solver::estimate::reml::unified::debug_stash::disarm();
         let stash = crate::solver::estimate::reml::unified::debug_stash::take_terms();
         let op_total = stash.op_total.clone().expect("op_total stashed");
-        let u_mat = stash.u_mat.clone().expect("u_mat stashed");
+        let _u_mat = stash.u_mat.clone().expect("u_mat stashed");
         let p = op_total.nrows();
         eprintln!(
             "[TERMS] analytic ψ-grad[0] = {:+.6e}  p={}  op_total shape={:?}",
