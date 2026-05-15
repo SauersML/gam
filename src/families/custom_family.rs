@@ -8737,13 +8737,30 @@ fn update_joint_trust_region_radius(
     step_norm: f64,
     actual_reduction: f64,
     predicted_reduction: f64,
+    objective_scale: f64,
 ) -> JointTrustRegionUpdate {
-    let rho = if predicted_reduction > 0.0 && predicted_reduction.is_finite() {
+    // Floating-point noise floor relative to the objective magnitude.
+    // When both the model-predicted and the realized reductions are at
+    // this scale, their sign is dominated by round-off in the
+    // log-likelihood evaluation rather than by genuine descent or
+    // ascent; rejecting on that sign would discard a perfectly
+    // converged step. Mirrors the noise-floor handling in
+    // src/solver/pirls.rs (see the analogous `noise_floor` block).
+    let noise_floor = objective_scale.abs().max(1.0) * 1e-14;
+    let predicted_finite_positive =
+        predicted_reduction > noise_floor && predicted_reduction.is_finite();
+    let rho = if predicted_finite_positive {
         actual_reduction / predicted_reduction
+    } else if actual_reduction.abs() <= noise_floor {
+        // Both predicted and actual reductions are at noise level —
+        // treat as a neutral step (rho = 1) so a numerically converged
+        // iterate is not rejected merely because round-off flipped the
+        // sign of `actual_reduction`.
+        1.0
     } else {
         f64::NEG_INFINITY
     };
-    let accepted = rho.is_finite() && rho > 0.0 && actual_reduction > 0.0;
+    let accepted = rho.is_finite() && rho > 0.0 && actual_reduction >= -noise_floor;
     let mut radius = old_radius;
     if !accepted || rho < 0.25 {
         radius *= 0.25;
@@ -8900,9 +8917,14 @@ fn joint_constrained_preconditioned_descent_delta(
         lhs[[j, j]] = preconditioner[j];
     }
     let rhs_beta = &(&preconditioner * beta_joint) + rhs;
-    let (candidate, active) =
-        solve_quadratic_with_linear_constraints(&lhs, &rhs_beta, beta_joint, constraints, active_rows)
-            .map_err(|e| format!("joint constrained descent solve failed: {e}"))?;
+    let (candidate, active) = solve_quadratic_with_linear_constraints(
+        &lhs,
+        &rhs_beta,
+        beta_joint,
+        constraints,
+        active_rows,
+    )
+    .map_err(|e| format!("joint constrained descent solve failed: {e}"))?;
     let delta = &candidate - beta_joint;
     if !delta.iter().all(|v| v.is_finite()) {
         return Ok(None);
@@ -9828,6 +9850,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let mut accepted_joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>> =
                 None;
             let mut line_search_attempts = 0usize;
+            let mut search_joint_active_set = joint_active_set.clone();
 
             // Pure Newton must take a full step on the first cycle of an
             // exact quadratic problem (i.e. converge in one cycle when the
@@ -9976,18 +9999,39 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 if !predicted_reduction.is_finite() || predicted_reduction <= 0.0 {
                     model_rejects += 1;
                     if !tried_preconditioned_descent {
-                        match joint_preconditioned_descent_delta(
-                            &joint_hessian_source,
-                            &ranges,
-                            &s_lambdas,
-                            joint_solver_diagonal_ridge,
-                            &rhs,
-                        ) {
-                            Ok(descent_delta) => {
-                                search_delta = descent_delta;
+                        if let Some(constraints) = joint_constraints.as_ref() {
+                            match joint_constrained_preconditioned_descent_delta(
+                                &joint_hessian_source,
+                                &ranges,
+                                &s_lambdas,
+                                joint_solver_diagonal_ridge,
+                                &rhs,
+                                &beta_joint,
+                                constraints,
+                                search_joint_active_set.as_deref(),
+                            ) {
+                                Ok(Some((descent_delta, active_set))) => {
+                                    search_delta = descent_delta;
+                                    search_joint_active_set = Some(active_set);
+                                }
+                                Ok(None) | Err(_) => {
+                                    joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
+                                }
                             }
-                            Err(_) => {
-                                joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
+                        } else {
+                            match joint_preconditioned_descent_delta(
+                                &joint_hessian_source,
+                                &ranges,
+                                &s_lambdas,
+                                joint_solver_diagonal_ridge,
+                                &rhs,
+                            ) {
+                                Ok(descent_delta) => {
+                                    search_delta = descent_delta;
+                                }
+                                Err(_) => {
+                                    joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
+                                }
                             }
                         }
                         tried_preconditioned_descent = true;
@@ -10064,6 +10108,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     step_norm,
                     actual_reduction,
                     predicted_reduction,
+                    old_objective,
                 );
                 let old_radius = joint_trust_radius;
                 joint_trust_radius = trust_update.radius;
@@ -10086,7 +10131,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     && trialobjective <= old_objective + 1e-10
                 {
                     current_penalty = trial_penalty;
-                    if let Some(joint_active_set) = joint_active_set.as_ref() {
+                    if let Some(joint_active_set) = search_joint_active_set.as_ref() {
                         cached_active_sets =
                             scatter_joint_active_set(joint_active_set, &block_constraints);
                     }
@@ -10748,6 +10793,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 alpha_accepted * step_inf,
                 actual_reduction,
                 predicted_reduction,
+                obj_before_block,
             );
             block_max_step[b] = trust_update.radius;
             if !accepted {
@@ -15194,60 +15240,144 @@ fn synchronized_states_from_flat_beta<F: CustomFamily + Clone + Send + Sync + 's
     Ok(synced)
 }
 
-/// Inf-norm of the penalized stationarity residual with KKT multipliers
-/// projected out at active lower bounds.
+/// Inf-norm of the penalized stationarity residual with valid KKT multipliers
+/// projected out at active linear constraints.
 ///
-/// For a box-constrained convex quadratic, the KKT conditions at β̂ read
+/// For a linearly constrained convex quadratic with constraints `Aβ ≥ b`,
+/// the KKT conditions at β̂ read
 ///
-///   [S·β̂ − ∇ℓ(β̂)]_j + λ_j = 0                (j with active bound β̂_j = lb_j)
-///   [S·β̂ − ∇ℓ(β̂)]_j      = 0                (j free / strictly interior)
-///   λ_j ≥ 0                                  (dual feasibility)
+///   S·β̂ − ∇ℓ(β̂) = A_activeᵀ λ
+///   Aβ̂ − b ≥ 0
+///   λ ≥ 0
+///   λᵢ(Aᵢβ̂ − bᵢ) = 0
 ///
-/// so `residual_j = +λ_j` on active-bound coordinates — not a convergence
-/// defect but a valid inequality multiplier. The inner-loop convergence
-/// check must measure only the **free-set** residual, otherwise it never
-/// fires at a constrained optimum and falls through to blockwise fallback,
-/// wasting inner cycles and reporting spurious non-convergence.
-///
-/// This helper zeros the residual at coordinate `j` when
-///   (i)  `j` carries a finite lower bound, AND
-///   (ii) `β_j` is within a scale-relative tolerance of that bound, AND
-///   (iii) `residual_j > 0` (sign of a valid inequality multiplier).
-///
-/// The tolerance matches `projected_gradient_norm` in `pirls.rs:2186`
-/// (`1e-6 · max(|β_j|, |lb_j|, 1) + 1e-10`), so the joint-Newton and
-/// blockwise PIRLS convergence criteria agree on the active set.
-///
-/// When `constraints` is `None` or cannot be decomposed into simple lower
-/// bounds (coupled inequalities), behaviour falls back to the unprojected
-/// inf-norm, which is the correct measure for unconstrained / coupled
-/// problems.
+/// The residual component represented by nonnegative active multipliers is
+/// therefore not a convergence defect. This helper removes that normal-cone
+/// component before taking the inf-norm. Axis-aligned lower bounds are just a
+/// special case; coupled derivative-guard rows must use the same KKT geometry.
 fn projected_stationarity_inf_norm(
     residual: &Array1<f64>,
     beta: &Array1<f64>,
     constraints: Option<&LinearInequalityConstraints>,
 ) -> f64 {
     debug_assert_eq!(residual.len(), beta.len());
-    let lower_bounds: Option<Array1<f64>> = constraints
-        .and_then(|c| extract_simple_lower_bounds(c, beta.len()).ok().flatten())
-        .map(|b| b.lower_bounds);
-    let mut inf = 0.0_f64;
-    for j in 0..residual.len() {
-        let r = residual[j];
-        if let Some(lb_arr) = lower_bounds.as_ref() {
-            let lb = lb_arr[j];
-            if lb.is_finite() && r > 0.0 {
-                let scale = beta[j].abs().max(lb.abs()).max(1.0);
-                let tol = 1e-6 * scale + 1e-10;
-                if beta[j] - lb <= tol {
-                    // Active lower bound with multiplier-signed residual; skip.
-                    continue;
+    let raw_inf = residual.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let Some(constraints) = constraints else {
+        return raw_inf;
+    };
+    projected_linear_constraint_stationarity_inf_norm(residual, beta, constraints)
+        .unwrap_or(raw_inf)
+}
+
+fn projected_linear_constraint_stationarity_inf_norm(
+    residual: &Array1<f64>,
+    beta: &Array1<f64>,
+    constraints: &LinearInequalityConstraints,
+) -> Option<f64> {
+    let p = beta.len();
+    if residual.len() != p
+        || constraints.a.ncols() != p
+        || constraints.a.nrows() != constraints.b.len()
+    {
+        return None;
+    }
+    let raw_inf = residual.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let mut active_rows = Vec::new();
+    let mut primal_violation = 0.0_f64;
+    for row in 0..constraints.a.nrows() {
+        if constraints.b[row] == f64::NEG_INFINITY {
+            continue;
+        }
+        if !constraints.b[row].is_finite() {
+            return None;
+        }
+        let a_row = constraints.a.row(row);
+        let value = a_row.dot(beta);
+        let slack = value - constraints.b[row];
+        if !slack.is_finite() {
+            return None;
+        }
+        primal_violation = primal_violation.max((-slack).max(0.0));
+        let scale = value.abs().max(constraints.b[row].abs()).max(1.0);
+        let active_tol = 1e-6 * scale + 1e-10;
+        if slack <= active_tol {
+            active_rows.push(row);
+        }
+    }
+    if active_rows.is_empty() {
+        return Some(raw_inf.max(primal_violation));
+    }
+
+    for _ in 0..constraints.a.nrows().max(1) {
+        let k = active_rows.len();
+        if k == 0 {
+            return Some(raw_inf.max(primal_violation));
+        }
+        let mut a_active = Array2::<f64>::zeros((k, p));
+        let mut b_active = Array1::<f64>::zeros(k);
+        let groups = (0..k).map(|idx| vec![idx]).collect::<Vec<_>>();
+        for (pos, &row) in active_rows.iter().enumerate() {
+            a_active.row_mut(pos).assign(&constraints.a.row(row));
+            b_active[pos] = constraints.b[row];
+        }
+        let (a_reduced, _, groups_reduced) =
+            rank_reduce_rows_pivoted_qr(a_active, b_active, groups);
+        let k_reduced = a_reduced.nrows();
+        if k_reduced == 0 {
+            return Some(raw_inf.max(primal_violation));
+        }
+
+        let mut gram = a_reduced.dot(&a_reduced.t());
+        let rhs = a_reduced.dot(residual);
+        let ridge_scale = gram.diag().iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        let ridge = f64::EPSILON * ridge_scale.max(1.0);
+        for i in 0..k_reduced {
+            gram[[i, i]] += ridge;
+        }
+        let factor =
+            match StableSolver::new("linear constraint KKT residual projection").factorize(&gram) {
+                Ok(factor) => factor,
+                Err(_) => return Some(raw_inf.max(primal_violation)),
+            };
+        let mut lambda = rhs;
+        {
+            let mut lambda_col = crate::faer_ndarray::array1_to_col_matmut(&mut lambda);
+            factor.solve_in_place(lambda_col.as_mut());
+        }
+        if !lambda.iter().all(|v| v.is_finite()) {
+            return Some(raw_inf.max(primal_violation));
+        }
+        let lambda_scale = lambda.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        let dual_tol = 1e-8 * lambda_scale.max(1.0);
+        let most_negative = lambda
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| **value < -dual_tol)
+            .min_by(|(_, left), (_, right)| {
+                left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(idx, _)| idx);
+        if let Some(reduced_idx) = most_negative {
+            let mut remove_positions = groups_reduced[reduced_idx].clone();
+            remove_positions.sort_unstable_by(|left, right| right.cmp(left));
+            for pos in remove_positions {
+                if pos < active_rows.len() {
+                    active_rows.remove(pos);
                 }
             }
+            continue;
         }
-        inf = inf.max(r.abs());
+
+        let projected = residual - &a_reduced.t().dot(&lambda);
+        let stationarity = projected.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        return Some(stationarity.max(primal_violation));
     }
-    inf
+
+    let mut inf = 0.0_f64;
+    for value in residual {
+        inf = inf.max(value.abs());
+    }
+    Some(inf.max(primal_violation))
 }
 
 fn exact_newton_joint_stationarity_inf_norm<F: CustomFamily + ?Sized>(
@@ -20641,6 +20771,86 @@ mod tests {
     }
 
     #[test]
+    fn projected_stationarity_inf_norm_projects_coupled_linear_kkt_multipliers() {
+        let constraints = LinearInequalityConstraints {
+            a: array![[1.0, 1.0]],
+            b: array![1.0],
+        };
+        let beta_active = array![0.25, 0.75];
+
+        let residual_valid_multiplier = array![3.0, 3.0];
+        let inf_valid = projected_stationarity_inf_norm(
+            &residual_valid_multiplier,
+            &beta_active,
+            Some(&constraints),
+        );
+        assert_relative_eq!(inf_valid, 0.0_f64, epsilon = 1e-10);
+
+        let residual_wrong_sign = array![-3.0, -3.0];
+        let inf_wrong =
+            projected_stationarity_inf_norm(&residual_wrong_sign, &beta_active, Some(&constraints));
+        assert_relative_eq!(inf_wrong, 3.0_f64, epsilon = 1e-12);
+
+        let beta_interior = array![0.75, 0.75];
+        let inf_interior = projected_stationarity_inf_norm(
+            &residual_valid_multiplier,
+            &beta_interior,
+            Some(&constraints),
+        );
+        assert_relative_eq!(inf_interior, 3.0_f64, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn constrained_preconditioned_descent_respects_active_linear_face() {
+        let source = JointHessianSource::Dense(Array2::eye(2));
+        let ranges = vec![(0usize, 2usize)];
+        let s_lambdas = vec![Array2::<f64>::zeros((2, 2))];
+        let constraints = LinearInequalityConstraints {
+            a: array![[1.0, 1.0]],
+            b: array![1.0],
+        };
+        let beta = array![0.5, 0.5];
+
+        let outward_rhs = array![-1.0, -1.0];
+        let outward = joint_constrained_preconditioned_descent_delta(
+            &source,
+            &ranges,
+            &s_lambdas,
+            0.0,
+            &outward_rhs,
+            &beta,
+            &constraints,
+            Some(&[0]),
+        )
+        .expect("constrained descent solve");
+        assert!(
+            outward.is_none(),
+            "outward gradient from an active face must not produce an infeasible retry direction"
+        );
+
+        let tangent_rhs = array![1.0, -1.0];
+        let tangent = joint_constrained_preconditioned_descent_delta(
+            &source,
+            &ranges,
+            &s_lambdas,
+            0.0,
+            &tangent_rhs,
+            &beta,
+            &constraints,
+            Some(&[0]),
+        )
+        .expect("constrained tangent descent solve")
+        .expect("tangent descent should exist")
+        .0;
+        assert_relative_eq!(
+            constraints.a.row(0).dot(&(&beta + &tangent)),
+            1.0,
+            epsilon = 1e-12
+        );
+        assert!(tangent_rhs.dot(&tangent) > 0.0);
+    }
+
+    #[test]
     fn zero_psi_derivative_operator_acts_as_zero_map() {
         let n = 17usize;
         let p = 5usize;
@@ -20854,17 +21064,18 @@ mod tests {
 
     #[test]
     fn joint_trust_region_radius_update_accept_reject_logic() {
-        let accepted = update_joint_trust_region_radius(1.0, 1.0, 2.0, 2.0);
+        let accepted = update_joint_trust_region_radius(1.0, 1.0, 2.0, 2.0, 1.0);
         assert!(accepted.accepted);
         assert!((accepted.rho - 1.0).abs() < 1.0e-12);
         assert!((accepted.radius - 2.0).abs() < 1.0e-12);
 
-        let rejected = update_joint_trust_region_radius(1.0, 0.5, -0.1, 2.0);
+        let rejected = update_joint_trust_region_radius(1.0, 0.5, -0.1, 2.0, 1.0);
         assert!(!rejected.accepted);
         assert!(rejected.rho < 0.0);
         assert!((rejected.radius - 0.25).abs() < 1.0e-12);
 
-        let rejected_inside_radius = update_joint_trust_region_radius(1.0, 1.0e-3, -0.1, 2.0);
+        let rejected_inside_radius =
+            update_joint_trust_region_radius(1.0, 1.0e-3, -0.1, 2.0, 1.0);
         assert!(!rejected_inside_radius.accepted);
         assert!(
             rejected_inside_radius.radius < 1.0e-3,
@@ -20872,7 +21083,7 @@ mod tests {
         );
         assert!((rejected_inside_radius.radius - 5.0e-4).abs() < 1.0e-12);
 
-        let poor = update_joint_trust_region_radius(1.0, 0.5, 0.1, 1.0);
+        let poor = update_joint_trust_region_radius(1.0, 0.5, 0.1, 1.0, 1.0);
         assert!(poor.accepted);
         assert!((poor.rho - 0.1).abs() < 1.0e-12);
         assert!((poor.radius - 0.25).abs() < 1.0e-12);
@@ -20902,7 +21113,7 @@ mod tests {
         assert!(predicted > 0.0);
         assert!((predicted - actual).abs() < 1.0e-10);
 
-        let update = update_joint_trust_region_radius(0.25, step_norm, actual, predicted);
+        let update = update_joint_trust_region_radius(0.25, step_norm, actual, predicted, old_objective);
         assert!(update.accepted);
         assert!(trial_objective < old_objective);
     }
