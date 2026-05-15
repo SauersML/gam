@@ -95,25 +95,6 @@ struct DerivativeContext {
     barrier_config: Option<super::unified::BarrierConfig>,
 }
 
-#[cfg(test)]
-pub(crate) struct DebugOriginalTauSurface {
-    pub(crate) beta: Array1<f64>,
-    pub(crate) mode_responses: Vec<Array1<f64>>,
-    pub(crate) finalweights: Array1<f64>,
-    pub(crate) h_total_original: Array2<f64>,
-    pub(crate) log_likelihood: f64,
-    pub(crate) penalty_quadratic: f64,
-    pub(crate) log_det_h: f64,
-    pub(crate) log_det_s: f64,
-    pub(crate) logdet_gradient_kernel: Array2<f64>,
-    pub(crate) ext_a: Vec<f64>,
-    pub(crate) ext_ld_s: Vec<f64>,
-    pub(crate) ext_trace_logdet: Vec<f64>,
-    pub(crate) ext_weight_dot: Vec<Array1<f64>>,
-    pub(crate) fixed_drifts: Vec<Array2<f64>>,
-    pub(crate) total_drifts: Vec<Array2<f64>>,
-}
-
 impl<'a> RemlState<'a> {
     pub(crate) fn analytic_outer_hessian_enabled(&self) -> bool {
         // The Tierney-Kadane fallback gate is no longer needed: the analytic
@@ -2346,123 +2327,6 @@ impl<'a> RemlState<'a> {
     ) -> Result<Array2<f64>, EstimationError> {
         let bundle = self.obtain_eval_bundle(rho)?;
         Ok(bundle.h_total.as_ref().clone())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn debug_original_beta_and_tau_v(
-        &self,
-        rho: &Array1<f64>,
-        hyper_dirs: &[crate::estimate::reml::DirectionalHyperParam],
-    ) -> Result<(Array1<f64>, Vec<Array1<f64>>), EstimationError> {
-        use super::unified::{DenseSpectralOperator, HessianOperator, PseudoLogdetMode};
-
-        let bundle = self.obtain_eval_bundle(rho)?;
-        let pirls_result = bundle.pirls_result.as_ref();
-        let beta = self.sparse_exact_beta_original(pirls_result);
-        let h_original =
-            self.bundle_matrix_in_original_basis(pirls_result, bundle.h_total.as_ref());
-        let hop =
-            DenseSpectralOperator::from_symmetric_with_mode(&h_original, PseudoLogdetMode::Smooth)
-                .map_err(EstimationError::InvalidInput)?;
-        let coords = self.build_tau_hyper_coords_original_basis(rho, &bundle, hyper_dirs)?;
-        let v = coords.iter().map(|coord| hop.solve(&coord.g)).collect();
-        Ok((beta, v))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn debug_original_tau_surface(
-        &self,
-        rho: &Array1<f64>,
-        hyper_dirs: &[crate::estimate::reml::DirectionalHyperParam],
-    ) -> Result<DebugOriginalTauSurface, EstimationError> {
-        use super::unified::{
-            DenseSpectralOperator, DriftDerivResult, HessianOperator, PseudoLogdetMode,
-        };
-
-        let bundle = self.obtain_eval_bundle(rho)?;
-        let pirls_result = bundle.pirls_result.as_ref();
-        let beta = self.sparse_exact_beta_original(pirls_result);
-        let h_total_original =
-            self.bundle_matrix_in_original_basis(pirls_result, bundle.h_total.as_ref());
-        let hop = DenseSpectralOperator::from_symmetric_with_mode(
-            &h_total_original,
-            PseudoLogdetMode::Smooth,
-        )
-        .map_err(EstimationError::InvalidInput)?;
-        let coords = self.build_tau_hyper_coords_original_basis(rho, &bundle, hyper_dirs)?;
-        let mode_responses: Vec<Array1<f64>> =
-            coords.iter().map(|coord| hop.solve(&coord.g)).collect();
-        let ctx = self.build_sparse_derivative_context(pirls_result, &bundle)?;
-        let assembly = self.build_dense_original_assembly(
-            rho,
-            &bundle,
-            super::unified::EvalMode::ValueAndGradient,
-        )?;
-        let log_det_h = assembly.hessian_op.logdet() + assembly.hessian_logdet_correction;
-        let log_det_s = assembly.penalty_logdet.value;
-        let logdet_factor = hop.logdet_gradient_factor();
-        let logdet_gradient_kernel = logdet_factor.dot(&logdet_factor.t());
-
-        let mut fixed_drifts = Vec::with_capacity(coords.len());
-        let mut total_drifts = Vec::with_capacity(coords.len());
-        let mut ext_trace_logdet = Vec::with_capacity(coords.len());
-        let mut ext_weight_dot = Vec::with_capacity(coords.len());
-        for (coord, v) in coords.iter().zip(mode_responses.iter()) {
-            let fixed = coord.drift.materialize();
-            let mut total = fixed.clone();
-            if let Some(correction) = ctx
-                .deriv_provider
-                .hessian_derivative_correction_result(v)
-                .map_err(EstimationError::InvalidInput)?
-            {
-                match correction {
-                    DriftDerivResult::Dense(matrix) => {
-                        total += &matrix;
-                    }
-                    DriftDerivResult::Operator(operator) => {
-                        total += &operator.to_dense();
-                    }
-                }
-            }
-            let trace_logdet = if let Some(kernel) = assembly.penalty_subspace_trace.as_ref() {
-                kernel.trace_projected_logdet(&total)
-            } else {
-                assembly.hessian_op.trace_logdet_gradient(&total)
-            };
-            let beta_dot = v.mapv(|value| -value);
-            let mut eta_total = self.x().matrixvectormultiply(&beta_dot);
-            if let Some(eta_fixed) = coord.tk_eta_fixed.as_ref() {
-                eta_total += eta_fixed;
-            }
-            let crate::pirls::DirectionalWorkingCurvature::Diagonal(weight_dot) =
-                crate::pirls::directionalworking_curvature_from_c_array(
-                    &pirls_result.solve_c_array,
-                    &pirls_result.finalweights,
-                    &eta_total,
-                );
-            fixed_drifts.push(fixed);
-            total_drifts.push(total);
-            ext_trace_logdet.push(trace_logdet);
-            ext_weight_dot.push(weight_dot);
-        }
-
-        Ok(DebugOriginalTauSurface {
-            beta,
-            mode_responses,
-            finalweights: pirls_result.finalweights.clone(),
-            h_total_original,
-            log_likelihood: assembly.log_likelihood,
-            penalty_quadratic: assembly.penalty_quadratic,
-            log_det_h,
-            log_det_s,
-            logdet_gradient_kernel,
-            ext_a: coords.iter().map(|coord| coord.a).collect(),
-            ext_ld_s: coords.iter().map(|coord| coord.ld_s).collect(),
-            ext_trace_logdet,
-            ext_weight_dot,
-            fixed_drifts,
-            total_drifts,
-        })
     }
 
     pub(super) fn active_constraint_free_basis(&self, pr: &PirlsResult) -> Option<Array2<f64>> {
@@ -5886,7 +5750,13 @@ impl<'a> RemlState<'a> {
         // null directions.  Keep `log|H|`, its gradient, its cross-traces, and
         // `H⁻¹` solves consistent on the same reduced active subspace by using
         // `HardPseudo` whenever a Firth operator is in play.
-        let hessian_mode = PseudoLogdetMode::HardPseudo;
+        let hessian_mode = if bundle.firth_dense_operator.is_some()
+            || bundle.firth_dense_operator_original.is_some()
+        {
+            PseudoLogdetMode::HardPseudo
+        } else {
+            PseudoLogdetMode::Smooth
+        };
         let hessian_op = std::sync::Arc::new(
             DenseSpectralOperator::from_symmetric_with_mode(&h_total_original, hessian_mode)
                 .map_err(|e| {
