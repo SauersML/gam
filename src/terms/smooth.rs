@@ -17751,7 +17751,8 @@ mod tests {
         crate::solver::estimate::reml::unified::debug_stash::disarm();
         let stash = crate::solver::estimate::reml::unified::debug_stash::take_terms();
         let op_total = stash.op_total.clone().expect("op_total stashed");
-        let _u_mat = stash.u_mat.clone().expect("u_mat stashed");
+        let u_mat = stash.u_mat.clone().expect("u_mat stashed");
+        let reg_eigs = stash.reg_eigenvalues.clone();
         let p = op_total.nrows();
         eprintln!(
             "[TERMS] analytic ψ-grad[0] = {:+.6e}  p={}  op_total shape={:?}",
@@ -17890,6 +17891,51 @@ mod tests {
         report_max("term4", stash.term4.as_ref());
         report_max("firth", stash.firth_partial.as_ref());
         report_max("correction", stash.correction.as_ref());
+
+        // ── Step 4: redo the trace decomposition in the OPERATOR'S OWN
+        // eigenbasis (the DenseSpectralOperator's U + r_ε(σ)), which is what
+        // the EIG-DECOMP block uses. Recover σ from r_ε via the same inverse
+        // the EIG-DECOMP block uses: σ = r − ε²/r.
+        eprintln!("[TERMS-OP-EIG] === per-term trace in OPERATOR eigenbasis ===");
+        let eps_sq_op = {
+            let eps_f = (2.22e-16_f64).sqrt() * (p as f64);
+            4.0 * eps_f * eps_f
+        };
+        let sigmas_op: Vec<f64> = reg_eigs
+            .iter()
+            .map(|r| r - eps_sq_op / (4.0 * r))
+            .collect();
+        let phi_prime_op: Vec<f64> = sigmas_op
+            .iter()
+            .map(|s| 1.0 / (s * s + eps_sq_op).sqrt())
+            .collect();
+        eprintln!("[TERMS-OP-EIG] σ_op = {:?}", sigmas_op);
+
+        let decomp_op = |label: &str, m: &Array2<f64>| -> f64 {
+            let m_eig = u_mat.t().dot(m).dot(&u_mat);
+            let mut tr = 0.0_f64;
+            eprintln!("[TERMS-OP-EIG] term={:14}", label);
+            for j in 0..p {
+                let mjj = m_eig[[j, j]];
+                let c = phi_prime_op[j] * mjj;
+                tr += c;
+                eprintln!(
+                    "          mode {:2}  σ={:+.4e}  φ'={:+.4e}  M_jj={:+.4e}  contrib={:+.4e}",
+                    j, sigmas_op[j], phi_prime_op[j], mjj, c
+                );
+            }
+            eprintln!("[TERMS-OP-EIG] term={:14} tr(K·M) = {:+.6e}", label, tr);
+            tr
+        };
+
+        let mut sum_op = 0.0_f64;
+        if let Some(m) = stash.term1.as_ref() { sum_op += decomp_op("term1", m); }
+        if let Some(m) = stash.term2.as_ref() { sum_op += decomp_op("term2", m); }
+        if let Some(m) = stash.term3.as_ref() { sum_op += decomp_op("term3", m); }
+        if let Some(m) = stash.term4.as_ref() { sum_op += decomp_op("term4", m); }
+        if let Some(m) = stash.firth_partial.as_ref() { sum_op += decomp_op("firth_partial", m); }
+        if let Some(m) = stash.correction.as_ref() { sum_op += decomp_op("correction", m); }
+        eprintln!("[TERMS-OP-EIG] SUM = {:+.6e}   (EIG-DECOMP reported +22.5)", sum_op);
     }
 
     /// Minimal focused dump of `op_total − fd_H` at ψ=0 for the iso-κ Duchon
