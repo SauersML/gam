@@ -113,6 +113,7 @@ use crate::linalg::matrix::DesignMatrix;
 //  used by the iso-κ Duchon FD investigation test. Empty in production runs.
 // ═══════════════════════════════════════════════════════════════════════════
 
+#[cfg(test)]
 pub mod debug_stash {
     use ndarray::Array2;
     use std::cell::RefCell;
@@ -5552,6 +5553,7 @@ pub fn reml_laml_evaluate(
                         "[EIG-DECOMP ext_idx={}] total_tr={:+.4e} per_mode={:?}",
                         ext_idx, total_tr, per_mode
                     );
+                    #[cfg(test)]
                     if debug_stash::is_armed() && ext_idx == 0 {
                         debug_stash::store(op_dense.clone(), u_mat.clone());
                     }

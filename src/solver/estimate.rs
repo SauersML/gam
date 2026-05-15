@@ -2173,6 +2173,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// transformed basis. This is the same matrix the analytic operator
     /// differentiates, so finite differences of this H w.r.t. ψ should match
     /// the analytic `B_i + correction`.
+    #[cfg(test)]
     pub(crate) fn debug_full_h(
         &mut self,
         x: &DesignMatrix,
