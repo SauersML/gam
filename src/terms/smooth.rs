@@ -17938,6 +17938,129 @@ mod tests {
         eprintln!("[TERMS-OP-EIG] SUM = {:+.6e}   (EIG-DECOMP reported +22.5)", sum_op);
     }
 
+    /// FD `c · dη/dψ_total` vs analytic `c·X_τβ̂ - c·X·v_ψ` per-row.
+    /// If they match: the M = term4 + correction matrix has the right diagonal,
+    /// and the trace bug must lie elsewhere (e.g., basis or weights).
+    /// If they don't match: the IFT formula or v_ψ is wrong.
+    #[test]
+    fn duchon_probit_per_row_dnu_dpsi_fd_vs_analytic() {
+        let n = 80usize;
+        let mut data = Array2::<f64>::zeros((n, 1));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            let eta = 1.4 * (2.0 * std::f64::consts::PI * t).sin() + 0.5 * (t - 0.5);
+            y[i] = if eta + 0.7 * (3.7 * (i as f64) + 1.0).sin() > 0.0 { 1.0 } else { 0.0 };
+        }
+        let weights = Array1::ones(n);
+        let offset = Array1::zeros(n);
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "duchon_1d".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0],
+                    spec: DuchonBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                        length_scale: Some(1.0),
+                        power: 1,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: None,
+                        operator_penalties: DuchonOperatorPenaltySpec::default(),
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let fit_opts = FitOptions {
+            latent_cloglog: None, mixture_link: None, optimize_mixture: false,
+            sas_link: None, optimize_sas: false, compute_inference: false,
+            max_iter: 200, tol: 1e-12, nullspace_dims: vec![],
+            linear_constraints: None, firth_bias_reduction: false,
+            adaptive_regularization: None, penalty_shrinkage_floor: None,
+            rho_prior: Default::default(), kronecker_penalty_system: None,
+            kronecker_factored: None,
+        };
+        let design = build_term_collection_design(data.view(), &spec).expect("design");
+        let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
+        let frozen_design = build_term_collection_design(data.view(), &frozen).expect("frozen design");
+        let spatial_terms = spatial_length_scale_term_indices(&frozen);
+        let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
+        let rho_dim = frozen_design.penalties.len();
+        let psi_dim: usize = dims_per_term.iter().sum();
+
+        let external_opts =
+            external_opts_for_design(LikelihoodFamily::BinomialProbit, &frozen_design, &fit_opts);
+        let mut cache = SingleBlockExactJointDesignCache::new(
+            data.view(), frozen.clone(), frozen_design.clone(),
+            spatial_terms.clone(), rho_dim, dims_per_term.clone(),
+        ).expect("cache");
+        let mut evaluator = crate::estimate::ExternalJointHyperEvaluator::new(
+            y.view(), weights.view(), &frozen_design.design, offset.view(),
+            &frozen_design.penalties, &external_opts, "per-row dη/dψ FD vs analytic",
+        ).expect("evaluator");
+
+        let theta_dim = rho_dim + psi_dim;
+        let theta_zero = Array1::<f64>::zeros(theta_dim);
+        let psi_idx = rho_dim;
+        let h = 1e-5_f64;
+
+        // ── η, W, c at ψ=0
+        cache.ensure_theta(&theta_zero).expect("ensure zero");
+        let dz = cache.design().clone();
+        let (eta_0, w_0, c_0) = evaluator.debug_full_eta_w_c(
+            &dz.design, &dz.penalties, &dz.nullspace_dims, dz.linear_constraints.clone(),
+            &theta_zero, rho_dim, "ψ=0",
+        ).expect("debug at 0");
+
+        // η at ψ=±h
+        let mut theta_p = theta_zero.clone(); theta_p[psi_idx] += h;
+        cache.ensure_theta(&theta_p).expect("ensure +h");
+        let dp = cache.design().clone();
+        let (eta_p, w_p, c_p) = evaluator.debug_full_eta_w_c(
+            &dp.design, &dp.penalties, &dp.nullspace_dims, dp.linear_constraints.clone(),
+            &theta_p, rho_dim, "ψ=+h",
+        ).expect("debug at +h");
+
+        let mut theta_m = theta_zero.clone(); theta_m[psi_idx] -= h;
+        cache.ensure_theta(&theta_m).expect("ensure -h");
+        let dm = cache.design().clone();
+        let (eta_m, _w_m, _c_m) = evaluator.debug_full_eta_w_c(
+            &dm.design, &dm.penalties, &dm.nullspace_dims, dm.linear_constraints.clone(),
+            &theta_m, rho_dim, "ψ=-h",
+        ).expect("debug at -h");
+
+        // dη/dψ_FD per row
+        let mut dnu_dpsi_fd = Array1::<f64>::zeros(n);
+        for i in 0..n { dnu_dpsi_fd[i] = (eta_p[i] - eta_m[i]) / (2.0 * h); }
+        let l2_dnu = (dnu_dpsi_fd.iter().map(|v| v*v).sum::<f64>()).sqrt();
+        eprintln!("[ROW] ||dη/dψ_FD||_L2 = {:+.6e}  per-row max|·| = {:+.4e}",
+            l2_dnu, dnu_dpsi_fd.iter().map(|v| v.abs()).fold(0.0_f64, f64::max));
+
+        // c · dη/dψ_FD per row
+        let c_dnu_fd: Array1<f64> = &c_0 * &dnu_dpsi_fd;
+        let l2_c_dnu = (c_dnu_fd.iter().map(|v| v*v).sum::<f64>()).sqrt();
+        eprintln!("[ROW] ||c·dη/dψ_FD||_L2 = {:+.6e}  per-row max|·| = {:+.4e}",
+            l2_c_dnu, c_dnu_fd.iter().map(|v| v.abs()).fold(0.0_f64, f64::max));
+
+        // Also: ∂W/∂ψ via FD = (W(+h) − W(-h)) / 2h.  Compare with c · dη/dψ.
+        // For canonical-only: ∂W/∂η = c, so ∂W/∂ψ_total = c · dη/dψ_total.
+        // For non-canonical (Probit): same formula holds with c = c_obs.
+        let mut dw_dpsi_fd = Array1::<f64>::zeros(n);
+        for i in 0..n { dw_dpsi_fd[i] = (w_p[i] - w_0[i]) / h; }
+        eprintln!("[ROW] (W(+h) − W(0)) / h  vs  c·dη/dψ_FD:");
+        for i in 0..15 {
+            eprintln!("  i={:2}  η_0={:+.4e}  eta_p-eta_m={:+.4e}  W_0={:+.4e}  W_p={:+.4e}  c_0={:+.4e}  c·dη/dψ={:+.4e}  ΔW/h={:+.4e}",
+                i, eta_0[i], eta_p[i] - eta_m[i], w_0[i], w_p[i], c_0[i],
+                c_dnu_fd[i], dw_dpsi_fd[i]);
+        }
+        let _ = c_p; // silence
+    }
+
     /// Test PIRLS determinism: call debug_full_h three times at the SAME
     /// theta=0 and check whether the returned H matrices are identical.
     /// If they differ, PIRLS produces a different Qs reparametrization
