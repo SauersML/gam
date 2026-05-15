@@ -118,14 +118,30 @@ pub mod debug_stash {
     use ndarray::Array2;
     use std::cell::RefCell;
 
+    #[allow(dead_code)]
+    #[derive(Clone, Debug, Default)]
+    pub struct TermStash {
+        pub op_total: Option<Array2<f64>>,
+        pub u_mat: Option<Array2<f64>>,
+        pub reg_eigenvalues: Vec<f64>,
+        pub term1: Option<Array2<f64>>,
+        pub term2: Option<Array2<f64>>,
+        pub term3: Option<Array2<f64>>,
+        pub term4: Option<Array2<f64>>,
+        pub firth_partial: Option<Array2<f64>>,
+        pub correction: Option<Array2<f64>>,
+    }
+
     thread_local! {
         pub static CAPTURE: RefCell<Option<(Array2<f64>, Array2<f64>)>> = const { RefCell::new(None) };
+        pub static TERMS: RefCell<TermStash> = RefCell::new(TermStash::default());
         pub static ENABLED: RefCell<bool> = const { RefCell::new(false) };
     }
 
     pub fn arm() {
         ENABLED.with(|f| *f.borrow_mut() = true);
         CAPTURE.with(|c| *c.borrow_mut() = None);
+        TERMS.with(|t| *t.borrow_mut() = TermStash::default());
     }
     pub fn disarm() {
         ENABLED.with(|f| *f.borrow_mut() = false);
@@ -138,6 +154,14 @@ pub mod debug_stash {
     }
     pub fn take() -> Option<(Array2<f64>, Array2<f64>)> {
         CAPTURE.with(|c| c.borrow_mut().take())
+    }
+    #[allow(dead_code)]
+    pub fn store_terms(stash: TermStash) {
+        TERMS.with(|t| *t.borrow_mut() = stash);
+    }
+    #[allow(dead_code)]
+    pub fn take_terms() -> TermStash {
+        TERMS.with(|t| std::mem::take(&mut *t.borrow_mut()))
     }
 }
 
@@ -1701,6 +1725,13 @@ pub trait HyperOperator: Send + Sync {
     fn block_local_data(&self) -> Option<(&Array2<f64>, usize, usize)> {
         None
     }
+
+    /// Test-only downcast to `SparseDirectionalHyperOperator`, used by the
+    /// per-term operator decomposition diagnostic.
+    #[cfg(test)]
+    fn as_sparse_directional(&self) -> Option<&SparseDirectionalHyperOperator> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -3110,6 +3141,7 @@ impl ImplicitHyperOperator {
 /// without materializing the full dense matrix up front.
 pub struct SparseDirectionalHyperOperator {
     /// Original-basis design derivative X_τ.
+    #[allow(private_interfaces)]
     pub x_tau: super::HyperDesignDerivative,
     /// Design matrix X in the sparse-native basis.
     pub x_design: DesignMatrix,
@@ -3183,6 +3215,11 @@ impl HyperOperator for SparseDirectionalHyperOperator {
 
     fn is_implicit(&self) -> bool {
         false
+    }
+
+    #[cfg(test)]
+    fn as_sparse_directional(&self) -> Option<&SparseDirectionalHyperOperator> {
+        Some(self)
     }
 }
 
@@ -5661,6 +5698,32 @@ pub fn reml_laml_evaluate(
                     #[cfg(test)]
                     if debug_stash::is_armed() && ext_idx == 0 {
                         debug_stash::store(op_dense.clone(), u_mat.clone());
+
+                        // Per-term breakdown of the operator portion (B), plus
+                        // the correction (D_β H[−v]) dense piece.
+                        let mut stash = debug_stash::TermStash::default();
+                        stash.op_total = Some(op_dense.clone());
+                        stash.u_mat = Some(u_mat.clone());
+                        stash.reg_eigenvalues = (0..ds.dim())
+                            .map(|j| ds.reg_eigenvalue(j))
+                            .collect();
+                        if let Some(op_arc) = coord.drift.operator.as_ref() {
+                            if let Some(sd) = op_arc.as_sparse_directional() {
+                                let bd = sd.term_breakdown_dense();
+                                stash.term1 = Some(bd.term1);
+                                stash.term2 = Some(bd.term2);
+                                stash.term3 = Some(bd.term3);
+                                stash.term4 = bd.term4;
+                                stash.firth_partial = bd.firth_partial;
+                            }
+                        }
+                        if let Some(c) = correction {
+                            stash.correction = Some(match c {
+                                DriftDerivResult::Dense(m) => m.clone(),
+                                DriftDerivResult::Operator(o) => o.to_dense(),
+                            });
+                        }
+                        debug_stash::store_terms(stash);
                     }
                 }
                 match (&solution.penalty_subspace_trace, drift) {
