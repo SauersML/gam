@@ -1668,22 +1668,6 @@ impl<'a> RemlState<'a> {
         ))
     }
 
-    /// Build the runtime `InverseLink` used by PIRLS so outer derivatives can
-    /// check `eta_clamp_active` row-by-row.
-    pub(crate) fn build_runtime_inverse_link(&self) -> InverseLink {
-        let link_function = self.config.link_function();
-        if let Some(state) = self.runtime_mixture_link_state.clone() {
-            InverseLink::Mixture(state)
-        } else if let Some(state) = self.runtime_sas_link_state {
-            if matches!(link_function, LinkFunction::BetaLogistic) {
-                InverseLink::BetaLogistic(state)
-            } else {
-                InverseLink::Sas(state)
-            }
-        } else {
-            InverseLink::Standard(link_function)
-        }
-    }
 
     /// Returns the (c, d, e) per-row mode-curvature carriers required for
     /// the analytic Tierney–Kadane c/d derivative propagation.
