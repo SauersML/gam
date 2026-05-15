@@ -1360,12 +1360,15 @@ impl<'a> RemlState<'a> {
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
         // Match PIRLS's stabilized H = X' W X + S where W = max(W_obs, floor).
         let zero_d = Array1::<f64>::zeros(pirls_result.finalweights.len());
+        let inverse_link = self.build_runtime_inverse_link();
         let (w_outer_owned, c_outer_owned, _) =
             crate::solver::pirls::outer_hessian_curvature_arrays(
                 &pirls_result.finalweights,
                 &pirls_result.solveweights,
                 &pirls_result.solve_c_array,
                 &zero_d,
+                &pirls_result.final_eta,
+                &inverse_link,
             );
         let w_diag = &w_outer_owned;
         let c_array = &c_outer_owned;
@@ -1942,11 +1945,14 @@ impl<'a> RemlState<'a> {
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
         // Match PIRLS's stabilized H = X' W X + S where W = max(W_obs, floor).
         let zero_d = Array1::<f64>::zeros(pirls_result.finalweights.len());
+        let inverse_link = self.build_runtime_inverse_link();
         let (w_outer, c_outer, _) = crate::solver::pirls::outer_hessian_curvature_arrays(
             &pirls_result.finalweights,
             &pirls_result.solveweights,
             &pirls_result.solve_c_array,
             &zero_d,
+            &pirls_result.final_eta,
+            &inverse_link,
         );
         let w_diag = std::sync::Arc::new(w_outer);
         let solve_c_outer = c_outer;
@@ -2189,11 +2195,14 @@ impl<'a> RemlState<'a> {
         let u = &pirls_result.solveweights
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
         // Match PIRLS's stabilized H = X' W X + S where W = max(W_obs, floor).
+        let inverse_link = self.build_runtime_inverse_link();
         let (w_diag, c_array, d_array) = crate::solver::pirls::outer_hessian_curvature_arrays(
             &pirls_result.finalweights,
             &pirls_result.solveweights,
             &pirls_result.solve_c_array,
             &pirls_result.solve_d_array,
+            &pirls_result.final_eta,
+            &inverse_link,
         );
         let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
 
