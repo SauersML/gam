@@ -9444,25 +9444,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // attempt. Reset every cycle alongside the line-search state.
         let mut accepted_predicted_reduction: f64 = f64::INFINITY;
 
-        // Plateau / flat-objective convergence diagnostics. The sliding
-        // 3-cycle window of descent ratios `current_residual /
-        // previous_residual` measures how much Newton is shaving off
-        // the gradient residual per cycle. When all three sit above
-        // 0.95, Newton has effectively stopped reducing the residual —
-        // any remaining residual lives in directions where the
-        // penalized Hessian has near-zero curvature (null space ∩
-        // ill-conditioned identifiable directions). Paired with a
-        // Cauchy-on-objective signal (`consecutive_obj_flat_cycles ≥
-        // 3`), this is the no-descent certificate that recognizes
-        // convergence on the identifiable subspace without grinding
-        // another N Newton cycles against directions that cannot
-        // reduce the objective by more than numerical noise. See the
-        // end-of-cycle convergence block below for the firing
-        // condition.
-        let mut descent_ratio_window: Vec<f64> = Vec::with_capacity(3);
-        let mut previous_residual: Option<f64> = None;
-        let mut consecutive_obj_flat_cycles: usize = 0;
-
         let mut joint_trust_radius = 1.0_f64;
         // Hard upper bound for the for-loop's range. The cap is fixed at
         // `inner_max_cycles` for the lifetime of this outer call (the
@@ -9539,7 +9520,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 None => {
                     let h_joint_opt = family.exact_newton_joint_hessian(&states)?;
                     let Some(h_joint) = h_joint_opt else {
-                        eprintln!("[JN-EXIT] cycle={cycle} reason=hessian_unavailable");
                         break; // Fall back to blockwise if joint Hessian unavailable
                     };
                     match symmetrized_square_matrix(
@@ -9548,24 +9528,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         "joint Newton inner exact-newton Hessian shape mismatch",
                     ) {
                         Ok(matrix) => JointHessianSource::Dense(matrix),
-                        Err(e) => {
-                            eprintln!("[JN-EXIT] cycle={cycle} reason=hessian_shape_err err={e}");
-                            break;
-                        }
+                        Err(_) => break,
                     }
                 }
             };
 
             // Concatenate block gradients and betas.
             let Some(grad_joint) = cached_joint_gradient.clone() else {
-                eprintln!("[JN-EXIT] cycle={cycle} reason=grad_joint_none");
                 break;
             };
             if grad_joint.len() != total_p {
-                eprintln!(
-                    "[JN-EXIT] cycle={cycle} reason=grad_joint_len_mismatch len={} expected={total_p}",
-                    grad_joint.len()
-                );
                 break;
             }
             let mut beta_joint = Array1::<f64>::zeros(total_p);
@@ -9783,7 +9755,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 }
                 if delta.is_none() {
                     if pcg_requested {
-                        eprintln!("[JN-EXIT] cycle={cycle} reason=pcg_no_delta");
                         break;
                     }
                     let mut lhs = match materialize_joint_hessian_source(
@@ -9792,12 +9763,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         "joint Newton inner dense fallback Hessian materialization",
                     ) {
                         Ok(matrix) => matrix,
-                        Err(e) => {
-                            eprintln!(
-                                "[JN-EXIT] cycle={cycle} reason=dense_lhs_materialize_err err={e}"
-                            );
-                            break;
-                        }
+                        Err(_) => break,
                     };
                     add_joint_penalty_to_matrix(
                         &mut lhs,
@@ -9814,15 +9780,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 }
 
                 let Some(delta) = delta else {
-                    eprintln!("[JN-EXIT] cycle={cycle} reason=delta_none_after_dense");
                     break; // Fall back to blockwise
                 };
                 if !delta.iter().all(|v| v.is_finite()) {
-                    let n_nan = delta.iter().filter(|v| !v.is_finite()).count();
-                    eprintln!(
-                        "[JN-EXIT] cycle={cycle} reason=delta_non_finite n_nan={n_nan} dim={}",
-                        delta.len()
-                    );
                     break; // Fall back to blockwise
                 }
                 (beta_joint.clone() + &delta, None)
@@ -10415,7 +10375,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 
             // Check convergence via joint stationarity
             let Some(gradient) = cached_joint_gradient.as_ref() else {
-                eprintln!("[JN-EXIT] cycle={cycle} reason=post_accept_grad_none");
                 break;
             };
             let residual = exact_newton_joint_stationarity_inf_norm_from_gradient(
@@ -10475,28 +10434,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 beta_inf,
             );
 
-            // Update the descent-ratio sliding window (Task 6 adaptive
-            // cap). Only meaningful when the previous cycle produced a
-            // strictly positive residual; otherwise the ratio is
-            // undefined and we leave the window untouched (the
-            // unconditional `previous_residual` refresh at the bottom of
-            // this block keeps the chain going).
-            if let Some(prev) = previous_residual
-                && prev > 0.0
-                && residual.is_finite()
-            {
-                let ratio = residual / prev;
-                if descent_ratio_window.len() == 3 {
-                    descent_ratio_window.remove(0);
-                }
-                descent_ratio_window.push(ratio);
-            }
-            previous_residual = Some(residual);
-
-            // Plateau-flat objective diagnostics are emitted in the
-            // end-of-cycle block below; they no longer certify convergence
-            // unless the residual test above has already fired.
-
             // KKT convergence: a small post-step residual is the
             // canonical optimality certificate for the penalized
             // objective. ‖∇L(β) − Sβ‖∞ ≤ residual_tol means the
@@ -10518,58 +10455,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 converged = true;
                 break;
             }
-            // Diagnostic only: a tiny accepted step with a tiny objective
-            // change used to be treated as projected-KKT convergence, but
-            // the survival marginal-slope timewiggle path showed that this
-            // can mask a live residual and feed invalid exact derivatives to
-            // the outer optimizer. Convergence is now certified only by the
-            // explicit residual test above.
-            if accepted_step_inf <= step_tol && objective_change <= objective_tol {
-                let made_progress = cycles_done >= 2;
-                eprintln!(
-                    "[JN-CONTINUE] cycle={cycle} reason=no_progress_without_kkt accepted_step_inf={accepted_step_inf:.3e} step_tol={step_tol:.3e} objective_change={objective_change:.3e} objective_tol={objective_tol:.3e} residual={residual:.3e} residual_tol={residual_tol:.3e} made_progress={made_progress}"
-                );
-            }
-            // Diagnostic only: a small model-predicted reduction is not a
-            // KKT certificate when the residual is still above tolerance.
-            // Continue iterating so the outer derivative assembly never sees
-            // a knowingly non-stationary inner solve.
-            if accepted_predicted_reduction.is_finite()
-                && accepted_predicted_reduction <= objective_tol
-                && objective_change <= objective_tol
-                && cycles_done >= 2
-            {
-                eprintln!(
-                    "[JN-CONTINUE] cycle={cycle} reason=predicted_reduction_below_tol_without_kkt predicted_reduction={accepted_predicted_reduction:.3e} objective_change={objective_change:.3e} objective_tol={objective_tol:.3e} accepted_step_inf={accepted_step_inf:.3e} residual={residual:.3e} residual_tol={residual_tol:.3e}"
-                );
-            }
-            // Diagnostic only: a flat objective plateau with a large
-            // residual is non-convergence, not a projected optimum.
-            if descent_ratio_window.len() == 3
-                && descent_ratio_window.iter().all(|r| *r > 0.95)
-                && consecutive_obj_flat_cycles >= 3
-                && residual.is_finite()
-                && cycles_done >= 2
-            {
-                eprintln!(
-                    "[JN-CONTINUE] cycle={cycle} reason=plateau_objective_flat_without_kkt residual={residual:.3e} residual_tol={residual_tol:.3e} obj_change={objective_change:.3e} objective_tol={objective_tol:.3e} ratios=[{:.3},{:.3},{:.3}] consecutive_flat={consecutive_obj_flat_cycles} accepted_step_inf={accepted_step_inf:.3e} step_tol={step_tol:.3e}",
-                    descent_ratio_window[0], descent_ratio_window[1], descent_ratio_window[2],
-                );
-            }
             // Carry the objective-stagnation signal into the next
             // cycle so the line-search-failure path above can pair it
             // with trust-region collapse to certify a KKT optimum on a
-            // rank-deficient null mode. The residual signal does not
-            // need a carry-over: by the time we reach this assignment
-            // the end-of-cycle test has already confirmed residual is
-            // above its tolerance, so a "previous cycle had small
-            // residual" branch in the failure path could never fire.
+            // rank-deficient null mode.
             last_cycle_obj_change_below_tol = objective_change <= objective_tol;
-            if objective_change <= objective_tol {
-                consecutive_obj_flat_cycles = consecutive_obj_flat_cycles.saturating_add(1);
-            } else {
-                consecutive_obj_flat_cycles = 0;
-            }
         }
 
         // If joint Newton converged, skip the blockwise loop entirely.
@@ -10622,9 +10512,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             });
         }
         if coupled_exact_joint_required {
-            eprintln!(
-                "[JN-EXIT-OUTER] cycles_done={cycles_done} converged={converged} inner_max_cycles={inner_max_cycles}"
-            );
             return Err(
                 "coupled exact-joint inner solve exited the joint Newton path before convergence"
                     .to_string(),
