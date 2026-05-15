@@ -2167,6 +2167,58 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         let rho = theta.slice(s![..rho_dim]).to_owned();
         self.reml_state.compute_cost(&rho)
     }
+
+    #[cfg(test)]
+    pub(crate) fn debug_beta_cost_only(
+        &mut self,
+        x: &DesignMatrix,
+        s_list: &[BlockwisePenalty],
+        nullspace_dims: &[usize],
+        linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
+        theta: &Array1<f64>,
+        rho_dim: usize,
+        context: &str,
+    ) -> Result<Array1<f64>, EstimationError> {
+        self.prepare_eval_state_cost_only(
+            x,
+            s_list,
+            nullspace_dims,
+            linear_constraints,
+            None,
+            context,
+        )?;
+        let rho = theta.slice(s![..rho_dim]).to_owned();
+        let (beta, _) = self.reml_state.debug_original_beta_and_tau_v(&rho, &[])?;
+        Ok(beta)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_beta_and_tau_v(
+        &mut self,
+        x: &DesignMatrix,
+        s_list: &[BlockwisePenalty],
+        nullspace_dims: &[usize],
+        linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
+        theta: &Array1<f64>,
+        rho_dim: usize,
+        hyper_dirs: Vec<DirectionalHyperParam>,
+        context: &str,
+    ) -> Result<(Array1<f64>, Vec<Array1<f64>>), EstimationError> {
+        let hyper_dirs = self.prepare_eval_state(
+            x,
+            s_list,
+            nullspace_dims,
+            linear_constraints,
+            theta,
+            rho_dim,
+            hyper_dirs,
+            None,
+            context,
+        )?;
+        let rho = theta.slice(s![..rho_dim]).to_owned();
+        self.reml_state
+            .debug_original_beta_and_tau_v(&rho, &hyper_dirs)
+    }
 }
 
 // canonicalize_active_penalties removed — replaced by
