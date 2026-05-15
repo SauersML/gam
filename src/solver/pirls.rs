@@ -7941,30 +7941,36 @@ pub fn outer_hessian_curvature_arrays(
     fisher_weights: &Array1<f64>,
     c_array: &Array1<f64>,
     d_array: &Array1<f64>,
+    eta: &Array1<f64>,
+    inverse_link: &InverseLink,
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
     let n = hessian_weights.len();
     let mut w_out = Array1::<f64>::zeros(n);
     let mut c_out = Array1::<f64>::zeros(n);
     let mut d_out = Array1::<f64>::zeros(n);
-    let mut floored_count = 0usize;
     for i in 0..n {
         let floor = solver_hessian_weight_floor_for_outer(fisher_weights[i]);
         let w = hessian_weights[i];
-        if w.is_finite() && w > floor {
+        let clamp_active = eta_clamp_active(inverse_link, eta[i]);
+        let w_below_floor = !(w.is_finite() && w > floor);
+        if w_below_floor {
+            // PIRLS replaced this row's curvature with the constant floor to
+            // keep H PD; the η-derivative of a constant is zero.
+            w_out[i] = floor;
+            c_out[i] = 0.0;
+            d_out[i] = 0.0;
+        } else if clamp_active {
+            // PIRLS evaluated W_obs at clamp(η), so ∂W_obs/∂η_unclamped
+            // is zero across the saturated tail. Operator must agree.
+            w_out[i] = w;
+            c_out[i] = 0.0;
+            d_out[i] = 0.0;
+        } else {
             w_out[i] = w;
             c_out[i] = c_array[i];
             d_out[i] = d_array[i];
-        } else {
-            w_out[i] = floor;
-            // The floor itself is W_F · 1e-6 or 1e-12, both of which have
-            // negligible η-derivative compared to c_obs. Zero them out so
-            // ∂W_used/∂η on the floored branch is exactly zero.
-            c_out[i] = 0.0;
-            d_out[i] = 0.0;
-            floored_count += 1;
         }
     }
-    eprintln!("[FLOOR-DBG] n={} floored={}", n, floored_count);
     (w_out, c_out, d_out)
 }
 
@@ -8040,6 +8046,17 @@ fn eta_for_observed_hessian_jet(inverse_link: &InverseLink, eta: f64) -> f64 {
         | InverseLink::BetaLogistic(_)
         | InverseLink::Mixture(_) => eta.clamp(-20.0, 20.0),
     }
+}
+
+/// Returns true at rows where PIRLS clamped η (so the observed-info weights
+/// were computed at the clamped value, making `∂W/∂η` zero w.r.t. the
+/// **unclamped** η).  Outer REML/LAML derivative formulas must mask `c_obs`
+/// and `d_obs` to zero on these rows or the analytic ∂H/∂ψ disagrees with
+/// the H whose log-det we differentiate.
+#[inline]
+pub fn eta_clamp_active(inverse_link: &InverseLink, eta: f64) -> bool {
+    let clamped = eta_for_observed_hessian_jet(inverse_link, eta);
+    clamped != eta
 }
 
 #[inline]
