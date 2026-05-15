@@ -285,21 +285,33 @@ jobs:
 
   release:
     name: Upload to PyPI
-    # Only publish on tag pushes; main-branch runs are cache-warming only.
-    # When the on-demand `linux_only=true` input is set on a workflow_dispatch
-    # against a tag ref, the macOS and Windows jobs are skipped — we still
-    # publish what built (Linux + musllinux + sdist) so the fast release
-    # path produces an installable PyPI version. Tolerate `skipped` on the
-    # two omitted jobs but require `success` on everything that did run.
-    # Publish when EITHER a tag push (`refs/tags/v*`) OR a `workflow_dispatch`
-    # fires. We've burned multiple debug cycles on `github.ref` vs
-    # `github.ref_name` semantics for workflow_dispatch: both interpretations
-    # silently evaluated false even when the dispatch was against a tag,
-    # leaving Upload to PyPI as `skipped` and PyPI permanently stuck at the
-    # last successful tag-push (0.1.43 / gam 0.3.23 in production). Trusting
-    # `github.event_name == 'workflow_dispatch'` is the only condition that
-    # works reliably for both transports — main-branch pushes still don't
-    # publish because they're `push` events that don't satisfy the tag prefix.
+    # Publish on:
+    #   * tag push (`refs/tags/v*`) — historical release path
+    #   * `workflow_dispatch` — on-demand republish
+    #   * push to `main` — every merged commit attempts a publish
+    #
+    # Why publish on every main push: main-branch runs already build the
+    # full wheel matrix (cache-warming was the original justification),
+    # so the marginal cost of also uploading is the ~1 min Upload step.
+    # `twine upload --skip-existing` makes this safe: if pyproject.toml's
+    # version is unchanged from what's on PyPI, twine no-ops silently;
+    # if the bump commit landed (the common case for "I want this fix
+    # released"), the upload publishes without anyone needing to dispatch
+    # the workflow manually.
+    #
+    # Failure mode this fixes: previously, after a `Bump versions` commit
+    # to main, the push-triggered run would build all wheels successfully
+    # but the Upload step was gated off — leaving gamfit stuck at the last
+    # tag-pushed / dispatched version on PyPI even though main carried a
+    # newer release. Required a manual `gh workflow run "Publish to PyPI"`
+    # after each bump. With push-to-main in the gate, the bump itself is
+    # the trigger.
+    #
+    # Tolerate `skipped` on macos / windows so the `linux_only=true`
+    # workflow_dispatch fast-release path still publishes Linux wheels.
+    # Tag pushes (the legacy release path) ignore that input and always
+    # run the full matrix.
+    #
     # `always()` is REQUIRED. By default, when ANY `needs:` job is `skipped`
     # (which is what happens for macos / windows under `linux_only=true`),
     # GitHub Actions auto-skips the dependent job BEFORE evaluating the
@@ -312,7 +324,9 @@ jobs:
     # at 0.1.43 on PyPI through v0.3.24..v0.3.34.
     if: |
       always() &&
-      (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') &&
+      (startsWith(github.ref, 'refs/tags/v') ||
+       github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'push' && github.ref == 'refs/heads/main')) &&
       needs.linux.result == 'success' &&
       needs.musllinux.result == 'success' &&
       needs.sdist.result == 'success' &&
