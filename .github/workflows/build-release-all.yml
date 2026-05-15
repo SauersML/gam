@@ -91,6 +91,17 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+          # Keep rustup/cargo shims owned by the toolchain setup step. Caching
+          # ~/.cargo/bin can restore macOS runner rustup-init stubs over them,
+          # which breaks `cargo +nightly`.
+          cache-bin: false
+
+      - name: Verify Rust toolchain
+        shell: bash
+        run: |
+          rustup --version
+          rustc +nightly --version
+          cargo +nightly --version
 
       - name: Remove local cargo config
         # Prevent .cargo/config.toml's target-cpu=native from interfering with release builds
