@@ -7911,8 +7911,60 @@ impl VarianceJet {
     }
 }
 
-const OBSERVED_HESSIAN_WEIGHT_FLOOR_FRAC: f64 = 1e-6;
-const OBSERVED_HESSIAN_WEIGHT_ABS_FLOOR: f64 = 1e-12;
+pub const OBSERVED_HESSIAN_WEIGHT_FLOOR_FRAC: f64 = 1e-6;
+pub const OBSERVED_HESSIAN_WEIGHT_ABS_FLOOR: f64 = 1e-12;
+
+/// Returns the per-row floor `max(fisher · 1e-6, 1e-12)` used by PIRLS to
+/// stabilize the observed-information Hessian H = X' W X + S. Saturated
+/// rows where W_obs ≤ floor were silently raised to `floor` when PIRLS
+/// built the inner Hessian; outer REML/LAML derivatives must use the
+/// **same** floored W to keep `H` and `dH/dψ` on one surface.
+#[inline]
+pub fn solver_hessian_weight_floor_for_outer(fisher_weight: f64) -> f64 {
+    (fisher_weight.max(0.0) * OBSERVED_HESSIAN_WEIGHT_FLOOR_FRAC)
+        .max(OBSERVED_HESSIAN_WEIGHT_ABS_FLOOR)
+}
+
+/// Build the (W, c, d) triple that matches PIRLS's stabilized H = X' W X + S.
+///
+/// PIRLS internally uses `W[i] = max(W_obs[i], floor(W_F[i]))` to keep H PD,
+/// but `pirls_result.finalweights` stores the **unfloored** observed weights.
+/// Reusing those directly in `∂H/∂ψ = X_τ' W X + … + X' diag(c · X_τ β̂) X`
+/// produces an operator that disagrees with `H` at every saturated row — a
+/// 5%-Frobenius bias that `tr(G_ε(H) · op)` amplifies by O(1/σ_min(H)),
+/// driving the analytic gradient off by orders of magnitude.
+///
+/// This helper returns the floored W, plus c and d masked to zero wherever
+/// the floor is active (so `∂W/∂η` is zero on the constant-floor branch).
+pub fn outer_hessian_curvature_arrays(
+    hessian_weights: &Array1<f64>,
+    fisher_weights: &Array1<f64>,
+    c_array: &Array1<f64>,
+    d_array: &Array1<f64>,
+) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
+    let n = hessian_weights.len();
+    let mut w_out = Array1::<f64>::zeros(n);
+    let mut c_out = Array1::<f64>::zeros(n);
+    let mut d_out = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let floor = solver_hessian_weight_floor_for_outer(fisher_weights[i]);
+        let w = hessian_weights[i];
+        if w.is_finite() && w > floor {
+            w_out[i] = w;
+            c_out[i] = c_array[i];
+            d_out[i] = d_array[i];
+        } else {
+            w_out[i] = floor;
+            // The floor itself is W_F · 1e-6 or 1e-12, both of which have
+            // negligible η-derivative compared to c_obs. Zero them out so
+            // ∂W_used/∂η on the floored branch is exactly zero.
+            c_out[i] = 0.0;
+            d_out[i] = 0.0;
+        }
+    }
+    (w_out, c_out, d_out)
+}
+
 
 #[inline]
 fn fixed_glm_dispersion(likelihood: GlmLikelihoodSpec) -> f64 {
