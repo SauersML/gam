@@ -2002,7 +2002,7 @@ impl<'a> RemlState<'a> {
                 None
             } else {
                 Some(directional_curvature_weights(
-                    &solve_c_outer,
+                    &pirls_result.solve_c_array,
                     w_diag.as_ref(),
                     &x_tau_beta_j,
                 ))
@@ -2170,16 +2170,9 @@ impl<'a> RemlState<'a> {
 
         let u = &pirls_result.solveweights
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
-        // Match PIRLS's stabilized H = X' W X + S where W = max(W_obs, floor).
-        let inverse_link = self.build_runtime_inverse_link();
-        let (w_diag, c_array, d_array) = crate::solver::pirls::outer_hessian_curvature_arrays(
-            &pirls_result.finalweights,
-            &pirls_result.solveweights,
-            &pirls_result.solve_c_array,
-            &pirls_result.solve_d_array,
-            &pirls_result.final_eta,
-            &inverse_link,
-        );
+        let w_diag = pirls_result.finalweights.clone();
+        let c_array = pirls_result.solve_c_array.clone();
+        let d_array = pirls_result.solve_d_array.clone();
         let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
 
         let s_tau_tau = std::sync::Arc::new(s_tau_tau);
@@ -2420,16 +2413,9 @@ impl<'a> RemlState<'a> {
         // Working residual u = w ⊙ (z − η̂).
         let u = &pirls_result.solveweights
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
-        // Match PIRLS's stabilized H = X' W X + S where W = max(W_obs, floor).
-        let inverse_link = self.build_runtime_inverse_link();
-        let (w_diag, c_array, d_array) = crate::solver::pirls::outer_hessian_curvature_arrays(
-            &pirls_result.finalweights,
-            &pirls_result.solveweights,
-            &pirls_result.solve_c_array,
-            &pirls_result.solve_d_array,
-            &pirls_result.final_eta,
-            &inverse_link,
-        );
+        let w_diag = pirls_result.finalweights.clone();
+        let c_array = pirls_result.solve_c_array.clone();
+        let d_array = pirls_result.solve_d_array.clone();
         let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
 
         // Capture into Arc for shared ownership in closures.

@@ -5132,19 +5132,7 @@ impl<'a> RemlState<'a> {
             if is_gaussian_identity {
                 Box::new(GaussianDerivatives)
             } else {
-                // Match PIRLS's stabilized H = X' W X + S where
-                // W = max(W_obs, floor(W_F)).  See `outer_hessian_curvature_arrays`.
                 let (c_array, d_array) = self.hessian_cd_arrays(pirls_result)?;
-                let inverse_link = self.build_runtime_inverse_link();
-                let (w_outer, c_outer, d_outer) =
-                    crate::solver::pirls::outer_hessian_curvature_arrays(
-                        &pirls_result.finalweights,
-                        &pirls_result.solveweights,
-                        &c_array,
-                        &d_array,
-                        &pirls_result.final_eta,
-                        &inverse_link,
-                    );
                 let x_transformed = if let Some(z) = free_basis_opt.as_ref() {
                     // Project the design: X_proj = X Z
                     let x_dense = pirls_result.x_transformed.to_dense();
@@ -5155,8 +5143,8 @@ impl<'a> RemlState<'a> {
                     pirls_result.x_transformed.clone()
                 };
                 let base = SinglePredictorGlmDerivatives {
-                    c_array: c_outer,
-                    d_array: Some(d_outer),
+                    c_array,
+                    d_array: Some(d_array),
                     hessian_weights: w_outer,
                     x_transformed,
                 };
