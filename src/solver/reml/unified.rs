@@ -3186,6 +3186,111 @@ impl HyperOperator for SparseDirectionalHyperOperator {
     }
 }
 
+#[cfg(test)]
+impl SparseDirectionalHyperOperator {
+    /// Per-term dense materialization for diagnostics. Each returned matrix
+    /// equals the contribution of a single term in the `mul_vec` expansion
+    ///
+    ///   B = X_τᵀ W X            (term1)
+    ///     + Xᵀ W X_τ            (term2)
+    ///     + S_τ                  (term3)
+    ///     + Xᵀ diag(c⊙X_τβ̂) X   (term4, non-Gaussian only)
+    ///     − (H_φ)_{τ}|_β        (firth_partial, when present)
+    pub fn term_breakdown_dense(&self) -> SparseDirectionalTermBreakdown {
+        let p = self.p;
+        let make = |selector: SparseDirectionalTermSelector| -> Array2<f64> {
+            let mut out = Array2::<f64>::zeros((p, p));
+            let mut basis = Array1::<f64>::zeros(p);
+            for j in 0..p {
+                basis[j] = 1.0;
+                let col = self.mul_vec_single_term(&basis, selector);
+                for i in 0..p {
+                    out[[i, j]] = col[i];
+                }
+                basis[j] = 0.0;
+            }
+            out
+        };
+
+        SparseDirectionalTermBreakdown {
+            term1: make(SparseDirectionalTermSelector::Term1XTauTWX),
+            term2: make(SparseDirectionalTermSelector::Term2XTWXTau),
+            term3: make(SparseDirectionalTermSelector::Term3STau),
+            term4: if self.c_x_tau_beta.is_some() {
+                Some(make(SparseDirectionalTermSelector::Term4Curvature))
+            } else {
+                None
+            },
+            firth_partial: if self.firth_hphi_tau_partial.is_some() {
+                Some(make(SparseDirectionalTermSelector::FirthPartial))
+            } else {
+                None
+            },
+        }
+    }
+
+    fn mul_vec_single_term(
+        &self,
+        v: &Array1<f64>,
+        selector: SparseDirectionalTermSelector,
+    ) -> Array1<f64> {
+        match selector {
+            SparseDirectionalTermSelector::Term1XTauTWX => {
+                let x_v = self.x_design.matrixvectormultiply(v);
+                let w_x_v = &*self.w_diag * &x_v;
+                self.x_tau
+                    .transpose_mul_original(&w_x_v)
+                    .expect("term1: x_tau transpose_mul shape mismatch")
+            }
+            SparseDirectionalTermSelector::Term2XTWXTau => {
+                let x_tau_v = self
+                    .x_tau
+                    .forward_mul_original(v)
+                    .expect("term2: x_tau forward_mul shape mismatch");
+                let w_x_tau_v = &*self.w_diag * &x_tau_v;
+                self.x_design.transpose_vector_multiply(&w_x_tau_v)
+            }
+            SparseDirectionalTermSelector::Term3STau => self.s_tau.dot(v),
+            SparseDirectionalTermSelector::Term4Curvature => {
+                if let Some(c_x_tau_beta) = self.c_x_tau_beta.as_ref() {
+                    let x_v = self.x_design.matrixvectormultiply(v);
+                    let weighted = c_x_tau_beta * &x_v;
+                    self.x_design.transpose_vector_multiply(&weighted)
+                } else {
+                    Array1::<f64>::zeros(self.p)
+                }
+            }
+            SparseDirectionalTermSelector::FirthPartial => {
+                if let Some(h) = self.firth_hphi_tau_partial.as_ref() {
+                    -&h.dot(v)
+                } else {
+                    Array1::<f64>::zeros(self.p)
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+enum SparseDirectionalTermSelector {
+    Term1XTauTWX,
+    Term2XTWXTau,
+    Term3STau,
+    Term4Curvature,
+    FirthPartial,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub struct SparseDirectionalTermBreakdown {
+    pub term1: Array2<f64>,
+    pub term2: Array2<f64>,
+    pub term3: Array2<f64>,
+    pub term4: Option<Array2<f64>>,
+    pub firth_partial: Option<Array2<f64>>,
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Data structures
 // ═══════════════════════════════════════════════════════════════════════════
