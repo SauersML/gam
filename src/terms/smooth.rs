@@ -17198,8 +17198,6 @@ mod tests {
         );
     }
 
-
-
     /// Architectural pin: for the iso-κ Duchon ψ-axis under BinomialProbit,
     /// the penalty-subspace projection (`solution.penalty_subspace_trace =
     /// Some(...)`) must be *active* AND must change the trace by an order of
@@ -17223,7 +17221,11 @@ mod tests {
             let t = i as f64 / (n as f64 - 1.0);
             data[[i, 0]] = t;
             let eta = 1.4 * (2.0 * std::f64::consts::PI * t).sin() + 0.5 * (t - 0.5);
-            y[i] = if eta + 0.7 * (3.7 * (i as f64) + 1.0).sin() > 0.0 { 1.0 } else { 0.0 };
+            y[i] = if eta + 0.7 * (3.7 * (i as f64) + 1.0).sin() > 0.0 {
+                1.0
+            } else {
+                0.0
+            };
         }
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
@@ -17249,17 +17251,27 @@ mod tests {
             }],
         };
         let fit_opts = FitOptions {
-            latent_cloglog: None, mixture_link: None, optimize_mixture: false,
-            sas_link: None, optimize_sas: false, compute_inference: false,
-            max_iter: 200, tol: 1e-12, nullspace_dims: vec![],
-            linear_constraints: None, firth_bias_reduction: false,
-            adaptive_regularization: None, penalty_shrinkage_floor: None,
-            rho_prior: Default::default(), kronecker_penalty_system: None,
+            latent_cloglog: None,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: false,
+            max_iter: 200,
+            tol: 1e-12,
+            nullspace_dims: vec![],
+            linear_constraints: None,
+            firth_bias_reduction: false,
+            adaptive_regularization: None,
+            penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
+            kronecker_penalty_system: None,
             kronecker_factored: None,
         };
         let design = build_term_collection_design(data.view(), &spec).expect("design");
         let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
-        let frozen_design = build_term_collection_design(data.view(), &frozen).expect("frozen design");
+        let frozen_design =
+            build_term_collection_design(data.view(), &frozen).expect("frozen design");
         let spatial_terms = spatial_length_scale_term_indices(&frozen);
         let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
         let rho_dim = frozen_design.penalties.len();
@@ -17268,32 +17280,57 @@ mod tests {
         let external_opts =
             external_opts_for_design(LikelihoodFamily::BinomialProbit, &frozen_design, &fit_opts);
         let mut cache = SingleBlockExactJointDesignCache::new(
-            data.view(), frozen.clone(), frozen_design.clone(),
-            spatial_terms.clone(), rho_dim, dims_per_term.clone(),
-        ).expect("cache");
+            data.view(),
+            frozen.clone(),
+            frozen_design.clone(),
+            spatial_terms.clone(),
+            rho_dim,
+            dims_per_term.clone(),
+        )
+        .expect("cache");
         let mut evaluator = crate::estimate::ExternalJointHyperEvaluator::new(
-            y.view(), weights.view(), &frozen_design.design, offset.view(),
-            &frozen_design.penalties, &external_opts, "penalty-subspace projection pin",
-        ).expect("evaluator");
+            y.view(),
+            weights.view(),
+            &frozen_design.design,
+            offset.view(),
+            &frozen_design.penalties,
+            &external_opts,
+            "penalty-subspace projection pin",
+        )
+        .expect("evaluator");
 
         let theta_dim = rho_dim + psi_dim;
         let theta_zero = Array1::<f64>::zeros(theta_dim);
 
         cache.ensure_theta(&theta_zero).expect("ensure_theta");
         let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
-            data.view(), cache.spec(), cache.design(), &cache.spatial_terms,
-        ).expect("hyper dirs build").expect("hyper dirs present");
+            data.view(),
+            cache.spec(),
+            cache.design(),
+            &cache.spatial_terms,
+        )
+        .expect("hyper dirs build")
+        .expect("hyper dirs present");
         let (cost_at_zero, grad_at_zero, _hess) = evaluate_joint_reml_outer_eval_at_theta(
-            &mut evaluator, cache.design(), &theta_zero, rho_dim, hyper_dirs, None,
+            &mut evaluator,
+            cache.design(),
+            &theta_zero,
+            rho_dim,
+            hyper_dirs,
+            None,
             crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
-        ).expect("analytic outer eval");
+        )
+        .expect("analytic outer eval");
         let stash = crate::solver::estimate::reml::unified::debug_stash::take_terms();
 
-        let unprojected_tr = stash.unprojected_tr
+        let unprojected_tr = stash
+            .unprojected_tr
             .expect("unprojected_tr must be captured by the EIG-DECOMP block at small p");
-        let production_tr = stash.production_tr
+        let production_tr = stash
+            .production_tr
             .expect("production_tr must be captured by the EIG-DECOMP block at small p");
-        let projection_active = stash.projection_active
+        let projection_active = stash
+            .projection_active
             .expect("projection_active must be captured");
 
         // INVARIANT 1: The projection must be active for the Duchon ψ axis
@@ -17308,20 +17345,36 @@ mod tests {
         // INVARIANT 2: Production trace agrees with FD ∂log|H|/∂ψ.
         let h = 1e-5_f64;
         let psi_idx = rho_dim;
-        let mut theta_p = theta_zero.clone(); theta_p[psi_idx] += h;
-        let mut theta_m = theta_zero.clone(); theta_m[psi_idx] -= h;
+        let mut theta_p = theta_zero.clone();
+        theta_p[psi_idx] += h;
+        let mut theta_m = theta_zero.clone();
+        theta_m[psi_idx] -= h;
         cache.ensure_theta(&theta_p).expect("ensure +h");
         let dp = cache.design().clone();
-        let h_plus = evaluator.debug_full_h(
-            &dp.design, &dp.penalties, &dp.nullspace_dims, dp.linear_constraints.clone(),
-            &theta_p, rho_dim, "subspace-pin +h",
-        ).expect("debug_full_h +h");
+        let h_plus = evaluator
+            .debug_full_h(
+                &dp.design,
+                &dp.penalties,
+                &dp.nullspace_dims,
+                dp.linear_constraints.clone(),
+                &theta_p,
+                rho_dim,
+                "subspace-pin +h",
+            )
+            .expect("debug_full_h +h");
         cache.ensure_theta(&theta_m).expect("ensure -h");
         let dm = cache.design().clone();
-        let h_minus = evaluator.debug_full_h(
-            &dm.design, &dm.penalties, &dm.nullspace_dims, dm.linear_constraints.clone(),
-            &theta_m, rho_dim, "subspace-pin -h",
-        ).expect("debug_full_h -h");
+        let h_minus = evaluator
+            .debug_full_h(
+                &dm.design,
+                &dm.penalties,
+                &dm.nullspace_dims,
+                dm.linear_constraints.clone(),
+                &theta_m,
+                rho_dim,
+                "subspace-pin -h",
+            )
+            .expect("debug_full_h -h");
         use crate::faer_ndarray::FaerEigh;
         let (eig_p, _) = h_plus.eigh(faer::Side::Lower).expect("eigh +h");
         let (eig_m, _) = h_minus.eigh(faer::Side::Lower).expect("eigh -h");
@@ -17333,7 +17386,9 @@ mod tests {
             rel_to_fd < 1e-2,
             "production trace must match FD ∂log|H|/∂ψ: production_tr={:+.4e} \
              fd_d_logdet_h={:+.4e} rel={:+.3e}",
-            production_tr, fd_d_logdet_h, rel_to_fd
+            production_tr,
+            fd_d_logdet_h,
+            rel_to_fd
         );
 
         // INVARIANT 3: The penalty-subspace projection must change the trace
@@ -17346,7 +17401,9 @@ mod tests {
             "penalty-subspace projection should eliminate a substantial \
              null-space contribution (unprojected={:+.4e}, production={:+.4e}, \
              gap={:+.4e})",
-            unprojected_tr, production_tr, gap
+            unprojected_tr,
+            production_tr,
+            gap
         );
 
         // Sanity: cost & gradient finite at θ=0.
@@ -17369,7 +17426,11 @@ mod tests {
             let t = i as f64 / (n as f64 - 1.0);
             data[[i, 0]] = t;
             let eta = 1.4 * (2.0 * std::f64::consts::PI * t).sin() + 0.5 * (t - 0.5);
-            y[i] = if eta + 0.7 * (3.7 * (i as f64) + 1.0).sin() > 0.0 { 1.0 } else { 0.0 };
+            y[i] = if eta + 0.7 * (3.7 * (i as f64) + 1.0).sin() > 0.0 {
+                1.0
+            } else {
+                0.0
+            };
         }
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
@@ -17395,17 +17456,27 @@ mod tests {
             }],
         };
         let fit_opts = FitOptions {
-            latent_cloglog: None, mixture_link: None, optimize_mixture: false,
-            sas_link: None, optimize_sas: false, compute_inference: false,
-            max_iter: 200, tol: 1e-12, nullspace_dims: vec![],
-            linear_constraints: None, firth_bias_reduction: false,
-            adaptive_regularization: None, penalty_shrinkage_floor: None,
-            rho_prior: Default::default(), kronecker_penalty_system: None,
+            latent_cloglog: None,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: false,
+            max_iter: 200,
+            tol: 1e-12,
+            nullspace_dims: vec![],
+            linear_constraints: None,
+            firth_bias_reduction: false,
+            adaptive_regularization: None,
+            penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
+            kronecker_penalty_system: None,
             kronecker_factored: None,
         };
         let design = build_term_collection_design(data.view(), &spec).expect("design");
         let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
-        let frozen_design = build_term_collection_design(data.view(), &frozen).expect("frozen design");
+        let frozen_design =
+            build_term_collection_design(data.view(), &frozen).expect("frozen design");
         let spatial_terms = spatial_length_scale_term_indices(&frozen);
         let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
         let rho_dim = frozen_design.penalties.len();
@@ -17414,13 +17485,24 @@ mod tests {
         let external_opts =
             external_opts_for_design(LikelihoodFamily::BinomialProbit, &frozen_design, &fit_opts);
         let mut cache = SingleBlockExactJointDesignCache::new(
-            data.view(), frozen.clone(), frozen_design.clone(),
-            spatial_terms.clone(), rho_dim, dims_per_term.clone(),
-        ).expect("cache");
+            data.view(),
+            frozen.clone(),
+            frozen_design.clone(),
+            spatial_terms.clone(),
+            rho_dim,
+            dims_per_term.clone(),
+        )
+        .expect("cache");
         let mut evaluator = crate::estimate::ExternalJointHyperEvaluator::new(
-            y.view(), weights.view(), &frozen_design.design, offset.view(),
-            &frozen_design.penalties, &external_opts, "per-row dη/dψ FD vs analytic",
-        ).expect("evaluator");
+            y.view(),
+            weights.view(),
+            &frozen_design.design,
+            offset.view(),
+            &frozen_design.penalties,
+            &external_opts,
+            "per-row dη/dψ FD vs analytic",
+        )
+        .expect("evaluator");
 
         let theta_dim = rho_dim + psi_dim;
         let theta_zero = Array1::<f64>::zeros(theta_dim);
@@ -17430,50 +17512,92 @@ mod tests {
         // ── η, W, c at ψ=0
         cache.ensure_theta(&theta_zero).expect("ensure zero");
         let dz = cache.design().clone();
-        let (eta_0, w_0, c_0) = evaluator.debug_full_eta_w_c(
-            &dz.design, &dz.penalties, &dz.nullspace_dims, dz.linear_constraints.clone(),
-            &theta_zero, rho_dim, "ψ=0",
-        ).expect("debug at 0");
+        let (eta_0, w_0, c_0) = evaluator
+            .debug_full_eta_w_c(
+                &dz.design,
+                &dz.penalties,
+                &dz.nullspace_dims,
+                dz.linear_constraints.clone(),
+                &theta_zero,
+                rho_dim,
+                "ψ=0",
+            )
+            .expect("debug at 0");
 
         // η at ψ=±h
-        let mut theta_p = theta_zero.clone(); theta_p[psi_idx] += h;
+        let mut theta_p = theta_zero.clone();
+        theta_p[psi_idx] += h;
         cache.ensure_theta(&theta_p).expect("ensure +h");
         let dp = cache.design().clone();
-        let (eta_p, w_p, c_p) = evaluator.debug_full_eta_w_c(
-            &dp.design, &dp.penalties, &dp.nullspace_dims, dp.linear_constraints.clone(),
-            &theta_p, rho_dim, "ψ=+h",
-        ).expect("debug at +h");
+        let (eta_p, w_p, c_p) = evaluator
+            .debug_full_eta_w_c(
+                &dp.design,
+                &dp.penalties,
+                &dp.nullspace_dims,
+                dp.linear_constraints.clone(),
+                &theta_p,
+                rho_dim,
+                "ψ=+h",
+            )
+            .expect("debug at +h");
 
-        let mut theta_m = theta_zero.clone(); theta_m[psi_idx] -= h;
+        let mut theta_m = theta_zero.clone();
+        theta_m[psi_idx] -= h;
         cache.ensure_theta(&theta_m).expect("ensure -h");
         let dm = cache.design().clone();
-        let (eta_m, _w_m, _c_m) = evaluator.debug_full_eta_w_c(
-            &dm.design, &dm.penalties, &dm.nullspace_dims, dm.linear_constraints.clone(),
-            &theta_m, rho_dim, "ψ=-h",
-        ).expect("debug at -h");
+        let (eta_m, _w_m, _c_m) = evaluator
+            .debug_full_eta_w_c(
+                &dm.design,
+                &dm.penalties,
+                &dm.nullspace_dims,
+                dm.linear_constraints.clone(),
+                &theta_m,
+                rho_dim,
+                "ψ=-h",
+            )
+            .expect("debug at -h");
 
         // dη/dψ_FD per row
         let mut dnu_dpsi_fd = Array1::<f64>::zeros(n);
-        for i in 0..n { dnu_dpsi_fd[i] = (eta_p[i] - eta_m[i]) / (2.0 * h); }
-        let l2_dnu = (dnu_dpsi_fd.iter().map(|v| v*v).sum::<f64>()).sqrt();
-        eprintln!("[ROW] ||dη/dψ_FD||_L2 = {:+.6e}  per-row max|·| = {:+.4e}",
-            l2_dnu, dnu_dpsi_fd.iter().map(|v| v.abs()).fold(0.0_f64, f64::max));
+        for i in 0..n {
+            dnu_dpsi_fd[i] = (eta_p[i] - eta_m[i]) / (2.0 * h);
+        }
+        let l2_dnu = (dnu_dpsi_fd.iter().map(|v| v * v).sum::<f64>()).sqrt();
+        eprintln!(
+            "[ROW] ||dη/dψ_FD||_L2 = {:+.6e}  per-row max|·| = {:+.4e}",
+            l2_dnu,
+            dnu_dpsi_fd.iter().map(|v| v.abs()).fold(0.0_f64, f64::max)
+        );
 
         // c · dη/dψ_FD per row
         let c_dnu_fd: Array1<f64> = &c_0 * &dnu_dpsi_fd;
-        let l2_c_dnu = (c_dnu_fd.iter().map(|v| v*v).sum::<f64>()).sqrt();
-        eprintln!("[ROW] ||c·dη/dψ_FD||_L2 = {:+.6e}  per-row max|·| = {:+.4e}",
-            l2_c_dnu, c_dnu_fd.iter().map(|v| v.abs()).fold(0.0_f64, f64::max));
+        let l2_c_dnu = (c_dnu_fd.iter().map(|v| v * v).sum::<f64>()).sqrt();
+        eprintln!(
+            "[ROW] ||c·dη/dψ_FD||_L2 = {:+.6e}  per-row max|·| = {:+.4e}",
+            l2_c_dnu,
+            c_dnu_fd.iter().map(|v| v.abs()).fold(0.0_f64, f64::max)
+        );
 
         // ── Get ANALYTIC per-row diagonals via debug_stash.
         cache.ensure_theta(&theta_zero).expect("ensure_theta zero");
         let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
-            data.view(), cache.spec(), cache.design(), &cache.spatial_terms,
-        ).expect("hyper dirs build").expect("hyper dirs present");
+            data.view(),
+            cache.spec(),
+            cache.design(),
+            &cache.spatial_terms,
+        )
+        .expect("hyper dirs build")
+        .expect("hyper dirs present");
         let _ = evaluate_joint_reml_outer_eval_at_theta(
-            &mut evaluator, cache.design(), &theta_zero, rho_dim, hyper_dirs, None,
+            &mut evaluator,
+            cache.design(),
+            &theta_zero,
+            rho_dim,
+            hyper_dirs,
+            None,
             crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
-        ).expect("analytic outer eval");
+        )
+        .expect("analytic outer eval");
         let stash = crate::solver::estimate::reml::unified::debug_stash::take_terms();
         let c_x_tau_beta = stash.c_x_tau_beta_diag.clone().expect("term4 diag stashed");
         let x_v_psi = stash.c_x_v_psi_diag.clone().expect("X·v_ψ stashed");
@@ -17498,7 +17622,8 @@ mod tests {
             "expected both IFT halves to be large in isolation (only their \
              row-wise sum should be small), got ||c·X_τβ̂||_L2={:+.3e}, \
              ||c·X·v_ψ||_L2={:+.3e}",
-            l2_term4_only, l2_corr_only
+            l2_term4_only,
+            l2_corr_only
         );
 
         let diff: Array1<f64> = &analytic_diag - &c_dnu_fd;
@@ -17509,7 +17634,9 @@ mod tests {
             "analytic IFT row-diagonal must match FD to 1e-3 relative \
              (got rel={:+.4e}, ||Δ||_L2={:+.4e}, ||FD||_L2={:+.4e}). \
              Regression in IFT chain rule (v_ψ formula or W-surface mix).",
-            rel, l2_diff, l2_c_dnu
+            rel,
+            l2_diff,
+            l2_c_dnu
         );
 
         let _ = c_p;
@@ -17532,7 +17659,11 @@ mod tests {
             let t = i as f64 / (n as f64 - 1.0);
             data[[i, 0]] = t;
             let eta = 1.4 * (2.0 * std::f64::consts::PI * t).sin() + 0.5 * (t - 0.5);
-            y[i] = if eta + 0.7 * (3.7 * (i as f64) + 1.0).sin() > 0.0 { 1.0 } else { 0.0 };
+            y[i] = if eta + 0.7 * (3.7 * (i as f64) + 1.0).sin() > 0.0 {
+                1.0
+            } else {
+                0.0
+            };
         }
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
@@ -17558,17 +17689,27 @@ mod tests {
             }],
         };
         let fit_opts = FitOptions {
-            latent_cloglog: None, mixture_link: None, optimize_mixture: false,
-            sas_link: None, optimize_sas: false, compute_inference: false,
-            max_iter: 200, tol: 1e-12, nullspace_dims: vec![],
-            linear_constraints: None, firth_bias_reduction: false,
-            adaptive_regularization: None, penalty_shrinkage_floor: None,
-            rho_prior: Default::default(), kronecker_penalty_system: None,
+            latent_cloglog: None,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: false,
+            max_iter: 200,
+            tol: 1e-12,
+            nullspace_dims: vec![],
+            linear_constraints: None,
+            firth_bias_reduction: false,
+            adaptive_regularization: None,
+            penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
+            kronecker_penalty_system: None,
             kronecker_factored: None,
         };
         let design = build_term_collection_design(data.view(), &spec).expect("design");
         let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
-        let frozen_design = build_term_collection_design(data.view(), &frozen).expect("frozen design");
+        let frozen_design =
+            build_term_collection_design(data.view(), &frozen).expect("frozen design");
         let spatial_terms = spatial_length_scale_term_indices(&frozen);
         let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
         let rho_dim = frozen_design.penalties.len();
@@ -17577,13 +17718,24 @@ mod tests {
         let external_opts =
             external_opts_for_design(LikelihoodFamily::BinomialProbit, &frozen_design, &fit_opts);
         let mut cache = SingleBlockExactJointDesignCache::new(
-            data.view(), frozen.clone(), frozen_design.clone(),
-            spatial_terms.clone(), rho_dim, dims_per_term.clone(),
-        ).expect("cache");
+            data.view(),
+            frozen.clone(),
+            frozen_design.clone(),
+            spatial_terms.clone(),
+            rho_dim,
+            dims_per_term.clone(),
+        )
+        .expect("cache");
         let mut evaluator = crate::estimate::ExternalJointHyperEvaluator::new(
-            y.view(), weights.view(), &frozen_design.design, offset.view(),
-            &frozen_design.penalties, &external_opts, "PIRLS-determinism",
-        ).expect("evaluator");
+            y.view(),
+            weights.view(),
+            &frozen_design.design,
+            offset.view(),
+            &frozen_design.penalties,
+            &external_opts,
+            "PIRLS-determinism",
+        )
+        .expect("evaluator");
 
         let theta_dim = rho_dim + psi_dim;
         let theta_zero = Array1::<f64>::zeros(theta_dim);
@@ -17592,11 +17744,17 @@ mod tests {
         for trial in 0..3 {
             cache.ensure_theta(&theta_zero).expect("ensure_theta");
             let d = cache.design().clone();
-            let h_i = evaluator.debug_full_h(
-                &d.design, &d.penalties, &d.nullspace_dims,
-                d.linear_constraints.clone(), &theta_zero, rho_dim,
-                &format!("determinism trial {}", trial),
-            ).expect("debug_full_h");
+            let h_i = evaluator
+                .debug_full_h(
+                    &d.design,
+                    &d.penalties,
+                    &d.nullspace_dims,
+                    d.linear_constraints.clone(),
+                    &theta_zero,
+                    rho_dim,
+                    &format!("determinism trial {}", trial),
+                )
+                .expect("debug_full_h");
             h_calls.push(h_i);
         }
 
@@ -17616,7 +17774,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn spatial_aniso_joint_large_psi_dim_keeps_second_order_route() {
