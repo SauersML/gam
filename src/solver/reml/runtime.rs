@@ -1668,7 +1668,6 @@ impl<'a> RemlState<'a> {
         ))
     }
 
-
     /// Returns the (c, d, e) per-row mode-curvature carriers required for
     /// the analytic Tierney–Kadane c/d derivative propagation.
     ///
