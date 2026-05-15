@@ -1668,6 +1668,23 @@ impl<'a> RemlState<'a> {
         ))
     }
 
+    /// Build the runtime `InverseLink` used by PIRLS so outer derivatives can
+    /// check `eta_clamp_active` row-by-row.
+    pub(crate) fn build_runtime_inverse_link(&self) -> InverseLink {
+        let link_function = self.config.link_function();
+        if let Some(state) = self.runtime_mixture_link_state.clone() {
+            InverseLink::Mixture(state)
+        } else if let Some(state) = self.runtime_sas_link_state {
+            if matches!(link_function, LinkFunction::BetaLogistic) {
+                InverseLink::BetaLogistic(state)
+            } else {
+                InverseLink::Sas(state)
+            }
+        } else {
+            InverseLink::Standard(link_function)
+        }
+    }
+
     /// Returns the (c, d, e) per-row mode-curvature carriers required for
     /// the analytic Tierney–Kadane c/d derivative propagation.
     ///
@@ -5118,12 +5135,15 @@ impl<'a> RemlState<'a> {
                 // Match PIRLS's stabilized H = X' W X + S where
                 // W = max(W_obs, floor(W_F)).  See `outer_hessian_curvature_arrays`.
                 let (c_array, d_array) = self.hessian_cd_arrays(pirls_result)?;
+                let inverse_link = self.build_runtime_inverse_link();
                 let (w_outer, c_outer, d_outer) =
                     crate::solver::pirls::outer_hessian_curvature_arrays(
                         &pirls_result.finalweights,
                         &pirls_result.solveweights,
                         &c_array,
                         &d_array,
+                        &pirls_result.final_eta,
+                        &inverse_link,
                     );
                 let x_transformed = if let Some(z) = free_basis_opt.as_ref() {
                     // Project the design: X_proj = X Z
@@ -5244,12 +5264,15 @@ impl<'a> RemlState<'a> {
                 // Match PIRLS's stabilized H = X' W X + S where
                 // W = max(W_obs, floor(W_F)).
                 let (c_array, d_array) = self.hessian_cd_arrays(pirls_result)?;
+                let inverse_link = self.build_runtime_inverse_link();
                 let (w_outer, c_outer, d_outer) =
                     crate::solver::pirls::outer_hessian_curvature_arrays(
                         &pirls_result.finalweights,
                         &pirls_result.solveweights,
                         &c_array,
                         &d_array,
+                        &pirls_result.final_eta,
+                        &inverse_link,
                     );
                 (
                     DispersionHandling::Fixed {
