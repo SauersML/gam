@@ -7948,29 +7948,32 @@ pub fn outer_hessian_curvature_arrays(
     let mut w_out = Array1::<f64>::zeros(n);
     let mut c_out = Array1::<f64>::zeros(n);
     let mut d_out = Array1::<f64>::zeros(n);
+    let mut clamp_count = 0usize;
+    let mut floor_count = 0usize;
+    let mut max_eta = 0.0_f64;
     for i in 0..n {
+        if eta[i].abs() > max_eta { max_eta = eta[i].abs(); }
         let floor = solver_hessian_weight_floor_for_outer(fisher_weights[i]);
         let w = hessian_weights[i];
         let clamp_active = eta_clamp_active(inverse_link, eta[i]);
         let w_below_floor = !(w.is_finite() && w > floor);
         if w_below_floor {
-            // PIRLS replaced this row's curvature with the constant floor to
-            // keep H PD; the η-derivative of a constant is zero.
             w_out[i] = floor;
             c_out[i] = 0.0;
             d_out[i] = 0.0;
+            floor_count += 1;
         } else if clamp_active {
-            // PIRLS evaluated W_obs at clamp(η), so ∂W_obs/∂η_unclamped
-            // is zero across the saturated tail. Operator must agree.
             w_out[i] = w;
             c_out[i] = 0.0;
             d_out[i] = 0.0;
+            clamp_count += 1;
         } else {
             w_out[i] = w;
             c_out[i] = c_array[i];
             d_out[i] = d_array[i];
         }
     }
+    eprintln!("[MASK-DBG] n={} clamp={} floor={} max|eta|={:.3}", n, clamp_count, floor_count, max_eta);
     (w_out, c_out, d_out)
 }
 
