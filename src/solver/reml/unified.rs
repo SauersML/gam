@@ -136,6 +136,20 @@ pub mod debug_stash {
         /// matrix is `−X' diag(c · X · v_ψ) X`, so multiplying this by c
         /// (from PIRLS) gives the diagonal entering the correction sandwich.
         pub c_x_v_psi_diag: Option<ndarray::Array1<f64>>,
+        /// Unprojected eigenmode trace Σ φ'(σ_j)·(Uᵀ op U)_jj — i.e. the value
+        /// of tr(K · op_total) using the full-space `G_ε(H)` kernel without
+        /// the penalty-subspace projection. Recorded for tests that need to
+        /// pin the projection-vs-unprojected gap.
+        pub unprojected_tr: Option<f64>,
+        /// The production `trace_logdet_i` value that actually enters the
+        /// outer gradient. Routes through `kernel.trace_projected_logdet`
+        /// when `penalty_subspace_trace` is Some, otherwise through the
+        /// full-space kernel. Recorded so tests can pin
+        /// `unprojected_tr ≠ production_tr` when projection is active.
+        pub production_tr: Option<f64>,
+        /// Whether `penalty_subspace_trace` was Some for this coordinate
+        /// (i.e. the production trace ran through the projected kernel).
+        pub projection_active: Option<bool>,
     }
 
     thread_local! {
@@ -5655,21 +5669,29 @@ pub fn reml_laml_evaluate(
             } else {
                 let correction = ext_corrections[ext_idx].as_ref();
                 let drift = hyper_coord_total_drift_result(&coord.drift, correction, hop.dim());
+                // Compute the production trace value first so any diagnostic
+                // logging can quote it alongside the unprojected variant.
+                let production_trace = match (&solution.penalty_subspace_trace, &drift) {
+                    (Some(kernel), DriftDerivResult::Dense(matrix)) => {
+                        kernel.trace_projected_logdet(matrix)
+                    }
+                    (Some(kernel), DriftDerivResult::Operator(op)) => {
+                        kernel.trace_operator(op.as_ref())
+                    }
+                    (None, DriftDerivResult::Dense(matrix)) => hop.trace_logdet_h_k(matrix, None),
+                    (None, DriftDerivResult::Operator(op)) => {
+                        hop.trace_logdet_operator(op.as_ref())
+                    }
+                };
                 // Test-only eigenmode diagnostic of the trace_logdet path.
                 //
                 // Production builds compile this block out entirely.  In test
-                // runs we log the trace under both kernels side-by-side so the
-                // reader can never mistake the unprojected debug number for
-                // the production value: the `unprojected_tr` field is
-                // `Σ φ'(σ_j)·(Uᵀ op_total U)_jj` (full-space G_ε(H)), and the
-                // `projected_tr` field is what `trace_logdet_i` returns at
-                // line ~+12 below (`kernel.trace_projected_logdet` when
-                // `penalty_subspace_trace` is `Some`, else the unprojected
-                // path through `hop.trace_logdet_h_k`).  For Duchon ψ axes
-                // the two values can disagree by orders of magnitude because
-                // the penalty-subspace projection eliminates a spurious
-                // null-space contribution that has no place in the cost
-                // identity.
+                // runs we log the unprojected `Σ φ'(σ_j)·(Uᵀ op_total U)_jj`
+                // alongside the production trace returned above, so the reader
+                // can never mistake one for the other.  For Duchon ψ axes the
+                // two values can disagree by orders of magnitude because the
+                // penalty-subspace projection eliminates a spurious null-space
+                // contribution that has no place in the cost identity.
                 #[cfg(test)]
                 if let Some(ds) = hop.as_exact_dense_spectral()
                     && ds.dim() <= 12
@@ -5702,7 +5724,7 @@ pub fn reml_laml_evaluate(
                         4.0 * eps_f * eps_f
                     };
                     let mut per_mode = Vec::with_capacity(p);
-                    let mut total_tr = 0.0_f64;
+                    let mut unprojected_tr = 0.0_f64;
                     for j in 0..p {
                         // reg_eigenvalue = r_ε(σ) = ½(σ + √(σ²+4ε²)). Recover σ.
                         let r = ds.reg_eigenvalue(j);
@@ -5710,12 +5732,13 @@ pub fn reml_laml_evaluate(
                         let phi_prime = 1.0 / (sigma * sigma + eps_sq).sqrt();
                         let contrib = phi_prime * proj[[j, j]];
                         per_mode.push((sigma, proj[[j, j]], contrib));
-                        total_tr += contrib;
+                        unprojected_tr += contrib;
                     }
+                    let projection_active = solution.penalty_subspace_trace.is_some();
                     eprintln!(
-                        "[EIG-DECOMP-UNPROJECTED ext_idx={}] unprojected_tr={:+.4e} \
-                         per_mode={:?}  (see [EXT-GRAD] for production trace)",
-                        ext_idx, total_tr, per_mode
+                        "[EIG-DECOMP ext_idx={}] unprojected_tr={:+.4e} \
+                         production_tr={:+.4e} (projection_active={}) per_mode={:?}",
+                        ext_idx, unprojected_tr, production_trace, projection_active, per_mode
                     );
                     if ext_idx == 0 {
                         debug_stash::store(op_dense.clone(), u_mat.clone());
@@ -5728,6 +5751,9 @@ pub fn reml_laml_evaluate(
                         stash.reg_eigenvalues = (0..ds.dim())
                             .map(|j| ds.reg_eigenvalue(j))
                             .collect();
+                        stash.unprojected_tr = Some(unprojected_tr);
+                        stash.production_tr = Some(production_trace);
+                        stash.projection_active = Some(projection_active);
                         if let Some(op_arc) = coord.drift.operator.as_ref() {
                             if let Some(sd) = op_arc.as_sparse_directional() {
                                 let bd = sd.term_breakdown_dense();
@@ -5755,18 +5781,8 @@ pub fn reml_laml_evaluate(
                         debug_stash::store_terms(stash);
                     }
                 }
-                match (&solution.penalty_subspace_trace, drift) {
-                    (Some(kernel), DriftDerivResult::Dense(matrix)) => {
-                        kernel.trace_projected_logdet(&matrix)
-                    }
-                    (Some(kernel), DriftDerivResult::Operator(op)) => {
-                        kernel.trace_operator(op.as_ref())
-                    }
-                    (None, DriftDerivResult::Dense(matrix)) => hop.trace_logdet_h_k(&matrix, None),
-                    (None, DriftDerivResult::Operator(op)) => {
-                        hop.trace_logdet_operator(op.as_ref())
-                    }
-                }
+                let _ = drift;
+                production_trace
             };
 
             let value = outer_gradient_entry(
