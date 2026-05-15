@@ -8743,25 +8743,7 @@ fn update_joint_trust_region_radius(
     };
     let accepted = rho.is_finite() && rho > 0.0 && actual_reduction > 0.0;
     let mut radius = old_radius;
-    // Noise-floor protection (Conn-Gould-Toint §17.4): when the predicted
-    // reduction is at machine-precision scale, the rho ratio is dominated by
-    // FP error in the (actual − predicted) difference and must not drive
-    // radius updates. The unprotected path inflates the trust region via
-    // ρ ∈ (0.75, ∞) computed from e.g. actual=3.35e-9, predicted=2.73e-9
-    // (ρ=1.23), doubling the radius at every numerically-converged cycle —
-    // observed empirically on failing fuzz seed 1200983908 driving β_σ to
-    // magnitude 703 over a few cycles after the inner solve was already at
-    // its quadratic minimum. The 1e-8 absolute floor matches the existing
-    // FIXED_STABILIZATION_RIDGE = 1e-8 used elsewhere as the ambient
-    // numerical-precision scale for penalized objectives in this codebase.
-    let reduction_noise_floor = 1.0e-8_f64;
-    let at_noise_floor = predicted_reduction.abs() < reduction_noise_floor
-        && actual_reduction.abs() < reduction_noise_floor;
-    if at_noise_floor {
-        // Hold the radius. Do not shrink (we did not see a bad model fit) and
-        // do not grow (the rho signal is pure noise). The inner-loop exit
-        // criterion will fire on its own when reductions are below tol.
-    } else if !accepted || rho < 0.25 {
+    if !accepted || rho < 0.25 {
         radius *= 0.25;
         if !accepted && step_norm.is_finite() && step_norm > 0.0 {
             radius = radius.min(0.5 * step_norm);
@@ -8833,10 +8815,6 @@ fn stabilized_joint_solver_diagonal_ridge<F: CustomFamily + ?Sized>(
     add_joint_penalty_to_matrix(&mut lhs, ranges, s_lambdas, base_diagonal_ridge);
     let shift = exact_newton_stabilizing_shift(&lhs, ridge_floor).unwrap_or(0.0);
     if shift > 0.0 {
-        eprintln!(
-            "[SHIFT-PROBE] base={base_diagonal_ridge:.3e} shift={shift:.3e} total={:.3e}",
-            base_diagonal_ridge + shift
-        );
         log::debug!(
             "[PIRLS/joint-Newton] stabilized dense penalized Hessian with diagonal shift {:.3e}",
             shift
@@ -9932,7 +9910,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 }
                 let predicted_reduction =
                     joint_quadratic_predicted_reduction(&rhs, &hpen_delta, &trial_delta);
-                if !predicted_reduction.is_finite() || predicted_reduction <= 0.0 {
+                if !predicted_reduction.is_finite()
+                    || predicted_reduction <= 0.0
+                    || (predicted_reduction <= objective_tol
+                        && current_stationarity_residual > residual_tol
+                        && !tried_preconditioned_descent)
+                {
                     model_rejects += 1;
                     if !tried_preconditioned_descent {
                         match joint_preconditioned_descent_delta(
@@ -15204,23 +15187,6 @@ fn projected_stationarity_inf_norm(
             }
         }
         inf = inf.max(r.abs());
-    }
-    if inf > 100.0 {
-        let mut max_idx = 0usize;
-        let mut max_abs = 0.0_f64;
-        for j in 0..residual.len() {
-            let abs = residual[j].abs();
-            if abs > max_abs {
-                max_abs = abs;
-                max_idx = j;
-            }
-        }
-        eprintln!(
-            "[RESID-PROBE] inf={inf:.3e} idx={max_idx} residual={:+.3e} beta={:+.3e} constraints={}",
-            residual[max_idx],
-            beta[max_idx],
-            constraints.is_some()
-        );
     }
     inf
 }
