@@ -9940,6 +9940,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     ridge,
                     options.ridge_policy,
                     &block_constraints,
+                    Some(cached_active_sets.as_slice()),
                 )?;
             // KKT certificate: ‖∇L − Sβ‖_∞ ≤ residual_tol together with
             // ‖δ‖_∞ ≤ step_tol is sufficient first-order optimality of the
@@ -10430,6 +10431,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 ridge,
                 options.ridge_policy,
                 &block_constraints,
+                Some(cached_active_sets.as_slice()),
             )?;
 
             // Scale-aware tolerances. The objective check was already
@@ -11074,6 +11076,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 &s_lambdas,
                 ridge,
                 options.ridge_policy,
+                None,
             )?
             .map(|residual| residual <= residual_tol)
             .unwrap_or(true)
@@ -15735,6 +15738,7 @@ fn exact_newton_joint_stationarity_inf_norm_from_gradient(
     ridge: f64,
     ridge_policy: RidgePolicy,
     block_constraints: &[Option<LinearInequalityConstraints>],
+    block_active_sets: Option<&[Option<Vec<usize>>]>,
 ) -> Result<f64, String> {
     if states.len() != specs.len() || states.len() != s_lambdas.len() {
         return Err(
@@ -15746,6 +15750,15 @@ fn exact_newton_joint_stationarity_inf_norm_from_gradient(
         return Err(format!(
             "exact-newton joint stationarity check from gradient: constraint count mismatch, got {}, expected {}",
             block_constraints.len(),
+            states.len()
+        ));
+    }
+    if let Some(sets) = block_active_sets
+        && sets.len() != states.len()
+    {
+        return Err(format!(
+            "exact-newton joint stationarity check from gradient: active-set count mismatch, got {}, expected {}",
+            sets.len(),
             states.len()
         ));
     }
@@ -15763,6 +15776,15 @@ fn exact_newton_joint_stationarity_inf_norm_from_gradient(
     // measure only the free-set residual. See `projected_stationarity_inf_norm`
     // for the tolerance choice and its parallel with `projected_gradient_norm`
     // in `pirls.rs`.
+    //
+    // The optional `block_active_sets` arrives from the joint-Newton inner
+    // loop's `cached_active_sets` and carries the QP solver's authoritative
+    // active rows per block. Threading it through is what makes the
+    // stationarity test correctly fire at the constrained optimum: the
+    // post-update feasibility projections leave β with row slacks slightly
+    // above the slack tolerance even though the QP identified the rows as
+    // binding, and slack-based detection alone then misses the rows and
+    // leaves the Lagrange-multiplier mass in the residual.
     let mut inf_norm = 0.0_f64;
     let mut offset = 0usize;
     for b in 0..states.len() {
@@ -15772,10 +15794,14 @@ fn exact_newton_joint_stationarity_inf_norm_from_gradient(
         if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
             residual += &states[b].beta.mapv(|v| ridge * v);
         }
+        let block_active_hint = block_active_sets
+            .and_then(|sets| sets.get(b))
+            .and_then(|opt| opt.as_deref());
         let block_inf = projected_stationarity_inf_norm(
             &residual,
             &states[b].beta,
             block_constraints[b].as_ref(),
+            block_active_hint,
         );
         inf_norm = inf_norm.max(block_inf);
         offset += width;
@@ -20896,7 +20922,7 @@ mod tests {
         // Test (i): no constraints → plain inf-norm.
         let beta = array![1.0, 2.0, -0.5];
         let residual = array![0.3, -0.1, 0.2];
-        let inf_nocon = projected_stationarity_inf_norm(&residual, &beta, None);
+        let inf_nocon = projected_stationarity_inf_norm(&residual, &beta, None, None);
         assert_relative_eq!(inf_nocon, 0.3_f64, epsilon = 1e-12);
 
         // Test (ii): β_j at its lower bound with residual_j > 0 is a KKT
@@ -20918,7 +20944,7 @@ mod tests {
             b: array![0.0],
         };
         let inf_projected =
-            projected_stationarity_inf_norm(&residual_active, &beta_active, Some(&single));
+            projected_stationarity_inf_norm(&residual_active, &beta_active, Some(&single), None);
         assert_relative_eq!(inf_projected, 0.1_f64, epsilon = 1e-12);
 
         // Also verify the per-coord handling of an explicitly-unconstrained
@@ -20930,8 +20956,12 @@ mod tests {
         // the projection's per-coord `lb.is_finite()` gate is what makes the
         // unconstrained-coord case work — NOT rejection of the whole
         // constraint set by `extract_simple_lower_bounds`.
-        let inf_with_two_row =
-            projected_stationarity_inf_norm(&residual_active, &beta_active, Some(&constraints_lb0));
+        let inf_with_two_row = projected_stationarity_inf_norm(
+            &residual_active,
+            &beta_active,
+            Some(&constraints_lb0),
+            None,
+        );
         assert_relative_eq!(inf_with_two_row, 0.1_f64, epsilon = 1e-12);
 
         // Test (iii): β_j at its bound but residual points the WRONG way
@@ -20945,16 +20975,24 @@ mod tests {
             a: array![[1.0]],
             b: array![0.0],
         };
-        let inf_wrong_sign =
-            projected_stationarity_inf_norm(&residual_wrong_sign, &beta_wrong_sign, Some(&single1));
+        let inf_wrong_sign = projected_stationarity_inf_norm(
+            &residual_wrong_sign,
+            &beta_wrong_sign,
+            Some(&single1),
+            None,
+        );
         assert_relative_eq!(inf_wrong_sign, 0.2_f64, epsilon = 1e-12);
 
         // Test (iv): an interior coordinate with a valid lower bound keeps
         // contributing to the norm, whatever the residual sign.
         let beta_interior = array![1.5];
         let residual_interior = array![0.4];
-        let inf_interior =
-            projected_stationarity_inf_norm(&residual_interior, &beta_interior, Some(&single1));
+        let inf_interior = projected_stationarity_inf_norm(
+            &residual_interior,
+            &beta_interior,
+            Some(&single1),
+            None,
+        );
         assert_relative_eq!(inf_interior, 0.4_f64, epsilon = 1e-12);
     }
 
@@ -20971,12 +21009,17 @@ mod tests {
             &residual_valid_multiplier,
             &beta_active,
             Some(&constraints),
+            None,
         );
         assert_relative_eq!(inf_valid, 0.0_f64, epsilon = 1e-10);
 
         let residual_wrong_sign = array![-3.0, -3.0];
-        let inf_wrong =
-            projected_stationarity_inf_norm(&residual_wrong_sign, &beta_active, Some(&constraints));
+        let inf_wrong = projected_stationarity_inf_norm(
+            &residual_wrong_sign,
+            &beta_active,
+            Some(&constraints),
+            None,
+        );
         assert_relative_eq!(inf_wrong, 3.0_f64, epsilon = 1e-12);
 
         let beta_interior = array![0.75, 0.75];
@@ -20984,6 +21027,7 @@ mod tests {
             &residual_valid_multiplier,
             &beta_interior,
             Some(&constraints),
+            None,
         );
         assert_relative_eq!(inf_interior, 3.0_f64, epsilon = 1e-12);
     }
@@ -21025,6 +21069,7 @@ mod tests {
             0.0,
             RidgePolicy::explicit_stabilization_full(),
             &[Some(constraints.clone())],
+            None,
         )
         .expect("stationarity projection should succeed");
         assert_relative_eq!(projected, 0.0_f64, epsilon = 1e-10);
@@ -21040,6 +21085,7 @@ mod tests {
             0.0,
             RidgePolicy::explicit_stabilization_full(),
             &[Some(constraints)],
+            None,
         )
         .expect("stationarity projection should succeed");
         assert_relative_eq!(unprojected, 4.0_f64, epsilon = 1e-12);
