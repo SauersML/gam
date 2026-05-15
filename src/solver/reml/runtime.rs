@@ -95,6 +95,16 @@ struct DerivativeContext {
     barrier_config: Option<super::unified::BarrierConfig>,
 }
 
+#[cfg(test)]
+pub(crate) struct DebugOriginalTauSurface {
+    pub(crate) beta: Array1<f64>,
+    pub(crate) mode_responses: Vec<Array1<f64>>,
+    pub(crate) finalweights: Array1<f64>,
+    pub(crate) h_total_original: Array2<f64>,
+    pub(crate) fixed_drifts: Vec<Array2<f64>>,
+    pub(crate) total_drifts: Vec<Array2<f64>>,
+}
+
 impl<'a> RemlState<'a> {
     pub(crate) fn analytic_outer_hessian_enabled(&self) -> bool {
         // The Tierney-Kadane fallback gate is no longer needed: the analytic
@@ -2348,6 +2358,64 @@ impl<'a> RemlState<'a> {
         let coords = self.build_tau_hyper_coords_original_basis(rho, &bundle, hyper_dirs)?;
         let v = coords.iter().map(|coord| hop.solve(&coord.g)).collect();
         Ok((beta, v))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_original_tau_surface(
+        &self,
+        rho: &Array1<f64>,
+        hyper_dirs: &[crate::estimate::reml::DirectionalHyperParam],
+    ) -> Result<DebugOriginalTauSurface, EstimationError> {
+        use super::unified::{
+            DenseSpectralOperator, DriftDerivResult, HessianOperator, PseudoLogdetMode,
+        };
+
+        let bundle = self.obtain_eval_bundle(rho)?;
+        let pirls_result = bundle.pirls_result.as_ref();
+        let beta = self.sparse_exact_beta_original(pirls_result);
+        let h_total_original =
+            self.bundle_matrix_in_original_basis(pirls_result, bundle.h_total.as_ref());
+        let hop = DenseSpectralOperator::from_symmetric_with_mode(
+            &h_total_original,
+            PseudoLogdetMode::Smooth,
+        )
+        .map_err(EstimationError::InvalidInput)?;
+        let coords = self.build_tau_hyper_coords_original_basis(rho, &bundle, hyper_dirs)?;
+        let mode_responses: Vec<Array1<f64>> =
+            coords.iter().map(|coord| hop.solve(&coord.g)).collect();
+        let ctx = self.build_sparse_derivative_context(pirls_result, &bundle)?;
+
+        let mut fixed_drifts = Vec::with_capacity(coords.len());
+        let mut total_drifts = Vec::with_capacity(coords.len());
+        for (coord, v) in coords.iter().zip(mode_responses.iter()) {
+            let fixed = coord.drift.materialize();
+            let mut total = fixed.clone();
+            if let Some(correction) = ctx
+                .deriv_provider
+                .hessian_derivative_correction_result(v)
+                .map_err(EstimationError::InvalidInput)?
+            {
+                match correction {
+                    DriftDerivResult::Dense(matrix) => {
+                        total += &matrix;
+                    }
+                    DriftDerivResult::Operator(operator) => {
+                        total += &operator.to_dense();
+                    }
+                }
+            }
+            fixed_drifts.push(fixed);
+            total_drifts.push(total);
+        }
+
+        Ok(DebugOriginalTauSurface {
+            beta,
+            mode_responses,
+            finalweights: pirls_result.finalweights.clone(),
+            h_total_original,
+            fixed_drifts,
+            total_drifts,
+        })
     }
 
     pub(super) fn active_constraint_free_basis(&self, pr: &PirlsResult) -> Option<Array2<f64>> {

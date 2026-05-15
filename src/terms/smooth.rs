@@ -16656,6 +16656,7 @@ mod tests {
                 )
                 .expect("debug hyper dirs build")
                 .expect("debug hyper dirs present");
+                let hyper_dirs_for_surface = hyper_dirs.clone();
                 let (_beta0, v_debug) = evaluator
                     .debug_beta_and_tau_v(
                         &cache.design().design,
@@ -16713,6 +16714,70 @@ mod tests {
                     analytic_dbeta.iter().map(|v| v * v).sum::<f64>().sqrt(),
                     beta_den,
                     beta_num / beta_den
+                );
+                cache
+                    .ensure_theta(theta)
+                    .expect("restore theta for surface debug");
+                let surface0 = evaluator
+                    .debug_original_tau_surface(
+                        &cache.design().design,
+                        &cache.design().penalties,
+                        &cache.design().nullspace_dims,
+                        cache.design().linear_constraints.clone(),
+                        theta,
+                        rho_dim,
+                        hyper_dirs_for_surface,
+                        "iso-kappa Duchon Hessian-surface debug",
+                    )
+                    .expect("debug Hessian surface");
+                cache
+                    .ensure_theta(&plus)
+                    .expect("ensure theta+ for surface debug");
+                let surface_plus = evaluator
+                    .debug_original_surface_cost_only(
+                        &cache.design().design,
+                        &cache.design().penalties,
+                        &cache.design().nullspace_dims,
+                        cache.design().linear_constraints.clone(),
+                        &plus,
+                        rho_dim,
+                        "iso-kappa Duchon Hessian+ debug",
+                    )
+                    .expect("debug Hessian+");
+                cache
+                    .ensure_theta(&minus)
+                    .expect("ensure theta- for surface debug");
+                let surface_minus = evaluator
+                    .debug_original_surface_cost_only(
+                        &cache.design().design,
+                        &cache.design().penalties,
+                        &cache.design().nullspace_dims,
+                        cache.design().linear_constraints.clone(),
+                        &minus,
+                        rho_dim,
+                        "iso-kappa Duchon Hessian- debug",
+                    )
+                    .expect("debug Hessian-");
+                let fd_h =
+                    (&surface_plus.h_total_original - &surface_minus.h_total_original) / (2.0 * h);
+                let fd_w = (&surface_plus.finalweights - &surface_minus.finalweights) / (2.0 * h);
+                let mat_norm = |m: &Array2<f64>| m.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let vec_norm = |v: &Array1<f64>| v.iter().map(|x| x * x).sum::<f64>().sqrt();
+                let fixed_err =
+                    mat_norm(&(&surface0.fixed_drifts[0] - &fd_h)) / mat_norm(&fd_h).max(1e-12);
+                let total_err =
+                    mat_norm(&(&surface0.total_drifts[0] - &fd_h)) / mat_norm(&fd_h).max(1e-12);
+                eprintln!(
+                    "[H-SURF {label}] |fd_H|={:.6e} |fixed_Hdot|={:.6e} |total_Hdot|={:.6e} \
+                     fixed_rel={:.3e} total_rel={:.3e} |fd_w|={:.6e} |beta|={:.6e} |v|={:.6e}",
+                    mat_norm(&fd_h),
+                    mat_norm(&surface0.fixed_drifts[0]),
+                    mat_norm(&surface0.total_drifts[0]),
+                    fixed_err,
+                    total_err,
+                    vec_norm(&fd_w),
+                    vec_norm(&surface0.beta),
+                    vec_norm(&surface0.mode_responses[0]),
                 );
             }
             for j in 0..theta_dim {
