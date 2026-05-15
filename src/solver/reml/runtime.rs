@@ -2020,12 +2020,43 @@ impl<'a> RemlState<'a> {
     pub(super) fn effectivehessian(
         &self,
         pr: &PirlsResult,
+        rho: &Array1<f64>,
     ) -> Result<(Array2<f64>, RidgePassport), EstimationError> {
-        // Verify PD via SymmetricMatrix::factorize() (sparse-aware),
-        // then densify for the spectral evaluator which needs eigh().
-        let h = &pr.stabilizedhessian_transformed;
-        if h.factorize().is_ok() {
-            return Ok((h.to_dense(), pr.ridge_passport));
+        // Rebuild H from the FINAL observed-information curvature arrays so
+        // outer REML/LAML derivatives see the same surface the analytic
+        // operator differentiates.  PIRLS's `stabilizedhessian_transformed`
+        // was built with `solver_weights = max(W_obs, floor(W_F))` to keep
+        // the *inner* Newton system PD; using that here makes ∂H/∂ψ
+        // disagree with the H whose log|·| we differentiate at every row
+        // where the inner floor was active.  See `outer_hessian_curvature_arrays`
+        // for the corresponding operator-side reconstruction.
+        let mut h = pr
+            .x_transformed
+            .compute_xtwx(&pr.finalweights)
+            .map_err(|_| EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            })?;
+
+        let lambdas = rho.mapv(f64::exp);
+        for (k, cp) in pr.reparam_result.canonical_transformed.iter().enumerate() {
+            if k < lambdas.len() && lambdas[k] != 0.0 {
+                cp.accumulate_weighted(&mut h, lambdas[k]);
+            }
+        }
+
+        let ridge_delta = pr.ridge_passport.delta;
+        if ridge_delta != 0.0 {
+            for i in 0..h.nrows().min(h.ncols()) {
+                h[[i, i]] += ridge_delta;
+            }
+        }
+        enforce_symmetry(&mut h);
+
+        if crate::linalg::matrix::SymmetricMatrix::Dense(h.clone())
+            .factorize()
+            .is_ok()
+        {
+            return Ok((h, pr.ridge_passport));
         }
 
         Err(EstimationError::ModelIsIllConditioned {
@@ -3325,7 +3356,7 @@ impl<'a> RemlState<'a> {
         key: Option<Vec<u64>>,
     ) -> Result<EvalShared, EstimationError> {
         let pirls_result = self.execute_pirls_if_needed(rho)?;
-        let (mut h_total, ridge_passport) = self.effectivehessian(pirls_result.as_ref())?;
+        let (mut h_total, ridge_passport) = self.effectivehessian(pirls_result.as_ref(), rho)?;
         let mut firth_dense_operator: Option<Arc<FirthDenseOperator>> = None;
         if self.config.firth_bias_reduction
             && matches!(self.config.link_function(), LinkFunction::Logit)
@@ -5112,19 +5143,11 @@ impl<'a> RemlState<'a> {
             if is_gaussian_identity {
                 Box::new(GaussianDerivatives)
             } else {
-                // Match PIRLS's stabilized H = X' W X + S where
-                // W = max(W_obs, floor(W_F)). Using unfloored W_obs here
-                // makes ∂H/∂ψ disagree with the actual H at saturated rows
-                // (where the floor was active), so the outer trace
-                // tr(G_ε(H) · ∂H/∂ψ) blows up via G_ε's near-singular weight.
+                // Differentiate the same Hessian-side curvature arrays that the
+                // inner PIRLS solve accepted at the mode.  `effectivehessian`
+                // rebuilds H from these unfloored observed-information arrays
+                // so ∂H/∂ψ here matches the surface whose log|·| we differentiate.
                 let (c_array, d_array) = self.hessian_cd_arrays(pirls_result)?;
-                let (w_floored, c_masked, d_masked) =
-                    crate::solver::pirls::outer_hessian_curvature_arrays(
-                        &pirls_result.finalweights,
-                        &pirls_result.solveweights,
-                        &c_array,
-                        &d_array,
-                    );
                 let x_transformed = if let Some(z) = free_basis_opt.as_ref() {
                     // Project the design: X_proj = X Z
                     let x_dense = pirls_result.x_transformed.to_dense();
@@ -5135,9 +5158,9 @@ impl<'a> RemlState<'a> {
                     pirls_result.x_transformed.clone()
                 };
                 let base = SinglePredictorGlmDerivatives {
-                    c_array: c_masked,
-                    d_array: Some(d_masked),
-                    hessian_weights: w_floored,
+                    c_array,
+                    d_array: Some(d_array),
+                    hessian_weights: pirls_result.finalweights.clone(),
                     x_transformed,
                 };
                 if firth_active_for_derivs {
@@ -5241,17 +5264,9 @@ impl<'a> RemlState<'a> {
                     Box::new(GaussianDerivatives),
                 )
             } else {
-                // Match PIRLS's stabilized H = X' W X + S where
-                // W = max(W_obs, floor(W_F)). See the matching block in
-                // build_dense_derivative_context for the rationale.
+                // Differentiate the same Hessian-side curvature arrays that the
+                // inner PIRLS solve accepted at the mode.
                 let (c_array, d_array) = self.hessian_cd_arrays(pirls_result)?;
-                let (w_floored, c_masked, d_masked) =
-                    crate::solver::pirls::outer_hessian_curvature_arrays(
-                        &pirls_result.finalweights,
-                        &pirls_result.solveweights,
-                        &c_array,
-                        &d_array,
-                    );
                 (
                     DispersionHandling::Fixed {
                         phi: pirls_result.likelihood.fixed_phi().unwrap_or(1.0),
@@ -5260,9 +5275,9 @@ impl<'a> RemlState<'a> {
                     },
                     {
                         let base = SinglePredictorGlmDerivatives {
-                            c_array: c_masked,
-                            d_array: Some(d_masked),
-                            hessian_weights: w_floored,
+                            c_array,
+                            d_array: Some(d_array),
+                            hessian_weights: pirls_result.finalweights.clone(),
                             x_transformed: self.x().clone(),
                         };
                         // Match the dense exact path: when Firth-logit is
