@@ -16627,32 +16627,6 @@ mod tests {
         // Inner PIRLS is at tol=1e-12 and ridge jitter is rare on small
         // n=80 BinomialProbit fits, so this leaves a healthy margin.
         let rel_tol = 5e-3_f64;
-        // SCALING-PROBE: dump FD at multiple h values for the psi
-        // coordinate at theta=zero to distinguish FD truncation from a
-        // genuine analytic bug.
-        {
-            let theta = &theta_zero;
-            let (_c, grad_an_probe) = analytic_at(theta, &mut cache, &mut evaluator);
-            let j_psi = rho_dim;
-            for h_probe in [1e-3_f64, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8] {
-                let mut plus = theta.clone();
-                let mut minus = theta.clone();
-                plus[j_psi] += h_probe;
-                minus[j_psi] -= h_probe;
-                let cp = cost_at(&plus, &mut cache, &mut evaluator);
-                let cm = cost_at(&minus, &mut cache, &mut evaluator);
-                let fd = (cp - cm) / (2.0 * h_probe);
-                eprintln!(
-                    "[H-SCAN psi@zero] h={:.0e} analytic={:+.6e} fd={:+.6e} \
-                     diff={:+.6e} dcost={:+.6e}",
-                    h_probe,
-                    grad_an_probe[j_psi],
-                    fd,
-                    grad_an_probe[j_psi] - fd,
-                    cp - cm
-                );
-            }
-        }
         let mut violations: Vec<String> = Vec::new();
         for (label, theta) in [
             ("zero", &theta_zero),
