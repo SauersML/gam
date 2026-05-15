@@ -9393,23 +9393,20 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 0.0
             };
 
-        // The inf-norm β-space cap previously applied here
-        // (`joint_newton_max_step_inf`, default 20.0) is intentionally
-        // not used. It conflated two distinct concerns and bound the
-        // step on every cycle of quasi-saturated problems where the
-        // optimum sits at large |β|:
+        // The inf-norm β-space cap is intentionally not applied as a
+        // per-attempt hard clamp. That old behavior conflated two distinct
+        // concerns and bound the step on every cycle of quasi-saturated
+        // problems where the optimum sits at large |β|:
         //   (a) η-overflow safety — a physical limit specific to the
         //       family's likelihood evaluator. Owned by the family via
         //       `max_feasible_step_size`, called by the line search.
         //   (b) Newton-model trust — an algorithmic limit that adapts
         //       via rho. Owned by `joint_trust_radius` below, updated
         //       by `update_joint_trust_region_radius` on every attempt.
-        // The L2 trust radius is strictly tighter than an inf-norm cap
-        // of the same magnitude (|·|_∞ ≤ |·|_2), so removing the cap
-        // does not weaken safety on any block. The trait method
-        // `joint_newton_max_step_inf` is retained for backward
-        // compatibility but no longer consulted; we still validate the
-        // returned value to surface family-side bugs.
+        // The trait value still has one narrow role below: it gates the
+        // cycle-0 trust-radius expansion so an ill-conditioned Newton vector
+        // cannot seed a huge initial radius. Validate it early to surface
+        // family-side bugs before optimization starts.
         let _initial_max_joint_step_unused = family.joint_newton_max_step_inf(specs);
         if !_initial_max_joint_step_unused.is_finite() || _initial_max_joint_step_unused <= 0.0 {
             return Err(format!(
@@ -9901,11 +9898,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // `update_joint_trust_region_radius` so a sane Newton
                     // step never pays for an attempt that would be
                     // immediately clamped.
-                    let initial_step_inf = delta
-                        .iter()
-                        .copied()
-                        .map(f64::abs)
-                        .fold(0.0_f64, f64::max);
+                    let initial_step_inf =
+                        delta.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
                     let max_step_inf = family.joint_newton_max_step_inf(specs);
                     let newton_step_is_sane = initial_step_inf.is_finite()
                         && max_step_inf.is_finite()
@@ -10362,9 +10356,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             line_search_attempts,
                             model_rejects,
                             barrier_rejects,
-                            joint_active_set
-                                .as_ref()
-                                .map_or(0, |active| active.len()),
+                            joint_active_set.as_ref().map_or(0, |active| active.len()),
                         );
                     }
                     converged = true;

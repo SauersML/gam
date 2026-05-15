@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
-/// Variants of `src/approx_ledger::ApproxKind`. Kept as bare identifiers so
-/// the scanner can match the same names that appear in source comments and
-/// in `pub enum ApproxKind`. If the enum gains a variant, add it here.
+/// Accepted `ApproxKind:` annotations used by the comment-based approximation
+/// scanner. Kept as bare identifiers so source comments can name them without
+/// coupling the build script to a Rust module.
 const APPROX_LEDGER_VARIANTS: &[&str] = &[
     "Exact",
     "NumericalApproximation",
@@ -21,9 +21,8 @@ const APPROX_LEDGER_VARIANTS: &[&str] = &[
 /// markers are *allowed* when classified.
 const HANDWAVY_MARKERS: &[&str] = &["bandaid", "hack", "magic", "FIXME"];
 
-/// Lines on either side of a marker line within which an `ApproxKind`
-/// reference counts as annotation. Mirrors `LEDGER_WINDOW` in
-/// `src/approx_ledger.rs`.
+/// Lines on either side of a marker line within which an `ApproxKind:`
+/// source comment counts as annotation.
 const LEDGER_WINDOW: usize = 8;
 
 fn main() {
@@ -61,9 +60,9 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Approximation-ledger scan: hand-wavy markers ("bandaid", "hack",
-    // "magic", "FIXME") are allowed only when the surrounding comment
-    // window names an ApproxKind variant from `src/approx_ledger.rs`.
+    // Approximation scan: hand-wavy markers ("bandaid", "hack", "magic",
+    // "FIXME") are allowed only when the surrounding comment window names
+    // an accepted ApproxKind annotation.
     let mut unclassified: Vec<(PathBuf, usize, &'static str, String)> = Vec::new();
     scan_for_unclassified_handwavy(&manifest_dir, &manifest_dir, &mut unclassified);
     if !unclassified.is_empty() {
@@ -73,9 +72,8 @@ fn main() {
             unclassified.len()
         );
         eprintln!(
-            "       Pair the marker with an ApproxKind annotation from \
-             src/approx_ledger.rs (one of: {}) within {} lines, or replace \
-             it with precise wording.",
+            "       Pair the marker with an ApproxKind annotation (one of: {}) \
+             within {} lines, or replace it with precise wording.",
             APPROX_LEDGER_VARIANTS.join(", "),
             LEDGER_WINDOW
         );
