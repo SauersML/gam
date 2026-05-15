@@ -18047,18 +18047,52 @@ mod tests {
         eprintln!("[ROW] ||c·dη/dψ_FD||_L2 = {:+.6e}  per-row max|·| = {:+.4e}",
             l2_c_dnu, c_dnu_fd.iter().map(|v| v.abs()).fold(0.0_f64, f64::max));
 
-        // Also: ∂W/∂ψ via FD = (W(+h) − W(-h)) / 2h.  Compare with c · dη/dψ.
-        // For canonical-only: ∂W/∂η = c, so ∂W/∂ψ_total = c · dη/dψ_total.
-        // For non-canonical (Probit): same formula holds with c = c_obs.
-        let mut dw_dpsi_fd = Array1::<f64>::zeros(n);
-        for i in 0..n { dw_dpsi_fd[i] = (w_p[i] - w_0[i]) / h; }
-        eprintln!("[ROW] (W(+h) − W(0)) / h  vs  c·dη/dψ_FD:");
-        for i in 0..15 {
-            eprintln!("  i={:2}  η_0={:+.4e}  eta_p-eta_m={:+.4e}  W_0={:+.4e}  W_p={:+.4e}  c_0={:+.4e}  c·dη/dψ={:+.4e}  ΔW/h={:+.4e}",
-                i, eta_0[i], eta_p[i] - eta_m[i], w_0[i], w_p[i], c_0[i],
-                c_dnu_fd[i], dw_dpsi_fd[i]);
+        // ── Get ANALYTIC per-row diagonals via debug_stash.
+        crate::solver::estimate::reml::unified::debug_stash::arm();
+        cache.ensure_theta(&theta_zero).expect("ensure_theta zero");
+        let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
+            data.view(), cache.spec(), cache.design(), &cache.spatial_terms,
+        ).expect("hyper dirs build").expect("hyper dirs present");
+        let _ = evaluate_joint_reml_outer_eval_at_theta(
+            &mut evaluator, cache.design(), &theta_zero, rho_dim, hyper_dirs, None,
+            crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+        ).expect("analytic outer eval");
+        crate::solver::estimate::reml::unified::debug_stash::disarm();
+        let stash = crate::solver::estimate::reml::unified::debug_stash::take_terms();
+        let c_x_tau_beta = stash.c_x_tau_beta_diag.clone().expect("term4 diag stashed");
+        let x_v_psi = stash.c_x_v_psi_diag.clone().expect("X·v_ψ stashed");
+        assert_eq!(c_x_tau_beta.len(), n);
+        assert_eq!(x_v_psi.len(), n);
+
+        // analytic c·dη/dψ_total = c·X_τβ̂ − c·X·v_ψ = c_x_tau_beta − c·x_v_psi
+        let c_x_v: Array1<f64> = &c_0 * &x_v_psi;
+        let analytic_diag: Array1<f64> = &c_x_tau_beta - &c_x_v;
+        let l2_analytic = analytic_diag.iter().map(|v| v*v).sum::<f64>().sqrt();
+        let max_analytic = analytic_diag.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        let l2_term4_only = c_x_tau_beta.iter().map(|v| v*v).sum::<f64>().sqrt();
+        let l2_corr_only = c_x_v.iter().map(|v| v*v).sum::<f64>().sqrt();
+        eprintln!("[ROW] ||c·X_τβ̂||_L2 = {:+.6e}  ||c·X·v_ψ||_L2 = {:+.6e}",
+            l2_term4_only, l2_corr_only);
+        eprintln!("[ROW] ||c·X_τβ̂ − c·X·v_ψ||_L2 = {:+.6e}  max|·| = {:+.4e}",
+            l2_analytic, max_analytic);
+        eprintln!("[ROW] (FD truth) ||c·dη/dψ_FD||_L2 = {:+.6e}", l2_c_dnu);
+
+        // Per-row comparison
+        let diff: Array1<f64> = &analytic_diag - &c_dnu_fd;
+        let l2_diff = diff.iter().map(|v| v*v).sum::<f64>().sqrt();
+        let max_diff = diff.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        eprintln!("[ROW] ||analytic − FD||_L2 = {:+.6e}  max|·| = {:+.4e}  rel = {:+.4e}",
+            l2_diff, max_diff, l2_diff / l2_c_dnu);
+
+        eprintln!("[ROW] === PER-ROW COMPARE (first 20) ===");
+        for i in 0..20.min(n) {
+            eprintln!("  i={:2}  c·X_τβ̂={:+.4e}  c·X·v_ψ={:+.4e}  analytic_sum={:+.4e}  FD={:+.4e}  Δ={:+.4e}",
+                i, c_x_tau_beta[i], c_x_v[i], analytic_diag[i], c_dnu_fd[i], diff[i]);
         }
-        let _ = c_p; // silence
+        let _ = c_p;
+        let _ = w_p;
+        let _ = w_0;
+        let _ = eta_0;
     }
 
     /// Test PIRLS determinism: call debug_full_h three times at the SAME
