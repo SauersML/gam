@@ -109,6 +109,38 @@ use crate::faer_ndarray::FaerEigh;
 use crate::linalg::matrix::DesignMatrix;
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  Debug stash: thread-local capture of (op_total, U) from the ext-grad path,
+//  used by the iso-κ Duchon FD investigation test. Empty in production runs.
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub mod debug_stash {
+    use ndarray::Array2;
+    use std::cell::RefCell;
+
+    thread_local! {
+        pub static CAPTURE: RefCell<Option<(Array2<f64>, Array2<f64>)>> = const { RefCell::new(None) };
+        pub static ENABLED: RefCell<bool> = const { RefCell::new(false) };
+    }
+
+    pub fn arm() {
+        ENABLED.with(|f| *f.borrow_mut() = true);
+        CAPTURE.with(|c| *c.borrow_mut() = None);
+    }
+    pub fn disarm() {
+        ENABLED.with(|f| *f.borrow_mut() = false);
+    }
+    pub fn is_armed() -> bool {
+        ENABLED.with(|f| *f.borrow())
+    }
+    pub fn store(op: Array2<f64>, u: Array2<f64>) {
+        CAPTURE.with(|c| *c.borrow_mut() = Some((op, u)));
+    }
+    pub fn take() -> Option<(Array2<f64>, Array2<f64>)> {
+        CAPTURE.with(|c| c.borrow_mut().take())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  Core traits
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -5520,6 +5552,9 @@ pub fn reml_laml_evaluate(
                         "[EIG-DECOMP ext_idx={}] total_tr={:+.4e} per_mode={:?}",
                         ext_idx, total_tr, per_mode
                     );
+                    if debug_stash::is_armed() && ext_idx == 0 {
+                        debug_stash::store(op_dense.clone(), u_mat.clone());
+                    }
                 }
                 match (&solution.penalty_subspace_trace, drift) {
                     (Some(kernel), DriftDerivResult::Dense(matrix)) => {
