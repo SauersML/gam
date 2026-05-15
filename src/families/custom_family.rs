@@ -9878,7 +9878,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // switch once to a diagonally preconditioned gradient step and keep
             // the same exact full-objective accept/reject test.
             const JOINT_TRUST_MAX_ATTEMPTS: usize = 24;
-            let mut search_delta = delta.clone();
+            let mut search_delta =
+                if step_inf <= step_tol && current_stationarity_residual > residual_tol {
+                    joint_preconditioned_descent_delta(
+                        &joint_hessian_source,
+                        &ranges,
+                        &s_lambdas,
+                        joint_solver_diagonal_ridge,
+                        &rhs,
+                    )?
+                } else {
+                    delta.clone()
+                };
             let mut tried_preconditioned_descent = false;
             let mut model_rejects = 0usize;
             let mut likelihood_rejects = 0usize;
