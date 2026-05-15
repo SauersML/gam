@@ -21,6 +21,7 @@ pub fn init_parallelism() {
 }
 
 pub mod families;
+pub mod gpu;
 pub mod inference;
 pub mod linalg;
 pub mod report;
@@ -35,6 +36,7 @@ pub mod types;
 pub use data::{
     encode_recordswith_inferred_schema, load_csvwith_inferred_schema, load_csvwith_schema,
 };
+pub use gpu::{gpu_available, selected_gpu_info};
 pub use inference::{
     alo, data, diagnostics, generative, hmc, predict, probability, quadrature, sample,
 };
