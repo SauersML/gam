@@ -9837,7 +9837,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // can never produce a strictly negative actual reduction).
             if current_stationarity_residual <= residual_tol && step_inf <= step_tol {
                 log::info!(
-                    "[PIRLS/joint-Newton convergence] cycle {:>3} | pre-line-search converged: step_inf={:.3e} (tol={:.3e}) | residual={:.3e} (tol={:.3e})",
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | pre-line-search converged: proposal_inf={:.3e} (tol={:.3e}) | residual={:.3e} (tol={:.3e})",
                     cycle,
                     step_inf,
                     step_tol,
@@ -10235,7 +10235,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // which is insufficient to choose the right algorithmic
             // remedy.
             log::info!(
-                "[PIRLS/joint-Newton convergence] cycle {:>3} | step_inf={:.3e} (tol={:.3e}) | accepted_step_inf={:.3e} | residual={:.3e} (tol={:.3e}) | obj_change={:.3e} (tol={:.3e}) | beta_inf={:.3e}",
+                "[PIRLS/joint-Newton convergence] cycle {:>3} | proposal_inf={:.3e} (tol={:.3e}) | accepted_step_inf={:.3e} | residual={:.3e} (tol={:.3e}) | obj_change={:.3e} (tol={:.3e}) | beta_inf={:.3e}",
                 cycle,
                 step_inf,
                 step_tol,
