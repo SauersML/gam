@@ -9974,6 +9974,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let mut model_rejects = 0usize;
             let mut likelihood_rejects = 0usize;
             let mut objective_rejects = 0usize;
+            let mut barrier_rejects = 0usize;
             let mut first_likelihood_reject: Option<String> = None;
             for trust_attempt in 0..JOINT_TRUST_MAX_ATTEMPTS {
                 line_search_attempts = trust_attempt + 1;
@@ -9990,6 +9991,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     }
                 }
                 if !barrier_ceiling.is_finite() || barrier_ceiling <= 0.0 {
+                    // Per-block feasibility barrier reduced the proposed step
+                    // length to zero. Without this counter the failure mode is
+                    // silent and the trust-region loop spins to its max-attempt
+                    // ceiling shrinking the radius while every attempt remains
+                    // infeasible — the failure shows up downstream as
+                    // `inner solve did not converge` with no diagnostic
+                    // pointing at the barrier. Counting and logging makes the
+                    // path visible and feeds the constrained-KKT certificate
+                    // in the post-loop rescue below.
+                    barrier_rejects += 1;
                     joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
                     continue;
                 }
@@ -10193,7 +10204,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // the next cycle's Newton proposal will be evaluated under
                 // a tighter L2 bound without any parallel adaptation here.
                 log::info!(
-                    "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=false hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} reject_model={} reject_likelihood={} reject_objective={} first_likelihood_reject={} grad_reload=0.000s total={:.3}s",
+                    "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=false hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} reject_model={} reject_likelihood={} reject_objective={} reject_barrier={} first_likelihood_reject={} grad_reload=0.000s total={:.3}s",
                     cycle,
                     hessian_and_qp_elapsed.as_secs_f64(),
                     line_search_elapsed.as_secs_f64(),
@@ -10201,6 +10212,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     model_rejects,
                     likelihood_rejects,
                     objective_rejects,
+                    barrier_rejects,
                     first_likelihood_reject.as_deref().unwrap_or("none"),
                     cycle_started.elapsed().as_secs_f64(),
                 );
@@ -10256,7 +10268,47 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // relaxed (residual > tol) KKT signature, so we never accept
                 // a degenerate cycle-0 failure as convergence.
                 let made_progress = cycles_done >= 2;
-                if trust_region_collapsed && last_cycle_obj_change_below_tol && made_progress {
+
+                // Constrained-KKT certificate: when every trust-region attempt
+                // failed via the model + feasibility barrier pair — i.e., the
+                // QP-derived Newton step had non-positive predicted reduction
+                // on the unconstrained quadratic model AND the preconditioned-
+                // descent fallback was barrier-blocked along the active
+                // constraint normals — β_current is the constrained QP optimum
+                // to within solver precision. Any feasible move from here
+                // either fails to descend the quadratic model (the QP saw it
+                // first) or crosses an active face (the barrier saw it next).
+                //
+                // The standard unconstrained stationarity test at the top of
+                // the cycle (‖Sβ − ∇L‖_∞ ≤ residual_tol) cannot detect this
+                // on its own: at a constrained optimum that residual equals
+                // the Lagrange-multiplier norm ‖Aᵀλ‖_∞ ≥ ‖λ_min‖ · ‖A_active‖,
+                // which does NOT vanish. Without this rescue branch the inner
+                // loop spins to `inner_max_cycles` producing byte-identical
+                // cycle summaries (the inner state is restored each iteration,
+                // so every attempt re-fires the same model + barrier pair),
+                // and the outer optimizer rejects the seed with
+                // `objective returned a non-finite cost`.
+                //
+                // Conditions ensure we only recognise this when:
+                // - we tried the model-rejection fallback (so a real QP step
+                //   was attempted and judged non-descending),
+                // - the fallback was structurally blocked by the constraint
+                //   barrier on at least one attempt (so the active face is
+                //   what's preventing progress, not curvature),
+                // - the QP returned a non-empty active set (so active
+                //   constraints actually exist for this configuration),
+                // - we have at least two prior successful cycles, matching
+                //   the standard rescue's progress guard.
+                let qp_constrained_kkt = model_rejects >= 1
+                    && tried_preconditioned_descent
+                    && barrier_rejects >= 1
+                    && joint_active_set
+                        .as_ref()
+                        .is_some_and(|active| !active.is_empty());
+                if (trust_region_collapsed && last_cycle_obj_change_below_tol && made_progress)
+                    || (qp_constrained_kkt && made_progress)
+                {
                     converged = true;
                 }
                 cycles_done = cycle + 1;
