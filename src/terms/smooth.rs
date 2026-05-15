@@ -17364,6 +17364,301 @@ mod tests {
             "[DIAG] (correct-basis) max OFF-DIAGONAL Δ in (op-fd_H) = {:+.4e} at ({},{}) (off-diag doesn't enter trace)",
             max_off_diff, max_off_idx.0, max_off_idx.1
         );
+
+        // ── Step 12: basis-invariant sanity check via log|H| FD.
+        let (eigvals_plus, _) = h_plus.eigh(faer::Side::Lower).expect("eigh h_plus");
+        let (eigvals_minus, _) = h_minus.eigh(faer::Side::Lower).expect("eigh h_minus");
+        let logdet_plus: f64 = eigvals_plus.iter().map(|s| (s.abs().max(1e-300)).ln()).sum();
+        let logdet_minus: f64 = eigvals_minus.iter().map(|s| (s.abs().max(1e-300)).ln()).sum();
+        let half_logdet_derivative = 0.5 * (logdet_plus - logdet_minus) / (2.0 * h);
+        eprintln!(
+            "[DIAG] log|H+|={:+.6e}  log|H-|={:+.6e}  ½ d log|H|/dψ (FD) = {:+.6e}",
+            logdet_plus, logdet_minus, half_logdet_derivative
+        );
+
+        // Compute tr(K · op_total) using the regularized kernel from
+        // u_zero/eigvals_zero (the correct H eigenbasis).
+        let mut tr_k_op_correct = 0.0_f64;
+        let mut tr_k_fd_correct = 0.0_f64;
+        for j in 0..p {
+            let sigma = eigvals_zero[j];
+            let phi_prime = 1.0 / (sigma * sigma + eps_sq).sqrt();
+            tr_k_op_correct += phi_prime * op_eig_correct[[j, j]];
+            tr_k_fd_correct += phi_prime * fd_eig_correct[[j, j]];
+        }
+        eprintln!(
+            "[DIAG] tr(K · op_total) in u_zero basis = {:+.6e} (EIG-DECOMP got +22.503 with stashed U)",
+            tr_k_op_correct
+        );
+        eprintln!(
+            "[DIAG] tr(K · fd_H) in u_zero basis = {:+.6e} (should ≈ +0.5·d log|H|/dψ = {:+.6e})",
+            tr_k_fd_correct, half_logdet_derivative
+        );
+    }
+
+    /// Per-term trace decomposition for the failing Duchon ψ-gradient. At
+    /// ψ=0 the analytic operator portion of `B_ψ` is
+    ///
+    ///   B = term1 (X_τᵀ W X) + term2 (Xᵀ W X_τ) + term3 (S_τ)
+    ///       + term4 (Xᵀ diag(c·X_τβ̂) X)         [non-Gaussian]
+    ///       + firth_partial (≡ 0 here, Firth off)
+    ///
+    /// and the IFT chain rule adds `correction = -Xᵀ diag(c·X v_ψ) X`.
+    /// This diagnostic dense-materializes each term separately, projects each
+    /// into the eigenbasis of H(ψ=0), and reports tr(K · M_term) where
+    /// K = G_ε(H). Their sum should match the +22.5 analytic trace produced
+    /// by `iso_kappa_duchon_op_vs_fd_h_eigenbasis_diagnostic`.
+    #[test]
+    fn iso_kappa_duchon_op_term_breakdown_at_zero() {
+        let n = 80usize;
+        let mut data = Array2::<f64>::zeros((n, 1));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            let eta = 1.4 * (2.0 * std::f64::consts::PI * t).sin() + 0.5 * (t - 0.5);
+            y[i] = if eta + 0.7 * (3.7 * (i as f64) + 1.0).sin() > 0.0 {
+                1.0
+            } else {
+                0.0
+            };
+        }
+        let weights = Array1::ones(n);
+        let offset = Array1::zeros(n);
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "duchon_1d".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0],
+                    spec: DuchonBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                        length_scale: Some(1.0),
+                        power: 1,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: None,
+                        operator_penalties: DuchonOperatorPenaltySpec::default(),
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let fit_opts = FitOptions {
+            latent_cloglog: None,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: false,
+            max_iter: 200,
+            tol: 1e-12,
+            nullspace_dims: vec![],
+            linear_constraints: None,
+            firth_bias_reduction: false,
+            adaptive_regularization: None,
+            penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
+        };
+
+        let design = build_term_collection_design(data.view(), &spec).expect("design");
+        let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
+        let frozen_design =
+            build_term_collection_design(data.view(), &frozen).expect("frozen design");
+        let spatial_terms = spatial_length_scale_term_indices(&frozen);
+        let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
+        let rho_dim = frozen_design.penalties.len();
+        let psi_dim: usize = dims_per_term.iter().sum();
+        assert!(psi_dim >= 1);
+
+        let external_opts =
+            external_opts_for_design(LikelihoodFamily::BinomialProbit, &frozen_design, &fit_opts);
+        let mut cache = SingleBlockExactJointDesignCache::new(
+            data.view(),
+            frozen.clone(),
+            frozen_design.clone(),
+            spatial_terms.clone(),
+            rho_dim,
+            dims_per_term.clone(),
+        )
+        .expect("single-block cache");
+        let mut evaluator = crate::estimate::ExternalJointHyperEvaluator::new(
+            y.view(),
+            weights.view(),
+            &frozen_design.design,
+            offset.view(),
+            &frozen_design.penalties,
+            &external_opts,
+            "iso-κ Duchon op-term-breakdown",
+        )
+        .expect("evaluator");
+
+        let theta_dim = rho_dim + psi_dim;
+        let theta_zero = Array1::<f64>::zeros(theta_dim);
+
+        // ── Step 1: arm capture, run analytic eval at ψ=0 to stash per-term breakdown.
+        crate::solver::estimate::reml::unified::debug_stash::arm();
+        cache.ensure_theta(&theta_zero).expect("ensure_theta");
+        let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
+            data.view(),
+            cache.spec(),
+            cache.design(),
+            &cache.spatial_terms,
+        )
+        .expect("hyper dirs build")
+        .expect("hyper dirs present");
+        let (_cost, grad, _hess) = evaluate_joint_reml_outer_eval_at_theta(
+            &mut evaluator,
+            cache.design(),
+            &theta_zero,
+            rho_dim,
+            hyper_dirs,
+            None,
+            crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+        )
+        .expect("analytic outer eval");
+        crate::solver::estimate::reml::unified::debug_stash::disarm();
+        let stash = crate::solver::estimate::reml::unified::debug_stash::take_terms();
+        let op_total = stash.op_total.clone().expect("op_total stashed");
+        let u_mat = stash.u_mat.clone().expect("u_mat stashed");
+        let p = op_total.nrows();
+        eprintln!(
+            "[TERMS] analytic ψ-grad[0] = {:+.6e}  p={}  op_total shape={:?}",
+            grad[rho_dim], p, op_total.shape()
+        );
+
+        // ── Step 2: build H(ψ=0) in original basis and eigendecompose for K = G_ε(H).
+        cache.ensure_theta(&theta_zero).expect("ensure_theta zero");
+        let design_zero = cache.design().clone();
+        let h_zero = evaluator
+            .debug_full_h(
+                &design_zero.design,
+                &design_zero.penalties,
+                &design_zero.nullspace_dims,
+                design_zero.linear_constraints.clone(),
+                &theta_zero,
+                rho_dim,
+                "term-breakdown 0",
+            )
+            .expect("debug_full_h 0");
+        use crate::faer_ndarray::FaerEigh;
+        let (eigvals_zero, u_zero) = h_zero.eigh(faer::Side::Lower).expect("eigh on h_zero");
+        eprintln!("[TERMS] eigvals(H) = {:?}", eigvals_zero.to_vec());
+
+        let eps_sq = {
+            let eps_f = (2.22e-16_f64).sqrt() * (p as f64);
+            4.0 * eps_f * eps_f
+        };
+        let phi_prime: Vec<f64> = (0..p)
+            .map(|j| {
+                let s = eigvals_zero[j];
+                1.0 / (s * s + eps_sq).sqrt()
+            })
+            .collect();
+
+        // Helper: compute tr(K · M) using K = G_ε(H) in u_zero eigenbasis,
+        // plus the per-mode contributions (returns vector of (sigma, M_jj, contrib)).
+        let trace_decompose = |label: &str, m: &Array2<f64>| -> (f64, Vec<(f64, f64, f64)>) {
+            let mut tr = 0.0_f64;
+            let m_eig = u_zero.t().dot(m).dot(&u_zero);
+            let mut per_mode = Vec::with_capacity(p);
+            for j in 0..p {
+                let s = eigvals_zero[j];
+                let mjj = m_eig[[j, j]];
+                let c = phi_prime[j] * mjj;
+                tr += c;
+                per_mode.push((s, mjj, c));
+            }
+            eprintln!(
+                "[TERMS] term={:14} tr(K·M)={:+.6e}  ||M||_F={:+.4e}",
+                label,
+                tr,
+                m.iter().map(|v| v * v).sum::<f64>().sqrt()
+            );
+            for (j, (s, mjj, c)) in per_mode.iter().enumerate() {
+                eprintln!(
+                    "          mode {:2}  σ={:+.4e}  φ'={:+.4e}  M_jj={:+.4e}  contrib={:+.4e}",
+                    j, s, phi_prime[j], mjj, c
+                );
+            }
+            (tr, per_mode)
+        };
+
+        // ── Step 3: walk through each stashed dense term and report.
+        let mut running_total = 0.0_f64;
+
+        if let Some(m) = stash.term1.as_ref() {
+            let (tr, _) = trace_decompose("term1 X_τᵀWX", m);
+            running_total += tr;
+        } else {
+            eprintln!("[TERMS] term1: ABSENT (operator was not SparseDirectionalHyperOperator)");
+        }
+        if let Some(m) = stash.term2.as_ref() {
+            let (tr, _) = trace_decompose("term2 XᵀWX_τ", m);
+            running_total += tr;
+        }
+        if let Some(m) = stash.term3.as_ref() {
+            let (tr, _) = trace_decompose("term3 S_τ", m);
+            running_total += tr;
+        }
+        if let Some(m) = stash.term4.as_ref() {
+            let (tr, _) = trace_decompose("term4 cX_τβ̂", m);
+            running_total += tr;
+        } else {
+            eprintln!("[TERMS] term4: not present (Gaussian path or c=0)");
+        }
+        if let Some(m) = stash.firth_partial.as_ref() {
+            let (tr, _) = trace_decompose("firth_partial", m);
+            running_total += tr;
+        }
+        if let Some(m) = stash.correction.as_ref() {
+            let (tr, _) = trace_decompose("correction IFT", m);
+            running_total += tr;
+        } else {
+            eprintln!("[TERMS] correction: ABSENT");
+        }
+
+        // Sanity: tr(K · op_total) should be running_total within roundoff.
+        let mut tr_op_total = 0.0_f64;
+        let op_eig = u_zero.t().dot(&op_total).dot(&u_zero);
+        for j in 0..p {
+            tr_op_total += phi_prime[j] * op_eig[[j, j]];
+        }
+        eprintln!(
+            "[TERMS] SUM of per-term tr(K·M) = {:+.6e}   tr(K · op_total) = {:+.6e}   diff={:+.4e}",
+            running_total, tr_op_total, running_total - tr_op_total
+        );
+
+        // Also compute the sum reconstructed from individual term matrices,
+        // and show which mode the term1/term2/term4/correction contributions
+        // concentrate on (the σ_max=24.4 mode is mode index p-1).
+        let max_idx = p - 1;
+        eprintln!(
+            "[TERMS] σ_max mode index = {}  σ_max = {:+.4e}  φ'(σ_max) = {:+.4e}",
+            max_idx, eigvals_zero[max_idx], phi_prime[max_idx]
+        );
+        let report_max = |label: &str, m_opt: Option<&Array2<f64>>| {
+            if let Some(m) = m_opt {
+                let m_eig = u_zero.t().dot(m).dot(&u_zero);
+                let mjj = m_eig[[max_idx, max_idx]];
+                eprintln!(
+                    "[TERMS-σmax] term={:14}  M_jj(σmax)={:+.4e}  contrib={:+.4e}",
+                    label,
+                    mjj,
+                    phi_prime[max_idx] * mjj
+                );
+            }
+        };
+        report_max("term1", stash.term1.as_ref());
+        report_max("term2", stash.term2.as_ref());
+        report_max("term3", stash.term3.as_ref());
+        report_max("term4", stash.term4.as_ref());
+        report_max("firth", stash.firth_partial.as_ref());
+        report_max("correction", stash.correction.as_ref());
     }
 
     /// Minimal focused dump of `op_total − fd_H` at ψ=0 for the iso-κ Duchon
@@ -17627,11 +17922,12 @@ mod tests {
         }
 
         // Top entries by |Δ| in eigenbasis.
-        let mut eig_entries: Vec<(usize, usize, f64, f64, f64)> = (0..p)
-            .flat_map(|i| {
-                (0..p).map(move |j| (i, j, eigvals[i], eigvals[j], diff_eig[[i, j]]))
-            })
-            .collect();
+        let mut eig_entries: Vec<(usize, usize, f64, f64, f64)> = Vec::with_capacity(p * p);
+        for i in 0..p {
+            for j in 0..p {
+                eig_entries.push((i, j, eigvals[i], eigvals[j], diff_eig[[i, j]]));
+            }
+        }
         eig_entries.sort_by(|a, b| {
             b.4.abs()
                 .partial_cmp(&a.4.abs())
