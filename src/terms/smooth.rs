@@ -16685,6 +16685,321 @@ mod tests {
         );
     }
 
+    /// Shared driver for iso-κ joint REML gradient FD variants. Returns the
+    /// worst psi rel_err across the four theta probes (zero / psi_only / base /
+    /// alt) and panics with full violations only if `assert_pass` is true.
+    /// Knobs let one-at-a-time variants of the original BinomialProbit Duchon
+    /// failure isolate which dimension triggers the analytic-vs-FD blow-up.
+    #[allow(clippy::too_many_arguments)]
+    fn iso_kappa_fd_variant_driver(
+        label: &str,
+        n: usize,
+        family: LikelihoodFamily,
+        use_thinplate: bool,
+        skip_psi: bool,
+    ) -> (bool, f64, Vec<String>) {
+        let mut data = Array2::<f64>::zeros((n, 1));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            let eta = 1.4 * (2.0 * std::f64::consts::PI * t).sin() + 0.5 * (t - 0.5);
+            let raw = eta + 0.7 * (3.7 * (i as f64) + 1.0).sin();
+            y[i] = match family {
+                LikelihoodFamily::GaussianIdentity => raw,
+                _ => {
+                    if raw > 0.0 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+            };
+        }
+        let weights = Array1::ones(n);
+        let offset = Array1::zeros(n);
+        let basis = if use_thinplate {
+            SmoothBasisSpec::ThinPlate {
+                feature_cols: vec![0],
+                spec: ThinPlateBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                    length_scale: 1.0,
+                    double_penalty: false,
+                    identifiability: SpatialIdentifiability::default(),
+                    radial_reparam: None,
+                },
+                input_scales: None,
+            }
+        } else {
+            SmoothBasisSpec::Duchon {
+                feature_cols: vec![0],
+                spec: DuchonBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                    length_scale: Some(1.0),
+                    power: 1,
+                    nullspace_order: DuchonNullspaceOrder::Linear,
+                    identifiability: SpatialIdentifiability::default(),
+                    aniso_log_scales: None,
+                    operator_penalties: DuchonOperatorPenaltySpec::default(),
+                },
+                input_scales: None,
+            }
+        };
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "variant_1d".to_string(),
+                basis,
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let fit_opts = FitOptions {
+            latent_cloglog: None,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: false,
+            max_iter: 200,
+            tol: 1e-12,
+            nullspace_dims: vec![],
+            linear_constraints: None,
+            firth_bias_reduction: false,
+            adaptive_regularization: None,
+            penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
+        };
+
+        let design = build_term_collection_design(data.view(), &spec).expect("design");
+        let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
+        let frozen_design =
+            build_term_collection_design(data.view(), &frozen).expect("frozen design");
+        let spatial_terms = spatial_length_scale_term_indices(&frozen);
+        let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
+        assert_eq!(dims_per_term, vec![1], "{label}: expect one log-κ axis");
+        let rho_dim = frozen_design.penalties.len();
+        let psi_dim: usize = dims_per_term.iter().sum();
+        assert!(psi_dim >= 1);
+
+        let external_opts = external_opts_for_design(family, &frozen_design, &fit_opts);
+        let mut cache = SingleBlockExactJointDesignCache::new(
+            data.view(),
+            frozen.clone(),
+            frozen_design.clone(),
+            spatial_terms.clone(),
+            rho_dim,
+            dims_per_term.clone(),
+        )
+        .expect("single-block cache");
+        let mut evaluator = crate::estimate::ExternalJointHyperEvaluator::new(
+            y.view(),
+            weights.view(),
+            &frozen_design.design,
+            offset.view(),
+            &frozen_design.penalties,
+            &external_opts,
+            "iso-κ variant FD evaluator",
+        )
+        .expect("evaluator");
+
+        let cost_at = |theta: &Array1<f64>,
+                       cache: &mut SingleBlockExactJointDesignCache<'_>,
+                       evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>|
+         -> f64 {
+            cache.ensure_theta(theta).expect("ensure_theta");
+            let design = cache.design();
+            evaluator
+                .evaluate_cost_only(
+                    &design.design,
+                    &design.penalties,
+                    &design.nullspace_dims,
+                    design.linear_constraints.clone(),
+                    theta,
+                    rho_dim,
+                    None,
+                    "iso-κ variant FD cost-only",
+                )
+                .expect("cost-only eval")
+        };
+
+        let analytic_at = |theta: &Array1<f64>,
+                           cache: &mut SingleBlockExactJointDesignCache<'_>,
+                           evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>|
+         -> (f64, Array1<f64>) {
+            cache.ensure_theta(theta).expect("ensure_theta");
+            let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
+                data.view(),
+                cache.spec(),
+                cache.design(),
+                &cache.spatial_terms,
+            )
+            .expect("hyper dirs build")
+            .expect("hyper dirs present");
+            let (cost, grad, _hess) = evaluate_joint_reml_outer_eval_at_theta(
+                evaluator,
+                cache.design(),
+                theta,
+                rho_dim,
+                hyper_dirs,
+                None,
+                crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+            )
+            .expect("outer eval");
+            (cost, grad)
+        };
+
+        let theta_dim = rho_dim + psi_dim;
+        let theta_zero = Array1::<f64>::zeros(theta_dim);
+        let mut theta_base = Array1::<f64>::zeros(theta_dim);
+        for j in 0..rho_dim {
+            theta_base[j] = 0.2 - 0.1 * j as f64;
+        }
+        let mut theta_psi_only = Array1::<f64>::zeros(theta_dim);
+        for k in 0..psi_dim {
+            theta_psi_only[rho_dim + k] = 0.4;
+        }
+        let mut theta_alt = theta_base.clone();
+        for j in 0..rho_dim {
+            theta_alt[j] = 1.0 + 0.05 * j as f64;
+        }
+        for k in 0..psi_dim {
+            theta_alt[rho_dim + k] = 0.4;
+        }
+
+        let h = 1e-5_f64;
+        let rel_tol = 5e-3_f64;
+        let mut violations: Vec<String> = Vec::new();
+        let mut worst_psi_rel = 0.0_f64;
+        for (probe, theta) in [
+            ("zero", &theta_zero),
+            ("psi_only", &theta_psi_only),
+            ("base", &theta_base),
+            ("alt", &theta_alt),
+        ] {
+            let (cost_an, grad_an) = analytic_at(theta, &mut cache, &mut evaluator);
+            assert!(cost_an.is_finite(), "{label} {probe}: cost not finite");
+            for j in 0..theta_dim {
+                let is_psi = j >= rho_dim;
+                if skip_psi && is_psi {
+                    continue;
+                }
+                let mut plus = theta.clone();
+                plus[j] += h;
+                let mut minus = theta.clone();
+                minus[j] -= h;
+                let cp = cost_at(&plus, &mut cache, &mut evaluator);
+                let cm = cost_at(&minus, &mut cache, &mut evaluator);
+                let fd = (cp - cm) / (2.0 * h);
+                let denom = fd.abs().max(grad_an[j].abs()).max(1e-3);
+                let rel = (grad_an[j] - fd).abs() / denom;
+                let kind = if is_psi { "psi" } else { "rho" };
+                eprintln!(
+                    "[{label} {probe}] {kind} j={j} an={:+.4e} fd={:+.4e} rel={:.3e}",
+                    grad_an[j], fd, rel
+                );
+                if is_psi && rel > worst_psi_rel {
+                    worst_psi_rel = rel;
+                }
+                if rel >= rel_tol {
+                    violations.push(format!(
+                        "{probe} {kind} j={j}: analytic={:+.6e} fd={:+.6e} rel={:.3e}",
+                        grad_an[j], fd, rel
+                    ));
+                }
+            }
+        }
+        let pass = violations.is_empty();
+        eprintln!(
+            "[{label} SUMMARY] pass={pass} worst_psi_rel={worst_psi_rel:.3e} \
+             violations={}",
+            violations.len()
+        );
+        (pass, worst_psi_rel, violations)
+    }
+
+    #[test]
+    fn iso_kappa_duchon_gaussian_identity_fd() {
+        let (pass, worst, violations) = iso_kappa_fd_variant_driver(
+            "duchon_gaussian",
+            80,
+            LikelihoodFamily::GaussianIdentity,
+            false,
+            false,
+        );
+        assert!(
+            pass,
+            "Gaussian Identity FD failed; worst_psi_rel={worst:.3e}\n  {}",
+            violations.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn iso_kappa_duchon_binomial_logit_fd() {
+        let (pass, worst, violations) = iso_kappa_fd_variant_driver(
+            "duchon_logit",
+            80,
+            LikelihoodFamily::BinomialLogit,
+            false,
+            false,
+        );
+        assert!(
+            pass,
+            "BinomialLogit FD failed; worst_psi_rel={worst:.3e}\n  {}",
+            violations.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn iso_kappa_thinplate_binomial_probit_fd() {
+        let (pass, worst, violations) = iso_kappa_fd_variant_driver(
+            "tps_probit",
+            80,
+            LikelihoodFamily::BinomialProbit,
+            true,
+            false,
+        );
+        assert!(
+            pass,
+            "ThinPlate Probit FD failed; worst_psi_rel={worst:.3e}\n  {}",
+            violations.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn iso_kappa_duchon_n_smaller_fd() {
+        let (pass, worst, violations) = iso_kappa_fd_variant_driver(
+            "duchon_probit_n20",
+            20,
+            LikelihoodFamily::BinomialProbit,
+            false,
+            false,
+        );
+        assert!(
+            pass,
+            "Duchon Probit n=20 FD failed; worst_psi_rel={worst:.3e}\n  {}",
+            violations.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn iso_kappa_duchon_no_psi_fd() {
+        let (pass, _worst, violations) = iso_kappa_fd_variant_driver(
+            "duchon_probit_rho_only",
+            80,
+            LikelihoodFamily::BinomialProbit,
+            false,
+            true,
+        );
+        assert!(
+            pass,
+            "Duchon Probit ρ-only FD failed:\n  {}",
+            violations.join("\n  ")
+        );
+    }
+
     /// Diagnostic: dump (op_total - fd_H) projected onto the eigenbasis of H
     /// at ψ=0 to localize which mode(s) carry the analytic-vs-FD trace error
     /// reported by `iso_kappa_duchon_binomial_probit_joint_gradient_matches_finite_difference`.
@@ -17049,6 +17364,286 @@ mod tests {
             "[DIAG] (correct-basis) max OFF-DIAGONAL Δ in (op-fd_H) = {:+.4e} at ({},{}) (off-diag doesn't enter trace)",
             max_off_diff, max_off_idx.0, max_off_idx.1
         );
+    }
+
+    /// Minimal focused dump of `op_total − fd_H` at ψ=0 for the iso-κ Duchon
+    /// setup. No assertions — prints every coefficient-basis entry of `diff`
+    /// and the full eigenbasis projection `U^T diff U`, plus Frobenius norms
+    /// and worst entries, so the bug location can be read off directly.
+    ///
+    /// `op_total` is captured from the analytic ext-gradient path via the
+    /// existing `unified::debug_stash` (it stores `B + correction` in the
+    /// original coefficient basis right where the operator is consumed).
+    /// `fd_H` is built from `(H(ψ+h) − H(ψ−h)) / 2h` using
+    /// `ExternalJointHyperEvaluator::debug_full_h`, which re-runs PIRLS at
+    /// the perturbed θ and hands back the same `H_total_original` the inner
+    /// hop solves against. No production code is touched: the stash and
+    /// `debug_full_h` are both `#[cfg(test)]` only.
+    #[test]
+    fn debug_duchon_op_vs_fd_h_at_zero() {
+        let n = 80usize;
+        let mut data = Array2::<f64>::zeros((n, 1));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            let eta = 1.4 * (2.0 * std::f64::consts::PI * t).sin() + 0.5 * (t - 0.5);
+            y[i] = if eta + 0.7 * (3.7 * (i as f64) + 1.0).sin() > 0.0 {
+                1.0
+            } else {
+                0.0
+            };
+        }
+        let weights = Array1::ones(n);
+        let offset = Array1::zeros(n);
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "duchon_1d".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0],
+                    spec: DuchonBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                        length_scale: Some(1.0),
+                        power: 1,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: None,
+                        operator_penalties: DuchonOperatorPenaltySpec::default(),
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let fit_opts = FitOptions {
+            latent_cloglog: None,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: false,
+            max_iter: 200,
+            tol: 1e-12,
+            nullspace_dims: vec![],
+            linear_constraints: None,
+            firth_bias_reduction: false,
+            adaptive_regularization: None,
+            penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
+        };
+
+        let design = build_term_collection_design(data.view(), &spec).expect("design");
+        let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
+        let frozen_design =
+            build_term_collection_design(data.view(), &frozen).expect("frozen design");
+        let spatial_terms = spatial_length_scale_term_indices(&frozen);
+        let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
+        let rho_dim = frozen_design.penalties.len();
+        let psi_dim: usize = dims_per_term.iter().sum();
+        assert!(psi_dim >= 1);
+
+        let external_opts =
+            external_opts_for_design(LikelihoodFamily::BinomialProbit, &frozen_design, &fit_opts);
+        let mut cache = SingleBlockExactJointDesignCache::new(
+            data.view(),
+            frozen.clone(),
+            frozen_design.clone(),
+            spatial_terms.clone(),
+            rho_dim,
+            dims_per_term.clone(),
+        )
+        .expect("single-block cache");
+        let mut evaluator = crate::estimate::ExternalJointHyperEvaluator::new(
+            y.view(),
+            weights.view(),
+            &frozen_design.design,
+            offset.view(),
+            &frozen_design.penalties,
+            &external_opts,
+            "debug_duchon_op_vs_fd_h_at_zero",
+        )
+        .expect("evaluator");
+
+        let theta_dim = rho_dim + psi_dim;
+        let theta_zero = Array1::<f64>::zeros(theta_dim);
+
+        // Capture op_total = B + correction (original coefficient basis)
+        // from the analytic ext-gradient path. This is the dense form of
+        // `coord.drift.to_dense() + correction_matrix_dense` as constructed
+        // by `build_tau_hyper_coords_original_basis` →
+        // `SinglePredictorGlmDerivatives::hessian_derivative_correction`.
+        crate::solver::estimate::reml::unified::debug_stash::arm();
+        cache.ensure_theta(&theta_zero).expect("ensure_theta zero");
+        let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
+            data.view(),
+            cache.spec(),
+            cache.design(),
+            &cache.spatial_terms,
+        )
+        .expect("hyper dirs build")
+        .expect("hyper dirs present");
+        let _ = evaluate_joint_reml_outer_eval_at_theta(
+            &mut evaluator,
+            cache.design(),
+            &theta_zero,
+            rho_dim,
+            hyper_dirs,
+            None,
+            crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+        )
+        .expect("analytic outer eval");
+        crate::solver::estimate::reml::unified::debug_stash::disarm();
+        let (op_total, _u_from_ds): (Array2<f64>, Array2<f64>) =
+            crate::solver::estimate::reml::unified::debug_stash::take()
+                .expect("debug_stash should have captured op_total");
+        let p = op_total.nrows();
+        assert_eq!(op_total.ncols(), p);
+
+        // Build fd_H = (H(ψ+h) − H(ψ−h)) / (2h) where H = H_total_original
+        // from each PIRLS hop. `debug_full_h` re-runs PIRLS at the perturbed
+        // θ and returns the same matrix the analytic operator differentiates.
+        let h = 1e-5_f64;
+        let psi_idx = rho_dim; // first ψ coord
+        let mut theta_plus = theta_zero.clone();
+        theta_plus[psi_idx] += h;
+        let mut theta_minus = theta_zero.clone();
+        theta_minus[psi_idx] -= h;
+
+        cache.ensure_theta(&theta_plus).expect("ensure_theta +h");
+        let dp = cache.design().clone();
+        let h_plus = evaluator
+            .debug_full_h(
+                &dp.design,
+                &dp.penalties,
+                &dp.nullspace_dims,
+                dp.linear_constraints.clone(),
+                &theta_plus,
+                rho_dim,
+                "debug +h",
+            )
+            .expect("debug_full_h +h");
+
+        cache.ensure_theta(&theta_minus).expect("ensure_theta -h");
+        let dm = cache.design().clone();
+        let h_minus = evaluator
+            .debug_full_h(
+                &dm.design,
+                &dm.penalties,
+                &dm.nullspace_dims,
+                dm.linear_constraints.clone(),
+                &theta_minus,
+                rho_dim,
+                "debug -h",
+            )
+            .expect("debug_full_h -h");
+
+        assert_eq!(h_plus.shape(), h_minus.shape());
+        assert_eq!(h_plus.nrows(), p);
+        let fd_h: Array2<f64> = (&h_plus - &h_minus).mapv(|v| v / (2.0 * h));
+
+        // True eigenbasis: eigendecompose H at ψ=0 itself.
+        cache.ensure_theta(&theta_zero).expect("ensure_theta 0");
+        let dz = cache.design().clone();
+        let h_zero = evaluator
+            .debug_full_h(
+                &dz.design,
+                &dz.penalties,
+                &dz.nullspace_dims,
+                dz.linear_constraints.clone(),
+                &theta_zero,
+                rho_dim,
+                "debug 0",
+            )
+            .expect("debug_full_h 0");
+
+        use crate::faer_ndarray::FaerEigh;
+        let (eigvals, u_mat) = h_zero.eigh(faer::Side::Lower).expect("eigh on h_zero");
+        eprintln!("[DBG-OPVH] p={}, eigenvalues(H at ψ=0) = {:?}", p, eigvals.to_vec());
+
+        // Frobenius norms.
+        let diff = &op_total - &fd_h;
+        let frob_op: f64 = op_total.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let frob_fd: f64 = fd_h.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let frob_diff: f64 = diff.iter().map(|v| v * v).sum::<f64>().sqrt();
+        eprintln!(
+            "[DBG-OPVH] ||op_total||_F={:+.6e}  ||fd_H||_F={:+.6e}  ||op-fd_H||_F={:+.6e}",
+            frob_op, frob_fd, frob_diff
+        );
+
+        // Full per-entry dump in coefficient basis.
+        eprintln!("[DBG-OPVH] diff[i,j] = (op_total - fd_H)[i,j] in coefficient basis:");
+        for i in 0..p {
+            for j in 0..p {
+                eprintln!(
+                    "  diff[{},{}] = op={:+.6e}  fd={:+.6e}  Δ={:+.6e}",
+                    i, j, op_total[[i, j]], fd_h[[i, j]], diff[[i, j]]
+                );
+            }
+        }
+
+        // Top entries by |diff| in coefficient basis.
+        let mut coef_entries: Vec<(usize, usize, f64)> = Vec::with_capacity(p * p);
+        for i in 0..p {
+            for j in 0..p {
+                coef_entries.push((i, j, diff[[i, j]]));
+            }
+        }
+        coef_entries.sort_by(|a, b| {
+            b.2.abs()
+                .partial_cmp(&a.2.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        eprintln!("[DBG-OPVH] top |Δ| in COEF basis:");
+        for (rank, (i, j, d)) in coef_entries.iter().take(15).enumerate() {
+            eprintln!("  #{:02}  (i={},j={})  Δ={:+.4e}", rank, i, j, d);
+        }
+
+        // Eigenbasis projection U^T diff U (and ops/fds for reference).
+        let op_eig = u_mat.t().dot(&op_total).dot(&u_mat);
+        let fd_eig = u_mat.t().dot(&fd_h).dot(&u_mat);
+        let diff_eig = u_mat.t().dot(&diff).dot(&u_mat);
+        eprintln!("[DBG-OPVH] U^T (op-fd_H) U  (eigenbasis):");
+        for i in 0..p {
+            for j in 0..p {
+                eprintln!(
+                    "  diff_eig[{},{}] σ=({:+.4e},{:+.4e})  op={:+.4e}  fd={:+.4e}  Δ={:+.4e}",
+                    i, j, eigvals[i], eigvals[j],
+                    op_eig[[i, j]], fd_eig[[i, j]], diff_eig[[i, j]]
+                );
+            }
+        }
+
+        // Diagonal-only eigenbasis summary (the part that enters tr H⁻¹ B).
+        eprintln!("[DBG-OPVH] diagonal-only (i=j) in eigenbasis:");
+        for j in 0..p {
+            eprintln!(
+                "  mode {}: σ={:+.6e}  op_jj={:+.4e}  fd_jj={:+.4e}  Δ_jj={:+.4e}",
+                j, eigvals[j], op_eig[[j, j]], fd_eig[[j, j]], diff_eig[[j, j]]
+            );
+        }
+
+        // Top entries by |Δ| in eigenbasis.
+        let mut eig_entries: Vec<(usize, usize, f64, f64, f64)> = (0..p)
+            .flat_map(|i| {
+                (0..p).map(move |j| (i, j, eigvals[i], eigvals[j], diff_eig[[i, j]]))
+            })
+            .collect();
+        eig_entries.sort_by(|a, b| {
+            b.4.abs()
+                .partial_cmp(&a.4.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        eprintln!("[DBG-OPVH] top |Δ| in EIGEN basis:");
+        for (rank, (i, j, si, sj, d)) in eig_entries.iter().take(15).enumerate() {
+            eprintln!(
+                "  #{:02}  (i={},j={})  σ=({:+.4e},{:+.4e})  Δ={:+.4e}",
+                rank, i, j, si, sj, d
+            );
+        }
     }
 
     #[test]
