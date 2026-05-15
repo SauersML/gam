@@ -38,8 +38,7 @@ use crate::smooth::{
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use std::collections::BTreeMap;
-use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 const MIN_WEIGHT: f64 = 1e-12;
 
@@ -110,24 +109,7 @@ pub struct LatentSurvivalFamily {
     pub x_mean: DesignMatrix,
     pub time_linear_constraints: Option<LinearInequalityConstraints>,
     pub quadctx: Arc<QuadratureContext>,
-    /// Reserved for the two-phase auto-subsample schedule once
-    /// `LatentSurvivalFamily` grows the row-mask plumbing that BMS and
-    /// `SurvivalMarginalSlopeFamily` already have. The family currently
-    /// has no `outer_score_subsample` / `outer_weighted_rows` consumers,
-    /// so the guard cannot install a mask without breaking row-iteration
-    /// hot paths. Field is laid down now so the struct shape is in
-    /// place when the plumbing arrives.
-    pub auto_subsample_phase_counter: Arc<AtomicUsize>,
-    /// Companion to `auto_subsample_phase_counter` (see field docs).
-    pub auto_subsample_last_rho: Arc<Mutex<Option<Array1<f64>>>>,
 }
-
-/// Phase-1 budget for the latent-survival auto-subsample schedule.
-/// Mirrors the BMS / survival-marginal-slope budgets so all three
-/// families share an empirical noise-floor schedule. Currently unused
-/// because the family lacks row-mask plumbing — see the field docs on
-/// `LatentSurvivalFamily::auto_subsample_phase_counter`.
-pub const LATENT_SURVIVAL_AUTO_SUBSAMPLE_PHASE1_BUDGET: usize = 12;
 
 #[derive(Clone)]
 pub struct LatentBinaryFamily {
@@ -142,13 +124,6 @@ pub struct LatentBinaryFamily {
     pub x_mean: DesignMatrix,
     pub time_linear_constraints: Option<LinearInequalityConstraints>,
     pub quadctx: Arc<QuadratureContext>,
-    /// Reserved for the two-phase auto-subsample schedule (see
-    /// `LatentSurvivalFamily::auto_subsample_phase_counter`). The
-    /// family currently lacks row-mask plumbing, so the guard cannot
-    /// be wired yet.
-    pub auto_subsample_phase_counter: Arc<AtomicUsize>,
-    /// Companion to `auto_subsample_phase_counter` (see field docs).
-    pub auto_subsample_last_rho: Arc<Mutex<Option<Array1<f64>>>>,
 }
 
 impl LatentSurvivalFamily {
@@ -345,8 +320,6 @@ pub fn fit_latent_survival_terms(
         x_mean: mean_design.design.clone(),
         time_linear_constraints: time_prepared.linear_constraints.clone(),
         quadctx: Arc::new(QuadratureContext::new()),
-        auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
-        auto_subsample_last_rho: Arc::new(Mutex::new(None)),
     };
 
     let mut blocks = vec![
@@ -392,8 +365,6 @@ pub fn fit_latent_binary_terms(
         x_mean: mean_design.design.clone(),
         time_linear_constraints: time_prepared.linear_constraints.clone(),
         quadctx: Arc::new(QuadratureContext::new()),
-        auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
-        auto_subsample_last_rho: Arc::new(Mutex::new(None)),
     };
 
     let blocks = vec![
@@ -3536,8 +3507,6 @@ mod tests {
             x_mean: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0, -0.3], [0.2, 0.9]])),
             time_linear_constraints: None,
             quadctx: Arc::new(QuadratureContext::new()),
-            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -3577,8 +3546,6 @@ mod tests {
             ))),
             time_linear_constraints: None,
             quadctx: Arc::new(QuadratureContext::new()),
-            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -3696,8 +3663,6 @@ mod tests {
             x_mean: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0, -0.3], [0.2, 0.9]])),
             time_linear_constraints: None,
             quadctx: Arc::new(QuadratureContext::new()),
-            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -4238,42 +4203,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn latent_survival_auto_subsample_phase_counter_field_initializes_to_zero() {
-        let family = learnable_sigma_test_family();
-        assert_eq!(
-            family
-                .auto_subsample_phase_counter
-                .load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "fresh latent-survival family must start at Phase-1 step 0"
-        );
-        assert!(
-            family
-                .auto_subsample_last_rho
-                .lock()
-                .expect("auto_subsample_last_rho mutex poisoned")
-                .is_none(),
-            "fresh latent-survival family must have no recorded last-rho proxy"
-        );
-
-        let binary = fixed_sigma_binary_test_family();
-        assert_eq!(
-            binary
-                .auto_subsample_phase_counter
-                .load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "fresh latent-binary family must start at Phase-1 step 0"
-        );
-        assert!(
-            binary
-                .auto_subsample_last_rho
-                .lock()
-                .expect("auto_subsample_last_rho mutex poisoned")
-                .is_none(),
-            "fresh latent-binary family must have no recorded last-rho proxy"
-        );
     }
 }
