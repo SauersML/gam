@@ -1342,6 +1342,11 @@ pub struct FitConfig {
     /// Enable Firth bias reduction for standard single-parameter families.
     pub firth: bool,
 
+    /// GPU backend policy: `auto` falls back to CPU for unsupported/small paths,
+    /// `off` disables GPU planning, and `force` fails loudly when no supported
+    /// device-resident path is available.
+    pub gpu_policy: crate::gpu::GpuPolicy,
+
     /// Optional override of the [`crate::resource::ResourcePolicy`] used when
     /// planning spatial bases (TPS / Matern / Duchon) during term construction.
     /// When `None`, the default-library policy is used.
@@ -1380,6 +1385,7 @@ impl Default for FitConfig {
             ridge_lambda: 1e-6,
             transformation_normal: false,
             firth: false,
+            gpu_policy: crate::gpu::GpuPolicy::Auto,
             resource_policy: None,
         }
     }
@@ -1434,12 +1440,21 @@ pub fn fit_from_formula(
     fit_model(mat.request)
 }
 
+fn validate_gpu_policy_for_materialize(config: &FitConfig) -> Result<(), String> {
+    if config.gpu_policy != crate::gpu::GpuPolicy::Force {
+        return Ok(());
+    }
+    let shape = crate::gpu::GpuWorkloadShape::dense_pirls(usize::MAX / 2, 2, false);
+    crate::gpu::plan_workload(config.gpu_policy, &shape).map(|_| ())
+}
+
 /// Parse a formula, resolve it against a dataset, and produce a ready-to-fit `FitRequest`.
 pub fn materialize<'a>(
     formula: &str,
     data: &'a Dataset,
     config: &FitConfig,
 ) -> Result<MaterializedModel<'a>, String> {
+    validate_gpu_policy_for_materialize(config)?;
     let parsed = parse_formula(formula)?;
     let col_map = data.column_map();
 
