@@ -2020,38 +2020,12 @@ impl<'a> RemlState<'a> {
     pub(super) fn effectivehessian(
         &self,
         pr: &PirlsResult,
-        rho: &Array1<f64>,
     ) -> Result<(Array2<f64>, RidgePassport), EstimationError> {
-        let mut h = pr
-            .x_transformed
-            .compute_xtwx(&pr.finalweights)
-            .map_err(|_| EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            })?;
-
-        let lambdas = rho.mapv(f64::exp);
-        for (k, cp) in pr.reparam_result.canonical_transformed.iter().enumerate() {
-            if k < lambdas.len() && lambdas[k] != 0.0 {
-                cp.accumulate_weighted(&mut h, lambdas[k]);
-            }
-        }
-
-        let ridge_delta = pr.ridge_passport.delta;
-        if ridge_delta != 0.0 {
-            for i in 0..h.nrows().min(h.ncols()) {
-                h[[i, i]] += ridge_delta;
-            }
-        }
-        enforce_symmetry(&mut h);
-
-        // Verify PD via the same dense factorization wrapper used by
-        // SymmetricMatrix-backed PIRLS Hessians, then return the dense matrix for the
-        // spectral evaluator.
-        if crate::linalg::matrix::SymmetricMatrix::Dense(h.clone())
-            .factorize()
-            .is_ok()
-        {
-            return Ok((h, pr.ridge_passport));
+        // Verify PD via SymmetricMatrix::factorize() (sparse-aware),
+        // then densify for the spectral evaluator which needs eigh().
+        let h = &pr.stabilizedhessian_transformed;
+        if h.factorize().is_ok() {
+            return Ok((h.to_dense(), pr.ridge_passport));
         }
 
         Err(EstimationError::ModelIsIllConditioned {
@@ -3351,7 +3325,7 @@ impl<'a> RemlState<'a> {
         key: Option<Vec<u64>>,
     ) -> Result<EvalShared, EstimationError> {
         let pirls_result = self.execute_pirls_if_needed(rho)?;
-        let (mut h_total, ridge_passport) = self.effectivehessian(pirls_result.as_ref(), rho)?;
+        let (mut h_total, ridge_passport) = self.effectivehessian(pirls_result.as_ref())?;
         let mut firth_dense_operator: Option<Arc<FirthDenseOperator>> = None;
         if self.config.firth_bias_reduction
             && matches!(self.config.link_function(), LinkFunction::Logit)
