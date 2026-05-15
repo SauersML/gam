@@ -17938,6 +17938,118 @@ mod tests {
         eprintln!("[TERMS-OP-EIG] SUM = {:+.6e}   (EIG-DECOMP reported +22.5)", sum_op);
     }
 
+    /// Test PIRLS determinism: call debug_full_h three times at the SAME
+    /// theta=0 and check whether the returned H matrices are identical.
+    /// If they differ, PIRLS produces a different Qs reparametrization
+    /// each call, and the op-vs-fd_H diagonal/eigenbasis comparison is
+    /// contaminated by basis non-determinism.
+    #[test]
+    fn duchon_probit_pirls_determinism_at_zero() {
+        let n = 80usize;
+        let mut data = Array2::<f64>::zeros((n, 1));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            let eta = 1.4 * (2.0 * std::f64::consts::PI * t).sin() + 0.5 * (t - 0.5);
+            y[i] = if eta + 0.7 * (3.7 * (i as f64) + 1.0).sin() > 0.0 { 1.0 } else { 0.0 };
+        }
+        let weights = Array1::ones(n);
+        let offset = Array1::zeros(n);
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "duchon_1d".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0],
+                    spec: DuchonBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                        length_scale: Some(1.0),
+                        power: 1,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: None,
+                        operator_penalties: DuchonOperatorPenaltySpec::default(),
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let fit_opts = FitOptions {
+            latent_cloglog: None, mixture_link: None, optimize_mixture: false,
+            sas_link: None, optimize_sas: false, compute_inference: false,
+            max_iter: 200, tol: 1e-12, nullspace_dims: vec![],
+            linear_constraints: None, firth_bias_reduction: false,
+            adaptive_regularization: None, penalty_shrinkage_floor: None,
+            rho_prior: Default::default(), kronecker_penalty_system: None,
+            kronecker_factored: None,
+        };
+        let design = build_term_collection_design(data.view(), &spec).expect("design");
+        let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
+        let frozen_design = build_term_collection_design(data.view(), &frozen).expect("frozen design");
+        let spatial_terms = spatial_length_scale_term_indices(&frozen);
+        let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
+        let rho_dim = frozen_design.penalties.len();
+        let psi_dim: usize = dims_per_term.iter().sum();
+
+        let external_opts =
+            external_opts_for_design(LikelihoodFamily::BinomialProbit, &frozen_design, &fit_opts);
+        let mut cache = SingleBlockExactJointDesignCache::new(
+            data.view(), frozen.clone(), frozen_design.clone(),
+            spatial_terms.clone(), rho_dim, dims_per_term.clone(),
+        ).expect("cache");
+        let mut evaluator = crate::estimate::ExternalJointHyperEvaluator::new(
+            y.view(), weights.view(), &frozen_design.design, offset.view(),
+            &frozen_design.penalties, &external_opts, "PIRLS-determinism",
+        ).expect("evaluator");
+
+        let theta_dim = rho_dim + psi_dim;
+        let theta_zero = Array1::<f64>::zeros(theta_dim);
+
+        let mut h_calls = Vec::new();
+        for trial in 0..3 {
+            cache.ensure_theta(&theta_zero).expect("ensure_theta");
+            let d = cache.design().clone();
+            let h_i = evaluator.debug_full_h(
+                &d.design, &d.penalties, &d.nullspace_dims,
+                d.linear_constraints.clone(), &theta_zero, rho_dim,
+                &format!("determinism trial {}", trial),
+            ).expect("debug_full_h");
+            h_calls.push(h_i);
+        }
+
+        let h0 = &h_calls[0];
+        eprintln!("[DET] H[0,0]={:+.10e}  ||H||_F={:+.6e}",
+            h0[[0,0]], h0.iter().map(|v| v*v).sum::<f64>().sqrt());
+
+        for trial in 1..3 {
+            let h_i = &h_calls[trial];
+            let diff = h_i - h0;
+            let max_abs = diff.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+            let frob_diff = diff.iter().map(|v| v*v).sum::<f64>().sqrt();
+            let frob_h0 = h0.iter().map(|v| v*v).sum::<f64>().sqrt();
+            eprintln!("[DET] trial {} vs trial 0: max|Δ|={:+.6e}  ||Δ||_F={:+.6e}  rel={:+.6e}",
+                trial, max_abs, frob_diff, frob_diff / frob_h0);
+            // Show entry-level diffs if non-trivial.
+            if max_abs > 1e-9 {
+                eprintln!("[DET] entries with |Δ|>1e-9 (showing top 10):");
+                let mut entries: Vec<(usize, usize, f64)> = Vec::new();
+                for i in 0..h0.nrows() {
+                    for j in 0..h0.ncols() {
+                        entries.push((i, j, diff[[i, j]]));
+                    }
+                }
+                entries.sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap());
+                for (rank, (i, j, d)) in entries.iter().take(10).enumerate() {
+                    eprintln!("  #{:02}  (i={},j={})  H0={:+.6e}  H{}={:+.6e}  Δ={:+.6e}",
+                        rank, i, j, h0[[*i, *j]], trial, h_i[[*i, *j]], d);
+                }
+            }
+        }
+    }
+
     /// Minimal focused dump of `op_total − fd_H` at ψ=0 for the iso-κ Duchon
     /// setup. No assertions — prints every coefficient-basis entry of `diff`
     /// and the full eigenbasis projection `U^T diff U`, plus Frobenius norms
