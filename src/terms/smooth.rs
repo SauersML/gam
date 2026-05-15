@@ -9967,7 +9967,7 @@ fn evaluate_joint_reml_outer_eval_at_theta(
         "evaluate_joint_reml_outer_eval_at_theta",
         order,
     )?;
-    replace_design_moving_hyper_gradient_with_cost_slope(
+    replace_design_moving_joint_gradient_with_cost_slope(
         evaluator,
         design,
         theta,
@@ -9979,7 +9979,7 @@ fn evaluate_joint_reml_outer_eval_at_theta(
     Ok((cost, gradient, hessian))
 }
 
-fn replace_design_moving_hyper_gradient_with_cost_slope(
+fn replace_design_moving_joint_gradient_with_cost_slope(
     evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
     design: &TermCollectionDesign,
     theta: &Array1<f64>,
@@ -9991,11 +9991,38 @@ fn replace_design_moving_hyper_gradient_with_cost_slope(
     if hyper_dirs.iter().all(|dir| dir.is_penalty_like) {
         return Ok(());
     }
+    let h = 1e-5_f64;
+    for rho_idx in 0..rho_dim {
+        let mut theta_plus = theta.clone();
+        theta_plus[rho_idx] += h;
+        let cost_plus = evaluator.evaluate_cost_only(
+            &design.design,
+            &design.penalties,
+            &design.nullspace_dims,
+            design.linear_constraints.clone(),
+            &theta_plus,
+            rho_dim,
+            warm_start_beta,
+            "positive design-moving joint rho-gradient slope",
+        )?;
+        let mut theta_minus = theta.clone();
+        theta_minus[rho_idx] -= h;
+        let cost_minus = evaluator.evaluate_cost_only(
+            &design.design,
+            &design.penalties,
+            &design.nullspace_dims,
+            design.linear_constraints.clone(),
+            &theta_minus,
+            rho_dim,
+            warm_start_beta,
+            "negative design-moving joint rho-gradient slope",
+        )?;
+        gradient[rho_idx] = (cost_plus - cost_minus) / (2.0 * h);
+    }
     let x0 = design
         .design
         .try_to_dense_arc("design-moving hyper-gradient slope requires dense design access")
         .map_err(EstimationError::InvalidInput)?;
-    let h = 1e-5_f64;
     for (psi_idx, dir) in hyper_dirs.iter().enumerate() {
         if dir.is_penalty_like {
             continue;
