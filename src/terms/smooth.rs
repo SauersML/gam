@@ -17321,7 +17321,8 @@ mod tests {
                 .expect("debug capture should have fired");
         eprintln!(
             "[DIAG] analytic ψ-grad[0] = {:+.6e}, op_total shape = {:?}",
-            grad[rho_dim], op_total.shape()
+            grad[rho_dim],
+            op_total.shape()
         );
 
         // ── Step 2: finite-difference H(ψ) along ψ[0].
@@ -17421,14 +17422,7 @@ mod tests {
         let mut entries: Vec<(usize, usize, f64, f64, f64, f64)> = Vec::with_capacity(p * p);
         for i in 0..p {
             for j in 0..p {
-                entries.push((
-                    i,
-                    j,
-                    sigmas[i],
-                    sigmas[j],
-                    op_eig[[i, j]],
-                    fd_eig[[i, j]],
-                ));
+                entries.push((i, j, sigmas[i], sigmas[j], op_eig[[i, j]], fd_eig[[i, j]]));
             }
         }
         // Sort by |op-fd| descending.
@@ -17460,10 +17454,19 @@ mod tests {
             trace_diff += contrib;
             eprintln!(
                 "  mode {:2}  σ={:+.4e}  φ'={:+.4e}  op_jj={:+.4e}  fd_jj={:+.4e}  Δ_jj={:+.4e}  trace_contrib={:+.4e}",
-                j, sigma, phi_prime, op_eig[[j, j]], fd_eig[[j, j]], d, contrib
+                j,
+                sigma,
+                phi_prime,
+                op_eig[[j, j]],
+                fd_eig[[j, j]],
+                d,
+                contrib
             );
         }
-        eprintln!("[DIAG] reconstructed trace error (analytic - fd) = {:+.4e}", trace_diff);
+        eprintln!(
+            "[DIAG] reconstructed trace error (analytic - fd) = {:+.4e}",
+            trace_diff
+        );
 
         // ── Step 8: directly check if U from analytic stash actually
         // diagonalizes h_zero (debug whether the two H sources match).
@@ -17496,10 +17499,20 @@ mod tests {
         let mut orig_entries: Vec<(usize, usize, f64, f64, f64)> = Vec::with_capacity(p * p);
         for i in 0..p {
             for j in 0..p {
-                orig_entries.push((i, j, op_total[[i, j]], fd_h[[i, j]], op_total[[i, j]] - fd_h[[i, j]]));
+                orig_entries.push((
+                    i,
+                    j,
+                    op_total[[i, j]],
+                    fd_h[[i, j]],
+                    op_total[[i, j]] - fd_h[[i, j]],
+                ));
             }
         }
-        orig_entries.sort_by(|a, b| b.4.abs().partial_cmp(&a.4.abs()).unwrap_or(std::cmp::Ordering::Equal));
+        orig_entries.sort_by(|a, b| {
+            b.4.abs()
+                .partial_cmp(&a.4.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         eprintln!("[DIAG] ORIGINAL-basis (op - fd_H), sorted by |Δ| desc (top 20):");
         for (rank, (i, j, oij, fij, d)) in orig_entries.iter().take(20).enumerate() {
             eprintln!(
@@ -17511,7 +17524,9 @@ mod tests {
         // Dump the full op_total and fd_h as dense matrices (small, ~7×7).
         eprintln!("[DIAG] op_total (original basis):");
         for i in 0..p {
-            let row: Vec<String> = (0..p).map(|j| format!("{:+.3e}", op_total[[i, j]])).collect();
+            let row: Vec<String> = (0..p)
+                .map(|j| format!("{:+.3e}", op_total[[i, j]]))
+                .collect();
             eprintln!("  row {}: [{}]", i, row.join(", "));
         }
         eprintln!("[DIAG] fd_H (original basis):");
@@ -17539,10 +17554,18 @@ mod tests {
             trace_diff2 += c;
             eprintln!(
                 "    mode {:2}  σ={:+.4e}  op_jj={:+.4e}  fd_jj={:+.4e}  Δ_jj={:+.4e}  contrib={:+.4e}",
-                j, sigma, op_eig_correct[[j, j]], fd_eig_correct[[j, j]], d, c
+                j,
+                sigma,
+                op_eig_correct[[j, j]],
+                fd_eig_correct[[j, j]],
+                d,
+                c
             );
         }
-        eprintln!("[DIAG] (correct-basis) reconstructed trace error = {:+.4e}", trace_diff2);
+        eprintln!(
+            "[DIAG] (correct-basis) reconstructed trace error = {:+.4e}",
+            trace_diff2
+        );
 
         // Also show off-diagonal magnitude in correct eigenbasis.
         let mut max_off_diff = 0.0_f64;
@@ -17566,8 +17589,14 @@ mod tests {
         // ── Step 12: basis-invariant sanity check via log|H| FD.
         let (eigvals_plus, _) = h_plus.eigh(faer::Side::Lower).expect("eigh h_plus");
         let (eigvals_minus, _) = h_minus.eigh(faer::Side::Lower).expect("eigh h_minus");
-        let logdet_plus: f64 = eigvals_plus.iter().map(|s| (s.abs().max(1e-300)).ln()).sum();
-        let logdet_minus: f64 = eigvals_minus.iter().map(|s| (s.abs().max(1e-300)).ln()).sum();
+        let logdet_plus: f64 = eigvals_plus
+            .iter()
+            .map(|s| (s.abs().max(1e-300)).ln())
+            .sum();
+        let logdet_minus: f64 = eigvals_minus
+            .iter()
+            .map(|s| (s.abs().max(1e-300)).ln())
+            .sum();
         let half_logdet_derivative = 0.5 * (logdet_plus - logdet_minus) / (2.0 * h);
         eprintln!(
             "[DIAG] log|H+|={:+.6e}  log|H-|={:+.6e}  ½ d log|H|/dψ (FD) = {:+.6e}",
@@ -17726,7 +17755,9 @@ mod tests {
         let p = op_total.nrows();
         eprintln!(
             "[TERMS] analytic ψ-grad[0] = {:+.6e}  p={}  op_total shape={:?}",
-            grad[rho_dim], p, op_total.shape()
+            grad[rho_dim],
+            p,
+            op_total.shape()
         );
 
         // ── Step 2: build H(ψ=0) in original basis and eigendecompose for K = G_ε(H).
@@ -17828,7 +17859,9 @@ mod tests {
         }
         eprintln!(
             "[TERMS] SUM of per-term tr(K·M) = {:+.6e}   tr(K · op_total) = {:+.6e}   diff={:+.4e}",
-            running_total, tr_op_total, running_total - tr_op_total
+            running_total,
+            tr_op_total,
+            running_total - tr_op_total
         );
 
         // Also compute the sum reconstructed from individual term matrices,
@@ -18055,7 +18088,11 @@ mod tests {
 
         use crate::faer_ndarray::FaerEigh;
         let (eigvals, u_mat) = h_zero.eigh(faer::Side::Lower).expect("eigh on h_zero");
-        eprintln!("[DBG-OPVH] p={}, eigenvalues(H at ψ=0) = {:?}", p, eigvals.to_vec());
+        eprintln!(
+            "[DBG-OPVH] p={}, eigenvalues(H at ψ=0) = {:?}",
+            p,
+            eigvals.to_vec()
+        );
 
         // Frobenius norms.
         let diff = &op_total - &fd_h;
@@ -18073,7 +18110,11 @@ mod tests {
             for j in 0..p {
                 eprintln!(
                     "  diff[{},{}] = op={:+.6e}  fd={:+.6e}  Δ={:+.6e}",
-                    i, j, op_total[[i, j]], fd_h[[i, j]], diff[[i, j]]
+                    i,
+                    j,
+                    op_total[[i, j]],
+                    fd_h[[i, j]],
+                    diff[[i, j]]
                 );
             }
         }
@@ -18104,8 +18145,13 @@ mod tests {
             for j in 0..p {
                 eprintln!(
                     "  diff_eig[{},{}] σ=({:+.4e},{:+.4e})  op={:+.4e}  fd={:+.4e}  Δ={:+.4e}",
-                    i, j, eigvals[i], eigvals[j],
-                    op_eig[[i, j]], fd_eig[[i, j]], diff_eig[[i, j]]
+                    i,
+                    j,
+                    eigvals[i],
+                    eigvals[j],
+                    op_eig[[i, j]],
+                    fd_eig[[i, j]],
+                    diff_eig[[i, j]]
                 );
             }
         }
@@ -18115,7 +18161,11 @@ mod tests {
         for j in 0..p {
             eprintln!(
                 "  mode {}: σ={:+.6e}  op_jj={:+.4e}  fd_jj={:+.4e}  Δ_jj={:+.4e}",
-                j, eigvals[j], op_eig[[j, j]], fd_eig[[j, j]], diff_eig[[j, j]]
+                j,
+                eigvals[j],
+                op_eig[[j, j]],
+                fd_eig[[j, j]],
+                diff_eig[[j, j]]
             );
         }
 
