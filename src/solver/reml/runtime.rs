@@ -5793,16 +5793,21 @@ impl<'a> RemlState<'a> {
         // lives) and rotate `U_S` back into the original basis via `Qs`
         // since the ψ/τ drift matrices consumed by the trace are produced
         // in the original basis by this assembly path.
-        eprintln!(
-            "[PROBE-ORIG] build_dense_original_assembly hessian_mode={:?} penalty_rank={} ncols={}",
-            hessian_mode,
-            penalty_rank,
-            h_total_original.ncols()
-        );
+        //
+        // The kernel is built UNCONDITIONALLY under `Smooth`, matching the
+        // sibling fix in `build_dense_assembly`.  An earlier version of this
+        // path gated on `penalty_rank < h_total_original.ncols()` — i.e.
+        // structural rank-deficiency of `S_λ` — but that condition is wrong
+        // for non-Gaussian families: the leakage onto `null(S)` is driven by
+        // the third-derivative correction `D_β H[v]`, which has support on
+        // `null(S_k)` for individual penalty components even when total `S_λ`
+        // has full rank.  Skipping the kernel there leaves Duchon ψ-axis
+        // gradients off by orders of magnitude (see
+        // `iso_kappa_duchon_penalty_subspace_projection_pins_trace`) and lets
+        // a spurious nonzero outer gradient leak at large `λ_k` on full-rank
+        // designs that route through this dense-original path.
         let (hessian_logdet_correction, penalty_subspace_trace) =
-            if matches!(hessian_mode, PseudoLogdetMode::Smooth)
-                && penalty_rank < h_total_original.ncols()
-            {
+            if matches!(hessian_mode, PseudoLogdetMode::Smooth) {
                 use super::unified::HessianOperator;
                 let qs = &pirls_result.reparam_result.qs;
                 let h_transformed = qs.t().dot(&h_total_original).dot(qs);
