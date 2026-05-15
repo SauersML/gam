@@ -12185,6 +12185,12 @@ fn joint_outer_evaluate(
             .map(|bundle| bundle.coords.len())
             .unwrap_or(0);
 
+    eprintln!(
+        "[PROBE-JOE] joint_outer_evaluate mode={:?} ext_bundle={} rho.len={}",
+        eval_mode,
+        ext_bundle.is_some(),
+        rho.len()
+    );
     let (objective, grad, outer_hessian) = unified_joint_cost_gradient(
         inner,
         specs,
@@ -12227,6 +12233,16 @@ fn joint_outer_evaluate(
             expected_theta_dim
         ));
     }
+    eprintln!(
+        "[PROBE-JOE] joint_outer_evaluate result kind={} grad.len={} expected={}",
+        match &outer_hessian {
+            crate::solver::outer_strategy::HessianResult::Analytic(_) => "Analytic",
+            crate::solver::outer_strategy::HessianResult::Operator(_) => "Operator",
+            crate::solver::outer_strategy::HessianResult::Unavailable => "Unavailable",
+        },
+        grad.len(),
+        expected_theta_dim
+    );
     match &outer_hessian {
         crate::solver::outer_strategy::HessianResult::Analytic(hessian) => {
             if hessian.iter().any(|value| !value.is_finite()) {
