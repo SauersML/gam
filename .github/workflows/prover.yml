@@ -149,31 +149,9 @@ jobs:
               file.filename === '.github/workflows/prover.yml'
             );
 
-            const commits = await github.paginate(
-              github.rest.pulls.listCommits,
-              {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: pr.number,
-                per_page: 100,
-              }
-            );
-            const hasJulesCommit = commits.some((c) => {
-              const name = (c.commit && c.commit.author && c.commit.author.name) || '';
-              return name.toLowerCase().includes('jules');
-            });
-
             const branchName = pr.head.ref;
-            const julesApiBranchPattern = /^fix-(lean|proofs|build).*?-\d+$/;
-            const julesScriptBranchPattern = /^jules-improvement-\d{8}-\d{6}$/;
-            const hasJulesBranch = julesApiBranchPattern.test(branchName) || julesScriptBranchPattern.test(branchName);
-            const isJulesPR = hasJulesCommit || hasJulesBranch;
-
             const proverFailed = '${{ needs.prove.result }}' === 'failure';
-
-            const shouldClose =
-              (touchesLean && proverFailed) ||
-              (isJulesPR && proverFailed);
+            const shouldClose = touchesLean && proverFailed;
 
             if (!shouldClose) {
               core.info('No auto-close conditions met; skipping.');
@@ -183,12 +161,10 @@ jobs:
             const body = [
               '## ❌ Lean Prover CI Failed',
               '',
-              'This PR was auto-closed due to one or more Lean rules:',
+              'This PR was auto-closed because Lean-related files changed and Lean Prover CI failed.',
               `- Touches Lean-related files and prover failed: ${touchesLean && proverFailed ? 'yes' : 'no'}`,
-              `- Jules PR and prover failed: ${isJulesPR && proverFailed ? 'yes' : 'no'}`,
               '',
               `Branch: \`${branchName}\``,
-              `Jules PR detected: ${isJulesPR ? 'yes' : 'no'} (branch pattern: ${hasJulesBranch}, commit author: ${hasJulesCommit})`,
               '',
               'Please fix and reopen when ready.',
             ].join('\n');
