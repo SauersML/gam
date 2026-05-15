@@ -16782,7 +16782,7 @@ mod tests {
         let theta_zero = Array1::<f64>::zeros(theta_dim);
 
         // ── Step 1: arm capture, run analytic eval at ψ=0 to stash op_total + U.
-        crate::solver::reml::unified::debug_stash::arm();
+        crate::solver::estimate::reml::unified::debug_stash::arm();
         cache.ensure_theta(&theta_zero).expect("ensure_theta");
         let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
             data.view(),
@@ -16802,9 +16802,10 @@ mod tests {
             crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
         )
         .expect("analytic outer eval");
-        crate::solver::reml::unified::debug_stash::disarm();
-        let (op_total, u_mat) = crate::solver::reml::unified::debug_stash::take()
-            .expect("debug capture should have fired");
+        crate::solver::estimate::reml::unified::debug_stash::disarm();
+        let (op_total, u_mat): (Array2<f64>, Array2<f64>) =
+            crate::solver::estimate::reml::unified::debug_stash::take()
+                .expect("debug capture should have fired");
         eprintln!(
             "[DIAG] analytic ψ-grad[0] = {:+.6e}, op_total shape = {:?}",
             grad[rho_dim], op_total.shape()
@@ -16870,7 +16871,7 @@ mod tests {
 
         // ── Step 4: rotate diff into eigenbasis of H. U from analytic stash.
         let ut_diff = u_mat.t().dot(&diff);
-        let diff_eig = ut_diff.dot(&u_mat);
+        let _diff_eig = ut_diff.dot(&u_mat);
         let ut_op = u_mat.t().dot(&op_total);
         let op_eig = ut_op.dot(&u_mat);
         let ut_fd = u_mat.t().dot(&fd_h);
