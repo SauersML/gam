@@ -1931,7 +1931,17 @@ impl<'a> RemlState<'a> {
 
         let u = &pirls_result.solveweights
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
-        let w_diag = std::sync::Arc::new(pirls_result.finalweights.clone());
+        // Match PIRLS's stabilized H = X' W X + S where W = max(W_obs, floor(W_F)).
+        // See `outer_hessian_curvature_arrays` for the rationale.
+        let zero_d = Array1::<f64>::zeros(pirls_result.finalweights.len());
+        let (w_floored, c_masked, _d_masked) = crate::solver::pirls::outer_hessian_curvature_arrays(
+            &pirls_result.finalweights,
+            &pirls_result.solveweights,
+            &pirls_result.solve_c_array,
+            &zero_d,
+        );
+        let w_diag = std::sync::Arc::new(w_floored);
+        let solve_c_floored = c_masked;
         let x_design = self.x().clone();
 
         let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
