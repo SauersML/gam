@@ -2445,11 +2445,14 @@ impl<'a> RemlState<'a> {
         let u = &pirls_result.solveweights
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
         // Match PIRLS's stabilized H = X' W X + S where W = max(W_obs, floor).
+        let inverse_link = self.build_runtime_inverse_link();
         let (w_diag, c_array, d_array) = crate::solver::pirls::outer_hessian_curvature_arrays(
             &pirls_result.finalweights,
             &pirls_result.solveweights,
             &pirls_result.solve_c_array,
             &pirls_result.solve_d_array,
+            &pirls_result.final_eta,
+            &inverse_link,
         );
         let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
 
