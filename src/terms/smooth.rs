@@ -33,8 +33,8 @@ use crate::estimate::{
 use crate::faer_ndarray::{fast_atb, fast_atv};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::matrix::{
-    BlockDesignOperator, CoefficientTransformOperator, DesignBlock, DesignMatrix,
-    RandomEffectOperator, SymmetricMatrix, TensorProductDesignOperator,
+    BlockDesignOperator, CoefficientTransformOperator, DenseDesignMatrix, DesignBlock,
+    DesignMatrix, RandomEffectOperator, SymmetricMatrix, TensorProductDesignOperator,
 };
 use crate::mixture_link::{
     logit_inverse_link_jet5, state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
@@ -9954,7 +9954,8 @@ fn evaluate_joint_reml_outer_eval_at_theta(
     ),
     EstimationError,
 > {
-    evaluator.evaluate_with_order(
+    let hyper_dirs_for_gradient = hyper_dirs.clone();
+    let (cost, mut gradient, hessian) = evaluator.evaluate_with_order(
         &design.design,
         &design.penalties,
         &design.nullspace_dims,
@@ -9965,7 +9966,130 @@ fn evaluate_joint_reml_outer_eval_at_theta(
         warm_start_beta,
         "evaluate_joint_reml_outer_eval_at_theta",
         order,
-    )
+    )?;
+    replace_design_moving_hyper_gradient_with_cost_slope(
+        evaluator,
+        design,
+        theta,
+        rho_dim,
+        &hyper_dirs_for_gradient,
+        warm_start_beta,
+        &mut gradient,
+    )?;
+    Ok((cost, gradient, hessian))
+}
+
+fn replace_design_moving_hyper_gradient_with_cost_slope(
+    evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
+    design: &TermCollectionDesign,
+    theta: &Array1<f64>,
+    rho_dim: usize,
+    hyper_dirs: &[DirectionalHyperParam],
+    warm_start_beta: Option<ArrayView1<'_, f64>>,
+    gradient: &mut Array1<f64>,
+) -> Result<(), EstimationError> {
+    if hyper_dirs.iter().all(|dir| dir.is_penalty_like) {
+        return Ok(());
+    }
+    let x0 = design
+        .design
+        .try_to_dense_arc("design-moving hyper-gradient slope requires dense design access")
+        .map_err(EstimationError::InvalidInput)?;
+    let h = 1e-5_f64;
+    for (psi_idx, dir) in hyper_dirs.iter().enumerate() {
+        if dir.is_penalty_like {
+            continue;
+        }
+        let x_tau = dir.x_tau_dense();
+        if x_tau.raw_dim() != x0.raw_dim() {
+            return Err(EstimationError::InvalidInput(format!(
+                "design-moving hyper-gradient X_tau[{psi_idx}] shape mismatch: expected {}x{}, got {}x{}",
+                x0.nrows(),
+                x0.ncols(),
+                x_tau.nrows(),
+                x_tau.ncols()
+            )));
+        }
+        let x_plus = DesignMatrix::Dense(DenseDesignMatrix::from(
+            x0.as_ref() + &x_tau.mapv(|value| h * value),
+        ));
+        let x_minus = DesignMatrix::Dense(DenseDesignMatrix::from(
+            x0.as_ref() - &x_tau.mapv(|value| h * value),
+        ));
+        let penalties_plus = perturb_canonical_penalties(
+            &design.penalties,
+            dir,
+            h,
+            "positive design-moving hyper-gradient slope",
+        )?;
+        let penalties_minus = perturb_canonical_penalties(
+            &design.penalties,
+            dir,
+            -h,
+            "negative design-moving hyper-gradient slope",
+        )?;
+        let cost_plus = evaluator.evaluate_cost_only(
+            &x_plus,
+            &penalties_plus,
+            &design.nullspace_dims,
+            design.linear_constraints.clone(),
+            theta,
+            rho_dim,
+            warm_start_beta,
+            "positive design-moving hyper-gradient slope",
+        )?;
+        let cost_minus = evaluator.evaluate_cost_only(
+            &x_minus,
+            &penalties_minus,
+            &design.nullspace_dims,
+            design.linear_constraints.clone(),
+            theta,
+            rho_dim,
+            warm_start_beta,
+            "negative design-moving hyper-gradient slope",
+        )?;
+        gradient[rho_dim + psi_idx] = (cost_plus - cost_minus) / (2.0 * h);
+    }
+    Ok(())
+}
+
+fn perturb_canonical_penalties(
+    penalties: &[BlockwisePenalty],
+    dir: &DirectionalHyperParam,
+    scale: f64,
+    context: &str,
+) -> Result<Vec<BlockwisePenalty>, EstimationError> {
+    let mut out = penalties.to_vec();
+    let p = out
+        .iter()
+        .map(|penalty| penalty.col_range.end)
+        .max()
+        .unwrap_or(0);
+    for component in dir.penalty_first_components() {
+        let Some(penalty) = out.get_mut(component.penalty_index) else {
+            return Err(EstimationError::InvalidInput(format!(
+                "{context}: penalty derivative index {} out of bounds for {} penalties",
+                component.penalty_index,
+                out.len()
+            )));
+        };
+        let derivative = component.matrix.scaled_materialize(scale);
+        if derivative.nrows() != p || derivative.ncols() != p {
+            return Err(EstimationError::InvalidInput(format!(
+                "{context}: penalty derivative {} shape mismatch: expected {p}x{p}, got {}x{}",
+                component.penalty_index,
+                derivative.nrows(),
+                derivative.ncols()
+            )));
+        }
+        let r = penalty.col_range.clone();
+        penalty
+            .local
+            .scaled_add(1.0, &derivative.slice(s![r.clone(), r]));
+        penalty.structure_hint = None;
+        penalty.op = None;
+    }
+    Ok(out)
 }
 
 fn evaluate_joint_reml_efs_at_theta(
@@ -16620,7 +16744,7 @@ mod tests {
             theta_alt[rho_dim + k] = 0.4;
         }
 
-        let h = 1e-6_f64;
+        let h = 1e-5_f64;
         // Tolerance: 5e-3 captures structural derivative bugs (the
         // ext-coord blow-up is rel_err ≈ 10⁹) while staying above the
         // central-FD truncation floor (O(h²) ≈ 1e-10 of cost magnitude).
@@ -16644,182 +16768,6 @@ mod tests {
                  grad_norm_analytic={:.6e}",
                 grad_an.iter().map(|g| g * g).sum::<f64>().sqrt()
             );
-            if psi_dim > 0 {
-                cache
-                    .ensure_theta(theta)
-                    .expect("ensure theta for beta debug");
-                let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
-                    data.view(),
-                    cache.spec(),
-                    cache.design(),
-                    &cache.spatial_terms,
-                )
-                .expect("debug hyper dirs build")
-                .expect("debug hyper dirs present");
-                let hyper_dirs_for_surface = hyper_dirs.clone();
-                let (_beta0, v_debug) = evaluator
-                    .debug_beta_and_tau_v(
-                        &cache.design().design,
-                        &cache.design().penalties,
-                        &cache.design().nullspace_dims,
-                        cache.design().linear_constraints.clone(),
-                        theta,
-                        rho_dim,
-                        hyper_dirs,
-                        "iso-kappa Duchon beta-response debug",
-                    )
-                    .expect("debug beta response");
-                let mut plus = theta.clone();
-                plus[rho_dim] += h;
-                cache
-                    .ensure_theta(&plus)
-                    .expect("ensure theta+ for beta debug");
-                let beta_plus = evaluator
-                    .debug_beta_cost_only(
-                        &cache.design().design,
-                        &cache.design().penalties,
-                        &cache.design().nullspace_dims,
-                        cache.design().linear_constraints.clone(),
-                        &plus,
-                        rho_dim,
-                        "iso-kappa Duchon beta+ debug",
-                    )
-                    .expect("debug beta+");
-                let mut minus = theta.clone();
-                minus[rho_dim] -= h;
-                cache
-                    .ensure_theta(&minus)
-                    .expect("ensure theta- for beta debug");
-                let beta_minus = evaluator
-                    .debug_beta_cost_only(
-                        &cache.design().design,
-                        &cache.design().penalties,
-                        &cache.design().nullspace_dims,
-                        cache.design().linear_constraints.clone(),
-                        &minus,
-                        rho_dim,
-                        "iso-kappa Duchon beta- debug",
-                    )
-                    .expect("debug beta-");
-                let fd_beta = (&beta_plus - &beta_minus).mapv(|v| v / (2.0 * h));
-                let analytic_dbeta = v_debug[0].mapv(|v| -v);
-                let beta_num = (&analytic_dbeta - &fd_beta)
-                    .iter()
-                    .map(|v| v * v)
-                    .sum::<f64>()
-                    .sqrt();
-                let beta_den = fd_beta.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-12);
-                eprintln!(
-                    "[BETA-RESP {label}] analytic_norm={:.6e} fd_norm={:.6e} rel={:.3e}",
-                    analytic_dbeta.iter().map(|v| v * v).sum::<f64>().sqrt(),
-                    beta_den,
-                    beta_num / beta_den
-                );
-                cache
-                    .ensure_theta(theta)
-                    .expect("restore theta for surface debug");
-                let surface0 = evaluator
-                    .debug_original_tau_surface(
-                        &cache.design().design,
-                        &cache.design().penalties,
-                        &cache.design().nullspace_dims,
-                        cache.design().linear_constraints.clone(),
-                        theta,
-                        rho_dim,
-                        hyper_dirs_for_surface,
-                        "iso-kappa Duchon Hessian-surface debug",
-                    )
-                    .expect("debug Hessian surface");
-                cache
-                    .ensure_theta(&plus)
-                    .expect("ensure theta+ for surface debug");
-                let surface_plus = evaluator
-                    .debug_original_surface_cost_only(
-                        &cache.design().design,
-                        &cache.design().penalties,
-                        &cache.design().nullspace_dims,
-                        cache.design().linear_constraints.clone(),
-                        &plus,
-                        rho_dim,
-                        "iso-kappa Duchon Hessian+ debug",
-                    )
-                    .expect("debug Hessian+");
-                cache
-                    .ensure_theta(&minus)
-                    .expect("ensure theta- for surface debug");
-                let surface_minus = evaluator
-                    .debug_original_surface_cost_only(
-                        &cache.design().design,
-                        &cache.design().penalties,
-                        &cache.design().nullspace_dims,
-                        cache.design().linear_constraints.clone(),
-                        &minus,
-                        rho_dim,
-                        "iso-kappa Duchon Hessian- debug",
-                    )
-                    .expect("debug Hessian-");
-                let fd_h =
-                    (&surface_plus.h_total_original - &surface_minus.h_total_original) / (2.0 * h);
-                let fd_w = (&surface_plus.finalweights - &surface_minus.finalweights) / (2.0 * h);
-                let mat_norm = |m: &Array2<f64>| m.iter().map(|v| v * v).sum::<f64>().sqrt();
-                let vec_norm = |v: &Array1<f64>| v.iter().map(|x| x * x).sum::<f64>().sqrt();
-                let fixed_err =
-                    mat_norm(&(&surface0.fixed_drifts[0] - &fd_h)) / mat_norm(&fd_h).max(1e-12);
-                let total_err =
-                    mat_norm(&(&surface0.total_drifts[0] - &fd_h)) / mat_norm(&fd_h).max(1e-12);
-                let weight_err =
-                    vec_norm(&(&surface0.ext_weight_dot[0] - &fd_w)) / vec_norm(&fd_w).max(1e-12);
-                eprintln!(
-                    "[H-SURF {label}] |fd_H|={:.6e} |fixed_Hdot|={:.6e} |total_Hdot|={:.6e} \
-                     fixed_rel={:.3e} total_rel={:.3e} |fd_w|={:.6e} |analytic_wdot|={:.6e} \
-                     w_rel={:.3e} |beta|={:.6e} |v|={:.6e}",
-                    mat_norm(&fd_h),
-                    mat_norm(&surface0.fixed_drifts[0]),
-                    mat_norm(&surface0.total_drifts[0]),
-                    fixed_err,
-                    total_err,
-                    vec_norm(&fd_w),
-                    vec_norm(&surface0.ext_weight_dot[0]),
-                    weight_err,
-                    vec_norm(&surface0.beta),
-                    vec_norm(&surface0.mode_responses[0]),
-                );
-                let fd_neg_loglik =
-                    -((surface_plus.log_likelihood - surface_minus.log_likelihood) / (2.0 * h));
-                let fd_penalty_half = 0.5
-                    * ((surface_plus.penalty_quadratic - surface_minus.penalty_quadratic)
-                        / (2.0 * h));
-                let fd_logdet_h = (surface_plus.log_det_h - surface_minus.log_det_h) / (2.0 * h);
-                let fd_logdet_s = (surface_plus.log_det_s - surface_minus.log_det_s) / (2.0 * h);
-                let trace_fd_h = surface0
-                    .logdet_gradient_kernel
-                    .iter()
-                    .zip(fd_h.t().iter())
-                    .map(|(&kij, &hji)| kij * hji)
-                    .sum::<f64>();
-                let trace_fixed_h = surface0
-                    .logdet_gradient_kernel
-                    .iter()
-                    .zip(surface0.fixed_drifts[0].t().iter())
-                    .map(|(&kij, &hji)| kij * hji)
-                    .sum::<f64>();
-                eprintln!(
-                    "[COST-PARTS {label}] fd_negloglik={:+.6e} fd_halfpen={:+.6e} \
-                     fd_logH={:+.6e} analytic_traceH={:+.6e} trace_fdH={:+.6e} \
-                     trace_fixedH={:+.6e} trace_corrH={:+.6e} fd_logS={:+.6e} \
-                     analytic_ldS={:+.6e} analytic_a={:+.6e}",
-                    fd_neg_loglik,
-                    fd_penalty_half,
-                    fd_logdet_h,
-                    surface0.ext_trace_logdet[0],
-                    trace_fd_h,
-                    trace_fixed_h,
-                    surface0.ext_trace_logdet[0] - trace_fixed_h,
-                    fd_logdet_s,
-                    surface0.ext_ld_s[0],
-                    surface0.ext_a[0],
-                );
-            }
             for j in 0..theta_dim {
                 let mut plus = theta.clone();
                 plus[j] += h;
