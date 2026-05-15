@@ -1342,6 +1342,11 @@ pub struct FitConfig {
     /// Enable Firth bias reduction for standard single-parameter families.
     pub firth: bool,
 
+    /// GPU backend selection policy. `Auto` uses supported device kernels for
+    /// large workloads, `Off` pins execution to CPU kernels, and `Force` fails
+    /// loudly when a requested GPU kernel has no compiled backend.
+    pub gpu_policy: crate::gpu::GpuPolicy,
+
     /// Optional override of the [`crate::resource::ResourcePolicy`] used when
     /// planning spatial bases (TPS / Matern / Duchon) during term construction.
     /// When `None`, the default-library policy is used.
@@ -1380,6 +1385,7 @@ impl Default for FitConfig {
             ridge_lambda: 1e-6,
             transformation_normal: false,
             firth: false,
+            gpu_policy: crate::gpu::GpuPolicy::Auto,
             resource_policy: None,
         }
     }
@@ -1440,6 +1446,7 @@ pub fn materialize<'a>(
     data: &'a Dataset,
     config: &FitConfig,
 ) -> Result<MaterializedModel<'a>, String> {
+    crate::gpu::configure_global_policy(config.gpu_policy);
     let parsed = parse_formula(formula)?;
     let col_map = data.column_map();
 
