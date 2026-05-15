@@ -74,6 +74,7 @@ struct PyFitConfig {
     noise_offset: Option<String>,
 
     firth: Option<bool>,
+    gpu: Option<String>,
 
     // Frailty (only consumed by survival families today). Mirrors the CLI
     // names: --frailty-kind, --frailty-sd, --hazard-loading.
@@ -1174,6 +1175,14 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
     }
     if let Some(flag) = py_config.firth {
         fit_config.firth = flag;
+    }
+    if let Some(raw_gpu) = py_config.gpu {
+        fit_config.gpu_policy = gam::gpu::GpuPolicy::parse(&raw_gpu).ok_or_else(|| {
+            format!(
+                "invalid gpu policy '{}'; supported values are auto, off, force",
+                raw_gpu
+            )
+        })?;
     }
     if let Some(kind) = py_config.frailty_kind {
         let trimmed = kind.trim().to_ascii_lowercase();

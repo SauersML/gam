@@ -21,6 +21,7 @@ pub fn init_parallelism() {
 }
 
 pub mod families;
+pub mod gpu;
 pub mod inference;
 pub mod linalg;
 pub mod report;
