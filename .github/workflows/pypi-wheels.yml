@@ -215,6 +215,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
+      # Install rustup proper before maturin-action runs.
+      #
+      # macOS GitHub-hosted runners (both macos-14 ARM and macos-15-intel)
+      # ship `rustup-init` but not full `rustup` on PATH. maturin-action's
+      # toolchain selection invokes `rustup-init +1.93.0 ...` to honor
+      # the in-repo `rust-toolchain.toml`, but `rustup-init` rejects the
+      # `+TOOLCHAIN` syntax — only the management tool `rustup` accepts
+      # it. The build dies with "error: unexpected argument '+1.93.0'
+      # found" before maturin gets a chance to run.
+      #
+      # Linux + Windows runners aren't affected: linux jobs run inside a
+      # manylinux/musllinux Docker image with a pre-installed rustc, and
+      # the windows runner image bundles full rustup. Only the macos
+      # path needs an explicit install.
+      - name: Install Rust toolchain (macos rustup-init workaround)
+        uses: dtolnay/rust-toolchain@1.93.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: pypi-${{ matrix.platform.target }}-macos
