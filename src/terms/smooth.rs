@@ -18064,31 +18064,38 @@ mod tests {
         assert_eq!(c_x_tau_beta.len(), n);
         assert_eq!(x_v_psi.len(), n);
 
-        // analytic c·dη/dψ_total = c·X_τβ̂ − c·X·v_ψ = c_x_tau_beta − c·x_v_psi
+        // Analytic per-row IFT diagonal:
+        //   d_i = (c·X_τβ̂)_i − (c·X·v_ψ)_i
+        //       = c_i · (X_τβ̂ + X·∂β̂/∂ψ)_i = c_i · (dη/dψ_total)_i.
+        // FD reference: c_i · (η_+ − η_−)_i / 2h.
         let c_x_v: Array1<f64> = &c_0 * &x_v_psi;
         let analytic_diag: Array1<f64> = &c_x_tau_beta - &c_x_v;
-        let l2_analytic = analytic_diag.iter().map(|v| v*v).sum::<f64>().sqrt();
-        let max_analytic = analytic_diag.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-        let l2_term4_only = c_x_tau_beta.iter().map(|v| v*v).sum::<f64>().sqrt();
-        let l2_corr_only = c_x_v.iter().map(|v| v*v).sum::<f64>().sqrt();
-        eprintln!("[ROW] ||c·X_τβ̂||_L2 = {:+.6e}  ||c·X·v_ψ||_L2 = {:+.6e}",
-            l2_term4_only, l2_corr_only);
-        eprintln!("[ROW] ||c·X_τβ̂ − c·X·v_ψ||_L2 = {:+.6e}  max|·| = {:+.4e}",
-            l2_analytic, max_analytic);
-        eprintln!("[ROW] (FD truth) ||c·dη/dψ_FD||_L2 = {:+.6e}", l2_c_dnu);
 
-        // Per-row comparison
+        // Each half is individually large (Frobenius ~ 88 for our test); the
+        // physics is in their row-wise cancellation. Pin the cancellation:
+        // |analytic - FD| / |FD|  must stay below 1e-3.  Our current
+        // measurement is rel ≈ 2.9e-5 with both halves at ||·||_L2 ≈ 88.5.
+        let l2_term4_only = c_x_tau_beta.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let l2_corr_only = c_x_v.iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!(
+            l2_term4_only > 10.0 && l2_corr_only > 10.0,
+            "expected both IFT halves to be large in isolation (only their \
+             row-wise sum should be small), got ||c·X_τβ̂||_L2={:+.3e}, \
+             ||c·X·v_ψ||_L2={:+.3e}",
+            l2_term4_only, l2_corr_only
+        );
+
         let diff: Array1<f64> = &analytic_diag - &c_dnu_fd;
-        let l2_diff = diff.iter().map(|v| v*v).sum::<f64>().sqrt();
-        let max_diff = diff.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-        eprintln!("[ROW] ||analytic − FD||_L2 = {:+.6e}  max|·| = {:+.4e}  rel = {:+.4e}",
-            l2_diff, max_diff, l2_diff / l2_c_dnu);
+        let l2_diff = diff.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let rel = l2_diff / l2_c_dnu.max(1e-30);
+        assert!(
+            rel < 1e-3,
+            "analytic IFT row-diagonal must match FD to 1e-3 relative \
+             (got rel={:+.4e}, ||Δ||_L2={:+.4e}, ||FD||_L2={:+.4e}). \
+             Regression in IFT chain rule (v_ψ formula or W-surface mix).",
+            rel, l2_diff, l2_c_dnu
+        );
 
-        eprintln!("[ROW] === PER-ROW COMPARE (first 20) ===");
-        for i in 0..20.min(n) {
-            eprintln!("  i={:2}  c·X_τβ̂={:+.4e}  c·X·v_ψ={:+.4e}  analytic_sum={:+.4e}  FD={:+.4e}  Δ={:+.4e}",
-                i, c_x_tau_beta[i], c_x_v[i], analytic_diag[i], c_dnu_fd[i], diff[i]);
-        }
         let _ = c_p;
         let _ = w_p;
         let _ = w_0;
@@ -18178,32 +18185,19 @@ mod tests {
         }
 
         let h0 = &h_calls[0];
-        eprintln!("[DET] H[0,0]={:+.10e}  ||H||_F={:+.6e}",
-            h0[[0,0]], h0.iter().map(|v| v*v).sum::<f64>().sqrt());
-
         for trial in 1..3 {
-            let h_i = &h_calls[trial];
-            let diff = h_i - h0;
+            let diff = &h_calls[trial] - h0;
             let max_abs = diff.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-            let frob_diff = diff.iter().map(|v| v*v).sum::<f64>().sqrt();
-            let frob_h0 = h0.iter().map(|v| v*v).sum::<f64>().sqrt();
-            eprintln!("[DET] trial {} vs trial 0: max|Δ|={:+.6e}  ||Δ||_F={:+.6e}  rel={:+.6e}",
-                trial, max_abs, frob_diff, frob_diff / frob_h0);
-            // Show entry-level diffs if non-trivial.
-            if max_abs > 1e-9 {
-                eprintln!("[DET] entries with |Δ|>1e-9 (showing top 10):");
-                let mut entries: Vec<(usize, usize, f64)> = Vec::new();
-                for i in 0..h0.nrows() {
-                    for j in 0..h0.ncols() {
-                        entries.push((i, j, diff[[i, j]]));
-                    }
-                }
-                entries.sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap());
-                for (rank, (i, j, d)) in entries.iter().take(10).enumerate() {
-                    eprintln!("  #{:02}  (i={},j={})  H0={:+.6e}  H{}={:+.6e}  Δ={:+.6e}",
-                        rank, i, j, h0[[*i, *j]], trial, h_i[[*i, *j]], d);
-                }
-            }
+            // PIRLS is deterministic at fixed θ: repeated debug_full_h calls
+            // must return bit-identical H matrices. Any drift indicates
+            // non-deterministic Qs reparametrization or stochastic seeding
+            // that would silently invalidate the analytic-vs-FD H comparison
+            // path (debug_duchon_op_vs_fd_h_at_zero, etc.).
+            assert_eq!(
+                max_abs, 0.0,
+                "PIRLS non-deterministic at fixed θ (trial {} vs 0): max|Δ|={:+.6e}",
+                trial, max_abs
+            );
         }
     }
 
