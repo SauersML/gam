@@ -21,6 +21,7 @@ pub fn init_parallelism() {
 }
 
 pub mod families;
+pub mod gpu;
 pub mod inference;
 pub mod linalg;
 pub mod report;
@@ -45,6 +46,8 @@ pub use resource::{
 };
 pub use solver::{estimate, mixture_link, pirls, seeding, visualizer};
 pub use terms::{basis, construction, hull, layout, smooth, term_builder};
+
+pub use gpu::{gpu_available, selected_gpu_info};
 
 pub use families::bernoulli_marginal_slope;
 pub use families::custom_family;
