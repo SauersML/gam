@@ -43,7 +43,7 @@ pub use resource::{
     ByteLruCache, DerivativeStorageMode, MaterializationPolicy, MatrixMaterializationError,
     ProblemHints, ResidentBytes, ResourcePolicy,
 };
-pub use solver::{estimate, mixture_link, pirls, seeding, visualizer};
+pub use solver::{estimate, gpu, mixture_link, pirls, seeding, visualizer};
 pub use terms::{basis, construction, hull, layout, smooth, term_builder};
 
 pub use families::bernoulli_marginal_slope;
