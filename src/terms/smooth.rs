@@ -16685,6 +16685,273 @@ mod tests {
         );
     }
 
+    /// Diagnostic: dump (op_total - fd_H) projected onto the eigenbasis of H
+    /// at ψ=0 to localize which mode(s) carry the analytic-vs-FD trace error
+    /// reported by `iso_kappa_duchon_binomial_probit_joint_gradient_matches_finite_difference`.
+    /// Not an assertion test — prints a report to stderr.
+    #[test]
+    fn iso_kappa_duchon_op_vs_fd_h_eigenbasis_diagnostic() {
+        let n = 80usize;
+        let mut data = Array2::<f64>::zeros((n, 1));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            let eta = 1.4 * (2.0 * std::f64::consts::PI * t).sin() + 0.5 * (t - 0.5);
+            y[i] = if eta + 0.7 * (3.7 * (i as f64) + 1.0).sin() > 0.0 {
+                1.0
+            } else {
+                0.0
+            };
+        }
+        let weights = Array1::ones(n);
+        let offset = Array1::zeros(n);
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "duchon_1d".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0],
+                    spec: DuchonBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                        length_scale: Some(1.0),
+                        power: 1,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: None,
+                        operator_penalties: DuchonOperatorPenaltySpec::default(),
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let fit_opts = FitOptions {
+            latent_cloglog: None,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: false,
+            max_iter: 200,
+            tol: 1e-12,
+            nullspace_dims: vec![],
+            linear_constraints: None,
+            firth_bias_reduction: false,
+            adaptive_regularization: None,
+            penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
+        };
+
+        let design = build_term_collection_design(data.view(), &spec).expect("design");
+        let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
+        let frozen_design =
+            build_term_collection_design(data.view(), &frozen).expect("frozen design");
+        let spatial_terms = spatial_length_scale_term_indices(&frozen);
+        let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
+        let rho_dim = frozen_design.penalties.len();
+        let psi_dim: usize = dims_per_term.iter().sum();
+        assert!(psi_dim >= 1);
+
+        let external_opts =
+            external_opts_for_design(LikelihoodFamily::BinomialProbit, &frozen_design, &fit_opts);
+        let mut cache = SingleBlockExactJointDesignCache::new(
+            data.view(),
+            frozen.clone(),
+            frozen_design.clone(),
+            spatial_terms.clone(),
+            rho_dim,
+            dims_per_term.clone(),
+        )
+        .expect("single-block cache");
+        let mut evaluator = crate::estimate::ExternalJointHyperEvaluator::new(
+            y.view(),
+            weights.view(),
+            &frozen_design.design,
+            offset.view(),
+            &frozen_design.penalties,
+            &external_opts,
+            "iso-κ Duchon op-vs-fd_H diagnostic",
+        )
+        .expect("evaluator");
+
+        let theta_dim = rho_dim + psi_dim;
+        let theta_zero = Array1::<f64>::zeros(theta_dim);
+
+        // ── Step 1: arm capture, run analytic eval at ψ=0 to stash op_total + U.
+        crate::solver::reml::unified::debug_stash::arm();
+        cache.ensure_theta(&theta_zero).expect("ensure_theta");
+        let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
+            data.view(),
+            cache.spec(),
+            cache.design(),
+            &cache.spatial_terms,
+        )
+        .expect("hyper dirs build")
+        .expect("hyper dirs present");
+        let (_cost, grad, _hess) = evaluate_joint_reml_outer_eval_at_theta(
+            &mut evaluator,
+            cache.design(),
+            &theta_zero,
+            rho_dim,
+            hyper_dirs,
+            None,
+            crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+        )
+        .expect("analytic outer eval");
+        crate::solver::reml::unified::debug_stash::disarm();
+        let (op_total, u_mat) = crate::solver::reml::unified::debug_stash::take()
+            .expect("debug capture should have fired");
+        eprintln!(
+            "[DIAG] analytic ψ-grad[0] = {:+.6e}, op_total shape = {:?}",
+            grad[rho_dim], op_total.shape()
+        );
+
+        // ── Step 2: finite-difference H(ψ) along ψ[0].
+        let h = 1e-5_f64;
+        let psi_idx = rho_dim; // first ψ coordinate
+        let mut theta_plus = theta_zero.clone();
+        theta_plus[psi_idx] += h;
+        let mut theta_minus = theta_zero.clone();
+        theta_minus[psi_idx] -= h;
+
+        // Important: ensure_theta re-realizes design at the perturbed κ,
+        // matching what `compute_cost` differentiates implicitly.
+        cache.ensure_theta(&theta_plus).expect("ensure_theta +h");
+        let design_plus = cache.design().clone();
+        let h_plus = evaluator
+            .debug_full_h(
+                &design_plus.design,
+                &design_plus.penalties,
+                &design_plus.nullspace_dims,
+                design_plus.linear_constraints.clone(),
+                &theta_plus,
+                rho_dim,
+                "diag +h",
+            )
+            .expect("debug_full_h +h");
+
+        cache.ensure_theta(&theta_minus).expect("ensure_theta -h");
+        let design_minus = cache.design().clone();
+        let h_minus = evaluator
+            .debug_full_h(
+                &design_minus.design,
+                &design_minus.penalties,
+                &design_minus.nullspace_dims,
+                design_minus.linear_constraints.clone(),
+                &theta_minus,
+                rho_dim,
+                "diag -h",
+            )
+            .expect("debug_full_h -h");
+
+        assert_eq!(h_plus.shape(), h_minus.shape(), "H shapes match");
+        let p = h_plus.nrows();
+        assert_eq!(op_total.nrows(), p, "op vs H dim");
+        let mut fd_h = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            for j in 0..p {
+                fd_h[[i, j]] = (h_plus[[i, j]] - h_minus[[i, j]]) / (2.0 * h);
+            }
+        }
+
+        // ── Step 3: diff in original basis.
+        let diff = &op_total - &fd_h;
+        let frob_op: f64 = op_total.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let frob_fd: f64 = fd_h.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let frob_diff: f64 = diff.iter().map(|v| v * v).sum::<f64>().sqrt();
+        eprintln!(
+            "[DIAG] ||op||_F={:+.4e} ||fd_H||_F={:+.4e} ||op-fd_H||_F={:+.4e}",
+            frob_op, frob_fd, frob_diff
+        );
+
+        // ── Step 4: rotate diff into eigenbasis of H. U from analytic stash.
+        let ut_diff = u_mat.t().dot(&diff);
+        let diff_eig = ut_diff.dot(&u_mat);
+        let ut_op = u_mat.t().dot(&op_total);
+        let op_eig = ut_op.dot(&u_mat);
+        let ut_fd = u_mat.t().dot(&fd_h);
+        let fd_eig = ut_fd.dot(&u_mat);
+
+        // ── Step 5: pull σ_j from the analytic operator for labeling.
+        // (Re-derive from regularized eigenvalues via the same formula the
+        // EIG-DECOMP log uses.)
+        let eps_sq = {
+            let eps_f = (2.22e-16_f64).sqrt() * (p as f64);
+            4.0 * eps_f * eps_f
+        };
+        // We don't have ds here, but the U-column ordering matches the eigenmode
+        // ordering of H (ascending σ). Recover σ_j from diag(U^T H U) where H
+        // is fd_H+something-close-to-H. Better: form H at ψ=0 directly.
+        cache.ensure_theta(&theta_zero).expect("ensure_theta zero");
+        let design_zero = cache.design().clone();
+        let h_zero = evaluator
+            .debug_full_h(
+                &design_zero.design,
+                &design_zero.penalties,
+                &design_zero.nullspace_dims,
+                design_zero.linear_constraints.clone(),
+                &theta_zero,
+                rho_dim,
+                "diag 0",
+            )
+            .expect("debug_full_h 0");
+        let h_diag = u_mat.t().dot(&h_zero).dot(&u_mat);
+        let sigmas: Vec<f64> = (0..p).map(|j| h_diag[[j, j]]).collect();
+        eprintln!("[DIAG] σ (diag U^T H U) = {:?}", sigmas);
+
+        // ── Step 6: dump per-entry diff in eigenbasis, sorted by magnitude.
+        let mut entries: Vec<(usize, usize, f64, f64, f64, f64)> = Vec::with_capacity(p * p);
+        for i in 0..p {
+            for j in 0..p {
+                entries.push((
+                    i,
+                    j,
+                    sigmas[i],
+                    sigmas[j],
+                    op_eig[[i, j]],
+                    fd_eig[[i, j]],
+                ));
+            }
+        }
+        // Sort by |op-fd| descending.
+        entries.sort_by(|a, b| {
+            let da = (a.4 - a.5).abs();
+            let db = (b.4 - b.5).abs();
+            db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        eprintln!(
+            "[DIAG] (op - fd_H) in eigenbasis, sorted by |Δ| desc (top {}):",
+            (p * p).min(30)
+        );
+        for (rank, (i, j, si, sj, oij, fij)) in entries.iter().take(30).enumerate() {
+            let d = oij - fij;
+            eprintln!(
+                "  #{:02} (i={:2},j={:2}) σ=({:>9.4},{:>9.4})  op={:+.4e}  fd={:+.4e}  Δ={:+.4e}",
+                rank, i, j, si, sj, oij, fij, d
+            );
+        }
+
+        // ── Step 7: trace contribution per diagonal mode.
+        let mut trace_diff = 0.0_f64;
+        eprintln!("[DIAG] per-mode diagonal Δ (drives the trace error):");
+        for j in 0..p {
+            let sigma = sigmas[j];
+            let phi_prime = 1.0 / (sigma * sigma + eps_sq).sqrt();
+            let d = op_eig[[j, j]] - fd_eig[[j, j]];
+            let contrib = phi_prime * d;
+            trace_diff += contrib;
+            eprintln!(
+                "  mode {:2}  σ={:+.4e}  φ'={:+.4e}  op_jj={:+.4e}  fd_jj={:+.4e}  Δ_jj={:+.4e}  trace_contrib={:+.4e}",
+                j, sigma, phi_prime, op_eig[[j, j]], fd_eig[[j, j]], d, contrib
+            );
+        }
+        eprintln!("[DIAG] reconstructed trace error (analytic - fd) = {:+.4e}", trace_diff);
+    }
+
     #[test]
     fn spatial_aniso_joint_large_psi_dim_keeps_second_order_route() {
         let cap = crate::solver::outer_strategy::OuterCapability {
