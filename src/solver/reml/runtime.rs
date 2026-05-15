@@ -105,6 +105,7 @@ pub(crate) struct DebugOriginalTauSurface {
     pub(crate) penalty_quadratic: f64,
     pub(crate) log_det_h: f64,
     pub(crate) log_det_s: f64,
+    pub(crate) logdet_gradient_kernel: Array2<f64>,
     pub(crate) ext_a: Vec<f64>,
     pub(crate) ext_ld_s: Vec<f64>,
     pub(crate) ext_trace_logdet: Vec<f64>,
@@ -2398,6 +2399,8 @@ impl<'a> RemlState<'a> {
         )?;
         let log_det_h = assembly.hessian_op.logdet() + assembly.hessian_logdet_correction;
         let log_det_s = assembly.penalty_logdet.value;
+        let logdet_factor = hop.logdet_gradient_factor();
+        let logdet_gradient_kernel = logdet_factor.dot(&logdet_factor.t());
 
         let mut fixed_drifts = Vec::with_capacity(coords.len());
         let mut total_drifts = Vec::with_capacity(coords.len());
@@ -2438,6 +2441,7 @@ impl<'a> RemlState<'a> {
             penalty_quadratic: assembly.penalty_quadratic,
             log_det_h,
             log_det_s,
+            logdet_gradient_kernel,
             ext_a: coords.iter().map(|coord| coord.a).collect(),
             ext_ld_s: coords.iter().map(|coord| coord.ld_s).collect(),
             ext_trace_logdet,
