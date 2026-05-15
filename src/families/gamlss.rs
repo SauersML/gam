@@ -24132,7 +24132,7 @@ mod tests {
             2,
             4,
             2,
-            false,
+            true,
         )
         .expect("wiggle block");
         let builder = BinomialLocationScaleWiggleTermBuilder {
