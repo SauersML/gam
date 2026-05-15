@@ -188,10 +188,6 @@ the truth is reasonable, but they take different paths to get there:
 | You want to control wiggliness directly | `matern(...)` with `nu`. |
 | You want scale-free behaviour | `duchon(...)` without `length_scale`. |
 
-Matérn and Duchon on the same data, viewed in 3-D:
-
-![3D side-by-side: Matern vs Duchon](images/surface_3d_compare.png)
-
 ## Adaptive anisotropy
 
 For multi-d smooths that support it, add `scale_dims=true` (or set
