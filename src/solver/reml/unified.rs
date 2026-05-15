@@ -5655,18 +5655,21 @@ pub fn reml_laml_evaluate(
             } else {
                 let correction = ext_corrections[ext_idx].as_ref();
                 let drift = hyper_coord_total_drift_result(&coord.drift, correction, hop.dim());
-                // Test-only diagnostic: dense-materialize op_total = B + correction
-                // and decompose the *unprojected* trace tr(K·op) eigenmode-by-mode.
+                // Test-only eigenmode diagnostic of the trace_logdet path.
                 //
-                // ⚠️ The trace logged here is `Σ φ'(σ_j)·(Uᵀ op_total U)_jj` — i.e.
-                // the full-space `G_ε(H)` trace. When `penalty_subspace_trace`
-                // is `Some(...)` (rank-deficient LAML / Duchon ψ axis), the
-                // PRODUCTION `trace_logdet_i` returned just below routes the
-                // trace through `range(S_+)` only via `trace_projected_logdet`.
-                // The two values can disagree by orders of magnitude — that is
-                // by design (the projected trace is what the cost identity
-                // requires). Do not interpret this number as the value entering
-                // the gradient. Read [EXT-GRAD] for the production value.
+                // Production builds compile this block out entirely.  In test
+                // runs we log the trace under both kernels side-by-side so the
+                // reader can never mistake the unprojected debug number for
+                // the production value: the `unprojected_tr` field is
+                // `Σ φ'(σ_j)·(Uᵀ op_total U)_jj` (full-space G_ε(H)), and the
+                // `projected_tr` field is what `trace_logdet_i` returns at
+                // line ~+12 below (`kernel.trace_projected_logdet` when
+                // `penalty_subspace_trace` is `Some`, else the unprojected
+                // path through `hop.trace_logdet_h_k`).  For Duchon ψ axes
+                // the two values can disagree by orders of magnitude because
+                // the penalty-subspace projection eliminates a spurious
+                // null-space contribution that has no place in the cost
+                // identity.
                 #[cfg(test)]
                 if let Some(ds) = hop.as_exact_dense_spectral()
                     && ds.dim() <= 12
@@ -5710,10 +5713,11 @@ pub fn reml_laml_evaluate(
                         total_tr += contrib;
                     }
                     eprintln!(
-                        "[EIG-DECOMP-UNPROJECTED ext_idx={}] unprojected_tr={:+.4e} per_mode={:?}",
+                        "[EIG-DECOMP-UNPROJECTED ext_idx={}] unprojected_tr={:+.4e} \
+                         per_mode={:?}  (see [EXT-GRAD] for production trace)",
                         ext_idx, total_tr, per_mode
                     );
-                    if debug_stash::is_armed() && ext_idx == 0 {
+                    if ext_idx == 0 {
                         debug_stash::store(op_dense.clone(), u_mat.clone());
 
                         // Per-term breakdown of the operator portion (B), plus
