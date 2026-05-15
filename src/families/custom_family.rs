@@ -10,7 +10,9 @@ use crate::smooth::{
     TermCollectionDesign, TermCollectionSpec, spatial_length_scale_term_indices,
     try_build_spatial_log_kappa_derivativeinfo_list,
 };
-use crate::solver::active_set::solve_quadratic_with_linear_constraints;
+use crate::solver::active_set::{
+    rank_reduce_rows_pivoted_qr, solve_quadratic_with_linear_constraints,
+};
 use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 use crate::solver::estimate::reml::unified::{
     BlockCoupledOperator, DispersionHandling, DriftDerivResult, FixedDriftDerivFn,
@@ -8866,6 +8868,51 @@ fn joint_preconditioned_descent_delta(
         }
     }
     Ok(delta)
+}
+
+fn joint_constrained_preconditioned_descent_delta(
+    source: &JointHessianSource,
+    ranges: &[(usize, usize)],
+    s_lambdas: &[Array2<f64>],
+    diagonal_ridge: f64,
+    rhs: &Array1<f64>,
+    beta_joint: &Array1<f64>,
+    constraints: &LinearInequalityConstraints,
+    active_rows: Option<&[usize]>,
+) -> Result<Option<(Array1<f64>, Vec<usize>)>, String> {
+    if rhs.len() != beta_joint.len() || constraints.a.ncols() != beta_joint.len() {
+        return Err(format!(
+            "joint constrained descent dimension mismatch: rhs={}, beta={}, A_cols={}",
+            rhs.len(),
+            beta_joint.len(),
+            constraints.a.ncols()
+        ));
+    }
+    let base_diagonal = match source {
+        JointHessianSource::Dense(h_joint) => h_joint.diag().to_owned(),
+        JointHessianSource::Operator { diagonal, .. } => diagonal.clone(),
+    };
+    let preconditioner =
+        joint_penalty_preconditioner_diag(&base_diagonal, ranges, s_lambdas, diagonal_ridge);
+    let p = beta_joint.len();
+    let mut lhs = Array2::<f64>::zeros((p, p));
+    for j in 0..p {
+        lhs[[j, j]] = preconditioner[j];
+    }
+    let rhs_beta = &(&preconditioner * beta_joint) + rhs;
+    let (candidate, active) =
+        solve_quadratic_with_linear_constraints(&lhs, &rhs_beta, beta_joint, constraints, active_rows)
+            .map_err(|e| format!("joint constrained descent solve failed: {e}"))?;
+    let delta = &candidate - beta_joint;
+    if !delta.iter().all(|v| v.is_finite()) {
+        return Ok(None);
+    }
+    let directional = rhs.dot(&delta);
+    if directional.is_finite() && directional > 0.0 {
+        Ok(Some((delta, active)))
+    } else {
+        Ok(None)
+    }
 }
 
 fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'static>(
