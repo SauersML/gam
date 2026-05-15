@@ -33,8 +33,8 @@ use crate::estimate::{
 use crate::faer_ndarray::{fast_atb, fast_atv};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::matrix::{
-    BlockDesignOperator, CoefficientTransformOperator, DenseDesignMatrix, DesignBlock,
-    DesignMatrix, RandomEffectOperator, SymmetricMatrix, TensorProductDesignOperator,
+    BlockDesignOperator, CoefficientTransformOperator, DesignBlock, DesignMatrix,
+    RandomEffectOperator, SymmetricMatrix, TensorProductDesignOperator,
 };
 use crate::mixture_link::{
     logit_inverse_link_jet5, state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
@@ -9954,8 +9954,7 @@ fn evaluate_joint_reml_outer_eval_at_theta(
     ),
     EstimationError,
 > {
-    let hyper_dirs_for_gradient = hyper_dirs.clone();
-    let (cost, mut gradient, hessian) = evaluator.evaluate_with_order(
+    evaluator.evaluate_with_order(
         &design.design,
         &design.penalties,
         &design.nullspace_dims,
@@ -9966,157 +9965,7 @@ fn evaluate_joint_reml_outer_eval_at_theta(
         warm_start_beta,
         "evaluate_joint_reml_outer_eval_at_theta",
         order,
-    )?;
-    replace_design_moving_joint_gradient_with_cost_slope(
-        evaluator,
-        design,
-        theta,
-        rho_dim,
-        &hyper_dirs_for_gradient,
-        warm_start_beta,
-        &mut gradient,
-    )?;
-    Ok((cost, gradient, hessian))
-}
-
-fn replace_design_moving_joint_gradient_with_cost_slope(
-    evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
-    design: &TermCollectionDesign,
-    theta: &Array1<f64>,
-    rho_dim: usize,
-    hyper_dirs: &[DirectionalHyperParam],
-    warm_start_beta: Option<ArrayView1<'_, f64>>,
-    gradient: &mut Array1<f64>,
-) -> Result<(), EstimationError> {
-    if hyper_dirs.iter().all(|dir| dir.is_penalty_like) {
-        return Ok(());
-    }
-    let h = 1e-5_f64;
-    for rho_idx in 0..rho_dim {
-        let mut theta_plus = theta.clone();
-        theta_plus[rho_idx] += h;
-        let cost_plus = evaluator.evaluate_cost_only(
-            &design.design,
-            &design.penalties,
-            &design.nullspace_dims,
-            design.linear_constraints.clone(),
-            &theta_plus,
-            rho_dim,
-            warm_start_beta,
-            "positive design-moving joint rho-gradient slope",
-        )?;
-        let mut theta_minus = theta.clone();
-        theta_minus[rho_idx] -= h;
-        let cost_minus = evaluator.evaluate_cost_only(
-            &design.design,
-            &design.penalties,
-            &design.nullspace_dims,
-            design.linear_constraints.clone(),
-            &theta_minus,
-            rho_dim,
-            warm_start_beta,
-            "negative design-moving joint rho-gradient slope",
-        )?;
-        gradient[rho_idx] = (cost_plus - cost_minus) / (2.0 * h);
-    }
-    let x0 = design
-        .design
-        .try_to_dense_arc("design-moving hyper-gradient slope requires dense design access")
-        .map_err(EstimationError::InvalidInput)?;
-    for (psi_idx, dir) in hyper_dirs.iter().enumerate() {
-        if dir.is_penalty_like {
-            continue;
-        }
-        let x_tau = dir.x_tau_dense();
-        if x_tau.raw_dim() != x0.raw_dim() {
-            return Err(EstimationError::InvalidInput(format!(
-                "design-moving hyper-gradient X_tau[{psi_idx}] shape mismatch: expected {}x{}, got {}x{}",
-                x0.nrows(),
-                x0.ncols(),
-                x_tau.nrows(),
-                x_tau.ncols()
-            )));
-        }
-        let x_plus = DesignMatrix::Dense(DenseDesignMatrix::from(
-            x0.as_ref() + &x_tau.mapv(|value| h * value),
-        ));
-        let x_minus = DesignMatrix::Dense(DenseDesignMatrix::from(
-            x0.as_ref() - &x_tau.mapv(|value| h * value),
-        ));
-        let penalties_plus = perturb_canonical_penalties(
-            &design.penalties,
-            dir,
-            h,
-            "positive design-moving hyper-gradient slope",
-        )?;
-        let penalties_minus = perturb_canonical_penalties(
-            &design.penalties,
-            dir,
-            -h,
-            "negative design-moving hyper-gradient slope",
-        )?;
-        let cost_plus = evaluator.evaluate_cost_only(
-            &x_plus,
-            &penalties_plus,
-            &design.nullspace_dims,
-            design.linear_constraints.clone(),
-            theta,
-            rho_dim,
-            warm_start_beta,
-            "positive design-moving hyper-gradient slope",
-        )?;
-        let cost_minus = evaluator.evaluate_cost_only(
-            &x_minus,
-            &penalties_minus,
-            &design.nullspace_dims,
-            design.linear_constraints.clone(),
-            theta,
-            rho_dim,
-            warm_start_beta,
-            "negative design-moving hyper-gradient slope",
-        )?;
-        gradient[rho_dim + psi_idx] = (cost_plus - cost_minus) / (2.0 * h);
-    }
-    Ok(())
-}
-
-fn perturb_canonical_penalties(
-    penalties: &[BlockwisePenalty],
-    dir: &DirectionalHyperParam,
-    scale: f64,
-    context: &str,
-) -> Result<Vec<BlockwisePenalty>, EstimationError> {
-    let mut out = penalties.to_vec();
-    let p = out
-        .iter()
-        .map(|penalty| penalty.col_range.end)
-        .max()
-        .unwrap_or(0);
-    for component in dir.penalty_first_components() {
-        let Some(penalty) = out.get_mut(component.penalty_index) else {
-            return Err(EstimationError::InvalidInput(format!(
-                "{context}: penalty derivative index {} out of bounds for {} penalties",
-                component.penalty_index,
-                out.len()
-            )));
-        };
-        let derivative = component.matrix.scaled_materialize(scale);
-        if derivative.nrows() != p || derivative.ncols() != p {
-            return Err(EstimationError::InvalidInput(format!(
-                "{context}: penalty derivative {} shape mismatch: expected {p}x{p}, got {}x{}",
-                component.penalty_index,
-                derivative.nrows(),
-                derivative.ncols()
-            )));
-        }
-        let r = penalty.col_range.clone();
-        penalty
-            .local
-            .scaled_add(1.0, &derivative.slice(s![r.clone(), r]));
-        penalty.structure_hint = None;
-        penalty.op = None;
-    }
-    Ok(out)
+    )
 }
 
 fn evaluate_joint_reml_efs_at_theta(
