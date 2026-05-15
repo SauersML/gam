@@ -5513,11 +5513,6 @@ impl<'a> RemlState<'a> {
         let (hessian_logdet_correction, penalty_subspace_trace) =
             if matches!(hessian_mode, PseudoLogdetMode::Smooth) {
                 use super::unified::HessianOperator;
-                eprintln!(
-                    "[PROBE-RANK] penalty_rank={} p={} smooth_mode",
-                    penalty_rank,
-                    h_for_operator.ncols()
-                );
                 let (log_det_h_proj, kernel) = self.fixed_subspace_hessian_projected_parts(
                     &h_for_operator,
                     &e_for_logdet,
@@ -5555,8 +5550,6 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
         use super::unified::{HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator};
-        eprintln!("[PROBE-PATH] sparse_assembly");
-
         let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput("missing sparse exact evaluation payload".to_string())
         })?;
@@ -5803,11 +5796,6 @@ impl<'a> RemlState<'a> {
                 && penalty_rank < h_total_original.ncols()
             {
                 use super::unified::HessianOperator;
-                eprintln!(
-                    "[PROBE-RANK orig] penalty_rank={} p={} smooth_mode",
-                    penalty_rank,
-                    h_total_original.ncols()
-                );
                 let qs = &pirls_result.reparam_result.qs;
                 let h_transformed = qs.t().dot(&h_total_original).dot(qs);
                 let (log_det_h_proj, kernel_trans) = self.fixed_subspace_hessian_projected_parts(
@@ -5877,13 +5865,6 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
         _has_ext: bool,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
-        eprintln!(
-            "[PROBE-PATH] auto_assembly backend={:?} frame={:?} acfb_is_some={}",
-            bundle.backend_kind(),
-            bundle.pirls_result.coordinate_frame,
-            self.active_constraint_free_basis(bundle.pirls_result.as_ref())
-                .is_some()
-        );
         if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             self.build_sparse_assembly(rho, bundle, mode)
         } else if matches!(
