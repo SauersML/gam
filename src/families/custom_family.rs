@@ -8743,16 +8743,18 @@ fn update_joint_trust_region_radius(
     };
     let accepted = rho.is_finite() && rho > 0.0 && actual_reduction > 0.0;
     let mut radius = old_radius;
-    // Noise-floor protection (Conn-Gould-Toint §17.4): when both the predicted
-    // and actual reductions are at machine-epsilon scale, their ratio is pure
-    // FP noise and must not drive radius updates. Without this guard, a
-    // numerically converged inner solve can keep growing the radius via
-    // ρ ∈ (0.75, ∞) computed from e.g. actual=2.7e-9, predicted=2.0e-9
-    // (ρ=1.35), inflating the trust region until accepted moves of size
-    // step_inf ≈ radius drift β by orders of magnitude across cycles.
-    // Empirically (failing fuzz seed 1200983908): radius grew 3.6→7.2 with
-    // every "rho≈1.2" step at obj_change=1e-9, accumulating β_σ to 703.
-    let reduction_noise_floor = 1.0e-12_f64.max(1.0e-12 * old_radius.abs().max(1.0));
+    // Noise-floor protection (Conn-Gould-Toint §17.4): when the predicted
+    // reduction is at machine-precision scale, the rho ratio is dominated by
+    // FP error in the (actual − predicted) difference and must not drive
+    // radius updates. The unprotected path inflates the trust region via
+    // ρ ∈ (0.75, ∞) computed from e.g. actual=3.35e-9, predicted=2.73e-9
+    // (ρ=1.23), doubling the radius at every numerically-converged cycle —
+    // observed empirically on failing fuzz seed 1200983908 driving β_σ to
+    // magnitude 703 over a few cycles after the inner solve was already at
+    // its quadratic minimum. The 1e-8 absolute floor matches the existing
+    // FIXED_STABILIZATION_RIDGE = 1e-8 used elsewhere as the ambient
+    // numerical-precision scale for penalized objectives in this codebase.
+    let reduction_noise_floor = 1.0e-8_f64;
     let at_noise_floor = predicted_reduction.abs() < reduction_noise_floor
         && actual_reduction.abs() < reduction_noise_floor;
     if at_noise_floor {
@@ -9812,28 +9814,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             if cycle == 0 {
                 let initial_step_norm = joint_trust_region_step_norm(&delta);
                 if initial_step_norm.is_finite() && initial_step_norm > joint_trust_radius {
-                    // Cap the cycle-0 bump. The rationale for bumping at all is
-                    // to preserve quadratic convergence on well-conditioned
-                    // problems, where the natural Newton step is small. A
-                    // near-singular penalized Hessian (e.g. quasi-saturated
-                    // GAMLSS σ-block) produces step norms of 10⁶+ that should
-                    // never become the trust radius — every accepted step at
-                    // such a radius drifts β by orders of magnitude across
-                    // cycles even with adaptive shrinkage. Bound the bump at
-                    // the larger of (a) `MAX_INITIAL_BUMP` (an absolute scale
-                    // on log-link / log-σ coefficients) and (b) `8 * |β|_∞`
-                    // (so well-conditioned problems with naturally large β
-                    // can still take their full Newton step).
-                    const MAX_INITIAL_BUMP: f64 = 64.0;
-                    let adaptive_cap = {
-                        let beta_inf = states
-                            .iter()
-                            .flat_map(|s| s.beta.iter().copied())
-                            .map(f64::abs)
-                            .fold(0.0_f64, f64::max);
-                        (8.0 * beta_inf).max(MAX_INITIAL_BUMP)
-                    };
-                    joint_trust_radius = initial_step_norm.min(adaptive_cap);
+                    joint_trust_radius = initial_step_norm;
                 }
             }
 
