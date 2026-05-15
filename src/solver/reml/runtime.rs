@@ -2329,6 +2329,27 @@ impl<'a> RemlState<'a> {
         Ok(bundle.h_total.as_ref().clone())
     }
 
+    #[cfg(test)]
+    pub(crate) fn debug_original_beta_and_tau_v(
+        &self,
+        rho: &Array1<f64>,
+        hyper_dirs: &[crate::estimate::reml::DirectionalHyperParam],
+    ) -> Result<(Array1<f64>, Vec<Array1<f64>>), EstimationError> {
+        use super::unified::{DenseSpectralOperator, HessianOperator, PseudoLogdetMode};
+
+        let bundle = self.obtain_eval_bundle(rho)?;
+        let pirls_result = bundle.pirls_result.as_ref();
+        let beta = self.sparse_exact_beta_original(pirls_result);
+        let h_original =
+            self.bundle_matrix_in_original_basis(pirls_result, bundle.h_total.as_ref());
+        let hop =
+            DenseSpectralOperator::from_symmetric_with_mode(&h_original, PseudoLogdetMode::Smooth)
+                .map_err(EstimationError::InvalidInput)?;
+        let coords = self.build_tau_hyper_coords_original_basis(rho, &bundle, hyper_dirs)?;
+        let v = coords.iter().map(|coord| hop.solve(&coord.g)).collect();
+        Ok((beta, v))
+    }
+
     pub(super) fn active_constraint_free_basis(&self, pr: &PirlsResult) -> Option<Array2<f64>> {
         let lin = pr.linear_constraints_transformed.as_ref()?;
         let active_tol = 1e-8;

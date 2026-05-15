@@ -16644,6 +16644,77 @@ mod tests {
                  grad_norm_analytic={:.6e}",
                 grad_an.iter().map(|g| g * g).sum::<f64>().sqrt()
             );
+            if psi_dim > 0 {
+                cache
+                    .ensure_theta(theta)
+                    .expect("ensure theta for beta debug");
+                let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
+                    data.view(),
+                    cache.spec(),
+                    cache.design(),
+                    &cache.spatial_terms,
+                )
+                .expect("debug hyper dirs build")
+                .expect("debug hyper dirs present");
+                let (_beta0, v_debug) = evaluator
+                    .debug_beta_and_tau_v(
+                        &cache.design().design,
+                        &cache.design().penalties,
+                        &cache.design().nullspace_dims,
+                        cache.design().linear_constraints.clone(),
+                        theta,
+                        rho_dim,
+                        hyper_dirs,
+                        "iso-kappa Duchon beta-response debug",
+                    )
+                    .expect("debug beta response");
+                let mut plus = theta.clone();
+                plus[rho_dim] += h;
+                cache
+                    .ensure_theta(&plus)
+                    .expect("ensure theta+ for beta debug");
+                let beta_plus = evaluator
+                    .debug_beta_cost_only(
+                        &cache.design().design,
+                        &cache.design().penalties,
+                        &cache.design().nullspace_dims,
+                        cache.design().linear_constraints.clone(),
+                        &plus,
+                        rho_dim,
+                        "iso-kappa Duchon beta+ debug",
+                    )
+                    .expect("debug beta+");
+                let mut minus = theta.clone();
+                minus[rho_dim] -= h;
+                cache
+                    .ensure_theta(&minus)
+                    .expect("ensure theta- for beta debug");
+                let beta_minus = evaluator
+                    .debug_beta_cost_only(
+                        &cache.design().design,
+                        &cache.design().penalties,
+                        &cache.design().nullspace_dims,
+                        cache.design().linear_constraints.clone(),
+                        &minus,
+                        rho_dim,
+                        "iso-kappa Duchon beta- debug",
+                    )
+                    .expect("debug beta-");
+                let fd_beta = (&beta_plus - &beta_minus).mapv(|v| v / (2.0 * h));
+                let analytic_dbeta = v_debug[0].mapv(|v| -v);
+                let beta_num = (&analytic_dbeta - &fd_beta)
+                    .iter()
+                    .map(|v| v * v)
+                    .sum::<f64>()
+                    .sqrt();
+                let beta_den = fd_beta.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-12);
+                eprintln!(
+                    "[BETA-RESP {label}] analytic_norm={:.6e} fd_norm={:.6e} rel={:.3e}",
+                    analytic_dbeta.iter().map(|v| v * v).sum::<f64>().sqrt(),
+                    beta_den,
+                    beta_num / beta_den
+                );
+            }
             for j in 0..theta_dim {
                 let mut plus = theta.clone();
                 plus[j] += h;
