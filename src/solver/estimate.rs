@@ -2167,6 +2167,42 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         let rho = theta.slice(s![..rho_dim]).to_owned();
         self.reml_state.compute_cost(&rho)
     }
+
+    /// DEBUG ONLY: run PIRLS at `theta` (cost-only path) and return the dense
+    /// effective Hessian `H_total = X' W_F X + S_λ + ridge I` in the
+    /// transformed basis. This is the same matrix the analytic operator
+    /// differentiates, so finite differences of this H w.r.t. ψ should match
+    /// the analytic `B_i + correction`.
+    pub(crate) fn debug_full_h(
+        &mut self,
+        x: &DesignMatrix,
+        s_list: &[BlockwisePenalty],
+        nullspace_dims: &[usize],
+        linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
+        theta: &Array1<f64>,
+        rho_dim: usize,
+        context: &str,
+    ) -> Result<Array2<f64>, EstimationError> {
+        if rho_dim > theta.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "rho_dim {} exceeds theta dimension {}",
+                rho_dim,
+                theta.len()
+            )));
+        }
+        self.prepare_eval_state_cost_only(
+            x,
+            s_list,
+            nullspace_dims,
+            linear_constraints,
+            None,
+            context,
+        )?;
+        let rho = theta.slice(s![..rho_dim]).to_owned();
+        // Drive PIRLS at this theta (populates eval bundle cache).
+        let _ = self.reml_state.compute_cost(&rho)?;
+        self.reml_state.objective_innerhessian(&rho)
+    }
 }
 
 // canonicalize_active_penalties removed — replaced by
