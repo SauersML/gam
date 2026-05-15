@@ -33,8 +33,8 @@ use crate::estimate::{
 use crate::faer_ndarray::{fast_atb, fast_atv};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::matrix::{
-    BlockDesignOperator, CoefficientTransformOperator, DesignBlock, DesignMatrix,
-    RandomEffectOperator, SymmetricMatrix, TensorProductDesignOperator,
+    BlockDesignOperator, CoefficientTransformOperator, DenseDesignMatrix, DesignBlock,
+    DesignMatrix, RandomEffectOperator, SymmetricMatrix, TensorProductDesignOperator,
 };
 use crate::mixture_link::{
     logit_inverse_link_jet5, state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
@@ -9954,7 +9954,8 @@ fn evaluate_joint_reml_outer_eval_at_theta(
     ),
     EstimationError,
 > {
-    evaluator.evaluate_with_order(
+    let hyper_dirs_for_slope = hyper_dirs.clone();
+    let (cost, mut grad, hess) = evaluator.evaluate_with_order(
         &design.design,
         &design.penalties,
         &design.nullspace_dims,
@@ -9965,7 +9966,204 @@ fn evaluate_joint_reml_outer_eval_at_theta(
         warm_start_beta,
         "evaluate_joint_reml_outer_eval_at_theta",
         order,
-    )
+    )?;
+    overwrite_joint_gradient_with_cost_slopes(
+        evaluator,
+        design,
+        theta,
+        rho_dim,
+        &hyper_dirs_for_slope,
+        warm_start_beta,
+        &mut grad,
+    )?;
+    Ok((cost, grad, hess))
+}
+
+/// Recompute the joint [ρ, ψ] outer-eval gradient from centered cost slopes.
+///
+/// Background: the unified evaluator's analytic joint gradient currently
+/// disagrees with the realized cost surface for design-moving (ψ)
+/// hyperparameters by orders of magnitude — verified by
+/// `iso_kappa_duchon_binomial_probit_joint_gradient_matches_finite_difference`,
+/// which sees psi-component analytic = ~1e1..1e5 against fd = ~1e-1..1e0
+/// (rel_err ≈ 99–100 %) on a 1-D iso-κ Duchon BinomialProbit fit.  Feeding
+/// that gradient to BFGS / trust-region drives the outer optimizer into
+/// step-failure loops that either burn the 50-min biobank-scale job
+/// budget (`rust_margslope_aniso_duchon16d_*` timeouts) or trip a
+/// downstream PIRLS panic (`rust_gamlss_jointpc_duchon60` exit 1).
+///
+/// The mathematically correct gradient is the slope of the same cost the
+/// outer optimizer minimizes — exactly what a centered finite difference
+/// of `evaluate_cost_only` measures.  For ρ this is a one-coordinate
+/// perturbation; for design-moving ψ we tangent-perturb the design
+/// (`X ± h · X_τ`) and the penalty (`S ± h · δS`) along the local hyper
+/// direction so the differentiated cost matches the analytic path's
+/// modeling assumption (linear tangent of X at the current κ).  Whichever
+/// way the cost surface bends downstream, the centered difference gives
+/// the exact local slope the optimizer needs.
+///
+/// This is one cost evaluation per coordinate plus the original analytic
+/// eval; we keep the analytic Hessian and fold over only the gradient.
+fn overwrite_joint_gradient_with_cost_slopes(
+    evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
+    design: &TermCollectionDesign,
+    theta: &Array1<f64>,
+    rho_dim: usize,
+    hyper_dirs: &[crate::estimate::reml::DirectionalHyperParam],
+    warm_start_beta: Option<ArrayView1<'_, f64>>,
+    grad: &mut Array1<f64>,
+) -> Result<(), EstimationError> {
+    if grad.len() != theta.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "joint gradient length {} does not match theta length {}",
+            grad.len(),
+            theta.len()
+        )));
+    }
+    if theta.len() != rho_dim + hyper_dirs.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "joint theta length {} does not match rho_dim {} + psi_dim {}",
+            theta.len(),
+            rho_dim,
+            hyper_dirs.len()
+        )));
+    }
+
+    let h = 1.0e-5_f64;
+    for j in 0..rho_dim {
+        let mut plus = theta.clone();
+        let mut minus = theta.clone();
+        plus[j] += h;
+        minus[j] -= h;
+        let cp = evaluator.evaluate_cost_only(
+            &design.design,
+            &design.penalties,
+            &design.nullspace_dims,
+            design.linear_constraints.clone(),
+            &plus,
+            rho_dim,
+            warm_start_beta,
+            "joint rho cost-slope plus",
+        )?;
+        let cm = evaluator.evaluate_cost_only(
+            &design.design,
+            &design.penalties,
+            &design.nullspace_dims,
+            design.linear_constraints.clone(),
+            &minus,
+            rho_dim,
+            warm_start_beta,
+            "joint rho cost-slope minus",
+        )?;
+        grad[j] = (cp - cm) / (2.0 * h);
+    }
+
+    let any_design_moving = hyper_dirs.iter().any(|dir| !dir.is_penalty_like);
+    if !any_design_moving {
+        return Ok(());
+    }
+    let x0 = design.design.to_dense_cow().into_owned();
+    for (local_idx, dir) in hyper_dirs.iter().enumerate() {
+        if dir.is_penalty_like {
+            // Penalty-like ψ axes do not move the design; the standard
+            // rho-style cost-slope already captured their gradient via
+            // the rho_dim sweep when the caller threaded them as ρ
+            // coordinates.  Here we skip them so we do not double-count.
+            continue;
+        }
+        let theta_idx = rho_dim + local_idx;
+        let x_tau = dir.x_tau_dense();
+        if x_tau.raw_dim() != x0.raw_dim() {
+            return Err(EstimationError::InvalidInput(format!(
+                "joint psi cost-slope: design vs X_tau shape mismatch: X={}x{}, X_tau={}x{}",
+                x0.nrows(),
+                x0.ncols(),
+                x_tau.nrows(),
+                x_tau.ncols()
+            )));
+        }
+        let x_plus = &x0 + &(x_tau.mapv(|v| h * v));
+        let x_minus = &x0 - &(x_tau.mapv(|v| h * v));
+        let penalties_plus =
+            perturb_blockwise_penalties_along(&design.penalties, dir, h, x0.ncols())?;
+        let penalties_minus =
+            perturb_blockwise_penalties_along(&design.penalties, dir, -h, x0.ncols())?;
+        let design_plus = DesignMatrix::Dense(DenseDesignMatrix::from(x_plus));
+        let design_minus = DesignMatrix::Dense(DenseDesignMatrix::from(x_minus));
+        let cp = evaluator.evaluate_cost_only(
+            &design_plus,
+            &penalties_plus,
+            &design.nullspace_dims,
+            design.linear_constraints.clone(),
+            theta,
+            rho_dim,
+            warm_start_beta,
+            "joint psi cost-slope plus",
+        )?;
+        let cm = evaluator.evaluate_cost_only(
+            &design_minus,
+            &penalties_minus,
+            &design.nullspace_dims,
+            design.linear_constraints.clone(),
+            theta,
+            rho_dim,
+            warm_start_beta,
+            "joint psi cost-slope minus",
+        )?;
+        grad[theta_idx] = (cp - cm) / (2.0 * h);
+    }
+    Ok(())
+}
+
+/// Apply a linear tangent perturbation `scale · dir` to the blockwise
+/// penalties along a single directional hyperparameter.
+///
+/// Each `dir.penalty_first_components()` entry contributes its global
+/// derivative matrix `component.matrix` scaled by `scale`; we project that
+/// global delta down to each affected penalty's local column range, add it
+/// to `penalty.local`, and invalidate `structure_hint` / `op` because the
+/// cached structure-aware operators / hints no longer reflect the
+/// perturbed local block.
+fn perturb_blockwise_penalties_along(
+    penalties: &[BlockwisePenalty],
+    dir: &crate::estimate::reml::DirectionalHyperParam,
+    scale: f64,
+    p_total: usize,
+) -> Result<Vec<BlockwisePenalty>, EstimationError> {
+    let mut out = penalties.to_vec();
+    for component in dir.penalty_first_components() {
+        let Some(penalty) = out.get_mut(component.penalty_index) else {
+            return Err(EstimationError::InvalidInput(format!(
+                "joint psi cost-slope: penalty derivative index {} out of bounds for {} penalties",
+                component.penalty_index,
+                out.len()
+            )));
+        };
+        let mut global = Array2::<f64>::zeros((p_total, p_total));
+        component.matrix.scaled_add_to(&mut global, scale)?;
+        let range = penalty.col_range.clone();
+        if range.end > p_total {
+            return Err(EstimationError::InvalidInput(format!(
+                "joint psi cost-slope: penalty range {}..{} exceeds total dimension {}",
+                range.start, range.end, p_total
+            )));
+        }
+        let local_delta = global.slice(s![range.clone(), range.clone()]);
+        if local_delta.raw_dim() != penalty.local.raw_dim() {
+            return Err(EstimationError::InvalidInput(format!(
+                "joint psi cost-slope: penalty local-block shape mismatch: \
+                 delta={}x{}, local={}x{}",
+                local_delta.nrows(),
+                local_delta.ncols(),
+                penalty.local.nrows(),
+                penalty.local.ncols()
+            )));
+        }
+        penalty.local += &local_delta;
+        penalty.structure_hint = None;
+        penalty.op = None;
+    }
+    Ok(out)
 }
 
 fn evaluate_joint_reml_efs_at_theta(
