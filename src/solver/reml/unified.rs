@@ -5474,6 +5474,53 @@ pub fn reml_laml_evaluate(
             } else {
                 let correction = ext_corrections[ext_idx].as_ref();
                 let drift = hyper_coord_total_drift_result(&coord.drift, correction, hop.dim());
+                // DEBUG: dense-materialize op_total and decompose tr(K · op) by eigenmode
+                if let Some(ds) = hop.as_exact_dense_spectral()
+                    && ds.dim() <= 12
+                {
+                    let mut op_dense = Array2::<f64>::zeros((ds.dim(), ds.dim()));
+                    let b_drift_again = hyper_coord_total_drift_result(&coord.drift, None, ds.dim());
+                    let b_dense = match b_drift_again {
+                        DriftDerivResult::Operator(o) => o.to_dense(),
+                        DriftDerivResult::Dense(m) => m,
+                    };
+                    op_dense += &b_dense;
+                    if let Some(c) = correction {
+                        match c {
+                            DriftDerivResult::Dense(m) => op_dense += m,
+                            DriftDerivResult::Operator(o) => op_dense += &o.to_dense(),
+                        }
+                    }
+                    // Rotate to eigenbasis: (U^T op U)_jj per eigenmode
+                    let p = ds.dim();
+                    let mut u_mat = Array2::<f64>::zeros((p, p));
+                    for col in 0..p {
+                        for row in 0..p {
+                            u_mat[[row, col]] = ds.eigenvector_entry(row, col);
+                        }
+                    }
+                    let ut_op = u_mat.t().dot(&op_dense);
+                    let proj = ut_op.dot(&u_mat);
+                    let eps_sq = {
+                        let eps_f = (2.22e-16_f64).sqrt() * (p as f64);
+                        4.0 * eps_f * eps_f
+                    };
+                    let mut per_mode = Vec::with_capacity(p);
+                    let mut total_tr = 0.0_f64;
+                    for j in 0..p {
+                        // reg_eigenvalue = r_ε(σ) = ½(σ + √(σ²+4ε²)). Recover σ.
+                        let r = ds.reg_eigenvalue(j);
+                        let sigma = r - eps_sq / (4.0 * r); // r = ½(σ + √(σ²+4ε²)) ⇒ σ = r − ε²/r
+                        let phi_prime = 1.0 / (sigma * sigma + eps_sq).sqrt();
+                        let contrib = phi_prime * proj[[j, j]];
+                        per_mode.push((sigma, proj[[j, j]], contrib));
+                        total_tr += contrib;
+                    }
+                    eprintln!(
+                        "[EIG-DECOMP ext_idx={}] total_tr={:+.4e} per_mode={:?}",
+                        ext_idx, total_tr, per_mode
+                    );
+                }
                 match (&solution.penalty_subspace_trace, drift) {
                     (Some(kernel), DriftDerivResult::Dense(matrix)) => {
                         kernel.trace_projected_logdet(&matrix)

@@ -2043,7 +2043,6 @@ impl<'a> RemlState<'a> {
         // The OUTER analytic operator constructs ∂H/∂ψ from the same
         // floored W (via `outer_hessian_curvature_arrays`), so log|H| and
         // its trace gradient live on a single, consistent surface.
-        eprintln!("[EH-PROBE] ridge_used={:.6e}", pr.ridge_used);
         let h = &pr.stabilizedhessian_transformed;
         if h.factorize().is_ok() {
             return Ok((h.to_dense(), pr.ridge_passport));
