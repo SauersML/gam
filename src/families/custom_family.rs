@@ -9895,6 +9895,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     trial_delta.mapv_inplace(|v| v * barrier_ceiling);
                 }
                 let step_norm = joint_trust_region_step_norm(&trial_delta);
+                let trial_step_inf = trial_delta
+                    .iter()
+                    .copied()
+                    .map(f64::abs)
+                    .fold(0.0_f64, f64::max);
                 let mut hpen_delta = Array1::<f64>::zeros(total_p);
                 if apply_joint_penalized_hessian_into(
                     &joint_hessian_source,
@@ -10016,7 +10021,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 let old_radius = joint_trust_radius;
                 joint_trust_radius = trust_update.radius;
                 log::info!(
-                    "[PIRLS/joint-Newton/trust-region] cycle={} attempt={} accepted={} rho={:.3e} actual_reduction={:.3e} predicted_reduction={:.3e} radius={:.3e}->{:.3e} step_norm={:.3e} step_inf={:.3e}",
+                    "[PIRLS/joint-Newton/trust-region] cycle={} attempt={} accepted={} rho={:.3e} actual_reduction={:.3e} predicted_reduction={:.3e} radius={:.3e}->{:.3e} step_norm={:.3e} step_inf={:.3e} proposal_inf={:.3e}",
                     cycle,
                     line_search_attempts,
                     trust_update.accepted,
@@ -10026,6 +10031,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     old_radius,
                     joint_trust_radius,
                     step_norm,
+                    trial_step_inf,
                     step_inf,
                 );
                 if trialobjective.is_finite()
