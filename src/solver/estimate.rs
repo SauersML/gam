@@ -2204,6 +2204,31 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         let _ = self.reml_state.compute_cost(&rho)?;
         self.reml_state.objective_innerhessian(&rho)
     }
+
+    /// Debug-only: return `(η, finalweights, solve_c_array)` at this theta.
+    #[cfg(test)]
+    pub(crate) fn debug_full_eta_w_c(
+        &mut self,
+        x: &DesignMatrix,
+        s_list: &[BlockwisePenalty],
+        nullspace_dims: &[usize],
+        linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
+        theta: &Array1<f64>,
+        rho_dim: usize,
+        context: &str,
+    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
+        self.prepare_eval_state_cost_only(
+            x,
+            s_list,
+            nullspace_dims,
+            linear_constraints,
+            None,
+            context,
+        )?;
+        let rho = theta.slice(s![..rho_dim]).to_owned();
+        let _ = self.reml_state.compute_cost(&rho)?;
+        self.reml_state.debug_eta_w_c(&rho)
+    }
 }
 
 // canonicalize_active_penalties removed — replaced by
