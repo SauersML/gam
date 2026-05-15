@@ -5035,6 +5035,24 @@ pub fn reml_laml_evaluate(
 
     let log_det_h = hop.logdet() + solution.hessian_logdet_correction;
     let log_det_s = solution.penalty_logdet.value;
+    let h_reg_diag_for_probe: Vec<f64> = if let Some(ds) = hop.as_exact_dense_spectral() {
+        if ds.dim() <= 12 {
+            let p = ds.dim();
+            let mut diag = vec![0.0; p];
+            for k in 0..p {
+                let lambda_k = ds.reg_eigenvalue(k);
+                for i in 0..p {
+                    let u_ik = ds.eigenvector_entry(i, k);
+                    diag[i] += u_ik * u_ik * lambda_k;
+                }
+            }
+            diag
+        } else { Vec::new() }
+    } else { Vec::new() };
+    eprintln!(
+        "[COST-PROBE] log_det_h={:+.12e} log_det_s={:+.12e} ll={:+.10e} pen_q={:+.10e} Hreg_diag={:?}",
+        log_det_h, log_det_s, solution.log_likelihood, solution.penalty_quadratic, h_reg_diag_for_probe,
+    );
     let (cost, profiled_scale, dp_cgrad, _dp_cgrad2) = match &solution.dispersion {
         DispersionHandling::ProfiledGaussian => {
             // Gaussian REML with profiled scale:
@@ -9681,6 +9699,9 @@ pub struct DenseSpectralOperator {
 }
 
 impl DenseSpectralOperator {
+    pub fn reg_eigenvalue(&self, k: usize) -> f64 { self.reg_eigenvalues[k] }
+    pub fn eigenvector_entry(&self, i: usize, k: usize) -> f64 { self.eigenvectors[[i, k]] }
+
     /// Create from a symmetric matrix (may be indefinite or singular).
     ///
     /// The eigendecomposition is computed once. Eigenvalues are smoothly
