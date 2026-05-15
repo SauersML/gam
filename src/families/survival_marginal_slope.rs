@@ -18755,22 +18755,27 @@ mod tests {
             "projection must pull β[0] back from {} (proposed)",
             proposed[0]
         );
-        // The closed-form max-α for this 1D constraint is
-        //   α_max = (qd1_current - guard) / (qd1_current - qd1_proposed)
-        //         = (0.4 - 1e-6) / (0.4 - (-0.6)) ≈ 0.4
-        // After the 0.5 % pull-back, α_safe ≈ 0.398, so β[0] ≈ 0.4 + 0.398·(-1.0).
-        let alpha_max = (0.4 - 1e-6) / (0.4 - (-0.6));
-        let alpha_safe = 0.995 * alpha_max;
-        let expected_beta_0 = 0.4 + alpha_safe * (proposed[0] - current[0]);
-        let expected_beta_1 = 7.0 + alpha_safe * (proposed[1] - current[1]);
+        // Bit-exact reproduction of the code path's max-α:
+        //   qd1_current = D·current + offset = 0.4 + 1e-6
+        //   qd1_proposed = D·proposed + offset = -0.6 + 1e-6
+        //   drift = qd1_proposed − qd1_current = −1.0
+        //   row_max = (qd1_current − guard) / −drift = (0.4 + 1e-6 − 1e-6) / 1.0 = 0.4
+        // Then α_safe = 0.995 · 0.4 = 0.398, so β = current + 0.398·(proposed−current).
+        let qd1_current_row = 1.0 * current[0] + 0.0 * current[1] + 1e-6;
+        let qd1_proposed_row = 1.0 * proposed[0] + 0.0 * proposed[1] + 1e-6;
+        let drift = qd1_proposed_row - qd1_current_row;
+        let row_max = (qd1_current_row - 1e-6) / -drift;
+        let alpha_safe = 0.995 * row_max;
+        let expected_beta_0 = current[0] + alpha_safe * (proposed[0] - current[0]);
+        let expected_beta_1 = current[1] + alpha_safe * (proposed[1] - current[1]);
         assert!(
-            (projected[0] - expected_beta_0).abs() < 1e-9,
-            "projected[0]={:.9} expected={expected_beta_0:.9}",
+            (projected[0] - expected_beta_0).abs() < 1e-12,
+            "projected[0]={:.12} expected={expected_beta_0:.12}",
             projected[0]
         );
         assert!(
-            (projected[1] - expected_beta_1).abs() < 1e-9,
-            "projected[1]={:.9} expected={expected_beta_1:.9}",
+            (projected[1] - expected_beta_1).abs() < 1e-12,
+            "projected[1]={:.12} expected={expected_beta_1:.12}",
             projected[1]
         );
     }
