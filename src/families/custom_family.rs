@@ -9923,8 +9923,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // Trust-region retries preserve the objective-decrease guarantee
             // when the initial radius is too optimistic. If the Newton proposal
             // is not a descent direction for the penalized quadratic model,
-            // switch once to a diagonally preconditioned gradient step and keep
-            // the same exact full-objective accept/reject test.
+            // switch once to a diagonally preconditioned descent step and keep
+            // the same exact full-objective accept/reject test. Constrained
+            // problems use a diagonal constrained QP for this rescue direction,
+            // so retries stay in the active linear-constraint tangent cone.
             const JOINT_TRUST_MAX_ATTEMPTS: usize = 24;
             let mut search_delta =
                 if step_inf <= step_tol && current_stationarity_residual > residual_tol {
@@ -10009,12 +10011,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // *should* produce near the optimum of a large-magnitude
                 // objective: ½δᵀHδ scales with curvature×step², so it can be
                 // far below the (relative) objective_tol = inner_tol·(1+|obj|)
-                // while still being a correct Newton step. Diverting to
-                // preconditioned descent here re-introduces gradient in
-                // directions Newton has already killed (the diagonal
-                // preconditioner ignores location-scale block coupling), and
-                // the residual oscillates instead of converging. Trust-region
-                // ρ shrink/expand handles small-but-valid Newton steps.
+                // while still being a correct Newton step. Trust-region ρ
+                // shrink/expand handles small-but-valid Newton steps; the
+                // preconditioned branch below is only for model-invalid
+                // directions, and preserves linear constraints when present.
                 if !predicted_reduction.is_finite() || predicted_reduction <= 0.0 {
                     model_rejects += 1;
                     if !tried_preconditioned_descent {
