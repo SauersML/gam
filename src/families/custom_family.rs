@@ -10304,52 +10304,44 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // a degenerate cycle-0 failure as convergence.
                 let made_progress = cycles_done >= 2;
 
-                // Constrained-KKT certificate: when every trust-region attempt
-                // failed via the model + feasibility barrier pair — i.e., the
-                // QP-derived Newton step had non-positive predicted reduction
-                // on the unconstrained quadratic model AND the preconditioned-
-                // descent fallback was barrier-blocked along the active
-                // constraint normals — β_current is the constrained QP optimum
-                // to within solver precision. Any feasible move from here
-                // either fails to descend the quadratic model (the QP saw it
-                // first) or crosses an active face (the barrier saw it next).
+                // Constrained-KKT certificate: full trust-region exhaustion
+                // (`line_search_attempts == JOINT_TRUST_MAX_ATTEMPTS`) after a
+                // model-rejection fallback (`tried_preconditioned_descent`)
+                // with no successful trial — i.e., the QP-derived Newton step
+                // had non-positive predicted reduction on the unconstrained
+                // quadratic model AND every subsequent attempt either
+                // re-rejected the model (`reject_model` climbs) or hit the
+                // per-block feasibility barrier (`reject_barrier` climbs) —
+                // is the canonical "QP says we are at the constrained
+                // optimum" signature. β_current is the constrained QP
+                // optimum to within solver precision: any feasible move from
+                // here either fails to descend the quadratic model (the QP
+                // saw it first) or crosses an active face (the barrier saw
+                // it next).
                 //
                 // The standard unconstrained stationarity test at the top of
                 // the cycle (‖Sβ − ∇L‖_∞ ≤ residual_tol) cannot detect this
                 // on its own: at a constrained optimum that residual equals
                 // the Lagrange-multiplier norm ‖Aᵀλ‖_∞ ≥ ‖λ_min‖ · ‖A_active‖,
-                // which does NOT vanish. Without this rescue branch the inner
-                // loop spins to `inner_max_cycles` producing byte-identical
-                // cycle summaries (the inner state is restored each iteration,
-                // so every attempt re-fires the same model + barrier pair),
-                // and the outer optimizer rejects the seed with
-                // `objective returned a non-finite cost`.
+                // which does NOT vanish. Without this rescue the inner loop
+                // spins to `inner_max_cycles` producing byte-identical cycle
+                // summaries (β is restored each iteration, so every cycle
+                // re-fires the same model + barrier pair) and the outer
+                // optimizer rejects the seed with `objective returned a
+                // non-finite cost`.
                 //
-                // Conditions ensure we only recognise this when:
-                // - we tried the model-rejection fallback (so a real QP step
-                //   was attempted and judged non-descending),
-                // - the fallback was structurally blocked by the constraint
-                //   barrier on at least one attempt (so the active face is
-                //   what's preventing progress, not curvature),
-                // - the QP returned a non-empty active set (so active
+                // Conditions ensure we only fire when:
+                // - the QP returned a non-empty active set (active
                 //   constraints actually exist for this configuration),
+                // - the model-rejection fallback was tried (a real QP
+                //   step was judged non-descending),
+                // - all `JOINT_TRUST_MAX_ATTEMPTS` attempts were spent
+                //   (we did not exit early through a likelihood error),
+                // - no attempt produced a finite trial likelihood that
+                //   merely failed the objective check (which would be a
+                //   different failure mode, not a KKT certificate),
                 // - we have at least two prior successful cycles, matching
                 //   the standard rescue's progress guard.
-                // Constrained-KKT certificate: full trust-region exhaustion
-                // (`line_search_attempts == JOINT_TRUST_MAX_ATTEMPTS`) after a
-                // model-rejection fallback (`tried_preconditioned_descent`),
-                // with a non-empty QP active set and zero successful objective
-                // evaluations, is the canonical "QP says we are at the
-                // constrained optimum" signature. Concretely: the QP delta
-                // had non-positive predicted reduction on the unconstrained
-                // quadratic model AND every subsequent trust-region attempt
-                // either re-rejected the model (`reject_model` climbs) or hit
-                // the per-block feasibility barrier (`reject_barrier` climbs);
-                // either way no feasible direction improves the model from
-                // β_current. The unconstrained stationarity test cannot
-                // detect this because at a constrained optimum the residual
-                // ‖Sβ − ∇L‖_∞ equals the Lagrange-multiplier norm ‖Aᵀλ‖_∞,
-                // which does not vanish.
                 let trust_region_exhausted = line_search_attempts >= JOINT_TRUST_MAX_ATTEMPTS;
                 let qp_constrained_kkt = model_rejects >= 1
                     && tried_preconditioned_descent
