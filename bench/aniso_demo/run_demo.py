@@ -18,7 +18,6 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
 from scipy.stats import gaussian_kde
 from sklearn.cluster import KMeans
 

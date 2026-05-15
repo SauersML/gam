@@ -9,7 +9,6 @@ Run from anywhere; paths are resolved relative to this file.
 """
 from __future__ import annotations
 
-import math
 from pathlib import Path
 
 import matplotlib as mpl

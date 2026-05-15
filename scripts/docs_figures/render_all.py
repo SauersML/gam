@@ -14,7 +14,6 @@ down. Output is unbuffered. Run with .venv313/bin/python -u.
 """
 from __future__ import annotations
 
-import sys
 import traceback
 from pathlib import Path
 
