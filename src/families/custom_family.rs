@@ -9812,7 +9812,28 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             if cycle == 0 {
                 let initial_step_norm = joint_trust_region_step_norm(&delta);
                 if initial_step_norm.is_finite() && initial_step_norm > joint_trust_radius {
-                    joint_trust_radius = initial_step_norm;
+                    // Cap the cycle-0 bump. The rationale for bumping at all is
+                    // to preserve quadratic convergence on well-conditioned
+                    // problems, where the natural Newton step is small. A
+                    // near-singular penalized Hessian (e.g. quasi-saturated
+                    // GAMLSS σ-block) produces step norms of 10⁶+ that should
+                    // never become the trust radius — every accepted step at
+                    // such a radius drifts β by orders of magnitude across
+                    // cycles even with adaptive shrinkage. Bound the bump at
+                    // the larger of (a) `MAX_INITIAL_BUMP` (an absolute scale
+                    // on log-link / log-σ coefficients) and (b) `8 * |β|_∞`
+                    // (so well-conditioned problems with naturally large β
+                    // can still take their full Newton step).
+                    const MAX_INITIAL_BUMP: f64 = 64.0;
+                    let adaptive_cap = {
+                        let beta_inf = states
+                            .iter()
+                            .flat_map(|s| s.beta.iter().copied())
+                            .map(f64::abs)
+                            .fold(0.0_f64, f64::max);
+                        (8.0 * beta_inf).max(MAX_INITIAL_BUMP)
+                    };
+                    joint_trust_radius = initial_step_norm.min(adaptive_cap);
                 }
             }
 

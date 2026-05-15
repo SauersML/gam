@@ -109,6 +109,7 @@ pub(crate) struct DebugOriginalTauSurface {
     pub(crate) ext_a: Vec<f64>,
     pub(crate) ext_ld_s: Vec<f64>,
     pub(crate) ext_trace_logdet: Vec<f64>,
+    pub(crate) ext_weight_dot: Vec<Array1<f64>>,
     pub(crate) fixed_drifts: Vec<Array2<f64>>,
     pub(crate) total_drifts: Vec<Array2<f64>>,
 }
@@ -2405,6 +2406,7 @@ impl<'a> RemlState<'a> {
         let mut fixed_drifts = Vec::with_capacity(coords.len());
         let mut total_drifts = Vec::with_capacity(coords.len());
         let mut ext_trace_logdet = Vec::with_capacity(coords.len());
+        let mut ext_weight_dot = Vec::with_capacity(coords.len());
         for (coord, v) in coords.iter().zip(mode_responses.iter()) {
             let fixed = coord.drift.materialize();
             let mut total = fixed.clone();
@@ -2427,9 +2429,21 @@ impl<'a> RemlState<'a> {
             } else {
                 assembly.hessian_op.trace_logdet_gradient(&total)
             };
+            let beta_dot = v.mapv(|value| -value);
+            let mut eta_total = self.x().matrixvectormultiply(&beta_dot);
+            if let Some(eta_fixed) = coord.tk_eta_fixed.as_ref() {
+                eta_total += eta_fixed;
+            }
+            let crate::pirls::DirectionalWorkingCurvature::Diagonal(weight_dot) =
+                crate::pirls::directionalworking_curvature_from_c_array(
+                    &pirls_result.solve_c_array,
+                    &pirls_result.finalweights,
+                    &eta_total,
+                );
             fixed_drifts.push(fixed);
             total_drifts.push(total);
             ext_trace_logdet.push(trace_logdet);
+            ext_weight_dot.push(weight_dot);
         }
 
         Ok(DebugOriginalTauSurface {
@@ -2445,6 +2459,7 @@ impl<'a> RemlState<'a> {
             ext_a: coords.iter().map(|coord| coord.a).collect(),
             ext_ld_s: coords.iter().map(|coord| coord.ld_s).collect(),
             ext_trace_logdet,
+            ext_weight_dot,
             fixed_drifts,
             total_drifts,
         })
