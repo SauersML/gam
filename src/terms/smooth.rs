@@ -16767,15 +16767,20 @@ mod tests {
                     mat_norm(&(&surface0.fixed_drifts[0] - &fd_h)) / mat_norm(&fd_h).max(1e-12);
                 let total_err =
                     mat_norm(&(&surface0.total_drifts[0] - &fd_h)) / mat_norm(&fd_h).max(1e-12);
+                let weight_err =
+                    vec_norm(&(&surface0.ext_weight_dot[0] - &fd_w)) / vec_norm(&fd_w).max(1e-12);
                 eprintln!(
                     "[H-SURF {label}] |fd_H|={:.6e} |fixed_Hdot|={:.6e} |total_Hdot|={:.6e} \
-                     fixed_rel={:.3e} total_rel={:.3e} |fd_w|={:.6e} |beta|={:.6e} |v|={:.6e}",
+                     fixed_rel={:.3e} total_rel={:.3e} |fd_w|={:.6e} |analytic_wdot|={:.6e} \
+                     w_rel={:.3e} |beta|={:.6e} |v|={:.6e}",
                     mat_norm(&fd_h),
                     mat_norm(&surface0.fixed_drifts[0]),
                     mat_norm(&surface0.total_drifts[0]),
                     fixed_err,
                     total_err,
                     vec_norm(&fd_w),
+                    vec_norm(&surface0.ext_weight_dot[0]),
+                    weight_err,
                     vec_norm(&surface0.beta),
                     vec_norm(&surface0.mode_responses[0]),
                 );
@@ -16792,15 +16797,24 @@ mod tests {
                     .zip(fd_h.t().iter())
                     .map(|(&kij, &hji)| kij * hji)
                     .sum::<f64>();
+                let trace_fixed_h = surface0
+                    .logdet_gradient_kernel
+                    .iter()
+                    .zip(surface0.fixed_drifts[0].t().iter())
+                    .map(|(&kij, &hji)| kij * hji)
+                    .sum::<f64>();
                 eprintln!(
                     "[COST-PARTS {label}] fd_negloglik={:+.6e} fd_halfpen={:+.6e} \
                      fd_logH={:+.6e} analytic_traceH={:+.6e} trace_fdH={:+.6e} \
-                     fd_logS={:+.6e} analytic_ldS={:+.6e} analytic_a={:+.6e}",
+                     trace_fixedH={:+.6e} trace_corrH={:+.6e} fd_logS={:+.6e} \
+                     analytic_ldS={:+.6e} analytic_a={:+.6e}",
                     fd_neg_loglik,
                     fd_penalty_half,
                     fd_logdet_h,
                     surface0.ext_trace_logdet[0],
                     trace_fd_h,
+                    trace_fixed_h,
+                    surface0.ext_trace_logdet[0] - trace_fixed_h,
                     fd_logdet_s,
                     surface0.ext_ld_s[0],
                     surface0.ext_a[0],
