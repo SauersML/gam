@@ -15190,6 +15190,23 @@ fn projected_stationarity_inf_norm(
         }
         inf = inf.max(r.abs());
     }
+    if inf > 100.0 {
+        let mut max_idx = 0usize;
+        let mut max_abs = 0.0_f64;
+        for j in 0..residual.len() {
+            let abs = residual[j].abs();
+            if abs > max_abs {
+                max_abs = abs;
+                max_idx = j;
+            }
+        }
+        eprintln!(
+            "[RESID-PROBE] inf={inf:.3e} idx={max_idx} residual={:+.3e} beta={:+.3e} constraints={}",
+            residual[max_idx],
+            beta[max_idx],
+            constraints.is_some()
+        );
+    }
     inf
 }
 
