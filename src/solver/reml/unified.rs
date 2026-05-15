@@ -5035,24 +5035,6 @@ pub fn reml_laml_evaluate(
 
     let log_det_h = hop.logdet() + solution.hessian_logdet_correction;
     let log_det_s = solution.penalty_logdet.value;
-    let h_reg_diag_for_probe: Vec<f64> = if let Some(ds) = hop.as_exact_dense_spectral() {
-        if ds.dim() <= 12 {
-            let p = ds.dim();
-            let mut diag = vec![0.0; p];
-            for k in 0..p {
-                let lambda_k = ds.reg_eigenvalue(k);
-                for i in 0..p {
-                    let u_ik = ds.eigenvector_entry(i, k);
-                    diag[i] += u_ik * u_ik * lambda_k;
-                }
-            }
-            diag
-        } else { Vec::new() }
-    } else { Vec::new() };
-    eprintln!(
-        "[COST-PROBE] log_det_h={:+.12e} log_det_s={:+.12e} ll={:+.10e} pen_q={:+.10e} Hreg_diag={:?}",
-        log_det_h, log_det_s, solution.log_likelihood, solution.penalty_quadratic, h_reg_diag_for_probe,
-    );
     let (cost, profiled_scale, dp_cgrad, _dp_cgrad2) = match &solution.dispersion {
         DispersionHandling::ProfiledGaussian => {
             // Gaussian REML with profiled scale:
@@ -5485,29 +5467,14 @@ pub fn reml_laml_evaluate(
             // trace through `range(S_+)` only, matching the cost exactly.
             // Gaussian identity skips this path harmlessly because `c = 0` forces
             // `D_β H = 0`, so `Ḣ` already lives entirely in `range(S_+)²`.
-            let (trace_logdet_i, trace_b_only_for_probe, trace_correction_only_for_probe) = if !incl_logdet_h {
-                (0.0, 0.0, 0.0)
+            let trace_logdet_i = if !incl_logdet_h {
+                0.0
             } else if let Some(ref stoch_traces) = stochastic_trace_values {
-                (stoch_traces[k + ext_idx], f64::NAN, f64::NAN)
+                stoch_traces[k + ext_idx]
             } else {
                 let correction = ext_corrections[ext_idx].as_ref();
-                // PROBE: compute B-only and correction-only traces separately
-                let b_only_drift =
-                    hyper_coord_total_drift_result(&coord.drift, None, hop.dim());
-                let b_only_trace = match (&solution.penalty_subspace_trace, b_only_drift) {
-                    (Some(kernel), DriftDerivResult::Dense(matrix)) => {
-                        kernel.trace_projected_logdet(&matrix)
-                    }
-                    (Some(kernel), DriftDerivResult::Operator(op)) => {
-                        kernel.trace_operator(op.as_ref())
-                    }
-                    (None, DriftDerivResult::Dense(matrix)) => hop.trace_logdet_h_k(&matrix, None),
-                    (None, DriftDerivResult::Operator(op)) => {
-                        hop.trace_logdet_operator(op.as_ref())
-                    }
-                };
                 let drift = hyper_coord_total_drift_result(&coord.drift, correction, hop.dim());
-                let full_trace = match (&solution.penalty_subspace_trace, drift) {
+                match (&solution.penalty_subspace_trace, drift) {
                     (Some(kernel), DriftDerivResult::Dense(matrix)) => {
                         kernel.trace_projected_logdet(&matrix)
                     }
@@ -5518,72 +5485,8 @@ pub fn reml_laml_evaluate(
                     (None, DriftDerivResult::Operator(op)) => {
                         hop.trace_logdet_operator(op.as_ref())
                     }
-                };
-                // EXTRA PROBE: dump op.to_dense and check tr(K · op) two ways
-                if let Some(ds) = hop.as_exact_dense_spectral() {
-                    let mut op_dense = Array2::<f64>::zeros((hop.dim(), hop.dim()));
-                    let b_drift_again =
-                        hyper_coord_total_drift_result(&coord.drift, None, hop.dim());
-                    let b_dense_for_dump = if let DriftDerivResult::Operator(op) = b_drift_again {
-                        op.to_dense()
-                    } else {
-                        Array2::<f64>::zeros((hop.dim(), hop.dim()))
-                    };
-                    op_dense += &b_dense_for_dump;
-                    let corr_dense_for_dump = if let Some(corr) = correction {
-                        match corr {
-                            DriftDerivResult::Dense(m) => m.clone(),
-                            DriftDerivResult::Operator(o) => o.to_dense(),
-                        }
-                    } else {
-                        Array2::<f64>::zeros((hop.dim(), hop.dim()))
-                    };
-                    op_dense += &corr_dense_for_dump;
-                    let frob_b = b_dense_for_dump.iter().map(|v| v * v).sum::<f64>().sqrt();
-                    let frob_corr = corr_dense_for_dump.iter().map(|v| v * v).sum::<f64>().sqrt();
-                    let frob_total = op_dense.iter().map(|v| v * v).sum::<f64>().sqrt();
-                    // Verify symmetry of op_dense (∂H/∂psi should be symmetric)
-                    let p = hop.dim();
-                    let mut max_asym = 0.0f64;
-                    for i in 0..p {
-                        for j in i+1..p {
-                            let asym = (op_dense[[i, j]] - op_dense[[j, i]]).abs();
-                            if asym > max_asym { max_asym = asym; }
-                        }
-                    }
-                    // Trace tr(K · op_dense) using ds.trace_logdet_h_k for the same matrix
-                    let trace_check = ds.trace_logdet_h_k(&op_dense, None);
-                    let trace_check_b = ds.trace_logdet_h_k(&b_dense_for_dump, None);
-                    let v_psi_v = &ext_v_is[ext_idx];
-                    let v_psi_norm = v_psi_v.iter().map(|v| v*v).sum::<f64>().sqrt();
-                    let g_psi_norm = coord.g.iter().map(|v| v*v).sum::<f64>().sqrt();
-                    let beta_norm = (0..solution.beta.len()).map(|i| solution.beta[i]*solution.beta[i]).sum::<f64>().sqrt();
-                    let tr_b = b_dense_for_dump.diag().sum();
-                    let tr_corr = corr_dense_for_dump.diag().sum();
-                    // Compute eigenvalues spectrum range
-                    let _ = ds;
-                    let op_diag: Vec<f64> = (0..p).map(|i| op_dense[[i,i]]).collect();
-                    eprintln!(
-                        "[EXTRA] frob_b={:.4e} frob_corr={:.4e} frob_tot={:.4e} max_asym={:.3e} \
-                         tr(K·op)={:+.4e} tr(K·B)={:+.4e} |v_psi|={:.4e} |g_psi|={:.4e} |beta|={:.4e} \
-                         tr(B)={:+.4e} tr(corr)={:+.4e} op_diag={:?}",
-                        frob_b, frob_corr, frob_total, max_asym, trace_check, trace_check_b,
-                        v_psi_norm, g_psi_norm, beta_norm, tr_b, tr_corr, op_diag
-                    );
                 }
-                (full_trace, b_only_trace, full_trace - b_only_trace)
             };
-
-            eprintln!(
-                "[EXT-TRACE-PROBE] ext_idx={} a={:+.6e} ld_s={:+.6e} \
-                 trace_full={:+.6e} trace_b_only={:+.6e} trace_correction={:+.6e}",
-                ext_idx,
-                coord.a,
-                coord.ld_s,
-                trace_logdet_i,
-                trace_b_only_for_probe,
-                trace_correction_only_for_probe
-            );
 
             let value = outer_gradient_entry(
                 coord.a,
@@ -9699,8 +9602,12 @@ pub struct DenseSpectralOperator {
 }
 
 impl DenseSpectralOperator {
-    pub fn reg_eigenvalue(&self, k: usize) -> f64 { self.reg_eigenvalues[k] }
-    pub fn eigenvector_entry(&self, i: usize, k: usize) -> f64 { self.eigenvectors[[i, k]] }
+    pub fn reg_eigenvalue(&self, k: usize) -> f64 {
+        self.reg_eigenvalues[k]
+    }
+    pub fn eigenvector_entry(&self, i: usize, k: usize) -> f64 {
+        self.eigenvectors[[i, k]]
+    }
 
     /// Create from a symmetric matrix (may be indefinite or singular).
     ///
