@@ -10309,6 +10309,17 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 if (trust_region_collapsed && last_cycle_obj_change_below_tol && made_progress)
                     || (qp_constrained_kkt && made_progress)
                 {
+                    if qp_constrained_kkt && !trust_region_collapsed {
+                        log::info!(
+                            "[PIRLS/joint-Newton] cycle={} constrained-KKT certificate: QP delta gave non-positive model reduction and preconditioned descent was barrier-blocked at active constraints (reject_model={}, reject_barrier={}, active_rows={})",
+                            cycle,
+                            model_rejects,
+                            barrier_rejects,
+                            joint_active_set
+                                .as_ref()
+                                .map_or(0, |active| active.len()),
+                        );
+                    }
                     converged = true;
                 }
                 cycles_done = cycle + 1;
