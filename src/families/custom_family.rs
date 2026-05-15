@@ -8833,6 +8833,10 @@ fn stabilized_joint_solver_diagonal_ridge<F: CustomFamily + ?Sized>(
     add_joint_penalty_to_matrix(&mut lhs, ranges, s_lambdas, base_diagonal_ridge);
     let shift = exact_newton_stabilizing_shift(&lhs, ridge_floor).unwrap_or(0.0);
     if shift > 0.0 {
+        eprintln!(
+            "[SHIFT-PROBE] base={base_diagonal_ridge:.3e} shift={shift:.3e} total={:.3e}",
+            base_diagonal_ridge + shift
+        );
         log::debug!(
             "[PIRLS/joint-Newton] stabilized dense penalized Hessian with diagonal shift {:.3e}",
             shift
