@@ -9866,7 +9866,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             if cycle == 0 {
                 let initial_step_norm = joint_trust_region_step_norm(&delta);
                 if initial_step_norm.is_finite() && initial_step_norm > joint_trust_radius {
-                    joint_trust_radius = initial_step_norm;
+                    // Cap at the same 1e6 ceiling `update_joint_trust_region_radius`
+                    // enforces. Bumping past it (e.g. when an ill-conditioned
+                    // joint Hessian produces a numerically meaningless 1e14
+                    // initial Newton step) just costs an extra failed
+                    // likelihood evaluation: the first rejected attempt is
+                    // immediately clamped back to 1e6 by the trust-region
+                    // update. Capping in advance preserves the quadratic
+                    // convergence on cycle 0 for well-conditioned problems
+                    // whose natural Newton step exceeds 1.0 but stays within
+                    // 1e6, while not paying for a guaranteed-to-be-clamped
+                    // first attempt on ill-conditioned starts.
+                    joint_trust_radius = initial_step_norm.min(1.0e6);
                 }
             }
 
@@ -20817,6 +20828,63 @@ mod tests {
             Some(&constraints),
         );
         assert_relative_eq!(inf_interior, 3.0_f64, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn joint_stationarity_from_gradient_projects_coupled_linear_constraints() {
+        let spec = ParameterBlockSpec {
+            name: "coupled".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+                [1.0, 0.0],
+                [0.0, 1.0]
+            ])),
+            offset: array![0.0, 0.0],
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+        };
+        let state = ParameterBlockState {
+            beta: array![0.25, 0.75],
+            eta: array![0.25, 0.75],
+        };
+        let constraints = LinearInequalityConstraints {
+            a: array![[1.0, 1.0]],
+            b: array![1.0],
+        };
+        let s_lambdas = vec![Array2::<f64>::zeros((2, 2))];
+
+        // residual = S beta - gradient = [4, 4] = A_active^T lambda,
+        // lambda=4.  This is a valid constrained KKT point and must not be
+        // reported as a large free-gradient residual.
+        let residual_multiplier = array![4.0, 4.0];
+        let gradient = -&residual_multiplier;
+        let projected = exact_newton_joint_stationarity_inf_norm_from_gradient(
+            &gradient,
+            &[state.clone()],
+            std::slice::from_ref(&spec),
+            &s_lambdas,
+            0.0,
+            RidgePolicy::explicit_stabilization_full(),
+            &[Some(constraints.clone())],
+        )
+        .expect("stationarity projection should succeed");
+        assert_relative_eq!(projected, 0.0_f64, epsilon = 1e-10);
+
+        // Wrong-signed normal residual means the active constraint wants to
+        // release. That is not convergence and must remain visible.
+        let wrong_signed_gradient = residual_multiplier;
+        let unprojected = exact_newton_joint_stationarity_inf_norm_from_gradient(
+            &wrong_signed_gradient,
+            &[state],
+            &[spec],
+            &s_lambdas,
+            0.0,
+            RidgePolicy::explicit_stabilization_full(),
+            &[Some(constraints)],
+        )
+        .expect("stationarity projection should succeed");
+        assert_relative_eq!(unprojected, 4.0_f64, epsilon = 1e-12);
     }
 
     #[test]
