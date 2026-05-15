@@ -5655,7 +5655,19 @@ pub fn reml_laml_evaluate(
             } else {
                 let correction = ext_corrections[ext_idx].as_ref();
                 let drift = hyper_coord_total_drift_result(&coord.drift, correction, hop.dim());
-                // DEBUG: dense-materialize op_total and decompose tr(K · op) by eigenmode
+                // Test-only diagnostic: dense-materialize op_total = B + correction
+                // and decompose the *unprojected* trace tr(K·op) eigenmode-by-mode.
+                //
+                // ⚠️ The trace logged here is `Σ φ'(σ_j)·(Uᵀ op_total U)_jj` — i.e.
+                // the full-space `G_ε(H)` trace. When `penalty_subspace_trace`
+                // is `Some(...)` (rank-deficient LAML / Duchon ψ axis), the
+                // PRODUCTION `trace_logdet_i` returned just below routes the
+                // trace through `range(S_+)` only via `trace_projected_logdet`.
+                // The two values can disagree by orders of magnitude — that is
+                // by design (the projected trace is what the cost identity
+                // requires). Do not interpret this number as the value entering
+                // the gradient. Read [EXT-GRAD] for the production value.
+                #[cfg(test)]
                 if let Some(ds) = hop.as_exact_dense_spectral()
                     && ds.dim() <= 12
                 {
@@ -5698,10 +5710,9 @@ pub fn reml_laml_evaluate(
                         total_tr += contrib;
                     }
                     eprintln!(
-                        "[EIG-DECOMP ext_idx={}] total_tr={:+.4e} per_mode={:?}",
+                        "[EIG-DECOMP-UNPROJECTED ext_idx={}] unprojected_tr={:+.4e} per_mode={:?}",
                         ext_idx, total_tr, per_mode
                     );
-                    #[cfg(test)]
                     if debug_stash::is_armed() && ext_idx == 0 {
                         debug_stash::store(op_dense.clone(), u_mat.clone());
 
