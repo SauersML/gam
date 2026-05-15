@@ -18677,6 +18677,171 @@ mod tests {
         assert_eq!(beta, array![0.0, 0.0]);
     }
 
+    /// Reproduces the biobank-scale failure mode: no `time_linear_constraints`
+    /// (no time-wiggle), so the only barrier between PIRLS and the
+    /// `qd1 ≥ derivative_guard` cliff is `project_time_qd1_feasible`.
+    /// The proposed β drives a row's qd1 from feasible (`+0.4`) deep into
+    /// infeasibility (`-0.6`); the projection must pull it back to the
+    /// feasible side with a strictly positive margin.
+    #[test]
+    fn time_block_post_update_projects_qd1_when_no_linear_constraints() {
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![1.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.0]),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                0.0
+            ]])),
+            design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[0.0]])),
+            // qd1 = 1.0 · β[0] + 0.0 · β[1] + offset
+            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0, 0.0]],
+            )),
+            offset_entry: Arc::new(array![0.0]),
+            offset_exit: Arc::new(array![0.0]),
+            // offset = derivative_guard exactly (the production setup).
+            derivative_offset_exit: Arc::new(array![1e-6]),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
+            score_warp: None,
+            link_dev: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+        };
+        let spec = ParameterBlockSpec {
+            name: "time_surface".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[0.0, 0.0]])),
+            offset: Array1::zeros(1),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+        };
+        let current = array![0.4, 7.0];
+        // qd1 at current = 1.0·0.4 + 0.0·7.0 + 1e-6 ≈ 0.4 (feasible)
+        // qd1 at proposed = 1.0·-0.6 + 0.0·-3.0 + 1e-6 ≈ -0.6 (infeasible)
+        let proposed = array![-0.6, -3.0];
+        let projected = family
+            .post_update_block_beta(
+                &[ParameterBlockState {
+                    beta: current.clone(),
+                    eta: array![0.0],
+                }],
+                0,
+                &spec,
+                proposed.clone(),
+            )
+            .expect("qd1 projection");
+        // Verify: projected sits strictly above the guard, NOT at proposed.
+        let qd1_projected = 1.0 * projected[0] + 0.0 * projected[1] + 1e-6;
+        assert!(
+            qd1_projected >= 1e-6,
+            "projected qd1 must clear guard, got {qd1_projected:.3e}"
+        );
+        assert!(
+            (projected[0] - proposed[0]).abs() > 1e-9,
+            "projection must pull β[0] back from {} (proposed)",
+            proposed[0]
+        );
+        // The closed-form max-α for this 1D constraint is
+        //   α_max = (qd1_current - guard) / (qd1_current - qd1_proposed)
+        //         = (0.4 - 1e-6) / (0.4 - (-0.6)) ≈ 0.4
+        // After the 0.5 % pull-back, α_safe ≈ 0.398, so β[0] ≈ 0.4 + 0.398·(-1.0).
+        let alpha_max = (0.4 - 1e-6) / (0.4 - (-0.6));
+        let alpha_safe = 0.995 * alpha_max;
+        let expected_beta_0 = 0.4 + alpha_safe * (proposed[0] - current[0]);
+        let expected_beta_1 = 7.0 + alpha_safe * (proposed[1] - current[1]);
+        assert!(
+            (projected[0] - expected_beta_0).abs() < 1e-9,
+            "projected[0]={:.9} expected={expected_beta_0:.9}",
+            projected[0]
+        );
+        assert!(
+            (projected[1] - expected_beta_1).abs() < 1e-9,
+            "projected[1]={:.9} expected={expected_beta_1:.9}",
+            projected[1]
+        );
+    }
+
+    /// When `current` already violates the qd1 monotonicity, the projection
+    /// surfaces a structured error (with the row index and qd1 value)
+    /// instead of silently returning a still-infeasible β. This is the
+    /// invariant the score_warp / link_dev projection enforces; the time
+    /// block now matches.
+    #[test]
+    fn time_block_post_update_errors_when_current_violates_qd1() {
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![1.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.0]),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                0.0
+            ]])),
+            design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[0.0]])),
+            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0]],
+            )),
+            offset_entry: Arc::new(array![0.0]),
+            offset_exit: Arc::new(array![0.0]),
+            derivative_offset_exit: Arc::new(array![1e-6]),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
+            score_warp: None,
+            link_dev: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+        };
+        let spec = ParameterBlockSpec {
+            name: "time_surface".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[0.0]])),
+            offset: Array1::zeros(1),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+        };
+        // current qd1 = -1.0 + 1e-6 < guard → infeasible.
+        let err = family
+            .post_update_block_beta(
+                &[ParameterBlockState {
+                    beta: array![-1.0],
+                    eta: array![0.0],
+                }],
+                0,
+                &spec,
+                array![0.5],
+            )
+            .expect_err("infeasible current must surface an error");
+        assert!(
+            err.contains("violates monotonicity") && err.contains("row 0"),
+            "unexpected error message: {err}"
+        );
+    }
+
     #[test]
     fn time_block_feasible_step_stays_inside_derivative_guard() {
         let family = SurvivalMarginalSlopeFamily {
