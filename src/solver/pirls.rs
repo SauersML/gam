@@ -7911,16 +7911,21 @@ impl VarianceJet {
     }
 }
 
-pub const OBSERVED_HESSIAN_WEIGHT_FLOOR_FRAC: f64 = 1e-6;
-pub const OBSERVED_HESSIAN_WEIGHT_ABS_FLOOR: f64 = 1e-12;
+const OBSERVED_HESSIAN_WEIGHT_FLOOR_FRAC: f64 = 1e-6;
+const OBSERVED_HESSIAN_WEIGHT_ABS_FLOOR: f64 = 1e-12;
 
 /// Returns the per-row floor `max(fisher · 1e-6, 1e-12)` used by PIRLS to
 /// stabilize the observed-information Hessian H = X' W X + S. Saturated
 /// rows where W_obs ≤ floor were silently raised to `floor` when PIRLS
 /// built the inner Hessian; outer REML/LAML derivatives must use the
 /// **same** floored W to keep `H` and `dH/dψ` on one surface.
+///
+/// This is the single source of truth for the floor formula. Both the
+/// inner solver (`solver_hessian_weights_into`) and the outer derivative
+/// path (`outer_hessian_curvature_arrays`) route through this helper so
+/// the inner-stabilized H and the outer dH/dψ cannot drift apart.
 #[inline]
-pub fn solver_hessian_weight_floor_for_outer(fisher_weight: f64) -> f64 {
+pub fn solver_hessian_weight_floor(fisher_weight: f64) -> f64 {
     (fisher_weight.max(0.0) * OBSERVED_HESSIAN_WEIGHT_FLOOR_FRAC)
         .max(OBSERVED_HESSIAN_WEIGHT_ABS_FLOOR)
 }
@@ -7949,7 +7954,7 @@ pub fn outer_hessian_curvature_arrays(
     let mut c_out = Array1::<f64>::zeros(n);
     let mut d_out = Array1::<f64>::zeros(n);
     for i in 0..n {
-        let floor = solver_hessian_weight_floor_for_outer(fisher_weights[i]);
+        let floor = solver_hessian_weight_floor(fisher_weights[i]);
         let w = hessian_weights[i];
         let clamp_active = eta_clamp_active(inverse_link, eta[i]);
         let w_below_floor = !(w.is_finite() && w > floor);
@@ -7969,7 +7974,6 @@ pub fn outer_hessian_curvature_arrays(
     }
     (w_out, c_out, d_out)
 }
-
 
 #[inline]
 fn fixed_glm_dispersion(likelihood: GlmLikelihoodSpec) -> f64 {
@@ -8053,12 +8057,6 @@ fn eta_for_observed_hessian_jet(inverse_link: &InverseLink, eta: f64) -> f64 {
 pub fn eta_clamp_active(inverse_link: &InverseLink, eta: f64) -> bool {
     let clamped = eta_for_observed_hessian_jet(inverse_link, eta);
     clamped != eta
-}
-
-#[inline]
-fn solver_hessian_weight_floor(fisher_weight: f64) -> f64 {
-    (fisher_weight.max(0.0) * OBSERVED_HESSIAN_WEIGHT_FLOOR_FRAC)
-        .max(OBSERVED_HESSIAN_WEIGHT_ABS_FLOOR)
 }
 
 /// Build solver-conditioned weights from the exact hessian weights.
