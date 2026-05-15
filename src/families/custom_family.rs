@@ -9866,18 +9866,53 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             if cycle == 0 {
                 let initial_step_norm = joint_trust_region_step_norm(&delta);
                 if initial_step_norm.is_finite() && initial_step_norm > joint_trust_radius {
-                    // Cap at the same 1e6 ceiling `update_joint_trust_region_radius`
-                    // enforces. Bumping past it (e.g. when an ill-conditioned
-                    // joint Hessian produces a numerically meaningless 1e14
-                    // initial Newton step) just costs an extra failed
-                    // likelihood evaluation: the first rejected attempt is
-                    // immediately clamped back to 1e6 by the trust-region
-                    // update. Capping in advance preserves the quadratic
-                    // convergence on cycle 0 for well-conditioned problems
-                    // whose natural Newton step exceeds 1.0 but stays within
-                    // 1e6, while not paying for a guaranteed-to-be-clamped
-                    // first attempt on ill-conditioned starts.
-                    joint_trust_radius = initial_step_norm.min(1.0e6);
+                    // The maintainer's argument for removing the
+                    // `joint_newton_max_step_inf` cap from the per-attempt
+                    // path — that the L2 trust radius is strictly tighter
+                    // than an inf-norm cap of the same magnitude — is
+                    // correct only while the trust radius is at its small
+                    // default (1.0). Bumping it to the unconstrained
+                    // Newton-step 2-norm here can push it to 1e6+ on an
+                    // ill-conditioned cycle 0, after which the inf-norm
+                    // cap is no longer redundant.
+                    //
+                    // Root cause of the explosion: the joint Hessian H+S
+                    // is SPD by construction (via `stabilized_joint_solver_diagonal_ridge`)
+                    // but its condition number is *not* bounded — for a
+                    // GAMLSS Duchon basis whose polynomial null-space has
+                    // no penalty coverage, with quasi-saturated starting
+                    // probabilities making `μ(1−μ)` tiny on most rows, H+S
+                    // can have a 1e-14 eigenvalue and Newton's `H⁻¹·g`
+                    // explodes to ~1e14 in that null direction. Bumping
+                    // the trust radius to 1e14 then wastes ~10 attempts at
+                    // progressively-shrinking radii (each rejected as a
+                    // NaN/diverging likelihood) before the trust region
+                    // adaptively recovers a sane scale.
+                    //
+                    // Family-supplied `joint_newton_max_step_inf` is the
+                    // family's own statement of what step magnitude is
+                    // physically meaningful in β space. If Newton's
+                    // proposal already exceeds that, the step direction is
+                    // dominated by the near-null eigenvector and bumping
+                    // the trust radius is counterproductive — keep the
+                    // default radius and let the trust region adapt from
+                    // a sane starting point. The 1e6 ceiling here matches
+                    // the existing clamp inside
+                    // `update_joint_trust_region_radius` so a sane Newton
+                    // step never pays for an attempt that would be
+                    // immediately clamped.
+                    let initial_step_inf = delta
+                        .iter()
+                        .copied()
+                        .map(f64::abs)
+                        .fold(0.0_f64, f64::max);
+                    let max_step_inf = family.joint_newton_max_step_inf(specs);
+                    let newton_step_is_sane = initial_step_inf.is_finite()
+                        && max_step_inf.is_finite()
+                        && initial_step_inf <= max_step_inf;
+                    if newton_step_is_sane {
+                        joint_trust_radius = initial_step_norm.min(1.0e6);
+                    }
                 }
             }
 
@@ -10300,9 +10335,27 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 //   constraints actually exist for this configuration),
                 // - we have at least two prior successful cycles, matching
                 //   the standard rescue's progress guard.
+                // Constrained-KKT certificate: full trust-region exhaustion
+                // (`line_search_attempts == JOINT_TRUST_MAX_ATTEMPTS`) after a
+                // model-rejection fallback (`tried_preconditioned_descent`),
+                // with a non-empty QP active set and zero successful objective
+                // evaluations, is the canonical "QP says we are at the
+                // constrained optimum" signature. Concretely: the QP delta
+                // had non-positive predicted reduction on the unconstrained
+                // quadratic model AND every subsequent trust-region attempt
+                // either re-rejected the model (`reject_model` climbs) or hit
+                // the per-block feasibility barrier (`reject_barrier` climbs);
+                // either way no feasible direction improves the model from
+                // β_current. The unconstrained stationarity test cannot
+                // detect this because at a constrained optimum the residual
+                // ‖Sβ − ∇L‖_∞ equals the Lagrange-multiplier norm ‖Aᵀλ‖_∞,
+                // which does not vanish.
+                let trust_region_exhausted = line_search_attempts >= JOINT_TRUST_MAX_ATTEMPTS;
                 let qp_constrained_kkt = model_rejects >= 1
                     && tried_preconditioned_descent
-                    && barrier_rejects >= 1
+                    && trust_region_exhausted
+                    && likelihood_rejects == 0
+                    && objective_rejects == 0
                     && joint_active_set
                         .as_ref()
                         .is_some_and(|active| !active.is_empty());
@@ -10311,8 +10364,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 {
                     if qp_constrained_kkt && !trust_region_collapsed {
                         log::info!(
-                            "[PIRLS/joint-Newton] cycle={} constrained-KKT certificate: QP delta gave non-positive model reduction and preconditioned descent was barrier-blocked at active constraints (reject_model={}, reject_barrier={}, active_rows={})",
+                            "[PIRLS/joint-Newton] cycle={} constrained-KKT certificate: QP delta gave non-positive model reduction and the preconditioned-descent fallback exhausted {} trust-region attempts at active constraints (reject_model={}, reject_barrier={}, active_rows={})",
                             cycle,
+                            line_search_attempts,
                             model_rejects,
                             barrier_rejects,
                             joint_active_set
