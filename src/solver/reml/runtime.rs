@@ -5115,11 +5115,16 @@ impl<'a> RemlState<'a> {
             if is_gaussian_identity {
                 Box::new(GaussianDerivatives)
             } else {
-                // Differentiate the same Hessian-side curvature arrays that the
-                // inner PIRLS solve accepted at the mode.  `effectivehessian`
-                // rebuilds H from these unfloored observed-information arrays
-                // so ∂H/∂ψ here matches the surface whose log|·| we differentiate.
+                // Match PIRLS's stabilized H = X' W X + S where
+                // W = max(W_obs, floor(W_F)).  See `outer_hessian_curvature_arrays`.
                 let (c_array, d_array) = self.hessian_cd_arrays(pirls_result)?;
+                let (w_outer, c_outer, d_outer) =
+                    crate::solver::pirls::outer_hessian_curvature_arrays(
+                        &pirls_result.finalweights,
+                        &pirls_result.solveweights,
+                        &c_array,
+                        &d_array,
+                    );
                 let x_transformed = if let Some(z) = free_basis_opt.as_ref() {
                     // Project the design: X_proj = X Z
                     let x_dense = pirls_result.x_transformed.to_dense();
@@ -5130,9 +5135,9 @@ impl<'a> RemlState<'a> {
                     pirls_result.x_transformed.clone()
                 };
                 let base = SinglePredictorGlmDerivatives {
-                    c_array,
-                    d_array: Some(d_array),
-                    hessian_weights: pirls_result.finalweights.clone(),
+                    c_array: c_outer,
+                    d_array: Some(d_outer),
+                    hessian_weights: w_outer,
                     x_transformed,
                 };
                 if firth_active_for_derivs {
@@ -5236,9 +5241,16 @@ impl<'a> RemlState<'a> {
                     Box::new(GaussianDerivatives),
                 )
             } else {
-                // Differentiate the same Hessian-side curvature arrays that the
-                // inner PIRLS solve accepted at the mode.
+                // Match PIRLS's stabilized H = X' W X + S where
+                // W = max(W_obs, floor(W_F)).
                 let (c_array, d_array) = self.hessian_cd_arrays(pirls_result)?;
+                let (w_outer, c_outer, d_outer) =
+                    crate::solver::pirls::outer_hessian_curvature_arrays(
+                        &pirls_result.finalweights,
+                        &pirls_result.solveweights,
+                        &c_array,
+                        &d_array,
+                    );
                 (
                     DispersionHandling::Fixed {
                         phi: pirls_result.likelihood.fixed_phi().unwrap_or(1.0),
@@ -5247,9 +5259,9 @@ impl<'a> RemlState<'a> {
                     },
                     {
                         let base = SinglePredictorGlmDerivatives {
-                            c_array,
-                            d_array: Some(d_array),
-                            hessian_weights: pirls_result.finalweights.clone(),
+                            c_array: c_outer,
+                            d_array: Some(d_outer),
+                            hessian_weights: w_outer,
                             x_transformed: self.x().clone(),
                         };
                         // Match the dense exact path: when Firth-logit is
