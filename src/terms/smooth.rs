@@ -16620,7 +16620,7 @@ mod tests {
             theta_alt[rho_dim + k] = 0.4;
         }
 
-        let h = 1e-5_f64;
+        let h = 1e-6_f64;
         // Tolerance: 5e-3 captures structural derivative bugs (the
         // ext-coord blow-up is rel_err ≈ 10⁹) while staying above the
         // central-FD truncation floor (O(h²) ≈ 1e-10 of cost magnitude).
