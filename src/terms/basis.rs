@@ -2784,19 +2784,12 @@ impl RadialScalarKind {
 /// Instead of persisting O(n*k*(d+2)) arrays, the operator stores the original
 /// data/centers/eta and recomputes q/t/s per chunk during matvec operations.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 enum StreamingAxisMode {
     /// Per-axis anisotropic ψ_a derivatives: expose one `s_a` component per axis.
-    PerAxis {
-        eta: Vec<f64>,
-        metric_weights: Arc<[f64]>,
-    },
+    PerAxis { metric_weights: Arc<[f64]> },
     /// Scalar ψ derivative: expose a single component equal to the total
     /// scaled squared radius r² = Σ_a exp(2η_a) h_a².
-    ScalarTotal {
-        eta: Vec<f64>,
-        metric_weights: Arc<[f64]>,
-    },
+    ScalarTotal { metric_weights: Arc<[f64]> },
 }
 
 #[derive(Debug, Clone)]
@@ -2823,10 +2816,7 @@ impl StreamingRadialState {
         s_buf: &mut [f64],
     ) -> Result<(f64, f64, f64), BasisError> {
         match &self.axis_mode {
-            StreamingAxisMode::PerAxis {
-                eta: _,
-                metric_weights,
-            } => {
+            StreamingAxisMode::PerAxis { metric_weights } => {
                 let dim = metric_weights.len();
                 debug_assert_eq!(s_buf.len(), dim);
                 debug_assert!(i < self.data.nrows() && j < self.centers.nrows());
@@ -2840,10 +2830,7 @@ impl StreamingRadialState {
                 }
                 self.radial_kind.eval_design_triplet(r2.sqrt())
             }
-            StreamingAxisMode::ScalarTotal {
-                eta: _,
-                metric_weights,
-            } => {
+            StreamingAxisMode::ScalarTotal { metric_weights } => {
                 debug_assert_eq!(s_buf.len(), 1);
                 let dim = metric_weights.len();
                 debug_assert!(i < self.data.nrows() && j < self.centers.nrows());
@@ -3043,10 +3030,7 @@ impl ImplicitDesignPsiDerivative {
             streaming: Some(StreamingRadialState {
                 data,
                 centers,
-                axis_mode: StreamingAxisMode::PerAxis {
-                    eta,
-                    metric_weights,
-                },
+                axis_mode: StreamingAxisMode::PerAxis { metric_weights },
                 radial_kind,
             }),
             ident_transform,
@@ -3085,10 +3069,7 @@ impl ImplicitDesignPsiDerivative {
             streaming: Some(StreamingRadialState {
                 data,
                 centers,
-                axis_mode: StreamingAxisMode::ScalarTotal {
-                    eta,
-                    metric_weights,
-                },
+                axis_mode: StreamingAxisMode::ScalarTotal { metric_weights },
                 radial_kind,
             }),
             ident_transform,

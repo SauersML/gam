@@ -3,14 +3,14 @@
 
 Usage: python bench/_repro_seed.py <seed> [outdir]
 """
-import sys, os, json
+import sys, json
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fuzz_vs_mgcv import (
     generate_scenario, generate_data,
-    build_rust_fit_cmd, rust_mean_formula, rust_noise_terms,
-    mgcv_formula, mgcv_sigma_formula,
+    rust_mean_formula,
+    mgcv_formula,
 )
 
 seed = int(sys.argv[1])

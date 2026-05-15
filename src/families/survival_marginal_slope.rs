@@ -5617,7 +5617,7 @@ impl SurvivalMarginalSlopeFamily {
     /// jet construction across the 10 upper-triangular (a, b) cells. This
     /// per-cell variant is retained as a regression baseline for the
     /// batched-vs-legacy equivalence test below.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn row_neglog_directional_refs(
         &self,
         row: usize,
