@@ -101,6 +101,13 @@ pub(crate) struct DebugOriginalTauSurface {
     pub(crate) mode_responses: Vec<Array1<f64>>,
     pub(crate) finalweights: Array1<f64>,
     pub(crate) h_total_original: Array2<f64>,
+    pub(crate) log_likelihood: f64,
+    pub(crate) penalty_quadratic: f64,
+    pub(crate) log_det_h: f64,
+    pub(crate) log_det_s: f64,
+    pub(crate) ext_a: Vec<f64>,
+    pub(crate) ext_ld_s: Vec<f64>,
+    pub(crate) ext_trace_logdet: Vec<f64>,
     pub(crate) fixed_drifts: Vec<Array2<f64>>,
     pub(crate) total_drifts: Vec<Array2<f64>>,
 }
@@ -2384,9 +2391,17 @@ impl<'a> RemlState<'a> {
         let mode_responses: Vec<Array1<f64>> =
             coords.iter().map(|coord| hop.solve(&coord.g)).collect();
         let ctx = self.build_sparse_derivative_context(pirls_result, &bundle)?;
+        let assembly = self.build_dense_original_assembly(
+            rho,
+            &bundle,
+            super::unified::EvalMode::ValueAndGradient,
+        )?;
+        let log_det_h = assembly.hessian_op.logdet() + assembly.hessian_logdet_correction;
+        let log_det_s = assembly.penalty_logdet.value;
 
         let mut fixed_drifts = Vec::with_capacity(coords.len());
         let mut total_drifts = Vec::with_capacity(coords.len());
+        let mut ext_trace_logdet = Vec::with_capacity(coords.len());
         for (coord, v) in coords.iter().zip(mode_responses.iter()) {
             let fixed = coord.drift.materialize();
             let mut total = fixed.clone();
@@ -2404,8 +2419,14 @@ impl<'a> RemlState<'a> {
                     }
                 }
             }
+            let trace_logdet = if let Some(kernel) = assembly.penalty_subspace_trace.as_ref() {
+                kernel.trace_projected_logdet(&total)
+            } else {
+                assembly.hessian_op.trace_logdet_gradient(&total)
+            };
             fixed_drifts.push(fixed);
             total_drifts.push(total);
+            ext_trace_logdet.push(trace_logdet);
         }
 
         Ok(DebugOriginalTauSurface {
@@ -2413,6 +2434,13 @@ impl<'a> RemlState<'a> {
             mode_responses,
             finalweights: pirls_result.finalweights.clone(),
             h_total_original,
+            log_likelihood: assembly.log_likelihood,
+            penalty_quadratic: assembly.penalty_quadratic,
+            log_det_h,
+            log_det_s,
+            ext_a: coords.iter().map(|coord| coord.a).collect(),
+            ext_ld_s: coords.iter().map(|coord| coord.ld_s).collect(),
+            ext_trace_logdet,
             fixed_drifts,
             total_drifts,
         })

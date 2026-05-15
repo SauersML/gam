@@ -16779,6 +16779,25 @@ mod tests {
                     vec_norm(&surface0.beta),
                     vec_norm(&surface0.mode_responses[0]),
                 );
+                let fd_neg_loglik =
+                    -((surface_plus.log_likelihood - surface_minus.log_likelihood) / (2.0 * h));
+                let fd_penalty_half = 0.5
+                    * ((surface_plus.penalty_quadratic - surface_minus.penalty_quadratic)
+                        / (2.0 * h));
+                let fd_logdet_h = (surface_plus.log_det_h - surface_minus.log_det_h) / (2.0 * h);
+                let fd_logdet_s = (surface_plus.log_det_s - surface_minus.log_det_s) / (2.0 * h);
+                eprintln!(
+                    "[COST-PARTS {label}] fd_negloglik={:+.6e} fd_halfpen={:+.6e} \
+                     fd_logH={:+.6e} analytic_traceH={:+.6e} fd_logS={:+.6e} \
+                     analytic_ldS={:+.6e} analytic_a={:+.6e}",
+                    fd_neg_loglik,
+                    fd_penalty_half,
+                    fd_logdet_h,
+                    surface0.ext_trace_logdet[0],
+                    fd_logdet_s,
+                    surface0.ext_ld_s[0],
+                    surface0.ext_a[0],
+                );
             }
             for j in 0..theta_dim {
                 let mut plus = theta.clone();
