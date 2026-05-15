@@ -309,6 +309,14 @@ pub fn fast_av<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 
     let (n, p) = a.dim();
     debug_assert_eq!(p, v.len(), "A cols must match v length");
+    crate::gpu::record_cpu_fallback(
+        "linalg.fast_av",
+        crate::gpu::profile::OperationKind::Gemv,
+        n,
+        p,
+        1,
+        0,
+    );
 
     if !should_use_faer_matmul(n, 1, p) {
         return a.dot(v);
@@ -345,6 +353,14 @@ pub fn fast_av_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let (n, p) = a.dim();
     debug_assert_eq!(v.len(), p, "vector length must match A cols");
     debug_assert_eq!(out.len(), n, "output length must match A rows");
+    crate::gpu::record_cpu_fallback(
+        "linalg.fast_av_into",
+        crate::gpu::profile::OperationKind::Gemv,
+        n,
+        p,
+        1,
+        0,
+    );
 
     if !should_use_faer_matmul(n, 1, p) {
         out.assign(&a.dot(v));
@@ -379,6 +395,14 @@ pub fn fast_av_view_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let (n, p) = a.dim();
     debug_assert_eq!(v.len(), p, "vector length must match A cols");
     debug_assert_eq!(out.len(), n, "output length must match A rows");
+    crate::gpu::record_cpu_fallback(
+        "linalg.fast_av_view_into",
+        crate::gpu::profile::OperationKind::Gemv,
+        n,
+        p,
+        1,
+        0,
+    );
 
     if !should_use_faer_matmul(n, 1, p) {
         let prod = a.dot(v);
@@ -418,6 +442,14 @@ pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 
     let (n, p) = a.dim();
     debug_assert_eq!(n, v.len(), "A rows must match v length");
+    crate::gpu::record_cpu_fallback(
+        "linalg.fast_atv",
+        crate::gpu::profile::OperationKind::GemvTranspose,
+        n,
+        p,
+        1,
+        0,
+    );
 
     // For very small arrays, ndarray might be faster
     if !should_use_faer_matmul(p, 1, n) {
@@ -463,6 +495,14 @@ pub fn fast_atv_into<S: Data<Elem = f64>>(
     let (n, p) = a.dim();
     debug_assert_eq!(v.len(), n, "vector length must match A rows");
     debug_assert_eq!(out.len(), p, "output length must match A cols");
+    crate::gpu::record_cpu_fallback(
+        "linalg.fast_atv_into",
+        crate::gpu::profile::OperationKind::GemvTranspose,
+        n,
+        p,
+        1,
+        0,
+    );
 
     if !should_use_faer_matmul(p, 1, n) {
         out.assign(&a.t().dot(v));
@@ -510,6 +550,14 @@ pub fn fast_xt_diag_x_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64
 
     let (n, p) = x.dim();
     debug_assert_eq!(n, w.len(), "X rows must match W length");
+    crate::gpu::record_cpu_fallback(
+        "linalg.fast_xt_diag_x",
+        crate::gpu::profile::OperationKind::XtDiagX,
+        n,
+        p,
+        p,
+        0,
+    );
     if n == 0 || p == 0 {
         return Array2::<f64>::zeros((p, p));
     }
@@ -577,6 +625,14 @@ pub fn fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem 
     let (n, q) = y.dim();
     let px = x.ncols();
     debug_assert_eq!(n, w.len(), "Y rows must match W length");
+    crate::gpu::record_cpu_fallback(
+        "linalg.fast_xt_diag_y",
+        crate::gpu::profile::OperationKind::XtDiagY,
+        n,
+        px,
+        q,
+        0,
+    );
     debug_assert_eq!(n, x.nrows(), "X rows must match Y rows");
     if n == 0 || px == 0 || q == 0 {
         return Array2::<f64>::zeros((px, q));
@@ -655,6 +711,14 @@ pub fn fast_joint_hessian_2x2<
     let pa = x_a.ncols();
     let pb = x_b.ncols();
     let total = pa + pb;
+    crate::gpu::record_cpu_fallback(
+        "linalg.fast_joint_hessian_2x2",
+        crate::gpu::profile::OperationKind::JointHessian2x2,
+        n,
+        pa,
+        pb,
+        0,
+    );
     debug_assert_eq!(n, x_b.nrows());
     debug_assert_eq!(n, w_aa.len());
     debug_assert_eq!(n, w_ab.len());
