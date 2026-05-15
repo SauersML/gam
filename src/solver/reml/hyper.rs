@@ -1358,16 +1358,8 @@ impl<'a> RemlState<'a> {
         // Working residual u = w ⊙ (z − η̂).
         let u = &pirls_result.solveweights
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
-        // Match PIRLS's stabilized H = X' W X + S where W = max(W_obs, floor).
-        let zero_d = Array1::<f64>::zeros(pirls_result.finalweights.len());
-        let (w_diag_owned, c_array_owned, _) = crate::solver::pirls::outer_hessian_curvature_arrays(
-            &pirls_result.finalweights,
-            &pirls_result.solveweights,
-            &pirls_result.solve_c_array,
-            &zero_d,
-        );
-        let w_diag = &w_diag_owned;
-        let c_array = &c_array_owned;
+        let w_diag = &pirls_result.finalweights;
+        let c_array = &pirls_result.solve_c_array;
 
         // Whether third-derivative corrections are needed (non-Gaussian).
         let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
@@ -1939,17 +1931,7 @@ impl<'a> RemlState<'a> {
 
         let u = &pirls_result.solveweights
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
-        // Match PIRLS's stabilized H = X' W X + S where W = max(W_obs, floor(W_F)).
-        // See `outer_hessian_curvature_arrays` for the rationale.
-        let zero_d = Array1::<f64>::zeros(pirls_result.finalweights.len());
-        let (w_floored, c_masked, _d_masked) = crate::solver::pirls::outer_hessian_curvature_arrays(
-            &pirls_result.finalweights,
-            &pirls_result.solveweights,
-            &pirls_result.solve_c_array,
-            &zero_d,
-        );
-        let w_diag = std::sync::Arc::new(w_floored);
-        let solve_c_floored = c_masked;
+        let w_diag = std::sync::Arc::new(pirls_result.finalweights.clone());
         let x_design = self.x().clone();
 
         let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
@@ -2020,7 +2002,7 @@ impl<'a> RemlState<'a> {
                 None
             } else {
                 Some(directional_curvature_weights(
-                    &solve_c_floored,
+                    &pirls_result.solve_c_array,
                     w_diag.as_ref(),
                     &x_tau_beta_j,
                 ))
@@ -2188,13 +2170,9 @@ impl<'a> RemlState<'a> {
 
         let u = &pirls_result.solveweights
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
-        // Match PIRLS's stabilized H = X' W X + S where W = max(W_obs, floor).
-        let (w_diag, c_array, d_array) = crate::solver::pirls::outer_hessian_curvature_arrays(
-            &pirls_result.finalweights,
-            &pirls_result.solveweights,
-            &pirls_result.solve_c_array,
-            &pirls_result.solve_d_array,
-        );
+        let w_diag = pirls_result.finalweights.clone();
+        let c_array = pirls_result.solve_c_array.clone();
+        let d_array = pirls_result.solve_d_array.clone();
         let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
 
         let s_tau_tau = std::sync::Arc::new(s_tau_tau);
@@ -2435,13 +2413,9 @@ impl<'a> RemlState<'a> {
         // Working residual u = w ⊙ (z − η̂).
         let u = &pirls_result.solveweights
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
-        // Match PIRLS's stabilized H = X' W X + S where W = max(W_obs, floor).
-        let (w_diag, c_array, d_array) = crate::solver::pirls::outer_hessian_curvature_arrays(
-            &pirls_result.finalweights,
-            &pirls_result.solveweights,
-            &pirls_result.solve_c_array,
-            &pirls_result.solve_d_array,
-        );
+        let w_diag = pirls_result.finalweights.clone();
+        let c_array = pirls_result.solve_c_array.clone();
+        let d_array = pirls_result.solve_d_array.clone();
         let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
 
         // Capture into Arc for shared ownership in closures.
