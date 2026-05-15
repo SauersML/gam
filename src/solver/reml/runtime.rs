@@ -2020,43 +2020,15 @@ impl<'a> RemlState<'a> {
     pub(super) fn effectivehessian(
         &self,
         pr: &PirlsResult,
-        rho: &Array1<f64>,
     ) -> Result<(Array2<f64>, RidgePassport), EstimationError> {
-        // Rebuild H from the FINAL observed-information curvature arrays so
-        // outer REML/LAML derivatives see the same surface the analytic
-        // operator differentiates.  PIRLS's `stabilizedhessian_transformed`
-        // was built with `solver_weights = max(W_obs, floor(W_F))` to keep
-        // the *inner* Newton system PD; using that here makes ∂H/∂ψ
-        // disagree with the H whose log|·| we differentiate at every row
-        // where the inner floor was active.  See `outer_hessian_curvature_arrays`
-        // for the corresponding operator-side reconstruction.
-        let mut h = pr
-            .x_transformed
-            .compute_xtwx(&pr.finalweights)
-            .map_err(|_| EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            })?;
-
-        let lambdas = rho.mapv(f64::exp);
-        for (k, cp) in pr.reparam_result.canonical_transformed.iter().enumerate() {
-            if k < lambdas.len() && lambdas[k] != 0.0 {
-                cp.accumulate_weighted(&mut h, lambdas[k]);
-            }
-        }
-
-        let ridge_delta = pr.ridge_passport.delta;
-        if ridge_delta != 0.0 {
-            for i in 0..h.nrows().min(h.ncols()) {
-                h[[i, i]] += ridge_delta;
-            }
-        }
-        enforce_symmetry(&mut h);
-
-        if crate::linalg::matrix::SymmetricMatrix::Dense(h.clone())
-            .factorize()
-            .is_ok()
-        {
-            return Ok((h, pr.ridge_passport));
+        // Use the same stabilized H = X' W X + S + δI that PIRLS built,
+        // where W = `solver_weights = max(W_obs, floor(W_F))` keeps H PD.
+        // The OUTER analytic operator constructs ∂H/∂ψ from the same
+        // floored W (via `outer_hessian_curvature_arrays`), so log|H| and
+        // its trace gradient live on a single, consistent surface.
+        let h = &pr.stabilizedhessian_transformed;
+        if h.factorize().is_ok() {
+            return Ok((h.to_dense(), pr.ridge_passport));
         }
 
         Err(EstimationError::ModelIsIllConditioned {
@@ -3356,7 +3328,7 @@ impl<'a> RemlState<'a> {
         key: Option<Vec<u64>>,
     ) -> Result<EvalShared, EstimationError> {
         let pirls_result = self.execute_pirls_if_needed(rho)?;
-        let (mut h_total, ridge_passport) = self.effectivehessian(pirls_result.as_ref(), rho)?;
+        let (mut h_total, ridge_passport) = self.effectivehessian(pirls_result.as_ref())?;
         let mut firth_dense_operator: Option<Arc<FirthDenseOperator>> = None;
         if self.config.firth_bias_reduction
             && matches!(self.config.link_function(), LinkFunction::Logit)
