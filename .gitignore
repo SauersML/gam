@@ -50,7 +50,6 @@ bench/**/RESULTS*
 scripts/__pycache__/
 scripts/latest_benchmark_summary.md
 scripts/scripts/latest_benchmark_summary.md
-scripts/jules_loop.py
 scripts/codex_nightrun.sh
 *.png
 !bench/aniso_demo/*.png
