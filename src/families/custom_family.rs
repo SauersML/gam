@@ -9910,12 +9910,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 }
                 let predicted_reduction =
                     joint_quadratic_predicted_reduction(&rhs, &hpen_delta, &trial_delta);
-                if !predicted_reduction.is_finite()
-                    || predicted_reduction <= 0.0
-                    || (predicted_reduction <= objective_tol
-                        && current_stationarity_residual > residual_tol
-                        && !tried_preconditioned_descent)
-                {
+                // Reject only non-descent directions on the quadratic model.
+                // A small-but-positive predicted reduction is what Newton
+                // *should* produce near the optimum of a large-magnitude
+                // objective: ½δᵀHδ scales with curvature×step², so it can be
+                // far below the (relative) objective_tol = inner_tol·(1+|obj|)
+                // while still being a correct Newton step. Diverting to
+                // preconditioned descent here re-introduces gradient in
+                // directions Newton has already killed (the diagonal
+                // preconditioner ignores location-scale block coupling), and
+                // the residual oscillates instead of converging. Trust-region
+                // ρ shrink/expand handles small-but-valid Newton steps.
+                if !predicted_reduction.is_finite() || predicted_reduction <= 0.0 {
                     model_rejects += 1;
                     if !tried_preconditioned_descent {
                         match joint_preconditioned_descent_delta(
