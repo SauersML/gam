@@ -2306,6 +2306,23 @@ impl<'a> RemlState<'a> {
         Ok(bundle.h_total.as_ref().clone())
     }
 
+    /// Debug-only: return `(final_eta, finalweights, solve_c_array)` at the
+    /// PIRLS state produced by driving the solver to convergence at this `rho`.
+    /// Used by the iso-κ Duchon FD probe to test whether the analytic
+    /// `c · dη/dψ_total` per-row diagonal matches FD `c · (η_+ − η_−) / 2h`.
+    #[cfg(test)]
+    pub(crate) fn debug_eta_w_c(
+        &self,
+        rho: &Array1<f64>,
+    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
+        let pr = self.execute_pirls_if_needed(rho)?;
+        Ok((
+            pr.final_eta.clone(),
+            pr.finalweights.clone(),
+            pr.solve_c_array.clone(),
+        ))
+    }
+
     pub(super) fn active_constraint_free_basis(&self, pr: &PirlsResult) -> Option<Array2<f64>> {
         let lin = pr.linear_constraints_transformed.as_ref()?;
         let active_tol = 1e-8;
