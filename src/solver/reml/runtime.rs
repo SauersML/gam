@@ -3393,7 +3393,7 @@ impl<'a> RemlState<'a> {
         let mut wz = self.y.to_owned();
         wz -= &self.offset;
         wz *= &weights_owned;
-        let xtwx = match self.x.diag_xtw_x(&weights_owned) {
+        let xtwx = match self.x.compute_xtwx(&weights_owned) {
             Ok(m) => m,
             Err(e) => {
                 log::warn!("[gaussian-fixed-cache] disabling cache: failed to build XᵀWX: {e}");
