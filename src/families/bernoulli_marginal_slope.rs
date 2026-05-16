@@ -16868,9 +16868,23 @@ pub fn fit_bernoulli_marginal_slope_terms(
         // > 0` for every β. This is the standard GAM `gam.side`
         // convention generalised to multi-anchor unions (mgcv applies it
         // sequentially across smooths sharing a covariate).
+        // When `enforce_cross_block_identifiability_for_flex_block`
+        // reparameterised the score-warp runtime against the parametric
+        // anchor union (marginal + logslope), it installed an
+        // `anchor_residual` and cached the training-row parametric
+        // anchor matrix on the runtime. `runtime.design()` on a
+        // residualised runtime returns the *raw* basis evaluation,
+        // which `debug_assert`s the caller hasn't conflated with the
+        // reparameterised basis — we want the reparameterised one
+        // here, so go through `design_at_training_with_residual` so
+        // the cached anchor rows are folded in. For score-warp
+        // configurations where reparameterisation was a no-op (no
+        // residual installed) the same call falls back to the raw
+        // `design()` path, so the residual-vs-no-residual branches
+        // converge on the right matrix.
         let score_warp_anchor_design = score_warp_prepared
             .as_ref()
-            .map(|sw| sw.runtime.design(&spec.z))
+            .map(|sw| sw.runtime.design_at_training_with_residual(&spec.z))
             .transpose()?;
         use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
         let mut anchors = vec![
