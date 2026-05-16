@@ -3900,4 +3900,16 @@ pub(crate) struct RemlState<'a> {
     /// analytic penalty-logdet evaluations.
     pub(crate) penalty_block_structural_nullities:
         RwLock<Option<penalty_logdet::PenaltyBlockStructuralNullities>>,
+
+    /// Precomputed `(XᵀWX, XᵀW(y − offset))` for the Gaussian + Identity
+    /// outer REML loop, populated once before the outer optimizer when the
+    /// family / link / constraint preconditions hold and the design supports
+    /// the Identity short-circuit at `pirls.rs:6237`. When present, each
+    /// inner `solve_penalized_least_squares_implicit` reads these matrices
+    /// instead of restreaming the O(N·p²) GEMM and O(N·p) matvec per outer
+    /// iteration — the penalty `λ·S` is still added per-λ.
+    ///
+    /// Invalidated jointly with the design in `reset_surface`.
+    pub(crate) gaussian_fixed_cache:
+        RwLock<Option<Arc<crate::pirls::GaussianFixedCache>>>,
 }

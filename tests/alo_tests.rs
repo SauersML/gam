@@ -63,6 +63,7 @@ fn fit_unpenalized(
             y: y.view(),
             priorweights: w_prior.view(),
             covariate_se: None,
+            gaussian_fixed_cache: None,
         },
         PenaltyConfig {
             canonical_penalties: &canonical,
@@ -117,6 +118,7 @@ fn fit_identity_penalized(
             y: y.view(),
             priorweights: w_prior.view(),
             covariate_se: None,
+            gaussian_fixed_cache: None,
         },
         PenaltyConfig {
             canonical_penalties: &canonical,
