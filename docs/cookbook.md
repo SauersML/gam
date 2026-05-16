@@ -97,26 +97,23 @@ gamfit.fit(
 ## Cyclic 1-D smooth (day-of-week, hour-of-day, angles)
 
 ```python
-import math
-
 # Day-of-week effect on a daily-aggregated outcome (period = 7).
 gamfit.fit(df, "y ~ s(dow, periodic=true, period=7)")
 
 # Hour-of-day with explicit half-open domain.
 gamfit.fit(df, "y ~ cyclic(hour, period_start=0, period_end=24)")
 
-# Angles in radians.
-gamfit.fit(df, f"y ~ s(theta, periodic=true, period={2*math.pi})")
+# Angles in radians — the DSL accepts the symbolic `pi` / `tau` constants
+# (case-insensitive), optionally multiplied by a single literal: `2*pi`,
+# `pi*2`, `.5*pi`, `tau`. See formulas.md for the full rule.
+gamfit.fit(df, "y ~ s(theta, periodic=true, period=2*pi)")
 ```
 
 ## Tensor product with a periodic axis (cylinder, day × hour, …)
 
 ```python
-import math
-two_pi = 2 * math.pi
-
 # Cylinder: theta wraps, h is open.
-gamfit.fit(df, f"y ~ te(theta, h, periodic=[0], period=[{two_pi}, None])")
+gamfit.fit(df, "y ~ te(theta, h, periodic=[0], period=[2*pi, None])")
 
 # Calendar surface: day-of-week × hour-of-day, both periodic.
 gamfit.fit(df,
@@ -124,7 +121,7 @@ gamfit.fit(df,
     "       periods=[7, 24], origins=[0, 0])")
 
 # Torus: both axes periodic.
-gamfit.fit(df, f"y ~ te(u, v, periodic=[0,1], period=[{two_pi}, {two_pi}])")
+gamfit.fit(df, "y ~ te(u, v, periodic=[0,1], period=[2*pi, 2*pi])")
 ```
 
 ## Intrinsic sphere smooth (lat / lon → scalar)
