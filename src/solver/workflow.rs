@@ -38,8 +38,8 @@ use crate::families::transformation_normal::{
 };
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::smooth::{
-    AdaptiveRegularizationDiagnostics, SmoothBasisSpec, SpatialLengthScaleOptimizationOptions,
-    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
+    AdaptiveRegularizationDiagnostics, SpatialLengthScaleOptimizationOptions, TermCollectionDesign,
+    TermCollectionSpec, build_term_collection_design,
     fit_term_collectionwith_spatial_length_scale_optimization,
 };
 use crate::types::{
@@ -3061,6 +3061,7 @@ mod tests {
         default_linkwiggle_formulaspec, parse_linkwiggle_formulaspec,
     };
     use crate::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
+    use crate::smooth::SmoothBasisSpec;
     use crate::solver::outer_strategy::{HessianSource, OuterPlan, OuterResult, Solver};
     use ndarray::Array2;
     use std::fs;
