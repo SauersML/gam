@@ -225,12 +225,18 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Fit a model from a dataset + formula and persist it to disk.
     #[command(alias = "train")]
     Fit(FitArgs),
+    /// Build an HTML report (coefficients, smooths, optional diagnostics).
     Report(ReportArgs),
+    /// Predict on a new dataset using a fitted model.
     Predict(PredictArgs),
+    /// Compute diagnostics (residuals, calibration, optional ALO) on a dataset.
     Diagnose(DiagnoseArgs),
+    /// Posterior-sample (NUTS where available, Laplace fallback otherwise).
     Sample(SampleArgs),
+    /// Draw synthetic responses from the fitted model for given covariates.
     #[command(alias = "simulate")]
     Generate(GenerateArgs),
 }
