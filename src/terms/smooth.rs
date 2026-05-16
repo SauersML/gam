@@ -412,10 +412,15 @@ impl TermCollectionSpec {
                 SmoothBasisSpec::BSpline1D { spec, .. } => {
                     if !matches!(
                         spec.knotspec,
-                        BSplineKnotSpec::Provided(_) | BSplineKnotSpec::PeriodicUniform { .. }
+<<<<<<< HEAD
+                        BSplineKnotSpec::Provided(_) | BSplineKnotSpec::Periodic { .. }
+=======
+                        BSplineKnotSpec::Provided(_)
+                            | BSplineKnotSpec::Periodic { knots: Some(_), .. }
+>>>>>>> origin/pr-42
                     ) {
                         return Err(format!(
-                            "{label} term '{}' is not frozen: BSpline knotspec must be Provided or PeriodicUniform",
+                            "{label} term '{}' is not frozen: BSpline knotspec must be Provided or Periodic",
                             st.name
                         ));
                     }
@@ -474,10 +479,15 @@ impl TermCollectionSpec {
                     for (dim, marginal) in spec.marginalspecs.iter().enumerate() {
                         if !matches!(
                             marginal.knotspec,
-                            BSplineKnotSpec::Provided(_) | BSplineKnotSpec::PeriodicUniform { .. }
+<<<<<<< HEAD
+                            BSplineKnotSpec::Provided(_) | BSplineKnotSpec::Periodic { .. }
+=======
+                            BSplineKnotSpec::Provided(_)
+                                | BSplineKnotSpec::Periodic { knots: Some(_), .. }
+>>>>>>> origin/pr-42
                         ) {
                             return Err(format!(
-                                "{label} term '{}' dim {} is not frozen: tensor marginal knotspec must be Provided or PeriodicUniform",
+                                "{label} term '{}' dim {} is not frozen: tensor marginal knotspec must be Provided or Periodic",
                                 st.name, dim
                             ));
                         }
@@ -2639,8 +2649,9 @@ fn build_shape_constraint_design_1d(
                 penalty_order: spec.penalty_order,
                 knotspec: periodic
                     .map(
-                        |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
-                            data_range: (domain_start, domain_start + period),
+                        |(domain_start, period, num_basis)| BSplineKnotSpec::Periodic {
+                            domain_start,
+                            period,
                             num_basis,
                         },
                     )
@@ -12016,14 +12027,32 @@ pub fn freeze_term_collection_from_design(
                     periodic,
                 },
             ) => {
+<<<<<<< HEAD
                 s.knotspec = periodic
                     .map(
-                        |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
-                            data_range: (domain_start, domain_start + period),
+                        |(domain_start, period, num_basis)| BSplineKnotSpec::Periodic {
+                            domain_start,
+                            period,
                             num_basis,
                         },
                     )
                     .unwrap_or_else(|| BSplineKnotSpec::Provided(knots.clone()));
+=======
+                s.knotspec = match &s.knotspec {
+                    BSplineKnotSpec::Periodic {
+                        origin,
+                        period,
+                        num_internal_knots,
+                        ..
+                    } => BSplineKnotSpec::Periodic {
+                        origin: *origin,
+                        period: *period,
+                        num_internal_knots: *num_internal_knots,
+                        knots: Some(knots.clone()),
+                    },
+                    _ => BSplineKnotSpec::Provided(knots.clone()),
+                };
+>>>>>>> origin/pr-42
                 s.identifiability = match identifiability_transform {
                     Some(z) => BSplineIdentifiability::FrozenTransform {
                         transform: z.clone(),
@@ -12200,14 +12229,32 @@ pub fn freeze_term_collection_from_design(
                 *feature_cols = fitted_cols.clone();
                 for i in 0..s.marginalspecs.len() {
                     s.marginalspecs[i].degree = degrees[i];
+<<<<<<< HEAD
                     s.marginalspecs[i].knotspec = periodic[i]
                         .map(
-                            |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
-                                data_range: (domain_start, domain_start + period),
+                            |(domain_start, period, num_basis)| BSplineKnotSpec::Periodic {
+                                domain_start,
+                                period,
                                 num_basis,
                             },
                         )
                         .unwrap_or_else(|| BSplineKnotSpec::Provided(knots[i].clone()));
+=======
+                    s.marginalspecs[i].knotspec = match &s.marginalspecs[i].knotspec {
+                        BSplineKnotSpec::Periodic {
+                            origin,
+                            period,
+                            num_internal_knots,
+                            ..
+                        } => BSplineKnotSpec::Periodic {
+                            origin: *origin,
+                            period: *period,
+                            num_internal_knots: *num_internal_knots,
+                            knots: Some(knots[i].clone()),
+                        },
+                        _ => BSplineKnotSpec::Provided(knots[i].clone()),
+                    };
+>>>>>>> origin/pr-42
                 }
                 s.identifiability = match identifiability_transform {
                     Some(z) => TensorBSplineIdentifiability::FrozenTransform {
