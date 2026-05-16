@@ -26,7 +26,8 @@ mul_op = _{ "*" | "/" }
 unary = { unary_op* ~ primary }
 unary_op = _{ "+" | "-" }
 
-primary = { function_call | ident | number | string_lit | "(" ~ expr ~ ")" }
+primary = { function_call | list_lit | ident | number | string_lit | "(" ~ expr ~ ")" }
+list_lit = { "[" ~ (expr ~ ("," ~ expr)* ~ ","?)? ~ "]" }
 function_call = { ident ~ "(" ~ arg_list? ~ ")" }
 arg_list = { arg ~ ("," ~ arg)* }
 arg = { named_arg | expr }

@@ -17,7 +17,7 @@ use crate::basis::{
 };
 use crate::inference::data::{EncodedDataset as Dataset, missing_column_message};
 use crate::inference::formula_dsl::{
-    ParsedTerm, SmoothKind, option_bool, option_f64, option_usize, option_usize_any,
+    ParsedTerm, SmoothKind, option_bool, option_f64, option_usize, option_usize_any, strip_quotes,
 };
 use crate::inference::model::ColumnKindTag;
 use crate::resource::ResourcePolicy;
@@ -213,6 +213,143 @@ pub fn build_termspec(
     })
 }
 
+fn split_list_option(raw: &str) -> Vec<String> {
+    let t = raw.trim();
+    let inner = t
+        .strip_prefix('[')
+        .and_then(|u| u.strip_suffix(']'))
+        .unwrap_or(t);
+    inner
+        .split(',')
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+fn parse_numeric_expr(raw: &str) -> Result<f64, String> {
+    let mut acc = 1.0f64;
+    let normalized = raw.replace(' ', "");
+    if normalized.eq_ignore_ascii_case("none") {
+        return Err("None is not numeric".to_string());
+    }
+    for factor in normalized.split('*') {
+        if factor.is_empty() {
+            return Err(format!("invalid numeric expression '{raw}'"));
+        }
+        let value = if factor.eq_ignore_ascii_case("pi") {
+            std::f64::consts::PI
+        } else {
+            factor
+                .parse::<f64>()
+                .map_err(|_| format!("invalid numeric expression '{raw}'"))?
+        };
+        acc *= value;
+    }
+    Ok(acc)
+}
+
+fn parse_periods_option(
+    options: &BTreeMap<String, String>,
+    dim: usize,
+) -> Result<Option<Vec<Option<f64>>>, String> {
+    let Some(raw) = options.get("period") else {
+        return Ok(None);
+    };
+    let values = split_list_option(raw);
+    let mut periods = vec![None; dim];
+    if values.len() == 1 && dim == 1 {
+        periods[0] = Some(parse_numeric_expr(&values[0])?);
+    } else {
+        if values.len() != dim {
+            return Err(format!(
+                "period list length {} must match smooth dimension {}",
+                values.len(),
+                dim
+            ));
+        }
+        for (i, v) in values.iter().enumerate() {
+            if v.eq_ignore_ascii_case("none") {
+                continue;
+            }
+            periods[i] = Some(parse_numeric_expr(v)?);
+        }
+    }
+    Ok(Some(periods))
+}
+
+fn parse_periodic_axes_option(
+    options: &BTreeMap<String, String>,
+    dim: usize,
+) -> Result<Option<Vec<Option<f64>>>, String> {
+    let Some(raw_axes) = options.get("periodic") else {
+        return Ok(None);
+    };
+    let mut periods = parse_periods_option(options, dim)?.unwrap_or_else(|| vec![None; dim]);
+    let axes = split_list_option(raw_axes);
+    if axes.is_empty() {
+        return Ok(Some(periods));
+    }
+    for a in axes {
+        let axis = a
+            .parse::<usize>()
+            .map_err(|_| format!("invalid periodic axis '{a}'"))?;
+        if axis >= dim {
+            return Err(format!(
+                "periodic axis {axis} out of range for {dim}D smooth"
+            ));
+        }
+        if periods[axis].is_none() {
+            return Err(format!(
+                "periodic axis {axis} requires period[{axis}] to be finite"
+            ));
+        }
+    }
+    // Axes not listed are non-periodic even if period list has a finite placeholder.
+    let listed: std::collections::BTreeSet<usize> = split_list_option(raw_axes)
+        .into_iter()
+        .filter_map(|a| a.parse::<usize>().ok())
+        .collect();
+    for i in 0..dim {
+        if !listed.contains(&i) {
+            periods[i] = None;
+        }
+    }
+    Ok(Some(periods))
+}
+
+fn parse_bc_periods_option(
+    options: &BTreeMap<String, String>,
+    dim: usize,
+) -> Result<Vec<Option<f64>>, String> {
+    let mut periods = vec![None; dim];
+    if let Some(raw_bc) = options.get("bc") {
+        let bc = split_list_option(raw_bc);
+        if bc.len() != dim {
+            return Err(format!(
+                "bc list length {} must match tensor dimension {}",
+                bc.len(),
+                dim
+            ));
+        }
+        let period_values = parse_periods_option(options, dim)?.unwrap_or_else(|| vec![None; dim]);
+        for (i, b) in bc.iter().enumerate() {
+            let b = strip_quotes(b).trim().to_ascii_lowercase();
+            match b.as_str() {
+                "periodic" | "cyclic" | "cc" => {
+                    periods[i] =
+                        period_values[i].or_else(|| if dim == 1 { period_values[0] } else { None });
+                    if periods[i].is_none() {
+                        return Err(format!("periodic tensor margin {i} requires period[{i}]"));
+                    }
+                }
+                "natural" | "cr" | "bspline" | "p-spline" | "ps" | "none" => {}
+                other => return Err(format!("unsupported tensor bc '{other}' at margin {i}")),
+            }
+        }
+    }
+    Ok(periods)
+}
+
 // ---------------------------------------------------------------------------
 // Smooth basis spec construction
 // ---------------------------------------------------------------------------
@@ -283,6 +420,7 @@ pub fn build_smooth_basis(
                 feature_cols: cols.to_vec(),
                 spec: TensorBSplineSpec {
                     marginalspecs: specs,
+                    periods: parse_bc_periods_option(options, cols.len())?,
                     double_penalty: smooth_double_penalty,
                     identifiability: parse_tensor_identifiability(options)?,
                 },
@@ -349,6 +487,7 @@ pub fn build_smooth_basis(
                 feature_cols: cols.to_vec(),
                 spec: ThinPlateBasisSpec {
                     center_strategy,
+                    periodic: parse_periodic_axes_option(options, cols.len())?,
                     length_scale: option_f64(options, "length_scale").unwrap_or(1.0),
                     double_penalty: smooth_double_penalty,
                     identifiability: parse_spatial_identifiability(options)?,
@@ -383,6 +522,7 @@ pub fn build_smooth_basis(
                 feature_cols: cols.to_vec(),
                 spec: MaternBasisSpec {
                     center_strategy,
+                    periodic: parse_periodic_axes_option(options, cols.len())?,
                     length_scale: option_f64(options, "length_scale").unwrap_or(1.0),
                     nu,
                     include_intercept: option_bool(options, "include_intercept").unwrap_or(false),
@@ -518,6 +658,7 @@ pub fn build_smooth_basis(
                 feature_cols: cols.to_vec(),
                 spec: DuchonBasisSpec {
                     center_strategy,
+                    periodic: parse_periodic_axes_option(options, cols.len())?,
                     length_scale,
                     power,
                     nullspace_order,
