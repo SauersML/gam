@@ -1597,7 +1597,12 @@ fn coalesce_periodic_spline_samples(
     let mut rows = u
         .iter()
         .enumerate()
-        .map(|(i, &ui)| (wrap_periodic_spline_coordinate(ui, options), y.row(i).to_vec()))
+        .map(|(i, &ui)| {
+            (
+                wrap_periodic_spline_coordinate(ui, options),
+                y.row(i).to_vec(),
+            )
+        })
         .collect::<Vec<_>>();
     rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -1649,7 +1654,9 @@ fn coalesce_periodic_spline_samples(
     let n = sites.len();
     let flat = values.into_iter().flatten().collect::<Vec<_>>();
     let values = Array2::from_shape_vec((n, d), flat).map_err(|e| {
-        BasisError::InvalidInput(format!("failed to construct periodic spline value matrix: {e}"))
+        BasisError::InvalidInput(format!(
+            "failed to construct periodic spline value matrix: {e}"
+        ))
     })?;
     Ok((Array1::from_vec(sites), values))
 }
