@@ -48,11 +48,11 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
 
         noise_terms = _FUZZ.rust_noise_terms(["x0", "x1", "x2"], sc)
 
-        # mgcv bs='ds' has no hybrid-mode analog, so the cross-implementation
-        # fuzz harness requests pure scale-free Duchon explicitly.
+        # Rust's default Duchon formula is pure scale-free Duchon, matching
+        # mgcv bs='ds' for this cross-implementation fuzz harness.
         self.assertEqual(
             noise_terms,
-            "duchon(x0, x1, centers=5, order=0, power=2, pure=true)",
+            "duchon(x0, x1, centers=5, order=0, power=2)",
         )
         self.assertNotIn("~", noise_terms)
 
