@@ -238,19 +238,21 @@ fn spherical_harmonic_basis_rotation_invariant_gram_under_longitude_shift() {
     };
     let a = build_spherical_spline_basis(data.view(), &spec).expect("base");
     let b = build_spherical_spline_basis(rotated.view(), &spec).expect("rotated");
-    // XᵀX is invariant under the block-orthogonal (sin(mφ),cos(mφ)) rotation
-    // induced by a pure longitude shift.
+    // Under a pure longitude shift the harmonic design columns rotate inside
+    // each (l, m) block by a 2x2 orthogonal block, so D_rotated = D · R for
+    // some block-orthogonal R. The COLUMN SPAN is invariant; equivalently
+    // the eigenvalue spectrum of D D^T is invariant (the row Gram).
     let da = a.design.to_dense();
     let db = b.design.to_dense();
-    let ga = da.t().dot(&da);
-    let gb = db.t().dot(&db);
-    for i in 0..ga.nrows() {
-        for j in 0..ga.ncols() {
+    let row_gram_a = da.dot(&da.t());
+    let row_gram_b = db.dot(&db.t());
+    for i in 0..row_gram_a.nrows() {
+        for j in 0..row_gram_a.ncols() {
             assert!(
-                (ga[(i, j)] - gb[(i, j)]).abs() < 1e-10,
-                "Gram entry ({i},{j}) not rotation-invariant: {} vs {}",
-                ga[(i, j)],
-                gb[(i, j)]
+                (row_gram_a[(i, j)] - row_gram_b[(i, j)]).abs() < 1e-10,
+                "row Gram entry ({i},{j}) not rotation-invariant: {} vs {}",
+                row_gram_a[(i, j)],
+                row_gram_b[(i, j)]
             );
         }
     }
