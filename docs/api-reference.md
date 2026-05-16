@@ -146,3 +146,36 @@ For narrative explanations, see the topical guides in the sidebar.
     options:
       show_root_heading: true
       heading_level: 3
+
+## Response geometry (manifold-valued responses)
+
+::: gamfit.ResponseGeometryModel
+    options:
+      show_root_heading: true
+      heading_level: 3
+      inherited_members: false
+
+::: gamfit.clr
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.alr
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.closure
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.simplex_frechet_mean
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.sphere_frechet_mean
+    options:
+      show_root_heading: true
+      heading_level: 3
