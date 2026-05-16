@@ -5645,8 +5645,16 @@ pub fn reml_laml_evaluate(
             // `G_ε(H)` there picks up a spurious null-space contribution absent
             // from `d log|U_Sᵀ H U_S|_+/dτ`; the projected kernel reroutes the
             // trace through `range(S_+)` only, matching the cost exactly.
-            // Gaussian identity skips this path harmlessly because `c = 0` forces
-            // `D_β H = 0`, so `Ḣ` already lives entirely in `range(S_+)²`.
+            // For canonical Gaussian (Identity link) the assembly skips
+            // installing `penalty_subspace_trace` at all — `c ≡ 0` forces
+            // `D_β H ≡ 0`, the classical Gaussian REML cost identity reads
+            // `log|H|` (not `log|H_proj|`), and the unprojected `G_ε(H)`
+            // kernel is the formula that matches that cost surface within
+            // FD precision (the moving-`U_S(ψ)` projection would otherwise
+            // add a `dU_S/dψ` term to the cost that the analytic gradient
+            // does not capture — see the `c_nontrivial` gate in
+            // `build_dense_assembly` / `build_dense_original_assembly`).
+            // Drops into the `None` arm below in that branch.
             let trace_logdet_i = if !incl_logdet_h {
                 0.0
             } else if let Some(ref stoch_traces) = stochastic_trace_values {
