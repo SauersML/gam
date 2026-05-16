@@ -8,7 +8,7 @@ use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
 use gam::terms::basis::BasisMetadata;
 use gam::terms::smooth::SmoothBasisSpec;
 use gam::terms::term_builder::build_termspec;
-use ndarray::array;
+use ndarray::{array, s};
 
 #[test]
 fn wahba_kernel_is_longitude_periodic_and_symmetric() {
@@ -257,6 +257,33 @@ fn spherical_harmonic_basis_rotation_invariant_gram_under_longitude_shift() {
             );
         }
     }
+}
+
+#[test]
+fn spherical_harmonic_basis_accepts_non_contiguous_views() {
+    use gam::basis::SphereMethod;
+    let padded = array![
+        [-80.0, -170.0, 1.0],
+        [-40.0, -60.0, 2.0],
+        [0.0, 0.0, 3.0],
+        [35.0, 80.0, 4.0],
+        [70.0, 160.0, 5.0],
+        [15.0, -20.0, 6.0],
+    ];
+    let data = padded.slice(s![..;2, 0..2]);
+    assert!(!data.is_standard_layout());
+    let spec = SphericalSplineBasisSpec {
+        center_strategy: CenterStrategy::FarthestPoint { num_centers: 0 },
+        penalty_order: 2,
+        double_penalty: false,
+        radians: false,
+        method: SphereMethod::Harmonic,
+        max_degree: Some(2),
+    };
+    let built = build_spherical_spline_basis(data, &spec)
+        .expect("harmonic basis should not require contiguous lat/lon rows");
+    assert_eq!(built.design.nrows(), 3);
+    assert_eq!(built.design.ncols(), 8);
 }
 
 #[test]
