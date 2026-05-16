@@ -1334,9 +1334,10 @@ pub struct FitConfig {
     // Fitting options
     pub scale_dimensions: bool,
     /// Enable exact spatial adaptive regularization for standard formula fits.
-    /// `None` uses the automatic policy: enable for Duchon smooths, because
-    /// they expose the full mass/tension/stiffness operator surface and benefit
-    /// from local Charbonnier regularization on high-yield spatial signals.
+    /// `None` uses the quality-first automatic policy. The current automatic
+    /// policy leaves LAREG off unless explicitly requested because the
+    /// optimizer's REML-selected local weights can over-regularize small
+    /// high-yield spatial signals.
     pub adaptive_regularization: Option<bool>,
     pub ridge_lambda: f64,
 
@@ -1566,13 +1567,9 @@ fn build_termspec_with_geometry(
 
 fn standard_adaptive_regularization_options(
     config: &FitConfig,
-    spec: &TermCollectionSpec,
+    _spec: &TermCollectionSpec,
 ) -> Option<AdaptiveRegularizationOptions> {
-    let auto_enable = spec
-        .smooth_terms
-        .iter()
-        .any(|term| matches!(&term.basis, SmoothBasisSpec::Duchon { .. }));
-    let enabled = config.adaptive_regularization.unwrap_or(auto_enable);
+    let enabled = config.adaptive_regularization.unwrap_or(false);
     enabled.then(|| AdaptiveRegularizationOptions {
         enabled: true,
         ..AdaptiveRegularizationOptions::default()
@@ -3251,7 +3248,7 @@ mod tests {
     }
 
     #[test]
-    fn materialize_standard_auto_enables_adaptive_regularization_for_duchon() {
+    fn materialize_standard_keeps_adaptive_regularization_off_by_default_for_duchon() {
         let data = duchon_workflow_dataset();
         let materialized = materialize(
             "y ~ duchon(ct, st, centers=12)",
@@ -3262,10 +3259,25 @@ mod tests {
         let FitRequest::Standard(request) = materialized.request else {
             panic!("expected standard request");
         };
+        assert!(request.options.adaptive_regularization.is_none());
+    }
+
+    #[test]
+    fn materialize_standard_honors_adaptive_regularization_enable() {
+        let data = duchon_workflow_dataset();
+        let config = FitConfig {
+            adaptive_regularization: Some(true),
+            ..FitConfig::default()
+        };
+        let materialized = materialize("y ~ duchon(ct, st, centers=12)", &data, &config)
+            .expect("Duchon materialization should allow enabling adaptive regularization");
+        let FitRequest::Standard(request) = materialized.request else {
+            panic!("expected standard request");
+        };
         let opts = request
             .options
             .adaptive_regularization
-            .expect("Duchon should enable adaptive regularization automatically");
+            .expect("Duchon should enable adaptive regularization when requested");
         assert!(opts.enabled);
     }
 
@@ -3282,6 +3294,56 @@ mod tests {
             panic!("expected standard request");
         };
         assert!(request.options.adaptive_regularization.is_none());
+    }
+
+    #[test]
+    fn materialize_standard_duchon_defaults_to_hybrid_length_scale() {
+        let data = duchon_workflow_dataset();
+        let materialized = materialize(
+            "y ~ duchon(ct, st, centers=12)",
+            &data,
+            &FitConfig::default(),
+        )
+        .expect("Duchon materialization should succeed");
+        let FitRequest::Standard(request) = materialized.request else {
+            panic!("expected standard request");
+        };
+        let SmoothBasisSpec::Duchon { spec, .. } = &request.spec.smooth_terms[0].basis else {
+            panic!("expected Duchon smooth");
+        };
+        assert_eq!(spec.length_scale, Some(1.0));
+        assert_eq!(spec.nullspace_order, DuchonNullspaceOrder::Zero);
+        assert_eq!(spec.power, 2);
+    }
+
+    #[test]
+    fn materialize_standard_duchon_accepts_explicit_pure_mode() {
+        let data = duchon_workflow_dataset();
+        let materialized = materialize(
+            "y ~ duchon(ct, st, centers=12, pure=true)",
+            &data,
+            &FitConfig::default(),
+        )
+        .expect("pure Duchon materialization should succeed");
+        let FitRequest::Standard(request) = materialized.request else {
+            panic!("expected standard request");
+        };
+        let SmoothBasisSpec::Duchon { spec, .. } = &request.spec.smooth_terms[0].basis else {
+            panic!("expected Duchon smooth");
+        };
+        assert_eq!(spec.length_scale, None);
+        assert!(matches!(
+            spec.nullspace_order,
+            DuchonNullspaceOrder::Degree(2)
+        ));
+
+        let err = materialize(
+            "y ~ duchon(ct, st, centers=12, pure=true, length_scale=1.0)",
+            &data,
+            &FitConfig::default(),
+        )
+        .expect_err("pure=true plus length_scale should be rejected");
+        assert!(err.contains("either pure=true or length_scale"));
     }
 
     #[test]
