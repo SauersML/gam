@@ -13493,6 +13493,149 @@ fn validate_lat_lon_matrix(
     Ok(())
 }
 
+/// High-accuracy SIMD natural logarithm for `f64x4`.
+///
+/// Implemented as `ln(x) = e·ln(2) + 2·atanh((m-1)/(m+1))` with the mantissa
+/// rebalanced into `m ∈ [√2/2, √2]` so `|f| = |(m-1)/(m+1)| ≤ 0.1716`. The
+/// `2·atanh` series uses exact rational coefficients `1/(2k+1)` through
+/// `f^{17}/17`; the truncation tail is bounded by `0.172^{19}/19 ≈ 1.4e-16`,
+/// safely below one ulp at the magnitudes that appear in
+/// `wahba_sphere_kernel_from_cos`. `ln(2)` is carried as a double-double
+/// (`hi + lo`) so the exponent reconstruction does not introduce its own
+/// rounding error.
+///
+/// Inputs are assumed strictly positive and finite — the call site clamps
+/// the kernel argument to `(0, ∞)` before invocation, so we skip the
+/// inf/NaN/subnormal blends that `wide::f64x4::ln` carries (those branches
+/// are also coarse at f64 precision; see `wide-0.7.33/src/f64x4_.rs:1297`).
+#[inline]
+fn wahba_simd_ln(x: wide::f64x4) -> wide::f64x4 {
+    use wide::f64x4;
+    // Bit-twiddle each lane to split into mantissa m ∈ [1, 2) and integer
+    // exponent e. `wide` keeps `fraction_2`/`exponent` private, so we route
+    // through `to_array` / `from`. The 8 scalar bit ops below are cheap
+    // relative to the vectorised polynomial that follows.
+    let arr = x.to_array();
+    let mut m_arr = [0.0_f64; 4];
+    let mut e_arr = [0.0_f64; 4];
+    for k in 0..4 {
+        let bits = arr[k].to_bits();
+        let raw_exp = ((bits >> 52) & 0x7FF) as i64;
+        let exp = raw_exp - 1023;
+        let m_bits = (bits & 0x000F_FFFF_FFFF_FFFF) | 0x3FF0_0000_0000_0000;
+        m_arr[k] = f64::from_bits(m_bits);
+        e_arr[k] = exp as f64;
+    }
+    let m = f64x4::from(m_arr);
+    let mut e = f64x4::from(e_arr);
+    // Rebalance into [√2/2, √2]: if m > √2, halve m and bump e by 1.
+    // We use `m > √2` rather than `> √2/2 · 2` so the centred range is symmetric.
+    let sqrt2 = f64x4::from(std::f64::consts::SQRT_2);
+    let mask = m.cmp_gt(sqrt2);
+    let m = mask.blend(m * f64x4::from(0.5), m);
+    e = mask.blend(e + f64x4::ONE, e);
+
+    // f = (m - 1) / (m + 1), then ln(m) = 2·atanh(f) = 2·Σ f^{2k+1}/(2k+1).
+    let one = f64x4::ONE;
+    let f = (m - one) / (m + one);
+    let f2 = f * f;
+    // Horner on the inner polynomial P(f²) so that 2·atanh(f) = 2·f·P(f²),
+    // with P(u) = 1 + u/3 + u²/5 + u³/7 + ... up to u^8 (degree 17 in f).
+    // Coefficients are exact 1/(2k+1) for k = 0..8.
+    let c0 = one;
+    let c1 = f64x4::from(1.0 / 3.0);
+    let c2 = f64x4::from(1.0 / 5.0);
+    let c3 = f64x4::from(1.0 / 7.0);
+    let c4 = f64x4::from(1.0 / 9.0);
+    let c5 = f64x4::from(1.0 / 11.0);
+    let c6 = f64x4::from(1.0 / 13.0);
+    let c7 = f64x4::from(1.0 / 15.0);
+    let c8 = f64x4::from(1.0 / 17.0);
+    // Horner: ((((((((c8·u + c7)·u + c6)·u + c5)·u + c4)·u + c3)·u + c2)·u + c1)·u + c0
+    let mut p = c8;
+    p = p * f2 + c7;
+    p = p * f2 + c6;
+    p = p * f2 + c5;
+    p = p * f2 + c4;
+    p = p * f2 + c3;
+    p = p * f2 + c2;
+    p = p * f2 + c1;
+    p = p * f2 + c0;
+    let ln_m = (f + f) * p;
+
+    // ln(2) double-double split: hi is the f64 closest to ln(2)
+    // (`0x3FE62E42FEFA39EF` = 0.69314718055994528623...), lo is the
+    // residual `ln(2) - hi ≈ 2.319e-17`. `e` is integer-valued and small
+    // (|e| ≤ ~1024), so `e * ln2_hi` introduces only a single rounding,
+    // and the `lo` term restores the lost precision.
+    let ln2_hi = f64x4::from(std::f64::consts::LN_2);
+    let ln2_lo = f64x4::from(2.319_046_813_846_299_6e-17_f64);
+    // ln(x) = e·ln2_hi + (e·ln2_lo + ln_m). Order matters for accuracy.
+    e * ln2_hi + (e * ln2_lo + ln_m)
+}
+
+/// SIMD-vectorised companion to `wahba_sphere_kernel_from_cos`. Each lane of
+/// `cos_gamma` produces one kernel value. Numerical agreement with the
+/// scalar path is exercised by `tests/wahba_simd_correctness.rs` — max
+/// abs/rel diff stays below 1e-12 across the full domain.
+#[inline]
+fn wahba_sphere_kernel_from_cos_simd(
+    cos_gamma: wide::f64x4,
+    penalty_order: usize,
+) -> wide::f64x4 {
+    use wide::f64x4;
+    let one = f64x4::ONE;
+    let neg_one = f64x4::from(-1.0);
+    let two_pi = f64x4::from(2.0 * std::f64::consts::PI);
+    // Match the scalar floor `(1 - cos_γ).max(EPSILON · 1e-4)`.
+    let floor = f64x4::from(f64::EPSILON * 1.0e-4);
+    let cg = cos_gamma.fast_max(neg_one).fast_min(one);
+    let z = (one - cg).fast_max(floor);
+    let w = f64x4::from(0.5) * z;
+    let c0 = w.sqrt();
+    let a = wahba_simd_ln(one + one / c0);
+    let c = f64x4::from(2.0) * c0;
+    match penalty_order {
+        1 => {
+            let q1 = f64x4::from(2.0) * a * w - c + one;
+            (q1 - f64x4::from(0.5)) / two_pi
+        }
+        2 => {
+            let w2 = w * w;
+            let q2 = a * (f64x4::from(6.0) * w2 - f64x4::from(2.0) * w)
+                - f64x4::from(3.0) * c * w
+                + f64x4::from(3.0) * w
+                + f64x4::from(0.5);
+            (q2 / f64x4::from(2.0) - f64x4::from(1.0 / 6.0)) / two_pi
+        }
+        3 => {
+            let w2 = w * w;
+            let w3 = w2 * w;
+            let q3 = (a * (f64x4::from(60.0) * w3 - f64x4::from(36.0) * w2)
+                + f64x4::from(30.0) * w2
+                + c * (f64x4::from(8.0) * w - f64x4::from(30.0) * w2)
+                - f64x4::from(3.0) * w
+                + one)
+                / f64x4::from(3.0);
+            (q3 / f64x4::from(6.0) - f64x4::from(1.0 / 24.0)) / two_pi
+        }
+        4 => {
+            let w2 = w * w;
+            let w3 = w2 * w;
+            let w4 = w3 * w;
+            let q4 = a
+                * (f64x4::from(70.0) * w4 - f64x4::from(60.0) * w3 + f64x4::from(6.0) * w2)
+                + f64x4::from(35.0) * w3 * (one - c)
+                + c * f64x4::from(55.0) * w2 / f64x4::from(3.0)
+                - f64x4::from(12.5) * w2
+                - w / f64x4::from(3.0)
+                + f64x4::from(0.25);
+            (q4 / f64x4::from(24.0) - f64x4::from(1.0 / 120.0)) / two_pi
+        }
+        _ => f64x4::from(f64::NAN),
+    }
+}
+
 #[inline]
 fn wahba_sphere_kernel_from_cos(cos_gamma: f64, penalty_order: usize) -> Result<f64, BasisError> {
     let cos_gamma = cos_gamma.clamp(-1.0, 1.0);
