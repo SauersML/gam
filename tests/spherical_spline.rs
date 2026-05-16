@@ -63,10 +63,14 @@ fn spherical_basis_builds_constrained_design_and_penalties() {
         BasisMetadata::Sphere {
             centers,
             penalty_order,
+            method,
+            max_degree,
             constraint_transform,
         } => {
             assert_eq!(centers, data);
             assert_eq!(penalty_order, 2);
+            assert_eq!(method, gam::basis::SphereMethod::Wahba);
+            assert_eq!(max_degree, None);
             let z = constraint_transform.expect("coefficient constraint transform");
             for col in 0..z.ncols() {
                 let sum = z.column(col).sum();
