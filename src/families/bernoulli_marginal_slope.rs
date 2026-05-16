@@ -1653,8 +1653,9 @@ pub(crate) enum CrossBlockAnchor<'a> {
 ///
 /// * `Reparameterised` — the candidate was reparameterised in place so
 ///   its column span at the n training rows is orthogonal to the anchor
-///   union. `kept` directions survive, `dropped` directions were exactly
-///   reproducible by the anchors and absorbed into the residualised basis.
+///   union. The exact kept/dropped direction counts are logged via
+///   `log::info!` at the construction site rather than carried on the
+///   enum, since no production consumer reads them back out.
 /// * `FullyAliased` — every direction in span(C) is reproducible by the
 ///   anchor union (`(I − P_A) C` has numerical rank zero). The candidate
 ///   carries no information independent of the anchors and the caller
@@ -1664,15 +1665,8 @@ pub(crate) enum CrossBlockAnchor<'a> {
 ///   caller can safely discard it.
 #[derive(Debug)]
 pub(crate) enum CrossBlockIdentifiabilityOutcome {
-    Reparameterised {
-        #[allow(dead_code)]
-        kept: usize,
-        #[allow(dead_code)]
-        dropped: usize,
-    },
-    FullyAliased {
-        reason: String,
-    },
+    Reparameterised,
+    FullyAliased { reason: String },
 }
 
 /// Structured warning surfaced by the BMS family when a candidate flex
@@ -1776,10 +1770,7 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
     let n = candidate_design.nrows();
     let p_candidate = candidate_design.ncols();
     if p_candidate == 0 {
-        return Ok(CrossBlockIdentifiabilityOutcome::Reparameterised {
-            kept: 0,
-            dropped: 0,
-        });
+        return Ok(CrossBlockIdentifiabilityOutcome::Reparameterised);
     }
     if training_row_weights.len() != n {
         return Err(format!(
@@ -1845,10 +1836,7 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
         // anchor's penalised span is structurally orthogonal to the
         // candidate's unpenalised null space (which is empty after the
         // drop). Return cleanly.
-        return Ok(CrossBlockIdentifiabilityOutcome::Reparameterised {
-            kept: p_candidate,
-            dropped: 0,
-        });
+        return Ok(CrossBlockIdentifiabilityOutcome::Reparameterised);
     }
 
     // Stack into N_train ∈ ℝ^{n × d} with d = total_parametric_cols.
@@ -1921,10 +1909,7 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
     if r == 0 {
         // Anchor block has no positive eigenvalues under W (degenerate
         // weights or numerically zero N) — nothing to orthogonalise.
-        return Ok(CrossBlockIdentifiabilityOutcome::Reparameterised {
-            kept: p_candidate,
-            dropped: 0,
-        });
+        return Ok(CrossBlockIdentifiabilityOutcome::Reparameterised);
     }
     // R = U_pos · diag(λ^{-1/2}) (d × r). Q_w_sqw = N_train_sqw · R is
     // the n × r orthonormal basis under the W inner product (in sqrt-W
@@ -2068,10 +2053,7 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
         lambda_max_c = lambda_max_c,
         drop_tol = drop_tol,
     );
-    Ok(CrossBlockIdentifiabilityOutcome::Reparameterised {
-        kept: new_p,
-        dropped: p_candidate - new_p,
-    })
+    Ok(CrossBlockIdentifiabilityOutcome::Reparameterised)
 }
 
 pub(crate) fn project_monotone_feasible_beta(
@@ -16873,7 +16855,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             &spec.weights,
         )?;
         match outcome {
-            CrossBlockIdentifiabilityOutcome::Reparameterised { .. } => Some(prepared),
+            CrossBlockIdentifiabilityOutcome::Reparameterised => Some(prepared),
             CrossBlockIdentifiabilityOutcome::FullyAliased { reason } => {
                 log::warn!(
                     "[BMS cross-block identifiability] score-warp block fully aliased \
@@ -16998,7 +16980,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             &spec.weights,
         )?;
         match outcome {
-            CrossBlockIdentifiabilityOutcome::Reparameterised { .. } => Some(prepared),
+            CrossBlockIdentifiabilityOutcome::Reparameterised => Some(prepared),
             CrossBlockIdentifiabilityOutcome::FullyAliased { reason } => {
                 log::warn!(
                     "[BMS cross-block identifiability] link-deviation block fully aliased \
@@ -17820,9 +17802,9 @@ mod tests {
                     "expected FullyAliased reason mentioning 'zero directions remaining', got: {reason}",
                 );
             }
-            CrossBlockIdentifiabilityOutcome::Reparameterised { kept, dropped } => {
+            CrossBlockIdentifiabilityOutcome::Reparameterised => {
                 panic!(
-                    "expected FullyAliased outcome but got Reparameterised(kept={kept}, dropped={dropped})"
+                    "expected FullyAliased outcome but got Reparameterised; the candidate basis should have been fully aliased by the anchor union"
                 );
             }
         }
@@ -17841,7 +17823,7 @@ mod tests {
             CrossBlockIdentifiabilityOutcome::FullyAliased { reason } => {
                 assert!(reason.contains("zero directions remaining"));
             }
-            CrossBlockIdentifiabilityOutcome::Reparameterised { .. } => {
+            CrossBlockIdentifiabilityOutcome::Reparameterised => {
                 panic!("constructed FullyAliased; cannot pattern-match as Reparameterised")
             }
         }

@@ -109,27 +109,17 @@ use crate::faer_ndarray::FaerEigh;
 use crate::linalg::matrix::DesignMatrix;
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Debug stash: thread-local capture of (op_total, U) from the ext-grad path,
-//  used by the iso-κ Duchon FD investigation test. Empty in production runs.
+//  Debug stash: thread-local capture of selected per-coordinate quantities
+//  from the ext-grad path, used by the iso-κ Duchon FD investigation tests in
+//  `terms/smooth.rs`. Empty in production runs.
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
 pub mod debug_stash {
-    use ndarray::Array2;
     use std::cell::RefCell;
 
-    #[allow(dead_code)]
     #[derive(Clone, Debug, Default)]
     pub struct TermStash {
-        pub op_total: Option<Array2<f64>>,
-        pub u_mat: Option<Array2<f64>>,
-        pub reg_eigenvalues: Vec<f64>,
-        pub term1: Option<Array2<f64>>,
-        pub term2: Option<Array2<f64>>,
-        pub term3: Option<Array2<f64>>,
-        pub term4: Option<Array2<f64>>,
-        pub firth_partial: Option<Array2<f64>>,
-        pub correction: Option<Array2<f64>>,
         /// Per-row diagonal of term4: `c · X_τβ̂` (n-vector).
         pub c_x_tau_beta_diag: Option<ndarray::Array1<f64>>,
         /// `X · v_ψ` per row, where v_ψ = hop⁻¹·stored_g. The correction
@@ -3228,111 +3218,6 @@ impl HyperOperator for SparseDirectionalHyperOperator {
     }
 }
 
-#[cfg(test)]
-impl SparseDirectionalHyperOperator {
-    /// Per-term dense materialization for diagnostics. Each returned matrix
-    /// equals the contribution of a single term in the `mul_vec` expansion
-    ///
-    ///   B = X_τᵀ W X            (term1)
-    ///     + Xᵀ W X_τ            (term2)
-    ///     + S_τ                  (term3)
-    ///     + Xᵀ diag(c⊙X_τβ̂) X   (term4, non-Gaussian only)
-    ///     − (H_φ)_{τ}|_β        (firth_partial, when present)
-    pub fn term_breakdown_dense(&self) -> SparseDirectionalTermBreakdown {
-        let p = self.p;
-        let make = |selector: SparseDirectionalTermSelector| -> Array2<f64> {
-            let mut out = Array2::<f64>::zeros((p, p));
-            let mut basis = Array1::<f64>::zeros(p);
-            for j in 0..p {
-                basis[j] = 1.0;
-                let col = self.mul_vec_single_term(&basis, selector);
-                for i in 0..p {
-                    out[[i, j]] = col[i];
-                }
-                basis[j] = 0.0;
-            }
-            out
-        };
-
-        SparseDirectionalTermBreakdown {
-            term1: make(SparseDirectionalTermSelector::Term1XTauTWX),
-            term2: make(SparseDirectionalTermSelector::Term2XTWXTau),
-            term3: make(SparseDirectionalTermSelector::Term3STau),
-            term4: if self.c_x_tau_beta.is_some() {
-                Some(make(SparseDirectionalTermSelector::Term4Curvature))
-            } else {
-                None
-            },
-            firth_partial: if self.firth_hphi_tau_partial.is_some() {
-                Some(make(SparseDirectionalTermSelector::FirthPartial))
-            } else {
-                None
-            },
-        }
-    }
-
-    fn mul_vec_single_term(
-        &self,
-        v: &Array1<f64>,
-        selector: SparseDirectionalTermSelector,
-    ) -> Array1<f64> {
-        match selector {
-            SparseDirectionalTermSelector::Term1XTauTWX => {
-                let x_v = self.x_design.matrixvectormultiply(v);
-                let w_x_v = &*self.w_diag * &x_v;
-                self.x_tau
-                    .transpose_mul_original(&w_x_v)
-                    .expect("term1: x_tau transpose_mul shape mismatch")
-            }
-            SparseDirectionalTermSelector::Term2XTWXTau => {
-                let x_tau_v = self
-                    .x_tau
-                    .forward_mul_original(v)
-                    .expect("term2: x_tau forward_mul shape mismatch");
-                let w_x_tau_v = &*self.w_diag * &x_tau_v;
-                self.x_design.transpose_vector_multiply(&w_x_tau_v)
-            }
-            SparseDirectionalTermSelector::Term3STau => self.s_tau.dot(v),
-            SparseDirectionalTermSelector::Term4Curvature => {
-                if let Some(c_x_tau_beta) = self.c_x_tau_beta.as_ref() {
-                    let x_v = self.x_design.matrixvectormultiply(v);
-                    let weighted = c_x_tau_beta * &x_v;
-                    self.x_design.transpose_vector_multiply(&weighted)
-                } else {
-                    Array1::<f64>::zeros(self.p)
-                }
-            }
-            SparseDirectionalTermSelector::FirthPartial => {
-                if let Some(h) = self.firth_hphi_tau_partial.as_ref() {
-                    -&h.dot(v)
-                } else {
-                    Array1::<f64>::zeros(self.p)
-                }
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug)]
-enum SparseDirectionalTermSelector {
-    Term1XTauTWX,
-    Term2XTWXTau,
-    Term3STau,
-    Term4Curvature,
-    FirthPartial,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub struct SparseDirectionalTermBreakdown {
-    pub term1: Array2<f64>,
-    pub term2: Array2<f64>,
-    pub term3: Array2<f64>,
-    pub term4: Option<Array2<f64>>,
-    pub firth_partial: Option<Array2<f64>>,
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  Data structures
 // ═══════════════════════════════════════════════════════════════════════════
@@ -5734,40 +5619,26 @@ pub fn reml_laml_evaluate(
                         ext_idx, unprojected_tr, production_trace, projection_active, per_mode
                     );
                     if ext_idx == 0 {
-                        // Per-term breakdown of the operator portion (B), plus
-                        // the correction (D_β H[−v]) dense piece.
+                        // Stash the diagnostic values that the EIG-DECOMP
+                        // analytic-vs-FD investigation tests in
+                        // `terms/smooth.rs` read back via `take_terms()`.
                         let mut stash = debug_stash::TermStash::default();
-                        stash.op_total = Some(op_dense.clone());
-                        stash.u_mat = Some(u_mat.clone());
-                        stash.reg_eigenvalues = (0..ds.dim())
-                            .map(|j| ds.reg_eigenvalue(j))
-                            .collect();
                         stash.unprojected_tr = Some(unprojected_tr);
                         stash.production_tr = Some(production_trace);
                         stash.projection_active = Some(projection_active);
                         if let Some(op_arc) = coord.drift.operator.as_ref() {
                             if let Some(sd) = op_arc.as_sparse_directional() {
-                                let bd = sd.term_breakdown_dense();
-                                stash.term1 = Some(bd.term1);
-                                stash.term2 = Some(bd.term2);
-                                stash.term3 = Some(bd.term3);
-                                stash.term4 = bd.term4;
-                                stash.firth_partial = bd.firth_partial;
-                                // Stash term4's diagonal `c · X_τβ̂` directly.
+                                // term4's diagonal `c · X_τβ̂`.
                                 stash.c_x_tau_beta_diag = sd.c_x_tau_beta.clone();
-                                // Also stash `X · v_ψ` per row, where
+                                // `X · v_ψ` per row, where
                                 // v_ψ = ext_v_is[ext_idx] = hop⁻¹·coord.g.
-                                // The diagonal entering correction is `c · X · v_ψ`;
-                                // multiplying by the test's known c gives that diagonal.
+                                // The correction sandwich's diagonal is
+                                // `c · X · v_ψ`; multiplying by the test's
+                                // known c gives the diagonal entering the
+                                // correction directly.
                                 let v_i = &ext_v_is[ext_idx];
                                 stash.c_x_v_psi_diag = Some(sd.x_design.matrixvectormultiply(v_i));
                             }
-                        }
-                        if let Some(c) = correction {
-                            stash.correction = Some(match c {
-                                DriftDerivResult::Dense(m) => m.clone(),
-                                DriftDerivResult::Operator(o) => o.to_dense(),
-                            });
                         }
                         debug_stash::store_terms(stash);
                     }
