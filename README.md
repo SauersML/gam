@@ -119,11 +119,11 @@ formulas, and reproduction script live in
 [docs/manifold-smooths.md](docs/manifold-smooths.md).
 
 ```python
-gamfit.fit(df, "y ~ s(theta, periodic=true, period=6.283)")        # circle
-gamfit.fit(df, "y ~ te(theta, h, periodic=[0], period=[6.283, None])")  # cylinder
-gamfit.fit(df, "y ~ te(u, v, periodic=[0,1], period=[6.283, 6.283])")   # torus
-gamfit.fit(df, "y ~ sphere(lat, lon, radians=true)")               # S²
-gamfit.fit(df, "y ~ s(x, bc=clamped)")                             # zero-slope endpoints
+gamfit.fit(df, "y ~ s(theta, periodic=true, period=2*pi)")             # circle
+gamfit.fit(df, "y ~ te(theta, h, periodic=[0], period=[2*pi, None])")  # cylinder
+gamfit.fit(df, "y ~ te(u, v, periodic=[0,1], period=[2*pi, 2*pi])")    # torus
+gamfit.fit(df, "y ~ sphere(lat, lon, radians=true)")                   # S²
+gamfit.fit(df, "y ~ s(x, bc=clamped)")                                 # zero-slope endpoints
 ```
 
 ### Flexible / learnable link functions
