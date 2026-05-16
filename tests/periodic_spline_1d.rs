@@ -73,7 +73,7 @@ fn periodic_spline_handles_skewed_oval_embedded_in_3d() {
 
 #[test]
 fn periodic_spline_accepts_unsorted_samples_and_duplicate_endpoints() {
-    let u = array![TWO_PI, 0.5 * TWO_PI, 0.0, 1.5 * TWO_PI, -0.5 * TWO_PI];
+    let u = array![TWO_PI, 0.25 * TWO_PI, 0.0, 0.75 * TWO_PI, -0.25 * TWO_PI];
     let mut y = Array2::<f64>::zeros((u.len(), 2));
     for i in 0..u.len() {
         let t = u[i];
