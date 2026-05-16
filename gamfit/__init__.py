@@ -26,6 +26,14 @@ from ._binding import RustExtensionUnavailableError
 from ._diagnostics import Diagnostics
 from ._exceptions import FormulaError, GamError, PredictionError, SchemaMismatchError
 from ._model import Model, SurvivalPrediction
+from ._response_geometry import (
+    ResponseGeometryModel,
+    alr,
+    closure,
+    clr,
+    simplex_frechet_mean,
+    sphere_frechet_mean,
+)
 from ._sampling import PosteriorPredictive, PosteriorSamples, SamplingConfig
 from ._schema import SchemaCheck, SchemaIssue
 from ._summary import Summary
@@ -71,6 +79,7 @@ __all__ = [
     "PosteriorPredictive",
     "PosteriorSamples",
     "PredictionError",
+    "ResponseGeometryModel",
     "RustExtensionUnavailableError",
     "SamplingConfig",
     "SchemaCheck",
@@ -79,11 +88,16 @@ __all__ = [
     "Summary",
     "SurvivalPrediction",
     "__version__",
+    "alr",
     "build_info",
+    "closure",
+    "clr",
     "explain_error",
     "fit",
     "load",
     "load_posterior",
     "loads",
+    "simplex_frechet_mean",
+    "sphere_frechet_mean",
     "validate_formula",
 ]
