@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Fit Rust GAM survival GAMLSS-style models and render generative digital-twin path plots."""
 from __future__ import annotations
 import typing
 
