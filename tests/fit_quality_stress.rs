@@ -152,9 +152,7 @@ fn report_fit_error(probe: &str, formula: &str, err: &str) {
     } else {
         "FIT_FAILED"
     };
-    eprintln!(
-        "[fit-quality] probe={probe} category={cat} formula=`{formula}` err=`{err}`",
-    );
+    eprintln!("[fit-quality] probe={probe} category={cat} formula=`{formula}` err=`{err}`",);
 }
 
 fn report(

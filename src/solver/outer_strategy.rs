@@ -1264,22 +1264,13 @@ fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
     attempts
 }
 
-fn outer_gradient_tolerance(tolerance: f64) -> GradientTolerance {
-    GradientTolerance {
-        abs: tolerance,
-        rel_initial_grad: Some(tolerance),
-        rel_cost: None,
-        projected: true,
-    }
-}
-
-/// Like [`outer_gradient_tolerance`] but widens the absolute floor by
-/// `objective_scale * 1e-9` when the caller has declared the natural
-/// magnitude of the objective. The relative-from-seed component is left
-/// alone so a well-scaled cold start still gets a 1e-6 reduction
-/// requirement; the change only matters when the relative threshold has
-/// already been satisfied and the absolute floor would otherwise force
-/// the optimizer to chase sub-ULP gradient components.
+/// Builds the outer-gradient convergence tolerance, optionally widening the
+/// absolute floor by `objective_scale * 1e-9` when the caller has declared the
+/// natural magnitude of the objective. The relative-from-seed component is left
+/// alone so a well-scaled cold start still gets a 1e-6 reduction requirement;
+/// the scale only matters when the relative threshold has already been
+/// satisfied and the absolute floor would otherwise force the optimizer to
+/// chase sub-ULP gradient components.
 fn outer_gradient_tolerance_with_scale(
     tolerance: f64,
     objective_scale: Option<f64>,
@@ -4412,7 +4403,10 @@ fn run_outer_with_plan(
                     // convergence with materially nonzero outer gradients.
                     // Use an absolute tolerance plus a relative reduction
                     // from the seed gradient instead.
-                    let grad_tol = outer_gradient_tolerance_with_scale(config.tolerance, config.objective_scale);
+                    let grad_tol = outer_gradient_tolerance_with_scale(
+                        config.tolerance,
+                        config.objective_scale,
+                    );
                     let max_iter =
                         MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
 
@@ -4537,7 +4531,10 @@ fn run_outer_with_plan(
                     let (lo, hi) = &bounds_template;
                     let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
                         .expect("outer rho bounds must be valid");
-                    let grad_tol = outer_gradient_tolerance_with_scale(config.tolerance, config.objective_scale);
+                    let grad_tol = outer_gradient_tolerance_with_scale(
+                        config.tolerance,
+                        config.objective_scale,
+                    );
                     let max_iter =
                         MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
 
@@ -4678,7 +4675,8 @@ fn run_outer_with_plan(
                 let (lo, hi) = &bounds_template;
                 let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
                     .expect("outer rho bounds must be valid");
-                let grad_tol = outer_gradient_tolerance_with_scale(config.tolerance, config.objective_scale);
+                let grad_tol =
+                    outer_gradient_tolerance_with_scale(config.tolerance, config.objective_scale);
                 let max_iter =
                     MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
                 let objective = OuterFirstOrderBridge {
@@ -5121,7 +5119,7 @@ mod tests {
 
     #[test]
     fn outer_gradient_tolerance_does_not_scale_with_raw_cost() {
-        let tol = outer_gradient_tolerance(1e-5);
+        let tol = outer_gradient_tolerance_with_scale(1e-5, None);
         assert_eq!(tol.rel_cost, None);
         assert_eq!(tol.rel_initial_grad, Some(1e-5));
         assert!((tol.threshold(1.0e9, 2.0) - 2.0e-5).abs() < 1e-14);
