@@ -116,9 +116,11 @@ nav:
   - Building a model:
     - Formula DSL: formulas.md
     - Families and link functions: families-and-links.md
+    - Manifold smooths gallery: manifold-smooths.md
     - Survival models: survival.md
     - Marginal-slope models: marginal-slope.md
     - Location-scale models: location-scale.md
+    - Response geometry: response-geometry.md
   - Using a fitted model:
     - Predictions: predictions.md
     - Posterior sampling: posterior-sampling.md
