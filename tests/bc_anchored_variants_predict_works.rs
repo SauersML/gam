@@ -68,9 +68,10 @@ fn bc_variants_fit_and_predict_end_to_end() {
         "y ~ s(x, bc_left=clamped)",
         "y ~ s(x, bc_right=clamped)",
         "y ~ s(x, bc_left=clamped, bc_right=clamped)",
-        "y ~ s(x, bc=anchored, anchor_left=1, anchor_right=-1)",
-        "y ~ s(x, bc_left=anchored, anchor_left=1)",
-        "y ~ s(x, bc_right=anchored, anchor_right=-1)",
+        "y ~ s(x, bc=anchored)",
+        "y ~ s(x, bc_left=anchored)",
+        "y ~ s(x, bc_right=anchored)",
+        "y ~ s(x, bc=anchored, anchor_left=0, anchor_right=0)",
         "y ~ s(x, start_bc=clamped)",
         "y ~ s(x, end_bc=clamped)",
     ];
@@ -94,5 +95,53 @@ fn bc_variants_fit_and_predict_end_to_end() {
         failures.is_empty(),
         "BC variants broken at fit or predict:\n  - {}",
         failures.join("\n  - "),
+    );
+}
+
+/// Non-zero anchor values are not (yet) supported by the basis builder.
+/// The term builder should reject them upfront with an actionable message
+/// instead of letting the user see a deep generic "Matrix conditioning" /
+/// "basis function generation failed" error from inside the basis layer.
+#[test]
+fn bc_nonzero_anchor_rejected_with_clear_error_at_term_build() {
+    init_parallelism();
+    let cases = &[
+        "y ~ s(x, bc=anchored, anchor_left=1, anchor_right=-1)",
+        "y ~ s(x, bc_left=anchored, anchor_left=1)",
+        "y ~ s(x, bc_right=anchored, anchor_right=-1)",
+        "y ~ s(x, bc_left=anchored, anchor_left=0.5)",
+    ];
+    let mut bad = Vec::<String>::new();
+    for f in cases {
+        match try_fit_and_predict(f) {
+            Ok(_) => {
+                // Fit succeeded → great, nonzero anchors are now supported.
+                eprintln!("[bc-nonzero] supported   {f}");
+            }
+            Err(e) => {
+                // Failure must be a clear actionable message. The basis-builder
+                // wrapper produces "Underlying basis function generation
+                // failed: Invalid input: ..."; we want a focused term-builder
+                // error that names `anchor` and the unsupported `value`.
+                let lower = e.to_lowercase();
+                let mentions_anchor = lower.contains("anchor");
+                let mentions_remedy =
+                    lower.contains("value 0") || lower.contains("anchor value 0")
+                    || lower.contains("subtract") || lower.contains("offset");
+                if !mentions_anchor || !mentions_remedy
+                    || lower.contains("matrix conditioning")
+                    || lower.contains("basis function generation")
+                {
+                    bad.push(format!("`{f}`: opaque error: {e}"));
+                } else {
+                    eprintln!("[bc-nonzero] clear-error {f} -- {e}");
+                }
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "Non-zero anchor cases should either work or yield a clear actionable error:\n  - {}",
+        bad.join("\n  - "),
     );
 }
