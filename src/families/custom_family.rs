@@ -16845,7 +16845,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "biobank-shape routing/timing guard; cheap but excluded from default unit lane"]
     fn biobank_shape_margslope_flex_cycle0_uses_bounded_dense_route() {
         let total_p = 51;
         let total_n = 320_000;

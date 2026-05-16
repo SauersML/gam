@@ -29,7 +29,6 @@ use margslope_flex_equivalence::{
 };
 
 #[test]
-#[ignore]
 fn margslope_flex_biobank_repro_cycle0() {
     gam::init_parallelism();
     let n = DEFAULT_REPRO_N;
@@ -59,7 +58,6 @@ fn margslope_flex_biobank_repro_cycle0() {
 }
 
 #[test]
-#[ignore]
 fn margslope_flex_beta_equivalence_smoke() {
     gam::init_parallelism();
     let n = DEFAULT_SMOKE_N;

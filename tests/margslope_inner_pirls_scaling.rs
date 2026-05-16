@@ -220,7 +220,6 @@ fn run_fit(n: usize, flex: bool) -> Row {
 }
 
 #[test]
-#[ignore]
 fn margslope_inner_pirls_scaling_law() {
     gam::init_parallelism();
 
@@ -332,7 +331,6 @@ fn margslope_inner_pirls_scaling_law() {
 }
 
 #[test]
-#[ignore]
 fn margslope_inner_pirls_flex_scaling_law() {
     gam::init_parallelism();
     // Warm up: a single small fit so the first measured timing isn't
