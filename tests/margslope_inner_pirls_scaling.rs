@@ -127,6 +127,7 @@ fn build_problem(n: usize, flex: bool) -> Problem {
                 },
                 double_penalty: false,
                 identifiability: Default::default(),
+                boundary_conditions: Default::default(),
             },
         },
         shape: ShapeConstraint::None,

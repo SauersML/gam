@@ -103,6 +103,17 @@ second-order difference penalty. Options:
 | `penalty_order` | 2 | Derivative order penalised (1 = slope, 2 = curvature). |
 | `type` | `ps` (1-D), `tps` (2+D) | `ps`, `tps`, `matern`, `duchon`. |
 | `double_penalty` | `true` | Add a ridge penalty alongside the difference penalty. |
+| `bc` | `free` | Apply the same endpoint boundary condition on both ends: `free`, `clamped`, or `anchored`. |
+| `bc_left`, `bc_right` | `free` | Per-endpoint boundary condition for half-open smooths. `clamped` forces zero endpoint derivative; `anchored` forces the endpoint value. |
+| `anchor_left`, `anchor_right` | `0` | Anchor value for `bc_left=anchored` / `bc_right=anchored`. Currently only zero anchors are supported by the fitter. |
+
+Examples:
+
+```
+y ~ s(x, bc_left=clamped)                 # starts flat, right end free
+y ~ s(x, bc_left=anchored, bc_right=free) # starts at zero, right end free
+y ~ s(x, bc=clamped)                      # zero slope at both endpoints
+```
 
 Default `k`: `clamp(unique_values / 4, 4, max(20, cbrt(unique_values)))`.
 

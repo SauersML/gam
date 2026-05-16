@@ -1403,6 +1403,49 @@ pub struct BSplineBasisSpec {
     pub knotspec: BSplineKnotSpec,
     pub double_penalty: bool,
     pub identifiability: BSplineIdentifiability,
+    /// Optional endpoint constraints for 1D B-spline smooths.
+    ///
+    /// `Clamped` enforces zero first derivative at the selected endpoint.
+    /// `Anchored { value: 0.0 }` enforces a zero endpoint value and can be
+    /// combined independently on the left and right sides. Non-zero anchors are
+    /// parsed and validated, but fitting them requires an affine term offset and
+    /// is rejected by the builder for now rather than silently ignored.
+    #[serde(default)]
+    pub boundary_conditions: BSplineBoundaryConditions,
+}
+
+/// Per-endpoint boundary condition for 1D B-spline smooths.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum BSplineEndpointBoundaryCondition {
+    /// No endpoint condition.
+    Free,
+    /// Force the first derivative to be zero at the endpoint.
+    Clamped,
+    /// Force the smooth value at the endpoint. Currently only `value == 0` is
+    /// supported by the homogeneous coefficient reparameterization.
+    Anchored { value: f64 },
+}
+
+impl Default for BSplineEndpointBoundaryCondition {
+    fn default() -> Self {
+        Self::Free
+    }
+}
+
+/// Boundary-condition policy for the left and right ends of a 1D B-spline.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct BSplineBoundaryConditions {
+    #[serde(default)]
+    pub left: BSplineEndpointBoundaryCondition,
+    #[serde(default)]
+    pub right: BSplineEndpointBoundaryCondition,
+}
+
+impl BSplineBoundaryConditions {
+    pub fn is_free(self) -> bool {
+        matches!(self.left, BSplineEndpointBoundaryCondition::Free)
+            && matches!(self.right, BSplineEndpointBoundaryCondition::Free)
+    }
 }
 
 /// Per-smooth identifiability policy for 1D B-spline bases.
@@ -5493,10 +5536,11 @@ pub fn build_bspline_basis_1d(
     data: ArrayView1<'_, f64>,
     spec: &BSplineBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
-    let prefer_sparse_design = matches!(
-        spec.identifiability,
-        BSplineIdentifiability::None | BSplineIdentifiability::WeightedSumToZero { .. }
-    );
+    let prefer_sparse_design = spec.boundary_conditions.is_free()
+        && matches!(
+            spec.identifiability,
+            BSplineIdentifiability::None | BSplineIdentifiability::WeightedSumToZero { .. }
+        );
     let (design_sparse_opt, design_dense_opt, knots) = if prefer_sparse_design {
         match &spec.knotspec {
             BSplineKnotSpec::Generate {
@@ -5689,13 +5733,37 @@ pub fn build_bspline_basis_1d(
             _ => unreachable!("sparse B-spline identifiability only supports sum-to-zero"),
         }
     } else {
-        let (design, penalties, identifiability_transform) = apply_bspline_identifiability_policy(
+        if !spec.boundary_conditions.is_free()
+            && matches!(
+                spec.identifiability,
+                BSplineIdentifiability::RemoveLinearTrend
+            )
+        {
+            return Err(BasisError::InvalidInput(
+                "B-spline boundary conditions cannot currently be combined with RemoveLinearTrend identifiability"
+                    .to_string(),
+            ));
+        }
+        let (design_bc, penalties_bc, boundary_transform) = apply_bspline_boundary_conditions(
             design_dense_opt.expect("dense B-spline basis should be present"),
             penalties_raw_mats,
             &knots,
             spec.degree,
+            spec.boundary_conditions,
+        )?;
+        let (design, penalties, ident_transform_local) = apply_bspline_identifiability_policy(
+            design_bc,
+            penalties_bc,
+            &knots,
+            spec.degree,
             &spec.identifiability,
         )?;
+        let identifiability_transform = match (boundary_transform, ident_transform_local) {
+            (Some(zb), Some(zi)) => Some(fast_ab(&zb, &zi)),
+            (Some(zb), None) => Some(zb),
+            (None, Some(zi)) => Some(zi),
+            (None, None) => None,
+        };
         let transformed_candidates = penalties
             .into_iter()
             .zip(penalties_raw.into_iter())
@@ -5732,6 +5800,131 @@ pub fn build_bspline_basis_1d(
         kronecker_factored: None,
         ops,
     })
+}
+
+fn bspline_boundary_value_row(
+    x: f64,
+    knots: &Array1<f64>,
+    degree: usize,
+) -> Result<Vec<f64>, BasisError> {
+    let xs = Array1::from_vec(vec![x]);
+    let (basis, _) = create_basis::<Dense>(
+        xs.view(),
+        KnotSource::Provided(knots.view()),
+        degree,
+        BasisOptions::value(),
+    )?;
+    Ok(basis.row(0).to_vec())
+}
+
+fn bspline_boundary_derivative_row(
+    x: f64,
+    knots: &Array1<f64>,
+    degree: usize,
+) -> Result<Vec<f64>, BasisError> {
+    let p = knots.len().checked_sub(degree + 1).ok_or_else(|| {
+        BasisError::InvalidInput("invalid B-spline knot/degree combination".to_string())
+    })?;
+    let mut row = vec![0.0; p];
+    evaluate_bspline_derivative_scalar(x, knots.view(), degree, &mut row)?;
+    Ok(row)
+}
+
+fn bspline_boundary_constraint_rows(
+    knots: &Array1<f64>,
+    degree: usize,
+    boundary_conditions: BSplineBoundaryConditions,
+) -> Result<Array2<f64>, BasisError> {
+    let p = knots.len().checked_sub(degree + 1).ok_or_else(|| {
+        BasisError::InvalidInput("invalid B-spline knot/degree combination".to_string())
+    })?;
+    let left_x = knots[degree];
+    let right_x = knots[knots.len() - degree - 1];
+    let mut rows: Vec<Vec<f64>> = Vec::new();
+
+    match boundary_conditions.left {
+        BSplineEndpointBoundaryCondition::Free => {}
+        BSplineEndpointBoundaryCondition::Clamped => {
+            rows.push(bspline_boundary_derivative_row(left_x, knots, degree)?);
+        }
+        BSplineEndpointBoundaryCondition::Anchored { value } => {
+            if value.abs() > 1e-12 {
+                return Err(BasisError::InvalidInput(format!(
+                    "non-zero B-spline left anchor {value} requires an affine term offset; currently only anchored value 0 is supported"
+                )));
+            }
+            rows.push(bspline_boundary_value_row(left_x, knots, degree)?);
+        }
+    }
+    match boundary_conditions.right {
+        BSplineEndpointBoundaryCondition::Free => {}
+        BSplineEndpointBoundaryCondition::Clamped => {
+            rows.push(bspline_boundary_derivative_row(right_x, knots, degree)?);
+        }
+        BSplineEndpointBoundaryCondition::Anchored { value } => {
+            if value.abs() > 1e-12 {
+                return Err(BasisError::InvalidInput(format!(
+                    "non-zero B-spline right anchor {value} requires an affine term offset; currently only anchored value 0 is supported"
+                )));
+            }
+            rows.push(bspline_boundary_value_row(right_x, knots, degree)?);
+        }
+    }
+
+    let q = rows.len();
+    let mut c = Array2::<f64>::zeros((q, p));
+    for (i, row) in rows.iter().enumerate() {
+        let norm = row.iter().map(|v| v * v).sum::<f64>().sqrt().max(1.0);
+        for (j, &v) in row.iter().enumerate() {
+            c[[i, j]] = v / norm;
+        }
+    }
+    Ok(c)
+}
+
+fn apply_bspline_boundary_conditions(
+    design: Array2<f64>,
+    penalties: Vec<Array2<f64>>,
+    knots: &Array1<f64>,
+    degree: usize,
+    boundary_conditions: BSplineBoundaryConditions,
+) -> Result<(Array2<f64>, Vec<Array2<f64>>, Option<Array2<f64>>), BasisError> {
+    if boundary_conditions.is_free() {
+        return Ok((design, penalties, None));
+    }
+    let c = bspline_boundary_constraint_rows(knots, degree, boundary_conditions)?;
+    if c.nrows() == 0 {
+        return Ok((design, penalties, None));
+    }
+    if c.ncols() != design.ncols() {
+        return Err(BasisError::DimensionMismatch(format!(
+            "B-spline boundary constraint width {} does not match design width {}",
+            c.ncols(),
+            design.ncols()
+        )));
+    }
+    let (z, rank) =
+        rrqr_nullspace_basis(&c.t(), default_rrqr_rank_alpha()).map_err(BasisError::LinalgError)?;
+    if z.ncols() == 0 || rank >= c.ncols() {
+        return Err(BasisError::ConstraintNullspaceCollapsed {
+            site: "apply_bspline_boundary_conditions",
+            cross_rank: rank,
+            coeff_dim: c.ncols(),
+            cross_frobenius: c.iter().map(|v| v * v).sum::<f64>().sqrt(),
+            constrained_gram_max_eigenvalue: f64::NAN,
+            constrained_gram_min_eigenvalue: f64::NAN,
+            spectral_tolerance: f64::NAN,
+        });
+    }
+    let design_c = fast_ab(&design, &z);
+    let penalties_c = penalties
+        .into_iter()
+        .map(|s| {
+            let zt_s = fast_atb(&z, &s);
+            fast_ab(&zt_s, &z)
+        })
+        .collect();
+    Ok((design_c, penalties_c, Some(z)))
 }
 
 fn apply_bspline_identifiability_policy(
@@ -22658,6 +22851,7 @@ mod tests {
             },
             double_penalty: true,
             identifiability: BSplineIdentifiability::default(),
+            boundary_conditions: Default::default(),
         };
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
         assert_eq!(result.penalties.len(), 2);
@@ -22672,6 +22866,122 @@ mod tests {
         assert_eq!(result.design.nrows(), x.len());
     }
 
+    fn bspline_transform_from_result(result: &BasisBuildResult) -> Array2<f64> {
+        match &result.metadata {
+            BasisMetadata::BSpline1D {
+                identifiability_transform: Some(z),
+                ..
+            } => z.clone(),
+            _ => panic!("expected constrained B-spline metadata"),
+        }
+    }
+
+    #[test]
+    fn test_bspline_half_open_left_clamped_boundary_condition() {
+        let x = Array::linspace(0.0, 1.0, 25);
+        let spec = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 5,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+            boundary_conditions: BSplineBoundaryConditions {
+                left: BSplineEndpointBoundaryCondition::Clamped,
+                right: BSplineEndpointBoundaryCondition::Free,
+            },
+        };
+        let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
+        let z = bspline_transform_from_result(&result);
+        assert_eq!(result.design.ncols(), z.nrows() - 1);
+
+        let knots = match &result.metadata {
+            BasisMetadata::BSpline1D { knots, .. } => knots.clone(),
+            _ => panic!("expected B-spline metadata"),
+        };
+        let mut d_left = vec![0.0; z.nrows()];
+        evaluate_bspline_derivative_scalar(0.0, knots.view(), spec.degree, &mut d_left).unwrap();
+        let left_projected = Array1::from_vec(d_left).dot(&z);
+        assert!(left_projected.iter().all(|v| v.abs() < 1e-10));
+
+        let mut d_right = vec![0.0; z.nrows()];
+        evaluate_bspline_derivative_scalar(1.0, knots.view(), spec.degree, &mut d_right).unwrap();
+        let right_projected = Array1::from_vec(d_right).dot(&z);
+        assert!(
+            right_projected.iter().any(|v| v.abs() > 1e-6),
+            "right endpoint should remain free for a half-open left-clamped smooth"
+        );
+    }
+
+    #[test]
+    fn test_bspline_anchored_and_clamped_boundary_conditions_compose() {
+        let x = Array::linspace(-2.0, 3.0, 40);
+        let spec = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Generate {
+                data_range: (-2.0, 3.0),
+                num_internal_knots: 6,
+            },
+            double_penalty: true,
+            identifiability: BSplineIdentifiability::WeightedSumToZero { weights: None },
+            boundary_conditions: BSplineBoundaryConditions {
+                left: BSplineEndpointBoundaryCondition::Anchored { value: 0.0 },
+                right: BSplineEndpointBoundaryCondition::Clamped,
+            },
+        };
+        let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
+        assert_eq!(
+            result.penalties.len(),
+            2,
+            "double penalty survives projection"
+        );
+        let z = bspline_transform_from_result(&result);
+        let knots = match &result.metadata {
+            BasisMetadata::BSpline1D { knots, .. } => knots.clone(),
+            _ => panic!("expected B-spline metadata"),
+        };
+
+        let left_row = create_basis::<Dense>(
+            array![-2.0].view(),
+            KnotSource::Provided(knots.view()),
+            spec.degree,
+            BasisOptions::value(),
+        )
+        .unwrap()
+        .0;
+        let left_projected = left_row.row(0).to_owned().dot(&z);
+        assert!(left_projected.iter().all(|v| v.abs() < 1e-10));
+
+        let mut d_right = vec![0.0; z.nrows()];
+        evaluate_bspline_derivative_scalar(3.0, knots.view(), spec.degree, &mut d_right).unwrap();
+        let right_projected = Array1::from_vec(d_right).dot(&z);
+        assert!(right_projected.iter().all(|v| v.abs() < 1e-10));
+    }
+
+    #[test]
+    fn test_bspline_nonzero_anchor_is_rejected_until_affine_offsets_exist() {
+        let x = Array::linspace(0.0, 1.0, 12);
+        let spec = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 3,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+            boundary_conditions: BSplineBoundaryConditions {
+                left: BSplineEndpointBoundaryCondition::Anchored { value: 2.5 },
+                right: BSplineEndpointBoundaryCondition::Free,
+            },
+        };
+        let err = build_bspline_basis_1d(x.view(), &spec).unwrap_err();
+        assert!(err.to_string().contains("non-zero B-spline left anchor"));
+    }
+
     #[test]
     fn test_build_bspline_basis_1d_automatic_uniform_uses_data_range() {
         let x = array![2.0, 3.0, 4.5, 6.0, 7.0, 8.0];
@@ -22684,6 +22994,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
+            boundary_conditions: Default::default(),
         };
 
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -22708,6 +23019,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
+            boundary_conditions: Default::default(),
         };
 
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -22745,6 +23057,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
+            boundary_conditions: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -22788,6 +23101,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
+            boundary_conditions: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).expect("build sparse bspline");
@@ -22806,6 +23120,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
+            boundary_conditions: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).expect("build centered sparse bspline");
@@ -22824,6 +23139,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
+            boundary_conditions: Default::default(),
         };
 
         match build_bspline_basis_1d(x.view(), &spec).unwrap_err() {
@@ -22876,6 +23192,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
+            boundary_conditions: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -22929,6 +23246,7 @@ mod tests {
             identifiability: BSplineIdentifiability::WeightedSumToZero {
                 weights: Some(weights.clone()),
             },
+            boundary_conditions: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -22955,6 +23273,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
+            boundary_conditions: Default::default(),
         };
         let constrained = BSplineBasisSpec {
             identifiability: BSplineIdentifiability::RemoveLinearTrend,
@@ -22985,6 +23304,7 @@ mod tests {
                 columns: constraints.clone(),
                 weights: None,
             },
+            boundary_conditions: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
