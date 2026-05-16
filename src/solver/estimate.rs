@@ -2171,7 +2171,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// DEBUG ONLY: run PIRLS at `theta` (cost-only path) and return the dense
     /// effective Hessian `H_total = X' W_F X + S_λ + ridge I` in the
     /// transformed basis. This is the same matrix the analytic operator
-    /// differentiates, so finite differences of this H w.r.t. ψ should match
+    /// differentiates, so directional probes of this H w.r.t. ψ should match
     /// the analytic `B_i + correction`.
     #[cfg(test)]
     pub(crate) fn debug_full_h(
