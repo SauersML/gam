@@ -26,7 +26,7 @@ pub mod runtime;
 pub mod solver;
 pub mod sparse;
 
-pub use device::{GpuCapability, GpuDeviceInfo};
+pub use device::GpuDeviceInfo;
 pub use dispatch::{
     try_fast_ab, try_fast_atb, try_fast_atv, try_fast_av, try_fast_xt_diag_x, try_fast_xt_diag_y,
 };
