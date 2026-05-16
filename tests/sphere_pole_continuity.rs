@@ -25,7 +25,8 @@ fn make_dataset(n_lat: usize, n_lon: usize) -> gam::data::EncodedDataset {
             let lat_r = lat.to_radians();
             let lon_r = lon.to_radians();
             // A smooth signal that genuinely varies with the pole's location
-            let y = 0.5 + 0.6 * lat_r.sin()
+            let y = 0.5
+                + 0.6 * lat_r.sin()
                 + 0.4 * lat_r.cos() * (2.0 * lon_r).cos()
                 + 0.2 * lat_r.cos().powi(2) * lon_r.sin();
             records.push(StringRecord::from(vec![
@@ -50,15 +51,20 @@ fn predict_data(lats: &[f64], lons: &[f64]) -> Array2<f64> {
     m
 }
 
-fn predict(formula: &str, data: &gam::data::EncodedDataset, lats: &[f64], lons: &[f64])
-    -> Vec<f64>
-{
+fn predict(
+    formula: &str,
+    data: &gam::data::EncodedDataset,
+    lats: &[f64],
+    lons: &[f64],
+) -> Vec<f64> {
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula(formula, data, &cfg).expect("sphere fit succeeded");
-    let FitResult::Standard(fit) = result else { panic!("expected standard fit") };
+    let FitResult::Standard(fit) = result else {
+        panic!("expected standard fit")
+    };
     let new_data = predict_data(lats, lons);
     let test_design = build_term_collection_design(new_data.view(), &fit.resolvedspec)
         .expect("rebuild design from frozen spec");
@@ -94,10 +100,7 @@ fn sphere_wahba_north_pole_is_a_single_point() {
 
 #[test]
 fn sphere_harmonic_north_pole_is_a_single_point() {
-    assert_pole_invariance(
-        "y ~ sphere(lat, lon, method=harmonic, max_degree=4)",
-        1e-6,
-    );
+    assert_pole_invariance("y ~ sphere(lat, lon, method=harmonic, max_degree=4)", 1e-6);
 }
 
 /// Sphere smooths must wrap continuously in longitude: f(lat, +180) and
@@ -136,8 +139,5 @@ fn sphere_wahba_longitude_wraps_continuously() {
 
 #[test]
 fn sphere_harmonic_longitude_wraps_continuously() {
-    assert_longitude_wrap(
-        "y ~ sphere(lat, lon, method=harmonic, max_degree=4)",
-        1e-4,
-    );
+    assert_longitude_wrap("y ~ sphere(lat, lon, method=harmonic, max_degree=4)", 1e-4);
 }
