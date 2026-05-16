@@ -5317,10 +5317,14 @@ fn with_identifiability_transform(
         BasisMetadata::Sphere {
             centers,
             penalty_order,
+            method,
+            max_degree,
             constraint_transform,
         } => Ok(BasisMetadata::Sphere {
             centers: centers.clone(),
             penalty_order: *penalty_order,
+            method: *method,
+            max_degree: *max_degree,
             constraint_transform: compose_identifiability_transforms(
                 constraint_transform.as_ref(),
                 transform,
@@ -12235,15 +12239,15 @@ pub fn freeze_term_collection_from_design(
                 BasisMetadata::Sphere {
                     centers,
                     penalty_order,
+                    method,
+                    max_degree,
                     ..
                 },
             ) => {
                 s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
                 s.penalty_order = *penalty_order;
-                if centers.nrows() == 0 {
-                    s.method = crate::basis::SphereMethod::Harmonic;
-                    s.max_degree = Some(*penalty_order);
-                }
+                s.method = *method;
+                s.max_degree = *max_degree;
             }
             (
                 SmoothBasisSpec::Matern {
