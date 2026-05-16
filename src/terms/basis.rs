@@ -13806,28 +13806,9 @@ pub fn spherical_wahba_kernel_matrix(
     Ok(out)
 }
 
-fn coefficient_sum_to_zero_transform(k: usize) -> Result<Array2<f64>, BasisError> {
-    if k < 2 {
-        return Err(BasisError::InsufficientColumnsForConstraint { found: k });
-    }
-    let c = Array2::<f64>::ones((k, 1));
-    let (z, rank) =
-        rrqr_nullspace_basis(&c, default_rrqr_rank_alpha()).map_err(BasisError::LinalgError)?;
-    if rank >= k {
-        return Err(BasisError::ConstraintNullspaceCollapsed {
-            site: "coefficient_sum_to_zero_transform",
-            cross_rank: rank,
-            coeff_dim: k,
-            cross_frobenius: (k as f64).sqrt(),
-            constrained_gram_max_eigenvalue: f64::NAN,
-            constrained_gram_min_eigenvalue: f64::NAN,
-            spectral_tolerance: f64::NAN,
-        });
-    }
-    Ok(z)
-}
-
-fn weighted_coefficient_sum_to_zero_transform(weights: ArrayView1<'_, f64>) -> Result<Array2<f64>, BasisError> {
+fn weighted_coefficient_sum_to_zero_transform(
+    weights: ArrayView1<'_, f64>,
+) -> Result<Array2<f64>, BasisError> {
     let k = weights.len();
     if k < 2 {
         return Err(BasisError::InsufficientColumnsForConstraint { found: k });
@@ -13885,8 +13866,7 @@ fn spherical_chord_distance2(a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>, rad
     let lon_a = a[1] * to_rad;
     let lat_b = b[0] * to_rad;
     let lon_b = b[1] * to_rad;
-    let cos_gamma =
-        lat_a.sin() * lat_b.sin() + lat_a.cos() * lat_b.cos() * (lon_a - lon_b).cos();
+    let cos_gamma = lat_a.sin() * lat_b.sin() + lat_a.cos() * lat_b.cos() * (lon_a - lon_b).cos();
     2.0 * (1.0 - cos_gamma.clamp(-1.0, 1.0))
 }
 
