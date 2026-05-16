@@ -6671,23 +6671,54 @@ impl BernoulliMarginalSlopeFamily {
         Ok(())
     }
 
-    /// Fast path: value + first derivative only, skips second derivative design.
-    fn link_terms_value_d1(
+    /// Single-row link-deviation value and first derivative at `eta0`,
+    /// honouring any cross-block anchor residual on `link_dev`.
+    ///
+    /// The closed-form intercept seed `row_intercept_closed_form_seed` is
+    /// called once per training row from `solve_row_intercept_base`; each
+    /// call needs `ℓ(η_a) = η_a + Φ(η_a) · β` evaluated at the row's pre-
+    /// scale rigid intercept `a_rigid_pre_scale`. When the link-deviation
+    /// runtime has been reparameterised against the marginal+logslope
+    /// parametric anchor, the per-row reparameterised basis is
+    ///
+    ///   Φ_new[row, :] = Φ_raw(η_a) − parametric_anchor[row, :] · M
+    ///
+    /// so the design value at `(row, η_a)` is the raw basis minus a row-
+    /// specific subtraction. `runtime.design()` returns the raw basis
+    /// only and `debug_assert`s in this configuration so callers don't
+    /// silently miscompute; instead route through `design_with_anchor_rows`
+    /// with the runtime's cached training-row anchor sliced to a single
+    /// row. The derivative path is unaffected — the subtraction is
+    /// constant in `η`, so its derivative is identically zero.
+    fn link_terms_value_d1_at_row(
         &self,
-        eta0: &Array1<f64>,
+        row: usize,
+        eta0: f64,
         beta_w: Option<&Array1<f64>>,
-    ) -> Result<(Array1<f64>, Array1<f64>), String> {
-        if let (Some(runtime), Some(beta)) = (&self.link_dev, beta_w) {
-            let basis = runtime.design(eta0)?;
-            let d1 = runtime.first_derivative_design(eta0)?;
-            Ok((eta0 + &basis.dot(beta), d1.dot(beta) + 1.0))
+    ) -> Result<(f64, f64), String> {
+        let (Some(runtime), Some(beta)) = (&self.link_dev, beta_w) else {
+            return Ok((eta0, 1.0));
+        };
+        let values = Array1::from_vec(vec![eta0]);
+        let basis = if let Some(anchor_rows) = runtime.anchor_rows_at_training() {
+            if row >= anchor_rows.nrows() {
+                return Err(format!(
+                    "link_terms_value_d1_at_row: row {row} out of bounds for {} cached training anchor rows",
+                    anchor_rows.nrows()
+                ));
+            }
+            let anchor_view = anchor_rows.slice(ndarray::s![row..row + 1, ..]);
+            runtime.design_with_anchor_rows(&values, anchor_view)?
         } else {
-            Ok((eta0.clone(), Array1::ones(eta0.len())))
-        }
+            runtime.design(&values)?
+        };
+        let d1 = runtime.first_derivative_design(&values)?;
+        Ok((eta0 + basis.row(0).dot(beta), d1.row(0).dot(beta) + 1.0))
     }
 
     fn row_intercept_closed_form_seed(
         &self,
+        row: usize,
         marginal: BernoulliMarginalLinkMap,
         slope: f64,
         beta_w: Option<&Array1<f64>>,
@@ -6696,17 +6727,15 @@ impl BernoulliMarginalSlopeFamily {
         let a_rigid_pre_scale =
             rigid_intercept_from_marginal(marginal.q, slope, probit_scale) / probit_scale;
         if beta_w.is_some() {
-            let v = Array1::from_vec(vec![a_rigid_pre_scale]);
-            let (l_val, l_d1) = self.link_terms_value_d1(&v, beta_w)?;
-            let ell1 = l_d1[0];
-            if ell1 > 1e-8 {
-                let ell0 = l_val[0] - ell1 * a_rigid_pre_scale;
-                let observed_logslope = probit_scale * ell1 * slope;
+            let (l_val, l_d1) = self.link_terms_value_d1_at_row(row, a_rigid_pre_scale, beta_w)?;
+            if l_d1 > 1e-8 {
+                let ell0 = l_val - l_d1 * a_rigid_pre_scale;
+                let observed_logslope = probit_scale * l_d1 * slope;
                 return Ok(
                     (marginal.q * (1.0 + observed_logslope * observed_logslope).sqrt()
                         / probit_scale
                         - ell0)
-                        / ell1,
+                        / l_d1,
                 );
             }
         }
@@ -6736,14 +6765,74 @@ impl BernoulliMarginalSlopeFamily {
         }
         let marginal_eta = &block_states[0].eta;
         let slope_eta = &block_states[1].eta;
-        let seeds: Result<Vec<f64>, String> = (0..n)
+        let probit_scale = self.probit_frailty_scale();
+
+        // Per-row marginal link map and rigid pre-scale intercept.
+        let marginals: Vec<BernoulliMarginalLinkMap> = (0..n)
             .into_par_iter()
+            .map(|row| self.marginal_link_map(marginal_eta[row]))
+            .collect::<Result<Vec<_>, _>>()?;
+        let a_pre_scale_vec: Array1<f64> = (0..n)
             .map(|row| {
-                let marginal = self.marginal_link_map(marginal_eta[row])?;
-                self.row_intercept_closed_form_seed(marginal, slope_eta[row], beta_w)
+                rigid_intercept_from_marginal(marginals[row].q, slope_eta[row], probit_scale)
+                    / probit_scale
             })
             .collect();
-        let seeds = seeds?;
+
+        // Batched link-deviation evaluation at each row's pre-scale intercept.
+        //
+        // The closed-form intercept seed needs ℓ(a_pre_scale_i) and
+        // ℓ'(a_pre_scale_i) where
+        //
+        //   ℓ(η) = η + Φ_link_dev(η) · β_link
+        //
+        // is the row-i link deviation. After
+        // `enforce_cross_block_identifiability_for_flex_block`
+        // reparameterised the link-deviation runtime against the
+        // marginal+logslope parametric anchor union, the per-row
+        // reparameterised basis is
+        //
+        //   Φ_new[i, :] = Φ_raw(η_i) − parametric_anchor[i, :] · M
+        //
+        // so ℓ depends on the row through both the raw basis evaluation
+        // and the row-specific subtraction. The basis derivative is
+        // unaffected: the subtraction is independent of η.
+        //
+        // Evaluating `link_dev.design()` on a single-row `eta0` vector
+        // would discard the row-specific subtraction (`design()`
+        // debug_asserts that the runtime has no anchor residual exactly
+        // to prevent this silent miscompute). Instead, feed the
+        // full-length per-row `a_pre_scale_vec` through
+        // `design_at_training_with_residual` so the runtime applies the
+        // cached training-row parametric anchor matrix at the correct
+        // row for every evaluation. For runtimes without an
+        // anchor_residual the same call falls back to raw `design()`.
+        let (l_val_vec, l_d1_vec) = match (&self.link_dev, beta_w) {
+            (Some(runtime), Some(beta)) => {
+                let basis = runtime.design_at_training_with_residual(&a_pre_scale_vec)?;
+                let d1 = runtime.first_derivative_design(&a_pre_scale_vec)?;
+                (&a_pre_scale_vec + &basis.dot(beta), d1.dot(beta) + 1.0)
+            }
+            _ => (a_pre_scale_vec.clone(), Array1::ones(n)),
+        };
+
+        let seeds: Vec<f64> = (0..n)
+            .into_par_iter()
+            .map(|row| {
+                let a = a_pre_scale_vec[row];
+                let ell1 = l_d1_vec[row];
+                if ell1 > 1e-8 {
+                    let ell0 = l_val_vec[row] - ell1 * a;
+                    let observed_logslope = probit_scale * ell1 * slope_eta[row];
+                    (marginals[row].q * (1.0 + observed_logslope * observed_logslope).sqrt()
+                        / probit_scale
+                        - ell0)
+                        / ell1
+                } else {
+                    a
+                }
+            })
+            .collect();
         let nan_bits = f64::NAN.to_bits();
         let mut preseeded = 0usize;
         let mut kept_warm = 0usize;
@@ -6985,7 +7074,7 @@ impl BernoulliMarginalSlopeFamily {
         // When link deviation is active, upgrade to affine-link warm start:
         //   s_f·L(u) ≈ s_f·(ℓ₀ + ℓ₁·u)
         //   ⟹  a = (q·√(1 + (s_f ℓ₁ b)²) / s_f − ℓ₀) / ℓ₁
-        let a_closed_form = self.row_intercept_closed_form_seed(marginal, slope, beta_w)?;
+        let a_closed_form = self.row_intercept_closed_form_seed(row, marginal, slope, beta_w)?;
 
         // Prefer the previous PIRLS iter's converged intercept as the
         // initial guess; β changes only a little between consecutive PIRLS
