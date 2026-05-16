@@ -13730,15 +13730,63 @@ pub fn spherical_wahba_kernel_matrix(
         .into_par_iter()
         .enumerate()
         .for_each(|(chunk_idx, mut block)| {
+            use wide::f64x4;
             let row_offset = chunk_idx * 256;
+            let chunks = k / 4;
+            let tail = k % 4;
             for (local_i, mut out_row) in block.outer_iter_mut().enumerate() {
                 let i = row_offset + local_i;
                 let lat = data[(i, 0)] * deg;
                 let lon = data[(i, 1)] * deg;
                 let (sin_lat, cos_lat) = lat.sin_cos();
                 let (sin_lon, cos_lon) = lon.sin_cos();
-                for j in 0..k {
-                    // cos(lat)·cos(lat_c)·cos(lon - lon_c) + sin(lat)·sin(lat_c)
+                let sin_lat_v = f64x4::from(sin_lat);
+                let cos_lat_v = f64x4::from(cos_lat);
+                let sin_lon_v = f64x4::from(sin_lon);
+                let cos_lon_v = f64x4::from(cos_lon);
+                // SIMD over 4 centers at a time.
+                for cidx in 0..chunks {
+                    let base = cidx * 4;
+                    let sl_c = f64x4::from([
+                        sin_lat_c[base],
+                        sin_lat_c[base + 1],
+                        sin_lat_c[base + 2],
+                        sin_lat_c[base + 3],
+                    ]);
+                    let cl_c = f64x4::from([
+                        cos_lat_c[base],
+                        cos_lat_c[base + 1],
+                        cos_lat_c[base + 2],
+                        cos_lat_c[base + 3],
+                    ]);
+                    let sn_c = f64x4::from([
+                        sin_lon_c[base],
+                        sin_lon_c[base + 1],
+                        sin_lon_c[base + 2],
+                        sin_lon_c[base + 3],
+                    ]);
+                    let cn_c = f64x4::from([
+                        cos_lon_c[base],
+                        cos_lon_c[base + 1],
+                        cos_lon_c[base + 2],
+                        cos_lon_c[base + 3],
+                    ]);
+                    let dlon_cos = cos_lon_v * cn_c + sin_lon_v * sn_c;
+                    let cos_gamma = sin_lat_v * sl_c + cos_lat_v * cl_c * dlon_cos;
+                    let vals = wahba_sphere_kernel_from_cos_simd(cos_gamma, penalty_order);
+                    let arr = vals.to_array();
+                    for lane in 0..4 {
+                        if !arr[lane].is_finite() {
+                            err_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                        out_row[base + lane] = arr[lane];
+                    }
+                }
+                // Scalar tail (0..3 elements).
+                let tail_start = chunks * 4;
+                for t in 0..tail {
+                    let j = tail_start + t;
                     let dlon_cos = cos_lon * cos_lon_c[j] + sin_lon * sin_lon_c[j];
                     let cos_gamma = sin_lat * sin_lat_c[j] + cos_lat * cos_lat_c[j] * dlon_cos;
                     match wahba_sphere_kernel_from_cos(cos_gamma, penalty_order) {
