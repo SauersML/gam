@@ -181,6 +181,82 @@ fn wahba_kernel_invariant_under_rigid_rotation_of_sphere() {
 }
 
 #[test]
+fn spherical_harmonic_basis_builds_with_correct_width_and_diagonal_penalty() {
+    use gam::basis::SphereMethod;
+    let data = array![
+        [-80.0, -170.0],
+        [-40.0, -60.0],
+        [0.0, 0.0],
+        [35.0, 80.0],
+        [70.0, 160.0]
+    ];
+    let spec = SphericalSplineBasisSpec {
+        center_strategy: CenterStrategy::FarthestPoint { num_centers: 0 },
+        penalty_order: 2,
+        double_penalty: false,
+        radians: false,
+        method: SphereMethod::Harmonic,
+        max_degree: Some(3),
+    };
+    let built = build_spherical_spline_basis(data.view(), &spec).expect("sphere harmonic basis");
+    // dim = L(L+2) = 3*5 = 15
+    assert_eq!(built.design.ncols(), 15);
+    assert_eq!(built.penalties.len(), 1);
+    let p = built.penalties[0].clone();
+    // diagonal
+    for i in 0..p.nrows() {
+        for j in 0..p.ncols() {
+            if i != j {
+                assert!(p[(i, j)].abs() < 1e-12, "off-diag penalty entry {i},{j}");
+            }
+        }
+    }
+}
+
+#[test]
+fn spherical_harmonic_basis_rotation_invariant_gram_under_longitude_shift() {
+    use gam::basis::SphereMethod;
+    let data = array![
+        [10.0, 20.0],
+        [-30.0, -40.0],
+        [50.0, 110.0],
+        [-60.0, -100.0],
+        [25.0_f64, 80.0_f64],
+    ];
+    let mut rotated = data.clone();
+    for r in 0..rotated.nrows() {
+        let lon = rotated[(r, 1)] + 47.0_f64;
+        rotated[(r, 1)] = ((lon + 180.0_f64).rem_euclid(360.0_f64)) - 180.0_f64;
+    }
+    let spec = SphericalSplineBasisSpec {
+        center_strategy: CenterStrategy::FarthestPoint { num_centers: 0 },
+        penalty_order: 2,
+        double_penalty: false,
+        radians: false,
+        method: SphereMethod::Harmonic,
+        max_degree: Some(3),
+    };
+    let a = build_spherical_spline_basis(data.view(), &spec).expect("base");
+    let b = build_spherical_spline_basis(rotated.view(), &spec).expect("rotated");
+    // XᵀX is invariant under the block-orthogonal (sin(mφ),cos(mφ)) rotation
+    // induced by a pure longitude shift.
+    let da = a.design.to_dense();
+    let db = b.design.to_dense();
+    let ga = da.t().dot(&da);
+    let gb = db.t().dot(&db);
+    for i in 0..ga.nrows() {
+        for j in 0..ga.ncols() {
+            assert!(
+                (ga[(i, j)] - gb[(i, j)]).abs() < 1e-10,
+                "Gram entry ({i},{j}) not rotation-invariant: {} vs {}",
+                ga[(i, j)],
+                gb[(i, j)]
+            );
+        }
+    }
+}
+
+#[test]
 fn spherical_basis_rejects_bad_latitudes_and_wrong_dimension() {
     let bad_lat = array![[91.0, 0.0], [0.0, 10.0]];
     let spec = SphericalSplineBasisSpec {
