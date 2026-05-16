@@ -6495,7 +6495,7 @@ mod continuous_order_tests {
 #[cfg(test)]
 mod invert_regularized_rho_hessian_tests {
     use super::{EigenClassification, invert_regularized_rho_hessian};
-    use ndarray::{Array1, Array2};
+    use ndarray::Array2;
 
     /// Build a real symmetric n×n matrix with a specified eigenvalue spectrum
     /// rotated by a fixed orthogonal basis. Returns (matrix, eigenvectors).
@@ -6692,11 +6692,6 @@ mod invert_regularized_rho_hessian_tests {
             result.is_none(),
             "expected None for Inf-bearing input matrix"
         );
-    }
-
-    #[allow(dead_code)]
-    fn _array1_use() -> Array1<f64> {
-        Array1::<f64>::zeros(0)
     }
 
     /// The slow eigendecomposition path must populate `eigenvalues` AND

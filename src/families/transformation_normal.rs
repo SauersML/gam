@@ -7635,13 +7635,6 @@ impl CustomFamily for TransformationNormalFamily {
         Ok(None)
     }
 
-    fn joint_newton_max_step_inf(&self, _specs: &[ParameterBlockSpec]) -> f64 {
-        // CTN's SCOP coefficients can legitimately travel far along shape-scale
-        // directions; the generic 20.0 cap throttles those accepted steps for
-        // dozens of exact-objective trust-region cycles at biobank scale.
-        100.0
-    }
-
     fn block_linear_constraints(
         &self,
         _: &[ParameterBlockState],
@@ -11218,13 +11211,6 @@ mod tests {
                 .is_err(),
             "dimension mismatches should still be rejected before line search"
         );
-    }
-
-    #[test]
-    fn ctn_joint_newton_uses_ctn_specific_step_cap() {
-        let psi = array![0.15, -0.10];
-        let (family, _, _, spec) = toy_family_and_derivatives(&psi);
-        assert_eq!(family.joint_newton_max_step_inf(&[spec]), 100.0);
     }
 
     #[test]
