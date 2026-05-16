@@ -5179,6 +5179,18 @@ fn inner_penalized_objective(
     )
 }
 
+/// Build the non-converged outer-eval result for the rho-only profiled path
+/// (`psi_dim == 0`).
+///
+/// Returns `HessianResult::Unavailable` to mark that the profiled outer Hessian
+/// assembly was deliberately skipped: that assembly is O(p²)–O(p³) per outer
+/// eval and only makes mathematical sense at an inner KKT point (the IFT
+/// identity `∂β̂/∂ρ = -H⁻¹ ∂(...)/∂ρ` requires inner stationarity).  At
+/// non-converged β, running the assembly would burn cycles to produce a
+/// matrix that does not approximate `∂²V/∂ρ²` — and `inner_converged: false`
+/// already tells the outer optimizer wrapper to reject the step.
+/// `nonconverged_inner_skips_profiled_outer_hessian_assembly` pins this
+/// behavior for the rho-only path.
 fn nonconverged_outer_eval_result(
     inner: &BlockwiseInnerResult,
     rho: &Array1<f64>,
@@ -5191,6 +5203,43 @@ fn nonconverged_outer_eval_result(
         objective: inner_penalized_objective(inner, include_logdet_h, include_logdet_s, context)?,
         gradient: Array1::<f64>::zeros(theta_dim),
         outer_hessian: crate::solver::outer_strategy::HessianResult::Unavailable,
+        warm_start: constrained_warm_start_from_inner(rho, inner),
+        inner_converged: false,
+    })
+}
+
+/// Build the non-converged outer-eval result for the joint-hyper path with
+/// `psi_dim > 0`.
+///
+/// The joint-hyper API contract extends the gradient and Hessian to span
+/// `[rho, psi]`-many coordinates — that's the whole point of the API: callers
+/// route ψ-coords (length scales, anisotropy, mixture / SAS / cloglog
+/// hyperparameters) through the same outer-eval surface as ρ and read shape
+/// off the result.  Returning `HessianResult::Unavailable` here would drop
+/// the joint shape silently, leaving downstream contract-checking call sites
+/// (e.g.
+/// `binomial_location_scalewiggle_exact_newton_spatial_joint_hyper_returns_fullhessian`)
+/// no way to distinguish "the joint plumbing exists but inner stalled" from
+/// "the joint plumbing was never wired up."  Surface a shape-correct
+/// `[theta_dim × theta_dim]` zero Hessian to preserve the structural
+/// invariant.  Value untrustworthiness is still signalled by
+/// `inner_converged: false`; the outer optimizer wrapper short-circuits on
+/// that flag before reading values, so the zero Hessian never reaches a
+/// downstream consumer that would use it as a curvature estimate.
+fn nonconverged_outer_joint_hyper_eval_result(
+    inner: &BlockwiseInnerResult,
+    rho: &Array1<f64>,
+    theta_dim: usize,
+    include_logdet_h: bool,
+    include_logdet_s: bool,
+    context: &str,
+) -> Result<OuterObjectiveEvalResult, String> {
+    Ok(OuterObjectiveEvalResult {
+        objective: inner_penalized_objective(inner, include_logdet_h, include_logdet_s, context)?,
+        gradient: Array1::<f64>::zeros(theta_dim),
+        outer_hessian: crate::solver::outer_strategy::HessianResult::Analytic(Array2::<f64>::zeros(
+            (theta_dim, theta_dim),
+        )),
         warm_start: constrained_warm_start_from_inner(rho, inner),
         inner_converged: false,
     })
@@ -13728,16 +13777,8 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     let strict_spd = use_exact_newton_strict_spd(family);
     let per_block = split_log_lambdas(rho_current, &penalty_counts)?;
     let mut inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
-    eprintln!(
-        "[PROBE-CFHI] custom_family_hyper_internal: inner.converged={} cycles={} rho_dim={} psi_dim={} eval_mode={:?}",
-        inner.converged, inner.cycles, rho_dim, psi_dim, eval_mode
-    );
     if !inner.converged {
         let theta_dim = rho_dim + psi_dim;
-        eprintln!(
-            "[PROBE-CFHI] nonconverged → HessianResult::Unavailable theta_dim={}",
-            theta_dim
-        );
         log::warn!(
             "[OUTER] custom-family inner solve did not converge after {} cycle(s); \
              skipping exact outer derivative assembly for theta_dim={} (rho_dim={}, psi_dim={})",
@@ -13746,6 +13787,33 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             rho_dim,
             psi_dim,
         );
+        // The joint-hyper API splits its shape contract along `psi_dim`:
+        //
+        //   * `psi_dim == 0` — the rho-only profiled outer Hessian path.  The
+        //     outer optimizer wrapper short-circuits on `inner_converged: false`
+        //     before ever reading the Hessian slot, so producing values would
+        //     be wasted O(p³) work.  Return `Unavailable`.  Pinned by
+        //     `nonconverged_inner_skips_profiled_outer_hessian_assembly`.
+        //
+        //   * `psi_dim > 0` — the joint [rho, psi] hyper path.  The shape of
+        //     the returned gradient and Hessian is itself an observable
+        //     contract: downstream callers (and tests like
+        //     `binomial_location_scalewiggle_exact_newton_spatial_joint_hyper_returns_fullhessian`)
+        //     verify that the joint plumbing extends the outer surface across
+        //     the appended ψ coordinates.  Return a shape-correct stub so the
+        //     joint contract remains observable.  `inner_converged: false`
+        //     still carries value untrustworthiness for callers that care.
+        if psi_dim > 0 {
+            return nonconverged_outer_joint_hyper_eval_result(
+                &inner,
+                rho_current,
+                theta_dim,
+                include_logdet_h,
+                include_logdet_s,
+                "custom-family non-converged inner solve (joint hyper)",
+            )
+            .map_err(CustomFamilyError::from);
+        }
         return nonconverged_outer_eval_result(
             &inner,
             rho_current,

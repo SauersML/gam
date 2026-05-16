@@ -5500,12 +5500,6 @@ impl<'a> RemlState<'a> {
         // projected kernel unconditionally under `Smooth` mode costs one
         // extra eigendecomposition of `S_λ` per outer eval (microseconds
         // at biobank p ≤ ~50) and restores the gradient cancellation.
-        eprintln!(
-            "[PROBE-TRANS] build_dense_assembly hessian_mode={:?} penalty_rank={} ncols={}",
-            hessian_mode,
-            penalty_rank,
-            h_for_operator.ncols()
-        );
         let (hessian_logdet_correction, penalty_subspace_trace) =
             if matches!(hessian_mode, PseudoLogdetMode::Smooth) {
                 use super::unified::HessianOperator;
@@ -5514,11 +5508,6 @@ impl<'a> RemlState<'a> {
                     &e_for_logdet,
                     ridge_passport,
                 )?;
-                let active = kernel.is_some();
-                eprintln!(
-                    "[PROBE-TRANS] kernel_active={} log_det_h_proj={:.6e}",
-                    active, log_det_h_proj
-                );
                 (
                     log_det_h_proj - hessian_op.logdet(),
                     kernel.map(std::sync::Arc::new),
@@ -5620,7 +5609,6 @@ impl<'a> RemlState<'a> {
         // sides of the LAML ratio on the same p-dim space) rather than
         // reintroducing the range(S_+) projection; Cholesky can't cheaply
         // compute `U_S^T H U_S` without densifying H.
-        eprintln!("[PROBE-SPARSE] build_sparse_assembly: penalty_subspace_trace=None (hardcoded)");
         Ok(self.finish_assembly(
             pirls_result,
             ctx,
