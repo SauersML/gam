@@ -45,8 +45,7 @@ fn try_fit_and_predict(formula: &str) -> Result<Vec<f64>, String> {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula(formula, &data, &cfg)
-        .map_err(|e| format!("fit failed: {e}"))?;
+    let result = fit_from_formula(formula, &data, &cfg).map_err(|e| format!("fit failed: {e}"))?;
     let FitResult::Standard(fit) = result else {
         return Err("expected standard fit".to_string());
     };

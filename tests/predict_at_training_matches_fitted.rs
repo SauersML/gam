@@ -25,7 +25,9 @@ fn predict_at_training_points_matches_fitted_values() {
     let mut rng = StdRng::seed_from_u64(229);
     let noise = Normal::new(0.0, 0.05).expect("normal");
     let n = 200usize;
-    let x: Vec<f64> = (0..n).map(|i| 0.01 + 0.98 * i as f64 / (n as f64 - 1.0)).collect();
+    let x: Vec<f64> = (0..n)
+        .map(|i| 0.01 + 0.98 * i as f64 / (n as f64 - 1.0))
+        .collect();
     let y: Vec<f64> = x
         .iter()
         .map(|&t| 0.6 * (2.0 * std::f64::consts::PI * t).sin() + noise.sample(&mut rng))
@@ -77,9 +79,7 @@ fn predict_at_training_points_matches_fitted_values() {
             bad_count += 1;
         }
     }
-    eprintln!(
-        "[predict-train] max_diff={max_diff:.3e} bad_count={bad_count}/{n}"
-    );
+    eprintln!("[predict-train] max_diff={max_diff:.3e} bad_count={bad_count}/{n}");
     assert!(
         max_diff <= 1e-9,
         "predict-at-training mismatched fitted values: max |fit − pred| = {max_diff:.3e} \

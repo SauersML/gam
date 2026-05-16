@@ -78,9 +78,7 @@ fn two_bumps_positive_and_negative_peaks_recovered() {
         let yhat = fit_predict(&format!("y ~ {body}"), &data, &probes);
         let pos = yhat[0];
         let neg = yhat[1];
-        eprintln!(
-            "[two-bumps] {label:10} pred(0.30)={pos:+.3} pred(0.75)={neg:+.3}"
-        );
+        eprintln!("[two-bumps] {label:10} pred(0.30)={pos:+.3} pred(0.75)={neg:+.3}");
         if pos < 0.50 {
             violations.push(format!(
                 "{label}: prediction at +bump (x=0.30) is {pos:+.3} < +0.50 (oversmoothed)"
