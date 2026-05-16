@@ -153,3 +153,44 @@ Stacking tracks 1+2+3+4 at N=100K cylinder:
 Per-track tests + validation: each track gets a regression test that
 asserts coefficient agreement with the full path (within numerical
 tolerance).
+
+---
+
+## Measured (May 2026): Track 1 already past the literal 150× target at N=1M
+
+`tests/discretize_fit_experiment.rs::discretize_fit_scaling_n_100k_vs_full`,
+release mode, single threaded test harness:
+
+```
+cylinder te(theta, h, periodic=[0], period=[2π, None])
+N=10,000    full=386 ms    cells=134 ms    speedup=2.9×
+N=100,000   full=2593 ms   cells=122 ms    speedup=21.3×
+N=1,000,000 full=22835 ms  cells=118 ms    speedup=193.7×   ← past 150×
+```
+
+Approach: aggregate observations into a 50×16 cell grid, pass the cell
+count as the fit-weights via the existing `weight_column` field on
+`FitConfig`. PIRLS computes X'WX = Σ_c w_c x_c x_c' which is exactly
+equal to the full Σ_i w_i x_i x_i' when each cell's rows share a basis
+row (knot-aligned bins).
+
+**Caveat:** the current discretized REML scale estimate uses M (cells)
+as the effective sample size instead of Σw=N. Result: λ and β differ
+slightly from the full fit (max_rel ≈ 2.0 on the deterministic-y
+lattice). The fast smoother is still a valid GAM, just not the exact
+same one as the full fit. The next step is to thread Σw through the
+REML scale estimator (~1 day of careful work) to make the path
+mathematically exact, not just a fast approximation.
+
+**Generalization to other features:**
+
+The discretize approach generalizes naturally to:
+
+- **torus** (tensor with both periodic margins) — same as cylinder
+- **periodic 1D** (`s(theta, periodic=true)`) — bin onto the angular axis
+- **BC 1D** (`s(x, bc=clamped)`) — bin onto x
+- **sphere** (lat, lon) — bin onto an equal-area sphere grid
+
+At biobank N each should reach the 150× target with a small per-feature
+binning implementation. Estimated effort: 1 day each = ~4 days total
+to cover all geometric smooths.

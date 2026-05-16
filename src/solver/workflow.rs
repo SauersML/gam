@@ -3321,35 +3321,37 @@ mod tests {
     }
 
     #[test]
-    fn materialize_standard_duchon_accepts_explicit_pure_mode() {
+    fn materialize_standard_duchon_rejects_redundant_pure_option() {
         let data = duchon_workflow_dataset();
-        let materialized = materialize(
+        let err = match materialize(
             "y ~ duchon(ct, st, centers=12, pure=true)",
             &data,
             &FitConfig::default(),
+        ) {
+            Ok(_) => panic!("pure=true should be rejected because Duchon is pure by default"),
+            Err(err) => err,
+        };
+        assert!(err.contains("pure scale-free Duchon by default"));
+    }
+
+    #[test]
+    fn materialize_standard_duchon_length_scale_opts_into_hybrid_basis() {
+        let data = duchon_workflow_dataset();
+        let materialized = materialize(
+            "y ~ duchon(ct, st, centers=12, length_scale=1.0)",
+            &data,
+            &FitConfig::default(),
         )
-        .expect("pure Duchon materialization should succeed");
+        .expect("hybrid Duchon materialization should succeed");
         let FitRequest::Standard(request) = materialized.request else {
             panic!("expected standard request");
         };
         let SmoothBasisSpec::Duchon { spec, .. } = &request.spec.smooth_terms[0].basis else {
             panic!("expected Duchon smooth");
         };
-        assert_eq!(spec.length_scale, None);
-        assert!(matches!(
-            spec.nullspace_order,
-            DuchonNullspaceOrder::Degree(2)
-        ));
-
-        let err = match materialize(
-            "y ~ duchon(ct, st, centers=12, pure=true, length_scale=1.0)",
-            &data,
-            &FitConfig::default(),
-        ) {
-            Ok(_) => panic!("pure=true plus length_scale should be rejected"),
-            Err(err) => err,
-        };
-        assert!(err.contains("either pure=true or length_scale"));
+        assert_eq!(spec.length_scale, Some(1.0));
+        assert_eq!(spec.nullspace_order, DuchonNullspaceOrder::Zero);
+        assert_eq!(spec.power, 2);
     }
 
     #[test]
