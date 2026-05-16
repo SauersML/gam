@@ -381,14 +381,14 @@ pub fn build_smooth_basis(
                     degree + 1
                 ));
             }
-            let period = parse_periods(options, &[true])?[0].unwrap_or(maxv - minv);
+            let (domain_start, period) = parse_periodic_domain_1d(options, minv, maxv)?;
             Ok(SmoothBasisSpec::BSpline1D {
                 feature_col: c,
                 spec: BSplineBasisSpec {
                     degree,
                     penalty_order: option_usize(options, "penalty_order").unwrap_or(2),
                     knotspec: BSplineKnotSpec::PeriodicUniform {
-                        data_range: (minv, minv + period),
+                        data_range: (domain_start, domain_start + period),
                         num_basis,
                     },
                     double_penalty: smooth_double_penalty,
@@ -435,9 +435,13 @@ pub fn build_smooth_basis(
                     );
                 }
                 {
-                    let p_value = periods[0].unwrap_or(maxv - minv);
+                    let (domain_start, p_value) = if periods[0].is_some() {
+                        (minv, periods[0].unwrap())
+                    } else {
+                        parse_periodic_domain_1d(options, minv, maxv)?
+                    };
                     BSplineKnotSpec::PeriodicUniform {
-                        data_range: (minv, minv + p_value),
+                        data_range: (domain_start, domain_start + p_value),
                         num_basis: n_knots + degree + 1,
                     }
                 }
@@ -520,12 +524,19 @@ pub fn build_smooth_basis(
                     "sphere smooth penalty order must be one of 1, 2, 3, 4; got {penalty_order}"
                 ));
             }
+            let radians = option_bool(options, "radians").unwrap_or_else(|| {
+                options
+                    .get("units")
+                    .map(|u| u.trim().to_ascii_lowercase() == "radians" || u.trim().to_ascii_lowercase() == "rad")
+                    .unwrap_or(false)
+            });
             Ok(SmoothBasisSpec::Sphere {
                 feature_cols: cols.to_vec(),
                 spec: SphericalSplineBasisSpec {
                     center_strategy,
                     penalty_order,
                     double_penalty: smooth_double_penalty,
+                    radians,
                 },
             })
         }
@@ -931,6 +942,49 @@ fn parse_periods(
         out[i] = Some(value);
     }
     Ok(out)
+}
+
+fn option_math_f64_any(options: &BTreeMap<String, String>, keys: &[&str]) -> Result<Option<f64>, String> {
+    for key in keys {
+        if let Some(raw) = options.get(*key) {
+            return parse_math_f64(raw).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn parse_periodic_domain_1d(
+    options: &BTreeMap<String, String>,
+    data_min: f64,
+    data_max: f64,
+) -> Result<(f64, f64), String> {
+    let start = option_math_f64_any(
+        options,
+        &["period_start", "period-start", "domain_start", "domain-start", "start"],
+    )?;
+    let end = option_math_f64_any(
+        options,
+        &["period_end", "period-end", "domain_end", "domain-end", "end"],
+    )?;
+    match (start, end) {
+        (Some(domain_start), Some(domain_end)) => {
+            let period = domain_end - domain_start;
+            if !period.is_finite() || period <= 0.0 {
+                return Err(format!(
+                    "period_end must be greater than period_start for periodic smooths, got start={domain_start}, end={domain_end}"
+                ));
+            }
+            Ok((domain_start, period))
+        }
+        (Some(_), None) | (None, Some(_)) => Err(
+            "periodic smooths require both period_start and period_end when either is provided"
+                .to_string(),
+        ),
+        (None, None) => {
+            let period = parse_periods(options, &[true])?[0].unwrap_or(data_max - data_min);
+            Ok((data_min, period))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
