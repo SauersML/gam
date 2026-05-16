@@ -16,8 +16,8 @@ use ndarray::{Array1, Array2};
 use std::sync::{Mutex, OnceLock};
 
 use super::driver::{
-    DeviceAllocation, DriverApi, bytes_len, check_cuda, cuda_library_candidates,
-    from_col_major_inplace, load_library, to_col_major, to_i32,
+    CudaWorkingState, DeviceAllocation, bytes_len, check_cuda, from_col_major_inplace,
+    load_library, to_col_major, to_i32,
 };
 use super::runtime::GpuRuntime;
 
@@ -61,7 +61,10 @@ fn route_chol_solve(p: usize) -> bool {
 fn with_runtime<T>(f: impl FnOnce(&mut CusolverRuntime) -> Option<T>) -> Option<T> {
     static RUNTIME: OnceLock<Option<Mutex<CusolverRuntime>>> = OnceLock::new();
     RUNTIME
-        .get_or_init(|| CusolverRuntime::new().ok().map(Mutex::new))
+        .get_or_init(|| {
+            let cuda = GpuRuntime::global().cuda_working_state()?;
+            CusolverRuntime::new(cuda).ok().map(Mutex::new)
+        })
         .as_ref()?
         .lock()
         .ok()
@@ -69,49 +72,28 @@ fn with_runtime<T>(f: impl FnOnce(&mut CusolverRuntime) -> Option<T>) -> Option<
 }
 
 struct CusolverRuntime {
-    _cuda_lib: Library,
+    cuda: &'static CudaWorkingState,
     _cusolver_lib: Library,
-    driver: DriverApi,
     solver: CusolverApi,
-    context: usize,
     handle: usize,
 }
 
 impl CusolverRuntime {
-    fn new() -> Result<Self, String> {
-        let selected = GpuRuntime::global()
-            .selected_device()
-            .ok_or_else(|| "no CUDA device selected".to_string())?;
-        let cuda_lib = load_library(cuda_library_candidates())?;
+    fn new(cuda: &'static CudaWorkingState) -> Result<Self, String> {
         let solver_lib = load_library(cusolver_library_candidates())?;
-        let driver = DriverApi::load(&cuda_lib)?;
         let solver = CusolverApi::load(&solver_lib)?;
-        unsafe {
-            check_cuda((driver.cu_init)(0), "cuInit")?;
-            let mut device = 0;
-            let ordinal = to_i32(selected.ordinal)
-                .ok_or_else(|| "CUDA device ordinal exceeds i32".to_string())?;
-            check_cuda((driver.cu_device_get)(&mut device, ordinal), "cuDeviceGet")?;
-            let mut context = 0usize;
-            check_cuda(
-                (driver.cu_ctx_create)(&mut context, 0, device),
-                "cuCtxCreate",
-            )?;
-            let mut handle = 0usize;
-            let status = (solver.create)(&mut handle);
-            if status != CUSOLVER_STATUS_SUCCESS {
-                let _ = (driver.cu_ctx_destroy)(context);
-                return Err(format!("cusolverDnCreate failed with status {status}"));
-            }
-            Ok(Self {
-                _cuda_lib: cuda_lib,
-                _cusolver_lib: solver_lib,
-                driver,
-                solver,
-                context,
-                handle,
-            })
+        cuda.set_current()?;
+        let mut handle = 0_usize;
+        let status = unsafe { (solver.create)(&mut handle) };
+        if status != CUSOLVER_STATUS_SUCCESS {
+            return Err(format!("cusolverDnCreate failed with status {status}"));
         }
+        Ok(Self {
+            cuda,
+            _cusolver_lib: solver_lib,
+            solver,
+            handle,
+        })
     }
 
     fn syevd_inplace(&mut self, a: &mut Array2<f64>) -> Option<Array1<f64>> {
@@ -124,10 +106,10 @@ impl CusolverRuntime {
         let bytes_info = bytes_len::<i32>(1)?;
 
         unsafe {
-            self.set_current().ok()?;
+            self.cuda.set_current().ok()?;
             let a_dev = self.alloc_copy(&a_col, bytes_a)?;
-            let eigs_dev = DeviceAllocation::new(&self.driver, bytes_eigs)?;
-            let info_dev = DeviceAllocation::new(&self.driver, bytes_info)?;
+            let eigs_dev = DeviceAllocation::new(&self.cuda.api, bytes_eigs)?;
+            let info_dev = DeviceAllocation::new(&self.cuda.api, bytes_info)?;
             let mut work_size: i32 = 0;
             if (self.solver.dsyevd_buffersize)(
                 self.handle,
@@ -145,7 +127,7 @@ impl CusolverRuntime {
             let scratch = if work_size > 0 {
                 let work_elems = usize::try_from(work_size).ok()?;
                 Some(DeviceAllocation::new(
-                    &self.driver,
+                    &self.cuda.api,
                     bytes_len::<f64>(work_elems)?,
                 )?)
             } else {
@@ -169,7 +151,7 @@ impl CusolverRuntime {
             }
             let mut info: i32 = 0;
             check_cuda(
-                (self.driver.cu_memcpy_dtoh)(
+                (self.cuda.api.cu_memcpy_dtoh)(
                     (&mut info) as *mut i32 as *mut std::ffi::c_void,
                     info_dev.ptr,
                     bytes_info,
@@ -181,12 +163,12 @@ impl CusolverRuntime {
                 return None;
             }
             check_cuda(
-                (self.driver.cu_memcpy_dtoh)(a_col.as_mut_ptr().cast(), a_dev.ptr, bytes_a),
+                (self.cuda.api.cu_memcpy_dtoh)(a_col.as_mut_ptr().cast(), a_dev.ptr, bytes_a),
                 "cuMemcpyDtoH A",
             )
             .ok()?;
             check_cuda(
-                (self.driver.cu_memcpy_dtoh)(eigs.as_mut_ptr().cast(), eigs_dev.ptr, bytes_eigs),
+                (self.cuda.api.cu_memcpy_dtoh)(eigs.as_mut_ptr().cast(), eigs_dev.ptr, bytes_eigs),
                 "cuMemcpyDtoH eigs",
             )
             .ok()?;
@@ -211,10 +193,10 @@ impl CusolverRuntime {
         let bytes_info = bytes_len::<i32>(1)?;
 
         unsafe {
-            self.set_current().ok()?;
+            self.cuda.set_current().ok()?;
             let a_dev = self.alloc_copy(&a_col, bytes_a)?;
             let rhs_dev = self.alloc_copy(&rhs_col, bytes_rhs)?;
-            let info_dev = DeviceAllocation::new(&self.driver, bytes_info)?;
+            let info_dev = DeviceAllocation::new(&self.cuda.api, bytes_info)?;
             let mut work_size: i32 = 0;
             if (self.solver.dpotrf_buffersize)(
                 self.handle,
@@ -230,7 +212,7 @@ impl CusolverRuntime {
             let scratch = if work_size > 0 {
                 let work_elems = usize::try_from(work_size).ok()?;
                 Some(DeviceAllocation::new(
-                    &self.driver,
+                    &self.cuda.api,
                     bytes_len::<f64>(work_elems)?,
                 )?)
             } else {
@@ -252,7 +234,7 @@ impl CusolverRuntime {
             }
             let mut info: i32 = 0;
             check_cuda(
-                (self.driver.cu_memcpy_dtoh)(
+                (self.cuda.api.cu_memcpy_dtoh)(
                     (&mut info) as *mut i32 as *mut std::ffi::c_void,
                     info_dev.ptr,
                     bytes_info,
@@ -278,7 +260,7 @@ impl CusolverRuntime {
                 return None;
             }
             check_cuda(
-                (self.driver.cu_memcpy_dtoh)(
+                (self.cuda.api.cu_memcpy_dtoh)(
                     (&mut info) as *mut i32 as *mut std::ffi::c_void,
                     info_dev.ptr,
                     bytes_info,
@@ -290,12 +272,12 @@ impl CusolverRuntime {
                 return None;
             }
             check_cuda(
-                (self.driver.cu_memcpy_dtoh)(a_col.as_mut_ptr().cast(), a_dev.ptr, bytes_a),
+                (self.cuda.api.cu_memcpy_dtoh)(a_col.as_mut_ptr().cast(), a_dev.ptr, bytes_a),
                 "cuMemcpyDtoH A",
             )
             .ok()?;
             check_cuda(
-                (self.driver.cu_memcpy_dtoh)(rhs_col.as_mut_ptr().cast(), rhs_dev.ptr, bytes_rhs),
+                (self.cuda.api.cu_memcpy_dtoh)(rhs_col.as_mut_ptr().cast(), rhs_dev.ptr, bytes_rhs),
                 "cuMemcpyDtoH rhs",
             )
             .ok()?;
@@ -305,21 +287,14 @@ impl CusolverRuntime {
         Some(())
     }
 
-    unsafe fn set_current(&self) -> Result<(), String> {
-        check_cuda(
-            unsafe { (self.driver.cu_ctx_set_current)(self.context) },
-            "cuCtxSetCurrent",
-        )
-    }
-
     unsafe fn alloc_copy<'a>(
         &'a self,
         values: &[f64],
         bytes: usize,
     ) -> Option<DeviceAllocation<'a>> {
-        let alloc = unsafe { DeviceAllocation::new(&self.driver, bytes) }?;
+        let alloc = unsafe { DeviceAllocation::new(&self.cuda.api, bytes) }?;
         check_cuda(
-            unsafe { (self.driver.cu_memcpy_htod)(alloc.ptr, values.as_ptr().cast(), bytes) },
+            unsafe { (self.cuda.api.cu_memcpy_htod)(alloc.ptr, values.as_ptr().cast(), bytes) },
             "cuMemcpyHtoD",
         )
         .ok()?;
@@ -330,9 +305,8 @@ impl CusolverRuntime {
 impl Drop for CusolverRuntime {
     fn drop(&mut self) {
         unsafe {
-            let _ = (self.driver.cu_ctx_set_current)(self.context);
+            let _ = self.cuda.set_current();
             let _ = (self.solver.destroy)(self.handle);
-            let _ = (self.driver.cu_ctx_destroy)(self.context);
         }
     }
 }

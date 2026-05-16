@@ -6181,6 +6181,7 @@ fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize> {
     match &term.basis {
         SmoothBasisSpec::BSpline1D { feature_col, .. } => Some(*feature_col),
         SmoothBasisSpec::ThinPlate { feature_cols, .. }
+        | SmoothBasisSpec::Sphere { feature_cols, .. }
         | SmoothBasisSpec::Matern { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
         | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
@@ -6946,6 +6947,7 @@ fn termspec_has_bounded_terms(spec: &TermCollectionSpec) -> bool {
 fn spatial_basiswarning_family_and_cols(term: &SmoothTermSpec) -> Option<(&'static str, &[usize])> {
     match &term.basis {
         SmoothBasisSpec::ThinPlate { feature_cols, .. } => Some(("thinplate/tps", feature_cols)),
+        SmoothBasisSpec::Sphere { feature_cols, .. } => Some(("sphere/sos", feature_cols)),
         SmoothBasisSpec::Matern { feature_cols, .. } => Some(("matern", feature_cols)),
         SmoothBasisSpec::Duchon { feature_cols, .. } => Some(("duchon", feature_cols)),
         SmoothBasisSpec::BSpline1D { .. } | SmoothBasisSpec::TensorBSpline { .. } => None,
@@ -7016,6 +7018,7 @@ fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
     match &term.basis {
         SmoothBasisSpec::BSpline1D { feature_col, .. } => vec![*feature_col],
         SmoothBasisSpec::ThinPlate { feature_cols, .. }
+        | SmoothBasisSpec::Sphere { feature_cols, .. }
         | SmoothBasisSpec::Matern { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
         | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
@@ -7072,8 +7075,9 @@ fn smooth_basiswarning_family_rank(term: &SmoothTermSpec) -> u8 {
         SmoothBasisSpec::BSpline1D { .. } => 0,
         SmoothBasisSpec::TensorBSpline { .. } => 1,
         SmoothBasisSpec::ThinPlate { .. } => 2,
-        SmoothBasisSpec::Matern { .. } => 3,
-        SmoothBasisSpec::Duchon { .. } => 4,
+        SmoothBasisSpec::Sphere { .. } => 3,
+        SmoothBasisSpec::Matern { .. } => 4,
+        SmoothBasisSpec::Duchon { .. } => 5,
     }
 }
 

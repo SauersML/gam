@@ -1820,6 +1820,27 @@ impl Default for SpatialIdentifiability {
     }
 }
 
+/// Wahba spherical spline basis configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SphericalSplineBasisSpec {
+    /// Center/knot selection strategy in latitude/longitude coordinates.
+    pub center_strategy: CenterStrategy,
+    /// Wahba pseudo-spline penalty order m. Currently m=1..4 are closed form; m=2 is the usual curvature penalty.
+    pub penalty_order: usize,
+    /// Add a ridge-like shrinkage penalty on the constrained kernel coefficients.
+    pub double_penalty: bool,
+}
+
+impl Default for SphericalSplineBasisSpec {
+    fn default() -> Self {
+        Self {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 50 },
+            penalty_order: 2,
+            double_penalty: true,
+        }
+    }
+}
+
 /// Matérn basis configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaternBasisSpec {
@@ -2073,6 +2094,11 @@ pub enum BasisMetadata {
         /// rotated radial basis at predict-time matches fit-time exactly. `None`
         /// in the lazy/streaming path which retains the original basis.
         radial_reparam: Option<Array2<f64>>,
+    },
+    Sphere {
+        centers: Array2<f64>,
+        penalty_order: usize,
+        constraint_transform: Option<Array2<f64>>,
     },
     Matern {
         centers: Array2<f64>,
@@ -12574,6 +12600,203 @@ pub fn create_matern_spline_basiswithworkspace(
 }
 
 /// Generic Matérn builder returning design + penalty list.
+
+#[inline]
+fn validate_lat_lon_matrix(data: ArrayView2<'_, f64>, context: &str) -> Result<(), BasisError> {
+    if data.ncols() != 2 {
+        return Err(BasisError::DimensionMismatch(format!(
+            "{context} requires exactly two columns: latitude and longitude in degrees; got {}",
+            data.ncols()
+        )));
+    }
+    if data.nrows() == 0 {
+        return Err(BasisError::InvalidInput(format!(
+            "{context} requires at least one row"
+        )));
+    }
+    for (i, row) in data.outer_iter().enumerate() {
+        let lat = row[0];
+        let lon = row[1];
+        if !lat.is_finite() || !lon.is_finite() {
+            return Err(BasisError::InvalidInput(format!(
+                "{context} requires finite latitude/longitude; row {i} has ({lat}, {lon})"
+            )));
+        }
+        if !(-90.0..=90.0).contains(&lat) {
+            return Err(BasisError::InvalidInput(format!(
+                "{context} latitude must be in [-90, 90] degrees; row {i} has {lat}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+fn wahba_sphere_kernel_from_cos(cos_gamma: f64, penalty_order: usize) -> Result<f64, BasisError> {
+    let cos_gamma = cos_gamma.clamp(-1.0, 1.0);
+    let z = (1.0 - cos_gamma).max(f64::EPSILON * 1.0e-4);
+    let w = 0.5 * z;
+    let c0 = w.sqrt();
+    let a = (1.0 + 1.0 / c0).ln();
+    let c = 2.0 * c0;
+    let two_pi = 2.0 * std::f64::consts::PI;
+    let value = match penalty_order {
+        1 => {
+            let q1 = 2.0 * a * w - c + 1.0;
+            (q1 - 0.5) / two_pi
+        }
+        2 => {
+            let w2 = w * w;
+            let q2 = a * (6.0 * w2 - 2.0 * w) - 3.0 * c * w + 3.0 * w + 0.5;
+            (q2 / 2.0 - 1.0 / 6.0) / two_pi
+        }
+        3 => {
+            let w2 = w * w;
+            let w3 = w2 * w;
+            let q3 = (a * (60.0 * w3 - 36.0 * w2) + 30.0 * w2 + c * (8.0 * w - 30.0 * w2)
+                - 3.0 * w
+                + 1.0)
+                / 3.0;
+            (q3 / 6.0 - 1.0 / 24.0) / two_pi
+        }
+        4 => {
+            let w2 = w * w;
+            let w3 = w2 * w;
+            let w4 = w3 * w;
+            let q4 = a * (70.0 * w4 - 60.0 * w3 + 6.0 * w2)
+                + 35.0 * w3 * (1.0 - c)
+                + c * 55.0 * w2 / 3.0
+                - 12.5 * w2
+                - w / 3.0
+                + 0.25;
+            (q4 / 24.0 - 1.0 / 120.0) / two_pi
+        }
+        other => {
+            return Err(BasisError::InvalidInput(format!(
+                "spherical spline penalty_order must be one of 1, 2, 3, 4; got {other}"
+            )));
+        }
+    };
+    if !value.is_finite() {
+        return Err(BasisError::InvalidInput(
+            "spherical spline kernel produced a non-finite value".to_string(),
+        ));
+    }
+    Ok(value)
+}
+
+pub fn spherical_wahba_kernel_matrix(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    penalty_order: usize,
+) -> Result<Array2<f64>, BasisError> {
+    validate_lat_lon_matrix(data, "spherical spline data")?;
+    validate_lat_lon_matrix(centers, "spherical spline centers")?;
+    let n = data.nrows();
+    let k = centers.nrows();
+    let deg = std::f64::consts::PI / 180.0;
+    let mut out = Array2::<f64>::zeros((n, k));
+    let mut center_trig = Vec::with_capacity(k);
+    for c in centers.outer_iter() {
+        let lat = c[0] * deg;
+        let lon = c[1] * deg;
+        center_trig.push((lat.sin(), lat.cos(), lon));
+    }
+    for (i, row) in data.outer_iter().enumerate() {
+        let lat = row[0] * deg;
+        let lon = row[1] * deg;
+        let (sin_lat, cos_lat) = (lat.sin(), lat.cos());
+        for (j, &(sin_c, cos_c, lon_c)) in center_trig.iter().enumerate() {
+            let cos_gamma = sin_lat * sin_c + cos_lat * cos_c * (lon - lon_c).cos();
+            out[(i, j)] = wahba_sphere_kernel_from_cos(cos_gamma, penalty_order)?;
+        }
+    }
+    Ok(out)
+}
+
+fn coefficient_sum_to_zero_transform(k: usize) -> Result<Array2<f64>, BasisError> {
+    if k < 2 {
+        return Err(BasisError::InsufficientColumnsForConstraint { found: k });
+    }
+    let c = Array2::<f64>::ones((k, 1));
+    let (z, rank) =
+        rrqr_nullspace_basis(&c, default_rrqr_rank_alpha()).map_err(BasisError::LinalgError)?;
+    if rank >= k {
+        return Err(BasisError::ConstraintNullspaceCollapsed {
+            site: "coefficient_sum_to_zero_transform",
+            cross_rank: rank,
+            coeff_dim: k,
+            cross_frobenius: (k as f64).sqrt(),
+            constrained_gram_max_eigenvalue: f64::NAN,
+            constrained_gram_min_eigenvalue: f64::NAN,
+            spectral_tolerance: f64::NAN,
+        });
+    }
+    Ok(z)
+}
+
+pub fn build_spherical_spline_basis(
+    data: ArrayView2<'_, f64>,
+    spec: &SphericalSplineBasisSpec,
+) -> Result<BasisBuildResult, BasisError> {
+    validate_lat_lon_matrix(data, "spherical spline")?;
+    if !(1..=4).contains(&spec.penalty_order) {
+        return Err(BasisError::InvalidInput(format!(
+            "spherical spline penalty_order must be one of 1, 2, 3, 4; got {}",
+            spec.penalty_order
+        )));
+    }
+    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    validate_lat_lon_matrix(centers.view(), "spherical spline centers")?;
+    if centers.nrows() < 2 {
+        return Err(BasisError::InsufficientColumnsForConstraint {
+            found: centers.nrows(),
+        });
+    }
+    let raw_design = spherical_wahba_kernel_matrix(data, centers.view(), spec.penalty_order)?;
+    let raw_penalty =
+        spherical_wahba_kernel_matrix(centers.view(), centers.view(), spec.penalty_order)?;
+    let z = coefficient_sum_to_zero_transform(centers.nrows())?;
+    let design = raw_design.dot(&z);
+    let penalty = z.t().dot(&raw_penalty).dot(&z);
+    let (penalty_norm, c_primary) = normalize_penalty(&((&penalty + &penalty.t()) * 0.5));
+    let mut candidates = vec![PenaltyCandidate {
+        matrix: penalty_norm,
+        nullspace_dim_hint: 0,
+        source: PenaltySource::Primary,
+        normalization_scale: c_primary,
+        kronecker_factors: None,
+        op: None,
+    }];
+    if spec.double_penalty {
+        let ridge = Array2::<f64>::eye(design.ncols());
+        let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
+        candidates.push(PenaltyCandidate {
+            matrix: ridge_norm,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::DoublePenaltyNullspace,
+            normalization_scale: c_ridge,
+            kronecker_factors: None,
+            op: None,
+        });
+    }
+    let (penalties, nullspace_dims, penaltyinfo, ops) =
+        filter_active_penalty_candidates_with_ops(candidates)?;
+    Ok(BasisBuildResult {
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
+        penalties,
+        nullspace_dims,
+        penaltyinfo,
+        metadata: BasisMetadata::Sphere {
+            centers,
+            penalty_order: spec.penalty_order,
+            constraint_transform: Some(z),
+        },
+        kronecker_factored: None,
+        ops,
+    })
+}
+
 pub fn build_matern_basis(
     data: ArrayView2<'_, f64>,
     spec: &MaternBasisSpec,

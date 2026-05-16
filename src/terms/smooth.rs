@@ -3,17 +3,18 @@ use crate::basis::{
     BasisMetadata, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy,
     CenterStrategyKind, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
     KroneckerFactoredBasis, MaternBasisSpec, MaternIdentifiability, PenaltyCandidate, PenaltyInfo,
-    PenaltySource, SpatialIdentifiability, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
-    build_bspline_basis_1d, build_duchon_basis, build_duchon_basis_log_kappa_aniso_derivatives,
-    build_duchon_basis_log_kappa_derivatives, build_duchon_basiswithworkspace, build_matern_basis,
+    PenaltySource, SpatialIdentifiability, SphericalSplineBasisSpec, ThinPlateBasisSpec,
+    apply_sum_to_zero_constraint, build_bspline_basis_1d, build_duchon_basis,
+    build_duchon_basis_log_kappa_aniso_derivatives, build_duchon_basis_log_kappa_derivatives,
+    build_duchon_basiswithworkspace, build_matern_basis,
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
     build_matern_basiswithworkspace, build_matern_collocation_operator_matrices,
-    build_thin_plate_basis, build_thin_plate_basis_log_kappa_derivatives, center_strategy_is_auto,
-    center_strategy_kind, center_strategy_num_centers, center_strategy_with_num_centers,
-    estimate_penalty_nullity, filter_active_penalty_candidates,
-    filter_active_penalty_candidates_with_ops, initial_aniso_contrasts,
-    orthogonality_transform_for_design, pairwise_distance_bounds, pairwise_distance_bounds_sampled,
-    points_in_aniso_y_space, select_centers_by_strategy,
+    build_spherical_spline_basis, build_thin_plate_basis,
+    build_thin_plate_basis_log_kappa_derivatives, center_strategy_is_auto, center_strategy_kind,
+    center_strategy_num_centers, center_strategy_with_num_centers, estimate_penalty_nullity,
+    filter_active_penalty_candidates, filter_active_penalty_candidates_with_ops,
+    initial_aniso_contrasts, orthogonality_transform_for_design, pairwise_distance_bounds,
+    pairwise_distance_bounds_sampled, points_in_aniso_y_space, select_centers_by_strategy,
 };
 use crate::construction::{
     kronecker_logdet_and_derivatives, kronecker_marginal_eigensystems, kronecker_product,
@@ -125,6 +126,10 @@ pub enum SmoothBasisSpec {
         /// (either d == 1 or explicitly disabled).
         #[serde(default)]
         input_scales: Option<Vec<f64>>,
+    },
+    Sphere {
+        feature_cols: Vec<usize>,
+        spec: SphericalSplineBasisSpec,
     },
     Matern {
         feature_cols: Vec<usize>,
@@ -425,6 +430,14 @@ impl TermCollectionSpec {
                     ) {
                         return Err(format!(
                             "{label} term '{}' is not frozen: ThinPlate identifiability must be FrozenTransform or None",
+                            st.name
+                        ));
+                    }
+                }
+                SmoothBasisSpec::Sphere { spec, .. } => {
+                    if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
+                        return Err(format!(
+                            "{label} term '{}' is not frozen: Sphere centers must be UserProvided",
                             st.name
                         ));
                     }
@@ -3359,6 +3372,16 @@ fn build_single_local_smooth_term(
             }
             result
         }
+        SmoothBasisSpec::Sphere { feature_cols, spec } => {
+            if term.shape != ShapeConstraint::None {
+                return Err(BasisError::InvalidInput(format!(
+                    "ShapeConstraint::{:?} for term '{}' is not supported on spherical splines",
+                    term.shape, term.name
+                )));
+            }
+            let x = select_columns(data, feature_cols)?;
+            build_spherical_spline_basis(x.view(), spec)?
+        }
         SmoothBasisSpec::Matern {
             feature_cols,
             spec,
@@ -4214,6 +4237,7 @@ fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
     match &term.basis {
         SmoothBasisSpec::BSpline1D { feature_col, .. } => vec![*feature_col],
         SmoothBasisSpec::ThinPlate { feature_cols, .. }
+        | SmoothBasisSpec::Sphere { feature_cols, .. }
         | SmoothBasisSpec::Matern { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
         | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
@@ -4225,8 +4249,9 @@ fn smooth_basis_family_rank(term: &SmoothTermSpec) -> u8 {
         SmoothBasisSpec::BSpline1D { .. } => 0,
         SmoothBasisSpec::TensorBSpline { .. } => 1,
         SmoothBasisSpec::ThinPlate { .. } => 2,
-        SmoothBasisSpec::Matern { .. } => 3,
-        SmoothBasisSpec::Duchon { .. } => 4,
+        SmoothBasisSpec::Sphere { .. } => 3,
+        SmoothBasisSpec::Matern { .. } => 4,
+        SmoothBasisSpec::Duchon { .. } => 5,
     }
 }
 
@@ -4242,6 +4267,9 @@ fn smooth_has_frozen_identifiability(term: &SmoothTermSpec) -> bool {
             spec.identifiability,
             SpatialIdentifiability::FrozenTransform { .. }
         ),
+        SmoothBasisSpec::Sphere { spec, .. } => {
+            matches!(spec.center_strategy, CenterStrategy::UserProvided(_))
+        }
         SmoothBasisSpec::Matern { spec, .. } => matches!(
             spec.identifiability,
             MaternIdentifiability::FrozenTransform { .. }
@@ -4941,6 +4969,18 @@ fn with_identifiability_transform(
             )?,
             input_scales: input_scales.clone(),
             radial_reparam: radial_reparam.clone(),
+        }),
+        BasisMetadata::Sphere {
+            centers,
+            penalty_order,
+            constraint_transform,
+        } => Ok(BasisMetadata::Sphere {
+            centers: centers.clone(),
+            penalty_order: *penalty_order,
+            constraint_transform: compose_identifiability_transforms(
+                constraint_transform.as_ref(),
+                transform,
+            )?,
         }),
         BasisMetadata::Matern {
             centers,
@@ -10343,6 +10383,7 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         None => return Ok(None),
     };
     let mut aniso_result = match &termspec.basis {
+        SmoothBasisSpec::Sphere { .. } => return Ok(None),
         SmoothBasisSpec::Matern {
             feature_cols,
             spec,
@@ -10546,6 +10587,7 @@ fn try_build_spatial_term_log_kappa_derivative(
             build_thin_plate_basis_log_kappa_derivatives(x.view(), spec)
                 .map_err(EstimationError::from)?
         }
+        SmoothBasisSpec::Sphere { .. } => return Ok(None),
         SmoothBasisSpec::Matern {
             feature_cols,
             spec,
@@ -12022,6 +12064,17 @@ pub fn freeze_term_collection_from_design(
                     },
                     input_scales: meta_scales.clone(),
                 };
+            }
+            (
+                SmoothBasisSpec::Sphere { spec: s, .. },
+                BasisMetadata::Sphere {
+                    centers,
+                    penalty_order,
+                    ..
+                },
+            ) => {
+                s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
+                s.penalty_order = *penalty_order;
             }
             (
                 SmoothBasisSpec::Matern {
