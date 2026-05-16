@@ -204,6 +204,8 @@ the truth is reasonable, but they take different paths to get there:
 ```
 y ~ s(theta, periodic=true, period=6.283)             # cyclic 1D B-spline
 y ~ cyclic(theta, period_start=0, period_end=6.283)   # equivalent alias
+y ~ periodic(theta, period=6.283)                     # alias of `cyclic`
+y ~ cp(theta, period=6.283)                           # alias of `cyclic`
 y ~ cc(day_of_week, period=7)                         # mgcv `bs="cc"` alias
 y ~ duchon(theta, periodic=true)                      # cyclic Duchon (1D)
 
