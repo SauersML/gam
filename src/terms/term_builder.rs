@@ -1239,6 +1239,7 @@ pub fn parse_ps_internal_knots(
     degree: usize,
     default_internal_knots: usize,
 ) -> Result<(usize, bool), String> {
+    const MIN_EXPRESSIVE_INTERNAL_KNOTS: usize = 2;
     let knots_internal = option_usize(options, "knots");
     let basis_dim = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"]);
     if knots_internal.is_some() && basis_dim.is_some() {
@@ -1255,7 +1256,7 @@ pub fn parse_ps_internal_knots(
                 k, degree, min_k
             ));
         }
-        Ok((k - min_k, false))
+        Ok(((k - min_k).max(MIN_EXPRESSIVE_INTERNAL_KNOTS), false))
     } else {
         Ok((
             knots_internal.unwrap_or(default_internal_knots),
@@ -1597,6 +1598,25 @@ mod tests {
                 "unexpected error for {raw:?}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn parse_ps_k_promotes_underexpressive_cubic_basis() {
+        let mut opts = BTreeMap::new();
+        opts.insert("k".to_string(), "4".to_string());
+        let (internal, inferred) = parse_ps_internal_knots(&opts, 3, 20).expect("k=4");
+        assert_eq!(internal, 2);
+        assert!(!inferred);
+
+        opts.insert("k".to_string(), "6".to_string());
+        let (internal, inferred) = parse_ps_internal_knots(&opts, 3, 20).expect("k=6");
+        assert_eq!(internal, 2);
+        assert!(!inferred);
+
+        opts.insert("k".to_string(), "10".to_string());
+        let (internal, inferred) = parse_ps_internal_knots(&opts, 3, 20).expect("k=10");
+        assert_eq!(internal, 6);
+        assert!(!inferred);
     }
 
     #[test]

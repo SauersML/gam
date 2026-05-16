@@ -85,7 +85,7 @@ fn ridge_2d_truth_recovered_by_2d_families() {
     let truth_fn = |a: f64, b: f64| (-((a - b).powi(2)) / 0.01).exp();
 
     let cases: &[(&str, &str)] = &[
-        ("te_k10",    "te(x1, x2, k=10)"),
+        ("te_k10", "te(x1, x2, k=10)"),
         ("matern_2d", "matern(x1, x2)"),
         ("duchon_2d", "duchon(x1, x2)"),
         ("thinplate", "thinplate(x1, x2)"),

@@ -23,9 +23,7 @@ fn build_dataset(n: usize, sigma: f64, seed: u64) -> gam::data::EncodedDataset {
     let mut rng = StdRng::seed_from_u64(seed);
     let ux = Uniform::new(0.0, 1.0).expect("uniform");
     let noise = Normal::new(0.0, sigma).expect("normal");
-    let f = |a: f64, b: f64| {
-        0.7 * (2.0 * std::f64::consts::PI * a).sin() + 0.5 * (b - 0.5).powi(2)
-    };
+    let f = |a: f64, b: f64| 0.7 * (2.0 * std::f64::consts::PI * a).sin() + 0.5 * (b - 0.5).powi(2);
     let headers = ["x1", "x2", "y"].into_iter().map(String::from).collect();
     let rows: Vec<StringRecord> = (0..n)
         .map(|_| {
