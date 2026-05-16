@@ -39,6 +39,12 @@ pub struct DispatchPolicy {
     /// with `spmv_min_nnz` via AND — a tiny matrix with many nnz still
     /// favors the host because cuSPARSE descriptor setup is heavy.
     pub spmv_min_rows: usize,
+    /// Minimum trailing dimension `p` to dispatch dense Cholesky factor +
+    /// solve through cuSOLVER (`dpotrf` + `dpotrs`).
+    pub chol_min_p: usize,
+    /// Minimum trailing dimension `p` to dispatch symmetric
+    /// eigendecomposition through cuSOLVER (`dsyevd`).
+    pub syevd_min_p: usize,
 }
 
 impl DispatchPolicy {
@@ -75,12 +81,21 @@ impl DispatchPolicy {
         let spmv_min_nnz = usize_threshold((1_000_000.0 / speedup).max(100_000.0));
         let spmv_min_rows = 1_024;
 
+        // cuSOLVER thresholds: dense Cholesky and dsyevd both pay the full
+        // host↔device round trip, so scale the dimension threshold with the
+        // throughput speedup. Faster cards lower the dimension where GPU
+        // wins; the clamp keeps both endpoints sane.
+        let chol_min_p = usize_threshold((4096.0 / speedup).clamp(128.0, 8_192.0));
+        let syevd_min_p = usize_threshold((2048.0 / speedup).clamp(64.0, 4_096.0));
+
         Self {
             xtwx_min_rows,
             gemm_min_flops,
             gemv_min_flops,
             spmv_min_nnz,
             spmv_min_rows,
+            chol_min_p,
+            syevd_min_p,
         }
     }
 
@@ -91,7 +106,19 @@ impl DispatchPolicy {
             gemv_min_flops: u64::MAX,
             spmv_min_nnz: usize::MAX,
             spmv_min_rows: usize::MAX,
+            chol_min_p: usize::MAX,
+            syevd_min_p: usize::MAX,
         }
+    }
+
+    /// Should a dense Cholesky factor + solve route to the device?
+    pub fn route_chol_solve(&self, p: usize) -> bool {
+        p >= self.chol_min_p
+    }
+
+    /// Should a symmetric eigendecomposition route to the device?
+    pub fn route_syevd(&self, p: usize) -> bool {
+        p >= self.syevd_min_p
     }
 
     /// Should a dense `Xᵀ diag(w) Y` route to the device?
@@ -165,12 +192,6 @@ fn usize_threshold(value: f64) -> usize {
     }
 }
 
-impl Default for DispatchPolicy {
-    fn default() -> Self {
-        Self::cpu_only()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,6 +223,8 @@ mod tests {
         assert!(!p.route_gemv(1_000_000, 1_000_000));
         assert!(!p.route_xt_diag_y(1_000_000, 1_000, 1_000));
         assert!(!p.route_csr_spmv(1_000_000, 1_000_000, 1_000_000_000));
+        assert!(!p.route_chol_solve(1_000_000));
+        assert!(!p.route_syevd(1_000_000));
     }
 
     #[test]
@@ -225,5 +248,14 @@ mod tests {
         let p = DispatchPolicy::for_device(Some(&device(8, 108)));
         assert!(!p.route_csr_spmv(10_000, 1_000, 1_024));
         assert!(p.route_csr_spmv(10_000, 1_000, 1_000_000));
+    }
+
+    #[test]
+    fn route_cusolver_uses_device_thresholds() {
+        let p = DispatchPolicy::for_device(Some(&device(8, 108)));
+        assert!(!p.route_chol_solve(p.chol_min_p.saturating_sub(1)));
+        assert!(p.route_chol_solve(p.chol_min_p));
+        assert!(!p.route_syevd(p.syevd_min_p.saturating_sub(1)));
+        assert!(p.route_syevd(p.syevd_min_p));
     }
 }
