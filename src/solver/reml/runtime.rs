@@ -5798,34 +5798,14 @@ impl<'a> RemlState<'a> {
             if matches!(hessian_mode, PseudoLogdetMode::Smooth) {
                 use super::unified::HessianOperator;
                 let qs = &pirls_result.reparam_result.qs;
-                eprintln!(
-                    "[PROBE-QS] qs.shape={:?} h_orig.shape={:?} e_trans.shape={:?}",
-                    qs.shape(),
-                    h_total_original.shape(),
-                    e_for_logdet.shape()
-                );
                 let h_transformed = qs.t().dot(&h_total_original).dot(qs);
-                eprintln!("[PROBE-QS] h_transformed.shape={:?}", h_transformed.shape());
                 let (log_det_h_proj, kernel_trans) = self.fixed_subspace_hessian_projected_parts(
                     &h_transformed,
                     &e_for_logdet,
                     ridge_passport,
                 )?;
-                if let Some(ref kernel_trans_ref) = kernel_trans {
-                    eprintln!(
-                        "[PROBE-QS] kernel_trans.u_s.shape={:?} h_proj_inverse.shape={:?} hop_logdet={:.4e} log_det_h_proj={:.4e}",
-                        kernel_trans_ref.u_s.shape(),
-                        kernel_trans_ref.h_proj_inverse.shape(),
-                        hessian_op.logdet(),
-                        log_det_h_proj
-                    );
-                }
                 let kernel_orig = kernel_trans.map(|kernel_trans| {
                     let u_s_orig = qs.dot(&kernel_trans.u_s);
-                    eprintln!(
-                        "[PROBE-QS] u_s_orig.shape={:?}",
-                        u_s_orig.shape()
-                    );
                     std::sync::Arc::new(super::unified::PenaltySubspaceTrace {
                         u_s: u_s_orig,
                         h_proj_inverse: kernel_trans.h_proj_inverse,
