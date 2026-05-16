@@ -2511,46 +2511,49 @@ where
             problem
         };
 
-        let prepass_seed: Option<Array1<f64>> = {
-            let bnds = reml_seed_config.bounds;
-            let (lo, hi) = if bnds.0 <= bnds.1 {
-                bnds
-            } else {
-                (bnds.1, bnds.0)
-            };
-            // risk_shift is the default seed bias when no caller warm-start is given;
-            // it is NOT applied on top of a caller-supplied heuristic_lambdas.
-            let risk_shift: f64 = match reml_seed_config.risk_profile {
-                SeedRiskProfile::Gaussian => 0.0,
-                SeedRiskProfile::GeneralizedLinear => 1.0,
-                SeedRiskProfile::Survival => 2.0,
-            };
-            let base = if let Some(h) = heuristic_lambdas.as_ref().filter(|h| h.len() == k) {
-                Array1::from_iter(h.iter().map(|&v| v.max(1e-12).ln().clamp(lo, hi)))
-            } else {
-                Array1::from_elem(k, risk_shift.clamp(lo, hi))
-            };
-            let refined = crate::seeding::select_objective_seed_on_log_lambda_grid(
-                &base,
-                (lo, hi),
-                k,
-                |rho| reml_state.compute_cost(rho).ok().filter(|c| c.is_finite()),
-            );
-            if refined
-                .iter()
-                .zip(base.iter())
-                .any(|(&a, &b)| (a - b).abs() > 1e-12)
-            {
-                log::info!(
-                    "[OUTER] standard REML objective-grid selected seed: {:?} -> {:?}",
-                    base.as_slice().unwrap_or(&[]),
-                    refined.as_slice().unwrap_or(&[])
-                );
-                Some(refined)
-            } else {
+        let prepass_seed: Option<Array1<f64>> =
+            if matches!(reml_seed_config.risk_profile, SeedRiskProfile::Gaussian) {
                 None
-            }
-        };
+            } else {
+                let bnds = reml_seed_config.bounds;
+                let (lo, hi) = if bnds.0 <= bnds.1 {
+                    bnds
+                } else {
+                    (bnds.1, bnds.0)
+                };
+                // risk_shift is the default seed bias when no caller warm-start is given;
+                // it is NOT applied on top of a caller-supplied heuristic_lambdas.
+                let risk_shift: f64 = match reml_seed_config.risk_profile {
+                    SeedRiskProfile::Gaussian => 0.0,
+                    SeedRiskProfile::GeneralizedLinear => 1.0,
+                    SeedRiskProfile::Survival => 2.0,
+                };
+                let base = if let Some(h) = heuristic_lambdas.as_ref().filter(|h| h.len() == k) {
+                    Array1::from_iter(h.iter().map(|&v| v.max(1e-12).ln().clamp(lo, hi)))
+                } else {
+                    Array1::from_elem(k, risk_shift.clamp(lo, hi))
+                };
+                let refined = crate::seeding::select_objective_seed_on_log_lambda_grid(
+                    &base,
+                    (lo, hi),
+                    k,
+                    |rho| reml_state.compute_cost(rho).ok().filter(|c| c.is_finite()),
+                );
+                if refined
+                    .iter()
+                    .zip(base.iter())
+                    .any(|(&a, &b)| (a - b).abs() > 1e-12)
+                {
+                    log::info!(
+                        "[OUTER] standard REML objective-grid selected seed: {:?} -> {:?}",
+                        base.as_slice().unwrap_or(&[]),
+                        refined.as_slice().unwrap_or(&[])
+                    );
+                    Some(refined)
+                } else {
+                    None
+                }
+            };
         let problem = if let Some(seed) = prepass_seed {
             problem.with_initial_rho(seed)
         } else {
