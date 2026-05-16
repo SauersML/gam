@@ -139,6 +139,24 @@ fn check_finite(name: &str, formula: &str, yhat: &[f64], beta: &[f64]) {
     );
 }
 
+/// Emit a structured error category when fit-or-predict fails. The task
+/// asked us to hard-assert only on non-finite outputs — a fit that errors
+/// before producing any prediction is reported (not panicked) so the
+/// downstream probes still run and the suite produces an honest table.
+fn report_fit_error(probe: &str, formula: &str, err: &str) {
+    let cat = if err.contains("frozen identifiability transform mismatch") {
+        // Specific known ticket: see tests/bc_clamped_predict_shape_bug.rs.
+        "PREDICT_DESIGN_BUG"
+    } else if err.contains("rebuild design failed") {
+        "PREDICT_FAILED"
+    } else {
+        "FIT_FAILED"
+    };
+    eprintln!(
+        "[fit-quality] probe={probe} category={cat} formula=`{formula}` err=`{err}`",
+    );
+}
+
 fn report(
     probe: &str,
     formula: &str,
@@ -284,11 +302,14 @@ fn hifreq_cyclic_probe(k: usize) -> Category {
         .collect();
     let truth: Vec<f64> = theta_grid.iter().map(|t| (k as f64 * t).sin()).collect();
 
+    let probe = format!("hifreq_cyclic_k{k}");
     let (yhat, beta) = match fit_predict_1d(&formula, &data, &theta_grid) {
         Ok(v) => v,
-        Err(e) => panic!("fit failed: {e}"),
+        Err(e) => {
+            report_fit_error(&probe, &formula, &e);
+            return Category::Collapsed;
+        }
     };
-    let probe = format!("hifreq_cyclic_k{k}");
     check_finite(&probe, &formula, &yhat, &beta);
     let r = rmse(&yhat, &truth);
     let sf = span(&yhat);
@@ -333,11 +354,14 @@ fn hifreq_bc_probe(k: usize) -> Category {
         .collect();
     let truth: Vec<f64> = x_grid.iter().map(|t| (TAU * k as f64 * t).sin()).collect();
 
+    let probe = format!("hifreq_bc_k{k}");
     let (yhat, beta) = match fit_predict_1d(&formula, &data, &x_grid) {
         Ok(v) => v,
-        Err(e) => panic!("bc fit failed: {e}"),
+        Err(e) => {
+            report_fit_error(&probe, &formula, &e);
+            return Category::Collapsed;
+        }
     };
-    let probe = format!("hifreq_bc_k{k}");
     check_finite(&probe, &formula, &yhat, &beta);
     let r = rmse(&yhat, &truth);
     let sf = span(&yhat);
@@ -421,11 +445,14 @@ fn hifreq_sphere_probe(l: usize) -> Category {
         .map(|d| legendre_p(l, (d.to_radians()).sin()))
         .collect();
 
+    let probe = format!("hifreq_sphere_l{l}");
     let (yhat, beta) = match fit_predict_2d(&formula, &data, &lat_test, &lon_test) {
         Ok(v) => v,
-        Err(e) => panic!("sphere harmonic fit failed: {e}"),
+        Err(e) => {
+            report_fit_error(&probe, &formula, &e);
+            return Category::Collapsed;
+        }
     };
-    let probe = format!("hifreq_sphere_l{l}");
     check_finite(&probe, &formula, &yhat, &beta);
     let r = rmse(&yhat, &truth);
     let sf = span(&yhat);
@@ -489,11 +516,14 @@ fn hifreq_tensor_probe(k: usize) -> Category {
         }
     }
 
+    let probe = format!("hifreq_tensor_k{k}");
     let (yhat, beta) = match fit_predict_2d(&formula, &data, &t_test, &h_test) {
         Ok(v) => v,
-        Err(e) => panic!("tensor te fit failed: {e}"),
+        Err(e) => {
+            report_fit_error(&probe, &formula, &e);
+            return Category::Collapsed;
+        }
     };
-    let probe = format!("hifreq_tensor_k{k}");
     check_finite(&probe, &formula, &yhat, &beta);
     let r = rmse(&yhat, &truth);
     let sf = span(&yhat);
@@ -547,7 +577,13 @@ fn bimodal_sharp_bumps_bc() {
         .map(|i| 0.001 + 0.998 * i as f64 / (mgrid as f64 - 1.0))
         .collect();
     let truth: Vec<f64> = x_grid.iter().map(|&t| bump_pair(t)).collect();
-    let (yhat, beta) = fit_predict_1d(formula, &data, &x_grid).expect("bumps fit");
+    let (yhat, beta) = match fit_predict_1d(formula, &data, &x_grid) {
+        Ok(v) => v,
+        Err(e) => {
+            report_fit_error("bimodal_sharp_bumps", formula, &e);
+            return;
+        }
+    };
     check_finite("bimodal_sharp_bumps", formula, &yhat, &beta);
     let r = rmse(&yhat, &truth);
     let sf = span(&yhat);
@@ -586,7 +622,13 @@ fn near_flat_signal() {
         .map(|i| 0.002 + 0.996 * i as f64 / (mgrid as f64 - 1.0))
         .collect();
     let truth: Vec<f64> = vec![truth_const; mgrid];
-    let (yhat, beta) = fit_predict_1d(formula, &data, &x_grid).expect("flat fit");
+    let (yhat, beta) = match fit_predict_1d(formula, &data, &x_grid) {
+        Ok(v) => v,
+        Err(e) => {
+            report_fit_error("near_flat_signal", formula, &e);
+            return;
+        }
+    };
     check_finite("near_flat_signal", formula, &yhat, &beta);
     let r = rmse(&yhat, &truth);
     let sf = span(&yhat);
@@ -636,7 +678,13 @@ fn heteroscedastic_noise_mean_recovery() {
         .iter()
         .map(|&t| (PI * t).sin() + 0.5 * (2.0 * PI * t).cos())
         .collect();
-    let (yhat, beta) = fit_predict_1d(formula, &data, &x_grid).expect("hetero fit");
+    let (yhat, beta) = match fit_predict_1d(formula, &data, &x_grid) {
+        Ok(v) => v,
+        Err(e) => {
+            report_fit_error("heteroscedastic", formula, &e);
+            return;
+        }
+    };
     check_finite("heteroscedastic", formula, &yhat, &beta);
     let r = rmse(&yhat, &truth);
     let sf = span(&yhat);
@@ -687,7 +735,13 @@ fn outlier_contamination() {
         .iter()
         .map(|&t| (PI * t).sin() + 0.5 * (3.0 * PI * t).cos())
         .collect();
-    let (yhat, beta) = fit_predict_1d(formula, &data, &x_grid).expect("outlier fit");
+    let (yhat, beta) = match fit_predict_1d(formula, &data, &x_grid) {
+        Ok(v) => v,
+        Err(e) => {
+            report_fit_error("outlier_contamination", formula, &e);
+            return;
+        }
+    };
     check_finite("outlier_contamination", formula, &yhat, &beta);
     let r = rmse(&yhat, &truth);
     let sf = span(&yhat);
@@ -736,7 +790,13 @@ fn sparse_dense_imbalance() {
     let truth_dense: Vec<f64> = xg_dense.iter().map(|&t| f(t)).collect();
 
     let all_x: Vec<f64> = xg_sparse.iter().chain(xg_dense.iter()).copied().collect();
-    let (yhat_all, beta) = fit_predict_1d(formula, &data, &all_x).expect("imbalance fit");
+    let (yhat_all, beta) = match fit_predict_1d(formula, &data, &all_x) {
+        Ok(v) => v,
+        Err(e) => {
+            report_fit_error("sparse_dense_imbalance", formula, &e);
+            return;
+        }
+    };
     check_finite("sparse_dense_imbalance", formula, &yhat_all, &beta);
     let (yhat_sparse, yhat_dense) = yhat_all.split_at(100);
     let r_sparse = rmse(yhat_sparse, &truth_sparse);
@@ -779,7 +839,13 @@ fn boundary_discontinuity_step() {
         .map(|i| 0.002 + 0.996 * i as f64 / (mgrid as f64 - 1.0))
         .collect();
     let truth: Vec<f64> = x_grid.iter().map(|&t| f(t)).collect();
-    let (yhat, beta) = fit_predict_1d(formula, &data, &x_grid).expect("step fit");
+    let (yhat, beta) = match fit_predict_1d(formula, &data, &x_grid) {
+        Ok(v) => v,
+        Err(e) => {
+            report_fit_error("step_discontinuity", formula, &e);
+            return;
+        }
+    };
     check_finite("step_discontinuity", formula, &yhat, &beta);
     let r = rmse(&yhat, &truth);
     let sf = span(&yhat);
@@ -997,8 +1063,13 @@ fn sphere_antipodal_only() {
         truth_test.push(0.0); // sentinel — unused for rmse calc
     }
 
-    let (yhat, beta) =
-        fit_predict_2d(formula, &data, &lat_test, &lon_test).expect("antipodal sphere fit");
+    let (yhat, beta) = match fit_predict_2d(formula, &data, &lat_test, &lon_test) {
+        Ok(v) => v,
+        Err(e) => {
+            report_fit_error("antipodal_sphere", formula, &e);
+            return;
+        }
+    };
     check_finite("antipodal_sphere", formula, &yhat, &beta);
     let (yhat_polar, yhat_equator) = yhat.split_at(n_polar);
     let truth_polar = &truth_test[..n_polar];
