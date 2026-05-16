@@ -18120,6 +18120,347 @@ pub fn evaluate_bspline_basis_scalar(
     Ok(())
 }
 
+/// Configuration for a dense one-dimensional periodic B-spline basis.
+///
+/// The basis lives on a circle parameterized by `origin + [0, period)`.  It is
+/// vector-valued agnostic: the same scalar periodic design can be shared by any
+/// number of ambient output coordinates, so a single fitted curve
+/// `u -> R^d_ambient` can trace ellipses, ovals, and skewed/distorted closed
+/// loops without assuming a unit circle embedding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeriodicBSplineBasisSpec {
+    /// Polynomial degree of the cardinal B-spline pieces.
+    pub degree: usize,
+    /// Number of periodic basis functions around the circle.
+    pub num_basis: usize,
+    /// Period of the parameter coordinate.
+    pub period: f64,
+    /// Parameter value identified with zero phase.
+    pub origin: f64,
+    /// Cyclic finite-difference order used by curve fitting penalties.
+    pub penalty_order: usize,
+}
+
+impl PeriodicBSplineBasisSpec {
+    /// Construct a validated-looking spec. Full semantic validation is still
+    /// performed by builders so deserialized specs receive identical checks.
+    pub fn new(
+        degree: usize,
+        num_basis: usize,
+        period: f64,
+        origin: f64,
+        penalty_order: usize,
+    ) -> Self {
+        Self {
+            degree,
+            num_basis,
+            period,
+            origin,
+            penalty_order,
+        }
+    }
+}
+
+/// Fitted vector-valued periodic spline curve.
+///
+/// `coefficients` has shape `(num_basis, ambient_dim)`. Evaluation multiplies
+/// the periodic scalar basis row by every output column, preserving any
+/// anisotropic stretching, skew, or non-circular shape present in the training
+/// coordinates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeriodicSplineCurve {
+    pub spec: PeriodicBSplineBasisSpec,
+    pub coefficients: Array2<f64>,
+}
+
+impl PeriodicSplineCurve {
+    /// Number of coordinates in the ambient output space.
+    pub fn ambient_dim(&self) -> usize {
+        self.coefficients.ncols()
+    }
+
+    /// Evaluate the fitted curve at arbitrary parameter values. Values outside
+    /// the base interval are wrapped modulo `period`.
+    pub fn evaluate(&self, u: ArrayView1<'_, f64>) -> Result<Array2<f64>, BasisError> {
+        if self.coefficients.nrows() != self.spec.num_basis {
+            return Err(BasisError::DimensionMismatch(format!(
+                "curve coefficient rows ({}) must equal periodic basis size ({})",
+                self.coefficients.nrows(),
+                self.spec.num_basis
+            )));
+        }
+        let basis = build_periodic_bspline_basis_1d(u, &self.spec)?;
+        Ok(basis.dot(&self.coefficients))
+    }
+}
+
+fn validate_periodic_bspline_spec(spec: &PeriodicBSplineBasisSpec) -> Result<(), BasisError> {
+    if spec.degree < 1 {
+        return Err(BasisError::InvalidDegree(spec.degree));
+    }
+    if spec.num_basis < spec.degree + 1 {
+        return Err(BasisError::InvalidInput(format!(
+            "periodic B-spline basis requires num_basis >= degree + 1 (got num_basis={}, degree={})",
+            spec.num_basis, spec.degree
+        )));
+    }
+    if !spec.period.is_finite() || spec.period <= 0.0 {
+        return Err(BasisError::InvalidInput(format!(
+            "periodic B-spline period must be finite and positive, got {}",
+            spec.period
+        )));
+    }
+    if !spec.origin.is_finite() {
+        return Err(BasisError::InvalidInput(format!(
+            "periodic B-spline origin must be finite, got {}",
+            spec.origin
+        )));
+    }
+    if spec.penalty_order == 0 || spec.penalty_order >= spec.num_basis {
+        return Err(BasisError::InvalidPenaltyOrder {
+            order: spec.penalty_order,
+            num_basis: spec.num_basis,
+        });
+    }
+    Ok(())
+}
+
+#[inline]
+fn wrap_periodic_phase(u: f64, origin: f64, period: f64) -> f64 {
+    let wrapped = (u - origin).rem_euclid(period);
+    // Keep values numerically on the half-open interval even when rem_euclid
+    // returns period after extreme-roundoff cancellation.
+    if wrapped >= period { 0.0 } else { wrapped }
+}
+
+fn cardinal_bspline_value(x: f64, degree: usize) -> f64 {
+    if degree == 0 {
+        return if (0.0..1.0).contains(&x) { 1.0 } else { 0.0 };
+    }
+    if x <= 0.0 || x >= (degree + 1) as f64 {
+        return 0.0;
+    }
+    let p = degree as f64;
+    (x / p) * cardinal_bspline_value(x, degree - 1)
+        + (((degree + 1) as f64 - x) / p) * cardinal_bspline_value(x - 1.0, degree - 1)
+}
+
+/// Build a dense periodic cardinal B-spline design for one circular parameter.
+///
+/// Row `i` contains `num_basis` periodic basis functions evaluated at `u[i]`.
+/// The rows form a partition of unity and are exactly periodic in `period`.
+/// No output-space normalization is performed; use the same design matrix for
+/// each coordinate of a vector-valued curve to preserve arbitrary anisotropic
+/// stretching in ambient space.
+pub fn build_periodic_bspline_basis_1d(
+    u: ArrayView1<'_, f64>,
+    spec: &PeriodicBSplineBasisSpec,
+) -> Result<Array2<f64>, BasisError> {
+    validate_periodic_bspline_spec(spec)?;
+    if u.iter().any(|v| !v.is_finite()) {
+        return Err(BasisError::InvalidInput(
+            "periodic B-spline inputs must all be finite".to_string(),
+        ));
+    }
+
+    let n = u.len();
+    let m = spec.num_basis;
+    let h = spec.period / m as f64;
+    let mut out = Array2::<f64>::zeros((n, m));
+    for (row_idx, &ui) in u.iter().enumerate() {
+        let t = wrap_periodic_phase(ui, spec.origin, spec.period) / h;
+        for col in 0..m {
+            // Periodized cardinal B-spline: only nearby copies can overlap the
+            // compact support [0, degree+1]. Checking a tiny k-window is both
+            // faster and avoids cancellation from irrelevant far copies.
+            let mut value = 0.0;
+            let base = t - col as f64;
+            let k_min = ((-base) / m as f64).floor() as isize - 1;
+            let k_max = (((spec.degree + 1) as f64 - base) / m as f64).ceil() as isize + 1;
+            for k in k_min..=k_max {
+                value += cardinal_bspline_value(base + (k as f64) * (m as f64), spec.degree);
+            }
+            out[[row_idx, col]] = value;
+        }
+        let rowsum = out.row(row_idx).sum();
+        if rowsum.is_finite() && rowsum > 0.0 {
+            for col in 0..m {
+                out[[row_idx, col]] /= rowsum;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Cyclic finite-difference penalty `D' D` for periodic spline coefficients.
+///
+/// Unlike ordinary P-spline differences, the stencil wraps at both ends, so the
+/// penalty does not introduce a seam at `origin`.
+pub fn create_cyclic_difference_penalty_matrix(
+    num_basis: usize,
+    order: usize,
+) -> Result<Array2<f64>, BasisError> {
+    if order == 0 || order >= num_basis {
+        return Err(BasisError::InvalidPenaltyOrder { order, num_basis });
+    }
+    let mut coeffs = vec![0.0; order + 1];
+    for (j, c) in coeffs.iter_mut().enumerate() {
+        let sign = if j % 2 == 0 { 1.0 } else { -1.0 };
+        *c = sign * binomial_f64(order, j);
+    }
+    let mut d = Array2::<f64>::zeros((num_basis, num_basis));
+    for row in 0..num_basis {
+        for (j, &c) in coeffs.iter().enumerate() {
+            let col = (row + order - j) % num_basis;
+            d[[row, col]] += c;
+        }
+    }
+    Ok(d.t().dot(&d))
+}
+
+fn solve_spd_cholesky(a: Array2<f64>, b: &Array2<f64>) -> Result<Array2<f64>, BasisError> {
+    let n = a.nrows();
+    if a.ncols() != n || b.nrows() != n {
+        return Err(BasisError::DimensionMismatch(format!(
+            "normal-equation solve shape mismatch: A is {}x{}, B is {}x{}",
+            a.nrows(),
+            a.ncols(),
+            b.nrows(),
+            b.ncols()
+        )));
+    }
+    let mut jitter = 0.0_f64;
+    for attempt in 0..8 {
+        let mut l = a.clone();
+        if jitter > 0.0 {
+            for i in 0..n {
+                l[[i, i]] += jitter;
+            }
+        }
+        let mut ok = true;
+        for i in 0..n {
+            for j in 0..=i {
+                let mut sum = l[[i, j]];
+                for k in 0..j {
+                    sum -= l[[i, k]] * l[[j, k]];
+                }
+                if i == j {
+                    if sum <= 0.0 || !sum.is_finite() {
+                        ok = false;
+                        break;
+                    }
+                    l[[i, j]] = sum.sqrt();
+                } else {
+                    l[[i, j]] = sum / l[[j, j]];
+                }
+            }
+            if !ok {
+                break;
+            }
+            for j in (i + 1)..n {
+                l[[i, j]] = 0.0;
+            }
+        }
+        if ok {
+            let mut y = Array2::<f64>::zeros(b.raw_dim());
+            for i in 0..n {
+                for rhs in 0..b.ncols() {
+                    let mut sum = b[[i, rhs]];
+                    for k in 0..i {
+                        sum -= l[[i, k]] * y[[k, rhs]];
+                    }
+                    y[[i, rhs]] = sum / l[[i, i]];
+                }
+            }
+            let mut x = Array2::<f64>::zeros(b.raw_dim());
+            for i_rev in 0..n {
+                let i = n - 1 - i_rev;
+                for rhs in 0..b.ncols() {
+                    let mut sum = y[[i, rhs]];
+                    for k in (i + 1)..n {
+                        sum -= l[[k, i]] * x[[k, rhs]];
+                    }
+                    x[[i, rhs]] = sum / l[[i, i]];
+                }
+            }
+            return Ok(x);
+        }
+        let diag_scale = (0..n)
+            .map(|i| a[[i, i]].abs())
+            .fold(0.0_f64, f64::max)
+            .max(1.0);
+        jitter = if attempt == 0 {
+            1e-12 * diag_scale
+        } else {
+            jitter * 10.0
+        };
+    }
+    Err(BasisError::InvalidInput(
+        "periodic spline normal equations were not positive definite even after jitter".to_string(),
+    ))
+}
+
+/// Fit a vector-valued 1D periodic spline curve by penalized least squares.
+///
+/// `y` may have any positive number of columns. Each column is solved with the
+/// same periodic basis and smoothing penalty, so the result is a single closed
+/// curve `u -> R^d_ambient`. This deliberately makes no circularity or
+/// isotropy assumption: ellipses, ovals, sheared loops, and other anisotropic
+/// embeddings are represented by the learned multi-output coefficients.
+pub fn fit_periodic_bspline_curve(
+    u: ArrayView1<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    spec: &PeriodicBSplineBasisSpec,
+    smoothing_lambda: f64,
+) -> Result<PeriodicSplineCurve, BasisError> {
+    validate_periodic_bspline_spec(spec)?;
+    if y.nrows() != u.len() {
+        return Err(BasisError::DimensionMismatch(format!(
+            "periodic curve fit requires y rows ({}) to match u length ({})",
+            y.nrows(),
+            u.len()
+        )));
+    }
+    if y.ncols() == 0 {
+        return Err(BasisError::InvalidInput(
+            "periodic curve fit requires at least one ambient output column".to_string(),
+        ));
+    }
+    if !smoothing_lambda.is_finite() || smoothing_lambda < 0.0 {
+        return Err(BasisError::InvalidInput(format!(
+            "smoothing_lambda must be finite and nonnegative, got {smoothing_lambda}"
+        )));
+    }
+    if y.iter().any(|v| !v.is_finite()) {
+        return Err(BasisError::InvalidInput(
+            "periodic curve outputs must all be finite".to_string(),
+        ));
+    }
+
+    let basis = build_periodic_bspline_basis_1d(u, spec)?;
+    let mut lhs = basis.t().dot(&basis);
+    if smoothing_lambda > 0.0 {
+        let penalty = create_cyclic_difference_penalty_matrix(spec.num_basis, spec.penalty_order)?;
+        lhs = lhs + smoothing_lambda * penalty;
+    }
+    // A tiny ridge selects a stable coefficient representative in the rare case
+    // of undersampled or exactly aliased parameter grids while leaving ordinary
+    // fits unchanged at test tolerances.
+    let diag_scale = (0..lhs.nrows())
+        .map(|i| lhs[[i, i]].abs())
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    for i in 0..lhs.nrows() {
+        lhs[[i, i]] += 1e-12 * diag_scale;
+    }
+    let rhs = basis.t().dot(&y);
+    let coefficients = solve_spd_cholesky(lhs, &rhs)?;
+    Ok(PeriodicSplineCurve {
+        spec: spec.clone(),
+        coefficients,
+    })
+}
+
 /// Evaluates M-spline basis functions at a scalar point `x` into a provided buffer.
 ///
 /// Construction:
@@ -21719,6 +22060,125 @@ mod tests {
     use ndarray::{Array1, Array2, array};
     use num_dual::{DualNum, second_derivative};
     use std::sync::Arc;
+
+    #[test]
+    fn periodic_bspline_basis_wraps_and_forms_partition_of_unity() {
+        let spec = PeriodicBSplineBasisSpec::new(3, 12, std::f64::consts::TAU, -0.25, 2);
+        let u = array![
+            -0.25,
+            0.0,
+            0.7,
+            std::f64::consts::TAU - 0.25,
+            std::f64::consts::TAU + 0.7,
+            4.0 * std::f64::consts::TAU + 1.2,
+        ];
+        let basis = build_periodic_bspline_basis_1d(u.view(), &spec).unwrap();
+        assert_eq!(basis.nrows(), u.len());
+        assert_eq!(basis.ncols(), spec.num_basis);
+        for row in basis.rows() {
+            assert_abs_diff_eq!(row.sum(), 1.0, epsilon = 1e-13);
+            assert!(row.iter().all(|v| *v >= -1e-14));
+        }
+
+        let shifted = array![
+            u[1] + spec.period,
+            u[2] - 3.0 * spec.period,
+            u[5] + spec.period
+        ];
+        let shifted_basis = build_periodic_bspline_basis_1d(shifted.view(), &spec).unwrap();
+        for col in 0..spec.num_basis {
+            assert_abs_diff_eq!(basis[[1, col]], shifted_basis[[0, col]], epsilon = 1e-13);
+            assert_abs_diff_eq!(basis[[2, col]], shifted_basis[[1, col]], epsilon = 1e-13);
+            assert_abs_diff_eq!(basis[[5, col]], shifted_basis[[2, col]], epsilon = 1e-13);
+        }
+    }
+
+    #[test]
+    fn cyclic_difference_penalty_has_no_endpoint_seam() {
+        let s = create_cyclic_difference_penalty_matrix(16, 2).unwrap();
+        assert_eq!(s.nrows(), 16);
+        assert_eq!(s.ncols(), 16);
+        assert_abs_diff_eq!(s[[0, 15]], -4.0, epsilon = 1e-14);
+        assert_abs_diff_eq!(s[[15, 0]], -4.0, epsilon = 1e-14);
+
+        let constants = Array2::from_elem((16, 1), 3.25);
+        let linear_phase = Array2::from_shape_fn((16, 1), |(i, _)| i as f64);
+        let const_pen = constants.t().dot(&s.dot(&constants))[[0, 0]];
+        let linear_pen = linear_phase.t().dot(&s.dot(&linear_phase))[[0, 0]];
+        assert_abs_diff_eq!(const_pen, 0.0, epsilon = 1e-12);
+        assert!(
+            linear_pen > 100.0,
+            "nonperiodic seam jump must be penalized"
+        );
+    }
+
+    #[test]
+    fn periodic_multioutput_curve_fits_anisotropic_ellipse_and_skewed_loop() {
+        let period = std::f64::consts::TAU;
+        let n = 240;
+        let mut u = Array1::<f64>::zeros(n);
+        let mut y = Array2::<f64>::zeros((n, 3));
+        for i in 0..n {
+            let t = period * (i as f64) / (n as f64);
+            u[i] = t;
+            y[[i, 0]] = 3.0 * t.cos() + 0.25 * (3.0 * t).sin();
+            y[[i, 1]] = 0.65 * t.sin() + 0.20 * (2.0 * t).cos();
+            y[[i, 2]] = 1.4 * (t + 0.35).cos() - 0.10 * (4.0 * t).sin();
+        }
+        let spec = PeriodicBSplineBasisSpec::new(3, 36, period, 0.0, 2);
+        let curve = fit_periodic_bspline_curve(u.view(), y.view(), &spec, 1e-9).unwrap();
+        assert_eq!(curve.ambient_dim(), 3);
+
+        let pred = curve.evaluate(u.view()).unwrap();
+        let rms = ((&pred - &y).mapv(|v| v * v).sum() / (n * 3) as f64).sqrt();
+        assert!(rms < 0.015, "periodic multi-output RMS too high: {rms}");
+
+        // The fit must preserve anisotropic output scale rather than projecting
+        // onto a unit circle.  The first coordinate is deliberately much wider
+        // than the second coordinate.
+        let x_min = pred.column(0).iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let x_max = pred
+            .column(0)
+            .iter()
+            .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        let y_min = pred.column(1).iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let y_max = pred
+            .column(1)
+            .iter()
+            .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        let aspect = (x_max - x_min) / (y_max - y_min);
+        assert!(
+            aspect > 3.5,
+            "ellipse stretching was not preserved: aspect={aspect}"
+        );
+
+        let query = array![0.13, 1.7, period - 0.02];
+        let wrapped = array![0.13 + 5.0 * period, 1.7 - 2.0 * period, -0.02];
+        let q_pred = curve.evaluate(query.view()).unwrap();
+        let w_pred = curve.evaluate(wrapped.view()).unwrap();
+        for i in 0..q_pred.nrows() {
+            for j in 0..q_pred.ncols() {
+                assert_abs_diff_eq!(q_pred[[i, j]], w_pred[[i, j]], epsilon = 1e-11);
+            }
+        }
+    }
+
+    #[test]
+    fn periodic_curve_validation_rejects_bad_shapes() {
+        let bad_period = PeriodicBSplineBasisSpec::new(3, 8, 0.0, 0.0, 2);
+        let u = array![0.0, 1.0];
+        let err = build_periodic_bspline_basis_1d(u.view(), &bad_period).unwrap_err();
+        assert!(err.to_string().contains("period"));
+
+        let spec = PeriodicBSplineBasisSpec::new(3, 8, 1.0, 0.0, 2);
+        let y = Array2::<f64>::zeros((3, 2));
+        let err = fit_periodic_bspline_curve(u.view(), y.view(), &spec, 0.0).unwrap_err();
+        assert!(err.to_string().contains("match u length"));
+
+        let no_outputs = Array2::<f64>::zeros((2, 0));
+        let err = fit_periodic_bspline_curve(u.view(), no_outputs.view(), &spec, 0.0).unwrap_err();
+        assert!(err.to_string().contains("ambient output"));
+    }
 
     #[test]
     fn stable_hybrid_duchon_radial_obeys_kernel_scaling_and_kappa_zero_limit() {
