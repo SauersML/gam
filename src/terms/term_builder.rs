@@ -218,16 +218,60 @@ pub fn build_termspec(
 // Smooth basis spec construction
 // ---------------------------------------------------------------------------
 
+/// Look up a per-side boundary-condition key under any of several names that
+/// users intuitively reach for, picking the first present. Aliases:
+///   - left  → bc_left, left_bc, start_bc
+///   - right → bc_right, right_bc, end_bc
+fn endpoint_bc_raw<'a>(options: &'a BTreeMap<String, String>, side: &str) -> Option<&'a String> {
+    let aliases: &[&str] = match side {
+        "left" => &["bc_left", "left_bc", "start_bc"],
+        "right" => &["bc_right", "right_bc", "end_bc"],
+        _ => &[],
+    };
+    aliases.iter().find_map(|k| options.get(*k))
+}
+
+/// Anchor lookup: per-side `anchor_<side>`/`<side>_anchor`, else global
+/// `anchor`/`anchor_value`/`value`.
+fn endpoint_anchor_value(options: &BTreeMap<String, String>, side: &str) -> Option<f64> {
+    let side_keys: &[&str] = match side {
+        "left" => &["anchor_left", "left_anchor"],
+        "right" => &["anchor_right", "right_anchor"],
+        _ => &[],
+    };
+    for k in side_keys {
+        if let Some(v) = option_f64(options, k) {
+            return Some(v);
+        }
+    }
+    for k in &["anchor", "anchor_value", "value"] {
+        if let Some(v) = option_f64(options, k) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+enum SideFilter {
+    Both,
+    Left,
+    Right,
+}
+
 fn parse_bspline_endpoint_condition(
     options: &BTreeMap<String, String>,
     side: &str,
     global_bc: Option<&str>,
+    side_filter: SideFilter,
 ) -> Result<BSplineEndpointBoundaryCondition, String> {
-    let side_key = format!("bc_{side}");
-    let raw = options
-        .get(&side_key)
+    let applies_global = matches!(
+        (side, side_filter),
+        (_, SideFilter::Both) | ("left", SideFilter::Left) | ("right", SideFilter::Right)
+    );
+    let raw = endpoint_bc_raw(options, side)
         .map(String::as_str)
-        .or(global_bc)
+        .or_else(|| if applies_global { global_bc } else { None })
         .unwrap_or("free")
         .trim()
         .to_ascii_lowercase();
@@ -237,8 +281,7 @@ fn parse_bspline_endpoint_condition(
             Ok(BSplineEndpointBoundaryCondition::Clamped)
         }
         "anchored" | "anchor" | "zero" | "zero_value" | "zero-value" => {
-            let value_key = format!("anchor_{side}");
-            let value = option_f64(options, &value_key).unwrap_or(0.0);
+            let value = endpoint_anchor_value(options, side).unwrap_or(0.0);
             Ok(BSplineEndpointBoundaryCondition::Anchored { value })
         }
         other => Err(format!(
@@ -251,9 +294,23 @@ fn parse_bspline_boundary_conditions(
     options: &BTreeMap<String, String>,
 ) -> Result<BSplineBoundaryConditions, String> {
     let global_bc = options.get("bc").map(String::as_str);
+    let side_filter = match options
+        .get("side")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("both") => SideFilter::Both,
+        Some("left") | Some("start") => SideFilter::Left,
+        Some("right") | Some("end") => SideFilter::Right,
+        Some(other) => {
+            return Err(format!(
+                "unsupported B-spline boundary side '{other}'; use left|right|both"
+            ));
+        }
+    };
     Ok(BSplineBoundaryConditions {
-        left: parse_bspline_endpoint_condition(options, "left", global_bc)?,
-        right: parse_bspline_endpoint_condition(options, "right", global_bc)?,
+        left: parse_bspline_endpoint_condition(options, "left", global_bc, side_filter)?,
+        right: parse_bspline_endpoint_condition(options, "right", global_bc, side_filter)?,
     })
 }
 
@@ -1223,5 +1280,36 @@ mod tests {
         let periods = parse_periods(&opts, &axes).expect("periods");
         assert_eq!(axes, vec![true]);
         assert!((periods[0].unwrap() - 2.0 * std::f64::consts::PI).abs() < 1e-12);
+    }
+
+    #[test]
+    fn parse_bspline_boundary_aliases_and_side_selector() {
+        let mut opts = BTreeMap::new();
+        opts.insert("bc".to_string(), "anchored".to_string());
+        opts.insert("side".to_string(), "left".to_string());
+        opts.insert("anchor".to_string(), "2.5".to_string());
+        let parsed = parse_bspline_boundary_conditions(&opts).expect("boundary options");
+        assert!(matches!(
+            parsed.left,
+            BSplineEndpointBoundaryCondition::Anchored { value } if (value - 2.5).abs() < 1e-12
+        ));
+        assert!(matches!(
+            parsed.right,
+            BSplineEndpointBoundaryCondition::Free
+        ));
+
+        let mut opts = BTreeMap::new();
+        opts.insert("start_bc".to_string(), "clamped".to_string());
+        opts.insert("end_bc".to_string(), "zero".to_string());
+        opts.insert("right_anchor".to_string(), "-1.0".to_string());
+        let parsed = parse_bspline_boundary_conditions(&opts).expect("boundary aliases");
+        assert!(matches!(
+            parsed.left,
+            BSplineEndpointBoundaryCondition::Clamped
+        ));
+        assert!(matches!(
+            parsed.right,
+            BSplineEndpointBoundaryCondition::Anchored { value } if (value + 1.0).abs() < 1e-12
+        ));
     }
 }
