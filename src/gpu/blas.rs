@@ -346,9 +346,7 @@ impl CublasRuntime {
     ) -> Option<DeviceAllocation<'a>> {
         let allocation = unsafe { DeviceAllocation::new(&self.driver, bytes) }?;
         check_cuda(
-            unsafe {
-                (self.driver.cu_memcpy_htod)(allocation.ptr, values.as_ptr().cast(), bytes)
-            },
+            unsafe { (self.driver.cu_memcpy_htod)(allocation.ptr, values.as_ptr().cast(), bytes) },
             "cuMemcpyHtoD",
         )
         .ok()?;
@@ -487,12 +485,18 @@ impl CublasApi {
     fn load(library: &Library) -> Result<Self, String> {
         unsafe {
             Ok(Self {
-                cublas_create: *library.get(b"cublasCreate_v2\0").map_err(|e| e.to_string())?,
+                cublas_create: *library
+                    .get(b"cublasCreate_v2\0")
+                    .map_err(|e| e.to_string())?,
                 cublas_destroy: *library
                     .get(b"cublasDestroy_v2\0")
                     .map_err(|e| e.to_string())?,
-                cublas_dgemm: *library.get(b"cublasDgemm_v2\0").map_err(|e| e.to_string())?,
-                cublas_dgemv: *library.get(b"cublasDgemv_v2\0").map_err(|e| e.to_string())?,
+                cublas_dgemm: *library
+                    .get(b"cublasDgemm_v2\0")
+                    .map_err(|e| e.to_string())?,
+                cublas_dgemv: *library
+                    .get(b"cublasDgemv_v2\0")
+                    .map_err(|e| e.to_string())?,
             })
         }
     }
@@ -511,7 +515,9 @@ fn check_cuda(result: CuResult, name: &str) -> Result<(), String> {
     if result == 0 {
         Ok(())
     } else {
-        Err(format!("{name} failed with CUDA driver error code {result}"))
+        Err(format!(
+            "{name} failed with CUDA driver error code {result}"
+        ))
     }
 }
 
@@ -538,10 +544,7 @@ fn cublas_library_candidates() -> &'static [&'static str] {
     if cfg!(target_os = "windows") {
         &["cublas64_12.dll", "cublas64_11.dll"]
     } else if cfg!(target_os = "macos") {
-        &[
-            "/usr/local/cuda/lib/libcublas.dylib",
-            "libcublas.dylib",
-        ]
+        &["/usr/local/cuda/lib/libcublas.dylib", "libcublas.dylib"]
     } else {
         &["libcublas.so.12", "libcublas.so.11", "libcublas.so"]
     }
