@@ -263,17 +263,44 @@ pub fn build_smooth_basis(
                     vars.join(",")
                 ));
             }
+            let bc = parse_boundary_conditions(options, cols.len())?;
+            let periods = parse_periods(options, cols.len())?;
             let specs = cols
                 .iter()
-                .map(|&c| {
+                .enumerate()
+                .map(|(dim, &c)| {
                     let (minv, maxv) = col_minmax(ds.values.column(c))?;
+                    let knotspec = if bc[dim].as_deref() == Some("periodic") {
+                        let period = periods
+                            .as_ref()
+                            .and_then(|p| p.get(dim).copied())
+                            .ok_or_else(|| {
+                                format!(
+                                    "periodic tensor margin '{}' requires period=[...] with one positive period per margin",
+                                    vars[dim]
+                                )
+                            })?;
+                        if !period.is_finite() || period <= 0.0 {
+                            return Err(format!(
+                                "periodic tensor margin '{}' requires a finite positive period, got {}",
+                                vars[dim], period
+                            ));
+                        }
+                        BSplineKnotSpec::Periodic {
+                            domain_start: minv,
+                            period,
+                            num_basis: n_knots + degree + 1,
+                        }
+                    } else {
+                        BSplineKnotSpec::Generate {
+                            data_range: (minv, maxv),
+                            num_internal_knots: n_knots,
+                        }
+                    };
                     Ok(BSplineBasisSpec {
                         degree,
                         penalty_order: 2,
-                        knotspec: BSplineKnotSpec::Generate {
-                            data_range: (minv, maxv),
-                            num_internal_knots: n_knots,
-                        },
+                        knotspec,
                         double_penalty: smooth_double_penalty,
                         identifiability: BSplineIdentifiability::None,
                     })
@@ -625,6 +652,73 @@ pub fn heuristic_knots_for_column(col: ArrayView1<'_, f64>) -> usize {
 
 pub fn heuristic_centers(n: usize, d: usize) -> usize {
     default_num_centers(n, d)
+}
+
+fn split_option_list(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    inner
+        .split(',')
+        .map(|part| {
+            part.trim()
+                .trim_matches(|c| c == '\'' || c == '"')
+                .to_ascii_lowercase()
+        })
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn parse_boundary_conditions(
+    options: &BTreeMap<String, String>,
+    dims: usize,
+) -> Result<Vec<Option<String>>, String> {
+    let Some(raw) = options.get("bc").or_else(|| options.get("boundary")) else {
+        return Ok(vec![None; dims]);
+    };
+    let values = split_option_list(raw);
+    if values.len() != dims {
+        return Err(format!(
+            "bc must provide one boundary condition per tensor margin (expected {dims}, got {})",
+            values.len()
+        ));
+    }
+    values
+        .into_iter()
+        .map(|v| match v.as_str() {
+            "periodic" | "cyclic" | "cycle" => Ok(Some("periodic".to_string())),
+            "none" | "open" | "natural" => Ok(None),
+            other => Err(format!(
+                "unsupported tensor boundary condition '{other}'; supported values are 'periodic' and 'none'"
+            )),
+        })
+        .collect()
+}
+
+fn parse_periods(
+    options: &BTreeMap<String, String>,
+    dims: usize,
+) -> Result<Option<Vec<f64>>, String> {
+    let Some(raw) = options.get("period").or_else(|| options.get("periods")) else {
+        return Ok(None);
+    };
+    let values = split_option_list(raw);
+    if values.len() != dims {
+        return Err(format!(
+            "period must provide one numeric period per tensor margin (expected {dims}, got {})",
+            values.len()
+        ));
+    }
+    values
+        .into_iter()
+        .map(|v| {
+            v.parse::<f64>()
+                .map_err(|_| format!("invalid period value '{v}'; expected a number"))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 // ---------------------------------------------------------------------------
