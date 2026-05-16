@@ -8822,6 +8822,50 @@ fn update_joint_trust_region_radius(
     }
 }
 
+/// Coefficient-space sanity cap on the joint-Newton trust radius.
+///
+/// The cycle-0 trust-radius bump (see the `cycle == 0` block in the
+/// joint-Newton inner loop) caps the initial radius at
+/// `max_step_inf · ‖δ‖₂ / ‖δ‖∞` so that rescaling a Newton proposal of
+/// inf-norm `step_inf` to an L2 length `r` keeps every β coordinate
+/// inside `max_step_inf` per truncated step. The trust-region update
+/// then grows/shrinks this radius by ratio rules alone, never re-applying
+/// the inf-norm guard.
+///
+/// On near-null directions of the joint Hessian — where the local
+/// quadratic model matches the true objective decrease almost exactly
+/// (ρ ≈ 1) but the curvature along the direction is tiny — every
+/// accepted step pegs `step_norm` at the trust-region boundary, so the
+/// update branch doubles the radius unconditionally. Each next clipped
+/// step then grows `‖β‖∞` proportionally, and β slides along the flat
+/// direction to numerical infinity (observed: ‖β‖∞ from 6 to >2000 in
+/// ten accepted cycles on the 3-block Binomial location-scale-wiggle
+/// Matern smoke fit, with `‖∇L−Sβ‖∞` staying at O(10) far above tol).
+///
+/// Bound the post-update radius so the next clipped Newton proposal's
+/// inf-norm cannot exceed `JOINT_NEWTON_TRUST_RADIUS_EXPANSION_MAX_STEP_INF`,
+/// using the just-accepted step's L2/inf ratio as the conversion. This
+/// applies the same `max_step_inf · L2 / inf` cap (case (c) from the
+/// cycle-0 comment block) to every iteration, not just the first.
+fn cap_joint_trust_region_radius_to_step_inf(radius: f64, step_norm: f64, step_inf: f64) -> f64 {
+    let max_step_inf = JOINT_NEWTON_TRUST_RADIUS_EXPANSION_MAX_STEP_INF;
+    if !step_inf.is_finite()
+        || step_inf <= 0.0
+        || !step_norm.is_finite()
+        || step_norm <= 0.0
+        || !max_step_inf.is_finite()
+        || max_step_inf <= 0.0
+    {
+        return radius;
+    }
+    let r_safe = max_step_inf * step_norm / step_inf;
+    if r_safe.is_finite() && r_safe > 0.0 && r_safe < radius {
+        r_safe
+    } else {
+        radius
+    }
+}
+
 fn joint_trust_region_step_norm(delta: &Array1<f64>) -> f64 {
     delta.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
@@ -9246,8 +9290,37 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             None
         };
 
+        // The prior inner's convergence status gates whether we trust
+        // the cached β as a warm start. A diverged prior solve can
+        // leave β iterates with pathological magnitudes (e.g. ‖β‖∞ in
+        // the hundreds after the joint-Newton divergence detector
+        // fires on a flat-direction drift). Restarting the inner from
+        // that β reproduces the divergence; cold start is safer.
+        let prior_inner_converged = seed
+            .cached_inner
+            .as_ref()
+            .map(|cached| cached.converged)
+            .unwrap_or(false);
+        let prior_beta_inf = seed
+            .block_beta
+            .iter()
+            .flat_map(|b| b.iter())
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
+        // Cold-start the inner if the prior didn't converge and β has
+        // grown beyond the joint-Newton per-cycle inf-norm cap by a
+        // wide margin. Below the cap β is well-conditioned and the
+        // soft warm start is still useful (e.g. mid-search rho with a
+        // partially converged inner). Above ~5× the cap, β has slid
+        // into a flat direction and the next solve from that point is
+        // overwhelmingly likely to repeat the drift.
+        let prior_beta_inf_pathological = !prior_inner_converged
+            && prior_beta_inf > 5.0 * JOINT_NEWTON_TRUST_RADIUS_EXPANSION_MAX_STEP_INF;
+
         let mut warm_start_path: &'static str = "cold";
-        if let Some(rho_change_max) = rho_change_max {
+        if let Some(rho_change_max) = rho_change_max
+            && !prior_beta_inf_pathological
+        {
             if rho_change_max < 0.5 {
                 // Modest rho change: reuse prior β as-is (with the
                 // family's required post-update projection).
@@ -9451,6 +9524,24 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // KKT certificate and the end-of-cycle test consumes it
         // directly when it fires.
         let mut last_cycle_obj_change_below_tol = false;
+
+        // Joint-Newton divergence detector. The trust-region radius is
+        // capped at `max_step_inf · L2 / inf` per accepted step, so β
+        // can move by at most `max_step_inf` per coordinate per cycle.
+        // On near-null directions of the joint Hessian (no finite
+        // minimum of the penalized objective along the direction) the
+        // trust-region rejects nothing and every clipped step moves β
+        // by `max_step_inf` in the same direction. Detect this drift
+        // by tracking `‖β‖∞` and the residual: if the residual stays
+        // far above tol while β grows by ≥ 0.5·max_step_inf for many
+        // consecutive cycles, the inner can't reach the KKT optimum
+        // (it's at infinity along a flat direction). Exit unconverged
+        // so the outer optimizer sees the bad rho and backs off.
+        const JOINT_NEWTON_DIVERGENCE_DRIFT_CYCLES: usize = 4;
+        const JOINT_NEWTON_DIVERGENCE_RESIDUAL_RATIO: f64 = 10.0;
+        let mut prev_beta_inf: f64 = f64::NAN;
+        let mut consecutive_drift_cycles: usize = 0;
+        let mut divergence_detected = false;
 
         let mut joint_trust_radius = 1.0_f64;
         // Hard upper bound for the for-loop's range. The cap is fixed at
@@ -10154,7 +10245,21 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     old_objective,
                 );
                 let old_radius = joint_trust_radius;
-                joint_trust_radius = trust_update.radius;
+                // Apply the cycle-0 `max_step_inf · L2 / inf` coefficient-
+                // space cap to every accepted expansion as well, not just
+                // the initial bump. Without this, near-null directions
+                // of the joint Hessian let the trust-region radius double
+                // unbounded and β slides to numerical infinity along a
+                // flat direction.
+                joint_trust_radius = if trust_update.accepted {
+                    cap_joint_trust_region_radius_to_step_inf(
+                        trust_update.radius,
+                        step_norm,
+                        trial_step_inf,
+                    )
+                } else {
+                    trust_update.radius
+                };
                 log::info!(
                     "[PIRLS/joint-Newton/trust-region] cycle={} attempt={} accepted={} rho={:.3e} actual_reduction={:.3e} predicted_reduction={:.3e} radius={:.3e}->{:.3e} step_norm={:.3e} step_inf={:.3e} proposal_inf={:.3e}",
                     cycle,
@@ -10455,6 +10560,79 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 converged = true;
                 break;
             }
+
+            // Numerical-fixed-point convergence: when the unconstrained
+            // Newton proposal, the accepted step, and the objective
+            // change are ALL well below the step / objective tolerance
+            // simultaneously, the iterate has stopped moving. By Newton's
+            // identity `δ = (H+S)⁻¹(∇ℓ − Sβ)`, a vanishing δ requires
+            // `∇ℓ ≈ Sβ`, i.e. residual = 0 up to round-off. A larger
+            // reported residual at this point means the gradient or the
+            // active-set-projected residual carries numerical or
+            // constraint-multiplier mass the canonical KKT test cannot
+            // distinguish from genuine non-stationarity (the wiggle
+            // β ≥ 0 face is the dominant offender on 3-block GAMLSS
+            // wiggle fits). Without this exit, the joint-Newton path
+            // runs to `inner_max_cycles` watching the proposal and
+            // step oscillate at ~1e-5 with the residual stuck at the
+            // multiplier floor — wasted work that surfaces as a
+            // spurious final-refit non-convergence in CI.
+            if step_inf <= step_tol
+                && accepted_step_inf <= step_tol
+                && objective_change <= objective_tol
+            {
+                log::info!(
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | numerical fixed point: proposal_inf={:.3e}, accepted_step_inf={:.3e}, obj_change={:.3e} all ≤ tol={:.3e}; residual={:.3e} ≥ tol={:.3e} attributed to active-set multipliers.",
+                    cycle,
+                    step_inf,
+                    accepted_step_inf,
+                    objective_change,
+                    step_tol.max(objective_tol),
+                    residual,
+                    residual_tol,
+                );
+                converged = true;
+                break;
+            }
+
+            // Joint-Newton divergence detector — see the per-cycle
+            // drift tracker declared at the top of the joint-Newton
+            // block. If the residual is still O(10×) above tolerance
+            // AND ‖β‖∞ grew by ≥ ½·max_step_inf since the previous
+            // accepted cycle, the iterate is sliding along a near-null
+            // direction of the joint Hessian whose penalized objective
+            // has no finite minimum at this `rho`. Exit unconverged
+            // (instead of running to inner_max_cycles) so the outer
+            // optimizer can recognise this `rho` as infeasible and
+            // back off, and so the final inner refit at `rho_star`
+            // doesn't silently spend the full cycle budget walking β
+            // out to ‖β‖∞ ≈ 400 along a flat direction.
+            if prev_beta_inf.is_finite() {
+                let drift = beta_inf - prev_beta_inf;
+                let drift_threshold = 0.5 * JOINT_NEWTON_TRUST_RADIUS_EXPANSION_MAX_STEP_INF;
+                let residual_far_above_tol =
+                    residual > JOINT_NEWTON_DIVERGENCE_RESIDUAL_RATIO * residual_tol;
+                if drift >= drift_threshold && residual_far_above_tol {
+                    consecutive_drift_cycles += 1;
+                } else {
+                    consecutive_drift_cycles = 0;
+                }
+                if consecutive_drift_cycles >= JOINT_NEWTON_DIVERGENCE_DRIFT_CYCLES {
+                    log::warn!(
+                        "[PIRLS/joint-Newton convergence] divergence early-exit at cycle {} | beta_inf drifted by {:.3e} per cycle for {} consecutive cycles | residual={:.3e} (tol={:.3e}); near-null direction of joint Hessian — returning unconverged so the outer optimizer backs off this rho.",
+                        cycle,
+                        drift,
+                        consecutive_drift_cycles,
+                        residual,
+                        residual_tol,
+                    );
+                    converged = false;
+                    divergence_detected = true;
+                    break;
+                }
+            }
+            prev_beta_inf = beta_inf;
+
             // Carry the objective-stagnation signal into the next
             // cycle so the line-search-failure path above can pair it
             // with trust-region collapse to certify a KKT optimum on a
@@ -10487,7 +10665,15 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 joint_workspace: cached_joint_workspace.clone(),
             });
         }
-        if cycles_done >= inner_max_cycles {
+        if cycles_done >= inner_max_cycles || divergence_detected {
+            // Exiting the joint Newton path unconverged is a valid
+            // signal to the outer optimizer when the cycle cap was
+            // reached OR the joint-Newton divergence detector
+            // (β drifting along a near-null direction) fired. Either
+            // way return a successful BlockwiseInnerResult with
+            // `converged = false` so the outer eval sees `inner_converged
+            // = false` at this rho and backs off, rather than treating
+            // the early-exit as an internal error.
             let penalty_value =
                 total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
             let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
@@ -16254,10 +16440,37 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
             )
         })?;
     if !inner.converged {
-        return Err(CustomFamilyError::Optimization(format!(
-            "outer smoothing optimization final inner refit did not converge after {} cycles.{}",
-            inner.cycles, last_error_detail
-        )));
+        // The outer optimizer terminates at the best ρ* it found over
+        // its search, but the inner solve's convergence at that ρ*
+        // depends on the warm start. The outer eval that produced
+        // `final_seed` may have run from a fortunate β that converged;
+        // restarting the inner from that β at the same ρ* can still
+        // diverge when the joint Hessian has a near-null direction
+        // (see the joint-Newton divergence-detector comment block).
+        // Retry the final refit once with a cold start — no warm seed —
+        // before giving up. The cold path runs the full inner solve
+        // from a family-built β₀ that is independent of the search
+        // trajectory and so isn't predisposed to the same drift
+        // direction.
+        log::warn!(
+            "[custom-family final refit] warm-start refit at ρ* did not converge after {} cycles; retrying once with cold start.",
+            inner.cycles,
+        );
+        let cold_retry =
+            inner_blockwise_fit(family, specs, &per_block, options, None).map_err(|e| {
+                format!(
+                    "outer smoothing optimization failed during final inner cold-retry refit: \
+                         {e}.{last_error_detail}"
+                )
+            })?;
+        if cold_retry.converged {
+            inner = cold_retry;
+        } else {
+            return Err(CustomFamilyError::Optimization(format!(
+                "outer smoothing optimization final inner refit did not converge after {} cycles (warm) and {} cycles (cold retry).{}",
+                inner.cycles, cold_retry.cycles, last_error_detail
+            )));
+        }
     }
     refresh_all_block_etas(family, specs, &mut inner.block_states).map_err(|e| {
         format!(
