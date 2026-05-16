@@ -57,7 +57,41 @@ Cost model: total ≈ 8 outer × (X'WX 50 ms + Cholesky 0.5 ms + glue)
 
 ## Roadmap to 150×
 
-### Track 1: discretize-and-fit for tensor smooths (`mgcv::bam` style)
+### Track 0 (preferred): analytic closed-form Gaussian REML
+
+For Gaussian (identity-link) fits — the most common case in geometric
+smooths — REML can be solved analytically without PIRLS iteration:
+
+1. One-time decomposition: simultaneously diagonalize `X'X` and the
+   penalty `S` via the generalized eigenproblem `X'X v = γ S v` (or, in
+   the multi-penalty case, sequential transformation following Wood
+   §6.6.2). Cost: `O(p³)` once.
+2. In the diagonalized basis, the REML score becomes a closed-form sum:
+   `REML(λ) = − 0.5 log|S(λ) + X'X| + log|S(λ)|/2 − 0.5 RSS(λ) / σ²(λ)`.
+   Each evaluation is `O(p)`.
+3. Optimize over λ by 1D (or D-dim) BFGS / Brent: ~10 evals.
+4. Final β = (X'X + S(λ_opt))⁻¹ X'y via the same diagonalization.
+
+Cost breakdown at biobank N=1M, p=128, D smoothing params:
+
+- X'WX assembly:   `O(N·p²)` once = 128 ms (BLAS, 8 cores)
+- Eigendecomp:    `O(p³)` once = ~2 ms
+- REML λ search:  ~10 × `O(p)` = sub-ms
+- Total fit:      **~130–150 ms** (vs. PIRLS at ~23 s)
+- Speedup:        **~150×** with no accuracy penalty (mathematically
+                  identical to the full PIRLS fit at convergence)
+
+This is the principled path: same answer as PIRLS, far less computation.
+
+Estimate: 1 week to implement + validate against PIRLS coefficient
+agreement on a wide test sweep.
+
+Affected modules:
+- `src/solver/estimate.rs` — Gaussian-direct entry that bypasses PIRLS
+- `src/solver/reml/unified.rs` — closed-form REML score + gradient
+- `src/terms/smooth.rs` — auto-detect when Gaussian-direct is safe
+
+### Track 1 (deprecated, kept for reference): discretize-and-fit
 
 For a 2D tensor smooth `te(x, y)` with knot-aligned bin edges:
 
