@@ -3910,6 +3910,5 @@ pub(crate) struct RemlState<'a> {
     /// iteration — the penalty `λ·S` is still added per-λ.
     ///
     /// Invalidated jointly with the design in `reset_surface`.
-    pub(crate) gaussian_fixed_cache:
-        RwLock<Option<Arc<crate::pirls::GaussianFixedCache>>>,
+    pub(crate) gaussian_fixed_cache: RwLock<Option<Arc<crate::pirls::GaussianFixedCache>>>,
 }
