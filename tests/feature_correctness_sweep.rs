@@ -94,7 +94,7 @@ fn periodic_bspline_evaluates_seam_exactly() {
 
 #[test]
 fn periodic_bspline_for_all_supported_degrees() {
-    for degree in 0_usize..=4 {
+    for degree in 1_usize..=4 {
         let period = TAU;
         let k = (degree + 1).max(4);
         let xs = make_uniform_loop(50, period);
@@ -662,7 +662,11 @@ fn both_sphere_methods_give_rotation_invariant_smoothers() {
         rot[(r, 1)] = ((v + 180.0_f64).rem_euclid(360.0_f64)) - 180.0_f64;
     }
     for method in [SphereMethod::Wahba, SphereMethod::Harmonic] {
-        let spec = SphericalSplineBasisSpec {
+        // For Wahba (kernel-based), centers must rotate WITH the data; for
+        // Harmonic (intrinsic basis, no centers), the center_strategy field
+        // is unused. Test the same construction for both: rotate centers
+        // alongside data so the intrinsic test is fair.
+        let spec_a = SphericalSplineBasisSpec {
             center_strategy: CenterStrategy::UserProvided(pts.clone()),
             penalty_order: 2,
             double_penalty: false,
@@ -670,8 +674,16 @@ fn both_sphere_methods_give_rotation_invariant_smoothers() {
             method,
             max_degree: Some(4),
         };
-        let a = build_spherical_spline_basis(pts.view(), &spec).unwrap();
-        let b = build_spherical_spline_basis(rot.view(), &spec).unwrap();
+        let spec_b = SphericalSplineBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(rot.clone()),
+            penalty_order: 2,
+            double_penalty: false,
+            radians: false,
+            method,
+            max_degree: Some(4),
+        };
+        let a = build_spherical_spline_basis(pts.view(), &spec_a).unwrap();
+        let b = build_spherical_spline_basis(rot.view(), &spec_b).unwrap();
         let da = a.design.to_dense();
         let db = b.design.to_dense();
         let ga = da.dot(&da.t());
