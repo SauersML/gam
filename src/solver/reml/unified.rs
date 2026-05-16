@@ -5817,20 +5817,7 @@ pub fn reml_laml_evaluate(
     }
 
     // Outer Hessian (if requested).
-    eprintln!(
-        "[PROBE-RLE] reml_laml_evaluate mode={:?} k={} ext_dim={} hop.dim={}",
-        mode,
-        k,
-        solution.ext_coords.len(),
-        hop.dim()
-    );
     let hessian = if mode == EvalMode::ValueGradientHessian {
-        let has_family_op = effective_deriv.family_outer_hessian_operator().is_some();
-        let has_kernel = effective_deriv.outer_hessian_derivative_kernel().is_some();
-        eprintln!(
-            "[PROBE-RLE] hessian branch family_op_present={} kernel_present={}",
-            has_family_op, has_kernel
-        );
         // First, allow the family to short-circuit with its own exact outer
         // Hv operator.  Default `None` keeps the fall-through identical to
         // the historical kernel-based assembly path; CTN/survival/GAMLSS
