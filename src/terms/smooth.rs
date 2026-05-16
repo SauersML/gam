@@ -12240,6 +12240,10 @@ pub fn freeze_term_collection_from_design(
             ) => {
                 s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
                 s.penalty_order = *penalty_order;
+                if centers.nrows() == 0 {
+                    s.method = crate::basis::SphereMethod::Harmonic;
+                    s.max_degree = Some(*penalty_order);
+                }
             }
             (
                 SmoothBasisSpec::Matern {
