@@ -45,6 +45,7 @@ fn bench_spatial_basis_construction(c: &mut Criterion) {
             identifiability: Default::default(),
             aniso_log_scales: Some(vec![0.15, -0.05, 0.0]),
             operator_penalties: DuchonOperatorPenaltySpec::default(),
+            periodic: false,
         };
         b.iter(|| black_box(build_duchon_basis(data.view(), &spec).unwrap()));
     });
