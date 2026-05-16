@@ -11,6 +11,7 @@ use std::sync::{Mutex, OnceLock};
 
 use super::driver::{
     DeviceAllocation, DriverApi, bytes_len, check_cuda, cuda_library_candidates, load_library,
+    to_i32, to_i64,
 };
 use super::runtime::GpuRuntime;
 
@@ -70,9 +71,12 @@ fn try_csr_spmv<S: Data<Elem = f64>>(
     transpose: bool,
 ) -> Option<Array1<f64>> {
     let nnz = values.len();
-    debug_assert_eq!(rowptr.len(), rows + 1);
-    debug_assert_eq!(colidx.len(), nnz);
-    debug_assert_eq!(x.len(), if transpose { rows } else { cols });
+    if rowptr.len() != rows.checked_add(1)?
+        || colidx.len() != nnz
+        || x.len() != if transpose { rows } else { cols }
+    {
+        return None;
+    }
     if !route_csr_spmv(rows, cols, nnz) {
         return None;
     }
@@ -117,8 +121,10 @@ impl CusparseRuntime {
         unsafe {
             check_cuda((driver.cu_init)(0), "cuInit")?;
             let mut device = 0;
+            let ordinal = to_i32(selected.ordinal)
+                .ok_or_else(|| "CUDA device ordinal exceeds i32".to_string())?;
             check_cuda(
-                (driver.cu_device_get)(&mut device, selected.ordinal as i32),
+                (driver.cu_device_get)(&mut device, ordinal),
                 "cuDeviceGet",
             )?;
             let mut context = 0usize;
@@ -154,11 +160,19 @@ impl CusparseRuntime {
         transpose: bool,
     ) -> Option<Array1<f64>> {
         let nnz = values.len();
+        if rowptr.len() != rows.checked_add(1)? || colidx.len() != nnz {
+            return None;
+        }
         let y_len = if transpose { cols } else { rows };
         let x_len = if transpose { rows } else { cols };
         if x.len() != x_len {
             return None;
         }
+        let rows_i64 = to_i64(rows)?;
+        let cols_i64 = to_i64(cols)?;
+        let nnz_i64 = to_i64(nnz)?;
+        let x_len_i64 = to_i64(x_len)?;
+        let y_len_i64 = to_i64(y_len)?;
         let x_host;
         let x_slice = if let Some(slice) = x.as_slice_memory_order() {
             slice
@@ -184,9 +198,9 @@ impl CusparseRuntime {
             let mut spmat: usize = 0;
             if (self.sparse.cusparse_create_csr)(
                 &mut spmat,
-                rows as i64,
-                cols as i64,
-                nnz as i64,
+                rows_i64,
+                cols_i64,
+                nnz_i64,
                 rowptr_dev.ptr,
                 colidx_dev.ptr,
                 values_dev.ptr,
@@ -201,7 +215,7 @@ impl CusparseRuntime {
             let mut x_descr: usize = 0;
             if (self.sparse.cusparse_create_dnvec)(
                 &mut x_descr,
-                x_len as i64,
+                x_len_i64,
                 x_dev.ptr,
                 CUDA_R_64F,
             ) != CUSPARSE_STATUS_SUCCESS
@@ -212,7 +226,7 @@ impl CusparseRuntime {
             let mut y_descr: usize = 0;
             if (self.sparse.cusparse_create_dnvec)(
                 &mut y_descr,
-                y_len as i64,
+                y_len_i64,
                 y_dev.ptr,
                 CUDA_R_64F,
             ) != CUSPARSE_STATUS_SUCCESS
