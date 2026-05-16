@@ -5125,6 +5125,49 @@ mod tests {
         assert!((tol.threshold(1.0e9, 2.0) - 2.0e-5).abs() < 1e-14);
     }
 
+    #[test]
+    fn outer_gradient_tolerance_with_scale_widens_absolute_floor_for_large_scale() {
+        // Without a scale: abs == tol (legacy behavior).
+        let unscaled = outer_gradient_tolerance_with_scale(1e-7, None);
+        assert_eq!(unscaled.abs, 1e-7);
+        assert_eq!(unscaled.rel_initial_grad, Some(1e-7));
+
+        // With scale = 1e6 (biobank n): abs floor lifts to 1e-3.
+        let big = outer_gradient_tolerance_with_scale(1e-7, Some(1.0e6));
+        assert!(
+            (big.abs - 1.0e-3).abs() < 1e-12,
+            "expected abs ≈ 1e-3 for scale=1e6, got {}",
+            big.abs
+        );
+        // The relative-from-seed component is independent of scale: it
+        // still requires a `tol`-relative reduction from the seed
+        // gradient norm.
+        assert_eq!(big.rel_initial_grad, Some(1e-7));
+
+        // Scale below 1 leaves abs at the bare `tol` (max with floor).
+        let small = outer_gradient_tolerance_with_scale(1e-7, Some(10.0));
+        assert_eq!(small.abs, 1e-7);
+    }
+
+    #[test]
+    fn outer_gradient_tolerance_with_scale_rejects_non_finite_scale_via_filter() {
+        // The OuterProblem builder filters out non-finite / non-positive
+        // scales in `with_objective_scale`; the helper itself just
+        // honors whatever it is given. Calling with NaN exercises the
+        // numerical path: NaN comparisons are false, so the floor never
+        // triggers and abs stays at `tol`. The builder filter prevents
+        // this branch from being reached in production.
+        let nan_scaled = outer_gradient_tolerance_with_scale(1e-7, Some(f64::NAN));
+        assert!(
+            nan_scaled.abs.is_finite(),
+            "abs floor must stay finite even for NaN scale"
+        );
+        assert_eq!(
+            nan_scaled.abs, 1e-7,
+            "NaN scale must not lift the abs floor"
+        );
+    }
+
     struct FailingSeedMaterializationOperator {
         dim: usize,
     }
