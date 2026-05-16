@@ -23,8 +23,8 @@ use crate::inference::model::ColumnKindTag;
 use crate::resource::ResourcePolicy;
 use crate::smooth::{
     LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec, ShapeConstraint,
-    SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability, TensorBSplineSpec,
-    TermCollectionSpec,
+    SmoothBasisSpec, SmoothTermSpec, SphereBasisSpec, TensorBSplineIdentifiability,
+    TensorBSplineSpec, TermCollectionSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -357,6 +357,44 @@ pub fn build_smooth_basis(
                 input_scales: None,
             })
         }
+        "sphere" | "s2" | "sos" => {
+            if cols.len() != 2 {
+                return Err(format!(
+                    "sphere smooth expects exactly two variables (lat, lon), got {}",
+                    cols.len()
+                ));
+            }
+            let max_degree =
+                option_usize_any(options, &["degree", "l", "max_degree", "max-degree"])
+                    .or_else(|| {
+                        option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])
+                            .and_then(|k| (1..=128).find(|&l| l * (l + 2) >= k))
+                    })
+                    .unwrap_or_else(|| default_sphere_degree(ds.values.nrows()));
+            if max_degree == 0 {
+                return Err("sphere smooth requires degree/max_degree >= 1".to_string());
+            }
+            if max_degree > 32 {
+                return Err(format!(
+                    "sphere smooth max_degree={} is too large for the dense harmonic engine (limit 32)",
+                    max_degree
+                ));
+            }
+            let radians = option_bool(options, "radians").unwrap_or_else(|| {
+                options
+                    .get("units")
+                    .map(|u| u.eq_ignore_ascii_case("radian") || u.eq_ignore_ascii_case("radians"))
+                    .unwrap_or(false)
+            });
+            Ok(SmoothBasisSpec::Sphere {
+                feature_cols: cols.to_vec(),
+                spec: SphereBasisSpec {
+                    max_degree,
+                    radians,
+                    double_penalty: smooth_double_penalty,
+                },
+            })
+        }
         "matern" => {
             let plan = plan_spatial_basis(
                 ds.values.nrows(),
@@ -625,6 +663,18 @@ pub fn heuristic_knots_for_column(col: ArrayView1<'_, f64>) -> usize {
 
 pub fn heuristic_centers(n: usize, d: usize) -> usize {
     default_num_centers(n, d)
+}
+
+pub fn default_sphere_degree(n: usize) -> usize {
+    // Real spherical harmonics through degree L have L(L+2) non-constant
+    // columns. Keep the default comfortably below n while permitting enough
+    // angular detail for ordinary sample sizes.
+    let target = ((n as f64).sqrt() as usize).clamp(3, 12);
+    let mut l = 1usize;
+    while l < 12 && l * (l + 2) < target {
+        l += 1;
+    }
+    l
 }
 
 // ---------------------------------------------------------------------------

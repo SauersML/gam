@@ -146,6 +146,23 @@ pub enum SmoothBasisSpec {
         feature_cols: Vec<usize>,
         spec: TensorBSplineSpec,
     },
+    /// Intrinsic S² smooth using real spherical harmonics with a curvature penalty.
+    ///
+    /// The two feature columns are latitude and longitude. Inputs are degrees by
+    /// default (Earth/data-frame convention) and radians when `radians=true`.
+    Sphere {
+        feature_cols: Vec<usize>,
+        spec: SphereBasisSpec,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SphereBasisSpec {
+    pub max_degree: usize,
+    #[serde(default)]
+    pub radians: bool,
+    #[serde(default)]
+    pub double_penalty: bool,
 }
 
 /// Tensor-product B-spline smooth specification.
@@ -450,6 +467,14 @@ impl TermCollectionSpec {
                     ) {
                         return Err(format!(
                             "{label} term '{}' is not frozen: Duchon identifiability must be FrozenTransform or None",
+                            st.name
+                        ));
+                    }
+                }
+                SmoothBasisSpec::Sphere { spec, .. } => {
+                    if spec.max_degree == 0 {
+                        return Err(format!(
+                            "{label} term '{}' is not frozen: sphere max_degree must be positive",
                             st.name
                         ));
                     }
@@ -3087,6 +3112,150 @@ fn build_tensor_bspline_basis(
     })
 }
 
+fn build_sphere_basis(
+    data: ArrayView2<'_, f64>,
+    feature_cols: &[usize],
+    spec: &SphereBasisSpec,
+) -> Result<BasisBuildResult, BasisError> {
+    if feature_cols.len() != 2 {
+        return Err(BasisError::InvalidInput(format!(
+            "Sphere smooth requires exactly two feature columns (lat, lon), got {}",
+            feature_cols.len()
+        )));
+    }
+    if spec.max_degree == 0 {
+        return Err(BasisError::InvalidInput(
+            "Sphere smooth requires max_degree >= 1".to_string(),
+        ));
+    }
+    let p_data = data.ncols();
+    for &c in feature_cols {
+        if c >= p_data {
+            return Err(BasisError::DimensionMismatch(format!(
+                "sphere feature column {c} is out of bounds for data with {p_data} columns"
+            )));
+        }
+    }
+
+    let n = data.nrows();
+    let p = spec.max_degree * (spec.max_degree + 2); // sum_{l=1}^L (2l+1)
+    let mut design = Array2::<f64>::zeros((n, p));
+    for i in 0..n {
+        let mut lat = data[[i, feature_cols[0]]];
+        let mut lon = data[[i, feature_cols[1]]];
+        if !lat.is_finite() || !lon.is_finite() {
+            return Err(BasisError::InvalidInput(format!(
+                "sphere smooth encountered non-finite latitude/longitude at row {i}"
+            )));
+        }
+        if !spec.radians {
+            lat = lat.to_radians();
+            lon = lon.to_radians();
+        }
+        // Clamp tiny floating overshoots at the poles and wrap longitude only
+        // through sin/cos in the harmonic recurrence (no seam discontinuity).
+        if lat < -std::f64::consts::FRAC_PI_2 - 1e-10 || lat > std::f64::consts::FRAC_PI_2 + 1e-10 {
+            return Err(BasisError::InvalidInput(format!(
+                "sphere latitude at row {i} is outside [-90, 90] degrees / [-pi/2, pi/2] radians"
+            )));
+        }
+        lat = lat.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
+        fill_real_spherical_harmonics_row(lat, lon, spec.max_degree, design.row_mut(i));
+    }
+
+    let mut penalty = Array2::<f64>::zeros((p, p));
+    let mut col = 0usize;
+    for l in 1..=spec.max_degree {
+        let eig = (l as f64 * (l as f64 + 1.0)).powi(2);
+        for _ in 0..(2 * l + 1) {
+            penalty[[col, col]] = eig;
+            col += 1;
+        }
+    }
+    let mut candidates = vec![PenaltyCandidate {
+        matrix: penalty,
+        nullspace_dim_hint: 0,
+        source: PenaltySource::Primary,
+        normalization_scale: 1.0,
+        kronecker_factors: None,
+        op: None,
+    }];
+    if spec.double_penalty {
+        candidates.push(PenaltyCandidate {
+            matrix: Array2::<f64>::eye(p),
+            nullspace_dim_hint: 0,
+            source: PenaltySource::DoublePenaltyNullspace,
+            normalization_scale: 1.0,
+            kronecker_factors: None,
+            op: None,
+        });
+    }
+    let (penalties, nullspace_dims, penaltyinfo, ops) =
+        filter_active_penalty_candidates_with_ops(candidates)?;
+    Ok(BasisBuildResult {
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
+        penalties,
+        nullspace_dims,
+        penaltyinfo,
+        metadata: BasisMetadata::Sphere {
+            max_degree: spec.max_degree,
+            radians: spec.radians,
+        },
+        kronecker_factored: None,
+        ops,
+    })
+}
+
+fn fill_real_spherical_harmonics_row(
+    lat: f64,
+    lon: f64,
+    max_degree: usize,
+    mut row: ndarray::ArrayViewMut1<'_, f64>,
+) {
+    let x = lat.sin(); // cos(colatitude)
+    let mut p_lm = vec![vec![0.0; max_degree + 1]; max_degree + 1];
+    p_lm[0][0] = 1.0;
+    let somx2 = (1.0 - x * x).max(0.0).sqrt();
+    for m in 1..=max_degree {
+        p_lm[m][m] = -((2 * m - 1) as f64) * somx2 * p_lm[m - 1][m - 1];
+    }
+    for m in 0..max_degree {
+        p_lm[m + 1][m] = ((2 * m + 1) as f64) * x * p_lm[m][m];
+    }
+    for m in 0..=max_degree {
+        for l in (m + 2)..=max_degree {
+            p_lm[l][m] = (((2 * l - 1) as f64) * x * p_lm[l - 1][m]
+                - ((l + m - 1) as f64) * p_lm[l - 2][m])
+                / ((l - m) as f64);
+        }
+    }
+
+    let mut col = 0usize;
+    for l in 1..=max_degree {
+        for m_neg in (1..=l).rev() {
+            let m = m_neg;
+            let norm = spherical_harmonic_norm(l, m);
+            row[col] = (2.0f64).sqrt() * norm * p_lm[l][m] * (m as f64 * lon).sin();
+            col += 1;
+        }
+        row[col] = spherical_harmonic_norm(l, 0) * p_lm[l][0];
+        col += 1;
+        for m in 1..=l {
+            let norm = spherical_harmonic_norm(l, m);
+            row[col] = (2.0f64).sqrt() * norm * p_lm[l][m] * (m as f64 * lon).cos();
+            col += 1;
+        }
+    }
+}
+
+fn spherical_harmonic_norm(l: usize, m: usize) -> f64 {
+    let mut ratio = 1.0;
+    for k in (l - m + 1)..=(l + m) {
+        ratio /= k as f64;
+    }
+    (((2 * l + 1) as f64) / (4.0 * std::f64::consts::PI) * ratio).sqrt()
+}
+
 fn tensor_product_design_from_marginals(
     marginal_designs: &[Array2<f64>],
 ) -> Result<Array2<f64>, BasisError> {
@@ -3479,6 +3648,15 @@ fn build_single_local_smooth_term(
         }
         SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
             build_tensor_bspline_basis(data, feature_cols, spec)?
+        }
+        SmoothBasisSpec::Sphere { feature_cols, spec } => {
+            if term.shape != ShapeConstraint::None {
+                return Err(BasisError::InvalidInput(format!(
+                    "ShapeConstraint::{:?} is unsupported for intrinsic sphere term '{}'",
+                    term.shape, term.name
+                )));
+            }
+            build_sphere_basis(data, feature_cols, spec)?
         }
     };
 
@@ -4215,7 +4393,8 @@ fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
         SmoothBasisSpec::ThinPlate { feature_cols, .. }
         | SmoothBasisSpec::Matern { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
-        | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
+        | SmoothBasisSpec::TensorBSpline { feature_cols, .. }
+        | SmoothBasisSpec::Sphere { feature_cols, .. } => feature_cols.clone(),
     }
 }
 
@@ -4226,6 +4405,7 @@ fn smooth_basis_family_rank(term: &SmoothTermSpec) -> u8 {
         SmoothBasisSpec::ThinPlate { .. } => 2,
         SmoothBasisSpec::Matern { .. } => 3,
         SmoothBasisSpec::Duchon { .. } => 4,
+        SmoothBasisSpec::Sphere { .. } => 5,
     }
 }
 
@@ -4253,6 +4433,7 @@ fn smooth_has_frozen_identifiability(term: &SmoothTermSpec) -> bool {
             spec.identifiability,
             TensorBSplineIdentifiability::FrozenTransform { .. }
         ),
+        SmoothBasisSpec::Sphere { .. } => false,
     }
 }
 
@@ -4980,6 +5161,13 @@ fn with_identifiability_transform(
                 identifiability_transform.as_ref(),
                 transform,
             )?,
+        }),
+        BasisMetadata::Sphere {
+            max_degree,
+            radians,
+        } => Ok(BasisMetadata::Sphere {
+            max_degree: *max_degree,
+            radians: *radians,
         }),
         BasisMetadata::TensorBSpline {
             feature_cols,
@@ -10569,7 +10757,9 @@ fn try_build_spatial_term_log_kappa_derivative(
             build_duchon_basis_log_kappa_derivatives(x.view(), spec)
                 .map_err(EstimationError::from)?
         }
-        SmoothBasisSpec::BSpline1D { .. } | SmoothBasisSpec::TensorBSpline { .. } => {
+        SmoothBasisSpec::BSpline1D { .. }
+        | SmoothBasisSpec::TensorBSpline { .. }
+        | SmoothBasisSpec::Sphere { .. } => {
             return Ok(None);
         }
     };
@@ -12086,6 +12276,16 @@ pub fn freeze_term_collection_from_design(
                 };
                 s.aniso_log_scales = meta_aniso.clone();
                 *input_scales = meta_scales.clone();
+            }
+            (
+                SmoothBasisSpec::Sphere { spec: s, .. },
+                BasisMetadata::Sphere {
+                    max_degree,
+                    radians,
+                },
+            ) => {
+                s.max_degree = *max_degree;
+                s.radians = *radians;
             }
             (
                 SmoothBasisSpec::TensorBSpline {
@@ -14003,6 +14203,109 @@ mod tests {
     use rand::RngExt;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
+
+    fn sphere_term(max_degree: usize) -> SmoothTermSpec {
+        SmoothTermSpec {
+            name: "sphere(lat,lon)".to_string(),
+            basis: SmoothBasisSpec::Sphere {
+                feature_cols: vec![0, 1],
+                spec: SphereBasisSpec {
+                    max_degree,
+                    radians: false,
+                    double_penalty: true,
+                },
+            },
+            shape: ShapeConstraint::None,
+        }
+    }
+
+    #[test]
+    fn sphere_basis_has_expected_width_and_curvature_penalty() {
+        let data = array![[0.0, 0.0], [45.0, 90.0], [-30.0, 180.0]];
+        let sd = build_smooth_design(data.view(), &[sphere_term(3)]).expect("sphere design");
+        let term = &sd.terms[0];
+        assert_eq!(term.coeff_range.len(), 15); // L(L+2) for L=3, excluding the constant.
+        assert_eq!(term.penalties_local.len(), 2);
+        let primary = &term.penalties_local[0];
+        assert_eq!(primary.nrows(), 15);
+        for i in 0..15 {
+            for j in 0..15 {
+                if i != j {
+                    assert!(primary[[i, j]].abs() < 1e-12);
+                }
+            }
+        }
+        assert!(primary[[0, 0]] > 0.0);
+        assert!(primary[[3, 3]] > primary[[0, 0]]);
+        assert!(primary[[8, 8]] > primary[[3, 3]]);
+        assert_eq!(sd.penaltyinfo[0].penalty.source, PenaltySource::Primary);
+        assert_eq!(
+            sd.penaltyinfo[1].penalty.source,
+            PenaltySource::DoublePenaltyNullspace
+        );
+    }
+
+    #[test]
+    fn sphere_basis_is_periodic_in_longitude_and_well_defined_at_poles() {
+        let data = array![[10.0, 0.0], [10.0, 360.0], [90.0, 12.0], [90.0, 231.0]];
+        let sd = build_smooth_design(data.view(), &[sphere_term(4)]).expect("sphere design");
+        let dense = sd.term_designs[0]
+            .try_to_dense_by_chunks("sphere test")
+            .expect("dense sphere design");
+        let seam_diff = (&dense.row(0) - &dense.row(1))
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(seam_diff < 1e-12, "longitude seam diff {seam_diff}");
+        let pole_diff = (&dense.row(2) - &dense.row(3))
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(pole_diff < 1e-12, "north-pole longitude diff {pole_diff}");
+    }
+
+    #[test]
+    fn sphere_frozen_replay_matches_fit_design() {
+        let data = array![
+            [-60.0, -120.0],
+            [-20.0, 10.0],
+            [0.0, 85.0],
+            [35.0, 150.0],
+            [70.0, -45.0]
+        ];
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            smooth_terms: vec![sphere_term(3)],
+            random_effect_terms: vec![],
+        };
+        let fit_design = build_term_collection_design(data.view(), &spec).expect("fit design");
+        let frozen = freeze_term_collection_from_design(&spec, &fit_design).expect("freeze");
+        frozen
+            .validate_frozen("sphere")
+            .expect("frozen sphere spec");
+        let replay_design = build_term_collection_design(data.view(), &frozen).expect("replay");
+        let fit_dense = fit_design
+            .design
+            .try_to_dense_by_chunks("sphere fit dense")
+            .expect("fit dense");
+        let replay_dense = replay_design
+            .design
+            .try_to_dense_by_chunks("sphere replay dense")
+            .expect("replay dense");
+        let max_abs = (&fit_dense - &replay_dense)
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(max_abs < 1e-12, "frozen replay changed design by {max_abs}");
+    }
+
+    #[test]
+    fn sphere_rejects_bad_latitudes() {
+        let data = array![[91.0, 0.0]];
+        let err = build_smooth_design(data.view(), &[sphere_term(2)])
+            .expect_err("bad latitude should be rejected");
+        assert!(err.to_string().contains("outside"));
+    }
 
     fn assert_spatial_derivative_width(
         label: &str,
