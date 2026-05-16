@@ -123,10 +123,7 @@ impl CusparseRuntime {
             let mut device = 0;
             let ordinal = to_i32(selected.ordinal)
                 .ok_or_else(|| "CUDA device ordinal exceeds i32".to_string())?;
-            check_cuda(
-                (driver.cu_device_get)(&mut device, ordinal),
-                "cuDeviceGet",
-            )?;
+            check_cuda((driver.cu_device_get)(&mut device, ordinal), "cuDeviceGet")?;
             let mut context = 0usize;
             check_cuda(
                 (driver.cu_ctx_create)(&mut context, 0, device),
@@ -213,23 +210,15 @@ impl CusparseRuntime {
                 return None;
             }
             let mut x_descr: usize = 0;
-            if (self.sparse.cusparse_create_dnvec)(
-                &mut x_descr,
-                x_len_i64,
-                x_dev.ptr,
-                CUDA_R_64F,
-            ) != CUSPARSE_STATUS_SUCCESS
+            if (self.sparse.cusparse_create_dnvec)(&mut x_descr, x_len_i64, x_dev.ptr, CUDA_R_64F)
+                != CUSPARSE_STATUS_SUCCESS
             {
                 let _ = (self.sparse.cusparse_destroy_spmat)(spmat);
                 return None;
             }
             let mut y_descr: usize = 0;
-            if (self.sparse.cusparse_create_dnvec)(
-                &mut y_descr,
-                y_len_i64,
-                y_dev.ptr,
-                CUDA_R_64F,
-            ) != CUSPARSE_STATUS_SUCCESS
+            if (self.sparse.cusparse_create_dnvec)(&mut y_descr, y_len_i64, y_dev.ptr, CUDA_R_64F)
+                != CUSPARSE_STATUS_SUCCESS
             {
                 let _ = (self.sparse.cusparse_destroy_dnvec)(x_descr);
                 let _ = (self.sparse.cusparse_destroy_spmat)(spmat);
