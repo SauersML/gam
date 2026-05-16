@@ -3144,28 +3144,41 @@ fn tensor_product_design_from_marginals(
     })?;
     // Tensor-product Khatri-Rao: design[i, j] = Π_d marginal_d[i, j_d]
     // where j is the multi-index (j_1, ..., j_D) flattened. Independent
-    // across rows — parallelize the per-row computation, then assemble
-    // into the contiguous Array2.
+    // across rows; parallelize row chunks and fill the pre-allocated
+    // contiguous Array2 in place (no Vec-flatten-collect intermediate,
+    // which doubled the peak memory at biobank N).
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
-    let row_data: Vec<f64> = (0..n)
+    let mut design = Array2::<f64>::zeros((n, total_cols));
+    design
+        .axis_chunks_iter_mut(ndarray::Axis(0), 1024)
         .into_par_iter()
-        .flat_map_iter(|i| {
-            let mut rowvals = vec![1.0_f64];
-            for b in marginal_designs {
-                let q = b.ncols();
-                let mut next = vec![0.0_f64; rowvals.len() * q];
-                for (a_idx, &aval) in rowvals.iter().enumerate() {
-                    for col in 0..q {
-                        next[a_idx * q + col] = aval * b[[i, col]];
+        .enumerate()
+        .for_each(|(chunk_idx, mut block)| {
+            let row_offset = chunk_idx * 1024;
+            // Scratch buffers reused across rows in this chunk.
+            let mut cur = Vec::<f64>::with_capacity(total_cols);
+            let mut next = Vec::<f64>::with_capacity(total_cols);
+            for (local_i, mut out_row) in block.outer_iter_mut().enumerate() {
+                let i = row_offset + local_i;
+                cur.clear();
+                cur.push(1.0);
+                for b in marginal_designs {
+                    let q = b.ncols();
+                    next.clear();
+                    next.resize(cur.len() * q, 0.0);
+                    for (a_idx, &aval) in cur.iter().enumerate() {
+                        let off = a_idx * q;
+                        for col in 0..q {
+                            next[off + col] = aval * b[[i, col]];
+                        }
                     }
+                    std::mem::swap(&mut cur, &mut next);
                 }
-                rowvals = next;
+                for (j, &v) in cur.iter().enumerate() {
+                    out_row[j] = v;
+                }
             }
-            rowvals.into_iter()
-        })
-        .collect();
-    let design = Array2::<f64>::from_shape_vec((n, total_cols), row_data)
-        .map_err(|e| BasisError::DimensionMismatch(format!("tensor design assembly: {e}")))?;
+        });
     Ok(design)
 }
 

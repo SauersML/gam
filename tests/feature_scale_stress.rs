@@ -304,7 +304,7 @@ fn cylinder_tensor_via_te_formula_scales_and_seam_wraps() {
     let FitResult::Standard(fit) = res else {
         panic!("expected standard fit");
     };
-    for c in fit.beta.iter() {
+    for c in fit.fit.beta.iter() {
         assert!(c.is_finite(), "non-finite cylinder coefficient");
     }
 }
