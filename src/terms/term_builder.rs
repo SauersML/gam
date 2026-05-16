@@ -714,7 +714,17 @@ pub fn build_smooth_basis(
                 ));
             }
             let requested_nullspace_order = parse_duchon_order(options)?;
-            let length_scale = option_f64(options, "length_scale");
+            let pure_duchon = option_bool(options, "pure").unwrap_or(false);
+            if pure_duchon && options.contains_key("length_scale") {
+                return Err(
+                    "duchon() accepts either pure=true or length_scale=..., not both".to_string(),
+                );
+            }
+            let length_scale = if pure_duchon {
+                None
+            } else {
+                Some(option_f64(options, "length_scale").unwrap_or(1.0))
+            };
             // Resolve `(nullspace_order, power)` against the joint constraints
             // (operator collocation + pure-mode CPD). Explicit power keeps the
             // user's nullspace as-is (validator will reject inconsistent combos);
@@ -775,7 +785,7 @@ pub fn build_smooth_basis(
                         inference_notes.push(format!(
                             "Note: pure Duchon CPD against polynomial nullspace requires order ≥ {:?} \
                              at dimension {} (Wendland 8.17, 2s < d); auto-escalated from {:?}. \
-                             Specify length_scale=... to use hybrid Duchon and bypass this constraint.",
+                             Specify length_scale=... or omit pure=true to use hybrid Duchon and bypass this constraint.",
                             resolved.0,
                             cols.len(),
                             requested_nullspace_order,
