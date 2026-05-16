@@ -133,7 +133,7 @@ pub fn selected_gpu_info() -> Option<GpuDeviceInfo> {
     GpuRuntime::global().selected_device().cloned()
 }
 
-fn probe_cuda_devices() -> Result<(&'static Library, Vec<GpuDeviceInfo>), GpuProbeError> {
+fn probe_cuda_devices() -> Result<Vec<GpuDeviceInfo>, GpuProbeError> {
     let library = load_cuda_driver()?;
 
     let cu_init: libloading::Symbol<'_, CuInit> =
@@ -224,7 +224,10 @@ fn probe_cuda_devices() -> Result<(&'static Library, Vec<GpuDeviceInfo>), GpuPro
     drop(cu_device_compute_capability);
     drop(cu_device_total_mem);
     drop(cu_device_get_attribute);
-    Ok((library, devices))
+    // `library` is a `&'static` handle owned by the `OnceLock` inside
+    // `load_cuda_driver`; the dlopen mapping outlives the program.
+    let _ = library;
+    Ok(devices)
 }
 
 fn load_cuda_driver() -> Result<&'static Library, GpuProbeError> {
