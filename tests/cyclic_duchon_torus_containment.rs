@@ -32,12 +32,19 @@ fn make_noisy_circle(n: usize, seed: u64) -> (Vec<f64>, Array2<f64>, Array2<f64>
     let (st, ct) = tilt.sin_cos();
 
     let theta: Vec<f64> = (0..n).map(|_| utheta.sample(&mut rng)).collect();
+    // Localized outward radial spike near θ = 2π/3 with width ~ 0.16 rad — a
+    // sharp truth feature whose resolution stresses center-heavy smooths.
+    let theta_spike = 2.0 * std::f64::consts::PI / 3.0;
+    let spike_sigma = 0.16_f64;
+    let spike_amp = 0.55_f64;
 
     let mut clean = Array2::<f64>::zeros((n, 3));
     let mut noisy = Array2::<f64>::zeros((n, 3));
     for (i, &t) in theta.iter().enumerate() {
-        let cx = t.cos();
-        let cy = t.sin();
+        let dt = (t - theta_spike).sin().atan2((t - theta_spike).cos());
+        let r = 1.0 + spike_amp * (-0.5 * (dt / spike_sigma).powi(2)).exp();
+        let cx = r * t.cos();
+        let cy = r * t.sin();
         // Rotate (cx, cy, 0) by `tilt` about x: y' = cy*cos − 0*sin, z' = cy*sin + 0*cos
         let x = cx;
         let y = cy * ct;
