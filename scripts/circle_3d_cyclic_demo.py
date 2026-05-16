@@ -2,6 +2,7 @@
 then plot the fitted curve against the noisy data."""
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -16,8 +17,14 @@ def make_circle_3d(n: int = 220, seed: int = 0):
     theta = rng.uniform(0.0, 2.0 * np.pi, n)
 
     # Circle in a tilted plane: rotate the (cos, sin, 0) circle by ~30 deg about x.
-    cx = np.cos(theta)
-    cy = np.sin(theta)
+    # Add a localized outward radial spike near theta = 2*pi/3 to break symmetry.
+    theta_spike = 2.0 * np.pi / 3.0
+    # Wrap-aware angular distance
+    d = np.arctan2(np.sin(theta - theta_spike), np.cos(theta - theta_spike))
+    spike = 0.55 * np.exp(-0.5 * (d / 0.16) ** 2)
+    r = 1.0 + spike
+    cx = r * np.cos(theta)
+    cy = r * np.sin(theta)
     cz = np.zeros_like(theta)
     tilt = np.deg2rad(30.0)
     R = np.array(
@@ -44,7 +51,7 @@ def fit_cyclic(theta: np.ndarray, y: np.ndarray):
         "st": np.sin(theta).tolist(),
         "y": y.tolist(),
     }
-    return gamfit.fit(data, "y ~ thinplate(ct, st)")
+    return gamfit.fit(data, "y ~ duchon(ct, st)")
 
 
 def predict_curve(models, n_grid: int = 400):
@@ -100,8 +107,12 @@ def main() -> Path:
 
     out = Path(__file__).resolve().parent / "circle_3d_cyclic_demo.png"
     fig.savefig(out, dpi=160, bbox_inches="tight")
-    plt.close(fig)
     print(f"wrote {out}")
+
+    if "--no-show" not in sys.argv:
+        plt.show()
+    else:
+        plt.close(fig)
     return out
 
 

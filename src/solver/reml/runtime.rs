@@ -2155,6 +2155,7 @@ impl<'a> RemlState<'a> {
             ift_cached_factor: RwLock::new(None),
             kronecker_penalty_system: None,
             kronecker_factored: None,
+            penalty_block_structural_nullities: RwLock::new(None),
         })
     }
 
@@ -2200,6 +2201,7 @@ impl<'a> RemlState<'a> {
         self.linear_constraints = linear_constraints;
         self.kronecker_penalty_system = kronecker_penalty_system;
         self.kronecker_factored = kronecker_factored;
+        *self.penalty_block_structural_nullities.write().unwrap() = None;
         self.cache_manager.clear_eval_and_factor_caches();
         self.cache_manager.pirls_cache.write().unwrap().clear();
         // The new surface has a different design / penalty system /
