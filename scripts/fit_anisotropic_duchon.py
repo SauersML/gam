@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Fit a multidimensional anisotropic Duchon model via the gam CLI with the large-data preprocessing path (pilot subsample + final joint fit)."""
 from __future__ import annotations
 
 import argparse

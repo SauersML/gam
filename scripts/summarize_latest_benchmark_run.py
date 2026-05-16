@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Download the most recent GitHub Actions benchmark.yml run artifact and emit a Markdown summary at scripts/latest_benchmark_summary.md."""
 from __future__ import annotations
 
 import json

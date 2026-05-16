@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Compare 1-D Duchon fits across the mgcv-style Duchon-spline `power` parameter on the same noisy dataset."""
 from __future__ import annotations
 
 import argparse
