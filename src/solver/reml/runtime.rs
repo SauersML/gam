@@ -2327,15 +2327,11 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
     ) -> Result<f64, EstimationError> {
-        // `HessianOperator::logdet` is the trait method we need; importing
-        // the trait makes it dispatchable on the `Arc<dyn HessianOperator>`
-        // field below.  Bring the trait into scope without a name binding
-        // so it cannot collide with other items at module scope.
-        use super::unified::HessianOperator as _;
         let bundle = self.obtain_eval_bundle(rho)?;
         let assembly =
             self.build_auto_assembly(rho, &bundle, super::unified::EvalMode::ValueOnly, false)?;
-        let logdet = assembly.hessian_op.logdet() + assembly.hessian_logdet_correction;
+        let logdet = super::unified::HessianOperator::logdet(assembly.hessian_op.as_ref())
+            + assembly.hessian_logdet_correction;
         Ok(logdet)
     }
 
