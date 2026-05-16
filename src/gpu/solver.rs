@@ -93,10 +93,7 @@ impl CusolverRuntime {
             let mut device = 0;
             let ordinal = to_i32(selected.ordinal)
                 .ok_or_else(|| "CUDA device ordinal exceeds i32".to_string())?;
-            check_cuda(
-                (driver.cu_device_get)(&mut device, ordinal),
-                "cuDeviceGet",
-            )?;
+            check_cuda((driver.cu_device_get)(&mut device, ordinal), "cuDeviceGet")?;
             let mut context = 0usize;
             check_cuda(
                 (driver.cu_ctx_create)(&mut context, 0, device),
@@ -450,7 +447,6 @@ fn cusolver_library_candidates() -> &'static [&'static str] {
         &["libcusolver.so.12", "libcusolver.so.11", "libcusolver.so"]
     }
 }
-
 
 #[cfg(test)]
 mod tests {

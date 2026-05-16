@@ -1671,8 +1671,8 @@ impl<'a> GamWorkingModel<'a> {
                 // GPU fast path: cuBLAS routes `Xᵀ diag(w) X` as a single
                 // device GEMM after row-scaling. The signed weights are
                 // preserved because the device kernel forms `Xᵀ (W X)`
-                // without any sqrt clipping. Falls through to the host
-                // streaming path on CPU-only builds.
+                // without any sqrt clipping. CPU-only builds continue through
+                // the host streaming path.
                 if let Some(out) = crate::gpu::try_fast_xt_diag_x(x_dense.as_ref(), weights) {
                     return Ok(out);
                 }
@@ -2761,9 +2761,9 @@ fn solve_newton_direction_dense(
     }
 
     // GPU fast path: fused Cholesky factor + solve in a single host↔device
-    // round-trip. Falls through to the CPU `StableSolver` whenever the GPU
-    // is unavailable, the matrix is too small to amortize the round-trip,
-    // or the device factorization reports a non-PD pivot.
+    // round-trip. CPU execution remains in charge when the GPU is unavailable,
+    // the matrix is too small to amortize the round-trip, or the device
+    // factorization reports a non-PD pivot.
     let mut hess_buf = hessian.clone();
     let mut rhs_mat = gradient.to_owned().insert_axis(ndarray::Axis(1));
     if crate::gpu::try_chol_solve_inplace(&mut hess_buf, &mut rhs_mat).is_some() {
@@ -2779,7 +2779,6 @@ fn solve_newton_direction_dense(
             );
             return Ok(());
         }
-        // GPU produced non-finite output; fall through to CPU.
     }
 
     let factor = StableSolver::new("pirls newton direction")

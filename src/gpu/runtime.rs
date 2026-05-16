@@ -203,13 +203,11 @@ fn probe_cuda_devices() -> Result<(&'static Library, Vec<GpuDeviceInfo>), GpuPro
             "cuDeviceGet",
         )?;
         let mut name_bytes = [0_i8; 256];
+        let name_len =
+            i32::try_from(name_bytes.len()).expect("CUDA device name buffer length must fit i32");
         check(
             unsafe {
-                cu_device_get_name(
-                    name_bytes.as_mut_ptr() as *mut c_char,
-                    name_bytes.len() as i32,
-                    raw_device,
-                )
+                cu_device_get_name(name_bytes.as_mut_ptr() as *mut c_char, name_len, raw_device)
             },
             "cuDeviceGetName",
         )?;
