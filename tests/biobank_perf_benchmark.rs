@@ -13,6 +13,14 @@ use csv::StringRecord;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
+use gam::basis::{BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec};
+use gam::linalg::matrix::DesignMatrix;
+use gam::smooth::{
+    ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability,
+    TensorBSplineSpec, TermCollectionSpec,
+};
+use gam::terms::smooth::build_term_collection_design;
+use ndarray::Array2;
 use std::f64::consts::{PI, TAU};
 use std::time::Instant;
 
