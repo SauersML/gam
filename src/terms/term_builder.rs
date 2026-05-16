@@ -761,12 +761,18 @@ pub fn build_smooth_basis(
                 ));
             }
             let requested_nullspace_order = parse_duchon_order(options)?;
-            if options.contains_key("pure") {
+            let pure = option_bool(options, "pure").unwrap_or(false);
+            if pure && options.contains_key("length_scale") {
                 return Err(
-                    "duchon() is pure scale-free Duchon by default; remove pure=... or specify length_scale=... for hybrid Duchon".to_string(),
+                    "duchon() cannot combine pure=true with length_scale=...; pure Duchon is scale-free"
+                        .to_string(),
                 );
             }
-            let length_scale = option_f64(options, "length_scale");
+            let length_scale = if pure {
+                None
+            } else {
+                Some(option_f64(options, "length_scale").unwrap_or(0.0))
+            };
             // Resolve `(nullspace_order, power)` against the joint constraints
             // (operator collocation + pure-mode CPD). Explicit power keeps the
             // user's nullspace as-is (validator will reject inconsistent combos);
@@ -827,7 +833,7 @@ pub fn build_smooth_basis(
                         inference_notes.push(format!(
                             "Note: pure Duchon CPD against polynomial nullspace requires order ≥ {:?} \
                              at dimension {} (Wendland 8.17, 2s < d); auto-escalated from {:?}. \
-                             Specify length_scale=... to use hybrid Duchon and bypass this constraint.",
+                             Use the default hybrid Duchon or specify length_scale=... to bypass this constraint.",
                             resolved.0,
                             cols.len(),
                             requested_nullspace_order,
@@ -1670,6 +1676,62 @@ mod tests {
                 num_basis: 8
             } if *data_range == (0.0, std::f64::consts::TAU)
         ));
+    }
+
+    #[test]
+    fn one_dimensional_duchon_defaults_to_auto_hybrid_length_scale() {
+        let ds = continuous_dataset(
+            &["y", "x"],
+            (0..32)
+                .map(|i| {
+                    let x = i as f64 / 31.0;
+                    vec![(std::f64::consts::TAU * x).sin(), x]
+                })
+                .collect(),
+        );
+        let parsed = parse_formula("y ~ duchon(x)").expect("parse");
+        let col_map = ds.column_map();
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut notes,
+            &crate::resource::ResourcePolicy::default_library(),
+        )
+        .expect("build default duchon termspec");
+        let SmoothBasisSpec::Duchon { spec, .. } = &terms.smooth_terms[0].basis else {
+            panic!("expected Duchon term");
+        };
+        assert_eq!(spec.length_scale, Some(0.0));
+    }
+
+    #[test]
+    fn duchon_pure_true_keeps_scale_free_mode() {
+        let ds = continuous_dataset(
+            &["y", "x"],
+            (0..32)
+                .map(|i| {
+                    let x = i as f64 / 31.0;
+                    vec![(std::f64::consts::TAU * x).sin(), x]
+                })
+                .collect(),
+        );
+        let parsed = parse_formula("y ~ duchon(x, pure=true)").expect("parse");
+        let col_map = ds.column_map();
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut notes,
+            &crate::resource::ResourcePolicy::default_library(),
+        )
+        .expect("build pure duchon termspec");
+        let SmoothBasisSpec::Duchon { spec, .. } = &terms.smooth_terms[0].basis else {
+            panic!("expected Duchon term");
+        };
+        assert_eq!(spec.length_scale, None);
     }
 
     #[test]

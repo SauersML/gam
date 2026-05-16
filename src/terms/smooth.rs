@@ -2328,6 +2328,13 @@ fn auto_init_length_scale_in_place(data: ArrayView2<'_, f64>, term: &mut SmoothT
                 spec.length_scale = auto_initial_length_scale(data, feature_cols);
             }
         }
+        SmoothBasisSpec::Duchon {
+            feature_cols, spec, ..
+        } => {
+            if spec.length_scale == Some(0.0) {
+                spec.length_scale = Some(auto_initial_length_scale(data, feature_cols));
+            }
+        }
         _ => {}
     }
 }

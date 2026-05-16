@@ -72,9 +72,15 @@ fn spherical_basis_builds_constrained_design_and_penalties() {
             assert_eq!(method, gam::basis::SphereMethod::Wahba);
             assert_eq!(max_degree, None);
             let z = constraint_transform.expect("coefficient constraint transform");
+            let weights = centers
+                .column(0)
+                .mapv(|lat: f64| lat.to_radians().cos().max(0.0));
             for col in 0..z.ncols() {
-                let sum = z.column(col).sum();
-                assert!(sum.abs() < 1e-12, "constraint column {col} sum {sum}");
+                let weighted_sum = weights.dot(&z.column(col));
+                assert!(
+                    weighted_sum.abs() < 1e-12,
+                    "constraint column {col} weighted sum {weighted_sum}"
+                );
             }
         }
         other => panic!("unexpected metadata: {other:?}"),
