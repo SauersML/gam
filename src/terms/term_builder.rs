@@ -1294,14 +1294,51 @@ fn has_explicit_countwith_basis_alias(
 }
 
 pub fn parse_matern_nu(raw: &str) -> Result<MaternNu, String> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1/2" | "0.5" | "half" => Ok(MaternNu::Half),
-        "3/2" | "1.5" => Ok(MaternNu::ThreeHalves),
-        "5/2" | "2.5" => Ok(MaternNu::FiveHalves),
-        "7/2" | "3.5" => Ok(MaternNu::SevenHalves),
-        "9/2" | "4.5" => Ok(MaternNu::NineHalves),
-        _ => Err(format!("unsupported Matern nu '{raw}'")),
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "half" {
+        return Ok(MaternNu::Half);
     }
+
+    let value = if let Some((num, den)) = trimmed.split_once('/') {
+        let num = num
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| unsupported_matern_nu_message(raw))?;
+        let den = den
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| unsupported_matern_nu_message(raw))?;
+        if den == 0.0 || !num.is_finite() || !den.is_finite() {
+            return Err(unsupported_matern_nu_message(raw));
+        }
+        num / den
+    } else {
+        trimmed
+            .parse::<f64>()
+            .map_err(|_| unsupported_matern_nu_message(raw))?
+    };
+
+    const TOL: f64 = 1e-12;
+    if (value - 0.5).abs() <= TOL {
+        Ok(MaternNu::Half)
+    } else if (value - 1.5).abs() <= TOL {
+        Ok(MaternNu::ThreeHalves)
+    } else if (value - 2.5).abs() <= TOL {
+        Ok(MaternNu::FiveHalves)
+    } else if (value - 3.5).abs() <= TOL {
+        Ok(MaternNu::SevenHalves)
+    } else if (value - 4.5).abs() <= TOL {
+        Ok(MaternNu::NineHalves)
+    } else {
+        Err(unsupported_matern_nu_message(raw))
+    }
+}
+
+fn unsupported_matern_nu_message(raw: &str) -> String {
+    format!(
+        "unsupported Matern nu '{raw}'; supported half-integer values are 1/2, 3/2, 5/2, 7/2, and 9/2"
+    )
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -1516,6 +1553,50 @@ mod tests {
         assert_eq!(axes, vec![true]);
         assert!((periods[0].unwrap() - 2.0 * std::f64::consts::PI).abs() < 1e-12);
         assert_eq!(origins[0], Some(0.0));
+    }
+
+    #[test]
+    fn parse_matern_nu_accepts_equivalent_half_integer_forms() {
+        let cases = [
+            ("1/2", MaternNu::Half),
+            (" 1 / 2 ", MaternNu::Half),
+            (".5", MaternNu::Half),
+            ("0.50", MaternNu::Half),
+            ("half", MaternNu::Half),
+            ("3 / 2", MaternNu::ThreeHalves),
+            ("1.50", MaternNu::ThreeHalves),
+            ("5 / 2", MaternNu::FiveHalves),
+            ("2.500000000000", MaternNu::FiveHalves),
+            ("7 / 2", MaternNu::SevenHalves),
+            ("3.50", MaternNu::SevenHalves),
+            ("9 / 2", MaternNu::NineHalves),
+            ("4.50", MaternNu::NineHalves),
+        ];
+        for (raw, expected) in cases {
+            let parsed = parse_matern_nu(raw).expect(raw);
+            assert!(
+                matches!(
+                    (parsed, expected),
+                    (MaternNu::Half, MaternNu::Half)
+                        | (MaternNu::ThreeHalves, MaternNu::ThreeHalves)
+                        | (MaternNu::FiveHalves, MaternNu::FiveHalves)
+                        | (MaternNu::SevenHalves, MaternNu::SevenHalves)
+                        | (MaternNu::NineHalves, MaternNu::NineHalves)
+                ),
+                "parsed {raw:?} as {parsed:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_matern_nu_rejects_unsupported_or_invalid_values() {
+        for raw in ["1", "2", "11/2", "1/0", "nan", "fast"] {
+            let err = parse_matern_nu(raw).expect_err(raw);
+            assert!(
+                err.contains("supported half-integer values"),
+                "unexpected error for {raw:?}: {err}"
+            );
+        }
     }
 
     #[test]
