@@ -13096,7 +13096,11 @@ pub fn spherical_wahba_kernel_matrix(
     validate_lat_lon_matrix(centers, "spherical spline centers", radians)?;
     let n = data.nrows();
     let k = centers.nrows();
-    let deg = if radians { 1.0 } else { std::f64::consts::PI / 180.0 };
+    let deg = if radians {
+        1.0
+    } else {
+        std::f64::consts::PI / 180.0
+    };
     let mut out = Array2::<f64>::zeros((n, k));
     let mut center_trig = Vec::with_capacity(k);
     for c in centers.outer_iter() {
