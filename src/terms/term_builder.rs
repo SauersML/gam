@@ -314,6 +314,24 @@ fn parse_bspline_boundary_conditions(
     })
 }
 
+fn bspline_bc_declares_periodic_axis(options: &BTreeMap<String, String>) -> bool {
+    options
+        .get("bc")
+        .map(|raw| {
+            let vals = split_list_option(raw);
+            vals.len() == 1
+                && matches!(
+                    vals[0]
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "periodic" | "cyclic" | "cc"
+                )
+        })
+        .unwrap_or(false)
+}
+
 pub fn build_smooth_basis(
     kind: SmoothKind,
     vars: &[String],
@@ -517,8 +535,13 @@ pub fn build_smooth_basis(
                     ceiling,
                 ));
             }
-            let boundary_conditions = parse_bspline_boundary_conditions(options)?;
             let periodic_axes = parse_periodic_axes(options, 1)?;
+            let boundary_conditions =
+                if periodic_axes[0] && bspline_bc_declares_periodic_axis(options) {
+                    BSplineBoundaryConditions::default()
+                } else {
+                    parse_bspline_boundary_conditions(options)?
+                };
             let periods = parse_periods(options, &periodic_axes)?;
             let origins = parse_period_origins(options, &periodic_axes)?;
             let knotspec = if periodic_axes[0] {
@@ -1554,6 +1577,41 @@ mod tests {
         assert_eq!(axes, vec![true]);
         assert!((periods[0].unwrap() - 2.0 * std::f64::consts::PI).abs() < 1e-12);
         assert_eq!(origins[0], Some(0.0));
+    }
+
+    #[test]
+    fn one_dimensional_bspline_accepts_bc_periodic_alias() {
+        let ds = continuous_dataset(
+            &["y", "theta"],
+            (0..16)
+                .map(|i| {
+                    let theta = std::f64::consts::TAU * i as f64 / 16.0;
+                    vec![theta.sin(), theta]
+                })
+                .collect(),
+        );
+        let parsed =
+            parse_formula("y ~ s(theta, bc=periodic, period=2*pi, origin=0, k=8)").expect("parse");
+        let col_map = ds.column_map();
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut notes,
+            &crate::resource::ResourcePolicy::default_library(),
+        )
+        .expect("periodic bc alias should build");
+        let SmoothBasisSpec::BSpline1D { spec, .. } = &terms.smooth_terms[0].basis else {
+            panic!("expected 1D B-spline");
+        };
+        assert!(matches!(
+            &spec.knotspec,
+            BSplineKnotSpec::PeriodicUniform {
+                data_range,
+                num_basis: 8
+            } if *data_range == (0.0, std::f64::consts::TAU)
+        ));
     }
 
     #[test]
