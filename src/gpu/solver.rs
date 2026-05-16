@@ -177,11 +177,7 @@ impl CusolverRuntime {
                 return None;
             }
             check_cuda(
-                (self.driver.cu_memcpy_dtoh)(
-                    a_col.as_mut_ptr().cast(),
-                    a_dev.ptr,
-                    bytes_a,
-                ),
+                (self.driver.cu_memcpy_dtoh)(a_col.as_mut_ptr().cast(), a_dev.ptr, bytes_a),
                 "cuMemcpyDtoH A",
             )
             .ok()?;
@@ -334,9 +330,7 @@ impl CusolverRuntime {
     ) -> Option<DeviceAllocation<'a>> {
         let alloc = unsafe { DeviceAllocation::new(&self.driver, bytes) }?;
         check_cuda(
-            unsafe {
-                (self.driver.cu_memcpy_htod)(alloc.ptr, values.as_ptr().cast(), bytes)
-            },
+            unsafe { (self.driver.cu_memcpy_htod)(alloc.ptr, values.as_ptr().cast(), bytes) },
             "cuMemcpyHtoD",
         )
         .ok()?;
@@ -560,10 +554,7 @@ fn cusolver_library_candidates() -> &'static [&'static str] {
     if cfg!(target_os = "windows") {
         &["cusolver64_12.dll", "cusolver64_11.dll"]
     } else if cfg!(target_os = "macos") {
-        &[
-            "/usr/local/cuda/lib/libcusolver.dylib",
-            "libcusolver.dylib",
-        ]
+        &["/usr/local/cuda/lib/libcusolver.dylib", "libcusolver.dylib"]
     } else {
         &["libcusolver.so.12", "libcusolver.so.11", "libcusolver.so"]
     }

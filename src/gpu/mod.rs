@@ -31,4 +31,4 @@ pub use dispatch::{
 pub use policy::DispatchPolicy;
 pub use runtime::{GpuProbeError, GpuRuntime, gpu_available, selected_gpu_info};
 pub use solver::{try_potrf_inplace, try_potrs_inplace, try_syevd_inplace};
-pub use sparse::try_csr_spmv;
+pub use sparse::{try_csr_spmv_usize, try_csr_t_spmv_usize};

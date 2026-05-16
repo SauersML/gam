@@ -2,8 +2,8 @@
 //!
 //! Built on the same dlopen pattern as [`super::blas`]: we resolve libcusparse
 //! at process start, hold a single context for the selected device, and route
-//! sufficiently large CSR SpMV calls through `cusparseSpMV`. CSR matrices
-//! below the threshold fall back to the CPU (sparse_exact / faer-sparse).
+//! sufficiently large CSR SpMV calls through `cusparseSpMV`. Smaller matrices
+//! continue on the in-process sparse CPU path.
 
 use libloading::Library;
 use ndarray::{Array1, ArrayBase, Data, Ix1};
@@ -11,33 +11,76 @@ use std::sync::{Mutex, OnceLock};
 
 use super::runtime::GpuRuntime;
 
-/// Dispatch entry point: returns `Some(y)` when the device runtime executed
-/// `y = A x` for the given CSR triple, `None` to fall back to CPU.
+/// Dispatch entry point for `y = A x` with `usize` CSR indices.
 #[inline]
-pub fn try_csr_spmv<S: Data<Elem = f64>>(
+pub fn try_csr_spmv_usize<S: Data<Elem = f64>>(
+    rowptr: &[usize],
+    colidx: &[usize],
+    values: &[f64],
+    rows: usize,
+    cols: usize,
+    x: &ArrayBase<S, Ix1>,
+) -> Option<Array1<f64>> {
+    try_csr_spmv_indexed(rowptr, colidx, values, rows, cols, x, false)
+}
+
+/// Dispatch entry point for `y = A^T x` with `usize` CSR indices.
+#[inline]
+pub fn try_csr_t_spmv_usize<S: Data<Elem = f64>>(
+    rowptr: &[usize],
+    colidx: &[usize],
+    values: &[f64],
+    rows: usize,
+    cols: usize,
+    x: &ArrayBase<S, Ix1>,
+) -> Option<Array1<f64>> {
+    try_csr_spmv_indexed(rowptr, colidx, values, rows, cols, x, true)
+}
+
+fn try_csr_spmv_indexed<S: Data<Elem = f64>>(
+    rowptr: &[usize],
+    colidx: &[usize],
+    values: &[f64],
+    rows: usize,
+    cols: usize,
+    x: &ArrayBase<S, Ix1>,
+    transpose: bool,
+) -> Option<Array1<f64>> {
+    if !route_csr_spmv(rows, cols, values.len()) {
+        return None;
+    }
+    let rowptr_i32 = checked_i32_vec(rowptr)?;
+    let colidx_i32 = checked_i32_vec(colidx)?;
+    try_csr_spmv(&rowptr_i32, &colidx_i32, values, rows, cols, x, transpose)
+}
+
+/// Dispatch entry point: returns `Some(y)` when the device runtime executed
+/// the CSR SpMV for the given CSR triple.
+#[inline]
+fn try_csr_spmv<S: Data<Elem = f64>>(
     rowptr: &[i32],
     colidx: &[i32],
     values: &[f64],
     rows: usize,
     cols: usize,
     x: &ArrayBase<S, Ix1>,
+    transpose: bool,
 ) -> Option<Array1<f64>> {
     let nnz = values.len();
     debug_assert_eq!(rowptr.len(), rows + 1);
     debug_assert_eq!(colidx.len(), nnz);
-    debug_assert_eq!(x.len(), cols);
+    debug_assert_eq!(x.len(), if transpose { rows } else { cols });
     if !route_csr_spmv(rows, cols, nnz) {
         return None;
     }
-    with_runtime(|rt| rt.csr_spmv(rowptr, colidx, values, rows, cols, x))
+    with_runtime(|rt| rt.csr_spmv(rowptr, colidx, values, rows, cols, x, transpose))
 }
 
 #[inline]
 fn route_csr_spmv(rows: usize, cols: usize, nnz: usize) -> bool {
-    // PCIe + cuSPARSE descriptor setup is expensive for small matrices; the
-    // 1M-nnz / 1024-row floor matches the Mainstream-bucket default in
-    // `DispatchPolicy::baseline()`.
-    rows >= 1_024 && cols > 0 && nnz >= 1_000_000
+    GpuRuntime::global()
+        .policy()
+        .route_csr_spmv(rows, cols, nnz)
 }
 
 fn with_runtime<T>(f: impl FnOnce(&mut CusparseRuntime) -> Option<T>) -> Option<T> {
@@ -105,21 +148,34 @@ impl CusparseRuntime {
         rows: usize,
         cols: usize,
         x: &ArrayBase<S, Ix1>,
+        transpose: bool,
     ) -> Option<Array1<f64>> {
         let nnz = values.len();
-        let mut y_host = vec![0.0_f64; rows];
+        let y_len = if transpose { cols } else { rows };
+        let x_len = if transpose { rows } else { cols };
+        if x.len() != x_len {
+            return None;
+        }
+        let x_host;
+        let x_slice = if let Some(slice) = x.as_slice_memory_order() {
+            slice
+        } else {
+            x_host = x.to_vec();
+            &x_host
+        };
+        let mut y_host = vec![0.0_f64; y_len];
         let bytes_rowptr = bytes_len::<i32>(rowptr.len())?;
         let bytes_colidx = bytes_len::<i32>(colidx.len())?;
         let bytes_values = bytes_len::<f64>(values.len())?;
-        let bytes_x = bytes_len::<f64>(cols)?;
-        let bytes_y = bytes_len::<f64>(rows)?;
+        let bytes_x = bytes_len::<f64>(x_len)?;
+        let bytes_y = bytes_len::<f64>(y_len)?;
 
         unsafe {
             self.set_current().ok()?;
             let rowptr_dev = self.alloc_copy_bytes(rowptr.as_ptr().cast(), bytes_rowptr)?;
             let colidx_dev = self.alloc_copy_bytes(colidx.as_ptr().cast(), bytes_colidx)?;
             let values_dev = self.alloc_copy_bytes(values.as_ptr().cast(), bytes_values)?;
-            let x_dev = self.alloc_copy_bytes(x.as_ptr().cast(), bytes_x)?;
+            let x_dev = self.alloc_copy_bytes(x_slice.as_ptr().cast(), bytes_x)?;
             let y_dev = DeviceAllocation::new(&self.driver, bytes_y)?;
 
             let mut spmat: usize = 0;
@@ -140,12 +196,8 @@ impl CusparseRuntime {
                 return None;
             }
             let mut x_descr: usize = 0;
-            if (self.sparse.cusparse_create_dnvec)(
-                &mut x_descr,
-                cols as i64,
-                x_dev.ptr,
-                CUDA_R_64F,
-            ) != CUSPARSE_STATUS_SUCCESS
+            if (self.sparse.cusparse_create_dnvec)(&mut x_descr, cols as i64, x_dev.ptr, CUDA_R_64F)
+                != CUSPARSE_STATUS_SUCCESS
             {
                 let _ = (self.sparse.cusparse_destroy_spmat)(spmat);
                 return None;
@@ -153,7 +205,7 @@ impl CusparseRuntime {
             let mut y_descr: usize = 0;
             if (self.sparse.cusparse_create_dnvec)(
                 &mut y_descr,
-                rows as i64,
+                y_len as i64,
                 y_dev.ptr,
                 CUDA_R_64F,
             ) != CUSPARSE_STATUS_SUCCESS
@@ -168,7 +220,7 @@ impl CusparseRuntime {
             let mut buffer_size: usize = 0;
             if (self.sparse.cusparse_spmv_buffersize)(
                 self.handle,
-                CUSPARSE_OP_N,
+                cusparse_op(transpose),
                 &alpha as *const f64 as *const std::ffi::c_void,
                 spmat,
                 x_descr,
@@ -192,7 +244,7 @@ impl CusparseRuntime {
             let buffer_ptr = scratch.as_ref().map(|s| s.ptr).unwrap_or(0);
             let exec_status = (self.sparse.cusparse_spmv)(
                 self.handle,
-                CUSPARSE_OP_N,
+                cusparse_op(transpose),
                 &alpha as *const f64 as *const std::ffi::c_void,
                 spmat,
                 x_descr,
@@ -350,28 +402,28 @@ type CusparseCreateDnvec = unsafe extern "C" fn(
 type CusparseDestroySpmat = unsafe extern "C" fn(usize) -> CusparseStatus;
 type CusparseDestroyDnvec = unsafe extern "C" fn(usize) -> CusparseStatus;
 type CusparseSpmvBufferSize = unsafe extern "C" fn(
-    usize,                       // handle
-    i32,                         // opA
-    *const std::ffi::c_void,     // alpha
-    usize,                       // matA
-    usize,                       // vecX
-    *const std::ffi::c_void,     // beta
-    usize,                       // vecY
-    i32,                         // compute type
-    i32,                         // alg
-    *mut usize,                  // buffer size
+    usize,                   // handle
+    i32,                     // opA
+    *const std::ffi::c_void, // alpha
+    usize,                   // matA
+    usize,                   // vecX
+    *const std::ffi::c_void, // beta
+    usize,                   // vecY
+    i32,                     // compute type
+    i32,                     // alg
+    *mut usize,              // buffer size
 ) -> CusparseStatus;
 type CusparseSpmv = unsafe extern "C" fn(
-    usize,                       // handle
-    i32,                         // opA
-    *const std::ffi::c_void,     // alpha
-    usize,                       // matA
-    usize,                       // vecX
-    *const std::ffi::c_void,     // beta
-    usize,                       // vecY
-    i32,                         // compute type
-    i32,                         // alg
-    u64,                         // external buffer
+    usize,                   // handle
+    i32,                     // opA
+    *const std::ffi::c_void, // alpha
+    usize,                   // matA
+    usize,                   // vecX
+    *const std::ffi::c_void, // beta
+    usize,                   // vecY
+    i32,                     // compute type
+    i32,                     // alg
+    u64,                     // external buffer
 ) -> CusparseStatus;
 
 struct CusparseApi {
@@ -418,6 +470,7 @@ impl CusparseApi {
 
 const CUSPARSE_STATUS_SUCCESS: CusparseStatus = 0;
 const CUSPARSE_OP_N: i32 = 0;
+const CUSPARSE_OP_T: i32 = 1;
 const CUSPARSE_INDEX_32I: i32 = 1;
 const CUSPARSE_INDEX_BASE_ZERO: i32 = 0;
 const CUSPARSE_SPMV_ALG_DEFAULT: i32 = 0;
@@ -454,10 +507,7 @@ fn cusparse_library_candidates() -> &'static [&'static str] {
     if cfg!(target_os = "windows") {
         &["cusparse64_12.dll", "cusparse64_11.dll"]
     } else if cfg!(target_os = "macos") {
-        &[
-            "/usr/local/cuda/lib/libcusparse.dylib",
-            "libcusparse.dylib",
-        ]
+        &["/usr/local/cuda/lib/libcusparse.dylib", "libcusparse.dylib"]
     } else {
         &["libcusparse.so.12", "libcusparse.so.11", "libcusparse.so"]
     }
@@ -465,6 +515,23 @@ fn cusparse_library_candidates() -> &'static [&'static str] {
 
 fn bytes_len<T>(len: usize) -> Option<usize> {
     len.checked_mul(std::mem::size_of::<T>())
+}
+
+fn checked_i32_vec(values: &[usize]) -> Option<Vec<i32>> {
+    values
+        .iter()
+        .copied()
+        .map(i32::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()
+}
+
+fn cusparse_op(transpose: bool) -> i32 {
+    if transpose {
+        CUSPARSE_OP_T
+    } else {
+        CUSPARSE_OP_N
+    }
 }
 
 #[cfg(test)]
@@ -478,6 +545,7 @@ mod tests {
         let colidx = vec![0_i32, 1];
         let values = vec![2.0_f64, 3.0];
         let x = array![1.0_f64, 1.0];
-        assert!(try_csr_spmv(&rowptr, &colidx, &values, 2, 2, &x).is_none());
+        assert!(try_csr_spmv(&rowptr, &colidx, &values, 2, 2, &x, false).is_none());
+        assert!(try_csr_t_spmv_usize(&[0, 1, 2], &[0, 1], &values, 2, 2, &x).is_none());
     }
 }
