@@ -36,6 +36,8 @@ use thiserror::Error;
 
 pub use crate::solver::estimate::reml::unified::{EvalMode, PseudoLogdetMode};
 
+const JOINT_NEWTON_TRUST_RADIUS_EXPANSION_MAX_STEP_INF: f64 = 20.0;
+
 /// A penalty matrix that may be stored in Kronecker-factored form.
 ///
 /// For tensor-product terms (e.g. time-varying survival covariates), the penalty
@@ -1105,15 +1107,6 @@ pub trait CustomFamily {
         _: &Array1<f64>,
     ) -> Result<Option<f64>, String> {
         Ok(None)
-    }
-
-    /// Family-specific infinity-norm cap for exact joint-Newton coefficient steps.
-    ///
-    /// The solver still applies the trust-region accept/reject test against the
-    /// exact penalized objective. This cap only prevents a single ill-conditioned
-    /// Newton proposal from dominating the trust-region model before that test.
-    fn joint_newton_max_step_inf(&self, _specs: &[ParameterBlockSpec]) -> f64 {
-        20.0
     }
 
     /// Optional linear inequality constraints for a block update:
@@ -9442,29 +9435,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 0.0
             };
 
-        // The inf-norm β-space cap previously applied here
-        // (`joint_newton_max_step_inf`, default 20.0) is intentionally
-        // not used. It conflated two distinct concerns and bound the
-        // step on every cycle of quasi-saturated problems where the
-        // optimum sits at large |β|:
-        //   (a) η-overflow safety — a physical limit specific to the
-        //       family's likelihood evaluator. Owned by the family via
-        //       `max_feasible_step_size`, called by the line search.
-        //   (b) Newton-model trust — an algorithmic limit that adapts
-        //       via rho. Owned by `joint_trust_radius` below, updated
-        //       by `update_joint_trust_region_radius` on every attempt.
-        // The L2 trust radius is strictly tighter than an inf-norm cap
-        // of the same magnitude (|·|_∞ ≤ |·|_2), so removing the cap
-        // does not weaken safety on any block. The trait method
-        // `joint_newton_max_step_inf` is retained for backward
-        // compatibility but no longer consulted; we still validate the
-        // returned value to surface family-side bugs.
-        let _initial_max_joint_step_unused = family.joint_newton_max_step_inf(specs);
-        if !_initial_max_joint_step_unused.is_finite() || _initial_max_joint_step_unused <= 0.0 {
-            return Err(format!(
-                "joint Newton max step cap must be finite and positive, got {_initial_max_joint_step_unused}"
-            ));
-        }
+        // Exact joint Newton steps are guarded by two independent mechanisms:
+        // family-owned feasibility (`max_feasible_step_size`) and the adaptive
+        // trust region below. There is intentionally no family hook for a
+        // hard per-attempt coefficient-space clamp; keeping the policy local
+        // avoids stale no-op configuration and makes the trust-region behavior
+        // explicit at the only place it is used.
 
         // Cross-cycle convergence carry-over: set at the end of every
         // accepted cycle so the next cycle can distinguish a true KKT
@@ -9915,7 +9891,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             if cycle == 0 {
                 let initial_step_norm = joint_trust_region_step_norm(&delta);
                 if initial_step_norm.is_finite() && initial_step_norm > joint_trust_radius {
-                    // Cycle-0 trust-radius bump.  Three competing caps:
+                    // Cycle-0 trust-radius bump. Three competing caps:
                     //
                     //   (a) the unconstrained Newton step's L2 norm — so a
                     //       well-conditioned problem gets a single full
@@ -9927,14 +9903,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     //   (c) `max_step_inf · L2 / inf` — the largest L2
                     //       radius for which rescaling the Newton step to
                     //       length r still keeps every coordinate inside
-                    //       the family's per-coordinate sanity bound
-                    //       `joint_newton_max_step_inf`. Beyond this, the
-                    //       step's largest entry exceeds what the family
-                    //       declared physically meaningful in β space
-                    //       (e.g. for a Probit family, the magnitude of a
-                    //       single `η` change beyond which `μ(1−μ)` falls
-                    //       below numerical precision and triggers an
-                    //       IRLS-style divergence).
+                    //       the local coefficient-space sanity threshold.
                     //
                     // The earlier all-or-nothing gate (`newton_step_is_sane
                     // = initial_step_inf <= max_step_inf`) discarded the
@@ -9952,10 +9921,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // the cycle budget. Cap (c) instead bumps to r_safe ≈
                     // 27.7 — large enough to make rapid progress, small
                     // enough that no β coordinate moves further than the
-                    // family allows.
+                    // local sanity threshold.
                     let initial_step_inf =
                         delta.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
-                    let max_step_inf = family.joint_newton_max_step_inf(specs);
+                    let max_step_inf = JOINT_NEWTON_TRUST_RADIUS_EXPANSION_MAX_STEP_INF;
                     let r_safe =
                         if initial_step_inf > 0.0 && max_step_inf.is_finite() && max_step_inf > 0.0
                         {
