@@ -123,10 +123,12 @@ Default `k`: `clamp(unique_values / 4, 4, max(20, cbrt(unique_values)))`.
 y ~ s(x1, x2)                       # thin-plate (default for ≥ 2 args)
 y ~ tps(x1, x2)                     # alias
 y ~ thinplate(x1, x2)               # alias
+y ~ thin_plate(x1, x2)              # alias
 y ~ matern(x1, x2, x3)
 y ~ duchon(x1, x2, x3)
 y ~ te(x, z)                        # tensor product
 y ~ tensor(x, z)                    # alias
+y ~ interaction(x, z)               # alias of `te`
 ```
 
 ### Thin-plate spline (`tps`, `thinplate`, `s(x1, x2)`)
