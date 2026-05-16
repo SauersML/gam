@@ -1273,6 +1273,38 @@ fn outer_gradient_tolerance(tolerance: f64) -> GradientTolerance {
     }
 }
 
+/// Like [`outer_gradient_tolerance`] but widens the absolute floor by
+/// `objective_scale * 1e-9` when the caller has declared the natural
+/// magnitude of the objective. The relative-from-seed component is left
+/// alone so a well-scaled cold start still gets a 1e-6 reduction
+/// requirement; the change only matters when the relative threshold has
+/// already been satisfied and the absolute floor would otherwise force
+/// the optimizer to chase sub-ULP gradient components.
+fn outer_gradient_tolerance_with_scale(
+    tolerance: f64,
+    objective_scale: Option<f64>,
+) -> GradientTolerance {
+    // 1e-9 is a deliberately tight per-unit-magnitude budget: at n=1e6
+    // and tol=1e-5 the floor becomes 1e-3, which is still ~9 decades
+    // below the seed gradient norm at biobank scale (typically 1e6+).
+    // Tighter constants leave the floor binding at convergence; looser
+    // constants risk declaring convergence at materially nonzero
+    // outer gradients.
+    let mut abs = tolerance;
+    if let Some(scale) = objective_scale {
+        let scaled_floor = scale * 1.0e-9;
+        if scaled_floor > abs {
+            abs = scaled_floor;
+        }
+    }
+    GradientTolerance {
+        abs,
+        rel_initial_grad: Some(tolerance),
+        rel_cost: None,
+        projected: true,
+    }
+}
+
 fn disabled_fallback_hybrid_efs_has_standalone_bfgs_primary(
     cap: &OuterCapability,
     config: &OuterConfig,
@@ -3513,6 +3545,13 @@ struct OuterConfig {
     outer_inner_cap: Option<InnerProgressFeedback>,
     solver_class: SolverClass,
     operator_initial_trust_radius: Option<f64>,
+    arc_initial_regularization: Option<f64>,
+    /// Optional scale factor for the objective's natural magnitude.
+    /// Used to widen the absolute gradient-norm floor on objectives whose
+    /// gradient lives on a non-unit scale (e.g. Gaussian-identity REML at
+    /// large `n`, whose ∂/∂logλ inherits the O(n) likelihood constant).
+    /// `None` falls back to the bare `tolerance` floor.
+    objective_scale: Option<f64>,
     bfgs_step_cap: Option<f64>,
 }
 
@@ -3532,6 +3571,8 @@ impl Default for OuterConfig {
             outer_inner_cap: None,
             solver_class: SolverClass::Primary,
             operator_initial_trust_radius: None,
+            arc_initial_regularization: None,
+            objective_scale: None,
             bfgs_step_cap: None,
         }
     }
@@ -3569,6 +3610,8 @@ pub struct OuterProblem {
     outer_inner_cap: Option<InnerProgressFeedback>,
     solver_class: SolverClass,
     operator_initial_trust_radius: Option<f64>,
+    arc_initial_regularization: Option<f64>,
+    objective_scale: Option<f64>,
     bfgs_step_cap: Option<f64>,
 }
 
@@ -3595,6 +3638,8 @@ impl OuterProblem {
             outer_inner_cap: None,
             solver_class: SolverClass::Primary,
             operator_initial_trust_radius: None,
+            arc_initial_regularization: None,
+            objective_scale: None,
             bfgs_step_cap: None,
         }
     }
@@ -3704,6 +3749,38 @@ impl OuterProblem {
         self
     }
 
+    /// Override the ARC initial cubic-regularization parameter sigma
+    /// (default in `opt`: 1.0). Smaller sigma → less cubic penalty on the
+    /// first step → larger first move on benign objectives. The matrix-
+    /// free Newton-TR analog is `with_operator_initial_trust_radius`.
+    ///
+    /// Used by Gaussian-identity REML at biobank n: the objective is
+    /// quadratic-like in log-λ near the optimum (sigma is the right
+    /// scale), and log-λ moves of 2–4 units in the early iters
+    /// otherwise burn 4–8 iters of trust-region expansion before the
+    /// model trusts the analytic Hessian.
+    pub fn with_arc_initial_regularization(mut self, sigma: Option<f64>) -> Self {
+        self.arc_initial_regularization = sigma.filter(|v| v.is_finite() && *v > 0.0);
+        self
+    }
+
+    /// Set the objective's natural magnitude scale, used to derive an
+    /// `n`-aware absolute gradient-norm floor. When set to `Some(s)`,
+    /// the runner uses `abs_floor = max(tol, s * 1e-9)` for the
+    /// projected-gradient convergence check.
+    ///
+    /// Rationale: a fixed `abs = tol` (e.g. 1e-6) is appropriate when the
+    /// objective and its gradient live on a unit scale, but Gaussian-
+    /// identity REML carries an O(n) likelihood constant that flows into
+    /// ∂/∂logλ. At biobank n the floor becomes binding even when the
+    /// relative-from-seed component (`rel_initial_grad * ‖g0‖`) declared
+    /// convergence iters earlier — chasing sub-ULP changes in log-λ at
+    /// the cost of repeated k²·n·p² analytic-Hessian assemblies.
+    pub fn with_objective_scale(mut self, scale: Option<f64>) -> Self {
+        self.objective_scale = scale.filter(|v| v.is_finite() && *v > 0.0);
+        self
+    }
+
     /// Cap the infinity-norm displacement of BFGS cost-only line-search probes
     /// from the most recent accepted gradient point. Also scales the initial
     /// inverse metric so the first trial direction respects the same local
@@ -3756,6 +3833,8 @@ impl OuterProblem {
             outer_inner_cap: self.outer_inner_cap.clone(),
             solver_class: self.solver_class,
             operator_initial_trust_radius: self.operator_initial_trust_radius,
+            arc_initial_regularization: self.arc_initial_regularization,
+            objective_scale: self.objective_scale,
             bfgs_step_cap: self.bfgs_step_cap,
         }
     }
@@ -4333,7 +4412,7 @@ fn run_outer_with_plan(
                     // convergence with materially nonzero outer gradients.
                     // Use an absolute tolerance plus a relative reduction
                     // from the seed gradient instead.
-                    let grad_tol = outer_gradient_tolerance(config.tolerance);
+                    let grad_tol = outer_gradient_tolerance_with_scale(config.tolerance, config.objective_scale);
                     let max_iter =
                         MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
 
@@ -4458,7 +4537,7 @@ fn run_outer_with_plan(
                     let (lo, hi) = &bounds_template;
                     let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
                         .expect("outer rho bounds must be valid");
-                    let grad_tol = outer_gradient_tolerance(config.tolerance);
+                    let grad_tol = outer_gradient_tolerance_with_scale(config.tolerance, config.objective_scale);
                     let max_iter =
                         MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
 
@@ -4501,6 +4580,13 @@ fn run_outer_with_plan(
                         .with_gradient_tolerance(grad_tol)
                         .with_max_iterations(max_iter)
                         .with_initial_sample(seed.clone(), initial_sample);
+                    if let Some(sigma) = config.arc_initial_regularization {
+                        // Caller-supplied initial cubic-regularization
+                        // sigma; smaller sigma → less penalty on the
+                        // first ARC step. Defaults to opt's 1.0 when
+                        // unset, matching the legacy behavior.
+                        optimizer = optimizer.with_initial_regularization(sigma);
+                    }
                     if let Some(feedback) = config.outer_inner_cap.as_ref() {
                         optimizer = optimizer.with_observer(OuterAcceptObserver {
                             feedback: feedback.clone(),
@@ -4592,7 +4678,7 @@ fn run_outer_with_plan(
                 let (lo, hi) = &bounds_template;
                 let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
                     .expect("outer rho bounds must be valid");
-                let grad_tol = outer_gradient_tolerance(config.tolerance);
+                let grad_tol = outer_gradient_tolerance_with_scale(config.tolerance, config.objective_scale);
                 let max_iter =
                     MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
                 let objective = OuterFirstOrderBridge {

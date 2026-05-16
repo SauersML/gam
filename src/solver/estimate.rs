@@ -2493,6 +2493,30 @@ where
         // Sparse designs short-circuit the policy because the n · p²
         // model does not apply to sparse linear algebra; ARC stays in
         // place and the sparse path's iteration-count advantage holds.
+        // Gaussian-identity REML has two well-conditioned features that
+        // the outer optimizer can exploit:
+        //
+        //   1. The REML cost is dominated by an O(n) likelihood constant,
+        //      so ∂/∂logλ inherits the same scale. A unit-magnitude
+        //      `abs` gradient floor (1e-6) becomes binding at biobank n
+        //      even after the relative-from-seed component declared
+        //      convergence iters earlier. `with_objective_scale(n)`
+        //      lifts the floor to ~n·1e-9 so the loop terminates once
+        //      the relative reduction is met.
+        //
+        //   2. The Gaussian profile likelihood is quadratic-like in
+        //      log-λ near the optimum, so the analytic Hessian is
+        //      trustworthy and the cubic regularization can start
+        //      smaller than opt's default sigma=1.0. Setting
+        //      sigma=0.25 allows the first ARC step to be ~4× the
+        //      default — matching the 2–4 unit log-λ moves typical of
+        //      Gaussian-identity REML cold starts on tensor smooths.
+        //
+        // Other families (logit, log, survival) keep the conservative
+        // defaults because their objective is non-quadratic in log-λ
+        // and their gradient is not on an O(n) scale.
+        let gaussian_identity = matches!(cfg.link_function(), LinkFunction::Identity);
+        let n_obs = y_o.len();
         let problem = OuterProblem::new(k)
             .with_gradient(Derivative::Analytic)
             .with_hessian(if analytic_outer_hessian_available {
@@ -2514,6 +2538,21 @@ where
                 last_converged: Arc::clone(&reml_state.last_inner_converged),
                 ift_residual: Arc::clone(&reml_state.last_ift_prediction_residual),
                 accept_rho: Arc::clone(&reml_state.last_pirls_accept_rho),
+            })
+            .with_objective_scale(if gaussian_identity {
+                Some(n_obs as f64)
+            } else {
+                None
+            })
+            .with_arc_initial_regularization(if gaussian_identity {
+                Some(0.25)
+            } else {
+                None
+            })
+            .with_operator_initial_trust_radius(if gaussian_identity {
+                Some(4.0)
+            } else {
+                None
             })
             .with_rho_bound(crate::estimate::RHO_BOUND);
         let problem = if let Some(ref h) = heuristic_lambdas {
