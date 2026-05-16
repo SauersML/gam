@@ -216,6 +216,9 @@ est = GAMRegressor(formula="y ~ s(x)").fit(X, y)
 - **CLI help:** `gam <command> --help` (commands: `fit`, `predict`,
   `report`, `diagnose`, `sample`, `generate`).
 - **Cookbook:** [docs/cookbook.md](docs/cookbook.md).
+- **Manifold smooths gallery:** [docs/manifold-smooths.md](docs/manifold-smooths.md)
+  — visual tour of the periodic / sphere / cylinder / torus / Möbius /
+  BC smooths, recovered from noisy 3-D point clouds.
 
 ## Repository layout
 
