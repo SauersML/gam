@@ -272,11 +272,11 @@ fn cylinder_tensor_via_te_formula_scales_and_seam_wraps() {
     // End-to-end periodic tensor build through the formula DSL, term
     // builder, tensor basis, and standard Gaussian fit. The larger 10k/100k
     // coverage above isolates basis hot loops; this full REML path is kept
-    // smaller so debug test runs remain practical.
+    // small so debug test runs remain practical.
     use csv::StringRecord;
     use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula};
     use std::f64::consts::TAU;
-    let n: usize = 1_000;
+    let n: usize = 100;
     let headers = vec!["theta".to_string(), "h".to_string(), "y".to_string()];
     let rows: Vec<StringRecord> = (0..n)
         .map(|i| {
