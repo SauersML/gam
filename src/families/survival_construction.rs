@@ -744,15 +744,22 @@ pub fn parse_survival_time_basis_config(
         "none" => Ok(SurvivalTimeBasisConfig::None),
         "ispline" => {
             if time_degree < 1 {
-                return Err("--time-degree must be >= 1 for ispline time basis".to_string());
+                return Err(
+                    "time-basis degree must be >= 1 for ispline time basis (CLI: --time-degree; Python: time_degree=)"
+                        .to_string(),
+                );
             }
             if time_num_internal_knots == 0 {
                 return Err(
-                    "--time-num-internal-knots must be > 0 for ispline time basis".to_string(),
+                    "time-basis must have > 0 internal knots for ispline time basis (CLI: --time-num-internal-knots; Python: time_num_internal_knots=)"
+                        .to_string(),
                 );
             }
             if !time_smooth_lambda.is_finite() || time_smooth_lambda < 0.0 {
-                return Err("--time-smooth-lambda must be finite and >= 0".to_string());
+                return Err(
+                    "time-basis smoothing lambda must be finite and >= 0 (CLI: --time-smooth-lambda; Python: time_smooth_lambda=)"
+                        .to_string(),
+                );
             }
             Ok(SurvivalTimeBasisConfig::ISpline {
                 degree: time_degree,
