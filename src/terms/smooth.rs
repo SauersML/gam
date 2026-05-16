@@ -17468,14 +17468,15 @@ mod tests {
         // `range(S_+)` is a strict subspace (for this 1-D Duchon test
         // `S_λ` has rank 5 in a 7-dim transformed basis, so two
         // directions of H sit outside `range(S)` and contribute their
-        // own ψ-dependence to `log|H_full|`).  FD'ing the full-space
-        // logdet picks up that extra contribution; FD'ing the projected
-        // logdet exposes exactly what the analytic trace formula
-        // `kernel.trace_projected_logdet(op_total)` computes.  Pinning
-        // against the wrong oracle made this invariant fire even on
-        // mathematically-correct production output, so the test pinned
-        // an impossible identity.  The corrected oracle is the only one
-        // the production code actually claims to satisfy.
+        // own ψ-dependence to `log|H_full|`).  Finite-differencing the
+        // full-space logdet picks up that extra contribution; finite-
+        // differencing the projected logdet exposes exactly what the
+        // analytic trace formula `kernel.trace_projected_logdet(op_total)`
+        // computes.  Pinning against the wrong finite-difference reference
+        // made this invariant fire even on mathematically-correct
+        // production output, so the test pinned an impossible identity.
+        // The corrected finite-difference reference is the only one the
+        // production code actually claims to satisfy.
         let h = 1e-5_f64;
         let psi_idx = rho_dim;
         let mut theta_p = theta_zero.clone();
