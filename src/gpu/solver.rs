@@ -50,14 +50,12 @@ pub fn try_chol_solve_inplace(a: &mut Array2<f64>, rhs: &mut Array2<f64>) -> Opt
 
 #[inline]
 fn route_syevd(p: usize) -> bool {
-    p >= 256
+    GpuRuntime::global().policy().route_syevd(p)
 }
 
 #[inline]
 fn route_chol_solve(p: usize) -> bool {
-    // Host faer factor+solve is dominated by host/device round-trip below
-    // ~512 columns; above that cuSOLVER's tensor-core-aware dpotrf wins.
-    p >= 512
+    GpuRuntime::global().policy().route_chol_solve(p)
 }
 
 fn with_runtime<T>(f: impl FnOnce(&mut CusolverRuntime) -> Option<T>) -> Option<T> {
