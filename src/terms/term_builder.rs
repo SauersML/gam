@@ -270,6 +270,7 @@ pub fn build_smooth_basis(
     let smooth_double_penalty = option_bool(options, "double_penalty").unwrap_or(true);
     let type_opt = options
         .get("type")
+        .or_else(|| options.get("bs"))
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_else(|| match kind {
             SmoothKind::Te => "tensor".to_string(),
@@ -397,6 +398,48 @@ pub fn build_smooth_basis(
                     radial_reparam: None,
                 },
                 input_scales: None,
+            })
+        }
+        "sphere" | "sos" | "spherical" => {
+            if cols.len() != 2 {
+                return Err(format!(
+                    "sphere smooth expects exactly two variables (latitude, longitude), got {}",
+                    cols.len()
+                ));
+            }
+            let plan = plan_spatial_basis(
+                ds.values.nrows(),
+                2,
+                CenterCountRequest::Default,
+                DuchonNullspaceOrder::Zero,
+                false,
+                policy,
+            )
+            .map_err(|e| e.to_string())?;
+            let centers = parse_countwith_basis_alias(options, "centers", plan.centers)?;
+            let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
+                CenterStrategy::FarthestPoint {
+                    num_centers: centers,
+                }
+            } else {
+                auto_spatial_center_strategy(centers, 2)
+            };
+            let penalty_order = option_usize(options, "m")
+                .or_else(|| option_usize(options, "order"))
+                .or_else(|| option_usize(options, "penalty_order"))
+                .unwrap_or(2);
+            if !(1..=4).contains(&penalty_order) {
+                return Err(format!(
+                    "sphere smooth penalty order must be one of 1, 2, 3, 4; got {penalty_order}"
+                ));
+            }
+            Ok(SmoothBasisSpec::Sphere {
+                feature_cols: cols.to_vec(),
+                spec: SphericalSplineBasisSpec {
+                    center_strategy,
+                    penalty_order,
+                    double_penalty: smooth_double_penalty,
+                },
             })
         }
         "matern" => {

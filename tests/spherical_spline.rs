@@ -1,0 +1,151 @@
+use gam::basis::{
+    CenterStrategy, SphericalSplineBasisSpec, build_spherical_spline_basis,
+    spherical_wahba_kernel_matrix,
+};
+use gam::inference::data::EncodedDataset;
+use gam::inference::formula_dsl::{ParsedTerm, parse_formula};
+use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
+use gam::terms::basis::BasisMetadata;
+use gam::terms::smooth::SmoothBasisSpec;
+use gam::terms::term_builder::build_termspec;
+use ndarray::array;
+
+#[test]
+fn wahba_kernel_is_longitude_periodic_and_symmetric() {
+    let points = array![[0.0, 0.0], [25.0, 179.0], [-60.0, -45.0]];
+    let shifted = array![[0.0, 360.0], [25.0, -181.0], [-60.0, 315.0]];
+
+    let k = spherical_wahba_kernel_matrix(points.view(), points.view(), 2).expect("kernel");
+    let k_shifted =
+        spherical_wahba_kernel_matrix(points.view(), shifted.view(), 2).expect("kernel");
+
+    for i in 0..k.nrows() {
+        for j in 0..k.ncols() {
+            assert!(
+                (k[(i, j)] - k[(j, i)]).abs() < 1e-12,
+                "kernel not symmetric"
+            );
+            assert!(
+                (k[(i, j)] - k_shifted[(i, j)]).abs() < 1e-12,
+                "kernel should be invariant to 360-degree longitude shifts"
+            );
+        }
+    }
+}
+
+#[test]
+fn spherical_basis_builds_constrained_design_and_penalties() {
+    let data = array![
+        [-80.0, -170.0],
+        [-40.0, -60.0],
+        [0.0, 0.0],
+        [35.0, 80.0],
+        [70.0, 160.0]
+    ];
+    let spec = SphericalSplineBasisSpec {
+        center_strategy: CenterStrategy::UserProvided(data.clone()),
+        penalty_order: 2,
+        double_penalty: true,
+    };
+
+    let built = build_spherical_spline_basis(data.view(), &spec).expect("sphere basis");
+    assert_eq!(built.design.nrows(), data.nrows());
+    assert_eq!(built.design.ncols(), data.nrows() - 1);
+    assert_eq!(built.penalties.len(), 2);
+    assert_eq!(built.penalties[0].nrows(), data.nrows() - 1);
+
+    match built.metadata {
+        BasisMetadata::Sphere {
+            centers,
+            penalty_order,
+            constraint_transform,
+        } => {
+            assert_eq!(centers, data);
+            assert_eq!(penalty_order, 2);
+            let z = constraint_transform.expect("coefficient constraint transform");
+            for col in 0..z.ncols() {
+                let sum = z.column(col).sum();
+                assert!(sum.abs() < 1e-12, "constraint column {col} sum {sum}");
+            }
+        }
+        other => panic!("unexpected metadata: {other:?}"),
+    }
+}
+
+#[test]
+fn sphere_formula_and_mgcv_sos_alias_resolve_to_sphere_basis() {
+    let parsed = parse_formula("y ~ sphere(lat, lon, k=4) + s(lat, lon, bs=\"sos\", k=4)")
+        .expect("formula parses");
+    assert_eq!(parsed.terms.len(), 2);
+    assert!(
+        matches!(parsed.terms[0], ParsedTerm::Smooth { ref vars, .. } if vars == &vec!["lat".to_string(), "lon".to_string()])
+    );
+
+    let values = array![
+        [1.0, -80.0, -170.0],
+        [2.0, -30.0, -60.0],
+        [3.0, 0.0, 0.0],
+        [4.0, 30.0, 60.0],
+        [5.0, 80.0, 170.0]
+    ];
+    let ds = EncodedDataset {
+        headers: vec!["y".into(), "lat".into(), "lon".into()],
+        values,
+        schema: DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "y".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "lat".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "lon".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+            ],
+        },
+        column_kinds: vec![ColumnKindTag::Continuous; 3],
+    };
+    let col_map = ds.column_map();
+    let mut notes = Vec::new();
+    let spec = build_termspec(
+        &parsed.terms,
+        &ds,
+        &col_map,
+        &mut notes,
+        &gam::ResourcePolicy::default_library(),
+    )
+    .expect("term spec");
+    assert_eq!(spec.smooth_terms.len(), 2);
+    assert!(matches!(
+        spec.smooth_terms[0].basis,
+        SmoothBasisSpec::Sphere { .. }
+    ));
+    assert!(matches!(
+        spec.smooth_terms[1].basis,
+        SmoothBasisSpec::Sphere { .. }
+    ));
+}
+
+#[test]
+fn spherical_basis_rejects_bad_latitudes_and_wrong_dimension() {
+    let bad_lat = array![[91.0, 0.0], [0.0, 10.0]];
+    let spec = SphericalSplineBasisSpec {
+        center_strategy: CenterStrategy::UserProvided(bad_lat.clone()),
+        penalty_order: 2,
+        double_penalty: false,
+    };
+    let err = build_spherical_spline_basis(bad_lat.view(), &spec).expect_err("invalid latitude");
+    assert!(err.to_string().contains("latitude must be in [-90, 90]"));
+
+    let wrong_dim = array![[0.0, 0.0, 1.0], [10.0, 20.0, 1.0]];
+    let err = spherical_wahba_kernel_matrix(wrong_dim.view(), wrong_dim.view(), 2)
+        .expect_err("wrong dimension");
+    assert!(err.to_string().contains("exactly two columns"));
+}

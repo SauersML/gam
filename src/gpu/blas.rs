@@ -5,8 +5,8 @@ use ndarray::{Array1, Array2, ArrayBase, Data, Ix1, Ix2};
 use std::sync::{Mutex, OnceLock};
 
 use super::driver::{
-    DeviceAllocation, DriverApi, bytes_len, check_cuda, cuda_library_candidates, from_col_major,
-    load_library, to_col_major, to_i32,
+    CudaWorkingState, DeviceAllocation, bytes_len, check_cuda, from_col_major, load_library,
+    to_col_major, to_i32,
 };
 use super::runtime::GpuRuntime;
 
@@ -115,7 +115,10 @@ fn route_xtwx(rows: usize, lhs_cols: usize, rhs_cols: usize) -> bool {
 fn with_runtime<T>(f: impl FnOnce(&mut CublasRuntime) -> Option<T>) -> Option<T> {
     static RUNTIME: OnceLock<Option<Mutex<CublasRuntime>>> = OnceLock::new();
     RUNTIME
-        .get_or_init(|| CublasRuntime::new().ok().map(Mutex::new))
+        .get_or_init(|| {
+            let cuda = GpuRuntime::global().cuda_working_state()?;
+            CublasRuntime::new(cuda).ok().map(Mutex::new)
+        })
         .as_ref()?
         .lock()
         .ok()
@@ -123,49 +126,29 @@ fn with_runtime<T>(f: impl FnOnce(&mut CublasRuntime) -> Option<T>) -> Option<T>
 }
 
 struct CublasRuntime {
-    _cuda_lib: Library,
+    /// Borrowed driver + context owned by [`GpuRuntime`].
+    cuda: &'static CudaWorkingState,
     _cublas_lib: Library,
-    driver: DriverApi,
     blas: CublasApi,
-    context: usize,
     handle: usize,
 }
 
 impl CublasRuntime {
-    fn new() -> Result<Self, String> {
-        let selected = GpuRuntime::global()
-            .selected_device()
-            .ok_or_else(|| "no CUDA device selected".to_string())?;
-        let cuda_lib = load_library(cuda_library_candidates())?;
+    fn new(cuda: &'static CudaWorkingState) -> Result<Self, String> {
         let cublas_lib = load_library(cublas_library_candidates())?;
-        let driver = DriverApi::load(&cuda_lib)?;
         let blas = CublasApi::load(&cublas_lib)?;
-        unsafe {
-            check_cuda((driver.cu_init)(0), "cuInit")?;
-            let mut device = 0;
-            let ordinal = to_i32(selected.ordinal)
-                .ok_or_else(|| "CUDA device ordinal exceeds i32".to_string())?;
-            check_cuda((driver.cu_device_get)(&mut device, ordinal), "cuDeviceGet")?;
-            let mut context = 0usize;
-            check_cuda(
-                (driver.cu_ctx_create)(&mut context, 0, device),
-                "cuCtxCreate",
-            )?;
-            let mut handle = 0usize;
-            let create_status = (blas.cublas_create)(&mut handle);
-            if create_status != CUBLAS_STATUS_SUCCESS {
-                let _ = (driver.cu_ctx_destroy)(context);
-                return Err(format!("cublasCreate failed with status {create_status}"));
-            }
-            Ok(Self {
-                _cuda_lib: cuda_lib,
-                _cublas_lib: cublas_lib,
-                driver,
-                blas,
-                context,
-                handle,
-            })
+        cuda.set_current()?;
+        let mut handle = 0_usize;
+        let create_status = unsafe { (blas.cublas_create)(&mut handle) };
+        if create_status != CUBLAS_STATUS_SUCCESS {
+            return Err(format!("cublasCreate failed with status {create_status}"));
         }
+        Ok(Self {
+            cuda,
+            _cublas_lib: cublas_lib,
+            blas,
+            handle,
+        })
     }
 
     fn gemm<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
@@ -195,10 +178,10 @@ impl CublasRuntime {
         let bytes_c = bytes_len::<f64>(c_host.len())?;
 
         unsafe {
-            self.set_current().ok()?;
+            self.cuda.set_current().ok()?;
             let a_dev = self.alloc_copy(&a_host, bytes_a)?;
             let b_dev = self.alloc_copy(&b_host, bytes_b)?;
-            let c_dev = DeviceAllocation::new(&self.driver, bytes_c)?;
+            let c_dev = DeviceAllocation::new(&self.cuda.api, bytes_c)?;
             let alpha = 1.0;
             let beta = 0.0;
             let status = (self.blas.cublas_dgemm)(
@@ -221,7 +204,7 @@ impl CublasRuntime {
                 return None;
             }
             check_cuda(
-                (self.driver.cu_memcpy_dtoh)(c_host.as_mut_ptr().cast(), c_dev.ptr, bytes_c),
+                (self.cuda.api.cu_memcpy_dtoh)(c_host.as_mut_ptr().cast(), c_dev.ptr, bytes_c),
                 "cuMemcpyDtoH",
             )
             .ok()?;
@@ -245,10 +228,10 @@ impl CublasRuntime {
         let bytes_y = bytes_len::<f64>(y_host.len())?;
 
         unsafe {
-            self.set_current().ok()?;
+            self.cuda.set_current().ok()?;
             let a_dev = self.alloc_copy(&a_host, bytes_a)?;
             let x_dev = self.alloc_copy(&x_host, bytes_x)?;
-            let y_dev = DeviceAllocation::new(&self.driver, bytes_y)?;
+            let y_dev = DeviceAllocation::new(&self.cuda.api, bytes_y)?;
             let alpha = 1.0;
             let beta = 0.0;
             let status = (self.blas.cublas_dgemv)(
@@ -269,7 +252,7 @@ impl CublasRuntime {
                 return None;
             }
             check_cuda(
-                (self.driver.cu_memcpy_dtoh)(y_host.as_mut_ptr().cast(), y_dev.ptr, bytes_y),
+                (self.cuda.api.cu_memcpy_dtoh)(y_host.as_mut_ptr().cast(), y_dev.ptr, bytes_y),
                 "cuMemcpyDtoH",
             )
             .ok()?;
@@ -299,11 +282,11 @@ impl CublasRuntime {
         let bytes_out = bytes_len::<f64>(out_host.len())?;
 
         unsafe {
-            self.set_current().ok()?;
+            self.cuda.set_current().ok()?;
             let x_dev = self.alloc_copy(&x_host, bytes_x)?;
             let y_dev = self.alloc_copy(&y_host, bytes_y)?;
             let w_dev = self.alloc_copy(&w_host, bytes_w)?;
-            let wy_dev = DeviceAllocation::new(&self.driver, bytes_y)?;
+            let wy_dev = DeviceAllocation::new(&self.cuda.api, bytes_y)?;
             let scale_status = (self.blas.cublas_ddgmm)(
                 self.handle,
                 CUBLAS_SIDE_LEFT,
@@ -319,7 +302,7 @@ impl CublasRuntime {
             if scale_status != CUBLAS_STATUS_SUCCESS {
                 return None;
             }
-            let out_dev = DeviceAllocation::new(&self.driver, bytes_out)?;
+            let out_dev = DeviceAllocation::new(&self.cuda.api, bytes_out)?;
             let alpha = 1.0;
             let beta = 0.0;
             let status = (self.blas.cublas_dgemm)(
@@ -342,7 +325,7 @@ impl CublasRuntime {
                 return None;
             }
             check_cuda(
-                (self.driver.cu_memcpy_dtoh)(out_host.as_mut_ptr().cast(), out_dev.ptr, bytes_out),
+                (self.cuda.api.cu_memcpy_dtoh)(out_host.as_mut_ptr().cast(), out_dev.ptr, bytes_out),
                 "cuMemcpyDtoH",
             )
             .ok()?;
@@ -350,21 +333,14 @@ impl CublasRuntime {
         Some(from_col_major(&out_host, x_cols, y_cols))
     }
 
-    unsafe fn set_current(&self) -> Result<(), String> {
-        check_cuda(
-            unsafe { (self.driver.cu_ctx_set_current)(self.context) },
-            "cuCtxSetCurrent",
-        )
-    }
-
     unsafe fn alloc_copy<'a>(
         &'a self,
         values: &[f64],
         bytes: usize,
     ) -> Option<DeviceAllocation<'a>> {
-        let allocation = unsafe { DeviceAllocation::new(&self.driver, bytes) }?;
+        let allocation = unsafe { DeviceAllocation::new(&self.cuda.api, bytes) }?;
         check_cuda(
-            unsafe { (self.driver.cu_memcpy_htod)(allocation.ptr, values.as_ptr().cast(), bytes) },
+            unsafe { (self.cuda.api.cu_memcpy_htod)(allocation.ptr, values.as_ptr().cast(), bytes) },
             "cuMemcpyHtoD",
         )
         .ok()?;
@@ -374,10 +350,13 @@ impl CublasRuntime {
 
 impl Drop for CublasRuntime {
     fn drop(&mut self) {
+        // The cuBLAS handle is library-local; destroying it here releases
+        // its small descriptor buffers. The CUDA context itself is owned
+        // by the shared [`CudaWorkingState`] and tears down once at
+        // process exit, not on every library runtime drop.
         unsafe {
-            let _ = (self.driver.cu_ctx_set_current)(self.context);
+            let _ = self.cuda.set_current();
             let _ = (self.blas.cublas_destroy)(self.handle);
-            let _ = (self.driver.cu_ctx_destroy)(self.context);
         }
     }
 }
