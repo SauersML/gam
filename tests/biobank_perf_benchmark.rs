@@ -294,3 +294,131 @@ fn biobank_perf_binomial_cylinder_n100k() {
     );
     eprintln!("[biobank-fit] binomial cylinder N={n} p={p}: {ms:.0} ms");
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Sparse Khatri-Rao tensor-product design construction
+// ────────────────────────────────────────────────────────────────────────────
+//
+// These tests time `build_term_collection_design` for a 2D `te(x, h)` smooth at
+// biobank N. The same problem is built twice:
+//
+//   * `identifiability = None`  → triggers the new sparse Khatri-Rao path
+//     (`build_tensor_bspline_basis` returns `DesignMatrix::Sparse`).
+//   * `identifiability = SumToZero` → forces the existing dense fall-back
+//     (the identifiability transform requires a fully materialized basis).
+//
+// Both runs eagerly densify nothing else: the sparse run completes when the
+// `SparseColMat` is assembled; the dense run completes when the
+// `n × ∏ q_j` `Array2` is filled. Times are reported via eprintln so they
+// show up in CI logs without gating CI on a hard latency budget.
+
+fn te_xh_design_spec(num_x: usize, num_h: usize, identifiability: TensorBSplineIdentifiability) -> TermCollectionSpec {
+    let spec_x = BSplineBasisSpec {
+        degree: 3,
+        penalty_order: 2,
+        knotspec: BSplineKnotSpec::Generate {
+            data_range: (0.0, 1.0),
+            num_internal_knots: num_x.saturating_sub(4),
+        },
+        double_penalty: false,
+        identifiability: BSplineIdentifiability::None,
+        boundary_conditions: Default::default(),
+    };
+    let spec_h = BSplineBasisSpec {
+        degree: 3,
+        penalty_order: 2,
+        knotspec: BSplineKnotSpec::Generate {
+            data_range: (0.0, 1.0),
+            num_internal_knots: num_h.saturating_sub(4),
+        },
+        double_penalty: false,
+        identifiability: BSplineIdentifiability::None,
+        boundary_conditions: Default::default(),
+    };
+    TermCollectionSpec {
+        linear_terms: vec![],
+        random_effect_terms: vec![],
+        smooth_terms: vec![SmoothTermSpec {
+            name: "te_xh".to_string(),
+            basis: SmoothBasisSpec::TensorBSpline {
+                feature_cols: vec![0, 1],
+                spec: TensorBSplineSpec {
+                    marginalspecs: vec![spec_x, spec_h],
+                    double_penalty: false,
+                    identifiability,
+                },
+            },
+            shape: ShapeConstraint::None,
+        }],
+    }
+}
+
+fn quasi_random_2d(n: usize) -> Array2<f64> {
+    let phi1: f64 = 0.6180339887498949;
+    let phi2: f64 = 0.7548776662466927;
+    let mut data = Array2::<f64>::zeros((n, 2));
+    for i in 0..n {
+        data[[i, 0]] = ((i as f64 + 0.5) * phi1).fract();
+        data[[i, 1]] = ((i as f64 + 0.5) * phi2).fract();
+    }
+    data
+}
+
+fn time_design_build(spec: &TermCollectionSpec, data: &Array2<f64>) -> (f64, usize, bool) {
+    let t = Instant::now();
+    let design = build_term_collection_design(data.view(), spec)
+        .expect("te(x, h) design build");
+    let ms = t.elapsed().as_secs_f64() * 1e3;
+    let term = &design.smooth.term_designs[0];
+    let p = term.ncols();
+    let is_sparse = matches!(term, DesignMatrix::Sparse(_));
+    (ms, p, is_sparse)
+}
+
+#[test]
+fn biobank_perf_sparse_vs_dense_te_n1m_p128() {
+    // p = 8 × 16 = 128 (matches the user's "p=128 at biobank N" scenario).
+    init_parallelism();
+    let n = 1_000_000;
+    let data = quasi_random_2d(n);
+
+    let spec_sparse = te_xh_design_spec(8, 16, TensorBSplineIdentifiability::None);
+    let (ms_sparse, p_sparse, is_sparse) = time_design_build(&spec_sparse, &data);
+    assert!(
+        is_sparse,
+        "identifiability=None on B-spline marginals must trigger the sparse Khatri-Rao path"
+    );
+
+    let spec_dense = te_xh_design_spec(8, 16, TensorBSplineIdentifiability::SumToZero);
+    let (ms_dense, p_dense, is_sparse_dense) = time_design_build(&spec_dense, &data);
+    assert!(
+        !is_sparse_dense,
+        "SumToZero identifiability must take the dense fall-back path"
+    );
+
+    let speedup = ms_dense / ms_sparse.max(1e-6);
+    eprintln!(
+        "[biobank-design] te(x,h) N={n} p_sparse={p_sparse} p_dense={p_dense}: \
+         sparse path = {ms_sparse:.0} ms, dense path = {ms_dense:.0} ms, speedup = {speedup:.1}×"
+    );
+}
+
+#[test]
+fn biobank_perf_sparse_vs_dense_te_n100k_p128() {
+    init_parallelism();
+    let n = 100_000;
+    let data = quasi_random_2d(n);
+
+    let spec_sparse = te_xh_design_spec(8, 16, TensorBSplineIdentifiability::None);
+    let (ms_sparse, p_sparse, is_sparse) = time_design_build(&spec_sparse, &data);
+    assert!(is_sparse);
+
+    let spec_dense = te_xh_design_spec(8, 16, TensorBSplineIdentifiability::SumToZero);
+    let (ms_dense, p_dense, _) = time_design_build(&spec_dense, &data);
+
+    let speedup = ms_dense / ms_sparse.max(1e-6);
+    eprintln!(
+        "[biobank-design] te(x,h) N={n} p_sparse={p_sparse} p_dense={p_dense}: \
+         sparse path = {ms_sparse:.1} ms, dense path = {ms_dense:.1} ms, speedup = {speedup:.1}×"
+    );
+}
