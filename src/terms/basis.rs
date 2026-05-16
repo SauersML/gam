@@ -1,8 +1,8 @@
 use crate::faer_ndarray::{
-    FaerEigh, FaerLinalgError, default_rrqr_rank_alpha, fast_ab, fast_ata, fast_atb,
-    rrqr_nullspace_basis,
+    FaerEigh, FaerLinalgError, array2_to_matmut, default_rrqr_rank_alpha, fast_ab, fast_ata,
+    fast_atb, rrqr_nullspace_basis,
 };
-use crate::linalg::utils::{KahanSum, matrix_inversewith_regularization};
+use crate::linalg::utils::{KahanSum, StableSolver};
 use crate::matrix::{
     ChunkedKernelDesignOperator, CoefficientTransformOperator, DesignMatrix, LinearOperator,
 };
@@ -2041,8 +2041,8 @@ pub fn create_periodic_bspline_derivative_dense(
                 let base = tau.floor() as isize;
                 for local in 0..=(degree + 1) {
                     let j_unwrapped = base - degree as isize + local as isize;
-                    let value = cardinal_bspline_derivative_value(tau - j_unwrapped as f64, degree)
-                        * inv_h;
+                    let value =
+                        cardinal_bspline_derivative_value(tau - j_unwrapped as f64, degree) * inv_h;
                     let j = j_unwrapped.rem_euclid(nb_isize) as usize;
                     out_row[j] += value;
                 }
@@ -2052,7 +2052,6 @@ pub fn create_periodic_bspline_derivative_dense(
         return Err(BasisError::InvalidInput(
             "periodic B-spline data contains non-finite coordinate".to_string(),
         ));
-        }
     }
     Ok(basis)
 }
@@ -2142,10 +2141,18 @@ pub fn fit_periodic_spline_curve(
     for i in 0..normal.nrows() {
         normal[[i, i]] += 1e-12;
     }
-    let rhs = fast_atb(&basis, &points.to_owned());
-    let inv = matrix_inversewith_regularization(&normal, "periodic_spline_curve_normal")
-        .ok_or_else(|| BasisError::LinalgError(FaerLinalgError::FactorizationFailed))?;
-    Ok(fast_ab(&inv, &rhs))
+    let mut control = fast_atb(&basis, &points.to_owned());
+    let factor = StableSolver::new("periodic_spline_curve_normal")
+        .factorize(&normal)
+        .map_err(|_| BasisError::LinalgError(FaerLinalgError::FactorizationFailed))?;
+    let mut control_view = array2_to_matmut(&mut control);
+    factor.solve_in_place(control_view.as_mut());
+    if !control.iter().all(|v| v.is_finite()) {
+        return Err(BasisError::LinalgError(
+            FaerLinalgError::FactorizationFailed,
+        ));
+    }
+    Ok(control)
 }
 
 /// Per-smooth identifiability policy for 1D B-spline bases.
@@ -13574,21 +13581,50 @@ pub fn spherical_wahba_kernel_matrix(
     } else {
         std::f64::consts::PI / 180.0
     };
-    let mut out = Array2::<f64>::zeros((n, k));
-    let mut center_trig = Vec::with_capacity(k);
+    // Precompute (sin_lat, cos_lat, lon) for each center once.
+    let mut sin_c = Vec::<f64>::with_capacity(k);
+    let mut cos_c = Vec::<f64>::with_capacity(k);
+    let mut lon_c = Vec::<f64>::with_capacity(k);
     for c in centers.outer_iter() {
         let lat = c[0] * deg;
         let lon = c[1] * deg;
-        center_trig.push((lat.sin(), lat.cos(), lon));
+        sin_c.push(lat.sin());
+        cos_c.push(lat.cos());
+        lon_c.push(lon);
     }
-    for (i, row) in data.outer_iter().enumerate() {
-        let lat = row[0] * deg;
-        let lon = row[1] * deg;
-        let (sin_lat, cos_lat) = (lat.sin(), lat.cos());
-        for (j, &(sin_c, cos_c, lon_c)) in center_trig.iter().enumerate() {
-            let cos_gamma = sin_lat * sin_c + cos_lat * cos_c * (lon - lon_c).cos();
-            out[(i, j)] = wahba_sphere_kernel_from_cos(cos_gamma, penalty_order)?;
-        }
+    let mut out = Array2::<f64>::zeros((n, k));
+    let err_flag = std::sync::atomic::AtomicBool::new(false);
+    // Parallelize over row chunks. Each row independently fills an n_chunk×k
+    // tile, so writes never alias. The inner per-row j loop is tight enough
+    // that chunk granularity of 256 gives good speedup without overwhelming
+    // the rayon work-stealing queue.
+    out.axis_chunks_iter_mut(ndarray::Axis(0), 256)
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(chunk_idx, mut block)| {
+            let row_offset = chunk_idx * 256;
+            for (local_i, mut out_row) in block.outer_iter_mut().enumerate() {
+                let i = row_offset + local_i;
+                let lat = data[(i, 0)] * deg;
+                let lon = data[(i, 1)] * deg;
+                let (sin_lat, cos_lat) = lat.sin_cos();
+                for j in 0..k {
+                    let cos_gamma =
+                        sin_lat * sin_c[j] + cos_lat * cos_c[j] * (lon - lon_c[j]).cos();
+                    match wahba_sphere_kernel_from_cos(cos_gamma, penalty_order) {
+                        Ok(v) => out_row[j] = v,
+                        Err(_) => {
+                            err_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    if err_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(BasisError::InvalidInput(
+            "spherical spline kernel produced a non-finite value".to_string(),
+        ));
     }
     Ok(out)
 }
@@ -13840,10 +13876,7 @@ fn build_spherical_harmonic_basis(
             for (local_i, mut out_row) in block.outer_iter_mut().enumerate() {
                 let i = row_offset + local_i;
                 let lat_raw = data_slice[i * 2] * to_rad;
-                let lat = lat_raw.clamp(
-                    -std::f64::consts::FRAC_PI_2,
-                    std::f64::consts::FRAC_PI_2,
-                );
+                let lat = lat_raw.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
                 let lon = data_slice[i * 2 + 1] * to_rad;
                 fill_real_spherical_harmonics_row(
                     lat,
