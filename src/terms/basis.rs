@@ -1872,10 +1872,10 @@ pub struct BSplineBasisSpec {
     /// Optional endpoint constraints for 1D B-spline smooths.
     ///
     /// `Clamped` enforces zero first derivative at the selected endpoint.
-    /// `Anchored { value }` enforces an endpoint value and can be combined
-    /// independently on the left and right sides. The raw basis builder handles
-    /// homogeneous anchors by null-space projection; model-level smooth builders
-    /// carry nonzero anchors as exact equality constraints.
+    /// `Anchored { value: 0.0 }` enforces a zero endpoint value and can be
+    /// combined independently on the left and right sides. Non-zero anchors are
+    /// parsed and validated, but fitting them requires an affine term offset and
+    /// is rejected by the builder for now rather than silently ignored.
     #[serde(default)]
     pub boundary_conditions: BSplineBoundaryConditions,
 }
@@ -1887,7 +1887,8 @@ pub enum BSplineEndpointBoundaryCondition {
     Free,
     /// Force the first derivative to be zero at the endpoint.
     Clamped,
-    /// Force the smooth value at the endpoint.
+    /// Force the smooth value at the endpoint. Currently only `value == 0` is
+    /// supported by the homogeneous coefficient reparameterization.
     Anchored { value: f64 },
 }
 
@@ -6777,7 +6778,7 @@ fn bspline_boundary_constraint_rows(
         BSplineEndpointBoundaryCondition::Anchored { value } => {
             if value.abs() > 1e-12 {
                 return Err(BasisError::InvalidInput(format!(
-                    "non-zero B-spline left anchor {value} requires model-level linear constraints; call through the smooth-term builder"
+                    "non-zero B-spline left anchor {value} requires an affine term offset; currently only anchored value 0 is supported"
                 )));
             }
             rows.push(bspline_boundary_value_row(left_x, knots, degree)?);
@@ -6791,7 +6792,7 @@ fn bspline_boundary_constraint_rows(
         BSplineEndpointBoundaryCondition::Anchored { value } => {
             if value.abs() > 1e-12 {
                 return Err(BasisError::InvalidInput(format!(
-                    "non-zero B-spline right anchor {value} requires model-level linear constraints; call through the smooth-term builder"
+                    "non-zero B-spline right anchor {value} requires an affine term offset; currently only anchored value 0 is supported"
                 )));
             }
             rows.push(bspline_boundary_value_row(right_x, knots, degree)?);
@@ -24629,7 +24630,7 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_bspline_builder_rejects_nonzero_anchor_without_model_constraints() {
+    fn test_bspline_nonzero_anchor_is_rejected_until_affine_offsets_exist() {
         let x = Array::linspace(0.0, 1.0, 12);
         let spec = BSplineBasisSpec {
             degree: 3,
