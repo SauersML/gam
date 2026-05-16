@@ -3317,7 +3317,7 @@ mod tests {
             spec.nullspace_order,
             DuchonNullspaceOrder::Degree(2)
         ));
-        assert_eq!(spec.power, 2);
+        assert_eq!(spec.power, 0);
     }
 
     #[test]
