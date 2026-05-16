@@ -68,6 +68,7 @@ struct PyFitConfig {
     link: Option<String>,
     flexible_link: Option<bool>,
     scale_dimensions: Option<bool>,
+    adaptive_regularization: Option<bool>,
 
     // Location-scale (GAMLSS).
     noise_formula: Option<String>,
@@ -1165,6 +1166,9 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
     }
     if let Some(flag) = py_config.scale_dimensions {
         fit_config.scale_dimensions = flag;
+    }
+    if let Some(flag) = py_config.adaptive_regularization {
+        fit_config.adaptive_regularization = Some(flag);
     }
     if let Some(formula) = py_config.noise_formula {
         fit_config.noise_formula = Some(formula);
