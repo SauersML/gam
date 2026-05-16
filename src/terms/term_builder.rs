@@ -462,7 +462,11 @@ pub fn build_smooth_basis(
             let c = cols[0];
             let (minv, maxv) = col_minmax(ds.values.column(c))?;
             let degree = option_usize(options, "degree").unwrap_or(3);
-            let default_basis = heuristic_knots_for_column(ds.values.column(c)).max(degree + 1);
+            let mut default_internal = heuristic_knots_for_column(ds.values.column(c));
+            if ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
+                default_internal = default_internal.min(1);
+            }
+            let default_basis = default_internal + degree + 1;
             let num_basis = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])
                 .unwrap_or(default_basis);
             if num_basis < degree + 1 {

@@ -263,6 +263,68 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
 }
 
 #[test]
+fn cyclic_alias_default_basis_size_matches_periodic_s_smooth() {
+    let n = 40usize;
+    let values = Array2::from_shape_vec(
+        (n, 2),
+        (0..n)
+            .flat_map(|i| {
+                let u = i as f64 / n as f64;
+                [(std::f64::consts::TAU * u).sin(), u]
+            })
+            .collect(),
+    )
+    .unwrap();
+    let ds = EncodedDataset {
+        headers: vec!["y".to_string(), "u".to_string()],
+        values,
+        schema: DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "y".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "u".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+            ],
+        },
+        column_kinds: vec![ColumnKindTag::Continuous, ColumnKindTag::Continuous],
+    };
+    let cmap = ds.column_map();
+    let mut notes = Vec::new();
+    let formulas = [
+        "y ~ s(u, periodic=true, period_start=0, period_end=1)",
+        "y ~ cyclic(u, period_start=0, period_end=1)",
+    ];
+    let mut basis_sizes = Vec::new();
+    for formula in formulas {
+        let parsed = gam::inference::formula_dsl::parse_formula(formula).unwrap();
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &cmap,
+            &mut notes,
+            &ResourcePolicy::default_library(),
+        )
+        .unwrap();
+        match &terms.smooth_terms[0].basis {
+            SmoothBasisSpec::BSpline1D { spec, .. } => match spec.knotspec {
+                BSplineKnotSpec::PeriodicUniform { num_basis, .. } => {
+                    basis_sizes.push(num_basis);
+                }
+                _ => panic!("{formula} did not create periodic knotspec"),
+            },
+            _ => panic!("{formula} did not create 1D periodic smooth"),
+        }
+    }
+    assert_eq!(basis_sizes[0], basis_sizes[1]);
+}
+
+#[test]
 fn cylinder_formula_builds_tensor_with_periodic_margin() {
     let two_pi = std::f64::consts::TAU;
     let data = EncodedDataset {
