@@ -905,6 +905,7 @@ fn rank_seeds_with_screening(
         rejected = 0;
         for (idx, seed) in seeds.iter().enumerate() {
             obj.reset();
+            screening_cap.store(cap, Ordering::Relaxed);
             match obj.eval_screening_proxy(seed) {
                 Ok(cost) if cost.is_finite() => ranked.push((idx, cost)),
                 Ok(_) | Err(_) => rejected += 1,
