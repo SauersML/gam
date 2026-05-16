@@ -527,7 +527,10 @@ pub fn build_smooth_basis(
             let radians = option_bool(options, "radians").unwrap_or_else(|| {
                 options
                     .get("units")
-                    .map(|u| u.trim().to_ascii_lowercase() == "radians" || u.trim().to_ascii_lowercase() == "rad")
+                    .map(|u| {
+                        u.trim().to_ascii_lowercase() == "radians"
+                            || u.trim().to_ascii_lowercase() == "rad"
+                    })
                     .unwrap_or(false)
             });
             Ok(SmoothBasisSpec::Sphere {
@@ -944,7 +947,10 @@ fn parse_periods(
     Ok(out)
 }
 
-fn option_math_f64_any(options: &BTreeMap<String, String>, keys: &[&str]) -> Result<Option<f64>, String> {
+fn option_math_f64_any(
+    options: &BTreeMap<String, String>,
+    keys: &[&str],
+) -> Result<Option<f64>, String> {
     for key in keys {
         if let Some(raw) = options.get(*key) {
             return parse_math_f64(raw).map(Some);
@@ -960,11 +966,23 @@ fn parse_periodic_domain_1d(
 ) -> Result<(f64, f64), String> {
     let start = option_math_f64_any(
         options,
-        &["period_start", "period-start", "domain_start", "domain-start", "start"],
+        &[
+            "period_start",
+            "period-start",
+            "domain_start",
+            "domain-start",
+            "start",
+        ],
     )?;
     let end = option_math_f64_any(
         options,
-        &["period_end", "period-end", "domain_end", "domain-end", "end"],
+        &[
+            "period_end",
+            "period-end",
+            "domain_end",
+            "domain-end",
+            "end",
+        ],
     )?;
     match (start, end) {
         (Some(domain_start), Some(domain_end)) => {
