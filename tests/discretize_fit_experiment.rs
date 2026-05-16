@@ -19,8 +19,15 @@ fn raw_dataset(n: usize) -> gam::data::EncodedDataset {
     let headers = vec!["theta".to_string(), "h".to_string(), "y".to_string()];
     let rows: Vec<StringRecord> = (0..n)
         .map(|i| {
-            let theta = TAU * (i as f64) / (n as f64);
-            let h = -1.0 + 2.0 * ((i % 16) as f64) / 15.0;
+            // The weighted-cell identity is exact only when every row in a
+            // cell has the same basis row. Build an explicit 50 x 16 lattice
+            // with repeated observations so the discretization below really
+            // coalesces duplicate design rows instead of replacing a curved
+            // basis row distribution by its coordinate mean.
+            let theta_idx = (i / 16) % 50;
+            let h_idx = i % 16;
+            let theta = TAU * (theta_idx as f64) / 50.0;
+            let h = -1.0 + 2.0 * (h_idx as f64) / 15.0;
             let y = 1.0 + 0.55 * theta.cos() - 0.25 * (2.0 * theta).sin() + 0.3 * h;
             StringRecord::from(vec![theta.to_string(), h.to_string(), y.to_string()])
         })
@@ -28,10 +35,11 @@ fn raw_dataset(n: usize) -> gam::data::EncodedDataset {
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
-/// Bin (theta, h) into a `bins_per_axis × bins_per_axis` grid and aggregate
-/// y, weights. Returns a synthetic dataset with one row per non-empty cell,
-/// where the row is the (cell_center_theta, cell_center_h, weighted_mean_y),
-/// plus a `weight` column to be used by the fit.
+/// Bin a grid-aligned `(theta, h)` dataset into a `bins_theta × bins_h` grid
+/// and aggregate y, weights. For the lattice built by [`raw_dataset`], every
+/// non-empty cell contains exact duplicate coordinates, so the cell mean is a
+/// true representative basis row and weighted fitting should recover the full
+/// fit coefficients up to solver tolerance.
 fn discretize(
     data: &gam::data::EncodedDataset,
     bins_theta: usize,
@@ -159,6 +167,16 @@ fn discretize_then_fit_recovers_baseline_within_tolerance_n10k() {
     eprintln!(
         "[discretize] weighted-cells coef agreement: max_abs={max_abs_diff:.3e}, max_rel={max_rel_diff:.3e}"
     );
+    assert_eq!(
+        baseline_beta.len(),
+        discretized_beta.len(),
+        "weighted cell fit changed coefficient dimension"
+    );
+    assert!(
+        max_abs_diff < 1e-6 && max_rel_diff < 1e-6,
+        "weighted duplicate-cell fit should recover the full-data coefficients; \
+         max_abs={max_abs_diff:.3e}, max_rel={max_rel_diff:.3e}"
+    );
 }
 
 #[test]
@@ -177,12 +195,12 @@ fn discretize_fit_scaling_n_100k_vs_full() {
     for &n in &[10_000_usize, 100_000, 1_000_000] {
         let data = raw_dataset(n);
         let t0 = Instant::now();
-        let _ = fit_from_formula(formula, &data, &cfg_full).expect("full");
+        fit_from_formula(formula, &data, &cfg_full).expect("full");
         let full_ms = t0.elapsed().as_secs_f64() * 1e3;
         let cells = discretize(&data, 50, 16);
         let cells_n = cells.values.nrows();
         let t1 = Instant::now();
-        let _ = fit_from_formula(formula, &cells, &cfg_cells).expect("cells");
+        fit_from_formula(formula, &cells, &cfg_cells).expect("cells");
         let cells_ms = t1.elapsed().as_secs_f64() * 1e3;
         eprintln!(
             "[discretize] N={n} full: {full_ms:.1} ms; cells={cells_n} weighted: {cells_ms:.1} ms; speedup={:.1}x",
