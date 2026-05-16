@@ -137,7 +137,7 @@ fn cyclic_duchon_centers_80_fit_stays_within_envelope() {
     let mut violations = Vec::new();
     for (label, body) in cases {
         let m = max_residual_against_truth(&theta, &y_noisy, &y_truth, body);
-        eprintln!("[envelope] {label:20s} max|fitted - truth| = {m:.4}");
+        eprintln!("[envelope] {label:20} max|fitted - truth| = {m:.4}");
         if m > TOL {
             violations.push(format!("{label} ({body}): {m:.4} > {TOL}"));
         }
