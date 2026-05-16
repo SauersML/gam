@@ -31691,7 +31691,8 @@ mod tests {
         let cases: &[(usize, usize)] = &[(3, 2), (3, 3), (5, 2), (5, 3), (7, 3), (7, 4)];
         for &(d, j) in cases {
             for &r in &[0.3_f64, 1.0, 3.0] {
-                // 5-point stencil for f''(r) and centered diff for f'(r).
+                // 5-point finite-difference stencil for f''(r) and centered
+                // finite difference for f'(r).
                 let h = 1e-3_f64 * r;
                 let f_mm = riesz_kernel_value(d, j, r - 2.0 * h);
                 let f_m = riesz_kernel_value(d, j, r - h);
@@ -33205,7 +33206,7 @@ mod tests {
                         dd_fd
                     );
                 }
-                // Off-diagonal: 4-point cross stencil.
+                // Off-diagonal: 4-point cross finite-difference stencil.
                 for k in 0..d {
                     for l in (k + 1)..d {
                         let mut epp = eta.clone();

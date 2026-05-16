@@ -5541,9 +5541,10 @@ impl<'a> RemlState<'a> {
         // `D_β H ≡ 0` — there is no leakage to project away. Activating
         // the projection there would silently switch the cost identity
         // from `log|H|` to `log|H_proj|`, putting the analytic ψ-gradient
-        // on a different cost surface than the direct cost-slope oracle (the
-        // missing `dU_S/dψ` contribution shows up as a ~6e-3 rel error in
-        // the Gaussian identity projection test). Skipping the projection
+        // on a different cost surface than a centered finite difference
+        // of the cost (the missing `dU_S/dψ` contribution shows up as a
+        // ~6e-3 rel error in the Gaussian identity projection test).
+        // Skipping the projection
         // when `c ≡ 0` preserves the classical Gaussian REML cost identity
         // (`log|H|`) and keeps that test on its analytic match.  For
         // every c-nontrivial family (Probit / Logit / cloglog / Poisson /
@@ -5843,8 +5844,8 @@ impl<'a> RemlState<'a> {
         // canonical Gaussian (Identity link, `c ≡ 0`): the cost identity
         // then silently shifts from `log|H|` to `log|H_proj|`, and the
         // analytic ψ-gradient (still computed via `K · op_total`) no
-        // longer matches the direct cost-slope oracle within the projection's
-        // numerical roundoff — surfacing as a ~6e-3 rel error in
+        // longer matches a centered finite difference of the cost within
+        // the projection's numerical roundoff — surfacing as a ~6e-3 rel error in
         // the Gaussian identity projection test. The `c_nontrivial`
         // gate keeps the rank-deficient LAML fix active for every
         // non-Gaussian-Identity family (where the leakage is real and
