@@ -2,7 +2,7 @@ use crate::faer_ndarray::{
     FaerEigh, FaerLinalgError, default_rrqr_rank_alpha, fast_ab, fast_ata, fast_atb,
     rrqr_nullspace_basis,
 };
-use crate::linalg::utils::KahanSum;
+use crate::linalg::utils::{KahanSum, matrix_inversewith_regularization};
 use crate::matrix::{
     ChunkedKernelDesignOperator, CoefficientTransformOperator, DesignMatrix, LinearOperator,
 };
@@ -1386,6 +1386,16 @@ pub enum BSplineKnotSpec {
         placement: BSplineKnotPlacement,
     },
     Provided(Array1<f64>),
+    /// Uniform cyclic cardinal B-spline basis on `[data_range.0, data_range.1)`.
+    ///
+    /// The first and last endpoints are identified, so evaluating at `x` and
+    /// `x + m * period` gives identical rows. `num_basis` is the number of
+    /// periodic control sites around the loop and must be at least
+    /// `degree + 1` for an unaliased local support stencil.
+    PeriodicUniform {
+        data_range: (f64, f64),
+        num_basis: usize,
+    },
 }
 
 /// Internal-knot placement strategy when knots are automatically inferred.
@@ -1446,6 +1456,253 @@ impl BSplineBoundaryConditions {
         matches!(self.left, BSplineEndpointBoundaryCondition::Free)
             && matches!(self.right, BSplineEndpointBoundaryCondition::Free)
     }
+}
+
+/// Configuration for fitting/evaluating a one-dimensional periodic spline curve
+/// `u -> R^d` with a shared cyclic basis and one coefficient vector per ambient
+/// output dimension.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeriodicSplineCurveSpec {
+    pub degree: usize,
+    pub num_basis: usize,
+    pub period: f64,
+    pub origin: f64,
+    pub penalty_order: usize,
+}
+
+impl PeriodicSplineCurveSpec {
+    pub fn new(
+        degree: usize,
+        num_basis: usize,
+        period: f64,
+        origin: f64,
+        penalty_order: usize,
+    ) -> Result<Self, BasisError> {
+        validate_periodic_spline_config(degree, num_basis, period)?;
+        Ok(Self {
+            degree,
+            num_basis,
+            period,
+            origin,
+            penalty_order,
+        })
+    }
+}
+
+fn validate_periodic_spline_config(
+    degree: usize,
+    num_basis: usize,
+    period: f64,
+) -> Result<(), BasisError> {
+    if degree < 1 {
+        return Err(BasisError::InvalidDegree(degree));
+    }
+    if num_basis < degree + 1 {
+        return Err(BasisError::InvalidInput(format!(
+            "periodic B-spline requires num_basis >= degree + 1; got num_basis={num_basis}, degree={degree}"
+        )));
+    }
+    if !period.is_finite() || period <= 0.0 {
+        return Err(BasisError::InvalidInput(format!(
+            "periodic B-spline period must be positive and finite; got {period}"
+        )));
+    }
+    Ok(())
+}
+
+fn factorial_f64(n: usize) -> f64 {
+    (2..=n).fold(1.0, |acc, v| acc * v as f64)
+}
+
+#[inline]
+fn positive_part_pow(x: f64, p: usize) -> f64 {
+    if x <= 0.0 { 0.0 } else { x.powi(p as i32) }
+}
+
+fn cardinal_bspline_value(x: f64, degree: usize) -> f64 {
+    if degree == 0 {
+        return if (0.0..1.0).contains(&x) { 1.0 } else { 0.0 };
+    }
+    if x <= 0.0 || x >= (degree + 1) as f64 {
+        return 0.0;
+    }
+    let mut acc = 0.0;
+    for i in 0..=(degree + 1) {
+        let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+        acc += sign * binomial_f64(degree + 1, i) * positive_part_pow(x - i as f64, degree);
+    }
+    (acc / factorial_f64(degree)).max(0.0)
+}
+
+fn cardinal_bspline_derivative_value(x: f64, degree: usize) -> f64 {
+    if degree == 0 {
+        return 0.0;
+    }
+    cardinal_bspline_value(x, degree - 1) - cardinal_bspline_value(x - 1.0, degree - 1)
+}
+
+/// Evaluate a uniform cyclic B-spline design matrix on a one-dimensional
+/// periodic coordinate.
+///
+/// Rows are periodic with `period = data_range.1 - data_range.0`: `x` and
+/// `x + m * period` produce bitwise-identical row stencils up to floating-point
+/// arithmetic. Columns are cyclic control sites, so arbitrary anisotropic
+/// stretching geometry is represented by using multiple output coefficient
+/// columns with this same design.
+pub fn create_periodic_bspline_basis_dense(
+    data: ArrayView1<'_, f64>,
+    data_range: (f64, f64),
+    degree: usize,
+    num_basis: usize,
+) -> Result<Array2<f64>, BasisError> {
+    let period = data_range.1 - data_range.0;
+    validate_periodic_spline_config(degree, num_basis, period)?;
+    if !data_range.0.is_finite() || !data_range.1.is_finite() || data_range.0 >= data_range.1 {
+        return Err(BasisError::InvalidRange(data_range.0, data_range.1));
+    }
+    let h = period / num_basis as f64;
+    let mut basis = Array2::<f64>::zeros((data.len(), num_basis));
+    for (row, &x) in data.iter().enumerate() {
+        if !x.is_finite() {
+            return Err(BasisError::InvalidInput(
+                "periodic B-spline data contains non-finite coordinate".to_string(),
+            ));
+        }
+        let tau = ((x - data_range.0) / h).rem_euclid(num_basis as f64);
+        let base = tau.floor() as isize;
+        for local in 0..=degree {
+            let j_unwrapped = base - degree as isize + local as isize;
+            let value = cardinal_bspline_value(tau - j_unwrapped as f64, degree);
+            let j = j_unwrapped.rem_euclid(num_basis as isize) as usize;
+            basis[[row, j]] += value;
+        }
+    }
+    Ok(basis)
+}
+
+/// Evaluate first derivatives of a uniform cyclic B-spline design with respect
+/// to the original coordinate scale.
+pub fn create_periodic_bspline_derivative_dense(
+    data: ArrayView1<'_, f64>,
+    data_range: (f64, f64),
+    degree: usize,
+    num_basis: usize,
+) -> Result<Array2<f64>, BasisError> {
+    let period = data_range.1 - data_range.0;
+    validate_periodic_spline_config(degree, num_basis, period)?;
+    if !data_range.0.is_finite() || !data_range.1.is_finite() || data_range.0 >= data_range.1 {
+        return Err(BasisError::InvalidRange(data_range.0, data_range.1));
+    }
+    let h = period / num_basis as f64;
+    let inv_h = 1.0 / h;
+    let mut basis = Array2::<f64>::zeros((data.len(), num_basis));
+    for (row, &x) in data.iter().enumerate() {
+        if !x.is_finite() {
+            return Err(BasisError::InvalidInput(
+                "periodic B-spline data contains non-finite coordinate".to_string(),
+            ));
+        }
+        let tau = ((x - data_range.0) / h).rem_euclid(num_basis as f64);
+        let base = tau.floor() as isize;
+        for local in 0..=(degree + 1) {
+            let j_unwrapped = base - degree as isize + local as isize;
+            let value = cardinal_bspline_derivative_value(tau - j_unwrapped as f64, degree) * inv_h;
+            let j = j_unwrapped.rem_euclid(num_basis as isize) as usize;
+            basis[[row, j]] += value;
+        }
+    }
+    Ok(basis)
+}
+
+/// Build a cyclic finite-difference penalty `D' D` with wrap-around rows.
+pub fn create_cyclic_difference_penalty_matrix(
+    num_basis: usize,
+    order: usize,
+) -> Result<Array2<f64>, BasisError> {
+    if order == 0 {
+        return Ok(Array2::<f64>::eye(num_basis));
+    }
+    if num_basis == 0 || num_basis < order + 1 {
+        return Err(BasisError::InvalidInput(format!(
+            "cyclic difference penalty requires num_basis >= order + 1; got num_basis={num_basis}, order={order}"
+        )));
+    }
+    let mut d = Array2::<f64>::zeros((num_basis, num_basis));
+    for row in 0..num_basis {
+        for j in 0..=order {
+            let sign = if (order - j) % 2 == 0 { 1.0 } else { -1.0 };
+            d[[row, (row + j) % num_basis]] = sign * binomial_f64(order, j);
+        }
+    }
+    Ok(fast_ata(&d))
+}
+
+/// Evaluate a multi-output periodic spline curve from cyclic control points.
+pub fn evaluate_periodic_spline_curve(
+    data: ArrayView1<'_, f64>,
+    control_points: ArrayView2<'_, f64>,
+    spec: &PeriodicSplineCurveSpec,
+) -> Result<Array2<f64>, BasisError> {
+    if control_points.nrows() != spec.num_basis {
+        return Err(BasisError::DimensionMismatch(format!(
+            "periodic curve control point row mismatch: expected {}, got {}",
+            spec.num_basis,
+            control_points.nrows()
+        )));
+    }
+    let basis = create_periodic_bspline_basis_dense(
+        data,
+        (spec.origin, spec.origin + spec.period),
+        spec.degree,
+        spec.num_basis,
+    )?;
+    Ok(fast_ab(&basis, &control_points.to_owned()))
+}
+
+/// Fit a shared 1D periodic spline basis to arbitrary-dimensional ambient
+/// coordinates. Each output dimension is solved simultaneously, so ellipses,
+/// ovals, skewed loops, and distorted closed curves are represented without any
+/// unit-circle assumption.
+pub fn fit_periodic_spline_curve(
+    data: ArrayView1<'_, f64>,
+    points: ArrayView2<'_, f64>,
+    spec: &PeriodicSplineCurveSpec,
+    smoothing_lambda: f64,
+) -> Result<Array2<f64>, BasisError> {
+    if points.nrows() != data.len() {
+        return Err(BasisError::DimensionMismatch(format!(
+            "periodic curve fit row mismatch: u has {}, points have {} rows",
+            data.len(),
+            points.nrows()
+        )));
+    }
+    if !smoothing_lambda.is_finite() || smoothing_lambda < 0.0 {
+        return Err(BasisError::InvalidInput(format!(
+            "smoothing_lambda must be non-negative and finite; got {smoothing_lambda}"
+        )));
+    }
+    let basis = create_periodic_bspline_basis_dense(
+        data,
+        (spec.origin, spec.origin + spec.period),
+        spec.degree,
+        spec.num_basis,
+    )?;
+    let mut normal = fast_ata(&basis);
+    if smoothing_lambda > 0.0 {
+        let penalty = create_cyclic_difference_penalty_matrix(spec.num_basis, spec.penalty_order)?;
+        for i in 0..normal.nrows() {
+            for j in 0..normal.ncols() {
+                normal[[i, j]] += smoothing_lambda * penalty[[i, j]];
+            }
+        }
+    }
+    for i in 0..normal.nrows() {
+        normal[[i, i]] += 1e-12;
+    }
+    let rhs = fast_atb(&basis, &points.to_owned());
+    let inv = matrix_inversewith_regularization(&normal, "periodic_spline_curve_normal")
+        .ok_or_else(|| BasisError::LinalgError(FaerLinalgError::FactorizationFailed))?;
+    Ok(fast_ab(&inv, &rhs))
 }
 
 /// Per-smooth identifiability policy for 1D B-spline bases.
@@ -5544,6 +5801,7 @@ pub fn build_bspline_basis_1d(
     spec: &BSplineBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
     let prefer_sparse_design = spec.boundary_conditions.is_free()
+        && !matches!(spec.knotspec, BSplineKnotSpec::PeriodicUniform { .. })
         && matches!(
             spec.identifiability,
             BSplineIdentifiability::None | BSplineIdentifiability::WeightedSumToZero { .. }
@@ -5574,6 +5832,9 @@ pub fn build_bspline_basis_1d(
                 )?;
                 (Some(basis), None, knots)
             }
+            BSplineKnotSpec::PeriodicUniform { .. } => unreachable!(
+                "periodic B-spline basis is dense because cyclic wraparound aliases sparse identifiability"
+            ),
             BSplineKnotSpec::Automatic {
                 num_internal_knots,
                 placement,
@@ -5625,6 +5886,18 @@ pub fn build_bspline_basis_1d(
                 )?;
                 (None, Some((*basis).clone()), knots)
             }
+            BSplineKnotSpec::PeriodicUniform {
+                data_range,
+                num_basis,
+            } => {
+                let basis = create_periodic_bspline_basis_dense(
+                    data,
+                    *data_range,
+                    spec.degree,
+                    *num_basis,
+                )?;
+                (None, Some(basis), Array1::<f64>::zeros(0))
+            }
             BSplineKnotSpec::Automatic {
                 num_internal_knots,
                 placement,
@@ -5656,12 +5929,16 @@ pub fn build_bspline_basis_1d(
         .map(|basis| basis.ncols())
         .or_else(|| design_dense_opt.as_ref().map(Array2::ncols))
         .expect("B-spline basis should be present");
-    let greville_for_penalty = penalty_greville_abscissae_for_knots(&knots, spec.degree)?;
-    let s_bend_raw = create_difference_penalty_matrix(
-        p_raw,
-        spec.penalty_order,
-        greville_for_penalty.as_ref().map(|g| g.view()),
-    )?;
+    let s_bend_raw = if matches!(spec.knotspec, BSplineKnotSpec::PeriodicUniform { .. }) {
+        create_cyclic_difference_penalty_matrix(p_raw, spec.penalty_order)?
+    } else {
+        let greville_for_penalty = penalty_greville_abscissae_for_knots(&knots, spec.degree)?;
+        create_difference_penalty_matrix(
+            p_raw,
+            spec.penalty_order,
+            greville_for_penalty.as_ref().map(|g| g.view()),
+        )?
+    };
     let mut penalties_raw = vec![PenaltyCandidate {
         matrix: s_bend_raw.clone(),
         nullspace_dim_hint: 0,
