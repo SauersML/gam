@@ -46,10 +46,18 @@ fn discretize(
     for i in 0..n {
         let t = data.values[(i, 0)];
         let h = data.values[(i, 1)];
-        if t < theta_min { theta_min = t; }
-        if t > theta_max { theta_max = t; }
-        if h < h_min { h_min = h; }
-        if h > h_max { h_max = h; }
+        if t < theta_min {
+            theta_min = t;
+        }
+        if t > theta_max {
+            theta_max = t;
+        }
+        if h < h_min {
+            h_min = h;
+        }
+        if h > h_max {
+            h_max = h;
+        }
     }
     let theta_step = (theta_max - theta_min) / bins_theta as f64;
     let h_step = (h_max - h_min) / bins_h as f64;
@@ -64,10 +72,10 @@ fn discretize(
         let ti = ti.min(bins_theta - 1);
         let hi = hi.min(bins_h - 1);
         let c = &mut cells[ti * bins_h + hi];
-        c.0 += y;        // sum_y (unweighted, since w_i = 1)
-        c.1 += 1.0;      // weight count
-        c.2 += t;        // sum_theta (for cell center)
-        c.3 += h;        // sum_h
+        c.0 += y; // sum_y (unweighted, since w_i = 1)
+        c.1 += 1.0; // weight count
+        c.2 += t; // sum_theta (for cell center)
+        c.3 += h; // sum_h
     }
     let mut headers = vec!["theta".to_string(), "h".to_string(), "y".to_string()];
     headers.push("__cell_weight".to_string());
@@ -106,7 +114,10 @@ fn discretize_then_fit_recovers_baseline_within_tolerance_n10k() {
         FitResult::Standard(f) => f.fit.beta,
         _ => panic!("standard"),
     };
-    eprintln!("[discretize] baseline N={n} fit: {baseline_ms:.3} ms; |beta|={}", baseline_beta.len());
+    eprintln!(
+        "[discretize] baseline N={n} fit: {baseline_ms:.3} ms; |beta|={}",
+        baseline_beta.len()
+    );
 
     // Discretized: bin 50×16 (h has 16 unique values already; theta into 50 bins)
     let cells = discretize(&data, 50, 16);
@@ -143,7 +154,9 @@ fn discretize_then_fit_recovers_baseline_within_tolerance_n10k() {
             max_rel_diff = rel;
         }
     }
-    eprintln!("[discretize] coef agreement: max_abs={max_abs_diff:.3e}, max_rel={max_rel_diff:.3e}");
+    eprintln!(
+        "[discretize] coef agreement: max_abs={max_abs_diff:.3e}, max_rel={max_rel_diff:.3e}"
+    );
     // Report only — not a strict pass/fail since unweighted aggregation
     // changes the effective sample size and hence the REML-chosen λ.
 }
