@@ -237,6 +237,9 @@ pub fn fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S2, Ix2>,
 ) -> Array2<f64> {
+    if let Some(out) = crate::gpu::try_fast_atb(a, b) {
+        return out;
+    }
     let (n_a, p) = a.dim();
     let (_, q) = b.dim();
     fast_atb_with_parallelism(a, b, matmul_parallelism(p, q, n_a))
@@ -307,6 +310,10 @@ pub fn fast_av<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     use faer::linalg::matmul::matmul;
     use faer::{Accum, Mat};
 
+    if let Some(out) = crate::gpu::try_fast_av(a, v) {
+        return out;
+    }
+
     let (n, p) = a.dim();
     debug_assert_eq!(p, v.len(), "A cols must match v length");
 
@@ -346,6 +353,11 @@ pub fn fast_av_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     debug_assert_eq!(v.len(), p, "vector length must match A cols");
     debug_assert_eq!(out.len(), n, "output length must match A rows");
 
+    if let Some(result) = crate::gpu::try_fast_av(a, v) {
+        out.assign(&result);
+        return;
+    }
+
     if !should_use_faer_matmul(n, 1, p) {
         out.assign(&a.dot(v));
         return;
@@ -379,6 +391,11 @@ pub fn fast_av_view_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let (n, p) = a.dim();
     debug_assert_eq!(v.len(), p, "vector length must match A cols");
     debug_assert_eq!(out.len(), n, "output length must match A rows");
+
+    if let Some(result) = crate::gpu::try_fast_av(a, v) {
+        out.assign(&result);
+        return;
+    }
 
     if !should_use_faer_matmul(n, 1, p) {
         let prod = a.dot(v);
@@ -415,6 +432,10 @@ pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 ) -> Array1<f64> {
     use faer::linalg::matmul::matmul;
     use faer::{Accum, Mat};
+
+    if let Some(out) = crate::gpu::try_fast_atv(a, v) {
+        return out;
+    }
 
     let (n, p) = a.dim();
     debug_assert_eq!(n, v.len(), "A rows must match v length");
@@ -464,6 +485,11 @@ pub fn fast_atv_into<S: Data<Elem = f64>>(
     debug_assert_eq!(v.len(), n, "vector length must match A rows");
     debug_assert_eq!(out.len(), p, "output length must match A cols");
 
+    if let Some(result) = crate::gpu::try_fast_atv(a, v) {
+        out.assign(&result);
+        return;
+    }
+
     if !should_use_faer_matmul(p, 1, n) {
         out.assign(&a.t().dot(v));
         return;
@@ -512,6 +538,9 @@ pub fn fast_xt_diag_x_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64
     debug_assert_eq!(n, w.len(), "X rows must match W length");
     if n == 0 || p == 0 {
         return Array2::<f64>::zeros((p, p));
+    }
+    if let Some(out) = crate::gpu::try_fast_xt_diag_x(x, w) {
+        return out;
     }
     if !should_use_faer_matmul(p, p, n) {
         let w_x = Array2::from_shape_fn((n, p), |(i, j)| w[i] * x[[i, j]]);
@@ -580,6 +609,9 @@ pub fn fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem 
     debug_assert_eq!(n, x.nrows(), "X rows must match Y rows");
     if n == 0 || px == 0 || q == 0 {
         return Array2::<f64>::zeros((px, q));
+    }
+    if let Some(out) = crate::gpu::try_fast_xt_diag_y(x, w, y) {
+        return out;
     }
     if !should_use_faer_matmul(px, q, n) {
         let w_y = Array2::from_shape_fn((n, q), |(i, j)| w[i] * y[[i, j]]);
@@ -812,6 +844,11 @@ pub fn fast_ab_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let (p_b, q) = b.dim();
     debug_assert_eq!(p, p_b, "A and B must have compatible inner dimensions");
     debug_assert_eq!(out.dim(), (n, q), "output dimensions must match A*B result");
+
+    if let Some(result) = crate::gpu::try_fast_ab(a, b) {
+        out.assign(&result);
+        return;
+    }
 
     if !should_use_faer_matmul(n, q, p) {
         out.assign(&a.dot(b));

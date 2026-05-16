@@ -21,6 +21,7 @@ pub fn init_parallelism() {
 }
 
 pub mod families;
+pub mod gpu;
 pub mod inference;
 pub mod linalg;
 pub mod report;
@@ -55,6 +56,7 @@ pub use families::survival_location_scale;
 pub use families::survival_marginal_slope;
 pub use families::survival_predict;
 pub use families::transformation_normal;
+pub use gpu::{GpuDeviceInfo, gpu_available, selected_gpu_info};
 pub use solver::protocol::{
     LatentScoreSemantics, MarginalSlopeCalibrationProtocol, SurvivalMarginalSlopeProtocol,
 };
