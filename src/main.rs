@@ -3866,11 +3866,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         "net" => SurvivalSpec::Net,
         "crude" => {
             return Err(
-                "survival spec 'crude' is not supported by the one-hazard fitter; use spec=net and compute crude risk from separate cause-specific hazards"
+                "survival spec 'crude' is not supported by the one-hazard fitter; use survmodel(spec=net) and compute crude risk from separate cause-specific hazards"
                     .to_string(),
             );
         }
-        other => return Err(format!("unsupported --spec '{other}'; use net")),
+        other => return Err(format!(
+            "unsupported survmodel(spec='{other}'); only spec=net is accepted by the one-hazard fitter"
+        )),
     };
     let requested_likelihood_mode =
         parse_survival_likelihood_mode(&effective_args.survival_likelihood)?;
