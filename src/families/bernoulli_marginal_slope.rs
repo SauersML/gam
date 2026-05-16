@@ -26382,7 +26382,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn bernoulli_flex_hvp_cache_timing_biobank_shape_pattern() {
         // Wall-clock micro-benchmark for the per-row primary-Hessian cache
         // (`row_primary_hessians`).  The matrix-free CG / inner-Newton loops

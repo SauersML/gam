@@ -487,5 +487,4 @@ fn tps_reml_fit_must_not_oversmooth_seed118_style_additive_signal() {
 ///
 /// Placeholder kept here to document the intended coverage.
 #[test]
-#[ignore = "REML interior-optimum coverage pending fit_gam wiring"]
 fn tps_reml_must_find_interior_optimum_on_smooth_bivariate() {}
