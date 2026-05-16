@@ -1381,23 +1381,7 @@ pub enum BSplineKnotSpec {
         data_range: (f64, f64),
         num_internal_knots: usize,
     },
-    /// Uniform cyclic B-spline basis on [domain_start, domain_start + period).
-    ///
-    /// The basis is built by evaluating an unclamped uniform B-spline basis on
-    /// an extended knot vector and folding columns whose indices differ by the
-    /// number of cyclic coefficients. The resulting columns are exactly
-    /// periodic at the seam, and the associated difference penalty is cyclic.
-    Periodic {
-        domain_start: f64,
-        period: f64,
-        num_basis: usize,
-    },
-    Automatic {
-        num_internal_knots: Option<usize>,
-        placement: BSplineKnotPlacement,
-    },
-    Provided(Array1<f64>),
-    /// Uniform cyclic cardinal B-spline basis on `[data_range.0, data_range.1)`.
+    /// Uniform cyclic B-spline basis on `[data_range.0, data_range.1)`.
     ///
     /// The first and last endpoints are identified, so evaluating at `x` and
     /// `x + m * period` gives identical rows. `num_basis` is the number of
@@ -1407,6 +1391,11 @@ pub enum BSplineKnotSpec {
         data_range: (f64, f64),
         num_basis: usize,
     },
+    Automatic {
+        num_internal_knots: Option<usize>,
+        placement: BSplineKnotPlacement,
+    },
+    Provided(Array1<f64>),
 }
 
 /// Internal-knot placement strategy when knots are automatically inferred.
@@ -5813,70 +5802,17 @@ pub fn select_centers_by_strategy(
     }
 }
 
-<<<<<<< HEAD
 #[inline]
 fn wrap_to_period(x: f64, left: f64, period: f64) -> f64 {
     left + (x - left).rem_euclid(period)
-=======
-fn wrap_periodic_value(x: f64, start: f64, period: f64) -> f64 {
-    let r = (x - start).rem_euclid(period);
-    // Keep exact seam evaluations stable: start + period maps to start.
-    start
-        + if (period - r).abs() <= 16.0 * f64::EPSILON * period.abs().max(1.0) {
-            0.0
-        } else {
-            r
-        }
 }
 
-fn periodic_uniform_extended_knots(
-    domain_start: f64,
-    period: f64,
-    num_basis: usize,
-    degree: usize,
-) -> Result<Array1<f64>, BasisError> {
-    if !domain_start.is_finite() || !period.is_finite() || period <= 0.0 {
-        return Err(BasisError::InvalidInput(format!(
-            "periodic B-spline requires finite positive period, got start={domain_start}, period={period}"
-        )));
-    }
-    if num_basis <= degree {
-        return Err(BasisError::InvalidInput(format!(
-            "periodic B-spline requires num_basis > degree, got num_basis={num_basis}, degree={degree}"
-        )));
-    }
-    let h = period / num_basis as f64;
-    let count = num_basis + 2 * degree + 1;
-    let knots = (0..count)
-        .map(|i| domain_start - degree as f64 * h + i as f64 * h)
-        .collect::<Vec<_>>();
-    Ok(Array1::from_vec(knots))
-}
-
-fn create_cyclic_difference_penalty_matrix(
-    num_basis: usize,
-    order: usize,
-) -> Result<Array2<f64>, BasisError> {
-    if order == 0 {
-        return Ok(Array2::<f64>::eye(num_basis));
-    }
-    if num_basis < 2 {
-        return Err(BasisError::InvalidInput(
-            "cyclic difference penalty requires at least two coefficients".to_string(),
-        ));
-    }
-    let mut d = Array2::<f64>::eye(num_basis);
-    for _ in 0..order {
-        let rows = d.nrows();
-        let mut next = Array2::<f64>::zeros((rows, num_basis));
-        for r in 0..rows {
-            for c in 0..num_basis {
-                next[[r, c]] = d[[r, c]] - d[[r, (c + 1) % num_basis]];
-            }
-        }
-        d = next;
-    }
-    Ok(d.t().dot(&d))
+fn periodic_bspline_metadata_knots(domain_start: f64, period: f64, num_basis: usize) -> Array1<f64> {
+    Array1::from_vec(
+        (0..=num_basis)
+            .map(|i| domain_start + period * i as f64 / num_basis as f64)
+            .collect(),
+    )
 }
 
 fn build_periodic_bspline_basis_1d(
@@ -5886,23 +5822,18 @@ fn build_periodic_bspline_basis_1d(
     num_basis: usize,
     spec: &BSplineBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
-    let knots = periodic_uniform_extended_knots(domain_start, period, num_basis, spec.degree)?;
-    let wrapped = data.mapv(|x| wrap_periodic_value(x, domain_start, period));
-    let (extended, knots) = create_basis::<Dense>(
-        wrapped.view(),
-        KnotSource::Provided(knots.view()),
-        spec.degree,
-        BasisOptions::value(),
-    )?;
-    let ext = extended.as_ref();
-    let mut design_raw = Array2::<f64>::zeros((ext.nrows(), num_basis));
-    for j in 0..ext.ncols() {
-        let target = j % num_basis;
-        for i in 0..ext.nrows() {
-            design_raw[[i, target]] += ext[[i, j]];
-        }
+    if !spec.boundary_conditions.is_free() {
+        return Err(BasisError::InvalidInput(
+            "periodic B-splines cannot also declare endpoint boundary conditions".to_string(),
+        ));
     }
-
+    let knots = periodic_bspline_metadata_knots(domain_start, period, num_basis);
+    let design_raw = create_periodic_bspline_basis_dense(
+        data,
+        (domain_start, domain_start + period),
+        spec.degree,
+        num_basis,
+    )?;
     let s_bend_raw = create_cyclic_difference_penalty_matrix(num_basis, spec.penalty_order)?;
     let mut penalties_raw = vec![PenaltyCandidate {
         matrix: s_bend_raw.clone(),
@@ -5927,7 +5858,7 @@ fn build_periodic_bspline_basis_1d(
 
     let penalties_raw_mats = penalties_raw
         .iter()
-        .map(|c| c.matrix.clone())
+        .map(|candidate| candidate.matrix.clone())
         .collect::<Vec<_>>();
     let (design, penalties, identifiability_transform) = apply_bspline_identifiability_policy(
         design_raw,
@@ -5938,7 +5869,7 @@ fn build_periodic_bspline_basis_1d(
     )?;
     let transformed_candidates = penalties
         .into_iter()
-        .zip(penalties_raw.into_iter())
+        .zip(penalties_raw)
         .map(|(matrix, candidate)| PenaltyCandidate {
             nullspace_dim_hint: candidate.nullspace_dim_hint,
             matrix,
@@ -5963,7 +5894,6 @@ fn build_periodic_bspline_basis_1d(
         kronecker_factored: None,
         ops,
     })
->>>>>>> origin/pr-43
 }
 
 /// Generic 1D B-spline builder returning design + penalty list.
@@ -5971,14 +5901,6 @@ pub fn build_bspline_basis_1d(
     data: ArrayView1<'_, f64>,
     spec: &BSplineBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
-<<<<<<< HEAD
-    let prefer_sparse_design = spec.boundary_conditions.is_free()
-        && !matches!(spec.knotspec, BSplineKnotSpec::PeriodicUniform { .. })
-        && matches!(
-            spec.identifiability,
-            BSplineIdentifiability::None | BSplineIdentifiability::WeightedSumToZero { .. }
-        );
-=======
     if let BSplineKnotSpec::Periodic {
         domain_start,
         period,
@@ -5987,11 +5909,11 @@ pub fn build_bspline_basis_1d(
     {
         return build_periodic_bspline_basis_1d(data, domain_start, period, num_basis, spec);
     }
-    let prefer_sparse_design = matches!(
-        spec.identifiability,
-        BSplineIdentifiability::None | BSplineIdentifiability::WeightedSumToZero { .. }
-    );
->>>>>>> origin/pr-43
+    let prefer_sparse_design = spec.boundary_conditions.is_free()
+        && matches!(
+            spec.identifiability,
+            BSplineIdentifiability::None | BSplineIdentifiability::WeightedSumToZero { .. }
+        );
     let (design_sparse_opt, design_dense_opt, knots) = if prefer_sparse_design {
         match &spec.knotspec {
             BSplineKnotSpec::Generate {
@@ -6018,15 +5940,9 @@ pub fn build_bspline_basis_1d(
                 )?;
                 (Some(basis), None, knots)
             }
-<<<<<<< HEAD
-            BSplineKnotSpec::PeriodicUniform { .. } => unreachable!(
-                "periodic B-spline basis is dense because cyclic wraparound aliases sparse identifiability"
-            ),
-=======
             BSplineKnotSpec::Periodic { .. } => {
                 unreachable!("periodic B-spline handled before storage selection")
             }
->>>>>>> origin/pr-43
             BSplineKnotSpec::Automatic {
                 num_internal_knots,
                 placement,
@@ -6078,22 +5994,8 @@ pub fn build_bspline_basis_1d(
                 )?;
                 (None, Some((*basis).clone()), knots)
             }
-<<<<<<< HEAD
-            BSplineKnotSpec::PeriodicUniform {
-                data_range,
-                num_basis,
-            } => {
-                let basis = create_periodic_bspline_basis_dense(
-                    data,
-                    *data_range,
-                    spec.degree,
-                    *num_basis,
-                )?;
-                (None, Some(basis), Array1::<f64>::zeros(0))
-=======
             BSplineKnotSpec::Periodic { .. } => {
                 unreachable!("periodic B-spline handled before storage selection")
->>>>>>> origin/pr-43
             }
             BSplineKnotSpec::Automatic {
                 num_internal_knots,
@@ -6126,16 +6028,12 @@ pub fn build_bspline_basis_1d(
         .map(|basis| basis.ncols())
         .or_else(|| design_dense_opt.as_ref().map(Array2::ncols))
         .expect("B-spline basis should be present");
-    let s_bend_raw = if matches!(spec.knotspec, BSplineKnotSpec::PeriodicUniform { .. }) {
-        create_cyclic_difference_penalty_matrix(p_raw, spec.penalty_order)?
-    } else {
-        let greville_for_penalty = penalty_greville_abscissae_for_knots(&knots, spec.degree)?;
-        create_difference_penalty_matrix(
-            p_raw,
-            spec.penalty_order,
-            greville_for_penalty.as_ref().map(|g| g.view()),
-        )?
-    };
+    let greville_for_penalty = penalty_greville_abscissae_for_knots(&knots, spec.degree)?;
+    let s_bend_raw = create_difference_penalty_matrix(
+        p_raw,
+        spec.penalty_order,
+        greville_for_penalty.as_ref().map(|g| g.view()),
+    )?;
     let mut penalties_raw = vec![PenaltyCandidate {
         matrix: s_bend_raw.clone(),
         nullspace_dim_hint: 0,
@@ -22753,8 +22651,9 @@ mod tests {
         let spec = BSplineBasisSpec {
             degree: 3,
             penalty_order: 2,
-            knotspec: BSplineKnotSpec::PeriodicUniform {
-                data_range: (0.0, 1.0),
+            knotspec: BSplineKnotSpec::Periodic {
+                domain_start: 0.0,
+                period: 1.0,
                 num_basis: 8,
             },
             double_penalty: false,
