@@ -96,9 +96,10 @@ fn run_one(bc_left: &str, bc_right: &str) {
             m[[i, 0]] = x;
             m[[i, 1]] = 0.0;
         }
-        let design = build_term_collection_design(m.view(), &fit.resolvedspec).unwrap_or_else(
-            |e| panic!("predict-at-training rows rebuild failed for `{formula}`: {e:?}"),
-        );
+        let design =
+            build_term_collection_design(m.view(), &fit.resolvedspec).unwrap_or_else(|e| {
+                panic!("predict-at-training rows rebuild failed for `{formula}`: {e:?}")
+            });
         let pred = design.design.apply(&fit.fit.beta).to_vec();
         assert_eq!(
             pred.len(),
@@ -120,9 +121,10 @@ fn run_one(bc_left: &str, bc_right: &str) {
             m[[i, 0]] = xt;
             m[[i, 1]] = 0.0;
         }
-        let design = build_term_collection_design(m.view(), &fit.resolvedspec).unwrap_or_else(
-            |e| panic!("predict-at-new-points rebuild failed for `{formula}`: {e:?}"),
-        );
+        let design =
+            build_term_collection_design(m.view(), &fit.resolvedspec).unwrap_or_else(|e| {
+                panic!("predict-at-new-points rebuild failed for `{formula}`: {e:?}")
+            });
         let pred = design.design.apply(&fit.fit.beta).to_vec();
         assert_eq!(
             pred.len(),
@@ -159,9 +161,10 @@ fn run_one(bc_left: &str, bc_right: &str) {
             m[[i, 0]] = x;
             m[[i, 1]] = 0.0;
         }
-        let design = build_term_collection_design(m.view(), &fit.resolvedspec).unwrap_or_else(
-            |e| panic!("predict-at-boundary rebuild failed for `{formula}`: {e:?}"),
-        );
+        let design =
+            build_term_collection_design(m.view(), &fit.resolvedspec).unwrap_or_else(|e| {
+                panic!("predict-at-boundary rebuild failed for `{formula}`: {e:?}")
+            });
         let pred = design.design.apply(&fit.fit.beta).to_vec();
         assert_eq!(
             pred.len(),

@@ -1734,8 +1734,7 @@ impl FittedModel {
     ) -> std::collections::HashSet<usize> {
         use crate::basis::BSplineKnotSpec;
         use crate::smooth::SmoothBasisSpec;
-        let mut out: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
+        let mut out: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let Some(spec) = self.resolved_termspec.as_ref() else {
             return out;
         };
@@ -1752,10 +1751,8 @@ impl FittedModel {
                 }
                 // 1D periodic B-spline: the single feature column is periodic.
                 SmoothBasisSpec::BSpline1D { feature_col, spec } => {
-                    if matches!(
-                        spec.knotspec,
-                        BSplineKnotSpec::PeriodicUniform { .. }
-                    ) && *feature_col < training_headers.len()
+                    if matches!(spec.knotspec, BSplineKnotSpec::PeriodicUniform { .. })
+                        && *feature_col < training_headers.len()
                     {
                         out.insert(*feature_col);
                     }
@@ -1764,10 +1761,7 @@ impl FittedModel {
                 // PeriodicUniform is periodic; mark those columns.
                 SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
                     for (i, marginal) in spec.marginalspecs.iter().enumerate() {
-                        if matches!(
-                            marginal.knotspec,
-                            BSplineKnotSpec::PeriodicUniform { .. }
-                        ) {
+                        if matches!(marginal.knotspec, BSplineKnotSpec::PeriodicUniform { .. }) {
                             if let Some(&col) = feature_cols.get(i) {
                                 if col < training_headers.len() {
                                     out.insert(col);
