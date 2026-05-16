@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 
 use libloading::Library;
 
-use super::device::{GpuCapability, GpuDeviceInfo};
+use super::device::GpuDeviceInfo;
 use super::policy::DispatchPolicy;
 
 // Minimal CUDA driver ABI surface required for autodetection.
@@ -29,6 +29,11 @@ type CuDeviceGet = unsafe extern "C" fn(*mut CuDevice, i32) -> CuResult;
 type CuDeviceGetName = unsafe extern "C" fn(*mut c_char, i32, CuDevice) -> CuResult;
 type CuDeviceComputeCapability = unsafe extern "C" fn(*mut i32, *mut i32, CuDevice) -> CuResult;
 type CuDeviceTotalMem = unsafe extern "C" fn(*mut usize, CuDevice) -> CuResult;
+type CuDeviceGetAttribute = unsafe extern "C" fn(*mut i32, i32, CuDevice) -> CuResult;
+
+// CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT from cuda.h. Hard-coded
+// because we resolve symbols dynamically and can't include the header.
+const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: i32 = 16;
 
 /// Reason that GPU probing failed; never surfaced to callers, only logged.
 #[derive(Debug)]
@@ -176,6 +181,9 @@ fn probe_cuda_devices() -> Result<(&'static Library, Vec<GpuDeviceInfo>), GpuPro
             .or_else(|_| library.get(b"cuDeviceTotalMem\0"))
     }
     .map_err(|_| GpuProbeError::MissingSymbol("cuDeviceTotalMem"))?;
+    let cu_device_get_attribute: libloading::Symbol<'_, CuDeviceGetAttribute> =
+        unsafe { library.get(b"cuDeviceGetAttribute\0") }
+            .map_err(|_| GpuProbeError::MissingSymbol("cuDeviceGetAttribute"))?;
 
     check(unsafe { cu_init(0) }, "cuInit")?;
     let mut count: i32 = 0;
@@ -216,13 +224,24 @@ fn probe_cuda_devices() -> Result<(&'static Library, Vec<GpuDeviceInfo>), GpuPro
             unsafe { cu_device_total_mem(&mut total_memory_bytes, raw_device) },
             "cuDeviceTotalMem",
         )?;
+        let mut sm_count: i32 = 0;
+        check(
+            unsafe {
+                cu_device_get_attribute(
+                    &mut sm_count,
+                    CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                    raw_device,
+                )
+            },
+            "cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)",
+        )?;
         devices.push(GpuDeviceInfo {
             ordinal: ordinal as usize,
             name: c_name_to_string(&name_bytes),
             compute_capability_major: major,
             compute_capability_minor: minor,
+            sm_count,
             total_memory_bytes,
-            capability: GpuCapability::from_compute_capability(major, minor),
         });
     }
     drop(cu_init);
@@ -231,6 +250,7 @@ fn probe_cuda_devices() -> Result<(&'static Library, Vec<GpuDeviceInfo>), GpuPro
     drop(cu_device_get_name);
     drop(cu_device_compute_capability);
     drop(cu_device_total_mem);
+    drop(cu_device_get_attribute);
     Ok((library, devices))
 }
 

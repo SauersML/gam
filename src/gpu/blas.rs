@@ -6,7 +6,7 @@ use std::sync::{Mutex, OnceLock};
 
 use super::driver::{
     DeviceAllocation, DriverApi, bytes_len, check_cuda, cuda_library_candidates,
-    from_col_major, load_library, to_col_major,
+    from_col_major, load_library, to_col_major, to_i32,
 };
 use super::runtime::GpuRuntime;
 
@@ -143,8 +143,10 @@ impl CublasRuntime {
         unsafe {
             check_cuda((driver.cu_init)(0), "cuInit")?;
             let mut device = 0;
+            let ordinal = to_i32(selected.ordinal)
+                .ok_or_else(|| "CUDA device ordinal exceeds i32".to_string())?;
             check_cuda(
-                (driver.cu_device_get)(&mut device, selected.ordinal as i32),
+                (driver.cu_device_get)(&mut device, ordinal),
                 "cuDeviceGet",
             )?;
             let mut context = 0usize;
@@ -467,10 +469,6 @@ fn cublas_library_candidates() -> &'static [&'static str] {
     } else {
         &["libcublas.so.12", "libcublas.so.11", "libcublas.so"]
     }
-}
-
-fn to_i32(value: usize) -> Option<i32> {
-    i32::try_from(value).ok()
 }
 
 #[cfg(test)]

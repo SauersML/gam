@@ -123,6 +123,16 @@ pub fn bytes_len<T>(len: usize) -> Option<usize> {
     len.checked_mul(std::mem::size_of::<T>())
 }
 
+#[inline]
+pub fn to_i32(value: usize) -> Option<i32> {
+    i32::try_from(value).ok()
+}
+
+#[inline]
+pub fn to_i64(value: usize) -> Option<i64> {
+    i64::try_from(value).ok()
+}
+
 /// Repack a 2D `ndarray::ArrayBase` (row-major) into the column-major
 /// layout expected by every cuBLAS / cuSOLVER entry point.
 pub fn to_col_major<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Vec<f64> {
