@@ -100,15 +100,23 @@ fn discretize(
 fn discretize_then_fit_recovers_baseline_within_tolerance_n10k() {
     init_parallelism();
     let formula = "y ~ te(theta, h, periodic=[0], period=[6.283185307179586, None])";
-    let cfg = FitConfig {
+    let cfg_full = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
+    // Cells path: pass __cell_weight as the GAM observation weights so the
+    // REML/PIRLS Gaussian solver computes X'WX = Σ_c w_c x_c x_c' — which is
+    // exactly equal to the full-N X'WX since within each cell all rows share
+    // the same basis row x_c (knot-aligned bins). Same Cholesky, same β.
+    let cfg_cells = FitConfig {
+        family: Some("gaussian".to_string()),
+        weight_column: Some("__cell_weight".to_string()),
+        ..FitConfig::default()
+    };
     let n = 10_000;
-    // Baseline: full fit
     let data = raw_dataset(n);
     let t0 = Instant::now();
-    let baseline = fit_from_formula(formula, &data, &cfg).expect("baseline");
+    let baseline = fit_from_formula(formula, &data, &cfg_full).expect("baseline");
     let baseline_ms = t0.elapsed().as_secs_f64() * 1e3;
     let baseline_beta = match baseline {
         FitResult::Standard(f) => f.fit.beta,
@@ -119,26 +127,20 @@ fn discretize_then_fit_recovers_baseline_within_tolerance_n10k() {
         baseline_beta.len()
     );
 
-    // Discretized: bin 50×16 (h has 16 unique values already; theta into 50 bins)
     let cells = discretize(&data, 50, 16);
     let cells_n = cells.values.nrows();
     let t1 = Instant::now();
-    let discretized = fit_from_formula(formula, &cells, &cfg).expect("discretized");
+    let discretized = fit_from_formula(formula, &cells, &cfg_cells).expect("discretized");
     let discretized_ms = t1.elapsed().as_secs_f64() * 1e3;
     let discretized_beta = match discretized {
         FitResult::Standard(f) => f.fit.beta,
         _ => panic!("standard"),
     };
     eprintln!(
-        "[discretize] cells={cells_n} fit: {discretized_ms:.3} ms; speedup={:.1}x",
+        "[discretize] cells={cells_n} weighted fit: {discretized_ms:.3} ms; speedup={:.1}x",
         baseline_ms / discretized_ms
     );
 
-    // Compare first few coefficients (intercept and low-order terms most
-    // sensitive). This is a sanity check, not a strict equivalence — the
-    // unweighted aggregation gives a slightly different (but still valid)
-    // smoother because the binned data has different effective N for REML
-    // scale estimation.
     let max_compare = baseline_beta.len().min(discretized_beta.len());
     let mut max_abs_diff: f64 = 0.0;
     let mut max_rel_diff: f64 = 0.0;
@@ -155,10 +157,8 @@ fn discretize_then_fit_recovers_baseline_within_tolerance_n10k() {
         }
     }
     eprintln!(
-        "[discretize] coef agreement: max_abs={max_abs_diff:.3e}, max_rel={max_rel_diff:.3e}"
+        "[discretize] weighted-cells coef agreement: max_abs={max_abs_diff:.3e}, max_rel={max_rel_diff:.3e}"
     );
-    // Report only — not a strict pass/fail since unweighted aggregation
-    // changes the effective sample size and hence the REML-chosen λ.
 }
 
 #[test]
