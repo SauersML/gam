@@ -799,15 +799,21 @@ fn sparse_dense_imbalance() {
     let (yhat_sparse, yhat_dense) = yhat_all.split_at(100);
     let r_sparse = rmse(yhat_sparse, &truth_sparse);
     let r_dense = rmse(yhat_dense, &truth_dense);
+    let r_worst = r_sparse.max(r_dense);
     let sf = span(&yhat_all);
-    let st = span(&truth_sparse) + span(&truth_dense);
+    let truth_all: Vec<f64> = truth_sparse
+        .iter()
+        .chain(truth_dense.iter())
+        .copied()
+        .collect();
+    let st = span(&truth_all);
     let extra = format!(
-        "rmse_sparse={r_sparse:.4} rmse_dense={r_dense:.4} n_sparse={n_sparse} n_dense={n_dense}"
+        "rmse_sparse={r_sparse:.4} rmse_dense={r_dense:.4} rmse_worst={r_worst:.4} n_sparse={n_sparse} n_dense={n_dense}"
     );
     let _ = report(
         "sparse_dense_imbalance",
         formula,
-        r_dense, // headline metric: did dense region fit well?
+        r_worst,
         sigma,
         sf,
         st,
