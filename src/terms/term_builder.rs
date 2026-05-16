@@ -1454,7 +1454,15 @@ mod tests {
                     num_internal_knots, ..
                 } => num_internal_knots + marginal.degree + 1,
                 BSplineKnotSpec::PeriodicUniform { num_basis, .. } => num_basis,
-                BSplineKnotSpec::Explicit { ref knots, .. } => {
+                BSplineKnotSpec::Automatic {
+                    num_internal_knots: Some(num_internal_knots),
+                    ..
+                } => num_internal_knots + marginal.degree + 1,
+                BSplineKnotSpec::Automatic {
+                    num_internal_knots: None,
+                    ..
+                } => panic!("test helper cannot infer automatic knot count"),
+                BSplineKnotSpec::Provided(ref knots) => {
                     knots.len().saturating_sub(marginal.degree + 1)
                 }
             })
