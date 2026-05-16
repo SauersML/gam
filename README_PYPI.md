@@ -14,6 +14,13 @@ extensions, survival likelihoods, and flexible/learnable links. Smoothing
 parameters are selected by REML or LAML. Posterior sampling uses NUTS
 where supported, with a Gaussian Laplace fallback elsewhere.
 
+Geometric / manifold smooths handle predictor spaces that wrap, including
+circles, cylinders, tori, the sphere (intrinsic Wahba / spherical
+harmonic kernels), and one-sided strips, with no seams or pole
+artefacts:
+
+![rotating recovery of a trefoil knot, latent-free loop, wobbly cylinder, lumpy sphere, bumpy torus, and Möbius strip from noisy 3-D point clouds](https://raw.githubusercontent.com/SauersML/gam/main/docs/images/geometric_shapes_demo.gif)
+
 **Docs:** <https://gamfit.readthedocs.io/>
 
 ## Install
