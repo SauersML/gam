@@ -1,9 +1,15 @@
-//! cuSOLVER routing for large dense symmetric eigensystems.
+//! cuSOLVER routing for large dense symmetric linear algebra.
 //!
-//! The active production surface is the `FaerEigh` implementation: large
-//! lower-triangle eigendecompositions can run through `cusolverDnDsyevd`
-//! after automatic CUDA detection. Smaller matrices stay on faer's CPU path
-//! because the host/device round trip dominates there.
+//! The active production surface is:
+//!
+//! * [`try_syevd_inplace`] — wired into [`crate::linalg::faer_ndarray::FaerEigh`]
+//!   for large lower-triangle symmetric eigendecompositions.
+//! * [`try_chol_solve_inplace`] — fused dense Cholesky factor + triangular
+//!   solve (`A = LLᵀ`, then `A X = B`) in a single host↔device round-trip,
+//!   matching the PIRLS Newton-direction solve and ridge-retry pattern.
+//!
+//! Smaller matrices stay on faer's CPU path because the host/device round
+//! trip dominates there. Thresholds live in the helper functions below.
 
 use libloading::Library;
 use ndarray::{Array1, Array2};
@@ -22,9 +28,33 @@ pub fn try_syevd_inplace(a: &mut Array2<f64>) -> Option<Array1<f64>> {
     with_runtime(|rt| rt.syevd_inplace(a))
 }
 
+/// Fused Cholesky factor + triangular solve: solve `A X = B` for SPD `A`,
+/// writing the solution into `rhs`. Returns `Some(())` on success, or `None`
+/// to fall back to the host path (size below threshold, factor not PD on
+/// device, or any device error).
+///
+/// `a` is consumed in-place because cuSOLVER overwrites the lower triangle
+/// with `L` during factorization; callers that need the original matrix
+/// must clone before calling.
+#[inline]
+pub fn try_chol_solve_inplace(a: &mut Array2<f64>, rhs: &mut Array2<f64>) -> Option<()> {
+    let p = a.nrows();
+    if p != a.ncols() || rhs.nrows() != p || !route_chol_solve(p) {
+        return None;
+    }
+    with_runtime(|rt| rt.chol_solve_inplace(a, rhs))
+}
+
 #[inline]
 fn route_syevd(p: usize) -> bool {
     p >= 256
+}
+
+#[inline]
+fn route_chol_solve(p: usize) -> bool {
+    // Host faer factor+solve is dominated by host/device round-trip below
+    // ~512 columns; above that cuSOLVER's tensor-core-aware dpotrf wins.
+    p >= 512
 }
 
 fn with_runtime<T>(f: impl FnOnce(&mut CusolverRuntime) -> Option<T>) -> Option<T> {
@@ -163,6 +193,115 @@ impl CusolverRuntime {
         Some(Array1::from_vec(eigs))
     }
 
+    /// Fused Cholesky factor + solve: `A` is overwritten with `L`, `rhs`
+    /// with `A⁻¹·rhs`. One device round trip; returns `None` on any failure
+    /// (factor not PD, allocation/copy error, library status non-zero) so
+    /// callers fall back to faer.
+    fn chol_solve_inplace(&mut self, a: &mut Array2<f64>, rhs: &mut Array2<f64>) -> Option<()> {
+        let p = a.nrows();
+        let nrhs = rhs.ncols();
+        let mut a_col = to_col_major(a);
+        let mut rhs_col = to_col_major(rhs);
+        let bytes_a = bytes_len::<f64>(a_col.len())?;
+        let bytes_rhs = bytes_len::<f64>(rhs_col.len())?;
+        let bytes_info = bytes_len::<i32>(1)?;
+
+        unsafe {
+            self.set_current().ok()?;
+            let a_dev = self.alloc_copy(&a_col, bytes_a)?;
+            let rhs_dev = self.alloc_copy(&rhs_col, bytes_rhs)?;
+            let info_dev = DeviceAllocation::new(&self.driver, bytes_info)?;
+            let mut work_size: i32 = 0;
+            if (self.solver.dpotrf_buffersize)(
+                self.handle,
+                CUBLAS_FILL_LOWER,
+                p as i32,
+                a_dev.ptr,
+                p as i32,
+                &mut work_size,
+            ) != CUSOLVER_STATUS_SUCCESS
+            {
+                return None;
+            }
+            let scratch = if work_size > 0 {
+                Some(DeviceAllocation::new(
+                    &self.driver,
+                    (work_size as usize) * std::mem::size_of::<f64>(),
+                )?)
+            } else {
+                None
+            };
+            let scratch_ptr = scratch.as_ref().map(|s| s.ptr).unwrap_or(0);
+            let factor_status = (self.solver.dpotrf)(
+                self.handle,
+                CUBLAS_FILL_LOWER,
+                p as i32,
+                a_dev.ptr,
+                p as i32,
+                scratch_ptr,
+                work_size,
+                info_dev.ptr,
+            );
+            if factor_status != CUSOLVER_STATUS_SUCCESS {
+                return None;
+            }
+            let mut info: i32 = 0;
+            check_cuda(
+                (self.driver.cu_memcpy_dtoh)(
+                    (&mut info) as *mut i32 as *mut std::ffi::c_void,
+                    info_dev.ptr,
+                    bytes_info,
+                ),
+                "cuMemcpyDtoH potrf info",
+            )
+            .ok()?;
+            if info != 0 {
+                // Matrix not PD on device; report None so faer's CPU path
+                // can fall through to its own ridge-bump policy.
+                return None;
+            }
+            let solve_status = (self.solver.dpotrs)(
+                self.handle,
+                CUBLAS_FILL_LOWER,
+                p as i32,
+                nrhs as i32,
+                a_dev.ptr,
+                p as i32,
+                rhs_dev.ptr,
+                p as i32,
+                info_dev.ptr,
+            );
+            if solve_status != CUSOLVER_STATUS_SUCCESS {
+                return None;
+            }
+            check_cuda(
+                (self.driver.cu_memcpy_dtoh)(
+                    (&mut info) as *mut i32 as *mut std::ffi::c_void,
+                    info_dev.ptr,
+                    bytes_info,
+                ),
+                "cuMemcpyDtoH potrs info",
+            )
+            .ok()?;
+            if info != 0 {
+                return None;
+            }
+            check_cuda(
+                (self.driver.cu_memcpy_dtoh)(a_col.as_mut_ptr().cast(), a_dev.ptr, bytes_a),
+                "cuMemcpyDtoH A",
+            )
+            .ok()?;
+            check_cuda(
+                (self.driver.cu_memcpy_dtoh)(rhs_col.as_mut_ptr().cast(), rhs_dev.ptr, bytes_rhs),
+                "cuMemcpyDtoH rhs",
+            )
+            .ok()?;
+        }
+        from_col_major_inplace(&a_col, a);
+        from_col_major_inplace(&rhs_col, rhs);
+        Some(())
+    }
+
     unsafe fn set_current(&self) -> Result<(), String> {
         check_cuda(
             unsafe { (self.driver.cu_ctx_set_current)(self.context) },
@@ -296,12 +435,44 @@ type CusolverDsyevd = unsafe extern "C" fn(
     i32,   // lwork
     u64,   // devInfo
 ) -> CusolverStatus;
+type CusolverDpotrfBufferSize = unsafe extern "C" fn(
+    usize,    // handle
+    i32,      // uplo
+    i32,      // n
+    u64,      // A
+    i32,      // lda
+    *mut i32, // lwork
+) -> CusolverStatus;
+type CusolverDpotrf = unsafe extern "C" fn(
+    usize, // handle
+    i32,   // uplo
+    i32,   // n
+    u64,   // A
+    i32,   // lda
+    u64,   // workspace
+    i32,   // lwork
+    u64,   // devInfo
+) -> CusolverStatus;
+type CusolverDpotrs = unsafe extern "C" fn(
+    usize, // handle
+    i32,   // uplo
+    i32,   // n
+    i32,   // nrhs
+    u64,   // A
+    i32,   // lda
+    u64,   // B
+    i32,   // ldb
+    u64,   // devInfo
+) -> CusolverStatus;
 
 struct CusolverApi {
     create: CusolverCreate,
     destroy: CusolverDestroy,
     dsyevd_buffersize: CusolverDsyevdBufferSize,
     dsyevd: CusolverDsyevd,
+    dpotrf_buffersize: CusolverDpotrfBufferSize,
+    dpotrf: CusolverDpotrf,
+    dpotrs: CusolverDpotrs,
 }
 
 impl CusolverApi {
@@ -319,6 +490,15 @@ impl CusolverApi {
                     .map_err(|e| e.to_string())?,
                 dsyevd: *library
                     .get(b"cusolverDnDsyevd\0")
+                    .map_err(|e| e.to_string())?,
+                dpotrf_buffersize: *library
+                    .get(b"cusolverDnDpotrf_bufferSize\0")
+                    .map_err(|e| e.to_string())?,
+                dpotrf: *library
+                    .get(b"cusolverDnDpotrf\0")
+                    .map_err(|e| e.to_string())?,
+                dpotrs: *library
+                    .get(b"cusolverDnDpotrs\0")
                     .map_err(|e| e.to_string())?,
             })
         }
