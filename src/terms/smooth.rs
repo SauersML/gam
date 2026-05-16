@@ -2612,12 +2612,21 @@ fn build_shape_constraint_design_1d(
             BasisMetadata::BSpline1D {
                 knots,
                 identifiability_transform,
+                periodic,
             },
         ) => {
             let evalspec = BSplineBasisSpec {
                 degree: spec.degree,
                 penalty_order: spec.penalty_order,
-                knotspec: BSplineKnotSpec::Provided(knots.clone()),
+                knotspec: periodic
+                    .map(
+                        |(domain_start, period, num_basis)| BSplineKnotSpec::Periodic {
+                            domain_start,
+                            period,
+                            num_basis,
+                        },
+                    )
+                    .unwrap_or_else(|| BSplineKnotSpec::Provided(knots.clone())),
                 double_penalty: false,
                 identifiability: identifiability_transform
                     .as_ref()
@@ -2907,6 +2916,7 @@ fn build_tensor_bspline_basis(
     let mut marginalnum_basis = Vec::<usize>::with_capacity(feature_cols.len());
     let mut marginal_penalties = Vec::<Array2<f64>>::with_capacity(feature_cols.len());
     let mut marginal_designs = Vec::<Array2<f64>>::with_capacity(feature_cols.len());
+    let mut marginal_periodic = Vec::<Option<(f64, f64, usize)>>::with_capacity(feature_cols.len());
 
     // Reuse the robust 1D builder to ensure the same knot validation and
     // marginal difference-penalty construction as standalone smooth terms.
@@ -2922,8 +2932,10 @@ fn build_tensor_bspline_basis(
         let mut marginal_unconstrained = marginalspec.clone();
         marginal_unconstrained.identifiability = BSplineIdentifiability::None;
         let built = build_bspline_basis_1d(data.column(col), &marginal_unconstrained)?;
-        let knots = match built.metadata {
-            BasisMetadata::BSpline1D { knots, .. } => knots,
+        let (knots, periodic) = match built.metadata {
+            BasisMetadata::BSpline1D {
+                knots, periodic, ..
+            } => (knots, periodic),
             _ => {
                 return Err(BasisError::InvalidInput(format!(
                     "internal TensorBSpline error at dim {dim}: expected BSpline1D metadata"
@@ -2931,6 +2943,7 @@ fn build_tensor_bspline_basis(
             }
         };
         marginal_knots.push(knots);
+        marginal_periodic.push(periodic);
         marginal_degrees.push(marginalspec.degree);
         marginalnum_basis.push(built.design.ncols());
         marginal_designs.push(built.design.to_dense());
@@ -3072,6 +3085,7 @@ fn build_tensor_bspline_basis(
             feature_cols: feature_cols.to_vec(),
             knots: marginal_knots,
             degrees: marginal_degrees,
+            periodic: marginal_periodic,
             identifiability_transform: z_opt,
         },
         kronecker_factored: if matches!(spec.identifiability, TensorBSplineIdentifiability::None) {
@@ -4918,8 +4932,10 @@ fn with_identifiability_transform(
         BasisMetadata::BSpline1D {
             knots,
             identifiability_transform,
+            periodic,
         } => Ok(BasisMetadata::BSpline1D {
             knots: knots.clone(),
+            periodic: *periodic,
             identifiability_transform: compose_identifiability_transforms(
                 identifiability_transform.as_ref(),
                 transform,
@@ -4985,11 +5001,13 @@ fn with_identifiability_transform(
             feature_cols,
             knots,
             degrees,
+            periodic,
             identifiability_transform,
         } => Ok(BasisMetadata::TensorBSpline {
             feature_cols: feature_cols.clone(),
             knots: knots.clone(),
             degrees: degrees.clone(),
+            periodic: periodic.clone(),
             identifiability_transform: compose_identifiability_transforms(
                 identifiability_transform.as_ref(),
                 transform,
@@ -11945,9 +11963,18 @@ pub fn freeze_term_collection_from_design(
                 BasisMetadata::BSpline1D {
                     knots,
                     identifiability_transform,
+                    periodic,
                 },
             ) => {
-                s.knotspec = BSplineKnotSpec::Provided(knots.clone());
+                s.knotspec = periodic
+                    .map(
+                        |(domain_start, period, num_basis)| BSplineKnotSpec::Periodic {
+                            domain_start,
+                            period,
+                            num_basis,
+                        },
+                    )
+                    .unwrap_or_else(|| BSplineKnotSpec::Provided(knots.clone()));
                 s.identifiability = match identifiability_transform {
                     Some(z) => BSplineIdentifiability::FrozenTransform {
                         transform: z.clone(),
@@ -12096,6 +12123,7 @@ pub fn freeze_term_collection_from_design(
                     feature_cols: fitted_cols,
                     knots,
                     degrees,
+                    periodic,
                     identifiability_transform,
                 },
             ) => {
@@ -12111,7 +12139,15 @@ pub fn freeze_term_collection_from_design(
                 *feature_cols = fitted_cols.clone();
                 for i in 0..s.marginalspecs.len() {
                     s.marginalspecs[i].degree = degrees[i];
-                    s.marginalspecs[i].knotspec = BSplineKnotSpec::Provided(knots[i].clone());
+                    s.marginalspecs[i].knotspec = periodic[i]
+                        .map(
+                            |(domain_start, period, num_basis)| BSplineKnotSpec::Periodic {
+                                domain_start,
+                                period,
+                                num_basis,
+                            },
+                        )
+                        .unwrap_or_else(|| BSplineKnotSpec::Provided(knots[i].clone()));
                 }
                 s.identifiability = match identifiability_transform {
                     Some(z) => TensorBSplineIdentifiability::FrozenTransform {
@@ -16086,6 +16122,114 @@ mod tests {
                 .iter()
                 .all(|bp| bp.col_range.end <= sd.total_smooth_cols())
         );
+    }
+
+    #[test]
+    fn periodic_bspline_margin_wraps_exactly_at_period() {
+        let x = array![0.0, 1.25, 2.5, 3.75, 7.0, 8.25];
+        let spec = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Periodic {
+                domain_start: 0.0,
+                period: 7.0,
+                num_basis: 8,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+        };
+        let built = build_bspline_basis_1d(x.view(), &spec).expect("periodic bspline");
+        let dense = built.design.to_dense();
+        assert_eq!(dense.ncols(), 8);
+        for j in 0..dense.ncols() {
+            assert!(
+                (dense[[0, j]] - dense[[4, j]]).abs() < 1e-12,
+                "seam row differs at column {j}: {} vs {}",
+                dense[[0, j]],
+                dense[[4, j]]
+            );
+            assert!(
+                (dense[[1, j]] - dense[[5, j]]).abs() < 1e-12,
+                "wrapped row differs at column {j}: {} vs {}",
+                dense[[1, j]],
+                dense[[5, j]]
+            );
+        }
+        for row in dense.rows() {
+            assert!((row.sum() - 1.0).abs() < 1e-12);
+        }
+        assert_eq!(built.nullspace_dims[0], 1);
+    }
+
+    #[test]
+    fn tensor_bspline_supports_two_periodic_margins_as_torus() {
+        let data = array![[0.0, 0.0], [7.0, 0.0], [0.0, 24.0], [7.0, 24.0], [1.5, 6.0]];
+        let spec_day = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Periodic {
+                domain_start: 0.0,
+                period: 7.0,
+                num_basis: 7,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+        };
+        let spec_hour = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Periodic {
+                domain_start: 0.0,
+                period: 24.0,
+                num_basis: 8,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+        };
+        let spec_collection = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "te_day_hour".to_string(),
+                basis: SmoothBasisSpec::TensorBSpline {
+                    feature_cols: vec![0, 1],
+                    spec: TensorBSplineSpec {
+                        marginalspecs: vec![spec_day, spec_hour],
+                        double_penalty: false,
+                        identifiability: TensorBSplineIdentifiability::None,
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let design = build_term_collection_design(data.view(), &spec_collection)
+            .expect("periodic tensor design");
+        let sd = &design.smooth;
+        let dense = sd.term_designs[0].to_dense();
+        assert_eq!(dense.ncols(), 56);
+        for j in 0..dense.ncols() {
+            assert!((dense[[0, j]] - dense[[1, j]]).abs() < 1e-12);
+            assert!((dense[[0, j]] - dense[[2, j]]).abs() < 1e-12);
+            assert!((dense[[0, j]] - dense[[3, j]]).abs() < 1e-12);
+        }
+        assert_eq!(sd.penalties.len(), 2);
+        assert!(sd.penalties.iter().all(|p| p.local.nrows() == 56));
+
+        let frozen = freeze_term_collection_from_design(&spec_collection, &design)
+            .expect("freeze periodic tensor");
+        match &frozen.smooth_terms[0].basis {
+            SmoothBasisSpec::TensorBSpline { spec, .. } => {
+                assert!(matches!(
+                    spec.marginalspecs[0].knotspec,
+                    BSplineKnotSpec::Periodic { period: 7.0, .. }
+                ));
+                assert!(matches!(
+                    spec.marginalspecs[1].knotspec,
+                    BSplineKnotSpec::Periodic { period: 24.0, .. }
+                ));
+            }
+            _ => panic!("expected tensor spec"),
+        }
     }
 
     #[test]

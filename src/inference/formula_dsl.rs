@@ -26,7 +26,8 @@ mul_op = _{ "*" | "/" }
 unary = { unary_op* ~ primary }
 unary_op = _{ "+" | "-" }
 
-primary = { function_call | ident | number | string_lit | "(" ~ expr ~ ")" }
+primary = { function_call | list_lit | ident | number | string_lit | "(" ~ expr ~ ")" }
+list_lit = { "[" ~ (expr ~ ("," ~ expr)*)? ~ "]" }
 function_call = { ident ~ "(" ~ arg_list? ~ ")" }
 arg_list = { arg ~ ("," ~ arg)* }
 arg = { named_arg | expr }
@@ -281,6 +282,30 @@ mod tests {
             CallArgSpec::Named {
                 key: "type".to_string(),
                 value: "\"duchon\"".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_list_options_for_periodic_tensor_smooths() {
+        let call = parse_function_call(
+            "te(day_of_week, hour, bc=['periodic', 'periodic'], period=[7, 24])",
+        )
+        .expect("call");
+        assert_eq!(call.name, "te");
+        assert_eq!(call.args.len(), 4);
+        assert_eq!(
+            call.args[2],
+            CallArgSpec::Named {
+                key: "bc".to_string(),
+                value: "['periodic', 'periodic']".to_string(),
+            }
+        );
+        assert_eq!(
+            call.args[3],
+            CallArgSpec::Named {
+                key: "period".to_string(),
+                value: "[7, 24]".to_string(),
             }
         );
     }
