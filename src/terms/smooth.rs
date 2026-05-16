@@ -3147,6 +3147,7 @@ fn tensor_product_design_from_marginals(
     // across rows; parallelize row chunks and fill the pre-allocated
     // contiguous Array2 in place (no Vec-flatten-collect intermediate,
     // which doubled the peak memory at biobank N).
+    use ndarray::parallel::prelude::*;
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let mut design = Array2::<f64>::zeros((n, total_cols));
     design
